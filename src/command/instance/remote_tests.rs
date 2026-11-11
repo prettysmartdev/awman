@@ -559,6 +559,7 @@ async fn mapping_snapshot_and_frames_reach_the_presenter_channels() {
         tab_id: tab_id.clone(),
         slot_id: step.slot_id,
         exit_code: Some(0),
+        final_screen: None,
     });
     unit.delta(InstanceDelta::GroupFinished {
         tab_id: tab_id.clone(),
@@ -613,6 +614,346 @@ async fn mapping_snapshot_and_frames_reach_the_presenter_channels() {
         event,
         BackendEvent::UiAck { ticket: t, outcome } if *t == ticket && outcome.claimed_by_host
     )));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dynamic_sequential_replacement_reattaches_workflow_requests() {
+    let mut unit = unit();
+    let tab_id = TabId::new();
+    unit.welcome(instance_snapshot(vec![tab_snapshot(
+        &unit.root,
+        tab_id.clone(),
+        vec![slot("", None)],
+    )]));
+    let InitialTabOpened::Normal { tab } = unit.backend.open_initial(session_spec(&unit.root))
+    else {
+        panic!("expected the daemon tab");
+    };
+    let events = tab.feeds.container.events.clone();
+    events.lock().unwrap().clear();
+
+    // The leader and later workflow steps replace the bound sequential slot.
+    let next = slot("leader", None);
+    unit.delta(InstanceDelta::SlotLaunched { tab_id, slot: next });
+    let queued: Vec<_> = events.lock().unwrap().drain(..).collect();
+    let requests = queued.iter().find_map(|event| match event {
+        ContainerSlotEvent::EngineAttached {
+            requests: Some(requests),
+            ..
+        } => Some(requests),
+        _ => None,
+    });
+    let requests = requests.expect("the replacement slot must attach Ctrl-W");
+    requests
+        .send(EngineRequest::OpenControlBoard {
+            step_name: "leader".into(),
+        })
+        .unwrap();
+    assert!(unit.sent().iter().any(|frame| matches!(
+        frame,
+        FrontendFrame::WorkflowRequest {
+            request: WorkflowRequestWire::OpenControlBoard { step_name },
+            ..
+        } if step_name == "leader"
+    )));
+    tab.feeds.signals.touch_user_for_step(Some("build"));
+    assert!(unit.sent().iter().any(|frame| matches!(
+        frame,
+        FrontendFrame::Activity { step_name: Some(step_name), .. }
+        if step_name == "build"
+    )));
+    tab.feeds.signals.touch_user_for_step(Some("test"));
+    assert!(
+        unit.sent().iter().any(|frame| matches!(
+            frame,
+            FrontendFrame::Activity { step_name: Some(step_name), .. }
+            if step_name == "test"
+        )),
+        "changing slots must bypass the activity throttle"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attaching_mid_parallel_group_stashes_the_backbone_before_step_slots() {
+    let unit = unit();
+    let tab_id = TabId::new();
+    let mut backbone = slot("", None);
+    backbone.dormant = true;
+    let step = slot("build", None);
+    unit.welcome(instance_snapshot(vec![tab_snapshot(
+        &unit.root,
+        tab_id,
+        vec![backbone, step],
+    )]));
+    let InitialTabOpened::Normal { tab } = unit.backend.open_initial(session_spec(&unit.root))
+    else {
+        panic!("expected the daemon tab");
+    };
+    let events: Vec<_> = tab
+        .feeds
+        .container
+        .events
+        .lock()
+        .unwrap()
+        .drain(..)
+        .collect();
+    let group = events
+        .iter()
+        .position(|event| matches!(event, ContainerSlotEvent::GroupStarted))
+        .expect("the snapshot must announce the parallel group");
+    let step = events
+        .iter()
+        .position(|event| matches!(event, ContainerSlotEvent::Launched { step_name, .. } if step_name == "build"))
+        .expect("the parallel step must launch");
+    assert!(group < step, "the TUI must stash the backbone first");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconnect_reconciles_parallel_transitions_and_cleared_reports() {
+    use crate::data::program_status::{EffectiveStatus, ProgramState};
+
+    let unit = unit();
+    let tab_id = TabId::new();
+    let backbone = slot("", None);
+    unit.welcome(instance_snapshot(vec![tab_snapshot(
+        &unit.root,
+        tab_id.clone(),
+        vec![backbone.clone()],
+    )]));
+    let InitialTabOpened::Normal { tab } = unit.backend.open_initial(session_spec(&unit.root))
+    else {
+        panic!("expected the daemon tab");
+    };
+    let events = tab.feeds.container.events.clone();
+    events.lock().unwrap().clear();
+
+    let mut dormant = backbone;
+    dormant.dormant = true;
+    let mut step = slot("build", None);
+    step.program_status = Some(EffectiveStatus {
+        state: ProgramState::Done,
+        kind: None,
+        progress: None,
+        msg: None,
+        app: None,
+        id: None,
+    });
+    step.yolo = Some(YoloState {
+        step_name: "build".into(),
+        remaining_secs: 5,
+        kind: CountdownKind::AgentDone,
+    });
+    let group = tab_snapshot(
+        &unit.root,
+        tab_id.clone(),
+        vec![dormant.clone(), step.clone()],
+    );
+    unit.welcome(instance_snapshot(vec![group.clone()]));
+    let queued: Vec<_> = events.lock().unwrap().drain(..).collect();
+    let group_started = queued
+        .iter()
+        .position(|event| matches!(event, ContainerSlotEvent::GroupStarted))
+        .unwrap();
+    let launched = queued
+        .iter()
+        .position(|event| matches!(event, ContainerSlotEvent::Launched { step_name, .. } if step_name == "build"))
+        .unwrap();
+    assert!(group_started < launched);
+    assert!(queued.iter().any(|event| matches!(event, ContainerSlotEvent::Reported { step_name, status: Some(_) } if step_name == "build")));
+    assert!(queued.iter().any(|event| matches!(event, ContainerSlotEvent::YoloTick { step_name, remaining_secs: 5 } if step_name == "build")));
+
+    let mut cleared = group;
+    cleared.slots[1].program_status = None;
+    cleared.slots[1].yolo = None;
+    cleared.slots[1].container_name = "replacement-container".into();
+    unit.welcome(instance_snapshot(vec![cleared]));
+    let queued: Vec<_> = events.lock().unwrap().drain(..).collect();
+    assert!(queued.iter().any(|event| matches!(event, ContainerSlotEvent::Reported { step_name, status: None } if step_name == "build")));
+    assert!(queued.iter().any(|event| matches!(event, ContainerSlotEvent::YoloFinished { step_name } if step_name == "build")));
+    assert!(queued.iter().any(|event| matches!(event, ContainerSlotEvent::ContainerName { step_name, container_name } if step_name == "build" && container_name == "replacement-container")));
+
+    let replacement = slot("review", None);
+    unit.welcome(instance_snapshot(vec![tab_snapshot(
+        &unit.root,
+        tab_id,
+        vec![replacement],
+    )]));
+    let queued: Vec<_> = events.lock().unwrap().drain(..).collect();
+    let group_finished = queued
+        .iter()
+        .position(|event| matches!(event, ContainerSlotEvent::GroupFinished))
+        .unwrap();
+    let launched = queued
+        .iter()
+        .position(|event| matches!(event, ContainerSlotEvent::SequentialLaunched { .. }))
+        .unwrap();
+    assert!(
+        group_finished < launched,
+        "restore the backbone before replacing it"
+    );
+    assert!(queued.iter().all(|event| !matches!(event, ContainerSlotEvent::Launched { step_name, .. } if step_name == "review")), "the next sequential step must not become a parallel slot");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_dialogs_late_response_cannot_answer_the_next_dialog() {
+    let mut unit = unit();
+    let tab_id = TabId::new();
+    unit.welcome(instance_snapshot(vec![tab_snapshot(
+        &unit.root,
+        tab_id.clone(),
+        vec![slot("", None)],
+    )]));
+    let InitialTabOpened::Normal { tab } = unit.backend.open_initial(session_spec(&unit.root))
+    else {
+        panic!("expected the daemon tab");
+    };
+    let StartupRun::Started(run) = tab.startup else {
+        panic!("expected a bound run");
+    };
+    let first = DialogId::new();
+    let next = DialogId::new();
+    let request = || DialogRequest::YesNo {
+        title: "Continue?".into(),
+        body: "Proceed".into(),
+    };
+    unit.frame(EngineFrame::DialogRequest {
+        dialog_id: first.clone(),
+        tab_id: tab_id.clone(),
+        request: request(),
+    });
+    let _ = run.feeds.dialog_request_rx.try_recv().unwrap();
+    unit.frame(EngineFrame::DialogClosed {
+        dialog_id: first,
+        answered_by: AnsweredBy::Api,
+    });
+    unit.frame(EngineFrame::DialogRequest {
+        dialog_id: next.clone(),
+        tab_id,
+        request: request(),
+    });
+    assert!(run.feeds.dialog_request_rx.try_recv().is_err());
+
+    run.feeds
+        .dialog_response_tx
+        .send(DialogResponse::Yes)
+        .unwrap();
+    assert!(
+        unit.sent()
+            .iter()
+            .all(|frame| !matches!(frame, FrontendFrame::DialogResponse { .. })),
+        "the old answer must be discarded while the close is pending"
+    );
+    assert!(unit
+        .backend
+        .poll()
+        .iter()
+        .any(|event| matches!(event, BackendEvent::DialogClosed { .. })));
+    let _ = run
+        .feeds
+        .dialog_request_rx
+        .try_recv()
+        .expect("the next dialog arrives after the close");
+
+    run.feeds
+        .dialog_response_tx
+        .send(DialogResponse::No)
+        .unwrap();
+    assert!(unit.sent().iter().any(|frame| matches!(frame,
+        FrontendFrame::DialogResponse { dialog_id, response: DialogResponse::No } if dialog_id == &next
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconnect_acknowledges_a_submitted_workflow_from_its_snapshot_slot() {
+    let unit = unit();
+    let tab_id = TabId::new();
+    unit.welcome(instance_snapshot(vec![tab_snapshot(
+        &unit.root,
+        tab_id.clone(),
+        Vec::new(),
+    )]));
+    let InitialTabOpened::Normal { tab } = unit.backend.open_initial(session_spec(&unit.root))
+    else {
+        panic!("expected the daemon tab");
+    };
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    let (run, _, _) = new_run(tab.feeds.clone());
+    unit.backend.shared.lock().tabs[0].pending = Some(PendingSubmit {
+        run,
+        saw_yolo_mode: false,
+        expected_command: "exec workflow".into(),
+        reply: reply_tx,
+    });
+
+    // A stale snapshot from the old command must not accept this submit.
+    unit.welcome(instance_snapshot(vec![tab_snapshot(
+        &unit.root,
+        tab_id.clone(),
+        vec![slot("", None)],
+    )]));
+    assert!(reply_rx.try_recv().is_err());
+
+    let mut running = tab_snapshot(&unit.root, tab_id, vec![slot("build", None)]);
+    running.execution_phase = ExecutionPhase::Running {
+        command: "exec workflow".into(),
+    };
+    unit.welcome(instance_snapshot(vec![running]));
+    let ack = reply_rx
+        .try_recv()
+        .expect("snapshot must accept the submit")
+        .unwrap();
+    assert_eq!(ack.display.agent_display_name, "claude");
+    assert!(ack.display.unattended);
+    assert!(unit.backend.shared.lock().tabs[0].run.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_exit_frame_delivers_its_final_screen_before_closing_the_slot() {
+    let unit = unit();
+    let tab_id = TabId::new();
+    let backbone = slot("", None);
+    unit.welcome(instance_snapshot(vec![tab_snapshot(
+        &unit.root,
+        tab_id.clone(),
+        vec![backbone.clone()],
+    )]));
+    let InitialTabOpened::Normal { tab } = unit.backend.open_initial(session_spec(&unit.root))
+    else {
+        panic!("expected the daemon tab");
+    };
+    let StartupRun::Started(mut run) = tab.startup else {
+        panic!("expected a bound run");
+    };
+    let output = unit.backend.shared.lock().tabs[0]
+        .run
+        .as_ref()
+        .unwrap()
+        .slots
+        .get(&backbone.slot_id)
+        .unwrap()
+        .output
+        .clone();
+
+    unit.delta(InstanceDelta::SlotExited {
+        tab_id,
+        slot_id: backbone.slot_id,
+        exit_code: Some(0),
+        final_screen: Some(b"final grid".to_vec()),
+    });
+    assert_eq!(run.slot_io.stdout_rx.try_recv().unwrap(), b"final grid");
+    assert!(output.lock().unwrap().send_live(b"late frame".to_vec()));
+    assert!(run.slot_io.stdout_rx.try_recv().is_err());
+    assert!(tab
+        .feeds
+        .container
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| matches!(
+            event,
+            ContainerSlotEvent::SequentialExited { exit_code: 0, .. }
+        )));
 }
 
 /// `submit` sends argv the engine re-parses and is answered by the run's own
@@ -1385,10 +1726,15 @@ async fn engine_slot_terminals_are_subscribed_through_the_hub() {
         resize_tx: _resize,
     } = io;
     let cancel = CancellationToken::new();
+    let output = Arc::new(Mutex::new(SlotOutput {
+        tx: pipes.stdout_tx.clone(),
+        active: true,
+    }));
     tokio::spawn(subscribe_terminal(
         daemon.socket.clone(),
         handle.id().clone(),
         pipes,
+        output,
         cancel.clone(),
     ));
     let mut seen = Vec::new();
@@ -1592,7 +1938,7 @@ async fn program_status_and_stats_reach_the_presenter_slot() {
 /// state, agent status and dashboard at once, not after each next change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attaching_restores_live_tab_state_from_the_snapshot() {
-    use crate::data::instance_snapshot::{AgentsDashboardWire, WorkflowViewState};
+    use crate::data::instance_snapshot::{AgentStatsWire, AgentsDashboardWire, WorkflowViewState};
     use crate::data::program_status::{EffectiveStatus, ProgramState};
     use crate::engine::agent_runtime::execution::StuckEvent;
 
@@ -1608,6 +1954,11 @@ async fn attaching_restores_live_tab_state_from_the_snapshot() {
     };
     let mut backbone = slot("", None);
     backbone.program_status = Some(status.clone());
+    backbone.stats = Some(AgentStatsWire {
+        name: "awman-c".into(),
+        cpu_percent: 7.5,
+        memory_mb: 128.0,
+    });
     let mut tab = tab_snapshot(&unit.root, tab_id.clone(), vec![backbone]);
     let invocation = uuid::Uuid::new_v4();
     tab.workflow = Some(WorkflowViewState::default());
@@ -1653,4 +2004,7 @@ async fn attaching_restores_live_tab_state_from_the_snapshot() {
             .any(|e| matches!(e, StuckEvent::Reported(Some(s)) if s == &status)),
         "{seen:?}"
     );
+    assert!(unit.backend.poll().iter().any(|event| matches!(event,
+        BackendEvent::SlotStats { stats, .. } if stats.name == "awman-c" && stats.memory_mb == 128.0
+    )));
 }

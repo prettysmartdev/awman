@@ -1341,6 +1341,85 @@ async fn workflow_request_survives_later_stuck_channel_attachment() {
 }
 
 #[tokio::test]
+async fn replacing_the_backbone_during_a_parallel_group_keeps_it_dormant() {
+    use crate::command::instance::feeds::ContainerSlotEvent;
+
+    let fx = fixture();
+    let (id, _primary, _rx) = fx.started().await;
+    let tab = fx.first_tab(&id);
+    let _command = bind_fake_command(&fx, &id, &tab);
+    let feeds = fx.host.test_tab_feeds(&id, &tab);
+    feeds.container.push(ContainerSlotEvent::GroupStarted);
+    fx.host.pump_at(Instant::now());
+
+    let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stdin_tx, _stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (resize_tx, _resize_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _stdout = stdout_tx;
+    feeds
+        .container
+        .push(ContainerSlotEvent::SequentialLaunched {
+            launch_id: uuid::Uuid::new_v4(),
+            title: Some("next step".into()),
+            io: ContainerSlotIo {
+                stdout_rx,
+                stdin_tx,
+                resize_tx,
+            },
+        });
+    fx.host.pump_at(Instant::now());
+
+    let snapshot = fx.host.snapshot(&id).expect("running instance");
+    let backbone = snapshot.tabs[0]
+        .slots
+        .iter()
+        .find(|slot| slot.step_name == "next step")
+        .expect("replacement backbone");
+    assert!(
+        backbone.dormant,
+        "a parallel group still owns the visible slots"
+    );
+}
+
+#[tokio::test]
+async fn step_exit_flushes_queued_terminal_output_before_hub_exit() {
+    use crate::data::terminal::TerminalFrame;
+
+    let fx = fixture();
+    let (id, _primary, mut rx) = fx.started().await;
+    let tab = fx.first_tab(&id);
+    let command = bind_fake_command(&fx, &id, &tab);
+    let terminal_id = fx.host.snapshot(&id).unwrap().tabs[0].slots[0]
+        .terminal_id
+        .clone()
+        .unwrap();
+    let mut terminal = fx.host.hub.subscribe(&terminal_id).unwrap();
+    let _ = terminal.next().await;
+    drain(&mut rx);
+
+    command._stdout.send(b"last output".to_vec()).unwrap();
+    let feeds = fx.host.test_tab_feeds(&id, &tab);
+    feeds.container.exited(0);
+    fx.host.pump_at(Instant::now());
+    let frames = drain(&mut rx);
+    assert!(
+        deltas(&frames).iter().any(|delta| matches!(delta,
+            InstanceDelta::SlotExited { final_screen: Some(screen), .. }
+                if screen.windows(b"last output".len()).any(|part| part == b"last output")
+        )),
+        "the exit frame carries the final grid"
+    );
+
+    assert!(matches!(terminal.next().await,
+        Some(TerminalFrame::Output { bytes }) if bytes == b"last output"
+    ));
+    assert!(matches!(
+        terminal.next().await,
+        Some(TerminalFrame::Exit { .. })
+    ));
+}
+
+#[tokio::test]
 async fn the_agents_dashboard_is_relayed_and_kept_in_the_snapshot() {
     use crate::command::commands::agents::{AgentTotals, AgentsOverview};
     use crate::command::instance::feeds::AgentsDashboardData;

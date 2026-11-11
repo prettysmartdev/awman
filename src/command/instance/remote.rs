@@ -444,6 +444,7 @@ struct RemoteTab {
     pty_size: Option<(u16, u16)>,
     last_input_seen: Option<Instant>,
     last_activity_sent: Option<Instant>,
+    last_activity_step: Option<String>,
 }
 
 /// One command's producer ends.
@@ -456,6 +457,13 @@ struct RemoteRun {
     dialogs: VecDeque<(DialogId, Instant)>,
     /// Dialog ids delivered (so a re-sync does not deliver one twice).
     delivered: HashSet<DialogId>,
+    /// Requests raised after a close are held until the TUI receives that
+    /// close, so it cannot display the next board before dismissing the old.
+    deferred_dialogs: VecDeque<(DialogId, DialogRequest)>,
+    /// A dialog closed elsewhere before this presenter observed the close.
+    /// Until the UI polls that event, any response still on the untagged
+    /// response channel belongs to the closed dialog, not its successor.
+    dialog_close_barrier: bool,
     /// Pipes for the first sequential slot (the `slot_io` handed out).
     first_slot: Option<SlotPipes>,
     slots: HashMap<SlotId, RemoteSlot>,
@@ -469,6 +477,7 @@ struct RemoteRun {
 struct PendingSubmit {
     run: RemoteRun,
     saw_yolo_mode: bool,
+    expected_command: String,
     reply: std::sync::mpsc::Sender<Result<SubmitAck, CommandError>>,
 }
 
@@ -485,8 +494,21 @@ enum SlotKind {
 
 struct RemoteSlot {
     kind: SlotKind,
+    container_name: String,
+    output: Arc<Mutex<SlotOutput>>,
     yolo_flag: Option<SharedYoloCancelFlag>,
     subscription: Option<CancellationToken>,
+}
+
+struct SlotOutput {
+    tx: UnboundedSender<Vec<u8>>,
+    active: bool,
+}
+
+impl SlotOutput {
+    fn send_live(&self, bytes: Vec<u8>) -> bool {
+        !self.active || self.tx.send(bytes).is_ok()
+    }
 }
 
 /// The producer ends of one slot's `ContainerSlotIo`.
@@ -528,6 +550,8 @@ fn new_run(feeds: TabCommandFeeds) -> (RemoteRun, TabFeeds, ContainerSlotIo) {
             command_result_tx,
             dialogs: VecDeque::new(),
             delivered: HashSet::new(),
+            deferred_dialogs: VecDeque::new(),
+            dialog_close_barrier: false,
             first_slot: Some(pipes),
             slots: HashMap::new(),
             engine_requests: None,
@@ -800,6 +824,9 @@ impl InstanceBackend for RemoteInstanceBackend {
                 .find(|tab| tab.session.id() == request.session_id)
                 .ok_or_else(|| CommandError::Other("no such tab".into()))?;
             tab.feeds = request.feeds;
+            tab.last_input_seen = None;
+            tab.last_activity_sent = None;
+            tab.last_activity_step = None;
             tab.pty_size = Some(request.pty_size);
             // Record the start the way the builtin backend's session does, so
             // the tab never renders an idle frame before the first delta.
@@ -810,6 +837,7 @@ impl InstanceBackend for RemoteInstanceBackend {
             tab.pending = Some(PendingSubmit {
                 run,
                 saw_yolo_mode: false,
+                expected_command: request.parsed.path.join(" "),
                 reply: tx,
             });
             tab.tab_id.clone()
@@ -864,7 +892,19 @@ impl InstanceBackend for RemoteInstanceBackend {
     }
 
     fn poll(&self) -> Vec<BackendEvent> {
-        self.shared.lock().events.drain(..).collect()
+        let mut state = self.shared.lock();
+        for tab in &mut state.tabs {
+            if let Some(run) = tab.run.as_mut() {
+                if run.dialog_close_barrier {
+                    while run.dialog_response_rx.try_recv().is_ok() {}
+                    run.dialog_close_barrier = false;
+                    while let Some((_, request)) = run.deferred_dialogs.pop_front() {
+                        let _ = run.dialog_request_tx.send(request);
+                    }
+                }
+            }
+        }
+        state.events.drain(..).collect()
     }
 
     fn quit(&self) -> QuitPlan {
@@ -900,10 +940,15 @@ impl InstanceBackend for RemoteInstanceBackend {
         // keystrokes in after the input grant, resizes to the hub. Dropping
         // the presenter's ends (or the backend stopping) ends it.
         let (io, pipes) = slot_channels();
+        let output = Arc::new(Mutex::new(SlotOutput {
+            tx: pipes.stdout_tx.clone(),
+            active: true,
+        }));
         self.shared.runtime.spawn(subscribe_terminal(
             self.shared.address.clone(),
             terminal_id.clone(),
             pipes,
+            output,
             self.shared.stop.child_token(),
         ));
         Ok(io)
@@ -1257,71 +1302,88 @@ async fn drive(
 ) {
     let mut tick = tokio::time::interval(INPUT_POLL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // A frame whose send failed, re-sent first after a reconnect.
-    let mut retry: Option<Outbound> = None;
+    // Inputs are consumed from local flags before sending. Keep every frame
+    // not sent when a socket fails, in order, so no cancel/request disappears.
+    let mut retry: VecDeque<Outbound> = VecDeque::new();
     loop {
-        let lost: Option<String> = tokio::select! {
-            biased;
-            _ = shared.stop.cancelled() => {
-                sender.close().await;
-                return;
-            }
-            next = receiver.next() => match next {
-                Ok(Some((seq, frame))) => {
-                    let fatal = {
-                        let mut state = shared.lock();
-                        handle_frame(&shared, &mut state, seq, frame);
-                        state.fatal.is_some()
-                    };
-                    if fatal {
-                        sender.close().await;
-                        return;
-                    }
-                    None
+        let lost: Option<String> = if let Some(item) = retry.pop_front() {
+            match send_outbound(&shared, &mut sender, &item).await {
+                Ok(()) => continue,
+                Err(FrontendStreamError::Transport(message)) => {
+                    retry.push_front(item);
+                    Some(message)
                 }
-                Ok(None) => Some("the engine closed the socket".into()),
-                Err(FrontendStreamError::Transport(message)) => Some(message),
                 Err(error) => {
                     fail(&shared, loss_for(&error));
                     sender.close().await;
                     return;
                 }
-            },
-            item = outbound.recv() => match item {
-                Some(item) => match send_outbound(&shared, &mut sender, &item).await {
-                    Ok(()) => None,
-                    Err(FrontendStreamError::Transport(message)) => {
-                        retry = Some(item);
-                        Some(message)
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = shared.stop.cancelled() => {
+                    sender.close().await;
+                    return;
+                }
+                next = receiver.next() => match next {
+                    Ok(Some((seq, frame))) => {
+                        let fatal = {
+                            let mut state = shared.lock();
+                            handle_frame(&shared, &mut state, seq, frame);
+                            state.fatal.is_some()
+                        };
+                        if fatal {
+                            sender.close().await;
+                            return;
+                        }
+                        None
                     }
+                    Ok(None) => Some("the engine closed the socket".into()),
+                    Err(FrontendStreamError::Transport(message)) => Some(message),
                     Err(error) => {
                         fail(&shared, loss_for(&error));
                         sender.close().await;
                         return;
                     }
                 },
-                None => None,
-            },
-            _ = tick.tick() => {
-                let frames = collect_inputs(&shared);
-                let mut lost = None;
-                for frame in frames {
-                    if let Err(error) = send_outbound(&shared, &mut sender, &frame).await {
-                        match error {
-                            FrontendStreamError::Transport(message) => {
-                                retry = Some(frame);
-                                lost = Some(message);
-                                break;
-                            }
-                            other => {
-                                fail(&shared, loss_for(&other));
-                                sender.close().await;
-                                return;
+                item = outbound.recv() => match item {
+                    Some(item) => match send_outbound(&shared, &mut sender, &item).await {
+                        Ok(()) => None,
+                        Err(FrontendStreamError::Transport(message)) => {
+                            retry.push_back(item);
+                            Some(message)
+                        }
+                        Err(error) => {
+                            fail(&shared, loss_for(&error));
+                            sender.close().await;
+                            return;
+                        }
+                    },
+                    None => None,
+                },
+                _ = tick.tick() => {
+                    let mut frames: VecDeque<_> = collect_inputs(&shared).into();
+                    let mut lost = None;
+                    while let Some(frame) = frames.pop_front() {
+                        if let Err(error) = send_outbound(&shared, &mut sender, &frame).await {
+                            match error {
+                                FrontendStreamError::Transport(message) => {
+                                    retry.push_back(frame);
+                                    retry.extend(frames);
+                                    lost = Some(message);
+                                    break;
+                                }
+                                other => {
+                                    fail(&shared, loss_for(&other));
+                                    sender.close().await;
+                                    return;
+                                }
                             }
                         }
                     }
+                    lost
                 }
-                lost
             }
         };
         let Some(reason) = lost else {
@@ -1333,19 +1395,26 @@ async fn drive(
                 shared.reconnects.fetch_add(1, Ordering::Relaxed);
                 sender = connection.sender;
                 receiver = connection.receiver;
-                {
+                let fatal = {
                     let mut state = shared.lock();
                     state.frontend_id = connection.frontend_id;
                     resync(&shared, &mut state, connection.snapshot);
-                }
-                if let Some(item) = retry.take() {
-                    if let Err(error) = send_outbound(&shared, &mut sender, &item).await {
-                        if !error.is_transport() {
-                            fail(&shared, loss_for(&error));
-                            return;
-                        }
-                        retry = Some(item);
+                    for frame in connection.early {
+                        handle_frame(&shared, &mut state, 0, frame);
                     }
+                    retry.retain(|item| match item {
+                        Outbound::Frame(FrontendFrame::Submit { tab_id, .. }) => state
+                            .tabs
+                            .iter()
+                            .find(|tab| &tab.tab_id == tab_id)
+                            .is_some_and(|tab| tab.pending.is_some()),
+                        _ => true,
+                    });
+                    state.fatal.is_some()
+                };
+                if fatal {
+                    sender.close().await;
+                    return;
                 }
             }
             Err(loss) => {
@@ -1485,6 +1554,9 @@ fn collect_inputs(shared: &Shared) -> Vec<Outbound> {
         let tab_id = tab.tab_id.clone();
         if let Some(run) = tab.run.as_mut() {
             while let Ok(response) = run.dialog_response_rx.try_recv() {
+                if run.dialog_close_barrier {
+                    continue;
+                }
                 // The command thread answers one dialog at a time, oldest first.
                 if let Some((dialog_id, raised)) = run.dialogs.pop_front() {
                     latency.dialog.push(raised.elapsed());
@@ -1536,14 +1608,20 @@ fn collect_inputs(shared: &Shared) -> Vec<Outbound> {
             }
         }
         let touched = tab.feeds.signals.last_user_input();
+        let step_name = tab.feeds.signals.last_user_step();
         if touched.is_some() && touched != tab.last_input_seen {
             tab.last_input_seen = touched;
-            if tab
-                .last_activity_sent
-                .is_none_or(|sent| sent.elapsed() >= ACTIVITY_INTERVAL)
+            if step_name != tab.last_activity_step
+                || tab
+                    .last_activity_sent
+                    .is_none_or(|sent| sent.elapsed() >= ACTIVITY_INTERVAL)
             {
                 tab.last_activity_sent = Some(Instant::now());
-                frames.push(Outbound::Frame(FrontendFrame::Activity { tab_id }));
+                tab.last_activity_step = step_name.clone();
+                frames.push(Outbound::Frame(FrontendFrame::Activity {
+                    tab_id,
+                    step_name,
+                }));
             }
         }
     }
@@ -1694,9 +1772,13 @@ fn deliver_dialog(run: &mut RemoteRun, dialog_id: DialogId, request: DialogReque
         return;
     }
     if request.awaits_answer() {
-        run.dialogs.push_back((dialog_id, Instant::now()));
+        run.dialogs.push_back((dialog_id.clone(), Instant::now()));
     }
-    let _ = run.dialog_request_tx.send(request);
+    if run.dialog_close_barrier {
+        run.deferred_dialogs.push_back((dialog_id, request));
+    } else {
+        let _ = run.dialog_request_tx.send(request);
+    }
 }
 
 fn close_dialog(state: &mut State, dialog_id: &DialogId, answered_by: AnsweredBy) {
@@ -1706,6 +1788,8 @@ fn close_dialog(state: &mut State, dialog_id: &DialogId, answered_by: AnsweredBy
         };
         if let Some(index) = run.dialogs.iter().position(|(id, _)| id == dialog_id) {
             run.dialogs.remove(index);
+            run.deferred_dialogs.retain(|(id, _)| id != dialog_id);
+            run.dialog_close_barrier = true;
             state.events.push_back(BackendEvent::DialogClosed {
                 dialog_id: Some(dialog_id.clone()),
                 tab_id: tab.tab_id.clone(),
@@ -1908,17 +1992,25 @@ fn apply_tab_delta(address: &Path, tab: &mut RemoteTab, delta: InstanceDelta) {
             slot_id,
             container_name,
             ..
-        } => with_slot(tab, &slot_id, |run, kind| match kind {
-            SlotKind::Sequential => run.feeds.container.running(container_name),
-            SlotKind::Step(step_name) => {
-                run.feeds.container.push(ContainerSlotEvent::ContainerName {
-                    step_name,
-                    container_name,
-                })
+        } => with_slot(tab, &slot_id, |run, kind| {
+            if let Some(slot) = run.slots.get_mut(&slot_id) {
+                slot.container_name = container_name.clone();
+            }
+            match kind {
+                SlotKind::Sequential => run.feeds.container.running(container_name),
+                SlotKind::Step(step_name) => {
+                    run.feeds.container.push(ContainerSlotEvent::ContainerName {
+                        step_name,
+                        container_name,
+                    })
+                }
             }
         }),
         InstanceDelta::SlotExited {
-            slot_id, exit_code, ..
+            slot_id,
+            exit_code,
+            final_screen,
+            ..
         } => {
             let Some(run) = tab.run.as_mut() else {
                 return;
@@ -1926,6 +2018,16 @@ fn apply_tab_delta(address: &Path, tab: &mut RemoteTab, delta: InstanceDelta) {
             let Some(slot) = run.slots.remove(&slot_id) else {
                 return;
             };
+            {
+                let mut output = slot
+                    .output
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                output.active = false;
+                if let Some(screen) = final_screen {
+                    let _ = output.tx.send(screen);
+                }
+            }
             if let Some(token) = &slot.subscription {
                 // Output already delivered stays; the stream ends.
                 token.cancel();
@@ -2149,21 +2251,17 @@ fn restore_presentation(address: &Path, tab: &mut RemoteTab, snapshot: &TabSnaps
             slot_id: slot.slot_id,
             kind: slot.countdown_kind,
         });
-        if slot.yolo.is_some() {
-            deltas.push(InstanceDelta::SlotYolo {
-                tab_id: tab_id.clone(),
-                slot_id: slot.slot_id,
-                state: slot.yolo.clone(),
-            });
-        }
+        deltas.push(InstanceDelta::SlotYolo {
+            tab_id: tab_id.clone(),
+            slot_id: slot.slot_id,
+            state: slot.yolo.clone(),
+        });
     }
     for delta in deltas {
         apply_tab_delta(address, tab, delta);
     }
     for slot in &snapshot.slots {
-        if slot.program_status.is_some() {
-            report_program_status(tab, &slot.slot_id, slot.program_status.clone());
-        }
+        report_program_status(tab, &slot.slot_id, slot.program_status.clone());
     }
 }
 
@@ -2198,36 +2296,39 @@ fn launch_slot(address: &Path, run: &mut RemoteRun, slot: &SlotSnapshot, in_grou
     if run.slots.contains_key(&slot.slot_id) {
         return;
     }
-    let kind = if in_group && !slot.step_name.is_empty() {
+    let kind = if in_group && !slot.dormant {
         SlotKind::Step(slot.step_name.clone())
     } else {
         SlotKind::Sequential
     };
     let pipes = match &kind {
-        SlotKind::Sequential => match run.first_slot.take() {
-            Some(pipes) => {
-                // The workflow engine's request/stuck channels, as the
-                // builtin backend publishes them for the command's slot.
-                let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
-                let (stuck_tx, stuck_rx) = tokio::sync::broadcast::channel(16);
-                run.engine_requests = Some(requests_rx);
-                run.stuck = Some(stuck_tx);
-                run.feeds
-                    .container
-                    .push(ContainerSlotEvent::EngineAttached {
-                        launch_id: run.feeds.container.launch_id(),
-                        requests: Some(requests_tx),
-                        stuck: Some(stuck_rx),
-                    });
-                pipes
-            }
-            None => {
-                let (io, pipes) = slot_channels();
-                let title = (!slot.step_name.is_empty()).then(|| slot.step_name.clone());
-                run.feeds.container.launch(title, io);
-                pipes
-            }
-        },
+        SlotKind::Sequential => {
+            let pipes = match run.first_slot.take() {
+                Some(pipes) => pipes,
+                None => {
+                    let (io, pipes) = slot_channels();
+                    let title = (!slot.step_name.is_empty()).then(|| slot.step_name.clone());
+                    run.feeds.container.launch(title, io);
+                    pipes
+                }
+            };
+            // A dynamic leader or a later sequential step gets a fresh
+            // launch id. Attach the workflow request channel to that launch,
+            // just as the builtin presenter does, so Ctrl-W keeps reaching
+            // the daemon after the initial bound slot is replaced.
+            let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (stuck_tx, stuck_rx) = tokio::sync::broadcast::channel(16);
+            run.engine_requests = Some(requests_rx);
+            run.stuck = Some(stuck_tx);
+            run.feeds
+                .container
+                .push(ContainerSlotEvent::EngineAttached {
+                    launch_id: run.feeds.container.launch_id(),
+                    requests: Some(requests_tx),
+                    stuck: Some(stuck_rx),
+                });
+            pipes
+        }
         SlotKind::Step(step_name) => {
             let (io, pipes) = slot_channels();
             run.feeds.container.push(ContainerSlotEvent::Launched {
@@ -2250,12 +2351,17 @@ fn launch_slot(address: &Path, run: &mut RemoteRun, slot: &SlotSnapshot, in_grou
             }
         }
     }
+    let output = Arc::new(Mutex::new(SlotOutput {
+        tx: pipes.stdout_tx.clone(),
+        active: true,
+    }));
     let subscription = slot.terminal_id.clone().map(|terminal_id| {
         let token = CancellationToken::new();
         tokio::spawn(subscribe_terminal(
             address.to_path_buf(),
             terminal_id,
             pipes,
+            Arc::clone(&output),
             token.clone(),
         ));
         token
@@ -2264,6 +2370,8 @@ fn launch_slot(address: &Path, run: &mut RemoteRun, slot: &SlotSnapshot, in_grou
         slot.slot_id,
         RemoteSlot {
             kind,
+            container_name: slot.container_name.clone(),
+            output,
             yolo_flag: None,
             subscription,
         },
@@ -2278,6 +2386,7 @@ async fn subscribe_terminal(
     address: PathBuf,
     terminal_id: TerminalId,
     mut pipes: SlotPipes,
+    output: Arc<Mutex<SlotOutput>>,
     cancel: CancellationToken,
 ) {
     let options = TerminalClientOptions::default();
@@ -2313,12 +2422,12 @@ async fn subscribe_terminal(
                         // A pristine hub screen is metadata, not agent output.
                         // Feeding its ANSI redraw into the presenter would
                         // open a container overlay for commands with no PTY.
-                        if has_output && pipes.stdout_tx.send(screen).is_err() {
+                        if has_output && !output.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).send_live(screen) {
                             return;
                         }
                     }
                     Ok(Some(TerminalFrame::Output { bytes })) => {
-                        if pipes.stdout_tx.send(bytes).is_err() {
+                        if !output.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).send_live(bytes) {
                             return;
                         }
                     }
@@ -2439,6 +2548,7 @@ fn register_tab(
         pty_size: None,
         last_input_seen: None,
         last_activity_sent: None,
+        last_activity_step: None,
     };
     // A bound command shows as at least one slot (the engine opens the
     // command's slot when it binds it).
@@ -2447,6 +2557,9 @@ fn register_tab(
             let (mut run, tab_feeds, slot_io) = new_run(feeds.clone());
             // The backbone (first) slot is the bound one, dormant or not.
             launch_slot(&shared.address, &mut run, first, false);
+            if tab.in_group {
+                run.feeds.container.push(ContainerSlotEvent::GroupStarted);
+            }
             for slot in &snapshot.slots {
                 launch_slot(&shared.address, &mut run, slot, tab.in_group);
             }
@@ -2530,6 +2643,34 @@ fn resync(shared: &Shared, state: &mut State, snapshot: InstanceSnapshot) {
         };
         catch_up(&address, tab, tab_snapshot);
     }
+    // Stats are presenter-owned state rather than a command feed. Repaint
+    // their latest sample after a reconnect (or an initial mid-run attach),
+    // even if no new sample arrives before the next render.
+    for tab_snapshot in &snapshot.tabs {
+        let Some(tab) = state
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.tab_id == tab_snapshot.tab_id)
+        else {
+            continue;
+        };
+        for slot in &tab_snapshot.slots {
+            let (Some(stats), Some(presenter)) =
+                (slot.stats.as_ref(), presenter_slot(tab, &slot.slot_id))
+            else {
+                continue;
+            };
+            state.events.push_back(BackendEvent::SlotStats {
+                tab_id: tab_snapshot.tab_id.clone(),
+                slot: presenter,
+                stats: AgentStats {
+                    name: stats.name.clone(),
+                    cpu_percent: stats.cpu_percent,
+                    memory_mb: stats.memory_mb,
+                },
+            });
+        }
+    }
     // Dialogs: deliver what is pending and not yet seen; close what was
     // answered during the gap.
     let pending: HashSet<&DialogId> = snapshot
@@ -2549,6 +2690,10 @@ fn resync(shared: &Shared, state: &mut State, snapshot: InstanceSnapshot) {
             }
             keep
         });
+        run.deferred_dialogs.retain(|(id, _)| pending.contains(id));
+        if closed.iter().any(|(_, tab_id)| tab_id == &tab.tab_id) {
+            run.dialog_close_barrier = true;
+        }
         for dialog in snapshot
             .pending_dialogs
             .iter()
@@ -2569,6 +2714,42 @@ fn resync(shared: &Shared, state: &mut State, snapshot: InstanceSnapshot) {
 
 /// Catch one known tab up with its snapshot.
 fn catch_up(address: &Path, tab: &mut RemoteTab, snapshot: &TabSnapshot) {
+    // A Submit may have reached the daemon just before the socket dropped.
+    // Its SlotLaunched acknowledgement was then lost, but the snapshot is
+    // authoritative: bind that slot to the already-waiting presenter run.
+    if tab.pending.as_ref().is_some_and(|pending| {
+        snapshot.execution_phase.command_name() == pending.expected_command
+            && snapshot.slots.first().is_some_and(|first| {
+                !tab.run
+                    .as_ref()
+                    .is_some_and(|old| old.slots.contains_key(&first.slot_id))
+            })
+    }) {
+        let first = &snapshot.slots[0];
+        let pending = tab.pending.take().unwrap();
+        tab.run = Some(pending.run);
+        tab.in_group = false;
+        let _ = pending.reply.send(Ok(SubmitAck {
+            display: LaunchDisplay {
+                agent_display_name: first.agent_display_name.clone(),
+                unattended: snapshot.yolo_mode,
+            },
+            sandboxed: first.sandboxed,
+        }));
+    } else if tab.pending.as_ref().is_some_and(|pending| {
+        snapshot.execution_phase.command_name() == pending.expected_command
+            && snapshot.slots.is_empty()
+            && matches!(
+                snapshot.execution_phase,
+                ExecutionPhase::Done { .. } | ExecutionPhase::Error { .. }
+            )
+    }) {
+        let pending = tab.pending.take().unwrap();
+        let _ = pending.reply.send(Err(CommandError::Other(
+            "the command finished while the engine was reconnecting; check the session result"
+                .into(),
+        )));
+    }
     catch_up_run(address, tab, snapshot);
     restore_presentation(address, tab, snapshot);
 }
@@ -2582,17 +2763,17 @@ fn catch_up_run(address: &Path, tab: &mut RemoteTab, snapshot: &TabSnapshot) {
         state.current_workflow = snapshot.current_workflow.clone();
         state.current_container = snapshot.current_container.clone();
     }
-    if snapshot.status_log.len() > tab.status_lines {
-        if let Ok(mut log) = tab.feeds.status_log.lock() {
-            log.extend(snapshot.status_log[tab.status_lines..].iter().cloned());
-        }
+    if let Ok(mut log) = tab.feeds.status_log.lock() {
+        *log = snapshot.status_log.clone();
     }
     tab.status_lines = snapshot.status_log.len();
     tab.yolo_mode = snapshot.yolo_mode;
     if let Ok(mut yolo) = tab.feeds.yolo_state.lock() {
         *yolo = snapshot.yolo.clone();
     }
-    let in_group = tab.in_group;
+    let in_group = snapshot.slots.iter().any(|slot| slot.dormant);
+    let was_in_group = tab.in_group;
+    tab.in_group = in_group;
     let Some(run) = tab.run.as_mut() else {
         return;
     };
@@ -2606,6 +2787,10 @@ fn catch_up_run(address: &Path, tab: &mut RemoteTab, snapshot: &TabSnapshot) {
         .collect();
     for slot_id in ended {
         if let Some(slot) = run.slots.remove(&slot_id) {
+            slot.output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .active = false;
             if let Some(token) = &slot.subscription {
                 token.cancel();
             }
@@ -2616,8 +2801,31 @@ fn catch_up_run(address: &Path, tab: &mut RemoteTab, snapshot: &TabSnapshot) {
             }
         }
     }
+    if in_group != was_in_group {
+        run.feeds.container.push(if in_group {
+            ContainerSlotEvent::GroupStarted
+        } else {
+            ContainerSlotEvent::GroupFinished
+        });
+    }
     for slot in &snapshot.slots {
         launch_slot(address, run, slot, in_group);
+        if let Some(current) = run.slots.get_mut(&slot.slot_id) {
+            if current.container_name != slot.container_name {
+                current.container_name = slot.container_name.clone();
+                match &current.kind {
+                    SlotKind::Sequential => {
+                        run.feeds.container.running(slot.container_name.clone())
+                    }
+                    SlotKind::Step(step_name) => {
+                        run.feeds.container.push(ContainerSlotEvent::ContainerName {
+                            step_name: step_name.clone(),
+                            container_name: slot.container_name.clone(),
+                        })
+                    }
+                }
+            }
+        }
     }
     // A run that finished during the gap: its result frame was missed.
     if !run.finished

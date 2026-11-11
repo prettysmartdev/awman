@@ -2042,6 +2042,38 @@ mod tests {
         )
     }
 
+    #[test]
+    fn a_closed_remote_dialog_is_dropped_before_its_request_is_read() {
+        use crate::command::instance::backend::BackendEvent;
+        use crate::data::frontend_protocol::AnsweredBy;
+        use crate::data::ids::DialogId;
+        use crate::frontend::tui::remote_tab::RemoteTabView;
+
+        let mut app = make_app();
+        let tab_id = app.backend.tab_id(&app.tabs[0].session_id).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.tabs[0].dialog_request_rx = Some(rx);
+        tx.send(step_confirm()).unwrap();
+        RemoteTabView::apply(
+            &mut app,
+            BackendEvent::DialogClosed {
+                dialog_id: Some(DialogId::new()),
+                tab_id,
+                answered_by: AnsweredBy::Engine,
+            },
+        );
+        app.poll_dialog_requests();
+        assert!(app.active_dialog.is_none());
+
+        tx.send(DialogRequest::YesNo {
+            title: "next".into(),
+            body: "question".into(),
+        })
+        .unwrap();
+        app.poll_dialog_requests();
+        assert!(matches!(app.active_dialog, Some(Dialog::YesNo { .. })));
+    }
+
     /// Review finding: a board the agent's report opened is closed and
     /// answered `Dismissed` once the command says the agent resumed.
     #[test]

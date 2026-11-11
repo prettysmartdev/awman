@@ -104,6 +104,7 @@ impl WorkflowEngine {
                     &group_names,
                     None,
                     true,
+                    false,
                 )? {
                     ParallelRequestOutcome::Continue => {}
                     ParallelRequestOutcome::Ended(wo) => return Ok(GroupOutcome::Ended(wo)),
@@ -230,6 +231,7 @@ impl WorkflowEngine {
                                 &group_names,
                                 Some(&name),
                                 false,
+                                false,
                             )? {
                                 ParallelRequestOutcome::Continue => {}
                                 ParallelRequestOutcome::Ended(wo) => {
@@ -277,6 +279,7 @@ impl WorkflowEngine {
                             &group_names,
                             retryable.as_deref(),
                             final_yolo_group && final_review_shown && failed.is_empty() && queue.is_empty(),
+                            true,
                         )? {
                             ParallelRequestOutcome::Continue => {}
                             ParallelRequestOutcome::Ended(wo) => return Ok(GroupOutcome::Ended(wo)),
@@ -306,6 +309,7 @@ impl WorkflowEngine {
                         &group_names,
                         retryable.as_deref(),
                         final_yolo_group && final_review_shown && failed.is_empty() && queue.is_empty(),
+                        false,
                     )? {
                         ParallelRequestOutcome::Continue => {}
                         ParallelRequestOutcome::Ended(wo) => return Ok(GroupOutcome::Ended(wo)),
@@ -1160,6 +1164,7 @@ impl WorkflowEngine {
         group: &[String],
         retryable: Option<&str>,
         final_review: bool,
+        opened_by_report: bool,
     ) -> Result<ParallelRequestOutcome, EngineError> {
         match req {
             EngineRequest::StepStuck { step_name } => {
@@ -1174,6 +1179,7 @@ impl WorkflowEngine {
                 // Scope the board to the focused container; peers keep running.
                 self.focus_parallel_step(&step_name);
                 let mut available = self.parallel_group_board_actions(group, retryable)?;
+                available.opened_by_report = opened_by_report;
                 if final_review {
                     available.acts_on_parallel_group = true;
                     available.can_finish_workflow = true;

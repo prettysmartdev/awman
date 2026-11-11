@@ -166,6 +166,10 @@ pub struct WorkflowControlBoardState {
     /// run duration), copied from `AvailableActions::step_failure`. Empty on an
     /// ordinary between-steps board (WI-0115 §1).
     pub failure_lines: Vec<String>,
+    /// The focused agent's current report, shown as status information even
+    /// when the step is still running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_line: Option<String>,
     /// A peer in the still-running parallel group that already failed and
     /// can be relaunched now with `[r]`, copied from
     /// `AvailableActions::retry_failed_step`. Rendered as a red line below the

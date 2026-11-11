@@ -29,6 +29,7 @@ pub(crate) fn render_control_board(
     } else {
         0
     };
+    let status_height = u16::from(state.status_line.is_some());
     // The retry line, plus a spacer when a continue reason sits right above it.
     let retry_label = state
         .retry_failed_step
@@ -62,16 +63,22 @@ pub(crate) fn render_control_board(
         .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()) + 6)
         .max()
         .unwrap_or(0) as u16;
+    let status_w = state
+        .status_line
+        .as_deref()
+        .map(|s| unicode_width::UnicodeWidthStr::width(s) as u16 + 6)
+        .unwrap_or(0);
     let step_w = unicode_width::UnicodeWidthStr::width(state.step_name.as_str()) as u16 + 10;
     let width = max_reason_w
         .max(max_failure_w)
+        .max(status_w)
         .max(step_w)
         .max(retry_w)
         .max(56)
         .min(area.width.saturating_sub(4));
     let dialog_area = dialogs::centered_fixed(
         width,
-        (base_height + extra_reasons + failure_height + retry_height)
+        (base_height + extra_reasons + failure_height + status_height + retry_height)
             .min(area.height.saturating_sub(2)),
         area,
     );
@@ -120,6 +127,12 @@ pub(crate) fn render_control_board(
         Span::raw(if failed { " Failed step: " } else { " Step: " }),
         Span::styled(&state.step_name, step_style),
     ])];
+    if let Some(status) = &state.status_line {
+        lines.push(Line::from(Span::styled(
+            format!("   {status}"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
     if failed {
         let err_style = Style::default().fg(Color::Red);
         for line in &state.failure_lines {

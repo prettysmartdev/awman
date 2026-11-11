@@ -2280,13 +2280,22 @@ mod program_status_tabs {
         frontend
             .signals
             .set_status(Some(status(ProgramState::Done, None)));
-        assert!(!frontend.should_defer_for_user());
+        assert!(!frontend.should_defer_for_step("build"));
 
         frontend.signals.touch_user();
         for state in [ProgramState::Done, ProgramState::Idle] {
             frontend.signals.set_status(Some(status(state, None)));
-            assert!(frontend.should_defer_for_user(), "{state:?} is deferred");
+            assert!(
+                frontend.should_defer_for_step("build"),
+                "{state:?} is deferred"
+            );
         }
+        frontend.signals.touch_user_for_step(Some("test"));
+        frontend
+            .signals
+            .set_status(Some(status(ProgramState::Done, None)));
+        assert!(frontend.should_defer_for_step("test"));
+        assert!(!frontend.should_defer_for_step("build"));
         for (state, kind) in [
             (ProgramState::Blocked, Some(BlockedKind::Permission)),
             (ProgramState::Error, None),
@@ -2294,14 +2303,46 @@ mod program_status_tabs {
         ] {
             frontend.signals.set_status(Some(status(state, kind)));
             assert!(
-                !frontend.should_defer_for_user(),
+                !frontend.should_defer_for_step("build"),
                 "{state:?} is not deferred"
             );
         }
         // And a blocked report never makes the wait loop sleep.
         let started = std::time::Instant::now();
-        frontend.wait_for_quiet_user();
+        frontend.wait_for_quiet_user("build");
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn parallel_report_decisions_use_the_focused_steps_status() {
+        let (mut frontend, _req, _resp) =
+            crate::frontend::tui::tests::test_command_frontend(&["workflow"], Default::default());
+        frontend.parallel_group_active = true;
+        frontend.signals.touch_user(); // previous sequential slot
+        frontend
+            .signals
+            .set_step_status("build", Some(status(ProgramState::Done, None)));
+        assert!(!frontend.should_defer_for_step("build"));
+        frontend.signals.touch_user_for_step(Some("build"));
+        frontend
+            .signals
+            .set_status(Some(status(ProgramState::Error, None)));
+        frontend
+            .signals
+            .set_step_status("build", Some(status(ProgramState::Done, None)));
+        frontend
+            .signals
+            .set_step_status("test", Some(status(ProgramState::Error, None)));
+
+        assert!(frontend.should_defer_for_step("build"));
+        assert!(!frontend.agent_resumed("build"));
+        assert!(!frontend.should_defer_for_step("test"));
+
+        frontend
+            .signals
+            .set_step_status("build", Some(status(ProgramState::Working, None)));
+        assert!(!frontend.should_defer_for_step("build"));
+        assert!(frontend.agent_resumed("build"));
     }
 
     /// Review finding: `working` dismisses an untouched report-opened board
@@ -2323,7 +2364,7 @@ mod program_status_tabs {
             );
             let signals = frontend.signals.clone();
             signals.set_status(Some(status(ProgramState::Blocked, None)));
-            let asked = std::thread::spawn(move || frontend.ask_report_dialog(request()));
+            let asked = std::thread::spawn(move || frontend.ask_report_dialog("build", request()));
             req_rx
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .expect("board requested");

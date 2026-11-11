@@ -255,6 +255,7 @@ fn setup_wcb_dialog(app: &mut App) -> std::sync::mpsc::Receiver<DialogResponse> 
             parallel_peer_count: 0,
             parallel_peers_running: 0,
             failure_lines: Vec::new(),
+            status_line: None,
             retry_failed_step: None,
             in_parallel_group: false,
         },
@@ -341,6 +342,7 @@ fn wcb_enter_ignored_when_finish_unavailable() {
             parallel_peer_count: 0,
             parallel_peers_running: 0,
             failure_lines: Vec::new(),
+            status_line: None,
             retry_failed_step: None,
             in_parallel_group: false,
         },
@@ -385,6 +387,7 @@ fn wcb_arrows_are_inert_for_actions_the_board_does_not_offer() {
                 parallel_peer_count: 0,
                 parallel_peers_running: 0,
                 failure_lines: vec!["Exit code: 1".into()],
+                status_line: None,
                 retry_failed_step: None,
                 in_parallel_group: false,
             },
@@ -1061,6 +1064,13 @@ fn ctrl_s_cycles_focused_slot_while_yolo_modal_is_open() {
     assert!(
         app.active_dialog.is_none(),
         "the modal is dismissed here; tick_all_tabs re-derives it for the new focus"
+    );
+    let signals = &app.active_tab().shared.signals;
+    let window = std::time::Duration::from_secs(60);
+    assert!(signals.user_active_within_step(window, "test"));
+    assert!(
+        !signals.user_active_within_step(window, "build"),
+        "activity after Ctrl-S must not hold the previous step's countdown"
     );
 }
 

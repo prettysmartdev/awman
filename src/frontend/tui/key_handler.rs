@@ -129,6 +129,12 @@ fn intercept_dialog_keys(app: &mut App, key: crossterm::event::KeyEvent) -> bool
     {
         app.active_dialog = None;
         app.active_tab_mut().cycle_focused_slot();
+        let tab = app.active_tab();
+        tab.shared.signals.touch_user_for_step(
+            tab.focused_slot()
+                .map(|slot| slot.step_name.as_str())
+                .filter(|s| !s.is_empty()),
+        );
         return true;
     }
 
@@ -167,6 +173,11 @@ fn intercept_dialog_keys(app: &mut App, key: crossterm::event::KeyEvent) -> bool
     {
         let tab = app.active_tab_mut();
         tab.cycle_focused_slot();
+        tab.shared.signals.touch_user_for_step(
+            tab.focused_slot()
+                .map(|slot| slot.step_name.as_str())
+                .filter(|s| !s.is_empty()),
+        );
         // No manual resize here: `tick_all_tabs` keeps every slot's parser
         // and PTY in lockstep with the overlay's actual inner rect, so the
         // rotated-in slot is already correctly sized.
@@ -229,7 +240,12 @@ fn intercept_agents_watch_stop(
 }
 pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
     // Active-tab suppression input: the user is interacting with this tab.
-    app.active_tab().shared.signals.touch_user();
+    let tab = app.active_tab();
+    tab.shared.signals.touch_user_for_step(
+        tab.focused_slot()
+            .map(|slot| slot.step_name.as_str())
+            .filter(|s| !s.is_empty()),
+    );
     // A runtime notice stays in the status bar until the next key press.
     app.status_bar.notice = None;
     if keymap::is_workflow_context_copy_key(key) {

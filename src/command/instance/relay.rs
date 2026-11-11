@@ -155,6 +155,7 @@ struct RelaySlot {
 impl RelaySlot {
     fn finish(&mut self, exit_code: i32) -> Option<TerminalId> {
         let terminal = self.terminal.take()?;
+        terminal.flush_pending_output();
         terminal.handle.exit(exit_code);
         Some(terminal.handle.id().clone())
     }
@@ -423,6 +424,7 @@ impl TabRelay {
             submitted.display.agent_display_name.clone(),
             None,
             Some(submitted.slot_io),
+            false,
         ));
         events
     }
@@ -439,6 +441,7 @@ impl TabRelay {
         agent: String,
         model: Option<String>,
         io: Option<ContainerSlotIo>,
+        dormant: bool,
     ) -> Vec<InstanceEvent> {
         let mut events = Vec::new();
         let terminal = match (io, &self.hub) {
@@ -479,7 +482,7 @@ impl TabRelay {
             yolo: None,
             sandboxed: self.sandboxed,
             phase_step_title: None,
-            dormant: false,
+            dormant,
         };
         events.push(self.delta(InstanceDelta::SlotLaunched {
             tab_id: self.tab_id.clone(),
@@ -511,6 +514,19 @@ impl TabRelay {
         };
         let mut slot = self.slots.remove(idx);
         let mut events = Vec::new();
+        let final_screen = if exit_code.is_some() {
+            slot.terminal.as_ref().and_then(|terminal| {
+                terminal.flush_pending_output();
+                self.hub
+                    .as_ref()?
+                    .snapshot(terminal.handle.id())
+                    .ok()
+                    .filter(|snapshot| snapshot.has_output)
+                    .map(|snapshot| snapshot.screen)
+            })
+        } else {
+            None
+        };
         if let Some(terminal_id) = slot.finish(exit_code.unwrap_or(0)) {
             events.push(InstanceEvent::TerminalClosed {
                 tab_id: self.tab_id.clone(),
@@ -522,6 +538,7 @@ impl TabRelay {
             tab_id: self.tab_id.clone(),
             slot_id: slot.snapshot.slot_id,
             exit_code,
+            final_screen,
         }));
         if self.focused == Some(slot.snapshot.slot_id) {
             self.focused = self.slots.last().map(|s| s.snapshot.slot_id);
@@ -632,6 +649,7 @@ impl TabRelay {
                         agent,
                         None,
                         Some(io),
+                        in_group,
                     ));
                 }
                 ContainerSlotEvent::SequentialRunning {
@@ -699,6 +717,7 @@ impl TabRelay {
                         agent,
                         model,
                         io,
+                        false,
                     ));
                 }
                 ContainerSlotEvent::ContainerName {
@@ -1025,7 +1044,10 @@ impl TabRelay {
 
     fn pump_session(&mut self, session: &Session, events: &mut Vec<InstanceEvent>) {
         let phase = ExecutionPhase::of_session_state(session.state());
-        if self.projection.phase.as_ref() != Some(&phase) {
+        if self.projection.phase.as_ref() != Some(&phase)
+            || self.current_workflow != session.state().current_workflow
+            || self.current_container != session.state().current_container
+        {
             self.phase = phase.clone();
             self.current_workflow = session.state().current_workflow.clone();
             self.current_container = session.state().current_container.clone();
@@ -1104,8 +1126,8 @@ impl TabRelay {
     }
 
     /// A person typed or scrolled in this tab.
-    pub fn note_activity(&self) {
-        self.feeds.signals.touch_user();
+    pub fn note_activity(&self, step_name: Option<&str>) {
+        self.feeds.signals.touch_user_for_step(step_name);
     }
 
     /// The agent-window size later slots open at.
@@ -1169,7 +1191,10 @@ impl Drop for TabRelay {
 #[cfg(test)]
 mod log_tests {
     use super::*;
+    use crate::data::config::env::EnvSnapshot;
     use crate::data::instance_snapshot::{WorkflowStepKind, WorkflowStepView};
+    use crate::data::session::SessionOpenOptions;
+    use crate::data::workflow_state::{WorkflowPhase, WorkflowSummary};
 
     fn view(steps: &[(&str, StepViewStatus)]) -> WorkflowViewState {
         WorkflowViewState {
@@ -1235,5 +1260,52 @@ mod log_tests {
         let changes = workflow_step_changes(None, &after);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].from, None);
+    }
+
+    #[test]
+    fn session_workflow_progress_is_relayed_without_a_phase_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let mut session = Session::open_at_directory_root(
+            dir.path().to_path_buf(),
+            SessionOpenOptions {
+                env: Some(EnvSnapshot::with_overrides([
+                    ("HOME", home.display().to_string()),
+                    ("AWMAN_HOME", home.join(".awman").display().to_string()),
+                ])),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tab_id = TabId::new();
+        let mut relay = TabRelay::new(
+            tab_id,
+            &session,
+            TabKindWire::Normal,
+            TabCommandFeeds::new(),
+            None,
+            (80, 24),
+        );
+        let mut summary = WorkflowSummary {
+            invocation_id: uuid::Uuid::new_v4(),
+            workflow_name: "build".into(),
+            work_item: None,
+            phase: WorkflowPhase::Main,
+            total_steps: 2,
+            completed_steps: 0,
+            failed_steps: 0,
+            current_step: Some("compile".into()),
+            updated_at: Utc::now(),
+        };
+        session.state_mut().current_workflow = Some(summary.clone());
+        let first = relay.pump(Some(&session));
+        assert!(first.iter().any(|event| matches!(event, InstanceEvent::Delta(InstanceDelta::Phase { current_workflow: Some(workflow), .. }) if workflow.current_step.as_deref() == Some("compile"))));
+
+        summary.current_step = Some("test".into());
+        summary.completed_steps = 1;
+        session.state_mut().current_workflow = Some(summary);
+        let next = relay.pump(Some(&session));
+        assert!(next.iter().any(|event| matches!(event, InstanceEvent::Delta(InstanceDelta::Phase { current_workflow: Some(workflow), .. }) if workflow.current_step.as_deref() == Some("test"))));
     }
 }

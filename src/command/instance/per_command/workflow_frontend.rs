@@ -54,24 +54,25 @@ impl WorkflowFrontend for InstanceCommandFrontend {
             .is_some_and(|s| matches!(s.state, ProgramState::Done | ProgramState::Idle));
         // Active-tab suppression: an idle/done report on the tab the user is
         // typing in must not pop the confirmation over their keystrokes.
-        if reported_done {
-            let seen_done = !self.agent_resumed();
-            self.wait_for_quiet_user();
+        if reported_done && available.opened_by_report {
+            let seen_done = !self.agent_resumed(&step_name);
+            self.wait_for_quiet_user(&step_name);
             // The agent resumed while the board was held back: it is stale,
             // so it is never shown (the step keeps running).
             let working = self
                 .signals
-                .status()
+                .step_status(&step_name)
+                .unwrap_or_else(|| self.signals.status())
                 .is_some_and(|s| s.state == ProgramState::Working);
-            if available.can_dismiss && (working || (seen_done && self.agent_resumed())) {
+            if available.can_dismiss && (working || (seen_done && self.agent_resumed(&step_name))) {
                 return Ok(NextAction::Dismiss);
             }
         }
-        let from_report = available.reported_status.is_some();
+        let from_report = available.opened_by_report;
         let presentation = self.presentation.clone();
         let ask = |request: DialogRequest| {
             if from_report {
-                self.ask_report_dialog(request)
+                self.ask_report_dialog(&step_name, request)
             } else {
                 self.ask_dialog(request)
             }
@@ -160,11 +161,12 @@ impl WorkflowFrontend for InstanceCommandFrontend {
     /// Active-tab suppression is an input to the engine, which holds an
     /// `AgentDone` countdown back while this is true (and keeps processing
     /// exits and reports). Never blocks.
-    fn user_interacting_with(&self, _step_name: &str) -> bool {
-        self.should_defer_for_user()
+    fn user_interacting_with(&self, step_name: &str) -> bool {
+        self.should_defer_for_step(step_name)
     }
 
     fn report_agent_status(&mut self, step_name: &str, status: Option<&EffectiveStatus>) {
+        self.signals.set_step_status(step_name, status.cloned());
         if self.parallel_group_active {
             self.push_container_slot_event(ContainerSlotEvent::Reported {
                 step_name: step_name.to_string(),
@@ -564,19 +566,11 @@ fn control_board_state_with(
     available: &AvailableActions,
     presentation: &dyn crate::command::instance::frontend::InstancePresentation,
 ) -> WorkflowControlBoardState {
-    // The agent's own words about why this board is open lead the detail lines.
-    let mut failure_lines: Vec<String> = available
-        .reported_status
+    let failure_lines = available
+        .step_failure
         .as_ref()
-        .map(|s| vec![presentation.status_line(s)])
+        .map(|f| f.detail_lines.clone())
         .unwrap_or_default();
-    failure_lines.extend(
-        available
-            .step_failure
-            .as_ref()
-            .map(|f| f.detail_lines.clone())
-            .unwrap_or_default(),
-    );
     WorkflowControlBoardState {
         step_name: step_name.to_string(),
         focused_step_name: step_name.to_string(),
@@ -596,6 +590,10 @@ fn control_board_state_with(
         parallel_peer_count: available.parallel_peer_count,
         parallel_peers_running: available.parallel_peers_running,
         failure_lines,
+        status_line: available
+            .reported_status
+            .as_ref()
+            .map(|s| presentation.status_line(s)),
         retry_failed_step: available.retry_failed_step.clone(),
         in_parallel_group: available.acts_on_parallel_group,
     }
@@ -1004,6 +1002,51 @@ mod tests {
             result,
             crate::engine::workflow::actions::NextAction::LaunchNext,
         );
+    }
+
+    #[test]
+    fn explicit_board_on_a_done_step_opens_without_waiting_for_quiet() {
+        use crate::data::program_status::{EffectiveStatus, ProgramState};
+        use crate::engine::workflow::actions::{AvailableActions, NextAction};
+        use crate::engine::workflow::frontend::WorkflowFrontend;
+
+        let (mut frontend, req_rx, resp_tx) = make_frontend();
+        let status = EffectiveStatus {
+            state: ProgramState::Done,
+            kind: None,
+            progress: None,
+            msg: None,
+            app: None,
+            id: None,
+        };
+        frontend
+            .signals
+            .set_step_status("build", Some(status.clone()));
+        frontend.signals.touch_user_for_step(Some("build"));
+        let cancel = frontend.command_cancel.clone();
+        let available = AvailableActions {
+            focused_step: Some("build".into()),
+            reported_status: Some(status),
+            can_dismiss: true,
+            // The report is visible on an explicit Ctrl-W board, but did not
+            // cause this board to open.
+            opened_by_report: false,
+            ..Default::default()
+        };
+        let state = make_workflow_state_two_pending();
+        let handle =
+            std::thread::spawn(move || frontend.show_workflow_control_board(&state, &available));
+        let opened = req_rx.recv_timeout(Duration::from_secs(1));
+        if opened.is_err() {
+            cancel.cancel();
+        }
+        resp_tx.send(DialogResponse::Dismissed).unwrap();
+        let result = handle.join().unwrap().unwrap();
+        assert!(
+            matches!(opened, Ok(DialogRequest::WorkflowControlBoard(_))),
+            "Ctrl-W must open the board without an inactivity delay: {opened:?}"
+        );
+        assert_eq!(result, NextAction::Dismiss);
     }
 
     #[test]
@@ -1568,6 +1611,29 @@ mod tests {
         assert_eq!(state.failure_lines, vec!["Exit code: 1", "Ran for 12s"]);
         assert!(!state.can_finish);
         assert!(!state.can_dismiss);
+    }
+
+    #[test]
+    fn control_board_state_keeps_a_running_report_out_of_failure_details() {
+        use crate::data::program_status::{EffectiveStatus, ProgramState};
+        use crate::engine::workflow::actions::AvailableActions;
+
+        let available = AvailableActions {
+            focused_step: Some("build".into()),
+            reported_status: Some(EffectiveStatus {
+                state: ProgramState::Done,
+                kind: None,
+                progress: None,
+                msg: None,
+                app: None,
+                id: None,
+            }),
+            can_dismiss: true,
+            ..Default::default()
+        };
+        let state = super::control_board_state("build", &available);
+        assert!(state.failure_lines.is_empty());
+        assert!(state.status_line.is_some());
     }
 
     #[test]

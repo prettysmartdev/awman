@@ -157,7 +157,10 @@ pub enum FrontendFrame {
     },
     Activity {
         tab_id: TabId,
-    }, // user typed/scrolled; coalesced ≤ 1/s
+        /// Focused parallel step, if activity was in a parallel slot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_name: Option<String>,
+    }, // user typed/scrolled; coalesced ≤ 1/s per focused step
     Resize(TermSize),
     UiRequest(UiRequest),
     Quit,
@@ -697,7 +700,10 @@ mod tests {
                     step_name: text.into(),
                 },
             },
-            FrontendFrame::Activity { tab_id },
+            FrontendFrame::Activity {
+                tab_id,
+                step_name: Some(text.into()),
+            },
             FrontendFrame::Resize(size),
             FrontendFrame::Quit,
         ];

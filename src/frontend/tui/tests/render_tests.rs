@@ -560,6 +560,29 @@ fn push_acp_slot(app: &mut App, agent: &str) -> crate::frontend::tui::tabs::Shar
     state
 }
 
+#[test]
+fn acp_workflow_window_shows_its_reported_step_status() {
+    use crate::data::program_status::{EffectiveStatus, ProgramState};
+    use crate::frontend::tui::tabs::ContainerWindowState;
+
+    let mut app = make_app();
+    push_acp_slot(&mut app, "codex");
+    let tab = app.active_tab_mut();
+    let slot = &mut tab.container_slots[0];
+    slot.step_name = "review".into();
+    slot.set_program_status(Some(EffectiveStatus {
+        state: ProgramState::Done,
+        kind: None,
+        progress: None,
+        msg: None,
+        app: None,
+        id: None,
+    }));
+    tab.container_window_state = ContainerWindowState::Maximized;
+    let text = buffer_text(&render_app(&mut app, 80, 30));
+    assert!(text.contains("review — ✓ done"), "{text}");
+}
+
 /// Coordinates of the first rounded top-left corner ('╭') rendered in
 /// `color`, scanning row-major (top-to-bottom, then left-to-right).
 fn find_border_corner_of_color(
@@ -2211,6 +2234,7 @@ fn plain_control_board() -> crate::frontend::tui::dialogs::WorkflowControlBoardS
         parallel_peer_count: 0,
         parallel_peers_running: 0,
         failure_lines: Vec::new(),
+        status_line: None,
         retry_failed_step: None,
         in_parallel_group: false,
     }
@@ -2262,6 +2286,21 @@ fn control_board_without_a_failure_keeps_its_ordinary_title() {
     assert!(text.contains("Workflow Control"), "{text}");
     assert!(!text.contains("step failed"), "{text}");
     assert!(text.contains("Restart current step"), "{text}");
+}
+
+#[test]
+fn running_step_report_is_not_rendered_as_a_failure_board() {
+    let mut app = make_app();
+    let mut state = plain_control_board();
+    state.can_dismiss = true;
+    state.status_line = Some("Agent reported done".into());
+    app.active_dialog = Some(Dialog::WorkflowControlBoard(state));
+
+    let text = buffer_text(&render_app(&mut app, 90, 30));
+    assert!(text.contains("step running"), "{text}");
+    assert!(text.contains("Agent reported done"), "{text}");
+    assert!(!text.contains("step failed"), "{text}");
+    assert!(!text.contains("Failed step:"), "{text}");
 }
 
 /// On a terminal with room for it, the detail modal is wide enough that every

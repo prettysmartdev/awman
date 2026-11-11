@@ -391,8 +391,14 @@ impl RemoteTabView {
             app.command_dialog_active = false;
             app.command_dialog_deadline = None;
             app.needs_redraw = true;
-        } else {
-            app.pending_dialog_requests.remove(&session_id);
+        } else if app.pending_dialog_requests.remove(&session_id).is_none() {
+            // The request may still be in the tab's channel when another
+            // frontend answers it. The remote backend holds later requests
+            // until this close event, so the first unread item is the closed
+            // board and must not be shown on the next tick.
+            if let Some(rx) = &app.tabs[index].dialog_request_rx {
+                let _ = rx.try_recv();
+            }
         }
     }
 }

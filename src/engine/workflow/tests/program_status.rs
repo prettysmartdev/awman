@@ -720,6 +720,7 @@ async fn non_yolo_done_opens_the_lightweight_confirm_at_once() {
     assert_eq!(outcome, WorkflowOutcome::Completed);
     assert!(log.countdowns.is_empty(), "no countdown without yolo");
     let board = &log.boards[0];
+    assert!(board.opened_by_report);
     assert_eq!(
         board.simple_advance,
         Some(SimpleAdvance {
@@ -971,6 +972,7 @@ async fn parallel_non_yolo_report_opens_the_board_for_that_step() {
     .await;
     run.wait_boards(1).await;
     let board = run.boards()[0].clone();
+    assert!(board.opened_by_report);
     assert_eq!(board.focused_step.as_deref(), Some("y"));
     assert_eq!(
         board.reported_status.as_ref().map(|s| s.kind),

@@ -1434,8 +1434,10 @@ pub(crate) fn show_leader_control_board(
         can_launch_next: true,
         launch_next_label: Some("Start dynamic workflow".to_string()),
         can_restart_current_step: true,
+        can_pause: true,
         can_abort: true,
         can_dismiss: true,
+        focused_step: Some(label.to_string()),
         ..Default::default()
     };
 

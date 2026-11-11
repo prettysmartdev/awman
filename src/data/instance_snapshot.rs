@@ -13,6 +13,37 @@ use crate::data::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
+
+mod optional_base64_bytes {
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        bytes: &Option<Vec<u8>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match bytes {
+            Some(bytes) => {
+                serializer.serialize_some(&base64::engine::general_purpose::STANDARD.encode(bytes))
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Vec<u8>>, D::Error> {
+        let encoded = Option::<String>::deserialize(deserializer)?;
+        encoded
+            .map(|value| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(value)
+                    .map_err(serde::de::Error::custom)
+            })
+            .transpose()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum ExecutionPhase {
@@ -419,6 +450,14 @@ pub enum InstanceDelta {
         tab_id: TabId,
         slot_id: SlotId,
         exit_code: Option<i32>,
+        /// Final visible terminal grid, sent before the exit is applied so
+        /// a slower terminal WebSocket cannot lose the last output frame.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "optional_base64_bytes"
+        )]
+        final_screen: Option<Vec<u8>>,
     },
     SlotStuck {
         tab_id: TabId,
@@ -530,6 +569,32 @@ pub enum GitFileChangeTypeWire {
 mod tests {
     use super::*;
     use crate::data::frontend_protocol::{Codec, EngineFrame};
+
+    #[test]
+    fn slot_exit_final_screen_is_base64_and_optional() {
+        let tab_id = TabId::new();
+        let slot_id = SlotId(uuid::Uuid::new_v4());
+        let exited = InstanceDelta::SlotExited {
+            tab_id: tab_id.clone(),
+            slot_id,
+            exit_code: Some(0),
+            final_screen: Some(b"tail\r\n".to_vec()),
+        };
+        let wire = serde_json::to_value(&exited).unwrap();
+        assert_eq!(wire["value"]["final_screen"], "dGFpbA0K");
+        round_trip(exited);
+
+        let absent = InstanceDelta::SlotExited {
+            tab_id,
+            slot_id,
+            exit_code: None,
+            final_screen: None,
+        };
+        let wire = serde_json::to_value(&absent).unwrap();
+        assert!(wire["value"].get("final_screen").is_none());
+        round_trip(absent);
+    }
+
     fn round_trip<T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug>(
         value: T,
     ) {
@@ -765,6 +830,7 @@ mod tests {
                     tab_id: tab_id.clone(),
                     slot_id,
                     exit_code: Some(0),
+                    final_screen: None,
                 },
                 InstanceDelta::SlotStuck {
                     tab_id: tab_id.clone(),

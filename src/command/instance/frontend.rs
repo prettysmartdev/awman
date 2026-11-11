@@ -160,8 +160,8 @@ impl InstanceCommandFrontend {
     /// report means; this only delays showing it. `blocked`/`error` never
     /// come through here. Gives up early if the agent resumes (a `working`,
     /// `blocked` or `error` report) or the command is cancelled.
-    pub(crate) fn wait_for_quiet_user(&self) {
-        while self.should_defer_for_user() {
+    pub(crate) fn wait_for_quiet_user(&self, step_name: &str) {
+        while self.should_defer_for_step(step_name) {
             if self.command_cancel.is_cancelled() {
                 return;
             }
@@ -169,20 +169,20 @@ impl InstanceCommandFrontend {
         }
     }
 
-    /// Whether an `idle`/`done` dialog should still wait: the user interacted
-    /// with this tab within `agents.stuckTimeout` and the agent has not moved
-    /// on to `working`, `blocked` or `error` (which are never deferred).
-    pub(crate) fn should_defer_for_user(&self) -> bool {
+    /// Hold a done/idle action only for recent activity in that step's slot.
+    /// The tab's aggregate status can belong to a different parallel agent.
+    pub(crate) fn should_defer_for_step(&self, step_name: &str) -> bool {
         use crate::data::program_status::ProgramState;
-        let window = crate::engine::container::timing::DEFAULT_STUCK_TIMEOUT;
-        if !self.signals.user_active_within(window) {
-            return false;
-        }
-        let resumed = self
+        let status = self
             .signals
-            .status()
-            .is_some_and(|s| !matches!(s.state, ProgramState::Done | ProgramState::Idle));
-        !resumed
+            .step_status(step_name)
+            .unwrap_or_else(|| self.signals.status());
+        self.signals.user_active_within_step(
+            crate::engine::container::timing::DEFAULT_STUCK_TIMEOUT,
+            step_name,
+        ) && (!self.parallel_group_active
+            || self.signals.last_user_step().as_deref() == Some(step_name))
+            && status.is_some_and(|s| matches!(s.state, ProgramState::Done | ProgramState::Idle))
     }
 
     pub(crate) fn squad_attach_has_explicit_target(&self) -> bool {
@@ -363,6 +363,7 @@ impl InstanceCommandFrontend {
     /// tab. Any key or scroll on the tab after it opened keeps it.
     pub(crate) fn ask_report_dialog(
         &self,
+        step_name: &str,
         request: DialogRequest,
     ) -> Result<DialogResponse, CommandError> {
         // A request left over from an earlier board must not close this one.
@@ -380,7 +381,7 @@ impl InstanceCommandFrontend {
         let mut dismiss_requested = false;
         // The tab learns of reports asynchronously: only a resume seen
         // after the reported problem/done itself reached the tab counts.
-        let mut seen_report = !self.agent_resumed();
+        let mut seen_report = !self.agent_resumed(step_name);
         loop {
             match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(response) => return Ok(response),
@@ -392,12 +393,17 @@ impl InstanceCommandFrontend {
             if dismiss_requested || self.command_cancel.is_cancelled() {
                 continue;
             }
-            let resumed = self.agent_resumed();
+            let resumed = self.agent_resumed(step_name);
             if !resumed {
                 seen_report = true;
                 continue;
             }
-            let touched = self.signals.last_user_input().is_some_and(|t| t >= opened);
+            let touched = self.signals.last_user_input().is_some_and(|t| t >= opened)
+                && if self.parallel_group_active {
+                    self.signals.last_user_step().as_deref() == Some(step_name)
+                } else {
+                    true
+                };
             if seen_report && !touched {
                 self.signals.request_report_dialog_dismiss();
                 dismiss_requested = true;
@@ -407,10 +413,11 @@ impl InstanceCommandFrontend {
 
     /// Whether the agent's latest report is `working` or a clear: a board
     /// opened for an earlier report is stale.
-    pub(crate) fn agent_resumed(&self) -> bool {
+    pub(crate) fn agent_resumed(&self, step_name: &str) -> bool {
         use crate::data::program_status::ProgramState;
         self.signals
-            .status()
+            .step_status(step_name)
+            .unwrap_or_else(|| self.signals.status())
             .is_none_or(|s| s.state == ProgramState::Working)
     }
 

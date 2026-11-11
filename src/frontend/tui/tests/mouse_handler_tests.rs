@@ -18,6 +18,27 @@ fn make_mouse_event(kind: MouseEventKind, col: u16, row: u16, mods: KeyModifiers
     }
 }
 
+#[test]
+fn scrolling_a_parallel_workflow_records_the_focused_step() {
+    use crate::frontend::tui::tabs::ContainerSlot;
+
+    let mut app = make_app();
+    let tab = app.active_tab_mut();
+    tab.container_slots
+        .push(ContainerSlot::new("build".into(), "claude".into(), 100));
+    tab.container_slots
+        .push(ContainerSlot::new("test".into(), "codex".into(), 100));
+    tab.focused_slot_idx = 1;
+    crate::frontend::tui::mouse_handler::handle_mouse_event(
+        &mut app,
+        make_mouse_event(MouseEventKind::ScrollUp, 10, 10, KeyModifiers::NONE),
+    );
+    assert_eq!(
+        app.active_tab().shared.signals.last_user_step().as_deref(),
+        Some("test")
+    );
+}
+
 fn install_overflowing_overview(app: &mut App) {
     use crate::frontend::tui::tabs::{
         StepViewStatus, WorkflowStepKind, WorkflowStepView, WorkflowViewState,

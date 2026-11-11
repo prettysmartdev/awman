@@ -366,6 +366,7 @@ impl WorkflowEngine {
     ) -> Result<AvailableActions, EngineError> {
         let mut available = self.compute_available_actions()?;
         available.reported_status = status.cloned();
+        available.opened_by_report = true;
         available.simple_advance = None;
         if response == ReportedResponse::ConfirmAdvance && available.can_launch_next {
             let failed = self

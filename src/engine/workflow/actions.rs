@@ -116,6 +116,10 @@ pub struct AvailableActions {
     /// the same agent later reports `working` — the engine's call is
     /// blocking, so closing an auto-opened board is the frontend's job.
     pub reported_status: Option<crate::data::program_status::EffectiveStatus>,
+    /// This board was opened automatically by the focused agent's report.
+    /// Explicit Ctrl-W boards may still display `reported_status`, but must
+    /// open immediately and stay open until the user answers.
+    pub opened_by_report: bool,
 }
 
 /// An answer to one of the engine's follow-up questions about a running
