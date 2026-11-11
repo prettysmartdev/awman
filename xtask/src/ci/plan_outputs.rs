@@ -181,5 +181,21 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("docker=unix:///var/run/docker.sock")));
+        assert!(entries.iter().any(|e| e["host_resources"]
+            .as_str()
+            .unwrap()
+            .contains("local-registry=127.0.0.1:5000")));
+        assert!(entries.iter().any(|e| e["host_resources"]
+            .as_str()
+            .unwrap()
+            .contains("git-transports")));
+        let unit_entries = output["shards"]["test-unit-linux-x64"].as_array().unwrap();
+        assert!(unit_entries.iter().all(|e| {
+            e["suites"]
+                .as_str()
+                .unwrap()
+                .split(',')
+                .all(|suite| m.suites[suite].kind == "nextest")
+        }));
     }
 }

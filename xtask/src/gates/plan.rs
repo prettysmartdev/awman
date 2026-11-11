@@ -213,7 +213,7 @@ pub fn create(m: &Manifest, gate: &str, request: Request, today: NaiveDate) -> R
         .collect();
     let mut groups: BTreeMap<(String, String, String, u32, u32), Vec<String>> = BTreeMap::new();
     for c in cells.iter().filter(|c| c.selected) {
-        if let Some(s) = m.suites.get(&c.cell.suite) {
+        if let Some(s) = m.suites.get(&c.cell.suite).filter(|s| s.kind == "nextest") {
             for shard in 1..=c.shards {
                 groups
                     .entry((
@@ -246,11 +246,21 @@ pub fn create(m: &Manifest, gate: &str, request: Request, today: NaiveDate) -> R
             let host_resources = caps
                 .into_iter()
                 .filter(|c| {
-                    ["docker", "apple-containers", "docker-sbx", "hypervisor"].contains(&c.as_str())
+                    [
+                        "docker",
+                        "local-registry",
+                        "git-transports",
+                        "apple-containers",
+                        "docker-sbx",
+                        "hypervisor",
+                    ]
+                    .contains(&c.as_str())
                 })
                 .map(|c| {
                     if c == "docker" {
                         "docker=unix:///var/run/docker.sock".to_owned()
+                    } else if c == "local-registry" {
+                        "local-registry=127.0.0.1:5000".to_owned()
                     } else {
                         c
                     }

@@ -152,8 +152,31 @@ jobs:
           client-id: ${{ vars.AWMAN_RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.AWMAN_RELEASE_APP_PRIVATE_KEY }}
           permission-contents: write
-      - *main
-      - *controller
+      -
+        name: Check out main (current release policy; never built or run)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: main
+          persist-credentials: false
+      -
+        name: Download the attested controller of the candidate run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$DRY_RUN" = true ]; then record="candidate-record-rehearsal-$VERSION-c$CANDIDATE"; else record="candidate-record-$VERSION-c$CANDIDATE"; fi
+          run_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$record&per_page=100" \
+            --jq '[.artifacts[] | select(.workflow_run.head_branch == "main" and (.expired | not))] | max_by(.id) | .workflow_run.id')
+          [ -n "$run_id" ] && [ "$run_id" != null ] || { echo "FAILED: no retained record $record; the candidate was abandoned or expired"; exit 1; }
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n release-controller -D controller-bin
+          gh attestation verify controller-bin/xtask --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/candidate.yml" --source-ref refs/heads/main
+          chmod +x controller-bin/xtask
+          if [ "$DRY_RUN" = true ]; then
+            echo "NAMESPACE_ARGS=--dry-run --namespace rehearsal/$run_id" >> "$GITHUB_ENV"
+          else
+            echo "NAMESPACE_ARGS=--namespace production" >> "$GITHUB_ENV"
+          fi
       - name: Create the annotated tag at the candidate commit
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -299,7 +322,24 @@ jobs:
       actions: read
       attestations: read
     steps:
-      - *controller
+      -
+        name: Download the attested controller of the candidate run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$DRY_RUN" = true ]; then record="candidate-record-rehearsal-$VERSION-c$CANDIDATE"; else record="candidate-record-$VERSION-c$CANDIDATE"; fi
+          run_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$record&per_page=100" \
+            --jq '[.artifacts[] | select(.workflow_run.head_branch == "main" and (.expired | not))] | max_by(.id) | .workflow_run.id')
+          [ -n "$run_id" ] && [ "$run_id" != null ] || { echo "FAILED: no retained record $record; the candidate was abandoned or expired"; exit 1; }
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n release-controller -D controller-bin
+          gh attestation verify controller-bin/xtask --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/candidate.yml" --source-ref refs/heads/main
+          chmod +x controller-bin/xtask
+          if [ "$DRY_RUN" = true ]; then
+            echo "NAMESPACE_ARGS=--dry-run --namespace rehearsal/$run_id" >> "$GITHUB_ENV"
+          else
+            echo "NAMESPACE_ARGS=--namespace production" >> "$GITHUB_ENV"
+          fi
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: verified-*

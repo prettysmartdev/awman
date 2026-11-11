@@ -60,7 +60,7 @@ listed=$(sed 's://.*$::' "$root/$runtime_src" | awk '!done && /UPGRADABLE_FROM[^
   grep -oE '"[^"]*"' | tr -d '"' | grep -Fx -- "$prev_protocol" || true)
 [ -z "$listed" ] || exit 0
 notes="$root/docs/releases/v$version.md"
-if [ -f "$notes" ] && grep -Eq "^[-*[:space:]]*$no_upgrade_phrase[[:space:]]*[^[:space:]]" "$notes"; then exit 0; fi
+if [ -f "$notes" ] && grep -Eq "^[-*[:space:]]*${no_upgrade_phrase}[[:space:]]*[^[:space:]]" "$notes"; then exit 0; fi
 {
   echo "builtin worker protocol changed: $prev_protocol ($prev_tag) -> $current"
   echo "Existing builtin state from $prev_tag cannot be upgraded in place. Either:"

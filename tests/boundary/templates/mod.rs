@@ -166,7 +166,14 @@ fn the_custom_agent_template_builds() {
     let mut sandbox = support::sandbox("templates::the_custom_agent_template_builds");
     let text = std::fs::read_to_string(templates_dir().join("Dockerfile.custom"))
         .expect("templates/Dockerfile.custom");
-    build_on_project_base(&mut sandbox, "custom", &text);
+    // Render a minimal custom definition through every template slot. The
+    // renderer's substitutions have separate unit coverage.
+    let rendered = text
+        .replace("{{AWMAN_NODE_BLOCK}}", "")
+        .replace("{{AWMAN_APT_BLOCK}}", "")
+        .replace("{{AWMAN_INSTALL_BLOCK}}", "")
+        .replace("{{AWMAN_BINARY}}", "sh");
+    build_on_project_base(&mut sandbox, "custom", &rendered);
     sandbox.finish();
 }
 

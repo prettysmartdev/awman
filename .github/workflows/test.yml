@@ -44,10 +44,10 @@ jobs:
           bash tools/test-release-runner.sh
 
       - name: Lints and unit tier
-        run: make check
+        run: bash tools/ci-test-home.sh make check
 
       - name: Unit and component tiers, both backends
-        run: make test
+        run: bash tools/ci-test-home.sh make test
 
       - name: Retained legacy targets
         run: make legacy-test
@@ -56,6 +56,11 @@ jobs:
     name: Full tests with Docker (Linux)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    services:
+      registry:
+        image: registry:2.8.3
+        ports:
+          - 5000:5000
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -70,8 +75,11 @@ jobs:
       - name: Verify Docker is available
         run: docker info
 
+      - name: Install the loopback Git transport
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server
+
       - name: Boundary tier against the runner's Docker engine
-        run: make test-boundary AWMAN_TEST_HOST_RESOURCES="docker=unix:///var/run/docker.sock"
+        run: bash tools/ci-test-home.sh make test-boundary AWMAN_TEST_HOST_RESOURCES="docker=unix:///var/run/docker.sock,local-registry=127.0.0.1:5000,git-transports"
 
       - name: Retained legacy targets with real Docker
         run: make legacy-test LEGACY_DOCKER=1
@@ -103,10 +111,14 @@ jobs:
           npm --prefix web/e2e ci --ignore-scripts
 
       - name: Install Playwright browsers
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
         run: npm --prefix web/e2e exec -- playwright install --with-deps chromium firefox
 
       - name: Web gates
-        run: make test-web
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
+        run: bash tools/ci-test-home.sh make test-web
 
   build-macos:
     name: Build smoke (macOS)
@@ -130,4 +142,4 @@ jobs:
         run: cargo build -p awman-cli --bin awman --release
 
       - name: Unit and component tiers, both backends
-        run: make test
+        run: bash tools/ci-test-home.sh make test

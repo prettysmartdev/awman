@@ -39,10 +39,10 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
         let base = std::env::var_os("RUNNER_TEMP")
             .map(PathBuf::from)
             .ok_or_else(|| anyhow::anyhow!("RUNNER_TEMP is required"))?;
-        let root = base.join(format!(
-            "awman-{}",
-            crate::evidence::digest::input_digest(&lease)?
-        ));
+        // Unix socket paths inside the run need room for both the run and
+        // per-test directories. The marker below still checks the full lease.
+        let digest = crate::evidence::digest::input_digest(&lease)?;
+        let root = base.join(format!("awman-{}", &digest[..16]));
         std::fs::create_dir_all(&root)?;
         let marker = root.join(".awman-owner");
         use std::io::Write;

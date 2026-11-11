@@ -23,7 +23,7 @@ runtime() { # protocol [allowlisted...]
 # it starts with "file:", or nothing when it is "none"), then commits HEAD.
 fixture() {
   local name=$1 previous=$2
-  rm -rf "$scratch/$name"
+  rm -rf "${scratch:?}/$name"
   mkdir -p "$scratch/$name"
   cd "$scratch/$name"
   git_ init -q

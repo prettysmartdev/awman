@@ -108,8 +108,8 @@ const PLAN: &str = r##"  plan:
           INPUT_GATE: ${{ inputs.gate }}
         run: |
           case "$EVENT" in
-            pull_request|merge_group) gate=pr ;;
-            push) gate=main ;;
+            pull_request|merge_group) gate='pr' ;;
+            push) gate='main' ;;
             *) gate="${INPUT_GATE:-pr}" ;;
           esac
           case "$gate" in
@@ -223,7 +223,7 @@ const LINT: &str = r##"  lint:
         run: cargo xtask matrix check
       - name: Lint suites with evidence (@@SUITES@@)
         if: ${{ !cancelled() }}
-        run: cargo xtask test run --suite "@@SUITE_LIST@@" --build @@BUILD@@ --evidence-dir evidence
+        run: bash tools/ci-test-home.sh cargo xtask test run --suite "@@SUITE_LIST@@" --build @@BUILD@@ --evidence-dir evidence
       - name: Upload evidence
         if: ${{ always() }}
         uses: @@UPLOAD@@
@@ -310,6 +310,12 @@ fn build_job(m: &Manifest, id: &str) -> String {
             "      - name: Install the static C toolchain\n        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools\n      - name: Build the distribution executable ({triple})\n        run: cargo build -p awman-cli --bin awman --release --locked --target {triple} {features}\n      - name: Smoke test the static executable\n        run: |\n          artifact=target/{triple}/release/awman\n          \"$artifact\" --version\n          if readelf -l \"$artifact\" | grep -q INTERP; then\n            echo 'expected a static executable without a dynamic loader' >&2\n            exit 1\n          fi\n"
         ));
     } else {
+        if b.features == "builtin" {
+            s.push_str(&format!(
+                "      - name: Prepare the verified builtin payload\n        run: bash tools/msb-payloads/fetch.sh {}\n",
+                p.triple
+            ));
+        }
         s.push_str(&format!(
             "      - name: Install the pinned test runner\n        run: cargo xtask test install-runner\n      - name: Build the nextest archive and the debug binary\n        run: cargo xtask test archive --build {id} --out archive\n      - name: Record digests\n        id: digests\n        run: |\n          cp \"target/debug/awman$(if [ \"$RUNNER_OS\" = Windows ]; then echo .exe; fi)\" archive/awman-debug-{id}\n          cargo xtask ci digest record --out archive/digests.json \\\n            archive=archive/test-archive-{id}.tar.zst \\\n            expected=archive/expected-tests-{id}.json \\\n            binary=archive/awman-debug-{id} >> \"$GITHUB_OUTPUT\"\n      - name: Upload the archive\n        uses: {UPLOAD}\n        with:\n          name: test-archive-${{{{ needs.plan.outputs.gate }}}}-${{{{ inputs.mode }}}}-{id}\n          path: archive\n          if-no-files-found: error\n          retention-days: 7\n"
         ));
@@ -335,17 +341,24 @@ fn test_job(m: &Manifest, t: &TestJob) -> String {
         cond.push_str(" && needs.plan.outputs.hardware == 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && github.event_name != 'merge_group'");
     }
     let mut s = format!(
-        "  {id}:\n    name: Test {tier} on {platform}\n    needs: [plan, {build_job}]\n    if: ${{{{ {cond} }}}}\n    runs-on: {runs_on}\n    timeout-minutes: {timeout}\n    strategy:\n      fail-fast: false\n      matrix:\n        shard: ${{{{ fromJSON(needs.plan.outputs.shards)['{id}'] || fromJSON('[{{\"i\":1,\"n\":1,\"suites\":\"\"}}]') }}}}\n    env:\n      GATE: ${{{{ needs.plan.outputs.gate }}}}\n      AWMAN_TEST_LEASE: ${{{{ strategy.job-index }}}}\n    steps:\n",
+        "  {id}:\n    name: Test {tier} on {platform}\n    needs: [plan, {build_job}]\n    if: ${{{{ {cond} }}}}\n    runs-on: {runs_on}\n    timeout-minutes: {timeout}\n    strategy:\n      fail-fast: false\n      matrix:\n        shard: ${{{{ fromJSON(needs.plan.outputs.shards)['{id}'] || fromJSON('[{{\"i\":1,\"n\":1,\"suites\":\"\"}}]') }}}}\n",
         id = t.id,
         tier = t.tier,
         platform = t.platform,
         runs_on = runs_on(&p.runs_on),
         timeout = timeout(&t.tier),
     );
+    if t.id == "boundary-linux-docker" || t.id.contains("private-registry") {
+        s.push_str("    services:\n      registry:\n        image: registry:2.8.3\n        ports:\n          - 5000:5000\n");
+    }
+    s.push_str("    env:\n      GATE: ${{ needs.plan.outputs.gate }}\n      AWMAN_TEST_LEASE: ${{ strategy.job-index }}\n    steps:\n");
     s.push_str(&indent(&checkout(false), 6));
     s.push('\n');
     s.push_str(&indent(&rust(&p.toolchain, &[]), 6));
     s.push('\n');
+    if t.id == "boundary-linux-docker" {
+        s.push_str("      - name: Install the loopback Git transport\n        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server\n");
+    }
     if !hosted {
         s.push_str(&format!(
             "      - name: Runner health (blocked early, never queued forever)\n        run: cargo xtask ci runner-preflight --platform {}\n",
@@ -354,7 +367,7 @@ fn test_job(m: &Manifest, t: &TestJob) -> String {
     }
     let bid = &t.build;
     s.push_str(&format!(
-        "      - name: Allocate this job attempt\n        run: cargo xtask ci sweep --init\n      - name: Download the test archive\n        uses: {DOWNLOAD}\n        with:\n          name: test-archive-${{{{ needs.plan.outputs.gate }}}}-${{{{ inputs.mode }}}}-{bid}\n          path: archive\n      - name: Verify the archive against the build job's recorded digests\n        env:\n          ARCHIVE_SHA256: ${{{{ needs.{build_job}.outputs.archive_sha256 }}}}\n          EXPECTED_SHA256: ${{{{ needs.{build_job}.outputs.expected_sha256 }}}}\n          BINARY_SHA256: ${{{{ needs.{build_job}.outputs.binary_sha256 }}}}\n        run: |\n          cargo xtask ci digest verify --file archive/digests.json \\\n            --expect \"archive=$ARCHIVE_SHA256\" \\\n            --expect \"expected=$EXPECTED_SHA256\" \\\n            --expect \"binary=$BINARY_SHA256\"\n      - name: Install the pinned test runner\n        run: cargo xtask test install-runner\n      - name: Fetch content-addressed fixtures\n        run: cargo xtask fixtures fetch --tier {tier}\n      - name: Run the suites from the archive\n        env:\n          SUITES: ${{{{ matrix.shard.suites }}}}\n          SHARD_I: ${{{{ matrix.shard.i }}}}\n          SHARD_N: ${{{{ matrix.shard.n }}}}\n          AWMAN_TEST_HOST_RESOURCES: ${{{{ matrix.shard.host_resources }}}}\n        run: |\n          cargo xtask test run --suite \"$SUITES\" --build {bid} \\\n            --archive archive/test-archive-{bid}.tar.zst \\\n            --shard \"$SHARD_I/$SHARD_N\" --evidence-dir evidence\n      - name: Leak sweep (processes, containers, VMs, temp roots of this run)\n        if: ${{{{ always() }}}}\n        run: cargo xtask ci sweep\n      - name: Upload evidence\n        if: ${{{{ always() }}}}\n        uses: {UPLOAD}\n        with:\n          name: evidence-${{{{ env.GATE }}}}-${{{{ inputs.mode }}}}-{id}-m${{{{ strategy.job-index }}}}\n          path: evidence\n          if-no-files-found: warn\n          retention-days: 30\n      - name: Upload failure records\n        if: ${{{{ failure() }}}}\n        uses: {UPLOAD}\n        with:\n          name: failure-${{{{ env.GATE }}}}-${{{{ inputs.mode }}}}-{id}-m${{{{ strategy.job-index }}}}\n          path: evidence/**/records\n          if-no-files-found: ignore\n          retention-days: 30\n",
+        "      - name: Allocate this job attempt\n        run: cargo xtask ci sweep --init\n      - name: Download the test archive\n        uses: {DOWNLOAD}\n        with:\n          name: test-archive-${{{{ needs.plan.outputs.gate }}}}-${{{{ inputs.mode }}}}-{bid}\n          path: archive\n      - name: Verify the archive against the build job's recorded digests\n        env:\n          ARCHIVE_SHA256: ${{{{ needs.{build_job}.outputs.archive_sha256 }}}}\n          EXPECTED_SHA256: ${{{{ needs.{build_job}.outputs.expected_sha256 }}}}\n          BINARY_SHA256: ${{{{ needs.{build_job}.outputs.binary_sha256 }}}}\n        run: |\n          cargo xtask ci digest verify --file archive/digests.json \\\n            --expect \"archive=$ARCHIVE_SHA256\" \\\n            --expect \"expected=$EXPECTED_SHA256\" \\\n            --expect \"binary=$BINARY_SHA256\"\n      - name: Install the pinned test runner\n        run: cargo xtask test install-runner\n      - name: Fetch content-addressed fixtures\n        run: cargo xtask fixtures fetch --tier {tier}\n      - name: Run the suites from the archive\n        env:\n          SUITES: ${{{{ matrix.shard.suites }}}}\n          SHARD_I: ${{{{ matrix.shard.i }}}}\n          SHARD_N: ${{{{ matrix.shard.n }}}}\n          AWMAN_TEST_HOST_RESOURCES: ${{{{ matrix.shard.host_resources }}}}\n        run: |\n          bash tools/ci-test-home.sh cargo xtask test run --suite \"$SUITES\" --build {bid} \\\n            --archive archive/test-archive-{bid}.tar.zst \\\n            --shard \"$SHARD_I/$SHARD_N\" --evidence-dir evidence\n      - name: Leak sweep (processes, containers, VMs, temp roots of this run)\n        if: ${{{{ always() }}}}\n        run: cargo xtask ci sweep\n      - name: Upload evidence\n        if: ${{{{ always() }}}}\n        uses: {UPLOAD}\n        with:\n          name: evidence-${{{{ env.GATE }}}}-${{{{ inputs.mode }}}}-{id}-m${{{{ strategy.job-index }}}}\n          path: evidence\n          if-no-files-found: warn\n          retention-days: 30\n      - name: Upload failure records\n        if: ${{{{ failure() }}}}\n        uses: {UPLOAD}\n        with:\n          name: failure-${{{{ env.GATE }}}}-${{{{ inputs.mode }}}}-{id}-m${{{{ strategy.job-index }}}}\n          path: evidence/**/records\n          if-no-files-found: ignore\n          retention-days: 30\n",
         tier = t.tier,
         id = t.id,
     ));
@@ -384,9 +397,13 @@ const WEB: &str = r##"  web:
           npm --prefix web/edge ci --ignore-scripts
           npm --prefix web/e2e ci --ignore-scripts
       - name: Install Playwright browsers
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
         run: npm --prefix web/e2e exec -- playwright install --with-deps chromium firefox
       - name: Web gates with evidence
-        run: cargo xtask test run --suite web --build linux-x64-default --evidence-dir evidence
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
+        run: bash tools/ci-test-home.sh cargo xtask test run --suite web --build linux-x64-default --evidence-dir evidence
       - name: Upload evidence
         if: ${{ always() }}
         uses: @@UPLOAD@@

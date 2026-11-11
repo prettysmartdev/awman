@@ -13,7 +13,7 @@ fn size_startup_and_rss_are_recorded_without_thresholds() {
             .assert_success();
         starts.push(start.elapsed().as_micros() as u64);
     }
-    let mut rss = None;
+    let mut rss: Option<u64> = None;
     #[cfg(target_os = "linux")]
     {
         let mut child = support::run_artifact(&s, &a)

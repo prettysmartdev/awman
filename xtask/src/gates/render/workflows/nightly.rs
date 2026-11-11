@@ -221,7 +221,8 @@ const HEAD: &str = r####"  plan:
 @@RUST@@
       - name: Two clean-room unsigned builds with separate target directories
         run: |
-          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct 2>/dev/null || echo 0)"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct 2>/dev/null || echo 0)"
+          export SOURCE_DATE_EPOCH
           for n in 1 2; do
             CARGO_TARGET_DIR="$RUNNER_TEMP/repro-$n" \
               RUSTFLAGS="--remap-path-prefix=$PWD=/build --remap-path-prefix=$RUNNER_TEMP/repro-$n=/target" \
@@ -294,8 +295,8 @@ const HEAD: &str = r####"  plan:
           mkdir -p trends/raw
           since="$(date -u -d '30 days ago' +%FT%TZ)"
           gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
-            --jq ".artifacts[] | select((.name | startswith(\"timing-\")) and .expired == false and .created_at >= \"$since\") | [.id, .name] | @tsv" |
-          while IFS=$'\t' read -r id name; do
+            --jq ".artifacts[] | select((.name | startswith(\"timing-\")) and .expired == false and .created_at >= \"$since\") | .id" |
+          while IFS= read -r id; do
             gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > "trends/raw/$id.zip"
             unzip -q -o "trends/raw/$id.zip" -d "trends/raw/$id" || true
           done

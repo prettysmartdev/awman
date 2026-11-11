@@ -85,8 +85,8 @@ jobs:
           INPUT_GATE: ${{ inputs.gate }}
         run: |
           case "$EVENT" in
-            pull_request|merge_group) gate=pr ;;
-            push) gate=main ;;
+            pull_request|merge_group) gate='pr' ;;
+            push) gate='main' ;;
             *) gate="${INPUT_GATE:-pr}" ;;
           esac
           case "$gate" in
@@ -207,7 +207,7 @@ jobs:
         run: cargo xtask matrix check
       - name: Lint suites with evidence (9)
         if: ${{ !cancelled() }}
-        run: cargo xtask test run --suite "lint-fmt,lint-clippy,lint-architecture,lint-hygiene,lint-shell,lint-workflows,lint-deny,lint-notice,doctests" --build linux-x64-default --evidence-dir evidence
+        run: bash tools/ci-test-home.sh cargo xtask test run --suite "lint-fmt,lint-clippy,lint-architecture,lint-hygiene,lint-shell,lint-workflows,lint-deny,lint-notice,doctests" --build linux-x64-default --evidence-dir evidence
       - name: Upload evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -258,6 +258,8 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ steps.cache-key.outputs.key }}
+      - name: Prepare the verified builtin payload
+        run: bash tools/msb-payloads/fetch.sh aarch64-unknown-linux-gnu
       - name: Install the pinned test runner
         run: cargo xtask test install-runner
       - name: Build the nextest archive and the debug binary
@@ -475,6 +477,8 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ steps.cache-key.outputs.key }}
+      - name: Prepare the verified builtin payload
+        run: bash tools/msb-payloads/fetch.sh aarch64-apple-darwin
       - name: Install the pinned test runner
         run: cargo xtask test install-runner
       - name: Build the nextest archive and the debug binary
@@ -681,6 +685,11 @@ jobs:
       fail-fast: false
       matrix:
         shard: ${{ fromJSON(needs.plan.outputs.shards)['boundary-linux-docker'] || fromJSON('[{"i":1,"n":1,"suites":""}]') }}
+    services:
+      registry:
+        image: registry:2.8.3
+        ports:
+          - 5000:5000
     env:
       GATE: ${{ needs.plan.outputs.gate }}
       AWMAN_TEST_LEASE: ${{ strategy.job-index }}
@@ -694,6 +703,8 @@ jobs:
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
         with:
           toolchain: "1.94.0"
+      - name: Install the loopback Git transport
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server
       - name: Allocate this job attempt
         run: cargo xtask ci sweep --init
       - name: Download the test archive
@@ -722,7 +733,7 @@ jobs:
           SHARD_N: ${{ matrix.shard.n }}
           AWMAN_TEST_HOST_RESOURCES: ${{ matrix.shard.host_resources }}
         run: |
-          cargo xtask test run --suite "$SUITES" --build linux-x64-default \
+          bash tools/ci-test-home.sh cargo xtask test run --suite "$SUITES" --build linux-x64-default \
             --archive archive/test-archive-linux-x64-default.tar.zst \
             --shard "$SHARD_I/$SHARD_N" --evidence-dir evidence
       - name: Leak sweep (processes, containers, VMs, temp roots of this run)
@@ -796,7 +807,7 @@ jobs:
           SHARD_N: ${{ matrix.shard.n }}
           AWMAN_TEST_HOST_RESOURCES: ${{ matrix.shard.host_resources }}
         run: |
-          cargo xtask test run --suite "$SUITES" --build linux-arm64-builtin \
+          bash tools/ci-test-home.sh cargo xtask test run --suite "$SUITES" --build linux-arm64-builtin \
             --archive archive/test-archive-linux-arm64-builtin.tar.zst \
             --shard "$SHARD_I/$SHARD_N" --evidence-dir evidence
       - name: Leak sweep (processes, containers, VMs, temp roots of this run)
@@ -872,7 +883,7 @@ jobs:
           SHARD_N: ${{ matrix.shard.n }}
           AWMAN_TEST_HOST_RESOURCES: ${{ matrix.shard.host_resources }}
         run: |
-          cargo xtask test run --suite "$SUITES" --build macos-arm64-ci-guest-builtin \
+          bash tools/ci-test-home.sh cargo xtask test run --suite "$SUITES" --build macos-arm64-ci-guest-builtin \
             --archive archive/test-archive-macos-arm64-ci-guest-builtin.tar.zst \
             --shard "$SHARD_I/$SHARD_N" --evidence-dir evidence
       - name: Leak sweep (processes, containers, VMs, temp roots of this run)
@@ -948,7 +959,7 @@ jobs:
           SHARD_N: ${{ matrix.shard.n }}
           AWMAN_TEST_HOST_RESOURCES: ${{ matrix.shard.host_resources }}
         run: |
-          cargo xtask test run --suite "$SUITES" --build macos-arm64-default \
+          bash tools/ci-test-home.sh cargo xtask test run --suite "$SUITES" --build macos-arm64-default \
             --archive archive/test-archive-macos-arm64-default.tar.zst \
             --shard "$SHARD_I/$SHARD_N" --evidence-dir evidence
       - name: Leak sweep (processes, containers, VMs, temp roots of this run)
@@ -1022,7 +1033,7 @@ jobs:
           SHARD_N: ${{ matrix.shard.n }}
           AWMAN_TEST_HOST_RESOURCES: ${{ matrix.shard.host_resources }}
         run: |
-          cargo xtask test run --suite "$SUITES" --build linux-x64-default \
+          bash tools/ci-test-home.sh cargo xtask test run --suite "$SUITES" --build linux-x64-default \
             --archive archive/test-archive-linux-x64-default.tar.zst \
             --shard "$SHARD_I/$SHARD_N" --evidence-dir evidence
       - name: Leak sweep (processes, containers, VMs, temp roots of this run)
@@ -1096,7 +1107,7 @@ jobs:
           SHARD_N: ${{ matrix.shard.n }}
           AWMAN_TEST_HOST_RESOURCES: ${{ matrix.shard.host_resources }}
         run: |
-          cargo xtask test run --suite "$SUITES" --build macos-arm64-default \
+          bash tools/ci-test-home.sh cargo xtask test run --suite "$SUITES" --build macos-arm64-default \
             --archive archive/test-archive-macos-arm64-default.tar.zst \
             --shard "$SHARD_I/$SHARD_N" --evidence-dir evidence
       - name: Leak sweep (processes, containers, VMs, temp roots of this run)
@@ -1172,7 +1183,7 @@ jobs:
           SHARD_N: ${{ matrix.shard.n }}
           AWMAN_TEST_HOST_RESOURCES: ${{ matrix.shard.host_resources }}
         run: |
-          cargo xtask test run --suite "$SUITES" --build macos-arm64-ci-guest-builtin \
+          bash tools/ci-test-home.sh cargo xtask test run --suite "$SUITES" --build macos-arm64-ci-guest-builtin \
             --archive archive/test-archive-macos-arm64-ci-guest-builtin.tar.zst \
             --shard "$SHARD_I/$SHARD_N" --evidence-dir evidence
       - name: Leak sweep (processes, containers, VMs, temp roots of this run)
@@ -1246,7 +1257,7 @@ jobs:
           SHARD_N: ${{ matrix.shard.n }}
           AWMAN_TEST_HOST_RESOURCES: ${{ matrix.shard.host_resources }}
         run: |
-          cargo xtask test run --suite "$SUITES" --build windows-x64-default \
+          bash tools/ci-test-home.sh cargo xtask test run --suite "$SUITES" --build windows-x64-default \
             --archive archive/test-archive-windows-x64-default.tar.zst \
             --shard "$SHARD_I/$SHARD_N" --evidence-dir evidence
       - name: Leak sweep (processes, containers, VMs, temp roots of this run)
@@ -1322,7 +1333,7 @@ jobs:
           SHARD_N: ${{ matrix.shard.n }}
           AWMAN_TEST_HOST_RESOURCES: ${{ matrix.shard.host_resources }}
         run: |
-          cargo xtask test run --suite "$SUITES" --build macos-arm64-ci-guest-builtin \
+          bash tools/ci-test-home.sh cargo xtask test run --suite "$SUITES" --build macos-arm64-ci-guest-builtin \
             --archive archive/test-archive-macos-arm64-ci-guest-builtin.tar.zst \
             --shard "$SHARD_I/$SHARD_N" --evidence-dir evidence
       - name: Leak sweep (processes, containers, VMs, temp roots of this run)
@@ -1396,7 +1407,7 @@ jobs:
           SHARD_N: ${{ matrix.shard.n }}
           AWMAN_TEST_HOST_RESOURCES: ${{ matrix.shard.host_resources }}
         run: |
-          cargo xtask test run --suite "$SUITES" --build linux-x64-default \
+          bash tools/ci-test-home.sh cargo xtask test run --suite "$SUITES" --build linux-x64-default \
             --archive archive/test-archive-linux-x64-default.tar.zst \
             --shard "$SHARD_I/$SHARD_N" --evidence-dir evidence
       - name: Leak sweep (processes, containers, VMs, temp roots of this run)
@@ -1429,6 +1440,11 @@ jobs:
       fail-fast: false
       matrix:
         shard: ${{ fromJSON(needs.plan.outputs.shards)['test-soak-linux-x64-private-registry'] || fromJSON('[{"i":1,"n":1,"suites":""}]') }}
+    services:
+      registry:
+        image: registry:2.8.3
+        ports:
+          - 5000:5000
     env:
       GATE: ${{ needs.plan.outputs.gate }}
       AWMAN_TEST_LEASE: ${{ strategy.job-index }}
@@ -1470,7 +1486,7 @@ jobs:
           SHARD_N: ${{ matrix.shard.n }}
           AWMAN_TEST_HOST_RESOURCES: ${{ matrix.shard.host_resources }}
         run: |
-          cargo xtask test run --suite "$SUITES" --build linux-x64-default \
+          bash tools/ci-test-home.sh cargo xtask test run --suite "$SUITES" --build linux-x64-default \
             --archive archive/test-archive-linux-x64-default.tar.zst \
             --shard "$SHARD_I/$SHARD_N" --evidence-dir evidence
       - name: Leak sweep (processes, containers, VMs, temp roots of this run)
@@ -1546,7 +1562,7 @@ jobs:
           SHARD_N: ${{ matrix.shard.n }}
           AWMAN_TEST_HOST_RESOURCES: ${{ matrix.shard.host_resources }}
         run: |
-          cargo xtask test run --suite "$SUITES" --build macos-arm64-ci-guest-builtin \
+          bash tools/ci-test-home.sh cargo xtask test run --suite "$SUITES" --build macos-arm64-ci-guest-builtin \
             --archive archive/test-archive-macos-arm64-ci-guest-builtin.tar.zst \
             --shard "$SHARD_I/$SHARD_N" --evidence-dir evidence
       - name: Leak sweep (processes, containers, VMs, temp roots of this run)
@@ -1620,7 +1636,7 @@ jobs:
           SHARD_N: ${{ matrix.shard.n }}
           AWMAN_TEST_HOST_RESOURCES: ${{ matrix.shard.host_resources }}
         run: |
-          cargo xtask test run --suite "$SUITES" --build linux-x64-default \
+          bash tools/ci-test-home.sh cargo xtask test run --suite "$SUITES" --build linux-x64-default \
             --archive archive/test-archive-linux-x64-default.tar.zst \
             --shard "$SHARD_I/$SHARD_N" --evidence-dir evidence
       - name: Leak sweep (processes, containers, VMs, temp roots of this run)
@@ -1694,7 +1710,7 @@ jobs:
           SHARD_N: ${{ matrix.shard.n }}
           AWMAN_TEST_HOST_RESOURCES: ${{ matrix.shard.host_resources }}
         run: |
-          cargo xtask test run --suite "$SUITES" --build macos-arm64-default \
+          bash tools/ci-test-home.sh cargo xtask test run --suite "$SUITES" --build macos-arm64-default \
             --archive archive/test-archive-macos-arm64-default.tar.zst \
             --shard "$SHARD_I/$SHARD_N" --evidence-dir evidence
       - name: Leak sweep (processes, containers, VMs, temp roots of this run)
@@ -1768,7 +1784,7 @@ jobs:
           SHARD_N: ${{ matrix.shard.n }}
           AWMAN_TEST_HOST_RESOURCES: ${{ matrix.shard.host_resources }}
         run: |
-          cargo xtask test run --suite "$SUITES" --build windows-x64-default \
+          bash tools/ci-test-home.sh cargo xtask test run --suite "$SUITES" --build windows-x64-default \
             --archive archive/test-archive-windows-x64-default.tar.zst \
             --shard "$SHARD_I/$SHARD_N" --evidence-dir evidence
       - name: Leak sweep (processes, containers, VMs, temp roots of this run)
@@ -1821,9 +1837,13 @@ jobs:
           npm --prefix web/edge ci --ignore-scripts
           npm --prefix web/e2e ci --ignore-scripts
       - name: Install Playwright browsers
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
         run: npm --prefix web/e2e exec -- playwright install --with-deps chromium firefox
       - name: Web gates with evidence
-        run: cargo xtask test run --suite web --build linux-x64-default --evidence-dir evidence
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
+        run: bash tools/ci-test-home.sh cargo xtask test run --suite web --build linux-x64-default --evidence-dir evidence
       - name: Upload evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

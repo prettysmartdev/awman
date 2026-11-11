@@ -53,6 +53,7 @@ fn inherited_input(name: &str) -> bool {
         "AWMAN_TEST_FIXTURES",
         "AWMAN_TEST_RUN_CONFIG",
         "CI",
+        "PLAYWRIGHT_BROWSERS_PATH",
     ]
     .contains(&name)
         || name.starts_with("CARGO_")

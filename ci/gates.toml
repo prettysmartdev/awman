@@ -6,7 +6,7 @@ override = []
 [tools.nextest]
 version = "0.9.150"
 source = "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.150"
-sha256 = { aarch64-unknown-linux-gnu = "9164568e9840c6509177086828ac7d3178c2d8feb0658b4d2bff62fa620e98c8", x86_64-unknown-linux-gnu = "b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f", universal-apple-darwin = "82a759b4d218d38359424196ab244c470e8f7c7d149c814fbbeef4d67c3c301a", x86_64-pc-windows-msvc = "b7a8bf567140b8b366716f2dea27b32e088dc12f53597315f976d0dbf7c6ade8" }
+sha256 = { aarch64-unknown-linux-gnu = "9164568e9840c6509177086828ac7d3178c2d8feb0658b4d2bff62fa620e98c8", x86_64-unknown-linux-gnu = "b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f", universal-apple-darwin = "82a759b4d218d38359424196ab244c470e8f7c7d149c814fbbeef4d67c3c301a", x86_64-pc-windows-msvc = "6fd8f9ba48c946a79a5bcdd35bf4f922447b149f7ca6c3ff7f39e12f32ef78db" }
 
 # shellcheck publishes no checksum file: these are the SHA-256 of the release
 # assets as downloaded on 2026-11-11 (maintainer cross-check recorded in the ledger).

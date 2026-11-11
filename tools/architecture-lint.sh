@@ -273,7 +273,7 @@ check_layer() {
     #   1. Direct: `crate::<forbidden>` anywhere on a non-comment line.
     #   2. Nested: a `use crate::{` block whose body lists a forbidden
     #      top-level segment, found on the collapsed logical lines.
-    local matches direct nested nested_re
+    local matches direct nested
     direct=$(grep_scan -rnE --include='*.rs' -- "$pattern" "$dir")
 
     nested=$(awk_files "$list" "$GROUP_IMPORT_AWK" -v root=crate | awk_stdin "$TOP_LEVEL_AWK" -v "segs=$(echo "$forbidden_segments" | paste -sd '|' -)")

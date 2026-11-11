@@ -30,8 +30,9 @@ fi
 # cache for every clean-checkout evidence run.
 runner_temp=${RUNNER_TEMP:-${TMPDIR:-/tmp}}
 mkdir -p "$runner_temp"
-export CARGO_HOME=$(mktemp -d "$runner_temp/awman-cargo-home.XXXXXX")
-export CARGO_TARGET_DIR=$(mktemp -d "$runner_temp/awman-target.XXXXXX")
+CARGO_HOME=$(mktemp -d "$runner_temp/awman-cargo-home.XXXXXX")
+CARGO_TARGET_DIR=$(mktemp -d "$runner_temp/awman-target.XXXXXX")
+export CARGO_HOME CARGO_TARGET_DIR
 bash tools/msb-payloads/fetch.sh "$target"
 bash tools/msb-payloads/verify.sh "$target"
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
