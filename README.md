@@ -2,13 +2,21 @@
   <img src="docs/awman_logo.svg" width="240" alt="awman logo">
 </p>
 
-# awman
+# awman - Agent Workflow Manager
 
 [![CI tests](https://github.com/prettysmartdev/awman/actions/workflows/test.yml/badge.svg)](https://github.com/prettysmartdev/awman/actions/workflows/test.yml)
 
 **Custom agent workflows for your hardest tasks, run safely in isolation.**
 
-awman is an Agent Workflow Manager that turns agent best practices like clear specs, independent review, tests, and autoremediation into a repeatable workflow for developers. Give it a work item: awman's leader agent designs a custom workflow, then awman validates and runs it in isolated containers or microVMs on your laptop, server, cloud VM, or homelab. Shared context carries decisions between agents, and the run can finish with a PR and passing CI. Bring Claude Code, Codex, OpenCode, or your preferred code agent.
+awman turns agent best practices like clear specs, task breakdown, independent review, enforced tests, and autoremediation into custom, repeatable workflows for developers.
+
+Give awman any task:
+- awman's leader agent designs a custom workflow.
+- The workflow is validated and executed in isolated containers or microVMs.
+- Shared context system carries progress and decisions between agents to improve coordination and reduce token usage.
+- Every run finishes with a PR and passing CI.
+- Runs on your laptop, server, cluster, or homelab.
+- Combine Claude Code, Codex, OpenCode, or any preferred code agent with your own subscriptions.
 
 ![Parallel agent workflow in the awman TUI](docs/blog/images/dynamic-workflows.png)
 
