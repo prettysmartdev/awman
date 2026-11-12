@@ -1,7 +1,7 @@
 <p align="center">
   <img src="docs/awman_logo.svg" width="440" alt="awman logo">
   <br>
-  [![CI tests](https://github.com/prettysmartdev/awman/actions/workflows/test.yml/badge.svg)](https://github.com/prettysmartdev/awman/actions/workflows/test.yml)
+  ![CI tests](https://github.com/prettysmartdev/awman/actions/workflows/test.yml/badge.svg)](https://github.com/prettysmartdev/awman/actions/workflows/test.yml)
 </p>
 
 # awman - Agent Workflow Manager
