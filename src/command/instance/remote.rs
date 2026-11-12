@@ -1609,20 +1609,24 @@ fn collect_inputs(shared: &Shared) -> Vec<Outbound> {
         }
         let touched = tab.feeds.signals.last_user_input();
         let step_name = tab.feeds.signals.last_user_step();
-        if touched.is_some() && touched != tab.last_input_seen {
-            tab.last_input_seen = touched;
-            if step_name != tab.last_activity_step
+        // Keep the latest unsent activity until the throttle permits it.
+        // While a dialog is open, every touch must reach the engine before
+        // its report-board auto-dismissal check.
+        if touched.is_some()
+            && touched != tab.last_input_seen
+            && (step_name != tab.last_activity_step
+                || tab.run.as_ref().is_some_and(|run| !run.dialogs.is_empty())
                 || tab
                     .last_activity_sent
-                    .is_none_or(|sent| sent.elapsed() >= ACTIVITY_INTERVAL)
-            {
-                tab.last_activity_sent = Some(Instant::now());
-                tab.last_activity_step = step_name.clone();
-                frames.push(Outbound::Frame(FrontendFrame::Activity {
-                    tab_id,
-                    step_name,
-                }));
-            }
+                    .is_none_or(|sent| sent.elapsed() >= ACTIVITY_INTERVAL))
+        {
+            tab.last_input_seen = touched;
+            tab.last_activity_sent = Some(Instant::now());
+            tab.last_activity_step = step_name.clone();
+            frames.push(Outbound::Frame(FrontendFrame::Activity {
+                tab_id,
+                step_name,
+            }));
         }
     }
     frames

@@ -181,15 +181,11 @@ impl WorkflowEngine {
             if self.yolo {
                 return Ok(IterationOutcome::Continue);
             }
-        } else if self.yolo {
-            // Last step in yolo mode: always require explicit user
-            // confirmation before ending the workflow so the user can
-            // review the final step's output.
-            let progress = self.workflow_progress_info();
-            self.frontend.report_workflow_progress(&progress);
         }
 
-        if !workflow_just_completed || self.yolo {
+        // run_to_completion enforces final review in every interactive mode,
+        // including natural exits and resumed runs with all steps complete.
+        if !workflow_just_completed {
             let available = self.compute_available_actions()?;
             let action = self
                 .frontend
@@ -566,7 +562,7 @@ impl WorkflowEngine {
         stuck_rx: &mut Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
     ) -> Result<Option<InterruptibleStepResult>, EngineError> {
         self.msg_warning(format!("Step '{}' appears stuck (no output)", step_name,));
-        if self.yolo && !self.is_last_step() {
+        if self.yolo && !self.is_final_review_step(step_name) {
             let yolo_result = self
                 .run_mid_step_yolo_countdown(step_name, cancel_handle, wait_rx, stuck_rx)
                 .await?;
@@ -605,14 +601,6 @@ impl WorkflowEngine {
                         .report_step_status(&step, WorkflowStepStatus::Succeeded);
                     let progress = self.workflow_progress_info();
                     self.frontend.report_workflow_progress(&progress);
-
-                    if self.is_last_step() {
-                        let available = self.compute_available_actions()?;
-                        let action = self
-                            .frontend
-                            .show_workflow_control_board(&self.state, &available)?;
-                        return Ok(Some(self.execute_top_level_action(action)?));
-                    }
 
                     Ok(Some(InterruptibleStepResult::LoopContinue))
                 }

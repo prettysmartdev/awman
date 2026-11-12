@@ -61,7 +61,7 @@ pub struct AvailableActions {
     pub parallel_peer_count: usize,
     /// Live peers of the focused step still running in the same parallel group
     /// (excludes the focused step itself). Finish remains available once the
-    /// final yolo group's review countdowns have all elapsed.
+    /// final group is ready for review.
     pub parallel_peers_running: usize,
     /// True when a container is currently running (mid-step). The engine
     /// computes this from `current_execution.is_some()` in

@@ -151,8 +151,11 @@ awman daemon status
 awman daemon status --json
 ```
 
-Status shows each feature as `on`, `off`, `ephemeral`, `draining`, or
-`degraded`. It includes running and queued counts, the oldest queued age when
+Status groups the process summary, features, and listeners into separate
+sections. The feature table aligns state, running, and queued columns;
+indented lines show instance counts, worker push/pull summaries, and diagnostics.
+Each feature is `on`, `off`, `ephemeral`, `draining`, or `degraded`.
+It includes the oldest queued age when
 available, restart/error details for a degraded feature, engine idle-out time,
 shared capacity, and local/network listener state. Each network listener is
 listed by name, address, transport, selected features and any bind error.

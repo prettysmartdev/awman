@@ -323,24 +323,22 @@ pub fn call_with_cap<T: Send + 'static>(
 /// Every `env(NAME)` named by a list of raw overlay specs, de-duplicated and in
 /// first-seen order. Specs of any other shape are ignored.
 ///
-/// Mirrors `parse_overlay_list`'s tolerance: the argument is any single
-/// non-empty, comma-free string, trimmed.
+/// Use the launch parser so comma-separated lists and whitespace have the
+/// same meaning for coverage as they do for the containers receiving them.
 pub fn env_overlay_names(specs: &[String]) -> Vec<String> {
+    use crate::data::config::overlays::{parse_overlay_list, TypedOverlay};
+
     let mut names: Vec<String> = Vec::new();
     for spec in specs {
-        let trimmed = spec.trim();
-        let Some(inner) = trimmed
-            .strip_prefix("env(")
-            .and_then(|rest| rest.strip_suffix(')'))
-        else {
+        let Ok(overlays) = parse_overlay_list(spec) else {
             continue;
         };
-        let name = inner.trim();
-        if name.is_empty() || name.contains(',') {
-            continue;
-        }
-        if !names.iter().any(|n| n == name) {
-            names.push(name.to_string());
+        for overlay in overlays {
+            if let TypedOverlay::Env(name) = overlay {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
         }
     }
     names

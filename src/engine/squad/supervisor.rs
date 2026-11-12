@@ -1,6 +1,6 @@
 //! Read-only squad health projection over the unified daemon.
 use crate::data::config::env::EnvSnapshot;
-use crate::data::fs::task_store::{RunStatus, Task};
+use crate::data::fs::task_store::{RunStatus, Task, TaskStatus};
 use crate::data::instance_snapshot::SquadHealthWire;
 use crate::engine::daemon::DaemonSupervisor;
 use crate::engine::error::EngineError;
@@ -64,7 +64,7 @@ impl SquadSupervisor {
         };
         if tasks
             .iter()
-            .any(|t| t.last_run_status == Some(RunStatus::Failed))
+            .any(|t| t.status == TaskStatus::Active && t.last_run_status == Some(RunStatus::Failed))
         {
             SquadHealth::Failed
         } else if tasks.iter().any(|t| !t.unmet_env.is_empty()) {

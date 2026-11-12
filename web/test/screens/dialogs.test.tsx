@@ -11,6 +11,23 @@ function show(r: DialogRequest) { const h = harness(); render(<DialogRenderer di
 function answer(h: ReturnType<typeof harness>, response: unknown) { expect(h.send).toHaveBeenLastCalledWith({ type: 'dialog_response', dialog_id: 'dlg_first', response }); }
 
 describe('engine dialogs', () => {
+  it.each(['Agent is working', 'Agent is idle', 'Agent reported done', 'Agent is waiting for input', 'Agent reported an error'])('keeps a running report out of the failure banner: %s', status => {
+    const board = { ...request('workflow_control_board'), can_dismiss: true };
+    show({ ...board, status_line: status, failure_lines: [] });
+    expect(screen.getByRole('dialog', { name: 'Workflow Control (step running)' })).toBeTruthy();
+    expect(screen.getByRole('status').textContent).toBe(status);
+    expect(screen.queryByRole('alert')).toBeNull();
+    cleanup();
+    // Older engines sent the same text as failure details.
+    show({ ...board, failure_lines: [status] });
+    expect(screen.getByRole('dialog', { name: 'Workflow Control (step running)' })).toBeTruthy();
+    expect(screen.getByRole('status').textContent).toBe(status);
+    expect(screen.queryByRole('alert')).toBeNull();
+    cleanup();
+    show({ ...board, can_dismiss: false, failure_lines: ['Exit code: 1'] });
+    expect(screen.getByRole('dialog', { name: 'Workflow Control — step failed' })).toBeTruthy();
+    expect(screen.getByRole('alert').textContent).toBe('Exit code: 1');
+  });
   it.each(['yes_no', 'yes_no_cancel'] as const)('renders %s wording and yes/no outcomes', kind => { const r = request(kind); const h = show(r); expect(screen.getByText(r.body)).toBeTruthy(); fireEvent.click(screen.getByRole('button', { name: 'Yes' })); answer(h, { kind: 'yes' }); expect(screen.getByText(/Waiting for the engine/)).toBeTruthy(); });
   it('supports explicit no and cancel', () => { const h = show(request('yes_no_cancel')); fireEvent.click(screen.getByRole('button', { name: 'Cancel' })); answer(h, { kind: 'cancel' }); });
   it.each(['text_input', 'multiline_input'] as const)('submits %s through the engine', kind => { const h = show(request(kind)); const input = screen.getByRole('textbox'); fireEvent.change(input, { target: { value: 'hello\nworld' } }); fireEvent.click(screen.getByRole('button', { name: kind === 'text_input' ? 'OK' : 'Submit' })); answer(h, { kind: 'text', value: kind === 'text_input' ? 'helloworld' : 'hello\nworld' }); });

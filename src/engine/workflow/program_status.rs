@@ -13,6 +13,10 @@
 //! | `blocked` | pause, "needs you" alert, no countdown | control board | [`CountdownKind::AgentBlocked`] → kill + fail |
 //! | `error` | keep running for repair | control board | keep running for repair |
 //!
+//! Interactive final steps are an exception to automatic completion: they
+//! open the WCB and remain alive until Finish. Final parallel groups hold each
+//! completed agent for the same review after its countdown.
+//!
 //! A problem (`blocked`, `error`) never advances a step in any mode. A step
 //! that exits after a problem report is finalised as Failed whatever its exit
 //! code ([`super::single_step`]'s
@@ -240,7 +244,7 @@ impl WorkflowEngine {
         respond_to_report(
             status,
             self.yolo,
-            self.frontend.supports_interactive_recovery(),
+            !self.non_interactive && self.frontend.supports_interactive_recovery(),
         )
     }
 
@@ -414,7 +418,15 @@ impl WorkflowEngine {
         let mut status = status;
         loop {
             self.note_reported_status(step_name, status.as_ref());
-            let response = self.reported_response(status.as_ref());
+            let response = if self.is_final_review_step(step_name)
+                && status
+                    .as_ref()
+                    .is_some_and(|s| matches!(s.state, ProgramState::Done | ProgramState::Idle))
+            {
+                ReportedResponse::ConfirmAdvance
+            } else {
+                self.reported_response(status.as_ref())
+            };
             if let Some(s) = &status {
                 self.narrate_report(step_name, s, response);
             }
@@ -482,8 +494,8 @@ impl WorkflowEngine {
     }
 
     /// An agent countdown expired on the single-step path. `AgentDone` kills
-    /// the container and advances — on the last step that completes the
-    /// workflow (no `is_last_step()` review, unlike the silence path). A
+    /// the container and advances. Interactive final steps open the review
+    /// board instead of starting this countdown. A
     /// problem countdown kills the container and waits for it, so
     /// `finalize_step` records the step as Failed with the agent's reason.
     async fn agent_countdown_expired(

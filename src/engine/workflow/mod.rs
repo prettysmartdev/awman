@@ -344,6 +344,7 @@ pub struct WorkflowEngine {
     work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
     workflow_context_permission: Option<OverlayPermission>,
     yolo: bool,
+    non_interactive: bool,
     abort_on_failure_triggered: bool,
     last_exit_info: Option<AgentExitInfo>,
     /// Automatic credential refresh/retry is permitted once per workflow step.
@@ -564,6 +565,25 @@ impl WorkflowEngine {
 
     pub fn set_yolo(&mut self, yolo: bool) {
         self.yolo = yolo;
+    }
+
+    /// Explicit unattended execution bypasses final review even on a frontend
+    /// that normally supports interaction.
+    pub fn set_non_interactive(&mut self, non_interactive: bool) {
+        self.non_interactive = non_interactive;
+    }
+
+    fn requires_final_review(&self) -> bool {
+        !self.non_interactive && self.frontend.supports_interactive_recovery()
+    }
+
+    fn is_final_review_step(&self, name: &str) -> bool {
+        self.requires_final_review()
+            && self
+                .workflow
+                .steps
+                .iter()
+                .all(|step| step.name == name || self.state.completed_steps.contains(&step.name))
     }
 
     /// Install the Layer 2 copy for the questions asked about a running
@@ -798,6 +818,7 @@ impl WorkflowEngine {
             work_item_context,
             workflow_context_permission,
             yolo: false,
+            non_interactive: false,
             abort_on_failure_triggered: false,
             last_exit_info: None,
             auth_retries_used: HashSet::new(),
@@ -914,6 +935,12 @@ impl WorkflowEngine {
             if self.cancel_requested() {
                 return self.cancel_run();
             }
+            if self.state.is_complete() && self.requires_final_review() {
+                match self.review_completed_workflow().await? {
+                    IterationOutcome::Ended(outcome) => return Ok(outcome),
+                    IterationOutcome::Continue => continue,
+                }
+            }
             if self.state.is_complete() {
                 let progress = self.workflow_progress_info();
                 self.frontend.report_workflow_progress(&progress);
@@ -929,11 +956,11 @@ impl WorkflowEngine {
             // Determine the current parallel group: every step whose
             // dependencies are already satisfied (source-file order). A cap
             // of 1 uses the single-step path except for the interactive final
-            // yolo group, whose members must stay alive together for review.
+            // group, whose members must stay alive together for review.
             let ready = self.next_ready_steps()?;
-            let final_yolo_group = self.is_final_yolo_group(&ready);
+            let final_review_group = self.is_final_review_group(&ready);
             let use_parallel =
-                ready.len() > 1 && (self.max_concurrent != Some(1) || final_yolo_group);
+                ready.len() > 1 && (self.max_concurrent != Some(1) || final_review_group);
 
             if use_parallel {
                 match self.run_parallel_group(ready).await? {

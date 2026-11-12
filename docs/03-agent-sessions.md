@@ -984,6 +984,19 @@ The summary also warns (without failing) when the repo has no `aspec/` folder or
 
 ### Credential health
 
+`awman ready` sends a fixed host-side greeting to the selected agent and every
+other agent with a `.awman/Dockerfile.<agent>`, checking that each is installed
+and authenticated. It checks all agents even if one fails. The summary groups
+their results into one success row and, when needed, one failure row:
+
+```text
+Auth: claude, codex   | success
+Auth: opencode       | fail
+```
+
+Failure details appear in the progress output. Custom definitions must pass
+the usual trust checks; a custom agent without `[ping]` skips its host check.
+
 `awman ready` also reports the health of any live-refreshed agent credential (currently Claude's Keychain-backed OAuth token), as read on the host at the time you ran `ready`:
 
 ```
@@ -1018,7 +1031,7 @@ With `--json`, `awman ready` prints one JSON object on stdout instead of the sum
 
 Each step's `status` is `ok`, `skipped`, `warn`, `failed`, `pending` or `running`, with the reason in `message`. `refresh` is `ok` when `--refresh` ran the audit. On the builtin runtime the object also carries `steps.image_source` and, when images were built or imported, `image_results`, `base_image_results` and `warnings`.
 
-`--json` implies `--headless`, so no prompts are shown, and audit output is not streamed. In `agent_credentials` (one entry per agent with a live-refreshed credential), `expires_in_secs` is `null` when the expiry couldn't be determined, and `read_error` is set when the credential couldn't be read at all. No token value ever appears in this output.
+`--json` implies `--headless`, so no prompts are shown, and audit output is not streamed. `agent_auth` lists each agent's host greeting result, including failure details; `steps.local_agent` reports their combined status. In `agent_credentials` (one entry per agent with a live-refreshed credential), `expires_in_secs` is `null` when the expiry couldn't be determined, and `read_error` is set when the credential couldn't be read at all. No token value ever appears in this output.
 
 ---
 

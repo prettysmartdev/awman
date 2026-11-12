@@ -34,6 +34,7 @@ use crate::command::instance::feeds::{SharedStatusLog, StatusLogSink};
 use crate::data::dialog::{DialogRequest, DialogResponse};
 use crate::data::message::{UserMessage, UserMessageSink};
 use crate::engine::agent_runtime::frontend::AgentIo;
+use std::time::Duration;
 
 /// TUI frontend struct. Implements every per-command frontend trait.
 ///
@@ -343,11 +344,19 @@ impl InstanceCommandFrontend {
         if let Some(wake) = &self.wake {
             wake.notify_one();
         }
-        self.dialog_rx
-            .lock()
-            .map_err(|_| CommandError::Aborted)?
-            .recv()
-            .map_err(|_| CommandError::Aborted)
+        let rx = self.dialog_rx.lock().map_err(|_| CommandError::Aborted)?;
+        loop {
+            if self.command_cancel.is_cancelled() {
+                return Err(CommandError::Aborted);
+            }
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(response) => return Ok(response),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(CommandError::Aborted)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
     }
 
     /// Present a workflow board opened because of the agent's own report
@@ -374,14 +383,22 @@ impl InstanceCommandFrontend {
         // after the reported problem/done itself reached the tab counts.
         let mut seen_report = !self.agent_resumed(step_name);
         loop {
+            if self.command_cancel.is_cancelled() {
+                return Err(CommandError::Aborted);
+            }
             match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    // Also clear here: the resume check can race with the
+                    // presenter's answer and set the flag just before receipt.
+                    self.signals.take_report_dialog_dismiss();
+                    return Ok(response);
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     return Err(CommandError::Aborted)
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
-            if dismiss_requested || self.command_cancel.is_cancelled() {
+            if dismiss_requested {
                 continue;
             }
             let resumed = self.agent_resumed(step_name);
@@ -741,5 +758,59 @@ impl CommandFrontend for InstanceCommandFrontend {
 
     fn arguments(&self, _command_path: &[&str], name: &str) -> Result<Vec<String>, CommandError> {
         Ok(self.parsed.args.arguments(name))
+    }
+}
+
+#[cfg(test)]
+mod cancellation_contracts {
+    use super::*;
+
+    #[test]
+    fn cancellation_unblocks_manual_and_report_boards_without_a_frontend_answer() {
+        for report in [false, true] {
+            let shared = TabCommandFeeds::new();
+            let cancel = shared.command_cancel.clone();
+            let (request_tx, request_rx) = std::sync::mpsc::channel();
+            let (_response_tx, response_rx) = std::sync::mpsc::channel();
+            let (stdout, _) = tokio::sync::mpsc::unbounded_channel();
+            let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+            let frontend = InstanceCommandFrontend::new(
+                crate::command::dispatch::parsed_input::parse(
+                    "ready",
+                    crate::command::dispatch::catalogue::CommandCatalogue::get(),
+                )
+                .unwrap(),
+                DialogChannels::new(request_tx, response_rx),
+                AgentIo {
+                    stdout: stdout.clone(),
+                    stderr: stdout,
+                    stdin_tx,
+                    stdin_rx,
+                    resize: None,
+                    initial_size: None,
+                },
+                shared,
+            );
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(move || {
+                    let request = DialogRequest::WorkflowStepConfirm(
+                        crate::data::dialog::WorkflowStepConfirmState {
+                            completed_step: "build".into(),
+                            next_step: "test".into(),
+                        },
+                    );
+                    if report {
+                        frontend.ask_report_dialog("build", request)
+                    } else {
+                        frontend.ask_dialog(request)
+                    }
+                });
+                request_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("board must be presented before cancellation");
+                cancel.cancel();
+                assert!(matches!(worker.join().unwrap(), Err(CommandError::Aborted)));
+            });
+        }
     }
 }

@@ -691,3 +691,72 @@ fn upsert_phase_step(
         }
     });
 }
+
+#[cfg(test)]
+mod control_board_contracts {
+    use super::*;
+    use crate::command::instance::frontend::PlainPresentation;
+    use crate::data::program_status::BlockedKind;
+    use crate::engine::workflow::actions::StepFailureContext;
+
+    #[test]
+    fn reports_remain_status_information_across_the_daemon_wire() {
+        for (state, kind) in [
+            (ProgramState::Working, None),
+            (ProgramState::Idle, None),
+            (ProgramState::Done, None),
+            (ProgramState::Error, None),
+            (ProgramState::Blocked, None),
+            (ProgramState::Blocked, Some(BlockedKind::Permission)),
+            (ProgramState::Blocked, Some(BlockedKind::Question)),
+            (ProgramState::Blocked, Some(BlockedKind::Auth)),
+        ] {
+            for can_dismiss in [false, true] {
+                for parallel in [false, true] {
+                    let available = AvailableActions {
+                        can_dismiss,
+                        acts_on_parallel_group: parallel,
+                        reported_status: Some(EffectiveStatus {
+                            state,
+                            kind,
+                            progress: None,
+                            msg: Some("agent message".into()),
+                            app: None,
+                            id: None,
+                        }),
+                        ..Default::default()
+                    };
+                    let board = control_board_state_with("build", &available, &PlainPresentation);
+                    let request = DialogRequest::WorkflowControlBoard(board.clone());
+                    let decoded: DialogRequest =
+                        serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+                    assert_eq!(decoded, request);
+                    assert!(board.failure_lines.is_empty(), "{state:?}");
+                    assert!(board.status_line.unwrap().contains("agent message"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failure_details_and_peer_recovery_stay_separate_from_live_status() {
+        let mut available = AvailableActions {
+            can_dismiss: true,
+            retry_failed_step: Some("peer".into()),
+            ..Default::default()
+        };
+        let board = control_board_state_with("build", &available, &PlainPresentation);
+        assert!(board.failure_lines.is_empty());
+        assert!(board.status_line.is_none());
+        assert_eq!(board.retry_failed_step.as_deref(), Some("peer"));
+
+        available.can_dismiss = false;
+        available.step_failure = Some(StepFailureContext {
+            detail_lines: vec!["Exit code: 1".into(), "Ran for 12s".into()],
+            ..Default::default()
+        });
+        let board = control_board_state_with("build", &available, &PlainPresentation);
+        assert_eq!(board.failure_lines, ["Exit code: 1", "Ran for 12s"]);
+        assert!(!board.can_dismiss);
+    }
+}

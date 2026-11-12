@@ -295,6 +295,7 @@ fn decode_outcome(
             image_source: field(payload, "image_source")?,
             agent_definition: field(payload, "agent_definition")?,
             local_agent: field(payload, "local_agent")?,
+            agent_auth: field::<Option<_>>(payload, "agent_auth")?.unwrap_or_default(),
             audit: field(payload, "audit")?,
             image_rebuild: field(payload, "image_rebuild")?,
             agent_credentials: field(payload, "agent_credentials")?,

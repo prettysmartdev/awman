@@ -52,7 +52,7 @@ and need review independently when their contents differ from the approved recip
     binary on the host**; a second such type, or a bare function that does it,
     is a security violation regardless of what it is called. Exactly four
     triggers are authorized, and no others:
-    - (a) during `awman ready` (`ReadyPhase::CheckingLocalAgent`);
+    - (a) during `awman ready` (`ReadyPhase::CheckingLocalAgent`), once for the selected agent and each other repo agent discovered through `.awman/Dockerfile.<agent>`, after resolving its definition through the normal trust boundary; custom definitions without `[ping]` are skipped;
     - (b) periodically by the credential-refresh monitor's tick loop while credentialed agent sessions are live (`CredentialRefreshMonitor::tick`, which reaches the host through the `HostAgentPinger` it holds), bounded by the per-agent backoff and a per-tick timeout;
     - (c) once, synchronously and time-bounded, as the workflow pre-step guard when a step's file-delivered credential is within the refresh threshold of expiry (`refresh_credential_blocking` from `exec_workflow.rs`); and
     - (d) at most once per workflow step, as auth-failure recovery after a step exits with an authentication error the descriptor recognizes (`recover_auth_failure`).

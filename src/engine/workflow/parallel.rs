@@ -9,9 +9,8 @@
 use super::*;
 
 impl WorkflowEngine {
-    pub(super) fn is_final_yolo_group(&self, ready: &[WorkflowStep]) -> bool {
-        self.yolo
-            && self.frontend.supports_interactive_recovery()
+    pub(super) fn is_final_review_group(&self, ready: &[WorkflowStep]) -> bool {
+        self.requires_final_review()
             && self.workflow.steps.iter().all(|step| {
                 self.state.completed_steps.contains(&step.name)
                     || ready.iter().any(|candidate| candidate.name == step.name)
@@ -20,7 +19,7 @@ impl WorkflowEngine {
 
     /// Run a whole parallel group to completion. Launches up to
     /// `max_concurrent` of `ready` (source-file order), except for an
-    /// interactive final yolo group, and queues the rest. Then it
+    /// interactive final group, and queues the rest. Then it
     /// drives all live containers concurrently through a `FuturesUnordered`
     /// select loop — launching queued steps as slots free up, running per-step
     /// stuck detection and per-step yolo countdowns independently, and honoring
@@ -31,12 +30,12 @@ impl WorkflowEngine {
     ) -> Result<GroupOutcome, EngineError> {
         // Only a group containing every remaining step is a final review
         // stage. Earlier groups still free their slots on yolo expiry.
-        let final_yolo_group = self.is_final_yolo_group(&ready);
+        let final_review_group = self.is_final_review_group(&ready);
         let group_names: Vec<String> = ready.iter().map(|s| s.name.clone()).collect();
         self.frontend.report_parallel_group_started(&group_names);
         // Final review needs every remaining agent visible and alive together.
         // The normal cap still governs every non-final group.
-        let slot_cap = if final_yolo_group {
+        let slot_cap = if final_review_group {
             ready.len().max(1)
         } else {
             match self.max_concurrent {
@@ -68,22 +67,15 @@ impl WorkflowEngine {
         let total = timing::yolo_countdown_duration();
         let mut failed: Vec<(String, i32)> = Vec::new();
         let mut review_ready = HashSet::new();
-        // Final-group steps an `AgentDone` countdown advanced (WI 0141): the
-        // agent said it was done, so they need no final review.
-        let mut done_advanced: HashSet<String> = HashSet::new();
         let mut final_review_shown = false;
         // Cloned so the select below borrows nothing of `self` for it.
         let cancel = self.cancel.clone();
 
-        while !self.active_steps.is_empty()
-            || (final_yolo_group
-                && failed.is_empty()
-                && !group_names.iter().all(|n| done_advanced.contains(n)))
-        {
+        while !self.active_steps.is_empty() || (final_review_group && failed.is_empty()) {
             // A final group stays alive after its countdowns. Once every live
             // member has reached review readiness (or exited), ask once; Esc
             // returns to the live containers, and Ctrl-W can reopen the board.
-            if final_yolo_group
+            if final_review_group
                 && !final_review_shown
                 && failed.is_empty()
                 && queue.is_empty()
@@ -111,7 +103,6 @@ impl WorkflowEngine {
                     ParallelRequestOutcome::Rewound => return Ok(GroupOutcome::Rewound),
                     ParallelRequestOutcome::RestartStep(name) => {
                         review_ready.remove(&name);
-                        done_advanced.remove(&name);
                         self.restart_parallel_step(
                             &name, &mut waits, &mut queue, slot_cap, &stuck_tx,
                         )?;
@@ -161,7 +152,6 @@ impl WorkflowEngine {
                         && self.recover_auth_failure(&name)?;
                     self.remove_active_step(&name);
                     review_ready.remove(&name);
-                    done_advanced.remove(&name);
                     self.last_exit_info = Some(exit.clone());
 
                     let (status, step_state) = if let Some(problem) = &problem {
@@ -220,7 +210,7 @@ impl WorkflowEngine {
                         // Every failure is recorded — each one gets its own
                         // recovery board once the group drains.
                         failed.push((name.clone(), exit_code));
-                        if final_yolo_group {
+                        if final_review_group {
                             // Final agents may already be held alive for
                             // review, so waiting for the group to drain would
                             // strand recovery. Offer the failed peer now.
@@ -243,7 +233,6 @@ impl WorkflowEngine {
                                 ParallelRequestOutcome::RestartStep(restart) => {
                                     failed.retain(|(failed_name, _)| *failed_name != restart);
                                     review_ready.remove(&restart);
-                                    done_advanced.remove(&restart);
                                     final_review_shown = false;
                                     self.restart_parallel_step(
                                         &restart,
@@ -269,6 +258,21 @@ impl WorkflowEngine {
                     return Ok(GroupOutcome::Ended(self.cancel_parallel_group()?));
                 }
                 Some((name, event)) = stuck_rx.recv() => {
+                    // Final agents remain alive for review in non-yolo mode
+                    // too. Wait for all peers before offering Finish.
+                    let ready_for_review = matches!(&event,
+                        StuckEvent::Reported(Some(status)) if matches!(status.state,
+                            crate::data::program_status::ProgramState::Done
+                            | crate::data::program_status::ProgramState::Idle))
+                        || matches!(&event, StuckEvent::Stuck);
+                    if final_review_group && ready_for_review && !self.yolo {
+                        self.handle_parallel_stuck_event(&name, event);
+                        self.mark_final_parallel_step_ready(&name, &mut review_ready);
+                        continue;
+                    }
+                    if final_review_group {
+                        review_ready.remove(&name);
+                    }
                     // A non-yolo report (`done`, `blocked`, `error`) opens the
                     // board for that step at once; its report rides along in
                     // `AvailableActions::reported_status`.
@@ -278,7 +282,7 @@ impl WorkflowEngine {
                             EngineRequest::OpenControlBoard { step_name: name },
                             &group_names,
                             retryable.as_deref(),
-                            final_yolo_group && final_review_shown && failed.is_empty() && queue.is_empty(),
+                            final_review_group && final_review_shown && failed.is_empty() && queue.is_empty(),
                             true,
                         )? {
                             ParallelRequestOutcome::Continue => {}
@@ -287,7 +291,6 @@ impl WorkflowEngine {
                             ParallelRequestOutcome::RestartStep(name) => {
                                 failed.retain(|(n, _)| *n != name);
                                 review_ready.remove(&name);
-                                done_advanced.remove(&name);
                                 final_review_shown = false;
                                 self.restart_parallel_step(
                                     &name,
@@ -308,7 +311,7 @@ impl WorkflowEngine {
                         req,
                         &group_names,
                         retryable.as_deref(),
-                        final_yolo_group && final_review_shown && failed.is_empty() && queue.is_empty(),
+                        final_review_group && final_review_shown && failed.is_empty() && queue.is_empty(),
                         false,
                     )? {
                         ParallelRequestOutcome::Continue => {}
@@ -317,7 +320,6 @@ impl WorkflowEngine {
                         ParallelRequestOutcome::RestartStep(name) => {
                             failed.retain(|(n, _)| *n != name);
                             review_ready.remove(&name);
-                            done_advanced.remove(&name);
                             final_review_shown = false;
                             self.restart_parallel_step(
                                 &name,
@@ -331,7 +333,7 @@ impl WorkflowEngine {
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
                     let launch_queued = failed.is_empty();
-                    let final_batch = final_yolo_group && queue.is_empty();
+                    let final_batch = final_review_group && queue.is_empty();
                     self.tick_parallel_yolo(
                         &mut waits,
                         &mut queue,
@@ -341,7 +343,6 @@ impl WorkflowEngine {
                         &stuck_tx,
                         final_batch,
                         &mut review_ready,
-                        &mut done_advanced,
                     )?;
                 }
             }
@@ -714,7 +715,6 @@ impl WorkflowEngine {
         stuck_tx: &StuckFanIn,
         final_review: bool,
         review_ready: &mut HashSet<String>,
-        done_advanced: &mut HashSet<String>,
     ) -> Result<(), EngineError> {
         let now = Instant::now();
         let ticking: Vec<(String, Instant, CountdownKind)> = self
@@ -768,14 +768,10 @@ impl WorkflowEngine {
             }
             if program_status::countdown_fails_step(kind) {
                 self.fail_parallel_step_for_report(&name);
-            } else if final_review && kind != CountdownKind::AgentDone {
-                // Only a silent (non-reporting) final agent is held for
-                // review; a reported `done` advances like any other step.
+            } else if final_review {
+                // Completion reports never waive interactive final review.
                 self.mark_final_parallel_step_ready(&name, review_ready);
             } else {
-                if kind == CountdownKind::AgentDone {
-                    done_advanced.insert(name.clone());
-                }
                 self.yolo_advance_parallel(&name, waits, queue, slot_cap, launch_queued, stuck_tx)?;
             }
         }

@@ -5,17 +5,17 @@ import { test, expect } from './fixtures.js';
 import { endpoint, origin, type Daemon } from './daemon.js';
 
 /**
- * The bearer from the app's own approved poll, kept only in test memory (never
- * logged) so the raw competing-socket case can obtain a ticket like a client
- * that bypasses the app.
+ * The bearer the app actually uses to request a ticket, kept only in test
+ * memory (never logged) so the raw competing-socket case can obtain a ticket
+ * like a client that bypasses the app. Observe the outgoing header: Chromium
+ * can discard the no-store poll response before Playwright reads its body.
  */
 function captureBearer(page: Page) {
-  let bearer: { id: string; token: string } | null = null;
-  page.on('response', response => {
-    if (!/\/v1\/browser-links\/[^/]+\/poll$/.test(response.url()) || response.status() !== 200) return;
-    void response.json().then(body => {
-      if (body?.status === 'approved' && typeof body.grant?.token === 'string') bearer = { id: body.grant.id, token: body.grant.token };
-    }, () => undefined);
+  let bearer: { token: string } | null = null;
+  page.on('request', request => {
+    if (request.url() !== `${endpoint}/v1/browser-tickets` || request.method() !== 'POST') return;
+    const authorization = request.headers().authorization;
+    if (authorization?.startsWith('Bearer ')) bearer = { token: authorization.slice('Bearer '.length) };
   });
   return () => bearer;
 }

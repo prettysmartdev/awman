@@ -45,7 +45,7 @@ use crate::data::config::daemon::EngineSettings;
 use crate::data::config::env::EnvSnapshot;
 use crate::data::config::ConfigOverrides;
 use crate::data::daemon_state::FeatureStatus;
-use crate::data::dialog::DialogResponse;
+use crate::data::dialog::{DialogRequest, DialogResponse};
 use crate::data::frontend_protocol::{
     chunk_snapshot, AnsweredBy, CommandResultWire, EngineFrame, ErrorWire, FrontendFrame,
     FrontendKindWire, FrontendRole, Hello, OpenTabOptions, ProtocolError, Seq, SubmitInput,
@@ -834,6 +834,15 @@ impl EngineInstanceHost {
     ) -> Result<DialogAnswerOutcome, HostError> {
         let hosted = self.find(id).ok_or(HostError::NotFound)?;
         let mut state = hosted.state();
+        Self::answer_pending(&mut state, dialog_id, response, by)
+    }
+
+    fn answer_pending(
+        state: &mut InstanceState,
+        dialog_id: &DialogId,
+        response: DialogResponse,
+        by: AnsweredBy,
+    ) -> Result<DialogAnswerOutcome, HostError> {
         let Some(idx) = state.pending.iter().position(|p| &p.dialog_id == dialog_id) else {
             return match state.answered.iter().find(|(d, _)| d == dialog_id) {
                 Some((_, by)) => Ok(DialogAnswerOutcome::AlreadyAnswered { by: by.clone() }),
@@ -848,7 +857,7 @@ impl EngineInstanceHost {
             .tab(&pending.tab_id)
             .map(|relay| relay.answer(response))
             .unwrap_or_else(|| Err(CommandError::Other("the dialog's tab is gone".into())));
-        Self::remember_answer(&mut state, dialog_id.clone(), by.clone());
+        Self::remember_answer(state, dialog_id.clone(), by.clone());
         let except = match &by {
             AnsweredBy::Frontend { frontend_id } => Some(frontend_id.clone()),
             _ => None,
@@ -1825,6 +1834,28 @@ impl EngineInstanceHost {
                     },
                     None,
                 ),
+                InstanceEvent::DismissReportDialog { tab_id } => {
+                    let dialog_id = state
+                        .pending
+                        .iter()
+                        .find(|pending| {
+                            pending.tab_id == tab_id
+                                && matches!(
+                                    pending.request,
+                                    DialogRequest::WorkflowControlBoard(_)
+                                        | DialogRequest::WorkflowStepConfirm(_)
+                                )
+                        })
+                        .map(|pending| pending.dialog_id.clone());
+                    if let Some(dialog_id) = dialog_id {
+                        let _ = Self::answer_pending(
+                            state,
+                            &dialog_id,
+                            DialogResponse::Dismissed,
+                            AnsweredBy::Engine,
+                        );
+                    }
+                }
                 InstanceEvent::ProgramStatus {
                     tab_id,
                     slot_id,
@@ -2835,5 +2866,113 @@ mod admission_authority_tests {
             );
             assert!(hosted.state().lifecycle.reconnecting().is_some());
         }
+    }
+}
+
+#[cfg(test)]
+mod workflow_dialog_contracts {
+    use super::*;
+    use crate::command::instance::feeds::{ContainerSlotIo, TabCommandFeeds, TabFeeds};
+    use crate::data::{
+        dialog::{DialogRequest, WorkflowStepConfirmState},
+        session::Session,
+    };
+    use awman_test_support::{TestCase, TestSandbox};
+
+    #[test]
+    fn resumed_report_closes_daemon_board_and_answers_command_once() {
+        let sandbox = TestSandbox::for_test(TestCase::component("command::instance::host::workflow_dialog_contracts::resumed_report_closes_daemon_board_and_answers_command_once"));
+        let host = EngineInstanceHost::new(HostParts {
+            hub: Arc::new(TerminalHub::new(Default::default())),
+            catalogue: CommandCatalogue::get(),
+            registry: IntegrationRegistry::compiled_in(),
+            opener: StartupOpener::new(Arc::new(super::super::frontend::PlainPresentation)),
+            executor: None,
+            build: "test".into(),
+        });
+        let id = host.create_instance(Default::default()).unwrap();
+        let hosted = host.find(&id).unwrap();
+        let session = Session::open_at_directory_root(sandbox.work(), Default::default()).unwrap();
+        let tab_id = TabId::new();
+        let feeds = TabCommandFeeds::new();
+        let mut relay = TabRelay::new(
+            tab_id.clone(),
+            &session,
+            TabKindWire::Normal,
+            feeds.clone(),
+            None,
+            (80, 24),
+        );
+        let (_result_tx, command_result_rx) = std::sync::mpsc::channel();
+        let (request_tx, dialog_request_rx) = std::sync::mpsc::channel();
+        let (dialog_response_tx, response_rx) = std::sync::mpsc::channel();
+        relay.bind(super::super::SubmittedCommand {
+            display: crate::command::dispatch::LaunchDisplay::unknown(),
+            sandboxed: false,
+            feeds: TabFeeds {
+                command_result_rx,
+                dialog_request_rx,
+                dialog_response_tx,
+            },
+            slot_io: ContainerSlotIo {
+                stdout_rx: tokio::sync::mpsc::unbounded_channel().1,
+                stdin_tx: tokio::sync::mpsc::unbounded_channel().0,
+                resize_tx: tokio::sync::mpsc::unbounded_channel().0,
+            },
+        });
+        let mut state = hosted.state();
+        state.tabs.push(relay);
+        request_tx
+            .send(DialogRequest::WorkflowStepConfirm(
+                WorkflowStepConfirmState {
+                    completed_step: "plan".into(),
+                    next_step: "build".into(),
+                },
+            ))
+            .unwrap();
+        let events = state.tabs[0].pump(None);
+        host.apply_events(&hosted, &mut state, events, &mut Outbox::default());
+        let dialog_id = state.pending[0].dialog_id.clone();
+        feeds.signals.request_report_dialog_dismiss();
+        let events = state.tabs[0].pump(None);
+        host.apply_events(&hosted, &mut state, events, &mut Outbox::default());
+        assert_eq!(response_rx.try_recv().unwrap(), DialogResponse::Dismissed);
+        assert!(state.pending.is_empty());
+        assert!(matches!(
+            EngineInstanceHost::answer_pending(
+                &mut state,
+                &dialog_id,
+                DialogResponse::Char('>'),
+                AnsweredBy::Api
+            )
+            .unwrap(),
+            DialogAnswerOutcome::AlreadyAnswered {
+                by: AnsweredBy::Engine
+            }
+        ));
+        assert!(response_rx.try_recv().is_err());
+        // An answer racing with auto-dismissal must not leave a request
+        // behind that could close the expanded board opened by Ctrl-W.
+        request_tx
+            .send(DialogRequest::WorkflowStepConfirm(
+                WorkflowStepConfirmState {
+                    completed_step: "plan".into(),
+                    next_step: "build".into(),
+                },
+            ))
+            .unwrap();
+        let events = state.tabs[0].pump(None);
+        host.apply_events(&hosted, &mut state, events, &mut Outbox::default());
+        let next_id = state.pending[0].dialog_id.clone();
+        feeds.signals.request_report_dialog_dismiss();
+        EngineInstanceHost::answer_pending(
+            &mut state,
+            &next_id,
+            DialogResponse::Char('W'),
+            AnsweredBy::Api,
+        )
+        .unwrap();
+        assert_eq!(response_rx.try_recv().unwrap(), DialogResponse::Char('W'));
+        assert!(!feeds.signals.take_report_dialog_dismiss());
     }
 }

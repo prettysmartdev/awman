@@ -160,14 +160,14 @@ Restricts the leader to a known, approved set of agents and models instead of ev
 
 ### `workflows.maxConcurrentSteps`
 
-The cap on concurrently running steps — enforced by the engine for every workflow, and also the number the leader is told to plan around. Interactive final yolo groups may exceed the cap so all remaining agents stay available for review:
+The cap on concurrently running steps — enforced by the engine for every workflow, and also the number the leader is told to plan around. Interactive final groups may exceed the cap so all remaining agents stay available for review:
 
 ```
 Maximum concurrent steps advised: 3. Plan parallelism
 accordingly.
 ```
 
-The leader uses it as a hint when deciding how much of the workflow to run in parallel via `depends_on`, and the scheduler enforces it at run time, whatever the leader planned. Interactive final yolo groups may exceed the cap so every remaining agent stays available for review. Must be `>= 1` if set; `0` is rejected when the config is loaded, since it would deadlock any workflow. See [Parallel workflows](05-workflows.md#parallel-workflows).
+The leader uses it as a hint when deciding how much of the workflow to run in parallel via `depends_on`, and the scheduler enforces it at run time, whatever the leader planned. Interactive final groups may exceed the cap so every remaining agent stays available for review. Must be `>= 1` if set; `0` is rejected when the config is loaded, since it would deadlock any workflow. See [Parallel workflows](05-workflows.md#parallel-workflows).
 
 ### `defaultLeader`
 

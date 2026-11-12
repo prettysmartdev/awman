@@ -26,7 +26,7 @@ async fn child_shell_sync_rotates_only_declared_values_and_read_only_queries_do_
             description: "paused: never launches an agent".into(),
             repo_scope: sandbox.work(),
             mount_scope: MountScope::Directory,
-            overlays: vec!["env(SLICE_TOKEN)".into(), "env(SLICE_ABSENT)".into()],
+            overlays: vec!["env(SLICE_TOKEN), env (SLICE_ABSENT), skill(*)".into()],
             interval_secs: 3600,
             status: TaskStatus::Paused,
             agent: None,
@@ -44,14 +44,51 @@ async fn child_shell_sync_rotates_only_declared_values_and_read_only_queries_do_
     let config = awman::data::config::file::global_config_path(&env).unwrap();
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     std::fs::write(
-        config,
-        json!({"daemon":{"features":{"squad":{"enabled":true,"envPersistence":"none"}}}})
-            .to_string(),
+        &config,
+        json!({
+            "daemon":{"features":{"squad":{"enabled":true,"envPersistence":"none"}}},
+            "overlays": ["env(SLICE_GLOBAL), skill(*)"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let repo_config = awman::data::config::file::repo_config_path(&sandbox.work());
+    std::fs::create_dir_all(repo_config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &repo_config,
+        json!({"overlays": ["env(SLICE_REPO)"]}).to_string(),
+    )
+    .unwrap();
+    let task_config = awman::data::fs::SquadPaths::from_env(&env)
+        .unwrap()
+        .task_config_file("env-sync")
+        .unwrap();
+    std::fs::create_dir_all(task_config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &task_config,
+        json!({"overlays": ["env(SLICE_TASK)"]}).to_string(),
     )
     .unwrap();
     let backend = Backend::start(BackendKind::Daemon, &sandbox).await;
     let client = DaemonSquadClient::new(backend.client().clone());
     let before = client.env_coverage().await.unwrap();
+    let expected = [
+        "SLICE_ABSENT",
+        "SLICE_GLOBAL",
+        "SLICE_REPO",
+        "SLICE_TASK",
+        "SLICE_TOKEN",
+    ];
+    assert_eq!(
+        before
+            .required
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(client.list().await.unwrap()[0].unmet_env, expected);
+    assert_eq!(client.get("env-sync").await.unwrap().unmet_env, expected);
     assert!(before.required.iter().all(|entry| entry.digest.is_none()));
     let salt = Salt::from_hex(&before.salt).unwrap();
     for value in ["first-private-value", "rotated-private-value"] {
@@ -73,6 +110,10 @@ async fn child_shell_sync_rotates_only_declared_values_and_read_only_queries_do_
         assert_eq!(
             held.digest,
             Some(coverage_digest(&salt, "SLICE_TOKEN", value))
+        );
+        assert_eq!(
+            client.get("env-sync").await.unwrap().unmet_env,
+            ["SLICE_ABSENT", "SLICE_GLOBAL", "SLICE_REPO", "SLICE_TASK"]
         );
         assert!(coverage
             .required
@@ -117,6 +158,29 @@ async fn child_shell_sync_rotates_only_declared_values_and_read_only_queries_do_
         serde_json::to_value(client.env_coverage().await.unwrap()).unwrap(),
         serde_json::to_value(held).unwrap()
     );
+    // Config edits become visible without restarting the daemon, including
+    // names discovered only in task/workspace/global configuration.
+    std::fs::write(
+        &task_config,
+        json!({"overlays": ["env(SLICE_ADDED)"]}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(&repo_config, "{}").unwrap();
+    let mut global: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+    global.as_object_mut().unwrap().remove("overlays");
+    std::fs::write(&config, global.to_string()).unwrap();
+    assert_eq!(
+        client.get("env-sync").await.unwrap().unmet_env,
+        ["SLICE_ABSENT", "SLICE_ADDED"]
+    );
+    sandbox.redact("new-private-value");
+    support::awman(&sandbox)
+        .args(["squad", "env"])
+        .env("SLICE_ADDED", "new-private-value")
+        .run()
+        .assert_success();
+    assert_eq!(client.list().await.unwrap()[0].unmet_env, ["SLICE_ABSENT"]);
     let status = backend
         .client()
         .call(&Request::get("/v1/status"))

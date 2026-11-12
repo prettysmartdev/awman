@@ -485,6 +485,7 @@ pub(crate) async fn execute_prepared_with_outputs(
             engine = engine.mirror_into_session(Arc::clone(session));
         }
         engine.set_yolo(yolo);
+        engine.set_non_interactive(flags.non_interactive);
         engine.set_ci_destination(prerequisites.remote("origin").map(|r| r.redacted));
         engine.set_ci_host_binaries(prerequisites.flow.options().custom_agent_binaries.clone());
         engine.set_cancellation(cancel.clone());

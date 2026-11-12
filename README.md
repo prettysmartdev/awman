@@ -1,19 +1,19 @@
 <p align="center">
-  <img src="docs/awman_logo.svg" width="240" alt="awman logo">
+  <img src="docs/awman_logo.svg" width="440" alt="awman logo">
+  <br>
+  ![CI tests](https://github.com/prettysmartdev/awman/actions/workflows/test.yml/badge.svg)](https://github.com/prettysmartdev/awman/actions/workflows/test.yml)
 </p>
 
 # awman - Agent Workflow Manager
 
-[![CI tests](https://github.com/prettysmartdev/awman/actions/workflows/test.yml/badge.svg)](https://github.com/prettysmartdev/awman/actions/workflows/test.yml)
-
 **Custom agent workflows for your hardest tasks, run safely in isolation.**
 
-awman turns agent best practices like clear specs, task breakdown, independent review, enforced tests, and autoremediation into custom, repeatable workflows for developers.
+`awman` creates custom, repeatable agent workflows to encode best practices like clear specs, task breakdown, independent review, enforced tests, and autoremediation into one developer tool.
 
 Give awman any task:
-- awman's leader agent designs a custom workflow.
+- The `awman` leader agent designs a custom workflow.
 - The workflow is validated and executed in isolated containers or microVMs.
-- Shared context system carries progress and decisions between agents to improve coordination and reduce token usage.
+- Shared context system carries progress and decisions between agent steps.
 - Every run finishes with a PR and passing CI.
 - Runs on your laptop, server, cluster, or homelab.
 - Combine Claude Code, Codex, OpenCode, or any preferred code agent with your own subscriptions.
@@ -22,40 +22,40 @@ Give awman any task:
 
 ## Make quality repeatable
 
-- **Give each task a process.** A work item sets the goal; [dynamic mode](docs/06-dynamic-workflows.md) designs a workflow for it, or you can [define it yourself](docs/05-workflows.md). awman validates the workflow before running its steps in isolation.
-- **Make review independent.** Put implementation, review, and verification in separate steps, with different agents or models if you choose. The change gets challenged before it reaches your PR.
-- **Keep decisions in the loop.** Dynamic workflows pass plans, notes, and intermediate results through shared [workflow context](docs/08-overlays.md#workflow-context). Later agents can build on earlier findings instead of rediscovering them.
-- **Fix the failing step.** Saved workflow state lets you retry, step back, or resume when things go sideways. Add [`on_failure` agents](docs/05-workflows.md#step-remediation-with-on_failure) to automatically diagnose and fix a failed test or CI check and retry it.
+- **A bespoke workflow for each task:** Your work item sets the goal, and [dynamic mode](docs/06-dynamic-workflows.md) designs a multi-agent workflow for it. You can also [define it yourself](docs/05-workflows.md). `awman` validates every workflow before running each agent in isolated environments.
+- **Mix and match agents for better results:** Put implementation, review, and verification in separate steps, with different agents or models you choose. The change gets challenged before it reaches your PR.
+- **Keep decisions in the loop:** `awman` workflows pass plans, notes, and intermediate results through shared [workflow context](docs/08-overlays.md#workflow-context). Later agents can build on earlier findings instead of rediscovering them.
+- **Fix issues automatically.** Persistent workflow state lets you retry, step back, or resume when things go sideways. Use [`on_failure` agents](docs/05-workflows.md#step-remediation-with-on_failure) to automatically diagnose and fix a failed test or CI check and retry it.
 
-## Keep the run contained and reviewable
+## Keep each task contained and reviewable
 
-- **Isolation makes autonomy practical.** Agents see the mounted project; [overlays](docs/08-overlays.md) grant extra directories, skills, or environment variables only where needed. Local dynamic runs use a Git worktree, remote runs use an isolated clone.
-- **Carry checks through to PR.** Workflow steps can run required tests, commit and push changes, open a PR, and wait for CI. Failing checks can automatically trigger a fix agent.
-- **Apply the same bar to recurring work.** [Squad](docs/12-squad.md) can watch new issues or failing PRs and launch workflows on a schedule. The [daemon API](docs/09-api-and-remote-mode.md) supports scripts and remote workers.
+- **Isolation lets you stay hands off, safely:** Agents run in microVMs or containers and can only access the mounted project. Optional [overlays](docs/08-overlays.md) grant extra directories, skills, or environment variables only where needed. Workflows execute in an isolated git corktree or fresh clone.
+- **Continuous checks so everything stays green:** Workflow steps can run tests, commit and push changes, open a PR, and wait for CI results. Failing checks can automatically trigger an `on_failure` agent.
+- **Delegate routine work to your squad:** The built-in [squad](docs/12-squad.md) can watch for any real world condition like new issues or failing PRs, and launch dynamic workflows automatically.
+- **Fan out and get more done:** The [`awman` API](docs/09-api-and-remote-mode.md) supports scripts, webhooks, and remote worker setups on any server or cloud.
 
 ## One engine, five ways to use it
 
-Use the [CLI](docs/14-command-reference.md) for scripts, the [TUI](docs/02-using-the-tui.md) for live oversight, the [API](docs/09-api-and-remote-mode.md) for integrations, the [web app](docs/20-webapp.md) for local browser control, or a [worker](docs/17-workers-and-work-servers.md) to claim jobs from a work server. Each path uses the same workflow engine and isolated agent execution.
+Use `awman` in whichever way makes sense to you: the [TUI](docs/02-using-the-tui.md) for live interaction, the [CLI](docs/14-command-reference.md) for scripting and CI, the [API](docs/09-api-and-remote-mode.md) for integrations, the [web app](docs/20-webapp.md) for point-and-click simplicity, or a [worker](docs/17-workers-and-work-servers.md) to pull jobs from anywhere. Each path uses the same workflow engine and isolated agent execution.
 
 ## Get started
 
-You'll need a Git repository, an account for your chosen agent, and a supported runtime such as Docker, Apple Containers, Docker sbx, or the builtin microVM runtime: [supported runtimes](docs/11-runtimes.md).
+You'll need a project in a git repo, an account for your chosen agent(s), and a supported runtime such as Docker, Apple Containers, Docker sbx, or the builtin microVM runtime: [supported runtimes](docs/11-runtimes.md).
 
 ```sh
 curl -s https://prettysmart.dev/install/awman.sh | sh
 cd your-repo
 awman init --agent codex
-awman ready
-awman new spec --interview
+awman # open the TUI
 ```
 
-`init` prepares the project; `ready` checks the runtime and agent authentication. `new spec --interview` turns your task summary into a numbered work item. Use the number it prints to run your first dynamic workflow:
+Some commands: `init` prepares the project; `ready` checks the runtime and agent authentication. `new spec --interview` turns your task summary into a numbered work item. `chat` runs your agent interactively. Then, run your first workflow:
 
 ```sh
-awman exec workflow --dynamic --work-item 0042
+awman exec workflow --dynamic --work-item ./path/to/spec.md
 ```
 
-Replace `0042` with your work-item number. awman generates the workflow and runs it autonomously in a separate Git worktree.
+`awman` generates the workflow and runs it autonomously in a separate git worktree.
 
 ## Other ways to work
 

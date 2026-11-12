@@ -80,6 +80,9 @@ pub enum InstanceEvent {
         dialog_id: DialogId,
         answered_by: AnsweredBy,
     },
+    DismissReportDialog {
+        tab_id: TabId,
+    },
     ProgramStatus {
         tab_id: TabId,
         slot_id: SlotId,
@@ -592,6 +595,11 @@ impl TabRelay {
                 request,
             });
         }
+        if self.feeds.signals.take_report_dialog_dismiss() {
+            events.push(InstanceEvent::DismissReportDialog {
+                tab_id: self.tab_id.clone(),
+            });
+        }
         if let Ok(result) = command.command_result_rx.try_recv() {
             events.push(InstanceEvent::CommandFinished {
                 tab_id: self.tab_id.clone(),
@@ -1074,6 +1082,9 @@ impl TabRelay {
 
     /// Forward the one answer arbitration let through to the command thread.
     pub fn answer(&self, response: DialogResponse) -> Result<(), CommandError> {
+        // A user answer wins over a queued auto-dismissal. It must not
+        // dismiss the next board (for example, Ctrl-W's expanded board).
+        self.feeds.signals.take_report_dialog_dismiss();
         let command = self
             .command
             .as_ref()

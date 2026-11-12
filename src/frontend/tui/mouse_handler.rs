@@ -14,11 +14,9 @@ pub(super) fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEv
         | MouseEventKind::ScrollLeft
         | MouseEventKind::ScrollRight => {
             let tab = app.active_tab();
-            tab.shared.signals.touch_user_for_step(
-                tab.focused_slot()
-                    .map(|slot| slot.step_name.as_str())
-                    .filter(|name| !name.is_empty()),
-            );
+            tab.shared
+                .signals
+                .touch_user_for_step(app.activity_step_name());
             let is_up = matches!(mouse.kind, MouseEventKind::ScrollUp);
             let horizontal = match mouse.kind {
                 MouseEventKind::ScrollLeft => Some(false),
