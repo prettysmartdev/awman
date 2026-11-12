@@ -1,9 +1,10 @@
-// Browser linking (design §2.4). Started from a user gesture; the polling
-// secret and the resulting grant stay in memory only.
+// Browser linking (design §2.4; WI 0160 C2). Started from a user gesture; the
+// polling secret and the resulting grant stay in memory only. A key-bound
+// link enrolls the public key of a fresh, already-persisted candidate record.
 import { DaemonError, LinkDenied, LinkExpired, LinkGone, ProtocolError } from './errors';
-import { grantFromWire, setGrant, type Grant } from './grant';
+import { bindingFromWire, grantFromWire, sameBinding, setGrant, type Grant, type ReauthBinding } from './grant';
 import { HttpTransport } from './http';
-import type { BrowserLinkCreated, BrowserLinkPollResponse } from './types';
+import type { BrowserLinkCreateRequest, BrowserLinkCreated, BrowserLinkPollResponse } from './types';
 
 export const LINK_CODE_RE = /^web-[A-Z0-9]{4}-[A-Z0-9]{4}$/;
 
@@ -16,6 +17,29 @@ export interface LinkRequest {
   expiresAt: string;
   listener: string;
   origin: string;
+  /** Key-bound links only: the binding the daemon confirmed at creation. */
+  reauth?: ReauthBinding;
+}
+
+/** Key enrollment for one explicit link attempt (WI 0160 C2). */
+export interface LinkEnrollment {
+  credentialId: string;
+  /** Raw uncompressed SEC1 public key, unpadded base64url. */
+  publicKey: string;
+  /** The probed listener binding the candidate record was committed under. */
+  listener: string;
+  daemonEpoch: string;
+  listenerEpoch: string;
+  /** Trusted page origin. */
+  origin: string;
+}
+
+/** The daemon answered for another listener/generation than the probed one: abort and re-probe. */
+export class EnrollmentMismatch extends Error {
+  override readonly name = 'EnrollmentMismatch';
+  constructor() {
+    super('The daemon changed while this browser was being linked. Check the daemon, then try again.');
+  }
 }
 
 /** The copyable owner-side approval command. */
@@ -23,13 +47,30 @@ export function linkCommand(request: Pick<LinkRequest, 'code'>): string {
   return `awman link ${request.code}`;
 }
 
-/** POST /v1/browser-links (body `{}`); call only from a user gesture. */
-export async function createLink(transport: HttpTransport = new HttpTransport(), signal?: AbortSignal): Promise<LinkRequest> {
-  const { body } = await transport.json<BrowserLinkCreated>('/v1/browser-links', { method: 'POST', body: {}, signal });
+/**
+ * POST /v1/browser-links; call only from a user gesture. Legacy body `{}`
+ * creates a keyless (memory-only) link; with `enrollment` the body is the
+ * exact C2 `reauth` object and the response must confirm the same binding.
+ */
+export async function createLink(transport: HttpTransport = new HttpTransport(), signal?: AbortSignal, enrollment?: LinkEnrollment): Promise<LinkRequest> {
+  const request: BrowserLinkCreateRequest = enrollment
+    ? { reauth: { version: 1, credential_id: enrollment.credentialId, algorithm: 'ECDSA_P256_SHA256', public_key: enrollment.publicKey } }
+    : {};
+  const { body } = await transport.json<BrowserLinkCreated>('/v1/browser-links', { method: 'POST', body: request, signal });
   if (!body || !LINK_CODE_RE.test(body.code) || typeof body.polling_secret !== 'string' || body.polling_secret.length < 32) {
     throw new ProtocolError('malformed browser-link response');
   }
+  let reauth: ReauthBinding | undefined;
+  if (enrollment) {
+    const confirmed = bindingFromWire(body.reauth);
+    const expected = { credentialId: enrollment.credentialId, daemonEpoch: enrollment.daemonEpoch, listenerEpoch: enrollment.listenerEpoch };
+    if (!confirmed || !sameBinding(confirmed, expected) || body.listener !== enrollment.listener || body.origin !== enrollment.origin) throw new EnrollmentMismatch();
+    reauth = confirmed;
+  } else if (body.reauth !== undefined) {
+    throw new ProtocolError('unexpected key binding on a keyless link');
+  }
   return {
+    ...(reauth ? { reauth } : {}),
     id: body.id,
     code: body.code,
     pollingSecret: body.polling_secret,
@@ -99,6 +140,10 @@ export async function pollLink(request: LinkRequest, signal: AbortSignal, deps: 
     }
     if (response.status === 'approved') {
       const grant = grantFromWire(response.grant);
+      // A key-bound link must release a grant carrying exactly its binding; a
+      // keyless link must not acquire one after approval.
+      if (request.reauth ? !sameBinding(grant.reauth, request.reauth) : grant.reauth !== undefined) throw new ProtocolError('approved grant does not match the link binding');
+      if (grant.origin !== request.origin || grant.listener !== request.listener) throw new ProtocolError('approved grant does not match the link');
       setGrant(grant);
       return grant;
     }

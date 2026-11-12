@@ -29,11 +29,18 @@ it('requires wasm-unsafe-eval (never unsafe-eval) when the export ships WebAssem
   expect(wasmPolicyProblems(['index.html'], "script-src 'self' 'unsafe-eval'")).toHaveLength(1);
 });
 
-it('limits connections to the loaded page host on the daemon port', async () => {
-  const { contentSecurityPolicy } = await import('../src/security');
-  expect(contentSecurityPolicy('http://100.101.102.103:3000')).toContain("connect-src 'self' http://100.101.102.103:9877 ws://100.101.102.103:9877");
-  expect(contentSecurityPolicy('https://host.tailnet.example')).toContain("connect-src 'self' https://host.tailnet.example:9877 wss://host.tailnet.example:9877");
-});
+// SR-01: the hosted v0 webapp predeclares only the fixed loopback listener
+// (WI 0159 §4); the page URL never moves or widens connect-src.
+it.each(['https://awman.prettysmart.dev/', 'https://awman.prettysmart.dev/?x=1', 'http://127.0.0.1:3000/', 'http://localhost:3000/', 'https://host.tailnet.example/', 'http://100.101.102.103:3000/'])(
+  'connect-src is exactly self plus the fixed loopback daemon for page %s', async pageUrl => {
+    const { contentSecurityPolicy } = await import('../src/security');
+    const directives = contentSecurityPolicy(pageUrl).split('; ');
+    expect(directives.filter(directive => directive.startsWith('connect-src'))).toEqual(["connect-src 'self' http://127.0.0.1:9877 ws://127.0.0.1:9877"]);
+    // No remote-protocol destination anywhere: TLS variants, wildcards, schemes or the page host on the daemon port.
+    const policy = contentSecurityPolicy(pageUrl);
+    expect(policy).not.toMatch(/https:\/\/[^ ;]*:9877|wss:|\*|\b(?:https?|wss?):(?:\s|;|$)/);
+    if (!['127.0.0.1'].includes(new URL(pageUrl).hostname)) expect(policy).not.toContain(`${new URL(pageUrl).hostname}:9877`);
+  });
 
 it('rejects deployment config keys outside the allowlist (privacy review #4)', () => {
   const base = { name: 'awman-web', main: 'src/index.ts', observability: { enabled: false } };

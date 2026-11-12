@@ -251,6 +251,10 @@ impl DaemonRuntime {
             }
         }
         Self::spawn_idle_watch(&runtime, std::time::Duration::from_secs(5));
+        // Browser grant expiry finishes without waiting for traffic.
+        runtime
+            .browser
+            .spawn_expiry_sweeper(runtime.core.shutdown());
         Ok(runtime)
     }
 }

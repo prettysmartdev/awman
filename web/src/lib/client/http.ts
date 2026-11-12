@@ -1,26 +1,30 @@
-// The one HTTP transport to the daemon on the host that served this page.
+// The one HTTP transport to the same-machine daemon.
 //
 // Every request: cache 'no-store', credentials 'omit', redirect 'error',
-// mode 'cors', and `targetAddressSpace: 'loopback'` only for a loopback host
-// (Chrome Local Network Access). Bodies are JSON with `Content-Type: application/json`
-// and bounded to 64 KiB (design §2.8). The grant travels only in the
-// Authorization header — never in a URL, cookie or storage.
+// mode 'cors', and `targetAddressSpace: 'loopback'` (Chrome Local Network
+// Access; browsers without it ignore the unknown member). Bodies are JSON with
+// `Content-Type: application/json` and bounded to 64 KiB (design §2.8). The
+// grant travels only in the Authorization header — never in a URL, cookie or
+// storage.
 import { DaemonError, DaemonUnreachable, ProtocolError, isAbortError } from './errors';
 import type { ApiErrorBody } from './types';
 
-/** Localhost pages use IPv4 because the built-in daemon listener binds 127.0.0.1. */
-export function daemonEndpoints(page: Pick<Location, 'hostname' | 'protocol'>): { http: string; ws: string; hostPort: string } {
-  const hostPort = `${page.hostname === 'localhost' ? '127.0.0.1' : page.hostname}:9877`;
-  const secure = page.protocol === 'https:';
-  return { http: `${secure ? 'https' : 'http'}://${hostPort}`, ws: `${secure ? 'wss' : 'ws'}://${hostPort}`, hostPort };
+/**
+ * The fixed v0 daemon destination (WI 0159 §2/§4, same-machine boundary). The
+ * hosted page (`https://awman.prettysmart.dev`), a local preview and an
+ * installed offline shell all target exactly this loopback listener; the
+ * page's own hostname or protocol never chooses the destination. The hosted
+ * CSP `connect-src` (web/edge/src/security.ts) admits only these two origins.
+ */
+export const DAEMON_HTTP = 'http://127.0.0.1:9877';
+export const DAEMON_WS = 'ws://127.0.0.1:9877';
+export const DAEMON_HOST_PORT = '127.0.0.1:9877';
+
+/** The daemon endpoints for any loaded page: always the fixed loopback listener. */
+export function daemonEndpoints(page?: Pick<Location, 'hostname' | 'protocol'>): { http: string; ws: string; hostPort: string } {
+  void page; // deliberately unused: the page never selects the destination
+  return { http: DAEMON_HTTP, ws: DAEMON_WS, hostPort: DAEMON_HOST_PORT };
 }
-// Static rendering has no page location. It has no daemon endpoint; browser
-// modules evaluate this again with the actual loaded hostname.
-const endpoints = typeof location === 'undefined' ? null : daemonEndpoints(location);
-export const DAEMON_HTTP = endpoints?.http ?? '';
-export const DAEMON_WS = endpoints?.ws ?? '';
-export const DAEMON_HOST_PORT = endpoints?.hostPort ?? '';
-const targetIsLoopback = typeof location !== 'undefined' && ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
 export const MAX_REQUEST_BODY_BYTES = 64 * 1024;
 /** Responses larger than this are refused (snapshots travel on the socket, not HTTP). */
 export const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -123,7 +127,8 @@ export class HttpTransport {
       mode: 'cors',
       referrerPolicy: 'no-referrer',
       signal: controller.signal,
-      ...(targetIsLoopback ? { targetAddressSpace: 'loopback' as const } : {}),
+      // The destination is always loopback, so the hint is always accurate.
+      targetAddressSpace: 'loopback',
     };
     try {
       const response = await this.fetchImpl(`${this.base}${path}`, init);

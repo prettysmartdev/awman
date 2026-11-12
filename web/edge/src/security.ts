@@ -4,15 +4,21 @@
 // load-failure notice. This allows WASM compilation only; JavaScript eval
 // stays forbidden. Never add 'unsafe-eval'.
 export const TERMINAL_REQUIRES_WASM_UNSAFE_EVAL = true;
-export function contentSecurityPolicy(pageUrl: string): string {
-  const page = new URL(pageUrl);
-  const hostPort = `${page.hostname}:9877`;
-  const secure = page.protocol === 'https:';
+/**
+ * The only daemon destinations the hosted v0 webapp may reach (WI 0159 §4:
+ * the same-machine boundary). Fixed: the page's hostname or protocol never
+ * widens or moves them. Must match web/src/lib/client/http.ts.
+ */
+export const DAEMON_CONNECT_SOURCES = ['http://127.0.0.1:9877', 'ws://127.0.0.1:9877'] as const;
+export const CONNECT_SRC = `connect-src 'self' ${DAEMON_CONNECT_SOURCES.join(' ')}`;
+/** The document policy. Identical for every page URL (hosted, preview or local). */
+export function contentSecurityPolicy(pageUrl?: string): string {
+  void pageUrl; // deliberately unused: the page never selects connect-src
   return [
     "default-src 'none'",
     `script-src 'self'${TERMINAL_REQUIRES_WASM_UNSAFE_EVAL ? " 'wasm-unsafe-eval'" : ''}`,
     "style-src 'self'", "font-src 'self'", "img-src 'self'", "manifest-src 'self'",
-    "worker-src 'self'", `connect-src 'self' ${secure ? 'https' : 'http'}://${hostPort} ${secure ? 'wss' : 'ws'}://${hostPort}`,
+    "worker-src 'self'", CONNECT_SRC,
     "base-uri 'none'", "form-action 'none'", "frame-ancestors 'none'", "object-src 'none'",
   ].join('; ');
 }

@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { cacheNameFor, decide, isSkipWaiting, staleCaches } from '@/sw/policy';
 
@@ -10,6 +12,24 @@ describe('service worker fetch policy', () => {
       expect(decide({ url, method: 'GET', mode: 'cors' }, SELF, PRECACHE)).toEqual({ kind: 'ignore' });
       expect(decide({ url, method: 'GET', mode: 'navigate' }, SELF, PRECACHE)).toEqual({ kind: 'ignore' });
     }
+  });
+
+  it('never answers same-origin /v1/* (auth routes included), Authorization or POST requests (WI 0160 C8)', () => {
+    const withV1 = new Set([...PRECACHE, '/v1/browser-reauth/challenge', '/v1/health']);
+    for (const path of ['/v1/browser-reauth/challenge', '/v1/browser-reauth/complete', '/v1/browser-links', '/v1/health', '/V1/health']) {
+      for (const mode of ['cors', 'navigate', 'no-cors', 'same-origin']) {
+        expect(decide({ url: `${SELF}${path}`, method: 'GET', mode }, SELF, withV1)).toEqual({ kind: 'ignore' });
+        expect(decide({ url: `${SELF}${path}`, method: 'POST', mode }, SELF, withV1)).toEqual({ kind: 'ignore' });
+      }
+    }
+    expect(decide({ url: `${SELF}/_next/static/chunks/a.js`, method: 'GET', mode: 'cors', hasAuthorization: true }, SELF, PRECACHE)).toEqual({ kind: 'ignore' });
+    expect(decide({ url: `${SELF}/`, method: 'GET', mode: 'navigate', hasAuthorization: true }, SELF, PRECACHE)).toEqual({ kind: 'ignore' });
+  });
+
+  it('the worker source has no auth broker: no IndexedDB, keys, signing, sync or session messages', () => {
+    const source = readFileSync(join(__dirname, '../../src/sw/sw.ts'), 'utf8') + readFileSync(join(__dirname, '../../src/sw/policy.ts'), 'utf8');
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+    expect(code).not.toMatch(/indexedDB|crypto\.subtle|\bsync\b|periodicsync|BroadcastChannel|clients\.matchAll|postMessage|awb_|Authorization: /);
   });
 
   it('serves precached shell assets cache-first', () => {

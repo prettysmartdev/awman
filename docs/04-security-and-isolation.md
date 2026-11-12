@@ -12,8 +12,9 @@ machine. Browser origins are configured per listener with
 `daemon.network.listeners.<name>.allowedOrigins`; this is an origin allowlist,
 not itself authentication. A browser must also be approved with `awman link
 web-<code>`; the resulting grant can be listed or revoked through the local
-daemon API. See the [Web App guide](20-webapp.md) for setup and usage
-reporting.
+daemon API. Grants last twelve hours; a reload within that time reconnects
+without a new approval. See the [Web App guide](20-webapp.md) for setup,
+when relinking is needed, and usage reporting.
 
 The owner decides how much the loopback listener exposes. Browser grants are
 scoped to the engine on that one listener; they can never create API keys,

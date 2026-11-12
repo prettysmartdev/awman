@@ -21,7 +21,8 @@ use crate::command::daemon_api::browser::{
 };
 use crate::command::daemon_api::{DaemonApi, Operation};
 use crate::data::browser_auth::{
-    BrowserLinkDecisionRequest, BrowserLinkPollRequest, BrowserTicketRequest,
+    BrowserLinkCreateRequest, BrowserLinkDecisionRequest, BrowserLinkPollRequest,
+    BrowserReauthChallengeRequest, BrowserReauthCompleteRequest, BrowserTicketRequest,
     TICKET_SUBPROTOCOL_PREFIX,
 };
 use crate::data::daemon_state::Principal;
@@ -37,6 +38,8 @@ pub(super) fn route(op: Operation, filter: MethodFilter) -> Option<MethodRouter<
         Operation::BrowsersList => axum::routing::on(filter, handle_browsers_list),
         Operation::BrowsersDelete => axum::routing::on(filter, handle_browsers_delete),
         Operation::BrowserTicketsCreate => axum::routing::on(filter, handle_tickets_create),
+        Operation::BrowserReauthChallenge => axum::routing::on(filter, handle_reauth_challenge),
+        Operation::BrowserReauthComplete => axum::routing::on(filter, handle_reauth_complete),
         _ => return None,
     })
 }
@@ -70,6 +73,82 @@ pub(super) fn error_response(error: BrowserError) -> Response {
             tracing::warn!(error = %message, "browser pairing operation failed");
             ApiError::internal("browser pairing failed").into_response()
         }
+        BrowserError::InvalidReauth => ApiError::invalid_request(error.to_string()).into_response(),
+        BrowserError::CredentialExists => {
+            ApiError::credential_exists(error.to_string()).into_response()
+        }
+        BrowserError::DaemonRestarted => {
+            ApiError::daemon_restarted(error.to_string()).into_response()
+        }
+        BrowserError::ListenerChanged => {
+            ApiError::listener_changed(error.to_string()).into_response()
+        }
+        BrowserError::ReauthFailed => ApiError::reauth_failed(error.to_string()).into_response(),
+        BrowserError::AuthorizationExpired => {
+            ApiError::authorization_expired(error.to_string()).into_response()
+        }
+        BrowserError::AuthorizationRevoked => {
+            ApiError::authorization_revoked(error.to_string()).into_response()
+        }
+        BrowserError::ReauthRateLimited(wait) => {
+            let mut response = ApiError::rate_limited(error.to_string()).into_response();
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(retry_after_secs(wait)),
+            );
+            response
+        }
+    }
+}
+
+/// WI 0160: the reauthorization routes take no query string at all.
+fn has_query(uri: &axum::http::Uri) -> bool {
+    uri.query().is_some()
+}
+
+/// `POST /v1/browser-reauth/challenge` (no Authorization).
+async fn handle_reauth_challenge(
+    State(api): State<Arc<DaemonApi>>,
+    browser: Option<axum::Extension<BrowserRequest>>,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(axum::Extension(browser)) = browser else {
+        return ApiError::not_found("resource not found").into_response();
+    };
+    let Ok(request) = serde_json::from_slice::<BrowserReauthChallengeRequest>(&body) else {
+        return error_response(BrowserError::InvalidReauth);
+    };
+    if has_query(&uri) {
+        return error_response(BrowserError::InvalidReauth);
+    }
+    match policy::reauth_challenge(&api, &context(&browser), &request) {
+        Ok(challenge) => (StatusCode::CREATED, Json(challenge)).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// `POST /v1/browser-reauth/complete` (no Authorization). A body that does
+/// not decode to exactly the three fields is not structurally valid and
+/// consumes nothing.
+async fn handle_reauth_complete(
+    State(api): State<Arc<DaemonApi>>,
+    browser: Option<axum::Extension<BrowserRequest>>,
+    uri: axum::http::Uri,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(axum::Extension(browser)) = browser else {
+        return ApiError::not_found("resource not found").into_response();
+    };
+    let Ok(request) = serde_json::from_slice::<BrowserReauthCompleteRequest>(&body) else {
+        return error_response(BrowserError::InvalidReauth);
+    };
+    if has_query(&uri) {
+        return error_response(BrowserError::InvalidReauth);
+    }
+    match policy::reauth_complete(&api, &context(&browser), &request) {
+        Ok(issued) => Json(issued).into_response(),
+        Err(e) => error_response(e),
     }
 }
 
@@ -86,10 +165,26 @@ async fn handle_links_create(
     let empty_object = body.iter().all(u8::is_ascii_whitespace)
         || serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&body)
             .is_ok_and(|m| m.is_empty());
-    if !empty_object {
-        return ApiError::invalid_request("browser link requests take no fields").into_response();
-    }
-    match policy::links_create(&api, &context(&browser)) {
+    // WI 0160: the only other accepted body is exactly `{"reauth":{…}}`.
+    let enrollment = if empty_object {
+        None
+    } else {
+        match serde_json::from_slice::<BrowserLinkCreateRequest>(&body) {
+            Ok(request) => Some(request.reauth),
+            Err(_) => {
+                let reauth_shaped =
+                    serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&body)
+                        .is_ok_and(|m| m.contains_key("reauth"));
+                return if reauth_shaped {
+                    error_response(BrowserError::InvalidReauth)
+                } else {
+                    ApiError::invalid_request("browser link requests take no fields")
+                        .into_response()
+                };
+            }
+        }
+    };
+    match policy::links_create_with(&api, &context(&browser), enrollment.as_ref()) {
         Ok(created) => (StatusCode::CREATED, Json(created)).into_response(),
         Err(e) => error_response(e),
     }

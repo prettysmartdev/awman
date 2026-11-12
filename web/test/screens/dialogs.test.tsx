@@ -38,3 +38,16 @@ describe('engine dialogs', () => {
 });
 it('uses failure wording for an agent error countdown without inventing an advance', () => { show({ ...request('workflow_yolo_countdown'), countdown_kind: 'agent_error', remaining_secs: 10 }); expect(screen.getByRole('dialog', { name: '⚠️ Step fails in 10s' })).toBeTruthy(); expect(screen.getByText('Agent reported an error: failing step in 10s')).toBeTruthy(); });
 it('renders prose and prerequisite review bodies as untrusted text', async () => { const fixtures = (await import('../lib/fixtures/dialog-requests.json')).default as DialogRequest[]; const reviews = fixtures.filter((r): r is Extract<DialogRequest, { kind: 'review' }> => r.kind === 'review' && r.body.kind !== 'exact'); expect(reviews.length).toBe(2); for (const r of reviews) { const h = show(r); expect(screen.getByRole('dialog', { name: r.title })).toBeTruthy(); if (r.body.kind === 'prerequisites') expect(screen.getByText('commits need a git identity')).toBeTruthy(); else expect(screen.getByLabelText('Review body').textContent).toContain(r.body.value); expect(document.querySelector('script,img')).toBeNull(); expect(h.send).not.toHaveBeenCalled(); cleanup(); } });
+it('review Stop interrupts once without sending Dismissed or approval', () => {
+  const h = show(request('review')); fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
+  answer(h, { kind: 'interrupted' }); fireEvent.click(screen.getByRole('button', { name: 'Stop' })); expect(h.send).toHaveBeenCalledTimes(1);
+});
+it('keeps satisfied prerequisite details behind an accessible disclosure', async () => {
+  const fixtures = (await import('../lib/fixtures/dialog-requests.json')).default as DialogRequest[];
+  const r = structuredClone(fixtures.find(r => r.kind === 'review' && r.body.kind === 'prerequisites')) as Extract<DialogRequest, { kind: 'review' }>;
+  if (r.body.kind !== 'prerequisites') throw new Error('Missing prerequisites fixture');
+  r.body.value.checks[0]!.status = 'satisfied'; show(r);
+  const toggle = screen.getByRole('button', { name: 'Satisfied prerequisites' });
+  expect(screen.queryByText('commits need a git identity')).toBeNull(); fireEvent.click(toggle);
+  expect(toggle.getAttribute('aria-expanded')).toBe('true'); expect(screen.getByText('commits need a git identity')).toBeTruthy();
+});

@@ -1262,6 +1262,21 @@ pub const ROUTES: &[RouteSpec] = &[
         local_only: false,
         capability: Some("browser_tickets"),
     },
+    // WI 0160: reload-safe reauthorization (browser listeners only).
+    RouteSpec {
+        method: "POST",
+        path: "/v1/browser-reauth/challenge",
+        op: Operation::BrowserReauthChallenge,
+        local_only: false,
+        capability: Some("browser_reauth"),
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/v1/browser-reauth/complete",
+        op: Operation::BrowserReauthComplete,
+        local_only: false,
+        capability: Some("browser_reauth"),
+    },
 ];
 /// Listener exposure controls owner-only paths; feature state controls whether
 /// a feature route is available and reports disabled features as 503. Network
@@ -1583,7 +1598,12 @@ async fn browser_auth(
     };
     match spec.op {
         Operation::CoreHealth => return next.run(request).await,
-        Operation::BrowserLinksCreate | Operation::BrowserLinksPoll => {
+        // WI 0160: recovery proves key possession instead of presenting a
+        // credential. Never consults Authorization, API keys or tickets.
+        Operation::BrowserLinksCreate
+        | Operation::BrowserLinksPoll
+        | Operation::BrowserReauthChallenge
+        | Operation::BrowserReauthComplete => {
             if !spec.op.allowed_for(&anonymous, &settings) {
                 return ApiError::not_found("resource not found").into_response();
             }
@@ -2941,18 +2961,37 @@ async fn listener_gate(
             .feature_state(crate::data::daemon_state::FeatureName::Engine)
             .state;
         let mut protocols = serde_json::json!({"api":1,"frontend":1,"terminal":1});
+        let mut capabilities: Vec<&str> =
+            crate::command::daemon_api::capabilities::CAPABILITIES.to_vec();
         if browser_links {
             protocols["browser"] = serde_json::json!(1);
         }
-        Json(serde_json::json!({
+        let mut body = serde_json::json!({
             "status":"ok",
             "build":env!("CARGO_PKG_VERSION"),
             "protocols":protocols,
-            "capabilities":crate::command::daemon_api::capabilities::CAPABILITIES,
             "listener":{"name":name,"transport":settings.transport,"features":settings.features.into_iter().filter(|f| api.runtime.listener_serves(&name,*f)).collect::<Vec<_>>()},
             "engine":{"state":engine_state},
             "browser_links":browser_links
-        })).into_response()
+        });
+        // WI 0160: advertised only where a browser can link (eligible
+        // loopback listener serving `engine`). Epochs are public identifiers.
+        if browser_links
+            && api
+                .runtime
+                .listener_serves(&name, crate::data::daemon_state::FeatureName::Engine)
+        {
+            let auth = api.runtime.browser_auth();
+            body["protocols"]["browser_reauth"] = serde_json::json!(1);
+            body["browser_reauth"] = serde_json::json!({
+                "version": crate::data::browser_auth::REAUTH_VERSION,
+                "daemon_epoch": auth.daemon_epoch(),
+                "listener_epoch": auth.listener_epoch(&name),
+            });
+            capabilities.push("browser_reauth");
+        }
+        body["capabilities"] = serde_json::json!(capabilities);
+        Json(body).into_response()
     } else {
         let method = request.method();
         if [

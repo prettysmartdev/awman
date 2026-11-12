@@ -1,8 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { DaemonClientDeps } from '@/lib/client/daemonClient';
+import { clearGrant, setGrant, takeAuthorizationEnd, type Grant } from '@/lib/client/grant';
+import type { RecoveryOutcome } from '@/lib/client/reauth';
 import { decodeBase64 } from '@/lib/client/base64';
 import { RESIZE_DEBOUNCE_MS, TerminalConnection, type TerminalErrorEvent } from '@/lib/client/terminalSocket';
 import type { TerminalFrame } from '@/lib/client/types';
-import { SocketHub, TICKET, fixture, flush, ticketClient } from './helpers';
+import { GRANT, SocketHub, TICKET, fixture, flush, ticketClient } from './helpers';
 
 const fx = fixture<{ server: TerminalFrame[]; decoded: Record<string, string> }>('terminal-frames.json');
 
@@ -145,18 +148,23 @@ describe('TerminalConnection', () => {
     expect(connection.state.get()).toBe('exited');
   });
 
-  it('close 1008 revokes; malformed frames close the socket', async () => {
-    const { hub, connection, client } = await setup();
+  it('malformed frames close the socket and reconnect', async () => {
+    const { hub, connection } = await setup();
     hub.last.open('awman.terminal.v1');
     hub.last.receive('{bad');
     expect(hub.sockets[0]!.closed).not.toBeNull();
     expect(connection.state.get()).toBe('reconnecting');
+  });
+
+  it('an unexplained 1008 on a keyless grant is classified, then ends the terminal', async () => {
     const second = await setup();
     second.hub.last.open('awman.terminal.v1');
     second.hub.last.serverClose(1008);
+    expect(second.connection.state.get()).toBe('reconnecting');
+    await new Promise(resolve => setTimeout(resolve, 300));
     expect(second.client.isRevoked).toBe(true);
     expect(second.connection.state.get()).toBe('closed');
-    void client;
+    expect(second.hub.sockets).toHaveLength(1);
   });
 
   it('close() detaches politely', async () => {
@@ -166,5 +174,85 @@ describe('TerminalConnection', () => {
     connection.close();
     expect(socket.frames()).toEqual([{ type: 'detached', reason: 'user' }]);
     expect(socket.closed?.code).toBe(1000);
+  });
+});
+
+// SR-09: terminal-only ending reasons. Each case has no frontend socket, so the
+// terminal's own close is the only evidence the client receives.
+describe('TerminalConnection policy close (1008) classification', () => {
+  const BOUND: Grant = { ...GRANT, reauth: { credentialId: 'Q'.repeat(42) + 'E', daemonEpoch: 'Gs9c1yhW-SA6P6HLQUsNew', listenerEpoch: 'C0tOZXEBuALBXtZAsgmDCg' } };
+  afterEach(() => {
+    clearGrant();
+    takeAuthorizationEnd();
+  });
+
+  async function bound(outcome: RecoveryOutcome) {
+    const hub = new SocketHub();
+    const timers = new Timers();
+    const recover = vi.fn(async () => outcome);
+    const forgetCredential = vi.fn(async () => undefined);
+    const deps: DaemonClientDeps = { recover, forgetCredential, unexplainedCloseDelayMs: 0 };
+    setGrant(BOUND);
+    const client = ticketClient([], BOUND, deps);
+    const ended: string[] = [];
+    client.onAuthEnded(state => ended.push(state));
+    const connection = new TerminalConnection(client, 'term_42', {}, { socketFactory: hub.factory, setTimer: timers.set, clearTimer: timers.clear });
+    await flush();
+    hub.last.open('awman.terminal.v1');
+    return { hub, timers, connection, client, recover, forgetCredential, ended };
+  }
+
+  it.each([
+    ['grant revoked', 'authorization_revoked', true],
+    ['grant expired', 'authorization_expired', true],
+    ['origin removed', 'origin_removed', true],
+    ['listener closed', 'listener_closed', true],
+    ['daemon stopping', 'daemon_stopped', false],
+  ] as const)('close reason %j ends with %s at once, without a proof', async (reason, state, forgets) => {
+    const h = await bound({ kind: 'granted', grant: BOUND });
+    h.hub.last.serverClose(1008, reason);
+    await flush();
+    expect(h.ended).toEqual([state]);
+    expect(h.client.endState).toBe(state);
+    expect(h.recover).not.toHaveBeenCalled();
+    expect(h.forgetCredential).toHaveBeenCalledTimes(forgets ? 1 : 0);
+    expect(h.connection.state.get()).toBe('closed');
+    expect(h.connection.control.get()).toEqual({ holder: 'none', inputAllowed: false });
+    await h.timers.runAll();
+    expect(h.hub.sockets).toHaveLength(1);
+    expect(h.client.ticketCalls).toBe(1);
+  });
+
+  it('an unexplained 1008 disproven by one proof is an ordinary reconnect (new ticket, control not re-taken)', async () => {
+    const h = await bound({ kind: 'granted', grant: BOUND });
+    void h.connection.takeControl();
+    expect(h.connection.control.get().holder).toBe('me');
+    h.hub.last.serverClose(1008, 'policy');
+    expect(h.connection.state.get()).toBe('reconnecting');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await flush();
+    expect(h.recover).toHaveBeenCalledTimes(1);
+    expect(h.ended).toEqual([]);
+    expect(h.client.isRevoked).toBe(false);
+    expect(h.connection.state.get()).toBe('reconnecting');
+    await h.timers.runAll();
+    expect(h.client.ticketCalls).toBe(2);
+    expect(h.hub.sockets).toHaveLength(2);
+    h.hub.last.open('awman.terminal.v1');
+    expect(h.connection.state.get()).toBe('open');
+    expect(h.connection.control.get()).toEqual({ holder: 'none', inputAllowed: true });
+    expect(h.hub.last.sent).toEqual([]);
+  });
+
+  it('an unexplained 1008 whose proof reports revocation ends with that verified state', async () => {
+    const h = await bound({ kind: 'ended', state: 'authorization_revoked' });
+    h.hub.last.serverClose(1008, '');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await flush();
+    expect(h.recover).toHaveBeenCalledTimes(1);
+    expect(h.ended).toEqual(['authorization_revoked']);
+    expect(h.connection.state.get()).toBe('closed');
+    await h.timers.runAll();
+    expect(h.hub.sockets).toHaveLength(1);
   });
 });

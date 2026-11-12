@@ -42,6 +42,34 @@ continue working with the same-machine daemon and know that the hosted service r
 
 ## Implementation Details:
 
+### Storage/security amendment — WI 0160
+
+The owner explicitly permits browser credential persistence in WI 0160, including
+short-lived or refresh tokens in localStorage, and prefers avoiding cookies.
+The selected mechanism in WI 0160's [Credential Lifecycle and Threat Model](0160-webapp-ux-and-liquid-glass.md#credential-lifecycle-and-threat-model)
+narrows that permission to one non-extractable WebCrypto signing key per approved
+browser authorization and its bounded public binding metadata in IndexedDB.
+For this mechanism, bearer grants, polling
+secrets, tickets, proofs and session content remain memory-only; no cookies,
+localStorage, HTTP cache or service-worker credential cache is permitted.
+The existing per-tab sessionStorage exception for opaque resume IDs and view
+preferences also permits the binding IDs specified in 0160. IDs confer no
+authority. A valid proof may recover the same grant until its original twelve-hour
+deadline; it cannot renew it, survive daemon restart, override revocation, or
+claim another grant's primary frontend. All other storage, CSP, cache and
+same-machine listener restrictions below remain in force. Storage audits must
+allow only these enumerated records, not exempt IndexedDB generally.
+
+The stored key is not encrypted at rest and does not protect against script
+running in the authorized origin or a reader of the browser profile; the
+security review of 0160 accepted that within the unchanged twelve-hour,
+daemon-restart and revocation limits. This amendment also tightens two rules
+that reload recovery depends on: a grant and its live connections end at the
+earlier of its wall-clock and monotonic deadlines, including across a system
+suspend, and an approved link that the browser never collected ends at the
+link's own deadline rather than at the next cleanup. Owner-only `browsers.list`
+shows which grants a browser can recover after reload.
+
 ### 1. Contracts and acceptance inventory
 - Start from the completed 0139–0142 contracts: /v1/engine/instances, awman.frontend.v1, /v1/terminals, awman.terminal.v1, the shared command catalogue, typed dialogs, instance snapshots/deltas and terminal input grants. Use 0143's worker and squad resources where TUI screens expose them. Feature detection uses /v1/status capabilities and protocol versions; an unknown required capability blocks that control with an upgrade message.
 - Make a screen/action matrix from docs/02-using-the-tui.md, src/frontend/tui/{app,key_handler,keymap,dialogs,workflow_view,container_view,git_sidebar,command_box}.rs and the completed aspec. Cover startup/ready, repo selection, tabs, command box/autocomplete, execution log, agent status, git sidebar, config, squad, workflow overview/control/approvals, parallel containers, dialogs, quit/cancel and every agent terminal. Record the daemon operation and browser interaction for each row; automate parity against this matrix. TUI features added before release join it.

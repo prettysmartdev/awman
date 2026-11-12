@@ -2,7 +2,7 @@
 import { useEffect, useState } from 'react';
 import type { FrontendConnection } from '@/lib/client/frontendSocket';
 import type { PickRun, QueueEntry, QueueReply, QueueSnapshot } from '@/lib/client/types';
-import { Modal, errorText } from './ui';
+import { Modal, errorText, useObservable } from './ui';
 
 function replyError(reply: QueueReply): string {
   if (reply.result !== 'error') return 'The engine returned an unexpected queue response.';
@@ -14,6 +14,8 @@ export function QueuePanel({ connection, tabId, readOnly, onPick, onClose }: {
   connection: FrontendConnection; tabId: string; readOnly: boolean;
   onPick: (run: PickRun) => Promise<void>; onClose: () => void;
 }) {
+  const connectionState = useObservable(connection.state);
+  const blocked = readOnly || connectionState !== 'open';
   const [snapshot, setSnapshot] = useState<QueueSnapshot | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [pendingRun, setPendingRun] = useState<PickRun | null>(null);
@@ -38,6 +40,7 @@ export function QueuePanel({ connection, tabId, readOnly, onPick, onClose }: {
   const item = rows.find(row => `${row.server}:${row.id}` === selected) ?? null;
   function dismiss() {
     if (busy) return;
+    if (pendingRun && blocked) { setMessage('Reconnect as primary to release this work item before closing.'); return; }
     if (pendingRun) void connection.queueRequest(tabId, { operation: 'finish', lease_id: pendingRun.lease_id, choice: 'release' }).catch(() => undefined);
     onClose();
   }
@@ -48,7 +51,7 @@ export function QueuePanel({ connection, tabId, readOnly, onPick, onClose }: {
     } finally { setPendingRun(null); }
   }
   async function pick(entry: QueueEntry) {
-    if (busy || readOnly) return;
+    if (busy || blocked) return;
     setBusy(true); setMessage('');
     let claimed: PickRun | null = null;
     try {
@@ -66,7 +69,7 @@ export function QueuePanel({ connection, tabId, readOnly, onPick, onClose }: {
     finally { setBusy(false); }
   }
   async function chooseCheckout(choice: 'worktree' | 'fresh_clone') {
-    if (!pendingRun || busy) return;
+    if (!pendingRun || busy || blocked) return;
     setBusy(true); setMessage('');
     try {
       const reply = await connection.queueRequest(tabId, { operation: 'checkout', lease_id: pendingRun.lease_id, choice });
@@ -75,7 +78,7 @@ export function QueuePanel({ connection, tabId, readOnly, onPick, onClose }: {
     } catch (error) { setMessage(errorText(error)); }
     finally { setBusy(false); }
   }
-  return <Modal title="Work queue" onDismiss={dismiss}>
+  return <Modal title="Work queue" onDismiss={dismiss}><div className="queue-content">
     {message && <p role="alert">{message}</p>}
     {snapshot?.error && <p role="alert">{snapshot.error}</p>}
     <p>{snapshot ? `${snapshot.for_you} for you · ${snapshot.new_since_seen} new` : 'Loading work items…'}</p>
@@ -86,9 +89,9 @@ export function QueuePanel({ connection, tabId, readOnly, onPick, onClose }: {
         <span>{entry.kind} · priority {entry.priority} · {Math.floor(entry.age_ms / 60000)}m{entry.for_you ? ' · for you' : ''} · {Object.entries(entry.labels).map(([k, v]) => `${k}=${v}`).join(', ') || 'no labels'}</span>
       </div>)}
     </div>
-    {pendingRun ? <section><h3>Run in your checkout?</h3><p>{pendingRun.title} belongs to this repository.</p><div className="actions"><button disabled={busy} onClick={() => void chooseCheckout('worktree')}>Run in a worktree of this checkout</button><button disabled={busy} onClick={() => void chooseCheckout('fresh_clone')}>Run in a fresh clone</button></div></section>
-      : item && <section><h3>{item.title}</h3>{item.summary && <p>{item.summary}</p>}{item.body && <pre className="prose">{item.body}</pre>}{item.source_url && <p>{item.source_url}</p>}<button disabled={busy || readOnly} onClick={() => void pick(item)}>{busy ? 'Claiming…' : 'Pick'}</button></section>}
-    {readOnly && <p className="hint">Attach as primary to pick a work item.</p>}
-    <div className="actions"><button className="secondary" disabled={busy} onClick={() => { void connection.queueRequest(tabId, { operation: 'refresh' }).then(() => connection.queueRequest(tabId, { operation: 'snapshot' })).then(reply => { if (reply.result === 'snapshot') setSnapshot(reply.value); else setMessage(replyError(reply)); }).catch(error => setMessage(errorText(error))); }}>Refresh</button></div>
-  </Modal>;
+    {pendingRun ? <section className="queue-detail"><h3>Run in your checkout?</h3><p>{pendingRun.title} belongs to this repository.</p><div className="actions"><button disabled={busy || blocked} onClick={() => void chooseCheckout('worktree')}>Run in a worktree of this checkout</button><button className="secondary" disabled={busy || blocked} onClick={() => void chooseCheckout('fresh_clone')}>Run in a fresh clone</button></div></section>
+      : item && <section className="queue-detail"><h3>{item.title}</h3>{item.summary && <p>{item.summary}</p>}{item.body && <pre className="prose">{item.body}</pre>}{item.source_url && <p>{item.source_url}</p>}<button disabled={busy || blocked} onClick={() => void pick(item)}>{busy ? 'Claiming…' : 'Pick'}</button></section>}
+    {blocked && <p className="hint">Attach as primary to pick a work item.</p>}
+    <div className="actions"><button className="secondary" disabled={busy || blocked} onClick={() => { void connection.queueRequest(tabId, { operation: 'refresh' }).then(() => connection.queueRequest(tabId, { operation: 'snapshot' })).then(reply => { if (reply.result === 'snapshot') setSnapshot(reply.value); else setMessage(replyError(reply)); }).catch(error => setMessage(errorText(error))); }}>Refresh</button></div>
+  </div></Modal>;
 }

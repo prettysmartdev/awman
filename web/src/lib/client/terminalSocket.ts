@@ -8,6 +8,12 @@
 // - input/resize are honoured only for the holder; another viewer taking
 //   control is not pushed — we learn it from an `error` on our next input;
 // - a reconnect releases the grant (never re-taken automatically).
+// - close 1008 forwards the daemon's close reason to
+//   DaemonClient.authorizationLost (SR-09): a daemon ending reason (`grant
+//   revoked`, `origin removed`, `daemon stopping`…) ends with exactly that
+//   state and no proof; an unexplained policy close is classified by one proof
+//   and, when authorization is still live, is an ordinary reconnect (new
+//   ticket, fresh snapshot, control not re-taken).
 // Bounded: input chunks ≤ 64 KiB, a single paste/input ≤ 1 MiB, and nothing
 // is queued while the socket is congested or closed.
 import { decodeBase64, encodeBase64 } from './base64';
@@ -131,7 +137,10 @@ export class TerminalConnection {
 
   /** Debounced resize; sent only while this viewer holds control. */
   resize(cols: number, rows: number): void {
+    const control = this.controlSubject.get();
+    if (control.holder !== 'me' || !control.inputAllowed || !this.openSocket()) return;
     if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1 || cols > 1000 || rows > 1000) return;
+    if (this.pendingResize?.cols === cols && this.pendingResize.rows === rows) return;
     this.pendingResize = { cols, rows };
     if (this.resizeTimer !== null) this.clearTimer(this.resizeTimer);
     this.resizeTimer = this.setTimer(() => {
@@ -139,9 +148,17 @@ export class TerminalConnection {
       const size = this.pendingResize;
       this.pendingResize = null;
       const socket = this.openSocket();
-      if (!size || !socket || this.controlSubject.get().holder !== 'me') return;
+      const current = this.controlSubject.get();
+      if (!size || !socket || current.holder !== 'me' || !current.inputAllowed) return;
       this.sendFrame(socket, { type: 'resize', cols: size.cols, rows: size.rows });
     }, RESIZE_DEBOUNCE_MS);
+  }
+
+  /** Invalidate measurements when hidden, unmounted, disconnected or refused. */
+  cancelResize(): void {
+    if (this.resizeTimer !== null) this.clearTimer(this.resizeTimer);
+    this.resizeTimer = null;
+    this.pendingResize = null;
   }
 
   /** Request the exclusive input grant; resolves when no refusal arrived within a short settle window. */
@@ -194,7 +211,7 @@ export class TerminalConnection {
     if (this.done) return;
     let socket: WebSocketLike;
     try {
-      socket = this.socketFactory(`${DAEMON_WS}/v1/terminals/${encodeURIComponent(this.terminalId)}`, ticketSubprotocols('terminal', ticket));
+      socket = this.socketFactory(`${DAEMON_WS}/v1/terminals/${encodeURIComponent(this.terminalId)}${this.opts.readOnly ? '?read_only=true' : ''}`, ticketSubprotocols('terminal', ticket));
     } catch {
       return this.scheduleReconnect();
     }
@@ -207,7 +224,7 @@ export class TerminalConnection {
       this.stateSubject.set('open');
     };
     socket.onmessage = event => this.onMessage(socket, event.data);
-    socket.onclose = event => this.onSocketClose(socket, event.code);
+    socket.onclose = event => this.onSocketClose(socket, event.code, event.reason);
     socket.onerror = () => undefined;
   }
 
@@ -264,6 +281,7 @@ export class TerminalConnection {
   }
 
   private onRefusal(code: string, message: string): void {
+    if (code === 'control_held' || code === 'input_not_allowed' || code === 'conflict') this.cancelResize();
     if (code === 'control_held') this.controlSubject.set({ holder: 'other', inputAllowed: !this.opts.readOnly });
     else if (code === 'input_not_allowed') this.controlSubject.set({ holder: 'none', inputAllowed: false });
     else if (code === 'conflict') this.controlSubject.set({ holder: 'none', inputAllowed: false });
@@ -276,15 +294,21 @@ export class TerminalConnection {
     this.errors.emit({ code, message });
   }
 
-  private onSocketClose(socket: WebSocketLike, code: number): void {
+  private onSocketClose(socket: WebSocketLike, code: number, reason?: string): void {
     if (socket !== this.socket) return;
     this.socket = null;
+    this.cancelResize();
     socket.onopen = socket.onmessage = socket.onclose = socket.onerror = null;
     if (this.done) return;
     this.controlSubject.set({ holder: 'none', inputAllowed: !this.opts.readOnly });
     if (code === CLOSE_POLICY) {
-      this.client.markRevoked();
-      return this.finish('closed');
+      this.stateSubject.set('reconnecting');
+      void this.client.authorizationLost(reason).then(valid => {
+        if (this.done) return;
+        if (!valid) return this.finish('closed');
+        this.scheduleReconnect();
+      });
+      return;
     }
     if (code === CLOSE_NORMAL) return this.finish('closed');
     this.scheduleReconnect();
@@ -303,6 +327,7 @@ export class TerminalConnection {
   private finish(state: 'closed' | 'exited'): void {
     if (this.done) return;
     this.done = true;
+    this.cancelResize();
     for (const handle of [this.timer, this.resizeTimer, this.controlWaiter?.timer]) if (handle !== null && handle !== undefined) this.clearTimer(handle);
     this.controlWaiter?.reject(new Error('terminal closed'));
     this.controlWaiter = null;

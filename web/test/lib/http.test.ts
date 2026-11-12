@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DaemonClient } from '@/lib/client/daemonClient';
 import { DaemonError, DaemonUnreachable, GrantRevoked, ProtocolError } from '@/lib/client/errors';
 import { clearGrant, currentGrant, setGrant } from '@/lib/client/grant';
@@ -10,16 +10,39 @@ const http = fixture<Record<string, unknown>>('http.json');
 afterEach(() => clearGrant());
 
 describe('HttpTransport', () => {
-  it('uses the loaded page hostname for daemon HTTP and WebSocket endpoints', () => {
-    expect(daemonEndpoints({ hostname: 'localhost', protocol: 'http:' })).toEqual({
-      http: 'http://127.0.0.1:9877', ws: 'ws://127.0.0.1:9877', hostPort: '127.0.0.1:9877',
-    });
-    expect(daemonEndpoints({ hostname: '100.101.102.103', protocol: 'http:' })).toEqual({
-      http: 'http://100.101.102.103:9877', ws: 'ws://100.101.102.103:9877', hostPort: '100.101.102.103:9877',
-    });
-    expect(daemonEndpoints({ hostname: 'host.tailnet.example', protocol: 'https:' })).toEqual({
-      http: 'https://host.tailnet.example:9877', ws: 'wss://host.tailnet.example:9877', hostPort: 'host.tailnet.example:9877',
-    });
+  // SR-01: the destination is the fixed same-machine listener (WI 0159 §2/§4),
+  // never derived from the page's host or protocol.
+  const FIXED = { http: 'http://127.0.0.1:9877', ws: 'ws://127.0.0.1:9877', hostPort: '127.0.0.1:9877' };
+  it.each([
+    'https://awman.prettysmart.dev/', 'https://awman.prettysmart.dev:443/app?x=1', 'http://127.0.0.1:3000/', 'http://localhost:3000/',
+    'http://100.101.102.103:3000/', 'https://host.tailnet.example/',
+  ])('targets only http/ws://127.0.0.1:9877 from page %s', pageUrl => {
+    const page = new URL(pageUrl);
+    const endpoints = daemonEndpoints(page);
+    expect(endpoints).toEqual(FIXED);
+    // No remote-protocol destination: no TLS variant, no page host on the daemon port.
+    expect(`${endpoints.http} ${endpoints.ws}`).not.toMatch(/https:|wss:/);
+    if (page.hostname !== '127.0.0.1') expect(`${endpoints.http} ${endpoints.ws}`).not.toContain(page.hostname);
+  });
+
+  it('a module loaded by the hosted page sends every request to loopback with the loopback hint', async () => {
+    vi.resetModules();
+    vi.stubGlobal('location', new URL('https://awman.prettysmart.dev/'));
+    try {
+      const hosted = await import('@/lib/client/http');
+      expect([hosted.DAEMON_HTTP, hosted.DAEMON_WS, hosted.DAEMON_HOST_PORT]).toEqual([FIXED.http, FIXED.ws, FIXED.hostPort]);
+      const calls: { url: string; init: RequestInit }[] = [];
+      const transport = new hosted.HttpTransport(async (url, init) => {
+        calls.push({ url, init });
+        return new Response('{"status":"ok"}', { status: 200 });
+      });
+      await transport.json('/v1/health');
+      expect(calls[0]!.url).toBe('http://127.0.0.1:9877/v1/health');
+      expect(calls[0]!.init).toMatchObject({ targetAddressSpace: 'loopback', credentials: 'omit', redirect: 'error' });
+    } finally {
+      vi.unstubAllGlobals();
+      vi.resetModules();
+    }
   });
   it('sends every request no-store, credential-less, redirect-refusing, with the loopback hint', async () => {
     const { calls, transport } = fakeFetch(() => ({ status: 200, body: { status: 'ok' } }));

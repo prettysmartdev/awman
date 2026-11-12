@@ -18,6 +18,7 @@ use crate::engine::error::EngineError;
 pub mod api_keys;
 pub mod browser_grants;
 pub mod browser_links;
+pub mod browser_reauth;
 pub mod credential;
 pub mod device_flow;
 pub mod github_token;

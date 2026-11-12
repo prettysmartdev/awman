@@ -11,6 +11,7 @@ import type { TerminalViewHandle, TerminalViewProps } from './contract';
 import { clampScrollback, loadGhosttyCore, type CoreFactory } from './core/loadCore';
 import { TerminalSession } from './adapter/session';
 import { TouchToolbar } from './input/TouchToolbar';
+import { CELL_PROBE_COLUMNS, measureTerminalGrid, observeTerminalGeometry } from './geometry';
 import type { KeyLike } from './input/encoder';
 import styles from './TerminalView.module.css';
 
@@ -38,7 +39,8 @@ function useObservableValue<T>(observable: { get(): T; subscribe(cb: (v: T) => v
 /** Build the view around a core factory (tests inject one that loads the WASM from disk). */
 export function createTerminalView(coreFactory: CoreFactory) {
   return forwardRef<TerminalViewHandle, TerminalViewProps>(function TerminalView(props, ref) {
-    const { connection, title, focused, control, onRequestControl, onLinkDetected, onTitleChange, scrollbackLines, touch, reducedMotion, theme } = props;
+    const { connection, title, focused, control, onRequestControl, onLinkDetected, onTitleChange, scrollbackLines, touch, reducedMotion, theme, barStart, barEnd, overlay: hostOverlay } = props;
+    const sectionRef = useRef<HTMLElement>(null);
     const viewportRef = useRef<HTMLDivElement>(null);
     const screenRef = useRef<HTMLDivElement>(null);
     const measureRef = useRef<HTMLSpanElement>(null);
@@ -53,6 +55,24 @@ export function createTerminalView(coreFactory: CoreFactory) {
     const state = useObservableValue(connection.state);
     const { holder, inputAllowed } = control;
     const holding = holder === 'me';
+
+    // Resize the PTY only while holding the input grant; the connection debounces (150 ms).
+    const fit = useCallback(() => {
+      const session = sessionRef.current;
+      const viewport = viewportRef.current;
+      const measure = measureRef.current;
+      const owner = connection.control.get();
+      if (!session?.ready || !viewport || !measure || !owner.inputAllowed || owner.holder !== 'me' || connection.state.get() !== 'open' || viewport.ownerDocument.hidden) {
+        connection.cancelResize();
+        return;
+      }
+      const size = measureTerminalGrid(viewport, measure);
+      if (!size) { connection.cancelResize(); return; }
+      const { cols, rows } = size;
+      const current = session.gridSize();
+      if (cols !== current.cols || rows !== current.rows) connection.resize(cols, rows);
+      else connection.cancelResize();
+    }, [connection]);
 
     useEffect(() => {
       callbacksRef.current = { onLinkDetected, onTitleChange, onRequestControl };
@@ -70,7 +90,7 @@ export function createTerminalView(coreFactory: CoreFactory) {
           onTitle: text => callbacksRef.current.onTitleChange?.(text),
           onLinks: links => callbacksRef.current.onLinkDetected(links),
           onNotice: setNotice,
-          onChange: () => setReady(session.ready),
+          onChange: () => { setReady(session.ready); fit(); },
         },
       );
       sessionRef.current = session;
@@ -85,37 +105,25 @@ export function createTerminalView(coreFactory: CoreFactory) {
       };
       // Theme and scrollback are applied below without recreating the session.
       // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [connection]);
+    }, [connection, fit]);
 
     useEffect(() => sessionRef.current?.setTheme(theme), [theme]);
     useEffect(() => sessionRef.current?.setScrollbackLines(scrollbackLines), [scrollbackLines]);
 
-    // Resize the PTY only while holding the input grant; the connection debounces (150 ms).
-    const fit = useCallback(() => {
-      const session = sessionRef.current;
+    useEffect(() => {
+      fit();
+    }, [holding, inputAllowed, ready, focused, state, theme, touch, fit]);
+
+    useEffect(() => {
       const viewport = viewportRef.current;
       const measure = measureRef.current;
-      if (!session?.ready || !session.holding || !viewport || !measure) return;
-      const cell = measure.getBoundingClientRect();
-      const cellWidth = cell.width / 10;
-      if (cellWidth <= 0 || cell.height <= 0) return;
-      const cols = Math.max(2, Math.floor(viewport.clientWidth / cellWidth));
-      const rows = Math.max(2, Math.floor(viewport.clientHeight / cell.height));
-      const current = session.gridSize();
-      if (cols !== current.cols || rows !== current.rows) connection.resize(cols, rows);
-    }, [connection]);
-
-    useEffect(() => {
-      if (holding && ready) fit();
-    }, [holding, ready, fit]);
-
-    useEffect(() => {
-      const viewport = viewportRef.current;
-      if (!viewport || typeof ResizeObserver !== 'function') return;
-      const observer = new ResizeObserver(() => fit());
-      observer.observe(viewport);
-      return () => observer.disconnect();
-    }, [fit]);
+      if (!viewport || !measure) return;
+      const stop = observeTerminalGeometry(viewport, measure, fit);
+      const offSnapshot = connection.onSnapshot(fit);
+      const offControl = connection.control.subscribe(fit);
+      const offState = connection.state.subscribe(fit);
+      return () => { stop(); offSnapshot(); offControl(); offState(); connection.cancelResize(); };
+    }, [connection, fit]);
 
     // Off-screen terminals keep parsing but stop painting.
     useEffect(() => {
@@ -128,14 +136,21 @@ export function createTerminalView(coreFactory: CoreFactory) {
       return () => observer.disconnect();
     }, []);
 
-    useEffect(() => {
-      if (focused) inputRef.current?.focus({ preventScroll: true });
-    }, [focused]);
+    // Focus never moves into the terminal on its own (load, sheet close, tab
+    // switch). Only a click in the viewport, Take control or the host calling
+    // focus() puts the keyboard here.
 
     const requestControl = useCallback(() => {
       if (!inputAllowed || holder === 'me') return;
       callbacksRef.current.onRequestControl();
     }, [inputAllowed, holder]);
+
+    /** Keyboard exit (Ctrl+]): focus the first control of the terminal header. */
+    const leave = useCallback(() => {
+      const target = sectionRef.current?.querySelector<HTMLElement>(`.${styles.bar} :is(button, select):not(:disabled)`);
+      if (target) target.focus();
+      else inputRef.current?.blur();
+    }, []);
 
     /** True when the key may be sent; otherwise asks for control (first keypress). */
     const canType = useCallback((): boolean => {
@@ -175,6 +190,10 @@ export function createTerminalView(coreFactory: CoreFactory) {
       if (!focused) return;
       const native = event.nativeEvent;
       const action = map(native, 'terminal');
+      if (action === 'terminal.exit') { event.preventDefault(); leave(); return; }
+      // Without control, Tab and Escape keep their page meaning (move focus)
+      // instead of taking control away from whoever holds it.
+      if (holder !== 'me' && (event.key === 'Tab' || event.key === 'Escape') && !event.ctrlKey && !event.altKey && !event.metaKey) return;
       // Global interceptors (Ctrl+M/O/G/\…, selection copy) bubble to the screens' shortcut handler.
       if (action === 'terminal.paste') return; // the browser fires `paste` with the clipboard text
       if (action !== 'terminal.forward') return;
@@ -316,13 +335,14 @@ export function createTerminalView(coreFactory: CoreFactory) {
     const rootClass = [styles.terminal, theme === 'light' ? styles.light : styles.dark, reducedMotion ? styles.still : '', holding ? styles.holding : styles.viewing].filter(Boolean).join(' ');
 
     return (
-      <section className={rootClass} aria-label={`Terminal: ${title}`} data-holder={holder}>
-        <div className={styles.bar}>
+      <section className={rootClass} aria-label={`Terminal: ${title}`} data-holder={holder} ref={sectionRef}>
+        <div className={[styles.bar, barStart || barEnd ? styles.header : ''].filter(Boolean).join(' ')}>
+          {barStart}
           <span className={styles.status} role="status">
             {statusText(state, holder, inputAllowed)}
           </span>
           {inputAllowed && holder !== 'me' && state === 'open' && (
-            <button type="button" onClick={requestControl}>
+            <button type="button" onClick={() => { requestControl(); inputRef.current?.focus({ preventScroll: true }); }}>
               Take control
             </button>
           )}
@@ -337,36 +357,51 @@ export function createTerminalView(coreFactory: CoreFactory) {
               Back to live
             </button>
           )}
-          <button type="button" onClick={() => void copySelection()}>
-            Copy
-          </button>
+          {barEnd ?? (
+            <button type="button" onClick={() => void copySelection()}>
+              Copy
+            </button>
+          )}
         </div>
-        <div className={styles.viewport} ref={viewportRef}>
-          <div className={styles.screen} ref={screenRef} role="log" aria-label={`${title} output`} aria-live="off" />
-          <span className={styles.measure} ref={measureRef} aria-hidden="true">
-            WWWWWWWWWW
-          </span>
-          <textarea
-            ref={inputRef}
-            className={styles.input}
-            aria-label={`Type into ${title}`}
-            autoCapitalize="off"
-            autoComplete="off"
-            autoCorrect="off"
-            spellCheck={false}
-            readOnly={!inputAllowed}
-            onKeyDown={onKeyDown}
-            onInput={onInput}
-            onCompositionEnd={onCompositionEnd}
-            onPaste={onPaste}
-          />
-          {overlay}
+        <div className={styles.body}>
+          <div className={styles.viewport} ref={viewportRef}>
+            <div className={styles.screen} ref={screenRef} role="log" aria-label={`${title} output`} aria-live="off" />
+            <span className={styles.measure} ref={measureRef} aria-hidden="true" data-terminal-probe="">
+              {'W'.repeat(CELL_PROBE_COLUMNS)}
+            </span>
+            <textarea
+              ref={inputRef}
+              className={styles.input}
+              aria-label={`Type into ${title}`}
+              autoCapitalize="off"
+              autoComplete="off"
+              autoCorrect="off"
+              spellCheck={false}
+              readOnly={!inputAllowed}
+              onKeyDown={onKeyDown}
+              onInput={onInput}
+              onCompositionEnd={onCompositionEnd}
+              onPaste={onPaste}
+            />
+            {overlay}
+          </div>
+          {/* Laid over the viewport, never in flow: status lines must not change
+              the PTY grid, and their buttons sit outside the viewport so clicks
+              are never reported to the agent as mouse input. */}
+          {(hostOverlay || notice) && (
+            <div className={styles.overlays}>
+              {hostOverlay}
+              {notice && (
+                <div className={styles.notice} role="status">
+                  <span>{notice}</span>
+                  <button type="button" aria-label="Dismiss terminal notice" onClick={() => setNotice('')}>
+                    ×
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
-        {notice && (
-          <p className={styles.notice} role="status">
-            {notice}
-          </p>
-        )}
         {touch && (
           <TouchToolbar
             className={styles.toolbar}

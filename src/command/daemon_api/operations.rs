@@ -115,6 +115,9 @@ pub enum Operation {
     BrowsersList,
     BrowsersDelete,
     BrowserTicketsCreate,
+    // WI 0160: reload-safe reauthorization (anonymous but Origin/Host gated).
+    BrowserReauthChallenge,
+    BrowserReauthComplete,
 }
 impl Operation {
     pub fn owner(self) -> Feature {
@@ -195,7 +198,9 @@ impl Operation {
             | Self::BrowserLinksPoll
             | Self::BrowserLinksLookup
             | Self::BrowserLinksDecide
-            | Self::BrowserTicketsCreate => Feature::Engine,
+            | Self::BrowserTicketsCreate
+            | Self::BrowserReauthChallenge
+            | Self::BrowserReauthComplete => Feature::Engine,
             Self::BrowsersList | Self::BrowsersDelete => Feature::Core,
         }
     }
@@ -280,6 +285,8 @@ impl Operation {
             Self::BrowsersList => "browsers.list",
             Self::BrowsersDelete => "browsers.delete",
             Self::BrowserTicketsCreate => "browser.tickets.create",
+            Self::BrowserReauthChallenge => "browser.reauth.challenge",
+            Self::BrowserReauthComplete => "browser.reauth.complete",
         }
     }
     pub fn creates(self) -> bool {
@@ -355,7 +362,11 @@ impl Operation {
     pub fn browser_only(self) -> bool {
         matches!(
             self,
-            Self::BrowserLinksCreate | Self::BrowserLinksPoll | Self::BrowserTicketsCreate
+            Self::BrowserLinksCreate
+                | Self::BrowserLinksPoll
+                | Self::BrowserTicketsCreate
+                | Self::BrowserReauthChallenge
+                | Self::BrowserReauthComplete
         )
     }
     /// Squad env routes carry secrets; owner and API keys only (D11).

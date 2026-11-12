@@ -19,10 +19,23 @@
 //   "not confirmed — check the log" notice and the snapshot is the truth.
 // - `send` refuses (throws) while not open, and when the socket's unsent
 //   buffer exceeds MAX_BUFFERED_BYTES: nothing is queued for later.
+// - Reload resume (WI 0160 C5): a key-bound primary holds the Web Lock
+//   `awman-primary:[daemonEpoch,listenerEpoch,instanceId]` for its lifetime,
+//   retrying up to 5 s when resuming from a hint; a transient `primary_exists`
+//   while holding it is retried with fresh tickets for at most 5 s (never
+//   without `resume`), then `other_primary`. The explicit manual resume asks
+//   the daemon even while another document holds the lock.
+// - A back/forward-cache restore (`pageshow` persisted) or resume from frozen
+//   is a reconnect: pending work is dropped (never replayed), the bearer is
+//   checked by a new ticket and mutations wait for a new snapshot.
+// - Close 1008 uses its actual reason (DaemonClient.authorizationLost); only a
+//   classified ending closes the connection.
 import { decodeBase64 } from './base64';
 import { DaemonError, GrantRevoked } from './errors';
 import { DAEMON_WS } from './http';
 import { InstanceStore } from './instanceStore';
+import { PRIMARY_LOCK_RETRY_MS, acquirePrimaryLock, primaryLockName, webLocker, type PrimaryLockHandle, type PrimaryLocker } from './primaryLock';
+import { RECOVERY_COPY, type AuthEndState } from './recovery';
 import { Emitter, Subject, type Observable } from './observable';
 import {
   CLOSE_CLIENT_PROTOCOL_ERROR,
@@ -69,7 +82,10 @@ export type ConnectionState = 'connecting' | 'open' | 'reconnecting' | 'closed';
 export type CloseReason =
   | { kind: 'user' }
   | { kind: 'navigation' }
-  | { kind: 'revoked' }
+  /** Authorization ended; `state` is the classified C7 state. */
+  | { kind: 'auth_ended'; state: AuthEndState }
+  /** Another document holds this workspace's primary (lock or persistent primary_exists). */
+  | { kind: 'other_primary' }
   | { kind: 'refused'; code: string; error: string }
   | { kind: 'detached'; reason: string }
   | { kind: 'grace_expired' }
@@ -84,7 +100,15 @@ export interface HelloOptions {
   termSize: TermSize;
   /** Resume a previous frontend id (sessionStorage after a reload, §5.7). */
   resumeFrontendId?: string;
+  /**
+   * Explicit “Resume workspace” gesture: ask the daemon even when another
+   * document holds the primary lock (C5); a refusal is final, not retried.
+   */
+  manualResume?: boolean;
 }
+
+/** Bounded retry for a transient `primary_exists` during a reload (C5). */
+export const PRIMARY_EXISTS_RETRY_MS = 5_000;
 
 export type OutboundFrame = Exclude<FrontendFrame, { type: 'hello' }>;
 
@@ -93,6 +117,15 @@ export interface FrontendConnectionDeps {
   now?: () => number;
   setTimer?: (fn: () => void, ms: number) => unknown;
   clearTimer?: (handle: unknown) => void;
+  /** Web Locks seam (default: navigator.locks). */
+  locker?: PrimaryLocker;
+  /** Page lifecycle events source (default: window/document when present). */
+  lifecycle?: { window: EventTargetLike | null; document: EventTargetLike | null };
+}
+
+interface EventTargetLike {
+  addEventListener(type: string, listener: (event: Event) => void): void;
+  removeEventListener(type: string, listener: (event: Event) => void): void;
 }
 
 export class NotConnectedError extends Error {
@@ -148,6 +181,18 @@ export class FrontendConnection {
   private readonly now: () => number;
   private readonly setTimer: (fn: () => void, ms: number) => unknown;
   private readonly clearTimer: (handle: unknown) => void;
+  private readonly locker: PrimaryLocker;
+  private lock: PrimaryLockHandle | null = null;
+  private lockDecided = false;
+  /** Resumed from a reload hint (or restored from bfcache): show the generic restored notice. */
+  private announceRestore: boolean;
+  private readonly reloadResume: boolean;
+  private primaryExistsSince: number | null = null;
+  private readonly lifecycle: { window: EventTargetLike | null; document: EventTargetLike | null };
+  private readonly onPageShow = (event: Event) => {
+    if ((event as PageTransitionEvent).persisted) this.resyncAfterRestore();
+  };
+  private readonly onPageResume = () => this.resyncAfterRestore();
 
   constructor(
     private readonly client: DaemonClient,
@@ -159,7 +204,16 @@ export class FrontendConnection {
     this.now = deps.now ?? Date.now;
     this.setTimer = deps.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
     this.clearTimer = deps.clearTimer ?? (handle => clearTimeout(handle as ReturnType<typeof setTimeout>));
+    this.locker = deps.locker ?? webLocker();
     this.frontendId = hello.resumeFrontendId ?? null;
+    this.reloadResume = hello.role === 'primary' && !!hello.resumeFrontendId;
+    this.announceRestore = this.reloadResume;
+    this.lifecycle = deps.lifecycle ?? {
+      window: typeof window !== 'undefined' && typeof window.addEventListener === 'function' ? window : null,
+      document: typeof document !== 'undefined' && typeof document.addEventListener === 'function' ? document : null,
+    };
+    this.lifecycle.window?.addEventListener('pageshow', this.onPageShow);
+    this.lifecycle.document?.addEventListener('resume', this.onPageResume);
     void this.connect();
   }
 
@@ -228,15 +282,50 @@ export class FrontendConnection {
     }
   }
 
+  /**
+   * Primary coordination lock, decided once per connection. False → another
+   * document holds it (or Web Locks are missing for an automatic resume).
+   */
+  private async ensurePrimaryLock(): Promise<boolean> {
+    if (this.lockDecided || this.hello.role !== 'primary') return true;
+    const binding = this.client.grant.reauth;
+    if (!binding) {
+      this.lockDecided = true; // memory-only grant: no cross-reload resume to coordinate
+      return true;
+    }
+    const manual = !!this.hello.manualResume;
+    if (!this.locker.supported) {
+      this.lockDecided = true;
+      // No Lock API: never restore a primary automatically; the explicit
+      // resume gesture (or a brand-new primary) goes to the daemon.
+      return manual || !this.reloadResume;
+    }
+    const handle = await acquirePrimaryLock(this.locker, primaryLockName(binding.daemonEpoch, binding.listenerEpoch, this.instanceId), {
+      retryForMs: this.reloadResume && !manual ? PRIMARY_LOCK_RETRY_MS : 0,
+      now: this.now,
+      sleep: ms => new Promise<void>(resolve => void this.setTimer(resolve, ms)),
+      cancelled: () => this.closedReason !== null,
+    });
+    this.lockDecided = true;
+    if (this.closedReason) {
+      handle?.release();
+      return false;
+    }
+    this.lock = handle;
+    return handle !== null || manual;
+  }
+
   private async connect(): Promise<void> {
     if (this.closedReason) return;
     this.attempt += 1;
     this.stateSubject.set(this.attempt === 1 && this.disconnectedAt === null ? 'connecting' : 'reconnecting');
+    if (!(await this.ensurePrimaryLock())) return this.finish({ kind: 'other_primary' });
+    if (this.closedReason) return;
     let ticket: string;
     try {
       ticket = await this.client.ticket('frontend', this.instanceId);
     } catch (error) {
-      if (error instanceof GrantRevoked) return this.finish({ kind: 'revoked' });
+      if (error instanceof GrantRevoked) return this.finish({ kind: 'auth_ended', state: this.client.endState ?? 'authorization_unavailable' });
       if (error instanceof DaemonError && (error.status === 404 || error.code === 'not_found')) return this.finish({ kind: 'not_found' });
       return this.scheduleReconnect();
     }
@@ -255,7 +344,7 @@ export class FrontendConnection {
     this.refusal = null;
     socket.onopen = () => this.onOpen(socket);
     socket.onmessage = event => this.onMessage(socket, event.data);
-    socket.onclose = event => this.onSocketClose(socket, event.code);
+    socket.onclose = event => this.onSocketClose(socket, event.code, event.reason);
     socket.onerror = () => undefined; // onclose follows
   }
 
@@ -410,6 +499,12 @@ export class FrontendConnection {
     this.store.applySnapshot(snapshot);
     this.attempt = 0;
     this.disconnectedAt = null;
+    this.primaryExistsSince = null;
+    if (this.announceRestore) {
+      // Acknowledgements did not survive the reload: say so once (C5/C7).
+      this.announceRestore = false;
+      this.store.notice('info', RECOVERY_COPY.restored, 'client');
+    }
     this.stateSubject.set('open');
   }
 
@@ -456,16 +551,36 @@ export class FrontendConnection {
     return true;
   }
 
-  private onSocketClose(socket: WebSocketLike, code: number): void {
+  private onSocketClose(socket: WebSocketLike, code: number, reason?: string): void {
     if (socket !== this.socket) return;
     this.socket = null;
     socket.onopen = socket.onmessage = socket.onclose = socket.onerror = null;
     if (this.closedReason) return;
     if (code === CLOSE_POLICY) {
-      this.client.markRevoked();
-      return this.finish({ kind: 'revoked' });
+      // Use the actual reason; an unexplained policy close is classified by
+      // one proof and, if still authorized, is an ordinary reconnect.
+      this.surfaceUnconfirmed();
+      this.store.beginResync();
+      this.stateSubject.set('reconnecting');
+      void this.client.authorizationLost(reason).then(valid => {
+        if (this.closedReason) return;
+        if (!valid) return this.finish({ kind: 'auth_ended', state: this.client.endState ?? 'authorization_unavailable' });
+        if (this.disconnectedAt === null) this.disconnectedAt = this.now();
+        this.scheduleReconnect();
+      });
+      return;
     }
-    // Every refusal is final: never loop on the daemon's "no".
+    if (this.refusal?.code === 'primary_exists' && this.hello.role === 'primary' && this.frontendId) {
+      // A reload can race its old socket's teardown: retry the same resume
+      // with fresh tickets, briefly, only while holding the lock (C5).
+      const now = this.now();
+      this.primaryExistsSince ??= now;
+      if (!this.lock || now - this.primaryExistsSince >= PRIMARY_EXISTS_RETRY_MS) return this.finish({ kind: 'other_primary' });
+      this.refusal = null;
+      if (this.disconnectedAt === null) this.disconnectedAt = now;
+      return this.scheduleReconnect();
+    }
+    // Every other refusal is final: never loop on the daemon's "no".
     if (this.refusal) return this.finish({ kind: 'refused', ...this.refusal });
     this.surfaceUnconfirmed();
     if (this.disconnectedAt === null) this.disconnectedAt = this.now();
@@ -490,6 +605,28 @@ export class FrontendConnection {
       pending.reject(new NotConnectedError());
     }
     this.pendingQueue.clear();
+  }
+
+  /** bfcache restore / resume from frozen: old memory is stale (C5). */
+  private resyncAfterRestore(): void {
+    if (this.closedReason) return;
+    const socket = this.socket;
+    this.socket = null;
+    if (this.timer !== null) this.clearTimer(this.timer);
+    this.timer = null;
+    if (socket) {
+      socket.onopen = socket.onmessage = socket.onclose = socket.onerror = null;
+      try {
+        socket.close(CLOSE_NORMAL, 'restored');
+      } catch {
+        // already closed
+      }
+    }
+    this.surfaceUnconfirmed();
+    this.store.beginResync();
+    this.announceRestore = true;
+    if (this.disconnectedAt === null) this.disconnectedAt = this.now();
+    this.scheduleReconnect();
   }
 
   private scheduleReconnect(): void {
@@ -530,9 +667,14 @@ export class FrontendConnection {
       pending.reject(new NotConnectedError());
     }
     this.pendingQueue.clear();
-    if (reason.kind === 'grace_expired') this.store.markEnded('connection lost for longer than the reconnect grace');
-    if (reason.kind === 'not_found') this.store.markEnded('instance not found (the daemon may have restarted)');
-    if (reason.kind === 'revoked') this.store.markEnded('browser access was revoked');
+    this.lock?.release();
+    this.lock = null;
+    this.lifecycle.window?.removeEventListener('pageshow', this.onPageShow);
+    this.lifecycle.document?.removeEventListener('resume', this.onPageResume);
+    if (reason.kind === 'grace_expired') this.store.markEnded(this.reloadResume ? RECOVERY_COPY.resume_unavailable : 'connection lost for longer than the reconnect grace');
+    if (reason.kind === 'not_found') this.store.markEnded(this.reloadResume ? RECOVERY_COPY.resume_unavailable : 'instance not found (the daemon may have restarted)');
+    if (reason.kind === 'auth_ended') this.store.markEnded(RECOVERY_COPY[reason.state]);
+    if (reason.kind === 'other_primary') this.store.markEnded(RECOVERY_COPY.other_primary);
     if (reason.kind === 'refused') this.store.markEnded(`${reason.code}: ${reason.error}`);
     this.stateSubject.set('closed');
     this.closeEmitter.emit(reason);

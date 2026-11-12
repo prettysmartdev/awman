@@ -1,0 +1,159 @@
+/* Workspace interiors. Terminal viewport, probe and cell metrics stay in their module. */
+.execution, .panel, .dialog-content, .queue-content { min-width: 0; overflow-wrap: anywhere; }
+.execution, .panel { background: var(--surface); }
+.panel { padding: var(--space-4); }
+.execution > header, .panel > header { margin-bottom: var(--space-3); }
+.execution h2, .panel h2, .panel h3, .terminal-chrome h3 { margin: 0; }
+.surface-toolbar, .composer-heading, .agent-window-controls { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.surface-toolbar { justify-content: space-between; margin-bottom: var(--space-3); }
+.badge { border-radius: var(--radius-pill); background: var(--surface-2); padding: var(--space-1) var(--space-2); overflow-wrap: anywhere; }
+.phase-running > header { border-color: var(--info); }
+.phase-error > header { border-color: var(--danger); }
+.phase-done > header { border-color: var(--accent); }
+.execution > header .badge { max-width: 100%; }
+.execution .virtual-frame, .git-panel .virtual-frame { min-width: 0; }
+.execution .virtual-list { background: var(--code-bg); border: 1px solid var(--border); border-radius: var(--radius-sm); overscroll-behavior: contain; }
+.execution table { width: 100%; table-layout: fixed; border-collapse: collapse; }
+.execution th, .execution td { padding: var(--space-2); text-align: left; vertical-align: top; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.execution [aria-label='Agent dashboard rows'] .virtual-row { white-space: normal; overflow: auto; }
+.summary-bar { color: var(--muted); font-size: var(--text-sm); }
+/* Output and squad menus participate in content flow so a short pane cannot clip
+   actions (no PTY lives there). Agent menus overlay the terminal instead: an
+   in-flow menu would push the viewport down and resize the agent PTY. */
+:is(.execution, .squad) .menu-popover:not(.terminal-panel *) { position: static; width: min(280px, 100%); max-width: 100%; max-height: 32dvh; margin-top: var(--space-2); box-shadow: var(--shadow-sm); }
+:is(.execution, .squad) .context-menu:not(.terminal-panel *):has([aria-expanded=true]) { flex-basis: 100%; width: 100%; }
+:is(.container-area, .terminal-panel) .menu-popover { z-index: 30; max-width: min(85vw, 320px); max-height: min(60dvh, 24rem); }
+:is(.execution, .container-area, .terminal-panel, .squad) .menu-popover .danger { border-top: 1px solid var(--border); }
+.git-file { display: flex; align-items: center; gap: var(--space-2); height: 100%; }
+.git-file > :first-child, .git-file > :last-child { flex-shrink: 0; font-size: var(--text-xs); }
+.git-path { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; unicode-bidi: plaintext; font-family: var(--mono); font-size: var(--text-sm); }
+.workflow-scroll { display: block; padding: 0; max-height: none; overflow: visible; }
+.workflow-scroll .virtual-list { height: min(600px, 60dvh); }
+.rows-232 .virtual-row { height: 232px; white-space: normal; padding-block: var(--space-1); }
+.workflow-step { height: 224px; width: 100%; overflow: auto; border: 1px solid var(--border); border-left: 3px solid var(--border-strong); border-radius: var(--radius-sm); padding: var(--space-3); background: var(--surface); }
+.workflow-step.phase-running { border-left-color: var(--info); }
+.workflow-step.phase-done, .workflow-step.phase-completed { border-left-color: var(--accent); }
+.workflow-step.phase-failed, .workflow-step.phase-error { border-left-color: var(--danger); }
+.workflow-step p { margin: var(--space-2) 0; }
+.workflow-step h3 { overflow-wrap: anywhere; }
+.container-slot { border-radius: var(--radius-sm); background: var(--surface); }
+.slot-summary { display: block; overflow-wrap: anywhere; font-size: var(--text-xs); }
+.slot-summary strong { display: block; font-size: var(--text-sm); }
+/* Agent header: one row (lead + identity + control status + one menu). */
+.agent-header { display: flex; flex-wrap: nowrap; align-items: center; gap: var(--space-2); min-height: 2.75rem; padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--border); }
+.agent-header > .agent-lead { flex: 1 1 auto; }
+.terminal-panel .agent-lead, .agent-header > .agent-lead { display: flex; flex-wrap: nowrap; align-items: center; gap: var(--space-2); min-width: 0; flex-shrink: 1; }
+.agent-lead > .stage-switch { flex-wrap: nowrap; flex-shrink: 0; gap: var(--space-1); }
+.agent-lead > .agent-selector { flex: 0 1 16rem; max-width: none; min-width: 7rem; }
+.agent-lead > .agent-selector select { width: 100%; }
+.agent-identity { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: var(--text-xs); color: var(--muted); }
+.agent-identity .slot-summary, .agent-identity .slot-summary strong { display: inline; white-space: nowrap; overflow-wrap: normal; }
+.agent-identity .slot-summary strong { color: var(--text); margin-right: var(--space-1); }
+.agent-window-controls { gap: var(--space-1); }
+.terminal-panel { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--surface); overflow: visible; position: relative; }
+.terminal-panel > section[aria-label^='Terminal:'] { flex: 1; min-height: 0; height: auto; }
+/* Status lines over the terminal viewport (never in flow; see TerminalView overlay). */
+.terminal-line { margin: 0; padding: var(--space-1) var(--space-2); font-size: var(--text-sm); color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); box-shadow: var(--shadow-sm); }
+.terminal-error { display: flex; align-items: center; gap: var(--space-2); color: var(--danger); background: var(--danger-soft); border-color: var(--danger); }
+.terminal-error > span { min-width: 0; overflow-wrap: anywhere; }
+.terminal-error > button { flex-shrink: 0; }
+.terminal-links { width: min(420px, 100%); max-height: 50%; overflow: auto; padding: var(--space-2); overflow-wrap: anywhere; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); box-shadow: var(--shadow); }
+.terminal-links header { flex-wrap: nowrap; }
+.terminal-links h3 { margin: 0; }
+/* A countdown laid over the agent: it never shortens the terminal. */
+.terminal-panel .embedded-banner, .stage-overlay .embedded-banner { width: min(560px, 100%); max-height: none; box-shadow: var(--shadow); }
+.stage-overlay { position: absolute; z-index: 5; inset: 3.5rem var(--space-2) auto var(--space-2); max-height: 60%; overflow: auto; }
+.acp-panel { min-height: 0; overflow: auto; }
+.acp-panel .virtual-row { overflow: auto; white-space: normal; }
+.acp-message { margin: 0; font-size: var(--text-sm); }
+.composer { position: relative; display: flex; flex-direction: column; gap: var(--space-1); }
+.composer-input { min-width: 0; align-items: center; }
+.composer-input textarea { min-width: 0; }
+.composer-input > button { flex: 0 0 auto; min-height: 44px; }
+.composer-input > button:last-child { flex-basis: 88px; }
+.composer-multiline { padding-inline: var(--space-2); font-size: var(--text-xs); }
+/* Stop remains bound to Workspace.interrupt, including workflow confirmation. */
+.composer-dock:has(.composer-stop) { display: grid; grid-template-columns: minmax(0, 1fr) 88px; gap: var(--space-2); align-items: center; }
+.composer-dock:has(.composer-stop) .composer-input > button:last-child { display: none; }
+.composer-dock .composer-stop { position: static; margin: 0; min-height: 44px; }
+/* Suggestions and errors open above the one-row composer, over the stage. */
+.composer-popover { position: absolute; z-index: 25; left: 0; right: 0; bottom: calc(100% + var(--space-2)); display: grid; gap: var(--space-2); pointer-events: none; }
+.composer-popover > * { pointer-events: auto; }
+.composer-popover:not(:has(> *:not(:empty))) { display: none; }
+.composer-error { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); box-shadow: var(--shadow); }
+.composer-error > span { min-width: 0; overflow-wrap: anywhere; }
+.composer-error > button { flex-shrink: 0; }
+.suggestions { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(160px, 240px); overflow: auto; overscroll-behavior: contain; max-height: 96px; margin: 0; padding: var(--space-2); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); }
+.suggestions button { max-width: none; white-space: normal; overflow: auto; text-align: left; padding: var(--space-2); }
+.suggestions .hint { display: block; font-size: var(--text-xs); }
+:is(.dialog-content, .config-editor, .queue-content, .squad, .composer, .terminal-panel) [role=alert]:not(.terminal-line) { padding: var(--space-3); border: 1px solid var(--danger); border-radius: var(--radius-sm); background: var(--danger-soft); color: var(--danger); overflow-wrap: anywhere; }
+.dialog-content { min-height: 0; }
+.dialog-content > p, .dialog-content > form > label { margin-block: var(--space-3); }
+.dialog-content .actions { justify-content: flex-end; border-top: 1px solid var(--border); padding-top: var(--space-3); }
+.dialog-content pre, .queue-detail pre, .task-properties dd { overflow-wrap: anywhere; white-space: pre-wrap; }
+.review-body { background: var(--surface-2); border-radius: var(--radius-sm); overscroll-behavior: contain; }
+.review-body article { padding-block: var(--space-2); border-bottom: 1px solid var(--border); }
+.board-actions { margin-block: var(--space-4); }
+.board-actions .board-danger { border-top: 1px solid var(--border); padding-top: var(--space-3); }
+.config-editor fieldset { padding: var(--space-3); border-radius: var(--radius-sm); }
+.config-head { margin-top: var(--space-3); font-size: var(--text-xs); color: var(--muted); }
+.config-row { grid-template-columns: minmax(140px, 2fr) repeat(3, minmax(110px, 1fr)); min-width: 500px; }
+.config-row span { white-space: nowrap; }
+.config-editor .virtual-list { overflow: auto; }
+.config-editor .virtual-row { min-width: 500px; overflow: visible; }
+.config-editor .hint { padding: var(--space-3); background: var(--surface-2); border-radius: var(--radius-sm); overflow-wrap: anywhere; }
+.queue-content { display: grid; gap: var(--space-3); }
+.queue-content p { margin: 0; }
+.queue-list { display: grid; gap: var(--space-2); max-height: 40dvh; overflow: auto; overscroll-behavior: contain; }
+.queue-list [role=listitem] { padding: var(--space-2); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.queue-list button { width: 100%; text-align: left; white-space: normal; }
+.queue-list span { display: block; margin-top: var(--space-2); font-size: var(--text-xs); color: var(--muted); }
+.queue-detail { padding: var(--space-3); background: var(--surface-2); border-radius: var(--radius-sm); max-height: 50dvh; overflow: auto; }
+.queue-detail > button { margin-top: var(--space-3); }
+.queue-content .actions { margin: 0; }
+.squad { display: grid; gap: var(--space-3); }
+.squad > .virtual-frame { min-width: 0; }
+.squad-card-row { gap: var(--space-3); }
+.squad-card-row .squad-card { display: flex; flex-direction: column; align-items: flex-start; gap: var(--space-1); border-radius: var(--radius); background: var(--surface-2); overflow-wrap: anywhere; }
+.squad-card-row .squad-card[aria-pressed=true] { background: var(--accent-soft); }
+.task-detail, .run-card { min-width: 0; border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-3); }
+.task-properties { margin-top: var(--space-3); max-height: 50dvh; overflow: auto; }
+.task-properties dl { margin-bottom: 0; }
+.run-history { max-height: 65dvh; overflow: auto; display: grid; gap: var(--space-3); }
+.run-card > button { width: 100%; text-align: left; }
+.run-card dd { white-space: pre-wrap; overflow-wrap: anywhere; }
+.squad-command { display: flex; align-items: flex-start; gap: var(--space-2); }
+.squad-command pre { flex: 1; min-width: 0; padding: var(--space-3); background: var(--code-bg); border-radius: var(--radius-sm); margin: 0; }
+.squad-terminal { min-width: 0; }
+.squad-terminal .terminal-panel { height: 55dvh; min-height: 0; }
+.notice { border-radius: var(--radius); }
+.notice > :first-child { min-width: 0; max-height: 24dvh; overflow: auto; }
+.notice button { flex-shrink: 0; }
+@media (pointer: coarse) {
+  :is(.execution, .panel, .terminal-panel, .dialog-content, .queue-content, .composer) :is(button, summary, input:not([type=radio]), select, a) { min-height: 44px; min-width: 44px; }
+  .config-editor .rows-44 .virtual-row { height: 44px; }
+  .terminal-links a { display: inline-flex; align-items: center; }
+}
+@media (max-width: 767px) {
+  .panel { padding: var(--space-3); }
+  .agent-window-controls { font-size: var(--text-xs); }
+  .agent-window-controls button { padding-inline: var(--space-2); }
+  .suggestions { max-height: 80px; }
+  .suggestions .hint { display: block; }
+  .config-row { font-size: var(--text-sm); }
+}
+/* Keep the idle dock compact; suggestions expand while composing. */
+.composer:not(:focus-within) .suggestions { display: none; }
+/* A long engine title scrolls independently of its choices. */
+.modal:has(> .dialog-content) { display: flex; flex-direction: column; overflow: hidden; }
+.modal:has(> .dialog-content) > header { flex: 0 1 auto; max-height: min(22dvh, 9rem); overflow: auto; }
+.modal > .dialog-content { flex: 1 1 auto; min-height: 0; max-height: 65dvh; overflow: auto; }
+.modal > .dialog-review { display: flex; flex-direction: column; overflow: hidden; }
+.dialog-review .review-body { flex: 1 1 auto; min-height: 80px; }
+.dialog-review > .actions { flex: 0 0 auto; }
+.dialog-review > p { flex: 0 0 auto; max-height: 15dvh; overflow: auto; }
+.workflow-step h3, .git-panel h2 { max-height: 5rem; overflow: auto; }
+.acp-message { height: 124px; overflow: auto; padding: var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); }
+.acp-message h3 { margin: 0 0 var(--space-2); font-size: var(--text-xs); color: var(--muted); }
+.acp-message pre { margin: 0; }
+.config-row span { overflow: auto; text-overflow: clip; }

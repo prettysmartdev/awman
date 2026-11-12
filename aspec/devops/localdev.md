@@ -148,6 +148,48 @@ and reproduce tests. Locally:
 The manifest's `[tools.*]` tables are the source of these versions. Any change
 to a pin is a manifest change reviewed together with its digest.
 
+### Web gate
+
+`make test-web` runs the web and edge checks, builds the daemon, and runs the
+Playwright acceptance suite in Chromium and Firefox. It requires Node.js 22.13
+or later and npm, in addition to Rust. `Dockerfile.dev` includes a pinned Node
+22 release and Playwright 1.58.2 with both browsers and their system libraries.
+These tools live in the image rather than a temporary agent home, so teardown
+shells have the same prerequisites. Keep the image's Playwright version aligned
+with `web/e2e/package.json` and rebuild the development image after changing it.
+
+An already running container keeps its old image. For minimal Debian 12
+containers where rebuilding is unavailable, prepare a checkout-local tool cache:
+
+```sh
+make web/test-setup WEB_TEST_SETUP_ARGS=--portable-linux
+make test-web
+```
+
+Setup installs the locked npm packages, pinned Playwright browsers and verified
+Debian browser libraries without root access. If Node/npm are missing, the web
+targets download the same checksum-verified Node release as `Dockerfile.dev`.
+The cache lives in `target/web-test-tools`, so it survives a fresh agent HOME.
+`make test-web` resolves that cache automatically and still runs every check;
+it does not install browser libraries implicitly. Outside Debian 12, use the
+system dependency installation below or rebuild the development image.
+
+After mounting the checkout, install its pinned packages before running the gate:
+
+```sh
+npm --prefix web ci --ignore-scripts
+npm --prefix web/edge ci --ignore-scripts
+npm --prefix web/e2e ci --ignore-scripts
+make test-web
+```
+
+Outside the development image, also install the browsers and their system
+dependencies before running the gate:
+
+```sh
+npm --prefix web/e2e exec -- playwright install --with-deps chromium firefox
+```
+
 Version control:
 - Git is used for this project
 

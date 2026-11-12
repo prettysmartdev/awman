@@ -5,7 +5,12 @@
 // icons, manifest). It never touches daemon traffic: requests to the daemon's
 // separate port are a different origin and are not intercepted, so
 // daemon responses, snapshots, terminal bytes, grants and commands can never
-// enter Cache Storage.
+// enter Cache Storage. WI 0160 C8: it also ignores every `/v1/*` path even on
+// the same origin, every non-GET, every request carrying Authorization and
+// every query string, and it is no auth broker: no IndexedDB access, no key or
+// signing operation, no background refresh/sync and no session-bearing
+// messages. Updating the shell never deletes the credential database; the
+// reloaded document performs a fresh proof.
 
 export const CACHE_PREFIX = 'awman-shell-';
 
@@ -30,6 +35,8 @@ export interface RequestFacts {
   url: string;
   method: string;
   mode: string;
+  /** The request carries an Authorization header (never answered from cache). */
+  hasAuthorization?: boolean;
 }
 
 export type FetchDecision =
@@ -43,6 +50,8 @@ export type FetchDecision =
  * Everything else — cross-origin (daemon), non-GET, unknown paths, query
  * strings — is ignored and goes straight to the network.
  */
+const API_PATH_RE = /^\/(?:__owner|api|v\d+)(?:\/|$)/i;
+
 export function decide(request: RequestFacts, selfOrigin: string, precache: ReadonlySet<string>): FetchDecision {
   let url: URL;
   try {
@@ -52,11 +61,13 @@ export function decide(request: RequestFacts, selfOrigin: string, precache: Read
   }
   if (url.origin !== selfOrigin) return { kind: 'ignore' };
   if (request.method !== 'GET') return { kind: 'ignore' };
+  if (request.hasAuthorization) return { kind: 'ignore' };
   if (url.search !== '') return { kind: 'ignore' };
+  // `/__owner/*` and API-like paths (daemon routes such as /v1/browser-reauth/*)
+  // are never served from, or written to, the cache, whatever the mode.
+  if (API_PATH_RE.test(url.pathname)) return { kind: 'ignore' };
   if (request.mode === 'navigate') {
     // One-page app: every in-scope navigation renders the same shell.
-    // `/__owner/*` and API-like paths are never served from the cache.
-    if (/^\/(?:__owner|api|v\d+)(?:\/|$)/.test(url.pathname)) return { kind: 'ignore' };
     return precache.has('/') ? { kind: 'cache-first', key: '/' } : { kind: 'ignore' };
   }
   return precache.has(url.pathname) ? { kind: 'cache-first', key: url.pathname } : { kind: 'ignore' };

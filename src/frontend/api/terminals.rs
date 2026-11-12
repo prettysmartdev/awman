@@ -372,7 +372,18 @@ pub(super) async fn serve_terminal_socket(
     grant: Option<GrantWatch>,
 ) {
     loop {
+        // Biased: when a grant ending or shutdown is ready together with
+        // client input, the ending wins and no further input reaches the PTY.
         tokio::select! {
+            biased;
+            reason = grant_ended(grant.as_ref()) => {
+                close(&mut socket, 1008, reason).await;
+                break;
+            }
+            _ = shutdown.cancelled() => {
+                close(&mut socket, 1001, "listener stopping").await;
+                break;
+            }
             frame = session.next_frame() => {
                 let Some(frame) = frame else {
                     if session.access_revoked() {
@@ -406,14 +417,6 @@ pub(super) async fn serve_terminal_socket(
                         break;
                     }
                 }
-            }
-            _ = shutdown.cancelled() => {
-                close(&mut socket, 1001, "listener stopping").await;
-                break;
-            }
-            reason = grant_ended(grant.as_ref()) => {
-                close(&mut socket, 1008, reason).await;
-                break;
             }
         }
     }

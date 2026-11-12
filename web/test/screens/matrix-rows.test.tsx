@@ -23,7 +23,7 @@ describe('matrix rows', () => {
   it('repo.new_tab_cancel: the Cancel button closes the dialog and sends nothing', async () => {
     const h = harness(); h.s.tabs = [{ ...h.s.tabs[0]!, workflow: null }]; h.store.applySnapshot(h.s);
     render(<Workspace client={h.client} connection={h.connection} launchContext="lc_default" squadAvailable={true} reconnect={vi.fn()} />);
-    fireEvent.click(screen.getByRole('button', { name: 'New tab' }));
+    fireEvent.click(screen.getAllByRole('button', { name: 'New tab' })[0]!);
     await screen.findByRole('option', { name: /Project/ });
     const before = h.send.mock.calls.length;
     fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: /Cancel|Close|Dismiss/ }));
@@ -37,7 +37,7 @@ describe('matrix rows', () => {
     const toggle = screen.getByRole('button', { name: 'Status log' });
     expect(screen.queryByText('container restarted')).toBeNull();
     fireEvent.click(toggle);
-    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(toggle.getAttribute('aria-pressed')).toBe('true');
     expect(screen.getByText('container restarted')).toBeTruthy();
     fireEvent.click(toggle);
     expect(screen.queryByText('container restarted')).toBeNull();
@@ -87,7 +87,7 @@ describe('matrix rows', () => {
     const h = harness(); h.api.squad.tasks.mockResolvedValue([{ ...h.task, status: 'paused' }]);
     render(<Squad client={h.client} available={true} readOnly={false} submit={vi.fn()} detach={vi.fn()} />);
     await screen.findByRole('button', { name: /Daily.*paused/ });
-    fireEvent.click(screen.getByRole('button', { name: 'Resume' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Task actions' })); fireEvent.click(screen.getByRole('menuitem', { name: 'Resume' }));
     await waitFor(() => expect(h.api.squad.patch).toHaveBeenCalledWith(h.task.id, { paused: false }));
     expect(screen.queryByRole('dialog')).toBeNull();
   });

@@ -61,6 +61,28 @@ export class Daemon {
     }
     throw new Error('isolated daemon failed to start');
   }
+  /**
+   * Make the sandbox repo a Git repo and register it as the default launch
+   * context. A new workspace then starts `ready`, which waits on a real
+   * yes/no dialog (no Dockerfile.dev yet) without needing Docker.
+   */
+  async launchContext() {
+    await execute('git', ['init', '-q'], { env: this.env, cwd: join(this.directory, 'repo'), timeout: 20_000 });
+    await this.cli('daemon', 'api', 'launch_contexts.create', 'default=true');
+  }
+  /** Owner view of browser grants (`GET /v1/browsers`). */
+  async browsers(): Promise<{ id: string; origin: string; listener: string; reauth?: { credential_id: string; key_sha256: string } }[]> {
+    return JSON.parse(await this.cli('daemon', 'api', '--raw', 'GET', '/v1/browsers', '--json')).items;
+  }
+  /** Owner revocation (`browsers.delete`). */
+  async revoke(id: string) {
+    await this.cli('daemon', 'api', 'browsers.delete', `id=${id}`);
+  }
+  /** Graceful stop, then a new daemon process on the same private state. */
+  async restart() {
+    await this.stop();
+    await this.start();
+  }
   async status() {
     return JSON.parse(await this.cli('daemon', 'api', '--raw', 'GET', '/v1/status', '--json'));
   }

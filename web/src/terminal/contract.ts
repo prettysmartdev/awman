@@ -14,7 +14,7 @@
 // - clipboard writes only from `copySelection()` inside a user gesture;
 // - paste: bracketed when the agent enabled mode 2004; >64 KiB chunked by the
 //   connection; >1 MiB refused with a visible message.
-import type { ForwardRefExoticComponent, RefAttributes } from 'react';
+import type { ForwardRefExoticComponent, ReactNode, RefAttributes } from 'react';
 import type { TerminalConnection, TerminalControl } from '@/lib/client/terminalSocket';
 
 export type { TerminalConnection, TerminalControl };
@@ -47,9 +47,23 @@ export interface TerminalViewProps {
   touch: boolean;
   reducedMotion: boolean;
   theme: 'light' | 'dark';
+  /**
+   * Host content merged into the terminal's single header row: `barStart`
+   * before the control status (identity, panel switch), `barEnd` after it (one
+   * overflow menu, which then replaces the inline Copy button).
+   */
+  barStart?: ReactNode;
+  barEnd?: ReactNode;
+  /**
+   * Host status lines (countdown, "working silently", errors) laid over the
+   * top of the viewport. They never take layout space, so showing or hiding
+   * them cannot change the PTY grid.
+   */
+  overlay?: ReactNode;
 }
 
 export interface TerminalViewHandle {
+  /** Re-measure the rendered viewport and font probe; transport debounces and checks ownership. */
   fit(): void;
   focus(): void;
   /** User gesture only. */

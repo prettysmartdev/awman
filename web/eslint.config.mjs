@@ -3,8 +3,10 @@ import reactHooks from 'eslint-plugin-react-hooks';
 import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
-// Storage policy (design §5.7): app code never touches persistent browser
-// storage. sessionStorage is allowed only through src/lib/state/session.ts.
+// Storage policy (design §5.7, WI 0160 C4): app code never touches persistent
+// browser storage. sessionStorage is allowed only through
+// src/lib/state/session.ts; IndexedDB only through the saved signing-key
+// module src/lib/client/credentialStore.ts. localStorage and cookies: never.
 const storageBans = [
   { name: 'localStorage', message: 'Persistent storage is forbidden (design §5.7).' },
   { name: 'indexedDB', message: 'Persistent storage is forbidden (design §5.7).' },
@@ -49,6 +51,14 @@ export default tseslint.config(
     rules: {
       'no-restricted-globals': ['error', ...storageBans.filter(ban => ban.name !== 'sessionStorage')],
       'no-restricted-syntax': ['error', ...storageSyntax.filter(rule => !rule.selector.includes('sessionStorage'))],
+    },
+  },
+  {
+    // WI 0160 C4: the one credential-persistence module (non-extractable key + public metadata).
+    files: ['src/lib/client/credentialStore.ts'],
+    rules: {
+      'no-restricted-globals': ['error', ...storageBans.filter(ban => ban.name !== 'indexedDB')],
+      'no-restricted-syntax': ['error', ...storageSyntax.filter(rule => !rule.selector.includes('indexedDB'))],
     },
   },
   {

@@ -48,14 +48,41 @@ describe('audit-output', () => {
     expect((await auditOutput(out)).join('\n')).toMatch(/relay\.example/);
   });
 
-  it('fails on a baked daemon hostname even on the usual port', async () => {
-    await put('_next/static/chunks/b.js', 'fetch("http://127.0.0.1:9877/v1/health")');
-    expect((await auditOutput(out)).join('\n')).toMatch(/127\.0\.0\.1/);
+  it('admits exactly the fixed loopback daemon destinations in shipped JavaScript (SR-01)', async () => {
+    await put('_next/static/chunks/b.js', 'const H="http://127.0.0.1:9877",W="ws://127.0.0.1:9877";fetch(H+"/v1/health")');
+    expect(await auditOutput(out)).toEqual([]);
+  });
+
+  it.each([
+    'https://127.0.0.1:9877', 'wss://127.0.0.1:9877', 'http://127.0.0.1:9878', 'ws://localhost:9877',
+    'https://awman.prettysmart.dev:9877', 'wss://awman.prettysmart.dev:9877', 'http://127.0.0.1:9877@evil.example',
+  ])('fails on a moved or remote-protocol daemon destination %s', async url => {
+    await put('_next/static/chunks/b.js', `fetch("${url}/v1/health")`);
+    expect((await auditOutput(out)).join('\n')).toMatch(/disallowed network origin/);
+  });
+
+  it('fails on the daemon origin outside shipped JavaScript', async () => {
+    await put('index.html', CLEAN_HTML.replace('awman', 'http://127.0.0.1:9877/v1/status'));
+    expect((await auditOutput(out)).join('\n')).toMatch(/index\.html: disallowed network origin/);
   });
 
   it('fails on persistent storage APIs', async () => {
     await put('_next/static/chunks/b.js', 'window.localStorage.setItem("x","y")');
     expect((await auditOutput(out)).join('\n')).toMatch(/persistent storage/);
+  });
+
+  it('admits only the credential-database open call, in one file (WI 0160 C4)', async () => {
+    await put('_next/static/chunks/b.js', 'function o(){return globalThis.indexedDB?.open("awman-browser-auth",1)??null}');
+    expect(await auditOutput(out)).toEqual([]);
+    await put('_next/static/chunks/c.js', 'indexedDB.open("other",1)');
+    expect((await auditOutput(out)).join('\n')).toMatch(/c\.js: uses browser persistent storage/);
+    await put('_next/static/chunks/c.js', 'indexedDB.open("awman-browser-auth",1)');
+    expect((await auditOutput(out)).join('\n')).toMatch(/opened from several files/);
+    await put('_next/static/chunks/c.js', 'x');
+    await put('_next/static/chunks/b.js', 'indexedDB.open("awman-browser-auth",1);indexedDB.deleteDatabase("x")');
+    expect((await auditOutput(out)).join('\n')).toMatch(/b\.js: uses browser persistent storage/);
+    await put('_next/static/chunks/b.js', 'indexedDB.open("awman-browser-auth",1);localStorage.x=1');
+    expect((await auditOutput(out)).join('\n')).toMatch(/b\.js: uses browser persistent storage/);
   });
 
   it('fails on session data or credentials in HTML', async () => {
