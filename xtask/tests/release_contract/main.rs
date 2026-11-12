@@ -687,33 +687,50 @@ fn row_17_local_tag_create_reuse_and_mismatch() {
     assert!(!f.calls().contains("<workflow> <run>"));
 }
 #[test]
-fn row_18_queued_cancel_default_and_decline() {
+fn row_18_preserve_own_candidate() {
     let own = Fixture::new("release::row_18_own_candidate");
     own.candidate("prepared");
     own.put("queued", "99\n");
     own.run();
     assert!(!own.calls().contains("gh <run> <cancel>"));
+}
+#[test]
+fn row_18_preserve_other_ci_labels() {
     let ci = Fixture::new("release::row_18_ci_labels");
     ci.put("queued", "89\n");
     ci.run();
     assert!(!ci.calls().contains("gh <run> <cancel>"));
+}
+#[test]
+fn row_18_cancel_in_progress_by_default() {
     let progress = Fixture::new("release::row_18_in_progress");
     progress.put("in-progress", "88\n");
     progress.prompt("Cancel them? [Y/n]", "\n", 0);
     assert!(progress.state().join("cancelled").exists());
+}
+#[test]
+fn row_18_cancel_duplicate_run_once() {
     let duplicate = Fixture::new("release::row_18_duplicate");
     duplicate.put("queued", "88\n");
     duplicate.put("in-progress", "88\n");
     let out = duplicate.prompt("Cancel them? [Y/n]", "\n", 0);
     contains(&out, "1 Tests run(s) waiting");
     assert_eq!(duplicate.calls().matches("gh <run> <cancel>").count(), 1);
-    for answer in ["\n", "n\n"] {
-        let f = Fixture::new("release::row_18");
-        f.put("queued", "");
-        f.prompt("Cancel them? [Y/n]", answer, 0);
-        assert_eq!(f.state().join("cancelled").exists(), answer == "\n");
-        contains(&f.calls(), "awman-release");
-    }
+}
+#[test]
+fn row_18_cancel_queued_by_default() {
+    cancel_queued_prompt("\n");
+}
+#[test]
+fn row_18_decline_cancellation() {
+    cancel_queued_prompt("n\n");
+}
+fn cancel_queued_prompt(answer: &str) {
+    let f = Fixture::new("release::row_18");
+    f.put("queued", "");
+    f.prompt("Cancel them? [Y/n]", answer, 0);
+    assert_eq!(f.state().join("cancelled").exists(), answer == "\n");
+    contains(&f.calls(), "awman-release");
 }
 #[test]
 fn row_20_push_then_candidate_never_tag() {
@@ -745,7 +762,7 @@ fn row_21_unmanaged_follow_line() {
     assert!(!f.calls().contains("gh <run> <watch>"));
 }
 #[test]
-fn row_22_watch_rerun_and_verified_success() {
+fn row_22_missing_run_exhausts_poll_budget() {
     let mut missing = Fixture::new("release::row_22_missing");
     missing.env("FORCE_NO_STATE", "1");
     let out = missing.prompt("Pre-checks", "", 1);
@@ -760,17 +777,26 @@ fn row_22_watch_rerun_and_verified_success() {
         60
     );
     assert!(!missing.state().join("runner").exists());
+}
+#[test]
+fn row_22_decline_failed_jobs_rerun() {
     let decline = Fixture::new("release::row_22_decline");
     decline.candidate("validated");
     decline.put("conclusion", "failure");
     decline.prompt("Re-run its failed jobs on this Mac? [Y/n]", "n\n", 1);
     assert!(!decline.calls().contains("gh <run> <rerun>"));
+}
+#[test]
+fn row_22_success_requires_verified_release() {
     let unverified = Fixture::new("release::row_22_unverified");
     unverified.candidate("validated");
     unverified.put("conclusion", "success");
     let out = unverified.prompt("Pre-checks", "", 1);
     contains(&out, "already succeeded");
     contains(&out, "has not verified the published release");
+}
+#[test]
+fn row_22_accept_rerun_and_watch() {
     let f = Fixture::new("release::row_22");
     f.candidate("validated");
     f.put("conclusion", "failure");
@@ -784,6 +810,9 @@ fn row_22_watch_rerun_and_verified_success() {
         "Re-run its failed jobs on this Mac?",
     );
     contains(&f.calls(), "<--exit-status> <--interval> <60>");
+}
+#[test]
+fn row_22_watch_failure_tears_down_runner() {
     let mut f = Fixture::new("release::row_22_fail");
     f.env("WATCH_FAIL", "1");
     let out = f.prompt("Pre-checks", "", 1);
@@ -792,26 +821,28 @@ fn row_22_watch_rerun_and_verified_success() {
     assert!(!f.state().join("runner").exists());
 }
 #[test]
-fn row_23_teardown_success_failure_and_double_interrupt() {
-    for sig in [
-        nix::sys::signal::Signal::SIGINT,
-        nix::sys::signal::Signal::SIGTERM,
-    ] {
-        let mut f = Fixture::new("release::row_23");
-        f.env("WATCH_HOLD", "1");
-        f.env("DOWN_HOLD", "1");
-        let mut c = f.start(
-            &root().join("xtask/src/release/operator/flow.sh"),
-            &["v1.2.3"],
-        );
-        c.wait_for_output("WATCH_READY", LIMIT);
-        nix::sys::signal::killpg(nix::unistd::Pid::from_raw(c.pid() as i32), sig).unwrap();
-        c.wait_for_output("TEARDOWN_READY", LIMIT);
-        nix::sys::signal::killpg(nix::unistd::Pid::from_raw(c.pid() as i32), sig).unwrap();
-        f.put("release-down", "");
-        assert_eq!(c.wait(LIMIT), Exit::Code(130), "{}", c.output_so_far());
-        assert!(!f.state().join("runner").exists());
-    }
+fn row_23_teardown_survives_double_interrupt() {
+    teardown_during_signal(nix::sys::signal::Signal::SIGINT);
+}
+#[test]
+fn row_23_teardown_survives_double_termination() {
+    teardown_during_signal(nix::sys::signal::Signal::SIGTERM);
+}
+fn teardown_during_signal(sig: nix::sys::signal::Signal) {
+    let mut f = Fixture::new("release::row_23");
+    f.env("WATCH_HOLD", "1");
+    f.env("DOWN_HOLD", "1");
+    let mut c = f.start(
+        &root().join("xtask/src/release/operator/flow.sh"),
+        &["v1.2.3"],
+    );
+    c.wait_for_output("WATCH_READY", LIMIT);
+    nix::sys::signal::killpg(nix::unistd::Pid::from_raw(c.pid() as i32), sig).unwrap();
+    c.wait_for_output("TEARDOWN_READY", LIMIT);
+    nix::sys::signal::killpg(nix::unistd::Pid::from_raw(c.pid() as i32), sig).unwrap();
+    f.put("release-down", "");
+    assert_eq!(c.wait(LIMIT), Exit::Code(130), "{}", c.output_so_far());
+    assert!(!f.state().join("runner").exists());
 }
 #[test]
 fn row_24_end_state_matches_operator_contract() {

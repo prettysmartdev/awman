@@ -1864,6 +1864,12 @@ fn lease_git_discards_ambient_config_trace_and_repository_selection() {
     let mut command =
         lease_transport_command(&env, &sandbox.work(), "origin", &LeaseTransport::default())
             .unwrap();
+    #[cfg(windows)]
+    assert_eq!(
+        env_of(&command, "SYSTEMROOT").as_deref(),
+        Some(sandbox.env().get_str("SystemRoot").unwrap()),
+        "lease Git needs the Windows system environment to load network providers"
+    );
     command.args(["config", "--get-regexp", "^url\\."]);
     let out = run_built(&sandbox, &command, Stdin::Null);
     assert_eq!(out.exit, Exit::Code(1), "no url.* rewrite is visible");

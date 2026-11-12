@@ -63,14 +63,15 @@ fn entitlements_mismatch_fails_verification() {
     let s = support::sandbox("tools::entitlements_mismatch_fails_verification");
     let (_codesign, plutil, binary) = setup(&s);
     let entitlements = root().join("packaging/macos/awman.entitlements");
+    // MSYS converts shell paths to forward-slash drive paths for native fakes;
+    // Path::join uses backslashes on Windows, so normalize the rule as well.
+    let entitlements = if cfg!(windows) {
+        entitlements.to_string_lossy().replace('\\', "/")
+    } else {
+        entitlements.to_string_lossy().into_owned()
+    };
     plutil
-        .on(&[
-            "-convert",
-            "json",
-            "-o",
-            "-",
-            entitlements.to_str().unwrap(),
-        ])
+        .on(&["-convert", "json", "-o", "-", &entitlements])
         .stdout("{\"com.apple.security.hypervisor\":true}\n");
     let out = s
         .command("bash")
@@ -78,7 +79,11 @@ fn entitlements_mismatch_fails_verification() {
         .arg("--verify")
         .arg(&binary)
         .run();
-    assert!(!out.exit.success(), "mismatched entitlements accepted");
+    assert!(
+        !out.exit.success(),
+        "mismatched entitlements accepted; converter calls: {:?}",
+        plutil.calls()
+    );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("embedded entitlements differ"),
         "{out:?}"

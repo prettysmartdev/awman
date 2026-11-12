@@ -395,13 +395,22 @@ impl EnvSnapshot {
             "SSL_CERT_DIR",
             "SSH_AUTH_SOCK",
         ];
+        // Windows environment names are case-insensitive. In particular,
+        // SYSTEMROOT must survive scrubbing for Winsock's provider loading.
+        let allowed = |key: &str| {
+            ALLOWED.iter().any(|name| {
+                if cfg!(windows) {
+                    name.eq_ignore_ascii_case(key)
+                } else {
+                    *name == key
+                }
+            })
+        };
         let mut clean = self.clone();
         clean
             .native
-            .retain(|(key, _)| key.to_str().is_some_and(|key| ALLOWED.contains(&key)));
-        clean
-            .values
-            .retain(|key, _| ALLOWED.contains(&key.as_str()));
+            .retain(|(key, _)| key.to_str().is_some_and(&allowed));
+        clean.values.retain(|key, _| allowed(key));
         for (key, value) in [
             ("GIT_CONFIG_GLOBAL", "/dev/null"),
             ("GIT_CONFIG_NOSYSTEM", "1"),

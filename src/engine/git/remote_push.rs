@@ -137,6 +137,7 @@ impl GitEngine {
     }
 
     fn isolate_transport(&self, repo: &Path, metadata: &Path, url: &str) -> Result<RemotePushGit> {
+        let repo = fs::canonicalize(repo).map_err(io)?;
         // A sibling of the clone is outside its bind mount even when the
         // server's TMPDIR was configured inside the repository.
         let parent = repo
@@ -351,8 +352,15 @@ impl RemotePushGit {
         };
         command
             .current_dir(self.private.path())
-            .env("GIT_DIR", self.private.path())
-            .env("GIT_WORK_TREE", &self.repo)
+            // Git parses these paths itself; Rust's Windows canonical paths
+            // use the verbatim prefix, which Git's repository discovery does
+            // not accept here. Both locations are siblings, so relative paths
+            // avoid translating or weakening the pinned filesystem paths.
+            .env("GIT_DIR", ".")
+            .env(
+                "GIT_WORK_TREE",
+                Path::new("..").join(self.repo.file_name().expect("clone has a parent")),
+            )
             .env("GIT_NO_REPLACE_OBJECTS", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env_remove("GIT_INDEX_FILE")
@@ -546,7 +554,7 @@ impl RemotePushGit {
                 let host = crate::engine::host_cli::command(&self.env, "git")
                     .args(["config", "--get", key])
                     .current_dir(self.private.path())
-                    .env("GIT_DIR", self.private.path())
+                    .env("GIT_DIR", ".")
                     .output()
                     .map_err(io)?;
                 let value = String::from_utf8_lossy(&host.stdout).trim().to_string();
