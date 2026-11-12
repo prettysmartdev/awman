@@ -19,7 +19,7 @@
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::data::program_status::ProgramState;
 use crate::frontend::tui::tabs::{
@@ -314,19 +314,13 @@ fn render_one_minimized_bar(slot: &ContainerSlot, area: Rect, frame: &mut Frame)
     } else {
         format!(" [{}]", slot.step_name)
     };
-    let content = format!(
-        "{}\u{1F512} {}{} | {}{}",
-        prefix,
-        slot.agent_name(),
-        step_segment,
-        stats_title.trim(),
-        yolo_suffix
+    let (left, right) = slot_titles_with_status(
+        slot,
+        format!("{}\u{1F512} {}{} ", prefix, slot.agent_name(), step_segment),
+        format!(" | {}{}", stats_title.trim(), yolo_suffix),
+        area.width.saturating_sub(1), // paragraph's leading space
     );
-    // The agent's own status and message, when it reports one.
-    let content = match slot_status_text(slot, 60) {
-        Some(status) => format!("{content} | {status}"),
-        None => content,
-    };
+    let content = format!("{left}{right}");
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -387,8 +381,29 @@ pub(crate) fn slot_titles_with_status(
         return (left_title, right_title);
     };
     let inner_width = usize::from(window_width.saturating_sub(2));
+    // Allow for the em dash and spaces separating the name and state.
+    let min_status_width = UnicodeWidthStr::width(head.as_str()) + 3;
+    // Long agent/step names can fill the border even after dropping stats.
+    // Keep the end of the step name and reserve space for the reported state.
+    let name_budget = inner_width.saturating_sub(min_status_width);
+    let left_title = if UnicodeWidthStr::width(left_title.as_str()) > name_budget {
+        let mut width = 0;
+        let suffix: String = left_title
+            .chars()
+            .rev()
+            .take_while(|c| {
+                width += c.width().unwrap_or(0);
+                width <= name_budget.saturating_sub(2)
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!(" …{suffix}")
+    } else {
+        left_title
+    };
     let base_width = UnicodeWidthStr::width(left_title.as_str());
-    let min_status_width = UnicodeWidthStr::width(head.as_str()) + 3; // em dash, spaces
     let right_width = UnicodeWidthStr::width(right_title.as_str());
     let right_title = if base_width + min_status_width + right_width < inner_width {
         right_title
@@ -396,8 +411,23 @@ pub(crate) fn slot_titles_with_status(
         String::new()
     };
     let budget =
-        inner_width.saturating_sub(base_width + UnicodeWidthStr::width(right_title.as_str()) + 4);
+        inner_width.saturating_sub(base_width + UnicodeWidthStr::width(right_title.as_str()) + 3);
     let status = slot_status_text(slot, budget).unwrap_or(head);
+    // Message limits are in characters; a wide-character message needs a
+    // final cell-width limit before being put on the terminal border.
+    let status = if UnicodeWidthStr::width(status.as_str()) > budget {
+        let mut width = 0;
+        let prefix: String = status
+            .chars()
+            .take_while(|c| {
+                width += c.width().unwrap_or(0);
+                width <= budget.saturating_sub(1)
+            })
+            .collect();
+        format!("{prefix}…")
+    } else {
+        status
+    };
     (format!("{left_title}\u{2014} {status} "), right_title)
 }
 

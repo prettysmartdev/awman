@@ -21,10 +21,13 @@ pub(crate) fn render_control_board(
     .iter()
     .filter(|x| **x)
     .count() as u16;
-    let failed = !state.failure_lines.is_empty();
+    // A failure board belongs to an exited container. Older daemons also
+    // put live agent reports in failure_lines; those are status information,
+    // even when the report itself says "error" or "blocked".
+    let failed = !state.can_dismiss && !state.failure_lines.is_empty();
     let base_height: u16 = if state.can_finish { 14 } else { 12 };
     // A failure banner adds its detail lines plus a blank separator.
-    let failure_height = if failed {
+    let failure_height = if !state.failure_lines.is_empty() {
         state.failure_lines.len() as u16 + 2
     } else {
         0
@@ -133,8 +136,8 @@ pub(crate) fn render_control_board(
             Style::default().fg(Color::Yellow),
         )));
     }
-    if failed {
-        let err_style = Style::default().fg(Color::Red);
+    if !state.failure_lines.is_empty() {
+        let err_style = Style::default().fg(if failed { Color::Red } else { Color::Yellow });
         for line in &state.failure_lines {
             lines.push(Line::from(Span::styled(format!("   {line}"), err_style)));
         }
@@ -313,4 +316,55 @@ pub(crate) fn render_step_confirm(
         )),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+#[cfg(test)]
+mod contracts {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn running_reports_from_older_daemons_do_not_render_as_failed_steps() {
+        for running in [true, false] {
+            // No status_line: this is the payload an older daemon sends.
+            let state = serde_json::from_value(serde_json::json!({
+                "step_name": "audit-actions-and-ia", "focused_step_name": "audit-actions-and-ia",
+                "can_launch_next": true, "can_continue_current": false,
+                "can_restart": true, "can_go_back": true, "can_finish": false,
+                "continue_unavailable_reason": null, "cancel_to_previous_unavailable_reason": null,
+                "finish_workflow_unavailable_reason": null, "restart_unavailable_reason": null,
+                "can_dismiss": running, "launch_next_label": null,
+                "parallel_peer_count": 0, "parallel_peers_running": 0,
+                "failure_lines": [if running { "Agent is working" } else { "Exit code: 1" }],
+                "retry_failed_step": null, "in_parallel_group": false
+            }))
+            .unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+            terminal
+                .draw(|frame| render_control_board(&state, frame.area(), frame))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert_eq!(text.contains("step failed"), !running, "{text}");
+            assert_eq!(text.contains("Restart failed step"), !running, "{text}");
+            assert!(text.contains(if running {
+                "Agent is working"
+            } else {
+                "Exit code: 1"
+            }));
+            let detail = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .find(|cell| cell.symbol() == if running { "A" } else { "E" })
+                .unwrap();
+            assert_eq!(detail.fg, if running { Color::Yellow } else { Color::Red });
+        }
+    }
 }

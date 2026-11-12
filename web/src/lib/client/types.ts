@@ -796,6 +796,7 @@ export interface WorkflowControlBoardState {
   parallel_peer_count: number;
   parallel_peers_running: number;
   failure_lines: string[];
+  status_line?: string | null;
   retry_failed_step: string | null;
   in_parallel_group: boolean;
 }

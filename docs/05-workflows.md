@@ -1157,6 +1157,13 @@ When a step completes and the next step is ready, awman shows a compact confirma
 
 The full control board appears when you have multiple options or want fine-grained control. It can be opened mid-step without disrupting the running container:
 
+Agent reports appear as status information while the step runs. Reports of
+`working`, `idle`, `done`, `blocked`, or `error` do not by themselves mean the
+step has failed. The red failure board describes a step that has exited and
+been recorded as failed. This applies to both builtin and daemon backends.
+The container title and minimized bar show the agent's reported state beside
+the step name; container statistics give way when the window is narrow.
+
 ```
 ╭───── Workflow Control ──────╮
 │ Step: implement             │

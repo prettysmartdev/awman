@@ -122,32 +122,28 @@ pub fn duration(ms: u64) -> String {
     format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
 }
 
-fn state_label(record: &FeatureRecord) -> String {
+fn state_label(record: &FeatureRecord) -> &'static str {
     match record.state {
-        FeatureState::Off => "off".into(),
-        FeatureState::On => "on".into(),
-        FeatureState::Draining => "draining".into(),
-        FeatureState::Degraded => "degraded".into(),
-        FeatureState::Ephemeral => match &record.reason {
-            Some(reason) => format!("ephemeral ({reason})"),
-            None => "ephemeral".into(),
-        },
+        FeatureState::Off => "off",
+        FeatureState::On => "on",
+        FeatureState::Draining => "draining",
+        FeatureState::Degraded => "degraded",
+        FeatureState::Ephemeral => "ephemeral",
     }
 }
 
-/// The `awman daemon status` text form.
 /// The `worker` record's push and pull lines (WI 0143).
 fn worker_sides(record: &FeatureRecord) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(push) = &record.push {
         lines.push(format!(
-            "    push  {} running  {} queued",
+            "    Push: {} running, {} queued",
             push.running, push.queued
         ));
     }
     if let Some(pull) = &record.pull {
         if pull.servers.is_empty() {
-            lines.push("    pull  no work servers (awman link <url>)".into());
+            lines.push("    Pull: no work servers (awman link <url>)".into());
         }
         let name_w = pull.servers.iter().map(|s| s.name.len()).max().unwrap_or(0);
         let state_w = pull
@@ -158,7 +154,7 @@ fn worker_sides(record: &FeatureRecord) -> Vec<String> {
             .unwrap_or(0);
         for server in &pull.servers {
             lines.push(format!(
-                "    pull  {:<name_w$}  {:<state_w$}  {} running  {} eligible",
+                "    Pull: {:<name_w$}  {:<state_w$}  {} running, {} eligible",
                 server.name, server.state, server.running, server.queued_eligible
             ));
         }
@@ -166,91 +162,110 @@ fn worker_sides(record: &FeatureRecord) -> Vec<String> {
     lines
 }
 
+/// The `awman daemon status` text form.
 pub fn render_status(status: &StatusResponse) -> String {
-    let mut out = vec![format!(
-        "awman daemon  pid {}  up {}  version {}",
-        status.pid,
-        duration(status.uptime_ms),
-        status.version
-    )];
     let running: usize = status.features.values().map(|f| f.running).sum();
-    out.push(format!(
-        "capacity  {running}/{} running",
-        status.max_concurrent_jobs
-    ));
-    if let Some(engine) = status.features.get("engine") {
-        let instances = engine
-            .detail
-            .as_ref()
-            .and_then(|detail| detail.get("instances"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        out.push(format!(
-            "engine  {}  {instances} instances",
-            state_label(engine)
-        ));
-    }
+    let mut out = vec![
+        "awman daemon is running".into(),
+        format!("  PID       {}", status.pid),
+        format!("  Uptime    {}", duration(status.uptime_ms)),
+        format!("  Version   {}", status.version),
+        format!(
+            "  Capacity  {running}/{} running",
+            status.max_concurrent_jobs
+        ),
+        String::new(),
+        "Features".into(),
+    ];
     let enabled = status
         .features
         .values()
         .any(|f| f.state != FeatureState::Off);
     if !enabled {
-        out.push("features: none enabled (the daemon stays up; awman daemon stop ends it)".into());
+        out.push("  None enabled (the daemon stays up; awman daemon stop ends it)".into());
     } else {
-        out.push("features".into());
-        let labels: Vec<(String, String)> = status
+        let rows: Vec<_> = status
             .features
             .iter()
-            .map(|(name, record)| (name.clone(), state_label(record)))
+            .map(|(name, record)| {
+                let (running, queued) = if record.state == FeatureState::Off {
+                    ("-".into(), "-".into())
+                } else {
+                    (
+                        record
+                            .max_concurrent_jobs
+                            .map(|max| format!("{}/{max}", record.running))
+                            .unwrap_or_else(|| record.running.to_string()),
+                        record.queued.to_string(),
+                    )
+                };
+                (name.as_str(), state_label(record), running, queued, record)
+            })
             .collect();
-        let name_w = labels.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
-        let state_w = labels.iter().map(|(_, s)| s.len()).max().unwrap_or(0);
-        for ((name, label), record) in labels.iter().zip(status.features.values()) {
-            let mut line = format!("  {name:<name_w$}  {label:<state_w$}");
+        let name_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(4);
+        let state_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(5);
+        let running_w = rows.iter().map(|r| r.2.len()).max().unwrap_or(0).max(7);
+        let queued_w = rows.iter().map(|r| r.3.len()).max().unwrap_or(0).max(6);
+        out.push(format!(
+            "  {:<name_w$}  {:<state_w$}  {:>running_w$}  {:>queued_w$}",
+            "NAME", "STATE", "RUNNING", "QUEUED"
+        ));
+        for (name, label, running, queued, record) in rows {
+            out.push(format!(
+                "  {name:<name_w$}  {label:<state_w$}  {running:>running_w$}  {queued:>queued_w$}"
+            ));
+            if name == "engine" {
+                let instances = record
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail.get("instances"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                out.push(format!("    Instances: {instances}"));
+            }
             if record.state != FeatureState::Off {
-                let share = record
-                    .max_concurrent_jobs
-                    .map(|max| format!("{}/{max}", record.running))
-                    .unwrap_or_else(|| record.running.to_string());
-                line.push_str(&format!("  {share} running"));
                 if record.queued > 0 {
-                    line.push_str(&format!("  {} queued", record.queued));
                     if let Some(age) = record.oldest_queued_age_ms {
-                        line.push_str(&format!(" (oldest {})", duration(age)));
+                        out.push(format!("    Oldest queued: {}", duration(age)));
+                    }
+                }
+                if record.state == FeatureState::Ephemeral {
+                    if let Some(reason) = &record.reason {
+                        out.push(format!("    Reason: {reason}"));
                     }
                 }
                 if let (Some(timeout), Some(idle)) = (record.idle_timeout_ms, record.idle_ms) {
                     if record.state == FeatureState::Ephemeral {
-                        line.push_str(&format!(
-                            "  idles out in {}",
+                        out.push(format!(
+                            "    Idles out in {}",
                             duration(timeout.saturating_sub(idle))
                         ));
                     }
                 }
             }
             if record.state == FeatureState::Degraded {
-                line.push_str(&format!("  restarts {}", record.restarts));
+                out.push(format!("    Restarts: {}", record.restarts));
                 if let Some(error) = &record.last_error {
-                    line.push_str(&format!("  last error: {error}"));
+                    out.push(format!("    Last error: {error}"));
                 }
             }
-            out.push(line.trim_end().to_string());
             if record.state != FeatureState::Off {
                 out.extend(worker_sides(record));
             }
         }
     }
-    out.push("listeners".into());
+    out.push(String::new());
+    out.push("Listeners".into());
     match &status.listeners.local {
         Some(local) => out.push(format!(
-            "  local    {}  {}",
+            "  local  {}\n    Address: {}",
             match local.transport {
                 LocalTransport::UnixSocket => "unix socket",
                 LocalTransport::NamedPipe => "named pipe",
             },
             local.address
         )),
-        None => out.push("  local    not bound".into()),
+        None => out.push("  local  not bound".into()),
     }
     if status.listeners.network.is_empty() {
         out.push("  network  off".into());
@@ -264,39 +279,42 @@ pub fn render_status(status: &StatusResponse) -> String {
                 .iter()
                 .map(|f| f.as_str())
                 .collect::<Vec<_>>()
-                .join(",")
+                .join(", ")
         };
+        out.push(format!("  {name}  {}", network.transport));
         match (&network.bound, &network.error) {
             (_, Some(error)) => out.push(format!(
-                "  {name}  {}  error  {}: {error}",
-                network.transport, network.listen
+                "    Listen: {}\n    Error: {error}",
+                network.listen
             )),
-            (Some(bound), None) => out.push(format!(
-                "  {name}  {}  {bound}  features: {features}  keys: {}",
-                network.transport, network.api_keys
-            )),
+            (Some(bound), None) => out.push(format!("    Address: {bound}")),
             (None, None) => out.push(format!(
-                "  {name}  {}  starting  {}",
-                network.transport, network.listen
+                "    Listen: {}\n    Status: starting",
+                network.listen
             )),
         }
+        out.push(format!("    Features: {features}"));
+        out.push(format!("    API keys: {}", network.api_keys));
         if network.transport == crate::data::config::network::ListenerTransport::LoopbackHttp {
             out.push(format!(
-                "    origins: {}  browsers: {}  links: {}",
-                network
-                    .allowed_origins
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
+                "    Origins: {}\n    Browsers: {}\n    Browser links: {}",
+                if network.allowed_origins.is_empty() {
+                    "none".into()
+                } else {
+                    network
+                        .allowed_origins
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                },
                 network.browser_grants,
                 if network.browser_links { "on" } else { "off" }
             ));
         }
         if network.api_keys == 0 {
             out.push(
-                "  warning: no API keys, so every network request is refused \
-                     (awman daemon api keys.create name=…)"
+                "    Warning: no API keys, so every network request is refused\n    Create a key: awman daemon api keys.create name=…"
                     .into(),
             );
         }

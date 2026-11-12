@@ -200,6 +200,71 @@ async fn narrow_workflow_window_preserves_the_reported_step_status() {
         .map(|cell| cell.symbol())
         .collect();
     assert!(text.contains("build — idle"), "{text}");
+
+    // The state must also survive names that fill the border on their own.
+    let slot = &mut app.tabs[0].container_slots[0];
+    slot.step_name = "audit-actions-and-ia".into();
+    slot.set_program_status(Some(EffectiveStatus {
+        state: ProgramState::Working,
+        kind: None,
+        progress: Some(42),
+        msg: None,
+        app: None,
+        id: None,
+    }));
+    for width in [48, 64, 80] {
+        let (left, right) = container_view::slot_titles_with_status(
+            slot,
+            " 🔒 A very long agent name (containerized) — audit-actions-and-ia ".into(),
+            " container-name | CPU | memory | 00:42 ".into(),
+            width,
+        );
+        assert!(left.contains(" — ◐ 42% working"), "{left}");
+        assert!(left.contains("actions-and-ia"), "{left}");
+        assert!(right.is_empty());
+        assert!(unicode_width::UnicodeWidthStr::width(left.as_str()) <= usize::from(width - 2));
+    }
+    let mut terminal = Terminal::new(TestBackend::new(64, 30)).unwrap();
+    terminal
+        .draw(|frame| {
+            container_view::render_container_bars(&app.tabs[0], frame.area(), frame, false);
+        })
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("actions-and-ia] — ◐ 42% working"), "{text}");
+
+    let slot = &mut app.tabs[0].container_slots[0];
+    slot.set_program_status(Some(EffectiveStatus {
+        state: ProgramState::Working,
+        kind: None,
+        progress: None,
+        msg: Some("正在检查工作流程中的所有步骤".repeat(10)),
+        app: None,
+        id: None,
+    }));
+    let (left, right) = container_view::slot_titles_with_status(
+        slot,
+        " audit-actions-and-ia ".into(),
+        String::new(),
+        64,
+    );
+    assert!(left.contains("working"));
+    assert!(unicode_width::UnicodeWidthStr::width(left.as_str()) <= 62);
+    assert!(right.is_empty());
+    slot.set_program_status(None);
+    let (left, _) = container_view::slot_titles_with_status(
+        slot,
+        " audit-actions-and-ia ".into(),
+        String::new(),
+        64,
+    );
+    assert_eq!(left, " audit-actions-and-ia ");
     drop(app);
     s.finish();
 }
