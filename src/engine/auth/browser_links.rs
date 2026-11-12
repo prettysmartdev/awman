@@ -72,8 +72,21 @@ impl PendingLink {
                 Some(Decision::Approved(_)) => BrowserLinkStatus::Approved,
                 Some(Decision::Denied) => BrowserLinkStatus::Denied,
             },
+            reauth: None,
         }
     }
+}
+
+/// WI 0160: what a proof found when it tried to collect an approval.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CollectOutcome {
+    /// The approved link was live and is now consumed by the proof.
+    Collected,
+    /// The approved link outlived its deadline uncollected; it is removed and
+    /// its grant must end.
+    Expired,
+    /// No approved link holds this grant (a poll already collected it).
+    Absent,
 }
 
 /// A freshly created link: its owner-facing view and the polling secret,
@@ -136,7 +149,9 @@ impl BrowserLinkTable {
         now: DateTime<Utc>,
     ) -> Result<CreatedLink, LinkCreateError> {
         let mut links = self.lock();
-        links.retain(|_, l| l.live(now));
+        // Expired approvals stay until `sweep_expired` hands their grants to
+        // the caller to end; dropping them silently would orphan the grant.
+        links.retain(|_, l| l.live(now) || matches!(l.decision, Some(Decision::Approved(_))));
         let pending = links
             .values()
             .filter(|l| l.listener == listener && l.decision.is_none())
@@ -244,6 +259,28 @@ impl BrowserLinkTable {
             Some(Decision::Approved(grant)) => PollOutcome::Approved(grant),
             Some(Decision::Denied) => PollOutcome::Denied,
             None => PollOutcome::Gone,
+        }
+    }
+
+    /// WI 0160: a proof collects the approved link holding `grant`. Poll and
+    /// proof share this table's lock, so exactly one of them consumes it; a
+    /// poller afterwards sees `Gone` (`410 link_gone`). The link deadline is
+    /// enforced here, at the release point, not only by the lazy sweep.
+    pub fn collect_approved(&self, grant: &BrowserGrantId, now: DateTime<Utc>) -> CollectOutcome {
+        let mut links = self.lock();
+        let Some(id) = links
+            .iter()
+            .find(|(_, l)| matches!(&l.decision, Some(Decision::Approved(g)) if &g.id == grant))
+            .map(|(id, _)| id.clone())
+        else {
+            return CollectOutcome::Absent;
+        };
+        let live = links.get(&id).is_some_and(|l| l.live(now));
+        links.remove(&id);
+        if live {
+            CollectOutcome::Collected
+        } else {
+            CollectOutcome::Expired
         }
     }
 

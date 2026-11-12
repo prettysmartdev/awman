@@ -147,3 +147,11 @@ describe('keymap behaviour (keymap.rs parity)', () => {
     expect(sheet.some(entry => entry.buttonOnly && entry.reserved.includes('Ctrl+Shift+C'))).toBe(true);
   });
 });
+
+describe('terminal keyboard exit (B7)', () => {
+  it('maps Ctrl+] to terminal.exit in the terminal and lists it on the shortcut sheet', () => {
+    expect(map({ key: ']', code: 'BracketRight', ctrlKey: true, altKey: false, shiftKey: false, metaKey: false }, 'terminal')).toBe('terminal.exit');
+    expect(map({ key: 'Tab', code: 'Tab', ctrlKey: false, altKey: false, shiftKey: false, metaKey: false }, 'terminal')).toBe('terminal.forward');
+    expect(shortcutSheet().some(entry => entry.keys.includes('Ctrl+]') && entry.group === 'Terminal')).toBe(true);
+  });
+});

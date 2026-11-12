@@ -19,3 +19,13 @@ it('shows the TUI "q to quit" ghost hint only while empty and idle/done (review 
   expect(composerPlaceholder('error', false)).not.toMatch(/q to quit/);
   expect(composerPlaceholder('idle', true)).not.toMatch(/q to quit/);
 });
+
+it('offers a touch multi-line mode without submitting on Enter', async () => {
+  const h = await show(); fireEvent.change(h.input, { target: { value: 'first' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Multi-line' }));
+  expect(screen.getByRole('button', { name: 'Multi-line' }).getAttribute('aria-pressed')).toBe('true');
+  fireEvent.keyDown(h.input, { key: 'Enter' }); expect(h.send).not.toHaveBeenCalled();
+  fireEvent.change(h.input, { target: { value: 'first\nsecond' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+  expect(h.send.mock.calls[0]?.[0]).toMatchObject({ type: 'submit', input: { raw: 'first\nsecond' } });
+});

@@ -44,7 +44,8 @@ impl ListenersDesired {
             .map(|(name, l)| {
                 let old = previous.and_then(|p| p.listeners.get(name));
                 let bind_generation = old.map_or(generation, |p| {
-                    if p.listen != l.listen || p.transport != l.transport || p.enabled != l.enabled
+                    if bind_identity(&p.listen, p.transport, p.enabled)
+                        != bind_identity(&l.listen, l.transport, l.enabled)
                     {
                         generation
                     } else {
@@ -71,6 +72,16 @@ impl ListenersDesired {
             listeners,
         }
     }
+}
+/// What identifies a listener's bind. Any change replaces the bind (a new
+/// `bind_generation`) and, for an enabled listener, ends its browser grants
+/// and reauthorization generation ([`browser_revocations_between`]).
+fn bind_identity(
+    listen: &ListenAddr,
+    transport: ListenerTransport,
+    enabled: bool,
+) -> (&ListenAddr, ListenerTransport, bool) {
+    (listen, transport, enabled)
 }
 pub fn prepare_tls(
     auth: &AuthEngine,
@@ -148,6 +159,8 @@ pub enum BrowserRevocation {
     EngineRemoved,
     TransportChanged,
     ListenerRemoved,
+    /// Same name, new bind (address or port): a new listener generation.
+    Rebound,
 }
 
 /// Reload hook for browser grants. The browser-auth lane supplies the store-backed implementation.
@@ -227,6 +240,14 @@ pub fn browser_revocations_between(
         if let Some(after) = after {
             if before.transport != after.transport {
                 changes.push((name.clone(), BrowserRevocation::TransportChanged));
+            } else if before.enabled
+                && after.enabled
+                && bind_identity(&before.listen, before.transport, before.enabled)
+                    != bind_identity(&after.listen, after.transport, after.enabled)
+            {
+                // Same name, new address or port: the old generation must not
+                // authorize on the new bind.
+                changes.push((name.clone(), BrowserRevocation::Rebound));
             }
         }
     }
@@ -237,4 +258,41 @@ pub fn browser_revocations_between(
 pub struct TlsStatus {
     pub fingerprint_sha256: String,
     pub sans: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::config::network::builtin_listener;
+
+    /// SR-07: the same listener name on a new address is a new bind
+    /// generation, and that replacement also ends its browser grants.
+    #[test]
+    fn a_rebind_to_a_new_address_is_a_new_generation_that_ends_browser_grants() {
+        let mut listener = builtin_listener("loopback").unwrap();
+        listener.enabled = true;
+        let before = NetworkSettings {
+            listeners: BTreeMap::from([("loopback".into(), listener)]),
+        };
+        let mut after = before.clone();
+        after.listeners.get_mut("loopback").unwrap().listen =
+            ListenAddr::parse("127.0.0.1:9878").unwrap();
+        let old = ListenersDesired::new(&before, None, None);
+        let new = ListenersDesired::new(&after, None, Some(&old));
+        assert_ne!(
+            old.listeners["loopback"].bind_generation,
+            new.listeners["loopback"].bind_generation
+        );
+        assert_eq!(
+            browser_revocations_between(&before, &after),
+            vec![("loopback".to_string(), BrowserRevocation::Rebound)]
+        );
+        // An unchanged bind keeps its generation and its grants.
+        let same = ListenersDesired::new(&after, None, Some(&new));
+        assert_eq!(
+            same.listeners["loopback"].bind_generation,
+            new.listeners["loopback"].bind_generation
+        );
+        assert!(browser_revocations_between(&after, &after).is_empty());
+    }
 }

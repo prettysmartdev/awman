@@ -3,6 +3,7 @@
 // The probe never concludes that the daemon is *stopped*: an unreachable
 // endpoint can equally be a changed port, a bind error, a disabled listener
 // or a browser block, so it reports `unreachable` with what was observable.
+import { isEpoch, LISTENER_NAME_RE, type ListenerBinding } from './credentialStore';
 import { DaemonError, DaemonUnreachable, ProtocolError } from './errors';
 import { currentGrant } from './grant';
 import { HttpTransport } from './http';
@@ -24,6 +25,23 @@ export const REQUIRED_CAPABILITIES = [
 export const SUPPORTED_PROTOCOLS = { api: 1, frontend: 1, terminal: 1, browser: 1 } as const;
 
 export const PROBE_TIMEOUT_MS = 3_000;
+
+/** WI 0160 C2: saved-key recovery protocol this build speaks. Optional: older daemons link memory-only. */
+export const REAUTH_PROTOCOL = 1;
+export const REAUTH_CAPABILITY = 'browser_reauth';
+
+/**
+ * The listener binding a saved key may be enrolled for or proven against, or
+ * null when this daemon/listener does not negotiate `browser_reauth:1`
+ * (protocol, capability and well-formed epochs are all required).
+ */
+export function reauthBinding(health: BrowserHealth): ListenerBinding | null {
+  const object = health.browser_reauth;
+  if (health.protocols.browser_reauth !== REAUTH_PROTOCOL || !health.capabilities.includes(REAUTH_CAPABILITY)) return null;
+  if (typeof object !== 'object' || object === null || object.version !== REAUTH_PROTOCOL) return null;
+  if (!isEpoch(object.daemon_epoch) || !isEpoch(object.listener_epoch) || !LISTENER_NAME_RE.test(health.listener.name)) return null;
+  return { listener: health.listener.name, daemonEpoch: object.daemon_epoch, listenerEpoch: object.listener_epoch };
+}
 
 export type ProbeResult =
   | { kind: 'unsupported'; missing: string[] } // this browser lacks an API the app needs

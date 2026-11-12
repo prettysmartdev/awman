@@ -138,6 +138,7 @@ describe('TerminalView', () => {
   });
 
   it('resizes the PTY only while holding control', async () => {
+    vi.spyOn(HTMLElement.prototype, 'getClientRects').mockReturnValue([{}] as DOMRect[] as unknown as DOMRectList);
     vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(800);
     vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(260);
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ width: 80, height: 13, top: 0, left: 0, right: 80, bottom: 13, x: 0, y: 0, toJSON: () => ({}) } as DOMRect);
@@ -149,11 +150,26 @@ describe('TerminalView', () => {
     await act(async () => {
       await conn.takeControl();
     });
-    await waitFor(() => expect(conn.resizeCalls).toEqual([{ cols: 100, rows: 20 }]));
+    await waitFor(() => expect(conn.resizeCalls.length).toBeGreaterThan(0));
+    expect(conn.resizeCalls.every(size => size.cols === 100 && size.rows === 20)).toBe(true);
+    const requests = conn.resizeCalls.length; // the real connection coalesces these measurements
     // The local grid follows the hub's resize frame, not the request.
     act(() => conn.resizes.emit({ cols: 100, rows: 20 }));
     act(() => handle.current?.fit());
-    expect(conn.resizeCalls).toHaveLength(1);
+    expect(conn.resizeCalls).toHaveLength(requests);
+  });
+
+  it('fits a replacement connection after its core loads even when ready was already true', async () => {
+    vi.spyOn(HTMLElement.prototype, 'getClientRects').mockReturnValue([{}] as DOMRect[] as unknown as DOMRectList);
+    vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockReturnValue(800);
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(260);
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({ width: 80, height: 13 } as DOMRect);
+    const first = new FakeConnection({ holder: 'none', inputAllowed: true });
+    const view = await mount(first);
+    const next = new FakeConnection({ holder: 'me', inputAllowed: true });
+    view.rerender(<Harness conn={next} />);
+    await waitFor(() => expect(next.resizeCalls).toContainEqual({ cols: 100, rows: 20 }));
+    expect(first.resizeCalls).toEqual([]);
   });
 
   it('touch toolbar sends control keys and latches Ctrl', async () => {
@@ -230,5 +246,50 @@ describe('TerminalView', () => {
     expect(conn.inputs).toHaveLength(0);
     fireEvent.keyDown(input(), { key: 'q' });
     await waitFor(() => expect(rows(container)).toContain('row 99'));
+  });
+});
+
+describe('TerminalView focus and keyboard exit (B7)', () => {
+  it('never takes focus by itself, even when it becomes focused/interactive', async () => {
+    const conn = new FakeConnection({ holder: 'me', inputAllowed: true });
+    const before = document.createElement('button'); document.body.append(before); before.focus();
+    const view = await mount(conn, { focused: false });
+    view.rerender(<Harness conn={conn} overrides={{ focused: true }} />);
+    expect(document.activeElement).toBe(before);
+    before.remove();
+  });
+
+  it('lets Tab and Escape pass without taking control from the holder', async () => {
+    const conn = new FakeConnection({ holder: 'other', inputAllowed: true });
+    await mount(conn);
+    for (const key of ['Tab', 'Escape']) {
+      const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true });
+      input().dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(false);
+    }
+    expect(conn.takeControlCalls).toBe(0);
+    fireEvent.keyDown(input(), { key: 'x' });
+    expect(conn.takeControlCalls).toBe(1); // a typed character still asks for control
+  });
+
+  it('forwards Tab while holding control and leaves on Ctrl+] to the header', async () => {
+    const conn = new FakeConnection({ holder: 'me', inputAllowed: true });
+    await mount(conn, { barEnd: <button type="button">Agent actions</button> });
+    input().focus();
+    fireEvent.keyDown(input(), { key: 'Tab' });
+    expect(conn.sent()).toBe('\t');
+    fireEvent.keyDown(input(), { key: ']', code: 'BracketRight', ctrlKey: true });
+    expect(conn.sent()).toBe('\t');
+    expect(document.activeElement?.textContent).toBe('Agent actions');
+  });
+
+  it('shows notices over the viewport with a dismiss control', async () => {
+    const conn = new FakeConnection({ holder: 'none', inputAllowed: false });
+    await mount(conn);
+    fireEvent.keyDown(input(), { key: 'x' });
+    const notice = screen.getByText('This terminal is read-only here.');
+    expect(notice.closest('[class*=viewport]')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss terminal notice' }));
+    expect(screen.queryByText('This terminal is read-only here.')).toBeNull();
   });
 });

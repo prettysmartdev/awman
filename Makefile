@@ -122,14 +122,22 @@ docs-reference:
 
 # Separate from the binary gates. Missing web/edge artifacts are a hard error,
 # not an implicit skip or a transport-only acceptance pass.
-.PHONY: web/dev web/reinstall test-web
+.PHONY: web/dev web/reinstall web/test-setup test-web test-web-check
 web/dev:
 	node tools/web-dev.mjs
 
 web/reinstall:
 	node tools/web-reinstall.mjs
 
+web/test-setup:
+	@bash tools/web-test-env.sh bash tools/web-test-setup.sh $(WEB_TEST_SETUP_ARGS)
+
 test-web:
+	@bash tools/web-test-env.sh $(MAKE) --no-print-directory test-web-check
+
+# Keep every gate in one place. The wrapper only prepares executable/library
+# lookup; it never substitutes for a check or treats missing tooling as a pass.
+test-web-check:
 	@test -f web/package.json && test -f web/edge/package.json || { echo 'WI 0159: web/edge implementation is missing' >&2; exit 1; }
 	npm --prefix web run check
 	npm --prefix web/edge run check

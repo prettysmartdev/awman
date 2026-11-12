@@ -12,7 +12,9 @@
 // - activate: delete older shell caches, claim clients.
 // - fetch: cache-first for precached same-origin shell paths only. No
 //   background revalidation of documents, no background sync, no push, no
-//   analytics, and never any cross-origin (daemon) request.
+//   analytics, and never any cross-origin (daemon) request, same-origin
+//   `/v1/*` request or request with Authorization (WI 0160 C8). The worker
+//   never opens IndexedDB, holds or uses keys, or relays session data.
 import { cacheNameFor, decide, isSkipWaiting, staleCaches, type PrecacheManifest } from './policy';
 
 declare const self: ServiceWorkerGlobalScope;
@@ -49,7 +51,7 @@ self.addEventListener('message', event => {
 
 self.addEventListener('fetch', event => {
   const request = event.request;
-  const decision = decide({ url: request.url, method: request.method, mode: request.mode }, self.location.origin, precache);
+  const decision = decide({ url: request.url, method: request.method, mode: request.mode, hasAuthorization: request.headers.has('Authorization') }, self.location.origin, precache);
   if (decision.kind === 'ignore') return;
   event.respondWith(
     (async () => {

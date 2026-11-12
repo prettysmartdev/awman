@@ -40,6 +40,10 @@ try {
   const security = (await readFile(resolve(packageRoot, 'src/security.ts'), 'utf8')).replace(/^\s*\/\/.*$/gm, '');
   const wasmFlag = /TERMINAL_REQUIRES_WASM_UNSAFE_EVAL = (true|false);/.exec(security)?.[1];
   if (!wasmFlag) failures.push('src/security.ts: cannot read TERMINAL_REQUIRES_WASM_UNSAFE_EVAL');
+  // connect-src is fixed to the same-machine daemon (WI 0159 §4); never page-derived or widened.
+  const sources = /DAEMON_CONNECT_SOURCES = \[([^\]]*)\] as const;/.exec(security)?.[1]?.replace(/\s+/g, '');
+  if (sources !== "'http://127.0.0.1:9877','ws://127.0.0.1:9877'") failures.push('src/security.ts: connect-src must be exactly the fixed loopback daemon');
+  if (!/`connect-src 'self' \$\{DAEMON_CONNECT_SOURCES\.join\(' '\)\}`/.test(security)) failures.push('src/security.ts: connect-src must be built only from DAEMON_CONNECT_SOURCES');
   const scriptSrc = `script-src 'self'${wasmFlag === 'true' ? " 'wasm-unsafe-eval'" : ''}${/'unsafe-eval'/.test(security) ? " 'unsafe-eval'" : ''}`;
   for (const problem of wasmPolicyProblems(entries.map(entry => entry.path), scriptSrc)) failures.push(problem);
   if (failures.length) throw new Error(failures.join('\n'));

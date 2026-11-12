@@ -49,6 +49,43 @@ pub const LINK_CODE_PREFIX: &str = "web";
 /// A ticket is offered as the WebSocket subprotocol `awman.ticket.<ticket>`.
 pub const TICKET_SUBPROTOCOL_PREFIX: &str = "awman.ticket.";
 
+// WI 0160: reload-safe reauthorization (proof of a non-extractable browser
+// key bound to one approved grant). See the work item's C1–C3.
+
+/// The only reauthorization protocol version.
+pub const REAUTH_VERSION: u32 = 1;
+/// The only enrollment algorithm: ECDSA P-256 over SHA-256, raw `r || s`.
+pub const REAUTH_ALGORITHM: &str = "ECDSA_P256_SHA256";
+/// Domain tag that starts every signed reauthorization transcript (followed
+/// by one zero byte).
+pub const REAUTH_TRANSCRIPT_DOMAIN: &[u8] = b"awman.browser.reauth.v1";
+/// The completion route, which is also signed into the transcript.
+pub const REAUTH_COMPLETE_PATH: &str = "/v1/browser-reauth/complete";
+/// A challenge ends this long after issue, by monotonic or wall time,
+/// whichever passes first.
+pub const REAUTH_CHALLENGE_TTL: Duration = Duration::from_secs(30);
+/// Outstanding challenges per presented credential ID; the oldest is dropped
+/// to admit a new one.
+pub const REAUTH_CHALLENGES_PER_CREDENTIAL: usize = 8;
+/// Outstanding challenges per listener; beyond this, `429`.
+pub const REAUTH_CHALLENGES_PER_LISTENER: usize = 256;
+/// `Retry-After` when a listener's challenge table is full.
+pub const REAUTH_CHALLENGES_FULL_RETRY: Duration = Duration::from_secs(30);
+/// Challenge requests per (listener, Origin) per minute.
+pub const REAUTH_CHALLENGES_PER_MINUTE: u32 = 60;
+/// Completion requests per (listener, Origin) per minute.
+pub const REAUTH_COMPLETES_PER_MINUTE: u32 = 120;
+/// Enrollment/binding/tombstone slots per listener.
+pub const REAUTH_SLOTS_PER_LISTENER: usize = 4096;
+/// `Retry-After` when a listener's enrollment slots are full.
+pub const REAUTH_SLOTS_FULL_RETRY: Duration = Duration::from_secs(60);
+/// A tombstone (public key and termination reason, never a bearer) is kept
+/// until the original grant expiry plus this, or daemon stop.
+pub const REAUTH_TOMBSTONE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+/// Live grant watches re-evaluate both deadlines at least this often, so a
+/// system suspend cannot keep a socket open past its grant.
+pub const GRANT_WATCH_RECHECK: Duration = Duration::from_secs(30);
+
 /// A credential carried on the wire. Serializes as the bare string, prints as
 /// `<redacted>`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +126,95 @@ pub struct BrowserLinkCreateResponse {
     pub listener: String,
     pub origin: String,
     pub scope: BrowserScope,
+    /// WI 0160: present only for a key-bound link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reauth: Option<BrowserReauthBinding>,
+}
+
+/// WI 0160: the key-bound body of `POST /v1/browser-links`
+/// (`{"reauth":{…}}`). The legacy absent/`{}` body is recognised by the
+/// adapter before this type is consulted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserLinkCreateRequest {
+    pub reauth: BrowserReauthEnrollment,
+}
+
+/// WI 0160: the public key a browser enrolls with a new link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserReauthEnrollment {
+    pub version: u32,
+    pub credential_id: String,
+    pub algorithm: String,
+    pub public_key: String,
+}
+
+/// WI 0160: the public binding of a key-bound link or grant. Public
+/// identifiers only, never a credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserReauthBinding {
+    pub version: u32,
+    pub credential_id: String,
+    pub daemon_epoch: String,
+    pub listener_epoch: String,
+}
+
+/// WI 0160: what the owner sees of a key-bound link or grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserReauthKeyView {
+    pub version: u32,
+    pub credential_id: String,
+    /// Unpadded base64url SHA-256 of the 65 raw public-key bytes.
+    pub key_sha256: String,
+}
+
+/// WI 0160: body of `POST /v1/browser-reauth/challenge`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserReauthChallengeRequest {
+    pub version: u32,
+    pub credential_id: String,
+    pub daemon_epoch: String,
+    pub listener_epoch: String,
+    pub client_nonce: String,
+}
+
+/// WI 0160: `201` body of `POST /v1/browser-reauth/challenge`. The same
+/// shape for known, unknown, expired and revoked credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserReauthChallengeResponse {
+    pub version: u32,
+    pub credential_id: String,
+    pub daemon_epoch: String,
+    pub listener_epoch: String,
+    pub origin: String,
+    pub listener: String,
+    pub challenge_id: String,
+    pub nonce: String,
+    pub client_nonce: String,
+    /// UTC RFC 3339 with exactly three fractional digits and `Z`; signed
+    /// byte-for-byte, never reformatted.
+    pub expires_at: String,
+}
+
+/// WI 0160: body of `POST /v1/browser-reauth/complete`. The signature is
+/// proof material and never prints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserReauthCompleteRequest {
+    pub version: u32,
+    pub challenge_id: String,
+    pub signature: BrowserSecret,
+}
+
+/// WI 0160: `200` body of `POST /v1/browser-reauth/complete`: the same
+/// grant, bearer and original expiry the approval minted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserReauthCompleteResponse {
+    pub grant: BrowserGrantIssued,
 }
 
 /// Body of `POST /v1/browser-links/{id}/poll`.
@@ -108,6 +234,9 @@ pub struct BrowserGrantIssued {
     pub origin: String,
     pub listener: String,
     pub expires_at: DateTime<Utc>,
+    /// WI 0160: the public binding; omitted for keyless grants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reauth: Option<BrowserReauthBinding>,
 }
 
 /// `200` body of a poll.
@@ -139,6 +268,9 @@ pub struct BrowserLinkView {
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub status: BrowserLinkStatus,
+    /// WI 0160: the enrolled key, for a key-bound link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reauth: Option<BrowserReauthKeyView>,
 }
 
 /// Body of `POST /v1/browser-links/{id}/decision` (owner socket only).
@@ -168,6 +300,9 @@ pub struct BrowserGrantView {
     pub last_used_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// WI 0160: present when the browser can recover this grant after reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reauth: Option<BrowserReauthKeyView>,
 }
 
 /// Which WebSocket a ticket opens.

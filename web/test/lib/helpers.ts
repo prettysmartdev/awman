@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { DaemonClient } from '@/lib/client/daemonClient';
+import { DaemonClient, type DaemonClientDeps } from '@/lib/client/daemonClient';
 import type { Grant } from '@/lib/client/grant';
 import { HttpTransport, type FetchLike } from '@/lib/client/http';
 import type { WebSocketLike } from '@/lib/client/socket';
@@ -53,9 +53,9 @@ export class FakeSocket implements WebSocketLike {
   receive(frame: unknown): void {
     this.onmessage?.({ data: typeof frame === 'string' ? frame : JSON.stringify(frame) });
   }
-  serverClose(code: number): void {
+  serverClose(code: number, reason = ''): void {
     this.readyState = 3;
-    this.onclose?.({ code, reason: '', wasClean: true });
+    this.onclose?.({ code, reason, wasClean: true });
   }
   frames(): Record<string, unknown>[] {
     return this.sent.map(text => JSON.parse(text) as Record<string, unknown>);
@@ -99,8 +99,8 @@ export function fakeFetch(handler: (url: string, init: RequestInit) => FakeRespo
 }
 
 /** A DaemonClient whose ticket() is scripted (no HTTP). */
-export function ticketClient(tickets: (() => Promise<string>)[] = []): DaemonClient & { ticketCalls: number } {
-  const client = new DaemonClient(GRANT, new HttpTransport(async () => new Response('{}', { status: 500 }))) as DaemonClient & { ticketCalls: number };
+export function ticketClient(tickets: (() => Promise<string>)[] = [], grant: Grant = GRANT, deps: DaemonClientDeps = {}): DaemonClient & { ticketCalls: number } {
+  const client = new DaemonClient(grant, new HttpTransport(async () => new Response('{}', { status: 500 })), deps) as DaemonClient & { ticketCalls: number };
   client.ticketCalls = 0;
   client.ticket = async () => {
     const next = tickets[client.ticketCalls] ?? (() => Promise.resolve(TICKET));

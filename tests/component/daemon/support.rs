@@ -36,10 +36,18 @@ impl Api {
         Self::with_config(sandbox, json!({})).await
     }
     pub async fn with_config(sandbox: &TestSandbox, extra: Value) -> Self {
-        let listener = sandbox.ports().tcp_listener();
-        let addr = listener.local_addr().unwrap();
         let docker = sandbox.install_fake(support::fake_cli_exe(), "docker");
         awman_test_support::fakes::docker_cli_baseline(&docker);
+        Self::boot(sandbox, extra).await
+    }
+    /// A new daemon process on the same private state after `shutdown`
+    /// (the fake runtime from the first start stays installed).
+    pub async fn restart(sandbox: &TestSandbox) -> Self {
+        Self::boot(sandbox, json!({})).await
+    }
+    async fn boot(sandbox: &TestSandbox, extra: Value) -> Self {
+        let listener = sandbox.ports().tcp_listener();
+        let addr = listener.local_addr().unwrap();
         let env = support::env_snapshot(sandbox);
         let path = awman::data::config::file::global_config_path(&env).unwrap();
         let mut doc = json!({"runtime":{"kind":"docker"},"agents":{"auth":{"refresh":{"enabled":false}}},
@@ -98,12 +106,25 @@ impl Api {
         origin: Option<&str>,
         body: Option<Value>,
     ) -> (u16, Value) {
+        self.request_at(&self.base, method, path, key, origin, body)
+            .await
+    }
+    /// [`Self::request`] against another base URL served by this daemon.
+    pub async fn request_at(
+        &self,
+        base: &str,
+        method: &str,
+        path: &str,
+        key: Option<&str>,
+        origin: Option<&str>,
+        body: Option<Value>,
+    ) -> (u16, Value) {
         let mut request = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap()
-            .request(method.parse().unwrap(), format!("{}{path}", self.base));
+            .request(method.parse().unwrap(), format!("{base}{path}"));
         if let Some(key) = key {
             request = request.bearer_auth(key);
         }
@@ -121,5 +142,64 @@ impl Api {
         self.stop.cancel();
         self.task.await.unwrap();
         self.api.runtime.shutdown(StopMode::Now).await;
+    }
+}
+
+/// One more production router for a listener name on a fresh address.
+pub(super) struct Served {
+    pub addr: String,
+    pub base: String,
+    stop: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Served {
+    pub async fn stop(self) {
+        self.stop.cancel();
+        self.task.await.unwrap();
+    }
+}
+
+impl Api {
+    /// Serve listener `name` on a newly bound loopback address as well.
+    pub async fn serve_listener_on_new_address(&self, sandbox: &TestSandbox, name: &str) -> Served {
+        let listener = sandbox.ports().tcp_listener();
+        let addr = listener.local_addr().unwrap();
+        let router = build_router_for_listener(
+            self.api.clone(),
+            ListenerPolicy::Network { name: name.into() },
+        );
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let stop = CancellationToken::new();
+        let stopped = stop.clone();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(stopped.cancelled_owned())
+                .await
+                .unwrap();
+        });
+        Served {
+            addr: addr.to_string(),
+            base: format!("http://{addr}"),
+            stop,
+            task,
+        }
+    }
+
+    /// Write listener `name`'s address `addr` to the global config and
+    /// reload, as `awman config set` followed by a reload would.
+    pub async fn set_listener_address(
+        &self,
+        sandbox: &TestSandbox,
+        name: &str,
+        addr: &str,
+    ) -> awman::command::daemon_api::core::ReloadResponse {
+        let env = support::env_snapshot(sandbox);
+        let path = awman::data::config::file::global_config_path(&env).unwrap();
+        let mut doc: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        doc["daemon"]["network"]["listeners"][name]["listen"] = json!(addr);
+        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        self.api.runtime.reload_config().await.unwrap()
     }
 }

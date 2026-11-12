@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueuePanel } from '@/components/QueuePanel';
 import { harness } from './helpers';
 import type { PickRun } from '@/lib/client/types';
@@ -50,6 +50,11 @@ it('offers the WI143 checkout choice and releases an unstarted claim on dismiss'
   fireEvent.click(await screen.findByRole('button', { name: 'Review · team' }));
   fireEvent.click(screen.getByRole('button', { name: 'Pick' }));
   await screen.findByRole('button', { name: 'Run in a fresh clone' });
+  act(() => h.state.set('reconnecting'));
+  for (const name of ['Run in a worktree of this checkout', 'Run in a fresh clone']) expect((screen.getByRole('button', { name }) as HTMLButtonElement).disabled).toBe(true);
+  const closes = onClose.mock.calls.length; fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+  expect(onClose).toHaveBeenCalledTimes(closes); expect(screen.getByRole('alert').textContent).toContain('Reconnect as primary');
+  act(() => h.state.set('open'));
   fireEvent.click(screen.getByRole('button', { name: 'Close' }));
   await waitFor(() => expect(h.queueRequest).toHaveBeenCalledWith('tab_1', { operation: 'finish', lease_id: 'lease_2', choice: 'release' }));
 });

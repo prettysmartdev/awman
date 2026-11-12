@@ -20,7 +20,9 @@ const WASM_FIXTURE_JS = `(async () => {
 
 export const test = base.extend<{ daemon: Daemon }, { shell: void }>({
   shell: [async ({}, use) => {
-    const output = resolve(root, 'web/out');
+    // AWMAN_E2E_WEB_OUT serves another export directory; used only for
+    // documented negative controls (a deliberately mutated copy outside the repo).
+    const output = process.env.AWMAN_E2E_WEB_OUT ? resolve(process.env.AWMAN_E2E_WEB_OUT) : resolve(root, 'web/out');
     const server = createServer(async (req, res) => {
       res.setHeader('Cache-Control', 'no-store');
       const url = new URL(req.url!, 'http://localhost');

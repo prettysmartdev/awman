@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { isTextInput, useShortcuts } from '@/lib/keys/useShortcuts';
 import { chordOf, isReservedChord } from '@/lib/keys/keymap';
 import type { DaemonClient } from '@/lib/client/daemonClient';
@@ -14,13 +14,22 @@ export function errorText(error: unknown): string {
 }
 export async function copyText(text: string): Promise<void> { await navigator.clipboard.writeText(text); }
 
-export function Modal({ title, children, onDismiss }: { title: string; children: ReactNode; onDismiss?: () => void }) {
+/** Presentation adapter for existing Queue and countdown content. No answers
+ * are emitted by this context or by changing panels. */
+export const SheetPresentation = createContext<'modal' | 'drawer' | 'banner'>('modal');
+
+export function Modal({ title, children, onDismiss, initialFocus }: { title: string; children: ReactNode; onDismiss?: () => void; initialFocus?: string }) {
+  const presentation = useContext(SheetPresentation);
   const ref = useRef<HTMLDivElement>(null);
-  useScreenShortcuts(() => ({ context: 'dialog', opts: { dialog: 'other' } }), action => { if (action === 'dialog.dismiss' && onDismiss && [...document.querySelectorAll('[role=dialog]')].at(-1) === ref.current) { onDismiss(); return; } return false; }, !!onDismiss);
+  // An embedded drawer shares Escape with a live countdown banner: the drawer
+  // takes it only while focus is inside the drawer (decided by focus).
+  const sheet = useRef<HTMLElement>(null);
+  useScreenShortcuts(() => ({ context: 'dialog', opts: { dialog: 'other' } }), action => { if (action === 'dialog.dismiss' && onDismiss && (presentation === 'drawer' ? !document.querySelector('[aria-modal=true]') && (!document.querySelector('.embedded-banner') || !!sheet.current?.contains(document.activeElement)) :[...document.querySelectorAll('[role=dialog]')].at(-1) === ref.current)) { onDismiss(); return; } return false; }, !!onDismiss);
   useEffect(() => {
+    if (presentation !== 'modal') return;
     const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const node = ref.current;
-    (node?.querySelector<HTMLElement>('input,textarea,button,[tabindex="0"]') ?? node)?.focus();
+    (node?.querySelector<HTMLElement>(initialFocus ?? 'input:not(:disabled),textarea:not(:disabled),button:not(:disabled),[tabindex="0"]') ?? node)?.focus();
     const trap = (event: KeyboardEvent) => {
       if (event.key !== 'Tab' || event.ctrlKey || event.altKey || event.metaKey) return;
       const nodes = [...(node?.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled),textarea:not(:disabled),select,[tabindex="0"],a[href]') ?? [])];
@@ -31,7 +40,8 @@ export function Modal({ title, children, onDismiss }: { title: string; children:
     };
     node?.addEventListener('keydown', trap);
     return () => { node?.removeEventListener('keydown', trap); previous?.focus(); };
-  }, []);
+  }, [presentation, initialFocus]);
+  if (presentation !== 'modal') return <section className={`embedded-sheet embedded-${presentation}`} aria-label={title} ref={sheet}><header><h2>{title}</h2>{onDismiss && <button className="secondary" onClick={onDismiss}>Close</button>}</header>{children}</section>;
   return <div className="modal-backdrop"><div className="modal" role="dialog" aria-modal="true" aria-label={title} tabIndex={-1} ref={ref}>
     <header><h2>{title}</h2>{onDismiss && <button className="secondary" onClick={onDismiss}>Close</button>}</header>{children}
   </div></div>;
@@ -54,7 +64,7 @@ export function VirtualList<T>({ items, render, label, rowHeight = 44, activeInd
   }, [activeIndex, rowHeight]);
   const start = Math.min(Math.max(0, Math.floor(scroll / rowHeight) - 5), Math.max(0, items.length - 30));
   const end = Math.min(items.length, start + 40);
-  return <div className="virtual-frame"><div className="list-tools"><span>{items.length} entries</span><button className="secondary" onClick={() => { if (ref.current) ref.current.scrollTop = 0; }}>Home</button><button className="secondary" onClick={() => { if (ref.current) ref.current.scrollTop = items.length * rowHeight; }}>End</button></div>
+  return <div className="virtual-frame"><div className="list-tools"><span>{items.length} entries</span><button className="secondary" aria-label={`Top of ${label}`} onClick={() => { if (ref.current) ref.current.scrollTop = 0; }}>↑</button><button className="secondary" aria-label={`End of ${label}`} onClick={() => { if (ref.current) ref.current.scrollTop = items.length * rowHeight; }}>↓</button></div>
     <div className={`virtual-list rows-${rowHeight}`} role="region" aria-label={label} tabIndex={0} ref={ref} onScroll={e => { const node = e.currentTarget; following.current = node.scrollHeight - node.scrollTop - node.clientHeight < rowHeight * 2; setScroll(node.scrollTop); }}>
       <svg aria-hidden="true" width="1" height={start * rowHeight} className="virtual-spacer" />
       {items.slice(start, end).map((item, index) => <div className="virtual-row" key={start + index}>{render(item, start + index)}</div>)}

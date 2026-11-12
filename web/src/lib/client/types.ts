@@ -1126,6 +1126,12 @@ export type KnownApiErrorCode =
   // design §2.4/§2.7/§3.4 (daemon side in progress)
   | 'rate_limited'
   | 'link_gone'
+  | 'credential_exists'
+  | 'daemon_restarted'
+  | 'listener_changed'
+  | 'reauth_failed'
+  | 'authorization_expired'
+  | 'authorization_revoked'
   | 'link_not_found'
   | 'browser_ticket_invalid'
   | 'dir_outside_context';
@@ -1141,11 +1147,77 @@ export interface BrowserHealth {
   status: 'ok';
   build: string;
   /** `browser` present (=1) only when `browser_links` is true. */
-  protocols: { api: number; frontend: number; terminal: number; browser?: number };
+  protocols: { api: number; frontend: number; terminal: number; browser?: number; browser_reauth?: number };
   capabilities: string[];
   listener: { name: string; transport: ListenerTransport; features: FeatureName[] };
   engine: { state: 'on' | 'off' | 'draining' | 'degraded' };
   browser_links: boolean;
+  /** WI 0160 C2: only on an eligible loopback browser listener with engine service. */
+  browser_reauth?: BrowserReauthHealth;
+}
+
+// WI 0160 C2: health `browser_reauth` object. Epochs: 16 random bytes, unpadded base64url.
+export interface BrowserReauthHealth {
+  version: 1;
+  daemon_epoch: string;
+  listener_epoch: string;
+}
+
+// WI 0160 C2: link-create enrollment body `{reauth:{…}}` (legacy body is `{}`).
+export interface BrowserLinkCreateRequest {
+  reauth?: {
+    version: 1;
+    /** 32 random bytes, unpadded base64url (43 chars). */
+    credential_id: string;
+    algorithm: 'ECDSA_P256_SHA256';
+    /** 65-byte uncompressed SEC1 point, unpadded base64url. */
+    public_key: string;
+  };
+}
+
+// WI 0160 C2: binding object on the link 201, the approved grant and the proof grant.
+export interface BrowserReauthBindingWire {
+  version: 1;
+  credential_id: string;
+  daemon_epoch: string;
+  listener_epoch: string;
+}
+
+// WI 0160 C3: `POST /v1/browser-reauth/challenge` body (no Authorization).
+export interface BrowserReauthChallengeRequest {
+  version: 1;
+  credential_id: string;
+  daemon_epoch: string;
+  listener_epoch: string;
+  client_nonce: string;
+}
+
+// WI 0160 C3: challenge 201. Exactly these fields; every value is signed verbatim.
+export interface BrowserReauthChallenge {
+  version: 1;
+  credential_id: string;
+  daemon_epoch: string;
+  listener_epoch: string;
+  origin: string;
+  listener: string;
+  challenge_id: string;
+  nonce: string;
+  client_nonce: string;
+  /** RFC3339 UTC with exactly three fractional digits and Z. */
+  expires_at: string;
+}
+
+// WI 0160 C3: `POST /v1/browser-reauth/complete` body (no Authorization).
+export interface BrowserReauthCompleteRequest {
+  version: 1;
+  challenge_id: string;
+  /** Raw r||s (64 bytes), unpadded base64url (86 chars). */
+  signature: string;
+}
+
+// WI 0160 C3: complete 200. Same grant id, bearer and original expiry.
+export interface BrowserReauthComplete {
+  grant: BrowserGrantWire;
 }
 
 // design §2.4 (daemon side in progress): `POST /v1/browser-links` → 201
@@ -1160,6 +1232,8 @@ export interface BrowserLinkCreated {
   listener: string;
   origin: string;
   scope: 'engine';
+  /** WI 0160 C2: key-bound links only. */
+  reauth?: BrowserReauthBindingWire;
 }
 
 // design §2.4 (daemon side in progress): poll request body
@@ -1176,6 +1250,8 @@ export interface BrowserGrantWire {
   origin: string;
   listener: string;
   expires_at: Timestamp;
+  /** WI 0160 C2: key-bound grants only; keyless grants omit it. */
+  reauth?: BrowserReauthBindingWire;
 }
 
 // design §2.4 (daemon side in progress): `POST /v1/browser-links/{id}/poll` → 200 (410 link_gone / 429 rate_limited are ApiErrorBody)

@@ -54,7 +54,7 @@ export type WebAction =
   | 'squad.detail' | 'squad.history' | 'squad.attach' | 'squad.new' | 'squad.edit' | 'squad.pause'
   | 'squad.resume' | 'squad.trigger' | 'squad.cancel' | 'squad.delete'
   // terminal
-  | 'terminal.forward' | 'terminal.paste';
+  | 'terminal.forward' | 'terminal.paste' | 'terminal.exit';
 
 /** The subset of KeyboardEvent the map needs (plain objects work in tests). */
 export interface KeyEventLike {
@@ -168,9 +168,9 @@ const DIALOG_BINDINGS: readonly Binding[] = [
 ];
 
 const CONTEXT_BINDINGS: readonly Binding[] = [
-  // Workflow overview horizontal scroll (only while a too-wide overview shows).
-  { action: 'workflow.overviewLeft', label: 'Scroll workflow overview left', keys: ['Shift+←'], contexts: BODY, when: o => !!o.overviewHScroll, matrix: ['wf.overview_hscroll'], group: 'Workflow' },
-  { action: 'workflow.overviewRight', label: 'Scroll workflow overview right', keys: ['Shift+→'], contexts: BODY, when: o => !!o.overviewHScroll, matrix: ['wf.overview_hscroll'], group: 'Workflow' },
+  // Workflow overview step selection (TUI: scroll stages sideways), only while it is open.
+  { action: 'workflow.overviewLeft', label: 'Previous workflow step', keys: ['Shift+←'], contexts: [...BODY, 'global'], when: o => !!o.overviewHScroll && !o.textInput, matrix: ['wf.overview_hscroll'], group: 'Workflow' },
+  { action: 'workflow.overviewRight', label: 'Next workflow step', keys: ['Shift+→'], contexts: [...BODY, 'global'], when: o => !!o.overviewHScroll && !o.textInput, matrix: ['wf.overview_hscroll'], group: 'Workflow' },
   // Command box
   { action: 'exec.stopWatch', label: 'Stop watching agents', keys: ['Esc'], contexts: ['composer', 'execution'], when: o => !!o.watching, matrix: ['startup.initial_tab_agents_watch', 'exec.agents_watch_stop'], group: 'Execution log' },
   { action: 'composer.newline', label: 'New line', keys: ['Shift+Enter'], alternates: ['Ctrl+Enter'], contexts: ['composer'], matrix: ['cmd.newline'], group: 'Command box' },
@@ -210,6 +210,8 @@ const CONTEXT_BINDINGS: readonly Binding[] = [
   // intercepted globally is forwarded to the agent (see map()).
   { action: 'terminal.paste', label: 'Paste into the agent', keys: ['Ctrl+V', 'Shift+Insert'], contexts: ['terminal'], matrix: ['term.paste'], group: 'Terminal' },
   { action: 'terminal.forward', label: 'Interrupt the agent (sent to the terminal)', keys: ['Ctrl+C'], contexts: ['terminal'], matrix: ['term.ctrl_c'], group: 'Terminal' },
+  // Keyboard exit: everything else is forwarded while you hold control, so Tab cannot leave.
+  { action: 'terminal.exit', label: 'Leave the terminal (focus moves to its header)', keys: ['Ctrl+]'], contexts: ['terminal'], matrix: ['term.typing'], group: 'Terminal' },
 ];
 
 const GLOBAL_BINDINGS: readonly Binding[] = [

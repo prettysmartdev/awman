@@ -4,9 +4,18 @@
 // distinct states are unit-tested exactly.
 import { DAEMON_START, DAEMON_STATUS, ENABLE_RECIPE, EXPECTED_ENDPOINT } from './recipe';
 import { linkCommand } from '../client/links';
-import type { ConnectState } from './controller';
+import { RECOVERY_COPY, type RecoveryState } from '../client/recovery';
+import type { ConnectNotice, ConnectState, SavedAuthorization } from './controller';
 
-export type ConnectAction = 'allow' | 'recheck' | 'connect' | 'cancel_link' | 'retry_link';
+export { RECOVERY_COPY, type RecoveryState } from '../client/recovery';
+
+/**
+ * `connect` is “Connect browser” (in `memory_only` it connects for this page
+ * only); `cancel_recovery` cancels a running reauthorization;
+ * `choose_credential` / `forget_credential` act on `view.choices`
+ * (controller.chooseCredential / forgetCredential).
+ */
+export type ConnectAction = 'allow' | 'recheck' | 'connect' | 'cancel_link' | 'retry_link' | 'cancel_recovery' | 'choose_credential' | 'forget_credential';
 
 export type ConnectViewKind =
   | 'starting'
@@ -20,7 +29,9 @@ export type ConnectViewKind =
   | 'ready_unlinked'
   | 'linking'
   | 'link_failed'
-  | 'connected';
+  | 'connected'
+  | 'choose_credential'
+  | Exclude<RecoveryState, 'restored' | 'other_primary' | 'resume_unavailable' | 'tab_closed' | 'terminal_view_only'>;
 
 export interface ConnectView {
   kind: ConnectViewKind;
@@ -39,6 +50,12 @@ export interface ConnectView {
   missing: string[];
   actions: ConnectAction[];
   busy: boolean;
+  /** The C7 state whose exact explanation is `body[0]`, if any (`restored` when connected by proof). */
+  notice: RecoveryState | null;
+  /** Saved authorizations to choose from (`choose_credential`): listener and expiry only. */
+  choices: SavedAuthorization[];
+  /** `rate_limited`: seconds until the automatic retry. */
+  retryAfterSec: number | null;
 }
 
 const BASE: Omit<ConnectView, 'kind' | 'title'> = {
@@ -50,6 +67,32 @@ const BASE: Omit<ConnectView, 'kind' | 'title'> = {
   missing: [],
   actions: [],
   busy: false,
+  notice: null,
+  choices: [],
+  retryAfterSec: null,
+};
+
+/** Headings for the connect-screen recovery states (the paragraph is the exact C7 text). */
+export const RECOVERY_TITLES: Readonly<Record<RecoveryState, string>> = {
+  reauthorizing: 'Reconnecting this browser…',
+  restored: 'Reconnected',
+  authorization_expired: 'Authorization expired',
+  authorization_revoked: 'Access revoked',
+  daemon_restarted: 'The daemon restarted',
+  daemon_stopped: 'The daemon stopped',
+  daemon_unreachable: 'awman did not answer',
+  other_primary: 'Open in another tab',
+  listener_changed: 'The listener changed',
+  listener_closed: 'The listener was closed',
+  origin_removed: 'This site is no longer allowed',
+  origin_mismatch: 'Saved for a different site',
+  authorization_unavailable: 'Could not reconnect this browser',
+  reauth_unsupported: 'Update awman to stay connected',
+  memory_only: 'This browser cannot stay connected',
+  resume_unavailable: 'Choose a workspace',
+  tab_closed: 'Tab closed',
+  terminal_view_only: 'View only',
+  rate_limited: 'Waiting to reconnect',
 };
 
 const STATUS_HINT = `Run \`${DAEMON_STATUS}\` to see each listener's address, features and any bind error. If the listener for this host uses a different port or failed to bind, fix that first: this app connects to ${EXPECTED_ENDPOINT}.`;
@@ -70,15 +113,72 @@ export function connectView(state: ConnectState): ConnectView {
         actions: ['allow'],
       };
     case 'probing':
-      return state.previous ? { ...connectView({ phase: 'probed', result: state.previous }), busy: true } : { ...BASE, kind: 'starting', title: 'Looking for awman on this machine…', busy: true };
+      return state.previous
+        ? { ...connectView({ phase: 'probed', result: state.previous, notice: state.notice ?? null }), busy: true }
+        : { ...BASE, kind: 'starting', title: 'Looking for awman on this machine…', busy: true };
     case 'connected':
-      return { ...BASE, kind: 'connected', title: 'Connected' };
+      return state.restored
+        ? { ...BASE, kind: 'connected', title: RECOVERY_TITLES.restored, body: [RECOVERY_COPY.restored], notice: 'restored' }
+        : { ...BASE, kind: 'connected', title: 'Connected' };
     case 'linking':
       return linkingView(state);
+    case 'reauthorizing':
+      return { ...BASE, kind: 'reauthorizing', title: RECOVERY_TITLES.reauthorizing, body: [RECOVERY_COPY.reauthorizing], notice: 'reauthorizing', actions: ['cancel_recovery'], busy: true };
+    case 'choose_credential':
+      return state.purpose === 'recover'
+        ? {
+            ...BASE,
+            kind: 'choose_credential',
+            title: 'Choose a saved authorization',
+            body: ['This browser holds more than one saved authorization for this daemon. Choose the one to reconnect with. No workspace is opened until you choose one.'],
+            choices: state.choices,
+            actions: ['choose_credential', 'forget_credential', 'connect'],
+          }
+        : {
+            ...BASE,
+            kind: 'choose_credential',
+            title: 'Forget a saved authorization',
+            body: ['This browser already holds the maximum of eight saved authorizations. Forget one before connecting this browser again. Forgetting does not revoke access that is already open in another tab.'],
+            choices: state.choices,
+            actions: ['forget_credential', 'recheck'],
+          };
     case 'probed':
       break;
   }
-  const result = state.result;
+  return state.notice ? withNotice(probedView(state.result), state.notice) : probedView(state.result);
+}
+
+/** Overlay a C7 explanation on the probe view, keeping its setup/repair guidance. */
+function withNotice(base: ConnectView, notice: ConnectNotice): ConnectView {
+  const state = notice.state;
+  const view: ConnectView = {
+    ...base,
+    kind: state as ConnectViewKind,
+    title: RECOVERY_TITLES[state],
+    body: [RECOVERY_COPY[state], ...base.body],
+    notice: state,
+    retryAfterSec: notice.retryAfterSec ?? null,
+  };
+  switch (state) {
+    case 'daemon_stopped':
+      return { ...view, startCommand: DAEMON_START, actions: ['recheck'] };
+    case 'daemon_unreachable':
+      return { ...view, statusHint: base.statusHint ?? STATUS_HINT, actions: base.actions.length ? base.actions : ['recheck'] };
+    case 'rate_limited':
+      return { ...view, body: [RECOVERY_COPY.rate_limited], actions: ['recheck'] };
+    case 'reauth_unsupported':
+      return { ...view, statusHint: `Run \`${DAEMON_STATUS}\` to see the daemon version.`, actions: ['recheck', 'connect'] };
+    case 'listener_changed':
+      return { ...view, actions: base.kind === 'ready_unlinked' ? ['recheck', 'connect'] : base.actions };
+    case 'listener_closed':
+    case 'origin_removed':
+      return { ...view, statusHint: base.statusHint ?? STATUS_HINT };
+    default:
+      return view;
+  }
+}
+
+function probedView(result: Extract<ConnectState, { phase: 'probed' }>['result']): ConnectView {
   switch (result.kind) {
     case 'unsupported':
       return {

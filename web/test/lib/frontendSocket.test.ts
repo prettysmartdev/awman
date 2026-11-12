@@ -3,8 +3,12 @@ import { encodeBase64 } from '@/lib/client/base64';
 import { GrantRevoked } from '@/lib/client/errors';
 import { BackpressureError, FrontendConnection, NotConnectedError, type HelloOptions } from '@/lib/client/frontendSocket';
 import type { EngineFrame, InstanceSnapshot } from '@/lib/client/types';
+import { RECOVERY_COPY } from '@/lib/client/recovery';
+import { DaemonClient } from '@/lib/client/daemonClient';
+import { HttpTransport } from '@/lib/client/http';
+import type { PrimaryLocker } from '@/lib/client/primaryLock';
 import type { FakeSocket} from './helpers';
-import { SocketHub, TICKET, fixture, flush, ticketClient } from './helpers';
+import { GRANT, SocketHub, TICKET, fixture, flush, ticketClient } from './helpers';
 
 const frames = fixture<(EngineFrame & { seq: number })[]>('engine-frames.json');
 const welcome = frames.find(f => f.type === 'welcome')!;
@@ -291,18 +295,32 @@ describe('FrontendConnection: endings', () => {
     expect(client.ticketCalls).toBe(1);
   });
 
-  it('close 1008 marks the grant revoked', async () => {
+  it('close 1008 with the daemon reason ends with exactly that state', async () => {
     const { hub, connection, client } = await setup();
     attach(hub.last);
-    hub.last.serverClose(1008);
-    expect(connection.closeReason).toEqual({ kind: 'revoked' });
+    hub.last.serverClose(1008, 'grant expired');
+    await flush();
+    expect(connection.closeReason).toEqual({ kind: 'auth_ended', state: 'authorization_expired' });
     expect(client.isRevoked).toBe(true);
-    expect(connection.store.get().ended).not.toBeNull();
+    expect(client.endState).toBe('authorization_expired');
+    expect(connection.store.get().ended?.reason).toBe(RECOVERY_COPY.authorization_expired);
+  });
+
+  it('an unexplained 1008 is classified, never assumed to be a revocation', async () => {
+    const { hub, connection, client } = await setup();
+    attach(hub.last);
+    hub.last.serverClose(1008, 'policy');
+    expect(connection.closeReason).toBeNull();
+    await new Promise(resolve => setTimeout(resolve, 300));
+    await flush();
+    // A keyless grant cannot be proven: it ends as unavailable, not "revoked".
+    expect(connection.closeReason).toEqual({ kind: 'auth_ended', state: 'authorization_unavailable' });
+    expect(client.endState).toBe('authorization_unavailable');
   });
 
   it('a revoked grant while fetching a ticket ends the connection', async () => {
     const { connection } = await setup({}, ticketClient([() => Promise.reject(new GrantRevoked())]));
-    expect(connection.closeReason).toEqual({ kind: 'revoked' });
+    expect(connection.closeReason).toEqual({ kind: 'auth_ended', state: 'authorization_unavailable' });
   });
 
   it('gives up after the 60 s web reconnect grace and marks the instance ended', async () => {
@@ -330,5 +348,149 @@ describe('FrontendConnection: endings', () => {
     connection.close('user');
     expect(hub.sockets[0]!.closed?.code).toBe(1000);
     expect(connection.state.get()).toBe('closed');
+  });
+});
+
+// WI 0160 C5: reload resume coordination, transient primary_exists, bfcache.
+describe('FrontendConnection: reload-safe primary resume', () => {
+  const BOUND = { ...GRANT, reauth: { credentialId: 'Z'.repeat(42) + 'E', daemonEpoch: 'Gs9c1yhW-SA6P6HLQUsNew', listenerEpoch: 'C0tOZXEBuALBXtZAsgmDCg' } };
+  function boundClient(): DaemonClient & { ticketCalls: number } {
+    const client = new DaemonClient(BOUND, new HttpTransport(async () => new Response('{}', { status: 500 }))) as DaemonClient & { ticketCalls: number };
+    client.ticketCalls = 0;
+    client.ticket = async () => {
+      client.ticketCalls += 1;
+      return TICKET;
+    };
+    return client;
+  }
+  function locker(held: Set<string>, supported = true) {
+    const names: string[] = [];
+    const released: string[] = [];
+    const value: PrimaryLocker = {
+      supported,
+      tryAcquire: async name => {
+        names.push(name);
+        if (held.has(name)) return null;
+        held.add(name);
+        return { release: () => { held.delete(name); released.push(name); } };
+      },
+    };
+    return { value, names, released };
+  }
+  class Target {
+    listeners = new Map<string, Set<(event: Event) => void>>();
+    addEventListener(type: string, fn: (event: Event) => void) { (this.listeners.get(type) ?? this.listeners.set(type, new Set()).get(type)!).add(fn); }
+    removeEventListener(type: string, fn: (event: Event) => void) { this.listeners.get(type)?.delete(fn); }
+    fire(type: string, event: object) { for (const fn of this.listeners.get(type) ?? []) fn(event as Event); }
+  }
+  async function resumeSetup(options: { held?: Set<string>; supported?: boolean; manual?: boolean } = {}) {
+    const hub = new SocketHub();
+    const clock = new Clock();
+    const lock = locker(options.held ?? new Set(), options.supported ?? true);
+    const win = new Target();
+    const doc = new Target();
+    const client = boundClient();
+    const connection = new FrontendConnection(
+      client,
+      SNAPSHOT.instance_id,
+      { role: 'primary', resumeFrontendId: 'frn_1', termSize: { cols: 120, rows: 40 }, ...(options.manual ? { manualResume: true } : {}) },
+      { socketFactory: hub.factory, now: () => clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer, locker: lock.value, lifecycle: { window: win, document: doc } },
+    );
+    await flush();
+    return { hub, clock, connection, client, lock, win, doc };
+  }
+  const LOCK = `awman-primary:${JSON.stringify(['Gs9c1yhW-SA6P6HLQUsNew', 'C0tOZXEBuALBXtZAsgmDCg', SNAPSHOT.instance_id])}`;
+
+  it('holds the epoch/instance lock, resumes the saved frontend and announces the restore once', async () => {
+    const { hub, connection, lock } = await resumeSetup();
+    expect(lock.names).toEqual([LOCK]);
+    attach(hub.last);
+    expect(hub.last.frames()[0]).toMatchObject({ type: 'hello', role: 'primary', resume: 'frn_1' });
+    expect(hub.last.frames()[0]).not.toHaveProperty('launch_context');
+    expect(connection.store.get().notices.map(n => n.text)).toEqual([RECOVERY_COPY.restored]);
+    connection.close('user');
+    expect(lock.released).toEqual([LOCK]);
+  });
+
+  it('retries the lock for up to five seconds (a reload can outrun the old document), then other_primary', async () => {
+    const held = new Set([LOCK]);
+    const { clock, connection, client, lock } = await resumeSetup({ held });
+    for (let i = 0; i < 20 && connection.closeReason === null; i++) await clock.advance(1000);
+    expect(lock.names.length).toBeGreaterThan(3);
+    expect(connection.closeReason).toEqual({ kind: 'other_primary' });
+    expect(connection.store.get().ended?.reason).toBe(RECOVERY_COPY.other_primary);
+    expect(client.ticketCalls).toBe(0);
+  });
+
+  it('acquires the lock as soon as the old document releases it', async () => {
+    const held = new Set([LOCK]);
+    const { clock, hub, client } = await resumeSetup({ held });
+    await clock.advance(200);
+    held.delete(LOCK);
+    for (let i = 0; i < 5 && !hub.sockets.length; i++) await clock.advance(1000);
+    expect(client.ticketCalls).toBe(1);
+    expect(hub.sockets).toHaveLength(1);
+  });
+
+  it('explicit Resume workspace asks the daemon even while another document holds the lock', async () => {
+    const { hub, client } = await resumeSetup({ held: new Set([LOCK]), manual: true });
+    expect(client.ticketCalls).toBe(1);
+    hub.last.open('awman.frontend.v1');
+    expect(hub.last.frames()[0]).toMatchObject({ resume: 'frn_1' });
+  });
+
+  it('without Web Locks never auto-resumes; the manual gesture still can', async () => {
+    const auto = await resumeSetup({ supported: false });
+    expect(auto.connection.closeReason).toEqual({ kind: 'other_primary' });
+    const manual = await resumeSetup({ supported: false, manual: true });
+    expect(manual.client.ticketCalls).toBe(1);
+  });
+
+  it('retries a transient primary_exists with fresh tickets and the same resume, for at most five seconds', async () => {
+    const { hub, clock, connection, client } = await resumeSetup();
+    for (let i = 0; i < 30 && connection.closeReason === null; i++) {
+      const socket = hub.last;
+      if (socket.readyState === 0) {
+        socket.open('awman.frontend.v1');
+        expect(socket.frames()[0]).toMatchObject({ resume: 'frn_1' });
+        socket.receive({ code: 'primary_exists', error: 'instance already has a primary' });
+        socket.serverClose(1005);
+      }
+      await clock.advance(500);
+    }
+    expect(connection.closeReason).toEqual({ kind: 'other_primary' });
+    expect(client.ticketCalls).toBeGreaterThan(2);
+    expect(hub.sockets.every(socket => socket.frames().every(frame => frame.type === 'hello' && frame.resume === 'frn_1'))).toBe(true);
+  });
+
+  it('a manual resume refused with primary_exists shows other_primary without retrying', async () => {
+    const { hub, clock, connection, client } = await resumeSetup({ held: new Set([LOCK]), manual: true });
+    hub.last.open('awman.frontend.v1');
+    hub.last.receive({ code: 'primary_exists', error: 'instance already has a primary' });
+    hub.last.serverClose(1005);
+    await clock.advance(5000);
+    expect(connection.closeReason).toEqual({ kind: 'other_primary' });
+    expect(client.ticketCalls).toBe(1);
+  });
+
+  it('a back/forward-cache restore drops unconfirmed work, never replays it, and resyncs from a new snapshot', async () => {
+    const { hub, clock, connection, win } = await resumeSetup();
+    attach(hub.last);
+    connection.send({ type: 'submit', tab_id: TAB, input: { source: 'command_box', raw: 'ls' }, pty_size: { cols: 80, rows: 24 } });
+    connection.send({ type: 'dialog_response', dialog_id: 'dlg_1', tab_id: TAB, response: { kind: 'yes_no', yes: true } } as never);
+    const first = hub.last;
+    win.fire('pageshow', { persisted: false });
+    expect(hub.sockets).toHaveLength(1);
+    win.fire('pageshow', { persisted: true });
+    expect(first.closed).not.toBeNull();
+    expect(connection.state.get()).toBe('reconnecting');
+    expect(() => connection.send({ type: 'activity', tab_id: TAB })).toThrow(NotConnectedError);
+    await clock.advance(1000);
+    attach(hub.last);
+    const resent = hub.last.frames().filter(frame => frame.type === 'submit' || frame.type === 'dialog_response');
+    expect(resent).toEqual([]);
+    const texts = connection.store.get().notices.map(n => n.text);
+    expect(texts.some(text => text.startsWith('Not confirmed'))).toBe(true);
+    expect(texts.filter(text => text === RECOVERY_COPY.restored)).toHaveLength(2);
   });
 });

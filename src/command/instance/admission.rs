@@ -38,6 +38,10 @@ pub enum AttachRefusal {
     /// 503 `instance_starting`: the instance could not be opened.
     #[error("instance failed to start: {0}")]
     StartFailed(String),
+    /// The browser grant the frontend attaches under ended before admission
+    /// completed (WI 0160). The socket closes with 1008 and the reason.
+    #[error("browser authorization ended: {}", .0.close_reason())]
+    GrantEnded(crate::data::browser_auth::GrantRevocationReason),
 }
 
 impl AttachRefusal {
@@ -51,6 +55,7 @@ impl AttachRefusal {
             Self::Draining => "feature_disabled",
             Self::InvalidAnnotation(_) => "invalid_annotation",
             Self::StartFailed(_) => "instance_start_failed",
+            Self::GrantEnded(_) => "browser_grant_invalid",
         }
     }
 }
@@ -95,6 +100,23 @@ impl Admitted {
             _ => FrontendRole::Primary,
         }
     }
+}
+
+/// WI 0160 C5: may this `Hello` resume a primary admitted under
+/// `recorded`? A primary `resume` must present the same authority (for a
+/// browser, the same grant ID; owner and API-key frontends carry none).
+/// Anything else is refused exactly like any other second primary. That the
+/// presented grant is still **live** is checked by the host, serialized with
+/// revocation, around this check and the lifecycle mutation.
+pub fn check_resume_authority<A: PartialEq + ?Sized>(
+    hello: &Hello,
+    recorded: Option<&A>,
+    presented: Option<&A>,
+) -> Result<(), AttachRefusal> {
+    if hello.role == FrontendRole::Primary && hello.resume.is_some() && recorded != presented {
+        return Err(AttachRefusal::PrimaryExists);
+    }
+    Ok(())
 }
 
 /// Decide one `Hello` against an instance's lifecycle, mutating it on
@@ -165,5 +187,104 @@ pub fn admit(
             lifecycle.attach_secondary(frontend_id.clone())?;
             Ok(Admitted::Secondary { frontend_id })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::annotations::Annotations;
+    use crate::data::frontend_protocol::{FrontendKindWire, TermSize, WEB_PRIMARY_RECONNECT_GRACE};
+    use crate::data::ids::LaunchContextId;
+    use std::time::Duration;
+
+    fn web_hello(resume: Option<FrontendId>) -> Hello {
+        Hello {
+            protocol: FRONTEND_SUBPROTOCOL.to_string(),
+            build: "test".into(),
+            kind: FrontendKindWire::Web,
+            role: FrontendRole::Primary,
+            annotations: Annotations::new(),
+            cwd: Default::default(),
+            argv: vec![],
+            env: Default::default(),
+            launch_context: resume.is_none().then(LaunchContextId::new),
+            term_size: TermSize { cols: 80, rows: 24 },
+            stdin_is_tty: false,
+            stdout_is_tty: false,
+            view: None,
+            resume,
+        }
+    }
+
+    /// The host's admission sequence: authority check, then lifecycle.
+    fn attach(
+        lifecycle: &mut FrontendLifecycle,
+        hello: &Hello,
+        recorded: Option<&str>,
+        presented: Option<&str>,
+        now: Instant,
+    ) -> Result<Admitted, AttachRefusal> {
+        check_resume_authority(hello, recorded, presented)?;
+        admit(hello, false, lifecycle, |_| true, now)
+    }
+
+    #[test]
+    fn only_the_admitting_grant_may_resume_a_web_primary_inside_its_grace() {
+        let start = Instant::now();
+        let mut lifecycle = FrontendLifecycle::reserved(start);
+        let first = attach(
+            &mut lifecycle,
+            &web_hello(None),
+            None,
+            Some("grant-a"),
+            start,
+        )
+        .unwrap();
+        let Admitted::StartingPrimary { frontend_id } = first else {
+            panic!("expected a starting primary")
+        };
+        let recorded = Some("grant-a");
+        // A connected primary is never displaced, even by its own grant.
+        let resume = web_hello(Some(frontend_id.clone()));
+        assert_eq!(
+            attach(&mut lifecycle, &resume, recorded, recorded, start),
+            Err(AttachRefusal::PrimaryExists)
+        );
+        let _ = lifecycle.disconnected(&frontend_id, start);
+        let inside = start + Duration::from_secs(1);
+        // Another grant (a newly re-linked browser) that knows the ID, and a
+        // non-browser caller, are refused like any second primary.
+        for presented in [Some("grant-b"), None] {
+            assert_eq!(
+                attach(&mut lifecycle, &resume, recorded, presented, inside),
+                Err(AttachRefusal::PrimaryExists)
+            );
+        }
+        // The same grant inside the grace resumes; only one winner.
+        assert!(matches!(
+            attach(&mut lifecycle, &resume, recorded, recorded, inside),
+            Ok(Admitted::ResumedPrimary { .. })
+        ));
+        assert_eq!(
+            attach(&mut lifecycle, &resume, recorded, recorded, inside),
+            Err(AttachRefusal::PrimaryExists)
+        );
+        // Outside the grace even the same grant cannot resume.
+        let _ = lifecycle.disconnected(&frontend_id, inside);
+        let late = inside + WEB_PRIMARY_RECONNECT_GRACE + Duration::from_secs(1);
+        assert!(attach(&mut lifecycle, &resume, recorded, recorded, late).is_err());
+    }
+
+    #[test]
+    fn non_resume_hellos_and_owner_frontends_are_unaffected() {
+        let hello = web_hello(None);
+        assert!(check_resume_authority(&hello, Some("grant-a"), Some("grant-b")).is_ok());
+        let mut tui = web_hello(Some(FrontendId::new()));
+        tui.kind = FrontendKindWire::Tui;
+        assert!(check_resume_authority::<str>(&tui, None, None).is_ok());
+        let mut secondary = web_hello(None);
+        secondary.role = FrontendRole::Secondary;
+        assert!(check_resume_authority(&secondary, Some("grant-a"), Some("grant-b")).is_ok());
     }
 }

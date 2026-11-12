@@ -59,6 +59,13 @@ constructors! {
     link_gone => ("link_gone", GONE),
     link_not_found => ("link_not_found", NOT_FOUND),
     rate_limited => ("rate_limited", TOO_MANY_REQUESTS),
+    // WI 0160 browser reauthorization.
+    credential_exists => ("credential_exists", CONFLICT),
+    daemon_restarted => ("daemon_restarted", CONFLICT),
+    listener_changed => ("listener_changed", CONFLICT),
+    reauth_failed => ("reauth_failed", UNAUTHORIZED),
+    authorization_expired => ("authorization_expired", FORBIDDEN),
+    authorization_revoked => ("authorization_revoked", FORBIDDEN),
     unauthorized => ("unauthorized", UNAUTHORIZED),
     forbidden_workdir => (failure_codes::FORBIDDEN_WORKDIR, FORBIDDEN),
     invalid_request => (failure_codes::INVALID_REQUEST, BAD_REQUEST),

@@ -27,7 +27,7 @@ describe('live countdown overlay', () => {
     const h = mount();
     expect(screen.queryByRole('button', { name: 'Cancel countdown' })).toBeNull();
     act(() => h.store.applyDelta({ delta: 'yolo', value: { tab_id: h.tab.tab_id, state: yolo('implement', 12) } }));
-    const overlay = screen.getByRole('dialog');
+    const overlay = document.querySelector<HTMLElement>('.embedded-banner')!;
     expect(within(overlay).getByText('Step: implement')).toBeTruthy();
     fireEvent.click(within(overlay).getByRole('button', { name: 'Cancel countdown' }));
     expect(h.send).toHaveBeenCalledWith({ type: 'cancel_countdown', tab_id: h.tab.tab_id, step_name: 'implement' });
@@ -59,10 +59,10 @@ describe('live countdown overlay', () => {
       h.store.applyDelta({ delta: 'slot_yolo', value: { tab_id: h.tab.tab_id, slot_id: 'slot_a', state: yolo('first') } });
       h.store.applyDelta({ delta: 'slot_yolo', value: { tab_id: h.tab.tab_id, slot_id: 'slot_b', state: yolo('second') } });
     });
-    expect(within(screen.getByRole('dialog')).getByText('Step: first')).toBeTruthy();
+    expect(within(document.querySelector<HTMLElement>('.embedded-banner')!).getByText('Step: first')).toBeTruthy();
     fireEvent.keyDown(document, { key: 's', ctrlKey: true });
-    expect(within(screen.getByRole('dialog')).getByText('Step: second')).toBeTruthy();
-    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel countdown' }));
+    expect(within(document.querySelector<HTMLElement>('.embedded-banner')!).getByText('Step: second')).toBeTruthy();
+    fireEvent.click(within(document.querySelector<HTMLElement>('.embedded-banner')!).getByRole('button', { name: 'Cancel countdown' }));
     expect(h.send).toHaveBeenLastCalledWith({ type: 'cancel_countdown', tab_id: h.tab.tab_id, step_name: 'second' });
     expect(answers(h.send)).toHaveLength(0);
   });
@@ -75,7 +75,7 @@ describe('live countdown overlay', () => {
       h.emit({ type: 'dialog_request', dialog_id: 'dlg_first', tab_id: h.tab.tab_id, request: { ...request('workflow_yolo_countdown'), step_name: 'first' } });
       h.emit({ type: 'dialog_request', dialog_id: 'dlg_second', tab_id: h.tab.tab_id, request: { ...request('workflow_yolo_countdown'), step_name: 'second' } });
     });
-    expect(within(screen.getByRole('dialog')).getByText('Step: second')).toBeTruthy();
+    expect(within(document.querySelector<HTMLElement>('.embedded-banner')!).getByText('Step: second')).toBeTruthy();
   });
 });
 

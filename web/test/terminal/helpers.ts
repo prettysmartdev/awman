@@ -77,6 +77,7 @@ export class FakeConnection {
     if (this.controlSubject.get().holder !== 'me') throw new Error('resize sent without holding control');
     this.resizeCalls.push({ cols, rows });
   }
+  cancelResize() {}
   takeControl() {
     this.takeControlCalls += 1;
     this.controlSubject.set({ holder: 'me', inputAllowed: true });

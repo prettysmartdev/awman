@@ -1,73 +1,63 @@
 'use client';
-
-// Responsive workspace skeleton (design §5.9). Desktop: tab bar, status row,
-// execution area with optional container/git/workflow panels, composer.
-// Narrow (<768 px): one panel at a time chosen from a bottom navigation
-// (Log / Agent / Workflow / Git / More) with a persistent active-agent chip.
-// Layout only: all content arrives through `slots` from the screens lane.
-import type { NarrowPanel, ShellSlots } from './panels';
+import { useEffect, useRef } from 'react';
+import type { InspectorKind, NarrowPanel, ShellSlots } from './panels';
 
 export interface ShellLayoutProps {
   slots: ShellSlots;
-  gitOpen: boolean;
-  workflowOpen: boolean;
+  inspector: InspectorKind;
   narrowPanel: NarrowPanel;
   onNarrowPanelChange(panel: NarrowPanel): void;
+  onInspectorClose(): void;
+  disabledPanels?: Partial<Record<NarrowPanel, string>>;
+  attention?: Partial<Record<NarrowPanel, boolean>>;
+  /**
+   * A nonmodal engine banner (the yolo countdown) is live. Escape is then
+   * decided by focus: it closes the inspector only while focus is inside it.
+   */
+  escapeNeedsFocus?: boolean;
 }
-
-const NARROW_ITEMS: { id: NarrowPanel; label: string }[] = [
-  { id: 'log', label: 'Log' },
-  { id: 'agent', label: 'Agent' },
-  { id: 'workflow', label: 'Workflow' },
-  { id: 'git', label: 'Git' },
-  { id: 'more', label: 'More' },
+/** The narrow layout shows one main panel at a time (shell.css). */
+export const NARROW_LAYOUT_QUERY = '(max-width: 767px)';
+export function isNarrowLayout(): boolean {
+  return typeof matchMedia === 'function' && matchMedia(NARROW_LAYOUT_QUERY).matches;
+}
+const ITEMS: { id: NarrowPanel; label: string }[] = [
+  { id: 'agent', label: 'Agent' }, { id: 'output', label: 'Output' },
+  { id: 'workflow', label: 'Workflow' }, { id: 'git', label: 'Git' }, { id: 'more', label: 'More' },
 ];
-
-export function ShellLayout({ slots, gitOpen, workflowOpen, narrowPanel, onNarrowPanelChange }: ShellLayoutProps) {
-  return (
-    <div className="shell" data-narrow-panel={narrowPanel}>
-      <header className="shell-tabs">{slots.tabBar}</header>
-      <div className="shell-status" role="status">
-        {slots.status}
-      </div>
-      {slots.activeAgent ? <div className="shell-agent-chip">{slots.activeAgent}</div> : null}
-      <div className="shell-body">
-        {workflowOpen && slots.workflow ? (
-          <aside className="shell-workflow" data-panel="workflow" aria-label="Workflow overview">
-            {slots.workflow}
-          </aside>
-        ) : null}
-        <main className="shell-main">
-          {slots.containers ? (
-            <section className="shell-containers" data-panel="agent" aria-label="Agents">
-              {slots.containers}
-            </section>
-          ) : null}
-          <section className="shell-execution" data-panel="log" aria-label="Execution log">
-            {slots.execution}
-          </section>
-        </main>
-        {gitOpen && slots.git ? (
-          <aside className="shell-git" data-panel="git" aria-label="Git changes">
-            {slots.git}
-          </aside>
-        ) : null}
-        <section className="shell-more" data-panel="more" aria-label="More">
-          {slots.shortcuts}
-        </section>
-      </div>
-      <footer className="shell-composer">{slots.composer}</footer>
-      <nav className="shell-narrow-nav" aria-label="Panels">
-        {NARROW_ITEMS.map(item => (
-          <button key={item.id} type="button" aria-pressed={narrowPanel === item.id} onClick={() => onNarrowPanelChange(item.id)}>
-            {item.label}
-          </button>
-        ))}
-      </nav>
-      {slots.dialogs}
-      <div className="shell-notices" aria-live="polite">
-        {slots.notices}
-      </div>
+export function ShellLayout({ slots, inspector, narrowPanel, onNarrowPanelChange, onInspectorClose, attention, disabledPanels, escapeNeedsFocus = false }: ShellLayoutProps) {
+  const drawer = useRef<HTMLElement>(null);
+  const close = useRef(onInspectorClose); close.current = onInspectorClose;
+  const needsFocus = useRef(escapeNeedsFocus); needsFocus.current = escapeNeedsFocus;
+  useEffect(() => {
+    if (!inspector) return;
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    // Nonmodal drawer: no focus trap; the stage and composer stay reachable.
+    const node = drawer.current; node?.focus();
+    const escape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented || document.querySelector('[aria-modal=true]')) return;
+      // Queue owns its lease-aware dismissal; its embedded Modal handles Esc.
+      if (inspector === 'queue') return;
+      if (needsFocus.current && !node?.contains(document.activeElement)) return;
+      close.current(); event.preventDefault();
+    };
+    document.addEventListener('keydown', escape);
+    return () => { document.removeEventListener('keydown', escape); if (previous?.isConnected && (document.activeElement === document.body || node?.contains(document.activeElement))) previous.focus(); };
+  }, [inspector]);
+  return <div className="shell" data-narrow-panel={narrowPanel} data-inspector={inspector ?? 'none'}>
+    <header className="shell-app-bar glass">{slots.appBar}</header>
+    <div className="shell-context-bar glass">{slots.contextBar}</div>
+    <div className="shell-agent-chip glass">{slots.activeAgent}</div>
+    <div className="shell-body">
+      <main className="shell-stage" aria-label="Workspace stage">{slots.stage}</main>
+      {inspector && <aside className="shell-inspector" aria-label={`${inspector} inspector`} tabIndex={-1} ref={drawer}>
+        {slots.inspector}
+      </aside>}
+      <section className="shell-more" aria-label="More workspace actions">{slots.more}</section>
     </div>
-  );
+    <footer className="shell-composer">{slots.composer}</footer>
+    <nav className="shell-narrow-nav glass" aria-label="Panels">{ITEMS.map(item => <button key={item.id} type="button" disabled={!!disabledPanels?.[item.id]} title={disabledPanels?.[item.id]} aria-pressed={narrowPanel === item.id} onClick={() => onNarrowPanelChange(item.id)}>{item.label}{attention?.[item.id] && <span aria-label="Needs attention"> ●</span>}</button>)}</nav>
+    {slots.dialogs}
+    <div className="shell-notices" aria-live="polite">{slots.notices}</div>
+  </div>;
 }

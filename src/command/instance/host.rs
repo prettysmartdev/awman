@@ -51,7 +51,7 @@ use crate::data::frontend_protocol::{
     FrontendKindWire, FrontendRole, Hello, OpenTabOptions, ProtocolError, Seq, SubmitInput,
     TabKindWire, TermSize, UiOutcome, UiRequest, FRONTEND_SUBPROTOCOL,
 };
-use crate::data::ids::{DialogId, FrontendId, InstanceId, TabId, TerminalId};
+use crate::data::ids::{BrowserGrantId, DialogId, FrontendId, InstanceId, TabId, TerminalId};
 use crate::data::instance_snapshot::{
     AnnotationTarget, DialogAnswerOutcome, FrontendSummary, InstanceDelta, InstanceDetail,
     InstanceSnapshot, InstanceSummary, PendingDialog, SquadHealthWire, TabSnapshot,
@@ -60,6 +60,7 @@ use crate::data::message::MessageLevel;
 use crate::data::session::SessionOpenOptions;
 use crate::data::session_manager::SessionManager;
 use crate::data::wire::{Cursor, List, Page};
+use crate::engine::auth::browser_grants::GrantWatch;
 use crate::engine::daemon::executor::SharedExecutor;
 use crate::engine::daemon::features::engine::{EngineActivity, EngineHost, EngineStopReason};
 use crate::engine::terminal_hub::TerminalHub;
@@ -298,6 +299,10 @@ struct InstanceState {
     annotations: Annotations,
     context_roots: Vec<PathBuf>,
     primary_kind: Option<FrontendKindWire>,
+    /// WI 0160 C5: the authority (a browser grant ID) that admitted the
+    /// current primary. A resume must present the same authority; owner
+    /// and API-key frontends carry none.
+    primary_authority: Option<BrowserGrantId>,
     frontends: Vec<FrontendRecord>,
     tabs: Vec<TabRelay>,
     pending: Vec<PendingDialog>,
@@ -382,6 +387,18 @@ thread_local! {
     /// `AnnotationTarget::Instance` write knows which instance it means.
     static PRESENTER_SCOPE: std::cell::RefCell<Option<InstanceId>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` while a browser frontend's grant is live, serialized with its
+/// revocation and expiry; owner and API-key frontends (`None`) always run.
+fn while_authorized<T>(
+    authority: Option<&GrantWatch>,
+    f: impl FnOnce() -> T,
+) -> Result<T, AttachRefusal> {
+    match authority {
+        Some(grant) => grant.while_live(f).map_err(AttachRefusal::GrantEnded),
+        None => Ok(f()),
+    }
 }
 
 fn with_presenter_scope<T>(instance: &InstanceId, f: impl FnOnce() -> T) -> T {
@@ -583,6 +600,7 @@ impl EngineInstanceHost {
                 annotations,
                 context_roots: vec![],
                 primary_kind: None,
+                primary_authority: None,
                 frontends: Vec::new(),
                 tabs: Vec::new(),
                 pending: Vec::new(),
@@ -1001,121 +1019,73 @@ impl EngineInstanceHost {
         hello: Hello,
         outbound: tokio::sync::mpsc::Sender<EngineFrame>,
     ) -> Result<FrontendSession, AttachRefusal> {
+        self.attach_frontend_as(id, hello, outbound, None).await
+    }
+
+    /// [`Self::attach_frontend`] for an authenticated caller (WI 0160 C5).
+    /// `authority` is the live grant of a browser frontend, `None` for owner
+    /// and API-key frontends. A new primary records the grant ID atomically
+    /// with admission; a primary `resume` must present the same grant or is
+    /// refused as `primary_exists`, before any `Welcome`.
+    ///
+    /// A browser grant must still be live at every step that changes the
+    /// instance: the lifecycle mutation and the `Welcome` run under the
+    /// instance lock *and* [`GrantWatch::while_live`] (serialized with
+    /// revocation and expiry), and the grant is checked again right before
+    /// a first primary opens the instance. A grant that ended first gets
+    /// [`AttachRefusal::GrantEnded`] and no `Welcome`.
+    pub async fn attach_frontend_as(
+        &self,
+        id: InstanceId,
+        hello: Hello,
+        outbound: tokio::sync::mpsc::Sender<EngineFrame>,
+        authority: Option<GrantWatch>,
+    ) -> Result<FrontendSession, AttachRefusal> {
         let hosted = self.find(&id).ok_or(AttachRefusal::NotFound)?;
+        let authority = authority.as_ref();
         let admitted = {
             let mut state = hosted.state();
-            let draining = self.draining.load(Ordering::SeqCst);
-            let tab_ids: Vec<TabId> = state.tabs.iter().map(|t| t.tab_id().clone()).collect();
-            if (hello.resume.is_some() && state.primary_kind != Some(hello.kind))
-                || (hello.kind == FrontendKindWire::Web
-                    && hello.role == FrontendRole::Secondary
-                    && state.primary_kind != Some(FrontendKindWire::Web))
-            {
-                return Err(AttachRefusal::ProtocolError(
-                    "frontend kind does not match the instance".into(),
-                ));
-            }
-            admit(
-                &hello,
-                draining,
-                &mut state.lifecycle,
-                |tab| tab_ids.contains(tab),
-                Instant::now(),
-            )?
+            while_authorized(authority, || {
+                let admitted =
+                    self.admit_locked(&mut state, &hello, authority.map(|g| g.grant_id()))?;
+                // Nothing to open: Welcome in the same critical section, so
+                // the grant cannot end between admission and Welcome.
+                if !matches!(admitted, Admitted::StartingPrimary { .. }) {
+                    self.welcome_locked(&hosted, &mut state, &hello, &outbound, &admitted);
+                }
+                Ok::<_, AttachRefusal>(admitted)
+            })??
         };
         if let Admitted::StartingPrimary { .. } = admitted {
+            // Last check before the instance opens (start cannot run under
+            // a lock). An ended grant leaves nothing started.
+            if let Some(reason) = authority.and_then(GrantWatch::check_now) {
+                self.end_unwelcomed(&hosted, QuitReason::NeverAttached);
+                return Err(AttachRefusal::GrantEnded(reason));
+            }
             match self.start_instance(&hosted, &hello).await {
                 Ok(outbox) => self.dispatch_presenter_events(&id, outbox),
                 Err(error) => {
-                    let mut state = hosted.state();
-                    self.end_locked(
-                        &hosted,
-                        &mut state,
-                        QuitReason::NeverAttached,
-                        &mut Outbox::default(),
-                    );
-                    drop(state);
-                    self.forget_ended();
+                    self.end_unwelcomed(&hosted, QuitReason::NeverAttached);
                     return Err(AttachRefusal::StartFailed(error.to_string()));
                 }
+            }
+            let welcomed = {
+                let mut state = hosted.state();
+                while_authorized(authority, || {
+                    self.welcome_locked(&hosted, &mut state, &hello, &outbound, &admitted)
+                })
+            };
+            if let Err(refusal) = welcomed {
+                // The grant ended while the instance opened: its primary
+                // never gets a Welcome, so the instance ends as if that
+                // primary were lost.
+                self.end_unwelcomed(&hosted, QuitReason::PrimaryLost);
+                return Err(refusal);
             }
         }
         let frontend_id = admitted.frontend_id().clone();
         let role = admitted.role();
-        {
-            let mut state = hosted.state();
-            let summary = FrontendSummary {
-                frontend_id: frontend_id.clone(),
-                kind: hello.kind,
-                role,
-                annotations: hello.annotations.clone(),
-                connected_at: Utc::now(),
-                view: hello.view.clone(),
-                reconnecting: false,
-            };
-            match state
-                .frontends
-                .iter_mut()
-                .find(|f| f.summary.frontend_id == frontend_id)
-            {
-                // The primary back within its grace keeps its id.
-                Some(record) => {
-                    record.summary.reconnecting = false;
-                    record.outbound = Some(outbound.clone());
-                    record.term_size = hello.term_size;
-                }
-                None => {
-                    state.broadcast(
-                        &EngineFrame::Delta(InstanceDelta::FrontendAttached(summary.clone())),
-                        None,
-                    );
-                    state.frontends.push(FrontendRecord {
-                        summary,
-                        outbound: Some(outbound.clone()),
-                        term_size: hello.term_size,
-                    });
-                }
-            }
-            if role == FrontendRole::Primary {
-                state.primary_kind = Some(hello.kind);
-            }
-            state.send_to(
-                &frontend_id,
-                EngineFrame::Welcome {
-                    frontend_id: frontend_id.clone(),
-                    instance_id: id.clone(),
-                    protocol: FRONTEND_SUBPROTOCOL.to_string(),
-                    build: self.build.clone(),
-                    role,
-                },
-            );
-            let snapshot = Self::snapshot_of(&hosted, &state);
-            match chunk_snapshot(&snapshot) {
-                Ok(frames) => {
-                    for frame in frames {
-                        state.send_to(&frontend_id, frame);
-                    }
-                }
-                Err(error) => state.send_to(
-                    &frontend_id,
-                    EngineFrame::Notice {
-                        level: MessageLevel::Error,
-                        text: format!("instance snapshot unavailable: {error}"),
-                    },
-                ),
-            }
-            if role == FrontendRole::Primary {
-                for text in std::mem::take(&mut state.notices) {
-                    state.send_to(
-                        &frontend_id,
-                        EngineFrame::Notice {
-                            level: MessageLevel::Info,
-                            text,
-                        },
-                    );
-                }
-            }
-        }
         tracing::info!(
             instance = %id,
             frontend = %frontend_id,
@@ -1130,6 +1100,135 @@ impl EngineInstanceHost {
             role,
             done: false,
         })
+    }
+
+    /// The admission decision under the instance lock: kind, resume
+    /// authority, then the lifecycle mutation (and, for a first primary,
+    /// recording the grant that admitted it).
+    fn admit_locked(
+        &self,
+        state: &mut InstanceState,
+        hello: &Hello,
+        grant: Option<&BrowserGrantId>,
+    ) -> Result<Admitted, AttachRefusal> {
+        let draining = self.draining.load(Ordering::SeqCst);
+        let tab_ids: Vec<TabId> = state.tabs.iter().map(|t| t.tab_id().clone()).collect();
+        if (hello.resume.is_some() && state.primary_kind != Some(hello.kind))
+            || (hello.kind == FrontendKindWire::Web
+                && hello.role == FrontendRole::Secondary
+                && state.primary_kind != Some(FrontendKindWire::Web))
+        {
+            return Err(AttachRefusal::ProtocolError(
+                "frontend kind does not match the instance".into(),
+            ));
+        }
+        // C5: only the grant that admitted the primary may resume it. Same
+        // refusal as any other second primary.
+        super::admission::check_resume_authority(hello, state.primary_authority.as_ref(), grant)?;
+        let admitted = admit(
+            hello,
+            draining,
+            &mut state.lifecycle,
+            |tab| tab_ids.contains(tab),
+            Instant::now(),
+        )?;
+        if let Admitted::StartingPrimary { .. } = admitted {
+            state.primary_authority = grant.cloned();
+        }
+        Ok(admitted)
+    }
+
+    /// End an instance whose admitted primary never got its `Welcome`.
+    fn end_unwelcomed(&self, hosted: &HostedInstance, reason: QuitReason) {
+        let mut state = hosted.state();
+        self.end_locked(hosted, &mut state, reason, &mut Outbox::default());
+        drop(state);
+        self.forget_ended();
+    }
+
+    /// Register an admitted frontend and send its `Welcome`, snapshot and
+    /// pending notices. Caller holds the instance lock.
+    fn welcome_locked(
+        &self,
+        hosted: &HostedInstance,
+        state: &mut InstanceState,
+        hello: &Hello,
+        outbound: &tokio::sync::mpsc::Sender<EngineFrame>,
+        admitted: &Admitted,
+    ) {
+        let frontend_id = admitted.frontend_id().clone();
+        let role = admitted.role();
+        let summary = FrontendSummary {
+            frontend_id: frontend_id.clone(),
+            kind: hello.kind,
+            role,
+            annotations: hello.annotations.clone(),
+            connected_at: Utc::now(),
+            view: hello.view.clone(),
+            reconnecting: false,
+        };
+        match state
+            .frontends
+            .iter_mut()
+            .find(|f| f.summary.frontend_id == frontend_id)
+        {
+            // The primary back within its grace keeps its id.
+            Some(record) => {
+                record.summary.reconnecting = false;
+                record.outbound = Some(outbound.clone());
+                record.term_size = hello.term_size;
+            }
+            None => {
+                state.broadcast(
+                    &EngineFrame::Delta(InstanceDelta::FrontendAttached(summary.clone())),
+                    None,
+                );
+                state.frontends.push(FrontendRecord {
+                    summary,
+                    outbound: Some(outbound.clone()),
+                    term_size: hello.term_size,
+                });
+            }
+        }
+        if role == FrontendRole::Primary {
+            state.primary_kind = Some(hello.kind);
+        }
+        state.send_to(
+            &frontend_id,
+            EngineFrame::Welcome {
+                frontend_id: frontend_id.clone(),
+                instance_id: hosted.id.clone(),
+                protocol: FRONTEND_SUBPROTOCOL.to_string(),
+                build: self.build.clone(),
+                role,
+            },
+        );
+        let snapshot = Self::snapshot_of(hosted, state);
+        match chunk_snapshot(&snapshot) {
+            Ok(frames) => {
+                for frame in frames {
+                    state.send_to(&frontend_id, frame);
+                }
+            }
+            Err(error) => state.send_to(
+                &frontend_id,
+                EngineFrame::Notice {
+                    level: MessageLevel::Error,
+                    text: format!("instance snapshot unavailable: {error}"),
+                },
+            ),
+        }
+        if role == FrontendRole::Primary {
+            for text in std::mem::take(&mut state.notices) {
+                state.send_to(
+                    &frontend_id,
+                    EngineFrame::Notice {
+                        level: MessageLevel::Info,
+                        text,
+                    },
+                );
+            }
+        }
     }
 
     /// Open the instance for its primary and its first tab, exactly as
@@ -2512,6 +2611,261 @@ impl std::fmt::Debug for EngineInstanceHost {
         f.debug_struct("EngineInstanceHost")
             .field("instances", &self.instance_count())
             .finish_non_exhaustive()
+    }
+}
+
+/// Hosts for unit tests: a real [`EngineInstanceHost`] whose opener never
+/// opens anything and counts how often it was asked to.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Default)]
+    pub(crate) struct RefusingOpener {
+        pub(crate) opened: AtomicUsize,
+    }
+
+    impl InstanceOpener for RefusingOpener {
+        fn open(&self, _: OpenInstanceRequest) -> Result<OpenedInstance, CommandError> {
+            self.opened.fetch_add(1, Ordering::SeqCst);
+            Err(CommandError::Other("test opener opens nothing".into()))
+        }
+    }
+
+    pub(crate) fn host(opener: Arc<RefusingOpener>) -> Arc<EngineInstanceHost> {
+        EngineInstanceHost::new(HostParts {
+            hub: Arc::new(TerminalHub::new(
+                crate::engine::terminal_hub::TerminalHubConfig::default(),
+            )),
+            catalogue: CommandCatalogue::get(),
+            registry: crate::command::integrations::IntegrationRegistry::compiled_in(),
+            opener,
+            executor: None,
+            build: "test".into(),
+        })
+    }
+
+    /// A first web primary `Hello`.
+    pub(crate) fn web_primary_hello() -> Hello {
+        Hello {
+            protocol: FRONTEND_SUBPROTOCOL.to_string(),
+            build: "test".into(),
+            kind: FrontendKindWire::Web,
+            role: FrontendRole::Primary,
+            annotations: Annotations::new(),
+            cwd: Default::default(),
+            argv: vec![],
+            env: Default::default(),
+            launch_context: Some(crate::data::ids::LaunchContextId::new()),
+            term_size: crate::data::frontend_protocol::TermSize { cols: 80, rows: 24 },
+            stdin_is_tty: false,
+            stdout_is_tty: false,
+            view: None,
+            resume: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod admission_authority_tests {
+    use super::test_support::{host, web_primary_hello, RefusingOpener};
+    use super::*;
+    use crate::data::browser_auth::{BrowserScope, GrantRevocationReason};
+    use crate::engine::auth::browser_grants::{BrowserGrantStore, ManualClock, SamplePoint};
+
+    struct Fixture {
+        _sandbox: awman_test_support::TestSandbox,
+        clock: Arc<ManualClock>,
+        grants: Arc<BrowserGrantStore>,
+        opener: Arc<RefusingOpener>,
+        host: Arc<EngineInstanceHost>,
+        instance: InstanceId,
+    }
+
+    fn fixture(id: &'static str) -> (Fixture, GrantWatch) {
+        let sandbox =
+            awman_test_support::TestSandbox::for_test(awman_test_support::TestCase::component(id));
+        let clock = ManualClock::new();
+        let path = sandbox.work().join("daemon").join("grants.json");
+        let grants = BrowserGrantStore::open(path).unwrap();
+        grants.set_clock(clock.clone());
+        let (now, _) =
+            crate::engine::auth::browser_grants::GrantClock::sample(&*clock, SamplePoint::Ordinary);
+        let (record, _) = grants
+            .create(
+                "http://127.0.0.1:3000",
+                "l",
+                BrowserScope::Engine,
+                None,
+                now,
+            )
+            .unwrap();
+        let watch = grants.watch(&record.id).unwrap();
+        let opener = Arc::new(RefusingOpener::default());
+        let host = host(opener.clone());
+        let instance = host.create_instance(Annotations::new()).unwrap();
+        (
+            Fixture {
+                _sandbox: sandbox,
+                clock,
+                grants,
+                opener,
+                host,
+                instance,
+            },
+            watch,
+        )
+    }
+
+    impl Fixture {
+        fn opened(&self) -> usize {
+            self.opener.opened.load(Ordering::SeqCst)
+        }
+        fn started(&self) -> bool {
+            self.host
+                .find(&self.instance)
+                .is_some_and(|i| i.state().lifecycle.started())
+        }
+        async fn attach(&self, watch: GrantWatch) -> Result<FrontendSession, AttachRefusal> {
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            self.host
+                .attach_frontend_as(self.instance.clone(), web_primary_hello(), tx, Some(watch))
+                .await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_grant_reaches_instance_start() {
+        // Positive control: with a live grant the same call path passes
+        // admission and goes on to start the instance (which fails here:
+        // the test registered no launch context).
+        let (f, watch) = fixture("command::instance::host::admission_authority_tests::a_live_grant_reaches_instance_start");
+        assert!(matches!(
+            f.attach(watch).await,
+            Err(AttachRefusal::StartFailed(_))
+        ));
+        assert!(
+            f.host.find(&f.instance).is_none(),
+            "the failed start ended it"
+        );
+    }
+
+    #[test]
+    fn revocation_while_admission_waits_for_the_instance_lock_admits_nothing() {
+        // Built outside a runtime, so no pump task touches the instance.
+        let (f, watch) = fixture("command::instance::host::admission_authority_tests::revocation_while_admission_waits_for_the_instance_lock_admits_nothing");
+        let grant = watch.grant_id().clone();
+        let hosted = f.host.find(&f.instance).unwrap();
+        let unclaimed = Arc::strong_count(&hosted);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let held = hosted.state();
+        let attaching = runtime.spawn({
+            let host = f.host.clone();
+            let instance = f.instance.clone();
+            async move {
+                let (tx, _rx) = tokio::sync::mpsc::channel(64);
+                host.attach_frontend_as(instance, web_primary_hello(), tx, Some(watch))
+                    .await
+                    .map(|_| ())
+            }
+        });
+        // Admission found the instance (holding a reference) and now waits
+        // for its lock.
+        awman_test_support::wait_for(
+            "admission to wait for the instance lock",
+            Duration::from_secs(5),
+            || (Arc::strong_count(&hosted) > unclaimed).then_some(()),
+        );
+        f.grants
+            .delete(&grant, GrantRevocationReason::Deleted)
+            .unwrap();
+        drop(held);
+        assert_eq!(
+            runtime.block_on(attaching).unwrap(),
+            Err(AttachRefusal::GrantEnded(GrantRevocationReason::Deleted))
+        );
+        assert_eq!(f.opened(), 0);
+        assert!(!f.started(), "no lifecycle mutation");
+        assert!(hosted.state().primary_authority.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expiry_observed_at_the_admission_check_admits_nothing() {
+        let (f, watch) = fixture("command::instance::host::admission_authority_tests::expiry_observed_at_the_admission_check_admits_nothing");
+        f.clock.jump_at(
+            SamplePoint::Admission,
+            chrono::Duration::hours(13),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            f.attach(watch.clone()).await.map(|_| ()),
+            Err(AttachRefusal::GrantEnded(GrantRevocationReason::Expired))
+        );
+        assert_eq!(f.opened(), 0);
+        assert!(!f.started());
+        // Final, even back on the original clock.
+        f.clock.jump_wall(-chrono::Duration::hours(13));
+        assert_eq!(watch.check_now(), Some(GrantRevocationReason::Expired));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expiry_after_admission_and_before_start_never_opens_the_instance() {
+        let (f, watch) = fixture("command::instance::host::admission_authority_tests::expiry_after_admission_and_before_start_never_opens_the_instance");
+        // Admission samples at `Admission`; the next ordinary sample is the
+        // last check before the instance opens.
+        f.clock.jump_at(
+            SamplePoint::Ordinary,
+            chrono::Duration::hours(13),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            f.attach(watch).await.map(|_| ()),
+            Err(AttachRefusal::GrantEnded(GrantRevocationReason::Expired))
+        );
+        assert_eq!(f.opened(), 0);
+        assert!(f.host.find(&f.instance).is_none(), "the reservation ended");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resume_needs_the_same_live_grant() {
+        let (f, watch) = fixture("command::instance::host::admission_authority_tests::a_resume_needs_the_same_live_grant");
+        let grant = watch.grant_id().clone();
+        let hosted = f.host.find(&f.instance).unwrap();
+        // A primary admitted under `grant`, now inside its reconnect grace.
+        let resume = {
+            let mut state = hosted.state();
+            let admitted = f
+                .host
+                .admit_locked(&mut state, &web_primary_hello(), Some(&grant))
+                .unwrap();
+            let _ = state
+                .lifecycle
+                .disconnected(admitted.frontend_id(), Instant::now());
+            state.primary_kind = Some(FrontendKindWire::Web);
+            let mut resume = web_primary_hello();
+            resume.launch_context = None;
+            resume.resume = Some(admitted.frontend_id().clone());
+            resume
+        };
+        {
+            f.grants
+                .delete(&grant, GrantRevocationReason::Deleted)
+                .unwrap();
+            let (tx, _rx) = tokio::sync::mpsc::channel(64);
+            assert_eq!(
+                f.host
+                    .attach_frontend_as(f.instance.clone(), resume, tx, Some(watch))
+                    .await
+                    .map(|_| ()),
+                Err(AttachRefusal::GrantEnded(GrantRevocationReason::Deleted))
+            );
+            assert!(hosted.state().lifecycle.reconnecting().is_some());
+        }
     }
 }
 

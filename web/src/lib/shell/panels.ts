@@ -69,20 +69,17 @@ export interface FocusReport {
 /** Shell-level handler for keymap actions; return false to decline. */
 export type ActionHandler = (action: WebAction) => boolean | undefined;
 
-/** Named regions of the layout (see ShellLayout). */
+/** Shell presentation only; engine dialogs remain in their original order. */
 export interface ShellSlots {
-  tabBar: ReactNode;
-  status: ReactNode;
-  execution: ReactNode;
+  appBar: ReactNode;
+  contextBar: ReactNode;
+  stage: ReactNode;
+  inspector?: ReactNode;
   composer: ReactNode;
-  containers?: ReactNode;
-  git?: ReactNode;
-  workflow?: ReactNode;
   dialogs?: ReactNode;
   notices?: ReactNode;
-  shortcuts?: ReactNode;
-  /** Narrow viewports: persistent "active agent" chip (design §5.9). */
   activeAgent?: ReactNode;
+  more?: ReactNode;
 }
-
-export type NarrowPanel = 'log' | 'agent' | 'workflow' | 'git' | 'more';
+export type InspectorKind = 'workflow' | 'git' | 'queue' | null;
+export type NarrowPanel = 'output' | 'agent' | 'workflow' | 'git' | 'more';

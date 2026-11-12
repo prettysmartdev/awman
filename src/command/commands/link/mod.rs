@@ -122,7 +122,13 @@ impl super::Command for LinkCommand {
                         })
                         .collect::<String>()
                 };
-                say(&mut *f, format!("Browser link request {code}\n  origin:   {}\n  listener: {} ({}, {})\n  scope:    engine\n  expires:  in {}m{}s\nApprove this browser? [y/N]", safe(view["origin"].as_str().unwrap_or("")), safe(listener), details["listen"].as_str().unwrap_or("unknown"), details["transport"].as_str().unwrap_or("loopback_http"), expiry/60, expiry%60));
+                // WI 0160: a key-bound link can be recovered after reload.
+                let reconnect = if view["reauth"].is_object() {
+                    "This browser may reconnect without another approval until this authorization expires, for up to 12 hours.\n"
+                } else {
+                    ""
+                };
+                say(&mut *f, format!("Browser link request {code}\n  origin:   {}\n  listener: {} ({}, {})\n  scope:    engine\n  expires:  in {}m{}s\n{reconnect}Approve this browser? [y/N]", safe(view["origin"].as_str().unwrap_or("")), safe(listener), details["listen"].as_str().unwrap_or("unknown"), details["transport"].as_str().unwrap_or("loopback_http"), expiry/60, expiry%60));
                 let approve = f.confirm()?;
                 client
                     .call(&Request {

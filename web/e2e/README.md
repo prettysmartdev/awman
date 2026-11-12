@@ -43,6 +43,26 @@ Specs:
   screen's recipe states (daemon stopped, engine off, listener off) and the
   recheck and link initiation controls. It fails explicitly if `web/out` is
   absent.
+- `layout.spec.ts` has two parts. The synthetic states check the production
+  stylesheet against static markup for connect, picker, workspace, concurrent
+  agents, long output and an open dialog at 1280×720, 1440×900, 1024×768,
+  768×1024 and 390×844 (overflow, control collisions, primary visibility,
+  terminal columns, touch targets, keyboard reach, dark mode, reduced motion,
+  opaque-surface contrast). The `real workspace` tests mount the production
+  `Workspace`, `Panels`, `TerminalPanel`, `TerminalView` and `Composer`
+  (`workspace-fixture.ts`: esbuild from `web/node_modules`, the production
+  global stylesheet, the shipped terminal WASM core and the exact production
+  CSP). Only the engine connection (an in-memory store fed from the recorded
+  snapshot fixture) and `TerminalConnection` (a recording fake with the real
+  150 ms resize debounce) are fakes. They assert terminal rows from the real
+  viewport and cell probe (≥24 at the four desktop/tablet sizes, ≥12 at
+  390×844), one header row, the touch key bar only on coarse pointers, that
+  menus, composer focus, suggestions, notices, countdowns and terminal errors
+  send no resize, notice expiry, focus never moving into the terminal, Tab and
+  Ctrl+], whole focus rings, short viewports and 200% zoom (640×360, 720×450,
+  512×384, 844×390), and that terminal connections survive agent, tab and
+  frontend-socket switches. No screenshots are written. The separate
+  `terminal-resize.spec.ts` retains the real daemon and PTY transport checks.
 - `csp.spec.ts` serves the app under the exact production Content Security
   Policy from `web/edge/src/security.ts`: the shipped terminal WASM core must
   compile, the same core must be refused without `'wasm-unsafe-eval'` (negative
