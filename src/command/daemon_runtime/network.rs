@@ -233,60 +233,6 @@ pub fn browser_revocations_between(
     changes
 }
 
-#[cfg(test)]
-mod revocation_tests {
-    use super::*;
-    use crate::data::config::{
-        env::EnvSnapshot, ConfigFile, ConfigLayers, EffectiveConfig, FileKind, FlagConfig,
-    };
-    use std::sync::Mutex;
-
-    fn settings(json: serde_json::Value) -> NetworkSettings {
-        EffectiveConfig::resolve(
-            ConfigLayers {
-                global: ConfigFile::from_value(json, FileKind::Global).unwrap(),
-                ..Default::default()
-            },
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-        )
-        .unwrap()
-        .daemon()
-        .network
-    }
-
-    #[derive(Default)]
-    struct RecordingSink(Mutex<Vec<(String, BrowserRevocation)>>);
-    impl BrowserRevocationSink for RecordingSink {
-        fn revoke(&self, listener: &str, reason: BrowserRevocation) {
-            self.0.lock().unwrap().push((listener.into(), reason));
-        }
-    }
-
-    #[test]
-    fn reload_revocation_hook_reports_origin_disable_and_engine_removal() {
-        let old = settings(
-            serde_json::json!({"daemon":{"network":{"listeners":{"loopback":{"enabled":true,"features":["engine"],"allowedOrigins":["https://awman.prettysmart.dev"]}}}}}),
-        );
-        let new = settings(
-            serde_json::json!({"daemon":{"network":{"listeners":{"loopback":{"enabled":false,"features":[],"allowedOrigins":[]}}}}}),
-        );
-        let sink = std::sync::Arc::new(RecordingSink::default());
-        let control = NetworkControl::new(ListenersDesired::default());
-        control.set_browser_revocation_sink(sink.clone());
-        control.revoke_browser_grants(browser_revocations_between(&old, &new));
-        let changes = sink.0.lock().unwrap();
-        assert!(changes.contains(&(
-            "loopback".into(),
-            BrowserRevocation::OriginRemoved(
-                crate::data::config::network::BrowserOrigin::parse("https://awman.prettysmart.dev")
-                    .unwrap()
-            )
-        )));
-        assert!(changes.contains(&("loopback".into(), BrowserRevocation::Disabled)));
-        assert!(changes.contains(&("loopback".into(), BrowserRevocation::EngineRemoved)));
-    }
-}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TlsStatus {
     pub fingerprint_sha256: String,

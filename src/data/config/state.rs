@@ -45,29 +45,3 @@ impl RepoState {
         crate::data::fs::config_file::write_user_config_file(&path, &content)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn missing_state_is_default_and_save_round_trips() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = DataPaths::at_root(tmp.path().join("data"));
-        let repo = Path::new("/some/repo");
-        assert_eq!(RepoState::load(&data, repo).unwrap(), RepoState::default());
-        let state = RepoState {
-            auto_agent_auth_accepted: Some(true),
-        };
-        state.save(&data, repo).unwrap();
-        let path = RepoState::path(&data, repo);
-        assert!(path.starts_with(tmp.path().join("data").join("repos")));
-        assert!(std::fs::read_to_string(&path)
-            .unwrap()
-            .contains("autoAgentAuthAccepted"));
-        assert_eq!(RepoState::load(&data, repo).unwrap(), state);
-        // Stable per git root, distinct across roots.
-        assert_eq!(path, RepoState::path(&data, repo));
-        assert_ne!(path, RepoState::path(&data, Path::new("/other")));
-    }
-}

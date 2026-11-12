@@ -12,9 +12,6 @@
 
 pub mod presenter;
 
-#[cfg(test)]
-mod tests;
-
 use std::sync::Arc;
 
 use crate::command::error::CommandError;

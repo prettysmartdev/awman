@@ -1,43 +1,152 @@
 # Local Development
 
+The manifest test system is the only supported path. See [replacement-ledger.md](replacement-ledger.md) for coverage decisions and evidence. Native Apple Silicon acceptance remains open until the maintainer's packet is independently reviewed.
+
 Development: local
 Build tools: make, cargo, docker
 
 Cargo workspace: the root `awman` package owns the Layer 0–3 library;
-`crates/awman-cli` owns the single `awman` executable and integration tests;
-`crates/awman-host-shims` owns the builtin worker and native Apple XPC transport.
-All three are default workspace members, so ordinary root `cargo build`,
-`cargo test`, and `--features builtin-runtime` commands continue to work.
-The worker remains a private re-exec route of the same executable.
-Use `-p awman-cli --bin awman` when selecting the executable by package.
-Static builds use `cargo build --workspace --release --bins --target x86_64-unknown-linux-musl`.
+`crates/awman-cli` owns the single `awman` executable and the integration test
+binaries; `crates/awman-host-shims` owns the builtin worker and native Apple XPC
+transport; `crates/awman-wsp` owns the work-server protocol;
+`crates/awman-test-support` is the test harness; `xtask/` is the repository's
+task runner (`cargo xtask`). The worker remains a private re-exec route of the
+same executable. Use `-p awman-cli --bin awman` when selecting the executable by
+package. Static builds use
+`cargo build --workspace --release --bins --target x86_64-unknown-linux-musl`.
 
 ## Workflows:
 
 Developer Loop:
 - running `make all` should build the aspec CLI binary using the local Rust/Cargo toolchain
 - running `make install` should build and sign as the invoking user, then install the awman CLI to /usr/local/bin/, using sudo only for the copy if needed; the installed macOS signature is verified afterwards
-
+- `make check` is the fast inner loop: every lint (`cargo xtask lint all`) and the unit tier of the crates you changed
+- `make pre-push` is `make check` plus `make test`; run it before pushing
 
 Local testing:
-- running `make test` should run all tests in the project that are safe to run on a developer's own machine
-- The workspace test profile disables debug information and incremental artifacts to keep the many linked integration-test binaries within small runners' disk budgets. Tests remain unoptimized with debug assertions enabled. For debugger symbols, use `CARGO_PROFILE_TEST_DEBUG=2 make test`. Cargo build progress stays visible while libtest prints compact results.
-- `make test*` runs each test binary with `RUST_TEST_THREADS` = twice the CPU count (`TEST_THREADS`, overridable: `make test TEST_THREADS=4`): most tests wait on subprocesses, sockets and timers, so oversubscribing finishes sooner. Four times the CPU count was measured faster still but surfaced fork/exec races in existing fixtures, so it is not the default
-- every `make test*` target runs through `tools/isolated-test.sh`: a throwaway `HOME`, no global git config, no inherited `AWMAN_*` or GitHub token variables, stdin from `/dev/null`, and `AWMAN_TEST_ISOLATION=1`, under which awman uses an in-memory keychain and clipboard, never starts daemons through launchd or `systemd --user`, and reaches no network beyond loopback. Unit tests (`cfg(test)`) are always isolated. No test may read or change the developer's real keychain, clipboard, daemons, home directory or git setup
-- tests that drive a real container, sandbox CLI, or builtin guest are opt-in: they run only with `AWMAN_TEST_DOCKER=1`, `AWMAN_TEST_APPLE_CONTAINER=1`, `AWMAN_TEST_SBX=1`, or `AWMAN_TEST_BUILTIN=1`; otherwise awman and the tests treat those runtimes as unavailable. `make test-full` sets `AWMAN_TEST_DOCKER=1`; it does not opt into builtin guest execution. Set `AWMAN_TEST_BUILTIN=1` only on a supported host with Apple Hypervisor.framework access or Linux KVM, and use a short, private `AWMAN_BUILTIN_STATE_DIR` for test state and sockets.
-- `make test-builtin-hw` (`tools/test-builtin-hw.sh`) is the one-command way to run the builtin runtime with real guests on a Mac (Apple Silicon) or a Linux KVM host, with no variables or setup. It fetches and verifies the host's payload if needed and builds the guest fixtures (`tools/builtin-hw-fixtures.sh`, shared with `make payloads-verify`). The fixtures come from a digest-pinned skopeo image run under Docker, or Apple Containers when Docker isn't running, so skopeo is never installed on the host. They are cached in `target/builtin-hw-fixtures/`. On macOS it loads the fixture into Apple Containers for the Apple-store tests and removes it afterwards. It then runs `make test-builtin` with real guests required and the network, pressure and measurement suites on, followed by `tools/test-msb-catalog-compat.sh`, and leaves the per-test report in `target/builtin-hw-report.tsv`. On macOS it needs Apple Containers installed, plus network access for the first run.
-- On macOS, Hypervisor.framework refuses unsigned processes. `make build` ad-hoc signs the Apple Silicon release binary with `packaging/macos/awman.entitlements` (`tools/macos-sign.sh`); `make sign-macos BIN=<path>` re-signs a copied or modified binary; `make test-builtin` builds the guest drivers explicitly and signs awman plus the drivers (`tools/macos-sign-test-artifacts.sh`, which also signs cargo's `deps/` originals because cargo re-copies them on every build). The hardware gate reports a missing entitlement as BLOCKED with that instruction.
-- The old-to-new upgrade test (`builtin_hw_actual_awman_boots_after_upgrading_a_072_state_directory`) needs the awman that last shipped the first `UPGRADABLE_FROM` protocol. On a host that can boot a guest, `make test-builtin` builds it itself with `tools/build-previous-builtin-awman.sh`. The script finds the revision in git history (so it needs a full clone), extracts it with `git archive`, runs that tree's own payload fetch and (on Linux) static libcap-ng build, and caches the result under `target/previous-builtin/` until the revision changes. `tools/native-builtin-ci.sh` does the same. Set `AWMAN_TEST_BUILTIN_PREVIOUS` to an existing output directory to skip the build, or `AWMAN_TEST_PREVIOUS_BUILTIN_REV` to pick another revision on that protocol. Nobody builds an older awman by hand.
-- `tools/test-msb-catalog-compat.sh` writes a catalog with the published 0.7.2 migrations, checks the raw 27→29 upgrade, then runs awman's own `prepare_catalog` upgrade test against that catalog (this needs the host's builtin payload). It leaves `tests/builtin_runtime/fixtures/msb-catalog-0.7.2.db` alone unless `AWMAN_UPDATE_CATALOG_FIXTURE=1` is set.
-- `tools/native-builtin-ci.sh aarch64-apple-darwin` runs the hardware suite under `AWMAN_TEST_BUILTIN_REQUIRE_HW=1`, so it also needs `AWMAN_TEST_APPLE_CONTAINER=1` and `AWMAN_TEST_APPLE_FIXTURE_REF` in its environment: under REQUIRE_HW a missing input fails its test instead of skipping it.
-- Further opt-ins for real services and inputs: `AWMAN_TEST_APPLE_FIXTURE_REF` (the promoted fixture loaded into Apple Containers) for the Apple-store guest test; `AWMAN_TEST_REGISTRY_PUBLIC=1` for normal-case pulls from Docker Hub and GHCR; `AWMAN_TEST_APPLE_KILL_HELPER=1` for the helper-crash test (disrupts the running Apple service). `AWMAN_CORPUS_BUILDER=apple tests/oci_import/corpus/build-corpus.sh <dir>` builds a Docker-free real-image corpus of every shipped template with Apple Containers.
-- The builtin builder scenarios (`tests/builtin_runtime/builder_native.rs`, `builtin_hw_builder_*`) build disposable project and agent images through the local store, import them, boot them in the builtin runtime, rebuild with a changed marker and then run with the builder unavailable. Docker needs `AWMAN_TEST_BUILTIN=1`, `AWMAN_TEST_DOCKER=1` and `AWMAN_TEST_BUILDER_DOCKER_HOST=unix:///…` naming the Engine the test may build in (never an assumed daemon); Apple needs `AWMAN_TEST_BUILTIN=1` and `AWMAN_TEST_APPLE_CONTAINER=1` on Apple Silicon macOS. `AWMAN_TEST_DOCKER_CLI` and `AWMAN_TEST_APPLE_CLI` name the CLIs, and `AWMAN_TEST_BUILDER_BASE_IMAGE` the base image (default `alpine:3.20`, pulled on first run). A missing prerequisite is reported as a skip or block, never as a pass.
-- Builtin integration tests must distinguish capability preflight from guest execution. A missing `/dev/kvm`, denied KVM access, missing Apple hypervisor entitlement, unverified target payload, or unsupported host is SKIP/BLOCKED with the concrete prerequisite recorded; it is never a passing boot test. Hermetic backend, archive, registry-wire, and transport tests remain in the ordinary isolated suite.
-- Guest network and memory-pressure scenarios add two opt-ins beyond `AWMAN_TEST_BUILTIN=1`: `AWMAN_TEST_BUILTIN_NETWORK=1` for the egress/DNS/host-port/isolation guest tests (they start their own loopback fixtures — no outbound network is required by the tests themselves, but the host proxy variables `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` must be scrubbed for the run so a passing proxy dependency can't hide as a pass) and `AWMAN_TEST_BUILTIN_PRESSURE=1` for the bounded guest-OOM scenario (a small, fixed-size VM), both needing the same hardware prerequisites as `AWMAN_TEST_BUILTIN`. The builtin test target is explicitly registered in `crates/awman-cli/Cargo.toml`; its `main.rs` includes the acquisition, lifecycle, and network-resource suites alongside the other builtin tests. List tests with `cargo test -p awman-cli --test builtin_runtime -- --list`.
-- SQLite and native dependency changes are covered by the production builtin SQLite tests, catalog compatibility check, native provider build and release artifact dependency scan. The historical standalone probe (`bash tools/oci-runtime-spike/sqlite-resolution/checks.sh auto`) is available for manual dependency investigations; it does not gate normal development, CI, prerelease or release.
-- Inspect final feature artifacts for dynamic dependencies and extracted-helper candidates (`bash tools/release-artifact-check.sh`, `bash tools/measure-release-artifact.sh`). The runtime must work offline with a minimal executable search path after build; no production runtime path may depend on `tools/` scripts, Cargo caches, or temporary spike artifacts.
-- `bash tools/reproducible-build-audit.sh [output-dir]` checks, on a native checkout with usable Git metadata, that build inputs (`.cargo/config.toml`, Cargo manifests/lock, patches, CI inputs) are Git-tracked and free of stray temp/cache paths. `make native-builtin-ci TARGET=<triple>` builds `awman` and its synthetic guest driver from a clean isolated `CARGO_HOME`/target dir and asserts the typed provider's info/version entrypoints on real hardware; it does not yet boot the actual `awman` entrypoint against a real guest (see the open request in `aspec/work-items/0121-complete-builtin-runtime-and-native-verification.md` for that remaining gap). Both fail closed (BLOCKED) rather than infer a pass when Git metadata, hardware, or verified payloads are unavailable.
-- The builtin driver uses the vendored `build_lazy_isolated()` entry point on pinned `microsandbox 0.7.8`. It starts from independent defaults and awman-owned paths without merging installed SDK config. `third_party/microsandbox-0.7.8/upstream.diff` contains the one-method patch selected in Cargo.toml and Cargo.lock; WI 0120 records its removal gate. The guest kernel comes from the published `msb_krun =0.1.41` `static-krunfw` feature: awman defines the `krunfw_get_kernel` callback in `crates/awman-host-shims/src/kernel.rs`, and no `msb_krun` patch is vendored. When checking the final binary, `krunfw_get_kernel` is visible to `nm` in debug and plain release builds but not after `strip` or under fat LTO, so artifact scans must not require the symbol name. The Darwin and x86_64 payloads in `third_party/msb-payloads/manifest.toml` are unverified until fetched and verified on native hosts. `make payloads-verify` (`tools/msb-payloads/payloads-verify.sh`) is the promotion path: on a clean native checkout it writes a candidate verified record, runs `make test-builtin` with real guests required, `tools/native-builtin-ci.sh` from a clean temporary checkout of HEAD plus the candidate, and `tools/release-artifact-check.sh` on the optimized (signed on macOS) artifact, and restores the unverified record if any gate fails. On macOS it loads the guest fixture into Apple Containers (starting the service if needed) and sets the Apple-store test inputs itself. It never commits. Feature compilation and hostile-config tests do not establish native coexistence. Do not replace this with process-global environment mutation.
+
+<!-- gates:begin contract -->
+Generated from `ci/gates.toml` (schema 1).
+
+| Gate | Budget (minutes) | Required status |
+| --- | --- | --- |
+| candidate | 20 | gate |
+| main | 20 | gate |
+| nightly | 60 | gate |
+| pr | 10 | gate |
+| promote | 20 | gate |
+
+| Tier | Per-test deadline (seconds) | Guarantees |
+| --- | --- | --- |
+| artifact | 300 | tempdir, loopback, subprocess, release-artifact |
+| boundary | 120 | tempdir, loopback, subprocess, awman-binary, fake-cli, local-git |
+| component | 20 | tempdir, loopback, subprocess, awman-binary, fake-cli, local-git |
+| guest | 300 | tempdir, loopback, subprocess, awman-binary, hypervisor, builtin-payload, guest-fixtures, previous-release |
+| soak | suite-specific | tempdir, loopback, subprocess, awman-binary |
+| unit | 1 | tempdir |
+
+Unit, lint, doctest and parity suites always run. Unknown/shared paths select the full PR set. Main and merge-group run the full set. Required skips, missing evidence and expired quarantine fail the gate.
+<!-- gates:end contract -->
+
+Tests are organised in tiers and selected by suites defined in `ci/gates.toml`;
+[testing.md](testing.md) explains the tiers, the support crate and how to write
+and reproduce tests. Locally:
+
+| Command | What it runs | Needs |
+|---|---|---|
+| `make check` | `cargo xtask lint all` and `cargo xtask test run --tier unit --changed` | pinned nextest; `cargo-deny` and `shellcheck` are skipped with a notice when absent (CI has neither exemption) |
+| `make test` | `cargo xtask test run --gate local`: the `unit` and `component` tiers of this host's build, both backends (builtin and daemon) | pinned nextest |
+| `make test-unit` / `make test-component` | one tier | pinned nextest |
+| `make test-boundary AWMAN_TEST_HOST_RESOURCES=…` | the `boundary` tier against the real engines and services you name | the named resources |
+| `make test-guest` | fetches the pinned guest fixtures, then the `guest` tier | Apple Silicon or KVM, verified payload (`make payloads`), Docker or Apple Containers for the fixtures |
+| `make test-artifact ARTIFACT=/abs/path/awman` | the `artifact` tier against a release executable | the executable |
+| `make gates` | `cargo xtask gates check`: manifest, generated files, Makefile contract and these documents | none |
+| `make architecture-lint` | the layering lint and `cargo xtask lint hygiene` | none |
+
+- `cargo-nextest` is required and pinned. `cargo xtask test install-runner`
+  installs the pinned, SHA-256-verified release into `target/xtask-tools/`;
+  `make test` and `make check` stop with that command if it is missing or a
+  different version. They use the same nextest profile as CI
+  (`.config/nextest.toml`, generated from the manifest: per-tier timeouts,
+  resource groups, zero retries). `cargo xtask test run --runner libtest` falls
+  back to the plain harness for debugging only.
+- `make test` and `make check` never touch a real container engine, guest,
+  keychain, clipboard, daemon manager, Git configuration, home directory or the
+  network. Isolation is a property of the tests themselves
+  (`crates/awman-test-support`: a private `HOME`, XDG and `AWMAN_HOME`, supervised
+  children, owned ports), so a bare `cargo test` or `cargo nextest run` is
+  equally safe; there is no wrapper script and no `AWMAN_TEST_*` opt-in. Real
+  resources are used only when named.
+- Run one suite or one test: `cargo xtask test run --suite component-engine`, or
+  `cargo nextest run -p awman-cli --test component -E 'test(=engine::git::clone_over_ssh)'`.
+  `cargo xtask test list` prints the expected test set.
+- `AWMAN_TEST_HOST_RESOURCES` is a comma-separated list of `docker=<DOCKER_HOST>`,
+  `local-registry=<ip:port>`, `git-transports`, `docker-base-image=<reference>`,
+  `apple-containers`, `docker-sbx`, `hypervisor`, `builtin-payload=<dir>`,
+  `offline`, `public-network`, `registry-credentials=<file>` and
+  `private-registry-reference=<repository>:<tag>`. Example:
+  `make test-boundary AWMAN_TEST_HOST_RESOURCES=docker=unix:///var/run/docker.sock,git-transports`.
+  A test whose capability is not named reports `BLOCKED`; it never passes and
+  never skips.
+- The boundary job contract: `docker` is the engine the tests may create, inspect
+  and remove containers and images on; `local-registry` is a loopback OCI
+  registry started outside the test; `git-transports` uses the host `sshd` and
+  `git http-backend`; `docker-base-image` names the base image the build tests
+  use.
+- Fixtures the guest and artifact tiers need are content-addressed:
+  `cargo xtask fixtures fetch [--tier guest]` downloads and verifies them into
+  the fixture store and `cargo xtask fixtures verify` re-checks the store. A
+  fixture whose pin is still `pending` in `ci/gates.toml` fails closed as
+  `BLOCKED`.
+- The workspace test profile disables debug information and incremental
+  artifacts to keep the linked test binaries within small runners' disk budgets.
+  Tests remain unoptimised with debug assertions enabled. For debugger symbols,
+  use `CARGO_PROFILE_TEST_DEBUG=2 make test`.
+- Property tests use `proptest` and snapshot tests use `insta`; regenerate
+  snapshots and golden files with `cargo xtask test update-golden --suite <id>`.
+  `make docs-reference` regenerates `docs/14-command-reference.md` from the
+  command catalogue.
+- On macOS, Hypervisor.framework refuses unsigned processes. `make build`
+  ad-hoc signs the Apple Silicon release binary with
+  `packaging/macos/awman.entitlements` (`tools/macos-sign.sh`); `make sign-macos
+  BIN=<path>` re-signs a copied or modified binary. `make validate-native` signs the native drivers and candidate and records signature verification in its evidence packet.
+- Guest scenarios (boot, exec, import, network, upgrade, builder, strategy) run
+  only in the `guest` tier on a host that can boot a guest. A missing
+  `/dev/kvm`, denied KVM access, missing Apple hypervisor entitlement,
+  unverified target payload, unpinned fixture or unsupported host is `BLOCKED`
+  with the concrete prerequisite recorded; it is never a passing boot test. The
+  upgrade scenario needs the pinned previous release (`previous-release`);
+  nobody builds an older awman by hand.
+- SQLite and native dependencies are exercised by persisted-state component contracts, the guest tier and `artifact-deps-scan`. Use `make test-artifact ARTIFACT=...` for a prepared candidate. Runtime execution must work offline with a minimal executable search path and cannot depend on build caches or tools scripts.
+- The builtin driver uses the vendored `build_lazy_isolated()` entry point on
+  pinned `microsandbox 0.7.8`. It starts from independent defaults and
+  awman-owned paths without merging installed SDK config.
+  `third_party/microsandbox-0.7.8/upstream.diff` contains the one-method patch
+  selected in Cargo.toml and Cargo.lock; WI 0120 records its removal gate. The
+  guest kernel comes from the published `msb_krun =0.1.41` `static-krunfw`
+  feature: awman defines the `krunfw_get_kernel` callback in
+  `crates/awman-host-shims/src/kernel.rs`, and no `msb_krun` patch is vendored.
+  In the final binary `krunfw_get_kernel` is visible to `nm` in debug and plain
+  release builds but not after `strip` or under fat LTO, so artifact scans must
+  not require the symbol name. `make payloads` fetches and checksum-verifies the
+  host's payload (`tools/msb-payloads/fetch.sh`); `make payloads-verify` verifies bytes against the reviewed payload record. A new payload status requires reviewed native evidence; the command does not automatically promote a record.
+
+### Pinned tooling
+
+| Tool | Version | Used for | Installed by |
+|---|---|---|---|
+| Rust toolchain | 1.94.0 (`rust-toolchain.toml`) | everything | `rustup` |
+| `cargo-nextest` | 0.9.150 | every test run, local and CI | `cargo xtask test install-runner` (verified release archive) |
+| `cargo-llvm-cov` | 0.6.21 | nightly diagnostic coverage per layer | `cargo install --locked --version 0.6.21 cargo-llvm-cov` |
+| `cargo-mutants` | 25.3.1 | nightly sampled mutation testing of `src/data` and `src/command` | `cargo install --locked --version 25.3.1 cargo-mutants` |
+| `cargo-deny` | 0.19.0 | licences, bans, sources (`deny.toml`) and nightly advisories | `cargo install --locked --version 0.19.0 cargo-deny` |
+| `actionlint` | 1.7.7 | workflow lint | `cargo xtask ci install-tool actionlint` (verified archive) |
+| `shellcheck` | 0.11.0 | shell lint | `cargo xtask ci install-tool shellcheck` (verified archive) |
+| `proptest` | 1.12.0 | property tests (workspace dev-dependency, exact pin) | `Cargo.toml` |
+| `insta` | 1.49.0 | snapshot tests (workspace dev-dependency, exact pin) | `Cargo.toml` |
+
+The manifest's `[tools.*]` tables are the source of these versions. Any change
+to a pin is a manifest change reviewed together with its digest.
 
 Version control:
 - Git is used for this project

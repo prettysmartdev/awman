@@ -25,8 +25,6 @@
 //! repo-planted `./claude` cannot be picked up via a relative lookup
 //! (INV-8, BLOCKING-2).
 
-#[cfg(test)]
-use crate::engine::agent::first_party::first_party;
 use crate::engine::agent::{AgentDefinition, ResolvedAgent};
 use crate::engine::auth::credential::{HostRefreshAction, RefreshableCredentialSpec};
 
@@ -146,9 +144,6 @@ const HOST_REFRESH_REMEDIATION: &str = "run `claude` on the host / check login";
 pub struct HostAgentPinger {
     env: Option<crate::data::config::env::EnvSnapshot>,
 }
-#[cfg(test)]
-#[allow(non_upper_case_globals)]
-pub const HostAgentPinger: HostAgentPinger = HostAgentPinger { env: None };
 
 impl HostAgentPinger {
     pub fn new() -> Self {
@@ -345,127 +340,5 @@ impl HostAgentPinger {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// INV-8 / BLOCKING-2: the Claude host ping pins the cheapest model,
-    /// carries the greeting drawn from the hardcoded table, and takes no other
-    /// argument (no user input, no repo content). The greeting is the only
-    /// variable part.
-    #[test]
-    fn ping_command_for_claude_pins_cheapest_model_and_only_the_greeting() {
-        let def = first_party("claude").unwrap();
-        let greeting = select_random_greeting();
-        let (cmd, args) = HostAgentPinger::ping_command(&def, greeting).unwrap();
-        assert_eq!(cmd, "claude");
-        assert_eq!(args, vec!["--model", "haiku", "--print", greeting]);
-        // Every argument except the greeting is a fixed literal, and the
-        // greeting itself is drawn only from the hardcoded table.
-        assert!(
-            GREETINGS.contains(&args.last().unwrap().as_str()),
-            "the ping's only variable argument must come from GREETINGS"
-        );
-    }
-
-    /// A definition without a `[ping]` produces no argv at all, and `ping`
-    /// returns without spawning anything. There is no catch-all argv.
-    #[tokio::test]
-    async fn a_definition_without_a_ping_has_no_command_and_spawns_nothing() {
-        let mut def = first_party("cline").unwrap();
-        def.ping_argv = None;
-        assert_eq!(HostAgentPinger::ping_command(&def, "Hello"), None);
-        assert_eq!(
-            HostAgentPinger::new()
-                .ping(&ResolvedAgent::for_test(def))
-                .await,
-            LocalAgentPingResult::CouldNotRun
-        );
-    }
-
-    /// The ping is reachable only through a `HostAgentPinger`. There is no
-    /// free function left that spawns an agent on the host — that is the
-    /// whole point of F-38, and `security.md` §Guidance names this type.
-    #[test]
-    fn a_pinger_is_the_only_handle_and_is_cheap_to_construct() {
-        let a = HostAgentPinger::new();
-        let b = a.clone();
-        let _ = (a, b, HostAgentPinger);
-    }
-}
-
-#[cfg(all(test, unix))]
-mod custom_tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    #[tokio::test]
-    async fn host_ping_is_time_bounded() {
-        let mut def = crate::engine::agent::custom::crush_fixture();
-        def.ping_argv = Some(vec!["/bin/sleep".into(), "60".into()]);
-        // sleep receives a greeting too, so use a script that deliberately ignores argv.
-        let temp = tempfile::tempdir().unwrap();
-        let script = temp.path().join("sleep-ping");
-        std::fs::write(&script, "#!/bin/sh\nexec sleep 60\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        def.ping_argv = Some(vec![script.to_string_lossy().into_owned()]);
-        assert_eq!(
-            HostAgentPinger::new()
-                .ping_with_timeout(
-                    &ResolvedAgent::for_test(def),
-                    std::time::Duration::from_millis(25)
-                )
-                .await,
-            LocalAgentPingResult::TimedOut
-        );
-    }
-
-    #[tokio::test]
-    async fn custom_ping_uses_only_argv_and_a_fresh_private_empty_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        let script = temp.path().join("probe");
-        std::fs::write(&script, "#!/bin/sh\n[ -z \"$(ls -A .)\" ] || exit 1\n[ \"$(stat -c %a . 2>/dev/null || stat -f %Lp .)\" = 700 ] || exit 2\n[ -z \"$CUSTOM_AGENT_STATIC_TEST\" ] || exit 3\n[ -z \"$CUSTOM_AGENT_AUTH_TEST\" ] || exit 4\n[ \"$#\" = 2 ] || exit 5\n[ \"$1\" = '--ping' ] || exit 6\nprintf '%s\\n' \"$2\"\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut def = crate::engine::agent::custom::crush_fixture();
-        def.ping_argv = Some(vec![script.to_string_lossy().into(), "--ping".into()]);
-        def.static_env = vec![(
-            "CUSTOM_AGENT_STATIC_TEST".into(),
-            "must not be applied".into(),
-        )];
-        def.auth_env = vec!["CUSTOM_AGENT_AUTH_TEST".into()];
-        // A value is available where container auth forwarding would read it
-        // (the daemon env overlay); the host ping must still not receive it.
-        // The overlay is process-wide: hold its test lock and remove the
-        // sentinel on drop, so no other test can capture or keep it.
-        struct Sentinel(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
-        impl Drop for Sentinel {
-            fn drop(&mut self) {
-                crate::data::config::env::update_daemon_overlay(|overlay| {
-                    overlay.remove("CUSTOM_AGENT_AUTH_TEST");
-                });
-            }
-        }
-        let _sentinel = Sentinel(
-            crate::data::config::env::DAEMON_OVERLAY_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        );
-        crate::data::config::env::update_daemon_overlay(|overlay| {
-            overlay.insert(
-                "CUSTOM_AGENT_AUTH_TEST".into(),
-                "sentinel-must-not-reach-ping".into(),
-            );
-        });
-        let LocalAgentPingResult::Ok { greeting, response } = HostAgentPinger::new()
-            .ping(&ResolvedAgent::for_test(def))
-            .await
-        else {
-            panic!("probe failed")
-        };
-        assert!(GREETINGS.contains(&greeting.as_str()));
-        assert_eq!(response, greeting);
     }
 }

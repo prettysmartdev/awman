@@ -642,6 +642,7 @@ impl WorkflowEngine {
                 true
             }
             ReportedResponse::Countdown(kind) => {
+                let clock = Arc::clone(&self.clock);
                 let Some(slot) = self.active_steps.iter_mut().find(|s| s.step_name == name) else {
                     return false;
                 };
@@ -655,7 +656,7 @@ impl WorkflowEngine {
                 slot.output_watch = if kind == CountdownKind::AgentError {
                     slot.output_tail
                         .clone()
-                        .map(program_status::OutputWatch::new)
+                        .map(|tail| program_status::OutputWatch::new(tail, clock))
                 } else {
                     None
                 };

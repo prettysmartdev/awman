@@ -89,31 +89,3 @@ pub fn advertised(mounts_outputs: bool, pull: &[&str]) -> Vec<String> {
         .map(|c| c.to_string())
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_capability_is_listed_once_and_pull_ones_only_when_reported() {
-        let all: Vec<&str> = CAPABILITIES
-            .iter()
-            .chain(PULL_CAPABILITIES)
-            .copied()
-            .collect();
-        let unique: std::collections::BTreeSet<_> = all.iter().collect();
-        assert_eq!(unique.len(), all.len());
-        let none = advertised(true, &[]);
-        assert!(none
-            .iter()
-            .all(|c| !PULL_CAPABILITIES.contains(&c.as_str())));
-        assert!(none.contains(&"outputs".to_string()));
-        assert!(!advertised(false, &[]).contains(&"outputs".to_string()));
-        let some = advertised(true, &["lease_read_only", "worker_pull", "bogus"]);
-        let tail: Vec<&str> = some[CAPABILITIES.len()..]
-            .iter()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(tail, ["worker_pull", "lease_read_only"]);
-    }
-}

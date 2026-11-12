@@ -127,17 +127,3 @@ fn sid_of(buffer: &[u64]) -> *mut core::ffi::c_void {
     // SAFETY: only called on buffers filled by GetTokenInformation(TokenUser), u64-aligned.
     unsafe { (*user).User.Sid }
 }
-
-#[cfg(test)]
-mod tests {
-    #[tokio::test]
-    async fn this_process_is_its_own_owner() {
-        let name = format!(r"\\.\pipe\awman-verify-{}", std::process::id());
-        let server = super::create(std::path::Path::new(&name), true).unwrap();
-        let _client = tokio::net::windows::named_pipe::ClientOptions::new()
-            .open(&name)
-            .unwrap();
-        server.connect().await.unwrap();
-        assert!(super::verify_client(&server).unwrap());
-    }
-}

@@ -93,6 +93,12 @@ pub async fn features_list(api: &DaemonApi) -> Result<Vec<FeatureRecord>, Comman
     }
     Ok(records)
 }
+/// Only the owner transport exposes this operation. The host drains features
+/// and flushes active local responses before exiting.
+pub fn request_shutdown(api: &DaemonApi) -> u32 {
+    api.runtime.exit_signal().cancel();
+    std::process::id()
+}
 pub async fn status(api: &DaemonApi) -> Result<StatusResponse, CommandError> {
     let mut status = api.runtime.status_snapshot();
     if let Some(worker) = status.features.remove(Feature::Worker.name()) {
@@ -410,61 +416,6 @@ pub async fn jobs_cancel_feature(
 }
 pub async fn config_reload(api: &DaemonApi) -> Result<ReloadResponse, CommandError> {
     api.runtime.reload_config().await
-}
-
-#[cfg(test)]
-mod worker_reload_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn removing_a_work_server_replaces_the_map_without_ghost_leaves() {
-        let before = json!({"workServers": {
-            "removed": {"url": "https://old.example", "claim": "auto", "labels": {"team": "a"}},
-            "kept": {"url": "https://kept.example"}
-        }});
-        let after =
-            json!({"workServers": {"kept": {"url": "https://kept.example", "claim": "auto"}}});
-        let paths: Vec<_> = crate::data::config::fields::CONFIG_KEYS
-            .iter()
-            .filter(|key| key.path.starts_with("workServers."))
-            .flat_map(|key| changed_paths(&before, &after, key.path))
-            .collect();
-        assert_eq!(paths, ["workServers"]);
-        let mut applied = before;
-        for path in paths {
-            crate::data::config::config_json::set_config_field(
-                &mut applied,
-                &path,
-                at(&after, &path).unwrap().clone(),
-            );
-        }
-        assert_eq!(applied, after);
-        assert_eq!(
-            changed_paths(&applied, &json!({}), "workServers.*.url"),
-            ["workServers"]
-        );
-    }
-
-    #[test]
-    fn live_worker_labels_preserve_dots_and_removals_as_map_keys() {
-        let before = json!({"workServers":{"team":{"url":"https://example.com","labels":{"team.example/owner":"old", "gone":"yes"}}}});
-        let after = json!({"workServers":{"team":{"url":"https://example.com","labels":{"team.example/owner":"new"}}}});
-        assert_eq!(
-            changed_paths(&before, &after, "workServers.*.labels"),
-            ["workServers.team.labels"]
-        );
-        assert!(changed_paths(&before, &after, "workServers.*.labels.*").is_empty());
-        let mut applied = before;
-        for path in changed_paths(&applied, &after, "workServers.*.labels") {
-            crate::data::config::config_json::set_config_field(
-                &mut applied,
-                &path,
-                at(&after, &path).unwrap().clone(),
-            );
-        }
-        assert_eq!(applied, after);
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,0 +1,804 @@
+# Release candidate: build once, validate those exact bytes, then call
+# promote.yml (design 12.1; WI 0144 sections 5.1, 5.2, 5.4-5.6).
+#
+# Started by `make release` (gh workflow run candidate.yml), by hand, or by
+# nightly.yml's dry-run rehearsal (workflow_call). Every decision is made by
+# `cargo xtask release candidate <step>`; this file only places the steps.
+#
+# Trust (design 16.3): dispatch/call from refs/heads/main only, checked again
+# by preflight. Test and build jobs hold no write token and never read the
+# draft; only preflight, assemble, gate and cleanup (trusted controller code
+# from this workflow's own revision, never candidate code) write release
+# state. No cache step exists in this file: release builds are cache-free.
+# Self-hosted jobs use the manifest's release labels, which are disjoint from
+# the CI guest labels, and the protected `release` environment (no reviewers,
+# so `make release` gains no manual step).
+name: Release candidate
+run-name: >-
+  Release ${{ inputs.version }} (${{ inputs.commit }})${{ inputs.dry_run && ' [rehearsal]' || '' }}${{
+  (contains(inputs.operator_record, '"record_only":true') || contains(inputs.operator_record, '"record_only": true')) && ' [journal]' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release (vX.Y.Z)
+        type: string
+        required: true
+      commit:
+        description: Full commit SHA; the tip of main or an ancestor
+        type: string
+        required: true
+      dry_run:
+        description: "Rehearsal: no public tag, nothing published, draft deleted at the end"
+        type: boolean
+        default: false
+      promote:
+        description: Call promote.yml after validation
+        type: boolean
+        default: true
+      operator_record:
+        description: JSON of the operator's answers and local-test record (advisory)
+        type: string
+        default: "{}"
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+      commit:
+        type: string
+        required: true
+      dry_run:
+        type: boolean
+        default: false
+      promote:
+        type: boolean
+        default: true
+      operator_record:
+        type: string
+        default: "{}"
+    outputs:
+      candidate:
+        description: Candidate number
+        value: ${{ jobs.preflight.outputs.candidate }}
+      state:
+        description: candidate-built, validated or the stop reason kind
+        value: ${{ jobs.gate.outputs.state }}
+      release_id:
+        description: Id of the candidate's draft release
+        value: ${{ jobs.assemble.outputs.release_id || jobs.preflight.outputs.release_id }}
+
+# Read-only by default; write scopes are granted per job below.
+permissions:
+  contents: read
+
+# One candidate workflow per version and mode at a time; never cancelled.
+# Operator journals (record-only dispatches) never queue behind a candidate.
+concurrency:
+  group: >-
+    candidate-${{ github.repository }}-${{ inputs.version }}-${{ inputs.dry_run }}-${{ github.run_id }}${{
+    (contains(inputs.operator_record, '"record_only":true') || contains(inputs.operator_record, '"record_only": true')) && format('-journal-{0}', github.run_id) || '' }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  VERSION: ${{ inputs.version }}
+  COMMIT: ${{ inputs.commit }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Cheap checks before any build minute is spent: trigger and ref, version
+  # = Cargo.toml, notes without placeholder, commit tip/ancestor of main,
+  # target set = release.assets, manifest valid, every fixture/payload/
+  # previous-release pin published, and the resume/supersede decision.
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+    outputs:
+      decision: ${{ steps.preflight.outputs.decision }}
+      candidate: ${{ steps.preflight.outputs.candidate }}
+      namespace: ${{ steps.preflight.outputs.namespace }}
+      release_id: ${{ steps.preflight.outputs.release_id }}
+      source_run: ${{ steps.preflight.outputs.source_run }}
+      record_artifact: ${{ steps.preflight.outputs.record_artifact }}
+      targets: ${{ steps.preflight.outputs.targets }}
+      release_labels: ${{ steps.preflight.outputs.release_labels }}
+    steps:
+      - name: Check out the controller (this workflow's revision on main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: controller
+          persist-credentials: false
+      - name: Check out the candidate commit (read only, never executed here)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          path: candidate
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
+        with:
+          toolchain: "1.94.0"
+      - name: Preflight
+        id: preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPERATOR_RECORD: ${{ inputs.operator_record }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          dry=()
+          [ "$DRY_RUN" = true ] && dry=(--dry-run)
+          cargo run --locked --quiet --manifest-path controller/Cargo.toml -p xtask -- \
+            release candidate preflight --version "$VERSION" --commit "$COMMIT" "${dry[@]}" \
+            --operator-record "$OPERATOR_RECORD" --event "$EVENT" --ref "$REF" \
+            --source candidate --out preflight
+      - name: Keep the operator journal
+        if: ${{ steps.preflight.outputs.decision == 'journal' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: operator-journal-${{ inputs.version }}-${{ github.run_id }}
+          path: preflight/journal.json
+          retention-days: 90
+      - name: Hand the decision to later jobs
+        if: ${{ steps.preflight.outputs.decision != 'journal' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-preflight
+          path: preflight/preflight.json
+          retention-days: 90
+          overwrite: true
+
+  # The controller every write-holding job and promote.yml runs: xtask built
+  # from this workflow's protected revision (not from the candidate), attested.
+  controller:
+    name: Controller
+    needs: preflight
+    if: ${{ contains(fromJSON('["new","resume","published"]'), needs.preflight.outputs.decision) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
+        with:
+          toolchain: "1.94.0"
+      - name: Build the controller
+        run: |
+          cargo build --locked --release -p xtask --target-dir "$RUNNER_TEMP/controller-target"
+          mkdir -p controller-bin
+          cp "$RUNNER_TEMP/controller-target/release/xtask" controller-bin/xtask
+      - name: Attest the controller
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: controller-bin/xtask
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-controller
+          path: controller-bin/xtask
+          retention-days: 90
+          if-no-files-found: error
+
+  # Release Mac health before anything expensive: disk, kern.hv_support,
+  # toolchain, fixture digests, Apple Containers state. Blocked, never queued.
+  runner-preflight:
+    name: Release runner health
+    needs: preflight
+    if: ${{ github.ref == 'refs/heads/main' && contains(fromJSON('["new","resume"]'), needs.preflight.outputs.decision) }}
+    runs-on: ${{ fromJSON(needs.preflight.outputs.release_labels) }}
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: controller
+          persist-credentials: false
+          clean: true
+      - name: Private Cargo home for this job
+        run: echo "CARGO_HOME=$(mktemp -d "$RUNNER_TEMP/awman-cargo-home.XXXXXX")" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
+        with:
+          toolchain: "1.94.0"
+      - name: Start clean (leftovers from a cancelled or timed-out job fail here)
+        working-directory: controller
+        run: cargo run --locked --quiet -p xtask -- ci sweep
+      - name: Runner health
+        working-directory: controller
+        run: cargo run --locked --quiet -p xtask -- ci runner-preflight --platform macos-arm64-release
+
+  # Each release target is compiled exactly once per candidate, with --locked,
+  # in a fresh target directory, on its native runner (macOS on the release
+  # Mac), then the Apple Silicon binary is signed once with the shipping
+  # entitlement. A rerun of this job reuses a recorded build, never repeats it.
+  build:
+    name: Build ${{ matrix.target.asset }}
+    needs: [preflight, runner-preflight]
+    if: ${{ github.ref == 'refs/heads/main' && needs.preflight.outputs.decision == 'new' }}
+    runs-on: ${{ matrix.target.runs_on }}
+    timeout-minutes: 60
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.preflight.outputs.targets) }}
+    steps:
+      - name: Check out the controller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: controller
+          persist-credentials: false
+          clean: true
+      - name: Check out the candidate commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          path: candidate
+          persist-credentials: false
+          clean: true
+      - name: Private Cargo home and target directories (cache-free)
+        run: |
+          echo "CARGO_HOME=$(mktemp -d "$RUNNER_TEMP/awman-cargo-home.XXXXXX")" >> "$GITHUB_ENV"
+          echo "XTASK_TARGET=$(mktemp -d "$RUNNER_TEMP/awman-xtask.XXXXXX")" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
+        with:
+          toolchain: "1.94.0"
+          targets: ${{ matrix.target.target }}
+      - name: Start clean
+        if: ${{ matrix.target.self_hosted }}
+        run: cargo run --locked --quiet --manifest-path controller/Cargo.toml --target-dir "$XTASK_TARGET" -p xtask -- ci sweep
+      - name: Prepare the verified builtin payload
+        if: ${{ matrix.target.sign }}
+        working-directory: candidate
+        run: |
+          bash tools/msb-payloads/fetch.sh "${{ matrix.target.target }}"
+          bash tools/msb-payloads/verify.sh "${{ matrix.target.target }}"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-preflight
+          path: preflight
+      - name: Build once
+        env:
+          ASSET: ${{ matrix.target.asset }}
+        run: |
+          cargo run --locked --quiet --manifest-path controller/Cargo.toml --target-dir "$XTASK_TARGET" -p xtask -- \
+            release candidate build --asset "$ASSET" --preflight preflight/preflight.json \
+            --source candidate --out "out/$ASSET"
+      - name: Sign once with the shipping entitlement
+        if: ${{ matrix.target.sign }}
+        env:
+          ASSET: ${{ matrix.target.asset }}
+        run: |
+          cargo run --locked --quiet --manifest-path controller/Cargo.toml --target-dir "$XTASK_TARGET" -p xtask -- \
+            release candidate sign --asset "$ASSET" --source candidate --out "out/$ASSET"
+      - name: Attest the shipped bytes
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/${{ matrix.target.asset }}/${{ matrix.target.asset }}
+      - name: Record digests, size, toolchain and input digest
+        env:
+          ASSET: ${{ matrix.target.asset }}
+          ATTESTATION: ${{ steps.attest.outputs.attestation-url }}
+        run: |
+          cargo run --locked --quiet --manifest-path controller/Cargo.toml --target-dir "$XTASK_TARGET" -p xtask -- \
+            release candidate record --asset "$ASSET" --preflight preflight/preflight.json \
+            --out "out/$ASSET" --attestation "$ATTESTATION"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: candidate-${{ matrix.target.asset }}
+          path: |
+            out/${{ matrix.target.asset }}/${{ matrix.target.asset }}
+            out/${{ matrix.target.asset }}/*.json
+          retention-days: 90
+          if-no-files-found: error
+      - name: Leave the runner clean
+        if: ${{ always() && matrix.target.self_hosted }}
+        run: cargo run --locked --quiet --manifest-path controller/Cargo.toml --target-dir "$XTASK_TARGET" -p xtask -- ci sweep
+
+  # Draft release with the four assets, SHA256SUMS and release-state.json.
+  # Supersedes older drafts under the publication lock; a rerun uploads only
+  # what is missing and never changes recorded bytes.
+  assemble:
+    name: Assemble the draft release
+    needs: [preflight, controller, build]
+    if: ${{ needs.preflight.outputs.decision == 'new' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+    concurrency:
+      group: publish-${{ github.repository }}-${{ inputs.version }}${{ inputs.dry_run && format('-rehearsal-{0}', github.run_id) || '' }}
+      cancel-in-progress: false
+    outputs:
+      release_id: ${{ steps.assemble.outputs.release_id }}
+    steps:
+      - &controller
+        name: Download and verify the controller
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-controller
+          path: controller-bin
+      - &verify-controller
+        name: Verify the controller's attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify controller-bin/xtask --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/candidate.yml" --source-ref refs/heads/main
+          chmod +x controller-bin/xtask
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-preflight
+          path: preflight
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: candidate-awman-*
+          path: builds
+      - name: Assemble
+        id: assemble
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: controller-bin/xtask release candidate assemble --preflight preflight/preflight.json --in builds --out assembled
+      - name: Retain the candidate record and superseded evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ needs.preflight.outputs.record_artifact }}
+          path: |
+            assembled/candidate-record.json
+            assembled/release-state.json
+            assembled/SHA256SUMS
+            assembled/superseded/
+          retention-days: 90
+          overwrite: true
+
+  # Reuse the commit's main gate evidence from its protected-main push run...
+  main-evidence:
+    name: Main gate evidence
+    needs: [preflight, controller]
+    if: ${{ contains(fromJSON('["new","resume"]'), needs.preflight.outputs.decision) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reused: ${{ steps.reuse.outputs.reused }}
+    steps:
+      -
+        name: Download and verify the controller
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-controller
+          path: controller-bin
+      -
+        name: Verify the controller's attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify controller-bin/xtask --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/candidate.yml" --source-ref refs/heads/main
+          chmod +x controller-bin/xtask
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-preflight
+          path: preflight
+      - name: Reuse or run
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: controller-bin/xtask release candidate reuse-main-evidence --preflight preflight/preflight.json --out main-evidence
+
+  # ...or run the full main gate set for exactly this commit.
+  main-gate:
+    needs: [preflight, main-evidence]
+    if: ${{ contains(fromJSON('["new","resume"]'), needs.preflight.outputs.decision) && needs.main-evidence.outputs.reused != 'true' }}
+    uses: ./.github/workflows/ci.yml
+    with:
+      gate: main
+      ref: ${{ inputs.commit }}
+      mode: gate
+    permissions:
+      contents: read
+      actions: read
+
+  # Artifact tier against the exact recorded bytes, on each target's native OS
+  # (macOS on the release Mac: signed offline boot, previous-release upgrade,
+  # dependency/helper scan and measurements of the signed binary).
+  artifact:
+    name: Artifact ${{ matrix.target.asset }}
+    needs: [preflight, runner-preflight, assemble]
+    if: ${{ github.ref == 'refs/heads/main' && always() && needs.preflight.result == 'success' && (needs.preflight.outputs.decision == 'resume' || needs.assemble.result == 'success') }}
+    runs-on: ${{ matrix.target.runs_on }}
+    timeout-minutes: 60
+    environment: release
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.preflight.outputs.targets) }}
+    steps:
+      - &checkout-controller
+        name: Check out the controller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: controller
+          persist-credentials: false
+          clean: true
+      - &checkout-candidate
+        name: Check out the candidate commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          path: candidate
+          persist-credentials: false
+          clean: true
+      - &private-dirs
+        name: Private Cargo home and target directories (cache-free)
+        run: |
+          echo "CARGO_HOME=$(mktemp -d "$RUNNER_TEMP/awman-cargo-home.XXXXXX")" >> "$GITHUB_ENV"
+          echo "XTASK_TARGET=$(mktemp -d "$RUNNER_TEMP/awman-xtask.XXXXXX")" >> "$GITHUB_ENV"
+      - &toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
+        with:
+          toolchain: "1.94.0"
+      - &sweep-start
+        name: Start clean
+        if: ${{ matrix.target.self_hosted }}
+        run: cargo run --locked --quiet --manifest-path controller/Cargo.toml --target-dir "$XTASK_TARGET" -p xtask -- ci sweep --init
+      - &preflight-artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-preflight
+          path: preflight
+      - &exact-bytes
+        name: Exact candidate bytes and record (from the run that built them)
+        id: bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET: ${{ matrix.target.asset }}
+          SOURCE_RUN: ${{ needs.preflight.outputs.source_run }}
+          RECORD: ${{ needs.preflight.outputs.record_artifact }}
+        run: |
+          gh run download "$SOURCE_RUN" --repo "$GITHUB_REPOSITORY" -n "candidate-$ASSET" -D in
+          gh run download "$SOURCE_RUN" --repo "$GITHUB_REPOSITORY" -n "$RECORD" -D record
+          gh attestation verify "in/$ASSET" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/candidate.yml" --source-ref refs/heads/main
+          cargo run --locked --quiet --manifest-path controller/Cargo.toml --target-dir "$XTASK_TARGET" -p xtask -- \
+            release candidate fetch --preflight preflight/preflight.json --asset "$ASSET" \
+            --record record/candidate-record.json --in in --out artifact
+      - name: Artifact tier on the exact bytes
+        working-directory: candidate
+        env:
+          AWMAN_TEST_ARTIFACT: ${{ steps.bytes.outputs.path }}
+          AWMAN_TEST_ARTIFACT_SHA256: ${{ steps.bytes.outputs.sha256 }}
+          BUILD: ${{ matrix.target.build }}
+        run: |
+          case "$RUNNER_OS" in
+            macOS) export AWMAN_TEST_HOST_RESOURCES=offline,hypervisor ;;
+            Linux) export AWMAN_TEST_HOST_RESOURCES=offline ;;
+            Windows) export AWMAN_TEST_HOST_RESOURCES="offline=windows-firewall" ;;
+          esac
+          cargo xtask test run --tier artifact --build "$BUILD" --evidence-dir "$GITHUB_WORKSPACE/evidence"
+      - name: Post-publish verification harness (prebuilt; promote.yml compiles nothing)
+        working-directory: candidate
+        env:
+          BUILD: ${{ matrix.target.build }}
+        run: cargo xtask test archive --build "$BUILD" --out "$GITHUB_WORKSPACE/harness"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verify-harness-${{ matrix.target.asset }}
+          path: harness/
+          retention-days: 90
+          overwrite: true
+      - &evidence-upload
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: evidence-candidate-${{ github.job }}-${{ matrix.target.asset }}
+          path: evidence/
+          retention-days: 90
+          if-no-files-found: warn
+          overwrite: true
+      - &sweep-end
+        name: Leave the runner clean (processes, VMs, images, temp roots)
+        if: ${{ always() && matrix.target.self_hosted }}
+        run: cargo run --locked --quiet --manifest-path controller/Cargo.toml --target-dir "$XTASK_TARGET" -p xtask -- ci sweep
+
+  # Guest tier for the commit on the release Mac (Hypervisor.framework,
+  # Apple Containers and the dedicated Docker pool are separate budgets).
+  guest:
+    name: Guest tier on the release Mac
+    needs: [preflight, runner-preflight, assemble]
+    if: ${{ github.ref == 'refs/heads/main' && always() && needs.runner-preflight.result == 'success' && (needs.preflight.outputs.decision == 'resume' || needs.assemble.result == 'success') }}
+    runs-on: ${{ fromJSON(needs.preflight.outputs.release_labels) }}
+    timeout-minutes: 60
+    environment: release
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      matrix:
+        target: [{ asset: awman-macos-arm64, self_hosted: true }]
+    steps:
+      -
+        name: Check out the controller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: controller
+          persist-credentials: false
+          clean: true
+      -
+        name: Check out the candidate commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          path: candidate
+          persist-credentials: false
+          clean: true
+      -
+        name: Private Cargo home and target directories (cache-free)
+        run: |
+          echo "CARGO_HOME=$(mktemp -d "$RUNNER_TEMP/awman-cargo-home.XXXXXX")" >> "$GITHUB_ENV"
+          echo "XTASK_TARGET=$(mktemp -d "$RUNNER_TEMP/awman-xtask.XXXXXX")" >> "$GITHUB_ENV"
+      -
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
+        with:
+          toolchain: "1.94.0"
+      -
+        name: Start clean
+        if: ${{ matrix.target.self_hosted }}
+        run: cargo run --locked --quiet --manifest-path controller/Cargo.toml --target-dir "$XTASK_TARGET" -p xtask -- ci sweep --init
+      -
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-preflight
+          path: preflight
+      -
+        name: Exact candidate bytes and record (from the run that built them)
+        id: bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET: ${{ matrix.target.asset }}
+          SOURCE_RUN: ${{ needs.preflight.outputs.source_run }}
+          RECORD: ${{ needs.preflight.outputs.record_artifact }}
+        run: |
+          gh run download "$SOURCE_RUN" --repo "$GITHUB_REPOSITORY" -n "candidate-$ASSET" -D in
+          gh run download "$SOURCE_RUN" --repo "$GITHUB_REPOSITORY" -n "$RECORD" -D record
+          gh attestation verify "in/$ASSET" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/candidate.yml" --source-ref refs/heads/main
+          cargo run --locked --quiet --manifest-path controller/Cargo.toml --target-dir "$XTASK_TARGET" -p xtask -- \
+            release candidate fetch --preflight preflight/preflight.json --asset "$ASSET" \
+            --record record/candidate-record.json --in in --out artifact
+      - name: Guest tier
+        working-directory: candidate
+        env:
+          AWMAN_TEST_ARTIFACT: ${{ steps.bytes.outputs.path }}
+          AWMAN_TEST_ARTIFACT_SHA256: ${{ steps.bytes.outputs.sha256 }}
+          AWMAN_TEST_HOST_RESOURCES: hypervisor,apple-containers
+        run: cargo xtask test run --tier guest --build macos-arm64-release-builtin --evidence-dir "$GITHUB_WORKSPACE/evidence"
+      -
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: evidence-candidate-${{ github.job }}-${{ matrix.target.asset }}
+          path: evidence/
+          retention-days: 90
+          if-no-files-found: warn
+          overwrite: true
+      -
+        name: Leave the runner clean (processes, VMs, images, temp roots)
+        if: ${{ always() && matrix.target.self_hosted }}
+        run: cargo run --locked --quiet --manifest-path controller/Cargo.toml --target-dir "$XTASK_TARGET" -p xtask -- ci sweep
+
+
+  # Clean-room unsigned rebuild compared with the recorded unsigned digests.
+  # Reported, non-blocking, and never the shipped bytes. macOS is audited only
+  # on its native release hardware, never by a hosted or cross build.
+  repro:
+    name: Reproducibility ${{ matrix.target.asset }}
+    needs: [preflight, assemble]
+    if: ${{ github.ref == 'refs/heads/main' && needs.preflight.outputs.decision == 'new' && needs.assemble.result == 'success' }}
+    runs-on: ${{ matrix.target.self_hosted && 'ubuntu-24.04' || matrix.target.runs_on }}
+    environment: release
+    timeout-minutes: 60
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.preflight.outputs.targets) }}
+    steps:
+      -
+        name: Check out the controller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: controller
+          persist-credentials: false
+          clean: true
+      -
+        name: Check out the candidate commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          path: candidate
+          persist-credentials: false
+          clean: true
+      -
+        name: Private Cargo home and target directories (cache-free)
+        run: |
+          echo "CARGO_HOME=$(mktemp -d "$RUNNER_TEMP/awman-cargo-home.XXXXXX")" >> "$GITHUB_ENV"
+          echo "XTASK_TARGET=$(mktemp -d "$RUNNER_TEMP/awman-xtask.XXXXXX")" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
+        with:
+          toolchain: "1.94.0"
+          targets: ${{ matrix.target.target }}
+      -
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-preflight
+          path: preflight
+      - name: Audit build
+        if: ${{ !matrix.target.self_hosted }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET: ${{ matrix.target.asset }}
+          RECORD: ${{ needs.preflight.outputs.record_artifact }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" -n "$RECORD" -D record
+          cargo run --locked --quiet --manifest-path controller/Cargo.toml --target-dir "$XTASK_TARGET" -p xtask -- \
+            release candidate repro --asset "$ASSET" --preflight preflight/preflight.json \
+            --record record/candidate-record.json --source candidate --out repro
+      - name: macOS is not reproduced on hosted runners
+        if: ${{ matrix.target.self_hosted }}
+        env:
+          ASSET: ${{ matrix.target.asset }}
+        run: echo "REPRO $ASSET - not audited on hosted runners (native release hardware only); reported, not blocking"
+
+  # The candidate gate: main gate set for the commit + every candidate cell
+  # against the exact bytes, release-critical scenarios by ID, committed
+  # overrides only. Failed/blocked cells rerun against the same artifacts
+  # with `gh run rerun --failed`; passing cells are not rerun.
+  gate:
+    name: Candidate gate
+    needs: [preflight, controller, assemble, main-evidence, main-gate, artifact, guest]
+    if: ${{ github.ref == 'refs/heads/main' && always() && needs.preflight.result == 'success' && needs.controller.result == 'success' && contains(fromJSON('["new","resume"]'), needs.preflight.outputs.decision) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
+    concurrency:
+      group: publish-${{ github.repository }}-${{ inputs.version }}${{ inputs.dry_run && format('-rehearsal-{0}', github.run_id) || '' }}
+      cancel-in-progress: false
+    outputs:
+      state: ${{ steps.gate.outputs.verdict == 'passed' && 'validated' || 'candidate-built' }}
+    steps:
+      -
+        name: Download and verify the controller
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-controller
+          path: controller-bin
+      -
+        name: Verify the controller's attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify controller-bin/xtask --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/candidate.yml" --source-ref refs/heads/main
+          chmod +x controller-bin/xtask
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-preflight
+          path: preflight
+      - name: Cell evidence of this run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: evidence-candidate-*
+          path: evidence
+      - name: Check out main (current release policy)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: main
+          persist-credentials: false
+      - name: Gate
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          controller-bin/xtask release candidate gate --preflight preflight/preflight.json \
+            --evidence evidence --main-checkout main --out gated
+      - name: Authenticate the exact validation statement
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: gated/validation.json
+      - name: Retain the gate evidence with the candidate record
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ needs.preflight.outputs.record_artifact }}-gate
+          path: gated/
+          retention-days: 90
+          overwrite: true
+
+  promote:
+    needs: [preflight, gate]
+    if: ${{ always() && inputs.promote && (needs.gate.result == 'success' || (needs.preflight.outputs.decision == 'published' && !inputs.dry_run)) }}
+    uses: ./.github/workflows/promote.yml
+    with:
+      version: ${{ inputs.version }}
+      commit: ${{ inputs.commit }}
+      candidate: ${{ needs.preflight.outputs.candidate }}
+      dry_run: ${{ inputs.dry_run }}
+    secrets: inherit
+    permissions:
+      contents: write
+      actions: read
+      attestations: read
+
+  # A rehearsal deletes its own draft (exact id, rehearsal namespace, this run).
+  cleanup:
+    name: Delete the rehearsal draft
+    needs: [preflight, controller, promote]
+    if: ${{ always() && inputs.dry_run && needs.controller.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      -
+        name: Download and verify the controller
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-controller
+          path: controller-bin
+      -
+        name: Verify the controller's attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify controller-bin/xtask --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/candidate.yml" --source-ref refs/heads/main
+          chmod +x controller-bin/xtask
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-preflight
+          path: preflight
+      - name: Delete only this rehearsal's draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: controller-bin/xtask release candidate cleanup --preflight preflight/preflight.json

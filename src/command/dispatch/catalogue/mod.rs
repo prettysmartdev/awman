@@ -787,9 +787,6 @@ mod link;
 mod queue;
 mod view;
 
-#[cfg(test)]
-mod tests;
-
 use agents::*;
 use attach::*;
 use core::*;

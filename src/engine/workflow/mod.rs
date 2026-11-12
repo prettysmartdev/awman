@@ -371,6 +371,10 @@ pub struct WorkflowEngine {
     /// handle rather than the engine's own clone, which is what makes the
     /// mirror visible to anyone else.
     session_mirror: Option<Arc<tokio::sync::RwLock<Session>>>,
+    /// Monotonic time for decisions measured inside the engine (the
+    /// `AgentError` output-settle window). [`crate::data::clock::system_clock`]
+    /// unless a caller installs another with [`WorkflowEngine::with_clock`].
+    clock: crate::data::clock::SharedClock,
     /// Fired by an external cancel request (the API's
     /// `POST /v1/worker/commands/{id}/cancel`). Never fired unless a caller installs
     /// one with [`WorkflowEngine::set_cancellation`].
@@ -802,8 +806,16 @@ impl WorkflowEngine {
             parallel_group_prompts: None,
             engine_rx: Some(rx),
             session_mirror: None,
+            clock: crate::data::clock::system_clock(),
             cancel: CancellationToken::new(),
         }
+    }
+
+    /// Use `clock` for time the engine measures itself (default: the system
+    /// clock). Tests pass a `ManualClock` to step over the settle window.
+    pub fn with_clock(mut self, clock: crate::data::clock::SharedClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Mirror this run's summary into `session`'s `SessionState` after every
@@ -1255,4 +1267,4 @@ pub fn workflow_name_for(workflow: &Workflow) -> String {
 }
 
 #[cfg(test)]
-mod tests;
+mod contracts;

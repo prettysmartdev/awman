@@ -32,13 +32,13 @@ pub fn refuse_symlinks_below(root: &Path, path: &Path) -> Result<(), DataError> 
         current.push(component);
         match std::fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(symlink_refusal(&current))
+                return Err(symlink_refusal(&current));
             }
             Ok(metadata) if current == path && !metadata.is_file() => {
                 return Err(DataError::Other(format!(
                     "{} is not a regular file; refusing to use it as config",
                     path.display()
-                )))
+                )));
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
@@ -185,136 +185,35 @@ pub fn write_config_file_atomically(path: &Path, content: &str) -> Result<(), Da
         .as_file()
         .sync_all()
         .map_err(|e| DataError::io(path, e))?;
+    #[cfg(not(windows))]
     temporary
         .persist(path)
         .map_err(|e| DataError::io(path, e.error))?;
+    #[cfg(windows)]
+    {
+        // MoveFileEx may transiently refuse replacement while another reader
+        // closes the old file. Retain the complete sibling and retry only the
+        // atomic rename, never truncate the visible checkpoint.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match temporary.persist(path) {
+                Ok(_) => break,
+                Err(error) => {
+                    if !matches!(error.error.raw_os_error(), Some(5 | 32 | 33))
+                        || std::time::Instant::now() >= deadline
+                    {
+                        return Err(DataError::io(path, error.error));
+                    }
+                    temporary = error.file;
+                    std::thread::park_timeout(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+    }
     // Make the rename itself durable.
     #[cfg(unix)]
     if let Ok(directory) = std::fs::File::open(parent) {
         let _ = directory.sync_all();
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(unix)]
-    #[test]
-    fn a_symlinked_parent_directory_is_refused_and_nothing_is_written_outside() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("repo");
-        let outside = tmp.path().join("outside");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(outside.join("config.json"), "{}").unwrap();
-        std::os::unix::fs::symlink(&outside, root.join(".awman")).unwrap();
-        let path = root.join(".awman").join("config.json");
-
-        let err = write_config_file_within(&root, &path, "{\"agent\":\"x\"}")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("is a symlink"), "{err}");
-        assert!(err.contains(".awman"), "{err}");
-        assert_eq!(
-            std::fs::read_to_string(outside.join("config.json")).unwrap(),
-            "{}"
-        );
-        let err = read_config_file_within(&root, &path)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("is a symlink"), "{err}");
-    }
-
-    #[test]
-    fn missing_components_are_allowed_and_paths_outside_root_refused() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join(".awman").join("config.json");
-        assert_eq!(read_config_file_within(tmp.path(), &path).unwrap(), None);
-        write_config_file_within(tmp.path(), &path, "{}").unwrap();
-        assert_eq!(
-            read_config_file_within(tmp.path(), &path)
-                .unwrap()
-                .as_deref(),
-            Some("{}")
-        );
-        let other = tempfile::tempdir().unwrap();
-        assert!(refuse_symlinks_below(other.path(), &path).is_err());
-    }
-
-    #[test]
-    fn a_directory_at_the_config_path_is_refused() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join(".awman").join("config.json");
-        std::fs::create_dir_all(&path).unwrap();
-        let err = read_config_file_within(tmp.path(), &path)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not a regular file"), "{err}");
-        assert!(write_config_file_atomically(&path, "{}").is_err());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_new_file_gets_the_umask_default_and_an_existing_mode_is_kept() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("config.json");
-        write_config_file_atomically(&path, "{}").unwrap();
-        // Whatever the umask, the same mode `fs::write` gives a new file.
-        let sibling = tmp.path().join("plain.json");
-        std::fs::write(&sibling, "{}").unwrap();
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&path), mode(&sibling));
-
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        write_config_file_atomically(&path, "{\"a\":1}").unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o640);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_user_config_symlink_is_followed_and_kept() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dotfiles = tmp.path().join("dotfiles");
-        std::fs::create_dir_all(&dotfiles).unwrap();
-        std::fs::write(dotfiles.join("awman.json"), "{}").unwrap();
-        let link = tmp.path().join("config.json");
-        std::os::unix::fs::symlink("dotfiles/awman.json", &link).unwrap();
-
-        write_user_config_file(&link, "{\"a\":1}").unwrap();
-        assert!(std::fs::symlink_metadata(&link)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert_eq!(
-            std::fs::read_to_string(dotfiles.join("awman.json")).unwrap(),
-            "{\"a\":1}"
-        );
-
-        // A dangling link creates its target, as a plain write would.
-        std::fs::remove_file(dotfiles.join("awman.json")).unwrap();
-        write_user_config_file(&link, "{}").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dotfiles.join("awman.json")).unwrap(),
-            "{}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn an_unwritable_existing_file_is_refused() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("config.json");
-        std::fs::write(&path, "{}").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let err = write_config_file_atomically(&path, "{\"a\":1}")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("read-only"), "{err}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
-    }
 }

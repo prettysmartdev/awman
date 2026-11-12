@@ -4,7 +4,7 @@
 // The caller supplies the current focus context; a handled action prevents
 // the browser default. Keys typed into a focused text field are left alone
 // unless the keymap claims them for that context.
-import { useEffect, useRef } from 'react';
+import { useEffect, useLayoutEffect, useRef } from 'react';
 import { map, type KeyContext, type MapOptions, type WebAction } from './keymap';
 
 export interface ShortcutScope {
@@ -29,7 +29,9 @@ export function isTextInput(target: EventTarget | null): boolean {
 export function useShortcuts(scope: () => ShortcutScope, onAction: (action: WebAction, event: KeyboardEvent) => boolean | undefined, enabled = true): void {
   const scopeRef = useRef(scope);
   const actionRef = useRef(onAction);
-  useEffect(() => {
+  // Publish handlers with the committed UI, before a focus or key event can
+  // observe the previous render's scope or catalogue.
+  useLayoutEffect(() => {
     scopeRef.current = scope;
     actionRef.current = onAction;
   });

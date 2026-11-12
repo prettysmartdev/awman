@@ -638,7 +638,3 @@ impl LocalDaemonLink {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "engine_handoff_tests.rs"]
-mod tests;

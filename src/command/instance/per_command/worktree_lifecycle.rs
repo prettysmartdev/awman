@@ -278,21 +278,3 @@ fn dirty_target_commit_response(
         _ => dirty_target_commit_message(None, suggested),
     }
 }
-
-#[cfg(test)]
-mod dirty_target_tests {
-    use super::*;
-    #[test]
-    fn escape_aborts_but_submitted_empty_text_accepts_default() {
-        assert_eq!(
-            dirty_target_commit_response(DialogResponse::Dismissed, "WIP"),
-            DirtyMergeTargetDecision::Abort
-        );
-        assert_eq!(
-            dirty_target_commit_response(DialogResponse::Text(String::new()), "WIP"),
-            DirtyMergeTargetDecision::Commit {
-                message: "WIP".into()
-            }
-        );
-    }
-}

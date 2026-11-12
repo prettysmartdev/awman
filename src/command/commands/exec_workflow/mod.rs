@@ -535,8 +535,7 @@ impl ExecWorkflowCommand {
 mod dynamic;
 mod execute;
 mod factory;
-#[cfg(test)]
-pub(crate) use factory::AgentFrontendProxy;
+
 mod issue;
 mod merge_fix_prompt;
 mod phase_container;
@@ -546,7 +545,7 @@ mod shared_frontend;
 pub(crate) use shared_frontend::SharedWorkflowFrontend;
 
 #[cfg(test)]
-pub(crate) mod tests;
+mod contract_tests;
 
 // The child modules' items are `pub(super)`; re-exporting them here is what
 // lets each one say `use super::*;` and see the others, exactly as they all

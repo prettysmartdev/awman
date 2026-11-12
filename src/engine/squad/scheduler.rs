@@ -135,6 +135,7 @@ impl SchedulerStatus {
 
 /// The always-on task scheduler.
 pub struct SquadScheduler {
+    clock: crate::data::clock::SharedClock,
     executor: Option<Arc<crate::engine::daemon::executor::SharedExecutor>>,
     store: Arc<TaskStore>,
     paths: SquadPaths,
@@ -174,6 +175,7 @@ impl SquadScheduler {
         env: EnvSnapshot,
     ) -> Self {
         Self {
+            clock: crate::data::clock::system_clock(),
             executor: None,
             store,
             paths,
@@ -185,6 +187,22 @@ impl SquadScheduler {
             env_state: None,
             tick_interval: TICK_INTERVAL,
             resolved_leaders: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Use the same clock for selection, completion and retry eligibility.
+    pub fn with_clock(mut self, clock: crate::data::clock::SharedClock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Evaluate one due-work snapshot and drain its evaluations. Embedders
+    /// can drive scheduling from their own wake source without a timer loop.
+    pub async fn evaluate_due(&self) {
+        let mut tasks = JoinSet::new();
+        self.tick(&mut tasks).await;
+        while let Some(result) = tasks.join_next().await {
+            result.expect("squad evaluation panicked");
         }
     }
 
@@ -321,7 +339,7 @@ impl SquadScheduler {
 
         self.log_running_agents();
 
-        let now = Utc::now();
+        let now = self.clock.now_utc();
         {
             // The tick count and timestamp are still recorded — `squad status`
             // reports both — but the tick itself is deliberately not logged.
@@ -408,7 +426,7 @@ impl SquadScheduler {
             // task is excluded from the very next tick's SQL selection by
             // its own `running` row. Opening it inside the task would let a
             // queued evaluation be selected a second time.
-            let started_at = Utc::now();
+            let started_at = self.clock.now_utc();
             let task_dir = match self.paths.task_dir(&task.name) {
                 Ok(dir) => dir,
                 Err(error) => {
@@ -468,9 +486,12 @@ impl SquadScheduler {
                         error: Some(format!("preparing per-container log directory: {error}")),
                         ..Default::default()
                     };
-                    let _ = self
-                        .store
-                        .finish_run(&run_id, RunStatus::Failed, &detail, Utc::now());
+                    let _ = self.store.finish_run(
+                        &run_id,
+                        RunStatus::Failed,
+                        &detail,
+                        self.clock.now_utc(),
+                    );
                     tracing::warn!(
                         task = %task.name,
                         run_id = %run_id,
@@ -500,9 +521,12 @@ impl SquadScheduler {
                         error: Some(format!("reading the task's config.json: {error}")),
                         ..Default::default()
                     };
-                    let _ = self
-                        .store
-                        .finish_run(&run_id, RunStatus::Failed, &detail, Utc::now());
+                    let _ = self.store.finish_run(
+                        &run_id,
+                        RunStatus::Failed,
+                        &detail,
+                        self.clock.now_utc(),
+                    );
                     tracing::warn!(
                         task = %task.name,
                         run_id = %run_id,
@@ -540,9 +564,11 @@ impl SquadScheduler {
             let guidance = effective.guidance.clone();
             let agents_to_models = effective.agents_to_models.clone();
             let default_leader = effective.default_leader.clone();
+            let clock = self.clock.clone();
             tasks.spawn(async move {
                 let _permit = permit;
                 evaluate_task(EvaluateArgs {
+                    clock,
                     store,
                     evaluator,
                     status,
@@ -666,6 +692,7 @@ pub struct RunningAgentSummary {
 
 /// Bundled arguments for one task's evaluation task.
 struct EvaluateArgs {
+    clock: crate::data::clock::SharedClock,
     store: Arc<TaskStore>,
     evaluator: Arc<dyn TaskEvaluator>,
     status: Arc<Mutex<SchedulerStatus>>,
@@ -691,6 +718,7 @@ struct EvaluateArgs {
 /// tick must never take down the daemon.
 async fn evaluate_task(args: EvaluateArgs) {
     let EvaluateArgs {
+        clock,
         store,
         evaluator,
         status,
@@ -738,12 +766,20 @@ async fn evaluate_task(args: EvaluateArgs) {
         outcome = evaluation => Some(outcome),
     };
     let Some(outcome) = outcome else {
-        finish_canceled_run(&store, &task, &run_id, &run_log_dir, runtime).await;
+        finish_canceled_run(
+            &store,
+            &task,
+            &run_id,
+            &run_log_dir,
+            runtime,
+            clock.now_utc(),
+        )
+        .await;
         return;
     };
 
     let (run_status, detail, failed) = classify(&outcome, &run_log_dir);
-    let finished_at = Utc::now();
+    let finished_at = clock.now_utc();
     if failed {
         // WI 0112 Part 5: a failed run is an error line that says why and
         // where to look, even when the failure happened before any step ran
@@ -911,6 +947,7 @@ async fn finish_canceled_run(
     run_id: &RunId,
     run_log_dir: &std::path::Path,
     runtime: Option<Arc<dyn AgentRuntimeEngine>>,
+    now: DateTime<Utc>,
 ) {
     tracing::info!(
         task = %task.name,
@@ -929,7 +966,7 @@ async fn finish_canceled_run(
                 .and_then(|verdict| verdict.reason),
             ..Default::default()
         },
-        Utc::now(),
+        now,
     ) {
         tracing::warn!(
             "squad: failed to record canceled run for {:?}: {error}",
@@ -1006,471 +1043,5 @@ impl Drop for InFlightGuard {
         {
             status.cancellations.remove(&self.task_id);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn backoff_grows_exponentially_then_caps() {
-        // interval 60s: 120, 240, 480, … up to the 6h ceiling.
-        assert_eq!(backoff_secs(60, 1), 120);
-        assert_eq!(backoff_secs(60, 2), 240);
-        assert_eq!(backoff_secs(60, 3), 480);
-        assert_eq!(backoff_secs(60, 100), MAX_BACKOFF_SECS);
-    }
-
-    #[test]
-    fn backoff_never_overflows() {
-        assert_eq!(backoff_secs(u64::MAX, 63), MAX_BACKOFF_SECS);
-        assert_eq!(backoff_secs(86_400, u32::MAX), MAX_BACKOFF_SECS);
-    }
-
-    fn executed(exit_code: Option<i32>) -> EvaluationOutcome {
-        EvaluationOutcome::WorkflowExecuted {
-            reason: Some("new issues".to_string()),
-            workflow_path: "/c/workflow.toml".into(),
-            workflow_state_path: Some("/state.json".into()),
-            exit_code,
-        }
-    }
-
-    #[test]
-    fn classify_maps_each_outcome() {
-        let log_dir = std::path::Path::new("/runs/r1");
-        let (status, detail, failed) = classify(
-            &EvaluationOutcome::NotTriggered {
-                reason: Some("nothing new".to_string()),
-            },
-            log_dir,
-        );
-        assert_eq!(status, RunStatus::NotTriggered);
-        assert!(!failed);
-        assert!(detail.error.is_none());
-        assert_eq!(detail.reason.as_deref(), Some("nothing new"));
-
-        let (status, detail, failed) = classify(&executed(Some(0)), log_dir);
-        assert_eq!(status, RunStatus::WorkflowExecuted);
-        assert!(!failed);
-        assert!(detail.error.is_none());
-        assert_eq!(detail.reason.as_deref(), Some("new issues"));
-        assert_eq!(
-            detail.workflow_path.as_deref(),
-            Some("/c/workflow.toml".as_ref())
-        );
-        assert_eq!(
-            detail.workflow_state_path.as_deref(),
-            Some("/state.json".as_ref())
-        );
-
-        let (status, detail, failed) = classify(
-            &EvaluationOutcome::Failed {
-                error: "boom".to_string(),
-                reason: Some("3 new issues".to_string()),
-            },
-            log_dir,
-        );
-        assert_eq!(status, RunStatus::Failed);
-        assert!(failed);
-        assert_eq!(detail.error.as_deref(), Some("boom"));
-        assert_eq!(detail.reason.as_deref(), Some("3 new issues"));
-    }
-
-    /// WI 0112 Part 6: a generated workflow that exited non-zero is a failed
-    /// run that backs the task off, and its paths stay on the row.
-    #[test]
-    fn classify_turns_a_non_zero_workflow_exit_into_a_failed_run() {
-        let log_dir = std::path::Path::new("/runs/r1");
-        for code in [1, 2, 137] {
-            let (status, detail, failed) = classify(&executed(Some(code)), log_dir);
-            assert_eq!(status, RunStatus::Failed, "exit {code}");
-            assert!(failed, "exit {code} backs off");
-            assert_eq!(
-                detail.error.as_deref(),
-                Some(format!("generated workflow exited with code {code}; see /runs/r1").as_str())
-            );
-            assert_eq!(
-                detail.workflow_path.as_deref(),
-                Some("/c/workflow.toml".as_ref()),
-                "the workflow path survives a failed classification"
-            );
-            assert_eq!(
-                detail.workflow_state_path.as_deref(),
-                Some("/state.json".as_ref())
-            );
-        }
-    }
-
-    /// A paused workflow (no exit code) cannot happen unattended, but the
-    /// mapping must not call it a failure if it ever did.
-    #[test]
-    fn classify_treats_a_workflow_without_an_exit_code_as_executed() {
-        let (status, detail, failed) = classify(&executed(None), std::path::Path::new("/r"));
-        assert_eq!(status, RunStatus::WorkflowExecuted);
-        assert!(!failed);
-        assert!(detail.error.is_none());
-    }
-
-    // ── Global config reload (WI 0129 F04) ────────────────────────────────
-
-    fn config_scheduler(tmp: &std::path::Path) -> (SquadScheduler, std::path::PathBuf) {
-        let store = Arc::new(summary_store(tmp));
-        let past = Utc::now() - chrono::Duration::hours(1);
-        store
-            .create(&Task {
-                prerequisites: None,
-                id: crate::data::ids::TaskId::new(),
-                name: "alpha".into(),
-                description: "d".into(),
-                repo_scope: tmp.to_path_buf(),
-                mount_scope: crate::data::fs::MountScope::Directory,
-                overlays: Vec::new(),
-                interval_secs: 60,
-                status: crate::data::fs::TaskStatus::Active,
-                agent: None,
-                model: None,
-                backoff_until: None,
-                created_at: past,
-                updated_at: past,
-                last_run_at: None,
-                trigger_requested_at: None,
-                last_run_status: None,
-                unmet_env: Vec::new(),
-            })
-            .unwrap();
-        let home = tmp.join("home");
-        std::fs::create_dir_all(&home).unwrap();
-        let env = EnvSnapshot::with_overrides([(
-            crate::data::fs::data_paths::AWMAN_HOME,
-            home.to_str().unwrap(),
-        )]);
-        let scheduler = SquadScheduler::new(
-            store,
-            SquadPaths::from_root(tmp.join("squad")),
-            Arc::new(NoopEvaluator),
-            env,
-        );
-        (scheduler, home.join("config.json"))
-    }
-
-    /// A started run takes the task out of the due set.
-    fn task_admitted(scheduler: &SquadScheduler) -> bool {
-        scheduler
-            .store
-            .due_for_evaluation(Utc::now())
-            .unwrap()
-            .is_empty()
-    }
-
-    #[tokio::test]
-    async fn a_malformed_global_config_admits_nothing_and_recovers_on_the_next_valid_reload() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (scheduler, config) = config_scheduler(tmp.path());
-        let mut tasks = JoinSet::new();
-
-        // Malformed with an unrelated run in flight: nothing is admitted, the
-        // in-flight count is untouched, and the tick is still counted.
-        adjust_in_flight(&scheduler.status, 1);
-        std::fs::write(&config, "{ not json").unwrap();
-        scheduler.tick(&mut tasks).await;
-        assert!(!task_admitted(&scheduler), "default policy must not admit");
-        {
-            let status = scheduler.status.lock().unwrap();
-            assert_eq!(status.in_flight, 1);
-            assert_eq!(status.tick_count, 1);
-        }
-        let first = scheduler.status.lock().unwrap().config_error.clone();
-        assert!(first.is_some(), "the named error is recorded");
-
-        // The same error on a later tick is not a new report.
-        scheduler.tick(&mut tasks).await;
-        assert_eq!(scheduler.status.lock().unwrap().config_error, first);
-        assert!(!task_admitted(&scheduler));
-
-        // A valid reload resumes admission with no restart, and the in-flight
-        // run still counts against the cap.
-        std::fs::write(
-            &config,
-            r#"{"daemon":{"features":{"squad":{"maxConcurrentEvaluations":1}}}}"#,
-        )
-        .unwrap();
-        scheduler.tick(&mut tasks).await;
-        assert!(scheduler
-            .status_handle()
-            .lock()
-            .unwrap()
-            .config_error
-            .is_none());
-        assert!(!task_admitted(&scheduler), "cap of 1 is still full");
-        adjust_in_flight(&scheduler.status, -1);
-        scheduler.tick(&mut tasks).await;
-        assert!(task_admitted(&scheduler));
-        while tasks.join_next().await.is_some() {}
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn an_inaccessible_global_config_admits_nothing_and_recovers_when_restored() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let (scheduler, config) = config_scheduler(tmp.path());
-        std::fs::write(
-            &config,
-            r#"{"daemon":{"features":{"squad":{"maxConcurrentEvaluations":1}}}}"#,
-        )
-        .unwrap();
-        let parent = config.parent().unwrap();
-        let mut tasks = JoinSet::new();
-        adjust_in_flight(&scheduler.status, 1);
-
-        for denied in [&config, &parent.to_path_buf()] {
-            let original = std::fs::metadata(denied).unwrap().permissions();
-            std::fs::set_permissions(denied, std::fs::Permissions::from_mode(0o000)).unwrap();
-            let enforced = std::fs::read_to_string(&config).is_err();
-            if enforced {
-                // Running as root the mode cannot deny access.
-                scheduler.tick(&mut tasks).await;
-            }
-            std::fs::set_permissions(denied, original).unwrap();
-            if !enforced {
-                return;
-            }
-            assert!(!task_admitted(&scheduler), "default policy must not admit");
-            assert_eq!(scheduler.status.lock().unwrap().in_flight, 1);
-            assert!(scheduler
-                .status_handle()
-                .lock()
-                .unwrap()
-                .config_error
-                .is_some());
-
-            // Restored: a valid reload clears the error with no restart.
-            scheduler.tick(&mut tasks).await;
-            assert!(scheduler
-                .status_handle()
-                .lock()
-                .unwrap()
-                .config_error
-                .is_none());
-            assert!(!task_admitted(&scheduler), "cap of 1 is still full");
-        }
-        adjust_in_flight(&scheduler.status, -1);
-        scheduler.tick(&mut tasks).await;
-        assert!(task_admitted(&scheduler));
-        while tasks.join_next().await.is_some() {}
-    }
-
-    #[tokio::test]
-    async fn an_absent_global_config_keeps_the_default_policy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (scheduler, config) = config_scheduler(tmp.path());
-        assert!(!config.exists());
-        let mut tasks = JoinSet::new();
-        scheduler.tick(&mut tasks).await;
-        assert!(task_admitted(&scheduler));
-        while tasks.join_next().await.is_some() {}
-    }
-
-    #[test]
-    fn operator_env_outranks_global_and_task_files_in_the_squad_view() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (mut scheduler, config) = config_scheduler(tmp.path());
-        std::fs::write(
-            &config,
-            r#"{"daemon":{"features":{"squad":{"maxConcurrentEvaluations":2}}},
-                "workflows":{"dynamic":{"defaultLeader":"claude::file"}}}"#,
-        )
-        .unwrap();
-        let task_file = scheduler.paths.task_config_file("alpha").unwrap();
-        std::fs::create_dir_all(task_file.parent().unwrap()).unwrap();
-        std::fs::write(
-            &task_file,
-            r#"{"workflows":{"dynamic":{"defaultLeader":"claude::task"}}}"#,
-        )
-        .unwrap();
-        // Files alone: the task file wins the leader.
-        let task_view = scheduler.resolve_squad_config(Some("alpha")).unwrap();
-        assert_eq!(task_view.default_leader.as_deref(), Some("claude::task"));
-        assert_eq!(task_view.max_concurrent_evaluations, Some(2));
-        // The daemon's environment outranks both files.
-        scheduler.env = EnvSnapshot::with_overrides([
-            (
-                crate::data::fs::data_paths::AWMAN_HOME,
-                config.parent().unwrap().to_str().unwrap(),
-            ),
-            (
-                "AWMAN_DAEMON_FEATURES_SQUAD_MAX_CONCURRENT_EVALUATIONS",
-                "1",
-            ),
-            ("AWMAN_WORKFLOWS_DYNAMIC_DEFAULT_LEADER", "claude::env"),
-        ]);
-        let task_view = scheduler.resolve_squad_config(Some("alpha")).unwrap();
-        assert_eq!(task_view.default_leader.as_deref(), Some("claude::env"));
-        assert_eq!(task_view.max_concurrent_evaluations, Some(1));
-        assert_eq!(
-            scheduler
-                .reload_squad_config()
-                .unwrap()
-                .max_concurrent_evaluations,
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn a_changed_config_error_is_reported_again() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (scheduler, config) = config_scheduler(tmp.path());
-        std::fs::write(&config, "{ not json").unwrap();
-        assert!(scheduler.reload_squad_config().is_none());
-        let first = scheduler.status.lock().unwrap().config_error.clone();
-        std::fs::write(
-            &config,
-            r#"{"daemon":{"features":{"squad":{"maxConcurrentEvaluations":0}}}}"#,
-        )
-        .unwrap();
-        assert!(scheduler.reload_squad_config().is_none());
-        assert_ne!(scheduler.status.lock().unwrap().config_error, first);
-    }
-
-    // ── The periodic running-agents summary (WI 0106 §3b) ─────────────────
-
-    fn summary_store(tmp: &std::path::Path) -> TaskStore {
-        let db = crate::data::fs::DataPaths::at_root(tmp.join("data")).db_path();
-        let store = TaskStore::open(&db).unwrap();
-        store.migrate().unwrap();
-        store
-    }
-
-    /// A scheduler over `store` with no runtime — enough to exercise the
-    /// running-agent summary, which only reads the store and the reported
-    /// leader identities.
-    fn summary_scheduler(store: Arc<TaskStore>, tmp: &std::path::Path) -> SquadScheduler {
-        SquadScheduler::new(
-            store,
-            SquadPaths::from_root(tmp.join("squad")),
-            Arc::new(NoopEvaluator),
-            EnvSnapshot::empty(),
-        )
-    }
-
-    /// An evaluator that is never invoked by the summary tests.
-    struct NoopEvaluator;
-
-    #[async_trait::async_trait]
-    impl TaskEvaluator for NoopEvaluator {
-        async fn evaluate(&self, _request: EvaluationRequest) -> EvaluationOutcome {
-            EvaluationOutcome::NotTriggered { reason: None }
-        }
-    }
-
-    fn handle(
-        name: &str,
-        image: &str,
-        started_at: DateTime<Utc>,
-    ) -> crate::data::session::AgentHandle {
-        crate::data::session::AgentHandle {
-            id: format!("id-{name}"),
-            image_tag: image.to_string(),
-            name: name.to_string(),
-            started_at,
-        }
-    }
-
-    /// Nothing running means nothing logged — including on the tick right
-    /// after the last container exits, since the snapshot is queried live and
-    /// an empty snapshot produces no summary lines at all.
-    #[test]
-    fn the_running_agents_summary_is_empty_when_nothing_is_running() {
-        let tmp = tempfile::tempdir().unwrap();
-        let scheduler = summary_scheduler(Arc::new(summary_store(tmp.path())), tmp.path());
-        assert!(
-            scheduler
-                .running_agent_summaries(&[], Utc::now())
-                .is_empty(),
-            "an empty container snapshot must produce no summary lines"
-        );
-    }
-
-    /// One entry per running container, carrying the task, container name,
-    /// agent/model, and elapsed running time.
-    #[test]
-    fn the_running_agents_summary_reports_one_entry_per_running_container() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(summary_store(tmp.path()));
-        let now = Utc::now();
-        let mut configured = Task {
-            prerequisites: None,
-            id: crate::data::ids::TaskId::new(),
-            name: "issue-triage".into(),
-            description: "d".into(),
-            repo_scope: tmp.path().to_path_buf(),
-            mount_scope: crate::data::fs::MountScope::Directory,
-            overlays: Vec::new(),
-            interval_secs: 21_600,
-            status: crate::data::fs::TaskStatus::Active,
-            agent: Some("codex".into()),
-            model: Some("gpt-5".into()),
-            backoff_until: None,
-            created_at: now,
-            updated_at: now,
-            last_run_at: None,
-            trigger_requested_at: None,
-            last_run_status: None,
-            unmet_env: Vec::new(),
-        };
-        store.create(&configured).unwrap();
-        configured.id = crate::data::ids::TaskId::new();
-        configured.name = "nightly-sweep".into();
-        configured.agent = None;
-        configured.model = None;
-        store.create(&configured).unwrap();
-
-        let handles = [
-            handle(
-                "awman-squad-issue-triage-0123abcd",
-                "awman-ws-codex:latest",
-                now - chrono::Duration::seconds(90),
-            ),
-            handle(
-                "awman-squad-nightly-sweep-89abcdef",
-                "awman-ws-claude:latest",
-                now - chrono::Duration::seconds(5),
-            ),
-        ];
-
-        let scheduler = summary_scheduler(Arc::clone(&store), tmp.path());
-        // The leader resolution Layer 2 reports for the second task. The
-        // first task's own `agent`/`model` columns still speak for it (F-46:
-        // the fallback is the recorded request, not a re-derived default).
-        scheduler.resolved_leaders.lock().unwrap().insert(
-            "nightly-sweep".to_string(),
-            ResolvedLeader {
-                agent: "claude".into(),
-                model: Some("opus".into()),
-            },
-        );
-
-        let summaries = scheduler.running_agent_summaries(&handles, now);
-
-        assert_eq!(summaries.len(), 2, "one entry per running container");
-        assert_eq!(
-            summaries[0],
-            RunningAgentSummary {
-                task: "issue-triage".into(),
-                container: "awman-squad-issue-triage-0123abcd".into(),
-                agent: "codex".into(),
-                model: Some("gpt-5".into()),
-                image: "awman-ws-codex:latest".into(),
-                elapsed_secs: 90,
-            }
-        );
-        // The second task configures neither agent nor model, so the summary
-        // reports what Layer 2 resolved for it.
-        assert_eq!(summaries[1].task, "nightly-sweep");
-        assert_eq!(summaries[1].agent, "claude");
-        assert_eq!(summaries[1].model.as_deref(), Some("opus"));
-        assert_eq!(summaries[1].elapsed_secs, 5);
     }
 }

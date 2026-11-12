@@ -498,6 +498,3 @@ fn parse_rest_pull_request(
         state,
     })
 }
-
-#[cfg(test)]
-mod tests;

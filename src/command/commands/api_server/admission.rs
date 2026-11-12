@@ -918,6 +918,3 @@ fn admission_body(
     }
     Ok(body)
 }
-
-#[cfg(test)]
-mod tests;

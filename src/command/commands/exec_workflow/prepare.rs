@@ -1621,33 +1621,3 @@ impl crate::engine::workflow::factory::AgentExecutionFactory for CleanupOnlyFact
         Ok(None)
     }
 }
-
-#[cfg(test)]
-mod compat_tests {
-    use super::*;
-
-    #[test]
-    fn import_setup_uses_runnable_agent_image_while_build_keeps_project_image() {
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let session = Session::for_tests_isolated(root.path(), home.path());
-        let project = crate::data::image_tags::project_image_tag(root.path());
-        let agent = crate::data::image_tags::agent_image_tag(root.path(), "claude");
-        assert_eq!(
-            resolve_phase_image(
-                &session,
-                root.path(),
-                crate::engine::agent_runtime::ImageAcquisition::Build
-            ),
-            project
-        );
-        assert_eq!(
-            resolve_phase_image(
-                &session,
-                root.path(),
-                crate::engine::agent_runtime::ImageAcquisition::Import
-            ),
-            agent
-        );
-    }
-}

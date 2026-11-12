@@ -94,7 +94,7 @@ impl DaemonPaths {
                     return Err(DataError::Other(format!(
                         "refusing to remove non-socket {}",
                         path.display()
-                    )))
+                    )));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(DataError::io(path, e)),

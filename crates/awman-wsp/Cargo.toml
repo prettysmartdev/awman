@@ -25,8 +25,7 @@ tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
 awman-wsp = { path = ".", features = ["mock", "terminal"] }
+# WI 0144 test infrastructure (it depends on this crate's mock; dev cycle is allowed).
+awman-test-support = { path = "../awman-test-support" }
 tokio = { version = "1", features = ["full"] }
 wiremock = "0.6"
-[[test]]
-name = "conformance"
-required-features = ["mock"]

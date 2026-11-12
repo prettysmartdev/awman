@@ -38,14 +38,6 @@ impl Tab {
         self.container_slots.get(self.focused_slot_idx)
     }
 
-    /// Focused slot's vt100 parser. Panics when no slot exists — test-only
-    /// convenience for feeding PTY bytes and probing the grid.
-    #[cfg(test)]
-    pub fn focused_parser_mut(&mut self) -> &mut vt100::Parser {
-        let idx = self.focused_slot_idx;
-        &mut self.container_slots[idx].vt100_parser
-    }
-
     /// Drain the shared parallel-slot event queue and update `container_slots`
     /// accordingly (WI-0096 §12). Events are processed in the order the engine
     /// emitted them, so an "exited then dequeued" pair in the same tick evicts

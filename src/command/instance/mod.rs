@@ -36,10 +36,6 @@ pub mod per_command;
 mod queue;
 pub mod relay;
 pub mod remote;
-#[cfg(test)]
-pub(crate) mod test_support;
-#[cfg(any(test, feature = "test-support"))]
-pub mod trace;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -310,8 +306,7 @@ pub struct EngineInstance {
     queue: Mutex<Option<crate::command::worker::queue_source::SharedQueueSource>>,
     input_available: std::sync::atomic::AtomicBool,
     wake: Mutex<Arc<tokio::sync::Notify>>,
-    #[cfg(any(test, feature = "test-support"))]
-    trace: Arc<trace::OutcomeTrace>,
+
     id: InstanceId,
     created_at: DateTime<Utc>,
     catalogue: &'static CommandCatalogue,
@@ -371,8 +366,7 @@ impl EngineInstance {
             queue: Default::default(),
             input_available: std::sync::atomic::AtomicBool::new(kind.can_ask_a_human()),
             wake: Mutex::new(Arc::new(tokio::sync::Notify::new())),
-            #[cfg(any(test, feature = "test-support"))]
-            trace: Arc::new(trace::OutcomeTrace::default()),
+
             id,
             kind,
             hub,
@@ -401,11 +395,6 @@ impl EngineInstance {
     pub fn set_input_available(&self, available: bool) {
         self.input_available
             .store(available, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn outcome_trace(&self) -> Arc<trace::OutcomeTrace> {
-        self.trace.clone()
     }
 
     pub fn created_at(&self) -> DateTime<Utc> {
@@ -451,8 +440,6 @@ impl EngineInstance {
                     .create(session.clone())
                     .expect("startup session id must be unique");
                 self.lifecycle().register(session.id(), pty_size);
-                #[cfg(any(test, feature = "test-support"))]
-                self.trace.record("session_created", session.working_dir());
                 // Only a tab opened to show a fatal startup error runs no
                 // startup command.
                 InitialTabOpened::Normal {
@@ -532,9 +519,7 @@ impl EngineInstance {
             .clone();
         if !self.lifecycle().register(session_id, pty_size) {
             return Err(instance_ended());
-        }
-        #[cfg(any(test, feature = "test-support"))]
-        self.trace.record("session_created", session.working_dir());
+        };
         Ok(self.opened(session, start_startup, pty_size))
     }
 
@@ -547,8 +532,6 @@ impl EngineInstance {
             return;
         }
         if self.session_manager.get(&id).is_none() {
-            #[cfg(any(test, feature = "test-support"))]
-            self.trace.record("session_created", session.working_dir());
             self.session_manager
                 .create(session.clone())
                 .expect("tab session id must be unique");
@@ -721,8 +704,6 @@ impl EngineInstance {
             None
         };
         self.admit(&parsed.path)?;
-        #[cfg(any(test, feature = "test-support"))]
-        self.trace.record("command", serde_json::json!({"path":parsed.path,"args":parsed.args.to_argv(self.catalogue.lookup(&parsed.path.iter().map(String::as_str).collect::<Vec<_>>()).expect("parsed command"))}));
 
         // Early refusal, before anything is built. The binding check is the
         // one under the lifecycle lock below.
@@ -779,8 +760,6 @@ impl EngineInstance {
         };
 
         let command_cancel = feeds.command_cancel.clone();
-        #[cfg(any(test, feature = "test-support"))]
-        feeds.container.set_trace(self.trace.clone());
         let command_bytes = feeds.command_bytes.clone();
         let wake = self.wake.lock().unwrap().clone();
         let frontend = InstanceCommandFrontend::new(
@@ -799,9 +778,6 @@ impl EngineInstance {
         .with_presentation(Arc::clone(&self.presentation))
         .with_pty_size(tab_pty_size)
         .with_squad_attach(squad_attach);
-
-        #[cfg(any(test, feature = "test-support"))]
-        let frontend = frontend.with_trace(self.trace.clone());
 
         let command_name = parsed.path.join(" ");
         let path_owned: Vec<String> = parsed.path.clone();
@@ -859,8 +835,7 @@ impl EngineInstance {
             self.executor.clone()
         };
         let command_runtime = self.runtime.clone();
-        #[cfg(any(test, feature = "test-support"))]
-        let trace = self.trace.clone();
+
         let task = self.runtime.spawn(async move {
             // Hosted commands share the daemon executor under the engine's
             // `maxConcurrentJobs` (WI 0142 §1, executor share).
@@ -907,8 +882,6 @@ impl EngineInstance {
                     "could not start command worker: {error}"
                 ))),
             };
-            #[cfg(any(test, feature = "test-support"))]
-            trace.record("result", relay::command_result_wire(&result));
             let _ = result_tx.send(result);
             wake.notify_one();
         });
@@ -1033,8 +1006,5 @@ impl EngineInstance {
         Ok((session, startup.gateway))
     }
 }
-
-#[cfg(test)]
-mod tests;
 
 pub mod launch_contexts;

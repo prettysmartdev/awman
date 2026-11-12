@@ -1169,16 +1169,13 @@ impl WorkflowEngine {
 }
 
 /// Waits between create_pull_request attempts while GitHub catches up with a
-/// push. Tests use zero delays so the retry path stays fast.
-#[cfg(not(test))]
+/// push.
 const PR_BRANCH_NOT_INDEXED_RETRY_DELAYS: [std::time::Duration; 4] = [
     std::time::Duration::from_secs(3),
     std::time::Duration::from_secs(5),
     std::time::Duration::from_secs(10),
     std::time::Duration::from_secs(15),
 ];
-#[cfg(test)]
-const PR_BRANCH_NOT_INDEXED_RETRY_DELAYS: [std::time::Duration; 4] = [std::time::Duration::ZERO; 4];
 
 /// `gh pr create` can report "No commits between" while GitHub indexes a
 /// push. The same message also accompanies invalid or absent refs, which
@@ -1221,28 +1218,6 @@ fn parse_gh_pr_create_output(output: &str) -> Option<String> {
     })
 }
 
-#[cfg(test)]
-mod pull_request_output_tests {
-    use super::parse_gh_pr_create_output;
-    #[test]
-    fn only_standalone_success_urls_are_captured_including_enterprise_hosts() {
-        for output in [
-            "https://github.com/o/r/pull/7",
-            "created\nhttps://git.example.test/o/r/pull/9\nextra diagnostics",
-        ] {
-            assert!(parse_gh_pr_create_output(output).is_some());
-        }
-        for output in [
-            "already exists: https://github.com/o/r/pull/7",
-            "https://github.com/o/r/pull/7/",
-            "https://github.com/o/r/pull/0",
-            "https://github.com/o/r/pull/1?x=1",
-        ] {
-            assert!(parse_gh_pr_create_output(output).is_none());
-        }
-    }
-}
-
 /// What poll_ci hands its on_failure agent when CI did not end green.
 ///
 /// `failure` is the CI report the poller recorded, which exists only when a
@@ -1268,45 +1243,3 @@ pub(super) fn poll_ci_failure_outcome(
 const NO_CI_FAILURE_REPORT: &str =
     "poll_ci recorded no failed CI run for this commit, so there are no failed jobs or log \
      tails to show; the error below is why the poll stopped.";
-
-#[cfg(test)]
-mod poll_ci_outcome_tests {
-    use super::*;
-
-    #[test]
-    fn a_failed_ci_run_hands_over_its_redacted_report_and_jobs() {
-        let redaction = RedactionSet::new();
-        redaction.add(SecretString::new("hunter2"));
-        let outcome = poll_ci_failure_outcome(
-            "poll_ci: CI failed: CI".into(),
-            Some(poll_ci::CiFailure {
-                report: "job lint: token hunter2 rejected".into(),
-                failed_jobs: vec!["lint".into()],
-            }),
-            &redaction,
-        );
-        assert!(outcome.failed);
-        assert_eq!(
-            outcome.stdout,
-            format!("job lint: token {} rejected", RedactionSet::MARK)
-        );
-        assert_eq!(outcome.stderr, "poll_ci: CI failed: CI");
-        assert_eq!(outcome.ci_failed_jobs, vec!["lint".to_string()]);
-    }
-
-    #[test]
-    fn a_poll_error_without_a_ci_report_says_so_instead_of_an_empty_report() {
-        let outcome = poll_ci_failure_outcome(
-            "poll_ci: CI did not complete within max_retries attempts".into(),
-            None,
-            &RedactionSet::new(),
-        );
-        assert!(outcome.failed);
-        assert_eq!(outcome.stdout, NO_CI_FAILURE_REPORT);
-        assert_eq!(
-            outcome.stderr,
-            "poll_ci: CI did not complete within max_retries attempts"
-        );
-        assert!(outcome.ci_failed_jobs.is_empty());
-    }
-}

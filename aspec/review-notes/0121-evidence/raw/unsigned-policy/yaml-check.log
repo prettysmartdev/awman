@@ -1,2 +1,0 @@
-PASS: .github/workflows/release.yml: YAML, job dependency references, shell syntax and no explicit signing operations
-PASS: .github/workflows/test.yml: YAML, job dependency references, shell syntax and no explicit signing operations

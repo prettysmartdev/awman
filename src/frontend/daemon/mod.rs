@@ -71,7 +71,7 @@ pub async fn serve(runtime: Arc<DaemonRuntime>, claim: DaemonClaim) -> Result<()
     let exit = runtime.exit_signal();
     tokio::select! {
             _ = exit.cancelled() => {
-                tracing::info!("awman daemon exiting: no feature left");
+                tracing::info!("awman daemon exit requested");
             }
             _ = shutdown_signal() => {
                 tracing::info!("awman daemon stopping on signal");
@@ -82,6 +82,7 @@ pub async fn serve(runtime: Arc<DaemonRuntime>, claim: DaemonClaim) -> Result<()
         _ = shutdown_signal() => runtime.shutdown(StopMode::Now).await,
     }
     drop(network);
+    listener.shutdown().await;
     drop(listener);
     tracing::info!("awman daemon stopped");
     Ok(())
@@ -104,7 +105,16 @@ async fn shutdown_signal() {
             _ = term.recv() => {}
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let mut stop =
+            tokio::signal::windows::ctrl_break().expect("install daemon Ctrl-Break handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = stop.recv() => {}
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = tokio::signal::ctrl_c().await;
     }

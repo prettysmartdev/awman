@@ -12,6 +12,7 @@ pub mod builtin_runtime;
 #[cfg(unix)]
 pub mod builtin_state;
 pub mod ci_poll_event;
+pub mod clock;
 // `command_status::CommandStatus` (API command rows) is not re-exported here;
 // `data::InvocationStatus` names the in-memory session command status.
 pub mod command_status;

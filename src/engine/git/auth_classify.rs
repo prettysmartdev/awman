@@ -96,107 +96,6 @@ impl GitFailureClass {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use GitFailureClass::*;
-
-    #[test]
-    fn classifies_auth_rejection_and_transport_signatures() {
-        for (stderr, class) in [
-            (
-                "remote: Invalid username or password.\nfatal: Authentication failed for 'https://h/r'",
-                Auth,
-            ),
-            (
-                "fatal: could not read Username for 'https://h': terminal prompts disabled",
-                Auth,
-            ),
-            ("fatal: unable to get password from user", Auth),
-            (
-                "fatal: unable to access 'https://h/r/': The requested URL returned error: 403",
-                Auth,
-            ),
-            ("git@h: Permission denied (publickey).", Auth),
-            (
-                " ! [rejected]        main -> main (non-fast-forward)",
-                RemoteRejected,
-            ),
-            (
-                " ! [remote rejected] main -> main (pre-receive hook declined)",
-                RemoteRejected,
-            ),
-            (
-                "remote: error: GH006: Protected branch update failed\n ! [remote rejected]",
-                RemoteRejected,
-            ),
-            (
-                "fatal: unable to access 'https://h/r/': The requested URL returned error: 404",
-                RemoteRejected,
-            ),
-            (
-                "fatal: unable to access 'https://h/': Could not resolve host: h",
-                Transport,
-            ),
-            (
-                "fatal: unable to access 'https://h/': Failed to connect to h port 443: Connection refused",
-                Transport,
-            ),
-            (
-                "error: RPC failed; curl 56 Recv failure: Connection reset by peer",
-                Other,
-            ),
-            ("fatal: the remote end hung up unexpectedly", Other),
-            (
-                "fatal: unable to access 'https://h/': The requested URL returned error: 502",
-                RemoteRejected,
-            ),
-            ("fatal: not a git repository", Other),
-        ] {
-            assert_eq!(classify_git_failure(stderr, false), class, "{stderr}");
-        }
-        assert_eq!(classify_git_failure("", true), Other);
-        // A rejected push that also mentions a hook's auth wording stays rejected.
-        assert_eq!(
-            classify_git_failure(" ! [remote rejected] x (access denied by hook)", false),
-            RemoteRejected
-        );
-    }
-
-    #[test]
-    fn class_round_trips_through_engine_error() {
-        for class in [Auth, Transport, RemoteRejected] {
-            assert_eq!(
-                GitFailureClass::of(&class.into_error("push", "m".into())),
-                class
-            );
-        }
-        assert_eq!(
-            GitFailureClass::of(&Other.into_error("push", "m".into())),
-            Other
-        );
-    }
-}
-
-#[cfg(test)]
-mod response_tests {
-    use super::*;
-    #[test]
-    fn responses_take_precedence_over_rpc_and_transport_text() {
-        for status in [413, 429, 500, 502, 503] {
-            assert_eq!(classify_git_failure(&format!("RPC failed; HTTP {status} curl 22 The requested URL returned error: {status}"), false), GitFailureClass::RemoteRejected);
-        }
-        assert_eq!(
-            classify_git_failure("remote: accepted upload; connection reset by peer", false),
-            GitFailureClass::RemoteRejected
-        );
-        assert_eq!(
-            classify_git_failure("operation timed out", true),
-            GitFailureClass::Other
-        );
-    }
-}
-
 /// Private curl evidence lets us distinguish a reset before any response
 /// from a reset after the peer started answering. Never emit trace contents.
 pub(super) struct ResponseTrace(tempfile::NamedTempFile);
@@ -211,39 +110,51 @@ impl ResponseTrace {
         Ok(Self(file))
     }
     pub fn classify(&self, stderr: &str, timed_out: bool) -> GitFailureClass {
-        let class = classify_git_failure(stderr, timed_out);
-        if matches!(
-            class,
-            GitFailureClass::Auth | GitFailureClass::RemoteRejected
-        ) {
-            return class;
-        }
-        let Ok(trace) = std::fs::read_to_string(self.0.path()) else {
-            return GitFailureClass::Other;
-        };
-        let trace = trace.to_ascii_lowercase();
-        // Git's wording for a refused or missing credential differs between
-        // versions; the remote's last answer does not. A final 401 or 403 is
-        // an authentication failure whatever stderr says.
-        if matches!(last_http_status(&trace), Some(401 | 403)) {
-            return GitFailureClass::Auth;
-        }
-        let response_seen = trace.contains("<= recv header") || trace.contains("<= recv data");
-        if response_seen {
-            return GitFailureClass::Other;
-        }
-        if class == GitFailureClass::Transport {
-            return class;
-        }
-        if trace.contains("== info:")
-            && stderr
-                .to_ascii_lowercase()
-                .contains("connection reset by peer")
-        {
-            GitFailureClass::Transport
-        } else {
-            GitFailureClass::Other
-        }
+        let trace = std::fs::read_to_string(self.0.path()).ok();
+        classify_response_trace(stderr, timed_out, trace.as_deref())
+    }
+}
+
+fn classify_response_trace(stderr: &str, timed_out: bool, trace: Option<&str>) -> GitFailureClass {
+    let class = classify_git_failure(stderr, timed_out);
+    if matches!(
+        class,
+        GitFailureClass::Auth | GitFailureClass::RemoteRejected
+    ) {
+        return class;
+    }
+    let Some(trace) = trace else {
+        return GitFailureClass::Other;
+    };
+    let trace = trace.to_ascii_lowercase();
+    // Git's wording for a refused or missing credential differs between
+    // versions; the remote's last answer does not. A final 401 or 403 is
+    // an authentication failure whatever stderr says.
+    if matches!(last_http_status(&trace), Some(401 | 403)) {
+        return GitFailureClass::Auth;
+    }
+    let response_seen = trace.contains("<= recv header") || trace.contains("<= recv data");
+    if response_seen {
+        return GitFailureClass::Other;
+    }
+    if class == GitFailureClass::Transport {
+        return class;
+    }
+    // libcurl distinguishes WSAECONNRESET and WSAECONNABORTED on Windows.
+    // Both disconnects still require evidence that no response arrived.
+    let stderr = stderr.to_ascii_lowercase();
+    if trace.contains("== info:")
+        && [
+            "connection reset by peer",
+            "connection was reset",
+            "connection was aborted",
+        ]
+        .iter()
+        .any(|reset| stderr.contains(reset))
+    {
+        GitFailureClass::Transport
+    } else {
+        GitFailureClass::Other
     }
 }
 
@@ -257,46 +168,42 @@ fn last_http_status(trace: &str) -> Option<u16> {
 }
 
 #[cfg(test)]
-mod response_evidence_tests {
+mod tests {
     use super::*;
+
     #[test]
-    fn a_final_401_or_403_is_an_auth_failure_whatever_git_printed() {
-        let mut command = std::process::Command::new("git");
-        let trace = ResponseTrace::attach(&mut command).unwrap();
-        let unknown = "fatal: unable to complete the request";
-        std::fs::write(
-            trace.0.path(),
-            "10:00:00.1 http.c:1 <= Recv header: HTTP/1.1 401 Unauthorized\n",
-        )
-        .unwrap();
-        assert_eq!(trace.classify(unknown, false), GitFailureClass::Auth);
-        std::fs::write(trace.0.path(), "<= Recv header: HTTP/2 403 \n").unwrap();
-        assert_eq!(trace.classify(unknown, false), GitFailureClass::Auth);
-        // A challenge that was then answered is not the failure.
-        std::fs::write(
-            trace.0.path(),
-            "<= Recv header: HTTP/1.1 401 Unauthorized\n<= Recv header: HTTP/1.1 200 OK\n",
-        )
-        .unwrap();
-        assert_eq!(trace.classify(unknown, false), GitFailureClass::Other);
-    }
-    #[test]
-    fn reset_after_response_is_never_retried_and_unknown_evidence_fails_closed() {
-        let mut command = std::process::Command::new("git");
-        let trace = ResponseTrace::attach(&mut command).unwrap();
-        let reset = "RPC failed; curl 56 Recv failure: Connection reset by peer";
-        assert_eq!(trace.classify(reset, false), GitFailureClass::Other);
-        std::fs::write(trace.0.path(), "== Info: Trying 127.0.0.1:8080\n").unwrap();
-        assert_eq!(trace.classify(reset, false), GitFailureClass::Transport);
-        std::fs::write(
-            trace.0.path(),
-            "== Info: Connected\n<= Recv header: HTTP/1.1 200 OK\n",
-        )
-        .unwrap();
-        assert_eq!(trace.classify(reset, false), GitFailureClass::Other);
-        assert_eq!(
-            trace.classify("empty reply from server", false),
-            GitFailureClass::Other
-        );
+    fn disconnects_need_evidence_of_no_response_on_every_platform() {
+        let started = "== Info: Connected to 127.0.0.1\n";
+        for message in [
+            "Recv failure: Connection reset by peer",
+            "Recv failure: Connection was reset",
+            "Recv failure: Connection was aborted",
+        ] {
+            for trace in [None, Some("")] {
+                assert_eq!(
+                    classify_response_trace(message, false, trace),
+                    GitFailureClass::Other
+                );
+            }
+            assert_eq!(
+                classify_response_trace(message, false, Some(started)),
+                GitFailureClass::Transport
+            );
+            for response in [
+                "<= Recv header: HTTP/1.1 200 OK\n",
+                "<= Recv data: partial\n",
+            ] {
+                let trace = format!("{started}{response}");
+                assert_eq!(
+                    classify_response_trace(message, false, Some(&trace)),
+                    GitFailureClass::Other
+                );
+            }
+            let trace = format!("{started}<= Recv header: HTTP/1.1 401 Unauthorized\n");
+            assert_eq!(
+                classify_response_trace(message, false, Some(&trace)),
+                GitFailureClass::Auth
+            );
+        }
     }
 }

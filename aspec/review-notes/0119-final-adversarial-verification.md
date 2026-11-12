@@ -1,5 +1,7 @@
 # WI 0119 final adversarial verification — 2026-09-24
 
+> Testing policy update (WI144): test commands, harness paths and test counts in this historical record are superseded by [the current testing contract](/aspec/devops/testing.md). Use manifest suites and `make validate-native` for native acceptance. Removed test sources and raw evidence bundles are available only in Git history; they must not be restored as test patterns.
+
 Historical review snapshot preserved in the repository on 2026-09-25.
 [WI 0121](../work-items/completed/0121-complete-builtin-runtime-and-native-verification.md)
 owns completion of the outstanding deficiencies. Log filenames below refer to

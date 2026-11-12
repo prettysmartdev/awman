@@ -15,16 +15,3 @@ pub mod command;
 pub mod data;
 pub mod engine;
 pub mod frontend;
-
-#[cfg(test)]
-#[path = "../tests/helpers/engine_daemon.rs"]
-pub(crate) mod parity_support;
-
-/// Process-global mutex for tests that must change the working directory.
-///
-/// `std::env::set_current_dir` is process-wide; tests run in parallel and can
-/// step on each other when CWD changes aren't serialized. Any test that calls
-/// `set_current_dir` MUST hold this lock for the duration of the CWD change
-/// and restore the directory before releasing it.
-#[cfg(test)]
-pub static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

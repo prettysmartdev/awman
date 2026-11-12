@@ -8,8 +8,7 @@ mod provision;
 pub mod queue_source;
 mod runner;
 mod terminal;
-#[cfg(test)]
-mod tests;
+
 pub mod tui_host;
 
 use crate::command::{

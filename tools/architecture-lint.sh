@@ -20,13 +20,19 @@
 #
 # Every scan distinguishes grep's "no match" (exit 1) from an execution error
 # (exit >= 2), uses only POSIX ERE (no `grep -P`, no `\b`), and is exercised on
-# fixture trees by tools/test-architecture-lint.sh. The scanned tree defaults
+# private fixture trees by tests/component/tools/architecture.rs. The scanned tree defaults
 # to the repository and can be redirected with ARCH_LINT_ROOT (used by the
 # fixtures).
 
 set -uo pipefail
 
 REPO_ROOT="${ARCH_LINT_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+# Resolve caller-provided Windows paths to the shell's spelling before passing
+# them to awk (-v interprets Windows backslashes as escape sequences).
+REPO_ROOT=$(cd "$REPO_ROOT" && pwd -P) || {
+    echo "architecture-lint: SCANNER ERROR: cannot resolve source root" >&2
+    exit 2
+}
 SRC="$REPO_ROOT/src"
 SHIMS="$REPO_ROOT/crates/awman-host-shims/src"
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/architecture-lint.XXXXXX") || {
@@ -273,7 +279,7 @@ check_layer() {
     #   1. Direct: `crate::<forbidden>` anywhere on a non-comment line.
     #   2. Nested: a `use crate::{` block whose body lists a forbidden
     #      top-level segment, found on the collapsed logical lines.
-    local matches direct nested nested_re
+    local matches direct nested
     direct=$(grep_scan -rnE --include='*.rs' -- "$pattern" "$dir")
 
     nested=$(awk_files "$list" "$GROUP_IMPORT_AWK" -v root=crate | awk_stdin "$TOP_LEVEL_AWK" -v "segs=$(echo "$forbidden_segments" | paste -sd '|' -)")

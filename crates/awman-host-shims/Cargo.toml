@@ -31,7 +31,9 @@ toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# WI 0144 test infrastructure.
+awman-test-support = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 tokio = { workspace = true }
-windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Security_Authorization", "Win32_Foundation", "Win32_System_Pipes", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Security_Authorization", "Win32_Foundation", "Win32_System_Pipes", "Win32_System_Threading", "Wdk_Storage_FileSystem", "Win32_System_IO"] }

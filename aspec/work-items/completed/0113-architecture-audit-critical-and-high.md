@@ -1,5 +1,7 @@
 # Work Item: Task
 
+> Testing policy update (WI144): test commands, harness paths and test counts in this historical record are superseded by [the current testing contract](/aspec/devops/testing.md). Use manifest suites and `make validate-native` for native acceptance. Removed test sources and raw evidence bundles are available only in Git history; they must not be restored as test patterns.
+
 Title: Architecture audit remediation, part 1 — the Critical and High findings
 (F-01 through F-12) from the 2026-09-03 architecture audit
 Issue: `aspec/review-notes/0113-architecture-audit.md`

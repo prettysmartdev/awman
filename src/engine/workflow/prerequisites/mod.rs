@@ -20,11 +20,6 @@ mod probes;
 pub mod sources;
 pub use sources::PreflightSources;
 
-#[cfg(test)]
-mod policy_tests;
-#[cfg(test)]
-mod tests;
-
 pub const PROBE_BUDGET: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

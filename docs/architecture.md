@@ -30,7 +30,7 @@ Three tenets:
 | 3 `frontend` | Layers 0–3; engine types and frontend traits only — engine behaviour is reached through Layer 2 |
 | 4 `main.rs`, `lib.rs` | anything |
 
-`make architecture-lint` (`tools/architecture-lint.sh`) enforces these rules and runs in CI and in `make pre-push`. `tools/test-architecture-lint.sh` checks the lint itself against fixture trees.
+`make architecture-lint` (`tools/architecture-lint.sh`) enforces these rules and runs in CI and in `make pre-push`. The component tools suite checks the lint against private fixture trees and scanner failures.
 
 ---
 

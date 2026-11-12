@@ -1,0 +1,28 @@
+{
+  "guest.actual-awman-boot": [
+    "awman-cli::guest boot::actual_awman_boots_a_guest"
+  ],
+  "guest.upgrade-from-previous-release": [
+    "awman-cli::guest upgrade::previous_release_state_upgrades_and_boots"
+  ],
+  "guest.strategy-matrix": [
+    "awman-cli::guest strategy::antigravity_all_skills",
+    "awman-cli::guest strategy::antigravity_named_skills",
+    "awman-cli::guest strategy::claude_all_skills",
+    "awman-cli::guest strategy::claude_named_skills",
+    "awman-cli::guest strategy::cline_all_skills",
+    "awman-cli::guest strategy::cline_named_skills",
+    "awman-cli::guest strategy::codex_all_skills",
+    "awman-cli::guest strategy::codex_named_skills",
+    "awman-cli::guest strategy::copilot_all_skills",
+    "awman-cli::guest strategy::copilot_named_skills",
+    "awman-cli::guest strategy::gemini_all_skills",
+    "awman-cli::guest strategy::gemini_named_skills",
+    "awman-cli::guest strategy::opencode_all_skills",
+    "awman-cli::guest strategy::opencode_named_skills"
+  ],
+  "artifact.signed-offline-session": [
+    "awman-cli::artifact signed_boot::signed_artifact_runs_an_offline_session",
+    "awman-cli::artifact signed_boot::signed_artifact_upgrades_previous_state_offline"
+  ]
+}

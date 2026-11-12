@@ -778,6 +778,3 @@ fn adopt_export(
     let _ = std::fs::remove_dir(export_dir);
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;

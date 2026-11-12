@@ -15,10 +15,6 @@ impl EngineInstance {
             .and_then(|source| source.prepared_run(lease_id))
     }
 
-    #[cfg(test)]
-    pub(crate) fn install_queue_for_test(&self, source: SharedQueueSource) {
-        *self.queue.lock().unwrap() = Some(source);
-    }
     pub fn queue_source(&self, session: &Session) -> Result<Option<SharedQueueSource>, String> {
         if !session.effective_config().tui_worker_enabled() {
             return Ok(None);

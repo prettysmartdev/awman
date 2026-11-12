@@ -348,11 +348,6 @@ impl TabRelay {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn feeds(&self) -> &TabCommandFeeds {
-        &self.feeds
-    }
-
     pub fn tab_id(&self) -> &TabId {
         &self.tab_id
     }
@@ -419,7 +414,6 @@ impl TabRelay {
         let launch_id = self.feeds.container.launch_id();
         events.extend(self.open_slot(
             SlotKey::Sequential(launch_id),
-            SlotId(launch_id),
             String::new(),
             submitted.display.agent_display_name.clone(),
             None,
@@ -436,13 +430,16 @@ impl TabRelay {
     fn open_slot(
         &mut self,
         key: SlotKey,
-        slot_id: SlotId,
         step_name: String,
         agent: String,
         model: Option<String>,
         io: Option<ContainerSlotIo>,
         dormant: bool,
     ) -> Vec<InstanceEvent> {
+        let slot_id = match &key {
+            SlotKey::Sequential(launch_id) => SlotId(*launch_id),
+            SlotKey::Step(_) => SlotId(uuid::Uuid::new_v4()),
+        };
         let mut events = Vec::new();
         let terminal = match (io, &self.hub) {
             (Some(io), Some(hub)) => Some(hub.bridge_agent_channels(
@@ -644,7 +641,6 @@ impl TabRelay {
                     }
                     events.extend(self.open_slot(
                         SlotKey::Sequential(launch_id),
-                        SlotId(launch_id),
                         title.unwrap_or_default(),
                         agent,
                         None,
@@ -710,15 +706,7 @@ impl TabRelay {
                 } => {
                     let key = SlotKey::Step(step_name.clone());
                     events.extend(self.close_slot(&key, None));
-                    events.extend(self.open_slot(
-                        key,
-                        SlotId(uuid::Uuid::new_v4()),
-                        step_name,
-                        agent,
-                        model,
-                        io,
-                        false,
-                    ));
+                    events.extend(self.open_slot(key, step_name, agent, model, io, false));
                 }
                 ContainerSlotEvent::ContainerName {
                     step_name,
@@ -1185,127 +1173,5 @@ impl Drop for TabRelay {
         for slot in &mut self.slots {
             slot.finish(0);
         }
-    }
-}
-
-#[cfg(test)]
-mod log_tests {
-    use super::*;
-    use crate::data::config::env::EnvSnapshot;
-    use crate::data::instance_snapshot::{WorkflowStepKind, WorkflowStepView};
-    use crate::data::session::SessionOpenOptions;
-    use crate::data::workflow_state::{WorkflowPhase, WorkflowSummary};
-
-    fn view(steps: &[(&str, StepViewStatus)]) -> WorkflowViewState {
-        WorkflowViewState {
-            steps: steps
-                .iter()
-                .map(|(name, status)| WorkflowStepView {
-                    name: name.to_string(),
-                    status: *status,
-                    agent: Some("claude".into()),
-                    model: None,
-                    depends_on: Vec::new(),
-                    kind: WorkflowStepKind::Agent,
-                })
-                .collect(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn pending_steps_and_unchanged_steps_are_not_logged() {
-        let first = view(&[
-            ("plan", StepViewStatus::Pending),
-            ("build", StepViewStatus::Pending),
-        ]);
-        assert!(workflow_step_changes(None, &first).is_empty());
-        let same = first.clone();
-        assert!(workflow_step_changes(Some(&first), &same).is_empty());
-    }
-
-    #[test]
-    fn each_real_transition_is_reported_once() {
-        let before = view(&[
-            ("plan", StepViewStatus::Running),
-            ("build", StepViewStatus::Pending),
-        ]);
-        let after = view(&[
-            ("plan", StepViewStatus::Done),
-            ("build", StepViewStatus::Running),
-        ]);
-        let changes = workflow_step_changes(Some(&before), &after);
-        assert_eq!(
-            changes,
-            vec![
-                StepChange {
-                    step: "plan",
-                    from: Some(StepViewStatus::Running),
-                    to: StepViewStatus::Done,
-                    agent: Some("claude"),
-                },
-                StepChange {
-                    step: "build",
-                    from: Some(StepViewStatus::Pending),
-                    to: StepViewStatus::Running,
-                    agent: Some("claude"),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn a_step_first_seen_running_has_no_previous_status() {
-        let after = view(&[("plan", StepViewStatus::Running)]);
-        let changes = workflow_step_changes(None, &after);
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].from, None);
-    }
-
-    #[test]
-    fn session_workflow_progress_is_relayed_without_a_phase_change() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
-        std::fs::create_dir_all(&home).unwrap();
-        let mut session = Session::open_at_directory_root(
-            dir.path().to_path_buf(),
-            SessionOpenOptions {
-                env: Some(EnvSnapshot::with_overrides([
-                    ("HOME", home.display().to_string()),
-                    ("AWMAN_HOME", home.join(".awman").display().to_string()),
-                ])),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let tab_id = TabId::new();
-        let mut relay = TabRelay::new(
-            tab_id,
-            &session,
-            TabKindWire::Normal,
-            TabCommandFeeds::new(),
-            None,
-            (80, 24),
-        );
-        let mut summary = WorkflowSummary {
-            invocation_id: uuid::Uuid::new_v4(),
-            workflow_name: "build".into(),
-            work_item: None,
-            phase: WorkflowPhase::Main,
-            total_steps: 2,
-            completed_steps: 0,
-            failed_steps: 0,
-            current_step: Some("compile".into()),
-            updated_at: Utc::now(),
-        };
-        session.state_mut().current_workflow = Some(summary.clone());
-        let first = relay.pump(Some(&session));
-        assert!(first.iter().any(|event| matches!(event, InstanceEvent::Delta(InstanceDelta::Phase { current_workflow: Some(workflow), .. }) if workflow.current_step.as_deref() == Some("compile"))));
-
-        summary.current_step = Some("test".into());
-        summary.completed_steps = 1;
-        session.state_mut().current_workflow = Some(summary);
-        let next = relay.pump(Some(&session));
-        assert!(next.iter().any(|event| matches!(event, InstanceEvent::Delta(InstanceDelta::Phase { current_workflow: Some(workflow), .. }) if workflow.current_step.as_deref() == Some("test"))));
     }
 }

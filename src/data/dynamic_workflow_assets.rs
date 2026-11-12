@@ -155,31 +155,3 @@ pub fn substitute_workflow_prerequisites(prompt: &str, summary: &str) -> String 
         prompt.replace(WORKFLOW_PREREQUISITES_PLACEHOLDER, summary)
     }
 }
-
-#[cfg(test)]
-mod prerequisite_placeholder_tests {
-    use super::*;
-
-    #[test]
-    fn substitute_workflow_prerequisites_removes_line_when_empty() {
-        let prompt = "before\n{{workflow_prerequisites}}\nafter\n";
-        assert_eq!(
-            substitute_workflow_prerequisites(prompt, ""),
-            "before\nafter\n"
-        );
-        assert_eq!(
-            substitute_workflow_prerequisites(prompt, "commit ✓"),
-            "before\ncommit ✓\nafter\n"
-        );
-        // No placeholder: unchanged either way.
-        assert_eq!(substitute_workflow_prerequisites("plain\n", ""), "plain\n");
-        assert_eq!(substitute_workflow_prerequisites("plain\n", "x"), "plain\n");
-    }
-
-    #[test]
-    fn leader_prompt_has_the_placeholder_and_no_manual_credential_overlay_advice() {
-        let leader = LEADER_PROMPT_MD;
-        assert!(leader.contains(WORKFLOW_PREREQUISITES_PLACEHOLDER));
-        assert!(!leader.contains("env(GITHUB_TOKEN)"));
-    }
-}

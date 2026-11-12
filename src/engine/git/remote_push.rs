@@ -137,6 +137,7 @@ impl GitEngine {
     }
 
     fn isolate_transport(&self, repo: &Path, metadata: &Path, url: &str) -> Result<RemotePushGit> {
+        let repo = fs::canonicalize(repo).map_err(io)?;
         // A sibling of the clone is outside its bind mount even when the
         // server's TMPDIR was configured inside the repository.
         let parent = repo
@@ -204,7 +205,8 @@ impl GitEngine {
             for key in ["user.name", "user.email", "extensions.objectformat"] {
                 let output = crate::engine::host_cli::command(&self.env, "git")
                     .args(["config", "--no-includes", "--file"])
-                    .arg(&local)
+                    // Keep Git's path parser away from Windows verbatim paths.
+                    .arg("source-config")
                     .args(["--get", key])
                     .current_dir(dir)
                     .output()
@@ -224,6 +226,13 @@ impl GitEngine {
                         )?;
                     }
                     git.run(&["config", key, &value], false, &mut sink)?;
+                } else if output.status.code() != Some(1) {
+                    // Exit 1 means the key is absent. A read/parse error must
+                    // not silently discard identity or the object format.
+                    return Err(EngineError::Git(format!(
+                        "read isolated Git config: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )));
                 }
             }
         }
@@ -308,8 +317,9 @@ impl RemotePushGit {
     /// built by the shared lease builder,
     /// [`lease_transport_command`](super::lease_transport::lease_transport_command),
     /// exactly like the lease's clone and fetches; everything else uses the
-    /// local hardening below.
-    pub(super) fn command(&self, transport: bool) -> Result<Command> {
+    /// local hardening below. Public so its isolation (environment, pinned
+    /// settings, helper) can be inspected without running it.
+    pub fn command(&self, transport: bool) -> Result<Command> {
         const PUSH_SETTINGS: [&str; 4] = [
             "-c",
             "push.followTags=false",
@@ -350,8 +360,15 @@ impl RemotePushGit {
         };
         command
             .current_dir(self.private.path())
-            .env("GIT_DIR", self.private.path())
-            .env("GIT_WORK_TREE", &self.repo)
+            // Git parses these paths itself; Rust's Windows canonical paths
+            // use the verbatim prefix, which Git's repository discovery does
+            // not accept here. Both locations are siblings, so relative paths
+            // avoid translating or weakening the pinned filesystem paths.
+            .env("GIT_DIR", ".")
+            .env(
+                "GIT_WORK_TREE",
+                Path::new("..").join(self.repo.file_name().expect("clone has a parent")),
+            )
             .env("GIT_NO_REPLACE_OBJECTS", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env_remove("GIT_INDEX_FILE")
@@ -545,7 +562,7 @@ impl RemotePushGit {
                 let host = crate::engine::host_cli::command(&self.env, "git")
                     .args(["config", "--get", key])
                     .current_dir(self.private.path())
-                    .env("GIT_DIR", self.private.path())
+                    .env("GIT_DIR", ".")
                     .output()
                     .map_err(io)?;
                 let value = String::from_utf8_lossy(&host.stdout).trim().to_string();
@@ -629,8 +646,13 @@ impl RemotePushGit {
         self.run(&["push", "-u", "origin", &refspec], true, sink)?;
         // Mirror the new upstream in the clone using config-file-only operations.
         // Parsing that file does not run its hooks, helpers or includes.
-        let metadata = self.repo.join(".git");
-        ensure_no_links(&metadata)?;
+        let fallback = self.repo.join(".git");
+        let metadata = self
+            .original
+            .as_ref()
+            .map(|(common, _)| common.as_path())
+            .unwrap_or(&fallback);
+        ensure_no_links(metadata)?;
         for (key, value) in [
             (format!("branch.{branch}.remote"), "origin".to_string()),
             (
@@ -640,9 +662,11 @@ impl RemotePushGit {
         ] {
             let output = crate::engine::host_cli::command(&self.env, "git")
                 .args(["config", "--no-includes", "--file"])
-                .arg(metadata.join("config"))
+                .arg("config")
                 .args([&key, &value])
-                .current_dir(self.private.path())
+                // This is an explicit file-only config edit, never a worktree
+                // or transport operation against the original repository.
+                .current_dir(metadata)
                 .output()
                 .map_err(io)?;
             if !output.status.success() {
@@ -692,10 +716,6 @@ fn copy_new_objects(source: &Path, dest: &Path) -> Result<()> {
 }
 
 /// File-backed capture avoids hanging on descendant-held stdout/stderr pipes.
-#[cfg(test)]
-fn bounded_output(command: &mut Command, timeout: std::time::Duration) -> Result<Output> {
-    bounded_output_guarded(command, timeout, None)
-}
 fn bounded_output_guarded(
     command: &mut Command,
     timeout: std::time::Duration,
@@ -756,268 +776,6 @@ fn bounded_output_guarded(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn isolated_host_commit_preserves_sha256_object_format() {
-        let root = tempfile::tempdir().unwrap();
-        let repo = root.path().join("clone");
-        std::fs::create_dir(&repo).unwrap();
-        let run = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{args:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
-        run(&["init", "-q", "-b", "main", "--object-format=sha256"]);
-        std::fs::write(repo.join("base"), "base").unwrap();
-        run(&["add", "-A"]);
-        run(&[
-            "-c",
-            "user.name=T",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "base",
-        ]);
-        let engine = super::GitEngine::new();
-        let before = engine.head_sha(&repo).unwrap();
-        assert_eq!(before.len(), 64);
-        let git = engine
-            .isolate_remote_push(&repo, "git://127.0.0.1:9/unused")
-            .unwrap();
-        let mut sink = crate::data::message::RecordingMessageSink::new();
-        assert_eq!(git.head(&mut sink).unwrap(), before);
-        std::fs::write(repo.join("edit"), "edit").unwrap();
-        git.commit_leftovers("leftovers", &mut sink).unwrap();
-        let after = git.head(&mut sink).unwrap();
-        assert_eq!(after.len(), 64);
-        assert_ne!(before, after);
-        assert_eq!(engine.head_sha(&repo).unwrap(), after);
-    }
-
-    #[test]
-    fn host_git_timeout_kills_a_stalled_process() {
-        let mut command = std::process::Command::new("sh");
-        command.args(["-c", "sleep 10"]);
-        let start = std::time::Instant::now();
-        let error =
-            super::bounded_output(&mut command, std::time::Duration::from_millis(30)).unwrap_err();
-        assert!(error.to_string().contains("timed out"));
-        assert!(start.elapsed() < std::time::Duration::from_secs(2));
-    }
-}
-
-#[cfg(test)]
-mod workflow_review_tests {
-    use super::*;
-    #[test]
-    fn linked_worktree_leftovers_update_pinned_admin_and_publish() {
-        let root = tempfile::tempdir().unwrap();
-        let repo = root.path().join("repo");
-        let worktree = root.path().join("worktree");
-        let remote = root.path().join("remote.git");
-        let run = |cwd: &Path, args: &[&str]| {
-            let out = Command::new("git")
-                .current_dir(cwd)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            String::from_utf8_lossy(&out.stdout).trim().to_owned()
-        };
-        run(
-            root.path(),
-            &["init", "-q", "-b", "main", repo.to_str().unwrap()],
-        );
-        run(
-            &repo,
-            &[
-                "-c",
-                "user.name=T",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "--allow-empty",
-                "-qm",
-                "base",
-            ],
-        );
-        run(
-            &repo,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                "-b",
-                "lease",
-                worktree.to_str().unwrap(),
-            ],
-        );
-        run(
-            root.path(),
-            &["init", "-q", "--bare", remote.to_str().unwrap()],
-        );
-        let engine = GitEngine::new();
-        let source = engine.capture_workflow_git_source(&worktree).unwrap();
-        let before = engine.head_sha(&repo).unwrap();
-        let isolated = engine
-            .isolate_workflow_transport(&source, remote.to_str().unwrap())
-            .unwrap();
-        fs::write(worktree.join("change.txt"), "lease edit").unwrap();
-        let mut sink = crate::data::message::RecordingMessageSink::new();
-        isolated
-            .commit_leftovers("lease changes", &mut sink)
-            .unwrap();
-        let head = isolated.head(&mut sink).unwrap();
-        assert_eq!(engine.head_sha(&worktree).unwrap(), head);
-        assert_eq!(engine.head_sha(&repo).unwrap(), before);
-        assert!(run(&worktree, &["status", "--porcelain"]).is_empty());
-        isolated
-            .run(
-                &["push", "origin", "HEAD:refs/heads/result"],
-                false,
-                &mut sink,
-            )
-            .unwrap();
-        assert_eq!(run(&remote, &["rev-parse", "refs/heads/result"]), head);
-        assert_eq!(
-            run(&remote, &["show", "refs/heads/result:change.txt"]),
-            "lease edit"
-        );
-    }
-
-    #[test]
-    fn isolated_workflow_transport_omits_agent_hooks_rewrites_and_pushurl() {
-        let repo = tempfile::tempdir().unwrap();
-        assert!(Command::new("git")
-            .args(["init", "-q"])
-            .arg(repo.path())
-            .status()
-            .unwrap()
-            .success());
-        let git = GitEngine::new();
-        let config = repo.path().join(".git/config");
-        fs::write(&config, "[core]\nrepositoryformatversion=0\n[remote \"origin\"]\nurl=https://approved.test/o/r\npushurl=https://evil.test/o/r\n[url \"https://evil.test/\"]\ninsteadOf=https://approved.test/\n[core]\nhooksPath=hooks\nsshCommand=evil\n").unwrap();
-        fs::write(repo.path().join(".git/hooks/pre-push"), "echo stolen").unwrap();
-        let isolated = git
-            .isolate_workflow_transport(
-                &git.capture_workflow_git_source(repo.path()).unwrap(),
-                "https://approved.test/o/r",
-            )
-            .unwrap();
-        let config = fs::read_to_string(isolated.metadata_dir().join("config")).unwrap();
-        assert!(config.contains("https://approved.test/o/r"));
-        for needle in [
-            "evil.test",
-            "insteadOf",
-            "hooksPath",
-            "sshCommand",
-            "pushurl",
-        ] {
-            assert!(!config.contains(needle));
-        }
-        assert!(!isolated.metadata_dir().join("hooks/pre-push").exists());
-        assert!(!isolated.metadata_dir().starts_with(repo.path()));
-    }
-
-    #[test]
-    fn pinned_workflow_metadata_ignores_rewritten_git_and_commondir_pointers() {
-        let root = tempfile::tempdir().unwrap();
-        let repo = root.path().join("repo");
-        let worktree = root.path().join("worktree");
-        let foreign = root.path().join("foreign");
-        for path in [&repo, &foreign] {
-            assert!(Command::new("git")
-                .args(["init", "-q"])
-                .arg(path)
-                .status()
-                .unwrap()
-                .success());
-        }
-        assert!(Command::new("git")
-            .current_dir(&repo)
-            .args([
-                "-c",
-                "user.name=Trusted",
-                "-c",
-                "user.email=trusted@test",
-                "commit",
-                "--allow-empty",
-                "-qm",
-                "initial",
-            ])
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("git")
-            .current_dir(&repo)
-            .args(["worktree", "add", "--detach", "-q"])
-            .arg(&worktree)
-            .status()
-            .unwrap()
-            .success());
-        let git = GitEngine::new();
-        let source = git.capture_workflow_git_source(&worktree).unwrap();
-        let foreign_head = fs::read(foreign.join(".git/HEAD")).unwrap();
-        fs::write(
-            foreign.join(".git/config"),
-            "[core]\nrepositoryformatversion=0\n[user]\nname=FOREIGN_CANARY\n",
-        )
-        .unwrap();
-        fs::write(
-            worktree.join(".git"),
-            format!("gitdir: {}\n", foreign.join(".git").display()),
-        )
-        .unwrap();
-        fs::write(
-            source.admin.join("commondir"),
-            format!("{}\n", foreign.join(".git").display()),
-        )
-        .unwrap();
-        let isolated = git
-            .isolate_workflow_transport(&source, "https://approved.test/o/r")
-            .unwrap();
-        assert!(!fs::read_to_string(isolated.metadata_dir().join("config"))
-            .unwrap()
-            .contains("FOREIGN_CANARY"));
-        assert_eq!(
-            fs::read(isolated.metadata_dir().join("HEAD")).unwrap(),
-            fs::read(source.admin.join("HEAD")).unwrap()
-        );
-        isolated.refresh_workflow_metadata().unwrap();
-        isolated.sync_workflow_metadata().unwrap();
-        assert_eq!(fs::read(foreign.join(".git/HEAD")).unwrap(), foreign_head);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn isolated_workflow_metadata_refuses_linked_config() {
-        let repo = tempfile::tempdir().unwrap();
-        assert!(Command::new("git")
-            .args(["init", "-q"])
-            .arg(repo.path())
-            .status()
-            .unwrap()
-            .success());
-        let git = GitEngine::new();
-        let source = git.capture_workflow_git_source(repo.path()).unwrap();
-        let foreign = tempfile::NamedTempFile::new().unwrap();
-        fs::remove_file(repo.path().join(".git/config")).unwrap();
-        std::os::unix::fs::symlink(foreign.path(), repo.path().join(".git/config")).unwrap();
-        assert!(git
-            .isolate_workflow_transport(&source, "https://approved.test/o/r")
-            .is_err());
-    }
-}
+// Unit tier: the lease guard decision. Every behaviour that runs `git`
+// (isolation, leftovers, push, cancellation of a stalled push) is in
+// `tests/component/engine/git.rs`.

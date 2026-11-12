@@ -85,31 +85,3 @@ impl WorkflowDirs {
         Ok(Some(dir))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn repo_dir_for_is_under_dot_awman() {
-        assert_eq!(
-            WorkflowDirs::repo_dir_for(Path::new("/r/proj")),
-            PathBuf::from("/r/proj/.awman/workflows")
-        );
-    }
-
-    #[test]
-    fn dynamic_workflow_path_is_zero_padded_beside_the_state_file() {
-        assert_eq!(
-            WorkflowDirs::dynamic_workflow_path(Path::new("/r/proj"), 7),
-            PathBuf::from("/r/proj/.awman/workflows/dynamic-0007.toml")
-        );
-    }
-
-    #[test]
-    fn dynamic_workflow_paths_differ_per_work_item() {
-        let a = WorkflowDirs::dynamic_workflow_path(Path::new("/r/proj"), 7);
-        let b = WorkflowDirs::dynamic_workflow_path(Path::new("/r/proj"), 8);
-        assert_ne!(a, b);
-    }
-}

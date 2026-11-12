@@ -88,7 +88,8 @@ export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
 export RUST_TEST_THREADS=${RUST_TEST_THREADS:-4}
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$root/target}
 mkdir -p "$CARGO_TARGET_DIR"
-export CARGO_TARGET_DIR=$(cd "$CARGO_TARGET_DIR" && pwd -P)
+CARGO_TARGET_DIR=$(cd "$CARGO_TARGET_DIR" && pwd -P)
+export CARGO_TARGET_DIR
 scratch=$(mktemp -d /tmp/aw-gate.XXXXXX)
 export AWMAN_TEST_TMPROOT=$scratch/tests
 mkdir -p "$AWMAN_TEST_TMPROOT"

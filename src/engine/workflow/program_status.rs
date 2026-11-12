@@ -185,16 +185,19 @@ const OUTPUT_SETTLE: Duration = Duration::from_secs(1);
 pub(super) struct OutputWatch {
     tail: Arc<OutputTail>,
     baseline: String,
-    started: Instant,
+    clock: crate::data::clock::SharedClock,
+    started: Duration,
 }
 
 impl OutputWatch {
-    pub(super) fn new(tail: Arc<OutputTail>) -> Self {
+    pub(super) fn new(tail: Arc<OutputTail>, clock: crate::data::clock::SharedClock) -> Self {
         let baseline = tail.snapshot_text();
+        let started = clock.monotonic();
         Self {
             tail,
             baseline,
-            started: Instant::now(),
+            clock,
+            started,
         }
     }
 
@@ -205,7 +208,7 @@ impl OutputWatch {
         if now == self.baseline {
             return false;
         }
-        if self.started.elapsed() < OUTPUT_SETTLE {
+        if self.clock.monotonic().saturating_sub(self.started) < OUTPUT_SETTLE {
             self.baseline = now;
             return false;
         }
@@ -556,7 +559,7 @@ impl WorkflowEngine {
         let mut output = (kind == CountdownKind::AgentError)
             .then_some(output_tail)
             .flatten()
-            .map(OutputWatch::new);
+            .map(|tail| OutputWatch::new(tail, Arc::clone(&self.clock)));
         // Active-tab suppression (WI 0141): while the user is typing or
         // scrolling on this agent's tab, an `AgentDone` countdown does not
         // start; the loop below still handles exits, reports and cancel.
@@ -714,150 +717,5 @@ pub(super) fn mid_step_result(mid: MidStepOutcome) -> Option<InterruptibleStepRe
         MidStepOutcome::StepCompleted(o) => Some(InterruptibleStepResult::StepCompleted(o)),
         MidStepOutcome::WorkflowEnded(wo) => Some(InterruptibleStepResult::WorkflowEnded(wo)),
         MidStepOutcome::LoopContinue => Some(InterruptibleStepResult::LoopContinue),
-    }
-}
-
-#[cfg(test)]
-mod policy_tests {
-    use super::*;
-    use crate::data::program_status::BlockedKind;
-
-    fn status(state: ProgramState) -> EffectiveStatus {
-        EffectiveStatus {
-            state,
-            kind: None,
-            progress: None,
-            msg: None,
-            app: None,
-            id: None,
-        }
-    }
-
-    #[test]
-    fn the_state_table_matches_the_design() {
-        use ReportedResponse as R;
-        let cases = [
-            // (state, yolo, attended) -> response
-            (ProgramState::Working, true, true, R::Resume),
-            (ProgramState::Working, false, true, R::Resume),
-            (ProgramState::Working, false, false, R::Resume),
-            (
-                ProgramState::Done,
-                true,
-                true,
-                R::Countdown(CountdownKind::AgentDone),
-            ),
-            (ProgramState::Done, false, true, R::ConfirmAdvance),
-            (
-                ProgramState::Done,
-                false,
-                false,
-                R::Countdown(CountdownKind::AgentDone),
-            ),
-            (
-                ProgramState::Idle,
-                true,
-                true,
-                R::Countdown(CountdownKind::AgentDone),
-            ),
-            (ProgramState::Idle, false, true, R::ConfirmAdvance),
-            (
-                ProgramState::Idle,
-                true,
-                false,
-                R::Countdown(CountdownKind::AgentDone),
-            ),
-            (ProgramState::Blocked, true, true, R::NeedsYou),
-            (ProgramState::Blocked, false, true, R::ProblemBoard),
-            (
-                ProgramState::Blocked,
-                true,
-                false,
-                R::Countdown(CountdownKind::AgentBlocked),
-            ),
-            (
-                ProgramState::Blocked,
-                false,
-                false,
-                R::Countdown(CountdownKind::AgentBlocked),
-            ),
-            (ProgramState::Error, true, true, R::AwaitRepair),
-            (ProgramState::Error, false, true, R::ProblemBoard),
-            (ProgramState::Error, false, false, R::AwaitRepair),
-            (ProgramState::Error, true, false, R::AwaitRepair),
-        ];
-        for (state, yolo, attended, expected) in cases {
-            assert_eq!(
-                respond_to_report(Some(&status(state)), yolo, attended),
-                expected,
-                "{state:?} yolo={yolo} attended={attended}"
-            );
-        }
-        assert_eq!(respond_to_report(None, true, false), R::Resume);
-    }
-
-    #[test]
-    fn problems_never_map_to_an_advance() {
-        for state in [ProgramState::Blocked, ProgramState::Error] {
-            for yolo in [true, false] {
-                for attended in [true, false] {
-                    let r = respond_to_report(Some(&status(state)), yolo, attended);
-                    assert!(
-                        !matches!(
-                            r,
-                            ReportedResponse::Countdown(CountdownKind::AgentDone)
-                                | ReportedResponse::ConfirmAdvance
-                        ),
-                        "{state:?} must never advance, got {r:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn agent_done_uses_its_own_duration_and_problems_fail_the_step() {
-        assert_eq!(
-            countdown_duration(CountdownKind::AgentDone),
-            timing::agent_done_countdown_duration()
-        );
-        assert_eq!(
-            countdown_duration(CountdownKind::AgentError),
-            timing::yolo_countdown_duration()
-        );
-        assert!(countdown_fails_step(CountdownKind::AgentBlocked));
-        assert!(countdown_fails_step(CountdownKind::AgentError));
-        assert!(!countdown_fails_step(CountdownKind::AgentDone));
-        assert!(!countdown_fails_step(CountdownKind::StuckStep));
-    }
-
-    #[test]
-    fn describe_quotes_kind_and_truncated_msg() {
-        let mut s = status(ProgramState::Blocked);
-        s.kind = Some(BlockedKind::Permission);
-        s.msg = Some("allow rm?".into());
-        assert_eq!(describe_status(&s), "blocked (permission): allow rm?");
-        s.msg = Some("x".repeat(500));
-        let d = describe_status(&s);
-        assert!(d.ends_with('…'));
-        assert!(d.chars().count() < 260);
-        assert_eq!(
-            reported_failure_reason(&status(ProgramState::Error)),
-            "agent reported error"
-        );
-    }
-
-    #[test]
-    fn output_watch_ignores_the_settle_window_then_sees_new_output() {
-        let tail = Arc::new(OutputTail::with_default_capacity());
-        tail.push_bytes(b"before\n");
-        let mut watch = OutputWatch::new(tail.clone());
-        assert!(!watch.produced_output());
-        tail.push_bytes(b"error text right after the report\n");
-        assert!(!watch.produced_output(), "settle window moves the baseline");
-        watch.started -= OUTPUT_SETTLE;
-        assert!(!watch.produced_output());
-        tail.push_bytes(b"recovered\n");
-        assert!(watch.produced_output());
     }
 }

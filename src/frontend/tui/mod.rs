@@ -63,9 +63,6 @@ pub mod text_edit;
 pub mod user_message;
 pub mod workflow_view;
 
-#[cfg(test)]
-pub(crate) mod tests;
-
 use app::App;
 use dialogs::Dialog;
 use tabs::Tab;
@@ -459,3 +456,6 @@ impl ViewEntry for ViewEntryPoint {
         Ok(i32::from(code))
     }
 }
+
+#[cfg(test)]
+mod contracts;

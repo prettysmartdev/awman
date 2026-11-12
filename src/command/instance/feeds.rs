@@ -386,8 +386,6 @@ pub type SharedContainerSlotEvents = Arc<Mutex<std::collections::VecDeque<Contai
 /// it was given, so late Running/Exited callbacks cannot relabel a newer slot.
 #[derive(Clone)]
 pub struct ContainerLifecycle {
-    #[cfg(any(test, feature = "test-support"))]
-    trace: Arc<Mutex<Option<Arc<super::trace::OutcomeTrace>>>>,
     pub events: SharedContainerSlotEvents,
     launch_id: uuid::Uuid,
 }
@@ -395,8 +393,6 @@ pub struct ContainerLifecycle {
 impl Default for ContainerLifecycle {
     fn default() -> Self {
         Self {
-            #[cfg(any(test, feature = "test-support"))]
-            trace: Default::default(),
             events: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             launch_id: uuid::Uuid::new_v4(),
         }
@@ -404,50 +400,11 @@ impl Default for ContainerLifecycle {
 }
 
 impl ContainerLifecycle {
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn set_trace(&self, trace: Arc<super::trace::OutcomeTrace>) {
-        *self.trace.lock().unwrap() = Some(trace);
-    }
     pub fn launch_id(&self) -> uuid::Uuid {
         self.launch_id
     }
 
     pub fn push(&self, event: ContainerSlotEvent) {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(trace) = self.trace.lock().unwrap().as_ref() {
-            let value = match &event {
-                ContainerSlotEvent::SequentialRunning { container_name, .. } => {
-                    Some(serde_json::json!({"event":"running","container":container_name}))
-                }
-                ContainerSlotEvent::SequentialExited { exit_code, .. } => {
-                    Some(serde_json::json!({"event":"exited","exit_code":exit_code}))
-                }
-                ContainerSlotEvent::SequentialLaunched { title, .. } => {
-                    Some(serde_json::json!({"event":"launched","title":title}))
-                }
-                ContainerSlotEvent::Launched {
-                    step_name,
-                    agent,
-                    model,
-                    ..
-                } => Some(
-                    serde_json::json!({"event":"step_launched","step":step_name,"agent":agent,"model":model}),
-                ),
-                ContainerSlotEvent::ContainerName {
-                    step_name,
-                    container_name,
-                } => Some(
-                    serde_json::json!({"event":"step_running","step":step_name,"container":container_name}),
-                ),
-                ContainerSlotEvent::Exited { step_name } => {
-                    Some(serde_json::json!({"event":"step_exited","step":step_name}))
-                }
-                _ => None,
-            };
-            if let Some(value) = value {
-                trace.record("container", value);
-            }
-        }
         if let Ok(mut queue) = self.events.lock() {
             queue.push_back(event);
         }
@@ -523,11 +480,6 @@ impl TabCommandFeeds {
         }
     }
 
-    #[cfg(test)]
-    pub fn for_tests() -> Self {
-        Self::new()
-    }
-
     pub fn reset_for_new_command(&mut self) {
         self.command_cancel.cancel();
         let context = self.tui_context_shared.clone();
@@ -574,8 +526,6 @@ pub type SharedStatusLog = Arc<Mutex<Vec<StatusLine>>>;
 /// `frontend::tui::user_message::TuiUserMessageSink` (re-exported there).
 #[derive(Clone)]
 pub struct StatusLogSink {
-    #[cfg(any(test, feature = "test-support"))]
-    trace: Option<Arc<super::trace::OutcomeTrace>>,
     output: Option<super::output::CommandBytes>,
     log: SharedStatusLog,
     wake: Option<Arc<tokio::sync::Notify>>,
@@ -587,8 +537,6 @@ impl StatusLogSink {
             log,
             wake: None,
             output: None,
-            #[cfg(any(test, feature = "test-support"))]
-            trace: None,
         }
     }
     pub fn with_wake(mut self, wake: Arc<tokio::sync::Notify>) -> Self {
@@ -598,11 +546,6 @@ impl StatusLogSink {
 }
 
 impl StatusLogSink {
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn with_trace(mut self, trace: Arc<super::trace::OutcomeTrace>) -> Self {
-        self.trace = Some(trace);
-        self
-    }
     pub fn with_output(mut self, output: super::output::CommandBytes) -> Self {
         self.output = Some(output);
         self
@@ -611,13 +554,6 @@ impl StatusLogSink {
 
 impl UserMessageSink for StatusLogSink {
     fn write_message(&mut self, msg: UserMessage) {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(trace) = &self.trace {
-            trace.record(
-                "status",
-                serde_json::json!({"level":msg.level,"text":msg.text}),
-            );
-        }
         if let Some(output) = &self.output {
             output.message(&msg);
         }

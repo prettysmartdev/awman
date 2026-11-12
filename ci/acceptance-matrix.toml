@@ -1,0 +1,223 @@
+# Important behavior anchors. Full suite/platform selection is derived from gates.toml.
+# covered means executable coverage exists, not that hardware or CI passed.
+schema = 1
+
+[[cell]]
+subsystem = "foundation"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "pr"
+tests = ["awman-test-support::component security::generic_registration_cannot_authorize_host_keychain_or_agent_names"]
+
+[[cell]]
+subsystem = "data"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "pr"
+tests = ["awman-cli::component data::persistence::migration_preserves_real_sqlite_session_and_command_rows"]
+
+[[cell]]
+subsystem = "config-keys"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "pr"
+tests = ["awman-cli::component data::config::every_key_default_is_valid_and_round_trips_through_file_validation"]
+
+[[cell]]
+subsystem = "command-catalogue"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "pr"
+tests = ["awman-cli::component command::catalogue::authorization_is_checked_for_every_leaf_and_alias"]
+
+[[cell]]
+subsystem = "engine"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "pr"
+tests = ["awman-cli::component engine::git::detached_head_and_current_branch_follow_checkout_state"]
+
+[[cell]]
+subsystem = "workflow"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "pr"
+tests = ["awman::awman engine::workflow::contracts::persisted_execution_resumes_without_repeating_completed_steps"]
+
+[[cell]]
+subsystem = "command"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "pr"
+tests = ["awman-cli::component command::workflow::concurrent_idempotent_submissions_have_exactly_one_owner"]
+
+[[cell]]
+subsystem = "daemon"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "pr"
+tests = ["awman-cli::component daemon::lifecycle::regression_585680c3_f23e75a4_9eac9cda_two_ready_daemons_have_distinct_state"]
+
+[[cell]]
+subsystem = "frontend"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "pr"
+tests = ["awman::awman frontend::tui::contracts::command_edit_validation_and_resize_preserve_user_input"]
+
+[[cell]]
+subsystem = "squad"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "pr"
+tests = ["awman-cli::component squad::refusal::sandbox_refusal_precedes_task_allocation_and_every_runtime_call"]
+
+[[cell]]
+subsystem = "worker"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "pr"
+tests = ["awman-cli::component worker::protocol::wsp_conformance_covers_auth_affinity_events_epoch_and_wire"]
+
+[[cell]]
+subsystem = "security"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "pr"
+tests = ["awman-cli::component security::trust::hostile_workflow_agent_definitions_are_refused_before_any_host_or_container_launch"]
+
+[[cell]]
+subsystem = "templates"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "pr"
+tests = ["awman-cli::boundary templates::shipped_templates_equal_the_files_under_templates"]
+
+[[cell]]
+subsystem = "boundary"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "pr"
+tests = ["awman-cli::boundary conformance::real_docker_cli_conforms"]
+
+[[cell]]
+subsystem = "native"
+mode = "contract"
+backend = "both"
+runtime = "hvf"
+platform = "macos-arm64-ci-guest"
+feature = "builtin"
+status = "covered"
+gate = "main"
+tests = ["awman-cli::guest boot::actual_awman_boots_a_guest"]
+
+[[cell]]
+subsystem = "ci-release"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "pr"
+tests = ["xtask::pipeline failed_commands_missing_shards_skipped_counts_and_empty_assertions_cannot_validate"]
+
+[[cell]]
+subsystem = "release awman-linux-amd64"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "candidate"
+tests = ["awman-cli::artifact smoke::exact_executable_runs_a_command_in_a_private_repository"]
+
+[[cell]]
+subsystem = "release awman-linux-arm64"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "candidate"
+tests = ["awman-cli::artifact smoke::exact_executable_runs_a_command_in_a_private_repository"]
+
+[[cell]]
+subsystem = "release awman-macos-arm64"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "candidate"
+tests = ["awman-cli::artifact smoke::exact_executable_runs_a_command_in_a_private_repository"]
+
+[[cell]]
+subsystem = "release awman-windows-amd64.exe"
+mode = "contract"
+backend = "both"
+runtime = "declared by suite"
+platform = "all-hosted"
+feature = "default"
+status = "covered"
+gate = "candidate"
+tests = ["awman-cli::artifact smoke::exact_executable_runs_a_command_in_a_private_repository"]

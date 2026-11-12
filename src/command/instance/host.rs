@@ -2483,35 +2483,3 @@ impl std::fmt::Debug for EngineInstanceHost {
             .finish_non_exhaustive()
     }
 }
-
-#[cfg(any(test, feature = "test-support"))]
-impl EngineInstanceHost {
-    /// Bind a hand-built command to a tab, as `submit` binds a real one, so a
-    /// test drives the command side of the channels itself.
-    pub fn bind_test_command(
-        &self,
-        id: &InstanceId,
-        tab_id: &TabId,
-        submitted: super::SubmittedCommand,
-    ) -> Arc<tokio::sync::Notify> {
-        let hosted = self.find(id).expect("instance");
-        let mut state = hosted.state();
-        let relay = state.tab_mut(tab_id).expect("tab");
-        let (_, mut events) = relay.reset_for_submit();
-        events.extend(relay.bind(submitted));
-        let mut outbox = Outbox::default();
-        self.apply_events(&hosted, &mut state, events, &mut outbox);
-        self.wake.clone()
-    }
-
-    /// The tab's command feeds, so a test plays the command side of them.
-    pub fn test_tab_feeds(&self, id: &InstanceId, tab_id: &TabId) -> super::feeds::TabCommandFeeds {
-        let hosted = self.find(id).expect("instance");
-        let state = hosted.state();
-        state.tab(tab_id).expect("tab").feeds().clone()
-    }
-}
-
-#[cfg(test)]
-#[path = "host_tests.rs"]
-mod tests;

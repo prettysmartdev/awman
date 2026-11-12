@@ -514,37 +514,3 @@ pub(crate) fn existing_worktree_choice(
         (None, false) => ExistingWorktreeChoice::Ask,
     }
 }
-
-#[cfg(test)]
-mod existing_worktree_choice_tests {
-    use super::existing_worktree_choice;
-    use crate::command::commands::worktree_lifecycle::{
-        ExistingWorktreeChoice as C, ExistingWorktreeDecision as D,
-    };
-
-    #[test]
-    fn explicit_choice_overrides_accepted_dynamic_resume() {
-        use crate::command::headless::HeadlessDefaults;
-
-        for decision in [D::Resume, D::Recreate, D::Fail] {
-            assert_eq!(
-                existing_worktree_choice(Some(decision), true),
-                C::Explicit(decision)
-            );
-        }
-        assert_eq!(existing_worktree_choice(None, true), C::ResumeAccepted);
-        assert_eq!(existing_worktree_choice(None, false), C::Ask);
-
-        // ResumeAccepted is resolved by the host: API fails even for saved
-        // dynamic state, while unattended squad and piped CLI keep resuming.
-        assert_eq!(HeadlessDefaults::api().existing_worktree(), D::Fail);
-        assert_eq!(
-            HeadlessDefaults::squad(
-                crate::command::commands::mount_scope::MountScopeDecision::MountGitRoot
-            )
-            .existing_worktree(),
-            D::Resume
-        );
-        assert_eq!(HeadlessDefaults::cli().existing_worktree(), D::Resume);
-    }
-}

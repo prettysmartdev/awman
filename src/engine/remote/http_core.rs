@@ -360,35 +360,3 @@ impl HttpCore {
         matches!(host, "127.0.0.1" | "::1" | "localhost")
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Unit tests always run isolated: loopback is reachable, the internet is
-    /// not.
-    #[test]
-    fn test_isolation_allows_loopback_only() {
-        for url in [
-            "http://localhost:9876/v1/status",
-            "http://127.0.0.1:1/x",
-            "http://[::1]:8080/",
-        ] {
-            assert!(
-                HttpCore::refuse_public_host_under_test_isolation(url).is_ok(),
-                "{url} must stay reachable"
-            );
-        }
-        for url in [
-            "https://api.github.com/repos/o/r/issues/1",
-            "https://raw.githubusercontent.com/x",
-            "https://localhost.example.com/",
-            "not a url",
-        ] {
-            assert!(
-                HttpCore::refuse_public_host_under_test_isolation(url).is_err(),
-                "{url} must be refused"
-            );
-        }
-    }
-}

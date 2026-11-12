@@ -107,11 +107,22 @@ macOS only lets a program start a virtual machine when its code signature carrie
   xattr -d com.apple.quarantine ./awman-macos-arm64
   ```
 
-- **Verify the checksum.** An ad-hoc signature proves the file has not changed since it was signed, not who signed it. The only way to confirm you have the genuine release is to compare its SHA-256 with the value published on the release page:
+- **Verify the checksum and attestation.** An ad-hoc signature proves the file has not changed since it was signed, not who signed it. Every release publishes a `SHA256SUMS` file next to the executables. Download it into the same directory as the executable and compare:
 
   ```sh
-  shasum -a 256 awman-macos-arm64
+  shasum -a 256 -c SHA256SUMS --ignore-missing
   ```
+
+  On Linux use `sha256sum -c SHA256SUMS --ignore-missing`. You can also compute the digest yourself (`shasum -a 256 awman-macos-arm64`) and compare it with the line for your file in `SHA256SUMS` or on the release page.
+
+  Releases built by awman's release pipeline also carry a GitHub build provenance attestation for each executable, which proves the file was built from this repository's source by its release workflow and has not changed since. Verify it with the [GitHub CLI](https://cli.github.com/):
+
+  ```sh
+  gh attestation verify awman-macos-arm64 --repo prettysmartdev/awman \
+    --signer-workflow prettysmartdev/awman/.github/workflows/candidate.yml
+  ```
+
+  The same command works for `awman-linux-amd64`, `awman-linux-arm64` and `awman-windows-amd64.exe`. A successful run prints the repository, workflow and commit the file was built from; a failure means the file is not the published release, so delete it and download it again. If the command reports that no attestations were found, the release predates the release pipeline, and the checksum is the check available for it. A checksum match does not replace the attestation: `SHA256SUMS` is published by the same release, whereas the attestation is signed by GitHub.
 
 - **Don't modify the binary.** Anything that changes the file after signing (for example `strip`, patching, or a tool that relinks it) invalidates the signature, and macOS then refuses to run it or to start VMs from it. Re-sign it (see *Building from source*) or download it again.
 - **Folder-access prompts.** macOS asks before a program reads `~/Desktop`, `~/Documents`, `~/Downloads`, iCloud Drive or removable volumes. When you run awman from a terminal, that permission belongs to your terminal app, so upgrading awman changes nothing. The **squad daemon** runs in the background under launchd, so there the permission belongs to awman itself — and because the signature is ad-hoc, macOS treats every new awman version as a new program. If a squad task works in a repository under one of those folders, macOS asks again after each awman upgrade, and the task waits until you answer. Keep squad workspaces elsewhere (for example `~/Workspaces`) to avoid this, or review the grants in **System Settings → Privacy & Security → Files and Folders**. The keychain is not affected: awman reads credentials through Apple's own `security` tool, so keychain access does not change when awman does.

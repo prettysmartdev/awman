@@ -263,8 +263,8 @@ snapshot silently ignores a relocated `AWMAN_CONFIG_HOME`.
 
 ```bash
 cargo build --release        # Single binary
-make test-fast              # Hermetic tests
-make test-full              # All tests (Docker needed)
+make test                   # Unit and component contracts
+make test-boundary          # Explicitly granted external services
 make architecture-lint      # No upward imports
 cargo clippy -- -D warnings # No warnings
 ```

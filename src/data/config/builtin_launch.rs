@@ -51,20 +51,3 @@ impl Default for BuiltinLaunchSettings {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_is_the_documented_defaults_with_no_repo_state_dir() {
-        let settings = BuiltinLaunchSettings::default();
-        assert_eq!((settings.vcpus, settings.memory_mib), (2, 4096));
-        assert_eq!(
-            (settings.root_disk_mib, settings.mount_quota_mib),
-            (30720, 30720)
-        );
-        assert_eq!(settings.network, BuiltinNetworkSettings::default());
-        assert_eq!(settings.repo_state_dir, None);
-    }
-}

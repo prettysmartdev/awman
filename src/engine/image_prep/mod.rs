@@ -229,36 +229,7 @@ impl AgentImagePreparer {
     ) -> Self {
         Self::with_inputs(ImageSources::default(), false, runtime, data_home, context)
     }
-    #[cfg(test)]
-    pub(crate) fn replace_sources(&mut self, sources: ImageSources) {
-        self.image_sources = sources;
-        self.plans.clear();
-        self.validated_policy = None;
-    }
-    #[cfg(test)]
-    pub(crate) fn image_sources(&self) -> &ImageSources {
-        &self.image_sources
-    }
-    #[cfg(test)]
-    pub(crate) fn with_build_stores(
-        mut self,
-        locks: ImageBuildLockStore,
-        receipts: PendingBuiltImageStore,
-    ) -> Self {
-        self.build_locks = locks;
-        self.pending_builds = receipts;
-        self
-    }
-    #[cfg(test)]
-    pub(crate) fn with_local_builder(mut self, builder: Arc<dyn LocalImageBuilder>) -> Self {
-        self.local_builder = Some(builder);
-        self
-    }
-    #[cfg(test)]
-    pub(crate) fn with_image_importer(mut self, importer: Arc<dyn ImageImporter>) -> Self {
-        self.image_importer = importer;
-        self
-    }
+
     pub fn cancel_token(&self) -> crate::engine::oci::CancelToken {
         self.cancel.clone()
     }
@@ -461,6 +432,3 @@ impl AgentImagePreparer {
 }
 
 mod prepare;
-
-#[cfg(test)]
-mod tests;

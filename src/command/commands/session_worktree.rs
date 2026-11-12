@@ -409,15 +409,11 @@ impl Resolver<'_> {
             self.announce_reuse(&worktree);
             self.refresh_reused(&worktree, &how)?;
             return Ok(worktree);
-        }
-        #[cfg(test)]
-        race_hooks::run(self.root, RaceStage::AfterLookup);
+        };
         let path = match self.available_path(directory_name) {
             Ok(path) => path,
             Err(error) => return self.reuse_after_collision(branch, error, &how),
         };
-        #[cfg(test)]
-        race_hooks::run(self.root, RaceStage::AfterPathCheck);
         let local = self.git.local_branch_exists(self.root, branch)?;
         let added = match (on_remote, local) {
             (true, false) => {
@@ -673,47 +669,6 @@ pub(crate) fn concurrent_add_failure(error: &crate::engine::error::EngineError) 
         || detail.contains("already used by worktree")
         // `git fetch` into a branch that another launch just checked out.
         || detail.contains("checked out at")
-}
-
-/// Test seam: run a callback (standing in for a concurrent launch) at a fixed
-/// point of the branch flow, for one repository only.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum RaceStage {
-    /// After the first checked-out lookup found nothing.
-    AfterLookup,
-    /// After the default path was found vacant.
-    AfterPathCheck,
-}
-
-#[cfg(test)]
-pub(crate) mod race_hooks {
-    use super::RaceStage;
-    use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
-
-    type Hook = Box<dyn FnOnce() + Send>;
-    static HOOKS: Mutex<Option<HashMap<(PathBuf, RaceStage), Hook>>> = Mutex::new(None);
-
-    /// Register `hook` to run once when the resolver for `root` reaches `stage`.
-    pub(crate) fn set(root: &Path, stage: RaceStage, hook: impl FnOnce() + Send + 'static) {
-        let mut hooks = HOOKS.lock().unwrap();
-        hooks
-            .get_or_insert_with(HashMap::new)
-            .insert((root.to_path_buf(), stage), Box::new(hook));
-    }
-
-    pub(super) fn run(root: &Path, stage: RaceStage) {
-        let hook = HOOKS
-            .lock()
-            .unwrap()
-            .as_mut()
-            .and_then(|hooks| hooks.remove(&(root.to_path_buf(), stage)));
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
 }
 
 fn canonicalize(path: &Path) -> Result<PathBuf, CommandError> {

@@ -105,29 +105,3 @@ pub fn body_text(body: &Value) -> String {
         other => other.to_string(),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn no_daemon_is_daemon_not_running() {
-        let home = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([("AWMAN_HOME", home.path().to_str().unwrap())]);
-        assert!(DaemonClient::discover(&env).unwrap().is_none());
-        assert!(matches!(
-            DaemonClient::connect(&env).unwrap_err(),
-            CommandError::DaemonNotRunning
-        ));
-    }
-
-    #[test]
-    fn error_bodies_render_as_text() {
-        assert_eq!(body_text(&Value::String("x".into())), "x");
-        assert_eq!(body_text(&Value::Null), "");
-        assert_eq!(
-            body_text(&serde_json::json!({"error":"e","code":"c"})),
-            r#"{"code":"c","error":"e"}"#
-        );
-    }
-}

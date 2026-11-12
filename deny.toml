@@ -1,0 +1,52 @@
+# cargo-deny policy (WI 0144). Owned by the ci-workflows step.
+#
+# CI runs `cargo deny check licenses bans sources` on every pull request (the
+# `lint-deny` suite) and `cargo deny check advisories` nightly, because the
+# advisory database changes without any commit and must never block an
+# unrelated pull request. Tool version: ci/gates.toml `tools.cargo-deny`.
+
+[graph]
+all-features = true
+
+[licenses]
+# Every license present in Cargo.lock today. A new license is a reviewed
+# decision: add it here with the dependency that needs it, never silently.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+# Workspace members with `publish = false` carry no license expression.
+private = { ignore = true }
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+# awman-wsp is a workspace member without a license field or its own license
+# file; it is licensed with the repository (Apache-2.0, ./LICENSE). The
+# maintainer-owned fix is `license = "Apache-2.0"` in its Cargo.toml (see the
+# ci-workflows handoff); until then it is clarified here and checked by hash.
+[[licenses.clarify]]
+crate = "awman-wsp"
+expression = "Apache-2.0"
+license-files = [{ path = "../../LICENSE", hash = 0 }]

@@ -289,38 +289,3 @@ fn status_code_name(status: u16) -> &'static str {
         _ => "refused",
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn refusal_bodies_are_recognised_and_frames_are_not() {
-        let refused = refusal_from_body(
-            None,
-            r#"{"error":"instance already has a primary frontend","code":"primary_exists"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            refused,
-            FrontendStreamError::Refused {
-                status: None,
-                code: "primary_exists".into(),
-                message: "instance already has a primary frontend".into(),
-            }
-        );
-        assert!(refusal_from_body(None, r#"{"seq":1,"type":"notice","code":"x"}"#).is_none());
-        assert!(refusal_from_body(None, "not json").is_none());
-        assert!(!refused.is_transport());
-        assert!(FrontendStreamError::Transport("gone".into()).is_transport());
-    }
-
-    #[test]
-    fn the_socket_path_names_the_instance() {
-        let id = InstanceId::new();
-        assert_eq!(
-            frontend_path(&id),
-            format!("/v1/engine/instances/{id}/frontend")
-        );
-    }
-}

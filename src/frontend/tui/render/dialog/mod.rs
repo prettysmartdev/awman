@@ -141,12 +141,7 @@ mod workflow;
 
 // `render/tests.rs` drives these two directly; the ConfigShow table is worth
 // asserting on without going through the whole dialog dispatch.
-#[cfg(test)]
-pub(super) use input::cursor_window;
-#[cfg(test)]
-pub(super) use input::render_config_show as render_config_show_for_tests;
-#[cfg(test)]
-pub(super) use workflow::render_yolo_countdown as render_yolo_countdown_for_tests;
+
 // The squad detail and history modals are called from arms that stayed in the
 // match above (they were already extracted before this split).
 use input::render_config_show;

@@ -19,3 +19,4 @@ src/command/commands/squad/gateway.rs:Env::from_process # LocalTaskGateway::new 
 src/engine/daemon/supervisor.rs:Env::from_process # ForwardedEnv bootstrap only; daemon owner is engine-feature-layer1
 
 src/command/worker/mod.rs:std::env::current_exe # private Git helper re-exec for production lease transport
+src/command/dispatch/projections/render_reference.rs:std::env::args_os # main() of the standalone awman-command-reference developer binary (make docs-reference) reads its own argv

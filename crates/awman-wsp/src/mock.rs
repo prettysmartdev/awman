@@ -11,9 +11,8 @@ mod http;
 pub use http::ServingMock;
 
 /// Deliberately nonconforming server behavior used to prove the probes reject it.
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TestFault {
+pub enum MockFault {
     IgnorePreferences,
     IgnoreEpoch,
     DuplicateEvents,
@@ -40,8 +39,7 @@ struct State {
     frames: HashMap<String, Vec<LeaseTerminalFrame>>,
     terminal_errors: HashMap<String, String>,
     next_id: u64,
-    #[cfg(test)]
-    fault: Option<TestFault>,
+    fault: Option<MockFault>,
 }
 struct Worker {
     request: RegisterRequest,
@@ -105,10 +103,7 @@ fn eligible<'a>(s: &'a State, worker: &str) -> Result<Vec<&'a Entry>, ApiError> 
                 && !s.leases.values().any(|l| l.lease.item.id == e.item.id)
         })
         .collect();
-    #[cfg(test)]
-    let ignore_preferences = s.fault == Some(TestFault::IgnorePreferences);
-    #[cfg(not(test))]
-    let ignore_preferences = false;
+    let ignore_preferences = s.fault == Some(MockFault::IgnorePreferences);
     entries.sort_by(|a, b| {
         b.item
             .priority
@@ -130,8 +125,8 @@ impl MockWorkServer {
     pub fn new() -> Self {
         Self::default()
     }
-    #[cfg(test)]
-    pub(crate) fn with_fault(fault: TestFault) -> Self {
+    /// Construct a deliberately nonconforming fake to validate conformance probes.
+    pub fn with_fault(fault: MockFault) -> Self {
         let server = Self::new();
         server.inner.lock().unwrap().fault = Some(fault);
         server
@@ -323,8 +318,7 @@ impl MockWorkServer {
                     .map_err(|_| error("invalid_event"))
             })
             .collect::<Result<_, _>>()?;
-        #[cfg(test)]
-        if s.fault == Some(TestFault::DuplicateEvents) {
+        if s.fault == Some(MockFault::DuplicateEvents) {
             let stored = s.events.get_mut(id).unwrap();
             let count = events.len();
             for event in events {
@@ -589,6 +583,15 @@ impl MockWorkServer {
     pub async fn serve(self: Arc<Self>) -> Result<ServingMock, std::io::Error> {
         http::serve(self).await
     }
+
+    /// Serve on a listener already owned by the caller. No port reservation
+    /// is released between allocation and serving.
+    pub async fn serve_on(
+        self: Arc<Self>,
+        listener: tokio::net::TcpListener,
+    ) -> Result<ServingMock, std::io::Error> {
+        http::serve_on(self, listener).await
+    }
 }
 fn secret() -> String {
     format!(
@@ -635,3 +638,6 @@ fn refresh_labels(s: &mut State) {
         worker.labels.extend(worker.server_labels.clone());
     }
 }
+
+#[cfg(test)]
+mod state_model;

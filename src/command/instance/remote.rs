@@ -2873,10 +2873,6 @@ fn p95(samples: &[Duration]) -> Option<Duration> {
     sorted.get(index.saturating_sub(1)).copied()
 }
 
-#[cfg(test)]
-#[path = "remote_tests.rs"]
-mod tests;
-
 /// Presentation proxy for the worker owned by the connected engine instance.
 struct RemoteQueue {
     shared: Arc<Shared>,
@@ -2969,3 +2965,7 @@ impl crate::command::worker::queue_source::QueueSource for RemoteQueue {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "remote_contracts.rs"]
+mod contracts;

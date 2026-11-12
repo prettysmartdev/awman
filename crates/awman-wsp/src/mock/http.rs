@@ -26,6 +26,12 @@ impl Drop for ServingMock {
 }
 pub(super) async fn serve(server: Arc<MockWorkServer>) -> Result<ServingMock, std::io::Error> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
+    serve_on(server, listener).await
+}
+pub(super) async fn serve_on(
+    server: Arc<MockWorkServer>,
+    listener: TcpListener,
+) -> Result<ServingMock, std::io::Error> {
     let addr = listener.local_addr()?;
     let router = Router::new().fallback(any(dispatch)).with_state(server);
     let handle = tokio::spawn(async move {
@@ -79,10 +85,7 @@ fn lease_auth(
         .get(id)
         .filter(|l| l.worker_id == worker)
         .ok_or_else(|| error("lease_lost"))?;
-    #[cfg(test)]
-    let ignore_epoch = s.fault == Some(TestFault::IgnoreEpoch);
-    #[cfg(not(test))]
-    let ignore_epoch = false;
+    let ignore_epoch = s.fault == Some(MockFault::IgnoreEpoch);
     if !ignore_epoch
         && headers
             .get("x-wsp-epoch")
@@ -95,16 +98,13 @@ fn lease_auth(
     Ok(l.lease.clone())
 }
 async fn dispatch(State(server): State<Arc<MockWorkServer>>, request: Request) -> Response {
-    #[cfg(test)]
     let fault = server.inner.lock().unwrap().fault;
-    #[cfg(test)]
     let path = request.uri().path().to_owned();
     let response = match dispatch_inner(server, request).await {
         Ok(r) => r,
         Err(e) => fail(e),
     };
-    #[cfg(test)]
-    if let Some(TestFault::Wire(suffix)) = fault {
+    if let Some(MockFault::Wire(suffix)) = fault {
         if path.ends_with(suffix) || (suffix == "error" && !response.status().is_success()) {
             let (parts, body) = response.into_parts();
             let bytes = to_bytes(body, 4 * 1024 * 1024).await.unwrap();
@@ -351,8 +351,7 @@ async fn dispatch_inner(
                         )?,
                     })
                     .into_response();
-                    #[cfg(test)]
-                    if server.inner.lock().unwrap().fault == Some(TestFault::EmptyEvents) {
+                    if server.inner.lock().unwrap().fault == Some(MockFault::EmptyEvents) {
                         return Ok(StatusCode::NO_CONTENT.into_response());
                     }
                     Ok(response)

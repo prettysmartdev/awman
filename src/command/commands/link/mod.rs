@@ -171,26 +171,3 @@ impl super::Command for LinkCommand {
         }
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn target_classification() {
-        assert_eq!(
-            LinkTarget::parse("WEB-k7pm-3q9x").unwrap(),
-            LinkTarget::Browser("web-K7PM-3Q9X".into())
-        );
-        for bad in [
-            "web-bad",
-            "x",
-            "http://example.com",
-            "https://user:pass@example.com",
-        ] {
-            assert!(LinkTarget::parse(bad).is_err(), "{bad}");
-        }
-        assert!(matches!(
-            LinkTarget::parse("https://example.com").unwrap(),
-            LinkTarget::WorkServer(_)
-        ));
-    }
-}

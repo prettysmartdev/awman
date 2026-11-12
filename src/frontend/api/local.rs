@@ -44,15 +44,30 @@ impl LocalBind {
 /// socket file (only if it is still the one this listener bound).
 pub struct LocalListener {
     task: tokio::task::JoinHandle<()>,
+    connections: tokio_util::task::TaskTracker,
+    stop: tokio_util::sync::CancellationToken,
     #[cfg(unix)]
     endpoint: PathBuf,
     #[cfg(unix)]
     identity: (u64, u64),
 }
 
+impl LocalListener {
+    /// Stop admission, flush active responses and close keep-alive connections.
+    pub async fn shutdown(&self) {
+        self.task.abort();
+        self.stop.cancel();
+        self.connections.close();
+        // A peer that stops reading cannot hold daemon shutdown indefinitely.
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(10), self.connections.wait()).await;
+    }
+}
+
 impl Drop for LocalListener {
     fn drop(&mut self) {
         self.task.abort();
+        self.stop.cancel();
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -70,8 +85,6 @@ impl Drop for LocalListener {
 /// then the private directory is created, the endpoint bound and secured, and
 /// the accept loop started.
 ///
-/// 0140: this is the design's `local::start(&DaemonClaim, &Path, Router)`;
-/// unified-router renames it to `start` when it deletes the legacy [`start`].
 pub fn start_claimed(
     claim: &DaemonClaim,
     endpoint: &Path,
@@ -140,6 +153,10 @@ fn bind(
         .map_err(|e| fail("chmod 0600", &e))?;
     let meta = std::fs::symlink_metadata(endpoint).map_err(|e| fail("stat", &e))?;
     let identity = (meta.dev(), meta.ino());
+    let connections = tokio_util::task::TaskTracker::new();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let tasks = connections.clone();
+    let connection_stop = stop.clone();
     let task = tokio::spawn(async move {
         loop {
             let stream = match listener.accept().await {
@@ -154,11 +171,13 @@ fn bind(
                 tracing::warn!(?peer, "refused a local connection from another user");
                 continue;
             }
-            serve_connection(stream, router.clone());
+            serve_connection(stream, router.clone(), &tasks, connection_stop.clone());
         }
     });
     let listener = LocalListener {
         task,
+        connections,
+        stop,
         endpoint: endpoint.to_path_buf(),
         identity,
     };
@@ -188,6 +207,10 @@ fn bind(
         ))
     })?;
     let name = endpoint.to_path_buf();
+    let connections = tokio_util::task::TaskTracker::new();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let tasks = connections.clone();
+    let connection_stop = stop.clone();
     let task = tokio::spawn(async move {
         loop {
             if listener.connect().await.is_err() {
@@ -201,7 +224,7 @@ fn bind(
                 }
             };
             if verify_pipe_client(&listener) {
-                serve_connection(listener, router.clone());
+                serve_connection(listener, router.clone(), &tasks, connection_stop.clone());
             } else {
                 tracing::warn!("refused a named pipe connection from another user");
                 let _ = listener.disconnect();
@@ -213,76 +236,37 @@ fn bind(
         transport: LocalTransport::NamedPipe,
         address: endpoint.display().to_string(),
     };
-    Ok((LocalListener { task }, bound))
+    Ok((
+        LocalListener {
+            task,
+            connections,
+            stop,
+        },
+        bound,
+    ))
 }
 
-fn serve_connection<S>(stream: S, router: Router)
-where
+fn serve_connection<S>(
+    stream: S,
+    router: Router,
+    tasks: &tokio_util::task::TaskTracker,
+    stop: tokio_util::sync::CancellationToken,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let service = hyper_util::service::TowerToHyperService::new(router);
-        let _ = hyper::server::conn::http1::Builder::new()
+        let connection = hyper::server::conn::http1::Builder::new()
             .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
             // `/v1/terminals/{id}` upgrades to a WebSocket (WI 0141).
-            .with_upgrades()
-            .await;
+            .with_upgrades();
+        tokio::pin!(connection);
+        tokio::select! {
+            _ = &mut connection => {}
+            _ = stop.cancelled() => {
+                connection.as_mut().graceful_shutdown();
+                let _ = connection.await;
+            }
+        }
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_the_owner_uid_is_served() {
-        assert!(peer_is_owner(Some(501), 501));
-        assert!(!peer_is_owner(Some(0), 501));
-        assert!(!peer_is_owner(Some(502), 501));
-        assert!(!peer_is_owner(None, 501));
-    }
-
-    /// Real uid switching is impossible unprivileged, so the listener is told
-    /// its owner is a different uid: the test process then *is* the wrong peer.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_peer_with_another_uid_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let endpoint = dir.path().join("d").join("api.sock");
-        let router = Router::new().route("/v1/health", axum::routing::get(|| async { "ok" }));
-        let other = owner_uid().wrapping_add(1);
-        let (_listener, _) = bind(&endpoint, router, |_| Ok(()), other).unwrap();
-        let error = crate::engine::remote::local::LocalClient::new(endpoint)
-            .with_timeout(std::time::Duration::from_secs(5))
-            .send("GET", "/v1/health", None)
-            .await
-            .unwrap_err();
-        assert!(
-            error.to_string().contains("local daemon request"),
-            "{error}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn the_owner_is_served_and_marked_owner_authenticated() {
-        let dir = tempfile::tempdir().unwrap();
-        let endpoint = dir.path().join("d").join("api.sock");
-        let router = Router::new().route(
-            "/v1/health",
-            axum::routing::get(
-                |ext: Option<axum::Extension<OwnerAuthenticated>>| async move {
-                    axum::Json(serde_json::json!({"owner": ext.is_some()}))
-                },
-            ),
-        );
-        let (_listener, bound) = bind(&endpoint, router, |_| Ok(()), owner_uid()).unwrap();
-        assert_eq!(bound.transport, LocalTransport::UnixSocket);
-        let response = crate::engine::remote::local::LocalClient::new(endpoint)
-            .send("GET", "/v1/health", None)
-            .await
-            .unwrap();
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body["owner"], true);
-    }
 }

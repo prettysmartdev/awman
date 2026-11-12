@@ -1,0 +1,29 @@
+# Test-hygiene rules for awman-test-support (WI 0144 design 9.1).
+#
+# Clippy reads the clippy.toml of the package being linted, so this file
+# applies to this crate only (library, fake-cli binary, build script and
+# tests). The few sanctioned call sites (the supervisor's spawn, the one
+# polling delay, the port-0 bind, the enumerated environment read) carry
+# `#[allow(clippy::disallowed_methods)]` with a reason. The workspace-wide
+# list in the root clippy.toml is applied by the integration step once
+# production call sites carry their own allows.
+disallowed-methods = [
+    { path = "std::env::set_var", reason = "tests never mutate the process environment: use TestSandbox::env_mut / EnvSnapshot::with_overrides (H1)" },
+    { path = "std::env::remove_var", reason = "tests never mutate the process environment: use TestSandbox::env_mut (H1)" },
+    { path = "std::env::set_current_dir", reason = "pass a directory explicitly, e.g. OwnedCommand::current_dir (H1)" },
+    { path = "std::env::var", reason = "only awman_test_support::runtime_env reads the process environment (H7)" },
+    { path = "std::env::var_os", reason = "only awman_test_support::runtime_env reads the process environment (H7)" },
+    { path = "std::env::vars", reason = "only awman_test_support::runtime_env reads the process environment (H7)" },
+    { path = "std::env::vars_os", reason = "only awman_test_support::runtime_env reads the process environment (H7)" },
+    { path = "std::env::temp_dir", reason = "use TestSandbox::tmp(); the temp root comes from runtime_env (H7)" },
+    { path = "std::thread::sleep", reason = "use wait_for, Ready or virtual time (H3)" },
+    { path = "tokio::time::sleep", reason = "use wait_for_async, events or paused time in the unit tier (H3)" },
+    { path = "std::process::Command::spawn", reason = "use TestSandbox::command (supervised, H2)" },
+    { path = "std::process::Command::output", reason = "use TestSandbox::command(..).run() (supervised, H2)" },
+    { path = "std::process::Command::status", reason = "use TestSandbox::command(..).run() (supervised, H2)" },
+    { path = "tokio::process::Command::spawn", reason = "use TestSandbox::command (supervised, H2)" },
+    { path = "tokio::process::Command::output", reason = "use TestSandbox::command (supervised, H2)" },
+    { path = "tokio::process::Command::status", reason = "use TestSandbox::command (supervised, H2)" },
+    { path = "std::net::TcpListener::bind", reason = "use TestSandbox::ports().tcp_listener() (owned, port 0, H4)" },
+    { path = "tokio::net::TcpListener::bind", reason = "use TestSandbox::ports().tcp_listener() (owned, port 0, H4)" },
+]

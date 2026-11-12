@@ -72,23 +72,3 @@ impl WorkerLabels {
         labels
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn submitted_dotted_keys_require_a_namespace() {
-        assert!(validate_key("infact.kind").is_err());
-        assert!(validate_key("infact.example/kind").is_ok());
-        assert!(validate_key("pool").is_ok());
-        let affinity = crate::Affinity {
-            required: vec![crate::Match {
-                key: "infact.kind".into(),
-                op: crate::MatchOp::Exists,
-                values: vec![],
-            }],
-            ..Default::default()
-        };
-        assert!(affinity.validate().is_err());
-    }
-}

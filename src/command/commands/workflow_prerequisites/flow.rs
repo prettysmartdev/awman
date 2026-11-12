@@ -520,6 +520,7 @@ impl WorkflowPrerequisiteFlow {
                 verify: self.options.policy.github_token.verify,
                 timeout: GITHUB_TOKEN_PROBE_TIMEOUT,
             })
+            .with_env_snapshot(self.session.env().clone())
             .with_refused_binaries(self.options.custom_agent_binaries.clone())
             .with_repository_root(self.options.git_root.clone())
     }
