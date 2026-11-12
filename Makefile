@@ -142,15 +142,14 @@ clean:
 	cargo clean
 
 # ── Release ──────────────────────────────────────────────────────────────────
-# Run every local/native Apple Silicon gate against the final clean main commit,
-# including the exact signed release artifact, without creating a tag.
+# Dispatch and watch the authenticated candidate rehearsal for current main.
+# For a local Apple Silicon acceptance packet, use validate-native instead.
 apple-silicon-prerelease:
 	@cargo xtask release validate
 
-# Release VERSION. On an Apple Silicon Mac with Hypervisor.framework, the
-# release job's /opt/awman scripts are installed or refreshed and the Mac is
-# registered as a temporary GitHub Actions runner for the Apple Silicon
-# release job, then removed when the Release workflow finishes.
+# Release VERSION. A managed Apple Silicon runner verifies the manifest fixtures
+# in its private runner directory, registers for the candidate job, and
+# deregisters after the pipeline finishes.
 # RELEASE_RUNNER=auto|local|none (see aspec/devops/release.md).
 RELEASE_RUNNER ?= auto
 release:

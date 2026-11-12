@@ -190,8 +190,8 @@ else
   if [ -n "$EXISTING" ] && [ "$RELEASE_RUNNER" = auto ]; then
     ok "Release runner: online runner(s) will take the Apple Silicon job: $EXISTING"
   elif runner check --hardware 2>/dev/null; then
-    # Install or refresh the job's /opt/awman scripts and guest fixture, so a
-    # release never depends on remembering to provision this Mac.
+    # Fetch and verify manifest fixtures in the private runner directory before
+    # registration; every release checks its inputs again.
     runner provision ||
       die "Could not set up this Mac's release scripts (see above). Fix that, or use RELEASE_RUNNER=none."
     RUNNER_CHECK=$(runner check 2>&1) ||

@@ -85,8 +85,6 @@ impl Drop for LocalListener {
 /// then the private directory is created, the endpoint bound and secured, and
 /// the accept loop started.
 ///
-/// 0140: this is the design's `local::start(&DaemonClaim, &Path, Router)`;
-/// unified-router renames it to `start` when it deletes the legacy [`start`].
 pub fn start_claimed(
     claim: &DaemonClaim,
     endpoint: &Path,
