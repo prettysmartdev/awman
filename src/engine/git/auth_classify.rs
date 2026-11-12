@@ -140,13 +140,17 @@ fn classify_response_trace(stderr: &str, timed_out: bool, trace: Option<&str>) -
     if class == GitFailureClass::Transport {
         return class;
     }
-    // libcurl renders WSAECONNRESET as "Connection was reset" on Windows.
-    // Either spelling still requires evidence that no response arrived.
+    // libcurl distinguishes WSAECONNRESET and WSAECONNABORTED on Windows.
+    // Both disconnects still require evidence that no response arrived.
     let stderr = stderr.to_ascii_lowercase();
     if trace.contains("== info:")
-        && ["connection reset by peer", "connection was reset"]
-            .iter()
-            .any(|reset| stderr.contains(reset))
+        && [
+            "connection reset by peer",
+            "connection was reset",
+            "connection was aborted",
+        ]
+        .iter()
+        .any(|reset| stderr.contains(reset))
     {
         GitFailureClass::Transport
     } else {
@@ -168,11 +172,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resets_need_evidence_of_no_response_on_every_platform() {
+    fn disconnects_need_evidence_of_no_response_on_every_platform() {
         let started = "== Info: Connected to 127.0.0.1\n";
         for message in [
             "Recv failure: Connection reset by peer",
             "Recv failure: Connection was reset",
+            "Recv failure: Connection was aborted",
         ] {
             for trace in [None, Some("")] {
                 assert_eq!(
