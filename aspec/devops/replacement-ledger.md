@@ -21,6 +21,15 @@ removed; Git history is the historical record.
 | Native guest and artifact | Boot/exec/import/network, persistent upgrade, builders/strategy, signed offline candidate, dependency and byte-integrity checks | `tests/guest`, `tests/artifact`; final native packet required |
 | CI and release | Conservative selection, exact compiled inventory/results, authenticated Actions artifacts/jobs, immutable candidate evidence, promotion refusal, operator interaction and runner repair | `xtask` unit, CI, pipeline and release contracts |
 
+The `nextgen` reconciliation also covers remote reconnects and parallel-slot
+transitions, stale dialog responses, sequential workflow request handover, and
+final terminal output before exit in `src/command/instance/remote_contracts.rs`,
+`tests/component/command/relay.rs`, and `tests/component/engine/terminal.rs`.
+Workflow report-policy contracts preserve the distinction between a reported
+error awaiting repair and a failed process; TUI contracts cover closed dialogs
+and status visibility in narrow windows. These use the current private-state
+contracts rather than restoring the retired harnesses.
+
 The workflow scheduler tests prove actual state transitions through the production
 engine. They do not claim that a fake executed a real agent. Real runtime behavior
 belongs to the boundary/guest/artifact tiers. Catalogue help or enumeration alone

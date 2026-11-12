@@ -20,8 +20,7 @@ impl OverlayPathResolver {
             return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
         }
         if let Some(rest) = path.strip_prefix("~/") {
-            {
-                let home = dirs::home_dir().expect("private HOME is required");
+            if let Some(home) = dirs::home_dir() {
                 return home.join(rest);
             }
         }

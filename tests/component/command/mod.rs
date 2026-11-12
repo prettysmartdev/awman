@@ -8,6 +8,7 @@ mod daemon;
 mod differential;
 mod failures;
 mod models;
+mod relay;
 mod scaffolding;
 mod scenarios;
 mod support;

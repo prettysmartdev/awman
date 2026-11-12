@@ -11,7 +11,7 @@
 //! (`TerminalHub::bridge_agent_channels`). Filled by the
 //! `engine-feature-layer1` step.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::{input_channel, TerminalHandle, TerminalHub, TerminalInput, TerminalRegistration};
 
@@ -21,6 +21,22 @@ pub struct BridgedTerminal {
     /// Ends when `stdout_rx` closes (the agent's output ended); the terminal
     /// is then marked exited with code 0 unless `handle.exit` already ran.
     pub task: tokio::task::JoinHandle<()>,
+    stdout: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>>,
+}
+
+impl BridgedTerminal {
+    /// Deliver bytes already queued by the agent before publishing its exit.
+    /// The background bridge polls and writes under this same lock, so a
+    /// fetched chunk cannot overtake the exit while the relay flushes.
+    pub fn flush_pending_output(&self) {
+        let mut stdout = self
+            .stdout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while let Ok(bytes) = stdout.try_recv() {
+            self.handle.push_output(&bytes);
+        }
+    }
 }
 
 impl TerminalHub {
@@ -30,7 +46,7 @@ impl TerminalHub {
     pub fn bridge_agent_channels(
         self: &Arc<Self>,
         registration: TerminalRegistration,
-        mut stdout_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        stdout_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
         stdin_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
         resize_tx: tokio::sync::mpsc::UnboundedSender<(u16, u16)>,
     ) -> BridgedTerminal {
@@ -46,13 +62,24 @@ impl TerminalHub {
             },
         );
         let output = handle.clone();
+        let stdout = Arc::new(Mutex::new(stdout_rx));
+        let task_stdout = Arc::clone(&stdout);
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    bytes = stdout_rx.recv() => match bytes {
-                        Some(bytes) => output.push_output(&bytes),
-                        None => break,
-                    },
+                    open = futures_util::future::poll_fn(|cx| {
+                        let mut receiver = task_stdout
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        match receiver.poll_recv(cx) {
+                            std::task::Poll::Ready(Some(bytes)) => {
+                                output.push_output(&bytes);
+                                std::task::Poll::Ready(true)
+                            }
+                            std::task::Poll::Ready(None) => std::task::Poll::Ready(false),
+                            std::task::Poll::Pending => std::task::Poll::Pending,
+                        }
+                    }) => if !open { break },
                     // Drained here, by the writer itself, so a stalled agent
                     // pushes back on viewers through the bounded queue.
                     input = input_rx.recv() => match input {
@@ -67,7 +94,11 @@ impl TerminalHub {
             }
             output.exit(0);
         });
-        BridgedTerminal { handle, task }
+        BridgedTerminal {
+            handle,
+            task,
+            stdout,
+        }
     }
 }
 

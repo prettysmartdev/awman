@@ -2321,8 +2321,10 @@ impl FrontendSession {
             FrontendFrame::WorkflowRequest { tab_id, request } => {
                 let _ = host.with_relay(id, &tab_id, |relay| relay.request_workflow(request));
             }
-            FrontendFrame::Activity { tab_id } => {
-                let _ = host.with_relay(id, &tab_id, |relay| relay.note_activity());
+            FrontendFrame::Activity { tab_id, step_name } => {
+                let _ = host.with_relay(id, &tab_id, |relay| {
+                    relay.note_activity(step_name.as_deref())
+                });
             }
             FrontendFrame::Resize(size) => {
                 if let Some(hosted) = host.find(id) {

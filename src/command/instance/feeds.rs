@@ -117,7 +117,9 @@ pub struct AgentSignals(Arc<Mutex<AgentSignalsInner>>);
 #[derive(Default)]
 struct AgentSignalsInner {
     last_user_input: Option<Instant>,
+    last_user_step: Option<String>,
     status: Option<EffectiveStatus>,
+    step_status: std::collections::HashMap<String, Option<EffectiveStatus>>,
     /// The command asked the App to close its report-opened board: the
     /// agent resumed (`working` / clear) before the user touched it.
     dismiss_report_dialog: bool,
@@ -126,18 +128,29 @@ struct AgentSignalsInner {
 impl AgentSignals {
     /// Record a key press or scroll on this tab.
     pub fn touch_user(&self) {
+        self.touch_user_for_step(None);
+    }
+
+    /// Record activity in the slot the person is actually viewing. `None`
+    /// denotes a sequential slot, whose workflow step is named by the engine.
+    pub fn touch_user_for_step(&self, step_name: Option<&str>) {
         if let Ok(mut g) = self.0.lock() {
             g.last_user_input = Some(Instant::now());
+            g.last_user_step = step_name.map(str::to_owned);
         }
     }
 
-    /// Whether the user typed or scrolled within the last `window`.
-    pub fn user_active_within(&self, window: std::time::Duration) -> bool {
-        self.0
-            .lock()
-            .ok()
-            .and_then(|g| g.last_user_input)
-            .is_some_and(|t| t.elapsed() < window)
+    pub fn last_user_step(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|g| g.last_user_step.clone())
+    }
+
+    pub fn user_active_within_step(&self, window: std::time::Duration, step_name: &str) -> bool {
+        self.0.lock().is_ok_and(|g| {
+            g.last_user_input.is_some_and(|t| t.elapsed() < window)
+                && g.last_user_step
+                    .as_deref()
+                    .is_none_or(|focused| focused == step_name)
+        })
     }
 
     pub fn set_status(&self, status: Option<EffectiveStatus>) {
@@ -148,6 +161,18 @@ impl AgentSignals {
 
     pub fn status(&self) -> Option<EffectiveStatus> {
         self.0.lock().ok().and_then(|g| g.status.clone())
+    }
+
+    /// The engine's latest report for one workflow step. The outer option
+    /// distinguishes an explicit clear from a step that has not reported.
+    pub fn step_status(&self, step_name: &str) -> Option<Option<EffectiveStatus>> {
+        self.0.lock().ok()?.step_status.get(step_name).cloned()
+    }
+
+    pub fn set_step_status(&self, step_name: &str, status: Option<EffectiveStatus>) {
+        if let Ok(mut g) = self.0.lock() {
+            g.step_status.insert(step_name.to_owned(), status);
+        }
     }
 
     /// When the user last typed or scrolled on this tab (dialog keys count).
@@ -317,6 +342,11 @@ pub enum ContainerSlotEvent {
     },
     /// A container exited — evict its slot with no grey summary bar.
     Exited { step_name: String },
+    /// A parallel agent's reported status for its own container strip.
+    Reported {
+        step_name: String,
+        status: Option<crate::data::program_status::EffectiveStatus>,
+    },
     /// A container's stuck timer fired (yolo off).
     Stuck { step_name: String },
     /// A stuck container recovered.

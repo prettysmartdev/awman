@@ -221,3 +221,47 @@ fn poll_ci_outside_a_repository_fails_after_the_attempt_banner() {
     assert_eq!(events, vec![CiPollEvent::Attempt { attempt: 1, of: 5 }]);
     sandbox.finish();
 }
+
+#[test]
+fn reported_error_waits_for_repair_while_blocked_and_done_keep_their_policies() {
+    use awman::data::program_status::{EffectiveStatus, ProgramState};
+    use awman::data::workflow_state::CountdownKind;
+    use awman::engine::workflow::program_status::{respond_to_report, ReportedResponse};
+    let mut status = EffectiveStatus {
+        state: ProgramState::Error,
+        kind: None,
+        progress: None,
+        msg: Some("repair in progress".into()),
+        app: None,
+        id: None,
+    };
+    for (yolo, attended) in [(true, true), (true, false), (false, false)] {
+        assert_eq!(
+            respond_to_report(Some(&status), yolo, attended),
+            ReportedResponse::AwaitRepair
+        );
+    }
+    assert_eq!(
+        respond_to_report(Some(&status), false, true),
+        ReportedResponse::ProblemBoard
+    );
+    status.state = ProgramState::Blocked;
+    assert_eq!(
+        respond_to_report(Some(&status), true, true),
+        ReportedResponse::NeedsYou
+    );
+    assert_eq!(
+        respond_to_report(Some(&status), true, false),
+        ReportedResponse::Countdown(CountdownKind::AgentBlocked)
+    );
+    status.state = ProgramState::Done;
+    assert_eq!(
+        respond_to_report(Some(&status), true, false),
+        ReportedResponse::Countdown(CountdownKind::AgentDone)
+    );
+    status.state = ProgramState::Working;
+    assert_eq!(
+        respond_to_report(Some(&status), true, false),
+        ReportedResponse::Resume
+    );
+}

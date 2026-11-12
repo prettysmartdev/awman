@@ -24,7 +24,9 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 
 use crate::engine::acp::{ContentBlock, SessionUpdate};
-use crate::frontend::tui::container_view::PARALLEL_BAR_HEIGHT;
+use crate::frontend::tui::container_view::{
+    slot_status_text, slot_titles_with_status, PARALLEL_BAR_HEIGHT,
+};
 use crate::frontend::tui::tabs::{format_duration, ContainerSlot, Tab};
 
 /// Identity color for ACP agent windows: a distinct purple (`#9333EA`).
@@ -117,6 +119,8 @@ pub fn render_acp_maximized(
         lines_update_count(&lines),
         format_duration(elapsed)
     );
+    let (left_title, right_title) =
+        slot_titles_with_status(slot, left_title, right_title, window_width);
 
     frame.render_widget(Clear, window_area);
 
@@ -228,10 +232,14 @@ fn render_one_acp_bar(slot: &ContainerSlot, area: Rect, frame: &mut Frame) {
     } else {
         format!(" [{}]", slot.step_name)
     };
+    let status_segment = slot_status_text(slot, 60)
+        .map(|status| format!(" | {status}"))
+        .unwrap_or_default();
     let content = format!(
-        "\u{1F512} {}{} | acp | {} updates | {}",
+        "\u{1F512} {}{}{} | acp | {} updates | {}",
         slot.agent_name(),
         step_segment,
+        status_segment,
         update_count,
         format_duration(slot.elapsed_secs()),
     );

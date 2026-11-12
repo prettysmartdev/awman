@@ -1434,8 +1434,10 @@ pub(crate) fn show_leader_control_board(
         can_launch_next: true,
         launch_next_label: Some("Start dynamic workflow".to_string()),
         can_restart_current_step: true,
+        can_pause: true,
         can_abort: true,
         can_dismiss: true,
+        focused_step: Some(label.to_string()),
         ..Default::default()
     };
 
@@ -1532,6 +1534,12 @@ fn narrate_leader_report(
             format!(
                 "Leader '{label}' needs you: agent reported {what}. Answer in the container \
                  or use the control board (Ctrl-W)"
+            ),
+        ),
+        ReportedResponse::AwaitRepair => (
+            MessageLevel::Warning,
+            format!(
+                "Leader '{label}': agent reported {what}; waiting for repair or a control-board action (Ctrl-W)"
             ),
         ),
         ReportedResponse::Resume

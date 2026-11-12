@@ -123,3 +123,83 @@ async fn tab_navigation_and_dialog_dismissal_keep_sessions_distinct() {
     drop(app);
     s.finish();
 }
+
+#[tokio::test]
+async fn closed_remote_dialog_is_discarded_without_losing_the_next_dialog() {
+    use crate::command::instance::backend::BackendEvent;
+    use crate::data::{dialog::DialogRequest, frontend_protocol::AnsweredBy, ids::DialogId};
+    let s = TestSandbox::for_test(TestCase::component("frontend::tui::contracts::closed_remote_dialog_is_discarded_without_losing_the_next_dialog"));
+    let mut app = app(&s);
+    let tab_id = app.backend.tab_id(&app.tabs[0].session_id).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.tabs[0].dialog_request_rx = Some(rx);
+    tx.send(DialogRequest::WorkflowStepConfirm(
+        dialogs::WorkflowStepConfirmState {
+            completed_step: "plan".into(),
+            next_step: "build".into(),
+        },
+    ))
+    .unwrap();
+    remote_tab::RemoteTabView::apply(
+        &mut app,
+        BackendEvent::DialogClosed {
+            dialog_id: Some(DialogId::new()),
+            tab_id,
+            answered_by: AnsweredBy::Engine,
+        },
+    );
+    app.poll_dialog_requests();
+    assert!(app.active_dialog.is_none());
+    tx.send(DialogRequest::YesNo {
+        title: "next".into(),
+        body: "question".into(),
+    })
+    .unwrap();
+    app.poll_dialog_requests();
+    assert!(matches!(app.active_dialog, Some(Dialog::YesNo { .. })));
+    drop(app);
+    s.finish();
+}
+
+#[tokio::test]
+async fn narrow_workflow_window_preserves_the_reported_step_status() {
+    use crate::data::program_status::{EffectiveStatus, ProgramState};
+    let s = TestSandbox::for_test(TestCase::component(
+        "frontend::tui::contracts::narrow_workflow_window_preserves_the_reported_step_status",
+    ));
+    let mut app = app(&s);
+    let mut slot = tabs::ContainerSlot::new("build".into(), "claude".into(), 1000);
+    slot.set_program_status(Some(EffectiveStatus {
+        state: ProgramState::Idle,
+        kind: None,
+        progress: None,
+        msg: None,
+        app: None,
+        id: None,
+    }));
+    let (left, right) = container_view::slot_titles_with_status(
+        &slot,
+        " 🔒 Claude Code (containerized) — build ".into(),
+        " very-long-container-name | ... | ... | 00:42 ".into(),
+        76,
+    );
+    assert!(left.contains("build — idle"), "{left}");
+    assert!(right.is_empty(), "statistics must yield to status");
+    app.tabs[0].container_slots.push(slot);
+    let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+    terminal
+        .draw(|frame| {
+            container_view::render_container_maximized(&mut app.tabs[0], frame.area(), 0, frame)
+        })
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("build — idle"), "{text}");
+    drop(app);
+    s.finish();
+}

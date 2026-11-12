@@ -11,11 +11,11 @@
 //! | `working` / cleared | cancel countdown | nothing (frontend may close an auto-opened board) | cancel countdown |
 //! | `done`, `idle` | [`CountdownKind::AgentDone`] → kill + advance | lightweight step confirm | as yolo |
 //! | `blocked` | pause, "needs you" alert, no countdown | control board | [`CountdownKind::AgentBlocked`] → kill + fail |
-//! | `error` | [`CountdownKind::AgentError`] → kill + fail | control board | as yolo |
+//! | `error` | keep running for repair | control board | keep running for repair |
 //!
 //! A problem (`blocked`, `error`) never advances a step in any mode. A step
-//! killed after a problem report, or one that exits by itself after one, is
-//! finalised as Failed whatever its exit code ([`super::single_step`]'s
+//! that exits after a problem report is finalised as Failed whatever its exit
+//! code ([`super::single_step`]'s
 //! `finalize_step`), so the ordinary failure paths (`on_failure`, the
 //! unattended one-retry `FailureRetry` countdown, the recovery board) apply.
 //!
@@ -36,9 +36,12 @@ pub enum ReportedResponse {
     /// `working`, or the agent cleared its records: cancel any running agent
     /// countdown and forget a recorded problem. The step keeps running.
     Resume,
+    /// The agent reported an error but is still alive. Preserve its status
+    /// and let it recover or accept input, without starting a kill timer.
+    AwaitRepair,
     /// Start this countdown. [`CountdownKind::AgentDone`] expiry kills the
-    /// container and advances; `AgentBlocked` / `AgentError` expiry kills it
-    /// and fails the step.
+    /// container and advances; `AgentBlocked` expiry kills it and fails the
+    /// step.
     Countdown(CountdownKind),
     /// Non-yolo with a user: open the lightweight "advance to the next step?"
     /// confirmation, as if the step had completed.
@@ -80,13 +83,8 @@ pub fn respond_to_report(
                 ReportedResponse::ProblemBoard
             }
         }
-        ProgramState::Error => {
-            if yolo || !attended {
-                ReportedResponse::Countdown(CountdownKind::AgentError)
-            } else {
-                ReportedResponse::ProblemBoard
-            }
-        }
+        ProgramState::Error if !yolo && attended => ReportedResponse::ProblemBoard,
+        ProgramState::Error => ReportedResponse::AwaitRepair,
     }
 }
 
@@ -321,6 +319,9 @@ impl WorkflowEngine {
         let what = describe_status(status);
         match response {
             ReportedResponse::Resume => {}
+            ReportedResponse::AwaitRepair => self.msg_warning(format!(
+                "Step '{step_name}': agent reported {what}; waiting for repair or an explicit control-board action (Ctrl-W)"
+            )),
             ReportedResponse::NeedsYou => {
                 let mut text = format!(
                     "Step '{step_name}' needs you: agent reported {what}. The workflow is paused \
@@ -368,6 +369,7 @@ impl WorkflowEngine {
     ) -> Result<AvailableActions, EngineError> {
         let mut available = self.compute_available_actions()?;
         available.reported_status = status.cloned();
+        available.opened_by_report = true;
         available.simple_advance = None;
         if response == ReportedResponse::ConfirmAdvance && available.can_launch_next {
             let failed = self
@@ -417,7 +419,9 @@ impl WorkflowEngine {
                 self.narrate_report(step_name, s, response);
             }
             match response {
-                ReportedResponse::Resume | ReportedResponse::NeedsYou => return Ok(None),
+                ReportedResponse::Resume
+                | ReportedResponse::AwaitRepair
+                | ReportedResponse::NeedsYou => return Ok(None),
                 ReportedResponse::ConfirmAdvance | ReportedResponse::ProblemBoard => {
                     let available =
                         self.reported_board_actions(step_name, status.as_ref(), response)?;

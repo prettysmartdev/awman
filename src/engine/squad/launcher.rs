@@ -215,10 +215,11 @@ impl SquadAgentLauncher {
     /// workflow engine's "no user" column
     /// ([`respond_to_report`](crate::engine::workflow::program_status::respond_to_report)):
     /// `done`/`idle` starts the short `AgentDone` countdown whose expiry is a
-    /// normal auto-advance; `blocked` and `error` start `AgentBlocked` /
-    /// `AgentError` countdowns whose expiry kills the agent as a **failure**
+    /// normal auto-advance; `blocked` starts an `AgentBlocked` countdown
+    /// whose expiry kills the agent as a **failure**
     /// (`killed_by_countdown == false`, [`UnattendedExit::reported_problem`]
-    /// set); `working` cancels whichever is running.
+    /// set). An `error` report stays live until the agent exits or reports
+    /// recovery; `working` cancels whichever countdown is running.
     ///
     /// Logging is lifecycle-only: countdown started / cancelled / auto-advanced.
     /// No per-tick messages ever reach the daemon log.

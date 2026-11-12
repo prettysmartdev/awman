@@ -19,6 +19,7 @@
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 use crate::data::program_status::ProgramState;
 use crate::frontend::tui::tabs::{
@@ -105,16 +106,8 @@ pub fn render_container_maximized(
         None => format!(" \u{1F512} {} ({}) ", agent_name, runtime_label),
     };
     let right_title = info.map(build_stats_title_from_info).unwrap_or_default();
-    // Reported status and message go in the title line, truncated to what
-    // is left after the agent name and the stats.
-    let left_title = {
-        let used = left_title.chars().count() + right_title.chars().count();
-        let budget = (container_width as usize).saturating_sub(used + 6);
-        match slot_status_text(focused_slot, budget) {
-            Some(status) => format!("{}\u{2014} {} ", left_title, status),
-            None => left_title,
-        }
-    };
+    let (left_title, right_title) =
+        slot_titles_with_status(focused_slot, left_title, right_title, container_width);
 
     let mut block = Block::default()
         .title(Line::from(left_title).alignment(Alignment::Left))
@@ -380,6 +373,32 @@ pub(crate) fn slot_status_text(slot: &ContainerSlot, max_chars: usize) -> Option
         Some(msg) if !msg.is_empty() => Some(format!("{head} \u{2014} {msg}")),
         _ => Some(head),
     }
+}
+
+/// Put the step's reported state beside its name. Container stats use the
+/// remaining space; a narrow window drops them before hiding the state.
+pub(crate) fn slot_titles_with_status(
+    slot: &ContainerSlot,
+    left_title: String,
+    right_title: String,
+    window_width: u16,
+) -> (String, String) {
+    let Some(head) = slot_status_text(slot, 0) else {
+        return (left_title, right_title);
+    };
+    let inner_width = usize::from(window_width.saturating_sub(2));
+    let base_width = UnicodeWidthStr::width(left_title.as_str());
+    let min_status_width = UnicodeWidthStr::width(head.as_str()) + 3; // em dash, spaces
+    let right_width = UnicodeWidthStr::width(right_title.as_str());
+    let right_title = if base_width + min_status_width + right_width < inner_width {
+        right_title
+    } else {
+        String::new()
+    };
+    let budget =
+        inner_width.saturating_sub(base_width + UnicodeWidthStr::width(right_title.as_str()) + 4);
+    let status = slot_status_text(slot, budget).unwrap_or(head);
+    (format!("{left_title}\u{2014} {status} "), right_title)
 }
 
 /// Build the right-side stats title: `" {container} | {cpu} | {mem} | {dur} "`.

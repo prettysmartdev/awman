@@ -155,6 +155,7 @@ struct RelaySlot {
 impl RelaySlot {
     fn finish(&mut self, exit_code: i32) -> Option<TerminalId> {
         let terminal = self.terminal.take()?;
+        terminal.flush_pending_output();
         terminal.handle.exit(exit_code);
         Some(terminal.handle.id().clone())
     }
@@ -413,11 +414,11 @@ impl TabRelay {
         let launch_id = self.feeds.container.launch_id();
         events.extend(self.open_slot(
             SlotKey::Sequential(launch_id),
-            SlotId(launch_id),
             String::new(),
             submitted.display.agent_display_name.clone(),
             None,
             Some(submitted.slot_io),
+            false,
         ));
         events
     }
@@ -429,12 +430,16 @@ impl TabRelay {
     fn open_slot(
         &mut self,
         key: SlotKey,
-        slot_id: SlotId,
         step_name: String,
         agent: String,
         model: Option<String>,
         io: Option<ContainerSlotIo>,
+        dormant: bool,
     ) -> Vec<InstanceEvent> {
+        let slot_id = match &key {
+            SlotKey::Sequential(launch_id) => SlotId(*launch_id),
+            SlotKey::Step(_) => SlotId(uuid::Uuid::new_v4()),
+        };
         let mut events = Vec::new();
         let terminal = match (io, &self.hub) {
             (Some(io), Some(hub)) => Some(hub.bridge_agent_channels(
@@ -474,7 +479,7 @@ impl TabRelay {
             yolo: None,
             sandboxed: self.sandboxed,
             phase_step_title: None,
-            dormant: false,
+            dormant,
         };
         events.push(self.delta(InstanceDelta::SlotLaunched {
             tab_id: self.tab_id.clone(),
@@ -506,6 +511,19 @@ impl TabRelay {
         };
         let mut slot = self.slots.remove(idx);
         let mut events = Vec::new();
+        let final_screen = if exit_code.is_some() {
+            slot.terminal.as_ref().and_then(|terminal| {
+                terminal.flush_pending_output();
+                self.hub
+                    .as_ref()?
+                    .snapshot(terminal.handle.id())
+                    .ok()
+                    .filter(|snapshot| snapshot.has_output)
+                    .map(|snapshot| snapshot.screen)
+            })
+        } else {
+            None
+        };
         if let Some(terminal_id) = slot.finish(exit_code.unwrap_or(0)) {
             events.push(InstanceEvent::TerminalClosed {
                 tab_id: self.tab_id.clone(),
@@ -517,6 +535,7 @@ impl TabRelay {
             tab_id: self.tab_id.clone(),
             slot_id: slot.snapshot.slot_id,
             exit_code,
+            final_screen,
         }));
         if self.focused == Some(slot.snapshot.slot_id) {
             self.focused = self.slots.last().map(|s| s.snapshot.slot_id);
@@ -622,11 +641,11 @@ impl TabRelay {
                     }
                     events.extend(self.open_slot(
                         SlotKey::Sequential(launch_id),
-                        SlotId(launch_id),
                         title.unwrap_or_default(),
                         agent,
                         None,
                         Some(io),
+                        in_group,
                     ));
                 }
                 ContainerSlotEvent::SequentialRunning {
@@ -655,9 +674,16 @@ impl TabRelay {
                     requests,
                     stuck,
                 } => {
-                    self.engine_requests = requests;
-                    self.stuck_launch = stuck.as_ref().map(|_| launch_id);
-                    self.stuck = stuck;
+                    // The workflow request sender arrives before the step's
+                    // stuck receiver. A later stuck-only handover must not
+                    // erase the sender used for Ctrl-W in daemon mode.
+                    if let Some(requests) = requests {
+                        self.engine_requests = Some(requests);
+                    }
+                    if let Some(stuck) = stuck {
+                        self.stuck_launch = Some(launch_id);
+                        self.stuck = Some(stuck);
+                    }
                 }
                 ContainerSlotEvent::AttachedExited { step_name, .. } => {
                     events.extend(self.close_slot(&SlotKey::Step(step_name), None));
@@ -680,14 +706,7 @@ impl TabRelay {
                 } => {
                     let key = SlotKey::Step(step_name.clone());
                     events.extend(self.close_slot(&key, None));
-                    events.extend(self.open_slot(
-                        key,
-                        SlotId(uuid::Uuid::new_v4()),
-                        step_name,
-                        agent,
-                        model,
-                        io,
-                    ));
+                    events.extend(self.open_slot(key, step_name, agent, model, io, false));
                 }
                 ContainerSlotEvent::ContainerName {
                     step_name,
@@ -711,6 +730,19 @@ impl TabRelay {
                 }
                 ContainerSlotEvent::Unstuck { step_name } => {
                     events.extend(self.set_slot_stuck(&step_name, false));
+                }
+                ContainerSlotEvent::Reported { step_name, status } => {
+                    if let Some(slot) = self.slot_mut(&SlotKey::Step(step_name)) {
+                        slot.snapshot.program_status = status.clone();
+                        if status.is_some() {
+                            slot.snapshot.stuck = false;
+                        }
+                        events.push(InstanceEvent::ProgramStatus {
+                            tab_id: tab_id.clone(),
+                            slot_id: slot.snapshot.slot_id,
+                            status,
+                        });
+                    }
                 }
                 ContainerSlotEvent::CountdownKind { step_name, kind } => {
                     if let Some(slot) = self.slot_mut(&SlotKey::Step(step_name)) {
@@ -781,6 +813,15 @@ impl TabRelay {
                 }
             }
         }
+        self.feeds.signals.set_status(
+            EffectiveStatus::most_urgent(
+                self.slots
+                    .iter()
+                    .filter(|slot| !slot.snapshot.dormant)
+                    .filter_map(|slot| slot.snapshot.program_status.as_ref()),
+            )
+            .cloned(),
+        );
     }
 
     fn set_slot_stuck(&mut self, step_name: &str, stuck: bool) -> Option<InstanceEvent> {
@@ -991,7 +1032,10 @@ impl TabRelay {
 
     fn pump_session(&mut self, session: &Session, events: &mut Vec<InstanceEvent>) {
         let phase = ExecutionPhase::of_session_state(session.state());
-        if self.projection.phase.as_ref() != Some(&phase) {
+        if self.projection.phase.as_ref() != Some(&phase)
+            || self.current_workflow != session.state().current_workflow
+            || self.current_container != session.state().current_container
+        {
             self.phase = phase.clone();
             self.current_workflow = session.state().current_workflow.clone();
             self.current_container = session.state().current_container.clone();
@@ -1070,8 +1114,8 @@ impl TabRelay {
     }
 
     /// A person typed or scrolled in this tab.
-    pub fn note_activity(&self) {
-        self.feeds.signals.touch_user();
+    pub fn note_activity(&self, step_name: Option<&str>) {
+        self.feeds.signals.touch_user_for_step(step_name);
     }
 
     /// The agent-window size later slots open at.

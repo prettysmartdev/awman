@@ -104,6 +104,7 @@ impl WorkflowEngine {
                     &group_names,
                     None,
                     true,
+                    false,
                 )? {
                     ParallelRequestOutcome::Continue => {}
                     ParallelRequestOutcome::Ended(wo) => return Ok(GroupOutcome::Ended(wo)),
@@ -230,6 +231,7 @@ impl WorkflowEngine {
                                 &group_names,
                                 Some(&name),
                                 false,
+                                false,
                             )? {
                                 ParallelRequestOutcome::Continue => {}
                                 ParallelRequestOutcome::Ended(wo) => {
@@ -277,6 +279,7 @@ impl WorkflowEngine {
                             &group_names,
                             retryable.as_deref(),
                             final_yolo_group && final_review_shown && failed.is_empty() && queue.is_empty(),
+                            true,
                         )? {
                             ParallelRequestOutcome::Continue => {}
                             ParallelRequestOutcome::Ended(wo) => return Ok(GroupOutcome::Ended(wo)),
@@ -306,6 +309,7 @@ impl WorkflowEngine {
                         &group_names,
                         retryable.as_deref(),
                         final_yolo_group && final_review_shown && failed.is_empty() && queue.is_empty(),
+                        false,
                     )? {
                         ParallelRequestOutcome::Continue => {}
                         ParallelRequestOutcome::Ended(wo) => return Ok(GroupOutcome::Ended(wo)),
@@ -627,7 +631,9 @@ impl WorkflowEngine {
         match response {
             // Working / cleared, or a problem that must never be pushed past:
             // whatever countdown was running — silence or `done` — stops.
-            ReportedResponse::Resume | ReportedResponse::NeedsYou => {
+            ReportedResponse::Resume
+            | ReportedResponse::AwaitRepair
+            | ReportedResponse::NeedsYou => {
                 self.cancel_parallel_countdown(name);
                 false
             }
@@ -673,7 +679,7 @@ impl WorkflowEngine {
         }
     }
 
-    /// A parallel `AgentBlocked` / `AgentError` countdown expired: kill just
+    /// A parallel agent-problem countdown expired: kill just
     /// that container and keep its slot. Its wait future then resolves and
     /// the group loop finalises the step as Failed on `reported_problem`, so
     /// the group's ordinary failure handling (abort_on_failure, recovery
@@ -696,7 +702,7 @@ impl WorkflowEngine {
     /// Drive every in-flight per-step yolo countdown one tick. Independent per
     /// slot — expiry kills only that container. A silence or `AgentDone`
     /// expiry advances (and frees the slot for the queue); an `AgentBlocked`
-    /// or `AgentError` expiry fails that step instead (WI 0141).
+    /// expiry fails that step instead (WI 0141).
     #[allow(clippy::too_many_arguments)] // The parallel scheduler passes its coordinated phase queues together.
     pub(super) fn tick_parallel_yolo(
         &mut self,
@@ -1159,6 +1165,7 @@ impl WorkflowEngine {
         group: &[String],
         retryable: Option<&str>,
         final_review: bool,
+        opened_by_report: bool,
     ) -> Result<ParallelRequestOutcome, EngineError> {
         match req {
             EngineRequest::StepStuck { step_name } => {
@@ -1173,6 +1180,7 @@ impl WorkflowEngine {
                 // Scope the board to the focused container; peers keep running.
                 self.focus_parallel_step(&step_name);
                 let mut available = self.parallel_group_board_actions(group, retryable)?;
+                available.opened_by_report = opened_by_report;
                 if final_review {
                     available.acts_on_parallel_group = true;
                     available.can_finish_workflow = true;
