@@ -32,6 +32,109 @@ impl ReadyEngine {
         self.summary.agent_credentials = credentials;
     }
 
+    async fn check_local_agents(
+        &mut self,
+        frontend: &mut dyn ReadyFrontend,
+    ) -> Result<(), EngineError> {
+        let mut agents: Vec<String> =
+            crate::data::repo_dockerfile_paths::RepoDockerfilePaths::new(self.session.git_root())
+                .discover_agent_dockerfiles()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+        agents.push(self.options.agent.as_str().to_string());
+        agents.sort();
+        agents.dedup();
+        self.summary.agent_auth.clear();
+        for agent_name in agents {
+            self.cancel.check()?;
+            // Reuse the selected definition captured before image setup.
+            // Other definitions must pass the same trust boundary before
+            // their optional host commands can run.
+            let definition = if agent_name == self.options.agent.as_str() {
+                self.definition
+                    .clone()
+                    .ok_or_else(|| EngineError::Other("selected agent definition missing".into()))
+            } else {
+                AgentName::new(&agent_name)
+                    .map_err(EngineError::from)
+                    .and_then(|name| self.agent_engine.resolve_definition(&self.session, &name))
+            };
+            let status = match definition {
+                Err(error) => StepStatus::Failed(format!("{agent_name}: {error}")),
+                Ok(def) if def.ping_argv.is_none() => {
+                    let path = match &def.origin {
+                        crate::engine::agent::AgentOrigin::Custom { path, .. } => {
+                            path.display().to_string()
+                        }
+                        _ => def.name.clone(),
+                    };
+                    frontend.write_message(crate::data::message::UserMessage {
+                        level: crate::data::message::MessageLevel::Info,
+                        text: format!("no [ping] command in {path}; host check skipped"),
+                    });
+                    StepStatus::Skipped
+                }
+                Ok(def) => {
+                    frontend.write_message(crate::data::message::UserMessage {
+                        level: crate::data::message::MessageLevel::Info,
+                        text: format!("Checking host auth: {agent_name}"),
+                    });
+                    let ping = self.host_agent.ping(&def).await;
+                    frontend.report_ping(&ping);
+                    match ping {
+                        LocalAgentPingResult::Ok { .. } => StepStatus::Done,
+                        LocalAgentPingResult::Error => {
+                            StepStatus::Failed(format!("{agent_name}: error (check auth)"))
+                        }
+                        LocalAgentPingResult::NotInstalled => {
+                            StepStatus::Failed(format!("{agent_name}: not installed"))
+                        }
+                        LocalAgentPingResult::CouldNotRun => {
+                            StepStatus::Failed(format!("{agent_name}: could not run"))
+                        }
+                        LocalAgentPingResult::TimedOut => StepStatus::Failed(format!(
+                            "{agent_name}: host ping timed out after 60 seconds"
+                        )),
+                    }
+                }
+            };
+            if let StepStatus::Failed(reason) = &status {
+                frontend.write_message(crate::data::message::UserMessage {
+                    level: crate::data::message::MessageLevel::Warning,
+                    text: reason.clone(),
+                });
+            }
+            self.summary.agent_auth.push((agent_name, status));
+        }
+        let failures: Vec<&str> = self
+            .summary
+            .agent_auth
+            .iter()
+            .filter_map(|(_, status)| match status {
+                StepStatus::Failed(reason) => Some(reason.as_str()),
+                _ => None,
+            })
+            .collect();
+        self.summary.local_agent = if !failures.is_empty() {
+            StepStatus::Failed(failures.join("; "))
+        } else if self
+            .summary
+            .agent_auth
+            .iter()
+            .any(|(_, status)| *status == StepStatus::Done)
+        {
+            StepStatus::Done
+        } else {
+            StepStatus::Skipped
+        };
+        frontend.report_step_status(
+            &ReadyStep::CheckLocalAgent.into(),
+            self.summary.local_agent.clone(),
+        );
+        Ok(())
+    }
+
     /// Advance one phase. Drives Q&A and progress through `frontend`.
     pub async fn step(
         &mut self,
@@ -545,81 +648,9 @@ impl ReadyEngine {
             // auth token before credentials are mounted into containerized
             // agents. Do not add other host-side agent invocations.
             ReadyPhase::CheckingLocalAgent => {
-                if let Some(def) = self.definition.as_ref().filter(|d| d.ping_argv.is_none()) {
-                    let path = match &def.origin {
-                        crate::engine::agent::AgentOrigin::Custom { path, .. } => {
-                            path.display().to_string()
-                        }
-                        _ => def.name.clone(),
-                    };
-                    frontend.write_message(crate::data::message::UserMessage {
-                        level: crate::data::message::MessageLevel::Info,
-                        text: format!("no [ping] command in {path}; host check skipped"),
-                    });
-                    self.summary.local_agent = StepStatus::Skipped;
-                    frontend.report_step_status(
-                        &ReadyStep::CheckLocalAgent.into(),
-                        StepStatus::Skipped,
-                    );
-                    self.pre_audit_dockerfile_hash =
-                        dockerfile_hash(self.preparer.project_dockerfile());
-                    self.phase = ReadyPhase::RunningAudit;
-                    return Ok(self.phase.clone());
-                }
                 frontend
                     .report_step_status(&ReadyStep::CheckLocalAgent.into(), StepStatus::Running);
-                let agent_name = self.options.agent.as_str();
-                // `definition` is always set by the time this phase runs (it
-                // is resolved on the first step); `CouldNotRun` keeps the
-                // impossible case from spawning anything.
-                let ping = match self.definition.clone() {
-                    Some(def) => self.host_agent.ping(&def).await,
-                    None => LocalAgentPingResult::CouldNotRun,
-                };
-                // The engine reports the result; the frontend draws the
-                // transcript. The default impl writes the same two `>`/`<`
-                // lines this arm used to compose (F-45).
-                frontend.report_ping(&ping);
-                match ping {
-                    LocalAgentPingResult::Ok { .. } => {
-                        self.summary.local_agent = StepStatus::Done;
-                        frontend.report_step_status(
-                            &ReadyStep::CheckLocalAgent.into(),
-                            StepStatus::Done,
-                        );
-                    }
-                    LocalAgentPingResult::Error => {
-                        self.summary.local_agent =
-                            StepStatus::Failed(format!("{agent_name}: error (check auth)"));
-                        frontend.report_step_status(
-                            &ReadyStep::CheckLocalAgent.into(),
-                            StepStatus::Failed(format!("{agent_name}: error (check auth)")),
-                        );
-                    }
-                    LocalAgentPingResult::NotInstalled => {
-                        self.summary.local_agent =
-                            StepStatus::Failed(format!("{agent_name}: not installed"));
-                        frontend.report_step_status(
-                            &ReadyStep::CheckLocalAgent.into(),
-                            StepStatus::Failed(format!("{agent_name}: not installed")),
-                        );
-                    }
-                    LocalAgentPingResult::CouldNotRun => {
-                        self.summary.local_agent =
-                            StepStatus::Failed(format!("{agent_name}: could not run"));
-                        frontend.report_step_status(
-                            &ReadyStep::CheckLocalAgent.into(),
-                            StepStatus::Failed(format!("{agent_name}: could not run")),
-                        );
-                    }
-                    LocalAgentPingResult::TimedOut => {
-                        let status = StepStatus::Failed(format!(
-                            "{agent_name}: host ping timed out after 60 seconds"
-                        ));
-                        self.summary.local_agent = status.clone();
-                        frontend.report_step_status(&ReadyStep::CheckLocalAgent.into(), status);
-                    }
-                }
+                self.check_local_agents(frontend).await?;
                 let dockerfile_path = self.preparer.project_dockerfile().to_path_buf();
                 self.pre_audit_dockerfile_hash = dockerfile_hash(&dockerfile_path);
                 ReadyPhase::RunningAudit

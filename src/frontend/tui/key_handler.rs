@@ -241,11 +241,9 @@ fn intercept_agents_watch_stop(
 pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
     // Active-tab suppression input: the user is interacting with this tab.
     let tab = app.active_tab();
-    tab.shared.signals.touch_user_for_step(
-        tab.focused_slot()
-            .map(|slot| slot.step_name.as_str())
-            .filter(|s| !s.is_empty()),
-    );
+    tab.shared
+        .signals
+        .touch_user_for_step(app.activity_step_name());
     // A runtime notice stays in the status bar until the next key press.
     app.status_bar.notice = None;
     if keymap::is_workflow_context_copy_key(key) {

@@ -37,6 +37,8 @@ pub struct ReadyOutcome {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_definition: Option<StepStatus>,
     pub local_agent: StepStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_auth: Vec<(String, StepStatus)>,
     pub audit: StepStatus,
     pub image_rebuild: StepStatus,
     pub agent_credentials: Vec<AgentCredentialHealth>,
@@ -74,6 +76,7 @@ impl From<ReadySummary> for ReadyOutcome {
             image_source: s.image_source,
             agent_definition: s.agent_definition,
             local_agent: s.local_agent,
+            agent_auth: s.agent_auth,
             audit: s.audit,
             image_rebuild: s.image_rebuild,
             agent_credentials: s.agent_credentials,
@@ -145,6 +148,7 @@ impl ReadyOutcome {
             "ready": checks_passed,
             "runtime": self.runtime,
             "agent_credentials": self.agent_credentials,
+            "agent_auth": self.agent_auth,
             "steps": {
                 "docker_daemon": step_to_json(&docker_daemon),
                 "dockerfile": step_to_json(&self.dockerfile),

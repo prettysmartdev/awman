@@ -14,6 +14,8 @@ use crate::engine::git::GitEngine;
 
 use crate::engine::overlay::OverlayEngine;
 use std::sync::Arc;
+#[cfg(test)]
+mod contracts;
 pub mod frontend;
 pub mod host_agent;
 mod phases;
@@ -59,7 +61,7 @@ pub struct ReadyEngine {
     /// in `security.md`.
     host_agent: Arc<dyn ReadyHostPing>,
     /// `options.agent` resolved once, on the first step, and read by every
-    /// later phase (the host ping included) so one `ready` run never mixes
+    /// later phase (its host ping included) so one `ready` run never mixes
     /// two versions of a definition.
     definition: Option<crate::engine::agent::ResolvedAgent>,
     preparer: crate::engine::image_prep::AgentImagePreparer,

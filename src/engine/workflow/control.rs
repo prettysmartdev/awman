@@ -8,6 +8,44 @@
 use super::*;
 
 impl WorkflowEngine {
+    /// Natural exits (or resuming a completed main phase) still require an
+    /// explicit Finish before the command layer may enter teardown. Dismissing
+    /// the board leaves the workflow here until the user reopens it.
+    pub(super) async fn review_completed_workflow(
+        &mut self,
+    ) -> Result<IterationOutcome, EngineError> {
+        let progress = self.workflow_progress_info();
+        self.frontend.report_workflow_progress(&progress);
+        loop {
+            let available = self.compute_available_actions()?;
+            let action = self
+                .frontend
+                .show_workflow_control_board(&self.state, &available)?;
+            self.log_wcb_action(&action);
+            if !matches!(
+                action,
+                NextAction::Dismiss | NextAction::LaunchNext | NextAction::RetryFailedStep { .. }
+            ) {
+                return Ok(match self.execute_top_level_action(action)? {
+                    InterruptibleStepResult::WorkflowEnded(outcome) => {
+                        IterationOutcome::Ended(outcome)
+                    }
+                    _ => IterationOutcome::Continue,
+                });
+            }
+            loop {
+                tokio::select! {
+                    _ = self.cancel.cancelled() => return Ok(IterationOutcome::Ended(self.cancel_run()?)),
+                    Some(request) = Self::recv_engine(&mut self.engine_rx) => {
+                        if let EngineRequest::OpenControlBoard { .. } = request {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Compose the failure-scoped [`AvailableActions`] for the Workflow
     /// Control Board (WI-0115 §1).
     ///
@@ -459,8 +497,7 @@ impl WorkflowEngine {
         }
     }
 
-    /// Execute a top-level action from the WCB (used after yolo auto-advance
-    /// on the last step, and in run_to_completion inter-step transitions).
+    /// Execute a top-level action from the final review WCB.
     pub(super) fn execute_top_level_action(
         &mut self,
         action: NextAction,
@@ -641,7 +678,11 @@ impl WorkflowEngine {
     pub fn compute_available_actions(&self) -> Result<AvailableActions, EngineError> {
         let has_execution = self.focused_execution().is_some();
         let mut a = AvailableActions {
-            can_launch_next: !self.state.is_complete(),
+            can_launch_next: !self.state.is_complete()
+                && !self
+                    .current_step_name
+                    .as_deref()
+                    .is_some_and(|name| self.is_final_review_step(name)),
             can_restart_current_step: self.current_step_name.is_some(),
             can_pause: true,
             can_abort: true,
@@ -716,9 +757,14 @@ impl WorkflowEngine {
     /// `FinishWorkflow` is valid on the topologically last step (as before)
     /// and once every step is terminal. In a DAG with more than one sink the
     /// step that finishes last is often not topologically last, and the final
-    /// yolo board must still be able to finish the run.
+    /// review board must still be able to finish the run while that agent lives.
     pub(super) fn workflow_can_finish(&self) -> bool {
-        self.is_last_step() || self.state.is_complete()
+        self.is_last_step()
+            || self.state.is_complete()
+            || self
+                .current_step_name
+                .as_deref()
+                .is_some_and(|name| self.is_final_review_step(name))
     }
 
     /// The step currently in `Running` state, if exactly one is.

@@ -448,7 +448,7 @@ awman exec workflow aspec/workflows/implement-hard.toml --set workflows.maxConcu
 AWMAN_WORKFLOWS_MAX_CONCURRENT_STEPS=2 awman exec workflow aspec/workflows/implement-hard.toml
 ```
 
-Leaving it unset (the default) means unlimited — every step whose dependencies are satisfied launches immediately. Lower it to match your machine's CPU/memory budget or your Docker daemon's capacity. The same key is the cap the dynamic-workflow leader is told about. Interactive final yolo groups launch all remaining agents together so they can stay alive through review. See [Parallel workflows](05-workflows.md#parallel-workflows).
+Leaving it unset (the default) means unlimited — every step whose dependencies are satisfied launches immediately. Lower it to match your machine's CPU/memory budget or your Docker daemon's capacity. The same key is the cap the dynamic-workflow leader is told about. Interactive final groups launch all remaining agents together so they can stay alive through review. See [Parallel workflows](05-workflows.md#parallel-workflows).
 
 ### Configure dynamic workflow agents, models, and leader
 

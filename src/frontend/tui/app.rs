@@ -1157,6 +1157,9 @@ impl App {
                 .is_some_and(is_board);
             if visible {
                 self.active_dialog = None;
+                self.command_dialog_active = false;
+                self.command_dialog_deadline = None;
+                self.needs_redraw = true;
             } else if queued {
                 self.pending_dialog_requests.remove(&session);
             } else {
@@ -1168,9 +1171,24 @@ impl App {
         }
     }
 
+    /// A workflow board owns activity even when another parallel slot was
+    /// focused before it opened.
+    pub(super) fn activity_step_name(&self) -> Option<&str> {
+        match &self.active_dialog {
+            Some(Dialog::WorkflowControlBoard(board)) => Some(&board.focused_step_name),
+            Some(Dialog::WorkflowStepConfirm(board)) => Some(&board.completed_step),
+            _ => self
+                .active_tab()
+                .focused_slot()
+                .map(|slot| slot.step_name.as_str())
+                .filter(|name| !name.is_empty()),
+        }
+    }
+
     /// Send a dialog response through the active tab's dialog_response_tx.
     pub fn send_dialog_response(&mut self, response: DialogResponse) {
         let tab = &self.tabs[self.active_tab];
+        tab.shared.signals.take_report_dialog_dismiss();
         if let Some(ref tx) = tab.dialog_response_tx {
             let _ = tx.send(response);
         }

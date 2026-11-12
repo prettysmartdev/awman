@@ -24,6 +24,10 @@ pub struct ReadySummary {
     pub base_image: StepStatus,
     pub agent_image: StepStatus,
     pub local_agent: StepStatus,
+    /// Per-agent host greeting results. `local_agent` retains the aggregate
+    /// status for existing consumers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_auth: Vec<(String, StepStatus)>,
     pub audit: StepStatus,
     pub image_rebuild: StepStatus,
     pub aspec_folder: StepStatus,
@@ -62,6 +66,7 @@ impl ReadySummary {
             base_image: StepStatus::Pending,
             agent_image: StepStatus::Pending,
             local_agent: StepStatus::Pending,
+            agent_auth: Vec::new(),
             audit: StepStatus::Pending,
             image_rebuild: StepStatus::Pending,
             aspec_folder: StepStatus::Pending,
@@ -95,7 +100,6 @@ impl ReadySummary {
             ("Dockerfile".to_string(), self.dockerfile.clone()),
             ("Base image".to_string(), self.base_image.clone()),
             ("Agent image".to_string(), self.agent_image.clone()),
-            ("Local agent".to_string(), self.local_agent.clone()),
             ("Audit".to_string(), self.audit.clone()),
             ("Image rebuild".to_string(), self.image_rebuild.clone()),
             ("aspec folder".to_string(), self.aspec_folder.clone()),
@@ -104,6 +108,12 @@ impl ReadySummary {
                 self.work_items_config.clone(),
             ),
         ];
+        let auth_rows = self.auth_rows();
+        if auth_rows.is_empty() {
+            rows.insert(3, ("Local agent".to_string(), self.local_agent.clone()));
+        } else {
+            rows.splice(3..3, auth_rows);
+        }
         if let Some(status) = &self.image_source {
             rows.insert(3, ("Image source".to_string(), status.clone()));
         }
@@ -128,6 +138,37 @@ impl ReadySummary {
         }
         for health in &self.agent_credentials {
             rows.push(health.row());
+        }
+        rows
+    }
+
+    /// Group attempted greetings by outcome, success first. Optional host
+    /// checks without a ping command are reported as skipped during progress.
+    pub fn auth_rows(&self) -> Vec<(String, StepStatus)> {
+        let mut rows = Vec::new();
+        for success in [true, false] {
+            let names: Vec<&str> = self
+                .agent_auth
+                .iter()
+                .filter(|(_, status)| {
+                    if success {
+                        *status == StepStatus::Done
+                    } else {
+                        matches!(status, StepStatus::Failed(_))
+                    }
+                })
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if !names.is_empty() {
+                rows.push((
+                    format!("Auth: {}", names.join(", ")),
+                    if success {
+                        StepStatus::Done
+                    } else {
+                        StepStatus::Failed(String::new())
+                    },
+                ));
+            }
         }
         rows
     }

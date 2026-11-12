@@ -478,6 +478,8 @@ impl LocalTaskGateway {
     ///
     /// * every `env(NAME)` across the task store, attributed to the task that
     ///   declares it;
+    /// * overlays in each task's workspace and task config files, attributed
+    ///   to that task, just as they are applied at launch;
     /// * every `env(NAME)` in the daemon's own global config and
     ///   `AWMAN_OVERLAYS`, attributed to *every* task because those overlays
     ///   apply to every run.
@@ -526,7 +528,7 @@ impl LocalTaskGateway {
 
         let mut required: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for task in tasks {
-            for name in env_overlay_names(&task.overlays) {
+            for name in self.task_env_names(task) {
                 required.entry(name).or_default().push(task.name.clone());
             }
             for name in self.custom_auth_env_names(task) {
@@ -543,6 +545,32 @@ impl LocalTaskGateway {
             required.insert(name, task_names.clone());
         }
         required
+    }
+
+    /// Overlay sources local to a task. Read files on each coverage refresh
+    /// so editing configuration is reflected before the next run or env push.
+    fn task_env_names(&self, task: &Task) -> Vec<String> {
+        use crate::data::config::file::{repo_config_path, ConfigFile, FileKind};
+
+        let mut specs = task.overlays.clone();
+        let root = if task.mount_scope.is_git_repo() {
+            self.engines.git_engine.resolve_root(&task.repo_scope).ok()
+        } else {
+            Some(task.repo_scope.clone())
+        };
+        if let Some(root) = root {
+            if let Ok(config) = ConfigFile::load(&repo_config_path(&root), FileKind::Repo) {
+                specs.extend(config.overlays.unwrap_or_default());
+            }
+        }
+        if let Ok(config) = self
+            .paths
+            .task_config_file(&task.name)
+            .and_then(|path| ConfigFile::load(&path, FileKind::Task))
+        {
+            specs.extend(config.overlays.unwrap_or_default());
+        }
+        env_overlay_names(&specs)
     }
 
     /// `auth.env` names of the approved custom agents `task` may launch: its
@@ -568,20 +596,16 @@ impl LocalTaskGateway {
     /// request: coverage is advisory, and a malformed global file already
     /// surfaces loudly on the scheduler's own tick.
     fn daemon_wide_env_names(&self) -> Vec<String> {
+        use crate::data::config::file::{global_config_path, ConfigFile, FileKind};
+
         let mut specs: Vec<String> = Vec::new();
-        specs.extend(
-            self.engines
-                .global_config
-                .overlays
-                .clone()
-                .unwrap_or_default(),
-        );
-        // `AWMAN_OVERLAYS` is one comma-separated string of specs; `env(NAME)`
-        // never contains a comma, so splitting first is lossless.
-        if let Some(raw) =
-            crate::data::config::env::host_var(crate::data::config::env::AWMAN_OVERLAYS)
+        if let Ok(config) =
+            global_config_path(&self.env).and_then(|path| ConfigFile::load(&path, FileKind::Global))
         {
-            specs.extend(raw.split(',').map(|spec| spec.trim().to_string()));
+            specs.extend(config.overlays.unwrap_or_default());
+        }
+        if let Some(raw) = self.env.get(crate::data::config::env::AWMAN_OVERLAYS) {
+            specs.push(raw.to_string());
         }
         env_overlay_names(&specs)
     }
@@ -1004,6 +1028,7 @@ impl TaskGateway for LocalTaskGateway {
     }
 
     async fn get(&self, name: &str) -> Result<Task, CommandError> {
+        self.refresh_required_env_best_effort().await;
         self.store
             .get(name)?
             .map(|task| self.with_unmet_env_one(task))

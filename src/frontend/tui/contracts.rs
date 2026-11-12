@@ -268,3 +268,63 @@ async fn narrow_workflow_window_preserves_the_reported_step_status() {
     drop(app);
     s.finish();
 }
+
+#[tokio::test]
+async fn resumed_report_clears_builtin_dialog_ownership_and_deadline() {
+    let s = TestSandbox::for_test(TestCase::component(
+        "frontend::tui::contracts::resumed_report_clears_builtin_dialog_ownership_and_deadline",
+    ));
+    let mut app = app(&s);
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.tabs[0].dialog_response_tx = Some(tx);
+    app.active_dialog = Some(Dialog::WorkflowStepConfirm(
+        dialogs::WorkflowStepConfirmState {
+            completed_step: "plan".into(),
+            next_step: "build".into(),
+        },
+    ));
+    app.command_dialog_active = true;
+    app.command_dialog_deadline = Some(std::time::Instant::now());
+    app.tabs[0].shared.signals.request_report_dialog_dismiss();
+    app.poll_dialog_requests();
+    assert!(app.active_dialog.is_none());
+    assert!(!app.command_dialog_active);
+    assert!(app.command_dialog_deadline.is_none());
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        crate::data::dialog::DialogResponse::Dismissed
+    );
+}
+
+#[tokio::test]
+async fn board_activity_belongs_to_its_step_instead_of_the_focused_peer() {
+    let s = TestSandbox::for_test(TestCase::component(
+        "frontend::tui::contracts::board_activity_belongs_to_its_step_instead_of_the_focused_peer",
+    ));
+    let mut app = app(&s);
+    app.active_dialog = Some(Dialog::WorkflowStepConfirm(
+        dialogs::WorkflowStepConfirmState {
+            completed_step: "build".into(),
+            next_step: "test".into(),
+        },
+    ));
+    press(&mut app, KeyCode::Left, KeyModifiers::NONE);
+    assert_eq!(
+        app.tabs[0].shared.signals.last_user_step().as_deref(),
+        Some("build")
+    );
+    assert!(app.active_dialog.is_some());
+    mouse_handler::handle_mouse_event(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(
+        app.tabs[0].shared.signals.last_user_step().as_deref(),
+        Some("build")
+    );
+}

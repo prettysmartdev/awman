@@ -508,3 +508,55 @@ async fn an_exit_frame_delivers_its_final_screen_before_closing_the_slot() {
             ContainerSlotEvent::SequentialExited { exit_code: 0, .. }
         )));
 }
+
+#[tokio::test]
+async fn activity_during_a_board_bypasses_throttle_and_deferred_activity_is_retained() {
+    let mut unit = unit("command::instance::remote::contracts::activity_during_a_board_bypasses_throttle_and_deferred_activity_is_retained");
+    let tab_id = TabId::new();
+    unit.welcome(instance_snapshot(vec![tab_snapshot(
+        &unit.root,
+        tab_id.clone(),
+        vec![slot("", None)],
+    )]));
+    let InitialTabOpened::Normal { tab } = unit.backend.open_initial(session_spec(&unit.root))
+    else {
+        panic!("expected tab")
+    };
+    tab.feeds.signals.touch_user();
+    assert!(unit
+        .sent()
+        .iter()
+        .any(|f| matches!(f, FrontendFrame::Activity { .. })));
+    tab.feeds.signals.touch_user();
+    assert!(!unit
+        .sent()
+        .iter()
+        .any(|f| matches!(f, FrontendFrame::Activity { .. })));
+    {
+        let mut state = unit.backend.shared.lock();
+        state.tabs[0].last_activity_sent = Some(Instant::now() - ACTIVITY_INTERVAL);
+    }
+    assert!(
+        unit.sent()
+            .iter()
+            .any(|f| matches!(f, FrontendFrame::Activity { .. })),
+        "a throttled final keystroke must eventually reach the daemon"
+    );
+    unit.frame(EngineFrame::DialogRequest {
+        dialog_id: DialogId::new(),
+        tab_id,
+        request: DialogRequest::WorkflowStepConfirm(
+            crate::data::dialog::WorkflowStepConfirmState {
+                completed_step: "plan".into(),
+                next_step: "build".into(),
+            },
+        ),
+    });
+    tab.feeds.signals.touch_user();
+    assert!(
+        unit.sent()
+            .iter()
+            .any(|f| matches!(f, FrontendFrame::Activity { .. })),
+        "touching a board must immediately prevent automatic dismissal"
+    );
+}

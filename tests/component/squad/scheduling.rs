@@ -64,6 +64,39 @@ fn task(name: &str, now: chrono::DateTime<Utc>, scope: std::path::PathBuf) -> Ta
         prerequisites: None,
     }
 }
+
+#[test]
+fn paused_failure_does_not_mask_live_squad_health() {
+    use awman::engine::squad::{SquadHealth, SquadSupervisor};
+
+    let mut paused = task("paused", Utc::now(), Default::default());
+    paused.status = TaskStatus::Paused;
+    paused.last_run_status = Some(RunStatus::Failed);
+    assert_eq!(
+        SquadSupervisor::health_of_running(Some(&[paused.clone()])),
+        SquadHealth::Healthy
+    );
+    let mut active = task("active", Utc::now(), Default::default());
+    active.last_run_status = Some(RunStatus::Running);
+    assert_eq!(
+        SquadSupervisor::health_of_running(Some(&[paused.clone(), active.clone()])),
+        SquadHealth::Running
+    );
+    active.unmet_env = vec!["MISSING_TOKEN".into()];
+    assert_eq!(
+        SquadSupervisor::health_of_running(Some(&[paused.clone(), active.clone()])),
+        SquadHealth::EnvUnmet
+    );
+    paused.status = TaskStatus::Active;
+    assert_eq!(
+        SquadSupervisor::health_of_running(Some(&[paused, active])),
+        SquadHealth::Failed
+    );
+    assert_eq!(
+        SquadSupervisor::health_of_running(None),
+        SquadHealth::Unreachable
+    );
+}
 /// Guards: 204cea73. Due eligibility uses the injected clock, so slow runners
 /// cannot move the backoff boundary or change the expected repair count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

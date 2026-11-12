@@ -371,6 +371,11 @@ host environment variable the squad daemon must hand to that task's
 containers. Squad tracks, for every such name across every task, whether it
 currently holds a value, and warns you when it doesn't.
 
+Coverage includes overlays from the task's flags, its workspace and task
+configuration files, global configuration, and `AWMAN_OVERLAYS`. Comma-separated
+overlay lists are supported. Configuration edits appear on the next coverage
+refresh; missing names are shown on task cards and in task details.
+
 ### How the daemon gets its environment
 
 The squad daemon is a long-lived background process — often started once, at
@@ -764,12 +769,13 @@ seconds:
 |--------|---------|
 | Grey | No squad daemon is running |
 | Yellow | A daemon is running but this awman cannot get an answer from it — no bearer key for it (see [Authenticating to the daemon](#authenticating-to-the-daemon)), a connection refused, a timeout, or any other error |
-| Red | Reachable, and some task's most recent run failed |
+| Red | Reachable, and some active task's most recent run failed |
 | Yellow | Reachable, nothing failed, and some task has an `env()` name the daemon doesn't currently hold a value for — see [Task environment values](#task-environment-values) |
 | Blue | Reachable, and a task is executing right now |
 | Green | Reachable, nothing failed, nothing running, nothing unmet |
 
-The first matching row wins from the top: a failure outranks an
+Paused tasks retain their run history but their past failures do not turn the
+indicator red. The first matching row wins from the top: an active task's failure outranks an
 unmet variable, which outranks a running task. Yellow means "worth a look, not
 broken" in both of its cases, which can never coincide. A keychain fallback
 (see [Persisting values across a restart](#persisting-values-across-a-restart))
