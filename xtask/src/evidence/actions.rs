@@ -161,7 +161,7 @@ fn job_passed(jobs: &[Value], name: &str, count: usize) -> Result<()> {
     );
     Ok(())
 }
-fn expected(v: &Value) -> Result<BTreeSet<String>> {
+pub(super) fn expected(v: &Value) -> Result<BTreeSet<String>> {
     let mut tests = BTreeSet::new();
     for suite in v["rust-suites"]
         .as_object()
@@ -185,7 +185,7 @@ fn expected(v: &Value) -> Result<BTreeSet<String>> {
     ensure!(!tests.is_empty(), "required test invocation is empty");
     Ok(tests)
 }
-fn file_in(dir: &Path, name: &str) -> Result<std::path::PathBuf> {
+pub(super) fn file_in(dir: &Path, name: &str) -> Result<std::path::PathBuf> {
     ensure!(
         !name.is_empty()
             && Path::new(name).components().count() == 1
@@ -364,6 +364,7 @@ pub fn aggregate(root: &Path, m: &Manifest, p: &Plan) -> Result<GateEvidence> {
     )?;
     let uploaded: Plan = serde_json::from_slice(&fs::read(scratch.path().join("plan/plan.json"))?)?;
     ensure!(uploaded == *p, "plan artifact differs");
+    let (queue_ms, execution_ms) = super::history::raw::job_times(&jobs)?;
     let mut report = GateEvidence {
         schema: 1,
         kind: "gate".into(),
@@ -378,8 +379,8 @@ pub fn aggregate(root: &Path, m: &Manifest, p: &Plan) -> Result<GateEvidence> {
         release_critical: vec![],
         quarantine: p.quarantine.clone(),
         overrides_applied: vec![],
-        queue_ms: 0,
-        execution_ms: 0,
+        queue_ms,
+        execution_ms,
         p95_budget_minutes: m.gates[&p.gate].budget_minutes,
         generated_at: chrono::Utc::now(),
         expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(24)),

@@ -56,6 +56,20 @@ enum Command {
 }
 #[derive(Subcommand)]
 enum History {
+    AppendRun {
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        run: PathBuf,
+        #[arg(long)]
+        gate: String,
+    },
+    AppendGate {
+        #[arg(long)]
+        store: PathBuf,
+        #[arg(long)]
+        evidence: PathBuf,
+    },
     Append {
         #[arg(long)]
         store: PathBuf,
@@ -167,6 +181,14 @@ pub fn run(args: &[String]) -> anyhow::Result<ExitCode> {
             })
         }
         Command::History { command } => match command {
+            History::AppendRun { store, run, gate } => {
+                history::raw::append_run(&store, &run, &gate)?;
+                Ok(ExitCode::SUCCESS)
+            }
+            History::AppendGate { store, evidence } => {
+                history::raw::append_gate(&store, &evidence)?;
+                Ok(ExitCode::SUCCESS)
+            }
             History::Append { store, evidence } => {
                 let e: schema::Evidence = serde_json::from_slice(&std::fs::read(evidence)?)?;
                 history::append(&store, &e)?;

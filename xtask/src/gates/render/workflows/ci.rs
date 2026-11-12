@@ -465,9 +465,10 @@ const GATE: &str = r##"  gate:
         if: ${{ always() }}
         run: |
           mkdir -p timing
-          find evidence-in -name evidence.json -print0 | while IFS= read -r -d '' file; do
-            cargo xtask evidence history append --store timing/history.jsonl --evidence "$file"
+          find evidence-in -name run.json -print0 | while IFS= read -r -d '' file; do
+            cargo xtask evidence history append-run --store timing/history.jsonl --run "$file" --gate "$GATE"
           done
+          cargo xtask evidence history append-gate --store timing/history.jsonl --evidence gate-out/gate-evidence.json
       - name: Upload the gate evidence
         if: ${{ always() }}
         uses: @@UPLOAD@@

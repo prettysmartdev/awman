@@ -60,8 +60,8 @@ Unit, lint, doctest and parity suites are always selected. Merge-group and
 `main` runs always run the full set. A plan that fails, a missing base commit or
 a truncated diff is non-green, never an empty selection.
 
-**Evidence.** Each test job writes `evidence.json` (one outcome per expected
-test id, not a total), JUnit and failure records. The `gate` job reconstructs
+**Evidence.** Each test job writes `run.json`, the selected test inventory,
+JUnit and failure records. The `gate` job reconstructs
 the expected set from the manifest and the commit itself, checks that shard
 sets are disjoint and complete, requires every expected job to have succeeded
 and every cell to have evidence, and only then reports success. A missing job,
@@ -124,6 +124,17 @@ reported as passed because it was skipped.
   release pipeline that publishes nothing (see [release.md](release.md)).
 - `ci-trends`: p50/p95 per gate, queue time, flake rate and cache hit rate
   from the last 30 days of `timing-*` artifacts.
+
+Timing history records measured invocation wall time (including runner startup)
+from `run.json` and individual outcomes from the inventories and JUnit. Shard
+sizing uses complete, successful, disjoint partitions: their durations are
+summed and their test IDs combined before calculating a suite median. Duplicate
+downloads count once, and attempts and build cells are kept separate. Main-gate
+budget history uses one wall-span measurement per run's latest attempt, rather
+than adding parallel suite durations. The span runs from the first completed
+predecessor's start to the last predecessor's finish; it excludes aggregation.
+Queue time is the longest predecessor queue. Unmeasured invocation queue and
+cache values remain unknown, rather than being reported as zero or cache misses.
 
 ## Pinned inputs
 

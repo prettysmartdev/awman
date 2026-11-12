@@ -507,11 +507,13 @@ fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
         if o.evidence_dir.is_some() && junit.exists() {
             std::fs::remove_file(&junit)?;
         }
+        let started = std::time::Instant::now();
         let code = execute(&mut command)?;
         records.push(serde_json::json!({
             "tier": inv.tier, "package": inv.package, "suites": inv.suites,
             "command": describe(&command), "exit": code,
             "expected": expected,
+            "execution_ms": started.elapsed().as_millis() as u64,
         }));
         if let (Some(dir), Runner::Nextest) = (&o.evidence_dir, o.runner) {
             let junit = target_dir(root).join(format!("nextest/{PROFILE}/junit.xml"));
@@ -550,17 +552,19 @@ fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
         };
         command.current_dir(root).env("PATH", tool_path(root));
         isolation.apply(&mut command);
+        let started = std::time::Instant::now();
         let code = execute(&mut command)?;
         records.push(serde_json::json!({
             "tier": s.tier, "suites": [id], "command": describe(&command), "exit": code,
+            "execution_ms": started.elapsed().as_millis() as u64,
         }));
         if code != 0 {
             failed.push(id.to_string());
         }
     }
     if let Some(dir) = &o.evidence_dir {
-        // Raw run record. Schema-1 cell evidence is produced from these files and
-        // the CI controller's run metadata by `cargo xtask evidence emit`.
+        // The Actions controller authenticates and reconciles these raw records.
+        // Invocation timings are diagnostic wall time, including runner startup.
         let run = serde_json::json!({
             "schema": 1, "build": build_id, "runner": format!("{:?}", o.runner).to_lowercase(),
             "shard": o.shard, "shuffle_seed": o.shuffle_seed, "manifest_version": m.version(),
