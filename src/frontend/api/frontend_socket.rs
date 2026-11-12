@@ -82,13 +82,33 @@ async fn refuse(socket: &mut WebSocket, code: &str, message: &str) {
 }
 /// Close with a policy code and reason (grant revoked, listener closed, …).
 async fn close_policy(socket: &mut WebSocket, reason: &'static str) {
-    let _ = socket
-        .send(Message::Close(Some(CloseFrame {
-            code: 1008,
-            reason: reason.into(),
-        })))
-        .with_subscriber(tracing::subscriber::NoSubscriber::default())
-        .await;
+    // Dropping TCP with unread client data can reset the connection and hide
+    // the policy close from the browser, especially on Windows. Complete the
+    // WebSocket closing handshake first. Discard any queued frames without
+    // decoding or admitting them, and bound peers that never acknowledge.
+    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+        if socket
+            .send(Message::Close(Some(CloseFrame {
+                code: 1008,
+                reason: reason.into(),
+            })))
+            .with_subscriber(tracing::subscriber::NoSubscriber::default())
+            .await
+            .is_err()
+        {
+            return;
+        }
+        while let Some(Ok(message)) = socket
+            .recv()
+            .with_subscriber(tracing::subscriber::NoSubscriber::default())
+            .await
+        {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await;
 }
 /// Resolves when a browser grant ends; never for owner/API-key sockets.
 async fn grant_ended(grant: Option<&GrantWatch>) -> &'static str {
@@ -109,7 +129,7 @@ pub(super) async fn serve_frontend_socket(
     // carries a process environment, so suppress payload-library diagnostics
     // while polling reads/writes; our own diagnostics contain frame types only.
     // Biased: when a Hello and the grant's ending are both ready, the
-    // ending wins and the Hello is never read.
+    // ending wins and the Hello is never decoded or admitted.
     let first = tokio::select! {
         biased;
         reason = grant_ended(grant.as_ref()) => {
@@ -379,14 +399,21 @@ mod tests {
             // Not a valid Hello: if it were read first, the daemon would
             // answer `protocol_error` instead of the policy close. It is sent
             // before the daemon side starts, so both are ready at once.
-            let _ = ws
-                .send(tungstenite::Message::Text("not a hello".into()))
-                .await;
+            ws.send(tungstenite::Message::Text("not a hello".into()))
+                .await
+                .unwrap();
             start.send(()).unwrap();
             assert_eq!(
                 first_message(&mut ws, Duration::from_secs(3)).await,
                 Some(policy_close("grant revoked")),
             );
+            // Flush the client's close acknowledgement and require a clean
+            // end of stream, not a TCP reset hiding the policy close.
+            ws.flush().await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_secs(3), ws.next())
+                .await
+                .unwrap()
+                .is_none());
         }
         assert_eq!(f.opener.opened.load(std::sync::atomic::Ordering::SeqCst), 0);
         f.finish().await;
