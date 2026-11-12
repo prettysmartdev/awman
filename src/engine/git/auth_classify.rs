@@ -110,39 +110,47 @@ impl ResponseTrace {
         Ok(Self(file))
     }
     pub fn classify(&self, stderr: &str, timed_out: bool) -> GitFailureClass {
-        let class = classify_git_failure(stderr, timed_out);
-        if matches!(
-            class,
-            GitFailureClass::Auth | GitFailureClass::RemoteRejected
-        ) {
-            return class;
-        }
-        let Ok(trace) = std::fs::read_to_string(self.0.path()) else {
-            return GitFailureClass::Other;
-        };
-        let trace = trace.to_ascii_lowercase();
-        // Git's wording for a refused or missing credential differs between
-        // versions; the remote's last answer does not. A final 401 or 403 is
-        // an authentication failure whatever stderr says.
-        if matches!(last_http_status(&trace), Some(401 | 403)) {
-            return GitFailureClass::Auth;
-        }
-        let response_seen = trace.contains("<= recv header") || trace.contains("<= recv data");
-        if response_seen {
-            return GitFailureClass::Other;
-        }
-        if class == GitFailureClass::Transport {
-            return class;
-        }
-        if trace.contains("== info:")
-            && stderr
-                .to_ascii_lowercase()
-                .contains("connection reset by peer")
-        {
-            GitFailureClass::Transport
-        } else {
-            GitFailureClass::Other
-        }
+        let trace = std::fs::read_to_string(self.0.path()).ok();
+        classify_response_trace(stderr, timed_out, trace.as_deref())
+    }
+}
+
+fn classify_response_trace(stderr: &str, timed_out: bool, trace: Option<&str>) -> GitFailureClass {
+    let class = classify_git_failure(stderr, timed_out);
+    if matches!(
+        class,
+        GitFailureClass::Auth | GitFailureClass::RemoteRejected
+    ) {
+        return class;
+    }
+    let Some(trace) = trace else {
+        return GitFailureClass::Other;
+    };
+    let trace = trace.to_ascii_lowercase();
+    // Git's wording for a refused or missing credential differs between
+    // versions; the remote's last answer does not. A final 401 or 403 is
+    // an authentication failure whatever stderr says.
+    if matches!(last_http_status(&trace), Some(401 | 403)) {
+        return GitFailureClass::Auth;
+    }
+    let response_seen = trace.contains("<= recv header") || trace.contains("<= recv data");
+    if response_seen {
+        return GitFailureClass::Other;
+    }
+    if class == GitFailureClass::Transport {
+        return class;
+    }
+    // libcurl renders WSAECONNRESET as "Connection was reset" on Windows.
+    // Either spelling still requires evidence that no response arrived.
+    let stderr = stderr.to_ascii_lowercase();
+    if trace.contains("== info:")
+        && ["connection reset by peer", "connection was reset"]
+            .iter()
+            .any(|reset| stderr.contains(reset))
+    {
+        GitFailureClass::Transport
+    } else {
+        GitFailureClass::Other
     }
 }
 
@@ -153,4 +161,44 @@ fn last_http_status(trace: &str) -> Option<u16> {
         .filter_map(|line| line.split_once("<= recv header: http/"))
         .filter_map(|(_, rest)| rest.split_whitespace().nth(1)?.parse().ok())
         .next_back()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resets_need_evidence_of_no_response_on_every_platform() {
+        let started = "== Info: Connected to 127.0.0.1\n";
+        for message in [
+            "Recv failure: Connection reset by peer",
+            "Recv failure: Connection was reset",
+        ] {
+            for trace in [None, Some("")] {
+                assert_eq!(
+                    classify_response_trace(message, false, trace),
+                    GitFailureClass::Other
+                );
+            }
+            assert_eq!(
+                classify_response_trace(message, false, Some(started)),
+                GitFailureClass::Transport
+            );
+            for response in [
+                "<= Recv header: HTTP/1.1 200 OK\n",
+                "<= Recv data: partial\n",
+            ] {
+                let trace = format!("{started}{response}");
+                assert_eq!(
+                    classify_response_trace(message, false, Some(&trace)),
+                    GitFailureClass::Other
+                );
+            }
+            let trace = format!("{started}<= Recv header: HTTP/1.1 401 Unauthorized\n");
+            assert_eq!(
+                classify_response_trace(message, false, Some(&trace)),
+                GitFailureClass::Auth
+            );
+        }
+    }
 }

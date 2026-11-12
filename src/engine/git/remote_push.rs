@@ -205,7 +205,8 @@ impl GitEngine {
             for key in ["user.name", "user.email", "extensions.objectformat"] {
                 let output = crate::engine::host_cli::command(&self.env, "git")
                     .args(["config", "--no-includes", "--file"])
-                    .arg(&local)
+                    // Keep Git's path parser away from Windows verbatim paths.
+                    .arg("source-config")
                     .args(["--get", key])
                     .current_dir(dir)
                     .output()
@@ -225,6 +226,13 @@ impl GitEngine {
                         )?;
                     }
                     git.run(&["config", key, &value], false, &mut sink)?;
+                } else if output.status.code() != Some(1) {
+                    // Exit 1 means the key is absent. A read/parse error must
+                    // not silently discard identity or the object format.
+                    return Err(EngineError::Git(format!(
+                        "read isolated Git config: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )));
                 }
             }
         }
@@ -654,9 +662,11 @@ impl RemotePushGit {
         ] {
             let output = crate::engine::host_cli::command(&self.env, "git")
                 .args(["config", "--no-includes", "--file"])
-                .arg(metadata.join("config"))
+                .arg("config")
                 .args([&key, &value])
-                .current_dir(self.private.path())
+                // This is an explicit file-only config edit, never a worktree
+                // or transport operation against the original repository.
+                .current_dir(metadata)
                 .output()
                 .map_err(io)?;
             if !output.status.success() {

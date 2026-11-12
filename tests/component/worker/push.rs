@@ -259,7 +259,8 @@ async fn regression_3e8d7e6c_transport_retry_and_cancellation_are_bounded() {
         .unwrap_err();
     assert_eq!(
         (failure.kind, failure.attempts),
-        (LeasePushFailureKind::Unreachable, 3)
+        (LeasePushFailureKind::Unreachable, 3),
+        "{failure:?}"
     );
     assert_eq!(
         observer
