@@ -124,19 +124,33 @@ async fn tab_navigation_and_dialog_dismissal_keep_sessions_distinct() {
     s.finish();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn full_engine_new_tab_shows_capacity_choices_and_escape_cancels_ready() {
+#[test]
+fn full_engine_new_tab_shows_capacity_choices_and_escape_cancels_ready() {
+    let s = TestSandbox::for_test(TestCase::component(
+        "frontend::tui::contracts::full_engine_new_tab_shows_capacity_choices_and_escape_cancels_ready",
+    ));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(capacity_dialog_scenario(&s));
+    // Tab drop cancels the Git poll, but abort cannot interrupt its current
+    // synchronous Git call. Join the runtime before removing its working
+    // directory: Windows refuses cleanup while that process still uses it.
+    drop(runtime);
+    s.finish();
+}
+
+async fn capacity_dialog_scenario(s: &TestSandbox) {
     use crate::command::instance::{EngineInstance, HostedOptions, OpenTabRequest};
     use crate::data::{daemon_state::FeatureName, ids::InstanceId};
     use crate::engine::daemon::executor::SharedExecutor;
     use std::time::Duration;
 
-    let s = TestSandbox::for_test(TestCase::component(
-        "frontend::tui::contracts::full_engine_new_tab_shows_capacity_choices_and_escape_cancels_ready",
-    ));
-    let mut app = app(&s);
+    let mut app = app(s);
     let env = app.active_tab().session.env().clone();
-    let repo = awman_test_support::fixtures::RepoBuilder::new(&s, "capacity").init();
+    let repo = awman_test_support::fixtures::RepoBuilder::new(s, "capacity").init();
     let executor = SharedExecutor::new(1);
     executor.set_share(FeatureName::Engine, 1);
     let _busy = executor.try_acquire(FeatureName::Engine).unwrap();
@@ -199,7 +213,6 @@ async fn full_engine_new_tab_shows_capacity_choices_and_escape_cancels_ready() {
     instance.quit();
     drop(app);
     drop(instance);
-    s.finish();
 }
 
 #[tokio::test]
