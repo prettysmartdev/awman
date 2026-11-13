@@ -74,7 +74,7 @@ pub const CAPABILITIES: &[&str] = &[
     "push_retry_codes",
     // WI 0145 slice 3: `git_auth` on session creation, delivered to every
     // push-session Git operation through the one-shot socket helper
-    // (`credentials_lost` after a restart). Unix only: omitted elsewhere.
+    // (`credentials_lost` after a restart), over Unix sockets or Windows pipes.
     "session_git_auth",
     // WI 0145: `secrets` on command submission, injected for `env(NAME)`
     // overlays, redacted from events/results, `secrets_lost` after restart.
@@ -124,7 +124,7 @@ mod tests {
         let with_pull = advertised(true, PULL_CAPABILITIES);
         let mut expected = CAPABILITIES
             .iter()
-            .filter(|c| cfg!(unix) || **c != "session_git_auth")
+            .filter(|c| cfg!(any(unix, windows)) || **c != "session_git_auth")
             .map(|c| c.to_string())
             .collect::<Vec<_>>();
         expected.extend(PULL_CAPABILITIES.iter().map(|c| c.to_string()));
@@ -153,7 +153,7 @@ mod tests {
             1
         );
         assert!(at("push_retry_codes") < at("command_secrets"));
-        if cfg!(unix) {
+        if cfg!(any(unix, windows)) {
             assert!(at("push_retry_codes") < at("session_git_auth"));
             assert!(at("session_git_auth") < at("command_secrets"));
         } else {

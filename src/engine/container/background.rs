@@ -24,6 +24,7 @@ pub struct BackgroundExecRequest<'a> {
     pub command: &'a str,
     pub working_dir: &'a str,
     pub env: Option<&'a HashMap<String, String>>,
+    pub private_stdin: Option<&'a crate::data::secret::SecretString>,
 }
 
 /// An idle setup/teardown container with per-session builtin settings.
@@ -112,6 +113,29 @@ impl BackgroundContainer {
     pub fn container_id(&self) -> &str {
         &self.container_id
     }
+
+    /// Seed a container-local credential cache without argv, env or disk delivery.
+    pub fn seed_git_credentials(
+        &self,
+        seed: &crate::data::secret::SecretString,
+    ) -> Result<(), EngineError> {
+        let result = self.backend.exec_in_background_streaming(
+            &BackgroundExecRequest {
+                id: &self.container_id,
+                command: crate::engine::git::credential_socket::SEED_CONTAINER_CACHE,
+                working_dir: &self.working_dir,
+                env: None,
+                private_stdin: Some(seed),
+            },
+            &mut |_| {},
+        )?;
+        if result.exit_code != 0 {
+            return Err(EngineError::Container(
+                "could not initialize the session Git credential helper".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for BackgroundContainer {
@@ -151,6 +175,7 @@ impl AgentExec for BackgroundContainer {
                 command,
                 working_dir: &self.working_dir,
                 env,
+                private_stdin: None,
             },
             on_line,
         )
@@ -344,13 +369,20 @@ pub(super) fn default_exec_in_background(
 
 pub(super) fn default_exec_in_background_streaming(
     cli: ContainerCli,
-    container_id: &str,
-    command: &str,
-    working_dir: &str,
-    env: Option<&HashMap<String, String>>,
+    request: &BackgroundExecRequest<'_>,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<ExecOutput, EngineError> {
+    let BackgroundExecRequest {
+        id: container_id,
+        command,
+        working_dir,
+        env,
+        private_stdin,
+    } = *request;
     let mut args = vec!["exec".to_string()];
+    if private_stdin.is_some() {
+        args.push("-i".into());
+    }
     args.extend(["-w".to_string(), working_dir.to_string()]);
 
     // Unlike `build_start_background_argv`, this keeps the `KEY=VALUE` form.
@@ -373,13 +405,25 @@ pub(super) fn default_exec_in_background_streaming(
     let mut child = cli
         .command()
         .args(&args)
-        .stdin(Stdio::null())
+        .stdin(if private_stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
             EngineError::Container(format!("exec in background container {container_id}: {e}"))
         })?;
+
+    // Write concurrently with draining output so a runtime cannot deadlock on
+    // full pipes. No PTY: credentials cannot be echoed by terminal line discipline.
+    let writer = private_stdin.map(|secret| {
+        let bytes = secret.clone();
+        let mut input = child.stdin.take().expect("piped private stdin");
+        std::thread::spawn(move || std::io::Write::write_all(&mut input, bytes.expose().as_bytes()))
+    });
 
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
@@ -426,6 +470,12 @@ pub(super) fn default_exec_in_background_streaming(
             "waiting for exec in background container {container_id}: {e}"
         ))
     })?;
+    if let Some(writer) = writer {
+        writer
+            .join()
+            .map_err(|_| EngineError::Container("private stdin writer failed".into()))?
+            .map_err(|_| EngineError::Container("private stdin delivery failed".into()))?;
+    }
 
     let exit_code = status.code().unwrap_or(-1);
     Ok(ExecOutput {

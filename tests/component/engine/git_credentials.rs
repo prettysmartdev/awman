@@ -25,6 +25,42 @@ use tokio_util::sync::CancellationToken;
 const TOKEN: &str = "test-secret-session-token";
 const STALE: &str = "test-secret-stale-user-helper";
 
+#[test]
+fn long_runtime_paths_use_private_short_sockets_and_clean_up() {
+    use awman::engine::git::transport::CredentialHelper;
+    use std::os::unix::fs::PermissionsExt;
+    let s = sandbox(
+        "engine::git_credentials::long_runtime_paths_use_private_short_sockets_and_clean_up",
+    );
+    let long = s.root().join("a".repeat(120));
+    let sockets = CredentialSocketServer::start(
+        &long,
+        HelperProgram::awman(support::awman_exe().to_path_buf()),
+    )
+    .unwrap();
+    let path = sockets.path().to_path_buf();
+    let parent = path.parent().unwrap().parent().unwrap().to_path_buf();
+    assert!(path.as_os_str().len() < 100);
+    assert_eq!(
+        std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let ticket = sockets.ticket(
+        spec(TOKEN),
+        CredentialScope::for_http_url("https://git.example/team/repo.git").unwrap(),
+    );
+    assert!(ask_helper(
+        &s,
+        &path,
+        &nonce_of(&ticket.git_config_args()),
+        "protocol=https\nhost=git.example\npath=team/repo.git\n\n"
+    )
+    .contains(TOKEN));
+    drop(ticket);
+    drop(sockets);
+    assert!(!parent.exists());
+}
+
 fn sandbox(id: &'static str) -> TestSandbox {
     let s = support::sandbox(id);
     s.require::<LocalGit>();

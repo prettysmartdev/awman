@@ -229,22 +229,20 @@ fn git_image(engine: &Engine) -> String {
 }
 
 /// WI 0145: a teardown/setup Git step of a `git_auth` push session reaches
-/// the command's mounted `credential-cache` socket with nothing but Git, gets
+/// a container-local `credential-cache` socket seeded over private stdin, gets
 /// the credential for the session's repository only, and the token is never
 /// in the container's environment. Runs the exact helper configuration
 /// `push_branch` renders (`PushAuth::SessionSocket`).
 #[cfg(target_os = "linux")]
 #[test]
-fn teardown_git_uses_the_mounted_credential_socket_only_for_the_session_host() {
+fn teardown_git_uses_the_private_credential_cache_only_for_the_session_host() {
     use awman::data::git_transport::{GitAuthKind, GitAuthSpec};
-    use awman::engine::git::credential_socket::{
-        CacheSocketListener, CONTAINER_CREDENTIAL_DIR, CONTAINER_CREDENTIAL_SOCKET,
-    };
+    use awman::engine::git::credential_socket::{CacheSocketListener, CONTAINER_CACHE_SOCKET};
     use awman::engine::git::lease_transport::CredentialScope;
     use awman::engine::workflow::step_commands::{transport_git, PushAuth, StepCommandOptions};
 
     let mut sandbox = support::sandbox(
-        "docker::teardown_git_uses_the_mounted_credential_socket_only_for_the_session_host",
+        "docker::teardown_git_uses_the_private_credential_cache_only_for_the_session_host",
     );
     let engine = Engine::grant(&mut sandbox);
     let image = git_image(&engine);
@@ -260,11 +258,6 @@ fn teardown_git_uses_the_mounted_credential_socket_only_for_the_session_host() {
     .expect("the per-command listener starts");
     let runtime = ContainerRuntime::docker_in(engine.snapshot());
     let env = HashMap::from([("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())]);
-    let overlays = [OverlaySpec {
-        host_path: listener.dir().to_path_buf(),
-        container_path: PathBuf::from(CONTAINER_CREDENTIAL_DIR),
-        permission: OverlayPermission::ReadWrite,
-    }];
     let workdir = engine.sandbox.work();
     let name = "awman-boundary-git-socket";
     let container = runtime
@@ -274,15 +267,18 @@ fn teardown_git_uses_the_mounted_credential_socket_only_for_the_session_host() {
             image: &image,
             workdir: &workdir,
             env: &env,
-            overlays: &overlays,
+            overlays: &[],
             builtin_launch: None,
         })
-        .expect("a background container starts with the socket directory");
+        .expect("a background container starts without host socket mounts");
     let cleanup = engine::Cleanup::new(&engine);
     cleanup.container(name);
+    container
+        .seed_git_credentials(&listener.cache_seed())
+        .unwrap();
     let git = transport_git(&StepCommandOptions {
         push_auth: PushAuth::SessionSocket {
-            socket: CONTAINER_CREDENTIAL_SOCKET.into(),
+            socket: CONTAINER_CACHE_SOCKET.into(),
         },
         remote_url: Some("https://git.example/team/repo.git".into()),
     });

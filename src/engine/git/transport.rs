@@ -17,6 +17,34 @@ use crate::engine::error::EngineError;
 
 type Result<T> = std::result::Result<T, EngineError>;
 
+#[cfg(windows)]
+type WindowsSpawn =
+    fn(&mut Command) -> std::io::Result<(std::process::Child, Box<dyn Send + Sync>)>;
+#[cfg(windows)]
+static WINDOWS_SPAWN: std::sync::OnceLock<WindowsSpawn> = std::sync::OnceLock::new();
+/// Install the binary's native process containment boundary.
+#[cfg(windows)]
+pub fn install_windows_spawn(spawn: WindowsSpawn) {
+    let _ = WINDOWS_SPAWN.set(spawn);
+}
+
+fn spawn_contained(
+    command: &mut Command,
+) -> std::io::Result<(std::process::Child, Box<dyn Send + Sync>)> {
+    #[cfg(windows)]
+    {
+        WINDOWS_SPAWN.get().ok_or_else(|| {
+            std::io::Error::other("native Windows Git process containment is not installed")
+        })?(command)
+    }
+    #[cfg(not(windows))]
+    {
+        command
+            .spawn()
+            .map(|child| (child, Box::new(()) as Box<dyn Send + Sync>))
+    }
+}
+
 /// A helper installation contains paths/handles only, never a secret in argv or env.
 pub trait CredentialHelper: Send + Sync + std::fmt::Debug {
     fn git_config_args(&self) -> Vec<String>;
@@ -218,7 +246,8 @@ impl HostGitTransport {
         if let Some((_, started)) = &guard.start_deadline {
             started.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        let mut child = command.spawn().map_err(io)?;
+        let (mut child, job) = spawn_contained(&mut command).map_err(io)?;
+        let mut job = Some(job);
         let started = std::time::Instant::now();
         let mut timed_out = false;
         let mut last_progress = 0;
@@ -254,6 +283,7 @@ impl HostGitTransport {
                     nix::sys::signal::Signal::SIGKILL,
                 );
                 let _ = child.kill();
+                drop(job.take());
                 let status = child.wait().map_err(io)?;
                 stopped?;
                 timed_out = true;
@@ -264,6 +294,7 @@ impl HostGitTransport {
             }
             std::thread::sleep(Duration::from_millis(10));
         };
+        drop(job);
         guard.check()?;
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -339,7 +370,8 @@ impl TransportGuard {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        let mut child = command.spawn().map_err(io)?;
+        let (mut child, job) = spawn_contained(command).map_err(io)?;
+        let mut job = Some(job);
         let end = std::time::Instant::now() + self.remaining_timeout();
         let status = loop {
             if self.check().is_err() || std::time::Instant::now() >= end {
@@ -349,6 +381,7 @@ impl TransportGuard {
                     nix::sys::signal::Signal::SIGKILL,
                 );
                 let _ = child.kill();
+                drop(job.take());
                 let _ = child.wait();
                 self.check()?;
                 return Err(EngineError::Git("local Git operation timed out".into()));
@@ -358,6 +391,7 @@ impl TransportGuard {
             }
             std::thread::sleep(Duration::from_millis(10));
         };
+        drop(job);
         let mut out = Vec::new();
         let mut err = Vec::new();
         stdout

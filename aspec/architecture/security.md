@@ -117,9 +117,12 @@ clone, fetch, remote-ref lookup and push. It clears inherited Git credential
 helpers, does not consult global credential configuration, and uses a private
 Git home so global authentication files such as `netrc` are not fallback
 sources. The credential is held in daemon memory and served to Git through a
-short-lived local credential socket; it is not written to the session database
-or placed in process arguments or environment variables. The socket is exposed
-only to phase containers that need Git access. A phase receiving it is trusted
+short-lived owner-only Unix socket or Windows named pipe; it is not written to
+the session database or placed in process arguments or environment variables.
+Only phase containers that need Git access receive the credential, through
+private stdin into a container-local, memory-only Git credential cache. Its
+socket is scoped to the session's protocol, host and repository path; removing
+the phase container destroys the cache. A phase receiving it is trusted
 with the reusable credential and can copy it; repository matching is not a
 confinement boundary for a malicious recipient. Use repository-scoped,
 short-lived credentials.

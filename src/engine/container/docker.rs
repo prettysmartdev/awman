@@ -390,19 +390,7 @@ impl ContainerBackend for DockerBackend {
         request: &crate::engine::container::background::BackgroundExecRequest<'_>,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<ExecOutput, EngineError> {
-        let id = request.id;
-        let command = request.command;
-        let working_dir = request.working_dir;
-        let env = request.env;
-
-        background::default_exec_in_background_streaming(
-            self.cli(),
-            id,
-            command,
-            working_dir,
-            env,
-            on_line,
-        )
+        background::default_exec_in_background_streaming(self.cli(), request, on_line)
     }
 
     fn stop_and_remove(&self, id: &str) -> Result<(), EngineError> {

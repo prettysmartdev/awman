@@ -30,7 +30,14 @@ pub fn fake_cli_exe() -> &'static Path {
 pub fn sandbox(id: &'static str) -> TestSandbox {
     // Match the binary's immutable native provider setup for in-process tests.
     #[cfg(windows)]
-    awman_host_shims::install_metadata_publisher();
+    {
+        awman_host_shims::install_metadata_publisher();
+        awman::engine::git::transport::install_windows_spawn(awman_host_shims::spawn_git);
+        awman::engine::remote::local::install_owner_pipe(
+            awman_host_shims::owner_pipe,
+            awman_host_shims::verify_client,
+        );
+    }
     let mut sandbox = TestSandbox::for_test(TestCase::component(id));
     sandbox.register_exe("awman", awman_exe());
     sandbox.register_exe("fake-cli", fake_cli_exe());

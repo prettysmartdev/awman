@@ -284,6 +284,10 @@ impl OverlayEngine {
                 if let (Some(token), Some(remote)) = (&grants.token, target.remote) {
                     if matches!(&remote.kind, GitRemoteKind::Https { host } if host.eq_ignore_ascii_case(&token.host))
                         && grants.allows_token(&remote.redacted)
+                        && (target.step_kind == PrerequisiteStepKind::CloneRepo
+                            || !target
+                                .session_git_socket
+                                .is_some_and(|listener| listener.matches_url(&remote.redacted)))
                     {
                         out.secret_env
                             .push((GRANT_TOKEN_ENV_GIT.into(), token.secret.clone()));
@@ -292,33 +296,6 @@ impl OverlayEngine {
                         out.display.push("AWMAN_GIT_TOKEN=***".into());
                         out.push_auth = PushAuth::HttpsToken {
                             env_var: GRANT_TOKEN_ENV_GIT.into(),
-                        };
-                    }
-                }
-                // WI 0145: a `git_auth` push session's own credential, through
-                // the command's mounted credential-cache socket, when no
-                // workflow grant chose another source for this HTTP remote.
-                if let (Some(listener), Some(remote), PushAuth::None) =
-                    (target.session_git_socket, target.remote, &out.push_auth)
-                {
-                    if target.step_kind != PrerequisiteStepKind::CloneRepo
-                        && is_http_remote(remote)
-                        && listener.matches_url(&remote.redacted)
-                    {
-                        out.overlays.push(OverlaySpec {
-                            host_path: listener.dir().to_path_buf(),
-                            container_path: PathBuf::from(
-                                crate::engine::git::credential_socket::CONTAINER_CREDENTIAL_DIR,
-                            ),
-                            permission: OverlayPermission::ReadWrite,
-                        });
-                        out.env_literals
-                            .push(("GIT_TERMINAL_PROMPT".into(), "0".into()));
-                        out.display.push("session git credential (socket)".into());
-                        out.push_auth = PushAuth::SessionSocket {
-                            socket:
-                                crate::engine::git::credential_socket::CONTAINER_CREDENTIAL_SOCKET
-                                    .into(),
                         };
                     }
                 }
@@ -381,6 +358,41 @@ impl OverlayEngine {
                 }
             }
             _ => {}
+        }
+        // Git invoked by gh must inherit the same helper too. Seeding a
+        // container-local cache over private stdin works across VM boundaries;
+        // no host Unix socket or secret-bearing file/env is needed.
+        if matches!(
+            target.step_kind,
+            PrerequisiteStepKind::PushBranch
+                | PrerequisiteStepKind::PullBranch
+                | PrerequisiteStepKind::CreatePullRequest
+        ) {
+            if let (Some(listener), Some(remote), PushAuth::None) =
+                (target.session_git_socket, target.remote, &out.push_auth)
+            {
+                if is_http_remote(remote) && listener.matches_url(&remote.redacted) {
+                    let socket = crate::engine::git::credential_socket::CONTAINER_CACHE_SOCKET;
+                    out.git_cache_seed = Some(listener.cache_seed());
+                    out.push_auth = PushAuth::SessionSocket {
+                        socket: socket.into(),
+                    };
+                    out.env_literals.extend([
+                        ("GIT_CONFIG_COUNT".into(), "3".into()),
+                        ("GIT_CONFIG_KEY_0".into(), "credential.helper".into()),
+                        ("GIT_CONFIG_VALUE_0".into(), "".into()),
+                        ("GIT_CONFIG_KEY_1".into(), "credential.helper".into()),
+                        (
+                            "GIT_CONFIG_VALUE_1".into(),
+                            format!("cache --socket {socket}"),
+                        ),
+                        ("GIT_CONFIG_KEY_2".into(), "credential.useHttpPath".into()),
+                        ("GIT_CONFIG_VALUE_2".into(), "true".into()),
+                    ]);
+                    out.display
+                        .push("session git credential (private helper)".into());
+                }
+            }
         }
         if !out.secret_env.is_empty()
             || !matches!(out.push_auth, PushAuth::None)

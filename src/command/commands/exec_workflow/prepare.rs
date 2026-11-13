@@ -629,6 +629,10 @@ pub(crate) async fn execute_prepared_with_outputs(
                                 .iter()
                                 .find(|(i, _)| *i == idx)
                                 .and_then(|(_, g)| g.transport.as_ref()),
+                            git_cache_seed: _setup_grants
+                                .iter()
+                                .find(|(i, _)| *i == idx)
+                                .and_then(|(_, g)| g.git_cache_seed.as_ref()),
                         }
                         .build(step, env, overlays)
                     };
@@ -816,6 +820,10 @@ pub(crate) async fn execute_prepared_with_outputs(
                                 .iter()
                                 .find(|(i, _)| *i == idx)
                                 .and_then(|(_, g)| g.transport.as_ref()),
+                            git_cache_seed: _teardown_grants
+                                .iter()
+                                .find(|(i, _)| *i == idx)
+                                .and_then(|(_, g)| g.git_cache_seed.as_ref()),
                         }
                         .build(step, env, overlays)
                     };
@@ -1629,6 +1637,7 @@ pub(crate) async fn finish_cancelled_cleanup(
                     interactive: false,
                     secret_env: &[],
                     transport: None,
+                    git_cache_seed: None,
                 }
                 .build(step, env, overlays)
             })

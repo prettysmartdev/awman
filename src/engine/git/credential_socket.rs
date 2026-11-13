@@ -5,7 +5,7 @@
 //! argv, the environment, a file or `.git/config`:
 //!
 //! - [`CredentialSocketServer`] serves **host** Git. One server per daemon
-//!   listens on an owner-only Unix socket inside a 0700 directory. Each use
+//!   listens on an owner-only Unix socket or Windows named pipe. Each use
 //!   of a session transport takes an [`OperationTicket`]: a random 128-bit
 //!   nonce registered with the credential and its repository scope. The
 //!   ticket is a [`CredentialHelper`]: Git runs
@@ -15,13 +15,11 @@
 //!   compare) and a request for exactly the ticket's protocol, host and
 //!   repository path; anything else is closed without output, so Git fails
 //!   without a prompt (`git_auth_failed`). Dropping the ticket revokes it.
-//! - [`CacheSocketListener`] serves **container** Git (teardown/setup
-//!   `push_branch` and `pull_branch`). It speaks Git's own
-//!   `credential-cache` socket protocol, so the container needs only `git`
-//!   (`credential.helper=cache --socket <path>`). It lives for one command,
-//!   answers `get` only for the session's protocol and host (and the
-//!   repository path when Git sends one) and ignores `store`, `erase` and
-//!   `exit`.
+//! - [`CacheSocketListener`] holds the command's scoped credential. Container
+//!   Git receives its [`CacheSocketListener::cache_seed`] over private stdin
+//!   into an in-memory, container-local Git cache. No host socket is mounted.
+//!   The Unix listener also supports Git's credential-cache protocol for local
+//!   consumers, answering scoped `get` requests only.
 //!
 //! Neither listener logs a request or a reply.
 //!
@@ -31,7 +29,9 @@
 //! short-lived credentials for untrusted workflows.
 
 use std::collections::HashMap;
-use std::io::{BufRead, Read, Write};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -48,6 +48,9 @@ pub const GIT_CREDENTIAL_SOCKET_ENV: &str = crate::data::config::env::AWMAN_GIT_
 pub const CONTAINER_CREDENTIAL_DIR: &str = "/awman/git-credential";
 /// The container listener's socket inside [`CONTAINER_CREDENTIAL_DIR`].
 pub const CONTAINER_CREDENTIAL_SOCKET: &str = "/awman/git-credential/sock";
+/// Private, container-local helper. Seeded over stdin, never through its filesystem.
+pub const CONTAINER_CACHE_SOCKET: &str = "/tmp/awman-git-credential/sock";
+pub const SEED_CONTAINER_CACHE: &str = "umask 077; mkdir /tmp/awman-git-credential && git -c credential.helper= credential-cache --timeout=2147483647 --socket=/tmp/awman-git-credential/sock store";
 
 /// Upper bound of one request on either socket.
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
@@ -103,7 +106,7 @@ struct Serving {
 
 /// The daemon's host-Git credential socket. See the module documentation.
 pub struct CredentialSocketServer {
-    _dir: tempfile::TempDir,
+    _dir: SocketDir,
     path: PathBuf,
     program: HelperProgram,
     tickets: Tickets,
@@ -122,11 +125,11 @@ impl std::fmt::Debug for CredentialSocketServer {
 impl CredentialSocketServer {
     /// Bind `<private_dir>/git-cred-<random>/s` (directory 0700, socket 0600)
     /// and serve it on a background thread until dropped. `private_dir` is
-    /// created owner-only; keep it short (a Unix socket path is limited to
-    /// about 100 bytes).
+    /// created owner-only; long paths use a private short-lived directory
+    /// below `/tmp` to fit Unix socket limits. Windows uses a named pipe.
     pub fn start(private_dir: &Path, program: HelperProgram) -> Result<Arc<Self>> {
         let dir = private_socket_dir(private_dir, "git-cred-", 0o700)?;
-        let path = dir.path().join("s");
+        let path = socket_path(dir.path(), "s");
         let tickets: Tickets = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
         let thread = imp::serve(
@@ -296,7 +299,7 @@ pub fn request_via_socket(
 /// A per-command listener speaking Git's `credential-cache` socket protocol
 /// for container Git. See the module documentation.
 pub struct CacheSocketListener {
-    dir: tempfile::TempDir,
+    dir: SocketDir,
     socket: PathBuf,
     stop: Arc<AtomicBool>,
     thread: Option<Serving>,
@@ -323,7 +326,7 @@ impl CacheSocketListener {
         scope: CredentialScope,
     ) -> Result<Self> {
         let dir = private_socket_dir(private_dir, "git-cred-cmd-", 0o711)?;
-        let socket = dir.path().join("sock");
+        let socket = socket_path(dir.path(), "sock");
         let stop = Arc::new(AtomicBool::new(false));
         let answer_scope = scope.clone();
         let answer_credential = credential.clone();
@@ -354,6 +357,19 @@ impl CacheSocketListener {
     }
     pub fn matches_url(&self, url: &str) -> bool {
         self.scope.matches_url(url)
+    }
+    pub fn scope(&self) -> &CredentialScope {
+        &self.scope
+    }
+    /// Git's cache protocol payload, delivered only through a private stdin pipe.
+    pub fn cache_seed(&self) -> crate::data::secret::SecretString {
+        crate::data::secret::SecretString::new(format!(
+            "protocol={}\nhost={}\npath={}\n{}\n",
+            self.scope.protocol(),
+            self.scope.host(),
+            self.scope.path(),
+            answer(&self.credential)
+        ))
     }
     pub fn has_active_request(&self) -> bool {
         self.thread
@@ -392,8 +408,40 @@ fn answer_cache(credential: &GitAuthSpec, scope: &CredentialScope, raw: &[u8]) -
     scope.answers(&request, true).then(|| answer(credential))
 }
 
-fn private_socket_dir(parent: &Path, prefix: &str, mode: u32) -> Result<tempfile::TempDir> {
+struct SocketDir {
+    dir: tempfile::TempDir,
+    // Keep the owner-only parent alive even when the exposed cache directory
+    // permits traversal by a container's uid. Drop the child first.
+    _short_parent: Option<tempfile::TempDir>,
+}
+impl SocketDir {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+fn private_socket_dir(parent: &Path, prefix: &str, mode: u32) -> Result<SocketDir> {
     crate::data::fs::private_files::create_private_dir(parent)?;
+    // A long HOME/TMPDIR is normal on CI and macOS. Use a short, randomly
+    // allocated owner-only parent for the ephemeral socket, never a predictable
+    // shared socket name or a secret-bearing file.
+    #[cfg(unix)]
+    let short_parent = if parent.as_os_str().len() + prefix.len() + 8 + 6 > 100 {
+        use std::os::unix::fs::PermissionsExt;
+        Some(
+            tempfile::Builder::new()
+                .prefix("ag-")
+                .rand_bytes(8)
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir_in("/tmp")
+                .map_err(|e| EngineError::io(parent, e))?,
+        )
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let short_parent: Option<tempfile::TempDir> = None;
+    let parent = short_parent.as_ref().map_or(parent, |dir| dir.path());
     let dir = tempfile::Builder::new()
         .prefix(prefix)
         .rand_bytes(8)
@@ -407,10 +455,14 @@ fn private_socket_dir(parent: &Path, prefix: &str, mode: u32) -> Result<tempfile
     }
     #[cfg(not(unix))]
     let _ = mode;
-    Ok(dir)
+    Ok(SocketDir {
+        dir,
+        _short_parent: short_parent,
+    })
 }
 
 /// Read a request of at most [`MAX_REQUEST_BYTES`] (the peer half-closes).
+#[cfg(unix)]
 fn read_request(stream: &mut dyn Read) -> Option<Vec<u8>> {
     let mut request = Vec::new();
     stream
@@ -422,7 +474,22 @@ fn read_request(stream: &mut dyn Read) -> Option<Vec<u8>> {
 
 /// Whether this platform can serve session credentials over a socket.
 pub fn supported() -> bool {
-    cfg!(unix)
+    cfg!(any(unix, windows))
+}
+
+fn socket_path(dir: &Path, name: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let _ = (dir, name);
+        PathBuf::from(format!(
+            r"\\.\pipe\awman-git-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        dir.join(name)
+    }
 }
 
 #[cfg(unix)]
@@ -538,7 +605,11 @@ mod imp {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+#[path = "credential_socket_windows.rs"]
+mod imp;
+
+#[cfg(not(any(unix, windows)))]
 mod imp {
     use super::*;
     pub(super) fn serve(

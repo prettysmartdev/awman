@@ -16,6 +16,7 @@ mod credentials;
 mod fake_world;
 mod git;
 mod git_credentials;
+mod git_credentials_windows;
 mod git_push_retry;
 mod git_transport;
 mod host_cli;

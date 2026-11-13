@@ -367,6 +367,13 @@ mod transport_contract_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pushed_command_adapter_retries_baseline_publishes_and_observes_cancellation() {
+        #[cfg(windows)]
+        {
+            crate::data::fs::git_metadata::GitMetadataCopy::install_windows_publisher(
+                awman_host_shims::publish_git_metadata,
+            );
+            crate::engine::git::transport::install_windows_spawn(awman_host_shims::spawn_git);
+        }
         let s=TestSandbox::for_test(TestCase::component("command::push_back::pushed_command_adapter_retries_baseline_publishes_and_observes_cancellation"));
         s.require::<awman_test_support::capability::LocalGit>();
         s.require::<awman_test_support::capability::Loopback>();

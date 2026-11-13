@@ -503,6 +503,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "async-trait",
+ "awman-host-shims",
  "awman-test-support",
  "awman-wsp",
  "axum",

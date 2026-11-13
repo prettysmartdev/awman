@@ -57,6 +57,7 @@ pub(crate) struct PhaseContainerFactory<'a> {
     pub workdir: &'a std::path::Path,
     pub interactive: bool,
     pub secret_env: &'a [(String, crate::engine::auth::credential::SecretString)],
+    pub git_cache_seed: Option<&'a crate::data::secret::SecretString>,
     pub transport: Option<&'a Arc<crate::engine::git::remote_push::RemotePushGit>>,
 }
 impl PhaseContainerFactory<'_> {
@@ -70,35 +71,40 @@ impl PhaseContainerFactory<'_> {
         let mut secret_env = self.secret_env.to_vec();
         // Caller overrides come last, including names also supplied by grants.
         secret_env.extend(env.secret_env.iter().cloned());
-        let container: Box<dyn AgentExec> = if self.interactive && secret_env.is_empty() {
-            Box::new(InteractivePhaseContainer::new(
-                self.runtime.clone(),
-                self.frontend.clone(),
-                step,
-                self.image,
-                PhaseContainerWorkspace {
-                    workdir: self.workdir.to_path_buf(),
-                    env: env.env.clone(),
-                    overlays: overlays.to_vec(),
-                    builtin_launch: launch,
-                },
-            ))
-        } else {
-            let name = self
-                .name_prefix
-                .map(|prefix| format!("{prefix}phase-{}", uuid::Uuid::new_v4().simple()));
-            Box::new(self.runtime.start_background(
-                &crate::engine::container::background::BackgroundLaunchRequest {
-                    secret_env: &secret_env,
-                    name: name.as_deref(),
-                    image: self.image,
-                    workdir: self.workdir,
-                    env,
-                    overlays,
-                    builtin_launch: launch.as_ref(),
-                },
-            )?)
-        };
+        let container: Box<dyn AgentExec> =
+            if self.interactive && secret_env.is_empty() && self.git_cache_seed.is_none() {
+                Box::new(InteractivePhaseContainer::new(
+                    self.runtime.clone(),
+                    self.frontend.clone(),
+                    step,
+                    self.image,
+                    PhaseContainerWorkspace {
+                        workdir: self.workdir.to_path_buf(),
+                        env: env.env.clone(),
+                        overlays: overlays.to_vec(),
+                        builtin_launch: launch,
+                    },
+                ))
+            } else {
+                let name = self
+                    .name_prefix
+                    .map(|prefix| format!("{prefix}phase-{}", uuid::Uuid::new_v4().simple()));
+                let background = self.runtime.start_background(
+                    &crate::engine::container::background::BackgroundLaunchRequest {
+                        secret_env: &secret_env,
+                        name: name.as_deref(),
+                        image: self.image,
+                        workdir: self.workdir,
+                        env,
+                        overlays,
+                        builtin_launch: launch.as_ref(),
+                    },
+                )?;
+                if let Some(seed) = self.git_cache_seed {
+                    background.seed_git_credentials(seed)?;
+                }
+                Box::new(background)
+            };
         if let Some(transport) = self.transport {
             Ok(Box::new(TransportPhaseContainer {
                 inner: container,

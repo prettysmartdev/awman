@@ -240,6 +240,9 @@ impl CredentialScope {
     pub fn host(&self) -> &str {
         &self.host
     }
+    pub fn path(&self) -> &str {
+        &self.path
+    }
     pub fn matches_url(&self, url: &str) -> bool {
         Self::for_http_url(url).as_ref() == Some(self)
     }

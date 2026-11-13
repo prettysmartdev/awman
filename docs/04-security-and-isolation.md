@@ -295,8 +295,12 @@ a substitute for limiting which command and workflow receives a secret.
 
 Remote API sessions may also supply `git_auth` for Git clone, fetch and
 push-back. Those credentials remain in daemon memory and are served to Git via
-a local credential socket; they are not placed in Git process arguments or
-environment variables. A phase container that receives the socket is trusted
+a private local credential channel; they are not placed in Git process arguments or
+environment variables. Git workflow steps receive a temporary, memory-only
+credential cache scoped to the session's repository. This works across container
+and microVM boundaries without mounting a host socket. Matching push and pull
+steps also use the session credential during preflight. PR creation uses it for
+Git operations and requires a separate GitHub API token. A phase container that receives the credential is trusted
 with the reusable credential. After daemon restart, the credential is lost and
 the session fails closed with `credentials_lost`; create a new session and
 provide credentials again.

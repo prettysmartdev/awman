@@ -17,7 +17,7 @@ use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 /// allowing write sharing would permit junction mutation before publication.
 /// The file must have DELETE access. Other directories cannot be selected here.
 /// https://learn.microsoft.com/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
-pub(super) fn publish(file: &File, leaf: &OsStr) -> io::Result<()> {
+pub fn publish(file: &File, leaf: &OsStr) -> io::Result<()> {
     let name: Vec<u16> = leaf.encode_wide().collect();
     if name.is_empty()
         || name.len() > u16::MAX as usize / 2
