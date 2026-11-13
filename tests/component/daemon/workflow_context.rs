@@ -701,6 +701,7 @@ fn retention_preserves_shared_invocations_and_retries_unsafe_directory_removal()
         .all_for_session(sessions[1].0.as_str())
         .unwrap()
         .is_empty());
+    drop(store);
     sandbox.finish();
 }
 

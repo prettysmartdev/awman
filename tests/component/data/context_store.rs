@@ -18,13 +18,16 @@ fn keyed_resolution_storage_preconditions_caps_and_diff() {
     );
     let resolver = ContextDirResolver::at_home(sandbox.awman_home());
     let key = ContextKey::parse("my-key").unwrap();
+    // The resolver canonicalizes the trusted home, including Windows' verbatim
+    // disk prefix. Compare paths in that same representation.
+    let home = std::fs::canonicalize(sandbox.awman_home()).unwrap();
     assert_eq!(
         resolver.keyed_repo_dir(&key),
-        sandbox.awman_home().join("context/repo/_keyed/my-key")
+        home.join("context/repo/_keyed/my-key")
     );
     assert_eq!(
         resolver.repo_dir(Some("https://github.com/Owner/Repo.git"), sandbox.root()),
-        sandbox.awman_home().join("context/repo/owner/repo")
+        home.join("context/repo/owner/repo")
     );
     assert_ne!(
         resolver.repo_dir(None, sandbox.root()),
