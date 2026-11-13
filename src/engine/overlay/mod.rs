@@ -295,6 +295,33 @@ impl OverlayEngine {
                         };
                     }
                 }
+                // WI 0145: a `git_auth` push session's own credential, through
+                // the command's mounted credential-cache socket, when no
+                // workflow grant chose another source for this HTTP remote.
+                if let (Some(listener), Some(remote), PushAuth::None) =
+                    (target.session_git_socket, target.remote, &out.push_auth)
+                {
+                    if target.step_kind != PrerequisiteStepKind::CloneRepo
+                        && is_http_remote(remote)
+                        && listener.matches_url(&remote.redacted)
+                    {
+                        out.overlays.push(OverlaySpec {
+                            host_path: listener.dir().to_path_buf(),
+                            container_path: PathBuf::from(
+                                crate::engine::git::credential_socket::CONTAINER_CREDENTIAL_DIR,
+                            ),
+                            permission: OverlayPermission::ReadWrite,
+                        });
+                        out.env_literals
+                            .push(("GIT_TERMINAL_PROMPT".into(), "0".into()));
+                        out.display.push("session git credential (socket)".into());
+                        out.push_auth = PushAuth::SessionSocket {
+                            socket:
+                                crate::engine::git::credential_socket::CONTAINER_CREDENTIAL_SOCKET
+                                    .into(),
+                        };
+                    }
+                }
                 if let Some(SshGrant::WholeDir { ssh_dir }) = &grants.ssh {
                     if target.remote.is_some_and(|r| {
                         matches!(r.kind, GitRemoteKind::Ssh { .. })
@@ -865,3 +892,10 @@ mod skills;
 
 pub(crate) use claude::*;
 pub(crate) use credential_file::*;
+
+/// An `http://` or `https://` remote: the only kind the session credential
+/// socket serves (its listener refuses every other protocol and host).
+fn is_http_remote(remote: &crate::data::workflow_prerequisites::GitRemoteUrl) -> bool {
+    let lower = remote.redacted.to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://")
+}

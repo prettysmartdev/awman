@@ -82,6 +82,15 @@ impl Capabilities {
     pub fn mounts_outputs(&self, requested: bool) -> bool {
         requested && self.arbitrary_host_mounts
     }
+
+    /// Whether a host Unix socket bind-mounted into a container is reachable
+    /// from inside it (WI 0145 session Git credential socket). True only for
+    /// a container engine sharing the host kernel (Docker on Linux); a VM
+    /// boundary (Docker Desktop, Apple containers, builtin) or a sandbox
+    /// does not carry the socket.
+    pub fn mounts_host_sockets(&self) -> bool {
+        self.arbitrary_host_mounts && !self.per_launch_vm_settings && cfg!(target_os = "linux")
+    }
 }
 /// How a runtime obtains the image an agent runs from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

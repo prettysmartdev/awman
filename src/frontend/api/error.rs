@@ -50,6 +50,13 @@ macro_rules! constructors {
 }
 
 constructors! {
+    invalid_secrets => ("invalid_secrets", BAD_REQUEST),
+    // WI 0145 session Git credentials.
+    invalid_git_auth => ("invalid_git_auth", BAD_REQUEST),
+    git_auth_unsupported_url => ("git_auth_unsupported_url", BAD_REQUEST),
+    git_auth_unsupported_platform => ("git_auth_unsupported_platform", BAD_REQUEST),
+    git_auth_failed => (crate::data::fs::api_db::failure_codes::GIT_AUTH_FAILED, UNPROCESSABLE_ENTITY),
+    credentials_lost => (crate::data::fs::api_db::failure_codes::CREDENTIALS_LOST, CONFLICT),
     host_mismatch => ("host_mismatch", MISDIRECTED_REQUEST),
     origin_not_allowed => ("origin_not_allowed", FORBIDDEN),
     browser_grant_required => ("browser_grant_required", UNAUTHORIZED),
@@ -174,6 +181,11 @@ impl ApiError {
             CommandError::Engine(EngineError::UnknownAgent { .. }) => {
                 Self::unknown_agent(error.to_string())
             }
+            CommandError::GitAuthUnsupportedUrl { .. }
+            | CommandError::GitAuthUnsupportedPlatform
+            | CommandError::GitAuthInvalid { .. }
+            | CommandError::GitAuthFailed { .. }
+            | CommandError::CredentialsLost => Self::from_command_error(error),
             _ => Self::invalid_request(error.to_string()),
         }
     }

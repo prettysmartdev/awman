@@ -903,6 +903,34 @@ Setup (cloning, for a remote session, then the same checks and image preparation
 | `merge_refs` | Branch names on `origin`, merged into the session branch in order before the session becomes `ready`. |
 | `push` | When `true`, the session branch is committed and pushed to `origin` after each successful `exec` workflow or prompt command. Default `false`. |
 
+For a remote session, the optional `git_auth` object supplies credentials for
+clone, setup fetch, remote-ref lookup and host-side push-back:
+
+```json
+{
+  "git_auth": { "kind": "token", "token": "<token>" }
+}
+```
+
+`kind` is `token` or `basic`. A token may include an optional `username`
+(default `x-access-token`); `basic` requires `username` and `password`. The
+secret is non-empty and at most 8 KiB; a username is non-empty and at most 256
+bytes. Values cannot contain CR, LF or NUL. Do not put credentials in
+`repo_url`: URL user information, query strings and fragments are rejected.
+Credentials are held in daemon memory only. A daemon restart loses them; a
+later operation on that session fails with `credentials_lost`, so create a new
+session and resubmit the credential. Session credentials are supported only
+for HTTPS repositories and loopback HTTP repositories, and only on platforms
+where `/v1/status` advertises `session_git_auth`. Other URLs are refused with
+`git_auth_unsupported_url`; unsupported platforms return
+`git_auth_unsupported_platform`. Invalid shapes return `invalid_git_auth`.
+An authentication failure during the synchronous merge-ref lookup returns
+HTTP 422 `git_auth_failed`; during asynchronous setup or a command it appears
+as `failure.stage: "git_auth"`, `failure.code: "git_auth_failed"`. If a
+credentialed session is used after its in-memory credential has been lost,
+admission fails fast with `credentials_lost` (HTTP 409) where possible; setup
+or a queued command interrupted by restart reports the same structured failure.
+
 `base_ref`, `merge_refs` and `push` are only valid on remote sessions (a local session returns HTTP 400), and each requires `branch` (HTTP 400 otherwise). A `branch` or `merge_refs` entry that is not a valid git branch name, or a malformed `base_ref`, is also rejected with HTTP 400. Merge targets reject `HEAD`, hexadecimal commit spellings (including abbreviated SHAs), and names advertised only as tags. A name that exists as both a branch and a tag selects the branch. An entirely missing ref fails during setup.
 
 **Setup stages.** `GET /v1/worker/sessions/:id` reports the stage the session is in: `initializing`, `cloning_repository`, `setting_up_branch`, `merging_refs`, `running_ready`, then `ready` (or `failed`). The `merging_refs` stage runs only when `merge_refs` is non-empty; each ref is merged as `origin/<ref>` in order, and progress is reported per ref. If a ref does not exist on `origin`, or a merge conflicts, setup fails, the error names the stage (for a conflict it lists the conflicting paths), and the clone is deleted. Merge commits use your git identity (`user.name` / `user.email`) when configured, and a built-in awman identity otherwise.
@@ -911,9 +939,51 @@ Setup (cloning, for a remote session, then the same checks and image preparation
 
 Commands share the clone's working state. Edits left by a failed command remain available for repair and are included if a later successful command leaves them in the clone. Workflow teardown runs before the automatic leftover commit: use `commit_changes` then `push_branch` before `create_pull_request` when the PR must already include those edits. A later automatic push updates the same branch.
 
-If the push fails (for example the branch moved on `origin`, or the credentials are rejected), the command ends with status `error`, exit code 1 and `stage: "push"`, with git's error text included. Local commits stay in the clone; nothing is retried or forced.
+Push-back retries temporary failures where Git received no response from the
+remote. Authentication failures and remote rejections (such as a protected
+branch, hook refusal or non-fast-forward update) are not retried. A response
+from the remote, even an error response, ends the attempt. Before retrying,
+awman checks whether `origin` already points at the commit being published; if
+so, it treats publication as successful without pushing again. Cancellation
+during a retry wait ends with `cancelled`. The retries are bounded and do not
+force-push.
 
-The push runs on the host as the user running the daemon, using that user's git credentials (SSH keys, credential helpers). Make sure that account can push to `repo_url`. Host push-back uses isolated Git metadata with hooks and repository-configured helpers disabled; the destination comes from the session's saved URL. Each host push-back Git operation times out after two minutes.
+The structured `result.failure` distinguishes these outcomes:
+
+| `stage` | `code` | Meaning |
+|---------|--------|---------|
+| `git_auth` | `git_auth_failed` | Git credentials were refused or unavailable during a Git operation. |
+| `push` | `push_unreachable` | Push-back could not get a remote response before retrying was exhausted. |
+| `push` | `push_failed` | The remote rejected the push or another non-retryable push error occurred. |
+| current operation | `cancelled` | The command was cancelled, including during retry wait. |
+| `git_auth` | `credentials_lost` | The session had `git_auth`, but a daemon restart cleared its in-memory credential. |
+
+Each scheduled retry also emits a `push_retry` event with `attempt`,
+`max_attempts`, `operation` (`push` or `ls-remote`), `delay_ms` and a safe
+`remote` identifier. It contains no Git output or credentials. Clients can
+detect these result codes and events through the `push_retry_codes` and
+`push_retry_events` capabilities; `git_auth_failure` identifies support for
+the structured Git authentication failure code.
+
+After a failure, local commits remain in an open session's clone. A run with
+`close_on_finish: true` closes the session and deletes its clone after retries
+and final result recording, including on failure. Leave `close_on_finish` false
+when you need to recover unpublished commits. Correct remote branch policy
+and submit another successful command to publish the remaining changes. If
+session credentials have expired or were lost, preserve the commits before
+opening a new credentialed session. If the command was cancelled or the connection was lost,
+inspect the remote branch first: a push may have landed before awman observed
+the interruption. An already-published matching commit is recognized on the
+next push attempt.
+
+The push runs on the host as the user running the daemon. Without `git_auth`,
+Git uses that user's global configuration and credentials, including SSH keys
+and global credential helpers. With `git_auth`, awman uses the supplied
+credential without falling back to global authentication files. Make sure the
+selected credential can access `repo_url`. Host push-back uses isolated Git
+metadata with hooks and repository-configured helpers disabled; the
+destination comes from the session's saved URL. System Git configuration is
+not read.
 
 **Local sessions** bind to an existing directory on the server. The directory must be in the allowlist (a `daemon.features.worker.push.workDirs.allow` entry, or a Git repository directly beneath a `daemon.features.worker.push.workDirs.roots` root). Commands run against that directory; an `exec workflow` with `--worktree` (implied by the API's default `--yolo`) runs in a worktree of it under `~/.awman/worktrees/`.
 
@@ -1154,6 +1224,35 @@ Returns immediately with a command ID — the command is **enqueued** and execut
   "flags_applied": { "yolo": true, "headless": true }
 }
 ```
+
+The optional `secrets` field supplies values for command overlays that request
+`env(NAME)`:
+
+```json
+{
+  "session_id": "<session-id>",
+  "subcommand": "exec prompt",
+  "args": ["hello"],
+  "secrets": { "DEPLOY_TOKEN": "<value>" }
+}
+```
+
+It is also accepted as `command.secrets` by `POST /v1/worker/runs`. A command
+may supply up to 32 secrets. Each value must be a non-empty string of at most
+8192 bytes without NUL. Names are at most 128 bytes and must match
+`^[A-Z_][A-Z0-9_]*$`; duplicate names are rejected. These values override the
+host environment for the matching `env(NAME)` overlay. The overlay must
+explicitly request each variable; command secrets are not added to every
+container environment.
+
+Secret values exist in daemon memory for the command lifetime and are not
+written to the command record or idempotency record. After a daemon restart,
+queued commands whose secret values were lost fail before execution with
+`failure.stage: "preflight"` and `failure.code: "secrets_lost"`; submit the
+command again with its secrets. Events, command results and logs are redacted
+for registered secret values and common encoded forms. Redaction is not
+content scanning for files: `/awman/output` files and raw terminal bytes are
+not redacted and must not be used to store or display secrets.
 
 The command begins executing as soon as a worker claims it from the queue. **At most one command per session runs at any given time** — commands within a session are processed sequentially in FIFO order. If a command is already running, subsequent commands are queued and wait their turn (they do not block the API request).
 
@@ -1885,6 +1984,14 @@ The `capabilities` array lists what clients can detect without relying on the se
 `error_codes` means every error body carries a `code` ([Error responses](#error-responses)). `structured_results` means command records carry the structured [`result`](#get-command-status); `outputs` means the [outputs endpoints](#list-and-retrieve-command-outputs) exist; `event_source` means events carry `source` and the event stream accepts `?step=`; `step_activity` means `step_activity` events can appear. `command_record` means `GET /v1/worker/commands/:id` is served. `session_setup_status` means sessions carry `setup_status` and `setup_error` and `GET /v1/worker/sessions` accepts `setup_status`. `command_session_body` means `POST /v1/worker/commands` accepts `session_id` in the body. `remote_dynamic` means `--dynamic` is accepted in `args`; `workdir_roots` means workdir roots are honoured; `event_ids` means SSE frames carry `id:` and `Last-Event-ID` resumes. `resource_routes`, `feature_states`, `config_routes`, `grant_routes`, `typed_ids`, `list_pages` and `headless_interaction` mean the [route tree](#route-tree), feature states, `/v1/config*`, `/v1/grants*`, prefixed IDs, list envelopes and the `interaction` request field.
 
 New capabilities are added to `capabilities`, never removed, so check for a capability rather than comparing versions.
+
+Git and credential capabilities describe current API behavior:
+`git_auth_failure` advertises structured Git authentication failures;
+`push_retry_events` advertises `push_retry` events;
+`push_retry_codes` advertises `push_unreachable` and `cancelled` push failure
+codes; `session_git_auth` advertises session credential input on supported
+platforms; and `command_secrets` advertises command-scoped `secrets` delivery
+and event/result redaction.
 
 ---
 

@@ -599,7 +599,7 @@ fn spawn_output_drains(
     // Drain stdout → translator → event bus (line-buffered).
     event_bus_stdout.clone().spawn_drain(async move {
         let shutdown = event_bus_stdout.output_shutdown();
-        let mut translator = crate::engine::agent_output::translator_for(format);
+        let mut translator = crate::engine::agent_output::translator_for_redacted(format, event_bus_stdout.redaction());
         let emit = |items: Vec<Translated>| {
             for item in items {
                 emit_translated(&event_bus_stdout, final_message.as_ref(), item);
@@ -617,7 +617,7 @@ fn spawn_output_drains(
                 let items = if line.truncated && format.is_structured() {
                     // A partial protocol frame is neither text nor a final
                     // answer. Forget any earlier candidate before EOF fallback.
-                    translator = crate::engine::agent_output::translator_for(format);
+                    translator = crate::engine::agent_output::translator_for_redacted(format, event_bus_stdout.redaction());
                     vec![Translated::Activity {
                         kind: crate::data::execution_event::StepActivityKind::Message,
                         summary: "Agent frame too large; final message may be unavailable".into(),
@@ -1190,10 +1190,7 @@ impl WorkflowFrontend for ApiDispatchFrontend {
 
     fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
         let Some(index) = self.step_index_for(&step.name) else {
-            tracing::warn!(
-                step = step.name,
-                "Skipping step transition without a definition index"
-            );
+            tracing::warn!("Skipping step transition without a definition index");
             return;
         };
         if matches!(status, WorkflowStepStatus::Succeeded) {

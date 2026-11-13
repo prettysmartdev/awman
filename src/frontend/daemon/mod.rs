@@ -36,6 +36,15 @@ pub async fn run(
 /// still holds the startup lock, then `server.json` is written and the claim
 /// released.
 pub async fn serve(runtime: Arc<DaemonRuntime>, claim: DaemonClaim) -> Result<(), CommandError> {
+    // Install handlers before publishing an endpoint. Another runtime thread
+    // can serve status immediately after bind, before this task next polls.
+    let mut signals = match ShutdownSignals::new() {
+        Ok(signals) => signals,
+        Err(error) => {
+            runtime.shutdown(StopMode::Now).await;
+            return Err(error);
+        }
+    };
     let api = Arc::new(DaemonApi::new(runtime.clone()));
     let paths = runtime.daemon_paths().clone();
     let bound = local::start_claimed(
@@ -73,13 +82,13 @@ pub async fn serve(runtime: Arc<DaemonRuntime>, claim: DaemonClaim) -> Result<()
             _ = exit.cancelled() => {
                 tracing::info!("awman daemon exit requested");
             }
-            _ = shutdown_signal() => {
+            _ = signals.wait() => {
                 tracing::info!("awman daemon stopping on signal");
             }
     }
     tokio::select! {
         _ = runtime.shutdown(StopMode::Drain) => {},
-        _ = shutdown_signal() => runtime.shutdown(StopMode::Now).await,
+        _ = signals.wait() => runtime.shutdown(StopMode::Now).await,
     }
     drop(network);
     listener.shutdown().await;
@@ -89,33 +98,50 @@ pub async fn serve(runtime: Arc<DaemonRuntime>, claim: DaemonClaim) -> Result<()
 }
 
 /// SIGINT or SIGTERM (Ctrl-C / Ctrl-Break on Windows).
-async fn shutdown_signal() {
+struct ShutdownSignals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(term) => term,
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
-        }
-    }
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
     #[cfg(windows)]
-    {
-        let mut stop =
-            tokio::signal::windows::ctrl_break().expect("install daemon Ctrl-Break handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = stop.recv() => {}
+    interrupt: tokio::signal::windows::CtrlC,
+    #[cfg(windows)]
+    terminate: tokio::signal::windows::CtrlBreak,
+}
+impl ShutdownSignals {
+    fn new() -> Result<Self, CommandError> {
+        let error =
+            |e| CommandError::Other(format!("cannot install daemon shutdown handlers: {e}"));
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt()).map_err(error)?,
+                terminate: signal(SignalKind::terminate()).map_err(error)?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                interrupt: tokio::signal::windows::ctrl_c().map_err(error)?,
+                terminate: tokio::signal::windows::ctrl_break().map_err(error)?,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = error;
+            Ok(Self {})
         }
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+    async fn wait(&mut self) {
+        #[cfg(any(unix, windows))]
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }

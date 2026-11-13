@@ -640,6 +640,14 @@ impl WorkflowPrerequisiteFlow {
         let report = Self::run_preflight_with_messages(&preflight, frontend);
         let resolved_needs = preflight.resolved_prerequisites(&report);
         let redaction = RedactionSet::new();
+        self.engines
+            .ephemeral_secrets
+            .register_current_git_redaction(&redaction);
+        if let Some(secrets) = self.engines.command_secrets() {
+            for secret in secrets.values() {
+                redaction.add(secret.clone());
+            }
+        }
         let outcome = self.resolve(&resolved_needs, report, &redaction, frontend)?;
         let remotes = self.remotes_for(&resolved_needs);
         Ok(PreparedPrerequisites {

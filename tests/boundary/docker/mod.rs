@@ -209,3 +209,110 @@ fn the_engine_store_exports_an_image_and_serves_it_from_cache() {
     assert!(missing.to_string().contains("does-not-exist"));
     sandbox.finish();
 }
+
+/// An image with Git for the session credential socket proof: the
+/// `docker-git-image` host resource, or a pinned `alpine/git`.
+fn git_image(engine: &Engine) -> String {
+    let reference = awman_test_support::runtime_env::get()
+        .host_resource("docker-git-image")
+        .filter(|r| !r.is_empty())
+        .unwrap_or("alpine/git:v2.45.2")
+        .to_string();
+    let present =
+        engine.has_image(&reference) || engine.run(&["pull", "--quiet", &reference]).exit.success();
+    assert!(
+        present,
+        "BLOCKED[docker]: Git image {reference} is neither present nor pullable; \
+         name one with docker-git-image=<reference> in AWMAN_TEST_HOST_RESOURCES"
+    );
+    reference
+}
+
+/// WI 0145: a teardown/setup Git step of a `git_auth` push session reaches
+/// the command's mounted `credential-cache` socket with nothing but Git, gets
+/// the credential for the session's repository only, and the token is never
+/// in the container's environment. Runs the exact helper configuration
+/// `push_branch` renders (`PushAuth::SessionSocket`).
+#[cfg(target_os = "linux")]
+#[test]
+fn teardown_git_uses_the_mounted_credential_socket_only_for_the_session_host() {
+    use awman::data::git_transport::{GitAuthKind, GitAuthSpec};
+    use awman::engine::git::credential_socket::{
+        CacheSocketListener, CONTAINER_CREDENTIAL_DIR, CONTAINER_CREDENTIAL_SOCKET,
+    };
+    use awman::engine::git::lease_transport::CredentialScope;
+    use awman::engine::workflow::step_commands::{transport_git, PushAuth, StepCommandOptions};
+
+    let mut sandbox = support::sandbox(
+        "docker::teardown_git_uses_the_mounted_credential_socket_only_for_the_session_host",
+    );
+    let engine = Engine::grant(&mut sandbox);
+    let image = git_image(&engine);
+    let token = "test-secret-container-socket";
+    engine.sandbox.redact(token);
+    let listener = CacheSocketListener::start(
+        &engine.sandbox.root().join("r"),
+        std::sync::Arc::new(
+            GitAuthSpec::new(GitAuthKind::Token, None, SecretString::new(token)).unwrap(),
+        ),
+        CredentialScope::for_http_url("https://git.example/team/repo.git").unwrap(),
+    )
+    .expect("the per-command listener starts");
+    let runtime = ContainerRuntime::docker_in(engine.snapshot());
+    let env = HashMap::from([("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())]);
+    let overlays = [OverlaySpec {
+        host_path: listener.dir().to_path_buf(),
+        container_path: PathBuf::from(CONTAINER_CREDENTIAL_DIR),
+        permission: OverlayPermission::ReadWrite,
+    }];
+    let workdir = engine.sandbox.work();
+    let name = "awman-boundary-git-socket";
+    let container = runtime
+        .launch_background(&BackgroundLaunchRequest {
+            secret_env: &[],
+            name: Some(name),
+            image: &image,
+            workdir: &workdir,
+            env: &env,
+            overlays: &overlays,
+            builtin_launch: None,
+        })
+        .expect("a background container starts with the socket directory");
+    let cleanup = engine::Cleanup::new(&engine);
+    cleanup.container(name);
+    let git = transport_git(&StepCommandOptions {
+        push_auth: PushAuth::SessionSocket {
+            socket: CONTAINER_CREDENTIAL_SOCKET.into(),
+        },
+        remote_url: Some("https://git.example/team/repo.git".into()),
+    });
+    let fill = |request: &str| {
+        container
+            .exec(
+                &format!("printf '{request}' | {git} credential fill 2>&1; echo \"exit=$?\""),
+                None,
+            )
+            .expect("exec runs git credential fill")
+            .stdout
+    };
+    let session = fill("protocol=https\\nhost=git.example\\npath=team/repo.git\\n\\n");
+    let other_host = fill("protocol=https\\nhost=evil.example\\npath=team/repo.git\\n\\n");
+    let other_repo = fill("protocol=https\\nhost=git.example\\npath=team/other.git\\n\\n");
+    let environment = engine.run_ok(&["inspect", "--format", "{{json .Config.Env}}", name]);
+    container.kill().expect("the container is removed");
+    assert!(
+        session.contains(&format!("password={token}")) && session.contains("exit=0"),
+        "the session repository got no credential: {session}"
+    );
+    for refused in [&other_host, &other_repo] {
+        assert!(!refused.contains(token), "another repository got the token");
+        assert!(!refused.contains("exit=0"), "{refused}");
+    }
+    assert!(
+        !environment.contains(token),
+        "the token is in the container env"
+    );
+    drop(cleanup);
+    drop(listener);
+    sandbox.finish();
+}

@@ -351,6 +351,7 @@ impl Command for ExecPromptCommand {
             };
 
             let mut run_opts = AgentRunOptions {
+                command_secrets: self.engines.command_secrets(),
                 yolo: self.flags.yolo.then_some(YoloMode::Enabled),
                 auto: self.flags.auto.then_some(AutoMode::Enabled),
                 plan: self.flags.plan.then_some(PlanMode::Enabled),

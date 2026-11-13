@@ -21,6 +21,13 @@ pub enum PushAuth {
     HttpsToken {
         env_var: String,
     },
+    /// WI 0145: a push session's caller credential through the command's
+    /// mounted `credential-cache` socket (`socket` is the container path).
+    /// The container needs only Git; the listener answers for the session's
+    /// repository host only.
+    SessionSocket {
+        socket: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -58,6 +65,12 @@ pub fn transport_git(opts: &StepCommandOptions) -> String {
         git.push_str(&format!(
             " -c credential.useHttpPath=true -c {}",
             sh_quote(&helper)
+        ));
+    }
+    if let PushAuth::SessionSocket { socket } = &opts.push_auth {
+        git.push_str(&format!(
+            " -c credential.useHttpPath=true -c {}",
+            sh_quote(&format!("credential.helper=cache --socket {socket}"))
         ));
     }
     git

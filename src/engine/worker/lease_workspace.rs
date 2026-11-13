@@ -283,36 +283,14 @@ impl<'a> LeaseCheckout<'a> {
         let dir = workspace.clone_dir();
         self.git
             .clone_with_lease_transport(&repo.url, None, dir, self.transport, sink, cancel)?;
-        // Setup fetch: any merge ref the clone did not bring (it fetches all
-        // heads, so this only runs for refs created since).
-        let missing: Vec<&String> = repo
-            .merge_refs
-            .iter()
-            .filter(|r| self.git.remote_ref_sha(dir, "origin", r).is_none())
-            .collect();
-        if !missing.is_empty() {
-            // Merge refs the clone did not bring: ask the remote (merge-ref
-            // `ls-remote`, same lease transport) and fetch only branches.
-            let advertised =
-                self.git
-                    .ls_remote_with_lease_transport(&repo.url, self.transport, sink, cancel)?;
-            let mut refspecs = Vec::new();
-            for name in missing {
-                if advertised.contains_key(&format!("refs/heads/{name}")) {
-                    refspecs.push(format!("+refs/heads/{name}:refs/remotes/origin/{name}"));
-                } else if advertised.contains_key(&format!("refs/tags/{name}")) {
-                    return Err(crate::engine::error::EngineError::Git(format!(
-                        "merge ref '{name}' is a tag on origin; merge_refs must name branches"
-                    )));
-                } else {
-                    return Err(crate::engine::error::EngineError::Git(format!(
-                        "merge ref '{name}' does not exist on origin"
-                    )));
-                }
-            }
-            self.git
-                .fetch_with_lease_transport(dir, &refspecs, self.transport, sink, cancel)?;
-        }
+        self.git.fetch_missing_merge_refs(
+            dir,
+            &repo.url,
+            &repo.merge_refs,
+            &self.transport.host_transport(),
+            sink,
+            &crate::engine::git::transport::TransportGuard::new(cancel.clone()),
+        )?;
         let (resumed_branch, start_point) = if self
             .git
             .remote_ref_sha(dir, "origin", &repo.branch)

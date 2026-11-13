@@ -59,6 +59,7 @@ fn lease_factory_for(
 /// engines accept per-invocation flag values.
 #[derive(Clone)]
 pub struct Engines {
+    pub ephemeral_secrets: Arc<super::ephemeral_secrets::EphemeralSecrets>,
     /// Cross-paradigm trait-object handle. Used for build(), list_running(),
     /// stats(), stop(), attach(), is_available(), capabilities() and
     /// other operations that exist on both paradigms.
@@ -106,6 +107,10 @@ pub struct Engines {
 }
 
 impl Engines {
+    pub fn command_secrets(&self) -> Option<Arc<crate::data::secret::CommandSecrets>> {
+        self.ephemeral_secrets.current()
+    }
+
     /// Assemble the engines for a session-backed command invocation.
     ///
     /// This is the single owner of the Layer 1 graph formerly assembled by
@@ -176,6 +181,7 @@ impl Engines {
 
         let workflow_root = api_paths.data_paths().root().to_path_buf();
         Ok(Self {
+            ephemeral_secrets: Arc::new(Default::default()),
             runtime,
             container_runtime,
             sandbox_runtime,
@@ -197,6 +203,7 @@ impl Engines {
         global_config: Arc<ConfigFile>,
     ) -> Self {
         Self {
+            ephemeral_secrets: Arc::new(Default::default()),
             runtime: Arc::new(
                 crate::command::commands::api_server::owned_runtime::CommandOwnedRuntime::new(
                     core.runtime().clone(),
@@ -243,6 +250,7 @@ impl Engines {
         );
 
         Ok(Self {
+            ephemeral_secrets: Arc::new(Default::default()),
             runtime,
             container_runtime,
             sandbox_runtime,

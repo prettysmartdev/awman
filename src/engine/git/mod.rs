@@ -17,13 +17,16 @@ use crate::engine::error::{EngineError, MergeFailedDetail};
 
 pub mod auth_classify;
 mod command_result;
+pub mod credential_socket;
 pub mod frontend;
 mod host_command;
 pub mod lease_transport;
 pub mod pull_request;
+pub mod push_publish;
 pub mod push_retry;
 pub mod remote_push;
 mod session_worktree;
+pub mod transport;
 
 pub use frontend::{GitCommand, GitFrontend};
 pub use session_worktree::{FetchLocalOutcome, WorktreeEntry, WorktreeUpdate};
@@ -2173,25 +2176,20 @@ impl GitEngine {
         &self,
         url: &str,
         names: &[String],
+        transport: &transport::HostGitTransport,
+        guard: &transport::TransportGuard,
     ) -> Result<Option<String>, EngineError> {
-        let scratch = tempfile::tempdir().map_err(|e| EngineError::Git(e.to_string()))?;
-        let mut command = host_command::command(&self.env, scratch.path());
-        command
-            .args(["ls-remote", "--heads", "--tags", url])
-            .current_dir(scratch.path())
-            .env("GIT_TERMINAL_PROMPT", "0");
-        let output = crate::engine::host_cli::checked_output(&mut command, "git ls-remote")
-            .map_err(|e| EngineError::Git(format!("cannot validate merge_refs: {e}")))?;
-        let listing = String::from_utf8_lossy(&output.stdout);
-        let advertised: std::collections::HashSet<&str> = listing
-            .lines()
-            .filter_map(|line| line.split_once('\t').map(|(_, r)| r))
-            .collect();
+        let advertised = self.ls_remote_with_transport(
+            url,
+            transport,
+            &mut crate::data::message::RecordingMessageSink::new(),
+            guard,
+        )?;
         Ok(names
             .iter()
             .find(|name| {
-                advertised.contains(format!("refs/tags/{name}").as_str())
-                    && !advertised.contains(format!("refs/heads/{name}").as_str())
+                advertised.contains_key(format!("refs/tags/{name}").as_str())
+                    && !advertised.contains_key(format!("refs/heads/{name}").as_str())
             })
             .cloned())
     }

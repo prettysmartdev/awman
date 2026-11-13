@@ -40,6 +40,9 @@ pub const GITHUB_TOKEN: &str = "GITHUB_TOKEN";
 
 /// Trusted host Git transport overrides, preserved by remote-session push-back.
 pub const AWMAN_LEASE_CREDENTIAL_FILE: &str = "AWMAN_LEASE_CREDENTIAL_FILE";
+/// WI 0145: the push-session credential socket the hidden Git helper relays
+/// to. A path only; the credential stays in daemon memory.
+pub const AWMAN_GIT_CREDENTIAL_SOCKET: &str = "AWMAN_GIT_CREDENTIAL_SOCKET";
 
 pub const GIT_SSH_COMMAND: &str = "GIT_SSH_COMMAND";
 pub const GIT_SSH: &str = "GIT_SSH";
@@ -113,6 +116,7 @@ pub const PROCESS_VARS: &[&str] = &[
     AWMAN_HOME,
     AWMAN_REMOTE_SESSION,
     AWMAN_LEASE_CREDENTIAL_FILE,
+    AWMAN_GIT_CREDENTIAL_SOCKET,
     AWMAN_TEST_ISOLATION,
     AWMAN_TEST_DOCKER,
     AWMAN_TEST_APPLE_CONTAINER,
@@ -423,6 +427,9 @@ impl EnvSnapshot {
     }
     pub fn lease_credential_file(&self) -> Option<PathBuf> {
         self.get_os(AWMAN_LEASE_CREDENTIAL_FILE).map(PathBuf::from)
+    }
+    pub fn git_credential_socket(&self) -> Option<PathBuf> {
+        self.get_os(AWMAN_GIT_CREDENTIAL_SOCKET).map(PathBuf::from)
     }
     pub fn spawn_env(&self) -> impl Iterator<Item = (&std::ffi::OsStr, &std::ffi::OsStr)> {
         self.native

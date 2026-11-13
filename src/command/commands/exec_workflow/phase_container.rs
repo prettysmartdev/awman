@@ -63,11 +63,14 @@ impl PhaseContainerFactory<'_> {
     pub fn build(
         &self,
         step: &PhaseStepRef,
-        env: &HashMap<String, String>,
+        env: &super::prepare::PhaseEnvironment,
         overlays: &[OverlaySpec],
     ) -> Result<Box<dyn AgentExec>, EngineError> {
         let launch = self.agent_engine.builtin_launch_settings(self.session)?;
-        let container: Box<dyn AgentExec> = if self.interactive && self.secret_env.is_empty() {
+        let mut secret_env = self.secret_env.to_vec();
+        // Caller overrides come last, including names also supplied by grants.
+        secret_env.extend(env.secret_env.iter().cloned());
+        let container: Box<dyn AgentExec> = if self.interactive && secret_env.is_empty() {
             Box::new(InteractivePhaseContainer::new(
                 self.runtime.clone(),
                 self.frontend.clone(),
@@ -75,7 +78,7 @@ impl PhaseContainerFactory<'_> {
                 self.image,
                 PhaseContainerWorkspace {
                     workdir: self.workdir.to_path_buf(),
-                    env: env.clone(),
+                    env: env.env.clone(),
                     overlays: overlays.to_vec(),
                     builtin_launch: launch,
                 },
@@ -86,7 +89,7 @@ impl PhaseContainerFactory<'_> {
                 .map(|prefix| format!("{prefix}phase-{}", uuid::Uuid::new_v4().simple()));
             Box::new(self.runtime.start_background(
                 &crate::engine::container::background::BackgroundLaunchRequest {
-                    secret_env: self.secret_env,
+                    secret_env: &secret_env,
                     name: name.as_deref(),
                     image: self.image,
                     workdir: self.workdir,

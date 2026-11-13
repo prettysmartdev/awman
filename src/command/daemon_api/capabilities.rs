@@ -64,6 +64,21 @@ pub const CAPABILITIES: &[&str] = &[
     "launch_contexts",
     "engine_catalogue",
     "web_frontend",
+    // WI 0145 slice 1: uniform push-session Git authentication failures.
+    "git_auth_failure",
+    // WI 0145 slice 2: typed `push_retry` events (attempt, operation,
+    // `delay_ms`, sanitized remote) while push-back retries.
+    "push_retry_events",
+    // WI 0145 slice 2: push-back results distinguish `push_unreachable`
+    // (retries exhausted) and `cancelled` from `push_failed`.
+    "push_retry_codes",
+    // WI 0145 slice 3: `git_auth` on session creation, delivered to every
+    // push-session Git operation through the one-shot socket helper
+    // (`credentials_lost` after a restart). Unix only: omitted elsewhere.
+    "session_git_auth",
+    // WI 0145: `secrets` on command submission, injected for `env(NAME)`
+    // overlays, redacted from events/results, `secrets_lost` after restart.
+    "command_secrets",
 ];
 
 /// WI 0143: capabilities of the pull worker, in their fixed order. Each is
@@ -85,7 +100,66 @@ pub fn advertised(mounts_outputs: bool, pull: &[&str]) -> Vec<String> {
     CAPABILITIES
         .iter()
         .filter(|c| mounts_outputs || **c != "outputs")
+        .filter(|c| crate::engine::git::credential_socket::supported() || **c != "session_git_auth")
         .chain(PULL_CAPABILITIES.iter().filter(|c| pull.contains(c)))
         .map(|c| c.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn auth_capability_is_present_without_outputs_or_pull_and_not_duplicated() {
+        let base = advertised(false, &[]);
+        assert_eq!(
+            base.iter()
+                .filter(|c| c.as_str() == "git_auth_failure")
+                .count(),
+            1
+        );
+        assert!(!base
+            .iter()
+            .any(|c| c == "outputs" || c == "lease_git_auth_failure"));
+        let with_pull = advertised(true, PULL_CAPABILITIES);
+        let mut expected = CAPABILITIES
+            .iter()
+            .filter(|c| cfg!(unix) || **c != "session_git_auth")
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>();
+        expected.extend(PULL_CAPABILITIES.iter().map(|c| c.to_string()));
+        assert_eq!(with_pull, expected);
+    }
+
+    #[test]
+    fn push_retry_flags_follow_auth_once_and_independent_of_later_slices() {
+        let base = advertised(false, &[]);
+        let at = |flag: &str| {
+            assert_eq!(base.iter().filter(|c| c.as_str() == flag).count(), 1);
+            base.iter().position(|c| c == flag).unwrap()
+        };
+        assert!(at("git_auth_failure") < at("push_retry_events"));
+        assert!(at("push_retry_events") < at("push_retry_codes"));
+    }
+
+    #[test]
+    fn credential_and_secret_flags_follow_push_retry_once() {
+        let base = advertised(false, &[]);
+        let at = |flag: &str| base.iter().position(|c| c == flag);
+        assert_eq!(
+            base.iter()
+                .filter(|c| c.as_str() == "command_secrets")
+                .count(),
+            1
+        );
+        assert!(at("push_retry_codes") < at("command_secrets"));
+        if cfg!(unix) {
+            assert!(at("push_retry_codes") < at("session_git_auth"));
+            assert!(at("session_git_auth") < at("command_secrets"));
+        } else {
+            assert_eq!(at("session_git_auth"), None);
+        }
+        // WSP keeps 0143's lease credential capability name.
+        assert!(PULL_CAPABILITIES.contains(&"lease_credentials"));
+    }
 }

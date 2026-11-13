@@ -196,10 +196,15 @@ and normal SSH configuration.
 Heartbeats extend the lease expiry confirmed by the server. A lease operation
 failure, expiry, lease loss, or revoked link stops the run and its in-flight
 Git work and prevents stale result reporting. A server cancellation reports a
-partial cancelled result. Credential refresh refusal stops publication. Push
-retry is limited to failures proven to happen before a remote response; any
-HTTP response, including 429 and 5xx, ends that push attempt. Git cannot undo
-a commit the remote accepted just before cancellation, but awman fences later
+partial cancelled result. Credential refresh refusal stops publication. Lease
+push-back retries only failures where no remote response was received; any
+HTTP response, including 429 and 5xx, ends that attempt. Before a retry, awman
+checks the remote branch so it can recognize a commit accepted before the
+connection failed, without publishing it twice. Retry progress is included as
+`push_retry` events with the attempt, operation, delay and sanitized remote;
+the event does not include Git output or credentials. Cancellation, expiry,
+credential refusal and remote rejection stop retrying. Git cannot undo a
+commit the remote accepted just before cancellation, but awman fences later
 work and reporting.
 
 The default daemon stop waits for running pulled work to finish. `awman daemon

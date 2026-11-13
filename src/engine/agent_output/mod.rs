@@ -95,6 +95,30 @@ pub fn translator_for(format: AgentOutputFormat) -> Box<dyn AgentOutputTranslato
     }
 }
 
+/// Redact complete input before the translator trims, removes controls or
+/// bounds an activity summary. The shared set includes JSON escaped forms.
+pub fn translator_for_redacted(
+    format: AgentOutputFormat,
+    redaction: crate::engine::auth::redaction::RedactionSet,
+) -> Box<dyn AgentOutputTranslator> {
+    struct Redacted {
+        inner: Box<dyn AgentOutputTranslator>,
+        redaction: crate::engine::auth::redaction::RedactionSet,
+    }
+    impl AgentOutputTranslator for Redacted {
+        fn feed_line(&mut self, stream: OutputStream, line: &str) -> Vec<Translated> {
+            self.inner.feed_line(stream, &self.redaction.redact(line))
+        }
+        fn finish(&mut self) -> Vec<Translated> {
+            self.inner.finish()
+        }
+    }
+    Box::new(Redacted {
+        inner: translator_for(format),
+        redaction,
+    })
+}
+
 /// Shared emission keeps the displayed transcript and result message identical.
 fn final_message(message: String) -> Vec<Translated> {
     // WI 0147: apply the same redaction as ordinary output to this message.
@@ -164,5 +188,35 @@ pub fn container_status_message(status: &crate::engine::agent_runtime::AgentStat
         AgentStatus::Stopping => "Stopping container...".to_string(),
         AgentStatus::Exited(code) => format!("Container exited with code {code}"),
         AgentStatus::Failed(reason) => format!("Container failed: {reason}"),
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+    #[test]
+    fn summaries_redact_before_truncation_trimming_and_control_removal() {
+        let set = crate::engine::auth::redaction::RedactionSet::new();
+        let secret = "test-secret-across-the-summary-boundary";
+        set.add(crate::data::secret::SecretString::new(secret));
+        set.add(crate::data::secret::SecretString::new(
+            "test\tcontrol-secret",
+        ));
+        let mut translator = translator_for_redacted(AgentOutputFormat::CodexJson, set);
+        for command in [
+            format!("{} {secret}", "x".repeat(175)),
+            "test\tcontrol-secret".into(),
+        ] {
+            let wire = serde_json::json!({"type":"item.started","item":{"type":"command_execution","command":command}}).to_string();
+            let events = translator.feed_line(OutputStream::Stdout, &wire);
+            let summary = match &events[0] {
+                Translated::Activity { summary, .. } => summary,
+                _ => panic!("activity missing"),
+            };
+            assert!(summary.contains("***"), "{summary}");
+            assert!(!summary.contains("test-secret"));
+            assert!(!summary.contains("control-secret"));
+            assert!(summary.chars().count() <= STEP_ACTIVITY_SUMMARY_MAX_CHARS);
+        }
     }
 }

@@ -9,13 +9,18 @@ pub fn persist_workflow_snapshot(
     events: &EventBusSender,
     state: &WorkflowState,
 ) {
-    match writer.write(state) {
-        Ok(()) => match serde_json::to_value(state) {
-            Ok(value) => events.emit(EventPayload::WorkflowState(
-                crate::command::daemon_api::workflow_view::client_view(value),
-            )),
-            Err(error) => tracing::warn!(%error, "failed to project command workflow state"),
-        },
+    let mut value = match serde_json::to_value(state) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "failed to project command workflow state");
+            return;
+        }
+    };
+    events.redaction().redact_json(&mut value);
+    match writer.write(&value) {
+        Ok(()) => events.emit(EventPayload::WorkflowState(
+            crate::command::daemon_api::workflow_view::client_view(value),
+        )),
         Err(error) => tracing::warn!(%error, "failed to write command workflow state"),
     }
 }
@@ -214,7 +219,10 @@ impl ForegroundRecorder {
                 *self.format.lock().unwrap()
             };
             self.events.spawn_drain(async move {
-                let mut translator = crate::engine::agent_output::translator_for(format);
+                let mut translator = crate::engine::agent_output::translator_for_redacted(
+                    format,
+                    events.redaction(),
+                );
                 let stream = if stderr {
                     crate::engine::agent_output::OutputStream::Stderr
                 } else {
@@ -233,7 +241,10 @@ impl ForegroundRecorder {
                 });
                 let mut process = |line: FramedLine| {
                     let items = if line.truncated && format.is_structured() {
-                        translator = crate::engine::agent_output::translator_for(format);
+                        translator = crate::engine::agent_output::translator_for_redacted(
+                            format,
+                            events.redaction(),
+                        );
                         vec![Translated::Activity {
                             kind: crate::data::execution_event::StepActivityKind::Message,
                             summary: "Agent frame too large; final message may be unavailable"

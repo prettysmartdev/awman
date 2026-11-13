@@ -1189,3 +1189,91 @@ pub(super) fn clear_stdio_nonblocking() {
         clear_fd(std::io::stderr());
     }
 }
+
+#[cfg(test)]
+mod command_secrets_tests {
+    use super::*;
+    use crate::data::secret::{CommandSecrets, SecretString};
+    use crate::engine::agent::AgentRunOptions;
+    use std::sync::Arc;
+
+    #[test]
+    fn requested_command_secrets_override_host_env_with_name_only_runtime_argv() {
+        let secrets = Arc::new(
+            CommandSecrets::new([
+                ("TOKEN".into(), SecretString::new("test-secret-container")),
+                (
+                    "UNREQUESTED".into(),
+                    SecretString::new("test-secret-unrequested"),
+                ),
+            ])
+            .unwrap(),
+        );
+        let run = AgentRunOptions {
+            command_secrets: Some(secrets),
+            env_passthrough: Some(vec!["TOKEN".into(), "HOST_ONLY".into()]),
+            ..Default::default()
+        };
+        let options = ResolvedContainerOptions {
+            host_env: Some(crate::data::config::env::EnvSnapshot::with_overrides([
+                ("TOKEN", "host-token"),
+                ("HOST_ONLY", "host-value"),
+            ])),
+            env_passthrough: vec![
+                crate::engine::container::options::EnvVar("TOKEN".into()),
+                crate::engine::container::options::EnvVar("HOST_ONLY".into()),
+            ],
+            env_overrides: run.secret_env(),
+            ..Default::default()
+        };
+        let values = resolve_env_passthrough(&options);
+        assert_eq!(
+            values.iter().find(|(name, _)| name == "TOKEN").unwrap().1,
+            "test-secret-container"
+        );
+        assert!(values
+            .iter()
+            .any(|(name, value)| name == "HOST_ONLY" && value == "host-value"));
+        assert!(!values.iter().any(|(name, _)| name == "UNREQUESTED"));
+        let args = build_run_argv(
+            &ContainerName("test-container".into()),
+            &ImageRef("test-image".into()),
+            &options,
+        )
+        .unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["-e", "TOKEN"]));
+        assert!(!format!("{args:?} {options:?}").contains("test-secret"));
+    }
+
+    #[test]
+    fn private_env_overlay_suppresses_host_provider_credentials_even_without_host_env() {
+        use crate::engine::container::options::{ContainerOption, EnvVar};
+        let options = ResolvedContainerOptions::resolve_in(
+            [
+                ContainerOption::EnvPassthrough(EnvVar("ANTHROPIC_API_KEY".into())),
+                ContainerOption::EnvOverride {
+                    key: "ANTHROPIC_API_KEY".into(),
+                    value: SecretString::new("test-secret-caller-provider"),
+                },
+                ContainerOption::AgentCredentials {
+                    env_vars: vec![(
+                        "CLAUDE_CODE_OAUTH_TOKEN".into(),
+                        "test-secret-host-provider".into(),
+                    )],
+                },
+            ],
+            &crate::data::config::env::EnvSnapshot::with_overrides(
+                std::iter::empty::<(&str, &str)>(),
+            ),
+        )
+        .unwrap();
+        assert!(options.agent_credentials.is_empty());
+        assert_eq!(
+            resolve_env_passthrough(&options),
+            [(
+                "ANTHROPIC_API_KEY".into(),
+                "test-secret-caller-provider".into()
+            )]
+        );
+    }
+}

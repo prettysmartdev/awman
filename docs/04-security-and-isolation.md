@@ -266,6 +266,41 @@ Grants never reach `run_shell` or `run_script` steps, main agent steps, `on_fail
 
 If you configure `workflows.prerequisites.githubToken.acquire.argv`, awman may run that token command on the host. It runs an argv list without a shell, with a timeout and bounded output, and the process group is cleaned up on every exit. The tool must be an installed program outside any Git checkout; known agent binaries (including configured custom agents), shells, interpreters and launch wrappers are refused. Approval binds the argv, the resolved executable and its content, and awman runs a verified private copy, so changing the installed program requires a new approval. A repository-configured command is approved by its argument-list hash before use. Approving a tool also trusts whatever it runs, so never approve one that delegates to an agent. The token is held as a secret, never written to config or logs, and redacted from all workflow output. See [Workflow prerequisites](05-workflows.md#workflow-prerequisite-checks) and [Configuration](07-configuration.md#workflow-prerequisites).
 
+### API command secrets
+
+An API command may include a `secrets` map for values requested by an
+`env(NAME)` overlay. The map is limited to 32 entries; each non-empty value is
+at most 8192 bytes and contains no NUL. Names are at most 128 bytes and must
+match `^[A-Z_][A-Z0-9_]*$`. A command secret overrides the daemon's host
+environment for that matching overlay variable. It is delivered only when the
+overlay asks for that name; repositories and workflows that request an
+environment variable are trusted recipients of its value.
+
+Command secret values are held in daemon memory, not command rows or
+idempotency records. A daemon restart drops them. A queued command that still
+has a names-only marker but no in-memory values fails before dispatch with
+`secrets_lost`; submit it again with the values. awman redacts registered
+values and common encodings from command events, logs, and structured results,
+including JSON data and map keys. This protects awman-published text and
+records; it does not sanitize arbitrary artifacts. Files in `/awman/output`
+and terminal bytes are not redacted. Do not write secrets to output files or
+print them to a terminal.
+
+Values passed through `env(NAME)` become part of the receiving process or
+container environment. The receiving runtime and its operators can inspect
+that environment, so environment delivery is not a boundary against a trusted
+recipient or runtime administrator. Exact-value redaction also cannot prevent
+deliberate exfiltration or every novel encoding. Do not treat log redaction as
+a substitute for limiting which command and workflow receives a secret.
+
+Remote API sessions may also supply `git_auth` for Git clone, fetch and
+push-back. Those credentials remain in daemon memory and are served to Git via
+a local credential socket; they are not placed in Git process arguments or
+environment variables. A phase container that receives the socket is trusted
+with the reusable credential. After daemon restart, the credential is lost and
+the session fails closed with `credentials_lost`; create a new session and
+provide credentials again.
+
 ---
 
 ## The daemon engine

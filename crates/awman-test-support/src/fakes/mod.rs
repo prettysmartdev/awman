@@ -10,7 +10,7 @@ mod registry;
 mod work_server;
 
 pub use cli::{Call, FakeCli, Rule, FAKE_PROTOCOL};
-pub use git_http::FakeGitHttp;
+pub use git_http::{FakeGitHttp, GitHttpBuilder, GitHttpFault, GitHttpRequest};
 pub use registry::FakeRegistry;
 pub use work_server::FakeWorkServer;
 

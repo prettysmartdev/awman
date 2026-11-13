@@ -35,6 +35,7 @@ path = "tests/component/main.rs"
 # The library's own unit tests use it as a dev-dependency, and a dependency
 # back on the library would give them a second, incompatible copy of its types.
 [dependencies]
+base64 = { workspace = true }
 awman-wsp = { workspace = true, features = ["mock"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -432,6 +432,19 @@ pub enum EventPayload {
     /// A structured-output agent did something (WI 0137 §4). `summary` is one
     /// line of at most [`STEP_ACTIVITY_SUMMARY_MAX_CHARS`] characters. The
     /// step it belongs to is the envelope's `source`.
+    /// A push (WI 0145) got no remote response and will be retried after
+    /// `delay_ms`. `attempt` is the attempt about to be made (the first retry
+    /// is 2); `operation` is `push` or the `ls-remote` head check; `remote` is
+    /// the sanitized remote identifier. Never carries Git output or
+    /// credentials. Attributed to the push phase by the envelope's `source`.
+    #[serde(alias = "push_retry")]
+    PushRetry {
+        attempt: u8,
+        max_attempts: u8,
+        operation: String,
+        delay_ms: u64,
+        remote: String,
+    },
     #[serde(alias = "step_activity")]
     StepActivity {
         kind: StepActivityKind,
@@ -530,6 +543,7 @@ impl EventPayload {
             EventPayload::WorkflowParallelStepExited { .. } => "workflow_parallel_step_exited",
             EventPayload::WorkflowParallelGroupFinished => "workflow_parallel_group_finished",
             EventPayload::StepActivity { .. } => "step_activity",
+            EventPayload::PushRetry { .. } => "push_retry",
             EventPayload::CommandStatus { .. } => "command_status",
             EventPayload::ProgramStatus { .. } => "program_status",
             EventPayload::TerminalOpened { .. } => "terminal_opened",
@@ -581,6 +595,15 @@ impl EventPayload {
             EventPayload::WorkflowParallelGroupFinished => {
                 Some("[parallel] group finished".to_string())
             }
+            EventPayload::PushRetry {
+                attempt,
+                max_attempts,
+                operation,
+                delay_ms,
+                remote,
+            } => Some(format!(
+                "push retry {attempt}/{max_attempts} in {delay_ms} ms ({operation} to {remote})"
+            )),
             // The activity feed is additive: `output.log` stays the agent's
             // output lines only, exactly as before WI 0137.
             EventPayload::StepActivity { .. } => None,

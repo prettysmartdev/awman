@@ -95,6 +95,9 @@ struct CreateSessionRequest {
     push: bool,
     #[serde(default)]
     labels: Labels,
+    /// WI 0145: decoded before the generic body by `git_auth::SessionBody`.
+    #[serde(skip)]
+    git_auth: super::git_auth::GitAuthBody,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -119,6 +122,10 @@ pub struct SessionResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     merge_refs: Vec<String>,
     push: bool,
+    /// WI 0145: `{"kind": "token"|"basic"}` when the session holds a
+    /// caller credential. Never the credential itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    git_auth: Option<serde_json::Value>,
     #[serde(default)]
     #[serde(deserialize_with = "crate::command::daemon_api::worker::stored_labels")]
     labels: Labels,
@@ -132,26 +139,29 @@ pub struct SessionResponse {
 
 impl SessionResponse {
     /// The row projection plus its labels and, for a failed setup, the
-    /// `{stage, message}` recorded in the session's setup_state.json.
+    /// `{stage, message}` of the setup snapshot it serves.
+    ///
+    /// `setup_error` comes from the same snapshot as `setup` (the live bus,
+    /// else setup_state.json). Setup persists the row's `failed` status
+    /// before it writes setup_state.json, so reading the error from disk
+    /// alone could report `failed` without its error in between.
     fn new(state: &AppState, row: SessionRecord, labels: Labels) -> Self {
-        let setup_error = state
-            .lifecycle()
-            .setup_error(&row)
+        let mut setup = state
+            .setup_buses
+            .try_lock()
+            .ok()
+            .and_then(|buses| buses.get(&row.id).map(|bus| bus.snapshot()))
+            .or_else(|| state.paths.read_setup_state(&row.id))
+            .unwrap_or_default();
+        setup.status = row.setup_status;
+        let setup_error = (row.setup_status == SessionSetupStatus::Failed)
+            .then_some(setup.error.as_ref())
+            .flatten()
             .and_then(|error| serde_json::to_value(error).ok());
         Self {
             labels,
             setup_error,
-            setup: {
-                let mut setup = state
-                    .setup_buses
-                    .try_lock()
-                    .ok()
-                    .and_then(|buses| buses.get(&row.id).map(|bus| bus.snapshot()))
-                    .or_else(|| state.paths.read_setup_state(&row.id))
-                    .unwrap_or_default();
-                setup.status = row.setup_status;
-                Some(setup)
-            },
+            setup: Some(setup),
             ..Self::from(row)
         }
     }
@@ -176,6 +186,9 @@ impl From<SessionRecord> for SessionResponse {
             base_ref: s.base_ref,
             merge_refs: s.merge_refs,
             push: s.push,
+            git_auth: s
+                .git_auth_kind
+                .map(|kind| serde_json::json!({ "kind": kind })),
             labels: Labels::empty(),
         }
     }
@@ -183,6 +196,8 @@ impl From<SessionRecord> for SessionResponse {
 
 #[derive(Deserialize)]
 struct CreateCommandRequest {
+    #[serde(skip)]
+    secrets: super::command_secrets::SecretsBody,
     #[serde(default)]
     allow_remote_input: bool,
     #[serde(default)]
@@ -264,6 +279,7 @@ use crate::frontend::api::error::ApiError;
 impl From<CreateCommandRequest> for CommandSubmission {
     fn from(body: CreateCommandRequest) -> Self {
         Self {
+            secrets: body.secrets.0,
             allow_remote_input: body.allow_remote_input,
             subcommand: body.subcommand,
             args: body.args,
@@ -1729,8 +1745,12 @@ async fn handle_create_session(
     State(state): State<Arc<AppState>>,
     axum::Extension(listener): axum::Extension<crate::data::daemon_state::CommandListener>,
     headers: HeaderMap,
-    Json(value): Json<serde_json::Value>,
+    input: Result<Json<super::git_auth::SessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    let super::git_auth::SessionBody { value, git_auth } = match super::git_auth::decode(input) {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
     let mut context = crate::data::daemon_state::CommandRequestContext::from_header(
         listener,
         headers.get("traceparent").and_then(|v| v.to_str().ok()),
@@ -1744,10 +1764,11 @@ async fn handle_create_session(
         "/v1/worker/sessions",
         &value.to_string(),
         |journal| async move {
-            let body = match serde_json::from_value(value) {
+            let mut body: CreateSessionRequest = match serde_json::from_value(value) {
                 Ok(body) => body,
                 Err(error) => return bad_request(error.to_string()),
             };
+            body.git_auth = git_auth;
             create_submission(st, context, body, None, false, journal.as_deref()).await
         },
     )
@@ -1760,8 +1781,19 @@ async fn handle_create_run(
     State(state): State<Arc<AppState>>,
     axum::Extension(listener): axum::Extension<crate::data::daemon_state::CommandListener>,
     headers: HeaderMap,
-    Json(value): Json<serde_json::Value>,
+    input: Result<
+        Json<super::command_secrets::RequestBody<true>>,
+        axum::extract::rejection::JsonRejection,
+    >,
 ) -> Response {
+    let super::command_secrets::RequestBody {
+        value,
+        secrets,
+        git_auth,
+    } = match super::command_secrets::decode(input) {
+        Ok(body) => body,
+        Err(error) => return error.into_response(),
+    };
     let mut context = crate::data::daemon_state::CommandRequestContext::from_header(
         listener,
         headers.get("traceparent").and_then(|v| v.to_str().ok()),
@@ -1776,10 +1808,12 @@ async fn handle_create_run(
         "/v1/worker/runs",
         &canonical,
         |journal| async move {
-            let body: CreateRunRequest = match serde_json::from_value(value) {
+            let mut body: CreateRunRequest = match serde_json::from_value(value) {
                 Ok(body) => body,
                 Err(error) => return bad_request(error.to_string()),
             };
+            body.command.secrets = secrets;
+            body.session.git_auth = git_auth;
             if body.command.session_id.is_some() {
                 return bad_request(
                     "command.session_id is not accepted: a run creates its session",
@@ -1819,6 +1853,7 @@ async fn create_submission(
             base_ref: body.base_ref,
             merge_refs: body.merge_refs,
             push: body.push,
+            git_auth: body.git_auth.0,
         },
         labels: body.labels,
     };
@@ -2150,17 +2185,26 @@ async fn handle_create_command(
     State(state): State<Arc<AppState>>,
     axum::Extension(listener): axum::Extension<crate::data::daemon_state::CommandListener>,
     headers: HeaderMap,
-    Json(value): Json<serde_json::Value>,
+    input: Result<
+        Json<super::command_secrets::RequestBody<false>>,
+        axum::extract::rejection::JsonRejection,
+    >,
 ) -> Response {
+    let super::command_secrets::RequestBody { value, secrets, .. } =
+        match super::command_secrets::decode(input) {
+            Ok(body) => body,
+            Err(error) => return error.into_response(),
+        };
     let mut context = crate::data::daemon_state::CommandRequestContext::from_header(
         listener,
         headers.get("traceparent").and_then(|v| v.to_str().ok()),
     );
     context.listener_name = receiving.map(|r| r.0 .0);
-    let body: CreateCommandRequest = match serde_json::from_value(value.clone()) {
+    let mut body: CreateCommandRequest = match serde_json::from_value(value.clone()) {
         Ok(body) => body,
         Err(error) => return bad_request(error.to_string()),
     };
+    body.secrets = secrets;
     let session_id = match command_session_id(&headers, body.session_id.as_deref()) {
         Ok(session_id) => session_id,
         Err(response) => return *response,

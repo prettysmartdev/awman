@@ -48,21 +48,33 @@ pub enum EngineError {
     #[error("git operation failed: {0}")]
     Git(String),
 
-    /// Lease Git transport: the remote refused the credentials. Never
+    /// Host Git transport: the remote refused the credentials. Never
     /// retried; the command layer reports `failure.stage: "git_auth"`,
     /// `failure.code: "git_auth_failed"`.
-    #[error("git {operation} authentication failed: {message}")]
-    GitAuth { operation: String, message: String },
+    #[error("{message}")]
+    GitAuth {
+        operation: String,
+        remote: String,
+        message: String,
+    },
 
-    /// Lease Git transport: no response from the remote (connect, reset,
+    /// Host Git transport: no response from the remote (connect, reset,
     /// timeout). The only class a lease push retries.
-    #[error("git {operation} could not reach the remote: {message}")]
-    GitTransport { operation: String, message: String },
+    #[error("{message}")]
+    GitTransport {
+        operation: String,
+        remote: String,
+        message: String,
+    },
 
-    /// Lease Git transport: the remote answered and refused the operation
+    /// Host Git transport: the remote answered and refused the operation
     /// (non-fast-forward, protected branch, hook). Never retried.
-    #[error("git {operation} was rejected by the remote: {message}")]
-    GitRejected { operation: String, message: String },
+    #[error("{message}")]
+    GitRejected {
+        operation: String,
+        remote: String,
+        message: String,
+    },
 
     /// A `git merge` (or the squash merge's commit) exited non-zero. Carries
     /// the exact command and its output so the merge-fix agent's prompt and

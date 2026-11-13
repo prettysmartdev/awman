@@ -12,7 +12,6 @@ use crate::data::fs::config_file::write_config_file_atomically;
 use crate::data::fs::daemon_paths::DaemonPaths;
 use crate::data::fs::data_paths::DataPaths;
 use crate::data::session_setup_event::SessionSetupState;
-use crate::data::workflow_state::WorkflowState;
 
 /// Filename of the API sqlite database.
 pub const API_DB_FILENAME: &str = "awman.db";
@@ -327,7 +326,7 @@ impl ApiPaths {
         &self,
         session_id: &str,
         command_id: &str,
-        state: &WorkflowState,
+        state: &impl serde::Serialize,
     ) -> Result<(), DataError> {
         let path = self.command_workflow_state_path(session_id, command_id);
         let tmp_path = path.with_extension("json.tmp");

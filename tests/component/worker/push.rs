@@ -31,6 +31,7 @@ fn policy() -> PushRetryPolicy {
         base_backoff: Duration::from_millis(1),
         max_backoff: Duration::from_millis(2),
         deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
+        ..PushRetryPolicy::for_command(None)
     }
 }
 fn pusher(
@@ -277,6 +278,7 @@ async fn regression_3e8d7e6c_transport_retry_and_cancellation_are_bounded() {
     long.deadline = chrono::Utc::now() + chrono::Duration::minutes(10);
     long.base_backoff = Duration::from_secs(60);
     long.max_backoff = Duration::from_secs(60);
+    long.window = Duration::from_secs(600);
     let cancel = CancellationToken::new();
     let push = pusher(&sandbox, repo.path(), &url, long);
     let run = push.run(&cancel, &observer);
@@ -441,5 +443,266 @@ async fn fencing_during_upload_kills_git_before_it_can_publish() {
     assert_eq!(failure.unwrap_err().kind, LeasePushFailureKind::Cancelled);
     assert!(!stale.exists());
     assert!(observer.retries.lock().unwrap().is_empty());
+    sandbox.finish();
+}
+
+// WI 0145: the lease runs the shared push loop (`PushPublisher`) through its
+// `LeaseGate`. Smart-HTTP faults are injected by `FakeGitHttp`.
+
+struct LeaseWorld<'a> {
+    repo: awman_test_support::fixtures::Repo<'a>,
+    bare: std::path::PathBuf,
+}
+
+fn lease_world(sandbox: &TestSandbox) -> LeaseWorld<'_> {
+    sandbox.require::<awman_test_support::capability::LocalGit>();
+    sandbox.require::<awman_test_support::capability::Loopback>();
+    let repo = RepoBuilder::new(sandbox, "repo")
+        .file("initial", "base")
+        .init();
+    let bare = repo.bare_remote("origin");
+    repo.write("change", "worker").commit("worker");
+    LeaseWorld { repo, bare }
+}
+
+impl LeaseWorld<'_> {
+    fn remote_main(&self) -> String {
+        self.repo
+            .git(&[
+                "ls-remote",
+                self.bare.to_str().unwrap(),
+                "refs/heads/wsp/item",
+            ])
+            .split('\t')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    }
+}
+
+fn lease_pusher(
+    sandbox: &TestSandbox,
+    repo: &std::path::Path,
+    url: &str,
+    policy: PushRetryPolicy,
+    heartbeat: Duration,
+    expiry: tokio::sync::watch::Receiver<chrono::DateTime<chrono::Utc>>,
+) -> LeasePush {
+    let git = GitEngine::with_env(support::env_snapshot(sandbox))
+        .isolate_remote_push(repo, url)
+        .unwrap()
+        .with_lease_transport(LeaseTransport::anonymous(LeaseUrlPolicy {
+            allow_local: true,
+        }));
+    LeasePush::new(Arc::new(git), "wsp/item", policy, heartbeat).with_expiry(expiry)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn short_lease_expiry_stops_retries_before_fencing_and_never_claims_a_push() {
+    use awman_test_support::fakes::{FakeGitHttp, GitHttpFault};
+    let sandbox = support::sandbox(
+        "worker::push::short_lease_expiry_stops_retries_before_fencing_and_never_claims_a_push",
+    );
+    let world = lease_world(&sandbox);
+    let root = world.bare.parent().unwrap().to_path_buf();
+
+    // An unreachable remote: retries stop on their own before the lease
+    // expires (expiry − 2 × heartbeat, then half of what is left).
+    let server = FakeGitHttp::builder(&sandbox, &root)
+        .fault(|_| Some(GitHttpFault::DropBeforeResponse))
+        .start();
+    let heartbeat = Duration::from_secs(1);
+    let expires = chrono::Utc::now() + chrono::Duration::seconds(4);
+    let (_renewals, expiry) = tokio::sync::watch::channel(expires);
+    let policy = PushRetryPolicy {
+        max_attempts: 50,
+        base_backoff: Duration::from_millis(400),
+        max_backoff: Duration::from_millis(400),
+        window: Duration::from_secs(60),
+        ..PushRetryPolicy::for_lease(expires, heartbeat)
+    };
+    let observer = Observer::default();
+    let failure = tokio::time::timeout(
+        Duration::from_secs(10),
+        lease_pusher(
+            &sandbox,
+            world.repo.path(),
+            &server.url("origin.git"),
+            policy,
+            heartbeat,
+            expiry,
+        )
+        .run(&CancellationToken::new(), &observer),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(chrono::Utc::now() < expires, "retries outlived the lease");
+    assert_eq!(
+        failure.kind,
+        LeasePushFailureKind::Unreachable,
+        "{failure:?}"
+    );
+    assert_eq!(failure.code(), "push_unreachable");
+    assert!(
+        failure.attempts >= 2 && failure.attempts < 50,
+        "{failure:?}"
+    );
+    assert_eq!(
+        observer.retries.lock().unwrap().len(),
+        usize::from(failure.attempts - 1)
+    );
+    assert_eq!(server.receive_packs(), 0);
+    drop(server);
+
+    // The push lands but its response is lost; the heartbeat cannot renew
+    // and the lease is gone before the retry. The landed push is never
+    // claimed and nothing is pushed again.
+    let server = FakeGitHttp::builder(&sandbox, &root)
+        .drop_after_receive_pack()
+        .start();
+    let expires = chrono::Utc::now() + chrono::Duration::seconds(60);
+    let (renewals, expiry) = tokio::sync::watch::channel(expires);
+    let policy = PushRetryPolicy {
+        base_backoff: Duration::from_millis(500),
+        max_backoff: Duration::from_millis(500),
+        ..PushRetryPolicy::for_lease(expires, heartbeat)
+    };
+    let observer = Observer::default();
+    let push = lease_pusher(
+        &sandbox,
+        world.repo.path(),
+        &server.url("origin.git"),
+        policy,
+        heartbeat,
+        expiry,
+    );
+    let cancel = CancellationToken::new();
+    let lose_lease = async {
+        observer.signal.notified().await;
+        renewals
+            .send(chrono::Utc::now() - chrono::Duration::seconds(1))
+            .unwrap();
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::join!(push.run(&cancel, &observer), lose_lease)
+    })
+    .await
+    .unwrap();
+    let failure = result.expect_err("a lost epoch never claims the push");
+    assert!(
+        matches!(
+            failure.kind,
+            LeasePushFailureKind::Unreachable | LeasePushFailureKind::Cancelled
+        ),
+        "{failure:?}"
+    );
+    assert_eq!(failure.attempts, 1);
+    assert_eq!(server.receive_packs(), 1, "never pushed again");
+    assert_eq!(world.remote_main(), world.repo.head());
+    drop(server);
+    drop(world);
+    sandbox.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lease_retry_emits_the_typed_push_retry_event() {
+    use awman::data::git_transport::{GitTransportOp, SafeRemote};
+    use awman_test_support::fakes::FakeGitHttp;
+    let sandbox = support::sandbox("worker::push::lease_retry_emits_the_typed_push_retry_event");
+    let world = lease_world(&sandbox);
+    let server = FakeGitHttp::builder(&sandbox, world.bare.parent().unwrap())
+        .fail_before_response(1)
+        .start();
+    let url = server.url("origin.git");
+    let expires = chrono::Utc::now() + chrono::Duration::seconds(60);
+    let (_renewals, expiry) = tokio::sync::watch::channel(expires);
+    let observer = Observer::default();
+    let outcome = lease_pusher(
+        &sandbox,
+        world.repo.path(),
+        &url,
+        policy(),
+        Duration::from_secs(1),
+        expiry,
+    )
+    .run(&CancellationToken::new(), &observer)
+    .await
+    .unwrap();
+    assert_eq!(
+        outcome,
+        LeasePushOutcome::Pushed {
+            sha: world.repo.head(),
+            attempts: 2
+        }
+    );
+    let retries = observer.retries.lock().unwrap().clone();
+    assert_eq!(
+        retries,
+        vec![PushRetry {
+            attempt: 2,
+            max_attempts: 3,
+            operation: GitTransportOp::LsRemote,
+            delay: Duration::from_millis(1),
+            remote: SafeRemote::from_url(&url),
+        }]
+    );
+    let event = retries[0].event();
+    assert_eq!(event.sse_event_type(), "push_retry");
+    assert_eq!(
+        event.to_plain_text().unwrap(),
+        format!(
+            "push retry 2/3 in 1 ms (ls-remote to {})",
+            SafeRemote::from_url(&url)
+        )
+    );
+    assert_eq!(server.receive_packs(), 1);
+    drop(server);
+    drop(world);
+    sandbox.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lease_cancel_during_backoff_is_cancelled() {
+    use awman_test_support::fakes::{FakeGitHttp, GitHttpFault};
+    let sandbox = support::sandbox("worker::push::lease_cancel_during_backoff_is_cancelled");
+    let world = lease_world(&sandbox);
+    let server = FakeGitHttp::builder(&sandbox, world.bare.parent().unwrap())
+        .fault(|_| Some(GitHttpFault::DropBeforeResponse))
+        .start();
+    let expires = chrono::Utc::now() + chrono::Duration::minutes(10);
+    let (_renewals, expiry) = tokio::sync::watch::channel(expires);
+    let mut long = policy();
+    long.base_backoff = Duration::from_secs(60);
+    long.max_backoff = Duration::from_secs(60);
+    long.window = Duration::from_secs(600);
+    long.deadline = expires;
+    let push = lease_pusher(
+        &sandbox,
+        world.repo.path(),
+        &server.url("origin.git"),
+        long,
+        Duration::from_secs(1),
+        expiry,
+    );
+    let observer = Observer::default();
+    let cancel = CancellationToken::new();
+    let cancelling = async {
+        observer.signal.notified().await;
+        cancel.cancel();
+    };
+    let (failure, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(push.run(&cancel, &observer), cancelling)
+    })
+    .await
+    .unwrap();
+    let failure = failure.unwrap_err();
+    assert_eq!(failure.kind, LeasePushFailureKind::Cancelled);
+    assert_eq!((failure.stage(), failure.code()), ("push", "cancelled"));
+    assert_eq!(observer.retries.lock().unwrap().len(), 1);
+    assert_eq!(server.receive_packs(), 0);
+    drop(server);
+    drop(world);
     sandbox.finish();
 }

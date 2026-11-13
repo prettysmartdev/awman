@@ -1108,7 +1108,22 @@ impl ExecWorkflowCommand {
             None => system_prompt,
         };
 
+        let mut cli_overlays = Vec::new();
+        for overlay in &self.flags.overlay {
+            cli_overlays.extend(parse_overlay_list(overlay).map_err(|reason| {
+                CommandError::InvalidOverlaySpec {
+                    spec: overlay.clone(),
+                    reason,
+                }
+            })?);
+        }
+        let collected =
+            self.session
+                .effective_config()
+                .collected_overlays(cli_overlays, None, None)?;
         let run_opts = AgentRunOptions {
+            command_secrets: self.engines.command_secrets(),
+            env_passthrough: Some(collected.env_passthrough),
             yolo: Some(YoloMode::Enabled),
             initial_prompt: Some(prompt.to_string()),
             model: model.map(|m| m.to_string()),

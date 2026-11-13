@@ -197,6 +197,38 @@ pub enum CommandError {
         reason: String,
     },
 
+    // ── Session Git credentials and command secrets (WI 0145) ─────────────
+    /// `git_auth` on a session whose repository the session helper cannot
+    /// serve: not a remote session, or not `https://` (or `http://` to a
+    /// loopback host).
+    #[error("git_auth is not supported for this session: {reason}")]
+    GitAuthUnsupportedUrl { reason: String },
+
+    /// `git_auth` on a platform without the session credential socket.
+    #[error("git_auth is not supported on this platform")]
+    GitAuthUnsupportedPlatform,
+
+    /// A malformed `git_auth` value. The reason never contains the secret.
+    #[error("invalid git_auth: {reason}")]
+    GitAuthInvalid { reason: String },
+
+    /// An authenticated Git operation at admission (the merge-ref
+    /// advertisement) was refused for its credentials.
+    #[error("{message}")]
+    GitAuthFailed { message: String },
+
+    /// The session was created with `git_auth`, but the daemon restarted and
+    /// no longer holds that in-memory credential.
+    #[error(
+        "the daemon restarted and this session's Git credentials were lost; open a new session"
+    )]
+    CredentialsLost,
+
+    /// A queued command had `secrets`, but the daemon restarted before it
+    /// ran and no longer holds their in-memory values.
+    #[error("the daemon restarted and this command's secrets were lost; submit it again")]
+    CommandSecretsLost,
+
     // ── Remote ────────────────────────────────────────────────────────────
     #[error("no remote session id; pass --session <id> or run `awman remote session start`")]
     RemoteSessionMissing,
@@ -278,6 +310,10 @@ pub enum CommandError {
 }
 
 impl CommandError {
+    /// Kept for callers of the slice that introduced command secrets.
+    pub fn command_secrets_lost() -> Self {
+        Self::CommandSecretsLost
+    }
     /// A copy of an error `parse_raw_args` can produce, so a parse result held
     /// behind a shared handle can report it from every accessor. `None` for
     /// any other variant, most of which wrap uncloneable engine or data errors.
@@ -432,6 +468,9 @@ impl CommandError {
         | CommandError::SessionFieldRemoteOnly { .. }
         | CommandError::SessionFieldRequiresBranch { .. }
         | CommandError::SessionRefInvalid { .. }
+        | CommandError::GitAuthUnsupportedUrl { .. }
+        | CommandError::GitAuthUnsupportedPlatform
+        | CommandError::GitAuthInvalid { .. }
         | CommandError::AgentAmbiguous { .. }
         | CommandError::AgentReferenceEmpty => 2,
 
@@ -467,6 +506,9 @@ impl CommandError {
         CommandError::NotImplemented(_) => 1,
         CommandError::NotAvailableForFrontend { .. } => 1,
         CommandError::AgentOwnerGone { .. } => 1,
+        CommandError::GitAuthFailed { .. }
+        | CommandError::CredentialsLost
+        | CommandError::CommandSecretsLost => 1,
         CommandError::Other(_) => 1,
     }
     }
@@ -486,6 +528,8 @@ impl CommandError {
             CommandError::SessionWorkdirNotAllowed { .. } => 403,
             CommandError::PrerequisiteWideningRefused { .. } => 403,
             CommandError::WorkflowPrerequisitesUnresolved { .. } => 409,
+            CommandError::CredentialsLost => 409,
+            CommandError::GitAuthFailed { .. } => 422,
             CommandError::MergeTargetDirty { .. }
             | CommandError::MergeConflict { .. }
             | CommandError::WorktreeExists { .. } => 409,
@@ -551,6 +595,11 @@ impl CommandError {
         match self {
             CommandError::WorkflowPrerequisitesUnresolved { .. } => WORKFLOW_PREREQUISITES,
 
+            CommandError::GitAuthFailed { .. } | CommandError::CredentialsLost => {
+                crate::data::fs::api_db::failure_stages::GIT_AUTH
+            }
+            CommandError::CommandSecretsLost => PREFLIGHT,
+
             CommandError::MergeConflict { .. } | CommandError::MergeTargetDirty { .. } => MERGE,
 
             CommandError::Engine(EngineError::UnknownAgent { .. })
@@ -584,6 +633,9 @@ impl CommandError {
             | CommandError::SessionFieldRemoteOnly { .. }
             | CommandError::SessionFieldRequiresBranch { .. }
             | CommandError::SessionRefInvalid { .. }
+            | CommandError::GitAuthUnsupportedUrl { .. }
+            | CommandError::GitAuthUnsupportedPlatform
+            | CommandError::GitAuthInvalid { .. }
             | CommandError::RemoteSessionMissing
             | CommandError::WorkItemNotFound { .. }
             | CommandError::SpecTemplateMissing { .. }
@@ -684,6 +736,12 @@ impl CommandError {
             CommandError::SessionFieldRemoteOnly { .. } => "session_field_remote_only",
             CommandError::SessionFieldRequiresBranch { .. } => "session_field_requires_branch",
             CommandError::SessionRefInvalid { .. } => "session_ref_invalid",
+            CommandError::GitAuthUnsupportedUrl { .. } => "git_auth_unsupported_url",
+            CommandError::GitAuthUnsupportedPlatform => "git_auth_unsupported_platform",
+            CommandError::GitAuthInvalid { .. } => "invalid_git_auth",
+            CommandError::GitAuthFailed { .. } => outcome_codes::GIT_AUTH_FAILED,
+            CommandError::CredentialsLost => outcome_codes::CREDENTIALS_LOST,
+            CommandError::CommandSecretsLost => "secrets_lost",
 
             CommandError::RemoteSessionMissing => "remote_session_missing",
             CommandError::RemoteSessionKillFailed { .. } => "remote_session_kill_failed",

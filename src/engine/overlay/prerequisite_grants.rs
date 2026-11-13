@@ -18,6 +18,10 @@ pub struct GrantTarget<'a> {
     pub phase: PhaseKind,
     pub container_home: Option<&'a str>,
     pub remote: Option<&'a GitRemoteUrl>,
+    /// WI 0145: the running command's container credential socket directory
+    /// (a `git_auth` push session). Mounted for `push_branch` and
+    /// `pull_branch` when no grant supplies credentials for the remote.
+    pub session_git_socket: Option<&'a crate::engine::git::credential_socket::CacheSocketListener>,
 }
 
 pub struct GrantOverlays {

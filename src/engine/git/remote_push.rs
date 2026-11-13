@@ -6,8 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use super::transport::{CredentialSource, HostGitTransport, TransportGuard};
 use super::{CommitIdentity, GitCommand, GitEngine, GitFrontend};
-use crate::data::config::env::{GIT_SSH, GIT_SSH_COMMAND};
+use crate::data::git_transport::{GitTransportOp, SafeRemote};
 use crate::data::message::{MessageLevel, UserMessage};
 use crate::engine::error::EngineError;
 
@@ -18,10 +19,9 @@ pub struct RemotePushGit {
     private: tempfile::TempDir,
     repo: PathBuf,
     original: Option<(PathBuf, PathBuf)>,
-    /// Lease transport (WI 0143): when set, transport calls use no global
-    /// or system config and the lease credential helper, and failures are
-    /// classified (`GitAuth` / `GitTransport` / `GitRejected`).
-    lease: Option<super::lease_transport::LeaseTransport>,
+    transport: HostGitTransport,
+    remote: SafeRemote,
+    local_guard: Option<TransportGuard>,
 }
 
 /// Checked before and throughout every host Git operation of a lease.
@@ -137,6 +137,66 @@ impl GitEngine {
     }
 
     fn isolate_transport(&self, repo: &Path, metadata: &Path, url: &str) -> Result<RemotePushGit> {
+        self.isolate_transport_with(
+            repo,
+            metadata,
+            url,
+            HostGitTransport::user(CredentialSource::Ambient).allow_local(),
+        )
+    }
+
+    pub fn isolate_remote_push_with_transport(
+        &self,
+        repo: &Path,
+        url: &str,
+        transport: HostGitTransport,
+    ) -> Result<RemotePushGit> {
+        let metadata = repo.join(".git");
+        if !fs::symlink_metadata(&metadata).map_err(io)?.is_dir() {
+            return Err(EngineError::Git(
+                "remote clone must have a real .git directory".into(),
+            ));
+        }
+        self.isolate_transport_with(repo, &metadata, url, transport)
+    }
+
+    pub fn isolate_remote_push_guarded(
+        &self,
+        repo: &Path,
+        url: &str,
+        transport: HostGitTransport,
+        guard: TransportGuard,
+    ) -> Result<RemotePushGit> {
+        let metadata = repo.join(".git");
+        if !fs::symlink_metadata(&metadata).map_err(io)?.is_dir() {
+            return Err(EngineError::Git(
+                "remote clone must have a real .git directory".into(),
+            ));
+        }
+        self.isolate_transport_with_guard(repo, &metadata, url, transport, Some(guard))
+    }
+
+    fn isolate_transport_with(
+        &self,
+        repo: &Path,
+        metadata: &Path,
+        url: &str,
+        transport: HostGitTransport,
+    ) -> Result<RemotePushGit> {
+        self.isolate_transport_with_guard(repo, metadata, url, transport, None)
+    }
+    fn isolate_transport_with_guard(
+        &self,
+        repo: &Path,
+        metadata: &Path,
+        url: &str,
+        transport: HostGitTransport,
+        local_guard: Option<TransportGuard>,
+    ) -> Result<RemotePushGit> {
+        if let Some(guard) = &local_guard {
+            guard.check()?;
+        }
+        transport.check_url(url)?;
         let repo = fs::canonicalize(repo).map_err(io)?;
         // A sibling of the clone is outside its bind mount even when the
         // server's TMPDIR was configured inside the repository.
@@ -152,7 +212,9 @@ impl GitEngine {
             private,
             repo: repo.to_path_buf(),
             original: None,
-            lease: None,
+            transport,
+            remote: SafeRemote::from_url(url),
+            local_guard,
         };
         let dir = git.private.path();
         fs::create_dir_all(dir.join("objects"))
@@ -203,14 +265,20 @@ impl GitEngine {
         copy_regular(&metadata.join("config"), &local)?;
         {
             for key in ["user.name", "user.email", "extensions.objectformat"] {
-                let output = crate::engine::host_cli::command(&self.env, "git")
+                let mut probe = crate::engine::host_cli::command(&self.env.for_lease_git(), "git");
+                probe
                     .args(["config", "--no-includes", "--file"])
                     // Keep Git's path parser away from Windows verbatim paths.
                     .arg("source-config")
                     .args(["--get", key])
-                    .current_dir(dir)
-                    .output()
-                    .map_err(|error| io_at(&local, error))?;
+                    .current_dir(dir);
+                let output = git
+                    .local_guard
+                    .clone()
+                    .unwrap_or_else(|| {
+                        TransportGuard::new(tokio_util::sync::CancellationToken::new())
+                    })
+                    .output(&mut probe)?;
                 if output.status.success() {
                     let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if key == "extensions.objectformat" {
@@ -248,7 +316,7 @@ impl RemotePushGit {
         transport: super::lease_transport::LeaseTransport,
     ) -> Self {
         self.env = self.env.for_lease_git();
-        self.lease = Some(transport);
+        self.transport = transport.host_transport();
         self
     }
 
@@ -313,51 +381,38 @@ impl RemotePushGit {
     }
 
     /// The Git command (before subcommand arguments) for one operation on
-    /// the private metadata. A lease transport call (`ls-remote`, `push`) is
-    /// built by the shared lease builder,
-    /// [`lease_transport_command`](super::lease_transport::lease_transport_command),
-    /// exactly like the lease's clone and fetches; everything else uses the
+    /// the private metadata. Every transport call (`ls-remote`, `push`) is
+    /// built by [`HostGitTransport::command`], exactly like clone and
+    /// setup fetch for that session or lease; everything else uses the
     /// local hardening below. Public so its isolation (environment, pinned
     /// settings, helper) can be inspected without running it.
     pub fn command(&self, transport: bool) -> Result<Command> {
+        self.command_guarded(
+            transport,
+            &self
+                .local_guard
+                .clone()
+                .unwrap_or_else(|| TransportGuard::new(tokio_util::sync::CancellationToken::new())),
+        )
+    }
+    fn command_guarded(&self, transport: bool, guard: &TransportGuard) -> Result<Command> {
         const PUSH_SETTINGS: [&str; 4] = [
             "-c",
             "push.followTags=false",
             "-c",
             "push.recurseSubmodules=no",
         ];
-        let lease = self.lease.as_ref().filter(|_| transport);
-        let mut command = match lease {
-            Some(lease) => {
-                let mut command = super::lease_transport::lease_transport_command(
-                    &self.env,
-                    self.private.path(),
-                    "origin",
-                    lease,
-                )?;
-                command.args(PUSH_SETTINGS);
-                command
-            }
-            None => {
-                let mut command = crate::engine::host_cli::command(&self.env, "git");
-                command.args([
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "-c",
-                    "core.fsmonitor=false",
-                    "-c",
-                    "commit.gpgSign=false",
-                    "-c",
-                    "push.gpgSign=false",
-                    "-c",
-                    "maintenance.auto=false",
-                    "-c",
-                    "gc.auto=0",
-                ]);
-                command.args(PUSH_SETTINGS);
-                command
-            }
+        let mut command = if transport {
+            self.transport
+                .command_guarded(&self.env, self.private.path(), "origin", guard)?
+        } else {
+            super::host_command::command_guarded(
+                &self.env.for_lease_git(),
+                self.private.path(),
+                guard,
+            )?
         };
+        command.args(PUSH_SETTINGS);
         command
             .current_dir(self.private.path())
             // Git parses these paths itself; Rust's Windows canonical paths
@@ -380,17 +435,6 @@ impl RemotePushGit {
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1");
         }
-        // Push-session transport: the host's chosen SSH executable/options
-        // remain trusted; add BatchMode when no explicit override was
-        // selected, so ssh cannot prompt either. (The lease builder pins
-        // `core.sshCommand` itself and runs with a scrubbed environment.)
-        if transport
-            && lease.is_none()
-            && self.env.get_os(GIT_SSH_COMMAND).is_none()
-            && self.env.get_os(GIT_SSH).is_none()
-        {
-            command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
-        }
         Ok(command)
     }
     fn run_guarded(
@@ -403,18 +447,22 @@ impl RemotePushGit {
         if let Some(guard) = guard {
             guard.check()?;
         }
+        if transport {
+            let mut transport_guard = guard
+                .map(TransportGuard::from)
+                .unwrap_or_else(|| TransportGuard::new(tokio_util::sync::CancellationToken::new()));
+            transport_guard.timeout = super::push_retry::PUSH_FIRST_ATTEMPT_TIMEOUT;
+            return self.run_transport(args, sink, &transport_guard);
+        }
         let display = GitCommand::new(args);
         sink.command_started(&display);
-        let lease = self.lease.as_ref().filter(|_| transport);
-        let mut command = self.command(transport)?;
+        let mut command = self.command(false)?;
         command.args(args);
-        let trace = if lease.is_some() {
-            Some(super::auth_classify::ResponseTrace::attach(&mut command)?)
+        let output = if let Some(local) = &self.local_guard {
+            local.output(&mut command)?
         } else {
-            None
+            bounded_output_guarded(&mut command, std::time::Duration::from_secs(120), guard)?
         };
-        let output =
-            bounded_output_guarded(&mut command, std::time::Duration::from_secs(120), guard)?;
         if let Some(guard) = guard {
             guard.check()?;
         }
@@ -425,32 +473,91 @@ impl RemotePushGit {
             if !line.trim().is_empty() {
                 sink.write_message(UserMessage {
                     level: MessageLevel::Info,
-                    text: self
-                        .lease
-                        .as_ref()
-                        .map_or_else(|| line.into(), |lease| lease.redact(line)),
+                    text: line.into(),
                 });
             }
         }
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if lease.is_some() {
-                let operation = args.first().copied().unwrap_or("git");
-                return Err(trace
-                    .as_ref()
-                    .expect("lease trace")
-                    .classify(&stderr, false)
-                    .into_error(
-                        operation,
-                        self.lease
-                            .as_ref()
-                            .expect("lease transport")
-                            .redact(&stderr),
-                    ));
-            }
-            return Err(EngineError::Git(format!("{display} failed: {stderr}")));
+            return Err(EngineError::Git(format!(
+                "{display} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
         }
         Ok(output)
+    }
+
+    /// One `ls-remote` or `push` through the shared transport runner.
+    fn run_transport(
+        &self,
+        args: &[&str],
+        sink: &mut dyn GitFrontend,
+        guard: &TransportGuard,
+    ) -> Result<Output> {
+        let op = match args.first().copied() {
+            Some("ls-remote") => GitTransportOp::LsRemote,
+            Some("push") => GitTransportOp::Push,
+            _ => {
+                return Err(EngineError::Git(
+                    "unsupported push transport operation".into(),
+                ))
+            }
+        };
+        self.transport.run(
+            self.command_guarded(true, guard)?,
+            args,
+            op,
+            &self.remote,
+            sink,
+            guard,
+        )
+    }
+
+    /// The remote identifier this push-back publishes to (never a credential).
+    pub fn remote(&self) -> &SafeRemote {
+        &self.remote
+    }
+
+    /// Head check: where `refs/heads/<branch>` points on the remote now,
+    /// bounded by `guard` (cancellation, deadline/expiry, process timeout).
+    pub fn remote_head(
+        &self,
+        branch: &str,
+        sink: &mut dyn GitFrontend,
+        guard: &TransportGuard,
+    ) -> Result<Option<String>> {
+        let name = format!("refs/heads/{branch}");
+        let output = self.run_transport(&["ls-remote", "--refs", "origin", &name], sink, guard)?;
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| {
+                let (sha, reference) = line.split_once('\t')?;
+                (reference == name).then(|| sha.to_string())
+            }))
+    }
+
+    /// One push of `HEAD` to `refs/heads/<branch>`: never forced, never
+    /// repeated by this method. Retry and the head check between attempts
+    /// belong to [`super::push_publish::PushPublisher`].
+    pub fn push_head(
+        &self,
+        branch: &str,
+        sink: &mut dyn GitFrontend,
+        guard: &TransportGuard,
+    ) -> Result<()> {
+        let refspec = format!("HEAD:refs/heads/{branch}");
+        self.run_transport(&["push", "origin", &refspec], sink, guard)?;
+        guard.check()
+    }
+
+    /// Mirror a publication of `sha` to `branch` into the clone: its
+    /// upstream configuration and remote-tracking ref. Used after a push
+    /// and after a head check found the push had already landed (its
+    /// response was lost), so both leave the clone in the same state.
+    pub fn record_published(&self, branch: &str, sha: &str) -> Result<()> {
+        let mut sink = crate::data::message::RecordingMessageSink::new();
+        let reference = format!("refs/remotes/origin/{branch}");
+        self.run(&["update-ref", &reference, sha], false, &mut sink)?;
+        self.mirror_upstream(branch)
     }
 
     fn text(&self, args: &[&str], transport: bool, sink: &mut dyn GitFrontend) -> Result<String> {
@@ -463,6 +570,15 @@ impl RemotePushGit {
 
     pub fn head(&self, sink: &mut dyn GitFrontend) -> Result<String> {
         self.text(&["rev-parse", "--verify", "HEAD^{commit}"], false, sink)
+    }
+    pub fn head_guarded(&self, guard: &TransportGuard) -> Result<String> {
+        let mut command = self.command_guarded(false, guard)?;
+        command.args(["rev-parse", "--verify", "HEAD^{commit}"]);
+        let output = guard.output(&mut command)?;
+        if !output.status.success() {
+            return Err(EngineError::Git("cannot resolve intended HEAD".into()));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().into())
     }
 
     pub fn origin_sha(&self, branch: &str, sink: &mut dyn GitFrontend) -> Result<Option<String>> {
@@ -644,6 +760,11 @@ impl RemotePushGit {
     pub fn push(&self, branch: &str, sink: &mut dyn GitFrontend) -> Result<String> {
         let refspec = format!("HEAD:refs/heads/{branch}");
         self.run(&["push", "-u", "origin", &refspec], true, sink)?;
+        self.mirror_upstream(branch)?;
+        self.head(sink)
+    }
+
+    fn mirror_upstream(&self, branch: &str) -> Result<()> {
         // Mirror the new upstream in the clone using config-file-only operations.
         // Parsing that file does not run its hooks, helpers or includes.
         let fallback = self.repo.join(".git");
@@ -660,27 +781,39 @@ impl RemotePushGit {
                 format!("refs/heads/{branch}"),
             ),
         ] {
-            let output = crate::engine::host_cli::command(&self.env, "git")
+            let mut probe = crate::engine::host_cli::command(&self.env.for_lease_git(), "git");
+            probe
                 .args(["config", "--no-includes", "--file"])
                 .arg("config")
                 .args([&key, &value])
                 // This is an explicit file-only config edit, never a worktree
                 // or transport operation against the original repository.
-                .current_dir(metadata)
-                .output()
-                .map_err(io)?;
+                .current_dir(metadata);
+            let output = self
+                .local_guard
+                .clone()
+                .unwrap_or_else(|| TransportGuard::new(tokio_util::sync::CancellationToken::new()))
+                .output(&mut probe)?;
             if !output.status.success() {
                 return Err(EngineError::Git(
-                    String::from_utf8_lossy(&output.stderr).into(),
+                    "cannot record published branch configuration".into(),
                 ));
             }
         }
         let reference = format!("refs/remotes/origin/{branch}");
-        copy_regular(
-            &self.private.path().join(&reference),
-            &metadata.join(reference),
-        )?;
-        self.head(sink)
+        let source = self.private.path().join(&reference);
+        if !source.exists() {
+            // An up-to-date push can leave this ref packed. Materialize the
+            // resolved hash in our private metadata before the safe copy.
+            let sha = self.text(
+                &["rev-parse", "--verify", &reference],
+                false,
+                &mut crate::data::message::RecordingMessageSink::new(),
+            )?;
+            fs::create_dir_all(source.parent().expect("ref parent")).map_err(io)?;
+            fs::write(&source, format!("{sha}\n")).map_err(io)?;
+        }
+        copy_regular(&source, &metadata.join(reference))
     }
 }
 

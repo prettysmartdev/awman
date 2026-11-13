@@ -146,8 +146,12 @@ impl OrderedEventSource for OrderedSource {
 struct Observer(EventBusSender);
 impl PushObserver for Observer {
     fn retry(&self, retry: &PushRetry) {
-        let (phase, message) = retry.status_message();
-        self.0.emit(EventPayload::StatusMessage { phase, message });
+        // WI 0145: the typed retry event, attributed to the push phase.
+        self.0
+            .with_source(crate::data::execution_event::EventSource::phase(
+                crate::data::execution_event::EventSourcePhase::Push,
+            ))
+            .emit(retry.event());
     }
     fn message(&self, message: crate::data::message::UserMessage) {
         self.0.emit(EventPayload::StatusMessage {
@@ -285,7 +289,7 @@ impl LeasePostProcess for PushStage {
                 result.pushed = Some(Some(crate::data::fs::api_db::PushedRef {
                     remote: "origin".into(),
                     branch: push_branch.to_string(),
-                    sha: outcome.sha().into(),
+                    sha: outcome.sha().unwrap_or_default().into(),
                 }))
             }
             Err(error) => {
@@ -424,7 +428,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             let (mut result, _output_dir) = match execution {
                 Ok(Ok(value)) => value,
                 Ok(Err(error)) => {
-                    let (stage, code) = if error == WorkerEngineError::GitAuth {
+                    let (stage, code) = if matches!(error, WorkerEngineError::GitAuth { .. }) {
                         ("git_auth", "git_auth_failed")
                     } else if matches!(error, WorkerEngineError::Invalid(_)) {
                         ("preflight", "setup_failed")
@@ -589,7 +593,9 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
         .await
         .map_err(invalid)?
         .map_err(|error| match error {
-            crate::engine::error::EngineError::GitAuth { .. } => WorkerEngineError::GitAuth,
+            crate::engine::error::EngineError::GitAuth {
+                operation, remote, ..
+            } => WorkerEngineError::GitAuth { operation, remote },
             error => invalid(error),
         })?;
         if active.control.cancelled().is_cancelled() {

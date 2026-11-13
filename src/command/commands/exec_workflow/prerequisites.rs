@@ -101,6 +101,11 @@ impl ExecWorkflowCommand {
     }
 }
 
+/// Stable message prefix (WI 0145) of a `push_branch`/`pull_branch` step of a
+/// `git_auth` session on a runtime that cannot mount the credential socket.
+pub(crate) const SESSION_GIT_AUTH_UNAVAILABLE_IN_CONTAINER: &str =
+    "session_git_auth_unavailable_in_container";
+
 /// Per-step command options, keyed by phase and step index.
 pub(crate) type StepCommandOptionsByStep = Vec<((PhaseKind, usize), StepCommandOptions)>;
 
@@ -127,6 +132,11 @@ pub(crate) fn apply_grant_overlays(
         .and_then(|rt| rt.image_home_dir(image_tag));
     let mut keep = Vec::new();
     let mut options = Vec::new();
+    // WI 0145: a `git_auth` session's per-command container socket. A
+    // runtime that cannot carry a host Unix socket into a container refuses
+    // the step instead of falling back to env injection or host credentials.
+    let session_socket = engines.ephemeral_secrets.container_git_socket();
+    let socket_carried = engines.runtime.capabilities().mounts_host_sockets();
     for (index, (kind, remote)) in kinds.iter().enumerate() {
         let Some(Ok((overlays, env))) = resolved.get_mut(index) else {
             continue;
@@ -149,6 +159,15 @@ pub(crate) fn apply_grant_overlays(
             phase,
             container_home: container_home.as_deref(),
             remote: remote_url.as_ref(),
+            session_git_socket: session_socket
+                .as_ref()
+                .filter(|listener| {
+                    socket_carried
+                        && remote_url
+                            .as_ref()
+                            .is_some_and(|r| listener.matches_url(&r.redacted))
+                })
+                .map(|listener| listener.as_ref()),
         };
         let grant = match engines
             .overlay_engine
@@ -164,9 +183,38 @@ pub(crate) fn apply_grant_overlays(
                         kind.label()
                     ),
                 });
+                resolved[index] = Err(CommandError::Other(format!(
+                    "workflow prerequisite grants unavailable: {e}"
+                )));
                 continue;
             }
         };
+        if session_socket.is_some()
+            && (!socket_carried
+                || session_socket.as_ref().is_some_and(|listener| {
+                    !remote_url
+                        .as_ref()
+                        .is_some_and(|r| listener.matches_url(&r.redacted))
+                }))
+            && matches!(
+                kind,
+                PrerequisiteStepKind::PushBranch | PrerequisiteStepKind::PullBranch
+            )
+            && grant.push_auth == crate::engine::workflow::step_commands::PushAuth::None
+            && remote_url.as_ref().is_some_and(|r| {
+                let lower = r.redacted.to_ascii_lowercase();
+                lower.starts_with("https://") || lower.starts_with("http://")
+            })
+        {
+            if let Some(slot) = resolved.get_mut(index) {
+                *slot = Err(CommandError::Other(format!(
+                    "{SESSION_GIT_AUTH_UNAVAILABLE_IN_CONTAINER}: {} step {index} ({}) needs the session's Git credential, but this container runtime cannot mount the credential socket",
+                    phase.label(),
+                    kind.label()
+                )));
+            }
+            continue;
+        }
         if grant.is_empty() {
             continue;
         }
