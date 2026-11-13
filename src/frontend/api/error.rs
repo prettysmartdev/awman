@@ -50,6 +50,8 @@ macro_rules! constructors {
 }
 
 constructors! {
+    precondition_failed => ("precondition_failed", PRECONDITION_FAILED),
+    context_too_large => ("context_too_large", PAYLOAD_TOO_LARGE),
     invalid_secrets => ("invalid_secrets", BAD_REQUEST),
     // WI 0145 session Git credentials.
     invalid_git_auth => ("invalid_git_auth", BAD_REQUEST),

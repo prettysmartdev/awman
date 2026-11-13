@@ -9,6 +9,16 @@ pub fn persist_workflow_snapshot(
     events: &EventBusSender,
     state: &WorkflowState,
 ) {
+    if let Err(error) = crate::data::context::CommandInvocationPins::new(writer.paths().clone())
+        .pin(
+            writer.session_id(),
+            writer.command_id(),
+            events.attempt(),
+            state.invocation_id,
+        )
+    {
+        tracing::warn!(%error, "failed to pin command workflow invocation");
+    }
     let mut value = match serde_json::to_value(state) {
         Ok(value) => value,
         Err(error) => {

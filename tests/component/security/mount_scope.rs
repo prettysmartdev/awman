@@ -73,6 +73,7 @@ fn admission_allows_only_exact_mounts_or_independent_direct_child_repositories()
     let policy = SessionCreatePolicy::new(vec![], s.tmp().join("clones"))
         .with_workdir_roots(vec![root.into()]);
     let request = |p: &Path| SessionCreateRequest {
+        context_key: None,
         workdir: Some(p.to_string_lossy().into_owned()),
         ..Default::default()
     };
@@ -95,6 +96,7 @@ fn remote_plans_reject_local_transport_and_option_injection_before_clone() {
     let policy = SessionCreatePolicy::new(vec![], s.tmp().join("clones"));
     for url in ["file:///etc", "/etc", "../repo", "ext::codex", "", "  "] {
         let request = SessionCreateRequest {
+            context_key: None,
             session_type: Some("remote".into()),
             repo_url: Some(url.into()),
             ..Default::default()
@@ -109,6 +111,7 @@ fn remote_plans_reject_local_transport_and_option_injection_before_clone() {
         "x\nexec",
     ] {
         let request = SessionCreateRequest {
+            context_key: None,
             session_type: Some("remote".into()),
             repo_url: Some("https://example.invalid/r.git".into()),
             branch: Some(branch.into()),
@@ -142,6 +145,7 @@ fn symlink_escapes_and_linked_git_directories_cannot_expand_admission() {
         let link = repo.path().join("escape");
         std::os::unix::fs::symlink(s.home(), &link).unwrap();
         let request = SessionCreateRequest {
+            context_key: None,
             workdir: Some(link.to_string_lossy().into_owned()),
             ..Default::default()
         };
@@ -153,6 +157,7 @@ fn symlink_escapes_and_linked_git_directories_cannot_expand_admission() {
         let policy = SessionCreatePolicy::new(vec![], s.tmp().join("clones"))
             .with_workdir_roots(vec![worktree.as_path().parent().unwrap().into()]);
         let request = SessionCreateRequest {
+            context_key: None,
             workdir: Some(worktree.as_path().to_string_lossy().into_owned()),
             ..Default::default()
         };

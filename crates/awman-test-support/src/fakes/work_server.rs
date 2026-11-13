@@ -22,8 +22,12 @@ impl FakeWorkServer {
     /// the sandbox then tracks (the "child reports its address" form of
     /// owned ports).
     pub async fn start(sandbox: &TestSandbox) -> FakeWorkServer {
+        Self::start_with(sandbox, Arc::new(MockWorkServer::new())).await
+    }
+
+    /// Start a supplied reference server, including deliberately faulty models.
+    pub async fn start_with(sandbox: &TestSandbox, server: Arc<MockWorkServer>) -> FakeWorkServer {
         let ports = sandbox.ports();
-        let server = Arc::new(MockWorkServer::new());
         let serving = server
             .clone()
             .serve()

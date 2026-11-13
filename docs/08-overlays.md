@@ -145,7 +145,7 @@ Pulled libraries and their skills are read from `~/.awman/skills/.library/<libra
 
 **awman's builtin skills.** `awman new skill --pull builtin` (or `--pull awman`) pulls the skills that ship with awman, such as `create-custom-agent`, into `~/.awman/skills/.library/awman/` as a shallow, sparse clone of just the `skills/` tree (older Git versions fall back to a plain shallow clone, with a warning). Mount them like any pulled library: `skill(awman)` for all of them, or `skill(awman/create-custom-agent)` for one. `--subdir` cannot be combined with the builtin library. Re-run the same command to refresh it. If you author your own `~/.awman/skills/awman/` directory, it takes precedence over the builtin library for `skill(awman)` and `skill(awman/...)`. See [Custom Agents](15-custom-agents.md#letting-an-agent-write-it-for-you).
 
-### `context(scope[:permission])`
+### `context(scope[@key][:permission])`
 
 Grants agent containers access to a persistent context directory on the host and delivers system prompt instructions explaining the context's purpose.
 
@@ -153,13 +153,14 @@ Context overlays combine a **directory mount** (persistent files on the host) wi
 
 **Syntax:**
 ```
-context(SCOPE[:ro|rw])
+context(SCOPE[@KEY][:ro|rw])
 ```
 
 - `SCOPE` — one of `global`, `repo`, or `workflow`:
   - `global` — persistent cross-project developer preferences (`~/.awman/context/global/`)
   - `repo` — project-specific context (`~/.awman/context/repo/{owner}/{repo}/`, derived from the `origin` remote and lowercased; `_local/{dirname}` when there is no remote)
   - `workflow` — per-workflow shared workspace for multi-agent coordination (`~/.awman/context/workflows/<run-id>/`)
+- `@KEY` — optional, `repo` only. Selects a **keyed** repo context instead of the one inferred from the `origin` remote (see [Keyed repo context](#keyed-repo-context)). `context(global@x)` and `context(workflow@x)` are rejected.
 - `permission` — optional; `ro` (read-only) or `rw` (read-write, default).
 
 **Examples:**
@@ -168,6 +169,8 @@ context(global)        # personal preferences, read-write
 context(repo)          # project context, read-write
 context(workflow:ro)   # workflow workspace, read-only
 context(global:rw)     # personal preferences, explicit read-write
+context(repo@shared-notes)     # keyed repo context, read-write
+context(repo@shared-notes:ro)  # keyed repo context, read-only
 ```
 
 **What happens when you use `context()`:**
@@ -185,6 +188,22 @@ Most agents natively support system prompt injection. If your agent does not (a 
 - `context(global)` and `context(repo)` default to `rw` because they are designed for agents to write accumulated knowledge back for future sessions.
 - `context(workflow)` is typically `rw` so agents can share state between steps.
 - Use `:ro` for read-only access if you want to ensure agents cannot modify the context directory (e.g. in CI/CD or shared environments).
+
+#### Keyed repo context
+
+By default `context(repo)` is **origin-inferred**: awman derives the directory from the `origin` remote, so every checkout of the same repository shares `~/.awman/context/repo/{owner}/{repo}/`.
+
+`context(repo@<key>)` names the directory yourself. It lives at `~/.awman/context/repo/_keyed/<key>/`, independent of any remote, so unrelated checkouts, forks, or repositories with different remotes can share one set of notes. A key is 1–128 characters from `a-z`, `0-9`, `.`, `_` and `-`, starting with a letter or digit (`^[a-z0-9][a-z0-9._-]{0,127}$`). An invalid key stops the command before any container launches.
+
+The same directory is what the [Context API](09-api-and-remote-mode.md#context-api) reads and writes, so a script or service can seed notes before a run and collect what the agent learned afterwards.
+
+An API session created with a `context_key` already selects its keyed directory. `context(repo)` (or `context(repo@<same key>)`) then mounts it; naming a different key in the overlay is ignored with a warning, because the session key wins. A session key on its own mounts nothing — you still need a `context(repo…)` overlay to give the agent access.
+
+**Parallel jobs on one key.** Agents write straight to the directory on disk, so when two jobs run `rw` against the same key the last writer wins for each file and earlier edits to that file are lost. Use `context(repo@<key>:ro)` for parallel jobs, and let one job (or your own tooling, through the API) update the notes. A command's [`context_changes`](09-api-and-remote-mode.md#command-context-changes) show which files it changed.
+
+#### Workflow scratch notes over the API
+
+Notes that workflow steps leave in `/awman/context/workflow/` can be read over the API while the command runs and after it finishes; see [Workflow scratch notes](09-api-and-remote-mode.md#workflow-scratch-notes). Access is read-only, and the notes are removed some time after the command's session is purged, so copy out anything you want to keep.
 
 ---
 
@@ -230,7 +249,7 @@ Environment variable names are deduplicated by name. If multiple sources list th
 
 ### Context overlays
 
-Context overlays use **union** semantics — all specified scopes are mounted and all prompts are combined. If the same scope appears in multiple sources (e.g. `context(global)` in both global config and a step's overlays), it is mounted once, with the permission from the first source that named it. The combined system prompt always presents scopes in the order: global, repo, workflow.
+Context overlays use **union** semantics — all specified scopes are mounted and all prompts are combined. If the same scope appears in multiple sources (e.g. `context(global)` in both global config and a step's overlays), it is mounted once, with the permission (and, for `repo`, the key) from the first source that named it. The combined system prompt always presents scopes in the order: global, repo, workflow.
 
 ---
 
@@ -570,6 +589,8 @@ for how this location is selected and preserved.
 
 **Repo context** (`context(repo)`) — project-specific knowledge worth preserving: architecture decisions unique to this codebase, known workarounds and technical debt, team conventions that differ from your personal style, notes from previous agent sessions ("we tried X, it failed because Y"). Example: after an agent refactors your auth layer, you add notes to `~/.awman/context/repo/myorg/myproject/auth-layer.md` so the next agent avoids the pitfalls the previous one discovered.
 
+Resuming a workflow reuses its invocation's scratch files, including notes from previous attempts or commands. A fresh invocation gets a separate directory. Context reads support an awman home reached through a symbolic link; links inside the context tree are refused.
+
 **Workflow context** (`context(workflow)`) — multi-step coordination where each step needs to see which steps completed, notes left by earlier steps, and a shared workspace. Example: a `plan` step writes `/awman/context/workflow/plan.md`, the `implement` step reads it and builds accordingly, the `document` step reads both. No step re-discovers what earlier steps decided.
 
 ### System prompt injection
@@ -733,6 +754,7 @@ invalid overlay spec 'notvalid': expected 'host:container' or 'host:container:pe
 invalid overlay spec 'skill()': skill() requires an argument; use skill(*) to mount all skills or skill(name) for a specific named skill
 invalid overlay spec 'env(A, B)': env() takes one argument; use separate env() calls for multiple vars
 invalid overlay spec 'context()': context() requires a scope argument: context(global), context(repo), or context(workflow)
+invalid overlay spec 'context(global@x)': a context key is allowed only with repo scope
 invalid overlay spec 'context(global:rx)': unknown permission 'rx' in 'context(global:rx)'; expected 'ro' or 'rw'
 ```
 

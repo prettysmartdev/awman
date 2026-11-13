@@ -676,6 +676,11 @@ impl SessionSetup {
             }
         };
 
+        crate::command::context::session_binding::apply(
+            &mut *session.write().await,
+            self.plan.context_key.as_ref().map(|k| k.as_str()),
+        );
+
         // For remote sessions, replace the default Local session_type so that
         // downstream consumers (e.g. worktree suppression in ExecWorkflowCommand)
         // see the correct variant.

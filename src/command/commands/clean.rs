@@ -436,6 +436,16 @@ impl CleanCommand {
         // matches a terminal workflow discovered above, or it carries a
         // `completed` marker file. Directories we cannot prove complete are
         // left untouched (conservative).
+        let pinned = match crate::data::fs::api_paths::ApiPaths::from_env(self.session.env())
+            .and_then(|paths| {
+                crate::data::context::CommandInvocationPins::new(paths).pinned_invocations()
+            }) {
+            Ok(pins) => pins,
+            Err(error) => {
+                tracing::warn!(%error, "cannot read context pins; preserving workflow scratch");
+                return;
+            }
+        };
         match crate::data::fs::ContextDirResolver::from_env(self.session.env()) {
             Ok(resolver) => {
                 let ctx_root = resolver.workflow_dir(uuid::Uuid::nil());
@@ -466,6 +476,11 @@ impl CleanCommand {
                                         Some(n) => n.to_string(),
                                         None => continue,
                                     };
+                                    if uuid::Uuid::parse_str(&name)
+                                        .is_ok_and(|id| pinned.contains(&id))
+                                    {
+                                        continue;
+                                    }
                                     let matches_terminal = uuid::Uuid::parse_str(&name)
                                         .map(|u| terminal_ids.contains(&u))
                                         .unwrap_or(false);

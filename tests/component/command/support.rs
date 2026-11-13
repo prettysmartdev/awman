@@ -58,6 +58,7 @@ impl AdmissionFixture {
     pub fn local(&self, sandbox: &TestSandbox) -> SessionSubmission {
         SessionSubmission {
             request: SessionCreateRequest {
+                context_key: None,
                 workdir: Some(sandbox.work().to_string_lossy().into_owned()),
                 ..Default::default()
             },

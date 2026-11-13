@@ -46,12 +46,19 @@ pub(super) fn for_settings(
     support: LeaseRuntimeSupport,
     settings: &WorkerSettings,
 ) -> Vec<&'static str> {
-    features(
+    let mut result = features(
         support,
         settings.pull_interaction,
         settings.pull_allow_override,
         true,
         true,
         true,
-    )
+    );
+    if super::lease_context::SUPPORTED {
+        result.push(awman_wsp::features::LEASE_CONTEXT);
+    }
+    if super::lease_workflow_context::SUPPORTED {
+        result.push(awman_wsp::features::LEASE_WORKFLOW_CONTEXT);
+    }
+    result
 }

@@ -391,3 +391,12 @@ async fn open_append_on_line_boundary(path: &Path) -> Result<File, DataError> {
     }
     Ok(file)
 }
+
+impl CommandStateWriter {
+    pub fn paths(&self) -> &ApiPaths {
+        &self.paths
+    }
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}

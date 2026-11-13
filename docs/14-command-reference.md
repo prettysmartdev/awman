@@ -83,7 +83,7 @@ Available via: CLI, TUI
 | `--auto` | bool | false | — | — | CLI, TUI, API | Enable auto permission mode. |
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to use (overrides .awman/config.json). |
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
-| `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a host directory into the agent container. Repeatable. |
+| `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a directory or context(repo@<key>[:ro\|rw]) into the agent container. Repeatable. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
 | `--branch` | string (optional) | — | — | `--pr`, `--worktree` | CLI, TUI | Run in a worktree for this branch. |
 | `--pr` | string (optional) | — | — | `--branch`, `--worktree` | CLI, TUI | Run in a worktree for this GitHub pull request. |
@@ -287,7 +287,7 @@ Available via: CLI, TUI, API
 | `--auto` | bool | false | — | — | CLI, TUI, API | Enable auto permission mode. |
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to use (overrides .awman/config.json). |
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
-| `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a host directory into the agent container. Repeatable. |
+| `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a directory or context(repo@<key>[:ro\|rw]) into the agent container. Repeatable. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
 | `--issue` | string (optional) | — | — | — | CLI, TUI, API | GitHub issue number, URL, or owner/repo#N to use as the prompt. |
 | `--interactive` | bool | false | — | `--headless` | CLI, TUI, API | Run the agent interactively in a terminal (PTY). Overrides a daemon worker's headless default where the worker allows it. |
@@ -319,7 +319,7 @@ Available via: CLI, TUI, API
 | `--auto` | bool | false | `--worktree` | — | CLI, TUI, API | Enable auto permission mode. Implies --worktree. |
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to use. |
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
-| `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a host directory into the agent container. Repeatable. |
+| `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a directory or context(repo@<key>[:ro\|rw]) into the agent container. Repeatable. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
 | `--issue` | string (optional) | — | — | `--work-item` | CLI, TUI, API | GitHub issue number, URL, or owner/repo#N to use as work item input. |
 | `--dynamic` | bool | false | — | — | CLI, TUI, API | Have a leader agent design and run a workflow for --work-item. Implies --yolo, --worktree, and context(workflow); the positional workflow path must be omitted. |
@@ -681,7 +681,7 @@ Runs without a working agent runtime — reachable even when the configured runt
 | `--auto` | bool | false | — | — | CLI, TUI, API | Enable auto permission mode. Implies --worktree. |
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to use. |
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
-| `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a host directory into the agent container. Repeatable. |
+| `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a directory or context(repo@<key>[:ro\|rw]) into the agent container. Repeatable. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
 | `--issue` | string (optional) | — | — | `--work-item` | CLI, TUI, API | GitHub issue number, URL, or owner/repo#N to use as work item input. |
 | `--dynamic` | bool | false | — | — | CLI, TUI, API | Have a leader agent design and run a workflow for --work-item. Implies --yolo, --worktree, and context(workflow); the positional workflow path must be omitted. |
@@ -718,7 +718,7 @@ Runs without a working agent runtime — reachable even when the configured runt
 | `--auto` | bool | false | — | — | CLI, TUI, API | Enable auto permission mode. |
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to use (overrides .awman/config.json). |
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
-| `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a host directory into the agent container. Repeatable. |
+| `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a directory or context(repo@<key>[:ro\|rw]) into the agent container. Repeatable. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
 | `--issue` | string (optional) | — | — | — | CLI, TUI, API | GitHub issue number, URL, or owner/repo#N to use as the prompt. |
 | `--interactive` | bool | false | — | `--headless` | CLI, TUI, API | Run the agent interactively in a terminal (PTY). Overrides a daemon worker's headless default where the worker allows it. |

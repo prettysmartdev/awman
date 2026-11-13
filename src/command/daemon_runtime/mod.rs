@@ -453,10 +453,10 @@ impl DaemonRuntime {
             .into(),
             version: env!("CARGO_PKG_VERSION").into(),
             protocol: [("api".into(), 1), ("frontend".into(), 1)].into(),
-            capabilities: crate::command::daemon_api::capabilities::CAPABILITIES
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            capabilities: crate::command::daemon_api::capabilities::advertised(
+                self.engines.runtime.capabilities().mounts_outputs(true),
+                &[],
+            ),
             features: FeatureName::ALL
                 .into_iter()
                 .map(|f| (f.as_str().into(), self.feature_record(f)))

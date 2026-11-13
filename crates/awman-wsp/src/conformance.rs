@@ -1,4 +1,6 @@
 //! Reusable HTTP conformance probes. The admin adapter provisions fixtures out of band.
+pub mod lease_context;
+pub mod workflow_context;
 use crate::*;
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, future::Future, pin::Pin};
@@ -59,6 +61,8 @@ pub fn cases() -> &'static [&'static str] {
 /// Test fixture shared by the conformance runner and server implementers.
 pub fn work_item(id: &str) -> WorkItem {
     WorkItem {
+        context: None,
+        workflow_context: None,
         id: id.into(),
         title: id.into(),
         summary: Some("conformance fixture".into()),
@@ -198,6 +202,8 @@ fn heartbeat() -> HeartbeatRequest {
 }
 fn result() -> LeaseResult<Value> {
     LeaseResult {
+        context_changes: None,
+        workflow_context: None,
         result: json!({"outcome":"done","exit_code":0,"final_message":"complete"}),
         outputs: Some(BTreeMap::new()),
         outputs_mounted: true,
@@ -401,6 +407,7 @@ async fn probe(
                 old.release(
                     &lease.id,
                     &ReleaseRequest::<Value> {
+                        context_changes: None,
                         reason: ReleaseReason::Error,
                         message: None,
                         result: None,
@@ -466,6 +473,7 @@ async fn probe(
             a.release(
                 &lease.id,
                 &ReleaseRequest {
+                    context_changes: None,
                     reason: ReleaseReason::Ineligible,
                     message: Some("test".into()),
                     result: Some(json!({"outcome":"paused"})),

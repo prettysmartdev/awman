@@ -8,6 +8,8 @@ use std::{
 };
 use tokio::sync::{broadcast, Notify};
 mod http;
+pub mod lease_context;
+pub mod workflow_context;
 pub use http::ServingMock;
 
 /// Deliberately nonconforming server behavior used to prove the probes reject it.
@@ -15,6 +17,7 @@ pub use http::ServingMock;
 pub enum MockFault {
     IgnorePreferences,
     IgnoreEpoch,
+    IgnoreWorkflowContextCapability,
     DuplicateEvents,
     EmptyEvents,
     Wire(&'static str),
@@ -99,6 +102,12 @@ fn eligible<'a>(s: &'a State, worker: &str) -> Result<Vec<&'a Entry>, ApiError> 
         .filter(|e| {
             !e.completed
                 && !e.excluded.contains(worker)
+                && lease_context::offer_allowed(&s.workers[worker].request.features, &e.item)
+                && (s.fault == Some(MockFault::IgnoreWorkflowContextCapability)
+                    || workflow_context::offer_allowed(
+                        &s.workers[worker].request.features,
+                        &e.item,
+                    ))
                 && e.item.affinity.eligible(labels)
                 && !s.leases.values().any(|l| l.lease.item.id == e.item.id)
         })
@@ -143,13 +152,19 @@ impl MockWorkServer {
     }
     /// Rejects malformed affinity and labels rather than silently changing eligibility.
     pub fn enqueue(&self, item: WorkItem, at: DateTime<Utc>) -> Result<(), ApiError> {
+        let mut state = self.inner.lock().unwrap();
+        Self::enqueue_locked(&mut state, item, at)?;
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+    fn enqueue_locked(s: &mut State, item: WorkItem, at: DateTime<Utc>) -> Result<(), ApiError> {
         item.affinity
             .validate()
             .map_err(|_| error("invalid_affinity"))?;
         for k in item.labels.keys() {
             validate_key(k).map_err(|_| error("invalid_label"))?;
         }
-        let mut s = self.inner.lock().unwrap();
         if s.items.iter().any(|e| e.item.id == item.id) {
             return Err(error("duplicate_item"));
         }
@@ -163,10 +178,9 @@ impl MockWorkServer {
             remote_input: false,
             next_lease_id: None,
         });
-        drop(s);
-        self.changed.notify_waiters();
         Ok(())
     }
+
     pub fn queue(&self, worker: &str) -> Result<List<QueueItem>, ApiError> {
         self.queue_at(worker, Utc::now(), 50, None)
     }
@@ -346,11 +360,13 @@ impl MockWorkServer {
         let mut s = self.inner.lock().unwrap();
         expire(&mut s, now);
         let item = live(&mut s, id, epoch)?.lease.item.id.clone();
+        workflow_context::on_result(&mut s, &item, &result)?;
         s.items
             .iter_mut()
             .find(|e| e.item.id == item)
             .unwrap()
             .completed = true;
+        lease_context::on_result(&mut s, &item, &result);
         s.results.insert(item, result);
         s.leases.remove(id);
         drop(s);
@@ -377,6 +393,7 @@ impl MockWorkServer {
                 .excluded
                 .insert(worker);
         }
+        lease_context::on_release(&mut s, &item, &req);
         s.releases.insert(id.into(), req);
         s.leases.remove(id);
         drop(s);

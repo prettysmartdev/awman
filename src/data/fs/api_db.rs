@@ -25,6 +25,7 @@ use crate::data::session_status::SessionStatus;
 /// Persistable session metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRecord {
+    pub context_key: Option<String>,
     pub id: String,
     pub workdir: String,
     pub created_at: String,
@@ -610,6 +611,7 @@ impl SqliteSessionStore {
         Self::add_column_if_missing(conn, "sessions", "push", "INTEGER NOT NULL DEFAULT 0")?;
         // WI 0145: kind marker of an in-memory session credential (no value).
         Self::add_column_if_missing(conn, "sessions", "git_auth_kind", "TEXT")?;
+        Self::add_column_if_missing(conn, "sessions", "context_key", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "worker_id", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "queued_at", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "result", "TEXT")?;
@@ -807,7 +809,7 @@ impl SqliteSessionStore {
         let mut stmt = conn.prepare(
             "SELECT id, workdir, created_at, status, closed_at, \
                     setup_status, session_type, cloned_path, \
-                    repo_url, branch, base_ref, merge_refs, push, git_auth_kind \
+                    repo_url, branch, base_ref, merge_refs, push, git_auth_kind, context_key \
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], session_record_from_row)?;
@@ -839,7 +841,7 @@ impl SqliteSessionStore {
         let mut stmt = conn.prepare(
             "SELECT id, workdir, created_at, status, closed_at, \
                     setup_status, session_type, cloned_path, \
-                    repo_url, branch, base_ref, merge_refs, push, git_auth_kind \
+                    repo_url, branch, base_ref, merge_refs, push, git_auth_kind, context_key \
              FROM sessions ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], session_record_from_row)?;
@@ -861,7 +863,7 @@ impl SqliteSessionStore {
         let mut stmt = conn.prepare(
             "SELECT id, workdir, created_at, status, closed_at, \
                     setup_status, session_type, cloned_path, \
-                    repo_url, branch, base_ref, merge_refs, push, git_auth_kind \
+                    repo_url, branch, base_ref, merge_refs, push, git_auth_kind, context_key \
              FROM sessions WHERE status = ?1 ORDER BY created_at",
         )?;
         let rows = stmt.query_map(params![status.as_str()], session_record_from_row)?;
@@ -952,7 +954,7 @@ impl SqliteSessionStore {
         labels: &[LabelSelector],
     ) -> Result<Vec<SessionRecord>, DataError> {
         let mut sql = String::from(
-            "SELECT id,workdir,created_at,status,closed_at,setup_status,session_type,cloned_path,repo_url,branch,base_ref,merge_refs,push,git_auth_kind FROM sessions s WHERE 1=1",
+            "SELECT id,workdir,created_at,status,closed_at,setup_status,session_type,cloned_path,repo_url,branch,base_ref,merge_refs,push,git_auth_kind,context_key FROM sessions s WHERE 1=1",
         );
         let mut args: Vec<Value> = Vec::new();
         if let Some(status) = status {
@@ -1011,7 +1013,7 @@ impl SqliteSessionStore {
         let mut stmt = conn.prepare(
             "SELECT id, workdir, created_at, status, closed_at, \
                     setup_status, session_type, cloned_path, \
-                    repo_url, branch, base_ref, merge_refs, push, git_auth_kind \
+                    repo_url, branch, base_ref, merge_refs, push, git_auth_kind, context_key \
              FROM sessions \
              WHERE setup_status IN ('initializing', 'cloning_repository', \
                                     'setting_up_branch', 'merging_refs', 'running_ready') \
@@ -1791,6 +1793,7 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
             .unwrap_or_default(),
         push: row.get(12)?,
         git_auth_kind: row.get(13)?,
+        context_key: row.get(14)?,
     })
 }
 
@@ -1912,4 +1915,18 @@ fn parse_timestamp(value: &str) -> Result<chrono::DateTime<chrono::Utc>, DataErr
     chrono::DateTime::parse_from_rfc3339(value)
         .map(|v| v.with_timezone(&chrono::Utc))
         .map_err(|e| DataError::Other(format!("invalid RFC3339 timestamp '{value}': {e}")))
+}
+
+impl SqliteSessionStore {
+    pub fn set_context_key(
+        &self,
+        id: &str,
+        key: Option<&crate::data::context::ContextKey>,
+    ) -> Result<(), DataError> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE sessions SET context_key=?1 WHERE id=?2",
+            params![key.map(|k| k.as_str()), id],
+        )?;
+        Ok(())
+    }
 }

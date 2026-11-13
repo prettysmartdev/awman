@@ -72,6 +72,8 @@ struct CancellationStoppingResponse {
 
 #[derive(Deserialize, Debug)]
 struct CreateSessionRequest {
+    #[serde(default)]
+    context_key: Option<String>,
     /// `"local"` (default) or `"remote"`.
     #[serde(default)]
     session_type: Option<String>,
@@ -102,6 +104,8 @@ struct CreateSessionRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     setup: Option<crate::data::session_setup_event::SessionSetupState>,
     id: crate::data::ids::WorkerSessionId,
@@ -171,6 +175,7 @@ impl From<SessionRecord> for SessionResponse {
     fn from(s: SessionRecord) -> Self {
         Self {
             setup: None,
+            context_key: s.context_key,
             id: crate::data::ids::WorkerSessionId::parse(&s.id).expect("stored session id"),
             workdir: s.workdir,
             created_at: parse_at(&s.created_at).expect("stored session created_at"),
@@ -728,6 +733,55 @@ pub struct RouteSpec {
     pub capability: Option<&'static str>,
 }
 pub const ROUTES: &[RouteSpec] = &[
+    RouteSpec {
+        method: "GET",
+        path: "/v1/contexts/{key}",
+        op: Operation::CoreContextsList,
+        local_only: false,
+        capability: Some("context_api"),
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/contexts/{key}/files/{*path}",
+        op: Operation::CoreContextFilesGet,
+        local_only: false,
+        capability: Some("context_api"),
+    },
+    RouteSpec {
+        method: "PUT",
+        path: "/v1/contexts/{key}/files/{*path}",
+        op: Operation::CoreContextFilesPut,
+        local_only: false,
+        capability: Some("context_api"),
+    },
+    RouteSpec {
+        method: "DELETE",
+        path: "/v1/contexts/{key}/files/{*path}",
+        op: Operation::CoreContextFilesDelete,
+        local_only: false,
+        capability: Some("context_api"),
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/commands/{id}/context_changes",
+        op: Operation::WorkerCommandsContextChanges,
+        local_only: false,
+        capability: Some("context_api"),
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/commands/{id}/context",
+        op: Operation::WorkerCommandsContext,
+        local_only: false,
+        capability: Some("workflow_context"),
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/commands/{id}/context/files/{*path}",
+        op: Operation::WorkerCommandsContextFile,
+        local_only: false,
+        capability: Some("workflow_context"),
+    },
     RouteSpec {
         method: "GET",
         path: "/v1/engine/catalogue",
@@ -1315,6 +1369,16 @@ pub fn build_router_for_listener(api: Arc<DaemonApi>, policy: ListenerPolicy) ->
             _ => unreachable!(),
         };
         let route: MethodRouter = match spec.op.owner() {
+            _ if super::contexts::route(spec.op, filter).is_some() => {
+                super::contexts::route(spec.op, filter)
+                    .expect("context route")
+                    .with_state(api.clone())
+            }
+            _ if super::command_context::route(spec.op, filter).is_some() => {
+                super::command_context::route(spec.op, filter)
+                    .expect("workflow context route")
+                    .with_state(api.clone())
+            }
             _ if super::browser::route(spec.op, filter).is_some() => {
                 super::browser::route(spec.op, filter)
                     .expect("browser route")
@@ -1498,7 +1562,11 @@ async fn daemon_auth(
             return ApiError::not_found("resource not found").into_response();
         }
         let hidden = |spec: &RouteSpec| {
-            spec.op.local_only()
+            spec.op
+                .requires_feature()
+                .and_then(|f| f.feature_name())
+                .is_some_and(|f| !api.runtime.listener_serves(name, f))
+                || spec.op.local_only()
                 || spec
                     .op
                     .owner()
@@ -1846,6 +1914,7 @@ async fn create_submission(
     }
     let submission = SessionSubmission {
         request: SessionCreateRequest {
+            context_key: body.context_key,
             session_type: body.session_type,
             workdir: body.workdir,
             repo_url: body.repo_url,
@@ -3009,8 +3078,7 @@ async fn listener_gate(
             .feature_state(crate::data::daemon_state::FeatureName::Engine)
             .state;
         let mut protocols = serde_json::json!({"api":1,"frontend":1,"terminal":1});
-        let mut capabilities: Vec<&str> =
-            crate::command::daemon_api::capabilities::CAPABILITIES.to_vec();
+        let mut capabilities = crate::command::daemon_api::capabilities::advertised(true, &[]);
         if browser_links {
             protocols["browser"] = serde_json::json!(1);
         }
@@ -3036,7 +3104,7 @@ async fn listener_gate(
                 "daemon_epoch": auth.daemon_epoch(),
                 "listener_epoch": auth.listener_epoch(&name),
             });
-            capabilities.push("browser_reauth");
+            capabilities.push("browser_reauth".into());
         }
         body["capabilities"] = serde_json::json!(capabilities);
         Json(body).into_response()

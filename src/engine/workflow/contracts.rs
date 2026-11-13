@@ -549,3 +549,40 @@ async fn unattended_and_explicit_non_interactive_runs_finish_without_review() {
     }
     s.finish();
 }
+
+#[tokio::test]
+async fn scratch_lease_spans_setup_single_steps_main_and_teardown_lifetime() {
+    let s = TestSandbox::for_test(TestCase::component("engine::workflow::contracts::scratch_lease_spans_setup_single_steps_main_and_teardown_lifetime"));
+    let resolver =
+        crate::data::fs::context_dirs::ContextDirResolver::from_env(&environment(&s)).unwrap();
+    let (mut workflow, _) = engine(
+        &s,
+        Arc::new(Mutex::new(Trace::default())),
+        false,
+        0,
+        false,
+        false,
+    )
+    .await;
+    let invocation = workflow.state().invocation_id;
+    let dir = resolver.workflow_dir(invocation);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("note"), b"live").unwrap();
+    assert!(
+        resolver.remove_workflow_dir(invocation).is_err(),
+        "lease is held before setup or main starts"
+    );
+    workflow.step_once().await.unwrap();
+    assert!(
+        resolver.remove_workflow_dir(invocation).is_err(),
+        "single-step foreground runs retain scratch"
+    );
+    workflow.run_to_completion().await.unwrap();
+    assert!(
+        resolver.remove_workflow_dir(invocation).is_err(),
+        "teardown can still use scratch after main completes"
+    );
+    drop(workflow);
+    resolver.remove_workflow_dir(invocation).unwrap();
+    assert!(!dir.exists());
+}

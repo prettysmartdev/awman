@@ -17,6 +17,7 @@ pub mod clock;
 // `data::InvocationStatus` names the in-memory session command status.
 pub mod command_status;
 pub mod config;
+pub mod context;
 pub mod dynamic_workflow_assets;
 pub mod error;
 pub mod execution_event;

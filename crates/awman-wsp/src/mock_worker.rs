@@ -3,6 +3,8 @@ use crate::{labels::WorkerLabels, *};
 use serde_json::Value;
 #[derive(Debug)]
 pub struct MockWorker {
+    pub context_changes: Option<fn(&Lease) -> ContextChanges>,
+    pub workflow_context: Option<fn(&Lease) -> WorkflowContextResult>,
     pub client: Client,
     name: String,
     labels: WorkerLabels,
@@ -23,6 +25,8 @@ pub struct LeaseReport {
 impl MockWorker {
     pub fn new(client: Client, name: &str, labels: WorkerLabels, features: Vec<String>) -> Self {
         Self {
+            context_changes: None,
+            workflow_context: None,
             client,
             name: name.into(),
             labels,
@@ -76,6 +80,7 @@ impl MockWorker {
                     .release(
                         &lease.id,
                         &ReleaseRequest::<Value> {
+                            context_changes: self.context_changes.map(|hook| hook(&lease)),
                             reason: ReleaseReason::Error,
                             message: heartbeat.cancel_reason,
                             result: None,
@@ -90,6 +95,10 @@ impl MockWorker {
                             .result(
                                 &lease.id,
                                 &LeaseResult {
+                                    context_changes: self.context_changes.map(|hook| hook(&lease)),
+                                    workflow_context: self
+                                        .workflow_context
+                                        .map(|hook| hook(&lease)),
                                     result: result.clone(),
                                     outputs: None,
                                     outputs_mounted: false,
@@ -103,6 +112,7 @@ impl MockWorker {
                             .release(
                                 &lease.id,
                                 &ReleaseRequest::<Value> {
+                                    context_changes: self.context_changes.map(|hook| hook(&lease)),
                                     reason: *reason,
                                     message: None,
                                     result: None,

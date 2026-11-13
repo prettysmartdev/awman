@@ -32,6 +32,7 @@ pub const DEFAULT_REPO_URL_SCHEMES: &[&str] = &["http://", "https://", "git@", "
 /// API's `CreateSessionRequest` body but carry no transport concerns.
 #[derive(Debug, Clone, Default)]
 pub struct SessionCreateRequest {
+    pub context_key: Option<String>,
     /// `"local"` (default) or `"remote"`. Case-insensitive.
     ///
     /// Still a `String` because it is what arrives on the wire; it is parsed
@@ -206,6 +207,7 @@ impl fmt::Display for WorkdirRefusal {
 /// route handler previously computed inline.
 #[derive(Debug, Clone)]
 pub struct SessionCreatePlan {
+    pub context_key: Option<crate::data::context::ContextKey>,
     /// The validated session kind.
     pub kind: SessionKind,
     /// Resolved workdir. For remote sessions this equals the clone destination.
@@ -296,6 +298,8 @@ impl SessionCreateRequest {
         // One parse, in Layer 2, producing the typed kind every later reader
         // uses (F-48). The `as_str()` matches this replaced ran in three
         // places against three separately-written literal sets.
+        let context_key =
+            crate::command::context::session_binding::plan_key(self.context_key.as_deref())?;
         let raw = self.session_type.as_deref().unwrap_or("local");
         let kind: SessionKind = raw.parse().map_err(|_| CommandError::SessionInvalidType {
             got: raw.to_string(),
@@ -340,6 +344,7 @@ impl SessionCreateRequest {
                         error
                     })?;
                 Ok(SessionCreatePlan {
+                    context_key,
                     kind,
                     resolved_workdir: requested,
                     cloned_path: None,
@@ -441,6 +446,7 @@ impl SessionCreateRequest {
                 let folder = repo_folder_from_url(&repo_url);
                 let cloned = policy.clone_base_dir.join(&folder);
                 Ok(SessionCreatePlan {
+                    context_key,
                     kind,
                     resolved_workdir: cloned.clone(),
                     cloned_path: Some(cloned),

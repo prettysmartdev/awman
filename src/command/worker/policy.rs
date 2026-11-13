@@ -48,6 +48,9 @@ pub fn plan(
     support: &LeaseRuntimeSupport,
     runtime: &str,
 ) -> Result<LeasePlan, String> {
+    let registered = super::capabilities::for_settings(*support, settings);
+    super::lease_context::admit(item, &registered)?;
+    super::lease_workflow_context::admit(item, &registered)?;
     item.affinity.validate().map_err(|e| e.to_string())?;
     if !item.affinity.eligible(labels) {
         return Err("required affinity changed before execution".into());

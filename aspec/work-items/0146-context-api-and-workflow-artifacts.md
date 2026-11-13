@@ -58,6 +58,7 @@ show the evidence without sharing a filesystem with the awman host
 - Advertise `workflow_context` in `capabilities` in `/v1/status` for the push routes, and `lease_workflow_context` in status and WSP `register.features` only when the result attachment is supported. A server offers the requested attachment only to a capable worker; mismatch releases `ineligible` before work. Keep these capabilities separate from durable repo-context capabilities.
 
 ## Edge Case Considerations:
+- Windows retains read-only context API access until safe filesystem mutations are implemented. It must not advertise `lease_context` and must refuse context-bearing leases before execution. Test Windows reads and mutation/staging refusal; the successful mutation and staging contracts apply to Unix. Workflow-note attachments remain independently supported.
 - Two commands writing the same key concurrently: last writer wins on disk. `context_changes` lets the client detect this; document that `:ro` is the safe default for parallel jobs.
 - A key with no directory yet: `GET` returns an empty list, not 404.
 - A malformed, symlinked, duplicate or traversal path in a pulled context snapshot is rejected before the lease starts. Size limits apply to decoded bytes. A failed/cancelled lease returns any safe context changes with its partial result under the same cap; a lost lease epoch cannot publish changes.

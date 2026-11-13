@@ -445,3 +445,18 @@ impl ApiPaths {
         }
     }
 }
+
+impl ApiPaths {
+    pub fn command_invocation_pin_path(&self, session_id: &str, command_id: &str) -> PathBuf {
+        self.command_dir(session_id, command_id)
+            .join("invocation.json")
+    }
+    pub fn command_context_start_path(&self, session_id: &str, command_id: &str) -> PathBuf {
+        self.command_dir(session_id, command_id)
+            .join("context_start.json")
+    }
+    pub fn command_context_changes_path(&self, session_id: &str, command_id: &str) -> PathBuf {
+        self.command_dir(session_id, command_id)
+            .join("context_changes.json")
+    }
+}

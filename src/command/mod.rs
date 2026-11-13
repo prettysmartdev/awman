@@ -6,6 +6,7 @@
 //! (frontends) or Layer 4 (the binary entrypoints).
 
 pub mod commands;
+pub mod context;
 pub mod daemon_api;
 pub mod dispatch;
 pub mod error;

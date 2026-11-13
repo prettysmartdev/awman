@@ -658,15 +658,19 @@ impl Host {
         let ClaimOutcome::Leased(lease) = outcome else {
             return Err("item no longer available".into());
         };
-        let plan = policy::plan(
-            &lease.item,
-            &server_handle.labels,
-            config,
-            &self.settings,
-            &LeaseRuntimeSupport::from_capabilities(self.engines.runtime.capabilities()),
-            self.engines.runtime.display_name(),
-        )
-        .and_then(|plan| policy::delivery(&lease, &plan, true).map(|()| plan));
+        let plan = super::lease_context::admit(&lease.item, &[])
+            .and_then(|()| super::lease_workflow_context::admit(&lease.item, &[]))
+            .and_then(|()| {
+                policy::plan(
+                    &lease.item,
+                    &server_handle.labels,
+                    config,
+                    &self.settings,
+                    &LeaseRuntimeSupport::from_capabilities(self.engines.runtime.capabilities()),
+                    self.engines.runtime.display_name(),
+                )
+            })
+            .and_then(|plan| policy::delivery(&lease, &plan, true).map(|()| plan));
         let plan = match plan {
             Ok(plan) => plan,
             Err(message) => {
@@ -675,6 +679,7 @@ impl Host {
                     .release(
                         &LeaseRef::of(&lease),
                         &ReleaseRequest {
+                            context_changes: None,
                             reason: ReleaseReason::Ineligible,
                             message: Some(message.clone()),
                             result: None,
@@ -837,6 +842,8 @@ impl Host {
                 .unwrap_or(false);
             let result = crate::data::worker::wire::ForegroundResult {
                 completion: awman_wsp::LeaseResult {
+                    context_changes: None,
+                    workflow_context: None,
                     result,
                     outputs: None,
                     outputs_mounted: mounted,
@@ -1155,6 +1162,9 @@ impl ManualRun {
                 control: control.clone(),
                 finish: Default::default(),
                 outputs: Default::default(),
+                context_stage: Default::default(),
+                context_changes: Default::default(),
+                workflow_context: Default::default(),
                 done: CancellationToken::new(),
             });
             preparation = Some((record.clone(), active.clone(), leases.clone()));
@@ -1394,6 +1404,7 @@ impl ManualRun {
                         .release(
                             &LeaseRef::of(&lease),
                             &ReleaseRequest {
+                                context_changes: None,
                                 reason,
                                 message: Some(error.clone()),
                                 result: None,
@@ -1495,6 +1506,7 @@ impl ManualRun {
                 .release(
                     &LeaseRef::of(&self.lease),
                     &ReleaseRequest {
+                        context_changes: None,
                         reason,
                         message: Some(message.into()),
                         result: Some(partial.clone()),

@@ -24,6 +24,8 @@ pub mod error;
 pub mod events;
 pub mod executor_share;
 pub mod heartbeat;
+pub mod lease_context;
+pub mod lease_workflow_context;
 pub mod lease_workspace;
 pub mod push;
 pub mod session;

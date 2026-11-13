@@ -1,4 +1,6 @@
 pub const CAPABILITIES: &[&str] = &[
+    "context_api",
+    "workflow_context",
     "daemon_features",
     "network_listener",
     "named_listeners",
@@ -85,6 +87,8 @@ pub const CAPABILITIES: &[&str] = &[
 /// advertised only while the daemon runs a pull worker that reports it
 /// (`PullHandle::capabilities`), never speculatively.
 pub const PULL_CAPABILITIES: &[&str] = &[
+    "lease_context",
+    "lease_workflow_context",
     "worker_pull",
     "lease_credentials",
     "lease_inline_work_item",
@@ -99,11 +103,26 @@ pub const PULL_CAPABILITIES: &[&str] = &[
 pub fn advertised(mounts_outputs: bool, pull: &[&str]) -> Vec<String> {
     CAPABILITIES
         .iter()
+        .filter(|c| enabled(c))
         .filter(|c| mounts_outputs || **c != "outputs")
         .filter(|c| crate::engine::git::credential_socket::supported() || **c != "session_git_auth")
-        .chain(PULL_CAPABILITIES.iter().filter(|c| pull.contains(c)))
+        .chain(
+            PULL_CAPABILITIES
+                .iter()
+                .filter(|c| pull.contains(c) && enabled(c)),
+        )
         .map(|c| c.to_string())
         .collect()
+}
+
+fn enabled(capability: &str) -> bool {
+    match capability {
+        "context_api" => crate::command::context::repo_api::SUPPORTED,
+        "workflow_context" => crate::command::context::workflow_api::SUPPORTED,
+        "lease_context" => crate::command::worker::lease_context::SUPPORTED,
+        "lease_workflow_context" => crate::command::worker::lease_workflow_context::SUPPORTED,
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -124,10 +143,16 @@ mod tests {
         let with_pull = advertised(true, PULL_CAPABILITIES);
         let mut expected = CAPABILITIES
             .iter()
+            .filter(|c| enabled(c))
             .filter(|c| cfg!(any(unix, windows)) || **c != "session_git_auth")
             .map(|c| c.to_string())
             .collect::<Vec<_>>();
-        expected.extend(PULL_CAPABILITIES.iter().map(|c| c.to_string()));
+        expected.extend(
+            PULL_CAPABILITIES
+                .iter()
+                .filter(|c| enabled(c))
+                .map(|c| c.to_string()),
+        );
         assert_eq!(with_pull, expected);
     }
 

@@ -72,3 +72,72 @@ async fn hostile_workflow_agent_definitions_are_refused_before_any_host_or_conta
     assert!(host_agent.calls().is_empty());
     s.finish();
 }
+
+#[cfg(unix)]
+#[test]
+fn context_launch_events_and_errors_do_not_expose_host_paths() {
+    use awman::command::commands::launch_policy::LaunchPolicy;
+    use awman::data::{
+        config::overlays::{ContextOverlaySpec, ContextScope, OverlayPermission},
+        context::ContextKey,
+        execution_event::EventPayload,
+        fs::context_dirs::ContextDirResolver,
+        session::RepoContextBinding,
+    };
+    let s = crate::support::sandbox(
+        "security::trust::context_launch_events_and_errors_do_not_expose_host_paths",
+    );
+    let mut session = Session::open_at_directory_root(
+        s.work(),
+        SessionOpenOptions {
+            env: Some(crate::support::env_snapshot(&s)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let bus = EventBus::new(32);
+    let mut events = bus.subscribe();
+    let mut frontend = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
+    let spec = ContextOverlaySpec {
+        scope: ContextScope::Repo,
+        permission: OverlayPermission::ReadWrite,
+        key: None,
+    };
+    let agent = AgentName::new("claude").unwrap();
+    LaunchPolicy::for_session(&session)
+        .resolve_context_overlays(
+            std::slice::from_ref(&spec),
+            &agent,
+            None,
+            None,
+            &mut frontend,
+        )
+        .unwrap();
+    let mut messages = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let EventPayload::StatusMessage { message, .. } = event.payload {
+            messages.push(message);
+        }
+    }
+    assert!(messages.iter().any(|m| m.contains("local fallback")));
+    for message in messages {
+        assert!(
+            !message.contains(s.awman_home().to_str().unwrap()),
+            "{message}"
+        );
+    }
+    let key = ContextKey::parse("secret-key").unwrap();
+    let resolver = ContextDirResolver::at_home(s.awman_home());
+    let keyed = resolver.keyed_repo_dir(&key);
+    std::fs::create_dir_all(keyed.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(s.work(), &keyed).unwrap();
+    session.set_repo_context(RepoContextBinding::Keyed(key));
+    let error = LaunchPolicy::for_session(&session)
+        .resolve_context_overlays(&[spec], &agent, None, None, &mut frontend)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "context overlay directory is unavailable"
+    );
+    assert!(!error.to_string().contains(s.awman_home().to_str().unwrap()));
+}

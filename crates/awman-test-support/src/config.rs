@@ -4,8 +4,8 @@
 //! Source, in order (design 16.7):
 //! 1. `AWMAN_TEST_RUN_CONFIG` (CI: the archived run configuration). Set but
 //!    unreadable → every sandbox panics `BLOCKED[run-config]`.
-//! 2. `<workspace>/ci/gates.toml`, located from this crate's compile-time
-//!    `CARGO_MANIFEST_DIR` (local runs).
+//! 2. `<workspace>/ci/gates.toml`, located from the working directory
+//!    (local runs), falling back to the compile-time `CARGO_MANIFEST_DIR`.
 //! 3. Built-in defaults equal to design section 3, used only when neither
 //!    exists (before the manifest is committed). A test in this crate checks
 //!    that the defaults equal `ci/gates.toml` whenever that file exists.
@@ -162,12 +162,33 @@ impl RunConfig {
     }
 }
 
-/// The repository root, from this crate's compile-time manifest directory.
+/// The repository root, resolved when the test runs rather than when it was built.
+///
+/// A compile-time `env!("CARGO_MANIFEST_DIR")` goes stale when one `target/`
+/// directory is shared by checkouts at different paths (a container and the
+/// host worktree): cargo's fingerprints are workspace-relative, so it reuses
+/// the test binary and the manifest would be looked up in the other checkout.
+/// Cargo and nextest run test binaries from their package directory, so the
+/// nearest ancestor of the working directory holding both `Cargo.toml` and
+/// `ci/gates.toml` wins; the build-time location is the last resort.
 pub(crate) fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .components()
-        .collect()
+    resolve_workspace_root(
+        std::env::current_dir().ok().as_deref(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+}
+
+fn resolve_workspace_root(cwd: Option<&Path>, compiled_manifest_dir: &Path) -> PathBuf {
+    let is_root =
+        |dir: &Path| dir.join("Cargo.toml").is_file() && dir.join("ci/gates.toml").is_file();
+    if let Some(found) = cwd.and_then(|c| c.ancestors().find(|d| is_root(d))) {
+        return found.to_path_buf();
+    }
+    compiled_manifest_dir
+        .ancestors()
+        .nth(2)
+        .unwrap_or(compiled_manifest_dir)
+        .to_path_buf()
 }
 
 pub(crate) fn run_config() -> &'static RunConfig {
@@ -290,6 +311,23 @@ pending = "P7"
         assert_eq!(previous.file.as_deref(), Some("awman-linux-amd64"));
         assert_eq!(previous.pending.as_deref(), Some("P7"));
         assert!(RunConfig::parse("x = 1", Source::BuiltinDefaults).is_err());
+    }
+
+    #[test]
+    fn workspace_root_follows_the_checkout_not_the_build_path() {
+        let sandbox = crate::TestSandbox::new();
+        let root = sandbox.work().join("checkout");
+        let cwd = root.join("crates/awman-test-support");
+        std::fs::create_dir_all(root.join("ci")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        std::fs::write(root.join("ci/gates.toml"), "").unwrap();
+        let stale = Path::new("/elsewhere/crates/awman-test-support");
+        assert_eq!(resolve_workspace_root(Some(&cwd), stale), root);
+        assert_eq!(
+            resolve_workspace_root(None, stale),
+            PathBuf::from("/elsewhere")
+        );
     }
 
     /// The defaults must not drift from the committed manifest.

@@ -406,7 +406,7 @@ package = "awman-cli"
 target = "test:component"
 contracts = ["component-daemon"]
 requires = []
-paths = ["tests/component/daemon/**", "src/engine/daemon/**", "src/command/daemon/**", "src/frontend/daemon/**"]
+paths = ["tests/component/daemon/**", "src/engine/daemon/**", "src/command/daemon/**", "src/frontend/daemon/**", "src/command/context/**", "src/command/daemon_api/**", "src/frontend/api/**", "src/data/context/**", "src/engine/workflow/context_files.rs"]
 filter = "test(/^daemon::/)"
 
 [suites.component-squad]
@@ -426,7 +426,7 @@ package = "awman-cli"
 target = "test:component"
 contracts = ["component-worker"]
 requires = []
-paths = ["tests/component/worker/**", "src/engine/worker/**", "src/command/worker/**", "src/frontend/worker/**"]
+paths = ["tests/component/worker/**", "src/engine/worker/**", "src/command/worker/**", "src/frontend/worker/**", "crates/awman-wsp/**", "src/data/context/**", "src/command/context/**"]
 filter = "test(/^worker::/)"
 
 [suites.component-security]

@@ -352,6 +352,9 @@ impl ApiAdmission {
                 journal,
                 &{
                     let mut body = serde_json::json!({"id":session_id,"workdir":plan.resolved_workdir,"created_at":created_at,"status":"active","setup_status":"initializing","session_type":plan.kind.as_str(),"repo_url":plan.repo_url,"branch":plan.branch,"base_ref":plan.base_ref,"merge_refs":plan.merge_refs,"push":plan.push,"labels":submission.labels});
+                    if let Some(key) = &plan.context_key {
+                        body["context_key"] = serde_json::json!(key.as_str());
+                    }
                     // The kind only: the response never echoes a credential.
                     if let Some(credential) = &git_credential {
                         body["git_auth"] =
@@ -397,6 +400,9 @@ impl ApiAdmission {
             tracing::error!(error = %e, "Failed to insert session");
             return Err(storage("Failed to create session", e));
         }
+        self.store
+            .set_context_key(&session_id, plan.context_key.as_ref())
+            .map_err(|e| storage("Failed to store context key", e))?;
         if let Some(credential) = &git_credential {
             self.engines.ephemeral_secrets.insert_session_git_auth(
                 &session_id,

@@ -308,6 +308,21 @@ pub async fn work_server(server: &WorkServerUnderTest<'_>) -> ConformanceReport 
     }
 }
 
+/// Optional lease-context protocol probes, kept separate from base WSP.
+pub async fn work_server_lease_context(
+    base_url: &str,
+    admin: &dyn awman_wsp::conformance::lease_context::LeaseContextAdmin,
+) -> awman_wsp::conformance::Report {
+    awman_wsp::conformance::lease_context::run(base_url, admin).await
+}
+/// Optional workflow artifact probes, kept separate from base WSP.
+pub async fn work_server_workflow_context(
+    base_url: &str,
+    admin: &dyn awman_wsp::conformance::workflow_context::WorkflowContextAdmin,
+) -> awman_wsp::conformance::Report {
+    awman_wsp::conformance::workflow_context::run(base_url, admin).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -160,6 +160,38 @@ impl PushObserver for Observer {
         });
     }
 }
+struct CollectionCancel(
+    Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<()>,
+);
+impl Drop for CollectionCancel {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.1.abort();
+    }
+}
+fn command_scratch(
+    paths: crate::data::fs::api_paths::ApiPaths,
+    command: &crate::data::fs::api_db::CommandRecord,
+) -> (crate::data::fs::api_paths::ApiPaths, String, String, u32) {
+    (
+        paths,
+        command.session_id.clone(),
+        command.id.clone(),
+        command.attempt,
+    )
+}
+fn collection_task_failed(result: CommandResult, repo_context_requested: bool) -> CommandResult {
+    if repo_context_requested && matches!(result.outcome, None | Some(CommandStatusKind::Done)) {
+        failed(
+            "context",
+            "context_invalid",
+            "context collection could not complete".into(),
+        )
+    } else {
+        result
+    }
+}
 struct PushStage {
     lease: Lease,
     workspace: Arc<LeaseWorkspace>,
@@ -172,11 +204,58 @@ struct PushStage {
     output_dir: PathBuf,
     run_root: PathBuf,
     git_source: Option<crate::engine::git::remote_push::WorkflowGitSource>,
+    scratch: Option<(crate::data::fs::api_paths::ApiPaths, String, String, u32)>,
 }
 #[async_trait::async_trait]
 impl LeasePostProcess for PushStage {
     async fn process(&self, mut result: CommandResult) -> CommandResult {
         let cancel = self.active.control.cancelled();
+        // Collect before every terminal path and before any branch publication.
+        // A lost epoch cannot publish either attachment.
+        if self.active.control.may_report() {
+            let active = self.active.clone();
+            let scratch = self.scratch.clone();
+            let env = self.env.clone();
+            let item = self.lease.item.clone();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let fenced = active.control.fenced();
+            let signal = stop.clone();
+            let watcher = tokio::spawn(async move {
+                fenced.cancelled().await;
+                signal.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+            let stop_on_drop = CollectionCancel(stop.clone(), watcher);
+            let fallback = result.clone();
+            let repo_context_requested = self.lease.item.context.is_some();
+            result = tokio::task::spawn_blocking(move || {
+                let mut result = result;
+                if let Some(stage) = active.context_stage.lock().unwrap().as_ref() {
+                    let (updated, changes) = super::lease_context::collect(stage, result, &stop);
+                    result = updated;
+                    *active.context_changes.lock().unwrap() = changes;
+                }
+                if let Some((paths, session, job, attempt)) = scratch {
+                    let attachment =
+                        match crate::data::fs::context_dirs::ContextDirResolver::from_env(&env) {
+                            Ok(resolver) => super::lease_workflow_context::collect(
+                                &paths, &resolver, &item, &session, &job, attempt, &stop,
+                            ),
+                            Err(_) => item
+                                .workflow_context
+                                .as_ref()
+                                .map(|_| super::lease_workflow_context::omitted()),
+                        };
+                    *active.workflow_context.lock().unwrap() = attachment;
+                }
+                result
+            })
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "context collection task failed");
+                collection_task_failed(fallback, repo_context_requested)
+            });
+            drop(stop_on_drop);
+        }
         if cancel.is_cancelled() {
             return cancelled(result);
         }
@@ -385,6 +464,15 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             control,
             finish: Mutex::new(Finish::default()),
             outputs: Mutex::new(None),
+            context_stage: Default::default(),
+            context_changes: Default::default(),
+            workflow_context: Mutex::new(
+                lease
+                    .item
+                    .workflow_context
+                    .as_ref()
+                    .map(|_| super::lease_workflow_context::omitted()),
+            ),
             done: CancellationToken::new(),
         });
         self.active
@@ -428,7 +516,9 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             let (mut result, _output_dir) = match execution {
                 Ok(Ok(value)) => value,
                 Ok(Err(error)) => {
-                    let (stage, code) = if matches!(error, WorkerEngineError::GitAuth { .. }) {
+                    let (stage, code) = if let WorkerEngineError::Context { code, .. } = &error {
+                        ("preflight", *code)
+                    } else if matches!(error, WorkerEngineError::GitAuth { .. }) {
                         ("git_auth", "git_auth_failed")
                     } else if matches!(error, WorkerEngineError::Invalid(_)) {
                         ("preflight", "setup_failed")
@@ -456,6 +546,8 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             let outputs = active.outputs.lock().unwrap().take();
             record.state = LeaseState::Lost;
             if active.control.may_report() {
+                let context_changes = active.context_changes.lock().unwrap().take();
+                let workflow_context = active.workflow_context.lock().unwrap().take();
                 record.state = LeaseState::Reporting;
                 record.expires_at = active.control.expires_at();
                 let _ = this.leases.update(&record);
@@ -467,6 +559,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                             session.release(
                                 &LeaseRef::of(&lease),
                                 &ReleaseRequest {
+                                    context_changes,
                                     reason,
                                     message: message.clone(),
                                     result: Some(result.clone()),
@@ -487,6 +580,8 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                             session.result(
                                 &LeaseRef::of(&lease),
                                 &LeaseResult {
+                                    context_changes,
+                                    workflow_context,
                                     result: result.clone(),
                                     outputs,
                                     outputs_mounted: record
@@ -549,6 +644,11 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
         active: Arc<Active>,
         interval: Duration,
     ) -> RunResult<(CommandResult, Option<PathBuf>)> {
+        let resolver =
+            crate::data::fs::context_dirs::ContextDirResolver::from_env(self.shared.sessions.env())
+                .map_err(invalid)?;
+        *active.context_stage.lock().unwrap() =
+            super::lease_context::stage(&resolver, &record.id, &lease.item)?;
         let root = crate::data::worker::paths::work_root(&self.data_paths(), &self.settings());
         let workspace = Arc::new(LeaseWorkspace::prepare(&root, &record.id)?);
         let transport = lease_transport(
@@ -616,6 +716,11 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             branch: lease.item.repo.branch.clone(),
             cloned_path: cwd.clone(),
         });
+        if let Some(stage) = active.context_stage.lock().unwrap().as_ref() {
+            run_session.set_repo_context(crate::data::session::RepoContextBinding::Staged(
+                stage.dir().to_path_buf(),
+            ));
+        }
         run_session.set_inline_work_item(inline.path().to_path_buf());
         provision::agents_for_lease(
             &self.shared.engines,
@@ -739,6 +844,15 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             output_dir: self.shared.paths.command_output_dir(&session_key, &job_id),
             run_root: workspace.clone_dir().into(),
             git_source: None,
+            scratch: Some(command_scratch(
+                self.shared.paths.clone(),
+                &self
+                    .shared
+                    .store
+                    .get_command(&job_id)
+                    .map_err(invalid)?
+                    .ok_or_else(|| invalid("lease command is missing"))?,
+            )),
         });
         let worker = QueueWorker::new(
             "pull".into(),
@@ -1001,6 +1115,7 @@ pub(super) async fn complete_foreground(
         output_dir,
         run_root,
         git_source: Some(git_source),
+        scratch: None,
     };
     let result = stage.process(result).await;
     let result = if active.control.cancelled().is_cancelled() {
@@ -1050,6 +1165,7 @@ pub(super) async fn complete_foreground(
             session.release(
                 &LeaseRef::of(&lease),
                 &ReleaseRequest {
+                    context_changes: None,
                     reason,
                     message,
                     result: Some(result.clone()),
@@ -1067,6 +1183,8 @@ pub(super) async fn complete_foreground(
         session.result(
             &LeaseRef::of(&lease),
             &LeaseResult {
+                context_changes: None,
+                workflow_context: None,
                 result: result.clone(),
                 outputs,
                 outputs_mounted: outputs_mounted
@@ -1078,4 +1196,179 @@ pub(super) async fn complete_foreground(
     .await
     .map_err(|e| e.to_string())?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod context_contract_tests {
+    use super::*;
+    use crate::data::fs::{
+        api_command_log::CommandStateWriter, api_paths::ApiPaths, context_dirs::ContextDirResolver,
+    };
+    struct PendingApi;
+    #[async_trait::async_trait]
+    impl LeaseApi for PendingApi {
+        async fn heartbeat(
+            &self,
+            _: &LeaseRef,
+            _: &awman_wsp::HeartbeatRequest,
+        ) -> RunResult<awman_wsp::HeartbeatResponse> {
+            std::future::pending().await
+        }
+        async fn post_events(&self, _: &LeaseRef, events: &[ExecutionEvent]) -> RunResult<usize> {
+            Ok(events.len())
+        }
+        async fn credentials(&self, _: &LeaseRef) -> RunResult<awman_wsp::Credentials> {
+            Err(WorkerEngineError::LeaseLost)
+        }
+    }
+    #[test]
+    fn artifact_task_failure_keeps_the_outcome_but_repo_failure_prevents_push() {
+        let done = CommandResult {
+            outcome: Some(CommandStatusKind::Done),
+            exit_code: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(collection_task_failed(done.clone(), false), done);
+        assert_eq!(
+            collection_task_failed(done, true).outcome,
+            Some(CommandStatusKind::Error)
+        );
+        let original = failed("step", "fixture", "already failed".into());
+        assert_eq!(collection_task_failed(original.clone(), true), original);
+    }
+    #[tokio::test]
+    async fn post_process_uses_the_recorded_attempt_pin_and_fences_lost_epoch_artifacts() {
+        let sandbox = awman_test_support::TestSandbox::for_test(awman_test_support::TestCase::component("command::worker::runner::post_process_uses_the_recorded_attempt_pin_and_fences_lost_epoch_artifacts"));
+        let env = crate::data::config::env::EnvSnapshot::from_instance_env(
+            sandbox
+                .env()
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect(),
+            sandbox.work().to_path_buf(),
+            vec![],
+        );
+        let resolver = ContextDirResolver::from_env(&env).unwrap();
+        let paths = ApiPaths::from_root(sandbox.work().join("api"));
+        let store = crate::data::fs::api_db::SqliteSessionStore::open_from_paths(&paths).unwrap();
+        store
+            .insert_session(
+                "session",
+                sandbox.work().to_str().unwrap(),
+                &Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+        store
+            .enqueue_command("job", "session", "exec workflow", "[]", "unused")
+            .unwrap();
+        store
+            .with_conn(|conn| {
+                conn.execute("UPDATE commands SET attempt = 2 WHERE id = 'job'", [])?;
+                Ok(())
+            })
+            .unwrap();
+        let command = store.get_command("job").unwrap().unwrap();
+        let bus = Arc::new(EventBus::for_attempt(32, command.attempt));
+        let state = crate::data::workflow_state::WorkflowState::new(
+            "notes".into(),
+            &[],
+            "hash".into(),
+            None,
+        );
+        let dir = resolver.workflow_dir(state.invocation_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("note.md"), b"note").unwrap();
+        let writer = CommandStateWriter::new(paths.clone(), "session", "job");
+        super::super::events::persist_workflow_snapshot(&writer, &bus.sender(), &state);
+        let mut item = awman_wsp::conformance::work_item("notes");
+        item.workflow_context = Some(awman_wsp::ItemWorkflowContext { max_bytes: 1024 });
+        let lease = Lease {
+            id: "server-lease".into(),
+            epoch: 1,
+            expires_at: Utc::now() + chrono::Duration::minutes(5),
+            item,
+            terminal: false,
+            remote_input: false,
+        };
+        let api: Arc<dyn LeaseApi> = Arc::new(PendingApi);
+        let (control, heartbeat) = HeartbeatLoop::spawn(
+            api.clone(),
+            LeaseRef::of(&lease),
+            Duration::from_secs(60),
+            HeartbeatStatus::new(HeartbeatState::Running),
+            lease.expires_at,
+        );
+        let active = Arc::new(Active {
+            foreground_seen: Default::default(),
+            started: AtomicBool::new(true),
+            _owner: crate::data::fs::private_files::create_private_file_new(
+                &sandbox.work().join("owner"),
+            )
+            .unwrap(),
+            server: "test".into(),
+            control: control.clone(),
+            finish: Default::default(),
+            outputs: Default::default(),
+            context_stage: Default::default(),
+            context_changes: Default::default(),
+            workflow_context: Default::default(),
+            done: CancellationToken::new(),
+        });
+        let workspace = Arc::new(
+            LeaseWorkspace::prepare(
+                &sandbox.work().join("workspaces"),
+                &crate::data::ids::LeaseId::new(),
+            )
+            .unwrap(),
+        );
+        let post = PushStage {
+            lease,
+            workspace,
+            transport: LeaseTransport::default(),
+            api,
+            active: active.clone(),
+            interval: Duration::from_secs(60),
+            env,
+            bus: bus.clone(),
+            output_dir: sandbox.work().join("output"),
+            run_root: sandbox.work().to_path_buf(),
+            git_source: None,
+            scratch: Some(command_scratch(paths, &command)),
+        };
+        post.process(failed("step", "fixture", "already failed".into()))
+            .await;
+        let attachment = active.workflow_context.lock().unwrap().take().unwrap();
+        assert!(!attachment.truncated);
+        assert_eq!(attachment.items[0].path, "note.md");
+        assert_eq!(
+            attachment.items[0].content_base64.as_deref(),
+            Some("bm90ZQ==")
+        );
+        control.fence();
+        post.process(failed("step", "fixture", "already failed".into()))
+            .await;
+        assert!(
+            active.workflow_context.lock().unwrap().is_none(),
+            "lost epoch must skip collection"
+        );
+        let session = WspSession::connect("test", "https://unused.invalid", String::new()).unwrap();
+        let polled = AtomicBool::new(false);
+        let result = terminal_report(&control, &session, async {
+            polled.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        })
+        .await;
+        assert!(matches!(result, Err(WorkerEngineError::LeaseLost)));
+        assert!(
+            !polled.load(std::sync::atomic::Ordering::Relaxed),
+            "lost epoch must never poll the report future"
+        );
+        control.stop();
+        heartbeat.await.unwrap();
+    }
 }

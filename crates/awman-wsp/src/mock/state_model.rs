@@ -77,6 +77,8 @@ fn lease_state_model_exclusive_claim_expiry_completion_and_stale_epoch() {
                                 lease.epoch,
                                 now,
                                 LeaseResult {
+                                    context_changes: None,
+                                    workflow_context: None,
                                     result: serde_json::json!({}),
                                     outputs: None,
                                     outputs_mounted: false,
@@ -96,6 +98,7 @@ fn lease_state_model_exclusive_claim_expiry_completion_and_stale_epoch() {
                                 lease.epoch,
                                 now,
                                 ReleaseRequest {
+                                    context_changes: None,
                                     reason: ReleaseReason::Shutdown,
                                     message: None,
                                     result: None,

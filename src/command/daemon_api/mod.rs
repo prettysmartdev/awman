@@ -1,6 +1,8 @@
 //! Resource operations shared by the daemon transports and clients.
 pub mod browser;
 pub mod capabilities;
+pub mod command_context;
+pub mod contexts;
 pub mod core;
 // WI 0142: typed `/v1/engine/*` operations (filled by engine-api-routes).
 pub mod engine;

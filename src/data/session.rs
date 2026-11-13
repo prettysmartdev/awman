@@ -408,6 +408,7 @@ impl SessionType {
 /// The ruling Layer 0 type that every command and workflow invocation hangs off.
 #[derive(Debug, Clone)]
 pub struct Session {
+    repo_context: RepoContextBinding,
     id: SessionId,
     inline_work_item: Option<PathBuf>,
     session_type: SessionType,
@@ -596,6 +597,7 @@ impl Session {
         session.config =
             EffectiveConfig::resolve(layers, session.flags.clone(), session.env.clone())?;
         session.definition_root = invoker.definition_root.clone();
+        session.repo_context = invoker.repo_context.clone();
         session.default_agent = invoker.default_agent.clone();
         Ok(session)
     }
@@ -615,6 +617,7 @@ impl Session {
         Ok(Self {
             id: SessionId::new(),
             inline_work_item: invoker.inline_work_item.clone(),
+            repo_context: invoker.repo_context.clone(),
             session_type: SessionType::Local {
                 workdir: working_dir,
             },
@@ -660,6 +663,7 @@ impl Session {
         Ok(Self {
             id: SessionId::new(),
             inline_work_item: None,
+            repo_context: RepoContextBinding::Inferred,
             session_type: SessionType::Local {
                 workdir: working_dir,
             },
@@ -857,5 +861,22 @@ impl Session {
             .clone()
             .with_flags(self.flags.clone())
             .with_env(self.env.clone())
+    }
+}
+
+/// The repository context selected for this session across all frontends.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RepoContextBinding {
+    #[default]
+    Inferred,
+    Keyed(crate::data::context::ContextKey),
+    Staged(std::path::PathBuf),
+}
+impl Session {
+    pub fn repo_context(&self) -> &RepoContextBinding {
+        &self.repo_context
+    }
+    pub fn set_repo_context(&mut self, binding: RepoContextBinding) {
+        self.repo_context = binding;
     }
 }

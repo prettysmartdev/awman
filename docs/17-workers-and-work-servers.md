@@ -252,8 +252,8 @@ The `features` array in registration contains capabilities this worker can
 currently use. WSP v1 capability names recognized by awman are `terminal`,
 `interactive`, `prompt`, `workflow_dynamic`, `workflow_file`, `outputs`,
 `outputs_mount_state`, `workflow_state_events`, `lease_credentials`,
-`lease_inline_work_item`, `lease_read_only`, `lease_git_auth_failure`, and
-`lease_push_retry`. The daemon API separately advertises `worker_pull` when
+`lease_inline_work_item`, `lease_read_only`, `lease_git_auth_failure`,
+`lease_push_retry`, `lease_context`, and `lease_workflow_context`. The daemon API separately advertises `worker_pull` when
 pull is active.
 
 Each `QueueItem` has `id`, `title`, `kind`, `labels`, integer `priority`,
@@ -317,6 +317,88 @@ that does not fit in the remaining budget is left out.
 Credentials contain secrets and must be protected in storage, logs, and
 responses.
 
+### Context memory and workflow notes
+
+Two optional exchanges let a server keep notes for a repository across runs and
+collect what a workflow wrote. Each is advertised by its own worker feature,
+and a server that offers an item needing one to a worker without it gets an
+`ineligible` release.
+
+**Repository context (`lease_context`).** A `WorkItem` may carry `context`:
+`{ "files": [{ "path", "content_base64" }], "max_bytes" }`. `path` is relative
+with `/` separators (no `..`, `.`, empty segments, leading `/`, backslash,
+colon or control characters), and `content_base64` is standard padded base64.
+`max_bytes` defaults to 1048576 and is capped at 16 MiB; it limits each file
+and the total of the staged files, and at most 1,000 files are accepted. The
+`context` object is decoded strictly, so an unknown field fails the lease.
+The worker writes the files to a fresh per-lease directory, mounts it as the
+item's `context(repo)`, and deletes it when the lease ends. It is never
+written to the worker's own repo context, and an overlay key does not change
+that.
+
+When the run ends, the worker compares the directory with what it staged and
+returns `context_changes` on `LeaseResult` (or on `ReleaseRequest` for a
+`shutdown` release): a list `{ "items": [...], "next_cursor": null }`. Each item
+has `path` and `change` (`added`, `modified` or `deleted`); added and modified
+items also carry `size_bytes`, `sha256` and `content_base64` (decoded content
+within the same `max_bytes` cap). Deletions carry nothing else. Symbolic links
+and non-regular files an agent leaves behind are not reported. Invalid file
+names or case-insensitive collisions fail collection with `context_invalid`;
+a resulting tree over the file-count or decoded-byte cap fails with
+`context_too_large`, including when unchanged files contribute to the total. The server applies the changes to its stored
+memory only when the lease epoch is current; a report from a lost lease is
+refused with `lease_lost` and changes nothing. A server should treat a change
+set as all-or-nothing and refuse one with invalid paths, bad base64, or a
+size that does not match.
+
+Failures use the `{ "error", "code" }` shape. A request with an invalid path,
+encoding, duplicate (including names that differ only in case), a file/directory
+clash, or an existing staging directory fails the lease before any work with
+`context_invalid`. Content over the cap fails it with `context_too_large`
+(HTTP 413). If the agent leaves more than `max_bytes` behind, the worker
+returns the changes as metadata only (no `content_base64`), fails the result
+with stage `context` and code `context_too_large`, and does not push the
+branch; a server must not apply metadata-only changes. An agent failure or
+cancellation that happened first is kept as the result. Foreground (picked)
+leases do not support `lease_context`, so an item carrying `context` is
+refused as `ineligible` there. Windows workers also omit `lease_context` from
+registration and refuse context-bearing leases as `ineligible`: their context
+API is read-only, and safe snapshot staging is not supported. Workflow-note
+attachments remain available through the separate `lease_workflow_context`
+capability.
+
+**Workflow notes (`lease_workflow_context`).** A `WorkItem` may carry
+`workflow_context`: `{ "max_bytes" }` (default 1048576, capped by the worker at 16 MiB). It asks the worker to
+return the files the workflow steps wrote to `/awman/context/workflow`.
+`LeaseResult` then carries `workflow_context`:
+
+```json
+{
+  "items": [
+    { "path": "plan.md", "size_bytes": 1204, "sha256": "…",
+      "modified_at": "2026-11-09T12:00:00Z", "content_base64": "…" }
+  ],
+  "next_cursor": null,
+  "truncated": false
+}
+```
+
+Every safe regular file is listed with `path`, `size_bytes`, `sha256` and
+`modified_at`. `content_base64` is included while the total inlined content
+fits within `max_bytes`; a file that does not fit is still listed, without
+content, and `truncated` is `true`. Agent-written names outside the portable
+context path rules are omitted and also set `truncated: true`. Artifact
+collection runs outside the async executor with a 30-second listing deadline
+and a 256 MiB hashing budget. If the notes cannot be read (or a rerun
+replaced them while they were read), the attachment has no items and
+`truncated` is `true`, with `collection_error: "unavailable"` to distinguish
+incomplete metadata from omitted content. This optional field is absent after
+a successful enumeration, including when only the inline byte cap was reached.
+Collection failures never change the command outcome. A command with
+no workflow notes returns an empty list with `truncated: false`. A result from
+a lost lease carries no attachment. A worker without `lease_workflow_context`
+releases an item that has `workflow_context` as `ineligible`.
+
 ### Fencing, heartbeats, events, and terminals
 
 Treat lease IDs as opaque. A new claim increments `epoch`; the worker pins the
@@ -359,6 +441,6 @@ Use JSON request and response bodies, snake_case field names, RFC 3339 UTC
 timestamps in `_at` fields, and integer milliseconds in `_ms` fields. Lists
 use `{ "items": [...], "next_cursor": ... }`; cursors are opaque. Errors use
 `{ "error": "...", "code": "..." }`. Common codes include `unauthorized`,
-`expired`, `taken`, `ineligible`, `lease_lost`, `not_found`, and
-`invalid_event`. Keep error codes stable. Do not return secrets in errors or
+`expired`, `taken`, `ineligible`, `lease_lost`, `not_found`,
+`invalid_event`, `context_invalid`, and `context_too_large` (HTTP 413). Keep error codes stable. Do not return secrets in errors or
 logs.
