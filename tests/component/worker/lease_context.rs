@@ -12,21 +12,20 @@ use awman::data::{
     execution_event::CommandStatusKind, fs::api_db::CommandResult,
     fs::context_dirs::ContextDirResolver, ids::LeaseId,
 };
-use awman::engine::worker::{
-    error::WorkerEngineError, lease_context::LeaseContextStage, LeaseRef, WspSession,
-};
+#[cfg(unix)]
+use awman::engine::worker::lease_context::LeaseContextStage;
+use awman::engine::worker::{error::WorkerEngineError, LeaseRef, WspSession};
 use awman_test_support::{fakes::FakeWorkServer, TestSandbox};
 use awman_wsp::{
-    codes, conformance::lease_context::LeaseContextAdmin, features, ClaimOutcome,
-    ContextChangeKind, ContextChanges, ItemContext, ItemContextFile, LeaseResult, RegisterRequest,
-    ReleaseReason, ReleaseRequest, WorkItem,
+    codes, conformance::lease_context::LeaseContextAdmin, features, ClaimOutcome, ContextChanges,
+    ItemContext, ItemContextFile, LeaseResult, RegisterRequest, WorkItem,
 };
+#[cfg(unix)]
+use awman_wsp::{ContextChangeKind, ReleaseReason, ReleaseRequest};
 use base64::Engine as _;
-use std::{
-    collections::BTreeMap,
-    path::Path,
-    sync::{atomic::AtomicBool, Arc},
-};
+use std::{collections::BTreeMap, sync::Arc};
+#[cfg(unix)]
+use std::{path::Path, sync::atomic::AtomicBool};
 
 const REPO: &str = "https://example.invalid/memory.git";
 
@@ -83,6 +82,7 @@ fn lease_result(
 }
 
 /// Files under a directory, path → content.
+#[cfg(unix)]
 fn tree(dir: &Path) -> BTreeMap<String, Vec<u8>> {
     fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
         for entry in std::fs::read_dir(dir).unwrap().flatten() {
@@ -104,6 +104,7 @@ fn tree(dir: &Path) -> BTreeMap<String, Vec<u8>> {
     out
 }
 
+#[cfg(unix)]
 fn files(pairs: &[(&str, &str)]) -> BTreeMap<String, Vec<u8>> {
     pairs
         .iter()
@@ -155,6 +156,7 @@ async fn claim(session: &WspSession, id: &str) -> awman_wsp::Lease {
 
 /// Claim on one host: admit with this worker's features and stage the
 /// snapshot before any clone.
+#[cfg(unix)]
 async fn begin(
     session: &WspSession,
     resolver: &ContextDirResolver,
@@ -170,6 +172,7 @@ async fn begin(
 }
 
 /// After the run: collect, report, tear down.
+#[cfg(unix)]
 async fn finish(session: &WspSession, lease: &awman_wsp::Lease, stage: LeaseContextStage) {
     let (result, changes) = lease_context::collect(&stage, done(), &AtomicBool::new(false));
     assert_eq!(result.outcome, Some(CommandStatusKind::Done));
@@ -183,6 +186,7 @@ async fn finish(session: &WspSession, lease: &awman_wsp::Lease, stage: LeaseCont
     assert!(!dir.exists());
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_hosts_share_server_memory_and_the_next_lease_sees_the_update() {
     let sandbox = support::sandbox(
@@ -237,6 +241,7 @@ async fn two_hosts_share_server_memory_and_the_next_lease_sees_the_update() {
     sandbox.finish();
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn leases_never_share_a_directory_or_carry_state() {
     let sandbox =
@@ -266,6 +271,37 @@ async fn leases_never_share_a_directory_or_carry_state() {
     );
     first.remove().unwrap();
     second.remove().unwrap();
+    sandbox.finish();
+}
+
+#[cfg(windows)]
+#[test]
+fn read_only_hosts_refuse_context_leases_without_staging_or_modifying_state() {
+    let sandbox = support::sandbox("worker::lease_context::read_only_hosts_refuse_context_leases_without_staging_or_modifying_state");
+    let resolver = host(&sandbox, "read-only");
+    for snapshot in [context(&[], 64), context(&[("note", b"memory")], 64)] {
+        let it = item("ctx", Some(snapshot));
+        assert!(lease_context::admit(&it, &capable()).is_err());
+        let lease = LeaseId::new();
+        let error = lease_context::stage(&resolver, &lease, &it).err().unwrap();
+        assert_eq!(code_of(error), codes::CONTEXT_INVALID);
+        assert!(!resolver.lease_repo_root().exists());
+        assert_no_host_keys(&resolver);
+    }
+    let lease = LeaseId::new();
+    let existing = resolver.lease_repo_dir(&lease);
+    std::fs::create_dir_all(&existing).unwrap();
+    std::fs::write(existing.join("note"), b"existing").unwrap();
+    let it = item("replace", Some(context(&[("note", b"overwrite")], 64)));
+    let error = lease_context::stage(&resolver, &lease, &it).err().unwrap();
+    assert_eq!(code_of(error), codes::CONTEXT_INVALID);
+    assert_eq!(std::fs::read(existing.join("note")).unwrap(), b"existing");
+    assert!(lease_context::admit(&item("plain", None), &[]).is_ok());
+    assert!(
+        lease_context::stage(&resolver, &LeaseId::new(), &item("plain", None))
+            .unwrap()
+            .is_none()
+    );
     sandbox.finish();
 }
 
@@ -357,6 +393,7 @@ async fn malformed_symlinked_and_oversized_snapshots_fail_before_anything_is_sta
     sandbox.finish();
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversized_changes_fail_explicitly_with_metadata_only() {
     let sandbox = support::sandbox(
@@ -433,6 +470,7 @@ async fn oversized_changes_fail_explicitly_with_metadata_only() {
     sandbox.finish();
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_and_cancelled_leases_return_changes_and_a_lost_epoch_publishes_nothing() {
     let sandbox = support::sandbox(
@@ -507,9 +545,12 @@ async fn unsupported_workers_fail_closed_and_capable_workers_advertise_the_flag(
     let sandbox = support::sandbox(
         "worker::lease_context::unsupported_workers_fail_closed_and_capable_workers_advertise_the_flag",
     );
-    const { assert!(lease_context::SUPPORTED) };
+    const { assert!(lease_context::SUPPORTED == cfg!(unix)) };
     let status = awman::command::daemon_api::capabilities::advertised(false, &capable());
-    assert_eq!(status.iter().filter(|c| *c == "lease_context").count(), 1);
+    assert_eq!(
+        status.iter().filter(|c| *c == "lease_context").count(),
+        usize::from(cfg!(unix))
+    );
     assert!(
         !awman::command::daemon_api::capabilities::advertised(false, &[])
             .iter()
@@ -518,7 +559,7 @@ async fn unsupported_workers_fail_closed_and_capable_workers_advertise_the_flag(
     let it = item("ctx", Some(context(&[("a", b"1")], 64)));
     // The foreground host registers no context feature: refused in admission.
     assert!(lease_context::admit(&it, &[]).is_err());
-    assert!(lease_context::admit(&it, &capable()).is_ok());
+    assert_eq!(lease_context::admit(&it, &capable()).is_ok(), cfg!(unix));
     assert!(lease_context::admit(&item("plain", None), &[]).is_ok());
     // The server never offers a context item to a worker without the feature.
     let server = FakeWorkServer::start(&sandbox).await;
@@ -555,16 +596,15 @@ async fn orphaned_staged_directories_are_removed_without_following_links() {
         "worker::lease_context::orphaned_staged_directories_are_removed_without_following_links",
     );
     let resolver = host(&sandbox, "host");
-    let it = item("x", Some(context(&[("a", b"1")], 64)));
     let (live, dead) = (LeaseId::new(), LeaseId::new());
-    let keep = lease_context::stage(&resolver, &live, &it)
-        .unwrap()
-        .unwrap();
-    let gone = lease_context::stage(&resolver, &dead, &it)
-        .unwrap()
-        .unwrap();
-    let gone_dir = gone.dir().to_path_buf();
-    std::mem::forget(gone); // a crashed worker left it behind
+    // Seed the startup state directly: cleanup also runs on read-only hosts
+    // and must not depend on successful staging in the current process.
+    let keep_dir = resolver.lease_repo_dir(&live);
+    let gone_dir = resolver.lease_repo_dir(&dead);
+    for dir in [&keep_dir, &gone_dir] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("a"), b"1").unwrap();
+    }
     #[cfg(unix)]
     let target = {
         let target = sandbox.work().join("target");
@@ -576,11 +616,11 @@ async fn orphaned_staged_directories_are_removed_without_following_links() {
     let expected = if cfg!(unix) { 2 } else { 1 };
     assert_eq!(lease_context::remove_orphans(&resolver, &[live]), expected);
     assert!(!gone_dir.exists());
-    assert!(keep.dir().exists());
+    assert!(keep_dir.exists());
     #[cfg(unix)]
     assert!(target.join("keep").exists());
     assert_eq!(lease_context::remove_orphans(&resolver, &[]), 1);
-    assert!(!keep.dir().exists());
+    assert!(!keep_dir.exists());
     sandbox.finish();
 }
 
@@ -732,10 +772,12 @@ fn complete_tree_must_be_stageable_and_staging_never_touches_keyed_memory() {
     );
     // Poison the unrelated keyed namespace; collection and cleanup still work.
     std::os::unix::fs::symlink(sandbox.work().join("absent"), &keyed).unwrap();
-    std::fs::write(stage.dir().join("NOTE"), b"new").unwrap();
+    // Use an invalid portable name that exists on both case-sensitive and
+    // case-insensitive Unix volumes. NOTE aliases note on default macOS.
+    std::fs::write(stage.dir().join("NUL"), b"new").unwrap();
     let (result, _) = lease_context::collect(&stage, done(), &AtomicBool::new(false));
     assert_eq!(result.failure.unwrap().code, codes::CONTEXT_INVALID);
-    std::fs::remove_file(stage.dir().join("NOTE")).unwrap();
+    std::fs::remove_file(stage.dir().join("NUL")).unwrap();
     for index in 0..1000 {
         std::fs::write(stage.dir().join(format!("file-{index}")), b"").unwrap();
     }

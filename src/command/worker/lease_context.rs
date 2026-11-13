@@ -26,8 +26,9 @@ use awman_wsp::codes;
 use std::sync::atomic::AtomicBool;
 
 /// Capability switch for `lease_context` (status and `register.features`).
-/// Only the daemon-hosted pull worker advertises it (design D3).
-pub const SUPPORTED: bool = true;
+/// Only daemon-hosted workers with safe context mutations advertise it.
+/// Windows context access remains read-only, so pulled snapshots are refused.
+pub const SUPPORTED: bool = cfg!(unix);
 
 /// Refuse before any work: `Err(reason)` → `release(ineligible)`.
 pub fn admit(item: &awman_wsp::WorkItem, registered: &[&str]) -> Result<(), String> {
@@ -116,11 +117,14 @@ mod tests {
         )
         .worker;
         let registered = super::super::capabilities::for_settings(support, &settings);
-        assert!(registered.contains(&awman_wsp::features::LEASE_CONTEXT));
+        assert_eq!(
+            registered.contains(&awman_wsp::features::LEASE_CONTEXT),
+            cfg!(unix)
+        );
         let status = crate::command::daemon_api::capabilities::advertised(false, &registered);
         assert_eq!(
             status.iter().filter(|c| *c == "lease_context").count(),
-            1,
+            usize::from(cfg!(unix)),
             "{status:?}"
         );
         assert!(

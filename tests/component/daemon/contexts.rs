@@ -102,6 +102,63 @@ async fn status_advertises_context_api() {
     server.shutdown().await;
 }
 
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn windows_context_api_reads_files_and_refuses_mutations() {
+    let s =
+        support::sandbox("daemon::contexts::windows_context_api_reads_files_and_refuses_mutations");
+    let server = Api::with_config(&s, worker_config(&[])).await;
+    let key = keys::keys_create(&server.api, "worker").unwrap();
+    s.redact(&key.key);
+    let k = &key.key;
+    let url = "/v1/contexts/memory/files/notes/plan.md";
+    let dir = keyed_dir(&s, "memory");
+    let empty = raw(&server, "GET", "/v1/contexts/memory", k, None, None).await;
+    assert_eq!(empty.status, 200);
+    assert_eq!(empty.json(), json!({"items": [], "next_cursor": null}));
+    let refused = raw(&server, "PUT", url, k, Some(b"new".to_vec()), None).await;
+    assert_eq!(refused.status, 500);
+    assert_eq!(refused.json()["code"], "internal");
+    assert_no_host_path(&s, &refused.bytes);
+    assert!(!dir.exists(), "a refused write must not create context");
+
+    // Agent-written files remain available through the read-only API.
+    std::fs::create_dir_all(dir.join("notes")).unwrap();
+    std::fs::write(dir.join("notes/plan.md"), b"memory").unwrap();
+    let digest = sha256(b"memory");
+    let fetched = raw(&server, "GET", url, k, None, None).await;
+    assert_eq!(fetched.status, 200);
+    assert_eq!(fetched.bytes, b"memory");
+    assert_eq!(
+        fetched.header("etag"),
+        Some(format!("\"{digest}\"").as_str())
+    );
+    assert_eq!(fetched.header("x-content-type-options"), Some("nosniff"));
+    assert_eq!(fetched.header("content-disposition"), Some("attachment"));
+    let listed = raw(&server, "GET", "/v1/contexts/memory", k, None, None).await;
+    assert_eq!(listed.status, 200);
+    let meta = listed.json();
+    assert_eq!(meta["items"].as_array().unwrap().len(), 1);
+    assert_eq!(meta["items"][0]["path"], "notes/plan.md");
+    assert_eq!(meta["items"][0]["size_bytes"], 6);
+    assert_eq!(meta["items"][0]["sha256"], digest);
+    assert!(meta["next_cursor"].is_null());
+    chrono::DateTime::parse_from_rfc3339(meta["items"][0]["modified_at"].as_str().unwrap())
+        .unwrap();
+    assert_no_host_path(&s, &listed.bytes);
+    for condition in [None, Some(digest.as_str())] {
+        for (method, body) in [("PUT", Some(b"changed".to_vec())), ("DELETE", None)] {
+            let refused = raw(&server, method, url, k, body, condition).await;
+            assert_eq!(refused.status, 500, "{method}");
+            assert_eq!(refused.json()["code"], "internal");
+            assert_no_host_path(&s, &refused.bytes);
+            assert_eq!(std::fs::read(dir.join("notes/plan.md")).unwrap(), b"memory");
+        }
+    }
+    server.shutdown().await;
+}
+
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keyed_files_round_trip_with_etags_and_preconditions() {
     let s =
@@ -328,7 +385,14 @@ async fn invalid_keys_paths_and_oversized_bodies_are_refused() {
         None,
     )
     .await;
-    assert_eq!(exact.status, 201);
+    if cfg!(unix) {
+        assert_eq!(exact.status, 201);
+    } else {
+        assert_eq!(exact.status, 500);
+        assert_eq!(exact.json()["code"], "internal");
+        assert_no_host_path(&s, &exact.bytes);
+        assert!(!keyed_dir(&s, "k").exists());
+    }
 
     // A symlink planted in the keyed directory is never followed.
     #[cfg(unix)]
@@ -599,7 +663,17 @@ async fn command_context_changes_list_added_modified_and_deleted_files() {
             None,
         )
         .await;
-        assert_eq!(put.status, 201);
+        if cfg!(unix) {
+            assert_eq!(put.status, 201);
+        } else {
+            assert_eq!(put.status, 500);
+            assert_eq!(put.json()["code"], "internal");
+            // Seed the files as an agent would through its mounted directory;
+            // Windows' HTTP context API itself remains read-only.
+            let dir = keyed_dir(&s, "acme.app");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(name), body).unwrap();
+        }
     }
 
     let unknown = awman::data::ids::CommandId::new().to_string();
@@ -631,7 +705,14 @@ async fn command_context_changes_list_added_modified_and_deleted_files() {
         None,
     )
     .await;
-    assert_eq!(deleted.status, 204);
+    if cfg!(unix) {
+        assert_eq!(deleted.status, 204);
+    } else {
+        assert_eq!(deleted.status, 500);
+        assert_eq!(deleted.json()["code"], "internal");
+        assert_eq!(std::fs::read(dir.join("drop.md")).unwrap(), b"bye");
+        std::fs::remove_file(dir.join("drop.md")).unwrap();
+    }
     let expected = json!({"items": [
         {"path": "drop.md", "change": "deleted"},
         {"path": "edit.md", "change": "modified", "size_bytes": 5, "sha256": sha256(b"after")},

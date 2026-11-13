@@ -361,7 +361,11 @@ with stage `context` and code `context_too_large`, and does not push the
 branch; a server must not apply metadata-only changes. An agent failure or
 cancellation that happened first is kept as the result. Foreground (picked)
 leases do not support `lease_context`, so an item carrying `context` is
-refused as `ineligible` there.
+refused as `ineligible` there. Windows workers also omit `lease_context` from
+registration and refuse context-bearing leases as `ineligible`: their context
+API is read-only, and safe snapshot staging is not supported. Workflow-note
+attachments remain available through the separate `lease_workflow_context`
+capability.
 
 **Workflow notes (`lease_workflow_context`).** A `WorkItem` may carry
 `workflow_context`: `{ "max_bytes" }` (default 1048576, capped by the worker at 16 MiB). It asks the worker to

@@ -49,58 +49,62 @@ fn keyed_resolution_storage_preconditions_caps_and_diff() {
     let a = ContextRelPath::parse("nested/a.md").unwrap();
     let b = ContextRelPath::parse("b.md").unwrap();
     let c = ContextRelPath::parse("c.md").unwrap();
-    let (first, outcome) = store.write(&a, b"old", &Precondition::None).unwrap();
-    assert_eq!(outcome, WriteOutcome::Created);
-    assert!(matches!(
-        store.write(&a, b"new", &Precondition::Sha256("wrong".into())),
-        Err(ContextStoreError::PreconditionFailed { .. })
-    ));
-    assert!(matches!(
-        store.delete(&a, &Precondition::Sha256("wrong".into())),
-        Err(ContextStoreError::PreconditionFailed { .. })
-    ));
-    assert_eq!(store.read(&a).unwrap().0, b"old");
-    assert!(matches!(
-        store.write(&b, b"12345", &Precondition::None),
-        Err(ContextStoreError::TooLarge(_))
-    ));
-    assert!(matches!(
-        store.write(&b, b"1234", &Precondition::None),
-        Err(ContextStoreError::TooLarge(_))
-    ));
-    let start = store.snapshot(&cancelled).unwrap();
-    let (replacement, outcome) = store
-        .write(&a, b"new!", &Precondition::Sha256(first.sha256))
-        .unwrap();
-    assert_eq!(outcome, WriteOutcome::Replaced);
-    assert_eq!(replacement, store.read(&a).unwrap().1);
-    store.write(&b, b"ok", &Precondition::None).unwrap();
-    assert!(matches!(
-        store.write(&c, b"", &Precondition::None),
-        Err(ContextStoreError::TooLarge(_))
-    ));
-    let changes = start.diff(&store.snapshot(&cancelled).unwrap());
-    assert_eq!(
-        changes
-            .iter()
-            .map(|c| (c.path.as_str(), c.change))
-            .collect::<Vec<_>>(),
-        vec![
-            ("b.md", ChangeKind::Added),
-            ("nested/a.md", ChangeKind::Modified)
-        ]
-    );
-    let before_delete = store.snapshot(&cancelled).unwrap();
-    store
-        .delete(&a, &Precondition::Sha256(replacement.sha256))
-        .unwrap();
-    let changes = before_delete.diff(&store.snapshot(&cancelled).unwrap());
-    assert_eq!(changes[0].change, ChangeKind::Deleted);
-    assert_eq!(changes[0].size_bytes, None);
-    assert_eq!(changes[0].sha256, None);
-    let mut same = before_delete.clone();
-    same.files.get_mut("nested/a.md").unwrap().modified_at = None;
-    assert!(before_delete.diff(&same).is_empty());
+    if cfg!(windows) {
+        assert_read_only(&store, &a);
+    } else {
+        let (first, outcome) = store.write(&a, b"old", &Precondition::None).unwrap();
+        assert_eq!(outcome, WriteOutcome::Created);
+        assert!(matches!(
+            store.write(&a, b"new", &Precondition::Sha256("wrong".into())),
+            Err(ContextStoreError::PreconditionFailed { .. })
+        ));
+        assert!(matches!(
+            store.delete(&a, &Precondition::Sha256("wrong".into())),
+            Err(ContextStoreError::PreconditionFailed { .. })
+        ));
+        assert_eq!(store.read(&a).unwrap().0, b"old");
+        assert!(matches!(
+            store.write(&b, b"12345", &Precondition::None),
+            Err(ContextStoreError::TooLarge(_))
+        ));
+        assert!(matches!(
+            store.write(&b, b"1234", &Precondition::None),
+            Err(ContextStoreError::TooLarge(_))
+        ));
+        let start = store.snapshot(&cancelled).unwrap();
+        let (replacement, outcome) = store
+            .write(&a, b"new!", &Precondition::Sha256(first.sha256))
+            .unwrap();
+        assert_eq!(outcome, WriteOutcome::Replaced);
+        assert_eq!(replacement, store.read(&a).unwrap().1);
+        store.write(&b, b"ok", &Precondition::None).unwrap();
+        assert!(matches!(
+            store.write(&c, b"", &Precondition::None),
+            Err(ContextStoreError::TooLarge(_))
+        ));
+        let changes = start.diff(&store.snapshot(&cancelled).unwrap());
+        assert_eq!(
+            changes
+                .iter()
+                .map(|c| (c.path.as_str(), c.change))
+                .collect::<Vec<_>>(),
+            vec![
+                ("b.md", ChangeKind::Added),
+                ("nested/a.md", ChangeKind::Modified)
+            ]
+        );
+        let before_delete = store.snapshot(&cancelled).unwrap();
+        store
+            .delete(&a, &Precondition::Sha256(replacement.sha256))
+            .unwrap();
+        let changes = before_delete.diff(&store.snapshot(&cancelled).unwrap());
+        assert_eq!(changes[0].change, ChangeKind::Deleted);
+        assert_eq!(changes[0].size_bytes, None);
+        assert_eq!(changes[0].sha256, None);
+        let mut same = before_delete.clone();
+        same.files.get_mut("nested/a.md").unwrap().modified_at = None;
+        assert!(before_delete.diff(&same).is_empty());
+    }
 }
 
 #[cfg(unix)]
@@ -197,7 +201,20 @@ fn staged_snapshots_are_validated_before_writes_and_budgeted_by_decoded_size() {
     let resolver = ContextDirResolver::at_home(sandbox.awman_home());
     let dir = resolver.lease_repo_dir(&awman::data::ids::LeaseId::new());
     let store = RepoContextStore::open(&resolver, dir, limits).unwrap();
-    store.stage_all(&files).unwrap();
+    if cfg!(unix) {
+        store.stage_all(&files).unwrap();
+    } else {
+        assert!(matches!(
+            store.stage_all(&files),
+            Err(ContextStoreError::Data(_))
+        ));
+        assert!(
+            !store.dir().exists(),
+            "refused staging must leave no directory"
+        );
+        std::fs::create_dir_all(store.dir().join("a")).unwrap();
+        std::fs::write(store.dir().join("a/b"), b"abc").unwrap();
+    }
     assert_eq!(store.read(&files[0].path).unwrap().0, b"abc");
     assert!(store.stage_all(&files).is_err());
     assert!(matches!(
@@ -384,6 +401,21 @@ fn oversized_agent_file_can_be_repaired_or_deleted_without_hashing_it() {
             store.read(&path),
             Err(ContextStoreError::TooLarge(_))
         ));
+        if cfg!(windows) {
+            assert!(matches!(
+                service.put("repair", "note", b"fixed", condition),
+                Err(awman::command::context::ContextApiError::Data(_))
+            ));
+            assert!(matches!(
+                service.delete("repair", "note", condition),
+                Err(awman::command::context::ContextApiError::Data(_))
+            ));
+            assert_eq!(
+                std::fs::metadata(store.dir().join("note")).unwrap().len(),
+                257 << 20
+            );
+            continue;
+        }
         service.put("repair", "note", b"fixed", condition).unwrap();
         assert_eq!(store.read(&path).unwrap().0, b"fixed");
         std::fs::File::create(store.dir().join("note"))
@@ -394,6 +426,49 @@ fn oversized_agent_file_can_be_repaired_or_deleted_without_hashing_it() {
         assert!(!store.dir().join("note").exists());
     }
     assert!(service.put("repair", "note", b"x", Some("*")).is_err());
+}
+
+// Exercise the documented Windows contract with real reads and snapshots,
+// including proof that neither overwrite nor delete changes agent-owned bytes.
+fn assert_read_only(store: &RepoContextStore, path: &ContextRelPath) {
+    assert!(matches!(
+        store.write(path, b"new", &Precondition::None),
+        Err(ContextStoreError::Data(_))
+    ));
+    assert!(!store.dir().exists());
+    let file = store.dir().join(path.as_str());
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, b"old").unwrap();
+    let (bytes, meta) = store.read(path).unwrap();
+    assert_eq!(bytes, b"old");
+    let cancelled = AtomicBool::new(false);
+    assert_eq!(store.list(&cancelled).unwrap(), vec![meta.clone()]);
+    let start = store.snapshot(&cancelled).unwrap();
+    for condition in [
+        Precondition::None,
+        Precondition::Exists,
+        Precondition::Sha256(meta.sha256),
+    ] {
+        assert!(matches!(
+            store.write(path, b"new", &condition),
+            Err(ContextStoreError::Data(_))
+        ));
+        assert!(matches!(
+            store.delete(path, &condition),
+            Err(ContextStoreError::Data(_))
+        ));
+        assert_eq!(std::fs::read(&file).unwrap(), b"old");
+    }
+    std::fs::write(&file, b"new").unwrap();
+    let changes = start.diff(&store.snapshot(&cancelled).unwrap());
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].path, path.as_str());
+    assert_eq!(changes[0].change, ChangeKind::Modified);
+    std::fs::remove_file(file).unwrap();
+    assert_eq!(
+        start.diff(&store.snapshot(&cancelled).unwrap())[0].change,
+        ChangeKind::Deleted
+    );
 }
 
 #[cfg(unix)]
