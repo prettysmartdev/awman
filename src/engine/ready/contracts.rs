@@ -7,18 +7,43 @@ use crate::data::{
     session::SessionOpenOptions,
 };
 use awman_test_support::{TestCase, TestSandbox};
-use std::{collections::HashMap, path::Path, sync::Mutex};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    },
+};
 
 #[derive(Default)]
 struct Pinger {
     calls: Mutex<Vec<String>>,
     failures: HashMap<String, LocalAgentPingResult>,
+    barrier: Option<tokio::sync::Barrier>,
+    pending: Vec<String>,
+    active: Arc<AtomicUsize>,
+}
+
+struct ActivePing(Arc<AtomicUsize>);
+impl Drop for ActivePing {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[async_trait::async_trait]
 impl ReadyHostPing for Pinger {
     async fn ping(&self, def: &crate::engine::agent::ResolvedAgent) -> LocalAgentPingResult {
         self.calls.lock().unwrap().push(def.name.clone());
+        self.active.fetch_add(1, Ordering::SeqCst);
+        let _active = ActivePing(self.active.clone());
+        if let Some(barrier) = &self.barrier {
+            barrier.wait().await;
+        }
+        if self.pending.contains(&def.name) {
+            std::future::pending::<()>().await;
+        }
         self.failures
             .get(&def.name)
             .cloned()
@@ -32,6 +57,8 @@ impl ReadyHostPing for Pinger {
 #[derive(Default)]
 struct Frontend {
     messages: Vec<UserMessage>,
+    active_pings: Option<Arc<AtomicUsize>>,
+    results: Vec<LocalAgentPingResult>,
 }
 impl UserMessageSink for Frontend {
     fn write_message(&mut self, message: UserMessage) {
@@ -56,6 +83,16 @@ impl ReadyFrontend for Frontend {
     }
     fn report_phase(&mut self, _: &ReadyPhase) {}
     fn report_summary(&mut self, _: &ReadySummary) {}
+    fn report_ping(&mut self, result: &LocalAgentPingResult) {
+        if let Some(active) = &self.active_pings {
+            assert_eq!(
+                active.load(Ordering::SeqCst),
+                0,
+                "reported before the batch finished"
+            );
+        }
+        self.results.push(result.clone());
+    }
 }
 
 fn engine(sandbox: &TestSandbox, selected: &str, pinger: Arc<Pinger>) -> ReadyEngine {
@@ -172,9 +209,10 @@ async fn failed_greetings_do_not_stop_other_agents_and_share_one_failure_row() {
         vec![
             ("Auth: opencode".into(), StepStatus::Done),
             (
-                "Auth: claude, codex".into(),
-                StepStatus::Failed(String::new())
+                "Auth: claude".into(),
+                StepStatus::Warn("claude: host ping timed out after 10 seconds".into())
             ),
+            ("Auth: codex".into(), StepStatus::Failed(String::new())),
         ]
     );
     assert!(frontend
@@ -185,6 +223,48 @@ async fn failed_greetings_do_not_stop_other_agents_and_share_one_failure_row() {
         .messages
         .iter()
         .any(|m| m.text.contains("codex: not installed")));
+}
+
+#[tokio::test(start_paused = true)]
+async fn host_checks_start_together_timeout_at_ten_seconds_and_report_after_the_batch() {
+    let sandbox = TestSandbox::for_test(TestCase::component(
+        "engine::ready::host_checks_start_together_timeout_at_ten_seconds_and_report_after_the_batch",
+    ));
+    dockerfiles(&sandbox, &["claude", "codex", "opencode"]);
+    let pinger = Arc::new(Pinger {
+        barrier: Some(tokio::sync::Barrier::new(3)),
+        pending: vec!["claude".into(), "codex".into()],
+        ..Default::default()
+    });
+    let mut frontend = Frontend {
+        active_pings: Some(pinger.active.clone()),
+        ..Default::default()
+    };
+    let mut engine = engine(&sandbox, "claude", pinger.clone());
+    let start = tokio::time::Instant::now();
+    engine.step(&mut frontend).await.unwrap();
+    assert_eq!(start.elapsed(), std::time::Duration::from_secs(10));
+    assert_eq!(
+        *pinger.calls.lock().unwrap(),
+        ["claude", "codex", "opencode"]
+    );
+    assert_eq!(frontend.results.len(), 3);
+    assert_eq!(
+        frontend.results[..2],
+        [
+            LocalAgentPingResult::TimedOut,
+            LocalAgentPingResult::TimedOut
+        ]
+    );
+    assert!(matches!(
+        frontend.results[2],
+        LocalAgentPingResult::Ok { .. }
+    ));
+    let summary = engine.summary();
+    assert!(matches!(summary.local_agent, StepStatus::Warn(_)));
+    let warning = &summary.auth_rows()[1];
+    assert_eq!(warning.0, "Auth: claude, codex");
+    assert!(matches!(&warning.1, StepStatus::Warn(reason) if reason.contains("10 seconds")));
 }
 
 #[tokio::test]

@@ -16,7 +16,10 @@ definition is approved for its current hash. The approval prompt shows the exact
 command and its resolved path; without `[ping]`, `ready` skips the host check.
 
 Custom host pings are argv-only, append one fixed greeting, run in a fresh private
-scratch directory and time out after 60 seconds with the child killed on drop.
+scratch directory and time out after 10 seconds during `ready`, with the child
+killed on drop. Ready launches host checks concurrently and reports their
+results together after the batch finishes; a timeout is a summary warning.
+Credential-refresh pings retain their separate 60-second timeout.
 Definition environment fields apply only inside containers. Automatic credential
 refresh remains first-party only. Container install steps use JSON exec-form RUN
 instructions so shell continuations and heredocs cannot consume later Dockerfile

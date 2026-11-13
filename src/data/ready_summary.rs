@@ -146,26 +146,44 @@ impl ReadySummary {
     /// checks without a ping command are reported as skipped during progress.
     pub fn auth_rows(&self) -> Vec<(String, StepStatus)> {
         let mut rows = Vec::new();
-        for success in [true, false] {
+        for outcome in [
+            StepStatus::Done,
+            StepStatus::Warn(String::new()),
+            StepStatus::Failed(String::new()),
+        ] {
             let names: Vec<&str> = self
                 .agent_auth
                 .iter()
                 .filter(|(_, status)| {
-                    if success {
-                        *status == StepStatus::Done
-                    } else {
-                        matches!(status, StepStatus::Failed(_))
-                    }
+                    matches!(
+                        (&outcome, status),
+                        (StepStatus::Done, StepStatus::Done)
+                            | (StepStatus::Warn(_), StepStatus::Warn(_))
+                            | (StepStatus::Failed(_), StepStatus::Failed(_))
+                    )
                 })
                 .map(|(name, _)| name.as_str())
                 .collect();
             if !names.is_empty() {
                 rows.push((
                     format!("Auth: {}", names.join(", ")),
-                    if success {
-                        StepStatus::Done
+                    if matches!(outcome, StepStatus::Warn(_)) {
+                        // Keep timeout details visible in the final summary.
+                        StepStatus::Warn(
+                            self.agent_auth
+                                .iter()
+                                .filter_map(|(_, status)| {
+                                    if let StepStatus::Warn(reason) = status {
+                                        Some(reason.as_str())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join("; "),
+                        )
                     } else {
-                        StepStatus::Failed(String::new())
+                        outcome
                     },
                 ));
             }

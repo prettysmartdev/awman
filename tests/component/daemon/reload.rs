@@ -27,12 +27,17 @@ async fn reload_switches_admission_without_restarting_and_invalid_changes_are_at
     for (key, value) in [
         ("daemon.features.squad.enabled", "true"),
         ("daemon.maxConcurrentJobs", "3"),
+        ("daemon.features.squad.maxConcurrentJobs", "2"),
+        ("daemon.features.engine.maxConcurrentJobs", "2"),
     ] {
-        support::awman(&sandbox)
+        let output = support::awman(&sandbox)
             .args(["config", "set", key, value, "--global"])
             .deadline(Duration::from_secs(5))
-            .run()
-            .assert_success();
+            .run();
+        output.assert_success();
+        assert!(output
+            .stdout_text()
+            .contains("applied to the running daemon"));
     }
     let status = backend
         .client()
@@ -42,6 +47,8 @@ async fn reload_switches_admission_without_restarting_and_invalid_changes_are_at
     assert_eq!(status["pid"], original["pid"]);
     assert_eq!(status["features"]["squad"]["state"], "on");
     assert_eq!(status["max_concurrent_jobs"], 3);
+    assert_eq!(status["features"]["squad"]["max_concurrent_jobs"], 2);
+    assert_eq!(status["features"]["engine"]["max_concurrent_jobs"], 2);
     let tasks = backend
         .client()
         .call(&Request::get("/v1/squad/tasks"))

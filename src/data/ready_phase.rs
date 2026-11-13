@@ -40,7 +40,7 @@ impl std::fmt::Display for ReadyPhase {
             Self::ImportingBaseImage => f.write_str("Checking base image..."),
             Self::ImportingAgentImage => f.write_str("Importing agent image..."),
             Self::CheckingNonDefaultAgents => f.write_str("Checking non-default agent images..."),
-            Self::CheckingLocalAgent => f.write_str("Checking local agent..."),
+            Self::CheckingLocalAgent => f.write_str("Checking host agent auth..."),
             Self::RunningAudit => f.write_str("Running audit..."),
             Self::RebuildingAfterAudit => f.write_str("Rebuilding after audit..."),
             Self::Complete => f.write_str("Ready checks complete"),

@@ -407,6 +407,7 @@ pub(super) fn handle_dialog_delete(app: &mut App) {
 pub(super) fn handle_dialog_scroll(app: &mut App, direction: i32) {
     let step = direction.unsigned_abs() as usize;
     match &mut app.active_dialog {
+        Some(Dialog::MultilineInput { editor, .. }) => editor.move_vertical(direction),
         Some(Dialog::Review(state)) => {
             if direction < 0 {
                 state.scroll = state.scroll.saturating_sub(step);

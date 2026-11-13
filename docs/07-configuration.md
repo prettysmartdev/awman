@@ -114,6 +114,16 @@ How values combine:
 
 The **Live** column of the [reference table](#reference-all-keys) says whether a running daemon picks a change up without restarting. `awman config set` of a live key tells the running daemon to reload (`POST /v1/config/reload`) and prints `applied to the running daemon`. A key that is not live prints `restart the daemon to apply`. A daemon keeps the `--set` overrides it was started with across reloads, and a reload that finds an invalid file leaves the running configuration untouched.
 
+Job capacity is live: `daemon.maxConcurrentJobs` is the shared cap, and
+`daemon.features.engine.maxConcurrentJobs`, `daemon.features.squad.maxConcurrentJobs`
+and `daemon.features.worker.maxConcurrentJobs` limit each feature. For example,
+`awman config set daemon.maxConcurrentJobs 12 --global` updates the running
+daemon without a restart. Raising a cap allows queued jobs to start; lowering
+one lets current jobs finish and holds new admissions until usage falls below
+the new limit. `workServers.<name>.maxConcurrentJobs` also reloads live and limits
+new leases from that server. Environment and startup `--set` overrides still
+take precedence over file edits.
+
 ---
 
 ## Managing config from the terminal

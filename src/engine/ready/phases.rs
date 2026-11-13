@@ -46,20 +46,29 @@ impl ReadyEngine {
         agents.sort();
         agents.dedup();
         self.summary.agent_auth.clear();
-        for agent_name in agents {
-            self.cancel.check()?;
+        // Collect the whole batch before reporting so transcripts stay together.
+        // Each future owns its deadline; slow agents do not delay the others.
+        let engine = &*self;
+        let checks = agents.into_iter().map(|agent_name| async move {
             // Reuse the selected definition captured before image setup.
             // Other definitions must pass the same trust boundary before
             // their optional host commands can run.
-            let definition = if agent_name == self.options.agent.as_str() {
-                self.definition
+            let definition = if agent_name == engine.options.agent.as_str() {
+                engine
+                    .definition
                     .clone()
                     .ok_or_else(|| EngineError::Other("selected agent definition missing".into()))
             } else {
                 AgentName::new(&agent_name)
                     .map_err(EngineError::from)
-                    .and_then(|name| self.agent_engine.resolve_definition(&self.session, &name))
+                    .and_then(|name| {
+                        engine
+                            .agent_engine
+                            .resolve_definition(&engine.session, &name)
+                    })
             };
+            let mut ping = None;
+            let mut skipped = None;
             let status = match definition {
                 Err(error) => StepStatus::Failed(format!("{agent_name}: {error}")),
                 Ok(def) if def.ping_argv.is_none() => {
@@ -69,20 +78,19 @@ impl ReadyEngine {
                         }
                         _ => def.name.clone(),
                     };
-                    frontend.write_message(crate::data::message::UserMessage {
-                        level: crate::data::message::MessageLevel::Info,
-                        text: format!("no [ping] command in {path}; host check skipped"),
-                    });
+                    skipped = Some(format!("no [ping] command in {path}; host check skipped"));
                     StepStatus::Skipped
                 }
                 Ok(def) => {
-                    frontend.write_message(crate::data::message::UserMessage {
-                        level: crate::data::message::MessageLevel::Info,
-                        text: format!("Checking host auth: {agent_name}"),
-                    });
-                    let ping = self.host_agent.ping(&def).await;
-                    frontend.report_ping(&ping);
-                    match ping {
+                    // Dropping a production ping kills its child. This shorter
+                    // ready deadline does not change credential-refresh pings.
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        engine.host_agent.ping(&def),
+                    )
+                    .await
+                    .unwrap_or(LocalAgentPingResult::TimedOut);
+                    let status = match &result {
                         LocalAgentPingResult::Ok { .. } => StepStatus::Done,
                         LocalAgentPingResult::Error => {
                             StepStatus::Failed(format!("{agent_name}: error (check auth)"))
@@ -93,13 +101,36 @@ impl ReadyEngine {
                         LocalAgentPingResult::CouldNotRun => {
                             StepStatus::Failed(format!("{agent_name}: could not run"))
                         }
-                        LocalAgentPingResult::TimedOut => StepStatus::Failed(format!(
-                            "{agent_name}: host ping timed out after 60 seconds"
+                        LocalAgentPingResult::TimedOut => StepStatus::Warn(format!(
+                            "{agent_name}: host ping timed out after 10 seconds"
                         )),
-                    }
+                    };
+                    ping = Some(result);
+                    status
                 }
             };
-            if let StepStatus::Failed(reason) = &status {
+            (agent_name, status, ping, skipped)
+        });
+        let results = futures_util::future::join_all(checks).await;
+        self.cancel.check()?;
+        for (agent_name, status, ping, skipped) in results {
+            use crate::data::message::{MessageLevel, UserMessage};
+            if let Some(ping) = ping {
+                if matches!(ping, LocalAgentPingResult::Ok { .. }) {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Info,
+                        text: format!("Host auth: {agent_name}"),
+                    });
+                }
+                frontend.report_ping(&ping);
+            }
+            if let Some(text) = skipped {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Info,
+                    text,
+                });
+            }
+            if let StepStatus::Failed(reason) | StepStatus::Warn(reason) = &status {
                 frontend.write_message(crate::data::message::UserMessage {
                     level: crate::data::message::MessageLevel::Warning,
                     text: reason.clone(),
@@ -116,8 +147,19 @@ impl ReadyEngine {
                 _ => None,
             })
             .collect();
+        let warnings: Vec<&str> = self
+            .summary
+            .agent_auth
+            .iter()
+            .filter_map(|(_, status)| match status {
+                StepStatus::Warn(reason) => Some(reason.as_str()),
+                _ => None,
+            })
+            .collect();
         self.summary.local_agent = if !failures.is_empty() {
             StepStatus::Failed(failures.join("; "))
+        } else if !warnings.is_empty() {
+            StepStatus::Warn(warnings.join("; "))
         } else if self
             .summary
             .agent_auth

@@ -59,6 +59,47 @@ fn draw(app: &mut App, width: u16, height: u16) -> String {
         .map(|cell| cell.symbol())
         .collect()
 }
+
+#[tokio::test]
+async fn multiline_dialog_arrows_follow_word_wrapping_and_resize() {
+    let s = TestSandbox::for_test(TestCase::component(
+        "frontend::tui::contracts::multiline_dialog_arrows_follow_word_wrapping_and_resize",
+    ));
+    let mut app = app(&s);
+    let text = "one two three four five six seven eight nine ten";
+    let mut editor = text_edit::TextEdit::new(true);
+    editor.set_text(text);
+    editor.move_home();
+    app.active_dialog = Some(Dialog::MultilineInput {
+        title: "Description".into(),
+        prompt: "Enter text".into(),
+        editor,
+    });
+    let screen = draw(&mut app, 60, 40);
+    assert!(screen.contains("one two three four five six seven"));
+    for key in [KeyCode::Right, KeyCode::Right, KeyCode::Down] {
+        press(&mut app, key, KeyModifiers::NONE);
+    }
+    let Some(Dialog::MultilineInput { editor, .. }) = &app.active_dialog else {
+        panic!("dialog closed")
+    };
+    assert_eq!(&editor.text[editor.cursor..], "ght nine ten");
+    press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+    let Some(Dialog::MultilineInput { editor, .. }) = &app.active_dialog else {
+        panic!("dialog closed")
+    };
+    assert_eq!(editor.cursor, 2);
+    draw(&mut app, 44, 40);
+    press(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    let Some(Dialog::MultilineInput { editor, .. }) = &app.active_dialog else {
+        panic!("dialog closed")
+    };
+    assert!(editor.cursor > 2 && editor.cursor < 36);
+    assert_eq!(editor.text, text);
+    drop(app);
+    s.finish();
+}
+
 #[tokio::test]
 async fn command_edit_validation_and_resize_preserve_user_input() {
     let s = TestSandbox::for_test(TestCase::component(
