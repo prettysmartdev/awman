@@ -223,6 +223,83 @@ test.describe('real workspace', () => {
     expect(await resizes(page), `${label}: no PTY resize`).toBe(before);
   }
 
+  test('execution and container resize, minimize and restore without losing the terminal', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    const violations = await openWorkspace(page, 'slots=1');
+    await showAgent(page);
+    const execution = page.getByRole('region', { name: 'Execution area' });
+    const containers = page.getByRole('region', { name: 'Agents', exact: true });
+    const divider = page.getByRole('separator', { name: 'Resize execution and container panels' });
+    const dimensions = async () => {
+      const e = (await execution.boundingBox())!, c = (await containers.boundingBox())!;
+      return { execution: e, containers: c, share: e.width / (e.width + c.width) };
+    };
+    for (const width of [768, 1440, 1920]) {
+      await page.setViewportSize({ width, height: 900 });
+      const boxes = await dimensions();
+      expect(boxes.execution.x + boxes.execution.width).toBeLessThan(boxes.containers.x);
+      expect(boxes.share).toBeCloseTo(1 / 3, 2);
+    }
+    const before = await grid(page);
+    // Wait for the divider to settle after the viewport changes before dragging.
+    await divider.hover({ position: { x: 6, y: 100 } });
+    const handle = (await divider.boundingBox())!;
+    await page.mouse.down();
+    await expect(divider).toBeFocused();
+    await page.mouse.move(handle.x + 200, handle.y + 100, { steps: 12 });
+    await page.mouse.up();
+    const resized = await dimensions();
+    expect(resized.share).toBeGreaterThan(0.4);
+    await expect.poll(async () => (await grid(page)).cols).toBeLessThan(before.cols);
+    await settled(page);
+    const lastCols = await page.evaluate(() => (window as unknown as { __fixture: { resizes: { cols: number }[] } }).__fixture.resizes.at(-1)!.cols);
+    expect(lastCols).toBe((await grid(page)).cols);
+    await page.getByRole('button', { name: 'Minimize execution' }).click();
+    await expect(execution).toBeHidden();
+    await expect(divider).toBeHidden();
+    const paneWidth = (await page.locator('.stage-panes').boundingBox())!.width;
+    expect((await containers.boundingBox())!.width).toBeCloseTo(paneWidth, 0);
+    await page.getByRole('button', { name: 'Minimize container' }).click();
+    await expect(containers).toBeHidden();
+    await expect(page.getByText('Restore a panel from the bar below.')).toBeVisible();
+    await page.getByRole('button', { name: 'Restore Execution', exact: true }).click();
+    expect((await execution.boundingBox())!.width).toBeCloseTo(paneWidth, 0);
+    await page.getByRole('button', { name: 'Restore Container', exact: true }).click();
+    expect((await dimensions()).share).toBeCloseTo(resized.share, 2);
+    await divider.focus();
+    await page.keyboard.press('ArrowRight');
+    expect((await dimensions()).share).toBeCloseTo(resized.share + 0.02, 2);
+    await page.keyboard.press('Enter');
+    expect((await dimensions()).share).toBeCloseTo(1 / 3, 2);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await showAgent(page);
+    await page.getByRole('button', { name: 'Minimize container' }).click();
+    await expect(execution).toBeVisible();
+    await page.getByRole('button', { name: 'Restore Container', exact: true }).click();
+    await expect(containers).toBeVisible();
+    await expect(execution).toBeHidden();
+    const connections = await page.evaluate(() => (window as unknown as { __fixture: { terminals: { closed: boolean }[] } }).__fixture.terminals.map(t => t.closed));
+    expect(connections).toEqual([false]);
+    expect(violations).toEqual([]);
+  });
+
+  test('the bottom bar restores the selected minimized agent', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await openWorkspace(page, 'slots=2');
+    await showAgent(page);
+    await page.getByRole('button', { name: 'Minimize container' }).click();
+    await page.getByRole('combobox', { name: 'Active agent' }).selectOption({ index: 1 });
+    await page.getByRole('button', { name: 'Minimize container' }).click();
+    const bar = page.getByRole('navigation', { name: 'Minimized panels' });
+    await expect(bar.getByRole('button')).toHaveCount(2);
+    await bar.getByRole('button').first().click();
+    await expect(page.getByRole('combobox', { name: 'Active agent' })).toHaveValue('tab_0_slot_0');
+    await bar.getByRole('button').click();
+    await expect(page.getByRole('combobox', { name: 'Active agent' })).toHaveValue('tab_0_slot_1');
+    await expect(bar).toBeHidden();
+    await expect(page.locator('section[aria-label^="Terminal:"]:visible')).toHaveCount(1);
+  });
+
   for (const query of ['slots=1', 'slots=3&phase=running']) {
     test(`agent terminal rows, overflow, overlaps and touch targets at five viewports (${query})`, async ({ page }) => {
       const violations = await openWorkspace(page, query);
@@ -232,7 +309,8 @@ test.describe('real workspace', () => {
         const size = await grid(page);
         const key = `${viewport.width}x${viewport.height}`;
         expect(size.rows, `${key}: agent terminal rows`).toBeGreaterThanOrEqual(minRows[key]!);
-        if (viewport.width >= 1024) expect(size.cols, `${key}: agent terminal columns`).toBeGreaterThanOrEqual(60);
+        // The default container now has two thirds of the former full-width stage.
+        if (viewport.width >= 1024) expect(size.cols, `${key}: split agent terminal columns`).toBeGreaterThanOrEqual(40);
         const layout = await page.evaluate(() => {
           const visible = (el: Element) => { const b = el.getBoundingClientRect(); const s = getComputedStyle(el); return b.width > 0 && b.height > 0 && s.visibility !== 'hidden' && !el.closest('[inert],[hidden]'); };
           const controls = Array.from(document.querySelectorAll('button,select,textarea:not([aria-label^="Type into"]),[role=tab]')).filter(el => visible(el) && !(el as HTMLButtonElement).disabled);
@@ -251,6 +329,11 @@ test.describe('real workspace', () => {
         expect(layout.small, `${key}: touch targets below 44px`).toEqual([]);
         expect(layout.headerHeight, `${key}: one agent header row`).toBeLessThanOrEqual(60);
         await expect(page.locator('[role=toolbar][aria-label="Terminal keys"]:visible')).toHaveCount(await page.evaluate(() => matchMedia('(pointer: coarse)').matches ? 1 : 0));
+        if (viewport.width >= 1024) {
+          await page.getByRole('button', { name: 'Minimize execution' }).click();
+          expect((await grid(page)).cols, `${key}: full-width agent terminal columns`).toBeGreaterThanOrEqual(60);
+          await page.getByRole('button', { name: 'Restore Execution', exact: true }).click();
+        }
       }
       expect(violations).toEqual([]);
     });
@@ -406,7 +489,7 @@ test.describe('real workspace', () => {
       await expect(composer).toBeInViewport();
       const narrow = viewport.width < 768;
       if (narrow) await page.getByRole('navigation', { name: 'Panels' }).getByRole('button', { name: 'Output', exact: true }).click();
-      else await page.locator('section[aria-label^="Terminal:"]:visible').getByRole('button', { name: 'Output', exact: true }).click();
+      else await page.getByRole('button', { name: 'Minimize container' }).click();
       const output = page.getByRole('region', { name: 'Command output' });
       await output.scrollIntoViewIfNeeded();
       const box = (await output.boundingBox())!;

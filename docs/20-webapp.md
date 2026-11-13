@@ -60,6 +60,13 @@ awman config set daemon.network.listeners.loopback.allowedOrigins https://awman.
 make web/dev
 ```
 
+If development reports a Next.js `LoaderRunnerError`, stop the development
+server, run `make web/reinstall`, then start it again with `make web/dev`.
+Reinstalling clears the Next.js build cache and restores the locked dependencies
+for the current machine. Stop the server before reinstalling so it cannot keep
+using modules from the previous installation. Run this sequence on the machine
+that reports the error, especially after using the checkout inside a container.
+
 ## Workspaces
 
 A browser has no shell of its own, so the web app opens sessions in
@@ -110,8 +117,14 @@ stage in the middle, and the command box at the bottom.
   with a summary of changed files, a **Workflow** chip when the tab has a
   workflow, and a connection indicator (for example **Read only** or
   **Reconnecting…**).
-- **Stage.** Switch between **Agent** and **Output**. When a tab runs several
-  agents, the agent switcher chooses which one you see.
+- **Stage.** Execution starts on the left at one third of the width, with the
+  container on the right at two thirds. Drag the divider to resize them, or
+  focus it and use Left/Right arrow keys. Double-click the divider or press
+  Enter to reset the split. Minimize either panel with its **−** button to
+  give the other the full width; restore it from the bar below the panels.
+  Both can be minimized, and restoring preserves your chosen split. Container
+  sessions and scrollback stay connected while minimized. When a tab runs
+  several agents, the agent switcher chooses which one you see.
 - **Command box.** **Run** starts the command and becomes **Stop** while one is
   running; use the multi-line toggle to write a command over several lines
   without a keyboard shortcut.

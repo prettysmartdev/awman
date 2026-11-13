@@ -7,6 +7,7 @@ import { hasRunningWork } from '@/lib/client/reducers';
 import { liveCountdownDialog } from '@/lib/client/countdown';
 import type { OpenDialog } from '@/lib/client/instanceStore';
 import { ShellLayout, isNarrowLayout } from '@/lib/shell/ShellLayout';
+import { StagePanes } from '@/lib/shell/StagePanes';
 import { CommandMenu } from '@/lib/shell/CommandMenu';
 import { Menu } from '@/lib/shell/Menu';
 import { catalogueActions, fillComposer, invokeAction, type ShellAction } from '@/lib/shell/actions';
@@ -83,6 +84,7 @@ export function Workspace({ client, connection, launchContext, squadAvailable, q
   const [narrowPanel, setNarrowPanel] = useState<NarrowPanel>('output');
   const [inspector, setInspector] = useState<InspectorKind>(null);
   const [stageMode, setStageMode] = useState<'agent' | 'output'>('agent');
+  const [executionMinimized, setExecutionMinimized] = useState<Record<string, boolean>>({});
   const [commands, setCommands] = useState(false); const [tabList, setTabList] = useState(false);
   const [catalogue, setCatalogue] = useState<Catalogue | null>(null);
   const [catalogueError, setCatalogueError] = useState('');
@@ -254,10 +256,12 @@ export function Workspace({ client, connection, launchContext, squadAvailable, q
     }
   }
   function closeInspector() { if (queue) return; setInspector(null); setNarrowPanel('output'); }
-  function choosePanel(panel: NarrowPanel) {
+  function choosePanel(panel: NarrowPanel, slotId = focusedSlot?.slot_id) {
     if (queue && (panel === 'workflow' || panel === 'git')) return;
     setNarrowPanel(panel);
     if (panel === 'agent' || panel === 'output') setStageMode(panel);
+    if (panel === 'output' && tab) setExecutionMinimized(v => ({ ...v, [tab.tab_id]: false }));
+    if (panel === 'agent' && slotId && (windows[slotId] ?? 'maximized') !== 'maximized') setWindow(slotId, 'maximized');
     // Only the narrow layout shows one main panel at a time. Where the
     // inspector docks or overlays, Agent/Output change the stage alone.
     if (!queue && (panel === 'workflow' || panel === 'git' || isNarrowLayout())) setInspector(panel === 'workflow' || panel === 'git' ? panel : null);
@@ -367,11 +371,12 @@ export function Workspace({ client, connection, launchContext, squadAvailable, q
       contextBar: <><div className="context-path" title={tab.session.cwd + (tab.worktree_path ? ' · ' + tab.worktree_path : '')}>{tab.session.cwd}{tab.worktree_path && <span> · {tab.worktree_path}</span>}</div><button className="secondary context-chip" disabled={!!queueReason} aria-pressed={inspector === 'git'} onClick={openGit}>Git · {tab.git_summary?.branch ?? 'No branch'} · {tab.git_summary?.files.length ?? 0}</button><button className="secondary context-chip" disabled={!!queueReason} aria-pressed={workflow} onClick={openOverview}>Workflow{tab.workflow ? ` · ${tab.workflow.current_step}` : ''}</button><span className="connection-pill" role="status">{connectionLabel(state)}{role === 'primary' ? '' : ' · View only'}</span></>,
       activeAgent: <button className="secondary" onClick={() => choosePanel('agent')}>{tab.kind === 'squad' && squadAttached ? 'Active agent · squad task' : focusedSlot ? <SlotBar slot={focusedSlot} /> : 'Active agent · none'}</button>,
       stage: <div className="stage-content" data-stage={agentVisible ? 'agent' : 'output'}><MediaQuery query="(max-width: 767px)">{narrow => {
-        // One agent header: when the agent terminal is on screen, the switch and
-        // selector live in its single header row; otherwise in the stage heading.
+        // Keep the minimize control and agent selector in the terminal header.
+        // When it is closed, the stage heading still offers agent selection.
         const inHeader = agentVisible && tab.kind !== 'squad' && (narrowPanel === 'agent' || !narrow);
-        const stageSwitch = <StageSwitch agent={agentVisible} agentDisabled={!focusedSlot} showAgent={() => { choosePanel('agent'); if (focusedSlot) setWindow(focusedSlot.slot_id, 'maximized'); }} showOutput={() => choosePanel('output')} />;
-        const selector = (slots: typeof tab.slots) => <AgentSelector slots={slots} value={focusedSlot?.slot_id ?? ''} choose={id => { setFocused(v => ({ ...v, [tab.tab_id]: id })); choosePanel('agent'); }} />;
+        const minimizeContainer = <button className="secondary panel-minimize" aria-label="Minimize container" title="Minimize container" onClick={() => { if (focusedSlot) { setWindow(focusedSlot.slot_id, 'minimized'); setNarrowPanel('output'); } }}>−</button>;
+        const stageSwitch = <StageSwitch agent={agentVisible} agentDisabled={!focusedSlot} showAgent={() => choosePanel('agent')} showOutput={() => choosePanel('output')} />;
+        const selector = (slots: typeof tab.slots) => <AgentSelector slots={slots} value={focusedSlot?.slot_id ?? ''} choose={id => { setFocused(v => ({ ...v, [tab.tab_id]: id })); choosePanel('agent', id); }} />;
         const banner = countdown && dialog ? <SheetPresentation.Provider value="banner"><DialogRenderer key={`${view.generation}:${dialog.dialogId}`} dialog={dialog} client={client} connection={connection} readOnly={readOnly} onLocalDismiss={() => setDismissedNotices(ids => new Set(ids).add(dialog.dialogId))} /></SheetPresentation.Provider> : null;
         const interactive = !modal && !countdown && agentVisible && (narrowPanel === 'agent' || !narrow);
         // Terminals of every tab stay mounted (hidden) so switching keeps their connection and control.
@@ -379,8 +384,11 @@ export function Workspace({ client, connection, launchContext, squadAvailable, q
         return <>{!inHeader && <div className="stage-heading">{stageSwitch}{tab.slots.length > 0 && selector(tab.slots)}</div>}
         {!inHeader && banner}
         <NoticeExpiry notices={view.notices} dismiss={id => connection.store.dismissNotice(id)} />
-        <div className="stage-panes"><section className="shell-containers" aria-label="Agents" inert={modal}>{agentTabs.map(t => { const current = t.tab_id === tab.tab_id; return <ContainerArea key={t.tab_id} hidden={!current} client={client} readOnly={readOnly} viewOnly={role === 'secondary'} tab={t} focused={current ? focusedSlot?.slot_id ?? null : t.slots.find(s => s.slot_id === focused[t.tab_id])?.slot_id ?? t.focused_slot} setFocused={id => setFocused(v => ({ ...v, [t.tab_id]: id }))} windows={windows} interactive={current && interactive} setWindow={setWindow} lead={current ? <>{stageSwitch}{t.slots.length > 1 && selector(t.slots)}</> : undefined} overlay={current && inHeader ? banner : undefined} />; })}{tab.kind !== 'squad' && !tab.slots.length && <p className="empty-state">No active agent in this tab. Run a command to get started.</p>}</section>
-        <section className="shell-execution" aria-label="Execution area">{tab.kind === 'squad' ? <Squad key={tab.tab_id} client={client} available={squadAvailable} readOnly={readOnly} submit={submit} detach={detach} onInterrupt={interrupt} onAttachmentChange={setSquadAttached} enabled={!modal} /> : <ExecutionLog tab={tab} entries={entries} showStatus={showStatus} toggleStatus={() => setShowStatus(v => !v)} stopWatch={cancel} copy={copy} readOnly={readOnly} />}</section></div></>;
+        <StagePanes inert={modal} executionOpen={!executionMinimized[tab.tab_id] || tab.kind === 'squad'} containersOpen={agentVisible}
+          minimized={<>{executionMinimized[tab.tab_id] && tab.kind !== 'squad' && <button className="secondary" onClick={() => { setExecutionMinimized(v => ({ ...v, [tab.tab_id]: false })); setNarrowPanel('output'); }}>Restore Execution</button>}{tab.slots.filter(s => (windows[s.slot_id] ?? 'maximized') !== 'maximized' || (s.slot_id === focusedSlot?.slot_id && !agentVisible)).map(s => <button className="secondary" key={s.slot_id} onClick={() => { setFocused(v => ({ ...v, [tab.tab_id]: s.slot_id })); setWindow(s.slot_id, 'maximized'); setNarrowPanel('agent'); }}>Restore Container{tab.slots.length > 1 ? ` · ${s.phase_step_title ?? s.step_name}` : ''}</button>)}</>}
+          containers={<>{agentTabs.map(t => { const current = t.tab_id === tab.tab_id; return <ContainerArea key={t.tab_id} hidden={!current} client={client} readOnly={readOnly} viewOnly={role === 'secondary'} tab={t} focused={current ? focusedSlot?.slot_id ?? null : t.slots.find(s => s.slot_id === focused[t.tab_id])?.slot_id ?? t.focused_slot} setFocused={id => setFocused(v => ({ ...v, [t.tab_id]: id }))} windows={windows} interactive={current && interactive} setWindow={setWindow} lead={current ? <>{minimizeContainer}{t.slots.length > 1 && selector(t.slots)}</> : undefined} overlay={current && inHeader ? banner : undefined} />; })}{tab.kind !== 'squad' && !tab.slots.length && <p className="empty-state">No active agent in this tab. Run a command to get started.</p>}</>}
+          execution={tab.kind === 'squad' ? <Squad key={tab.tab_id} client={client} available={squadAvailable} readOnly={readOnly} submit={submit} detach={detach} onInterrupt={interrupt} onAttachmentChange={setSquadAttached} enabled={!modal} /> : <ExecutionLog tab={tab} entries={entries} showStatus={showStatus} toggleStatus={() => setShowStatus(v => !v)} stopWatch={cancel} copy={copy} readOnly={readOnly} minimize={() => { setExecutionMinimized(v => ({ ...v, [tab.tab_id]: true })); if (agentVisible) setNarrowPanel('agent'); }} />} />
+        </>;
       }}</MediaQuery></div>,
       composer: <div className="composer-dock" inert={modal}>{tab.kind === 'squad' ? <p className="hint">Squad task controls are above. The command box is inactive.</p> : <><Composer key={tab.tab_id} client={client} connection={connection} tab={tab} readOnly={readOnly} entries={entries} quit={() => act('quit')} copy={copy} />{tab.execution_phase.phase === 'running' && <button className="composer-stop danger" disabled={readOnly} onClick={stop}>{forceCancel ? 'Force stop' : 'Stop'}</button>}</>}</div>,
       inspector: queue ? <SheetPresentation.Provider value="drawer">{queueAvailable ? <QueuePanel connection={connection} tabId={queueOwner ?? tab.tab_id} readOnly={readOnly} onPick={openPicked} onClose={() => { setQueue(false); setInspector(null); setNarrowPanel('output'); }} /> : <Modal title="Work queue" onDismiss={() => { setQueue(false); setInspector(null); setNarrowPanel('output'); }}><p>Update awman to use the work queue in the browser.</p></Modal>}</SheetPresentation.Provider> : inspector === 'git' ? <GitPanel tab={tab} close={closeInspector} /> : <>{workflowActions}<WorkflowPanel tab={tab} close={closeInspector} control={control} readOnly={readOnly || engineModal} /></>,

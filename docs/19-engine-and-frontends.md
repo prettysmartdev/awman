@@ -30,6 +30,13 @@ awman config set daemon.features.engine.enabled true
 
 See [The daemon](16-daemon.md#features) for the engine settings and `awman daemon status`.
 
+The engine runs up to **8** jobs by default, subject to the shared daemon limit
+(also **8**). These limits are `daemon.features.engine.maxConcurrentJobs` and
+`daemon.maxConcurrentJobs`. When a new tab or command reaches either limit,
+the TUI shows usage and offers to increase capacity and continue, wait for a
+slot, or cancel. Increasing capacity saves the displayed changes globally and
+applies them to the running daemon without a restart.
+
 ## Instances and frontends
 
 An **instance** is one TUI session hosted by the engine: its tabs, running commands, workflows and dialogs. A **frontend** is a terminal attached to an instance. The TUI you launch is the instance's primary frontend; when it quits, the instance ends the same way a builtin TUI would, with the same prompts about running work.

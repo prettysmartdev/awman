@@ -201,7 +201,7 @@ impl DaemonSettings {
         let pull = worker.pull.clone().unwrap_or_default();
         let engine = features.engine.unwrap_or_default();
         Self {
-            max_concurrent_jobs: config.max_concurrent_jobs.unwrap_or(4),
+            max_concurrent_jobs: config.max_concurrent_jobs.unwrap_or(8),
             verbose_setup: config.verbose_setup.unwrap_or(false),
             terminal: TerminalSettings {
                 cols: terminal.cols.unwrap_or(120),
@@ -247,7 +247,7 @@ impl DaemonSettings {
                 idle_timeout: engine
                     .idle_timeout
                     .map_or(std::time::Duration::from_secs(15 * 60), |d| d.to_duration()),
-                max_concurrent_jobs: engine.max_concurrent_jobs.unwrap_or(4),
+                max_concurrent_jobs: engine.max_concurrent_jobs.unwrap_or(8),
             },
         }
     }

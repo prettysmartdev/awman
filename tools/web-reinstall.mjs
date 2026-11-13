@@ -4,6 +4,11 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+// Webpack caches loader resolution under .next. Replacing node_modules alone
+// leaves that state behind, including paths from another host or installation.
+console.log('Clearing the Next.js build cache (stop the dev server before reinstalling)');
+rmSync(fileURLToPath(new URL('../web/.next', import.meta.url)), { recursive: true, force: true });
+
 for (const packageDir of ['web', 'web/edge', 'web/e2e']) {
   const cwd = fileURLToPath(new URL(`../${packageDir}/`, import.meta.url));
   const dependencies = fileURLToPath(new URL(`../${packageDir}/node_modules`, import.meta.url));

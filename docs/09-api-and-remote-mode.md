@@ -564,7 +564,7 @@ curl https://localhost:9876/v1/worker/workdirs
 The worker feature uses a per-session FIFO queue to serialize command execution. When you submit a command via `POST /v1/worker/commands`, it is enqueued immediately and returns with a `command_id`. A pool of worker tasks processes the queue: each worker claims one queued command at a time and executes it, then claims the next one.
 
 - **One command per session at a time**, in submission order, so commands in a session don't interfere with each other.
-- **Concurrency across sessions**: the daemon shares a default capacity of four concurrent jobs across enabled features. Set the shared cap with `daemon.maxConcurrentJobs`; see [Configuration](07-configuration.md#reference-all-keys).
+- **Concurrency across sessions**: the daemon shares a default capacity of eight concurrent jobs across enabled features. Set the shared cap with `daemon.maxConcurrentJobs`; see [Configuration](07-configuration.md#reference-all-keys).
 - **Submission does not wait for execution**: a valid command for a ready session is enqueued with HTTP 202. `POST /v1/worker/commands` returns 409 if the session is closing or its setup is not ready; `POST /v1/worker/runs` can queue its command during setup.
 
 Track progress with `GET /v1/worker/commands/{id}`, or inspect a session's queue depth, running command and recent completions with [`GET /v1/worker/sessions/{id}/queue`](#get-session-queue-status).
@@ -2247,7 +2247,7 @@ Worker and network settings live in the `daemon` section of global config (`$AWM
 ```json
 {
   "daemon": {
-    "maxConcurrentJobs": 4,
+    "maxConcurrentJobs": 8,
     "verboseSetup": true,
     "network": {
       "listeners": {
@@ -2277,7 +2277,7 @@ Worker and network settings live in the `daemon` section of global config (`$AWM
 
 | Key | Meaning |
 |-----|---------|
-| `daemon.maxConcurrentJobs` | Shared maximum number of daemon jobs running at once (default 4). Live: `awman config set` applies it to a running daemon. |
+| `daemon.maxConcurrentJobs` | Shared maximum number of daemon jobs running at once (default 8). Live: `awman config set` applies it to a running daemon. |
 | `daemon.network.listeners.<name>.listen` | `host:port` the named listener binds. Restart required. |
 | `daemon.verboseSetup` | Log full session-setup output at `info` level (default `false`). |
 | `daemon.features.worker.push.workDirs.allow` | Exact working directories clients may use. |

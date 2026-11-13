@@ -3,6 +3,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 vi.mock('@/components/TerminalPanel', () => ({ TerminalPanel: () => <div>Contract terminal</div> }));
 import { Workspace } from '@/components/Workspace';
+import { StagePanes } from '@/lib/shell/StagePanes';
 import { BINDINGS } from '@/lib/keys/keymap';
 import { catalogueActions } from '@/lib/shell/actions';
 import { harness, request } from './helpers';
@@ -12,6 +13,21 @@ function show() {
   render(<Workspace client={h.client} connection={h.connection} launchContext="lc_default" squadAvailable reconnect={vi.fn()} />);
   return h;
 }
+it('resizes with the active touch and stops when that touch is canceled', () => {
+  render(<StagePanes execution={<p>Output</p>} containers={<p>Terminal</p>} executionOpen containersOpen minimized={null} inert={false} />);
+  const divider = screen.getByRole('separator');
+  vi.spyOn(divider.parentElement!, 'getBoundingClientRect').mockReturnValue({ left: 0, width: 900 } as DOMRect);
+  vi.spyOn(divider, 'getBoundingClientRect').mockReturnValue({ width: 12 } as DOMRect);
+  fireEvent.touchStart(divider, { changedTouches: [{ identifier: 7, clientX: 300 }] });
+  fireEvent.touchMove(document, { changedTouches: [{ identifier: 8, clientX: 600 }] });
+  expect(divider.getAttribute('aria-valuenow')).toBe('33');
+  fireEvent.touchMove(document, { changedTouches: [{ identifier: 7, clientX: 600 }] });
+  expect(divider.getAttribute('aria-valuenow')).toBe('67');
+  fireEvent.touchCancel(document, { changedTouches: [{ identifier: 7 }] });
+  fireEvent.touchMove(document, { changedTouches: [{ identifier: 7, clientX: 100 }] });
+  expect(divider.getAttribute('aria-valuenow')).toBe('67');
+  expect(divider.parentElement!.getAttribute('data-resizing')).toBe('false');
+});
 it('catalogue selection fills the controlled composer and never submits', async () => {
   const h = show(); fireEvent.click(screen.getByRole('button', { name: 'Actions' }));
   const menu = screen.getByRole('dialog', { name: 'Actions' });

@@ -24,6 +24,22 @@ body:has(> .update-banner) .shell { height: calc(100dvh - var(--update-banner-he
 .agent-selector { margin: 0; max-width: 55%; }
 .agent-selector select { min-height: 36px; padding: var(--space-1) var(--space-2); }
 .stage-panes { position: relative; flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); }
+.pane-divider { display: none; }
+.stage-panes[data-resizing=true] { user-select: none; cursor: col-resize; }
+.panel-minimize { flex: 0 0 auto; min-width: 44px; }
+.execution > header .panel-minimize { margin-left: auto; }
+.minimized-panels { display: flex; flex: 0 0 auto; align-items: center; gap: var(--space-2); padding: var(--space-1); overflow-x: auto; border-top: 1px solid var(--border); background: var(--surface); }
+.minimized-panels:empty { display: none; }
+.minimized-panels button { flex: 0 0 auto; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.panes-empty { align-self: center; text-align: center; color: var(--muted); }
+.stage-panes[data-execution-open=false] > .shell-execution, .stage-panes[data-containers-open=false] > .shell-containers { display: none !important; }
+@media (min-width: 768px) {
+  .stage-panes[data-execution-open=true][data-containers-open=true] { grid-template-columns: minmax(0, var(--execution-share, 1fr)) 12px minmax(0, var(--container-share, 2fr)); }
+  .stage-panes[data-execution-open=true][data-containers-open=true] > .pane-divider { display: block; }
+  .pane-divider { cursor: col-resize; touch-action: none; position: relative; border-radius: var(--radius-sm); }
+  .pane-divider::after { content: ''; position: absolute; top: 0; bottom: 0; left: 5px; width: 2px; background: var(--border); }
+  .pane-divider:hover::after, .pane-divider:focus-visible::after, [data-resizing=true] > .pane-divider::after { background: var(--accent); }
+}
 /* The agent pane never scrolls: a scrollbar would change the terminal width. */
 .shell-containers { min-height: 0; overflow: hidden; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
 /* One scroll region for output: the log fills the pane instead of nesting a second scroller. */
@@ -33,7 +49,6 @@ body:has(> .update-banner) .shell { height: calc(100dvh - var(--update-banner-he
 .shell-execution .execution > .virtual-frame { flex: 1 1 0; min-height: 8rem; display: flex; flex-direction: column; }
 .shell-execution .execution > .virtual-frame > .virtual-list { flex: 1 1 auto; height: auto; min-height: 88px; }
 .shell-execution .execution > :is(header, .surface-toolbar, .summary-bar) { flex: 0 0 auto; }
-.stage-content[data-stage=agent] .shell-execution, .stage-content[data-stage=output] .shell-containers { display: none; }
 /* Bound every terminal ancestor. The internal viewport/probe remain untouched. */
 .shell-containers .container-area { display: flex; flex-direction: column; min-height: 0; height: 100%; overflow: visible; }
 .container-area[hidden], .container-slot[hidden] { display: none !important; }
@@ -52,9 +67,6 @@ body:has(> .update-banner) .shell { height: calc(100dvh - var(--update-banner-he
 }
 @container workspace (min-width: 1920px) {
   .shell-inspector { --inspector-width: 400px; }
-  .stage-panes { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--space-3); }
-  .stage-content[data-stage=agent] .shell-execution { display: flex; }
-  .stage-content[data-stage=output] .stage-panes { grid-template-columns: minmax(0, 1fr); }
 }
 /* Composer: one row; its popover (suggestions, errors) overlays the stage above it. */
 .shell-composer { grid-area: composer; min-height: 0; position: relative; padding: var(--space-2) var(--space-4); background: var(--surface); border-top: 1px solid var(--border); z-index: 10; }

@@ -87,7 +87,7 @@ see one picture of everything awman is doing on this machine
 - **Config** (`~/.awman/config.json`, global only; the shape and names are from 0139 §2):
   ```json
   "daemon": {
-    "maxConcurrentJobs": 4,
+    "maxConcurrentJobs": 8,
     "terminal": { "cols": 120, "rows": 40, "remoteInput": false },
     "network": { "enabled": false, "listen": "127.0.0.1:9876", "tlsSans": [], "features": ["worker"] },
     "features": {
@@ -97,7 +97,7 @@ see one picture of everything awman is doing on this machine
                   "push": { "enabled": true, "interaction": "headless", "allowOverride": true,
                             "workDirs": { "allow": [], "roots": [] } },
                   "pull": { "enabled": true, "interaction": "interactive", "allowOverride": true, "workRoot": null } },
-      "engine": { "enabled": false, "allowEphemeral": true, "idleTimeout": "15m", "maxConcurrentJobs": 4 }
+      "engine": { "enabled": false, "allowEphemeral": true, "idleTimeout": "15m", "maxConcurrentJobs": 8 }
     }
   }
   ```

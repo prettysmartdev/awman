@@ -41,7 +41,7 @@ Engine behavior is controlled by four live, global settings:
 | `daemon.features.engine.enabled` | `false` | Keep the engine on persistently. |
 | `daemon.features.engine.allowEphemeral` | `true` | Let a TUI start the engine on demand. |
 | `daemon.features.engine.idleTimeout` | `15m` | How long an unused ephemeral engine stays up. |
-| `daemon.features.engine.maxConcurrentJobs` | `4` | Engine jobs run at once. |
+| `daemon.features.engine.maxConcurrentJobs` | `8` | Engine jobs run at once. |
 
 A persistent engine stays up until you disable it; an ephemeral one is started on demand and stops once it has been idle for `idleTimeout`. To make it persistent:
 

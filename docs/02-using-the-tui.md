@@ -707,6 +707,14 @@ If the tab cannot be opened — the path is not a directory, or its
 created and a **could not open new tab** modal shows the error. Press
 **Enter** or **Esc** to dismiss it.
 
+When the daemon engine is at capacity, the new tab shows an **Engine capacity
+reached** warning before its startup command runs. Both the engine limit and
+the shared daemon limit default to **8** jobs. The warning shows current usage
+and offers **i** to increase the full limits by one, save them globally, apply
+them immediately, and continue; **w** to wait for a slot; or **c** / **Esc** to
+cancel the command. Existing configured limits are respected. The same warning
+appears when another command needs a slot while the engine is full.
+
 ```
 Ctrl+T          open a new tab (prompts for working directory)
 Ctrl+A          switch to the previous tab

@@ -124,6 +124,84 @@ async fn tab_navigation_and_dialog_dismissal_keep_sessions_distinct() {
     s.finish();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_engine_new_tab_shows_capacity_choices_and_escape_cancels_ready() {
+    use crate::command::instance::{EngineInstance, HostedOptions, OpenTabRequest};
+    use crate::data::{daemon_state::FeatureName, ids::InstanceId};
+    use crate::engine::daemon::executor::SharedExecutor;
+    use std::time::Duration;
+
+    let s = TestSandbox::for_test(TestCase::component(
+        "frontend::tui::contracts::full_engine_new_tab_shows_capacity_choices_and_escape_cancels_ready",
+    ));
+    let mut app = app(&s);
+    let env = app.active_tab().session.env().clone();
+    let repo = awman_test_support::fixtures::RepoBuilder::new(&s, "capacity").init();
+    let executor = SharedExecutor::new(1);
+    executor.set_share(FeatureName::Engine, 1);
+    let _busy = executor.try_acquire(FeatureName::Engine).unwrap();
+    let instance = EngineInstance::new_hosted(
+        InstanceParts {
+            catalogue: CommandCatalogue::get(),
+            engines: Engines::for_env(env.clone()).unwrap(),
+            session_manager: Arc::new(SessionManager::in_memory(env.clone())),
+            runtime: tokio::runtime::Handle::current(),
+            env: Arc::new(move || env.clone()),
+            presentation: Arc::new(command_frontend::TuiPresentation),
+        },
+        HostedOptions {
+            id: InstanceId::new(),
+            kind: crate::command::dispatch::catalogue::FrontendKind::ENGINE_LOCAL,
+            hub: None,
+            executor: Some(executor.clone()),
+        },
+    );
+    let opened = instance
+        .open_tab(OpenTabRequest {
+            dir: repo.path().to_path_buf(),
+            options: SessionOpenOptions::default(),
+            pty_size: (80, 24),
+        })
+        .unwrap();
+    let (tab, startup) = Tab::from_opened(opened);
+    let idx = app.push_tab(tab);
+    app.active_tab = idx;
+    app.bind_startup(idx, startup, (80, 24));
+    awman_test_support::wait_for("capacity modal", Duration::from_secs(5), || {
+        app.poll_dialog_requests();
+        app.active_dialog.is_some().then_some(())
+    });
+    let screen = draw(&mut app, 80, 24);
+    for text in [
+        "Engine capacity reached",
+        "Engine jobs: 1 / 1",
+        "[i] Increase and continue",
+        "[w] Wait for a slot",
+        "[c] Cancel",
+        "[Esc] cancel",
+    ] {
+        assert!(screen.contains(text), "missing {text}: {screen}");
+    }
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        app.active_dialog.is_some(),
+        "Enter must not increase capacity"
+    );
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert!(app.active_dialog.is_none());
+    awman_test_support::wait_for("cancelled ready", Duration::from_secs(5), || {
+        (instance.running_jobs() == 0).then_some(())
+    });
+    assert_eq!(
+        executor.snapshot().per_feature[&FeatureName::Engine].running,
+        1
+    );
+    instance.quit();
+    drop(app);
+    drop(instance);
+    s.finish();
+}
+
 #[tokio::test]
 async fn closed_remote_dialog_is_discarded_without_losing_the_next_dialog() {
     use crate::command::instance::backend::BackendEvent;

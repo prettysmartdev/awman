@@ -137,7 +137,7 @@ keep the surface consistent without reviewing naming by hand.
     "integrations": { "rex": { /* 0154, 0155 */ } }
   },
   "daemon": {
-    "maxConcurrentJobs": 4,                    // host-wide cap (was workers)
+    "maxConcurrentJobs": 8,                    // host-wide cap (was workers)
     "terminal": { "cols": 120, "rows": 40, "remoteInput": false },
     "network": { "enabled": false, "listen": "127.0.0.1:9876", "tlsSans": [], "features": ["worker"] },  // listen replaces bind + port
     "features": {
@@ -155,7 +155,7 @@ keep the surface consistent without reviewing naming by hand.
         },
         "pull": { "enabled": true, "interaction": "interactive", "allowOverride": true, "workRoot": null }   // workRoot was worker.workRoot
       },
-      "engine": { "enabled": false, "allowEphemeral": true, "idleTimeout": "15m", "maxConcurrentJobs": 4 }
+      "engine": { "enabled": false, "allowEphemeral": true, "idleTimeout": "15m", "maxConcurrentJobs": 8 }
     }
   },
   "workServers": {                             // 0143 pull sources, keyed by name (was worker.servers[])

@@ -37,7 +37,7 @@ function Dashboard({ overview }: { overview: JsonValue }) {
   const agents = Array.isArray(object.agents) ? object.agents : [];
   return <section aria-label="Agents dashboard"><h3>Agents dashboard</h3><table><caption>Runtime status</caption><tbody>{Object.entries(object).filter(([key]) => key !== 'agents').map(([key, value]) => <tr key={key}><th scope="row">{key}</th><td>{typeof value === 'string' ? value : JSON.stringify(value)}</td></tr>)}</tbody></table><VirtualList label="Agent dashboard rows" items={agents} render={agent => <span>{agent && typeof agent === 'object' && !Array.isArray(agent) ? Object.entries(agent).map(([key, value]) => key + ': ' + (typeof value === 'string' ? value : JSON.stringify(value))).join(' · ') : String(agent)}</span>} /></section>;
 }
-export function ExecutionLog({ tab, entries, showStatus, toggleStatus, stopWatch, copy, readOnly = false }: { tab: TabSnapshot; entries: readonly OutputEntry[]; showStatus: boolean; toggleStatus: () => void; stopWatch: () => void; copy: () => void; readOnly?: boolean }) {
+export function ExecutionLog({ tab, entries, showStatus, toggleStatus, stopWatch, copy, readOnly = false, minimize }: { tab: TabSnapshot; entries: readonly OutputEntry[]; showStatus: boolean; toggleStatus: () => void; stopWatch: () => void; copy: () => void; readOnly?: boolean; minimize?: () => void }) {
   const lines = useMemo(() => {
     const tail: { text: string; level: string }[] = [];
     for (let index = entries.length - 1; index >= 0 && tail.length < 50_000; index--) {
@@ -47,7 +47,7 @@ export function ExecutionLog({ tab, entries, showStatus, toggleStatus, stopWatch
     }
     return tail.reverse();
   }, [entries]);
-  return <div className={`execution phase-${tab.execution_phase.phase}`} data-key-context="execution"><header><h2>Execution</h2><span className="badge">{phaseLabel(tab.execution_phase.phase)}{'command' in tab.execution_phase ? ` · ${tab.execution_phase.command}` : ''}</span></header>
+  return <div className={`execution phase-${tab.execution_phase.phase}`} data-key-context="execution"><header><h2>Execution</h2><span className="badge">{phaseLabel(tab.execution_phase.phase)}{'command' in tab.execution_phase ? ` · ${tab.execution_phase.command}` : ''}</span>{minimize && <button className="secondary panel-minimize" aria-label="Minimize execution" title="Minimize execution" onClick={minimize}>−</button>}</header>
     <div className="surface-toolbar"><button className="secondary" aria-pressed={showStatus} onClick={toggleStatus}>Status log</button><Menu label="Output actions" actions={[
       { id: 'copy', label: 'Copy selection', group: 'Output', matrix: ['exec.select_copy'], run: copy },
       ...(tab.agents_dashboard?.watching ? [{ id: 'stop', label: 'Stop watching', group: 'Danger' as const, matrix: ['exec.agents_watch_stop'], disabled: readOnly ? 'Attach as primary to stop watching.' : undefined, run: stopWatch }] : []),

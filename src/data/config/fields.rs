@@ -698,7 +698,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
     row(
         "daemon.maxConcurrentJobs",
         POSITIVE,
-        "4",
+        "8",
         Global,
         true,
         "Jobs the daemon runs at once.",
@@ -946,7 +946,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
     row(
         "daemon.features.engine.maxConcurrentJobs",
         POSITIVE,
-        "4",
+        "8",
         Global,
         true,
         "Engine jobs the daemon runs at once.",

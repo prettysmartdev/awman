@@ -26,6 +26,7 @@
 
 pub mod admission;
 pub mod backend;
+mod capacity;
 pub mod feeds;
 pub mod frontend;
 pub mod host;
@@ -837,16 +838,6 @@ impl EngineInstance {
         let command_runtime = self.runtime.clone();
 
         let task = self.runtime.spawn(async move {
-            // Hosted commands share the daemon executor under the engine's
-            // `maxConcurrentJobs` (WI 0142 §1, executor share).
-            let _permit = match executor {
-                Some(executor) => Some(
-                    executor
-                        .acquire(crate::data::daemon_state::FeatureName::Engine)
-                        .await,
-                ),
-                None => None,
-            };
             // Frontend trait methods ask synchronous questions. Run the
             // command on a dedicated worker: parking a Tokio worker here can
             // also strand the host pump in that worker's non-stealable LIFO
@@ -856,12 +847,29 @@ impl EngineInstance {
             // A command can synchronously enter the dynamic-workflow launch
             // stack. Give it the CLI main thread's normal stack budget;
             // Tokio's default 2 MiB blocking workers are too small in debug
-            // builds. The executor permit above still bounds concurrency.
+            // builds. Admission below still bounds command execution.
             let worker = std::thread::Builder::new()
                 .name("awman-command".into())
                 .stack_size(8 * 1024 * 1024)
                 .spawn(move || {
                     let result = handle.block_on(Box::pin(async move {
+                        // Capacity prompts block this dedicated thread while
+                        // the host keeps pumping dialog requests and answers.
+                        let _permit = match executor {
+                            Some(executor) => {
+                                let session = session_for_state.read().await.clone();
+                                Some(
+                                    capacity::acquire(
+                                        &executor,
+                                        dispatch.frontend(),
+                                        &session,
+                                        &crate::command::commands::config::LocalDaemons,
+                                    )
+                                    .await?,
+                                )
+                            }
+                            None => None,
+                        };
                         let path_refs: Vec<&str> = path_owned.iter().map(String::as_str).collect();
                         // Command futures can include a complete dynamic
                         // workflow. Keep their state on the heap rather than

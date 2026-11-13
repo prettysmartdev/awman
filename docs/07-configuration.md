@@ -705,7 +705,7 @@ have the effective defaults above.
 | `tui.worker.enabled` | bool | `false` | repo | no | no | `AWMAN_TUI_WORKER_ENABLED` | Enable the TUI work queue panel (Ctrl+Q) and an instance-owned manual worker. |
 | `tui.integrations.*` | object | `{}` | repo | no | no | — | Integration-specific TUI settings keyed by integration name. |
 | `tui.integrations.*.enabled` | enum `auto\|on\|off` | `"auto"` | repo | no | no | `AWMAN_TUI_INTEGRATIONS_<NAME>_ENABLED` | Whether this TUI integration is selected automatically, enabled, or disabled. |
-| `daemon.maxConcurrentJobs` | int ≥ 1 | `4` | global | no | yes | `AWMAN_DAEMON_MAX_CONCURRENT_JOBS` | Jobs the daemon runs at once. |
+| `daemon.maxConcurrentJobs` | int ≥ 1 | `8` | global | no | yes | `AWMAN_DAEMON_MAX_CONCURRENT_JOBS` | Jobs the daemon runs at once. |
 | `daemon.verboseSetup` | bool | `false` | global | no | yes | `AWMAN_DAEMON_VERBOSE_SETUP` | Log session setup in detail. |
 | `daemon.terminal.cols` | int ≥ 1 | `120` | global | no | yes | `AWMAN_DAEMON_TERMINAL_COLS` | Default daemon terminal width. |
 | `daemon.terminal.rows` | int ≥ 1 | `40` | global | no | yes | `AWMAN_DAEMON_TERMINAL_ROWS` | Default daemon terminal height. |
@@ -736,7 +736,7 @@ have the effective defaults above.
 | `daemon.features.engine.enabled` | bool | `false` | global | no | yes | `AWMAN_DAEMON_FEATURES_ENGINE_ENABLED` | Serve engine instances from the daemon. |
 | `daemon.features.engine.allowEphemeral` | bool | `true` | global | no | yes | `AWMAN_DAEMON_FEATURES_ENGINE_ALLOW_EPHEMERAL` | Allow the daemon to start the engine feature on demand. |
 | `daemon.features.engine.idleTimeout` | duration | `"15m"` | global | no | yes | `AWMAN_DAEMON_FEATURES_ENGINE_IDLE_TIMEOUT` | Idle time after which an unused on-demand engine stops. |
-| `daemon.features.engine.maxConcurrentJobs` | int ≥ 1 | `4` | global | no | yes | `AWMAN_DAEMON_FEATURES_ENGINE_MAX_CONCURRENT_JOBS` | Engine jobs the daemon runs at once. |
+| `daemon.features.engine.maxConcurrentJobs` | int ≥ 1 | `8` | global | no | yes | `AWMAN_DAEMON_FEATURES_ENGINE_MAX_CONCURRENT_JOBS` | Engine jobs the daemon runs at once. |
 | `workServers.*.url` | string | `null` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_URL` | Base URL of a linked work server; required for every entry. |
 | `workServers.*.enabled` | bool | `true` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_ENABLED` | Whether this work server is enabled. |
 | `workServers.*.claim` | enum `auto\|manual` | `"auto"` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_CLAIM` | Claim automatically or wait for a person to pick work items. |
