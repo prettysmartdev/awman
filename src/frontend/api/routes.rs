@@ -2036,7 +2036,7 @@ impl SessionSetupPresenter for ApiSessionSetupPresenter {
 
     async fn finished(&mut self) {
         tokio::spawn(cleanup_setup_bus(
-            Arc::clone(&self.state),
+            Arc::downgrade(&self.state),
             self.session_id.clone(),
         ));
     }
@@ -2045,9 +2045,13 @@ impl SessionSetupPresenter for ApiSessionSetupPresenter {
 /// Retain the setup bus for 60 seconds after the run reaches a terminal state,
 /// so a client that polls or subscribes just after completion still sees the
 /// final events, then drop it.
-async fn cleanup_setup_bus(state: Arc<AppState>, session_id: String) {
+async fn cleanup_setup_bus(state: std::sync::Weak<AppState>, session_id: String) {
     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-    state.setup_buses.lock().await.remove(&session_id);
+    // Retaining presentation history must not keep the daemon's database or
+    // session credentials alive after shutdown.
+    if let Some(state) = state.upgrade() {
+        state.setup_buses.lock().await.remove(&session_id);
+    }
 }
 
 async fn handle_list_sessions(

@@ -153,5 +153,10 @@ async fn remote_run_clone_auth_failure_reports_git_auth_failed() {
     assert!(!events["events"].as_array().unwrap().is_empty());
     assert!(!events.to_string().contains(secret));
     assert!(!events.to_string().contains(stale));
+    let store = std::sync::Arc::downgrade(&server.api.worker.as_ref().unwrap().store);
     server.shutdown().await;
+    assert!(
+        store.upgrade().is_none(),
+        "shutdown must release the database"
+    );
 }

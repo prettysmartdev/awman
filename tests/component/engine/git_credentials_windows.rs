@@ -47,7 +47,9 @@ fn native_pipe_scopes_and_revokes_the_session_credential() {
             .stdout_text()
     };
     assert!(ask(nonce, "team/repo.git").contains(secret));
+    assert!(ask(nonce, "team/repo.git").contains(secret));
     assert!(!ask(nonce, "team/other.git").contains(secret));
+    assert!(ask(nonce, "team/repo.git").contains(secret));
     assert!(!ask("invalid", "team/repo.git").contains(secret));
     let filled = s
         .command("git")

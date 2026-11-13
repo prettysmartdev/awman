@@ -27,7 +27,7 @@ pub(super) fn serve(
                 }
             };
             runtime.block_on(async {
-                let mut pipe = match crate::engine::remote::local::owner_pipe(&path, true) {
+                let mut listener = match crate::engine::remote::local::owner_pipe(&path, true) {
                     Ok(pipe) => pipe,
                     Err(error) => {
                         let _ = ready.send(Err(error));
@@ -39,9 +39,18 @@ pub(super) fn serve(
                 }
                 while !stop.load(Ordering::SeqCst) {
                     tokio::select! {
-                        result = pipe.connect() => { if result.is_err() { break; } }
+                        result = listener.connect() => { if result.is_err() { break; } }
                         _ = tokio::time::sleep(Duration::from_millis(10)) => continue,
                     }
+                    // Each connection needs fresh overlapped I/O state. Reusing
+                    // a disconnected Tokio pipe can expose a pending read's
+                    // EOF to the next client. Create its replacement before
+                    // dropping this instance so the protected name stays owned.
+                    let next = match crate::engine::remote::local::owner_pipe(&path, false) {
+                        Ok(next) => next,
+                        Err(_) => break,
+                    };
+                    let mut pipe = std::mem::replace(&mut listener, next);
                     if crate::engine::remote::local::verify_pipe_client(&pipe) {
                         serving.store(true, Ordering::SeqCst);
                         let exchange = async {
@@ -71,9 +80,6 @@ pub(super) fn serve(
                             _ = stopped => {},
                         }
                         serving.store(false, Ordering::SeqCst);
-                    }
-                    if pipe.disconnect().is_err() {
-                        break;
                     }
                 }
             });
