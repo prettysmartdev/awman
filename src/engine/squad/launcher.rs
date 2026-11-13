@@ -14,8 +14,10 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::data::dynamic_workflow_assets::WORKFLOW_USAGE_MD;
+use crate::data::program_status::EffectiveStatus;
 use crate::data::session::{AgentName, Session};
 use crate::data::RepoDockerfilePaths;
 use crate::engine::agent::{AgentEngine, AgentRunOptions};
@@ -28,7 +30,12 @@ use crate::engine::auth::AgentCredentials;
 use crate::engine::container::naming::{generate_squad_container_name, validate_task_slug};
 use crate::engine::container::options::ContainerName;
 use crate::engine::error::EngineError;
-use crate::engine::workflow::timing::yolo_countdown_duration;
+use crate::engine::workflow::actions::CountdownKind;
+use crate::engine::workflow::program_status::{
+    describe_status, drain_pending_reports, final_tracker_status, respond_to_report,
+    ReportedResponse,
+};
+use crate::engine::workflow::timing::{agent_done_countdown_duration, yolo_countdown_duration};
 
 /// The label key carrying the squad evaluation session id — the same key an
 /// interactive session uses, so `docker ps` inspection is uniform.
@@ -203,6 +210,17 @@ impl SquadAgentLauncher {
     /// (`Unstuck`), and expiry kills the container and returns — the unattended
     /// equivalent of the dynamic path's yolo auto-advance.
     ///
+    /// An agent that reports its own status over OSC 7501 (WI 0141) is judged
+    /// on its reports instead — the detector never sends it `Stuck` — with the
+    /// workflow engine's "no user" column
+    /// ([`respond_to_report`](crate::engine::workflow::program_status::respond_to_report)):
+    /// `done`/`idle` starts the short `AgentDone` countdown whose expiry is a
+    /// normal auto-advance; `blocked` starts an `AgentBlocked` countdown
+    /// whose expiry kills the agent as a **failure**
+    /// (`killed_by_countdown == false`, [`UnattendedExit::reported_problem`]
+    /// set). An `error` report stays live until the agent exits or reports
+    /// recovery; `working` cancels whichever countdown is running.
+    ///
     /// Logging is lifecycle-only: countdown started / cancelled / auto-advanced.
     /// No per-tick messages ever reach the daemon log.
     ///
@@ -211,91 +229,11 @@ impl SquadAgentLauncher {
     /// not recoverable from the exit code alone — a 137 the container produced on
     /// its own (an OOM kill, an external `docker kill`) looks identical.
     pub async fn drive_unattended_agent(
-        mut execution: AgentExecution,
+        execution: AgentExecution,
         task: &str,
         label: &str,
     ) -> Result<UnattendedExit, EngineError> {
-        let cancel = execution.cancel_handle();
-        let mut stuck_rx = execution.subscribe_stuck();
-        let (wait_tx, mut wait_rx) =
-            tokio::sync::oneshot::channel::<Result<AgentExitInfo, EngineError>>();
-        tokio::spawn(async move {
-            let result = execution.wait().await;
-            let _ = wait_tx.send(result);
-        });
-
-        loop {
-            tokio::select! {
-                biased;
-                result = &mut wait_rx => {
-                    return result
-                        .map_err(|_| EngineError::Other("agent wait task dropped unexpectedly".into()))?
-                        .map(UnattendedExit::own_exit);
-                }
-                ev = stuck_rx.recv() => match ev {
-                    Ok(StuckEvent::Stuck) => {
-                        tracing::info!(
-                            task,
-                            agent = label,
-                            "squad yolo countdown started for task {task:?} ({label}): no output — \
-                             advancing automatically in {}s",
-                            yolo_countdown_duration().as_secs(),
-                        );
-                        match run_unattended_countdown(task, label, &mut wait_rx, &mut stuck_rx).await {
-                            CountdownOutcome::Exited(result) => {
-                                return result.map(UnattendedExit::own_exit)
-                            }
-                            CountdownOutcome::Recovered => {}
-                            CountdownOutcome::Expired => {
-                                tracing::info!(
-                                    task,
-                                    agent = label,
-                                    "squad yolo countdown expired for task {task:?} ({label}); \
-                                     auto-advancing past the idle agent",
-                                );
-                                if let Some(cancel) = &cancel {
-                                    let _ = cancel.cancel();
-                                }
-                                // The kill makes the real wait resolve; fall back to
-                                // a synthetic killed exit if the backend errors.
-                                let now = chrono::Utc::now();
-                                let exit = (&mut wait_rx).await.ok().and_then(Result::ok).unwrap_or(
-                                    AgentExitInfo {
-                                        exit_code: KILLED_EXIT_CODE,
-                                        signal: None,
-                                        started_at: now,
-                                        ended_at: now,
-                                    },
-                                );
-                                return Ok(UnattendedExit {
-                                    exit,
-                                    killed_by_countdown: true,
-                                });
-                            }
-                        }
-                    }
-                    Ok(StuckEvent::Unstuck) => {}
-                    Ok(StuckEvent::StartupGraceExpired) => {
-                        // The bridge already killed the container; the wait branch
-                        // above resolves with its exit on the next loop pass.
-                        tracing::warn!(
-                            task,
-                            agent = label,
-                            "squad agent produced no output before its startup grace expired; \
-                             container was killed",
-                        );
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        // No more stuck events can arrive — just wait for exit.
-                        return (&mut wait_rx)
-                            .await
-                            .map_err(|_| EngineError::Other("agent wait task dropped unexpectedly".into()))?
-                            .map(UnattendedExit::own_exit);
-                    }
-                }
-            }
-        }
+        drive_unattended_agent_with(execution, task, label, CountdownDurations::current()).await
     }
 
     /// Seed, launch, and await the leader agent, returning its exit, the
@@ -346,6 +284,7 @@ impl SquadAgentLauncher {
         let UnattendedExit {
             exit,
             killed_by_countdown,
+            ..
         } = Self::drive_unattended_agent(execution, &spec.task_name, "leader").await?;
         Ok(LeaderExit {
             exit,
@@ -383,20 +322,34 @@ impl SquadAgentLauncher {
 /// was what ended it.
 #[derive(Debug, Clone)]
 pub struct UnattendedExit {
+    /// The container's exit. When the agent reported a problem and then
+    /// exited by itself with code 0, the code is rewritten to 1: a reported
+    /// `blocked`/`error` outranks the exit code (WI 0141), and callers decide
+    /// failure from the code.
     pub exit: AgentExitInfo,
     /// `true` only when [`SquadAgentLauncher::drive_unattended_agent`]'s
     /// countdown expired and
     /// killed the container. An agent that exited on its own — with any
-    /// code, 137 included — is `false`.
+    /// code, 137 included — is `false`. Also `false` when an `AgentBlocked`
+    /// or `AgentError` countdown killed it: that is a failure, not an
+    /// auto-advance.
     pub killed_by_countdown: bool,
+    /// The agent's last reported problem (`blocked`/`error`) when the run
+    /// ended on one; `None` otherwise. Its `msg` is untrusted agent text.
+    pub reported_problem: Option<EffectiveStatus>,
 }
 
 impl UnattendedExit {
-    /// An exit the container produced on its own.
-    fn own_exit(exit: AgentExitInfo) -> Self {
+    /// An exit the container produced on its own. A pending reported
+    /// problem makes it a failure even with code 0.
+    fn own_exit(mut exit: AgentExitInfo, reported_problem: Option<EffectiveStatus>) -> Self {
+        if reported_problem.is_some() && exit.exit_code == 0 {
+            exit.exit_code = 1;
+        }
         Self {
             exit,
             killed_by_countdown: false,
+            reported_problem,
         }
     }
 }
@@ -411,27 +364,269 @@ pub struct LeaderExit {
     pub killed_by_countdown: bool,
 }
 
+/// The countdown lengths [`drive_unattended_agent_with`] uses; tests shorten
+/// them.
+#[derive(Debug, Clone, Copy)]
+struct CountdownDurations {
+    /// Silence (`StuckStep`) and problem (`AgentBlocked`/`AgentError`).
+    yolo: Duration,
+    /// `AgentDone`.
+    agent_done: Duration,
+}
+
+impl CountdownDurations {
+    fn current() -> Self {
+        Self {
+            yolo: yolo_countdown_duration(),
+            agent_done: agent_done_countdown_duration(),
+        }
+    }
+
+    fn of(self, kind: CountdownKind) -> Duration {
+        match kind {
+            CountdownKind::AgentDone => self.agent_done,
+            _ => self.yolo,
+        }
+    }
+}
+
+/// [`SquadAgentLauncher::drive_unattended_agent`] with explicit countdown
+/// lengths.
+async fn drive_unattended_agent_with(
+    mut execution: AgentExecution,
+    task: &str,
+    label: &str,
+    durations: CountdownDurations,
+) -> Result<UnattendedExit, EngineError> {
+    let cancel = execution.cancel_handle();
+    let mut stuck_rx = execution.subscribe_stuck();
+    let tracker = execution.program_status_tracker();
+    let (wait_tx, mut wait_rx) =
+        tokio::sync::oneshot::channel::<Result<AgentExitInfo, EngineError>>();
+    tokio::spawn(async move {
+        let result = execution.wait().await;
+        let _ = wait_tx.send(result);
+    });
+
+    // The last problem the agent reported, until `working`/`done`/a clear.
+    let mut problem: Option<EffectiveStatus> = None;
+    // A report a countdown handed back for a fresh decision.
+    let mut pending: Option<Option<EffectiveStatus>> = None;
+
+    loop {
+        let kind = if let Some(status) = pending.take() {
+            match unattended_response(status.as_ref(), &mut problem) {
+                Some(kind) => kind,
+                None => continue,
+            }
+        } else {
+            tokio::select! {
+                biased;
+                result = &mut wait_rx => {
+                    // A report ready together with the exit still counts.
+                    settle_problem(&mut problem, &mut stuck_rx, tracker.as_ref());
+                    return result
+                        .map_err(|_| EngineError::Other("agent wait task dropped unexpectedly".into()))?
+                        .map(|exit| UnattendedExit::own_exit(exit, problem));
+                }
+                ev = stuck_rx.recv() => match ev {
+                    Ok(StuckEvent::Stuck) => CountdownKind::StuckStep,
+                    Ok(StuckEvent::Reported(status)) => {
+                        match unattended_response(status.as_ref(), &mut problem) {
+                            Some(kind) => kind,
+                            None => continue,
+                        }
+                    }
+                    Ok(StuckEvent::Unstuck) => continue,
+                    Ok(StuckEvent::StartupGraceExpired) => {
+                        // The bridge already killed the container; the wait branch
+                        // above resolves with its exit on the next loop pass.
+                        tracing::warn!(
+                            task,
+                            agent = label,
+                            "squad agent produced no output before its startup grace expired; \
+                             container was killed",
+                        );
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // No more stuck events can arrive — just wait for exit.
+                        let result = (&mut wait_rx).await;
+                        settle_problem(&mut problem, &mut stuck_rx, tracker.as_ref());
+                        return result
+                            .map_err(|_| EngineError::Other("agent wait task dropped unexpectedly".into()))?
+                            .map(|exit| UnattendedExit::own_exit(exit, problem));
+                    }
+                }
+            }
+        };
+
+        let duration = durations.of(kind);
+        log_countdown_started(task, label, kind, duration, problem.as_ref());
+        match run_unattended_countdown(
+            task,
+            label,
+            kind,
+            duration,
+            &mut wait_rx,
+            &mut stuck_rx,
+            &mut problem,
+        )
+        .await
+        {
+            CountdownOutcome::Exited(result) => {
+                settle_problem(&mut problem, &mut stuck_rx, tracker.as_ref());
+                return result.map(|exit| UnattendedExit::own_exit(exit, problem));
+            }
+            // Output cancels an `AgentError` countdown only: the error stays
+            // recorded until a new report, so an exit without one fails.
+            CountdownOutcome::Recovered => {}
+            CountdownOutcome::Superseded(status) => pending = Some(status),
+            CountdownOutcome::Expired => {
+                let fails = matches!(
+                    kind,
+                    CountdownKind::AgentBlocked | CountdownKind::AgentError
+                );
+                if fails {
+                    tracing::warn!(
+                        task,
+                        agent = label,
+                        "squad countdown expired for task {task:?} ({label}) on a reported \
+                         problem; stopping the agent as a failure",
+                    );
+                } else {
+                    tracing::info!(
+                        task,
+                        agent = label,
+                        "squad yolo countdown expired for task {task:?} ({label}); \
+                         auto-advancing past the idle agent",
+                    );
+                }
+                if let Some(cancel) = &cancel {
+                    let _ = cancel.cancel();
+                }
+                // The kill makes the real wait resolve; fall back to
+                // a synthetic killed exit if the backend errors.
+                let now = chrono::Utc::now();
+                let exit =
+                    (&mut wait_rx)
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .unwrap_or(AgentExitInfo {
+                            exit_code: KILLED_EXIT_CODE,
+                            signal: None,
+                            started_at: now,
+                            ended_at: now,
+                        });
+                return Ok(if fails {
+                    settle_problem(&mut problem, &mut stuck_rx, tracker.as_ref());
+                    UnattendedExit::own_exit(exit, problem)
+                } else {
+                    UnattendedExit {
+                        exit,
+                        killed_by_countdown: true,
+                        reported_problem: None,
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Settle the problem as the agent exits: reports still queued (the exit
+/// won the biased select), then the execution's tracker, which also holds a
+/// report the detector had not published yet.
+fn settle_problem(
+    problem: &mut Option<EffectiveStatus>,
+    stuck_rx: &mut tokio::sync::broadcast::Receiver<StuckEvent>,
+    tracker: Option<&crate::engine::agent_runtime::program_status::SharedProgramStatusTracker>,
+) {
+    let mut record = |status: Option<EffectiveStatus>| {
+        *problem = status.filter(|s| s.state.is_problem());
+    };
+    for status in drain_pending_reports(stuck_rx) {
+        record(status);
+    }
+    if let Some(status) = tracker.and_then(final_tracker_status) {
+        record(status);
+    }
+}
+
+/// The unattended ("no user") response to a report: the countdown to start,
+/// or `None` to keep waiting. Records or clears `problem` as it goes.
+fn unattended_response(
+    status: Option<&EffectiveStatus>,
+    problem: &mut Option<EffectiveStatus>,
+) -> Option<CountdownKind> {
+    *problem = status.filter(|s| s.state.is_problem()).cloned();
+    match respond_to_report(status, true, false) {
+        ReportedResponse::Countdown(kind) => Some(kind),
+        // Unattended never yields a board or a needs-you pause.
+        _ => None,
+    }
+}
+
+fn log_countdown_started(
+    task: &str,
+    label: &str,
+    kind: CountdownKind,
+    duration: Duration,
+    problem: Option<&EffectiveStatus>,
+) {
+    let secs = duration.as_secs();
+    match kind {
+        CountdownKind::AgentDone => tracing::info!(
+            task,
+            agent = label,
+            "squad agent reported done for task {task:?} ({label}); advancing in {secs}s",
+        ),
+        CountdownKind::AgentBlocked | CountdownKind::AgentError => {
+            let what = problem.map(describe_status).unwrap_or_default();
+            tracing::warn!(
+                task,
+                agent = label,
+                "squad agent reported {what} for task {task:?} ({label}); failing in {secs}s",
+            );
+        }
+        CountdownKind::StuckStep | CountdownKind::FailureRetry => tracing::info!(
+            task,
+            agent = label,
+            "squad yolo countdown started for task {task:?} ({label}): no output — \
+             advancing automatically in {secs}s",
+        ),
+    }
+}
+
 /// How one countdown window ended.
 enum CountdownOutcome {
-    /// The countdown ran out with the agent still idle — auto-advance.
+    /// The countdown ran out with the agent still idle — auto-advance (or,
+    /// for a problem countdown, fail).
     Expired,
     /// The agent produced output again (or the bridge already killed it);
     /// cancel the countdown and keep waiting.
     Recovered,
+    /// A report that calls for a different response; decide it afresh.
+    Superseded(Option<EffectiveStatus>),
     /// The agent exited on its own mid-countdown — this IS the run's exit.
     Exited(Result<AgentExitInfo, EngineError>),
 }
 
-/// One countdown window of [`yolo_countdown_duration`]. A completed agent
-/// always wins over a same-instant expiry (`biased` puts the wait branch
-/// first), matching the dynamic leader countdown's ordering.
+/// One countdown window of `duration`. A completed agent always wins over a
+/// same-instant expiry (`biased` puts the wait branch first), matching the
+/// dynamic leader countdown's ordering. Output (`Unstuck`) recovers a silence
+/// or `AgentError` countdown; `done`/`blocked` ones end only on a report.
 async fn run_unattended_countdown(
     task: &str,
     label: &str,
+    kind: CountdownKind,
+    duration: Duration,
     wait_rx: &mut tokio::sync::oneshot::Receiver<Result<AgentExitInfo, EngineError>>,
     stuck_rx: &mut tokio::sync::broadcast::Receiver<StuckEvent>,
+    problem: &mut Option<EffectiveStatus>,
 ) -> CountdownOutcome {
-    let deadline = tokio::time::Instant::now() + yolo_countdown_duration();
+    let deadline = tokio::time::Instant::now() + duration;
     loop {
         tokio::select! {
             biased;
@@ -441,7 +636,25 @@ async fn run_unattended_countdown(
                 }));
             }
             ev = stuck_rx.recv() => match ev {
-                Ok(StuckEvent::Unstuck) => {
+                Ok(StuckEvent::Reported(status)) => {
+                    if respond_to_report(status.as_ref(), true, false)
+                        == ReportedResponse::Countdown(kind)
+                    {
+                        // Same countdown, deadline kept; the new kind or
+                        // message is still the one a failure quotes.
+                        *problem = status.filter(|s| s.state.is_problem());
+                    } else {
+                        tracing::info!(
+                            task,
+                            agent = label,
+                            "squad agent reported a new status; countdown cancelled",
+                        );
+                        return CountdownOutcome::Superseded(status);
+                    }
+                }
+                Ok(StuckEvent::Unstuck)
+                    if matches!(kind, CountdownKind::StuckStep | CountdownKind::AgentError) =>
+                {
                     tracing::info!(
                         task,
                         agent = label,
@@ -449,7 +662,7 @@ async fn run_unattended_countdown(
                     );
                     return CountdownOutcome::Recovered;
                 }
-                Ok(StuckEvent::Stuck) => {}
+                Ok(StuckEvent::Unstuck) | Ok(StuckEvent::Stuck) => {}
                 Ok(StuckEvent::StartupGraceExpired) => return CountdownOutcome::Recovered,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -458,310 +671,5 @@ async fn run_unattended_countdown(
             },
             _ = tokio::time::sleep_until(deadline) => return CountdownOutcome::Expired,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// An agent that exits on its own is returned as-is — the auto-advance
-    /// machinery only ever fires for a stuck-but-alive agent.
-    #[tokio::test]
-    async fn drive_unattended_agent_returns_a_self_exiting_agents_exit() {
-        let now = chrono::Utc::now();
-        let handle = crate::data::session::AgentHandle {
-            id: "id".into(),
-            image_tag: "img".into(),
-            name: "awman-squad-t-00000000".into(),
-            started_at: now,
-        };
-        let info = AgentExitInfo {
-            exit_code: 3,
-            signal: None,
-            started_at: now,
-            ended_at: now,
-        };
-        let execution = AgentExecution::finished(handle, info);
-        let exit = SquadAgentLauncher::drive_unattended_agent(execution, "t", "leader")
-            .await
-            .unwrap();
-        assert_eq!(exit.exit.exit_code, 3);
-        assert!(
-            !exit.killed_by_countdown,
-            "an agent that exited on its own was not killed by the countdown"
-        );
-    }
-
-    /// WI 0112 Part 6: a self-produced 137 is *not* a countdown kill. Only the
-    /// `Expired` arm of the countdown sets the flag.
-    #[tokio::test]
-    async fn a_self_produced_137_is_not_reported_as_a_countdown_kill() {
-        let now = chrono::Utc::now();
-        let handle = crate::data::session::AgentHandle {
-            id: "id".into(),
-            image_tag: "img".into(),
-            name: "awman-squad-t-00000000".into(),
-            started_at: now,
-        };
-        let info = AgentExitInfo {
-            exit_code: KILLED_EXIT_CODE,
-            signal: Some(9),
-            started_at: now,
-            ended_at: now,
-        };
-        let exit = SquadAgentLauncher::drive_unattended_agent(
-            AgentExecution::finished(handle, info),
-            "t",
-            "leader",
-        )
-        .await
-        .unwrap();
-        assert_eq!(exit.exit.exit_code, KILLED_EXIT_CODE);
-        assert!(!exit.killed_by_countdown);
-    }
-
-    #[test]
-    fn seed_writes_reference_assets_and_preserves_leader_written_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("tasks").join("issue-triage");
-        // The durable workspace survives between runs: a `workflow.toml` (and
-        // anything else) the leader wrote on an earlier run must still be
-        // there afterwards. The leader is explicitly allowed to reuse it.
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("workflow.toml"), "from a previous run").unwrap();
-        std::fs::write(dir.join("leader-notes.md"), "durable state").unwrap();
-
-        SquadAgentLauncher::seed_task_dir(&dir).unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(dir.join("workflow.toml")).unwrap(),
-            "from a previous run",
-            "seeding must never delete or rewrite the leader's workflow.toml"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dir.join("leader-notes.md")).unwrap(),
-            "durable state",
-            "seeding must never touch any other leader-written file"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dir.join("workflow-usage.md")).unwrap(),
-            WORKFLOW_USAGE_MD
-        );
-        assert!(!dir.join("example-workflow.toml").exists());
-    }
-
-    #[test]
-    fn seed_is_idempotent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("c");
-        SquadAgentLauncher::seed_task_dir(&dir).unwrap();
-        // A second seed over an existing directory must not error.
-        SquadAgentLauncher::seed_task_dir(&dir).unwrap();
-        assert!(dir.join("workflow-usage.md").exists());
-    }
-
-    // ── BLOCKER-1: one stamping implementation for every task container ──
-
-    use crate::engine::container::naming::parse_squad_task_slug;
-
-    #[test]
-    fn stamp_applies_a_parseable_squad_name_and_both_labels() {
-        let identity = SquadContainerIdentity::new("issue-triage", "sess-123");
-        let resolved = ResolvedAgentOptions::container(Vec::new()).unwrap();
-        let ResolvedAgentOptions::Container(options) = identity.stamp(resolved).unwrap() else {
-            panic!("stamp must keep the container variant");
-        };
-        let name = options.name.expect("stamp must set a container name");
-        let name = name.as_str();
-        assert!(
-            name.starts_with("awman-squad-issue-triage-"),
-            "unexpected container name: {name}"
-        );
-        assert_eq!(
-            parse_squad_task_slug(name),
-            Some("issue-triage"),
-            "the squad name must round-trip back to the task slug"
-        );
-        assert!(options
-            .labels
-            .iter()
-            .any(|(k, v)| k == SESSION_LABEL_KEY && v == "sess-123"));
-        assert!(options
-            .labels
-            .iter()
-            .any(|(k, v)| k == TASK_LABEL_KEY && v == "issue-triage"));
-    }
-
-    #[test]
-    fn stamp_generates_a_fresh_name_each_call() {
-        // Every generated-workflow step gets its own container, so two stamps
-        // of the same identity must not collide on the unique suffix.
-        let identity = SquadContainerIdentity::new("release-notes", "s");
-        let first = match identity
-            .stamp(ResolvedAgentOptions::container(Vec::new()).unwrap())
-            .unwrap()
-        {
-            ResolvedAgentOptions::Container(o) => o.name.unwrap().as_str().to_string(),
-            _ => unreachable!(),
-        };
-        let second = match identity
-            .stamp(ResolvedAgentOptions::container(Vec::new()).unwrap())
-            .unwrap()
-        {
-            ResolvedAgentOptions::Container(o) => o.name.unwrap().as_str().to_string(),
-            _ => unreachable!(),
-        };
-        assert_ne!(first, second, "each stamp must mint a fresh unique suffix");
-    }
-
-    #[test]
-    fn stamp_rejects_the_sandbox_variant() {
-        let identity = SquadContainerIdentity::new("issue-triage", "s");
-        let sandbox = ResolvedAgentOptions::sandbox(Vec::new());
-        let error = identity.stamp(sandbox).unwrap_err();
-        assert!(
-            error.to_string().contains("container runtime"),
-            "sandbox refusal must explain the container requirement: {error}"
-        );
-    }
-
-    // ── Directory-workspace image sources (WI 0106 remediation, B1) ────────
-
-    /// A plain directory task root starts with no `Dockerfile.dev` and no
-    /// `.awman/Dockerfile.<agent>`, so `ensure_agent_image` has nothing to
-    /// build from and a default-workspace task cannot launch its leader at
-    /// all. Scaffolding fills both in from the bundled templates.
-    #[tokio::test]
-    async fn a_plain_directory_workspace_gains_the_image_sources_it_needs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("workspace");
-
-        SquadAgentLauncher::ensure_directory_workspace_project(&root, &["claude".to_string()])
-            .await
-            .unwrap();
-
-        let paths = RepoDockerfilePaths::new(&root);
-        assert!(
-            paths.project_dockerfile().exists(),
-            "the base image needs a Dockerfile.dev at the task root"
-        );
-        let agent_dockerfile = paths.agent_dockerfile("claude");
-        assert!(agent_dockerfile.exists());
-        let body = std::fs::read_to_string(&agent_dockerfile).unwrap();
-        assert!(
-            !body.contains("{{AWMAN_BASE_IMAGE}}"),
-            "the base-image placeholder must be substituted, as it is on the \
-             `awman init` path: {body}"
-        );
-        assert!(
-            body.contains(&crate::data::image_tags::project_image_tag(&root)),
-            "the agent image must layer on this task root's own base image"
-        );
-        assert_eq!(
-            paths
-                .discover_agent_dockerfiles()
-                .into_iter()
-                .map(|(agent, _)| agent)
-                .collect::<Vec<_>>(),
-            vec!["claude".to_string()],
-            "the scaffolded Dockerfile must be discoverable for the leader's \
-             agent listing and for workflow validation"
-        );
-    }
-
-    /// The durable workspace belongs to the task for its whole lifetime, so
-    /// scaffolding is create-if-missing: an edited Dockerfile survives every
-    /// later run untouched.
-    #[tokio::test]
-    async fn scaffolding_never_overwrites_an_existing_dockerfile() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let paths = RepoDockerfilePaths::new(&root);
-        std::fs::create_dir_all(paths.awman_dir()).unwrap();
-        std::fs::write(paths.project_dockerfile(), "FROM my-own-base\n").unwrap();
-        std::fs::write(paths.agent_dockerfile("claude"), "FROM my-own-agent\n").unwrap();
-
-        SquadAgentLauncher::ensure_directory_workspace_project(&root, &["claude".to_string()])
-            .await
-            .unwrap();
-        SquadAgentLauncher::ensure_directory_workspace_project(&root, &["claude".to_string()])
-            .await
-            .unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(paths.project_dockerfile()).unwrap(),
-            "FROM my-own-base\n"
-        );
-        assert_eq!(
-            std::fs::read_to_string(paths.agent_dockerfile("claude")).unwrap(),
-            "FROM my-own-agent\n"
-        );
-    }
-
-    /// An agent with no bundled template is left to `ensure_agent_image`'s
-    /// existing "agent has no Dockerfile" error rather than being invented.
-    #[tokio::test]
-    async fn directory_workspace_renders_approved_custom_agents_with_the_session_env() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("workspace");
-        let home = temp.path().join("global");
-        std::fs::create_dir_all(&root).unwrap();
-        let env = crate::data::config::env::EnvSnapshot::with_overrides([(
-            "AWMAN_CONFIG_HOME",
-            home.to_str().unwrap(),
-        )]);
-        crate::engine::agent::custom::install_crush_fixture(&root, &env);
-        SquadAgentLauncher::ensure_directory_workspace_project_with_env(
-            &env,
-            &root,
-            &["crush".into()],
-        )
-        .await
-        .unwrap();
-        let paths = RepoDockerfilePaths::new(&root);
-        let rendered = std::fs::read_to_string(paths.agent_dockerfile("crush")).unwrap();
-        assert!(rendered.starts_with(crate::engine::agent::custom::DOCKERFILE_HEADER_PREFIX));
-        assert!(rendered.contains(&format!(
-            "FROM {}",
-            crate::data::image_tags::project_image_tag(&root)
-        )));
-        std::fs::remove_file(home.join("trusted-agents.json")).unwrap();
-        let error = SquadAgentLauncher::ensure_directory_workspace_project_with_env(
-            &env,
-            &root,
-            &["crush".into()],
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            EngineError::AgentDefinitionUntrusted { .. }
-        ));
-        assert_eq!(
-            std::fs::read_to_string(paths.agent_dockerfile("crush")).unwrap(),
-            rendered
-        );
-    }
-
-    #[tokio::test]
-    async fn an_unknown_agent_surfaces_unknown_agent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = RepoDockerfilePaths::new(tmp.path());
-        std::fs::create_dir_all(paths.awman_dir()).unwrap();
-        std::fs::write(
-            paths.agent_dockerfile("not-a-real-agent"),
-            "# awman-generated from repo:deleted\nFROM project\n",
-        )
-        .unwrap();
-        let error = SquadAgentLauncher::ensure_directory_workspace_project(
-            tmp.path(),
-            &["not-a-real-agent".to_string()],
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(error, EngineError::UnknownAgent { name, .. } if name == "not-a-real-agent")
-        );
     }
 }

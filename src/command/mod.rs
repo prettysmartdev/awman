@@ -6,16 +6,22 @@
 //! (frontends) or Layer 4 (the binary entrypoints).
 
 pub mod commands;
-pub mod config_notices;
+pub mod context;
+pub mod daemon_api;
 pub mod dispatch;
 pub mod error;
 pub mod git_summary;
 pub mod headless;
+pub mod host_output;
+pub mod interaction;
+pub mod program_status_projection;
 pub mod prompts;
 pub mod session_create;
+pub mod session_git_transport;
 pub mod session_setup;
 pub mod startup;
 pub mod stats_sampler;
+pub mod terminals;
 
 pub use dispatch::catalogue::{CommandCatalogue, CommandSpec, FlagSpec, FrontendVisibility};
 pub use dispatch::{
@@ -28,3 +34,16 @@ pub use session_create::{
 };
 pub use session_setup::{SessionSetup, SessionSetupPresenter};
 pub use startup::{Startup, StartupOutcome};
+
+pub mod daemon_runtime;
+
+// WI 0142 — instances, the builtin/daemon backends, the integration registry and the
+// builtin-vs-daemon hand-off. Scaffolded by architecture-design-contract; see
+// /awman/context/workflow/0142-design.md §3–§4 for each module's contract.
+pub mod engine_handoff;
+pub mod instance;
+pub mod integrations;
+
+pub mod git_credential_helper;
+
+pub mod worker;

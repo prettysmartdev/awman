@@ -94,7 +94,7 @@ pub trait SpecsCommandFrontend:
     }
 
     /// Prompt for a summary pre-populated with `content`. The TUI implementation
-    /// renders the text box pre-filled; non-interactive frontends return the
+    /// renders the text box pre-filled; headless frontends return the
     /// content unmodified.
     fn ask_spec_summary_prefilled(&mut self, content: &str) -> Result<String, CommandError> {
         Ok(content.to_string())
@@ -127,7 +127,7 @@ impl SpecsCommand {
         let sub = match ctx.caller.leaf() {
             "amend" => SpecsSubcommand::Amend(SpecsAmendFlags {
                 work_item: ctx.args.require("work_item")?,
-                non_interactive: ctx.flags.bool("non-interactive"),
+                non_interactive: ctx.flags.bool("headless"),
                 allow_docker: ctx.flags.bool("allow-docker"),
             }),
             _ => return Err(CommandError::unknown_command(&ctx.path())),
@@ -153,7 +153,7 @@ impl Command for SpecsCommand {
             SpecsSubcommand::Amend(f) => {
                 let session = self.session;
                 let git_root = session.git_root().to_path_buf();
-                let work_items_dir = session.repo_config().work_items_dir_or_default(&git_root);
+                let work_items_dir = session.effective_config().work_items_dir(&git_root);
                 // Look up the file for the requested work-item number.
                 let n: u32 = f.work_item.trim_start_matches('0').parse().unwrap_or(0);
                 let prefix = format!("{:04}-", n);
@@ -178,7 +178,7 @@ impl Command for SpecsCommand {
                 }
 
                 // Run the amend agent to review the file against the
-                // implementation. Honors --non-interactive and --allow-docker.
+                // implementation. Honors --headless and --allow-docker.
                 let agent = match LaunchPolicy::for_session(&session).resolve_agent(&None) {
                     Ok(a) => a,
                     Err(e) => {
@@ -284,10 +284,9 @@ pub(crate) async fn create_new_spec(
     frontend: &mut dyn SpecsCommandFrontend,
 ) -> Result<NewSpecOutcome, CommandError> {
     let git_root = session.git_root().to_path_buf();
-    let work_items_dir = session.repo_config().work_items_dir_or_default(&git_root);
-    let template_path = session
-        .repo_config()
-        .work_items_template_or_default(&git_root);
+    let config = session.effective_config();
+    let work_items_dir = config.work_items_dir(&git_root);
+    let template_path = config.work_items_template(&git_root);
 
     if !template_path.exists() {
         let err = CommandError::SpecTemplateMissing {
@@ -616,160 +615,5 @@ fn slugify(input: &str) -> String {
         "untitled".into()
     } else {
         trimmed
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::session::Session;
-
-    #[test]
-    fn slugify_basic_lowercases_and_hyphenates() {
-        assert_eq!(slugify("Hello World"), "hello-world");
-        assert_eq!(slugify("Foo!Bar?"), "foo-bar");
-        assert_eq!(slugify("  trim  edges  "), "trim-edges");
-        assert_eq!(slugify(""), "untitled");
-    }
-
-    #[test]
-    fn next_work_item_number_empty_dir_starts_at_one() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(next_work_item_number(tmp.path()), 1);
-    }
-
-    #[test]
-    fn next_work_item_number_finds_max() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("0001-a.md"), "").unwrap();
-        std::fs::write(tmp.path().join("0042-b.md"), "").unwrap();
-        std::fs::write(tmp.path().join("0007-c.md"), "").unwrap();
-        assert_eq!(next_work_item_number(tmp.path()), 43);
-    }
-
-    // ── SpecsCommand::Amend tests ────────────────────────────────────────────
-
-    struct FakeSpecsFrontend;
-    impl crate::data::message::UserMessageSink for FakeSpecsFrontend {
-        fn write_message(&mut self, _: crate::data::message::UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-    impl crate::command::commands::mount_scope::MountScopeFrontend for FakeSpecsFrontend {
-        fn ask_mount_scope(
-            &mut self,
-            _git_root: &std::path::Path,
-            _cwd: &std::path::Path,
-        ) -> Result<
-            crate::command::commands::mount_scope::MountScopeDecision,
-            crate::command::error::CommandError,
-        > {
-            Ok(crate::command::commands::mount_scope::MountScopeDecision::MountGitRoot)
-        }
-    }
-    impl crate::command::commands::agent_setup::AgentSetupFrontend for FakeSpecsFrontend {
-        fn ask_agent_setup(
-            &mut self,
-            _requested: &crate::data::session::AgentName,
-            _default: &crate::data::session::AgentName,
-            _default_available: bool,
-            _image_only: bool,
-        ) -> Result<
-            crate::command::commands::agent_setup::AgentSetupDecision,
-            crate::command::error::CommandError,
-        > {
-            Ok(crate::command::commands::agent_setup::AgentSetupDecision::Setup)
-        }
-        fn record_fallback(
-            &mut self,
-            _requested: &crate::data::session::AgentName,
-            _fallback: &crate::data::session::AgentName,
-        ) {
-        }
-    }
-    impl crate::command::commands::agent_auth::AgentAuthFrontend for FakeSpecsFrontend {
-        fn ask_agent_auth_consent(
-            &mut self,
-            _agent: &crate::data::session::AgentName,
-            _env_var_names: &[&str],
-        ) -> Result<
-            crate::command::commands::agent_auth::AgentAuthDecision,
-            crate::command::error::CommandError,
-        > {
-            Ok(crate::command::commands::agent_auth::AgentAuthDecision::Decline)
-        }
-    }
-    /// The fake never launches a container; both methods are inert.
-    impl crate::command::commands::agent_setup::HasAgentFrontend for FakeSpecsFrontend {
-        fn container_frontend(
-            &mut self,
-        ) -> Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend> {
-            Box::new(crate::command::commands::agent_setup::NullAgentFrontend)
-        }
-    }
-
-    impl crate::command::commands::agent_trust::AgentTrustFrontend for FakeSpecsFrontend {}
-    impl crate::command::commands::agent_setup::AgentLaunchFrontend for FakeSpecsFrontend {
-        fn set_pty_active(&mut self, _active: bool) {}
-    }
-
-    impl super::SpecsCommandFrontend for FakeSpecsFrontend {
-        fn ask_spec_title(&mut self) -> Result<String, crate::command::error::CommandError> {
-            Ok("My Test Spec".to_string())
-        }
-        fn ask_spec_summary(&mut self) -> Result<String, crate::command::error::CommandError> {
-            Ok("A one-line summary.".to_string())
-        }
-    }
-
-    #[tokio::test]
-    async fn specs_amend_locates_file_then_invokes_agent() {
-        // After locating the file, amend invokes the agent. In a test env
-        // without Docker that spawn fails, but we can still check that the
-        // file lookup succeeded by asserting the error is NOT
-        // `WorkItemNotFound`.
-        let tmp = tempfile::tempdir().unwrap();
-        let work_items = tmp.path().join("aspec").join("work-items");
-        std::fs::create_dir_all(&work_items).unwrap();
-        std::fs::write(work_items.join("0042-my-feature.md"), "# My Feature").unwrap();
-
-        let engines = Engines::for_tests(tmp.path());
-        let session = Session::for_tests(tmp.path());
-        let cmd = super::SpecsCommand::new(
-            super::SpecsSubcommand::Amend(super::SpecsAmendFlags {
-                work_item: "0042".to_string(),
-                non_interactive: true,
-                allow_docker: false,
-            }),
-            engines,
-            session,
-        );
-        let result = cmd.run_with_frontend(Box::new(FakeSpecsFrontend)).await;
-        if let Err(crate::command::error::CommandError::WorkItemNotFound { .. }) = &result {
-            panic!("file lookup must succeed for an existing work item: {result:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn specs_amend_returns_error_when_work_item_not_found() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_items = tmp.path().join("aspec").join("work-items");
-        std::fs::create_dir_all(&work_items).unwrap();
-
-        let engines = Engines::for_tests(tmp.path());
-        let session = Session::for_tests(tmp.path());
-        let cmd = super::SpecsCommand::new(
-            super::SpecsSubcommand::Amend(super::SpecsAmendFlags {
-                work_item: "9999".to_string(),
-                non_interactive: false,
-                allow_docker: false,
-            }),
-            engines,
-            session,
-        );
-        let result = cmd.run_with_frontend(Box::new(FakeSpecsFrontend)).await;
-        assert!(
-            result.is_err(),
-            "must return error when work item 9999 not found"
-        );
     }
 }

@@ -124,8 +124,9 @@ approval or automatic progression. Interactive frontends share the same command
 prompts and safe dismissal defaults; unattended frontends use policy and explicit
 inputs. Remote clients cannot widen the operator's credential ceiling without a
 global opt-in. Check-only output exits 0 only when every check is satisfied,
-otherwise 1 (including unknown checks). Summary Esc continues; summary Ctrl-C
-aborts. Invalid credential inputs, refused widening and unresolved fail policies
+otherwise 1 (including unknown checks). Summary Enter continues to the questions
+and Esc or Ctrl-C cancels. Prerequisite answers use ordered numeric keys, then
+letters for longer lists. Invalid credential inputs, refused widening and unresolved fail policies
 use exit 2; explicit abort uses 130. Per-command syntax belongs in the generated
 command reference.
 
@@ -244,6 +245,17 @@ belongs to rather than inventing a new code.
   then global config, then the catalogue's built-in default. A command
   never reads configuration through a path that skips a level of this
   order.
+
+Agent status reporting is controlled by `agents.programStatus.enabled`
+(default `true`). TUI host-terminal status emission is controlled separately
+by `tui.programStatus.emit` (default `true`); it can be disabled for one run
+with `awman --set tui.programStatus.emit=false`. Daemon-managed interactive
+terminals start at `daemon.terminal.cols` × `daemon.terminal.rows` (120 × 40
+by default), and retain their size after launch. Squad and pushed-worker runs
+select `interactive` or `headless` mode through their respective
+`daemon.features.*.interaction` setting. `allowOverride` controls whether a
+run can request a different mode; the default is `true`. Configuration
+accepts the pull-worker interaction setting, but no pull worker runs currently.
 
 ## Runtime and image-source configuration
 

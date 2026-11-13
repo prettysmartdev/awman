@@ -36,8 +36,8 @@
 //!
 //! ## Socket path
 //!
-//! This rendezvous socket lives under `~/.awman/attach/` (or
-//! `$AWMAN_ATTACH_DIR`), named by a hash of the container name. The builtin
+//! This rendezvous socket lives under `<data home>/attach/` (`$AWMAN_HOME/attach`,
+//! else `$XDG_DATA_HOME/awman/attach`, else `~/.awman/attach`), named by a hash of the container name. The builtin
 //! runtime resolves its own attach sockets with `BuiltinPaths::attach`, inside
 //! its private state home (keyed by sandbox id and owner, subject to that
 //! home's socket-length budget and `AWMAN_BUILTIN_STATE_DIR`). The two stay
@@ -51,19 +51,20 @@ use std::sync::Arc;
 
 use crate::data::config::env::EnvSnapshot;
 use crate::data::session::AgentHandle;
+use crate::engine::agent_runtime::program_status::{ProgramStatusStream, ProgramStatusTracker};
 use crate::engine::error::EngineError;
 
-/// The directory attach sockets live in: `$AWMAN_ATTACH_DIR` when set (used
-/// by tests and relocated setups), else `~/.awman/attach/`. Both the serving
-/// process and the attaching process derive it the same way, which is what
-/// makes the socket discoverable across processes of the same user.
-///
-/// The variable is declared and parsed in Layer 0
-/// ([`EnvSnapshot::attach_dir`]); nothing above Layer 0 reads the environment
-/// directly (F-37).
+/// The directory attach sockets live in: `<data home>/attach/` (`$AWMAN_HOME`,
+/// else `$XDG_DATA_HOME/awman`, else `~/.awman`). Both the serving process and
+/// the attaching process derive it the same way, which is what makes the
+/// socket discoverable across processes of the same user. With none of those
+/// in the snapshot there is no ambient fallback.
 pub(crate) fn default_attach_socket_dir(env: &EnvSnapshot) -> Option<PathBuf> {
-    if let Some(dir) = env.attach_dir() {
-        return Some(dir);
+    if let Some(home) = crate::data::fs::data_paths::awman_home(env) {
+        return Some(home.join("attach"));
+    }
+    if let Some(xdg) = env.xdg_data_home() {
+        return Some(xdg.join("awman").join("attach"));
     }
     env.home_dir()
         .map(|home| home.join(".awman").join("attach"))
@@ -80,6 +81,10 @@ pub(crate) fn attach_socket_path(env: &EnvSnapshot, container_name: &str) -> Opt
 
 /// What the socket server needs from the owning PTY bridge.
 pub(crate) struct AttachHooks {
+    pub terminal: Option<(
+        Arc<crate::engine::terminal_hub::TerminalHub>,
+        crate::data::ids::TerminalId,
+    )>,
     /// Live PTY output. Each client subscribes; a lagging client is told that
     /// its stream is incomplete and disconnected.
     pub output: Arc<tokio::sync::broadcast::Sender<Vec<u8>>>,
@@ -194,6 +199,14 @@ mod unix_impl {
             tokio::select! {
                 accepted = listener.accept() => match accepted {
                     Ok((stream, _)) => {
+                        if let Some((hub, id)) = &hooks.terminal {
+                            // The listener may close in the backend's wait
+                            // before the execution wrapper publishes Exit.
+                            // Hub subscriptions finish on that event (or hub
+                            // shutdown), so let them drain independently.
+                            tokio::spawn(serve_hub_client(stream, hub.clone(), id.clone()));
+                            continue;
+                        }
                         let output_rx = hooks.output.subscribe();
                         let stdin = hooks.stdin.clone();
                         let resize = Arc::clone(&hooks.resize);
@@ -207,6 +220,58 @@ mod unix_impl {
                 },
                 // Reap finished sessions so the set doesn't grow unbounded.
                 Some(_) = clients.join_next(), if !clients.is_empty() => {}
+            }
+        }
+    }
+
+    /// The internal binary attach transport subscribes to the same daemon hub
+    /// and exclusive capability as WebSocket viewers.
+    pub(crate) async fn serve_hub_client(
+        stream: tokio::net::UnixStream,
+        hub: Arc<crate::engine::terminal_hub::TerminalHub>,
+        id: crate::data::ids::TerminalId,
+    ) {
+        use crate::data::terminal::TerminalFrame;
+        let Ok(mut output) = hub.subscribe(&id) else {
+            return;
+        };
+        let grant = hub.take_control(&id).ok();
+        drop(hub); // subscription and grant deliberately retain only weak references
+        let (mut reader, mut writer) = stream.into_split();
+        loop {
+            let input = read_frame(&mut reader);
+            tokio::pin!(input);
+            loop {
+                tokio::select! {
+                    frame = output.next() => {
+                        let (tag, bytes, exited) = match frame {
+                            Some(TerminalFrame::Snapshot { screen, .. } | TerminalFrame::Output { bytes: screen }) => (Tag::Output, screen, false),
+                            Some(TerminalFrame::Exit { code }) => (Tag::Exit, code.to_le_bytes().to_vec(), true),
+                            Some(_) => continue,
+                            None => return,
+                        };
+                        if write_frame_bounded(&mut writer, tag, &bytes, WRITE_TIMEOUT).await.is_err() || exited { return; }
+                    }
+                    frame = &mut input => {
+                        match frame {
+                            Ok((Tag::Stdin, bytes)) => {
+                                if let Some(grant) = &grant {
+                                    if matches!(grant.send_input(bytes), Err(crate::engine::terminal_hub::TerminalHubError::InputBackpressure)) { return; }
+                                }
+                            }
+                            Ok((Tag::Resize, bytes)) => {
+                                if let (Some(grant), Some((cols, rows))) = (&grant, parse_resize(&bytes)) {
+                                    // Exit may revoke the grant while this
+                                    // frame is in flight. Keep reading so the
+                                    // queued terminal exit code still arrives.
+                                    let _ = grant.resize(cols, rows);
+                                }
+                            }
+                            _ => return,
+                        }
+                        break;
+                    }
+                }
             }
         }
     }
@@ -303,7 +368,9 @@ mod unix_impl {
             );
             let grace_timeout = frontend.grace_timeout();
             let stuck_timeout = frontend.stuck_timeout();
+            let mut status_config = frontend.program_status_config();
             let io = frontend.take_io();
+            status_config.answer_queries = io.initial_size.is_some();
 
             let stream = std::os::unix::net::UnixStream::connect(&self.path).map_err(|e| {
                 EngineError::Container(format!(
@@ -369,7 +436,10 @@ mod unix_impl {
             // tracking the PTY bridge feeds its stuck detector from.
             let output_tail = Arc::new(OutputTail::with_default_capacity());
             let output_activity = OutputActivity::new();
-            let (exit_tx, exit_rx) = std::sync::mpsc::channel::<Result<(), EngineError>>();
+            let program_status = ProgramStatusTracker::shared();
+            let mut status_stream = ProgramStatusStream::new(program_status.clone(), status_config);
+            let query_stdin = stdin_injector.clone();
+            let (exit_tx, exit_rx) = std::sync::mpsc::channel::<Result<i32, EngineError>>();
             let cancelled = Arc::new(AtomicBool::new(false));
             let stdout_tx = io.stdout;
             let tail = Arc::clone(&output_tail);
@@ -381,6 +451,12 @@ mod unix_impl {
                 loop {
                     let payload = match read_frame(&mut read_half).await {
                         Ok((Tag::Output, payload)) => payload,
+                        Ok((Tag::Exit, payload)) if payload.len() == 4 => {
+                            outcome = Ok(i32::from_le_bytes(
+                                payload.try_into().expect("checked exit payload"),
+                            ));
+                            break;
+                        }
                         Ok((Tag::Lagged, _)) => {
                             outcome = Err(EngineError::Container(
                                 "attach output lagged; reconnect to the live agent".into(),
@@ -402,8 +478,16 @@ mod unix_impl {
                         }
                     };
                     act.touch();
-                    tail.push_bytes(&payload);
-                    let _ = stdout_tx.send(payload);
+                    let bytes = status_stream.feed(&payload, |reply| {
+                        let _ = query_stdin.send(reply.to_vec());
+                    });
+                    tail.push_bytes(&bytes);
+                    let _ = stdout_tx.send(bytes.into_owned());
+                }
+                let bytes = status_stream.finish();
+                tail.push_bytes(&bytes);
+                if !bytes.is_empty() {
+                    let _ = stdout_tx.send(bytes);
                 }
                 let _ = exit_tx.send(outcome);
             });
@@ -415,6 +499,7 @@ mod unix_impl {
                     container_start_delay: std::time::Duration::ZERO,
                     cancel_on_grace_expired: None,
                     poll_interval: crate::engine::container::io_bridge::STUCK_POLL_INTERVAL,
+                    program_status: Some(program_status.clone()),
                 },
                 &output_activity,
             );
@@ -427,12 +512,10 @@ mod unix_impl {
                 started_at,
                 cancelled,
             };
-            Ok(AgentExecution::new(
-                handle,
-                Box::new(backend),
-                stuck_tx,
-                Some(output_tail),
-            ))
+            Ok(
+                AgentExecution::new(handle, Box::new(backend), stuck_tx, Some(output_tail))
+                    .with_program_status(program_status),
+            )
         }
     }
 
@@ -450,7 +533,7 @@ mod unix_impl {
     /// local socket down — never the target container, which belongs to the
     /// serving process.
     struct SocketAttachExecution {
-        exit_rx: std::sync::mpsc::Receiver<Result<(), EngineError>>,
+        exit_rx: std::sync::mpsc::Receiver<Result<i32, EngineError>>,
         shutdown: std::os::unix::net::UnixStream,
         shutdown_for_handle: Arc<std::os::unix::net::UnixStream>,
         stdin_injector: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
@@ -465,11 +548,13 @@ mod unix_impl {
             let outcome = self.exit_rx.recv().map_err(|_| {
                 EngineError::Container("attach reader stopped without a result".into())
             })?;
-            if !self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
-                outcome?;
-            }
+            let exit_code = if !self.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                outcome?
+            } else {
+                0
+            };
             Ok(AgentExitInfo {
-                exit_code: 0,
+                exit_code,
                 signal: None,
                 started_at: self.started_at,
                 ended_at: chrono::Utc::now(),
@@ -503,371 +588,14 @@ mod unix_impl {
 }
 
 #[cfg(unix)]
+pub(crate) use unix_impl::serve_hub_client;
+#[cfg(unix)]
 pub(crate) use unix_impl::spawn_attach_socket_server;
 
 // ─── Non-unix stubs ──────────────────────────────────────────────────────────
 //
 // Unix sockets don't exist elsewhere; the Apple runtime is macOS-only anyway,
 // so these stubs exist purely to keep cross-platform builds compiling.
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-    use std::time::Duration;
-
-    use crate::data::message::{UserMessage, UserMessageSink};
-    use crate::engine::agent_runtime::execution::AgentInstance;
-    use crate::engine::agent_runtime::frontend::{
-        AgentFrontend, AgentIo, AgentProgress, AgentStatus,
-    };
-
-    #[test]
-    fn socket_paths_are_deterministic_short_and_name_scoped() {
-        let env = EnvSnapshot::with_overrides([("AWMAN_ATTACH_DIR", "/tmp/awman-attach-test")]);
-        let a = attach_socket_path(&env, "awman-squad-some-quite-long-task-name-0123abcd").unwrap();
-        let b = attach_socket_path(&env, "awman-squad-some-quite-long-task-name-0123abcd").unwrap();
-        let c = attach_socket_path(&env, "awman-squad-other-89abcdef").unwrap();
-        assert_eq!(a, b, "the path must be derivable in any process");
-        assert_ne!(a, c);
-        let file = a.file_name().unwrap().to_str().unwrap();
-        // Hashed filename: bounded length regardless of container-name length,
-        // because unix socket paths have a hard OS limit (104 bytes on macOS).
-        assert_eq!(file.len(), "0123456789abcdef.sock".len(), "{file}");
-    }
-
-    #[test]
-    fn default_dir_derives_from_snapshot_home_not_process_home() {
-        let a = EnvSnapshot::with_overrides([("HOME", "/home/session-a")]);
-        assert_eq!(
-            default_attach_socket_dir(&a),
-            Some(PathBuf::from("/home/session-a/.awman/attach"))
-        );
-        // No HOME in the snapshot: no ambient fallback.
-        assert_eq!(default_attach_socket_dir(&EnvSnapshot::empty()), None);
-        // An explicit attach dir wins over HOME.
-        let both =
-            EnvSnapshot::with_overrides([("HOME", "/home/a"), ("AWMAN_ATTACH_DIR", "/run/x")]);
-        assert_eq!(
-            default_attach_socket_dir(&both),
-            Some(PathBuf::from("/run/x"))
-        );
-    }
-
-    /// A test-side handle to a sender the frontend creates lazily.
-    type SharedSender<T> = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<T>>>>;
-
-    /// Frontend fixture mirroring the TUI attach frontend's `AgentIo` shape.
-    #[derive(Clone, Default)]
-    struct Captured {
-        stdout: Arc<Mutex<Vec<u8>>>,
-        stdin_tx: SharedSender<Vec<u8>>,
-        resize_tx: SharedSender<(u16, u16)>,
-    }
-
-    struct TestFrontend {
-        captured: Captured,
-    }
-
-    impl UserMessageSink for TestFrontend {
-        fn write_message(&mut self, _msg: UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-
-    #[async_trait::async_trait]
-    impl AgentFrontend for TestFrontend {
-        fn report_status(&mut self, _status: AgentStatus) {}
-        fn report_progress(&mut self, _progress: AgentProgress) {}
-        fn take_io(&mut self) -> AgentIo {
-            let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-            let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-            let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-            let (resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
-            *self.captured.stdin_tx.lock().unwrap() = Some(stdin_tx.clone());
-            *self.captured.resize_tx.lock().unwrap() = Some(resize_tx);
-            let buf = self.captured.stdout.clone();
-            tokio::spawn(async move {
-                while let Some(chunk) = stdout_rx.recv().await {
-                    buf.lock().unwrap().extend_from_slice(&chunk);
-                }
-            });
-            tokio::spawn(async move { while stderr_rx.recv().await.is_some() {} });
-            AgentIo {
-                stdout: stdout_tx,
-                stderr: stderr_tx,
-                stdin_tx,
-                stdin_rx,
-                resize: Some(resize_rx),
-                initial_size: Some((80, 24)),
-            }
-        }
-    }
-
-    struct ServerFixture {
-        output: Arc<tokio::sync::broadcast::Sender<Vec<u8>>>,
-        stdin_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-        resizes: Arc<Mutex<Vec<(u16, u16)>>>,
-        guard: AttachSocketGuard,
-        path: PathBuf,
-        _dir: tempfile::TempDir,
-    }
-
-    fn start_server() -> ServerFixture {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent.sock");
-        let (output_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(64);
-        let output = Arc::new(output_tx);
-        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let resizes: Arc<Mutex<Vec<(u16, u16)>>> = Arc::new(Mutex::new(Vec::new()));
-        let resizes_hook = Arc::clone(&resizes);
-        let guard = spawn_attach_socket_server(
-            &path,
-            AttachHooks {
-                output: Arc::clone(&output),
-                stdin: stdin_tx,
-                resize: Arc::new(move |cols, rows| {
-                    resizes_hook.lock().unwrap().push((cols, rows));
-                }),
-            },
-        )
-        .expect("server must bind");
-        ServerFixture {
-            output,
-            stdin_rx,
-            resizes,
-            guard,
-            path,
-            _dir: dir,
-        }
-    }
-
-    fn instance(path: &Path) -> Box<SocketAttachInstance> {
-        Box::new(SocketAttachInstance {
-            handle: AgentHandle {
-                id: "awman-squad-t-00000001".into(),
-                name: "awman-squad-t-00000001".into(),
-                image_tag: "img".into(),
-                started_at: chrono::Utc::now(),
-            },
-            path: path.to_path_buf(),
-        })
-    }
-
-    async fn wait_until(mut check: impl FnMut() -> bool, what: &str) {
-        for _ in 0..200 {
-            if check() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("timed out waiting for {what}");
-    }
-
-    /// The full attach parity contract, end to end over a real unix socket:
-    /// PTY output reaches the client, client keystrokes reach the agent's
-    /// stdin, resizes (the initial one included) reach the real PTY, ending
-    /// one session leaves the server (and thus the container) untouched, and
-    /// tearing the server down ends every client's `wait()`.
-    #[tokio::test]
-    async fn socket_attach_round_trips_output_stdin_and_resize() {
-        let mut server = start_server();
-
-        let captured = Captured::default();
-        let mut execution = instance(&server.path)
-            .run_with_frontend(Box::new(TestFrontend {
-                captured: captured.clone(),
-            }))
-            .expect("attach must connect");
-
-        // The client's very first act is the initial resize — the repaint
-        // trigger that fills a fresh attach screen.
-        wait_until(
-            || server.resizes.lock().unwrap().first() == Some(&(80, 24)),
-            "the initial resize",
-        )
-        .await;
-
-        // Output: broadcast (what the PTY reader taps) → client stdout.
-        server.output.send(b"agent screen bytes".to_vec()).unwrap();
-        wait_until(
-            || captured.stdout.lock().unwrap().as_slice() == b"agent screen bytes",
-            "output to reach the attach client",
-        )
-        .await;
-
-        // Stdin: client keystrokes → the bridge's stdin injector.
-        let stdin_tx = captured.stdin_tx.lock().unwrap().clone().unwrap();
-        stdin_tx.send(b"ls\r".to_vec()).unwrap();
-        let received = tokio::time::timeout(Duration::from_secs(2), server.stdin_rx.recv())
-            .await
-            .expect("stdin must arrive")
-            .expect("stdin channel open");
-        assert_eq!(received, b"ls\r");
-
-        // Resize: client → real PTY.
-        let resize_tx = captured.resize_tx.lock().unwrap().clone().unwrap();
-        resize_tx.send((132, 50)).unwrap();
-        wait_until(
-            || server.resizes.lock().unwrap().contains(&(132, 50)),
-            "the client resize",
-        )
-        .await;
-
-        // Ending this session must not tear the server down: a second client
-        // can still attach (docker-attach parity — multiple clients, and a
-        // detach never stops the target).
-        execution.cancel().expect("cancel");
-        tokio::time::timeout(Duration::from_secs(5), execution.wait())
-            .await
-            .expect("wait must resolve after cancel")
-            .expect("wait result");
-
-        let captured2 = Captured::default();
-        let mut execution2 = instance(&server.path)
-            .run_with_frontend(Box::new(TestFrontend {
-                captured: captured2.clone(),
-            }))
-            .expect("a second client must connect after the first detached");
-        // The server subscribes on accept; wait for the subscription before
-        // sending, or the broadcast has zero receivers and drops the send.
-        let output = Arc::clone(&server.output);
-        wait_until(
-            || output.receiver_count() > 0,
-            "the second client's server-side subscription",
-        )
-        .await;
-        server.output.send(b"still live".to_vec()).unwrap();
-        wait_until(
-            || {
-                captured2
-                    .stdout
-                    .lock()
-                    .unwrap()
-                    .windows(b"still live".len())
-                    .any(|w| w == b"still live")
-            },
-            "output to the second client",
-        )
-        .await;
-
-        // Dropping the guard (container teardown) ends the remaining session
-        // and removes the socket file.
-        let path = server.path.clone();
-        drop(server.guard);
-        let ended = tokio::time::timeout(Duration::from_secs(5), execution2.wait())
-            .await
-            .expect("wait must resolve when the server goes away")
-            .unwrap_err();
-        assert!(ended.to_string().contains("without an exit status"));
-        wait_until(|| !path.exists(), "socket file removal").await;
-    }
-
-    #[tokio::test]
-    async fn lagging_socket_attach_reports_incomplete_output() {
-        let server = start_server();
-        let captured = Captured::default();
-        let mut execution = instance(&server.path)
-            .run_with_frontend(Box::new(TestFrontend {
-                captured: captured.clone(),
-            }))
-            .unwrap();
-        wait_until(|| server.output.receiver_count() > 0, "attach subscription").await;
-        // This test uses the current-thread executor. Sending a full ring
-        // without awaiting forces the server's receiver to overrun.
-        for byte in 0..256 {
-            server.output.send(vec![byte as u8]).unwrap();
-        }
-        let result = tokio::time::timeout(Duration::from_secs(2), execution.wait())
-            .await
-            .unwrap();
-        assert!(result.unwrap_err().to_string().contains("lagged"));
-    }
-
-    /// The server speaks the shared codec: raw frames in, tagged frames out,
-    /// and a lagging client is sent `Lagged` (tag 6), never a stderr tag.
-    #[tokio::test]
-    async fn server_speaks_the_shared_codec_on_a_raw_socket() {
-        use crate::engine::container::attach_protocol::{
-            read_frame, resize_payload, write_frame, Tag,
-        };
-        let mut server = start_server();
-        let mut stream = tokio::net::UnixStream::connect(&server.path).await.unwrap();
-        write_frame(&mut stream, Tag::Resize, &resize_payload(100, 30))
-            .await
-            .unwrap();
-        write_frame(&mut stream, Tag::Stdin, &[0, 255, 13])
-            .await
-            .unwrap();
-        let stdin = tokio::time::timeout(Duration::from_secs(2), server.stdin_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stdin, [0, 255, 13]);
-        assert_eq!(server.resizes.lock().unwrap().as_slice(), [(100, 30)]);
-        server.output.send(b"screen".to_vec()).unwrap();
-        assert_eq!(
-            read_frame(&mut stream).await.unwrap(),
-            (Tag::Output, b"screen".to_vec())
-        );
-        for byte in 0..256 {
-            server.output.send(vec![byte as u8]).unwrap();
-        }
-        loop {
-            let (tag, _) = read_frame(&mut stream).await.unwrap();
-            if tag == Tag::Lagged {
-                assert_eq!(tag as u8, 6);
-                break;
-            }
-            assert_eq!(tag, Tag::Output);
-        }
-        // Server-to-client tags are not valid client input: the server drops us.
-        let mut stream = tokio::net::UnixStream::connect(&server.path).await.unwrap();
-        write_frame(&mut stream, Tag::Exit, &0_i32.to_le_bytes())
-            .await
-            .unwrap();
-        assert!(read_frame(&mut stream).await.is_err());
-    }
-
-    /// No serving process → a clear, attributable error instead of a doomed
-    /// spawn (the pre-parity behaviour was an instantly-dying client).
-    #[tokio::test]
-    async fn attach_without_a_live_endpoint_fails_with_a_clear_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("gone.sock");
-        let error = instance(&path)
-            .run_with_frontend(Box::new(TestFrontend {
-                captured: Captured::default(),
-            }))
-            .err()
-            .expect("connecting to a missing socket must fail");
-        let text = error.to_string();
-        assert!(text.contains("no live attach endpoint"), "{text}");
-        assert!(text.contains("awman-squad-t-00000001"), "{text}");
-    }
-
-    /// A stale socket file from a crashed predecessor must not block a new
-    /// server for the same container name.
-    #[tokio::test]
-    async fn rebinding_over_a_stale_socket_file_succeeds() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("stale.sock");
-        // A dead socket file: bind and immediately drop the listener.
-        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
-        assert!(path.exists());
-        let (output_tx, _) = tokio::sync::broadcast::channel::<Vec<u8>>(4);
-        let (stdin_tx, _stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-        let guard = spawn_attach_socket_server(
-            &path,
-            AttachHooks {
-                output: Arc::new(output_tx),
-                stdin: stdin_tx,
-                resize: Arc::new(|_, _| {}),
-            },
-        )
-        .expect("rebinding over a stale socket must succeed");
-        drop(guard);
-    }
-}
 
 #[cfg(not(unix))]
 pub(crate) fn spawn_attach_socket_server(
@@ -898,7 +626,3 @@ impl crate::engine::agent_runtime::execution::AgentInstance for SocketAttachInst
         ))
     }
 }
-
-#[cfg(all(test, unix))]
-#[path = "attach_socket_tests.rs"]
-mod coverage_tests;

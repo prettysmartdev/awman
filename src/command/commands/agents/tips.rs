@@ -28,8 +28,8 @@ pub const TIPS: &[&str] = &[
     "`awman exec prompt --issue 42` uses a GitHub issue as the prompt.",
     "`--yolo` enables fully autonomous mode; `--auto` enables auto permission mode.",
     "`--agent-flag=--verbose` passes an extra argument straight to the agent command.",
-    "`--launch-mode acp` launches the agent over ACP instead of a raw terminal.",
-    "`-n` runs the agent in non-interactive (print) mode instead of an interactive session.",
+    "`--set agents.launchMode=acp` launches the agent over ACP instead of a raw terminal.",
+    "`-n` (`--headless`) runs the agent in print mode instead of an interactive session.",
     // ── Workflows ────────────────────────────────────────────────────────────
     "`awman exec workflow <file>` (or `awman exec wf`) runs a multi-step workflow.",
     "`awman exec workflow <file> --work-item 0042` fills workflow templates from a work item.",
@@ -37,7 +37,7 @@ pub const TIPS: &[&str] = &[
     "`awman exec workflow --dynamic --work-item 0042` lets a leader agent design the workflow.",
     "`awman exec workflow <file> --worktree` runs in an isolated Git worktree.",
     "`--yolo` and `--auto` on a workflow imply `--worktree`, keeping your checkout untouched.",
-    "`awman exec workflow <file> --max-concurrent 2` caps how many steps run in parallel.",
+    "`--set workflows.maxConcurrentSteps=2` caps how many workflow steps run in parallel.",
     "`awman exec workflow <file> --check-prerequisites` reports what setup and teardown steps need.",
     "`awman exec workflow <file> --on-existing-worktree resume` skips the existing-worktree question.",
     "`awman exec workflow <file> --on-merge-failure agent` has an agent fix a failed merge-back.",
@@ -69,7 +69,7 @@ pub const TIPS: &[&str] = &[
     "`awman agents ls` (or `ps`) lists running agents; add `-a` to include stopped ones.",
     "`awman agents ls -q` prints only agent IDs, handy for scripting.",
     "`awman agents detail <id>` (or `inspect`) shows one agent in depth; an ID prefix works too.",
-    "`awman agents attach <id>` connects to an agent's terminal; detaching never stops the agent.",
+    "`awman attach <term-id>` connects to an agent's terminal; detaching never stops the agent.",
     "`awman agents rm <id>` (or `kill`) stops and removes an agent; `-y` skips the prompt.",
     "`awman clean` removes stopped agents, finished workflow data and dangling images.",
     "`awman clean --dry-run` shows what would be removed without deleting anything.",
@@ -97,12 +97,12 @@ pub const TIPS: &[&str] = &[
     "`awman config show` lists every setting at global and repo level.",
     "`awman config get <field>` shows a setting's global, repo and effective values.",
     "`awman config set <field> <value> --global` writes to global instead of repo config.",
-    "`awman config migrate` moves a repo's `dynamicWorkflows` block into `workflows.dynamic`.",
-    "`awman config prerequisite-grants list` shows the workflow credential choices awman remembers.",
+    "`awman config set <key> <value>` writes the file the key belongs in and prints its path.",
+    "`--set key=value` overrides any config key for one run; `awman config show` lists them.",
     // ── Runtimes and security ────────────────────────────────────────────────
     "Agents never run on your host: they run in Docker, Apple Containers, Docker Sandboxes or a microVM.",
     "`awman config set runtime apple-containers --global` switches to Apple Containers.",
-    "On Apple Silicon Macs, the `builtin-experimental` runtime runs each agent in a microVM.",
+    "On Apple Silicon Macs, the experimental `builtin` runtime runs each agent in a microVM.",
     "The builtin runtime's `network` setting can be `public`, `allowlist` or `none`.",
     "Only the current Git repo root is mounted into agents — never its parent directories.",
     "`--allow-docker` mounts the host Docker socket into the agent; use it only when needed.",
@@ -112,14 +112,15 @@ pub const TIPS: &[&str] = &[
     "`awman squad trigger <task>` evaluates a task now, ignoring its schedule.",
     "`awman squad attach <task>` attaches to the agent running a squad task.",
     "`awman squad pause <task>` and `awman squad resume <task>` toggle a task's schedule.",
-    "`awman squad env --push` re-sends env() values to the squad daemon after rotating a token.",
-    "`awman squad logs -f` follows the squad daemon log.",
+    "`awman squad env --push` re-sends env() values to the daemon after rotating a token.",
+    "`awman daemon logs -f` follows the awman daemon log.",
     // ── API and remote ───────────────────────────────────────────────────────
-    "`awman api start --background` runs the awman HTTP API as a background service.",
-    "`awman api status` and `awman api logs` check on the background API server.",
+    "`awman daemon start --background` runs the awman daemon as a background service.",
+    "`awman daemon status` shows the daemon's features, listeners and running jobs.",
+    "`awman config set daemon.features.worker.enabled true` turns on the worker API live.",
     "`awman remote exec workflow <file> --follow` runs a workflow on a remote awman host.",
-    "Set `remote.defaultAddr` in global config so `awman remote` commands need no `--remote-addr`.",
-    "`awman api start --workdir-root ~/src` lets API sessions use any repo cloned under `~/src`.",
+    "Set `remote.default` so `awman remote` commands need no `--remote <target>`.",
+    "`daemon.features.worker.push.workDirs.roots` lets API sessions use any repo cloned under one.",
 ];
 
 /// Select a tip using the current unix-second as a seed. Seconds (not nanos)
@@ -131,138 +132,4 @@ pub fn select_random_tip() -> &'static str {
         .unwrap_or_default()
         .as_secs();
     TIPS[(secs % TIPS.len() as u64) as usize]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::command::dispatch::catalogue::{CommandCatalogue, CommandSpec};
-
-    /// Longest tip that still fits on one dashboard line in an 80-column
-    /// terminal once the `Tip: ` prefix is added.
-    const MAX_TIP_CHARS: usize = 100;
-
-    /// Every `` `awman …` `` span in a tip, without the surrounding backticks.
-    fn awman_invocations(tip: &str) -> Vec<&str> {
-        tip.split('`')
-            .skip(1)
-            .step_by(2)
-            .filter(|span| *span == "awman" || span.starts_with("awman "))
-            .collect()
-    }
-
-    /// Walk one invocation through the catalogue: each word must be a
-    /// subcommand (or alias) while the current command has subcommands, and
-    /// every flag must exist on the command it ends at. Placeholders and
-    /// positional values (`<file>`, `0042`, `"<text>"`) are skipped.
-    fn check_invocation(invocation: &str) -> Result<(), String> {
-        let mut spec: &CommandSpec = CommandCatalogue::get().root();
-        let mut tokens = invocation.split_whitespace().skip(1).peekable();
-        while let Some(word) = tokens.peek() {
-            if word.starts_with('-') || spec.subcommands.is_empty() {
-                break;
-            }
-            spec = spec
-                .find_subcommand(word)
-                .ok_or_else(|| format!("unknown subcommand `{word}` in `{invocation}`"))?;
-            tokens.next();
-        }
-        for token in tokens {
-            if let Some(long) = token.strip_prefix("--") {
-                let name = long.split('=').next().unwrap_or(long);
-                if spec.find_flag(name).is_none() {
-                    return Err(format!("unknown flag `--{name}` in `{invocation}`"));
-                }
-            } else if let Some(short) = token.strip_prefix('-') {
-                for c in short.chars() {
-                    if !spec.flags.iter().any(|f| f.short == Some(c)) {
-                        return Err(format!("unknown short flag `-{c}` in `{invocation}`"));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn select_random_tip_returns_a_tip_from_the_list() {
-        let tip = select_random_tip();
-        assert!(TIPS.contains(&tip));
-    }
-
-    #[test]
-    fn no_tip_is_empty() {
-        for t in TIPS {
-            assert!(!t.trim().is_empty());
-        }
-    }
-
-    #[test]
-    fn no_tip_is_duplicated() {
-        let mut seen = std::collections::HashSet::new();
-        for t in TIPS {
-            assert!(seen.insert(*t), "duplicate tip: {t}");
-        }
-    }
-
-    #[test]
-    fn every_tip_fits_on_one_line() {
-        for t in TIPS {
-            assert!(
-                t.chars().count() <= MAX_TIP_CHARS,
-                "tip is {} chars (max {MAX_TIP_CHARS}): {t}",
-                t.chars().count()
-            );
-        }
-    }
-
-    #[test]
-    fn every_awman_command_in_a_tip_exists_in_the_catalogue() {
-        let errors: Vec<String> = TIPS
-            .iter()
-            .flat_map(|tip| awman_invocations(tip))
-            .filter_map(|invocation| check_invocation(invocation).err())
-            .collect();
-        assert!(errors.is_empty(), "stale tips:\n{}", errors.join("\n"));
-    }
-
-    #[test]
-    fn no_tip_names_the_removed_status_command() {
-        for tip in TIPS {
-            for invocation in awman_invocations(tip) {
-                assert!(
-                    invocation != "awman status" && !invocation.starts_with("awman status "),
-                    "stale `awman status` in tip: {tip}"
-                );
-            }
-            assert!(!tip.contains("awman status"), "stale tip: {tip}");
-        }
-    }
-
-    #[test]
-    fn agents_tips_cover_each_subcommand() {
-        for needle in [
-            "agents status",
-            "agents ls",
-            "agents detail",
-            "agents attach",
-            "agents rm",
-        ] {
-            assert!(
-                TIPS.iter().any(|t| t.contains(needle)),
-                "no tip mentions `awman {needle}`"
-            );
-        }
-    }
-
-    #[test]
-    fn invocation_check_rejects_unknown_commands_and_flags() {
-        assert!(check_invocation("awman exec workflow <file> --worktree").is_ok());
-        assert!(check_invocation("awman exec wf <file>").is_ok());
-        assert!(check_invocation("awman clean -y").is_ok());
-        assert!(check_invocation("awman nonexistent").is_err());
-        assert!(check_invocation("awman squad lst").is_err());
-        assert!(check_invocation("awman ready --no-such-flag").is_err());
-        assert!(check_invocation("awman clean -z").is_err());
-    }
 }

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="4" skipped="0" failures="0" errors="0" uuid="7383dc61-4c61-413a-a504-2738731ec4b5" timestamp="2026-11-11T21:58:33.810+00:00" time="0.073">
+    <testsuite name="awman" tests="4" skipped="0" errors="0" failures="0">
+        <testcase name="command::commands::exec_workflow::contract_tests::work_item_numbers_reject_overflow_and_keep_hostile_text_as_data" classname="awman" timestamp="2026-11-11T21:58:33.811+00:00" time="0.029"/>
+        <testcase name="command::commands::exec_workflow::contract_tests::minimal_recovery_traces_prioritize_failure_over_unfinished_work" classname="awman" timestamp="2026-11-11T21:58:33.811+00:00" time="0.029"/>
+        <testcase name="command::commands::exec_workflow::contract_tests::work_item_lookup_uses_session_scope_and_inline_content_without_executing_it" classname="awman" timestamp="2026-11-11T21:58:33.811+00:00" time="0.034"/>
+        <testcase name="command::commands::exec_workflow::contract_tests::workflow_recovery_and_resume_planning_follow_the_state_model" classname="awman" timestamp="2026-11-11T21:58:33.811+00:00" time="0.072"/>
+    </testsuite>
+</testsuites>

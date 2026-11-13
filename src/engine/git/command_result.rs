@@ -6,8 +6,12 @@ use super::{host_command, GitEngine};
 use crate::data::fs::api_db::{ChangedFile, ChangedFileStatus, GitResult, CHANGED_FILES_CAP};
 use crate::engine::error::EngineError;
 
-fn read(root: &Path, args: &[&str]) -> Result<Vec<u8>, EngineError> {
-    let output = host_command::command(root)
+fn read(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    root: &Path,
+    args: &[&str],
+) -> Result<Vec<u8>, EngineError> {
+    let output = host_command::command(snapshot, root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
         .output()
@@ -20,8 +24,12 @@ fn read(root: &Path, args: &[&str]) -> Result<Vec<u8>, EngineError> {
     Ok(output.stdout)
 }
 
-fn text(root: &Path, args: &[&str]) -> Option<String> {
-    let bytes = read(root, args).ok()?;
+fn text(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    root: &Path,
+    args: &[&str],
+) -> Option<String> {
+    let bytes = read(snapshot, root, args).ok()?;
     let value = String::from_utf8_lossy(&bytes).trim().to_string();
     (!value.is_empty()).then_some(value)
 }
@@ -29,7 +37,7 @@ fn text(root: &Path, args: &[&str]) -> Option<String> {
 impl GitEngine {
     /// HEAD before dispatch. None also covers a non-git session or an unborn HEAD.
     pub fn command_base_sha(&self, root: &Path) -> Option<String> {
-        text(root, &["rev-parse", "--verify", "HEAD"])
+        text(self.env(), root, &["rev-parse", "--verify", "HEAD"])
     }
 
     /// Compare the initial commit with the final working tree, including dirty
@@ -40,28 +48,39 @@ impl GitEngine {
         root: &Path,
         base: Option<&str>,
     ) -> Result<Option<GitResult>, EngineError> {
-        if text(root, &["rev-parse", "--is-inside-work-tree"]).as_deref() != Some("true") {
+        if text(self.env(), root, &["rev-parse", "--is-inside-work-tree"]).as_deref()
+            != Some("true")
+        {
             return Ok(None);
         }
         let mut result = GitResult {
-            branch: text(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]),
+            branch: text(
+                self.env(),
+                root,
+                &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            ),
             base_sha: base.map(str::to_owned),
             head_sha: self.command_base_sha(root),
             ..GitResult::default()
         };
-        let untracked = read(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+        let untracked = read(
+            self.env(),
+            root,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+        )?;
         // --no-optional-locks/GIT_OPTIONAL_LOCKS=0 prevents status's optional
         // index refresh. Status also handles unborn branches and staged edits.
-        result.dirty = !read(root, &["status", "--porcelain", "-z"])?.is_empty();
+        result.dirty = !read(self.env(), root, &["status", "--porcelain", "-z"])?.is_empty();
         // An unborn branch still has staged/tracked changes. Compute the
         // empty tree id without modifying the index or object database.
         let empty_tree = if base.is_none() {
-            text(root, &["hash-object", "-t", "tree", "--stdin"])
+            text(self.env(), root, &["hash-object", "-t", "tree", "--stdin"])
         } else {
             None
         };
         if let Some(base) = base.or(empty_tree.as_deref()) {
             let stats = read(
+                self.env(),
                 root,
                 &[
                     "diff",
@@ -75,6 +94,7 @@ impl GitEngine {
                 ],
             );
             let names = read(
+                self.env(),
                 root,
                 &[
                     "diff",

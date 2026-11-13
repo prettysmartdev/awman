@@ -111,17 +111,17 @@ When more than one source could determine the leader, awman applies this precede
 
 ## Configuring dynamic workflows
 
-Add a `workflows.dynamic` block to either `.awman/config.json` or `~/.awman/config.json` to configure which agents and models the leader may schedule, cap how many steps run concurrently, set a default leader, and provide guidance.
+Add a `workflows.dynamic` block to either the repo config (`.awman/config.json`) or the global config (`~/.awman/config.json`) to configure which agents and models the leader may schedule, set a default leader, and provide guidance. The step cap is the ordinary `workflows.maxConcurrentSteps` key.
 
 ```json
 {
   "workflows": {
+    "maxConcurrentSteps": 3,
     "dynamic": {
       "agentsToModels": {
         "claude": ["claude-opus-4-8", "claude-sonnet-4-6"],
         "codex": ["codex-mini-latest"]
       },
-      "maxConcurrentSteps": 3,
       "defaultLeader": "claude::claude-opus-4-8",
       "guidance": [
         "Never spawn more than two agents in parallel.",
@@ -132,7 +132,7 @@ Add a `workflows.dynamic` block to either `.awman/config.json` or `~/.awman/conf
 }
 ```
 
-All four fields are optional and independent.
+All of these keys are optional and independent.
 
 ### `agentsToModels`
 
@@ -158,18 +158,16 @@ Restricts the leader to a known, approved set of agents and models instead of ev
 - An empty repo map (`{}`) is treated the same as omitting it and falls through to the global map. A repo that wants to use only its own agents instead of inheriting a global map must set a non-empty repo map listing the agents and models it allows.
 - Each agent's model list must be non-empty, and no model name may be empty or whitespace-only; both are rejected when the config is loaded.
 
-### `maxConcurrentSteps`
+### `workflows.maxConcurrentSteps`
 
-An advisory cap the leader is told to plan around:
+The cap on concurrently running steps — enforced by the engine for every workflow, and also the number the leader is told to plan around. Interactive final groups may exceed the cap so all remaining agents stay available for review:
 
 ```
 Maximum concurrent steps advised: 3. Plan parallelism
 accordingly.
 ```
 
-This is advisory only — awman does not enforce it in the workflow scheduler. It is a hint the leader agent uses when deciding how much of the workflow to run in parallel via `depends_on`. Must be `>= 1` if set; `0` is rejected when the config is loaded, since it would deadlock any workflow.
-
-Don't confuse this with [`maxConcurrentAgents`](07-configuration.md#reference), a differently-named, differently-scoped setting: `maxConcurrentAgents` is the cap the engine actually enforces at run time, for every workflow (dynamic or not), regardless of what the leader planned. See [Parallel workflows](05-workflows.md#parallel-workflows).
+The leader uses it as a hint when deciding how much of the workflow to run in parallel via `depends_on`, and the scheduler enforces it at run time, whatever the leader planned. Interactive final groups may exceed the cap so every remaining agent stays available for review. Must be `>= 1` if set; `0` is rejected when the config is loaded, since it would deadlock any workflow. See [Parallel workflows](05-workflows.md#parallel-workflows).
 
 ### `defaultLeader`
 
@@ -194,11 +192,11 @@ You MUST follow these project-specific instructions when building the workflow:
 
 ### Managing this config
 
-`workflows.dynamic.defaultLeader` and `workflows.dynamic.maxConcurrentSteps` are editable with `awman config set` / the TUI config dialog:
+`workflows.dynamic.defaultLeader` and `workflows.maxConcurrentSteps` are editable with `awman config set` / the TUI config dialog:
 
 ```sh
 awman config set workflows.dynamic.defaultLeader claude::claude-opus-4-8
-awman config set workflows.dynamic.maxConcurrentSteps 3
+awman config set workflows.maxConcurrentSteps 3
 ```
 
 `agentsToModels` is managed one agent at a time. On the command line, set an agent's comma-separated model list (or clear it with an empty value):
@@ -208,14 +206,14 @@ awman config set workflows.dynamic.agentsToModels.claude "claude-opus-4-8, claud
 awman config set workflows.dynamic.agentsToModels.claude ""   # remove the mapping
 ```
 
-In `awman config show` and the TUI config dialog, the map appears as a summary row plus one editable row per agent (`workflows.dynamic.agentsToModels.<agentName>`); in the TUI, **Ctrl+N** adds a new mapping and per-agent rows are edited inline — see [Using the TUI](02-using-the-tui.md#agentmodel-mappings-workflowsdynamicagentstomodels). See [Configuration](07-configuration.md#reference) for the full field reference.
+In `awman config show` and the TUI config dialog, the map appears as a summary row plus one editable row per agent (`workflows.dynamic.agentsToModels.<agentName>`); in the TUI, **Ctrl+N** adds a new mapping and per-agent rows are edited inline — see [Using the TUI](02-using-the-tui.md#agentmodel-mappings-workflowsdynamicagentstomodels). See [Configuration](07-configuration.md#reference-all-keys) for the full field reference.
 
-`guidance` is managed one entry at a time, addressed by index on the command line:
+`guidance` is a list; on the command line, set the whole list with comma-separated entries (a later layer adds to the earlier ones, so a repo list extends the global one):
 
 ```sh
-awman config set workflows.dynamic.guidance.0 "Never spawn more than two agents in parallel."
-awman config set workflows.dynamic.guidance.1 "Always include a validation step after each implementation step."
-awman config set workflows.dynamic.guidance.0 ""   # remove entry 0; remaining entries shift down and re-index
+awman config set workflows.dynamic.guidance "Never spawn more than two agents in parallel."
+awman config set workflows.dynamic.guidance "Always include a validation step after each implementation step." --global
+awman config unset workflows.dynamic.guidance   # remove the list from this repo
 ```
 
 In `awman config show` and the TUI config dialog, the list appears as a summary row (`workflows.dynamic.guidance`, showing the entry count or `(none)`) plus one editable row per entry (`workflows.dynamic.guidance.<index>`). In the TUI:
@@ -224,7 +222,7 @@ In `awman config show` and the TUI config dialog, the list appears as a summary 
 - Existing entries are edited inline like any other field.
 - Saving an **empty** value on an entry row removes it; remaining entries re-index automatically.
 
-See [Using the TUI](02-using-the-tui.md#developer-guidance-list-workflowsdynamicguidance) for the walkthrough and [Configuration](07-configuration.md#reference) for the full field reference.
+See [Using the TUI](02-using-the-tui.md#developer-guidance-list-workflowsdynamicguidance) for the walkthrough and [Configuration](07-configuration.md#reference-all-keys) for the full field reference.
 
 ### Global and repo settings
 
@@ -232,11 +230,7 @@ Both the global config and repo config can set `workflows.dynamic`. For `agentsT
 
 Guidance from the global and repo lists is combined in that order, with duplicate entries dropped. The combined list can contain at most 50 entries. The repo can add project-specific instructions while inheriting the global guidance.
 
-The scalar fields `defaultLeader` and `maxConcurrentSteps` use the repo value when set, then the global value. A repo `defaultLeader` takes precedence over a global one, which is why leader resolution checks the global setting after repo config.
-
-### Upgrading from `dynamicWorkflows`
-
-The older repo key `dynamicWorkflows` is still accepted as an alias. Run `awman config migrate` to move it to `workflows.dynamic`; saving repo config (for example with `config set` or the TUI dialog) also moves it automatically. Older awman versions do not read `workflows.dynamic`, so teammates using an older version will stop seeing these settings after the migrated config is committed. The old global key was never read; move any desired settings into the global `workflows.dynamic` block yourself.
+The scalar keys `defaultLeader` and `workflows.maxConcurrentSteps` use the repo value when set, then the global value. A repo `defaultLeader` takes precedence over a global one, which is why leader resolution checks the global setting after repo config.
 
 ---
 
@@ -383,9 +377,9 @@ All flag errors are surfaced before any container work begins.
 | `--work-item <N>` | Required with `--dynamic`; the work item number to pass to the leader |
 | `--leader <agent::model>` | Override the agent container and model used for the leader step |
 | `--model <NAME>` | Default model for the generated workflow's steps; also the leader's model when neither `--leader` nor `defaultLeader` is set |
-| `--agent-flag=<ARG>` | Extra argument for the selected agent (`--agent`, else config): the leader when it runs that agent, and generated steps that use the workflow's default agent. Other agents keep their configured [`agentFlags`](07-configuration.md#pass-extra-flags-to-an-agent) |
+| `--agent-flag=<ARG>` | Extra argument for the selected agent (`--agent`, else config): the leader when it runs that agent, and generated steps that use the workflow's default agent. Other agents keep their configured [`agents.flags`](07-configuration.md#pass-extra-flags-to-an-agent) |
 
-The leader and every generated step also get their agent's configured `agentFlags`. These are read from the repository you launched from, not the worktree, so an `agentFlags` entry you haven't committed still reaches the leader.
+The leader and every generated step also get their agent's configured `agents.flags`. These are read from the repository you launched from, not the worktree, so an `agents.flags` entry you haven't committed still reaches the leader.
 
 Dynamic mode always enforces `--yolo`, `--worktree`, and `--overlay context(workflow)`. Passing any of these explicitly has no effect (they are already active).
 
@@ -405,7 +399,8 @@ Dynamic mode always enforces `--yolo`, `--worktree`, and `--overlay context(work
 | Agent image build fails | Hard error with build output; workflow does not start; repair loop is not entered |
 | Leader modifies source files outside the context directory | Dynamic run aborts before executing the generated workflow; changed paths are reported |
 | User restarts the leader via WCB | Current leader container killed, `workflow.toml` deleted, fresh leader launched |
-| User aborts during the leader yolo countdown | Leader container killed, entire dynamic run aborts — no workflow executes |
+| Esc during the leader yolo countdown | Countdown cancelled; leader stays running for further interaction |
+| User aborts from the leader control board | Leader container killed, entire dynamic run aborts — no workflow executes |
 | User pauses during the leader step | Leader container killed; resume semantics follow the standard workflow pause/resume path |
 | A generated workflow step fails | The [step-failure control board](05-workflows.md#when-a-step-fails) opens: restart, go back, skip ahead, pause, or Ctrl+C to cancel |
 | Re-run after cancelling a failed run, worktree kept | Resume prompt offers the failed step, the one before it, and the one after it, by name |
@@ -421,7 +416,7 @@ Dynamic mode always enforces `--yolo`, `--worktree`, and `--overlay context(work
 | Repo `workflows.dynamic.agentsToModels` is `{}` (empty map) | Falls through to the global map; set an explicit repo map to use only this repo's Dockerfile discovery |
 | `workflows.dynamic.agentsToModels` key matches a Dockerfile only after case folding | Workflow proceeds using the lowercase agent name; a warning is shown |
 | Two `workflows.dynamic.agentsToModels` keys fold to the same agent (e.g. `"Claude"` and `"claude"`) | Error at workflow start, before any container is spawned; ambiguous model lists are never merged |
-| `workflows.dynamic.maxConcurrentSteps` is `0` | Rejected when the config is loaded — awman never starts with this value |
+| `workflows.maxConcurrentSteps` is `0` | Rejected when the config is loaded — awman never starts with this value |
 | `workflows.dynamic.defaultLeader` is malformed | Rejected when the config is loaded, before any UI or workflow starts |
 | `--leader` and `workflows.dynamic.defaultLeader` both set | `--leader` wins |
 | `--model` and `workflows.dynamic.defaultLeader` both set, no `--leader` | `defaultLeader` controls the leader's model; `--model` still applies to the generated workflow's steps |

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 pub use crate::data::agent_output_format::AgentOutputFormat;
 pub use crate::data::fs::agent_dirs::DefinitionScope;
 
-use crate::data::config::repo::LaunchMode;
+use crate::data::config::agents::LaunchMode;
 use crate::engine::container::options::{AutoMode, Entrypoint, ModelFlagForm, PlanMode, YoloMode};
 use crate::engine::error::EngineError;
 
@@ -64,6 +64,8 @@ pub enum SystemPromptMode {
     AgentsMd,
     /// Env var pointing to a file.
     EnvFile { var: String },
+    /// Env var pointing to a directory containing AGENTS.md.
+    EnvDir { var: String },
     /// Extra workspace dir flag (agy --add-dir) + AGENTS.md.
     AddDir { flag: String },
     /// Not supported.
@@ -92,6 +94,19 @@ pub enum SettingsMount {
     /// token read from the host keychain, synthesized when the host dir is
     /// absent but a keychain token exists.
     Antigravity,
+}
+
+/// A private host directory mounted for one agent execution. The directory
+/// follows the container execution's lifetime, rather than the engine's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStorageDir {
+    /// Destination relative to the container's effective HOME.
+    pub home_relative_path: String,
+    /// Optional environment variable set to the absolute destination.
+    pub env_var: Option<String>,
+    /// Optional CLI flag and config key for agents whose config file takes
+    /// precedence over the environment variable. Emitted after user flags.
+    pub config_override: Option<(String, String)>,
 }
 
 /// Which host credential scheme awman reads for an agent.
@@ -133,7 +148,7 @@ pub enum ModelFlagDelivery {
 /// container. Those agents declare a dedicated flag instead (opencode
 /// `--prompt <text>`).
 ///
-/// This only governs interactive delivery. Non-interactive runs use the
+/// This only governs interactive delivery. Headless runs use the
 /// agent's `non_interactive_flag` entrypoint shape (e.g. `opencode run`) and
 /// receive the prompt over stdin.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,9 +195,12 @@ pub struct AgentDefinition {
     pub image: AgentImageSource,
     /// Bare interactive entrypoint (e.g. `["claude"]`, `["copilot", "-i"]`).
     pub interactive_entrypoint: Vec<String>,
-    /// Print/non-interactive entrypoint suffix (e.g. `--print` for Claude).
+    /// Print/headless entrypoint suffix (e.g. `--print` for Claude).
     pub non_interactive_flag: Option<String>,
-    /// The structured output mode a non-interactive run can print in
+    /// Headless invocation takes the prompt as the argument after its mode
+    /// flag rather than reading plain text from stdin.
+    pub headless_prompt_in_argv: bool,
+    /// The structured output mode a headless run can print in
     /// (WI 0137 §4). A capability of the table, not a name match: under the
     /// API an agent with a structured format runs in that mode (claude
     /// `--output-format stream-json --verbose`, codex `exec --json`) and the
@@ -191,7 +209,7 @@ pub struct AgentDefinition {
     /// for every other agent and for a custom definition that declares none.
     pub output_format: AgentOutputFormat,
     /// Flags appended to the entrypoint only for an interactive (non-`-n`)
-    /// launch — for options the agent's non-interactive mode rejects (codex
+    /// launch — for options the agent's headless mode rejects (codex
     /// `--no-daemon`, which `codex exec` refuses). Not used for ACP launches.
     pub interactive_only_flags: Vec<String>,
     /// Plan-mode flags. Empty means plan mode is unsupported
@@ -237,6 +255,11 @@ pub struct AgentDefinition {
     /// How the host agent's settings/credential directory is passed into a
     /// container. Consumed by `OverlayEngine::agent_settings_overlays_*`.
     pub settings_mount: SettingsMount,
+    /// Additional host directories mounted at the same relative location in
+    /// the guest (for agents that split configuration and credentials).
+    pub extra_settings_mounts: Vec<String>,
+    /// Private writable directories mounted for one execution.
+    pub session_storage_dirs: Vec<SessionStorageDir>,
     /// Where the global skills directory is mounted inside the container,
     /// relative to the container `$HOME`. `None` means the agent has no known
     /// skills directory and the skills overlay is skipped with a warning.
@@ -403,7 +426,7 @@ impl AgentDefinition {
     }
 
     /// The flags [`Self::entrypoint_for`] itself adds for this launch shape,
-    /// beyond the bare entrypoint and the non-interactive form. A user
+    /// beyond the bare entrypoint and the headless form. A user
     /// `agentFlags` entry naming one of them is dropped from that launch
     /// rather than passed twice.
     pub fn entrypoint_managed_flags(&self, non_interactive: bool) -> &[String] {
@@ -414,7 +437,7 @@ impl AgentDefinition {
         }
     }
 
-    /// Build the entrypoint with optional non-interactive shape.
+    /// Build the entrypoint with optional headless shape.
     pub fn entrypoint_for(&self, non_interactive: bool) -> Entrypoint {
         let mut parts = self.interactive_entrypoint.clone();
         if non_interactive {

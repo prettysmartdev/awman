@@ -1,7 +1,7 @@
 //! `ApiDispatchFrontend` — the single Layer 3 struct that implements
 //! every per-command frontend trait for API HTTP command dispatch.
 //!
-//! When a `POST /v1/commands` request arrives, the route handler constructs
+//! When a `POST /v1/worker/commands` request arrives, the route handler constructs
 //! a `ApiDispatchFrontend` pre-loaded with the parsed args/flags from
 //! the HTTP request body, then hands it to `Dispatch::run_command`. All
 //! output (UserMessages, container stdout/stderr) is written to the
@@ -34,9 +34,6 @@ use crate::command::commands::agent_setup::{
     AgentSetupDecision, AgentSetupFrontend, HasAgentFrontend,
 };
 use crate::command::commands::agents::AgentsCommandFrontend;
-use crate::command::commands::api_server::{
-    ApiKeyDisclosure, ApiServerCommandFrontend, ApiServerRuntime,
-};
 use crate::command::commands::chat::ChatCommandFrontend;
 use crate::command::commands::config::{ConfigCommandFrontend, ConfigEditRequest, ConfigFieldRow};
 use crate::command::commands::exec_prompt::ExecPromptCommandFrontend;
@@ -56,10 +53,10 @@ use crate::command::dispatch::projections::raw_args::ParsedArgs;
 use crate::command::dispatch::CommandFrontend;
 use crate::command::error::CommandError;
 use crate::command::headless::HeadlessDefaults;
-use crate::data::config::repo::WorkItemsConfig;
+use crate::data::config::work_items::WorkItemsConfig;
 use crate::data::fs::api_command_log::CommandStateWriter;
 use crate::data::fs::api_db::{FailedStep, FailedStepPhase};
-use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::data::message::{UserMessage, UserMessageSink};
 use crate::data::ready_phase::ReadyPhase;
 use crate::data::ready_summary::ReadySummary;
 use crate::data::session::AgentName;
@@ -82,6 +79,19 @@ use crate::engine::workflow::frontend::{ContainerSource, WorkflowFrontend};
 /// The API dispatch frontend. Emits typed events to an `EventBusSender`
 /// for distribution to logfile writers and SSE clients.
 pub struct ApiDispatchFrontend {
+    /// Initial prerequisite progress follows its structured report on the wire.
+    prerequisite_messages: Option<Vec<UserMessage>>,
+
+    /// The run's resolved interaction (WI 0141), from Layer 2. `None` for a
+    /// frontend built without one (tests, admission probes): piped.
+    interaction: Option<crate::command::interaction::InteractionDecision>,
+    /// The sender of the last single-agent PTY sink handed out
+    /// (`container_frontend_for_pty`): `program_status` events of that agent
+    /// carry its container attribution.
+    pty_sink_sender: Option<EventBusSender>,
+    /// Forwards a single-agent launch.s `StuckEvent::Reported` to the bus
+    /// (`set_stuck_sender`); aborted when replaced or dropped.
+    status_forwarder: Option<AbortOnDrop>,
     frontend_kind: FrontendKind,
     /// The outcome of Layer 2 parsing (`CommandCatalogue::parse_raw_args`),
     /// captured at construction. Every `CommandFrontend` accessor reports a
@@ -176,7 +186,16 @@ impl ApiDispatchFrontend {
     /// 0097, Findings A + D). The `Api` frontend profile is what forces
     /// `non-interactive=true` and defaults `yolo=true`.
     pub fn new(subcommand: &str, args: &[String], event_bus: EventBusSender) -> Self {
-        Self::for_frontend(subcommand, args, event_bus, FrontendKind::Api)
+        Self::for_frontend(subcommand, args, event_bus, FrontendKind::WORKER_LOCAL)
+    }
+    /// Project an already catalogue-validated foreground invocation.
+    pub fn from_input(
+        input: crate::command::dispatch::ParsedCommandBoxInput,
+        events: EventBusSender,
+    ) -> Self {
+        let mut frontend = Self::new(&input.path.join(" "), &[], events);
+        frontend.parsed = Arc::new(Ok(input.args));
+        frontend
     }
 
     pub fn for_frontend(
@@ -190,6 +209,10 @@ impl ApiDispatchFrontend {
             CommandCatalogue::get().parse_raw_args_with_profile(&path, args, frontend_kind);
 
         Self {
+            prerequisite_messages: None,
+            interaction: None,
+            pty_sink_sender: None,
+            status_forwarder: None,
             frontend_kind,
             parsed: Arc::new(parsed),
             event_bus,
@@ -218,6 +241,22 @@ impl ApiDispatchFrontend {
             command_path: CommandCatalogue::get().canonical_path(&path).join(" "),
             headless: HeadlessDefaults::api(),
         }
+    }
+
+    /// The interaction Layer 2 resolved for this run (WI 0141). It decides
+    /// what `headless` reads as and whether `take_io` asks for a PTY
+    /// (`AgentIo::initial_size = decision.pty_size`); the frontend decides
+    /// nothing about it itself.
+    pub fn with_interaction(
+        mut self,
+        decision: crate::command::interaction::InteractionDecision,
+    ) -> Self {
+        self.interaction = Some(decision);
+        self
+    }
+
+    fn is_interactive(&self) -> bool {
+        self.interaction.is_some_and(|d| !d.is_headless())
     }
 
     /// Mirror workflow snapshots into the command directory for API polling.
@@ -301,8 +340,17 @@ impl ApiDispatchFrontend {
     }
 }
 
+impl ApiDispatchFrontend {
+    fn flush_prerequisite_messages(&mut self) {
+        for message in self.prerequisite_messages.take().unwrap_or_default() {
+            emit_user_message(&self.container_sender(), message);
+        }
+    }
+}
+
 impl Drop for ApiDispatchFrontend {
     fn drop(&mut self) {
+        self.flush_prerequisite_messages();
         // The engine writes container output in arbitrary byte chunks. Anything
         // not terminated by `\n` lives in the line buffers — flush it as a
         // final event so SSE clients and `events.log` see the trailing line.
@@ -332,7 +380,11 @@ impl crate::engine::git::GitFrontend for ApiDispatchFrontend {}
 
 impl UserMessageSink for ApiDispatchFrontend {
     fn write_message(&mut self, msg: UserMessage) {
-        emit_user_message(&self.container_sender(), msg);
+        if let Some(messages) = &mut self.prerequisite_messages {
+            messages.push(msg);
+        } else {
+            emit_user_message(&self.container_sender(), msg);
+        }
     }
 
     fn replay_queued(&mut self) {}
@@ -353,10 +405,23 @@ impl ApiDispatchFrontend {
 }
 
 impl CommandFrontend for ApiDispatchFrontend {
+    fn input_available(&self) -> bool {
+        self.is_interactive()
+    }
     fn kind(&self) -> crate::command::dispatch::catalogue::FrontendKind {
         self.frontend_kind
     }
     fn flag_bool(&self, _command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError> {
+        self.parsed()?;
+        // The resolved decision is authoritative for both spellings, so a
+        // run never reads a mode admission did not choose.
+        if let Some(decision) = self.interaction {
+            match flag {
+                "headless" => return Ok(Some(decision.is_headless())),
+                "interactive" => return Ok(Some(!decision.is_headless())),
+                _ => {}
+            }
+        }
         Ok(self.parsed()?.flag_bool(flag))
     }
 
@@ -445,15 +510,22 @@ impl AgentFrontend for ApiDispatchFrontend {
     }
 
     fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
-        // API never has interactive stdin: the engine owns the only sender
-        // and drops it after seeding the prompt (see `spawn_piped_docker`)
-        // so the container sees EOF promptly. The drains keep the lent
-        // source, so every line of this container stays attributed to it.
-        spawn_output_drains(
+        // Headless: no interactive stdin. The engine owns the only sender and
+        // drops it after seeding the prompt (see `spawn_piped_docker`) so the
+        // container sees EOF promptly. The drains keep the lent source, so
+        // every line of this container stays attributed to it.
+        let io = spawn_output_drains(
             &self.container_sender(),
             std::mem::take(&mut self.output_format),
             self.final_message_sink(),
-        )
+        );
+        // Interactive (WI 0141): the size Layer 2 read from
+        // `daemon.terminal.{cols,rows}` at spawn is what makes the runtime
+        // take `spawn_pty_bridged`. Nobody here resizes the PTY; viewers do
+        // that through the terminal hub. ACP launches never reach this
+        // `take_io` (they bind their own piped transport), so they stay
+        // piped whatever the decision says.
+        with_pty_size(io, self.interaction.and_then(|d| d.pty_size))
     }
 
     fn set_agent_output_format(&mut self, format: AgentOutputFormat) {
@@ -471,7 +543,37 @@ impl AgentFrontend for ApiDispatchFrontend {
 
 // Structured frames contain whole messages and tool results. Keep a larger
 // explicit bound than plain text, while bounding malformed protocol output.
-const MAX_STRUCTURED_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STRUCTURED_FRAME_BYTES: usize =
+    crate::engine::agent_output::line_framer::MAX_STRUCTURED_FRAME_BYTES;
+
+/// `EffectiveStatus` → the `program_status` event payload: spec spellings
+/// (`snake_case` state and kind), absent fields omitted. The record `id` is
+/// not part of the event; step attribution rides the envelope `source`.
+pub(crate) fn program_status_event(
+    status: &crate::data::program_status::EffectiveStatus,
+) -> EventPayload {
+    EventPayload::ProgramStatus {
+        state: status.state,
+        kind: status.kind,
+        progress: status.progress,
+        msg: status.msg.clone(),
+        app: status.app.clone(),
+    }
+}
+
+/// Ask for a PTY of `size` (`Some`) or keep the piped I/O (`None`). The
+/// resize receiver has no sender here: an unattended PTY keeps its spawn
+/// size until a viewer holding input resizes it through the hub.
+fn with_pty_size(
+    mut io: crate::engine::agent_runtime::frontend::AgentIo,
+    size: Option<(u16, u16)>,
+) -> crate::engine::agent_runtime::frontend::AgentIo {
+    if let Some(size) = size {
+        io.initial_size = Some(size);
+        io.resize = Some(tokio::sync::mpsc::unbounded_channel().1);
+    }
+    io
+}
 
 /// Wire a container's stdout/stderr byte channels to the event bus
 /// (WI 0137 §4): both streams are line-buffered, stdout runs through the
@@ -497,7 +599,7 @@ fn spawn_output_drains(
     // Drain stdout → translator → event bus (line-buffered).
     event_bus_stdout.clone().spawn_drain(async move {
         let shutdown = event_bus_stdout.output_shutdown();
-        let mut translator = crate::engine::agent_output::translator_for(format);
+        let mut translator = crate::engine::agent_output::translator_for_redacted(format, event_bus_stdout.redaction());
         let emit = |items: Vec<Translated>| {
             for item in items {
                 emit_translated(&event_bus_stdout, final_message.as_ref(), item);
@@ -515,7 +617,7 @@ fn spawn_output_drains(
                 let items = if line.truncated && format.is_structured() {
                     // A partial protocol frame is neither text nor a final
                     // answer. Forget any earlier candidate before EOF fallback.
-                    translator = crate::engine::agent_output::translator_for(format);
+                    translator = crate::engine::agent_output::translator_for_redacted(format, event_bus_stdout.redaction());
                     vec![Translated::Activity {
                         kind: crate::data::execution_event::StepActivityKind::Message,
                         summary: "Agent frame too large; final message may be unavailable".into(),
@@ -623,6 +725,7 @@ impl ApiDispatchFrontend {
 // ─── HasAgentFrontend ───────────────────────────────────────────────────
 
 impl HasAgentFrontend for ApiDispatchFrontend {
+    /// Image setup, probes and other helper containers: always piped.
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(ApiContainerSink::new(
             &self.event_bus,
@@ -630,6 +733,62 @@ impl HasAgentFrontend for ApiDispatchFrontend {
             self.state_writer.clone(),
         ))
     }
+
+    /// The single-agent launch (`exec prompt`, `chat`): it carries the
+    /// interaction Layer 2 resolved, so an interactive run gets its PTY
+    /// (`AgentIo::initial_size = decision.pty_size`). ACP launches bind
+    /// their own piped transport and never call this.
+    fn container_frontend_for_pty(&mut self) -> Box<dyn AgentFrontend> {
+        let mut sink = ApiContainerSink::new(
+            &self.event_bus,
+            self.final_message_sink(),
+            self.state_writer.clone(),
+        );
+        sink.pty_size = self.interaction.and_then(|d| d.pty_size);
+        self.pty_sink_sender = Some(sink.event_bus.clone());
+        Box::new(sink)
+    }
+}
+
+/// Aborts its task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Forward one agent's `StuckEvent::Reported` as `program_status` events,
+/// skipping an unchanged repeat, until its detector channel closes. The
+/// `Arc<Sender>` itself is not retained, so the task never keeps the channel
+/// open past the execution.
+fn spawn_status_forwarder(
+    sender: &tokio::sync::broadcast::Sender<crate::engine::agent_runtime::StuckEvent>,
+    event_bus: EventBusSender,
+) -> Option<AbortOnDrop> {
+    use crate::engine::agent_runtime::StuckEvent;
+    use tokio::sync::broadcast::error::RecvError;
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    let mut events = sender.subscribe();
+    Some(AbortOnDrop(runtime.spawn(async move {
+        let mut last: Option<crate::data::program_status::EffectiveStatus> = None;
+        loop {
+            match events.recv().await {
+                Ok(StuckEvent::Reported(status)) => {
+                    if status == last {
+                        continue;
+                    }
+                    if let Some(status) = &status {
+                        event_bus.emit(program_status_event(status));
+                    }
+                    last = status;
+                }
+                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => break,
+            }
+        }
+    })))
 }
 
 // ─── AgentImageFrontend ─────────────────────────────────────────────────
@@ -702,6 +861,8 @@ struct ApiContainerSink {
     output_format: AgentOutputFormat,
     /// Where a translated final message goes (`exec prompt`).
     final_message: Option<FinalMessageSink>,
+    /// The interactive PTY size for the single-agent launch; `None` = piped.
+    pty_size: Option<(u16, u16)>,
 }
 
 impl ApiContainerSink {
@@ -719,6 +880,7 @@ impl ApiContainerSink {
             source,
             output_format: AgentOutputFormat::Text,
             final_message,
+            pty_size: None,
         }
     }
 }
@@ -775,6 +937,9 @@ fn emit_user_message(sender: &EventBusSender, msg: UserMessage) {
 
 #[async_trait]
 impl AgentFrontend for ApiContainerSink {
+    fn terminal_source(&self) -> Option<EventSource> {
+        self.source.lock().ok().map(|s| s.clone())
+    }
     fn report_status(&mut self, status: AgentStatus) {
         // Attribute this and every later event to the running container
         // before the status line is emitted.
@@ -793,11 +958,13 @@ impl AgentFrontend for ApiContainerSink {
     fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
         // Engine owns the single stdin_tx and drops it after seeding so EOF
         // arrives at the container's stdin pipe (see `spawn_piped_docker`).
-        spawn_output_drains(
+        // An interactive single-agent launch asks for its PTY here.
+        let io = spawn_output_drains(
             &self.event_bus,
             std::mem::take(&mut self.output_format),
             self.final_message.clone(),
-        )
+        );
+        with_pty_size(io, self.pty_size)
     }
 
     fn set_agent_output_format(&mut self, format: AgentOutputFormat) {
@@ -926,9 +1093,11 @@ impl WorkflowFrontend for ApiDispatchFrontend {
                     });
                 }
             }
-            if let Err(error) = writer.write(state) {
-                tracing::warn!(%error, "failed to write command workflow state");
-            }
+            crate::command::worker::events::persist_workflow_snapshot(
+                writer,
+                &self.event_bus,
+                state,
+            );
         }
     }
 
@@ -937,6 +1106,7 @@ impl WorkflowFrontend for ApiDispatchFrontend {
         _state: &crate::data::workflow_state::WorkflowState,
         available: &AvailableActions,
     ) -> Result<NextAction, EngineError> {
+        let _awaiting_input = self.event_bus.awaiting_input();
         Ok(self.headless.workflow_next_action(available))
     }
 
@@ -956,6 +1126,9 @@ impl WorkflowFrontend for ApiDispatchFrontend {
             let what = match self.countdown_kind {
                 CountdownKind::StuckStep => "auto-advancing",
                 CountdownKind::FailureRetry => "retrying after failure",
+                CountdownKind::AgentDone => "advancing after the agent reported done",
+                CountdownKind::AgentBlocked => "failing the step: the agent reported blocked",
+                CountdownKind::AgentError => "failing the step: the agent reported an error",
             };
             // `step_name` is a countdown label, which for an `on_failure` agent
             // is not a step: attribute it only when it names one.
@@ -977,6 +1150,28 @@ impl WorkflowFrontend for ApiDispatchFrontend {
         self.countdown_kind = kind;
     }
 
+    /// WI 0141: the agent's effective OSC 7501 status, as a `program_status`
+    /// event attributed to its step (an `on_failure` agent or the dynamic
+    /// leader reports under a label that is not a step: root sender). The
+    /// engine already deduplicated and rate-limited it. A clear (`None`) has
+    /// no `program_status` spelling, so it emits nothing; the step's next
+    /// status event or its end supersedes the last reported state.
+    fn report_agent_status(
+        &mut self,
+        step_name: &str,
+        status: Option<&crate::data::program_status::EffectiveStatus>,
+    ) {
+        let Some(payload) = status.map(program_status_event) else {
+            return;
+        };
+        let sender = if self.step_order.iter().any(|n| n == step_name) {
+            self.step_sender(step_name)
+        } else {
+            self.event_bus.clone()
+        };
+        sender.emit(payload);
+    }
+
     fn yolo_countdown_finished(&mut self, _step_name: &str) {
         self.last_sink_message_time = None;
         self.countdown_kind = CountdownKind::default();
@@ -995,10 +1190,7 @@ impl WorkflowFrontend for ApiDispatchFrontend {
 
     fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
         let Some(index) = self.step_index_for(&step.name) else {
-            tracing::warn!(
-                step = step.name,
-                "Skipping step transition without a definition index"
-            );
+            tracing::warn!("Skipping step transition without a definition index");
             return;
         };
         if matches!(status, WorkflowStepStatus::Succeeded) {
@@ -1523,6 +1715,36 @@ impl ReadyFrontend for ApiDispatchFrontend {
 
 impl RemoteCommandFrontend for ApiDispatchFrontend {}
 
+// Attach is excluded from API dispatch by the catalogue. Keep the adapter
+// total for DispatchFrontend, with an explicit refusal if called directly.
+#[async_trait]
+impl crate::command::commands::attach::AttachCommandFrontend for ApiDispatchFrontend {
+    fn begin_attach(
+        &mut self,
+        _terminal_id: &crate::data::ids::TerminalId,
+    ) -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
+    }
+
+    fn hangup(&self) -> tokio_util::sync::CancellationToken {
+        tokio_util::sync::CancellationToken::new()
+    }
+
+    fn bind_terminal(
+        &mut self,
+        _stream: crate::engine::remote::terminal_client::TerminalStream,
+        _read_only: bool,
+        _policy: crate::data::terminal::HostOutputPolicy,
+    ) -> Result<tokio::task::JoinHandle<()>, CommandError> {
+        Err(CommandError::NotAvailableForFrontend {
+            command: "attach".into(),
+            frontend: "API".into(),
+        })
+    }
+
+    fn end_attach(&mut self) {}
+}
+
 impl AgentsCommandFrontend for ApiDispatchFrontend {
     fn render_overview(
         &mut self,
@@ -1582,27 +1804,17 @@ impl crate::command::commands::clean::CleanCommandFrontend for ApiDispatchFronte
 }
 
 #[async_trait]
-impl ApiServerCommandFrontend for ApiDispatchFrontend {
-    async fn serve_until_shutdown(
+impl crate::command::commands::daemon::lifecycle::DaemonCommandFrontend for ApiDispatchFrontend {
+    /// The daemon is not a command an API request can become.
+    async fn host_daemon(
         &mut self,
-        _runtime: ApiServerRuntime,
+        _env: crate::data::config::env::EnvSnapshot,
+        _set: crate::data::config::overrides::ConfigOverrides,
     ) -> Result<(), CommandError> {
-        Err(CommandError::Other(
-            "Cannot start a nested API server from within API dispatch".into(),
-        ))
-    }
-
-    /// The key as text, on the message stream the caller is already reading.
-    /// The API used to receive the CLI's banner and serialise the `═` runs
-    /// into JSON, which no HTTP client wanted.
-    fn show_api_key(&mut self, disclosure: &ApiKeyDisclosure) {
-        self.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: format!(
-                "awman API key (store this — it will not be shown again): {}",
-                disclosure.key()
-            ),
-        });
+        Err(CommandError::NotAvailableForFrontend {
+            command: "daemon start".into(),
+            frontend: "api".into(),
+        })
     }
 }
 
@@ -1612,6 +1824,25 @@ impl ChatCommandFrontend for ApiDispatchFrontend {}
 /// behind an HTTP request, so there is nothing for `set_pty_active` to gate.
 impl crate::command::commands::agent_setup::AgentLaunchFrontend for ApiDispatchFrontend {
     fn set_pty_active(&mut self, _active: bool) {}
+
+    /// WI 0141: a single-agent command's OSC 7501 reports become
+    /// `program_status` events, attributed to the launched container (the
+    /// last `container_frontend_for_pty` sink). Workflow steps report
+    /// through `WorkflowFrontend::report_agent_status` instead; setup
+    /// frontends (`agent_setup`) never call this, so their exemption stays.
+    fn set_stuck_sender(
+        &mut self,
+        sender: std::sync::Arc<
+            tokio::sync::broadcast::Sender<crate::engine::agent_runtime::StuckEvent>,
+        >,
+    ) {
+        let bus = self
+            .pty_sink_sender
+            .clone()
+            .unwrap_or_else(|| self.event_bus.clone());
+        // Replacing the forwarder aborts the previous agent's.
+        self.status_forwarder = spawn_status_forwarder(&sender, bus);
+    }
 }
 
 impl AcpFrontend for ApiDispatchFrontend {
@@ -1687,6 +1918,10 @@ impl crate::command::commands::agent_trust::AgentTrustFrontend for ApiDispatchFr
 impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
     for ApiDispatchFrontend
 {
+    fn begin_workflow_prerequisites(&mut self) {
+        self.prerequisite_messages.get_or_insert_with(Vec::new);
+    }
+
     fn show_workflow_prerequisites(
         &mut self,
         report: &crate::data::workflow_prerequisites::WorkflowPrerequisiteReport,
@@ -1696,6 +1931,7 @@ impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFront
             phase: report.phase,
             report: report.clone(),
         });
+        self.flush_prerequisite_messages();
         Ok(())
     }
 
@@ -1707,753 +1943,5 @@ impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFront
             phase: report.phase,
             report: report.clone(),
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[path = "agent_output.rs"]
-    mod agent_output;
-    #[path = "dynamic_workflow_e2e.rs"]
-    mod dynamic_workflow_e2e;
-    #[path = "live_engine_state.rs"]
-    mod live_engine_state;
-
-    use crate::command::dispatch::projections::raw_args::shared_cases::{
-        assert_reads, classification, CASES, ERROR_CASES,
-    };
-
-    fn make_frontend(subcommand: &str, args: &[&str]) -> ApiDispatchFrontend {
-        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
-        let sender = bus.sender();
-        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        ApiDispatchFrontend::new(subcommand, &args, sender)
-    }
-
-    // ─── WI 0136: output drains finish before Done ─────────────────────────
-    //
-    // The queue worker waits for the bus's drain barrier and only then emits
-    // `Done`. Writing right up to exit, the last stdout line (even without a
-    // trailing newline) must precede `Done` for every consumer.
-
-    /// One simulated run: output is produced right up to "exit" by a
-    /// concurrent producer, then the worker's barrier and `Done`.
-    async fn run_once(run: usize, lines: usize, unterminated_tail: bool) {
-        use crate::command::commands::api_server::event_bus::EventBus;
-        use crate::data::execution_event::ExecutionEvent;
-
-        let bus = EventBus::new(4096);
-        let mut live = bus.subscribe();
-        let mut log = bus.subscribe_log();
-        let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender()).deferring_done();
-        let io = AgentFrontend::take_io(&mut fe);
-
-        let stdout = io.stdout.clone();
-        let stderr = io.stderr.clone();
-        drop(io);
-        let last = format!("last-{run}");
-        let producer = tokio::spawn({
-            let last = last.clone();
-            async move {
-                for i in 0..lines {
-                    stdout.send(format!("line {i}\n").into_bytes()).unwrap();
-                    if i % 7 == 0 {
-                        stderr.send(format!("err {i}\n").into_bytes()).unwrap();
-                        tokio::task::yield_now().await;
-                    }
-                }
-                let tail = if unterminated_tail {
-                    last
-                } else {
-                    format!("{last}\n")
-                };
-                // Split the tail across chunks so a partial line is buffered.
-                let (head, rest) = tail.split_at(2);
-                stdout.send(head.as_bytes().to_vec()).unwrap();
-                stdout.send(rest.as_bytes().to_vec()).unwrap();
-                // Senders drop here: the container's pipes closed on exit.
-            }
-        });
-        producer.await.unwrap();
-        fe.report_workflow_completed(&WorkflowOutcome::Completed);
-        drop(fe);
-
-        assert!(
-            bus.wait_output_drained(Duration::from_secs(5)).await,
-            "run {run}: drains must finish once the pipes close"
-        );
-        // Simulate the queue worker's single final status, after the drain.
-        bus.sender().finish(EventPayload::CommandStatus {
-            status: CommandStatusKind::Done,
-            exit_code: Some(0),
-            error: None,
-            result: None,
-        });
-        bus.sender().emit(EventPayload::Done);
-
-        let mut from_live: Vec<ExecutionEvent> = Vec::new();
-        while let Ok(event) = live.try_recv() {
-            from_live.push(event);
-        }
-        let mut from_log: Vec<ExecutionEvent> = Vec::new();
-        while let Ok(event) = log.try_recv() {
-            from_log.push(event);
-        }
-        for (name, events) in [("stream", from_live), ("events.log", from_log)] {
-            let done = events
-                .iter()
-                .position(|e| matches!(e.payload, EventPayload::Done))
-                .unwrap_or_else(|| panic!("run {run}: {name} has no Done"));
-            assert_eq!(done, events.len() - 1, "run {run}: {name} Done is last");
-            let last_stdout = events
-                .iter()
-                .rposition(|e| matches!(e.payload, EventPayload::StdoutLine(_)))
-                .unwrap();
-            assert!(
-                matches!(&events[last_stdout].payload, EventPayload::StdoutLine(s) if *s == last),
-                "run {run}: {name} last stdout line was {:?}",
-                events[last_stdout].payload
-            );
-            assert!(last_stdout < done, "run {run}: {name} stdout before Done");
-            let status = events
-                .iter()
-                .position(|e| matches!(e.payload, EventPayload::CommandStatus { .. }))
-                .unwrap();
-            let last_output = events
-                .iter()
-                .rposition(|e| {
-                    matches!(
-                        e.payload,
-                        EventPayload::StdoutLine(_) | EventPayload::StderrLine(_)
-                    )
-                })
-                .unwrap();
-            assert!(
-                last_output < status && status < done,
-                "run {run}: {name} completion order"
-            );
-            let sequences: Vec<u64> = events.iter().map(|e| e.sequence).collect();
-            let expected: Vec<u64> = (0..events.len() as u64).collect();
-            assert_eq!(sequences, expected, "run {run}: {name} dense sequences");
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn stress_last_stdout_line_always_precedes_done_in_stream_and_log() {
-        // Many short runs: the race window is the gap between the producer's
-        // last write and the worker emitting Done.
-        let mut runs = Vec::new();
-        for run in 0..200 {
-            runs.push(tokio::spawn(run_once(
-                run,
-                5 + run % 40,
-                run.is_multiple_of(2),
-            )));
-        }
-        for run in runs {
-            run.await.unwrap();
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn drain_barrier_times_out_when_a_pipe_never_closes() {
-        use crate::command::commands::api_server::event_bus::EventBus;
-
-        let bus = EventBus::new(16);
-        let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
-        let io = AgentFrontend::take_io(&mut fe);
-        // `io` keeps the senders alive, as a backend that leaks a pipe would.
-        assert!(!bus.wait_output_drained(Duration::from_millis(50)).await);
-        drop(io);
-    }
-
-    // ─── ReadyFrontend::{report_phase, report_summary} ─────────────────────
-    //
-    // Before WI 0125, `report_summary` was a no-op here — the API dropped the
-    // whole `ReadySummary`. It now emits one `StatusMessage` per row, the
-    // hint (if any), and the outcome line, through the same event path every
-    // other ready/init progress line already uses.
-
-    fn status_messages(
-        rx: &mut tokio::sync::broadcast::Receiver<crate::data::execution_event::ExecutionEvent>,
-    ) -> Vec<String> {
-        let mut out = Vec::new();
-        while let Ok(event) = rx.try_recv() {
-            if let crate::data::execution_event::EventPayload::StatusMessage { message, .. } =
-                event.payload
-            {
-                out.push(message);
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn report_phase_emits_a_status_message_with_the_shared_ready_phase_display() {
-        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
-        let mut rx = bus.subscribe();
-        let mut fe = ApiDispatchFrontend::new("ready", &[], bus.sender());
-
-        ReadyFrontend::report_phase(&mut fe, &ReadyPhase::ImportingAgentImage);
-
-        let messages = status_messages(&mut rx);
-        assert!(
-            messages.contains(&"ready: Importing agent image...".to_string()),
-            "{messages:?}"
-        );
-    }
-
-    /// `report_summary` was a no-op `fn report_summary(&mut self, _summary: &ReadySummary) {}`
-    /// before WI 0125: this is the regression it fixed. Every row, the hint,
-    /// and the outcome line must now reach the event stream.
-    #[test]
-    fn report_summary_emits_rows_hint_and_outcome_line() {
-        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
-        let mut rx = bus.subscribe();
-        let mut fe = ApiDispatchFrontend::new("ready", &[], bus.sender());
-
-        let mut summary = ReadySummary::new("builtin");
-        summary.dockerfile = StepStatus::Done;
-        summary.base_image = StepStatus::Skipped;
-        summary.agent_image = StepStatus::Failed("daemon unreachable".into());
-
-        ReadyFrontend::report_summary(&mut fe, &summary);
-
-        let messages = status_messages(&mut rx);
-        assert!(
-            !summary.is_ready(),
-            "sanity: this summary must not be ready"
-        );
-        assert!(
-            messages
-                .iter()
-                .any(|m| m == &format!("Dockerfile: {}", StepStatus::Done.label())),
-            "every row must be reported: {messages:?}"
-        );
-        assert!(
-            messages.iter().any(|m| m.contains("daemon unreachable")),
-            "the failed row's message must reach the event stream: {messages:?}"
-        );
-        assert!(
-            messages.contains(
-                &"Tip: complete the required image steps, then run \"awman ready\" again."
-                    .to_string()
-            ),
-            "{messages:?}"
-        );
-        assert!(
-            messages.contains(&"awman is not ready.".to_string()),
-            "the outcome line must be the summary's own, last: {messages:?}"
-        );
-    }
-
-    // ─── flag_bool ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn flag_bool_bare_flag_is_true() {
-        let f = make_frontend("chat", &["--yolo"]);
-        assert_eq!(f.flag_bool(&["chat"], "yolo").unwrap(), Some(true));
-    }
-
-    #[test]
-    fn flag_bool_presence_sets_true() {
-        // Workflow's boolean worktree flag remains available via the API.
-        let f = make_frontend("exec workflow", &["--worktree"]);
-        assert_eq!(
-            f.flag_bool(&["exec", "workflow"], "worktree").unwrap(),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn unknown_flag_surfaces_structured_error_from_accessor() {
-        // Catalogue-driven parsing rejects an undeclared flag rather than
-        // silently dropping it; the error surfaces on the first accessor call.
-        let f = make_frontend("exec prompt", &["--not-a-real-flag"]);
-        let err = f.flag_bool(&["exec", "prompt"], "yolo").unwrap_err();
-        assert!(matches!(err, CommandError::UnknownFlag { .. }));
-    }
-
-    // ─── Shared parsing cases (raw_args::shared_cases) ────────────────────────
-
-    #[test]
-    fn shared_cases_read_the_same_through_the_api_profile() {
-        for case in CASES {
-            // CLI-only flags on commands unavailable via API are exercised
-            // through the CLI/TUI versions of this shared table.
-            if !CommandCatalogue::get().is_allowed_for_frontend(FrontendKind::Api, case.path) {
-                continue;
-            }
-            let f = make_frontend(&case.path.join(" "), case.args);
-            assert_eq!(f.command_path, case.canonical.join(" "), "{}", case.name);
-            assert_reads(&f, case, case.reads);
-            assert_reads(&f, case, case.api_reads);
-        }
-    }
-
-    #[test]
-    fn parse_errors_keep_their_classification_from_every_accessor() {
-        for (path, args, want) in ERROR_CASES {
-            let f = make_frontend(&path.join(" "), args);
-            let direct = CommandCatalogue::get()
-                .parse_raw_args_with_profile(
-                    path,
-                    &args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                    FrontendKind::Api,
-                )
-                .expect_err("the case must be rejected");
-            let reads = [
-                f.flag_bool(path, "yolo").map(|_| ()).unwrap_err(),
-                f.flag_string(path, "agent").map(|_| ()).unwrap_err(),
-                f.flag_strings(path, "overlay").map(|_| ()).unwrap_err(),
-                f.flag_path(path, "workflow").map(|_| ()).unwrap_err(),
-                f.flag_enum(path, "launch-mode").map(|_| ()).unwrap_err(),
-                f.flag_u16(path, "port").map(|_| ()).unwrap_err(),
-                f.flag_usize(path, "max-concurrent")
-                    .map(|_| ())
-                    .unwrap_err(),
-                f.argument(path, "prompt").map(|_| ()).unwrap_err(),
-                f.arguments(path, "prompt").map(|_| ()).unwrap_err(),
-            ];
-            for error in reads {
-                assert_eq!(classification(&error), *want, "{path:?} {args:?}");
-                assert_eq!(error.to_string(), direct.to_string());
-            }
-        }
-    }
-
-    // ─── flag_string ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn flag_string_parses_value_after_flag() {
-        let f = make_frontend("exec prompt", &["--agent", "claude"]);
-        assert_eq!(
-            f.flag_string(&["exec", "prompt"], "agent")
-                .unwrap()
-                .as_deref(),
-            Some("claude")
-        );
-    }
-
-    #[test]
-    fn flag_string_parses_equals_syntax() {
-        let f = make_frontend("exec prompt", &["--agent=claude"]);
-        assert_eq!(
-            f.flag_string(&["exec", "prompt"], "agent")
-                .unwrap()
-                .as_deref(),
-            Some("claude")
-        );
-    }
-
-    #[test]
-    fn flag_string_absent_returns_none() {
-        let f = make_frontend("exec prompt", &[]);
-        assert_eq!(f.flag_string(&["exec", "prompt"], "agent").unwrap(), None);
-    }
-
-    // ─── flag_u16 ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn cli_only_port_flag_is_refused_by_api_profile() {
-        let f = make_frontend("api start", &["--port", "9876"]);
-        assert!(matches!(
-            f.flag_u16(&["api", "start"], "port").unwrap_err(),
-            CommandError::InvalidFlagValue { flag, .. } if flag == "port"
-        ));
-    }
-
-    // ─── argument (positional) ────────────────────────────────────────────────
-
-    #[test]
-    fn argument_exec_prompt_maps_positional_to_prompt() {
-        let f = make_frontend("exec prompt", &["hello", "world"]);
-        assert_eq!(
-            f.argument(&["exec", "prompt"], "prompt")
-                .unwrap()
-                .as_deref(),
-            Some("hello world")
-        );
-    }
-
-    // ─── non-interactive and yolo flags are always set ────────────────────────
-
-    #[test]
-    fn non_interactive_flag_always_set() {
-        let f = make_frontend("chat", &[]);
-        assert_eq!(
-            f.flag_bool(&["chat"], "non-interactive").unwrap(),
-            Some(true),
-            "non-interactive must always be set in API mode"
-        );
-    }
-
-    #[test]
-    fn yolo_flag_always_set() {
-        let f = make_frontend("chat", &[]);
-        assert_eq!(
-            f.flag_bool(&["chat"], "yolo").unwrap(),
-            Some(true),
-            "yolo must always be set in API mode"
-        );
-    }
-
-    // ─── flag_strings (multi-value) ───────────────────────────────────────────
-
-    #[test]
-    fn flag_strings_collects_multiple_values() {
-        let f = make_frontend("exec prompt", &["--overlay", "/a", "--overlay", "/b"]);
-        let dirs = f.flag_strings(&["exec", "prompt"], "overlay").unwrap();
-        assert!(dirs.contains(&"/a".to_string()));
-        assert!(dirs.contains(&"/b".to_string()));
-    }
-
-    // ─── Drop emits Done and flushes partial lines ─────────────────────────────
-
-    #[test]
-    fn deferred_drop_flushes_output_and_leaves_done_to_worker() {
-        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
-        let mut rx = bus.subscribe();
-        let mut frontend =
-            ApiDispatchFrontend::new("exec prompt", &[], bus.sender()).deferring_done();
-        frontend.line_buffer_stdout = "trailing output".into();
-        drop(frontend);
-        assert!(matches!(rx.try_recv().unwrap().payload,
-            EventPayload::StdoutLine(ref line) if line == "trailing output"));
-        assert!(matches!(
-            rx.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-
-        bus.sender().emit(EventPayload::Done);
-        assert!(matches!(rx.try_recv().unwrap().payload, EventPayload::Done));
-    }
-
-    #[tokio::test]
-    async fn drop_emits_done_sentinel_when_emit_done_was_not_called() {
-        use crate::engine::agent_runtime::frontend::AgentFrontend;
-        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
-        let mut rx = bus.subscribe();
-        let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
-        let io = fe.take_io();
-        io.stdout.send(b"a line\n".to_vec()).unwrap();
-        drop(io);
-        // Give the drain task a moment to process.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        drop(fe);
-
-        let line = rx.recv().await.unwrap();
-        assert!(matches!(line.payload, EventPayload::StdoutLine(ref s) if s == "a line"));
-        let done = rx.recv().await.unwrap();
-        assert!(
-            matches!(done.payload, EventPayload::Done),
-            "Drop must emit Done; got {:?}",
-            done.payload
-        );
-    }
-
-    #[tokio::test]
-    async fn drop_flushes_partial_stdout_line_before_done() {
-        use crate::engine::agent_runtime::frontend::AgentFrontend;
-        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
-        let mut rx = bus.subscribe();
-        let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
-        let io = fe.take_io();
-        // No trailing newline — the line lives in the drain task buffer until
-        // the sender is dropped and the drain flushes.
-        io.stdout.send(b"trailing partial".to_vec()).unwrap();
-        drop(io);
-        // Give the drain task a moment to process and flush.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        drop(fe);
-
-        let line = rx.recv().await.unwrap();
-        assert!(
-            matches!(line.payload, EventPayload::StdoutLine(ref s) if s == "trailing partial"),
-            "partial stdout line must be flushed by drain task; got {:?}",
-            line.payload
-        );
-        let done = rx.recv().await.unwrap();
-        assert!(matches!(done.payload, EventPayload::Done));
-    }
-
-    #[tokio::test]
-    async fn drop_flushes_partial_stderr_line_before_done() {
-        use crate::engine::agent_runtime::frontend::AgentFrontend;
-        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
-        let mut rx = bus.subscribe();
-        let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
-        let io = fe.take_io();
-        io.stderr.send(b"err partial".to_vec()).unwrap();
-        drop(io);
-        // Give the drain task a moment to process and flush.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        drop(fe);
-
-        let line = rx.recv().await.unwrap();
-        assert!(
-            matches!(line.payload, EventPayload::StderrLine(ref s) if s == "err partial"),
-            "partial stderr line must be flushed by drain task; got {:?}",
-            line.payload
-        );
-        let done = rx.recv().await.unwrap();
-        assert!(matches!(done.payload, EventPayload::Done));
-    }
-
-    #[tokio::test]
-    async fn explicit_emit_done_then_drop_does_not_double_emit() {
-        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
-        let mut rx = bus.subscribe();
-        let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
-        fe.emit_done();
-        drop(fe);
-
-        let done = rx.recv().await.unwrap();
-        assert!(matches!(done.payload, EventPayload::Done));
-        // Second recv must time out — no second Done.
-        let again = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
-        assert!(
-            again.is_err(),
-            "Drop must NOT emit a second Done after explicit emit_done; got {:?}",
-            again
-        );
-    }
-
-    // ── yolo countdown message throttle ──────────────────────────────────────
-
-    fn count_countdown_events(
-        rx: &mut tokio::sync::broadcast::Receiver<crate::data::execution_event::ExecutionEvent>,
-    ) -> usize {
-        let mut count = 0;
-        while let Ok(evt) = rx.try_recv() {
-            if matches!(
-                &evt.payload,
-                EventPayload::StatusMessage { phase, .. } if phase == "yolo_countdown"
-            ) {
-                count += 1;
-            }
-        }
-        count
-    }
-
-    /// Collect the `yolo_countdown` status messages emitted so far.
-    fn countdown_messages(
-        rx: &mut tokio::sync::broadcast::Receiver<crate::data::execution_event::ExecutionEvent>,
-    ) -> Vec<String> {
-        let mut out = Vec::new();
-        while let Ok(evt) = rx.try_recv() {
-            if let EventPayload::StatusMessage { phase, message } = &evt.payload {
-                if phase == "yolo_countdown" {
-                    out.push(message.clone());
-                }
-            }
-        }
-        out
-    }
-
-    /// WI-0115 §3: a failure retry and a stuck-step advance share one reporting
-    /// channel, but they mean opposite things. An API consumer told a failing
-    /// run is "auto-advancing" would conclude the workflow is making progress.
-    #[tokio::test]
-    async fn a_failure_retry_countdown_is_not_reported_as_auto_advancing() {
-        use crate::engine::workflow::frontend::WorkflowFrontend as _;
-        let bus = crate::command::commands::api_server::event_bus::EventBus::new(64);
-        let mut rx = bus.subscribe();
-        let mut fe = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
-
-        fe.yolo_countdown_started("build", CountdownKind::FailureRetry);
-        fe.yolo_countdown_tick(
-            "build",
-            std::time::Duration::from_secs(60),
-            std::time::Duration::from_secs(60),
-        )
-        .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-        let messages = countdown_messages(&mut rx);
-        assert_eq!(messages.len(), 1, "{messages:?}");
-        assert!(
-            messages[0].contains("retrying after failure"),
-            "a retry must say so: {}",
-            messages[0]
-        );
-
-        // And the kind resets, so the next stuck-step countdown reads normally.
-        fe.yolo_countdown_finished("build");
-        fe.yolo_countdown_tick(
-            "test",
-            std::time::Duration::from_secs(60),
-            std::time::Duration::from_secs(60),
-        )
-        .unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-        let messages = countdown_messages(&mut rx);
-        assert_eq!(messages.len(), 1, "{messages:?}");
-        assert!(
-            messages[0].contains("auto-advancing"),
-            "a stuck-step countdown must keep its own wording: {}",
-            messages[0]
-        );
-    }
-
-    /// Ten rapid ticks must produce exactly one `yolo_countdown` status message
-    /// because all subsequent calls fall within the 10-second throttle window.
-    #[tokio::test]
-    async fn yolo_countdown_throttles_api_messages_within_window() {
-        use crate::engine::workflow::frontend::WorkflowFrontend as _;
-        let bus = crate::command::commands::api_server::event_bus::EventBus::new(64);
-        let mut rx = bus.subscribe();
-        let mut fe = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
-
-        for i in 0..10u64 {
-            fe.yolo_countdown_tick(
-                "step",
-                std::time::Duration::from_secs(60u64.saturating_sub(i)),
-                std::time::Duration::from_secs(60),
-            )
-            .unwrap();
-        }
-
-        // Allow any async tasks to flush.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-        let count = count_countdown_events(&mut rx);
-        assert_eq!(
-            count, 1,
-            "only the first tick should emit within the 10-second throttle window"
-        );
-    }
-
-    /// After `yolo_countdown_finished` resets the timer, the very next tick
-    /// must emit a fresh message.
-    #[tokio::test]
-    async fn yolo_countdown_tick_emits_again_after_finished_resets_timer() {
-        use crate::engine::workflow::frontend::WorkflowFrontend as _;
-        let bus = crate::command::commands::api_server::event_bus::EventBus::new(64);
-        let mut rx = bus.subscribe();
-        let mut fe = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
-
-        // First tick: emits.
-        fe.yolo_countdown_tick(
-            "step",
-            std::time::Duration::from_secs(60),
-            std::time::Duration::from_secs(60),
-        )
-        .unwrap();
-        // Rapid second tick: throttled.
-        fe.yolo_countdown_tick(
-            "step",
-            std::time::Duration::from_secs(59),
-            std::time::Duration::from_secs(60),
-        )
-        .unwrap();
-
-        // Reset.
-        fe.yolo_countdown_finished("step");
-
-        // Next tick after reset: must emit again.
-        fe.yolo_countdown_tick(
-            "step",
-            std::time::Duration::from_secs(60),
-            std::time::Duration::from_secs(60),
-        )
-        .unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-        let count = count_countdown_events(&mut rx);
-        assert_eq!(
-            count, 2,
-            "expect 2 events: initial tick + tick after countdown_finished reset"
-        );
-    }
-
-    /// Simulating an elapsed throttle window by rewinding `last_sink_message_time`
-    /// makes the next tick emit a new message.
-    #[tokio::test]
-    async fn yolo_countdown_tick_emits_after_throttle_window_elapses() {
-        use crate::engine::workflow::frontend::WorkflowFrontend as _;
-        let bus = crate::command::commands::api_server::event_bus::EventBus::new(64);
-        let mut rx = bus.subscribe();
-        let mut fe = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
-
-        // First tick emits.
-        fe.yolo_countdown_tick(
-            "step",
-            std::time::Duration::from_secs(60),
-            std::time::Duration::from_secs(60),
-        )
-        .unwrap();
-
-        // Rewind the throttle timestamp to simulate 11 seconds having passed.
-        fe.last_sink_message_time =
-            Some(std::time::Instant::now() - std::time::Duration::from_secs(11));
-
-        // Next tick must emit (window elapsed).
-        fe.yolo_countdown_tick(
-            "step",
-            std::time::Duration::from_secs(58),
-            std::time::Duration::from_secs(60),
-        )
-        .unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-        let count = count_countdown_events(&mut rx);
-        assert_eq!(
-            count, 2,
-            "expected 2 events: initial tick + tick after simulated 11-second gap"
-        );
-    }
-    #[test]
-    fn worktree_preparation_and_resume_record_structured_result_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = crate::data::fs::api_paths::ApiPaths::at_root(tmp.path());
-        let writer = CommandStateWriter::new(paths, "s", "c");
-        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
-        let mut frontend = ApiDispatchFrontend::new("exec workflow", &[], bus.sender())
-            .with_state_writer(writer.clone());
-        for resumed in [false, true] {
-            let wt = tmp.path().join(if resumed { "resumed" } else { "created" });
-            std::fs::create_dir(&wt).unwrap();
-            if resumed {
-                frontend.report_worktree_resumed(&wt, "branch");
-            } else {
-                frontend.report_worktree_created(&wt, "branch");
-            }
-            assert_eq!(writer.kept_worktree(), Some(wt));
-        }
-        // A later checkout may reuse the same directory before completion;
-        // explicit cleanup must clear this command's ownership of the path.
-        frontend.report_worktree_discarded("branch");
-        assert!(writer.kept_worktree().is_none());
-    }
-}
-
-#[cfg(test)]
-mod config_migrate_tests {
-    use super::*;
-
-    /// `config migrate` is not API-allowed, but if its frontend trait is ever
-    /// reached the API must refuse to confirm rather than guess: the answer
-    /// is the same as the CLI's `--non-interactive` without `--yes`.
-    #[test]
-    fn api_frontend_never_confirms_a_config_migration() {
-        let bus = crate::command::commands::api_server::event_bus::EventBus::new(16);
-        let mut fe = ApiDispatchFrontend::new("config migrate", &[], bus.sender());
-        let prompt = crate::command::prompts::config_migrate_confirm("PREVIEW");
-        let err = fe
-            .confirm_config_migration(&prompt)
-            .expect_err("the API cannot answer a confirmation");
-        assert!(
-            matches!(
-                err,
-                CommandError::InteractiveInputUnavailable { ref prompt } if prompt == "yes"
-            ),
-            "{err:?}"
-        );
     }
 }

@@ -16,7 +16,10 @@ definition is approved for its current hash. The approval prompt shows the exact
 command and its resolved path; without `[ping]`, `ready` skips the host check.
 
 Custom host pings are argv-only, append one fixed greeting, run in a fresh private
-scratch directory and time out after 60 seconds with the child killed on drop.
+scratch directory and time out after 10 seconds during `ready`, with the child
+killed on drop. Ready launches host checks concurrently and reports their
+results together after the batch finishes; a timeout is a summary warning.
+Credential-refresh pings retain their separate 60-second timeout.
 Definition environment fields apply only inside containers. Automatic credential
 refresh remains first-party only. Container install steps use JSON exec-form RUN
 instructions so shell continuations and heredocs cannot consume later Dockerfile
@@ -52,7 +55,7 @@ and need review independently when their contents differ from the approved recip
     binary on the host**; a second such type, or a bare function that does it,
     is a security violation regardless of what it is called. Exactly four
     triggers are authorized, and no others:
-    - (a) during `awman ready` (`ReadyPhase::CheckingLocalAgent`);
+    - (a) during `awman ready` (`ReadyPhase::CheckingLocalAgent`), once for the selected agent and each other repo agent discovered through `.awman/Dockerfile.<agent>`, after resolving its definition through the normal trust boundary; custom definitions without `[ping]` are skipped;
     - (b) periodically by the credential-refresh monitor's tick loop while credentialed agent sessions are live (`CredentialRefreshMonitor::tick`, which reaches the host through the `HostAgentPinger` it holds), bounded by the per-agent backoff and a per-tick timeout;
     - (c) once, synchronously and time-bounded, as the workflow pre-step guard when a step's file-delivered credential is within the refresh threshold of expiry (`refresh_credential_blocking` from `exec_workflow.rs`); and
     - (d) at most once per workflow step, as auth-failure recovery after a step exits with an authentication error the descriptor recognizes (`recover_auth_failure`).
@@ -99,10 +102,40 @@ archive bytes are shared.
 
 When a remote API session is created with `push: true`, awman pushes the session branch to `origin` after a successful `exec` command. This is a host-side Git operation; all agent work still happens in containers. The clone lives under `<API root>/sessions/<id>/<repository-folder>`. The API root is selected in order from `AWMAN_API_ROOT`, `AWMAN_CONFIG_HOME/api`, `XDG_DATA_HOME/awman/api`, or `~/.awman/api`.
 
-- **Credentials:** every host-side transport operation in a session (clone, setup fetch, merge-ref `ls-remote`, push-back `ls-remote` and push) uses one command policy: trusted user/global Git configuration, no system gitconfig, and the same scoped credential source. Without a per-session credential, that source is the user running awman (their SSH keys and user/global credential helpers); a session or lease credential uses the one-shot helper when available. Prompting is disabled (`GIT_TERMINAL_PROMPT=0`; default SSH uses `BatchMode=yes`). Each push-back Git operation has a two-minute timeout.
+- **Credentials:** every host-side transport operation in a session (clone, setup fetch, merge-ref `ls-remote`, push-back `ls-remote` and push) disables system Git configuration and uses the session's credential choice. Without `git_auth`, the daemon user's global Git configuration and credentials (including SSH keys and user/global credential helpers) are used. With `git_auth`, inherited helpers and global authentication files are excluded, and the supplied credential is used. Prompting is disabled (`GIT_TERMINAL_PROMPT=0`; default SSH uses `BatchMode=yes`).
 - **No force:** awman never force-pushes. A rejected push fails the command with a `push` stage error and leaves local commits in the clone.
 - **Untrusted metadata:** agents can write the clone's `.git`, so absence of hooks immediately after clone provides no protection. Push-back imports only inert objects and refs into a private Git directory outside the mount, rejects symlinks/special files in imported metadata, disables hooks and fsmonitor explicitly, and never imports the clone's config, index, alternates, attributes, or signing/transport helpers. Work-tree staging/committing uses no system/global config, preventing configured filters from executing on agent files. Only identity values and the inert object format are preserved; transport uses a newly authored `origin` pinned to the session's persisted `repo_url`, with trusted host credentials. No agent-authored configuration is evaluated as host commands. Commit objects and the resulting index/ref are copied back without executing Git in the writable clone.
 - **Scope:** only `refs/heads/<session branch>` on `origin` is pushed, and only when the session was explicitly created with `push: true`. Explicit workflow `push_branch` steps execute in the container, accept branch names rather than force options/refspecs, and delimit positional arguments with `--`.
+
+### Host Git configuration and session credentials
+
+Every host-side Git network operation disables the system Git configuration. A
+push session without `git_auth` may use the daemon user's global Git
+configuration, credential helpers, SSH agent and SSH configuration. It cannot
+use system-wide Git settings. Repository-scoped transport settings are not
+trusted for host transport.
+
+When a session supplies `git_auth`, awman uses that credential consistently for
+clone, fetch, remote-ref lookup and push. It clears inherited Git credential
+helpers, does not consult global credential configuration, and uses a private
+Git home so global authentication files such as `netrc` are not fallback
+sources. The credential is held in daemon memory and served to Git through a
+short-lived owner-only Unix socket or Windows named pipe; it is not written to
+the session database or placed in process arguments or environment variables.
+Only phase containers that need Git access receive the credential, through
+private stdin into a container-local, memory-only Git credential cache. Its
+socket is scoped to the session's protocol, host and repository path; removing
+the phase container destroys the cache. A phase receiving it is trusted
+with the reusable credential and can copy it; repository matching is not a
+confinement boundary for a malicious recipient. Use repository-scoped,
+short-lived credentials.
+
+Repository URLs containing user information, query strings or fragments are
+rejected. Supply credentials through `git_auth` or the daemon user's Git setup.
+If the daemon restarts after a credentialed session is created, the secret is
+gone. The session fails closed with `credentials_lost`; create a new session
+with credentials rather than retrying the old one. Authentication refusal is
+reported as `git_auth_failed`.
 
 ## Workflow prerequisite credentials
 
@@ -132,3 +165,22 @@ untrusted diagnostics, and the process group is cleaned up on every exit. Tokens
 stay in secret-typed launch overrides until the runtime child environment is
 constructed; runs holding token grants use filtered phase streams, including
 CLI/TUI, so raw terminal or attach output cannot precede redaction.
+
+### WI 0144 test and release execution boundaries
+
+Temporary release runners register only into an organization group whose
+server-reported workflow allowlist matches the selected protected-main release
+path. Labels serve scheduling only. Repository allocation, branch/environment
+protection, tag rulesets, account isolation, and native teardown remain explicit
+administrator/hardware cutover obligations; source checks cannot certify them.
+
+The test supervisor rejects registered host keychain/clipboard/agent names before
+checking ordinary executable allowlists, and still examines registered
+interpreter arguments. Only explicit FakeCli installations receive the separate
+fake provenance exception. This is a test discipline guard, not a transitive
+execution sandbox: a permitted native executable can start other executables.
+Linux session creation is constrained and escaped children retaining private
+root environment values are detected, killed with PID creation-time checks and
+reported as leaks. A hostile program that erases ownership data requires a
+kernel containment boundary. macOS and Windows containment/kill recovery must be
+validated on native runners before release cutover.

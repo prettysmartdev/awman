@@ -1,14 +1,15 @@
 //! Reading and writing a dot-notation path inside a config JSON document.
 //!
-//! `awman config get|set` addresses fields by dotted name — `work_items.dir`,
+//! `awman config get|set` addresses fields by dotted name — `workItems.dir`,
 //! `workflows.dynamic.guidance.2` — and these four navigate, create and remove
 //! the corresponding JSON. Layer 0 (WI 0114 F-51): they know nothing about
 //! which fields exist or what their values mean, only how a path maps onto a
 //! `serde_json::Value`.
 
-/// Look up a JSON field value, supporting dot-notation (e.g. "work_items.dir").
+/// Look up a JSON field value, supporting dot-notation (e.g. "workItems.dir").
 pub fn config_field_value(json: &serde_json::Value, field: &str) -> Option<String> {
-    let parts: Vec<&str> = field.split('.').collect();
+    let owned = crate::data::config::fields::path_segments(field);
+    let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
     let mut current = json;
     for part in &parts {
         // A numeric segment indexes into an array (e.g. the
@@ -52,12 +53,13 @@ pub fn apply_config_field(json: &mut serde_json::Value, field: &str, value: serd
 /// automatically re-indexed (WI-0099). Missing intermediate objects make this
 /// a no-op.
 pub fn remove_config_field(json: &mut serde_json::Value, field: &str) {
-    let parts: Vec<&str> = field.split('.').collect();
+    let owned = crate::data::config::fields::path_segments(field);
+    let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
     let last = *parts.last().expect("split never yields an empty vec");
     // Trailing numeric segment: remove the element from the parent array.
     if let Ok(index) = last.parse::<usize>() {
         if parts.len() >= 2 {
-            let mut current = json;
+            let mut current = &mut *json;
             for part in &parts[..parts.len() - 1] {
                 match current.get_mut(*part) {
                     Some(v) => current = v,
@@ -68,8 +70,10 @@ pub fn remove_config_field(json: &mut serde_json::Value, field: &str) {
                 if index < arr.len() {
                     arr.remove(index);
                 }
+                return;
             }
-            return;
+            // Not an array: an all-digit map key (such as a work server
+            // named `42`) is removed like any other key, below.
         }
     }
     let mut current = json;
@@ -85,9 +89,10 @@ pub fn remove_config_field(json: &mut serde_json::Value, field: &str) {
 }
 
 /// Set a JSON field, supporting dot-notation for nested objects.
-/// E.g. "work_items.dir" sets `json["work_items"]["dir"]`.
+/// E.g. "workItems.dir" sets `json["workItems"]["dir"]`.
 pub fn set_config_field(json: &mut serde_json::Value, field: &str, value: serde_json::Value) {
-    let parts: Vec<&str> = field.split('.').collect();
+    let owned = crate::data::config::fields::path_segments(field);
+    let parts: Vec<&str> = owned.iter().map(String::as_str).collect();
     // Trailing numeric segment: set (or append) an element in the parent
     // array-of-strings field (e.g. `workflows.dynamic.guidance.<n>`). An index
     // at or past the current length appends, which is how the TUI Ctrl+N flow

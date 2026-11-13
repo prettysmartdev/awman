@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 use crate::engine::agent_runtime::execution::StuckEvent;
 use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::engine::agent_runtime::output_tail::OutputTail;
+use crate::engine::agent_runtime::program_status::{
+    ProgramStatusBridgeConfig, ProgramStatusStream, ProgramStatusTracker, ReportedGate,
+    SharedProgramStatusTracker,
+};
 use crate::engine::error::EngineError;
 
 /// A PTY bridge's writer that never types into the session when dropped.
@@ -100,6 +104,8 @@ pub(crate) type CancelFn = Arc<dyn Fn() + Send + Sync>;
 /// Per-bridge configuration. Bundled into one struct so the bridge functions
 /// don't grow an unwieldy parameter list as more knobs land.
 pub(crate) struct BridgeConfig {
+    pub terminal: Option<crate::engine::agent_runtime::execution::TerminalLaunch>,
+    pub program_status: ProgramStatusBridgeConfig,
     pub grace_timeout: Duration,
     pub stuck_timeout: Duration,
     /// Window after container launch during which the detector ignores
@@ -130,6 +136,7 @@ pub(crate) struct BridgeConfig {
 /// Bundle returned by `bridge_pty` / `bridge_piped` containing the artifacts
 /// the backend needs to store for the execution lifetime.
 pub(crate) struct BridgeResult {
+    pub program_status: SharedProgramStatusTracker,
     /// Sender for `try_inject_stdin` — the engine retains a clone.
     pub stdin_injector: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     /// Broadcast sender for stuck events — stored in `AgentExecution`.
@@ -154,14 +161,6 @@ impl OutputActivity {
         Self::default()
     }
 
-    #[cfg(test)]
-    fn with_state(last: Option<Instant>, first_byte: bool) -> Self {
-        Self {
-            last: Arc::new(Mutex::new(last)),
-            first_byte: Arc::new(AtomicBool::new(first_byte)),
-        }
-    }
-
     /// Record that a chunk of output arrived now.
     pub(crate) fn touch(&self) {
         if let Ok(mut guard) = self.last.lock() {
@@ -173,6 +172,7 @@ impl OutputActivity {
 
 /// Timing knobs and the grace-expiry callback for one [`StuckDetector`].
 pub(crate) struct StuckConfig {
+    pub program_status: Option<SharedProgramStatusTracker>,
     pub grace_timeout: Duration,
     pub stuck_timeout: Duration,
     /// See [`BridgeConfig::container_start_delay`].
@@ -221,6 +221,7 @@ impl StuckDetector {
         output: &OutputActivity,
     ) -> Arc<tokio::sync::broadcast::Sender<StuckEvent>> {
         let StuckConfig {
+            program_status,
             grace_timeout,
             stuck_timeout,
             container_start_delay,
@@ -249,6 +250,8 @@ impl StuckDetector {
             }
 
             let mut is_stuck = false;
+            let mut reported_gate = ReportedGate::new();
+            let mut generation = 0;
             let grace_start = Instant::now();
             loop {
                 tokio::time::sleep(poll_interval).await;
@@ -256,6 +259,38 @@ impl StuckDetector {
                     Some(tx) => tx,
                     None => break,
                 };
+
+                let (reporting, effective, last_report, ended, tracker_generation) = program_status
+                    .as_ref()
+                    .and_then(|tracker| tracker.lock().ok())
+                    .map(|tracker| {
+                        (
+                            tracker.reporting(),
+                            tracker.effective(),
+                            tracker.last_report_at(),
+                            tracker.is_ended(),
+                            tracker.generation(),
+                        )
+                    })
+                    .unwrap_or((false, None, None, false, 0));
+                if ended {
+                    break;
+                }
+                if generation != tracker_generation {
+                    generation = tracker_generation;
+                    reported_gate = ReportedGate::new();
+                }
+                if reporting {
+                    if is_stuck && effective.is_some() {
+                        is_stuck = false;
+                        let _ = tx.send(StuckEvent::Unstuck);
+                    }
+                    if let Some(status) = reported_gate.next(Instant::now(), effective.as_ref()) {
+                        let _ = tx.send(StuckEvent::Reported(status));
+                    }
+                } else {
+                    reported_gate = ReportedGate::new();
+                }
 
                 if !first_byte.load(Ordering::Acquire) {
                     // Grace phase — measure from end of the start-delay window.
@@ -270,12 +305,20 @@ impl StuckDetector {
                 }
 
                 // Stuck phase — measure from the most recent byte.
+                if reporting && effective.is_some() {
+                    continue;
+                }
                 let elapsed = {
                     let guard = match activity.lock() {
                         Ok(g) => g,
                         Err(_) => break,
                     };
-                    match *guard {
+                    let last = if reporting {
+                        (*guard).max(last_report)
+                    } else {
+                        *guard
+                    };
+                    match last {
                         Some(t) => t.elapsed(),
                         None => grace_start.elapsed(),
                     }
@@ -319,8 +362,20 @@ pub(crate) fn bridge_pty(
         .take_writer()
         .map_err(|e| EngineError::Container(format!("take pty writer: {e}")))?;
     let mut writer = QuietPtyWriter::new(writer, pair.master.as_ref());
+    let master_arc = Arc::new(Mutex::new(pair.master));
+    let (terminal, mut remote_input) = match &config.terminal {
+        Some(launch) => {
+            let (cols, rows) = io.initial_size.unwrap_or((120, 40));
+            let (handle, input) = launch.register_pty(cols, rows, &master_arc);
+            (Some(handle), Some(input))
+        }
+        None => (None, None),
+    };
+    let reader_terminal = terminal.clone();
+    let drain = config.terminal.as_ref().map(|launch| launch.drain.writer());
 
     let output = OutputActivity::new();
+    let program_status = ProgramStatusTracker::shared();
 
     // Reader thread: PTY → stdout channel (activity tracked).
     //
@@ -335,6 +390,14 @@ pub(crate) fn bridge_pty(
     // A writer handle, so a caller can wait for this thread to finish.
     let tail = config.output_tail.writer();
     let broadcast = config.output_broadcast.clone();
+    let mut status_stream = ProgramStatusStream::new(
+        program_status.clone(),
+        ProgramStatusBridgeConfig {
+            answer_queries: true,
+            ..config.program_status
+        },
+    );
+    let query_stdin = io.stdin_tx.clone();
     std::thread::spawn(move || {
         use std::io::Read;
         let mut buf = [0u8; 4096];
@@ -344,22 +407,37 @@ pub(crate) fn bridge_pty(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     act.touch();
-                    tail.push_bytes(&buf[..n]);
+                    let bytes = status_stream.feed(&buf[..n], |reply| {
+                        let _ = query_stdin.send(reply.to_vec());
+                    });
+                    tail.push_bytes(&bytes);
+                    if let Some(terminal) = &reader_terminal {
+                        terminal.push_output(&bytes);
+                    }
                     if let Some(tx) = &broadcast {
                         // Copy only when someone is attached; a lagged client
                         // drops chunks. (A new client's subscription always
                         // precedes the repaint its initial resize triggers,
                         // so this gate can't starve it.)
                         if tx.receiver_count() > 0 {
-                            let _ = tx.send(buf[..n].to_vec());
+                            let _ = tx.send(bytes.to_vec());
                         }
                     }
-                    if sink_open && stdout_tx.send(buf[..n].to_vec()).is_err() {
+                    if sink_open && stdout_tx.send(bytes.to_vec()).is_err() {
                         sink_open = false;
                     }
                 }
             }
         }
+        let bytes = status_stream.finish();
+        tail.push_bytes(&bytes);
+        if let Some(terminal) = &reader_terminal {
+            terminal.push_output(&bytes);
+        }
+        if !bytes.is_empty() {
+            let _ = stdout_tx.send(bytes);
+        }
+        drop(drain);
     });
 
     // Writer task: stdin channel → PTY.
@@ -367,7 +445,11 @@ pub(crate) fn bridge_pty(
     let mut stdin_rx = io.stdin_rx;
     tokio::spawn(async move {
         use std::io::Write;
-        while let Some(bytes) = stdin_rx.recv().await {
+        loop {
+            let bytes = tokio::select! {
+                bytes = stdin_rx.recv() => match bytes { Some(bytes) => bytes, None => break },
+                bytes = crate::engine::agent_runtime::execution::next_terminal_input(&mut remote_input) => bytes,
+            };
             if writer.write_all(&bytes).is_err() {
                 break;
             }
@@ -378,12 +460,19 @@ pub(crate) fn bridge_pty(
     });
 
     // Resize task.
-    let master_arc = Arc::new(Mutex::new(pair.master));
     if let Some(mut resize_rx) = io.resize {
         let master_for_resize = Arc::clone(&master_arc);
         tokio::spawn(async move {
             use portable_pty::PtySize;
             while let Some((cols, rows)) = resize_rx.recv().await {
+                if let Some(terminal) = &terminal {
+                    // Local presentation changes only the fallback while a
+                    // remote viewer owns the PTY size.
+                    if let Some(launch) = &config.terminal {
+                        let _ = launch.hub.set_default_size(terminal.id(), cols, rows);
+                    }
+                    continue;
+                }
                 if let Ok(master) = master_for_resize.lock() {
                     let _ = master.resize(PtySize {
                         rows,
@@ -403,6 +492,7 @@ pub(crate) fn bridge_pty(
             container_start_delay: config.container_start_delay,
             cancel_on_grace_expired: config.cancel_on_grace_expired,
             poll_interval: STUCK_POLL_INTERVAL,
+            program_status: Some(program_status.clone()),
         },
         &output,
     );
@@ -413,6 +503,7 @@ pub(crate) fn bridge_pty(
             stdin_injector: stdin_tx,
             stuck_tx,
             output_tail: config.output_tail,
+            program_status,
         },
     ))
 }
@@ -431,6 +522,7 @@ pub(crate) fn bridge_piped(
     config: BridgeConfig,
 ) -> BridgeResult {
     let output = OutputActivity::new();
+    let program_status = ProgramStatusTracker::shared();
 
     // stdout reader thread.
     //
@@ -444,6 +536,13 @@ pub(crate) fn bridge_piped(
         // A writer handle, so a caller can wait for this thread to finish.
         let tail = config.output_tail.writer();
         let broadcast = config.output_broadcast.clone();
+        let mut status_stream = ProgramStatusStream::new(
+            program_status.clone(),
+            ProgramStatusBridgeConfig {
+                answer_queries: false,
+                ..config.program_status
+            },
+        );
         std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stdout;
@@ -454,17 +553,26 @@ pub(crate) fn bridge_piped(
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         act.touch();
-                        tail.push_bytes(&buf[..n]);
+                        let bytes = status_stream.feed(&buf[..n], |_| {});
+                        tail.push_bytes(&bytes);
                         if let Some(tx) = &broadcast {
                             if tx.receiver_count() > 0 {
-                                let _ = tx.send(buf[..n].to_vec());
+                                let _ = tx.send(bytes.to_vec());
                             }
                         }
-                        if sink_open && stdout_tx.send(buf[..n].to_vec()).is_err() {
+                        if sink_open && stdout_tx.send(bytes.to_vec()).is_err() {
                             sink_open = false;
                         }
                     }
                 }
+            }
+            let bytes = status_stream.finish();
+            tail.push_bytes(&bytes);
+            if let Some(tx) = &broadcast {
+                let _ = tx.send(bytes.clone());
+            }
+            if !bytes.is_empty() {
+                let _ = stdout_tx.send(bytes);
             }
         });
     }
@@ -477,6 +585,13 @@ pub(crate) fn bridge_piped(
         // A writer handle, so a caller can wait for this thread to finish.
         let tail = config.output_tail.writer();
         let broadcast = config.output_broadcast.clone();
+        let mut status_stream = ProgramStatusStream::new(
+            program_status.clone(),
+            ProgramStatusBridgeConfig {
+                answer_queries: false,
+                ..config.program_status
+            },
+        );
         std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stderr;
@@ -487,17 +602,26 @@ pub(crate) fn bridge_piped(
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         act.touch();
-                        tail.push_bytes(&buf[..n]);
+                        let bytes = status_stream.feed(&buf[..n], |_| {});
+                        tail.push_bytes(&bytes);
                         if let Some(tx) = &broadcast {
                             if tx.receiver_count() > 0 {
-                                let _ = tx.send(buf[..n].to_vec());
+                                let _ = tx.send(bytes.to_vec());
                             }
                         }
-                        if sink_open && stderr_tx.send(buf[..n].to_vec()).is_err() {
+                        if sink_open && stderr_tx.send(bytes.to_vec()).is_err() {
                             sink_open = false;
                         }
                     }
                 }
+            }
+            let bytes = status_stream.finish();
+            tail.push_bytes(&bytes);
+            if let Some(tx) = &broadcast {
+                let _ = tx.send(bytes.clone());
+            }
+            if !bytes.is_empty() {
+                let _ = stderr_tx.send(bytes);
             }
         });
     }
@@ -527,6 +651,7 @@ pub(crate) fn bridge_piped(
             container_start_delay: config.container_start_delay,
             cancel_on_grace_expired: config.cancel_on_grace_expired,
             poll_interval: STUCK_POLL_INTERVAL,
+            program_status: Some(program_status.clone()),
         },
         &output,
     );
@@ -535,639 +660,6 @@ pub(crate) fn bridge_piped(
         stdin_injector: stdin_tx,
         stuck_tx,
         output_tail: config.output_tail,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::{Duration, Instant};
-    use tokio::sync::mpsc;
-
-    // ── Stuck detector ────────────────────────────────────────────────────────
-
-    /// Production `StuckDetector::spawn` must terminate once its only
-    /// `Arc<Sender>` is dropped, even if the timeout hasn't elapsed.
-    /// Without this the task leaks for the lifetime of the process.
-    #[tokio::test]
-    async fn stuck_detector_exits_when_arc_dropped() {
-        let output = OutputActivity::with_state(Some(Instant::now()), true);
-        let tx = StuckDetector::spawn(
-            StuckConfig {
-                grace_timeout: Duration::from_secs(30),
-                stuck_timeout: Duration::from_secs(30),
-                container_start_delay: Duration::ZERO,
-                cancel_on_grace_expired: None,
-                poll_interval: Duration::from_millis(10),
-            },
-            &output,
-        );
-        // Hold a weak reference so we can observe the task dropping the Arc.
-        let weak = Arc::downgrade(&tx);
-        drop(tx);
-
-        // The detector polls every 10ms here; allow a loaded runner 5s to
-        // notice the Arc is gone.
-        for _ in 0..500 {
-            if weak.upgrade().is_none() {
-                return; // task dropped its Arc clone → exited
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("StuckDetector::spawn did not exit within 5s of its Arc being dropped");
-    }
-
-    /// Stuck phase, both directions: silence past `stuck_timeout` publishes
-    /// `Stuck` exactly once, and fresh output afterwards publishes `Unstuck`.
-    #[tokio::test]
-    async fn stuck_detector_reports_stuck_then_unstuck_when_output_resumes() {
-        let output = OutputActivity::with_state(Some(Instant::now()), true);
-        let tx = StuckDetector::spawn(
-            StuckConfig {
-                grace_timeout: Duration::from_secs(30),
-                stuck_timeout: Duration::from_millis(100),
-                container_start_delay: Duration::ZERO,
-                cancel_on_grace_expired: None,
-                poll_interval: Duration::from_millis(10),
-            },
-            &output,
-        );
-        let mut rx = tx.subscribe();
-        async fn next(rx: &mut tokio::sync::broadcast::Receiver<StuckEvent>) -> StuckEvent {
-            tokio::time::timeout(Duration::from_secs(5), rx.recv())
-                .await
-                .expect("timed out waiting for a stuck event")
-                .expect("channel closed")
-        }
-
-        assert_eq!(next(&mut rx).await, StuckEvent::Stuck);
-        // Stay silent for several more samples: a detector that re-published
-        // Stuck on every sample would hand the next `recv` a second Stuck
-        // instead of the Unstuck below.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // The container speaks again. The next sample sees fresh activity.
-        output.touch();
-        assert_eq!(next(&mut rx).await, StuckEvent::Unstuck);
-
-        // And silence after recovery makes it stuck again.
-        assert_eq!(next(&mut rx).await, StuckEvent::Stuck);
-    }
-
-    /// Grace phase: when no byte ever arrives and `grace_timeout` elapses,
-    /// the detector publishes `StartupGraceExpired` and invokes the cancel
-    /// callback.
-    #[tokio::test]
-    async fn stuck_detector_emits_startup_grace_expired() {
-        let output = OutputActivity::with_state(None, false);
-        let cancel_called = Arc::new(AtomicBool::new(false));
-        let cancel_clone = Arc::clone(&cancel_called);
-        let cancel: CancelFn = Arc::new(move || {
-            cancel_clone.store(true, Ordering::Release);
-        });
-
-        let tx = StuckDetector::spawn(
-            StuckConfig {
-                grace_timeout: Duration::from_millis(50),
-                stuck_timeout: Duration::from_secs(30),
-                container_start_delay: Duration::ZERO,
-                cancel_on_grace_expired: Some(cancel),
-                poll_interval: Duration::from_millis(10),
-            },
-            &output,
-        );
-        let mut rx = tx.subscribe();
-
-        let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("timed out waiting for StartupGraceExpired")
-            .expect("channel closed");
-        assert_eq!(event, StuckEvent::StartupGraceExpired);
-
-        // The detector invokes the callback right after publishing the event;
-        // wait for it rather than for a fixed tick.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !cancel_called.load(Ordering::Acquire) {
-            assert!(
-                Instant::now() < deadline,
-                "grace expiry must invoke the cancel callback"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-
-    /// Stuck phase: once `first_byte` flips true, the detector ignores grace
-    /// and emits `Stuck` based on `stuck_timeout` measured from last activity.
-    #[tokio::test]
-    async fn stuck_detector_switches_to_stuck_phase_after_first_byte() {
-        let output = OutputActivity::with_state(Some(Instant::now()), true);
-
-        // Set grace to something we'd notice if it incorrectly fired
-        // (anything > stuck_timeout would work).
-        let tx = StuckDetector::spawn(
-            StuckConfig {
-                grace_timeout: Duration::from_secs(30),
-                stuck_timeout: Duration::from_millis(50),
-                container_start_delay: Duration::ZERO,
-                cancel_on_grace_expired: None,
-                poll_interval: Duration::from_millis(10),
-            },
-            &output,
-        );
-        let mut rx = tx.subscribe();
-
-        // We must receive Stuck (not StartupGraceExpired) — grace must be
-        // skipped because `first_byte` was already true.
-        let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("timed out waiting for Stuck")
-            .expect("channel closed");
-        assert_eq!(event, StuckEvent::Stuck);
-    }
-
-    /// `container_start_delay`: bytes that "arrive" during the delay window
-    /// must not satisfy the first_byte check. Simulates Apple's `container`
-    /// runtime printing startup chatter before the workload begins — those
-    /// bytes flip `first_byte` to true, but the detector must wipe it at
-    /// the end of the delay window and re-enter the grace phase.
-    #[tokio::test]
-    async fn stuck_detector_start_delay_discards_pre_delay_first_byte() {
-        let output = OutputActivity::with_state(Some(Instant::now()), true);
-
-        // Start delay 150ms, grace 100ms. If the delay correctly discarded
-        // the pre-delay first_byte, the detector should re-enter grace and
-        // (since no real first byte ever arrives) publish
-        // StartupGraceExpired roughly 150ms + ~grace later.
-        let tx = StuckDetector::spawn(
-            StuckConfig {
-                grace_timeout: Duration::from_millis(100),
-                stuck_timeout: Duration::from_secs(30),
-                container_start_delay: Duration::from_millis(150),
-                cancel_on_grace_expired: None,
-                poll_interval: Duration::from_millis(10),
-            },
-            &output,
-        );
-        let mut rx = tx.subscribe();
-
-        let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
-            .await
-            .expect("timed out waiting for StartupGraceExpired")
-            .expect("channel closed");
-        assert_eq!(
-            event,
-            StuckEvent::StartupGraceExpired,
-            "start-delay must wipe pre-delay first_byte so grace runs from end of delay"
-        );
-    }
-
-    // ── stdin EOF ─────────────────────────────────────────────────────────────
-
-    /// When all stdin senders are dropped (non-interactive path), the writer
-    /// task draining stdin_rx terminates cleanly without errors.
-    #[tokio::test]
-    async fn stdin_eof_non_interactive_terminates_writer_task_cleanly() {
-        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        // Drop the sole sender immediately — simulates non-interactive frontend.
-        drop(stdin_tx);
-
-        let mut stdin_rx = stdin_rx;
-        let task = tokio::spawn(async move {
-            let mut total = 0usize;
-            while let Some(bytes) = stdin_rx.recv().await {
-                total += bytes.len();
-            }
-            total
-        });
-
-        let bytes_received = tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .expect("writer task should terminate promptly when stdin is EOF")
-            .expect("writer task must not panic");
-
-        assert_eq!(
-            bytes_received, 0,
-            "no bytes should arrive when sender is dropped"
-        );
-    }
-
-    // ── bridge_piped wiring (real child process) ─────────────────────────────
-
-    /// Spawn a real subprocess with piped stdio, wire it through
-    /// `bridge_piped`, and verify that stdout bytes from the child arrive at
-    /// the frontend's stdout sink. This exercises the same code path both
-    /// the Docker and Apple backends use for non-interactive runs, without
-    /// requiring an actual container runtime.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bridge_piped_stdout_bytes_reach_frontend_sink() {
-        use crate::engine::agent_runtime::frontend::AgentIo;
-        use std::process::{Command, Stdio};
-
-        let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (stderr_tx, _stderr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-
-        let io = AgentIo {
-            stdout: stdout_tx,
-            stderr: stderr_tx,
-            stdin_tx,
-            stdin_rx,
-            resize: None,
-            initial_size: None,
-        };
-
-        let mut child = Command::new("sh")
-            .args(["-c", "printf 'hello\\n'"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn sh");
-
-        let bridge = bridge_piped(
-            io,
-            &mut child,
-            BridgeConfig {
-                grace_timeout: Duration::from_secs(30),
-                stuck_timeout: Duration::from_secs(30),
-                container_start_delay: Duration::ZERO,
-                cancel_on_grace_expired: None,
-                output_tail: Arc::new(OutputTail::with_default_capacity()),
-                output_broadcast: None,
-            },
-        );
-        // Non-interactive flow: drop the engine's stdin handle so the writer
-        // task exits and child stdin closes (mirrors `spawn_piped_docker`).
-        drop(bridge.stdin_injector);
-
-        // `child.wait()` is blocking — run on a blocking thread so the tokio
-        // runtime stays free to drive the bridge's reader/writer tasks.
-        let _ = tokio::task::spawn_blocking(move || child.wait()).await;
-
-        let bytes = tokio::time::timeout(Duration::from_secs(5), stdout_rx.recv())
-            .await
-            .expect("stdout bytes should arrive promptly")
-            .expect("channel alive");
-        assert_eq!(
-            bytes, b"hello\n",
-            "bridge_piped must forward child stdout verbatim"
-        );
-    }
-
-    /// stderr bytes are routed to the stderr sink (separate from stdout).
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bridge_piped_stderr_bytes_reach_frontend_stderr_sink() {
-        use crate::engine::agent_runtime::frontend::AgentIo;
-        use std::process::{Command, Stdio};
-
-        let (stdout_tx, _stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (stderr_tx, mut stderr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-
-        let io = AgentIo {
-            stdout: stdout_tx,
-            stderr: stderr_tx,
-            stdin_tx,
-            stdin_rx,
-            resize: None,
-            initial_size: None,
-        };
-
-        let mut child = Command::new("sh")
-            .args(["-c", "printf 'oops\\n' >&2"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn sh");
-
-        let bridge = bridge_piped(
-            io,
-            &mut child,
-            BridgeConfig {
-                grace_timeout: Duration::from_secs(30),
-                stuck_timeout: Duration::from_secs(30),
-                container_start_delay: Duration::ZERO,
-                cancel_on_grace_expired: None,
-                output_tail: Arc::new(OutputTail::with_default_capacity()),
-                output_broadcast: None,
-            },
-        );
-        drop(bridge.stdin_injector);
-
-        let _ = tokio::task::spawn_blocking(move || child.wait()).await;
-
-        let bytes = tokio::time::timeout(Duration::from_secs(5), stderr_rx.recv())
-            .await
-            .expect("stderr bytes should arrive promptly")
-            .expect("channel alive");
-        assert_eq!(bytes, b"oops\n");
-    }
-
-    /// Ending a PTY bridge's input while the client still runs (a detach)
-    /// types nothing into it: portable-pty's writer would otherwise send
-    /// "\n" + EOF on drop.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bridge_pty_input_close_sends_nothing_to_a_live_client() {
-        use crate::engine::agent_runtime::frontend::AgentIo;
-        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-
-        let dir = tempfile::tempdir().unwrap();
-        let received = dir.path().join("received");
-        let (stdout_tx, _stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (stderr_tx, _stderr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let io = AgentIo {
-            stdout: stdout_tx,
-            stderr: stderr_tx,
-            stdin_tx,
-            stdin_rx,
-            resize: None,
-            initial_size: Some((80, 24)),
-        };
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-        let mut cmd = CommandBuilder::new("sh");
-        cmd.args(["-c", &format!("exec cat > '{}'", received.display())]);
-        let mut child = pair.slave.spawn_command(cmd).unwrap();
-        let (_master, bridge) = bridge_pty(
-            io,
-            pair,
-            BridgeConfig {
-                grace_timeout: Duration::from_secs(30),
-                stuck_timeout: Duration::from_secs(30),
-                container_start_delay: Duration::ZERO,
-                cancel_on_grace_expired: None,
-                output_tail: Arc::new(OutputTail::with_default_capacity()),
-                output_broadcast: None,
-            },
-        )
-        .unwrap();
-
-        bridge.stdin_injector.send(b"hello\n".to_vec()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while std::fs::read(&received).unwrap_or_default() != b"hello\n" {
-            assert!(Instant::now() < deadline, "input never reached the client");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        drop(bridge.stdin_injector);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "closing the bridge's input must not end the client"
-        );
-        assert_eq!(std::fs::read(&received).unwrap(), b"hello\n");
-        child.kill().unwrap();
-        let _ = child.wait();
-    }
-
-    /// A CLI detach returns while the writer task still waits for input, and
-    /// runtime shutdown drops the task mid-await. That drop must type nothing
-    /// into the still-live client either.
-    #[cfg(unix)]
-    #[test]
-    fn bridge_pty_writer_task_dropped_by_runtime_sends_nothing_to_a_live_client() {
-        use crate::engine::agent_runtime::frontend::AgentIo;
-        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-
-        let dir = tempfile::tempdir().unwrap();
-        let received = dir.path().join("received");
-        let (stdout_tx, _stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (stderr_tx, _stderr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let io = AgentIo {
-            stdout: stdout_tx,
-            stderr: stderr_tx,
-            stdin_tx,
-            stdin_rx,
-            resize: None,
-            initial_size: Some((80, 24)),
-        };
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-        let mut cmd = CommandBuilder::new("sh");
-        cmd.args(["-c", &format!("exec cat > '{}'", received.display())]);
-        let mut child = pair.slave.spawn_command(cmd).unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (_master, bridge) = runtime.block_on(async {
-            let (master, bridge) = bridge_pty(
-                io,
-                pair,
-                BridgeConfig {
-                    grace_timeout: Duration::from_secs(30),
-                    stuck_timeout: Duration::from_secs(30),
-                    container_start_delay: Duration::ZERO,
-                    cancel_on_grace_expired: None,
-                    output_tail: Arc::new(OutputTail::with_default_capacity()),
-                    output_broadcast: None,
-                },
-            )
-            .unwrap();
-            bridge.stdin_injector.send(b"hello\n".to_vec()).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while std::fs::read(&received).unwrap_or_default() != b"hello\n" {
-                assert!(Instant::now() < deadline, "input never reached the client");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            (master, bridge)
-        });
-
-        // The input stays open (`bridge` is alive), so the writer task is
-        // parked in `recv` and only the runtime's shutdown ends it.
-        drop(runtime);
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "dropping the writer task must not end the client"
-        );
-        assert_eq!(std::fs::read(&received).unwrap(), b"hello\n");
-        drop(bridge);
-        child.kill().unwrap();
-        let _ = child.wait();
-    }
-
-    /// Bytes pushed through `stdin_tx` reach the child's stdin. We use `cat`
-    /// — it echoes stdin to stdout — and verify the echo reappears on the
-    /// stdout sink. Dropping `stdin_injector` then closes the child's stdin,
-    /// `cat` sees EOF and exits.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bridge_piped_stdin_writes_reach_child() {
-        use crate::engine::agent_runtime::frontend::AgentIo;
-        use std::process::{Command, Stdio};
-
-        let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (stderr_tx, _stderr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-
-        // Queue the input BEFORE spawning the bridge — the writer task will
-        // see these bytes on its first `recv().await`.
-        stdin_tx.send(b"round-trip payload\n".to_vec()).unwrap();
-
-        let io = AgentIo {
-            stdout: stdout_tx,
-            stderr: stderr_tx,
-            stdin_tx,
-            stdin_rx,
-            resize: None,
-            initial_size: None,
-        };
-
-        let mut child = Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn cat");
-
-        let bridge = bridge_piped(
-            io,
-            &mut child,
-            BridgeConfig {
-                grace_timeout: Duration::from_secs(30),
-                stuck_timeout: Duration::from_secs(30),
-                container_start_delay: Duration::ZERO,
-                cancel_on_grace_expired: None,
-                output_tail: Arc::new(OutputTail::with_default_capacity()),
-                output_broadcast: None,
-            },
-        );
-        // Drop the engine's stdin sender so `cat` sees EOF after the payload.
-        drop(bridge.stdin_injector);
-
-        // `child.wait()` is blocking; running it directly would freeze the
-        // tokio runtime and starve the writer task, deadlocking the test.
-        let status = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::task::spawn_blocking(move || child.wait()),
-        )
-        .await
-        .expect("cat should exit within 5s of stdin EOF")
-        .expect("blocking join")
-        .expect("wait");
-        assert!(status.success(), "cat must exit cleanly");
-
-        // Drain stdout — `cat` may emit the bytes in multiple chunks. The
-        // reader thread drops its sender at EOF, which ends the loop; the
-        // timeout only bounds a hang, it does not decide what was collected.
-        let mut collected = Vec::new();
-        while let Some(bytes) = tokio::time::timeout(Duration::from_secs(5), stdout_rx.recv())
-            .await
-            .expect("the stdout channel must close once cat exits")
-        {
-            collected.extend_from_slice(&bytes);
-        }
-        assert_eq!(
-            collected, b"round-trip payload\n",
-            "bytes sent via stdin_tx must arrive at the child's stdin and round-trip back through cat"
-        );
-    }
-
-    /// When the frontend's stdout sink dies mid-stream, the reader thread
-    /// must keep draining the child's stdout so the child isn't backpressured.
-    /// We can't directly observe the child's pipe buffer state, but we can
-    /// confirm: (a) the child exits cleanly, and (b) activity tracking still
-    /// fires (which proves the reader is still reading after the sink dies).
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn bridge_piped_keeps_draining_after_stdout_sink_drops() {
-        use crate::engine::agent_runtime::frontend::AgentIo;
-        use std::process::{Command, Stdio};
-
-        let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (stderr_tx, _stderr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-
-        // Drop the receiver immediately — every send will return SendError.
-        drop(stdout_rx);
-
-        let io = AgentIo {
-            stdout: stdout_tx,
-            stderr: stderr_tx,
-            stdin_tx,
-            stdin_rx,
-            resize: None,
-            initial_size: None,
-        };
-
-        // Print many bytes so the kernel pipe buffer would fill if we
-        // stopped reading (typical pipe buffer is 64 KiB).
-        let mut child = Command::new("sh")
-            .args(["-c", "yes | head -c 200000"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn sh");
-
-        let bridge = bridge_piped(
-            io,
-            &mut child,
-            BridgeConfig {
-                grace_timeout: Duration::from_secs(30),
-                stuck_timeout: Duration::from_secs(30),
-                container_start_delay: Duration::ZERO,
-                cancel_on_grace_expired: None,
-                output_tail: Arc::new(OutputTail::with_default_capacity()),
-                output_broadcast: None,
-            },
-        );
-        drop(bridge.stdin_injector);
-
-        // Child must exit promptly — if the reader stopped draining, this
-        // would deadlock at ~64 KiB.
-        let status = tokio::task::spawn_blocking(move || child.wait())
-            .await
-            .expect("join")
-            .expect("wait");
-        assert!(
-            status.success(),
-            "child must exit cleanly even when the stdout sink is dead"
-        );
-    }
-
-    /// With data already in the channel before the sender is dropped, the
-    /// writer task drains all bytes then terminates cleanly.
-    #[tokio::test]
-    async fn stdin_writer_task_drains_all_bytes_then_terminates_on_eof() {
-        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-
-        stdin_tx.send(b"hello\n".to_vec()).unwrap();
-        stdin_tx.send(b"world\n".to_vec()).unwrap();
-        drop(stdin_tx);
-
-        let mut stdin_rx = stdin_rx;
-        let task = tokio::spawn(async move {
-            let mut received = Vec::new();
-            while let Some(bytes) = stdin_rx.recv().await {
-                received.extend_from_slice(&bytes);
-            }
-            received
-        });
-
-        let received = tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .expect("task should complete")
-            .expect("no panic");
-
-        assert_eq!(received, b"hello\nworld\n");
+        program_status,
     }
 }

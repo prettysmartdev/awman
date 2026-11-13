@@ -2,7 +2,8 @@
 //! backend.
 //!
 //! Everything after the entrypoint (mode flags, tool restrictions, model,
-//! system prompt, add-dirs, user `agentFlags`, interactive seeded prompt) is
+//! system prompt, add-dirs, user `agentFlags`, managed storage flags,
+//! interactive seeded prompt) is
 //! the agent CLI's contract, not the runtime's: Docker and Apple append it
 //! after the image and entrypoint of a `run` argv, and builtin appends it to
 //! the entrypoint it hands the sandbox driver. One builder keeps the three from drifting.
@@ -55,12 +56,13 @@ impl AgentArgv {
                         .into(),
                 ));
             }
-            // The user's own `agentFlags` are the one exception: they were
-            // configured for exactly this agent and launch.
+            // The agent's own flags and managed storage overrides are the
+            // only argv tail on an ACP launch.
             argv.extend(options.agent_flags.iter().cloned());
+            argv.extend(options.managed_agent_flags.iter().cloned());
             return Ok(Self(argv));
         }
-        // The non-interactive sub-command or flag (`exec`, `run`, `--print`) is
+        // The headless sub-command or flag (`exec`, `run`, `--print`) is
         // already part of the entrypoint (`AgentDefinition::entrypoint_for`); it
         // is never repeated here.
         // Per-agent mode flags (yolo, auto, plan) — literal args.
@@ -103,14 +105,18 @@ impl AgentArgv {
         // User-configured extra agent args (`agentFlags` / `--agent-flag`): after
         // every awman-generated flag, before the seeded prompt positional.
         argv.extend(options.agent_flags.iter().cloned());
+        argv.extend(options.managed_agent_flags.iter().cloned());
         // Interactive + seeded prompt: most agents take the prompt as the final
         // positional; agents with an `interactive_seed_flag` (opencode
         // `--prompt`) take a flag pair, because their bare positional means
-        // something else. Non-interactive prompts are piped on stdin instead.
-        if options.interactive {
+        // something else. Headless delivery follows each CLI's contract:
+        // either a final argv operand or stdin.
+        if options.interactive || options.headless_prompt_in_argv {
             if let Some(prompt) = &options.seeded_prompt {
-                if let Some(flag) = &options.interactive_seed_flag {
-                    argv.push(flag.clone());
+                if options.interactive {
+                    if let Some(flag) = &options.interactive_seed_flag {
+                        argv.push(flag.clone());
+                    }
                 }
                 argv.push(prompt.clone());
             }
@@ -145,6 +151,3 @@ impl PathRendering {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

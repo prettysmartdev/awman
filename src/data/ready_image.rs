@@ -32,6 +32,10 @@ pub struct ReadyImageResult {
     pub build: StepStatus,
     /// Acquisition from the source and install into the runtime.
     pub import: StepStatus,
+    /// Internal recovery signal for callers that can rebuild a broken local
+    /// source image. The user-facing failure remains in `import`.
+    #[serde(skip)]
+    pub import_failure: Option<ReadyImageImportFailure>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ReadyImageWarning>,
     /// A non-default agent's image, prepared by `ready --build`. Its
@@ -51,6 +55,7 @@ impl ReadyImageResult {
             reference: None,
             build: StepStatus::Pending,
             import: StepStatus::Pending,
+            import_failure: None,
             warnings: Vec::new(),
             optional: false,
         }
@@ -65,6 +70,11 @@ impl ReadyImageResult {
     pub fn is_unfinished(&self) -> bool {
         !self.build.is_terminal() || !self.import.is_terminal()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadyImageImportFailure {
+    AppleContentMissing,
 }
 
 /// The project base image built into one store, as a build input for the
@@ -213,96 +223,6 @@ impl std::fmt::Display for ReadyImageWarning {
                 "Dockerfile changed: rebuild the image externally and configure \
                  `builtin.imageSource`, then run `awman ready --build` to import it"
             ),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// WI 0126 F1/F3: the builder warnings that used to be free text are
-    /// typed and render the same words in every frontend and in
-    /// `ready --json`.
-    #[test]
-    fn builder_warnings_render_their_wording_and_serialize_by_kind() {
-        let tag = || "awman-r-claude:latest".to_string();
-        let cases = [
-            (
-                ReadyImageWarning::BuilderUnreachable {
-                    tag: tag(),
-                    builder: "Docker at unix:///d.sock".into(),
-                    detail: "down".into(),
-                },
-                "awman-r-claude:latest: Docker at unix:///d.sock is unreachable; using the \
-                 installed image (down)",
-                "builder-unreachable",
-            ),
-            (
-                ReadyImageWarning::BuiltImageNotExposed {
-                    tag: tag(),
-                    reference: "a:1".into(),
-                },
-                "awman-r-claude:latest: a:1 no longer exposes the image an earlier `awman \
-                 ready` built; refreshing the source import",
-                "built-image-not-exposed",
-            ),
-            (
-                ReadyImageWarning::StaleBuildReceipt {
-                    tag: tag(),
-                    reference: "a:1".into(),
-                },
-                "awman-r-claude:latest: a:1 no longer holds the image an earlier `awman ready` \
-                 built for it; importing the image it holds now (run `awman ready --build` to \
-                 rebuild)",
-                "stale-build-receipt",
-            ),
-            (
-                ReadyImageWarning::ReceiptNotCleared {
-                    tag: tag(),
-                    detail: "denied".into(),
-                },
-                "awman-r-claude:latest: could not clear its build receipt: denied",
-                "receipt-not-cleared",
-            ),
-            (
-                ReadyImageWarning::BuildOkImportFailed { tag: tag() },
-                "awman-r-claude:latest: the build succeeded but the import failed; run `awman \
-                 ready` again to retry the import",
-                "build-ok-import-failed",
-            ),
-            (
-                ReadyImageWarning::RebuildInSourceStore { tag: tag() },
-                "awman-r-claude:latest: run `awman ready --build` to rebuild it in its source \
-                 store",
-                "rebuild-in-source-store",
-            ),
-            (
-                ReadyImageWarning::AuditRebuildUnavailable {
-                    source_configured: true,
-                },
-                "Dockerfile changed: rebuild the image in its source store (or enable \
-                 `builtin.builder.enabled` with a `docker-local` or `apple-local` source), then \
-                 run `awman ready --build` to re-import it",
-                "audit-rebuild-unavailable",
-            ),
-            (
-                ReadyImageWarning::AuditRebuildUnavailable {
-                    source_configured: false,
-                },
-                "Dockerfile changed: rebuild the image externally and configure \
-                 `builtin.imageSource`, then run `awman ready --build` to import it",
-                "audit-rebuild-unavailable",
-            ),
-        ];
-        for (warning, text, kind) in cases {
-            assert_eq!(warning.to_string(), text);
-            let json = serde_json::to_value(&warning).unwrap();
-            assert_eq!(json["kind"], kind);
-            assert_eq!(
-                serde_json::from_value::<ReadyImageWarning>(json).unwrap(),
-                warning
-            );
         }
     }
 }

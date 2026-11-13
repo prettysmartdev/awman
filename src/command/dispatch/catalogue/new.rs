@@ -20,6 +20,8 @@ pub(super) const NEW: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[&NEW_SPEC, &NEW_WORKFLOW, &NEW_SKILL, &NEW_AGENT],
 };
 
@@ -42,9 +44,9 @@ pub(super) const NEW_SPEC: CommandSpec = CommandSpec {
             optional: true,
         },
         FlagSpec {
-            long: "non-interactive",
+            long: "headless",
             short: Some('n'),
-            help: "Run the interview agent in non-interactive (print) mode.",
+            help: "Run the interview agent headless (print mode).",
             kind: FlagKind::Bool,
             default: FlagDefault::Bool(false),
             frontends: FrontendVisibility::All,
@@ -70,6 +72,8 @@ pub(super) const NEW_SPEC: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: true,
     subcommands: &[],
 };
 
@@ -94,9 +98,9 @@ pub(super) const NEW_WORKFLOW: CommandSpec = CommandSpec {
             optional: true,
         },
         FlagSpec {
-            long: "non-interactive",
+            long: "headless",
             short: Some('n'),
-            help: "Run the interview agent in non-interactive (print) mode.",
+            help: "Run the interview agent headless (print mode).",
             kind: FlagKind::Bool,
             default: FlagDefault::Bool(false),
             frontends: FrontendVisibility::All,
@@ -133,6 +137,8 @@ pub(super) const NEW_WORKFLOW: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: true,
     subcommands: &[],
 };
 
@@ -155,9 +161,9 @@ pub(super) const NEW_SKILL: CommandSpec = CommandSpec {
             optional: true,
         },
         FlagSpec {
-            long: "non-interactive",
+            long: "headless",
             short: Some('n'),
-            help: "Run the interview agent in non-interactive (print) mode.",
+            help: "Run the interview agent headless (print mode).",
             kind: FlagKind::Bool,
             default: FlagDefault::Bool(false),
             frontends: FrontendVisibility::All,
@@ -216,6 +222,8 @@ pub(super) const NEW_SKILL: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: true,
     subcommands: &[],
 };
 
@@ -276,5 +284,7 @@ pub(super) const NEW_AGENT: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: true,
     subcommands: &[],
 };

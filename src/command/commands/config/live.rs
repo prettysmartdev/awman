@@ -1,0 +1,202 @@
+//! Live apply for `awman config set` / `unset`: after a file is written,
+//! tell the running daemon to re-read its config (`POST /v1/config/reload`
+//! over its owner-only local listener) and report what happened.
+//!
+//! There is no bearer key: the local socket or named pipe proves the caller
+//! is the daemon's owner.
+
+use serde::Serialize;
+
+use crate::data::config::fields::ConfigKey;
+use crate::data::session::Session;
+
+/// What `config set` / `unset` reports after writing a file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "status", content = "detail")]
+pub enum LiveApply {
+    /// The running daemon re-read the file and applied the key.
+    Applied,
+    AppliedWithEffects(Vec<crate::command::daemon_api::core::ReloadEffect>),
+    /// No daemon is running: the next start reads the new value.
+    NextStart,
+    /// A daemon is running but the key is not live (or the daemon said so).
+    RestartRequired,
+    /// The reload request failed; the value still applies on the next start.
+    Failed(String),
+}
+
+impl LiveApply {
+    /// The line printed after `wrote <path>`.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Applied => "applied to the running daemon".into(),
+            Self::AppliedWithEffects(effects) => format!("applied to the running daemon; {}", effects.iter().map(|e| match e { crate::command::daemon_api::core::ReloadEffect::Rebound { listener, disconnected_clients } => format!("listener {listener} rebound; {disconnected_clients} clients disconnected"), crate::command::daemon_api::core::ReloadEffect::CertificateReloaded { listener } => format!("listener {listener} certificate reloaded") }).collect::<Vec<_>>().join("; ")),
+            Self::NextStart => "takes effect on next start".into(),
+            Self::RestartRequired => {
+                "restart the daemon to apply (awman daemon stop && awman daemon start)".into()
+            }
+            Self::Failed(reason) => {
+                format!("takes effect on next start (the running daemon did not reload: {reason})")
+            }
+        }
+    }
+}
+
+/// The running daemon, and where its local listener is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningDaemon {
+    pub pid: u32,
+    pub local_endpoint: std::path::PathBuf,
+}
+
+/// The reload response fields `config set` reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct ReloadReply {
+    #[serde(default)]
+    pub applied: Vec<String>,
+    #[serde(default)]
+    pub restart_required: Vec<String>,
+    #[serde(default)]
+    pub effects: Vec<crate::command::daemon_api::core::ReloadEffect>,
+}
+
+/// The seam `config set` talks to the daemon through; tests substitute it.
+pub trait DaemonReloader: Send + Sync {
+    fn running(&self, session: &Session) -> Option<RunningDaemon>;
+    fn reload(&self, daemon: &RunningDaemon) -> Result<ReloadReply, String>;
+    /// How many leases the daemon still runs for work server `server`.
+    /// `awman config unset workServers.<name>` defers deleting the token
+    /// file while this is nonzero. The default says none.
+    fn running_leases(&self, _daemon: &RunningDaemon, _server: &str) -> Result<usize, String> {
+        Ok(0)
+    }
+}
+
+/// Decide the live-apply outcome for `key` (written at concrete `path`).
+pub fn apply(
+    reloader: &dyn DaemonReloader,
+    session: &Session,
+    key: &ConfigKey,
+    path: &str,
+) -> LiveApply {
+    let Some(daemon) = reloader.running(session) else {
+        return LiveApply::NextStart;
+    };
+    if !key.live {
+        return LiveApply::RestartRequired;
+    }
+    match reloader.reload(&daemon) {
+        Ok(reply) if reply.restart_required.iter().any(|p| covers(p, path)) => {
+            LiveApply::RestartRequired
+        }
+        Ok(reply) if !reply.effects.is_empty() => LiveApply::AppliedWithEffects(reply.effects),
+        Ok(_) => LiveApply::Applied,
+        Err(reason) => LiveApply::Failed(reason),
+    }
+}
+
+/// Whether a reported path is `path` or one of its ancestors/descendants
+/// (`unset workServers.a` reports `workServers.a.url`).
+fn covers(reported: &str, path: &str) -> bool {
+    reported == path
+        || reported.starts_with(&format!("{path}."))
+        || path.starts_with(&format!("{reported}."))
+}
+
+/// The production reloader: the daemon found through its live pidfile and
+/// `server.json`, reached over its local listener.
+pub struct LocalDaemons;
+
+impl DaemonReloader for LocalDaemons {
+    fn running(&self, session: &Session) -> Option<RunningDaemon> {
+        let paths = crate::data::fs::DataPaths::from_env(session.env())
+            .ok()?
+            .daemon();
+        crate::engine::remote::local::discover(&paths)
+            .ok()
+            .flatten()
+            .map(|endpoint| RunningDaemon {
+                pid: endpoint.pid,
+                local_endpoint: endpoint.address,
+            })
+    }
+
+    fn reload(&self, daemon: &RunningDaemon) -> Result<ReloadReply, String> {
+        let daemon = daemon.clone();
+        // `config` runs inside the CLI's tokio runtime; the request is one
+        // short call, so it runs on a scoped thread with its own runtime
+        // rather than threading `async` through the edit loop.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    runtime.block_on(post_reload(&daemon))
+                })
+                .join()
+                .map_err(|_| "reload request panicked".to_string())?
+        })
+    }
+
+    fn running_leases(&self, daemon: &RunningDaemon, server: &str) -> Result<usize, String> {
+        let daemon = daemon.clone();
+        let server = server.to_string();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| e.to_string())?;
+                    runtime.block_on(get_running_leases(&daemon, &server))
+                })
+                .join()
+                .map_err(|_| "lease request panicked".to_string())?
+        })
+    }
+}
+
+/// `GET /v1/worker/leases?server=<name>` on the daemon's local listener.
+/// A daemon without the worker routes (404) runs no leases.
+async fn get_running_leases(daemon: &RunningDaemon, server: &str) -> Result<usize, String> {
+    let client = crate::engine::remote::local::LocalClient::new(daemon.local_endpoint.clone());
+    let path = format!("/v1/worker/leases?server={server}&state=active&limit=1");
+    let response = client
+        .send("GET", &path, None)
+        .await
+        .map_err(|e| e.to_string())?;
+    if response.status == 404 {
+        return Ok(0);
+    }
+    if response.status >= 400 {
+        return Err(format!(
+            "HTTP {}: {}",
+            response.status,
+            crate::command::commands::daemon::client::body_text(&response.body)
+        ));
+    }
+    response
+        .body
+        .get("items")
+        .and_then(|items| items.as_array())
+        .map(Vec::len)
+        .ok_or_else(|| "unexpected lease listing".to_string())
+}
+
+async fn post_reload(daemon: &RunningDaemon) -> Result<ReloadReply, String> {
+    let client = crate::engine::remote::local::LocalClient::new(daemon.local_endpoint.clone());
+    let response = client
+        .send("POST", "/v1/config/reload", None)
+        .await
+        .map_err(|e| e.to_string())?;
+    if response.status >= 400 {
+        return Err(format!(
+            "HTTP {}: {}",
+            response.status,
+            crate::command::commands::daemon::client::body_text(&response.body)
+        ));
+    }
+    serde_json::from_value(response.body).map_err(|e| e.to_string())
+}

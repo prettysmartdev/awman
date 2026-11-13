@@ -1,0 +1,8 @@
+{
+  "name": "awman-edge-test", "main": "../src/index.ts", "compatibility_date": "2026-03-10",
+  "durable_objects": { "bindings": [{ "name": "USAGE", "class_name": "UsageCounter" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["UsageCounter"] }],
+  "assets": { "directory": "./assets", "binding": "ASSETS", "run_worker_first": true, "html_handling": "auto-trailing-slash", "not_found_handling": "404-page" },
+  "vars": { "USAGE_HMAC_SECRET": "test-only-hmac-secret-at-least-32-bytes", "OWNER_EXPORT_SECRET": "test-only-owner-secret-at-least-32-bytes" },
+  "observability": { "enabled": false, "logs": { "enabled": false, "invocation_logs": false } }
+}

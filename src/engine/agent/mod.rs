@@ -7,11 +7,11 @@
 //! custom definition. Option builders resolve once and pass the definition
 //! down.
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
+use crate::data::config::agents::LaunchMode;
 use crate::data::config::builtin_launch::BuiltinLaunchSettings;
 use crate::data::config::effective::EffectiveConfig;
-use crate::data::config::repo::LaunchMode;
 use crate::data::image_tags::{agent_image_tag, project_image_tag};
 use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
 use crate::data::session::{AgentName, Session};
@@ -138,10 +138,15 @@ pub fn custom_build_failure(def: &AgentDefinition, error: impl std::fmt::Display
     match (&def.origin, &def.image) {
         (AgentOrigin::Custom { path, .. }, AgentImageSource::Rendered { spec }) => {
             format!(
-            "{error}\nCheck [image] in {}: smoke binary '{}' must be on PATH. Install steps:\n{}",
-            path.display(), spec.binary,
-            spec.install.iter().map(|s| format!("  {s}")).collect::<Vec<_>>().join("\n")
-        )
+                "{error}\nCheck [image] in {}: smoke binary '{}' must be on PATH. Install steps:\n{}",
+                path.display(),
+                spec.binary,
+                spec.install
+                    .iter()
+                    .map(|s| format!("  {s}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
         }
         _ => error.to_string(),
     }
@@ -153,13 +158,15 @@ pub(crate) fn user_owned_dockerfile_note(name: &str) -> String {
     )
 }
 
-fn custom_auth_env(def: &AgentDefinition, overlays: &[String]) -> Vec<String> {
+fn custom_auth_env_in(
+    env: &crate::data::config::env::EnvSnapshot,
+    def: &AgentDefinition,
+    overlays: &[String],
+) -> Vec<String> {
     let mut seen: std::collections::HashSet<&str> = overlays.iter().map(String::as_str).collect();
     def.auth_env
         .iter()
-        .filter(|name| {
-            crate::data::config::env::host_var_os(name).is_some() && seen.insert(name.as_str())
-        })
+        .filter(|name| env.get(name).is_some() && seen.insert(name.as_str()))
         .cloned()
         .collect()
 }
@@ -174,6 +181,8 @@ pub enum AutoMode {
 /// Options governing how an agent container is invoked.
 #[derive(Debug, Default, Clone)]
 pub struct AgentRunOptions {
+    /// Caller values are used only for explicit env overlay names.
+    pub command_secrets: Option<Arc<crate::data::secret::CommandSecrets>>,
     pub yolo: Option<crate::engine::container::options::YoloMode>,
     pub auto: Option<crate::engine::container::options::AutoMode>,
     pub plan: Option<crate::engine::container::options::PlanMode>,
@@ -197,6 +206,9 @@ pub struct AgentRunOptions {
     pub env_passthrough: Option<Vec<String>>,
     /// User-supplied directory overlays.
     pub directory_overlays: Vec<DirectorySpec>,
+    /// Host-authored outputs and verified Git sidecars, never parsed from
+    /// repository/config/workflow overlay expressions.
+    pub command_mounts: Vec<DirectorySpec>,
     /// When true, mount all skill directories.
     pub include_all_skills: bool,
     /// Named skills to mount (when `include_all_skills` is false).
@@ -218,6 +230,22 @@ pub struct AgentRunOptions {
 
 /// Extra user arguments appended to `agent`'s launch command: the run's
 /// explicit `--agent-flag` list, else the session's effective `agentFlags`.
+impl AgentRunOptions {
+    pub fn secret_env(&self) -> Vec<(String, crate::data::secret::SecretString)> {
+        self.env_passthrough
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|name| {
+                self.command_secrets
+                    .as_ref()?
+                    .get(name)
+                    .map(|value| (name.clone(), value.clone()))
+            })
+            .collect()
+    }
+}
+
 fn resolve_agent_flags(session: &Session, agent: &AgentName, run: &AgentRunOptions) -> Vec<String> {
     match &run.agent_flags {
         Some(values) => values.clone(),
@@ -261,6 +289,95 @@ fn with_yolo_disallowed_tools<'a>(
     Ok(Cow::Owned(merged))
 }
 
+/// Writable scratch directory of a read-only workspace launch.
+pub const READ_ONLY_SCRATCH_PATH: &str = "/awman/scratch";
+/// Environment variable naming [`READ_ONLY_SCRATCH_PATH`] inside the container.
+pub const READ_ONLY_SCRATCH_ENV: &str = "AWMAN_SCRATCH";
+
+fn read_only_unsupported(runtime: &str) -> EngineError {
+    EngineError::Config(format!(
+        "the {runtime} runtime cannot mount the workspace read-only; this run requires a read-only workspace"
+    ))
+}
+
+/// Runs after all overlays are assembled and before any runtime sees them.
+fn validate_workspace_mounts(
+    options: &mut [ContainerOption],
+    workspace: &Path,
+    read_only: bool,
+    lease_scope: Option<&Path>,
+    inline_file: Option<&Path>,
+    command_mounts: &[crate::engine::container::options::OverlaySpec],
+) -> Result<(), EngineError> {
+    use crate::engine::container::options::OverlayPermission;
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|e| EngineError::io(workspace, e))?;
+    let inline_file = inline_file.and_then(|path| path.canonicalize().ok());
+    let lease_root = lease_scope
+        .map(|scope| scope.canonicalize())
+        .transpose()
+        .map_err(|e| EngineError::Config(format!("lease workspace: {e}")))?;
+    for option in options {
+        let ContainerOption::Overlay(spec) = option else {
+            continue;
+        };
+        let host = spec
+            .host_path
+            .canonicalize()
+            .map_err(|e| EngineError::io(&spec.host_path, e))?;
+        if let Some(clone) = &lease_root {
+            if !host.starts_with(clone)
+                && inline_file.as_deref() != Some(host.as_path())
+                && !command_mounts.iter().any(|allowed| {
+                    // Compare resolved paths: on macOS a temporary directory is
+                    // reached through a symlink (/var -> /private/var).
+                    allowed
+                        .host_path
+                        .canonicalize()
+                        .unwrap_or_else(|_| allowed.host_path.clone())
+                        == host
+                        && allowed.container_path == spec.container_path
+                        && allowed.permission == spec.permission
+                })
+            {
+                return Err(EngineError::Config(
+                    "overlay exposes a path outside the lease workspace".into(),
+                ));
+            }
+        }
+        let guest = &spec.container_path;
+        if guest.components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        }) {
+            return Err(EngineError::Config(
+                "overlay guest path must be normalized".into(),
+            ));
+        }
+        let guest_workspace = Path::new("/workspace");
+        if guest_workspace.starts_with(guest) && (guest != guest_workspace || host != workspace) {
+            return Err(EngineError::Config(
+                "overlay overlaps the workspace mount".into(),
+            ));
+        }
+        if read_only
+            && (host.starts_with(&workspace)
+                || workspace.starts_with(&host)
+                || guest.starts_with(guest_workspace))
+        {
+            spec.permission = OverlayPermission::ReadOnly;
+        }
+        if inline_file.as_deref() == Some(host.as_path()) {
+            spec.permission = OverlayPermission::ReadOnly;
+        }
+        spec.host_path = host;
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct AgentEngine {
     overlay_engine: Arc<OverlayEngine>,
@@ -269,10 +386,11 @@ pub struct AgentEngine {
     /// builds options for (F-38). `None` — the default — disables leases, the
     /// same behaviour the absent process-global monitor used to produce.
     lease_factory: Option<crate::engine::credential_refresh::LeaseFactoryHandle>,
-    /// A recording builder for daemon-free launch tests; production builds
-    /// with the host builder.
-    #[cfg(test)]
-    local_builder: Option<Arc<dyn crate::engine::image_prep::builder::LocalImageBuilder>>,
+    /// Mount the session workspace read-only (pulled leases with
+    /// `exec.read_only`), with a writable scratch directory at
+    /// [`READ_ONLY_SCRATCH_PATH`]. The agent home stays writable.
+    read_only_workspace: bool,
+    lease_workspace_scope: Option<std::path::PathBuf>,
 }
 
 impl AgentEngine {
@@ -281,9 +399,63 @@ impl AgentEngine {
             overlay_engine,
             runtime,
             lease_factory: None,
-            #[cfg(test)]
-            local_builder: None,
+            read_only_workspace: false,
+            lease_workspace_scope: None,
         }
+    }
+
+    /// Mount `/workspace` read-only for every launch this engine prepares.
+    /// A runtime that cannot enforce it (see
+    /// [`crate::engine::agent_runtime::Capabilities::read_only_workspace`])
+    /// refuses the launch rather than mounting the workspace writable.
+    pub fn with_read_only_workspace(mut self, read_only: bool) -> Self {
+        self.read_only_workspace = read_only;
+        self
+    }
+
+    /// Scope every final host bind to this lease's clone. Private and sibling
+    /// lease state may never be exposed through an extra overlay.
+    pub fn with_lease_workspace_scope(mut self, clone: std::path::PathBuf) -> Self {
+        self.lease_workspace_scope = Some(clone);
+        self
+    }
+
+    pub fn is_lease_workspace(&self) -> bool {
+        self.lease_workspace_scope.is_some()
+    }
+    pub fn read_only_workspace(&self) -> bool {
+        self.read_only_workspace
+    }
+
+    /// The `/workspace` mount, plus the writable scratch directory when the
+    /// workspace is read-only.
+    fn workspace_mounts(&self, session: &Session) -> Result<Vec<ContainerOption>, EngineError> {
+        use crate::engine::container::options::{MountGuard, OverlayPermission, OverlaySpec};
+        let permission = if self.read_only_workspace {
+            if !self.runtime.capabilities().read_only_workspace() {
+                return Err(read_only_unsupported(self.runtime.display_name()));
+            }
+            OverlayPermission::ReadOnly
+        } else {
+            OverlayPermission::ReadWrite
+        };
+        let mut mounts = vec![ContainerOption::Overlay(OverlaySpec {
+            host_path: session.git_root().to_path_buf(),
+            container_path: std::path::PathBuf::from("/workspace"),
+            permission,
+        })];
+        if self.read_only_workspace {
+            let scratch = tempfile::Builder::new()
+                .prefix("awman-scratch-")
+                .tempdir()
+                .map_err(|e| EngineError::Other(format!("create scratch directory: {e}")))?;
+            mounts.push(ContainerOption::TemporaryDirectoryMount {
+                container_path: std::path::PathBuf::from(READ_ONLY_SCRATCH_PATH),
+                env_var: Some(READ_ONLY_SCRATCH_ENV.to_string()),
+                guard: MountGuard::new_dir(scratch),
+            });
+        }
+        Ok(mounts)
     }
 
     /// Attach the credential-refresh lease factory this engine's launches
@@ -294,15 +466,6 @@ impl AgentEngine {
         factory: Option<crate::engine::credential_refresh::LeaseFactoryHandle>,
     ) -> Self {
         self.lease_factory = factory;
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_local_builder(
-        mut self,
-        builder: Arc<dyn crate::engine::image_prep::builder::LocalImageBuilder>,
-    ) -> Self {
-        self.local_builder = Some(builder);
         self
     }
 
@@ -380,7 +543,7 @@ impl AgentEngine {
             let mut preparer = AgentImagePreparer::new(
                 resolved,
                 self.runtime.clone(),
-                crate::data::config::global::GlobalConfig::data_home_with(config.env())?,
+                crate::data::fs::data_paths::data_home(config.env())?,
                 // Default agent = the configured one, as `ready` and preflight
                 // use it, so a single-image default source is refused for
                 // any other agent here too.
@@ -394,10 +557,7 @@ impl AgentEngine {
             // policy). An installed image keeps `CheckOnly`'s provenance
             // check, and without a usable source `CheckOnly` reports the
             // typed configuration error.
-            #[cfg(test)]
-            if let Some(builder) = &self.local_builder {
-                preparer = preparer.with_local_builder(builder.clone());
-            }
+
             let missing = builder_enabled && !self.runtime.image_exists(&tag)?;
             let policy = match missing.then(|| preparer.missing_image_plan(&tag, agent.as_str())) {
                 Some(ReadyImagePlan::BuildAndImport | ReadyImagePlan::Import) => {
@@ -589,6 +749,11 @@ impl AgentEngine {
         // A `--yolo` launch carries the configured `yoloDisallowedTools`.
         let yolo_run = with_yolo_disallowed_tools(session, &def, run, RunParadigm::Container)?;
         let run: &AgentRunOptions = &yolo_run;
+        if self.lease_workspace_scope.is_some() && run.allow_docker {
+            return Err(EngineError::Config(
+                "leases cannot expose the host Docker socket".into(),
+            ));
+        }
         // Plan-mode support, ACP support and the plan/yolo conflict are all
         // definition facts, checked identically on both paradigms.
         def.validate_run(run, RunParadigm::Container)?;
@@ -616,6 +781,10 @@ impl AgentEngine {
         };
 
         let mut options = vec![
+            ContainerOption::AgentIdentity {
+                agent: agent.as_str().to_owned(),
+                model: run.model.clone(),
+            },
             ContainerOption::Image(image),
             ContainerOption::Entrypoint(entrypoint),
             ContainerOption::Interactive(!run.non_interactive),
@@ -639,6 +808,13 @@ impl AgentEngine {
         {
             options.push(ContainerOption::AgentOutputFormat(def.output_format));
         }
+
+        options.push(ContainerOption::ProgramStatus(
+            crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig {
+                enabled: session.effective_config().program_status_enabled(),
+                answer_queries: false,
+            },
+        ));
 
         // Mode flags.
         if let Some(y) = run.yolo {
@@ -690,9 +866,13 @@ impl AgentEngine {
         // Initial prompt. In interactive mode most agents receive it as a
         // trailing positional arg; agents whose bare positional means something
         // else (opencode: a project dir) declare a delivery flag in their definition.
-        // Non-interactive runs pipe it over stdin regardless.
+        // Headless delivery follows each CLI's prompt contract: some expect
+        // an argv operand, while the others read stdin.
         if let Some(prompt) = run.initial_prompt.as_ref() {
             options.push(ContainerOption::SeededPrompt(prompt.clone()));
+            if def.headless_prompt_in_argv {
+                options.push(ContainerOption::HeadlessPromptInArgv(true));
+            }
             if let InteractiveSeedDelivery::Flag(flag) = &def.interactive_seed_delivery {
                 options.push(ContainerOption::InteractiveSeedFlag(flag.to_string()));
             }
@@ -706,7 +886,7 @@ impl AgentEngine {
 
         // Env passthrough.
         let env_pass = run.env_passthrough.as_deref().unwrap_or(&[]);
-        let auth_env = custom_auth_env(&def, env_pass);
+        let auth_env = custom_auth_env_in(session.env(), &def, env_pass);
         let mut emitted = std::collections::HashSet::new();
         for name in env_pass.iter().chain(auth_env.iter()) {
             if !emitted.insert(name) {
@@ -714,6 +894,14 @@ impl AgentEngine {
             }
             options.push(ContainerOption::EnvPassthrough(EnvVar(name.clone())));
         }
+        // Secret overrides never enter EnvSnapshot or literal env options.
+        // The backend passes only `-e NAME` in argv, with the value in the
+        // runtime child environment; an unrequested name is never injected.
+        options.extend(
+            run.secret_env()
+                .into_iter()
+                .map(|(key, value)| ContainerOption::EnvOverride { key, value }),
+        );
 
         // Per-agent static env vars, from the one per-agent table.
         for (key, value) in &def.static_env {
@@ -726,13 +914,7 @@ impl AgentEngine {
         }
 
         // Mount the project source into the container's working directory.
-        options.push(ContainerOption::Overlay(
-            crate::engine::container::options::OverlaySpec {
-                host_path: session.git_root().to_path_buf(),
-                container_path: std::path::PathBuf::from("/workspace"),
-                permission: crate::engine::container::options::OverlayPermission::ReadWrite,
-            },
-        ));
+        options.extend(self.workspace_mounts(session)?);
 
         // Overlays — agent settings + user-supplied dirs + skills.
         // Prefer the running image's baked-in `$HOME` (the actual runtime
@@ -753,7 +935,7 @@ impl AgentEngine {
             )));
         }
         let container_home = image_home.or_else(|| {
-            let home = dirs::home_dir().unwrap_or_default();
+            let home = session.env().home_dir().unwrap_or_default();
             // The definition root is the invoking checkout for session worktrees, so a
             // branch or PR cannot pick the credential mount point via its Dockerfile.
             crate::engine::overlay::detect_container_home(
@@ -762,6 +944,39 @@ impl AgentEngine {
                 session.definition_root(),
             )
         });
+        // Private writable mounts are definition facts. The generic mount
+        // option owns each tempdir through the execution's guest-exit guard;
+        // an OverlayEngine-wide TempDir would be shared across launches.
+        for storage in &def.session_storage_dirs {
+            let relative = std::path::Path::new(&storage.home_relative_path);
+            if storage.home_relative_path.is_empty()
+                || !relative
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err(EngineError::Config(format!(
+                    "invalid session storage path: {}",
+                    storage.home_relative_path
+                )));
+            }
+            let guest_path =
+                std::path::Path::new(container_home.as_deref().unwrap_or("/root")).join(relative);
+            let dir = tempfile::Builder::new()
+                .prefix("awman-session-storage-")
+                .tempdir()
+                .map_err(|e| EngineError::Other(format!("create session storage: {e}")))?;
+            options.push(ContainerOption::TemporaryDirectoryMount {
+                container_path: guest_path.clone(),
+                env_var: storage.env_var.clone(),
+                guard: crate::engine::container::options::MountGuard::new_dir(dir),
+            });
+            if let Some((flag, key)) = &storage.config_override {
+                options.push(ContainerOption::ManagedAgentFlags(vec![
+                    flag.clone(),
+                    format!("{key}={}", guest_path.display()),
+                ]));
+            }
+        }
         let request = OverlayRequest {
             directories: run.directory_overlays.clone(),
             include_all_skills: run.include_all_skills,
@@ -773,18 +988,16 @@ impl AgentEngine {
             materialize_credentials: false,
             definition: Some(def.definition()),
         };
-        let (overlays, staged_credentials) =
-            if matches!(&credentials.delivery, CredentialDelivery::File(_)) {
-                let mut request = request;
-                request.materialize_credentials = true;
-                self.overlay_engine
-                    .build_overlays_with_credentials(session, &request)?
-            } else {
-                (
-                    self.overlay_engine.build_overlays(session, &request)?,
-                    Vec::new(),
-                )
-            };
+        let mut request = request;
+        request.materialize_credentials =
+            matches!(&credentials.delivery, CredentialDelivery::File(_));
+        let (overlays, staged_credentials) = self.overlay_engine.build_scoped_overlays(
+            session,
+            &request,
+            self.lease_workspace_scope.as_deref(),
+            &run.command_mounts,
+        )?;
+        let sanctioned_mounts = overlays.clone();
         for spec in overlays {
             options.push(ContainerOption::Overlay(spec));
         }
@@ -821,11 +1034,30 @@ impl AgentEngine {
             )?;
         }
 
+        if let Some(body) = session.inline_work_item() {
+            options.push(ContainerOption::Overlay(
+                crate::engine::container::options::OverlaySpec {
+                    host_path: body.to_path_buf(),
+                    container_path: "/awman/work-item.md".into(),
+                    permission: crate::engine::container::options::OverlayPermission::ReadOnly,
+                },
+            ));
+        }
         // Default working dir for the agent container.
         options.push(ContainerOption::WorkingDir(std::path::PathBuf::from(
             "/workspace",
         )));
 
+        if self.read_only_workspace || self.lease_workspace_scope.is_some() {
+            validate_workspace_mounts(
+                &mut options,
+                session.git_root(),
+                self.read_only_workspace,
+                self.lease_workspace_scope.as_deref(),
+                session.inline_work_item(),
+                &sanctioned_mounts,
+            )?;
+        }
         Ok(options)
     }
 
@@ -854,13 +1086,21 @@ impl AgentEngine {
         // *different* one than the engine was built with could resolve
         // sandbox options and then build them on a container runtime.
         if self.runtime.capabilities().kit_declarative {
+            if !run.secret_env().is_empty() {
+                return Err(EngineError::Config(
+                    "command secrets require a container runtime".into(),
+                ));
+            }
             let mut options = self.build_sandbox_options(session, agent, run)?;
             if !credentials.env_vars.is_empty() {
                 options.push(SandboxOption::AgentCredentials {
                     env_vars: credentials.env_vars.clone(),
                 });
             }
-            Ok(ResolvedAgentOptions::sandbox(options))
+            let mut resolved =
+                crate::engine::sandbox::options::ResolvedSandboxOptions::resolve(options);
+            resolved.host_env = Some(session.env().clone());
+            Ok(ResolvedAgentOptions::Sandbox(Box::new(resolved)))
         } else {
             let mut options =
                 self.build_options_with_credentials(session, agent, run, credentials)?;
@@ -871,7 +1111,12 @@ impl AgentEngine {
                     env_vars: credentials.env_vars.clone(),
                 });
             }
-            ResolvedAgentOptions::container(options)
+            Ok(ResolvedAgentOptions::Container(Box::new(
+                crate::engine::container::options::ResolvedContainerOptions::resolve_in(
+                    options,
+                    session.env(),
+                )?,
+            )))
         }
     }
 
@@ -887,6 +1132,9 @@ impl AgentEngine {
         agent: &AgentName,
         run: &AgentRunOptions,
     ) -> Result<Vec<SandboxOption>, EngineError> {
+        if self.read_only_workspace {
+            return Err(read_only_unsupported(self.runtime.display_name()));
+        }
         let def = self.resolve_definition(session, agent)?;
 
         // Parity validation with the container path so a sandbox-configured
@@ -904,6 +1152,12 @@ impl AgentEngine {
             SandboxOption::AgentId(agent.as_str().to_string()),
             SandboxOption::WorkspaceDir(session.git_root().to_path_buf()),
             SandboxOption::Interactive(!run.non_interactive),
+            SandboxOption::ProgramStatus(
+                crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig {
+                    enabled: session.effective_config().program_status_enabled(),
+                    answer_queries: false,
+                },
+            ),
         ];
 
         // Seeded prompt — recorded in session.json exactly once. For `kind: agent`
@@ -965,7 +1219,11 @@ impl AgentEngine {
         // User-configured extra agent args. Only `kind: agent` kits have an
         // argv channel; a mixin kit's launch command belongs to Docker's
         // built-in template, so the flags are warned about, not dropped.
-        let agent_flags = resolve_agent_flags(session, agent, run);
+        let mut agent_flags = resolve_agent_flags(session, agent, run);
+        if matches!(def.sbx_kit_kind, SbxKitKind::Agent) {
+            let managed = def.entrypoint_managed_flags(run.non_interactive);
+            agent_flags.retain(|flag| !managed.contains(flag));
+        }
         if !agent_flags.is_empty() {
             match def.sbx_kit_kind {
                 SbxKitKind::Agent => {
@@ -990,16 +1248,16 @@ impl AgentEngine {
             )));
         }
 
-        // Non-interactive shape (`--print` / `exec` / `run` / `task`): the
+        // Headless shape (`--print` / `exec` / `run` / `task`): the
         // dsbx driver appends it as an agent arg for `kind: agent` kits, but
         // mixin kits launch through the built-in template's interactive
         // entrypoint — the prompt still arrives via piped stdin, the agent's
-        // own non-interactive mode just cannot be enabled. Warn, don't drop
+        // own headless mode just cannot be enabled. Warn, don't drop
         // silently.
         if run.non_interactive && matches!(def.sbx_kit_kind, SbxKitKind::Mixin) {
             if let Some(flag) = &def.non_interactive_flag {
                 options.push(SandboxOption::UnsupportedNote(format!(
-                    "non-interactive mode ('{flag}') cannot be enabled for '{agent}' \
+                    "headless mode ('{flag}') cannot be enabled for '{agent}' \
                      under the sandbox runtime (the built-in template owns the launch \
                      command); the prompt is piped to the agent's interactive \
                      entrypoint instead",
@@ -1041,7 +1299,7 @@ impl AgentEngine {
         // Host-directory mounts cannot be honored: the VM sees only the
         // virtiofs-mounted workspace. Record each requested-but-unmountable
         // feature as a note; `run_interactive` surfaces them as warnings.
-        for dir in &run.directory_overlays {
+        for dir in run.directory_overlays.iter().chain(&run.command_mounts) {
             options.push(SandboxOption::UnsupportedNote(format!(
                 "directory overlay '{}' cannot be mounted into the sandbox VM \
                  (only the workspace is visible); continuing without it",
@@ -1129,6 +1387,15 @@ impl AgentEngine {
                     guard,
                 });
             }
+            SystemPromptMode::EnvDir { var } => {
+                let (guard, container_path) = write_prompt_temp_dir(prompt_text)?;
+                options.push(ContainerOption::SystemPromptEnvFile {
+                    env_var: var.to_string(),
+                    host_path: guard.host_path().to_path_buf(),
+                    container_path,
+                    guard,
+                });
+            }
             SystemPromptMode::AddDir { flag } => {
                 for ctx in context_overlays {
                     plant_agents_md(&ctx.host_path, prompt_text);
@@ -1172,6 +1439,29 @@ fn write_prompt_temp_file(
         std::path::PathBuf::from("/tmp").join(tmp.path().file_name().unwrap_or_default());
     Ok((
         crate::engine::container::options::PromptFileGuard::new(tmp),
+        container_path,
+    ))
+}
+
+fn write_prompt_temp_dir(
+    text: &str,
+) -> Result<
+    (
+        crate::engine::container::options::PromptFileGuard,
+        std::path::PathBuf,
+    ),
+    EngineError,
+> {
+    let dir = tempfile::Builder::new()
+        .prefix("awman-ctx-instructions-")
+        .tempdir()
+        .map_err(|e| EngineError::io(std::path::PathBuf::from("/tmp"), e))?;
+    let file = dir.path().join("AGENTS.md");
+    std::fs::write(&file, text).map_err(|e| EngineError::io(&file, e))?;
+    let container_path =
+        std::path::PathBuf::from("/tmp").join(dir.path().file_name().unwrap_or_default());
+    Ok((
+        crate::engine::container::options::PromptFileGuard::new_dir(dir),
         container_path,
     ))
 }
@@ -1224,7 +1514,7 @@ fn emit_sandbox_system_prompt_options(
                 text: format!("{preamble}{prompt_text}"),
             });
         }
-        SystemPromptMode::EnvFile { var } => {
+        SystemPromptMode::EnvFile { var } | SystemPromptMode::EnvDir { var } => {
             // The mixin apply script materializes the text into a VM-local file
             // and points `var` at it; the flag slot carries the env-var name.
             options.push(SandboxOption::SystemPromptInline {
@@ -1274,2881 +1564,5 @@ fn plant_agents_md(host_dir: &std::path::Path, prompt_text: &str) {
             "context overlay: failed to plant AGENTS.md (host dir read-only?); \
              agent will not be automatically notified about the context directory"
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::*;
-    use crate::data::config::effective::EffectiveConfig;
-    use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
-    use crate::engine::container::options::{ContainerOption, PlanMode, YoloMode};
-    use crate::engine::overlay::OverlayEngine;
-
-    #[test]
-    fn build_options_rejects_plan_for_unsupported_agent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        // opencode does not support plan mode.
-        let agent = crate::data::session::AgentName::new("opencode").unwrap();
-        let run = AgentRunOptions {
-            plan: Some(PlanMode::Enabled),
-            ..Default::default()
-        };
-        let result = engine.build_options(&session, &agent, &run);
-        assert!(
-            matches!(result, Err(EngineError::PlanModeUnsupported { .. })),
-            "expected PlanModeUnsupported for opencode with plan mode, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn build_options_rejects_acp_for_unsupported_agent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        // codex does not support ACP (only cline does today).
-        let agent = crate::data::session::AgentName::new("codex").unwrap();
-        let run = AgentRunOptions {
-            launch_mode: LaunchMode::Acp,
-            ..Default::default()
-        };
-        let result = engine.build_options(&session, &agent, &run);
-        assert!(
-            matches!(result, Err(EngineError::AcpUnsupported { .. })),
-            "expected AcpUnsupported for codex with ACP launch mode, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn build_options_acp_for_cline_emits_acp_option_and_acp_entrypoint() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("cline").unwrap();
-        let run = AgentRunOptions {
-            launch_mode: LaunchMode::Acp,
-            ..Default::default()
-        };
-        let opts = engine.build_options(&session, &agent, &run).unwrap();
-
-        assert!(
-            opts.iter().any(|o| matches!(o, ContainerOption::Acp(true))),
-            "cline + ACP must emit ContainerOption::Acp(true); got {opts:?}"
-        );
-        let entrypoint = opts
-            .iter()
-            .find_map(|o| {
-                if let ContainerOption::Entrypoint(e) = o {
-                    Some(e.0.clone())
-                } else {
-                    None
-                }
-            })
-            .expect("Entrypoint option must be present");
-        assert_eq!(
-            entrypoint,
-            vec!["cline".to_string(), "--acp".to_string()],
-            "cline ACP launch must use the `cline --acp` entrypoint"
-        );
-    }
-
-    #[test]
-    fn build_options_stdio_launch_mode_emits_no_acp_option() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        // cline supports ACP, but the default Stdio launch mode must not opt in.
-        let agent = crate::data::session::AgentName::new("cline").unwrap();
-        let opts = engine
-            .build_options(&session, &agent, &AgentRunOptions::default())
-            .unwrap();
-        assert!(
-            !opts.iter().any(|o| matches!(o, ContainerOption::Acp(_))),
-            "default (Stdio) launch mode must not emit a ContainerOption::Acp; got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_acp_for_cline_is_not_implemented() {
-        // cline passes the supports_acp guard, but the sandbox paradigm has no
-        // ACP-piping option, so the request surfaces NotImplemented rather than
-        // silently launching in stdio mode (WI 0089 convention).
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("cline").unwrap();
-        let run = AgentRunOptions {
-            launch_mode: LaunchMode::Acp,
-            ..Default::default()
-        };
-        let result = engine.build_sandbox_options(&session, &agent, &run);
-        assert!(
-            matches!(result, Err(EngineError::NotImplemented(_))),
-            "expected NotImplemented for cline + ACP on the sandbox path, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_acp_for_unsupported_agent_is_acp_unsupported() {
-        // An agent that doesn't support ACP fails the supports_acp guard first,
-        // so both paradigms surface AcpUnsupported consistently.
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("codex").unwrap();
-        let run = AgentRunOptions {
-            launch_mode: LaunchMode::Acp,
-            ..Default::default()
-        };
-        let result = engine.build_sandbox_options(&session, &agent, &run);
-        assert!(
-            matches!(result, Err(EngineError::AcpUnsupported { .. })),
-            "expected AcpUnsupported for codex + ACP on the sandbox path, got {result:?}"
-        );
-    }
-
-    /// How many times `token` appears in the resolved entrypoint.
-    fn non_interactive_tokens(opts: &[ContainerOption], token: &str) -> usize {
-        opts.iter()
-            .filter_map(|o| match o {
-                ContainerOption::Entrypoint(ep) => {
-                    Some(ep.0.iter().filter(|t| *t == token).count())
-                }
-                _ => None,
-            })
-            .sum()
-    }
-
-    fn make_agent_engine(home: &std::path::Path) -> (AgentEngine, crate::data::session::Session) {
-        let session_tmp = tempfile::tempdir().unwrap();
-        // We only use session_tmp as session root; home is for auth paths.
-        let resolver = StaticGitRootResolver::new(session_tmp.path());
-        let session = crate::data::session::Session::open(
-            session_tmp.path().to_path_buf(),
-            &resolver,
-            SessionOpenOptions::default(),
-        )
-        .unwrap();
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(home),
-        );
-        let runtime = crate::engine::container::ContainerRuntime::docker();
-        let engine = AgentEngine::new(Arc::new(overlay), Arc::new(runtime));
-        (engine, session)
-    }
-
-    /// Like [`make_agent_engine`], but over an explicit runtime — the
-    /// resolver reads the paradigm off the engine's own runtime (F-40b), so
-    /// a parity test has to build one engine per tier.
-    fn make_agent_engine_on(
-        home: &std::path::Path,
-        runtime: Arc<dyn crate::engine::agent_runtime::AgentRuntimeEngine>,
-    ) -> (AgentEngine, crate::data::session::Session) {
-        let session_tmp = tempfile::tempdir().unwrap();
-        let resolver = StaticGitRootResolver::new(session_tmp.path());
-        let session = crate::data::session::Session::open(
-            session_tmp.path().to_path_buf(),
-            &resolver,
-            SessionOpenOptions::default(),
-        )
-        .unwrap();
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(home),
-        );
-        let engine = AgentEngine::new(Arc::new(overlay), runtime);
-        (engine, session)
-    }
-
-    #[test]
-    fn build_options_includes_image_and_entrypoint_for_claude() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let opts = engine
-            .build_options(&session, &agent, &AgentRunOptions::default())
-            .unwrap();
-        assert!(
-            opts.iter().any(|o| matches!(o, ContainerOption::Image(_))),
-            "Image option must be present"
-        );
-        assert!(
-            opts.iter()
-                .any(|o| matches!(o, ContainerOption::Entrypoint(_))),
-            "Entrypoint option must be present"
-        );
-    }
-
-    /// WI 0101 §2.2 regression guard: after `SessionLabel` was generalized to
-    /// `Label { key, value }`, the one existing producer must still emit
-    /// exactly `awman.session=<session id>` and nothing else.
-    #[test]
-    fn build_options_still_emits_the_session_label_after_the_label_generalization() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let opts = engine
-            .build_options(&session, &agent, &AgentRunOptions::default())
-            .unwrap();
-        let labels: Vec<(&str, &str)> = opts
-            .iter()
-            .filter_map(|o| match o {
-                ContainerOption::Label { key, value } => Some((key.as_str(), value.as_str())),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            labels,
-            vec![("awman.session", session.id().to_string().as_str())],
-            "an ordinary session container carries exactly the session label"
-        );
-    }
-
-    #[test]
-    fn build_options_includes_image_and_entrypoint_for_codex() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("codex").unwrap();
-        let opts = engine
-            .build_options(&session, &agent, &AgentRunOptions::default())
-            .unwrap();
-        assert!(opts.iter().any(|o| matches!(o, ContainerOption::Image(_))));
-        assert!(opts
-            .iter()
-            .any(|o| matches!(o, ContainerOption::Entrypoint(_))));
-    }
-
-    #[test]
-    fn build_options_with_yolo_includes_yolo_option() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            yolo: Some(YoloMode::Enabled),
-            ..Default::default()
-        };
-        let opts = engine.build_options(&session, &agent, &run).unwrap();
-        assert!(
-            opts.iter()
-                .any(|o| matches!(o, ContainerOption::Yolo(YoloMode::Enabled))),
-            "Yolo option must be present when requested"
-        );
-    }
-
-    #[test]
-    fn build_options_with_allowed_tools_includes_allowed_tools() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            allowed_tools: vec!["Bash".to_string(), "Read".to_string()],
-            ..Default::default()
-        };
-        let opts = engine.build_options(&session, &agent, &run).unwrap();
-        let has = opts.iter().any(|o| {
-            if let ContainerOption::AllowedTools(tools) = o {
-                tools.contains(&"Bash".to_string()) && tools.contains(&"Read".to_string())
-            } else {
-                false
-            }
-        });
-        assert!(has, "AllowedTools option must contain the requested tools");
-    }
-
-    #[test]
-    fn build_options_plan_and_yolo_together_conflict() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            plan: Some(PlanMode::Enabled),
-            yolo: Some(YoloMode::Enabled),
-            ..Default::default()
-        };
-        let result = engine.build_options(&session, &agent, &run);
-        assert!(
-            matches!(result, Err(EngineError::ConflictingOptions(_))),
-            "plan + yolo must be rejected as conflicting, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn structured_output_options_are_non_interactive_only() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        for (name, format, flags) in [
-            (
-                "claude",
-                AgentOutputFormat::ClaudeStreamJson,
-                vec!["--output-format", "stream-json", "--verbose"],
-            ),
-            ("codex", AgentOutputFormat::CodexJson, vec!["--json"]),
-        ] {
-            let agent = AgentName::new(name).unwrap();
-            for (non_interactive, structured_output) in
-                [(false, false), (true, false), (false, true), (true, true)]
-            {
-                let run = AgentRunOptions {
-                    non_interactive,
-                    structured_output,
-                    ..Default::default()
-                };
-                let options = engine.build_options(&session, &agent, &run).unwrap();
-                let resolved =
-                    crate::engine::container::options::ResolvedContainerOptions::resolve(options)
-                        .unwrap();
-                assert_eq!(
-                    resolved.agent_output_format,
-                    if non_interactive && structured_output {
-                        format
-                    } else {
-                        AgentOutputFormat::Text
-                    }
-                );
-                for flag in &flags {
-                    assert_eq!(
-                        resolved.agent_mode_flags.iter().any(|value| value == flag),
-                        non_interactive && structured_output
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn structured_output_opt_in_still_excludes_acp_and_cli_sandbox_warnings() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = AgentName::new("claude").unwrap();
-        let acp_agent = AgentName::new("cline").unwrap();
-        let run = AgentRunOptions {
-            structured_output: true,
-            non_interactive: true,
-            launch_mode: LaunchMode::Acp,
-            ..Default::default()
-        };
-        let resolved = crate::engine::container::options::ResolvedContainerOptions::resolve(
-            engine.build_options(&session, &acp_agent, &run).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(resolved.agent_output_format, AgentOutputFormat::Text);
-        assert!(!resolved
-            .agent_mode_flags
-            .iter()
-            .any(|flag| flag == "--output-format"));
-        for structured_output in [false, true] {
-            let run = AgentRunOptions {
-                structured_output,
-                non_interactive: true,
-                ..Default::default()
-            };
-            let options = engine
-                .build_sandbox_options(&session, &agent, &run)
-                .unwrap();
-            assert_eq!(options.iter().any(|option| matches!(option, SandboxOption::UnsupportedNote(note) if note.contains("structured output"))), structured_output);
-        }
-    }
-
-    #[test]
-    fn build_options_non_interactive_true_includes_print_flag_for_claude() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            non_interactive: true,
-            ..Default::default()
-        };
-        let opts = engine.build_options(&session, &agent, &run).unwrap();
-        // The entrypoint carries the non-interactive form, exactly once; no
-        // other option repeats it (it used to be emitted twice).
-        assert_eq!(non_interactive_tokens(&opts, "--print"), 1, "claude");
-    }
-
-    #[test]
-    fn build_options_non_interactive_true_includes_print_flag_for_cline() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("cline").unwrap();
-        let run = AgentRunOptions {
-            non_interactive: true,
-            ..Default::default()
-        };
-        let opts = engine.build_options(&session, &agent, &run).unwrap();
-        // The entrypoint carries the non-interactive form, exactly once; no
-        // other option repeats it (it used to be emitted twice).
-        assert_eq!(non_interactive_tokens(&opts, "task"), 1, "cline");
-    }
-
-    #[test]
-    fn build_options_opencode_seeded_prompt_emits_interactive_seed_flag() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("opencode").unwrap();
-        let run = AgentRunOptions {
-            initial_prompt: Some("implement the work item".into()),
-            ..Default::default()
-        };
-        let opts = engine.build_options(&session, &agent, &run).unwrap();
-        assert!(
-            opts.iter().any(
-                |o| matches!(o, ContainerOption::SeededPrompt(p) if p == "implement the work item")
-            ),
-            "opencode must still carry the seeded prompt"
-        );
-        assert!(
-            opts.iter()
-                .any(|o| matches!(o, ContainerOption::InteractiveSeedFlag(f) if f == "--prompt")),
-            "opencode must emit InteractiveSeedFlag(--prompt) alongside the seeded prompt"
-        );
-    }
-
-    #[test]
-    fn build_options_claude_seeded_prompt_has_no_interactive_seed_flag() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            initial_prompt: Some("do it".into()),
-            ..Default::default()
-        };
-        let opts = engine.build_options(&session, &agent, &run).unwrap();
-        assert!(
-            !opts
-                .iter()
-                .any(|o| matches!(o, ContainerOption::InteractiveSeedFlag(_))),
-            "claude seeds positionally and must not emit an InteractiveSeedFlag"
-        );
-    }
-
-    #[test]
-    fn build_options_antigravity_entrypoint_is_agy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("antigravity").unwrap();
-        let opts = engine
-            .build_options(&session, &agent, &AgentRunOptions::default())
-            .unwrap();
-        let entrypoint = opts
-            .iter()
-            .find_map(|o| {
-                if let ContainerOption::Entrypoint(e) = o {
-                    Some(e.0.clone())
-                } else {
-                    None
-                }
-            })
-            .expect("Entrypoint option must be present");
-        assert_eq!(
-            entrypoint,
-            vec!["agy".to_string()],
-            "antigravity interactive entrypoint must be [\"agy\"]"
-        );
-    }
-
-    #[test]
-    fn build_options_antigravity_yolo_non_interactive_includes_print_and_skip_permissions() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("antigravity").unwrap();
-        let run = AgentRunOptions {
-            yolo: Some(YoloMode::Enabled),
-            non_interactive: true,
-            ..Default::default()
-        };
-        let opts = engine.build_options(&session, &agent, &run).unwrap();
-
-        // --print must appear in the entrypoint (non_interactive=true appends it).
-        let entrypoint = opts
-            .iter()
-            .find_map(|o| {
-                if let ContainerOption::Entrypoint(e) = o {
-                    Some(e.0.clone())
-                } else {
-                    None
-                }
-            })
-            .expect("Entrypoint option must be present");
-        assert!(
-            entrypoint.contains(&"--print".to_string()),
-            "entrypoint must contain --print for non_interactive antigravity; got {entrypoint:?}"
-        );
-
-        assert_eq!(non_interactive_tokens(&opts, "--print"), 1);
-
-        // AgentModeFlags must contain --dangerously-skip-permissions.
-        let mode_flags: Vec<String> = opts
-            .iter()
-            .filter_map(|o| {
-                if let ContainerOption::AgentModeFlags(flags) = o {
-                    Some(flags.clone())
-                } else {
-                    None
-                }
-            })
-            .flatten()
-            .collect();
-        assert!(
-            mode_flags.contains(&"--dangerously-skip-permissions".to_string()),
-            "AgentModeFlags must contain --dangerously-skip-permissions for antigravity yolo; got {mode_flags:?}"
-        );
-    }
-
-    #[test]
-    fn build_options_antigravity_plan_returns_plan_unsupported_error() {
-        // agy has no `--approval-mode=plan` CLI flag (verified against
-        // `agy --help`; plan/auto modes live only in settings.json's
-        // `toolPermission` field or interactive slash commands). Asking for
-        // plan mode on antigravity must surface as `PlanModeUnsupported`
-        // rather than silently emitting a flag agy treats as garbage.
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("antigravity").unwrap();
-        let run = AgentRunOptions {
-            plan: Some(PlanMode::Enabled),
-            non_interactive: true,
-            ..Default::default()
-        };
-        let err = engine
-            .build_options(&session, &agent, &run)
-            .expect_err("plan mode on antigravity must be rejected");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("antigravity") && msg.to_lowercase().contains("plan"),
-            "error must call out plan-mode for antigravity; got: {msg}"
-        );
-    }
-
-    #[test]
-    fn build_options_antigravity_model_flag_returns_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("antigravity").unwrap();
-        let run = AgentRunOptions {
-            model: Some("gemini-3.5-flash".to_string()),
-            ..Default::default()
-        };
-        let result = engine.build_options(&session, &agent, &run);
-        assert!(
-            result.is_err(),
-            "build_options with model for antigravity must return Err; got {result:?}"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("antigravity"),
-            "error must name the agent 'antigravity'; got: {msg}"
-        );
-        assert!(
-            msg.contains("does not support a model flag"),
-            "error must say 'does not support a model flag'; got: {msg}"
-        );
-    }
-
-    #[test]
-    fn build_options_non_interactive_false_no_print_flag() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            non_interactive: false,
-            ..Default::default()
-        };
-        let opts = engine.build_options(&session, &agent, &run).unwrap();
-        assert_eq!(non_interactive_tokens(&opts, "--print"), 0);
-    }
-
-    // ── ensure_available tests ───────────────────────────────────────────────
-
-    struct FakeAgentFrontend {
-        statuses: Vec<(String, StepStatus)>,
-        container_call_count: usize,
-        messages: Vec<crate::data::message::UserMessage>,
-    }
-
-    impl FakeAgentFrontend {
-        fn new() -> Self {
-            Self {
-                statuses: Vec::new(),
-                container_call_count: 0,
-                messages: Vec::new(),
-            }
-        }
-    }
-
-    impl crate::data::message::UserMessageSink for FakeAgentFrontend {
-        fn write_message(&mut self, message: crate::data::message::UserMessage) {
-            self.messages.push(message);
-        }
-        fn replay_queued(&mut self) {}
-    }
-
-    struct FakeRuntimeFrontend;
-    impl crate::data::message::UserMessageSink for FakeRuntimeFrontend {
-        fn write_message(&mut self, _: crate::data::message::UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-    #[async_trait::async_trait]
-    impl crate::engine::agent_runtime::frontend::AgentFrontend for FakeRuntimeFrontend {
-        fn report_status(&mut self, _: crate::engine::agent_runtime::frontend::AgentStatus) {}
-        fn report_progress(&mut self, _: crate::engine::agent_runtime::frontend::AgentProgress) {}
-        fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
-            let (stdout_tx, _) = tokio::sync::mpsc::unbounded_channel();
-            let (stderr_tx, _) = tokio::sync::mpsc::unbounded_channel();
-            let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-            crate::engine::agent_runtime::frontend::AgentIo {
-                stdout: stdout_tx,
-                stderr: stderr_tx,
-                stdin_tx,
-                stdin_rx,
-                resize: None,
-                initial_size: None,
-            }
-        }
-    }
-
-    impl AgentImageFrontend for FakeAgentFrontend {
-        fn report_step_status(&mut self, step: &SetupStep, status: StepStatus) {
-            self.statuses.push((step.to_string(), status));
-        }
-        fn container_frontend(
-            &mut self,
-        ) -> Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend> {
-            self.container_call_count += 1;
-            Box::new(FakeRuntimeFrontend)
-        }
-    }
-
-    /// A builtin launch session for `chat --agent codex` in a repo with no
-    /// `.awman/config.json`: the global config alone sets the source and
-    /// builder. The agent Dockerfile is present so no test downloads it.
-    fn builtin_launch_fixture(global: &str) -> (tempfile::TempDir, tempfile::TempDir, Session) {
-        let config_home = tempfile::tempdir().unwrap();
-        std::fs::write(config_home.path().join("config.json"), global).unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        std::fs::write(repo.path().join("Dockerfile.dev"), "FROM scratch\n").unwrap();
-        std::fs::create_dir_all(repo.path().join(".awman")).unwrap();
-        std::fs::write(
-            repo.path().join(".awman/Dockerfile.codex"),
-            "FROM scratch\n",
-        )
-        .unwrap();
-        let session = Session::for_tests_isolated(repo.path(), config_home.path());
-        (config_home, repo, session)
-    }
-
-    /// Regression: `chat`/`exec prompt` passed a default config, so a global
-    /// `apple-local` source with the builder on was reported as "no image
-    /// source is configured ... its builder is off". With the builder on, a
-    /// missing image is now built into the source store and imported, as the
-    /// building runtimes build it — base image first, then the agent.
-    #[tokio::test]
-    async fn ensure_available_builds_and_imports_a_missing_image_when_the_builder_is_on() {
-        use crate::engine::ready::tests::fakes::{FakeImportRuntime, FakeLocalBuilder};
-        use crate::engine::ready::tests::{built_identity, script_missing_image_build};
-        let (config_home, repo, session) = builtin_launch_fixture(
-            r#"{"builtin":{"imageSource":{"type":"apple-local"},"builder":{"enabled":true}}}"#,
-        );
-        let tag = agent_image_tag(repo.path(), "codex");
-        let base = project_image_tag(repo.path());
-        let platform = crate::data::oci_identity::OciPlatform::host_linux();
-        let builder = Arc::new(FakeLocalBuilder::new());
-        script_missing_image_build(
-            &builder,
-            &base,
-            &tag,
-            built_identity('a', platform.clone()),
-            built_identity('b', platform),
-        );
-        let runtime = Arc::new(FakeImportRuntime::new(false));
-        let (engine, _) = make_agent_engine_on(config_home.path(), runtime.clone());
-        let engine = engine.with_local_builder(builder.clone());
-
-        engine
-            .ensure_available_for_session(
-                &session,
-                &AgentName::new("codex").unwrap(),
-                &mut FakeAgentFrontend::new(),
-            )
-            .await
-            .unwrap();
-
-        let built: Vec<_> = builder
-            .build_calls()
-            .into_iter()
-            .map(|b| b.reference)
-            .collect();
-        assert_eq!(built, vec![base, tag.clone()]);
-        let imports = runtime.imports.lock().unwrap();
-        assert_eq!(imports.len(), 1);
-        assert_eq!(imports[0].tag, tag);
-    }
-
-    /// The builder-off and no-source cases keep the check-only launch: no
-    /// builder call, no import, and the typed error naming the next step.
-    #[tokio::test]
-    async fn ensure_available_stays_check_only_without_a_buildable_source() {
-        use crate::engine::ready::tests::fakes::{FakeImportRuntime, FakeLocalBuilder};
-        for (global, unconfigured) in [
-            (
-                r#"{"builtin":{"imageSource":{"type":"apple-local"},"builder":{"enabled":false}}}"#,
-                false,
-            ),
-            (r#"{"builtin":{"builder":{"enabled":true}}}"#, true),
-        ] {
-            let (config_home, _repo, session) = builtin_launch_fixture(global);
-            let builder = Arc::new(FakeLocalBuilder::new());
-            let runtime = Arc::new(FakeImportRuntime::new(false));
-            let (engine, _) = make_agent_engine_on(config_home.path(), runtime.clone());
-            let engine = engine.with_local_builder(builder.clone());
-
-            let error = engine
-                .ensure_available_for_session(
-                    &session,
-                    &AgentName::new("codex").unwrap(),
-                    &mut FakeAgentFrontend::new(),
-                )
-                .await
-                .unwrap_err();
-
-            if unconfigured {
-                assert!(
-                    matches!(error, EngineError::ImageSourceUnconfigured { .. }),
-                    "{error}"
-                );
-                assert!(error.to_string().contains("awman ready --build"), "{error}");
-            } else {
-                assert!(
-                    matches!(error, EngineError::BuiltinImageNotImported { .. }),
-                    "{error}"
-                );
-            }
-            assert!(builder.build_calls().is_empty(), "{global}");
-            assert_eq!(builder.inspect_count(), 0, "{global}");
-            assert!(runtime.imports.lock().unwrap().is_empty(), "{global}");
-        }
-    }
-
-    /// A failed build fails the launch with the build's own reason, and
-    /// nothing is imported.
-    #[tokio::test]
-    async fn ensure_available_fails_the_launch_when_the_build_fails() {
-        use crate::engine::oci::SourceImage;
-        use crate::engine::ready::tests::fakes::{FakeImportRuntime, FakeLocalBuilder};
-        let (config_home, repo, session) = builtin_launch_fixture(
-            r#"{"builtin":{"imageSource":{"type":"apple-local"},"builder":{"enabled":true}}}"#,
-        );
-        let tag = agent_image_tag(repo.path(), "codex");
-        let base = project_image_tag(repo.path());
-        let builder = Arc::new(FakeLocalBuilder::new());
-        builder.script_inspect(&tag, Ok(SourceImage::Absent));
-        builder.script_inspect(&base, Ok(SourceImage::Absent));
-        builder.script_build(&base, Err("Dockerfile.dev: step 3 failed".into()));
-        let runtime = Arc::new(FakeImportRuntime::new(false));
-        let (engine, _) = make_agent_engine_on(config_home.path(), runtime.clone());
-        let engine = engine.with_local_builder(builder.clone());
-
-        let error = engine
-            .ensure_available_for_session(
-                &session,
-                &AgentName::new("codex").unwrap(),
-                &mut FakeAgentFrontend::new(),
-            )
-            .await
-            .unwrap_err()
-            .to_string();
-
-        assert!(
-            error.contains("failed to build image for agent 'codex'"),
-            "{error}"
-        );
-        assert!(error.contains("step 3 failed"), "{error}");
-        assert!(runtime.imports.lock().unwrap().is_empty());
-    }
-
-    // Scenario 1: project image absent → returns AgentRequiresProjectImage error.
-    #[tokio::test]
-    async fn ensure_available_checks_enabled_builder_provenance_and_pending_receipts() {
-        use crate::data::config::{
-            env::{EnvSnapshot, AWMAN_CONFIG_HOME},
-            flags::FlagConfig,
-            global::GlobalConfig,
-            repo::RepoConfig,
-        };
-        use crate::data::image_build_lock::BuildStoreKey;
-        use crate::data::image_build_state::{
-            PendingBuildKey, PendingBuiltImage, PendingBuiltImageStore,
-        };
-        use crate::data::oci_identity::{BuiltImageIdentity, Digest, OciPlatform};
-        use crate::engine::ready::tests::fakes::FakeImportRuntime;
-        for scenario in ["pending", "changed", "invalid"] {
-            let tmp = tempfile::tempdir().unwrap();
-            let (mut engine, session) = make_agent_engine(tmp.path());
-            let runtime = Arc::new(FakeImportRuntime::new(true));
-            engine.runtime = runtime.clone();
-            let agent = AgentName::new("claude").unwrap();
-            let tag = agent_image_tag(session.git_root(), "claude");
-            let source = crate::data::config::image_source::ImageSourceSpec::DockerStore {
-                host: Some("unix:///test/docker.sock".into()),
-                tls: None,
-                reference: None,
-            };
-            *runtime.cached_request.lock().unwrap() =
-                Some(crate::engine::agent_runtime::ImageImportRequest {
-                    tag: tag.clone(),
-                    source: source.clone(),
-                    platform: OciPlatform::host_linux(),
-                    refresh: false,
-                    expected_built_identity: None,
-                    immutable_export_selector: None,
-                    registries: Default::default(),
-                });
-            let config = |source| {
-                let mut global: GlobalConfig =
-                    serde_json::from_str(r#"{"builtin":{"builder":{"enabled":true}}}"#).unwrap();
-                global.builtin.as_mut().unwrap().image_source = Some(source);
-                EffectiveConfig::new(
-                    FlagConfig::default(),
-                    EnvSnapshot::with_overrides([(
-                        AWMAN_CONFIG_HOME,
-                        tmp.path().to_str().unwrap(),
-                    )]),
-                    RepoConfig::default(),
-                    global,
-                )
-            };
-            let mut frontend = FakeAgentFrontend::new();
-            engine
-                .ensure_available(
-                    &session,
-                    &agent,
-                    &config(source.clone()),
-                    &mut frontend,
-                    |_| panic!("container probe must not run"),
-                )
-                .await
-                .unwrap();
-            let changed_source = if scenario == "pending" {
-                let key = PendingBuildKey {
-                    store: BuildStoreKey::Docker {
-                        endpoint: "unix:///test/docker.sock".into(),
-                    },
-                    reference: tag.clone(),
-                    platform: OciPlatform::host_linux(),
-                    install_tag: tag.clone(),
-                };
-                let identity = BuiltImageIdentity::new(
-                    Some(Digest::parse(&format!("sha256:{}", "c".repeat(64))).unwrap()),
-                    None,
-                    OciPlatform::host_linux(),
-                )
-                .unwrap();
-                PendingBuiltImageStore::under_data_home(tmp.path())
-                    .save(&PendingBuiltImage { key, identity }, || Ok(()))
-                    .unwrap();
-                source
-            } else {
-                crate::data::config::image_source::ImageSourceSpec::DockerStore {
-                    host: Some(
-                        if scenario == "invalid" {
-                            "tcp://build.example:2375"
-                        } else {
-                            "unix:///other/docker.sock"
-                        }
-                        .into(),
-                    ),
-                    tls: None,
-                    reference: None,
-                }
-            };
-            let error = engine
-                .ensure_available(
-                    &session,
-                    &agent,
-                    &config(changed_source),
-                    &mut frontend,
-                    |_| panic!("container probe must not run"),
-                )
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(error, EngineError::BuiltinImageNeedsPreparation { .. }),
-                "{error}"
-            );
-            assert!(error.to_string().contains("awman ready"));
-            assert!(runtime.imports.lock().unwrap().is_empty());
-        }
-    }
-
-    #[tokio::test]
-    async fn ensure_available_fails_when_project_image_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let config = EffectiveConfig::default();
-        let mut frontend = FakeAgentFrontend::new();
-
-        let result = engine
-            .ensure_available(&session, &agent, &config, &mut frontend, |_| false)
-            .await;
-
-        assert!(
-            matches!(result, Err(EngineError::AgentRequiresProjectImage { .. })),
-            "must fail with AgentRequiresProjectImage when project image is absent, got {result:?}"
-        );
-    }
-
-    // Scenario 2: project image present, agent image present → no-op (no status calls).
-    #[tokio::test]
-    async fn ensure_available_is_noop_when_all_images_present() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let config = EffectiveConfig::default();
-        let mut frontend = FakeAgentFrontend::new();
-
-        // Write a fake Dockerfile so the file-presence check passes.
-        let paths =
-            crate::data::repo_dockerfile_paths::RepoDockerfilePaths::new(session.git_root());
-        let dockerfile = paths.agent_dockerfile("claude");
-        if let Some(parent) = dockerfile.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(&dockerfile, "FROM scratch").unwrap();
-
-        // Both images "exist".
-        let result = engine
-            .ensure_available(&session, &agent, &config, &mut frontend, |_| true)
-            .await;
-
-        assert!(
-            result.is_ok(),
-            "must succeed when all images present, got {result:?}"
-        );
-        assert!(
-            frontend.statuses.is_empty(),
-            "no status reports expected when already up-to-date"
-        );
-        assert_eq!(
-            frontend.container_call_count, 0,
-            "no container_frontend calls expected when images are present"
-        );
-    }
-
-    // Scenario 3: project image present, agent image absent → build step fires.
-    #[tokio::test]
-    async fn ensure_available_builds_agent_image_when_absent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let config = EffectiveConfig::default();
-        let mut frontend = FakeAgentFrontend::new();
-
-        // Write a fake Dockerfile so the file-presence check passes.
-        let paths =
-            crate::data::repo_dockerfile_paths::RepoDockerfilePaths::new(session.git_root());
-        let dockerfile = paths.agent_dockerfile("claude");
-        if let Some(parent) = dockerfile.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(&dockerfile, "FROM scratch").unwrap();
-
-        let project_tag = crate::data::image_tags::project_image_tag(session.git_root());
-        // Project image exists; agent image does not.
-        let result = engine
-            .ensure_available(&session, &agent, &config, &mut frontend, |tag| {
-                tag == project_tag
-            })
-            .await;
-
-        // The build step MUST fire — runtime.build_image gets invoked. In a
-        // test environment without `docker` on PATH the spawn fails and the
-        // engine surfaces a structured error; that's the documented behavior
-        // (no silent soft-fail). What we check here is that the engine
-        // reached the build step and called the runtime, regardless of
-        // whether docker is installed.
-        let _ = result;
-        let statuses: Vec<_> = frontend
-            .statuses
-            .iter()
-            .filter(|(s, _)| s == "Building image")
-            .collect();
-        assert!(
-            !statuses.is_empty(),
-            "Building image status must have fired"
-        );
-        assert_eq!(
-            frontend.container_call_count, 1,
-            "container_frontend must be called once for the build step"
-        );
-    }
-
-    // Scenario 4: project image present, agent Dockerfile absent → the
-    // download is refused (unit tests are always under test isolation), the
-    // bundled template is provisioned instead, and the build of the missing
-    // agent image then fails — docker is unavailable under isolation, and with
-    // AWMAN_TEST_DOCKER the image's FROM (a project tag never built) cannot
-    // resolve — so a failed "Building image" status is reported and the call
-    // errors.
-    #[tokio::test]
-    async fn ensure_available_reports_failed_status_when_dockerfile_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let config = EffectiveConfig::default();
-        let mut frontend = FakeAgentFrontend::new();
-
-        let project_tag = crate::data::image_tags::project_image_tag(session.git_root());
-        // Project image present; Dockerfile absent → triggers download attempt.
-        let result = engine
-            .ensure_available(&session, &agent, &config, &mut frontend, |tag| {
-                tag == project_tag
-            })
-            .await;
-
-        assert!(
-            result.is_err(),
-            "a failed agent image build must surface as an error"
-        );
-        let dockerfile =
-            crate::data::repo_dockerfile_paths::RepoDockerfilePaths::new(session.git_root())
-                .agent_dockerfile("claude");
-        let provisioned = std::fs::read_to_string(&dockerfile)
-            .expect("the missing Dockerfile is provisioned from the bundled template");
-        assert!(
-            provisioned.contains(&project_tag),
-            "the template's base image is the project image: {provisioned}"
-        );
-        let building: Vec<_> = frontend
-            .statuses
-            .iter()
-            .filter(|(step, _)| step == "Building image")
-            .map(|(_, status)| status)
-            .collect();
-        assert!(
-            matches!(building.first(), Some(StepStatus::Running)),
-            "{building:?}"
-        );
-        assert!(
-            matches!(building.last(), Some(StepStatus::Failed(_))),
-            "the build failure is reported as a failed status: {building:?}"
-        );
-    }
-
-    // ─── WI-0087: build_options single emitter ────────────────────────────────
-
-    #[test]
-    fn build_options_claude_with_context_global_emits_overlay_at_container_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-
-        // Context dir host path (need not exist — context overlays bypass the
-        // host-existence check in resolve_user_overlay).
-        let ctx_host = tmp.path().join("context").join("global");
-
-        let run = AgentRunOptions {
-            context_overlays: vec![crate::engine::overlay::ContextOverlay {
-                scope: crate::engine::overlay::ContextScope::Global,
-                host_path: ctx_host,
-                container_path: std::path::PathBuf::from("/awman/context/global"),
-                permission: crate::engine::container::options::OverlayPermission::ReadWrite,
-            }],
-            ..Default::default()
-        };
-
-        let opts = engine.build_options(&session, &agent, &run).unwrap();
-
-        let has_ctx_overlay = opts.iter().any(|o| {
-            if let ContainerOption::Overlay(spec) = o {
-                spec.container_path == std::path::Path::new("/awman/context/global")
-            } else {
-                false
-            }
-        });
-        assert!(
-            has_ctx_overlay,
-            "build_options must emit ContainerOption::Overlay for /awman/context/global; \
-             got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn build_options_claude_with_system_prompt_emits_system_prompt_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-
-        let ctx_host = tmp.path().join("context").join("global");
-
-        let run = AgentRunOptions {
-            system_prompt: Some("Test context prompt.".to_string()),
-            context_overlays: vec![crate::engine::overlay::ContextOverlay {
-                scope: crate::engine::overlay::ContextScope::Global,
-                host_path: ctx_host,
-                container_path: std::path::PathBuf::from("/awman/context/global"),
-                permission: crate::engine::container::options::OverlayPermission::ReadWrite,
-            }],
-            ..Default::default()
-        };
-
-        let opts = engine.build_options(&session, &agent, &run).unwrap();
-
-        let prompt_file_opt = opts
-            .iter()
-            .find(|o| matches!(o, ContainerOption::SystemPromptFile { .. }));
-        assert!(
-            prompt_file_opt.is_some(),
-            "build_options must emit ContainerOption::SystemPromptFile for claude; \
-             got {opts:?}"
-        );
-        if let Some(ContainerOption::SystemPromptFile { flag, .. }) = prompt_file_opt {
-            assert_eq!(
-                flag, "--append-system-prompt-file",
-                "claude system prompt flag must be --append-system-prompt-file"
-            );
-        }
-    }
-
-    #[test]
-    fn build_options_no_system_prompt_option_without_system_prompt_input() {
-        // When system_prompt is None, no SystemPromptFile option must be emitted.
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-
-        let run = AgentRunOptions {
-            system_prompt: None,
-            ..Default::default()
-        };
-
-        let opts = engine.build_options(&session, &agent, &run).unwrap();
-
-        let has_prompt_file = opts
-            .iter()
-            .any(|o| matches!(o, ContainerOption::SystemPromptFile { .. }));
-        assert!(
-            !has_prompt_file,
-            "no SystemPromptFile option must be emitted when system_prompt is None; \
-             got {opts:?}"
-        );
-    }
-
-    fn prompt_file_path(options: &[ContainerOption]) -> std::path::PathBuf {
-        options
-            .iter()
-            .find_map(|option| match option {
-                ContainerOption::SystemPromptFile {
-                    guard, host_path, ..
-                }
-                | ContainerOption::SystemPromptEnvFile {
-                    guard, host_path, ..
-                } => {
-                    assert_eq!(guard.host_path(), host_path);
-                    Some(host_path.clone())
-                }
-                _ => None,
-            })
-            .expect("a file-delivered system prompt")
-    }
-
-    #[test]
-    fn prompt_files_belong_to_the_launch_and_not_the_shared_engine() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            system_prompt: Some("Test prompt.".to_string()),
-            ..Default::default()
-        };
-
-        // Engine clones are what `Engines` shares between daemon commands.
-        let shared = engine.clone();
-        let first = engine.build_options(&session, &agent, &run).unwrap();
-        let second = shared.build_options(&session, &agent, &run).unwrap();
-        let (first_path, second_path) = (prompt_file_path(&first), prompt_file_path(&second));
-        assert_ne!(first_path, second_path);
-        assert_eq!(
-            std::fs::read_to_string(&first_path).unwrap(),
-            "Test prompt."
-        );
-
-        drop(first);
-        assert!(!first_path.exists(), "an unlaunched plan retained its file");
-        assert!(
-            second_path.exists(),
-            "dropping one plan removed another's file"
-        );
-        drop(second);
-        assert!(!second_path.exists());
-
-        for _ in 0..64 {
-            let options = engine.build_options(&session, &agent, &run).unwrap();
-            let path = prompt_file_path(&options);
-            assert!(path.exists());
-            drop(options);
-            assert!(!path.exists(), "the engine retained a prompt file");
-        }
-    }
-
-    #[test]
-    fn custom_agent_prompt_files_follow_the_same_launch_lifetime() {
-        for table in [
-            "delivery = \"append-file\"\nflag = \"--system\"",
-            "delivery = \"env-file\"\nenv = \"CRUSH_SYSTEM\"",
-        ] {
-            let tmp = tempfile::tempdir().unwrap();
-            let (engine, _) = make_agent_engine(tmp.path());
-            let session = Session::for_tests_isolated(tmp.path(), &tmp.path().join("global"));
-            custom::install_crush_fixture_with_prompt(session.git_root(), session.env(), table);
-            let agent = crate::data::session::AgentName::new("crush").unwrap();
-            let run = AgentRunOptions {
-                system_prompt: Some("Test prompt.".to_string()),
-                ..Default::default()
-            };
-            let options = engine.build_options(&session, &agent, &run).unwrap();
-            let path = prompt_file_path(&options);
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), "Test prompt.");
-            drop(options);
-            assert!(
-                !path.exists(),
-                "{table}: custom agent file outlived its plan"
-            );
-        }
-    }
-
-    #[test]
-    fn build_options_custom_with_system_prompt_does_not_emit_system_prompt_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, _) = make_agent_engine(tmp.path());
-        let session = Session::for_tests_isolated(tmp.path(), &tmp.path().join("global"));
-        custom::install_crush_fixture(session.git_root(), session.env());
-        let agent = crate::data::session::AgentName::new("crush").unwrap();
-
-        let run = AgentRunOptions {
-            system_prompt: Some("Test prompt.".to_string()),
-            ..Default::default()
-        };
-
-        let opts = engine.build_options(&session, &agent, &run).unwrap();
-
-        let has_prompt_file = opts
-            .iter()
-            .any(|o| matches!(o, ContainerOption::SystemPromptFile { .. }));
-        assert!(
-            !has_prompt_file,
-            "custom delivery=none must not emit SystemPromptFile; got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn build_options_cline_emits_inline_system_prompt_with_preamble() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("cline").unwrap();
-        let run = AgentRunOptions {
-            system_prompt: Some("Test prompt body.".to_string()),
-            ..Default::default()
-        };
-        let opts = engine.build_options(&session, &agent, &run).unwrap();
-        let inline = opts
-            .iter()
-            .find_map(|o| {
-                if let ContainerOption::SystemPromptInline { flag, text } = o {
-                    Some((flag.clone(), text.clone()))
-                } else {
-                    None
-                }
-            })
-            .expect("cline must emit SystemPromptInline");
-        assert_eq!(inline.0, "--system", "cline flag must be --system");
-        assert!(
-            inline.1.starts_with("You are cline,"),
-            "cline replace mode must prepend baseline preamble; got: {}",
-            inline.1
-        );
-        assert!(
-            inline.1.contains("Test prompt body."),
-            "cline inline must contain the prompt body; got: {}",
-            inline.1
-        );
-        // No SystemPromptFile should be emitted for cline.
-        assert!(
-            !opts
-                .iter()
-                .any(|o| matches!(o, ContainerOption::SystemPromptFile { .. })),
-            "cline must not emit SystemPromptFile; got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn build_options_codex_emits_inline_developer_instructions_config() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("codex").unwrap();
-        let run = AgentRunOptions {
-            system_prompt: Some("Codex test body.".to_string()),
-            ..Default::default()
-        };
-        let opts = engine.build_options(&session, &agent, &run).unwrap();
-        let inline = opts
-            .iter()
-            .find_map(|o| {
-                if let ContainerOption::SystemPromptInline { flag, text } = o {
-                    Some((flag.clone(), text.clone()))
-                } else {
-                    None
-                }
-            })
-            .expect("codex must emit SystemPromptInline (config key=value)");
-        assert_eq!(inline.0, "--config", "codex flag must be --config");
-        assert!(
-            inline.1.starts_with("developer_instructions="),
-            "codex inline must use key=value form; got: {}",
-            inline.1
-        );
-        assert!(
-            inline.1.contains("Codex test body."),
-            "codex inline must contain the prompt body; got: {}",
-            inline.1
-        );
-    }
-
-    // ─── WI-0091: build_sandbox_options ───────────────────────────────────────
-
-    #[test]
-    fn build_sandbox_options_emits_agent_id_workspace_dir_and_interactive() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &AgentRunOptions::default())
-            .unwrap();
-        assert!(
-            opts.iter()
-                .any(|o| matches!(o, SandboxOption::AgentId(id) if id == "claude")),
-            "AgentId(\"claude\") must be present; got {opts:?}"
-        );
-        assert!(
-            opts.iter()
-                .any(|o| matches!(o, SandboxOption::WorkspaceDir(_))),
-            "WorkspaceDir must be present; got {opts:?}"
-        );
-        assert!(
-            opts.iter()
-                .any(|o| matches!(o, SandboxOption::Interactive(_))),
-            "Interactive must be present; got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_interactive_false_when_non_interactive() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            non_interactive: true,
-            ..Default::default()
-        };
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &run)
-            .unwrap();
-        let interactive_val = opts
-            .iter()
-            .find_map(|o| {
-                if let SandboxOption::Interactive(v) = o {
-                    Some(*v)
-                } else {
-                    None
-                }
-            })
-            .expect("Interactive option must be present");
-        assert!(
-            !interactive_val,
-            "Interactive must be false for non_interactive=true"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_mode_flags_for_agent_kits_mirror_container_argv() {
-        // cline is a `kind: agent` kit: yolo must surface as the same literal
-        // argv flag the container path emits.
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("cline").unwrap();
-        let run = AgentRunOptions {
-            yolo: Some(YoloMode::Enabled),
-            ..Default::default()
-        };
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &run)
-            .unwrap();
-        assert!(
-            opts.iter().any(|o| matches!(
-                o,
-                SandboxOption::AgentModeFlags(flags) if flags == &vec!["--yolo".to_string()]
-            )),
-            "cline yolo must emit AgentModeFlags([--yolo]); got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_claude_modes_become_permission_mode() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        for (run, expected) in [
-            (
-                AgentRunOptions {
-                    yolo: Some(YoloMode::Enabled),
-                    ..Default::default()
-                },
-                "yolo",
-            ),
-            (
-                AgentRunOptions {
-                    plan: Some(PlanMode::Enabled),
-                    ..Default::default()
-                },
-                "plan",
-            ),
-            (
-                AgentRunOptions {
-                    auto: Some(crate::engine::container::options::AutoMode::Enabled),
-                    ..Default::default()
-                },
-                "auto",
-            ),
-        ] {
-            let opts = engine
-                .build_sandbox_options(&session, &agent, &run)
-                .unwrap();
-            assert!(
-                opts.iter().any(|o| matches!(
-                    o,
-                    SandboxOption::PermissionMode(m) if m == expected
-                )),
-                "claude mixin mode must emit PermissionMode({expected}); got {opts:?}"
-            );
-            assert!(
-                !opts
-                    .iter()
-                    .any(|o| matches!(o, SandboxOption::AgentModeFlags(_))),
-                "mixin kits must not receive argv mode flags; got {opts:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn build_sandbox_options_non_claude_mixin_modes_become_unsupported_notes() {
-        // codex is a mixin without an awman-managed settings equivalent for
-        // permission modes — the request must surface as a warning note,
-        // never silently drop.
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("codex").unwrap();
-        let run = AgentRunOptions {
-            yolo: Some(YoloMode::Enabled),
-            ..Default::default()
-        };
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &run)
-            .unwrap();
-        assert!(
-            opts.iter().any(|o| matches!(
-                o,
-                SandboxOption::UnsupportedNote(n) if n.contains("--yolo") && n.contains("codex")
-            )),
-            "codex yolo under sbx must surface as an UnsupportedNote; got {opts:?}"
-        );
-        assert!(
-            !opts.iter().any(|o| matches!(
-                o,
-                SandboxOption::AgentModeFlags(_) | SandboxOption::PermissionMode(_)
-            )),
-            "codex must get neither argv flags nor a permission mode; got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_mixin_non_interactive_adds_unsupported_note() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            non_interactive: true,
-            ..Default::default()
-        };
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &run)
-            .unwrap();
-        assert!(
-            opts.iter().any(|o| matches!(
-                o,
-                SandboxOption::UnsupportedNote(n) if n.contains("non-interactive")
-            )),
-            "mixin non-interactive mode under sbx must warn; got {opts:?}"
-        );
-
-        // kind: agent kits CAN take the flag as an agent arg — no note.
-        let agent = crate::data::session::AgentName::new("cline").unwrap();
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &run)
-            .unwrap();
-        assert!(
-            !opts.iter().any(|o| matches!(
-                o,
-                SandboxOption::UnsupportedNote(n) if n.contains("non-interactive")
-            )),
-            "agent-kit non-interactive mode is deliverable — no note expected; got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_copilot_model_adds_unsupported_note() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("copilot").unwrap();
-        let run = AgentRunOptions {
-            model: Some("gpt-5".into()),
-            ..Default::default()
-        };
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &run)
-            .unwrap();
-        assert!(
-            opts.iter().any(|o| matches!(
-                o,
-                SandboxOption::UnsupportedNote(n) if n.contains("--model")
-            )),
-            "copilot --model under sbx must warn host-side; got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_seeded_prompt_appears_exactly_once() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            initial_prompt: Some("do something useful".into()),
-            ..Default::default()
-        };
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &run)
-            .unwrap();
-        let prompt_count = opts
-            .iter()
-            .filter(|o| matches!(o, SandboxOption::SeededPrompt(_)))
-            .count();
-        assert_eq!(
-            prompt_count, 1,
-            "SeededPrompt must appear exactly once; got {prompt_count} times in {opts:?}"
-        );
-        let prompt_val = opts
-            .iter()
-            .find_map(|o| {
-                if let SandboxOption::SeededPrompt(p) = o {
-                    Some(p.clone())
-                } else {
-                    None
-                }
-            })
-            .unwrap();
-        assert_eq!(
-            prompt_val, "do something useful",
-            "SeededPrompt must carry the original prompt text"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_model_flag_emitted_for_claude() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            model: Some("claude-opus-4-8".into()),
-            ..Default::default()
-        };
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &run)
-            .unwrap();
-        assert!(
-            opts.iter()
-                .any(|o| matches!(o, SandboxOption::Model { .. })),
-            "Model option must be present when run.model is Some; got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_allowed_tools_emitted() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            allowed_tools: vec!["Bash".into(), "Read".into()],
-            ..Default::default()
-        };
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &run)
-            .unwrap();
-        let found = opts.iter().any(|o| {
-            if let SandboxOption::AllowedTools(tools) = o {
-                tools.contains(&"Bash".to_string()) && tools.contains(&"Read".to_string())
-            } else {
-                false
-            }
-        });
-        assert!(
-            found,
-            "AllowedTools must contain the requested tools; got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_disallowed_tools_emitted() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            disallowed_tools: vec!["Write".into()],
-            ..Default::default()
-        };
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &run)
-            .unwrap();
-        let found = opts.iter().any(|o| {
-            if let SandboxOption::DisallowedTools(tools) = o {
-                tools.contains(&"Write".to_string())
-            } else {
-                false
-            }
-        });
-        assert!(
-            found,
-            "DisallowedTools must contain the requested tools; got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_env_passthrough_emitted() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            env_passthrough: Some(vec!["LOG_LEVEL".into(), "DEBUG".into()]),
-            ..Default::default()
-        };
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &run)
-            .unwrap();
-        let pass_names: Vec<_> = opts
-            .iter()
-            .filter_map(|o| {
-                if let SandboxOption::EnvPassthrough(v) = o {
-                    Some(v.0.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert!(
-            pass_names.contains(&"LOG_LEVEL".to_string()),
-            "LOG_LEVEL must appear in EnvPassthrough; got {pass_names:?}"
-        );
-        assert!(
-            pass_names.contains(&"DEBUG".to_string()),
-            "DEBUG must appear in EnvPassthrough; got {pass_names:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_copilot_has_static_offline_env_literal() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("copilot").unwrap();
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &AgentRunOptions::default())
-            .unwrap();
-        let has_offline = opts.iter().any(|o| {
-            if let SandboxOption::EnvLiteral(lit) = o {
-                lit.key == "COPILOT_OFFLINE" && lit.value == "true"
-            } else {
-                false
-            }
-        });
-        assert!(
-            has_offline,
-            "copilot must have COPILOT_OFFLINE=true EnvLiteral; got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_plan_yolo_conflict_rejected_parity_with_container_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            plan: Some(crate::engine::container::options::PlanMode::Enabled),
-            yolo: Some(crate::engine::container::options::YoloMode::Enabled),
-            ..Default::default()
-        };
-        let result = engine.build_sandbox_options(&session, &agent, &run);
-        assert!(
-            matches!(result, Err(EngineError::ConflictingOptions(_))),
-            "plan + yolo must be rejected as ConflictingOptions (parity with container path); \
-             got {result:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_plan_mode_unsupported_agent_rejected_parity_with_container_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        // opencode does not support plan mode (same as in build_options test).
-        let agent = crate::data::session::AgentName::new("opencode").unwrap();
-        let run = AgentRunOptions {
-            plan: Some(crate::engine::container::options::PlanMode::Enabled),
-            ..Default::default()
-        };
-        let result = engine.build_sandbox_options(&session, &agent, &run);
-        assert!(
-            matches!(result, Err(EngineError::PlanModeUnsupported { .. })),
-            "PlanModeUnsupported must be returned for opencode (parity with container path); \
-             got {result:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_system_prompt_emitted_as_inline_for_claude() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            system_prompt: Some("focus on performance".into()),
-            ..Default::default()
-        };
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &run)
-            .unwrap();
-        assert!(
-            opts.iter()
-                .any(|o| matches!(o, SandboxOption::SystemPromptInline { .. })),
-            "SystemPromptInline must be present for claude system_prompt; got {opts:?}"
-        );
-        // No file-based delivery — sandbox VMs don't have arbitrary host mounts.
-        assert!(
-            !opts
-                .iter()
-                .any(|o| matches!(o, SandboxOption::SystemPromptFile { .. })),
-            "SystemPromptFile must NOT appear for claude in sandbox mode; got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_opencode_system_prompt_emitted_as_inline() {
-        // opencode's container delivery mode is AgentsMd (file planting) —
-        // under sbx the text must still travel inline so the apply script can
-        // surface it instead of silently dropping it.
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("opencode").unwrap();
-        let run = AgentRunOptions {
-            system_prompt: Some("focus on tests".into()),
-            ..Default::default()
-        };
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &run)
-            .unwrap();
-        let inline = opts
-            .iter()
-            .find_map(|o| {
-                if let SandboxOption::SystemPromptInline { text, .. } = o {
-                    Some(text.clone())
-                } else {
-                    None
-                }
-            })
-            .expect("opencode system prompt must be emitted inline under sbx");
-        assert_eq!(inline, "focus on tests");
-    }
-
-    #[test]
-    fn build_sandbox_options_antigravity_system_prompt_becomes_unsupported_note() {
-        // antigravity delivers system prompts via --add-dir mounts, which do
-        // not exist under sbx — must warn (note), never drop silently.
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("antigravity").unwrap();
-        let run = AgentRunOptions {
-            system_prompt: Some("focus on tests".into()),
-            ..Default::default()
-        };
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &run)
-            .unwrap();
-        assert!(
-            opts.iter().any(|o| matches!(
-                o,
-                SandboxOption::UnsupportedNote(n) if n.contains("system prompt")
-            )),
-            "antigravity system prompt must surface as an UnsupportedNote; got {opts:?}"
-        );
-        assert!(
-            !opts
-                .iter()
-                .any(|o| matches!(o, SandboxOption::SystemPromptInline { .. })),
-            "antigravity must not emit an inline system prompt under sbx; got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_directory_overlays_become_unsupported_notes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            directory_overlays: vec![crate::engine::overlay::DirectorySpec {
-                host: "~/reference".into(),
-                container: "/mnt/reference".into(),
-                permission: crate::engine::container::options::OverlayPermission::ReadOnly,
-            }],
-            ..Default::default()
-        };
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &run)
-            .unwrap();
-        assert!(
-            opts.iter().any(|o| matches!(
-                o,
-                SandboxOption::UnsupportedNote(n)
-                    if n.contains("~/reference") && n.contains("cannot be mounted")
-            )),
-            "dir overlay must surface as an UnsupportedNote naming the host path; got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_skills_become_unsupported_note() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        for run in [
-            AgentRunOptions {
-                include_all_skills: true,
-                ..Default::default()
-            },
-            AgentRunOptions {
-                named_skills: vec!["review".into()],
-                ..Default::default()
-            },
-        ] {
-            let opts = engine
-                .build_sandbox_options(&session, &agent, &run)
-                .unwrap();
-            assert!(
-                opts.iter().any(|o| matches!(
-                    o,
-                    SandboxOption::UnsupportedNote(n) if n.contains("skill")
-                )),
-                "skill mounts must surface as an UnsupportedNote; got {opts:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn build_sandbox_options_context_overlays_become_unsupported_note() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = make_agent_engine(tmp.path());
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            context_overlays: vec![crate::engine::overlay::ContextOverlay {
-                scope: crate::engine::overlay::ContextScope::Repo,
-                host_path: tmp.path().join("ctx"),
-                container_path: std::path::PathBuf::from("/awman/context/repo"),
-                permission: crate::engine::container::options::OverlayPermission::ReadWrite,
-            }],
-            ..Default::default()
-        };
-        let opts = engine
-            .build_sandbox_options(&session, &agent, &run)
-            .unwrap();
-        assert!(
-            opts.iter().any(|o| matches!(
-                o,
-                SandboxOption::UnsupportedNote(n) if n.contains("context")
-            )),
-            "context dirs must surface as an UnsupportedNote; got {opts:?}"
-        );
-    }
-
-    // ─── WI-0091: resolve_agent_options parity tests ─────────────────────────
-
-    /// A minimal `AgentRuntimeEngine` stub for option-construction parity
-    /// tests. Does not implement build() — only capabilities() is exercised.
-    struct FakeRuntime {
-        caps: crate::engine::agent_runtime::Capabilities,
-        name: &'static str,
-    }
-
-    impl FakeRuntime {
-        fn sandbox() -> Self {
-            use crate::engine::agent_runtime::Capabilities;
-            Self {
-                caps: Capabilities {
-                    arbitrary_host_mounts: false,
-                    kit_declarative: true,
-                    has_image_store: false,
-                    image_acquisition:
-                        crate::engine::agent_runtime::capabilities::ImageAcquisition::Kit,
-                    per_launch_vm_settings: false,
-                    reports_resource_stats: true,
-                },
-                name: "fake-sbx",
-            }
-        }
-
-        fn container() -> Self {
-            use crate::engine::agent_runtime::Capabilities;
-            Self {
-                caps: Capabilities {
-                    arbitrary_host_mounts: true,
-                    kit_declarative: false,
-                    has_image_store: true,
-                    image_acquisition:
-                        crate::engine::agent_runtime::capabilities::ImageAcquisition::Build,
-                    per_launch_vm_settings: false,
-                    reports_resource_stats: true,
-                },
-                name: "fake-container",
-            }
-        }
-
-        /// A container-tier runtime with the builtin backend's per-launch
-        /// VM settings capability.
-        fn builtin() -> Self {
-            let mut runtime = Self {
-                name: crate::engine::container::runtime::BUILTIN_RUNTIME_NAME,
-                ..Self::container()
-            };
-            runtime.caps.per_launch_vm_settings = true;
-            runtime
-        }
-    }
-
-    impl crate::engine::agent_runtime::AgentRuntimeEngine for FakeRuntime {
-        fn ready_agent(
-            &self,
-            _agent: &str,
-            _opts: crate::engine::agent_runtime::ReadyAgentOptions,
-            _sink: &mut dyn crate::data::message::UserMessageSink,
-        ) -> Result<(), crate::engine::error::EngineError> {
-            Ok(())
-        }
-        fn image_exists(&self, _tag: &str) -> Result<bool, crate::engine::error::EngineError> {
-            Ok(true)
-        }
-        fn image_home_dir(
-            &self,
-            _tag: &str,
-        ) -> Result<Option<String>, crate::engine::error::EngineError> {
-            Ok(None)
-        }
-        fn build_image(
-            &self,
-            _request: &crate::engine::container::BuildRequest,
-            _on_line: &mut dyn FnMut(&str),
-        ) -> Result<(), crate::engine::error::EngineError> {
-            Ok(())
-        }
-        fn runtime_name(&self) -> &'static str {
-            self.name
-        }
-        fn display_name(&self) -> &'static str {
-            "Fake Runtime"
-        }
-        fn capabilities(&self) -> &crate::engine::agent_runtime::Capabilities {
-            &self.caps
-        }
-        fn is_available(&self) -> bool {
-            true
-        }
-        fn build(
-            &self,
-            _: crate::engine::agent_runtime::ResolvedAgentOptions,
-        ) -> Result<Box<dyn crate::engine::agent_runtime::AgentInstance>, EngineError> {
-            unimplemented!(
-                "FakeRuntime: build() is not exercised by option-construction parity tests"
-            )
-        }
-        fn list_running(
-            &self,
-            _: &crate::data::session::Session,
-        ) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
-            Ok(vec![])
-        }
-        fn list_running_all(&self) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
-            Ok(vec![])
-        }
-        fn stats(
-            &self,
-            _: &crate::data::session::AgentHandle,
-        ) -> Result<crate::engine::agent_runtime::AgentStats, EngineError> {
-            Ok(crate::engine::agent_runtime::AgentStats {
-                name: "fake".into(),
-                cpu_percent: 0.0,
-                memory_mb: 0.0,
-            })
-        }
-        fn stop(&self, _: &crate::data::session::AgentHandle) -> Result<(), EngineError> {
-            Ok(())
-        }
-        fn attach(
-            &self,
-            _: &crate::data::session::AgentHandle,
-        ) -> Result<Box<dyn crate::engine::agent_runtime::AgentInstance>, EngineError> {
-            unimplemented!(
-                "FakeRuntime: attach() is not exercised by option-construction parity tests"
-            )
-        }
-        fn list_running_with_name_prefix(
-            &self,
-            _: &str,
-        ) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
-            Ok(vec![])
-        }
-    }
-
-    #[test]
-    fn resolve_agent_options_sandbox_runtime_yields_sandbox_variant() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::sandbox()));
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let result = engine.resolve_agent_options(
-            &session,
-            &agent,
-            &AgentRunOptions::default(),
-            &AgentCredentials::default(),
-        );
-        assert!(
-            matches!(
-                result,
-                Ok(crate::engine::agent_runtime::ResolvedAgentOptions::Sandbox(
-                    _
-                ))
-            ),
-            "kit_declarative runtime must yield Sandbox variant; got {result:?}"
-        );
-    }
-
-    /// A session over a temp repo whose `.awman/config.json` holds
-    /// `repo_builtin`, with global config `global_builtin` pinned in a temp
-    /// config home. Returns the temp dirs so they outlive the session.
-    fn builtin_session(
-        global_builtin: &str,
-        repo_builtin: Option<&str>,
-    ) -> (
-        crate::data::session::Session,
-        tempfile::TempDir,
-        tempfile::TempDir,
-    ) {
-        let home = tempfile::tempdir().unwrap();
-        std::fs::write(
-            home.path().join("config.json"),
-            format!(r#"{{"builtin":{global_builtin}}}"#),
-        )
-        .unwrap();
-        let repo = tempfile::tempdir().unwrap();
-        if let Some(block) = repo_builtin {
-            let dir = repo.path().join(".awman");
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("config.json"), format!(r#"{{"builtin":{block}}}"#)).unwrap();
-        }
-        let session = crate::data::session::Session::for_tests_isolated(repo.path(), home.path());
-        (session, repo, home)
-    }
-
-    #[test]
-    fn builtin_launch_settings_come_from_each_sessions_own_config() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, _) =
-            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::builtin()));
-        let global = r#"{"vcpus":4,"network":{"mode":"allowlist","allow":["*.example.com"]}}"#;
-        let (narrowing, _r1, _h1) = builtin_session(
-            global,
-            Some(r#"{"vcpus":1,"network":{"allow":["api.example.com"]}}"#),
-        );
-        let (plain, _r2, _h2) = builtin_session(global, None);
-
-        let narrowed = engine.builtin_launch_settings(&narrowing).unwrap().unwrap();
-        assert_eq!(narrowed.vcpus, 1);
-        assert_eq!(narrowed.network.allow.len(), 1);
-        assert_eq!(narrowed.network.allow[0].to_string(), "api.example.com");
-        let inherited = engine.builtin_launch_settings(&plain).unwrap().unwrap();
-        assert_eq!(inherited.vcpus, 4);
-        assert_eq!(inherited.network.allow[0].to_string(), "*.example.com");
-
-        // `build_options` carries exactly that value as a typed option.
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        for (session, expected) in [(&narrowing, &narrowed), (&plain, &inherited)] {
-            let options = engine
-                .build_options(session, &agent, &AgentRunOptions::default())
-                .unwrap();
-            let carried: Vec<_> = options
-                .iter()
-                .filter_map(|o| match o {
-                    ContainerOption::BuiltinLaunch(launch) => Some(launch),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(carried, vec![expected]);
-        }
-    }
-
-    #[test]
-    fn a_widening_repo_block_fails_builtin_launches_only() {
-        let (widening, _r, _h) = builtin_session(
-            r#"{"network":{"mode":"none"}}"#,
-            Some(r#"{"network":{"mode":"public"}}"#),
-        );
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-
-        let (builtin, _) =
-            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::builtin()));
-        let error = builtin
-            .build_options(&widening, &agent, &AgentRunOptions::default())
-            .unwrap_err();
-        assert!(
-            error.to_string().starts_with("invalid configuration: ")
-                && error.to_string().contains("builtin.network"),
-            "{error}"
-        );
-
-        // Docker never reads the builtin block, so it neither fails on it nor
-        // carries it.
-        let (docker, _) =
-            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::container()));
-        assert_eq!(docker.builtin_launch_settings(&widening).unwrap(), None);
-        let options = docker
-            .build_options(&widening, &agent, &AgentRunOptions::default())
-            .unwrap();
-        assert!(!options
-            .iter()
-            .any(|o| matches!(o, ContainerOption::BuiltinLaunch(_))));
-    }
-
-    #[test]
-    fn resolve_agent_options_container_runtime_yields_container_variant() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::container()));
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let result = engine.resolve_agent_options(
-            &session,
-            &agent,
-            &AgentRunOptions::default(),
-            &AgentCredentials::default(),
-        );
-        assert!(
-            matches!(
-                result,
-                Ok(crate::engine::agent_runtime::ResolvedAgentOptions::Container(_))
-            ),
-            "non-kit_declarative runtime must yield Container variant; got {result:?}"
-        );
-    }
-
-    #[test]
-    fn resolve_agent_options_credentials_become_agent_credentials_in_sandbox() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::sandbox()));
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let creds = vec![("ANTHROPIC_API_KEY".to_string(), "sk-secret".to_string())];
-        let credentials = AgentCredentials {
-            env_vars: creds,
-            ..Default::default()
-        };
-        let result = engine
-            .resolve_agent_options(&session, &agent, &AgentRunOptions::default(), &credentials)
-            .unwrap();
-        if let crate::engine::agent_runtime::ResolvedAgentOptions::Sandbox(resolved) = result {
-            assert!(
-                resolved
-                    .agent_credentials
-                    .contains(&("ANTHROPIC_API_KEY".into(), "sk-secret".into())),
-                "credential must appear in agent_credentials; got {:?}",
-                resolved.agent_credentials
-            );
-        } else {
-            panic!("expected Sandbox variant");
-        }
-    }
-
-    #[test]
-    fn resolve_agent_options_credentials_never_in_env_passthrough_or_env_literal_in_sandbox() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::sandbox()));
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let creds = vec![("ANTHROPIC_API_KEY".to_string(), "sk-secret".to_string())];
-        let credentials = AgentCredentials {
-            env_vars: creds,
-            ..Default::default()
-        };
-        let run = AgentRunOptions {
-            // Put the same key in env_passthrough — it must still only end up in
-            // agent_credentials, not in env_passthrough in the resolved bag.
-            env_passthrough: Some(vec!["ANTHROPIC_API_KEY".into()]),
-            ..Default::default()
-        };
-        let result = engine
-            .resolve_agent_options(&session, &agent, &run, &credentials)
-            .unwrap();
-        if let crate::engine::agent_runtime::ResolvedAgentOptions::Sandbox(resolved) = result {
-            // Credentials from `creds` must not appear as EnvPassthrough env var
-            // values in the session config (they are filtered by DSbxSessionConfig).
-            // The agent_credentials field must carry the credential pair.
-            assert!(
-                resolved
-                    .agent_credentials
-                    .iter()
-                    .any(|(k, _)| k == "ANTHROPIC_API_KEY"),
-                "ANTHROPIC_API_KEY must appear in agent_credentials; got {:?}",
-                resolved.agent_credentials
-            );
-        } else {
-            panic!("expected Sandbox variant");
-        }
-    }
-
-    #[test]
-    fn resolve_agent_options_same_agent_model_tools_intent_in_both_paradigms() {
-        // For a fixed set of flags, the sandbox and container variants must
-        // carry the same agent, model, and tool intent.
-        let tmp = tempfile::tempdir().unwrap();
-        let (sbx_engine, session) =
-            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::sandbox()));
-        let (ctr_engine, _ctr_session) =
-            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::container()));
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            model: Some("claude-sonnet-4-6".into()),
-            allowed_tools: vec!["Bash".into()],
-            disallowed_tools: vec!["Write".into()],
-            initial_prompt: Some("implement feature X".into()),
-            non_interactive: true,
-            ..Default::default()
-        };
-
-        let sbx_result = sbx_engine
-            .resolve_agent_options(&session, &agent, &run, &AgentCredentials::default())
-            .unwrap();
-        let ctr_result = ctr_engine
-            .resolve_agent_options(&session, &agent, &run, &AgentCredentials::default())
-            .unwrap();
-
-        // Both must successfully build.
-        let sbx_opts = match sbx_result {
-            crate::engine::agent_runtime::ResolvedAgentOptions::Sandbox(r) => r,
-            other => panic!("expected Sandbox, got {other:?}"),
-        };
-        let ctr_opts = match ctr_result {
-            crate::engine::agent_runtime::ResolvedAgentOptions::Container(r) => r,
-            other => panic!("expected Container, got {other:?}"),
-        };
-
-        // Agent id.
-        assert_eq!(
-            sbx_opts.agent_id, "claude",
-            "sandbox agent_id must be claude"
-        );
-
-        // Seeded prompt is present in sandbox.
-        assert_eq!(
-            sbx_opts.seeded_prompt.as_deref(),
-            Some("implement feature X"),
-            "sandbox seeded_prompt must carry the prompt"
-        );
-
-        // Model present in both.
-        assert!(sbx_opts.model.is_some(), "sandbox model must be set");
-        assert!(ctr_opts.model.is_some(), "container model must be set");
-
-        // Tool lists present in both.
-        assert!(
-            sbx_opts.allowed_tools.contains(&"Bash".to_string()),
-            "sandbox allowed_tools must contain Bash"
-        );
-        assert!(
-            sbx_opts.disallowed_tools.contains(&"Write".to_string()),
-            "sandbox disallowed_tools must contain Write"
-        );
-        assert!(
-            ctr_opts.allowed_tools.contains(&"Bash".to_string()),
-            "container allowed_tools must contain Bash"
-        );
-        assert!(
-            ctr_opts.disallowed_tools.contains(&"Write".to_string()),
-            "container disallowed_tools must contain Write"
-        );
-    }
-
-    #[test]
-    fn resolve_agent_options_seeded_prompt_in_sandbox_exactly_once() {
-        // The prompt must appear in SeededPrompt exactly once, regardless of
-        // system prompt or other options (no double-delivery).
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            make_agent_engine_on(tmp.path(), std::sync::Arc::new(FakeRuntime::sandbox()));
-        let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            initial_prompt: Some("run the tests".into()),
-            system_prompt: Some("You are a helpful assistant.".into()),
-            ..Default::default()
-        };
-        let result = engine
-            .resolve_agent_options(&session, &agent, &run, &AgentCredentials::default())
-            .unwrap();
-        if let crate::engine::agent_runtime::ResolvedAgentOptions::Sandbox(resolved) = result {
-            assert_eq!(
-                resolved.seeded_prompt.as_deref(),
-                Some("run the tests"),
-                "seeded_prompt must carry the user's prompt text"
-            );
-            // system_prompt_inline is from the system prompt, not the user prompt.
-            // They are distinct fields — seeded_prompt is the user task prompt.
-            if let Some((_, text)) = &resolved.system_prompt_inline {
-                assert!(
-                    !text.contains("run the tests"),
-                    "system_prompt_inline must not contain the user seeded_prompt text: {text}"
-                );
-            }
-        } else {
-            panic!("expected Sandbox variant");
-        }
-    }
-
-    // ─── agentFlags ──────────────────────────────────────────────────────────
-
-    /// A docker-backed engine over a session whose repo config is `repo_json`,
-    /// with the global config isolated in a temp dir.
-    fn engine_with_repo_config(
-        tmp: &std::path::Path,
-        repo_json: &str,
-    ) -> (AgentEngine, crate::data::session::Session) {
-        let root = tmp.join("repo");
-        let awman_dir = root.join(".awman");
-        std::fs::create_dir_all(&awman_dir).unwrap();
-        std::fs::write(awman_dir.join("config.json"), repo_json).unwrap();
-        let session =
-            crate::data::session::Session::for_tests_isolated(&root, &tmp.join("config-home"));
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp.join("home")),
-        );
-        let runtime = crate::engine::container::ContainerRuntime::docker();
-        (
-            AgentEngine::new(Arc::new(overlay), Arc::new(runtime)),
-            session,
-        )
-    }
-
-    // ─── yoloDisallowedTools ─────────────────────────────────────────────────
-
-    fn yolo_run() -> AgentRunOptions {
-        AgentRunOptions {
-            yolo: Some(YoloMode::Enabled),
-            ..Default::default()
-        }
-    }
-
-    fn container_disallowed(opts: &[ContainerOption]) -> Vec<String> {
-        opts.iter()
-            .filter_map(|o| match o {
-                ContainerOption::DisallowedTools(v) => Some(v.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect()
-    }
-
-    #[test]
-    fn yolo_launch_carries_configured_disallowed_tools_and_flag() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = engine_with_repo_config(
-            tmp.path(),
-            r#"{"yoloDisallowedTools": ["Bash", "computer"]}"#,
-        );
-        let claude = AgentName::new("claude").unwrap();
-        let opts = engine
-            .build_options(&session, &claude, &yolo_run())
-            .unwrap();
-        assert_eq!(container_disallowed(&opts), vec!["Bash", "computer"]);
-        assert!(
-            opts.iter().any(|o| matches!(
-                o,
-                ContainerOption::DisallowedToolsFlag(flag) if flag == "--disallowedTools"
-            )),
-            "claude's --disallowedTools flag must be emitted; got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn non_yolo_launch_ignores_yolo_disallowed_tools() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"yoloDisallowedTools": ["Bash"]}"#);
-        let claude = AgentName::new("claude").unwrap();
-        let opts = engine
-            .build_options(&session, &claude, &AgentRunOptions::default())
-            .unwrap();
-        assert!(container_disallowed(&opts).is_empty());
-        // Codex has no disallowed-tools flag, but outside yolo the list does
-        // not apply, so the launch is not refused.
-        let codex = AgentName::new("codex").unwrap();
-        engine
-            .build_options(&session, &codex, &AgentRunOptions::default())
-            .unwrap();
-    }
-
-    #[test]
-    fn yolo_disallowed_tools_merge_with_explicit_list_without_duplicates() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"yoloDisallowedTools": ["Bash", "Write"]}"#);
-        let claude = AgentName::new("claude").unwrap();
-        let run = AgentRunOptions {
-            disallowed_tools: vec!["Bash".into()],
-            ..yolo_run()
-        };
-        let opts = engine.build_options(&session, &claude, &run).unwrap();
-        assert_eq!(container_disallowed(&opts), vec!["Bash", "Write"]);
-    }
-
-    #[test]
-    fn yolo_with_disallowed_tools_is_refused_for_an_agent_without_the_flag() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"yoloDisallowedTools": ["Bash"]}"#);
-        let codex = AgentName::new("codex").unwrap();
-        let err = engine
-            .build_options(&session, &codex, &yolo_run())
-            .unwrap_err();
-        assert!(
-            matches!(
-                &err,
-                EngineError::YoloDisallowedToolsUnsupported { agent, tools }
-                    if agent == "codex" && tools == &vec!["Bash".to_string()]
-            ),
-            "got {err:?}"
-        );
-        let message = err.to_string();
-        assert!(message.contains("yoloDisallowedTools (Bash)"), "{message}");
-        assert!(message.contains("--yolo"), "{message}");
-        // The sandbox paradigm refuses it identically.
-        let err = engine
-            .build_sandbox_options(&session, &codex, &yolo_run())
-            .unwrap_err();
-        assert!(
-            matches!(err, EngineError::YoloDisallowedToolsUnsupported { .. }),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn empty_repo_yolo_disallowed_tools_lets_any_agent_run_yolo() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"yoloDisallowedTools": []}"#);
-        let codex = AgentName::new("codex").unwrap();
-        let opts = engine.build_options(&session, &codex, &yolo_run()).unwrap();
-        assert!(container_disallowed(&opts).is_empty());
-    }
-
-    #[test]
-    fn sandbox_yolo_launch_carries_configured_disallowed_tools() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"yoloDisallowedTools": ["Bash"]}"#);
-        let claude = AgentName::new("claude").unwrap();
-        let opts = engine
-            .build_sandbox_options(&session, &claude, &yolo_run())
-            .unwrap();
-        assert!(
-            opts.iter().any(|o| matches!(
-                o,
-                SandboxOption::DisallowedTools(tools) if tools == &vec!["Bash".to_string()]
-            )),
-            "got {opts:?}"
-        );
-    }
-
-    fn container_agent_flags(opts: &[ContainerOption]) -> Vec<String> {
-        opts.iter()
-            .filter_map(|o| match o {
-                ContainerOption::AgentFlags(v) => Some(v.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect()
-    }
-
-    #[test]
-    fn build_options_emits_configured_agent_flags_for_that_agent_only() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"agentFlags": {"codex": ["--search"]}}"#);
-        let codex = AgentName::new("codex").unwrap();
-        let claude = AgentName::new("claude").unwrap();
-
-        let opts = engine
-            .build_options(&session, &codex, &AgentRunOptions::default())
-            .unwrap();
-        assert_eq!(container_agent_flags(&opts), vec!["--search"]);
-
-        let opts = engine
-            .build_options(&session, &claude, &AgentRunOptions::default())
-            .unwrap();
-        assert!(
-            !opts
-                .iter()
-                .any(|o| matches!(o, ContainerOption::AgentFlags(_))),
-            "claude has no agentFlags entry; got {opts:?}"
-        );
-    }
-
-    /// awman passes codex `--no-daemon` itself on interactive launches. A user
-    /// entry for it is dropped there (not doubled), and kept as configured on a
-    /// non-interactive launch, where the entrypoint does not carry it.
-    #[test]
-    fn build_options_drops_an_agent_flag_the_entrypoint_already_carries() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) = engine_with_repo_config(
-            tmp.path(),
-            r#"{"agentFlags": {"codex": ["--no-daemon", "--search"]}}"#,
-        );
-        let codex = AgentName::new("codex").unwrap();
-        let interactive = engine
-            .build_options(&session, &codex, &AgentRunOptions::default())
-            .unwrap();
-        assert_eq!(non_interactive_tokens(&interactive, "--no-daemon"), 1);
-        assert_eq!(container_agent_flags(&interactive), vec!["--search"]);
-
-        let run = AgentRunOptions {
-            non_interactive: true,
-            ..Default::default()
-        };
-        let batch = engine.build_options(&session, &codex, &run).unwrap();
-        assert_eq!(non_interactive_tokens(&batch, "--no-daemon"), 0);
-        assert_eq!(
-            container_agent_flags(&batch),
-            vec!["--no-daemon", "--search"]
-        );
-    }
-
-    #[test]
-    fn build_options_cli_agent_flags_replace_configured_entry() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"agentFlags": {"codex": ["--no-daemon"]}}"#);
-        let codex = AgentName::new("codex").unwrap();
-        let run = AgentRunOptions {
-            agent_flags: Some(vec!["--search".into()]),
-            ..Default::default()
-        };
-        let opts = engine.build_options(&session, &codex, &run).unwrap();
-        assert_eq!(container_agent_flags(&opts), vec!["--search"]);
-    }
-
-    #[test]
-    fn build_options_empty_cli_agent_flags_emit_nothing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"agentFlags": {"codex": ["--no-daemon"]}}"#);
-        let codex = AgentName::new("codex").unwrap();
-        let run = AgentRunOptions {
-            agent_flags: Some(vec![]),
-            ..Default::default()
-        };
-        let opts = engine.build_options(&session, &codex, &run).unwrap();
-        assert!(container_agent_flags(&opts).is_empty());
-    }
-
-    #[test]
-    fn build_sandbox_options_agent_kit_gets_agent_flags() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"agentFlags": {"cline": ["--debug"]}}"#);
-        let cline = AgentName::new("cline").unwrap();
-        let opts = engine
-            .build_sandbox_options(&session, &cline, &AgentRunOptions::default())
-            .unwrap();
-        assert!(
-            opts.iter().any(
-                |o| matches!(o, SandboxOption::AgentFlags(v) if v == &vec!["--debug".to_string()])
-            ),
-            "cline (kind: agent) must get its agentFlags; got {opts:?}"
-        );
-    }
-
-    #[test]
-    fn build_sandbox_options_mixin_agent_flags_become_unsupported_note() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, session) =
-            engine_with_repo_config(tmp.path(), r#"{"agentFlags": {"codex": ["--no-daemon"]}}"#);
-        let codex = AgentName::new("codex").unwrap();
-        let opts = engine
-            .build_sandbox_options(&session, &codex, &AgentRunOptions::default())
-            .unwrap();
-        assert!(
-            opts.iter().any(|o| matches!(
-                o,
-                SandboxOption::UnsupportedNote(n) if n.contains("--no-daemon") && n.contains("codex")
-            )),
-            "codex (mixin) agentFlags must surface as a note; got {opts:?}"
-        );
-        assert!(!opts
-            .iter()
-            .any(|o| matches!(o, SandboxOption::AgentFlags(_))));
-    }
-    mod custom_launch_tests {
-        use super::*;
-
-        #[test]
-        fn discovery_filters_stale_and_unapproved_agents_individually() {
-            let root = tempfile::tempdir().unwrap();
-            let session = Session::for_tests_isolated(root.path(), &root.path().join("global"));
-            let paths = RepoDockerfilePaths::new(root.path());
-            std::fs::create_dir_all(root.path().join(".awman/agents")).unwrap();
-            for name in ["claude", "crush", "pi"] {
-                std::fs::write(paths.agent_dockerfile(name), "FROM scratch\n").unwrap();
-            }
-            std::fs::write(root.path().join(".awman/agents/pi.toml"), "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[image]\ninstall=['install pi']\n").unwrap();
-            let engine = AgentEngine::new(
-                Arc::new(OverlayEngine::with_auth_resolver(
-                    crate::data::fs::AuthPathResolver::at_home(root.path()),
-                )),
-                Arc::new(FakeRuntime::container()),
-            );
-            let (available, warnings) =
-                engine.filter_available_agents(&session, paths.discover_agent_dockerfiles());
-            assert_eq!(
-                available
-                    .iter()
-                    .map(|(name, _)| name.as_str())
-                    .collect::<Vec<_>>(),
-                ["claude"]
-            );
-            assert_eq!(warnings.len(), 2);
-            assert!(warnings
-                .iter()
-                .any(|w| w.contains("crush") && w.contains("no longer built in")));
-            assert!(warnings
-                .iter()
-                .any(|w| w.contains("pi") && w.contains("approved")));
-        }
-
-        #[test]
-        fn maki_escape_hatch_migration_keeps_noninteractive_prompt_without_extra_token() {
-            let root = tempfile::tempdir().unwrap();
-            let session = Session::for_tests_isolated(root.path(), &root.path().join("global"));
-            let dir = root.path().join(".awman/agents");
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join("maki.toml"),
-                include_str!("../../../skills/create-custom-agent/examples/maki.toml"),
-            )
-            .unwrap();
-            std::fs::write(
-                dir.join("maki.Dockerfile"),
-                include_str!("../../../skills/create-custom-agent/examples/maki.Dockerfile"),
-            )
-            .unwrap();
-            let name = AgentName::new("maki").unwrap();
-            let untrusted =
-                AgentRegistry::load_untrusted(session.env(), &name, Some(root.path())).unwrap();
-            AgentRegistry::record_approval(
-                session.env(),
-                untrusted.definition(),
-                Some(root.path()),
-            )
-            .unwrap();
-            let engine = AgentEngine::new(
-                Arc::new(OverlayEngine::with_auth_resolver(
-                    crate::data::fs::AuthPathResolver::at_home(root.path()),
-                )),
-                Arc::new(FakeRuntime::container()),
-            );
-            let options = engine
-                .build_options(
-                    &session,
-                    &name,
-                    &AgentRunOptions {
-                        non_interactive: true,
-                        initial_prompt: Some("migration prompt".into()),
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            assert!(options
-                .iter()
-                .any(|o| matches!(o, ContainerOption::Entrypoint(e) if e.0 == ["maki"])));
-            assert!(options
-                .iter()
-                .any(|o| matches!(o, ContainerOption::Interactive(false))));
-            assert!(options
-                .iter()
-                .any(|o| matches!(o, ContainerOption::SeededPrompt(p) if p == "migration prompt")));
-        }
-
-        #[tokio::test]
-        async fn custom_launch_build_failure_contains_the_recipe_hint() {
-            let root = tempfile::tempdir().unwrap();
-            let session = Session::for_tests_isolated(root.path(), &root.path().join("global"));
-            custom::install_crush_fixture(root.path(), session.env());
-            let mut runtime = crate::engine::ready::tests::fakes::FakeImportRuntime::new(false);
-            runtime.caps.image_acquisition = crate::engine::agent_runtime::ImageAcquisition::Build;
-            let engine = AgentEngine::new(
-                Arc::new(OverlayEngine::with_auth_resolver(
-                    crate::data::fs::AuthPathResolver::at_home(root.path()),
-                )),
-                Arc::new(runtime),
-            );
-            let base = project_image_tag(root.path());
-            let mut frontend = FakeAgentFrontend::new();
-            let error = engine
-                .ensure_available(
-                    &session,
-                    &AgentName::new("crush").unwrap(),
-                    &session.effective_config(),
-                    &mut frontend,
-                    |tag| tag == base,
-                )
-                .await
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains(".awman/agents/crush.toml"), "{error}");
-            assert!(error.contains("smoke binary 'crush'"), "{error}");
-            assert!(
-                error.contains("npm install -g --prefix=/usr/local @charmland/crush"),
-                "{error}"
-            );
-        }
-
-        #[test]
-        fn sandbox_refusal_is_after_trust_and_before_option_or_image_work() {
-            let temp = tempfile::tempdir().unwrap();
-            let session = Session::for_tests_isolated(temp.path(), &temp.path().join("global"));
-            let dir = temp.path().join(".awman/agents");
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join("crush.toml"),
-                include_str!("../../../skills/create-custom-agent/examples/crush.toml"),
-            )
-            .unwrap();
-            let overlay = Arc::new(OverlayEngine::with_auth_resolver(
-                crate::data::fs::AuthPathResolver::at_home(temp.path()),
-            ));
-            let engine = AgentEngine::new(overlay, Arc::new(FakeRuntime::sandbox()));
-            let name = AgentName::new("crush").unwrap();
-            for sandbox_builder in [false, true] {
-                let result = if sandbox_builder {
-                    engine
-                        .build_sandbox_options(&session, &name, &AgentRunOptions::default())
-                        .map(|_| ())
-                } else {
-                    engine
-                        .build_options(&session, &name, &AgentRunOptions::default())
-                        .map(|_| ())
-                };
-                assert!(matches!(
-                    result,
-                    Err(EngineError::AgentDefinitionUntrusted { .. })
-                ));
-            }
-            let def =
-                AgentRegistry::load_untrusted(session.env(), &name, Some(temp.path())).unwrap();
-            AgentRegistry::record_approval(session.env(), def.definition(), Some(temp.path()))
-                .unwrap();
-            for sandbox_builder in [false, true] {
-                let result = if sandbox_builder {
-                    engine
-                        .build_sandbox_options(&session, &name, &AgentRunOptions::default())
-                        .map(|_| ())
-                } else {
-                    engine
-                        .build_options(&session, &name, &AgentRunOptions::default())
-                        .map(|_| ())
-                };
-                assert!(matches!(
-                    result,
-                    Err(EngineError::CustomAgentRuntimeUnsupported { .. })
-                ));
-            }
-            assert!(!RepoDockerfilePaths::new(temp.path())
-                .agent_dockerfile("crush")
-                .exists());
-        }
-
-        #[tokio::test]
-        async fn custom_auth_is_deduplicated_settings_mounts_and_existing_image_is_not_rebuilt() {
-            let temp = tempfile::tempdir().unwrap();
-            let session = Session::for_tests_isolated(temp.path(), &temp.path().join("global"));
-            custom::install_crush_fixture(temp.path(), session.env());
-            let path = temp.path().join(".awman/agents/crush.toml");
-            let source = std::fs::read_to_string(&path)
-                .unwrap()
-                .replace("[run]", "[run]\nenv = { CRUSH_TELEMETRY = '0' }");
-            std::fs::write(&path, source).unwrap();
-            let def = AgentRegistry::load_untrusted(
-                session.env(),
-                &AgentName::new("crush").unwrap(),
-                Some(temp.path()),
-            )
-            .unwrap()
-            .definition()
-            .clone();
-            AgentRegistry::record_approval(session.env(), &def, Some(temp.path())).unwrap();
-            std::fs::create_dir_all(temp.path().join(".config/crush")).unwrap();
-            let engine = AgentEngine::new(
-                Arc::new(OverlayEngine::with_auth_resolver(
-                    crate::data::fs::AuthPathResolver::at_home(temp.path()),
-                )),
-                Arc::new(FakeRuntime::container()),
-            );
-            let name = AgentName::new("crush").unwrap();
-            // An existing, non-secret host variable exercises auth passthrough without
-            // mutating the process environment or depending on provider credentials.
-            let mut auth = def.clone();
-            auth.auth_env = vec!["PATH".into(), "NOT_SET_CUSTOM_AGENT_TEST".into()];
-            let vars = custom_auth_env(&auth, &["PATH".into()]);
-            assert!(vars.is_empty());
-            let vars = custom_auth_env(&auth, &[]);
-            assert_eq!(vars, ["PATH"]);
-            let options = engine
-                .build_options(&session, &name, &AgentRunOptions::default())
-                .unwrap();
-            assert!(options.iter().any(|o| matches!(o, ContainerOption::EnvLiteral(v) if v.key == "CRUSH_TELEMETRY" && v.value == "0")));
-            assert!(options.iter().any(|o| matches!(o, ContainerOption::Overlay(v) if v.host_path == temp.path().join(".config/crush").canonicalize().unwrap() && v.container_path.to_string_lossy().ends_with("/.config/crush"))));
-            let mut frontend = FakeAgentFrontend::new();
-            engine
-                .ensure_available(
-                    &session,
-                    &name,
-                    &session.effective_config(),
-                    &mut frontend,
-                    |_| true,
-                )
-                .await
-                .unwrap();
-            assert!(
-                !frontend
-                    .messages
-                    .iter()
-                    .any(|m| m.text.contains("changed since its image was built")),
-                "recreating a missing Dockerfile is not a definition change"
-            );
-            assert!(!frontend
-                .statuses
-                .iter()
-                .any(|(step, _)| step == "Building image"));
-        }
     }
 }

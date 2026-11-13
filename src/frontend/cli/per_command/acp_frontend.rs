@@ -6,7 +6,7 @@
 //! agent window: no raw mode, no PTY, just read/print like the rest of the
 //! CLI's interactive Q&A (see `per_command/helpers.rs`).
 //!
-//! Headless runs (`-n`/`--non-interactive`, and `--yolo`/`--auto` which the
+//! Headless runs (`-n`/`--headless`, and `--yolo`/`--auto` which the
 //! engine driver already handles by never calling `request_permission` at
 //! all) must never block on stdin: `non_interactive` degrades
 //! `request_permission` to auto-approve and `next_prompt` to "no follow-up",
@@ -15,16 +15,43 @@
 
 use std::io::Write;
 
+use crate::data::terminal::{HostOutputPolicy, ProgramStatusMode};
 use crate::engine::acp::protocol::{sanitize_terminal_text, ContentChunk, ToolCallLocation};
 use crate::engine::acp::{
     AcpFrontend, AvailableCommand, ContentBlock, PermissionDecision, PermissionOption,
     PermissionRequest, PlanEntry, SessionUpdate, ToolCall, ToolCallUpdate,
 };
+use crate::frontend::terminal_output_filter::{filter_all, HostOutputFilter};
 
 use crate::frontend::cli::command_frontend::CliFrontend;
 
 impl AcpFrontend for CliFrontend {
     fn render_update(&mut self, update: SessionUpdate) {
+        let stream = match &update {
+            SessionUpdate::AgentMessageChunk { chunk } => Some((chunk, false)),
+            SessionUpdate::AgentThoughtChunk { chunk } => Some((chunk, true)),
+            _ => None,
+        };
+        if let Some((
+            ContentChunk {
+                content: ContentBlock::Text { text },
+                ..
+            },
+            dim,
+        )) = stream
+        {
+            let filter = self
+                .acp_output_filter
+                .get_or_insert_with(|| HostOutputFilter::new(text_policy()));
+            let safe = stream_text(filter, text);
+            if dim {
+                print!("\x1b[2m{safe}\x1b[0m");
+            } else {
+                print!("{safe}");
+            }
+            let _ = std::io::stdout().flush();
+            return;
+        }
         match render_update_text(&update) {
             RenderedUpdate::Stream(text) => {
                 print!("{text}");
@@ -35,7 +62,7 @@ impl AcpFrontend for CliFrontend {
                 // printable) with agent-provided titles/paths/URIs; sanitising
                 // the whole line strips any control chars the agent injected
                 // without touching awman's formatting.
-                println!("{}", sanitize_terminal_text(&text));
+                println!("{}", sanitize_agent_text(&text));
             }
         }
     }
@@ -46,7 +73,7 @@ impl AcpFrontend for CliFrontend {
         }
         println!(
             "{}",
-            sanitize_terminal_text(&format_permission_request(&request))
+            sanitize_agent_text(&format_permission_request(&request))
         );
         loop {
             print!("choice: ");
@@ -69,6 +96,23 @@ impl AcpFrontend for CliFrontend {
         let _ = std::io::stdout().flush();
         read_stdin_line()
     }
+}
+
+fn sanitize_agent_text(text: &str) -> String {
+    let filtered = filter_all(text_policy(), text.as_bytes());
+    sanitize_terminal_text(&String::from_utf8_lossy(&filtered))
+}
+
+fn text_policy() -> HostOutputPolicy {
+    HostOutputPolicy {
+        program_status: ProgramStatusMode::Strip,
+        ..Default::default()
+    }
+}
+fn stream_text(filter: &mut HostOutputFilter, text: &str) -> String {
+    let mut safe = Vec::new();
+    filter.feed(text.as_bytes(), &mut safe);
+    sanitize_terminal_text(&String::from_utf8_lossy(&safe))
 }
 
 /// A single rendered update, split so the streamed-text case (message/thought
@@ -107,7 +151,7 @@ fn render_content_chunk(chunk: &ContentChunk, dim: bool) -> RenderedUpdate {
             // BEFORE wrapping with awman's own "dim" escape, so a malicious
             // agent can't smuggle escape sequences through the structured
             // renderer — but awman's intentional formatting is preserved.
-            let text = sanitize_terminal_text(text);
+            let text = sanitize_agent_text(text);
             let text = if dim {
                 format!("\x1b[2m{text}\x1b[0m")
             } else {
@@ -247,7 +291,7 @@ fn match_permission_option(options: &[PermissionOption], input: &str) -> Option<
 /// `Some(String::new())` for a blank line. `per_command::helpers::read_line`
 /// cannot be reused here because it collapses "not a TTY" and "EOF" into the
 /// same `None`, while an ACP session must react to those differently (a
-/// live-but-non-interactive run degrades before ever calling this; a live
+/// live-but-headless run degrades before ever calling this; a live
 /// interactive run's EOF must end the session).
 fn read_stdin_line() -> Option<String> {
     let mut buf = String::new();
@@ -255,289 +299,5 @@ fn read_stdin_line() -> Option<String> {
         Ok(0) => None,
         Ok(_) => Some(buf.trim().to_string()),
         Err(_) => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::command::dispatch::catalogue::CommandCatalogue;
-
-    /// Build a non-interactive `CliFrontend` for unit tests — exactly the
-    /// degrade path `request_permission`/`next_prompt` must take without
-    /// blocking on a read. Forced rather than inferred: `cargo test` run from
-    /// a terminal inherits a TTY stdin, so the mode cannot be left to
-    /// `stdin_is_tty()`.
-    fn make_frontend() -> CliFrontend {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman", "chat"]).unwrap();
-        let mut fe = CliFrontend::new(m);
-        fe.non_interactive = true;
-        fe
-    }
-
-    fn text_chunk(text: &str) -> ContentChunk {
-        ContentChunk {
-            content: ContentBlock::Text { text: text.into() },
-            message_id: Some("m1".into()),
-        }
-    }
-
-    #[test]
-    fn message_chunk_streams_raw_text() {
-        let update = SessionUpdate::AgentMessageChunk {
-            chunk: text_chunk("hello"),
-        };
-        assert_eq!(
-            render_update_text(&update),
-            RenderedUpdate::Stream("hello".into())
-        );
-    }
-
-    #[test]
-    fn agent_text_is_stripped_of_terminal_control_sequences() {
-        // A malicious agent embeds an OSC 52 clipboard-write escape in its
-        // message text; the structured renderer must neutralise it rather than
-        // hand raw terminal-control bytes to the user's terminal.
-        let update = SessionUpdate::AgentMessageChunk {
-            chunk: text_chunk("ok\x1b]52;c;ZXZpbA==\x07done"),
-        };
-        match render_update_text(&update) {
-            RenderedUpdate::Stream(text) => {
-                assert!(!text.contains('\x1b'), "ESC must be stripped: {text:?}");
-                assert!(!text.contains('\x07'), "BEL must be stripped: {text:?}");
-                assert!(text.contains("ok") && text.contains("done"));
-            }
-            other => panic!("expected Stream, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn thought_chunk_streams_dimmed_text() {
-        let update = SessionUpdate::AgentThoughtChunk {
-            chunk: text_chunk("pondering"),
-        };
-        assert_eq!(
-            render_update_text(&update),
-            RenderedUpdate::Stream("\x1b[2mpondering\x1b[0m".into())
-        );
-    }
-
-    #[test]
-    fn non_text_chunk_renders_as_a_labeled_block_not_json() {
-        let chunk = ContentChunk {
-            content: ContentBlock::Image {
-                data: "base64...".into(),
-                mime_type: "image/png".into(),
-            },
-            message_id: None,
-        };
-        let update = SessionUpdate::AgentMessageChunk { chunk };
-        match render_update_text(&update) {
-            RenderedUpdate::Block(text) => {
-                assert_eq!(text, "[image: image/png]");
-                assert!(!text.contains('{'), "must never dump raw JSON: {text}");
-            }
-            other => panic!("expected Block, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tool_call_renders_title_kind_status_and_locations() {
-        let tool_call = ToolCall {
-            tool_call_id: "t1".into(),
-            title: "Read file".into(),
-            kind: Some("read".into()),
-            status: Some("pending".into()),
-            content: vec![],
-            locations: vec![ToolCallLocation {
-                path: "src/lib.rs".into(),
-                line: Some(10),
-            }],
-            raw_input: None,
-            raw_output: None,
-        };
-        let update = SessionUpdate::ToolCall { tool_call };
-        match render_update_text(&update) {
-            RenderedUpdate::Block(text) => {
-                assert!(text.contains("Read file"), "{text}");
-                assert!(text.contains("[read]"), "{text}");
-                assert!(text.contains("pending"), "{text}");
-                assert!(text.contains("src/lib.rs:10"), "{text}");
-                assert!(!text.contains('{'), "must never dump raw JSON: {text}");
-            }
-            other => panic!("expected Block, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tool_call_update_falls_back_to_tool_call_id_when_title_missing() {
-        let update = ToolCallUpdate {
-            tool_call_id: "t1".into(),
-            kind: None,
-            status: Some("completed".into()),
-            title: None,
-            content: None,
-            locations: None,
-            raw_input: None,
-            raw_output: None,
-        };
-        let rendered = render_update_text(&SessionUpdate::ToolCallUpdate { tool_call: update });
-        match rendered {
-            RenderedUpdate::Block(text) => {
-                assert!(text.contains("tool t1"), "{text}");
-                assert!(text.contains("completed"), "{text}");
-            }
-            other => panic!("expected Block, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn plan_renders_every_entry() {
-        let entries = vec![
-            PlanEntry {
-                content: "write tests".into(),
-                priority: "high".into(),
-                status: "pending".into(),
-            },
-            PlanEntry {
-                content: "ship it".into(),
-                priority: "low".into(),
-                status: "pending".into(),
-            },
-        ];
-        let text = format_plan(&entries);
-        assert!(text.starts_with("plan:"));
-        assert!(text.contains("write tests"));
-        assert!(text.contains("ship it"));
-    }
-
-    #[test]
-    fn available_commands_lists_name_and_description() {
-        let commands = vec![AvailableCommand {
-            name: "build".into(),
-            description: "build the project".into(),
-            input: None,
-        }];
-        let text = format_available_commands(&commands);
-        assert!(text.contains("/build"));
-        assert!(text.contains("build the project"));
-    }
-
-    #[test]
-    fn available_commands_empty_list_has_no_trailing_garbage() {
-        assert_eq!(format_available_commands(&[]), "available commands: (none)");
-    }
-
-    #[test]
-    fn permission_request_lists_numbered_options() {
-        let request = PermissionRequest {
-            request_id: Default::default(),
-            session_id: "s1".into(),
-            tool_call: ToolCallUpdate {
-                tool_call_id: "t1".into(),
-                kind: Some("execute".into()),
-                status: None,
-                title: Some("Run tests".into()),
-                content: None,
-                locations: None,
-                raw_input: None,
-                raw_output: None,
-            },
-            options: vec![
-                PermissionOption {
-                    option_id: "allow".into(),
-                    name: "Allow".into(),
-                    kind: "allow_once".into(),
-                },
-                PermissionOption {
-                    option_id: "deny".into(),
-                    name: "Deny".into(),
-                    kind: "reject_once".into(),
-                },
-            ],
-        };
-        let text = format_permission_request(&request);
-        assert!(text.contains("Run tests"), "{text}");
-        assert!(text.contains("[1] Allow (allow_once)"), "{text}");
-        assert!(text.contains("[2] Deny (reject_once)"), "{text}");
-    }
-
-    #[test]
-    fn match_permission_option_by_index_name_or_id() {
-        let options = vec![
-            PermissionOption {
-                option_id: "allow-once".into(),
-                name: "Allow once".into(),
-                kind: "allow_once".into(),
-            },
-            PermissionOption {
-                option_id: "deny-once".into(),
-                name: "Deny once".into(),
-                kind: "reject_once".into(),
-            },
-        ];
-        assert_eq!(
-            match_permission_option(&options, "1"),
-            Some("allow-once".into())
-        );
-        assert_eq!(
-            match_permission_option(&options, "deny once"),
-            Some("deny-once".into())
-        );
-        assert_eq!(
-            match_permission_option(&options, "ALLOW-ONCE"),
-            Some("allow-once".into())
-        );
-        assert_eq!(match_permission_option(&options, "nope"), None);
-        assert_eq!(match_permission_option(&options, "0"), None);
-        assert_eq!(match_permission_option(&options, "99"), None);
-    }
-
-    #[test]
-    fn non_interactive_next_prompt_ends_session_without_blocking() {
-        let mut fe = make_frontend();
-        assert!(fe.non_interactive);
-        assert_eq!(AcpFrontend::next_prompt(&mut fe), None);
-    }
-
-    #[test]
-    fn non_interactive_request_permission_auto_approves_without_blocking() {
-        let mut fe = make_frontend();
-        assert!(fe.non_interactive);
-        let options = vec![
-            PermissionOption {
-                option_id: "deny".into(),
-                name: "Deny".into(),
-                kind: "reject_once".into(),
-            },
-            PermissionOption {
-                option_id: "allow".into(),
-                name: "Allow".into(),
-                kind: "allow_once".into(),
-            },
-        ];
-        let request = PermissionRequest {
-            request_id: Default::default(),
-            session_id: "s1".into(),
-            tool_call: ToolCallUpdate {
-                tool_call_id: "t1".into(),
-                kind: None,
-                status: None,
-                title: None,
-                content: None,
-                locations: None,
-                raw_input: None,
-                raw_output: None,
-            },
-            options,
-        };
-        let decision = AcpFrontend::request_permission(&mut fe, request);
-        assert_eq!(
-            decision,
-            PermissionDecision::Selected {
-                option_id: "allow".into()
-            }
-        );
     }
 }

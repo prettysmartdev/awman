@@ -69,6 +69,9 @@ pub(super) fn handle(app: &mut App, action: Action) {
             if app.active_dialog.is_some() {
                 return;
             }
+            if queue::prompt_lease_close(app) {
+                return;
+            }
             // If a workflow is active in the focused tab, prefer the
             // workflow-cancel confirmation over the close-tab one.
             // The user can still escape and Ctrl+C again to close

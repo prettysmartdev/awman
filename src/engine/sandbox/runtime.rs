@@ -30,6 +30,7 @@ static SANDBOX_CAPABILITIES: Capabilities = Capabilities {
 };
 
 pub struct SandboxRuntime {
+    env: crate::data::config::env::EnvSnapshot,
     backend: Arc<dyn SandboxBackend>,
 }
 
@@ -52,7 +53,7 @@ impl SandboxRuntime {
         no_cache: bool,
         sink: &mut dyn crate::data::message::UserMessageSink,
     ) -> Result<(), EngineError> {
-        super::dsbx::ready_agent(agent, no_cache, sink)
+        super::dsbx::ready_agent_in(&self.env, agent, no_cache, sink)
     }
 
     /// Construct with the Docker Sandbox (`sbx`) backend.
@@ -60,6 +61,9 @@ impl SandboxRuntime {
     /// Platform guard: Docker Sandboxes are not available on Linux. Erroring
     /// here (rather than from the first backend call) gives the user an actionable platform message up front.
     pub fn dsbx() -> Result<Self, EngineError> {
+        Self::dsbx_in(crate::engine::host_cli::process_env())
+    }
+    pub fn dsbx_in(env: crate::data::config::env::EnvSnapshot) -> Result<Self, EngineError> {
         if cfg!(target_os = "linux") {
             return Err(EngineError::BackendUnsupportedOnPlatform {
                 backend: "docker-sbx-experimental".into(),
@@ -69,23 +73,9 @@ impl SandboxRuntime {
             });
         }
         Ok(Self {
-            backend: Arc::new(DSbxBackend::new()),
+            backend: Arc::new(DSbxBackend::with_env(env.clone())),
+            env,
         })
-    }
-
-    /// The same runtime without the platform guards, so the layers above can
-    /// be tested on a host `dsbx()` refuses to run on.
-    ///
-    /// Nothing here probes `sbx`: the backend is a unit struct and every
-    /// method that shells out is only reached by a test that asks for it.
-    /// What this makes testable is the *paradigm* — `capabilities()`,
-    /// `runtime_name()`, and which `ResolvedAgentOptions` variant the layers
-    /// above resolve for a sandbox-class runtime.
-    #[cfg(test)]
-    pub(crate) fn for_tests() -> Self {
-        Self {
-            backend: Arc::new(DSbxBackend::new()),
-        }
     }
 }
 
@@ -107,8 +97,7 @@ impl AgentRuntimeEngine for SandboxRuntime {
 
     fn is_available(&self) -> bool {
         crate::engine::host_cli::checked_output(
-            std::process::Command::new(crate::engine::host_cli::program(self.backend.cli_binary()))
-                .arg("ls"),
+            crate::engine::host_cli::command(&self.env, self.backend.cli_binary()).arg("ls"),
             self.backend.cli_binary(),
         )
         .is_ok()
@@ -116,7 +105,10 @@ impl AgentRuntimeEngine for SandboxRuntime {
 
     fn build(&self, options: ResolvedAgentOptions) -> Result<Box<dyn AgentInstance>, EngineError> {
         match options {
-            ResolvedAgentOptions::Sandbox(opts) => {
+            ResolvedAgentOptions::Sandbox(mut opts) => {
+                if opts.host_env.is_none() {
+                    opts.host_env = Some(self.env.clone());
+                }
                 opts.validate_tool_restrictions()?;
                 Ok(Box::new(SandboxAgentInstance { options: *opts }))
             }
@@ -146,6 +138,7 @@ impl AgentRuntimeEngine for SandboxRuntime {
 
     fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
         Ok(Box::new(SandboxAttachInstance {
+            env: self.env.clone(),
             handle: handle.clone(),
             cli_binary: self.backend.cli_binary(),
         }))
@@ -238,6 +231,7 @@ impl AgentInstance for SandboxAgentInstance {
 /// Configured-but-not-running sandbox attach handle. `run_with_frontend`
 /// opens an `sbx exec -it <name> bash` session and bridges it to the frontend.
 struct SandboxAttachInstance {
+    env: crate::data::config::env::EnvSnapshot,
     handle: AgentHandle,
     cli_binary: &'static str,
 }
@@ -286,7 +280,7 @@ impl AgentInstance for SandboxAttachInstance {
         self: Box<Self>,
         mut frontend: Box<dyn AgentFrontend>,
     ) -> Result<AgentExecution, EngineError> {
-        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use portable_pty::{native_pty_system, PtySize};
 
         let started_at = chrono::Utc::now();
         let handle = self.handle.clone();
@@ -319,7 +313,7 @@ impl AgentInstance for SandboxAttachInstance {
                     pixel_height: 0,
                 })
                 .map_err(|e| EngineError::Sandbox(format!("openpty: {e}")))?;
-            let mut cmd = CommandBuilder::new(crate::engine::host_cli::program(self.cli_binary));
+            let mut cmd = crate::engine::host_cli::pty_command(&self.env, self.cli_binary);
             for arg in &argv {
                 cmd.arg(arg);
             }
@@ -346,7 +340,7 @@ impl AgentInstance for SandboxAttachInstance {
 
         // Piped path.
         let argv = sbx_attach_argv(&handle.id, &[], &["bash"]);
-        let mut cmd = std::process::Command::new(crate::engine::host_cli::program(self.cli_binary));
+        let mut cmd = crate::engine::host_cli::command(&self.env, self.cli_binary);
         cmd.args(&argv);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
@@ -552,159 +546,5 @@ impl ExecutionBackend for SandboxAttachExecution {
             kill_local_sbx_exec(pid);
             Ok(())
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engine::agent_runtime::{AgentRuntimeEngine, ResolvedAgentOptions};
-    use crate::engine::container::options::ResolvedContainerOptions;
-    use crate::engine::error::EngineError;
-
-    // ─── Platform guards ──────────────────────────────────────────────────────
-
-    #[test]
-    fn dsbx_errors_on_linux() {
-        if cfg!(target_os = "linux") {
-            match SandboxRuntime::dsbx() {
-                Err(EngineError::BackendUnsupportedOnPlatform { backend, platform }) => {
-                    assert_eq!(backend, "docker-sbx-experimental");
-                    assert!(
-                        platform.starts_with("linux"),
-                        "platform should name linux, got: {platform}"
-                    );
-                    assert!(
-                        platform.contains("Issue #51"),
-                        "platform should explain the upstream blocker, got: {platform}"
-                    );
-                }
-                Err(e) => panic!("expected BackendUnsupportedOnPlatform on linux, got: {e:?}"),
-                Ok(_) => panic!("dsbx() must fail on linux"),
-            }
-        }
-    }
-
-    // ─── Option-variant mismatch via SandboxRuntime ───────────────────────────
-
-    /// `SandboxRuntime::build` must reject container-paradigm options with a
-    /// clear `OptionVariantMismatch` error on platforms where dsbx is
-    /// supported. Skipped via early-return on unsupported platforms.
-    #[test]
-    fn sandbox_runtime_via_trait_rejects_container_options() {
-        let rt = match SandboxRuntime::dsbx() {
-            Ok(rt) => rt,
-            Err(_) => return, // unsupported platform — platform guard test covers this
-        };
-        let opts = ResolvedAgentOptions::Container(Box::new(
-            ResolvedContainerOptions::resolve([]).unwrap(),
-        ));
-        match <SandboxRuntime as AgentRuntimeEngine>::build(&rt, opts) {
-            Err(EngineError::OptionVariantMismatch { runtime, got }) => {
-                assert_eq!(runtime, "docker-sbx-experimental");
-                assert_eq!(got, "container");
-            }
-            Err(e) => panic!("expected OptionVariantMismatch, got: {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
-    }
-
-    // ─── runtime_name and display_name ────────────────────────────────────────
-
-    #[test]
-    fn dsbx_runtime_name_and_display_name() {
-        // dsbx() errors on unsupported platforms; the guard tests above
-        // cover that path.
-        if let Ok(rt) = SandboxRuntime::dsbx() {
-            assert_eq!(rt.runtime_name(), "docker-sbx-experimental");
-            assert!(
-                rt.display_name().contains("experimental"),
-                "display_name should mention experimental, got: {}",
-                rt.display_name()
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod inspect_default_tests {
-    use super::*;
-    use crate::engine::agent_runtime::AgentRuntimeEngine;
-
-    struct InspectableBackend(AgentHandle);
-    impl super::SandboxBackend for InspectableBackend {
-        fn stop(&self, _: &AgentHandle) -> Result<(), EngineError> {
-            Ok(())
-        }
-        fn list_running(&self) -> Result<Vec<AgentHandle>, EngineError> {
-            Ok(vec![self.0.clone()])
-        }
-        fn stats(&self, _: &AgentHandle) -> Result<AgentStats, EngineError> {
-            panic!("unsupported stats must not be sampled");
-        }
-        fn name(&self) -> &'static str {
-            "docker-sbx-experimental"
-        }
-        fn cli_binary(&self) -> &'static str {
-            "sbx"
-        }
-    }
-
-    #[test]
-    fn sandbox_probe_observes_collection_cancellation_before_spawning() {
-        let rt = SandboxRuntime::for_tests();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        cancel.cancel();
-        let start = std::time::Instant::now();
-        let available =
-            crate::engine::host_cli::with_collection_cancel(cancel.clone(), || rt.is_available());
-        assert!(!available);
-        // Generous: far below the CLI call's own 10 s deadline, which a probe
-        // that ignored the cancellation could wait out.
-        assert!(start.elapsed() < std::time::Duration::from_secs(5));
-
-        // Causality, not timing: under a cancelled collection the probe's
-        // runner refuses before spawning, so a command that would leave a
-        // trace never runs.
-        let tmp = tempfile::tempdir().unwrap();
-        let marker = tmp.path().join("spawned");
-        let result = crate::engine::host_cli::with_collection_cancel(cancel, || {
-            crate::engine::host_cli::checked_output(
-                std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg("touch \"$1\"")
-                    .arg("sh")
-                    .arg(&marker),
-                "sh",
-            )
-        });
-        let error = result.expect_err("a cancelled collection must not run the CLI");
-        assert!(
-            error.to_string().contains("collection cancelled"),
-            "{error}"
-        );
-        assert!(!marker.exists(), "nothing may be spawned once cancelled");
-    }
-
-    #[test]
-    fn sandbox_runtime_uses_the_default_inspect_without_stats() {
-        let handle = AgentHandle {
-            id: "sb1".into(),
-            name: "awman-sbx".into(),
-            image_tag: String::new(),
-            started_at: chrono::Utc::now(),
-        };
-        let rt = SandboxRuntime {
-            backend: Arc::new(InspectableBackend(handle.clone())),
-        };
-        assert!(!rt.capabilities().reports_resource_stats);
-        let d = rt.inspect(&handle).unwrap();
-        assert_eq!(d.name, "awman-sbx");
-        assert!(d.running);
-        assert_eq!((d.cpu_percent, d.memory_mb), (None, None));
-        assert!(d.owner.is_none());
-        assert!(d.runtime_extras.is_empty());
-        assert!(rt.list_stopped().unwrap().is_empty());
-        assert!(!rt.reattach_after_owner_exit());
     }
 }

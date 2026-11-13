@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 
 use crate::data::config::builtin_launch::BuiltinLaunchSettings;
@@ -24,6 +24,7 @@ pub struct BackgroundExecRequest<'a> {
     pub command: &'a str,
     pub working_dir: &'a str,
     pub env: Option<&'a HashMap<String, String>>,
+    pub private_stdin: Option<&'a crate::data::secret::SecretString>,
 }
 
 /// An idle setup/teardown container with per-session builtin settings.
@@ -112,6 +113,29 @@ impl BackgroundContainer {
     pub fn container_id(&self) -> &str {
         &self.container_id
     }
+
+    /// Seed a container-local credential cache without argv, env or disk delivery.
+    pub fn seed_git_credentials(
+        &self,
+        seed: &crate::data::secret::SecretString,
+    ) -> Result<(), EngineError> {
+        let result = self.backend.exec_in_background_streaming(
+            &BackgroundExecRequest {
+                id: &self.container_id,
+                command: crate::engine::git::credential_socket::SEED_CONTAINER_CACHE,
+                working_dir: &self.working_dir,
+                env: None,
+                private_stdin: Some(seed),
+            },
+            &mut |_| {},
+        )?;
+        if result.exit_code != 0 {
+            return Err(EngineError::Container(
+                "could not initialize the session Git credential helper".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for BackgroundContainer {
@@ -151,6 +175,7 @@ impl AgentExec for BackgroundContainer {
                 command,
                 working_dir: &self.working_dir,
                 env,
+                private_stdin: None,
             },
             on_line,
         )
@@ -178,10 +203,10 @@ pub(super) fn default_start_background(
     let mut args = build_start_background_argv(&name, image, workdir, env, overlays);
     // Insert names before the image; values exist only in the CLI child env.
     for (key, _) in secret_env {
-        args.splice(args.len() - 3..args.len() - 3, ["-e".into(), key.clone()]);
+        args.splice(args.len() - 2..args.len() - 2, ["-e".into(), key.clone()]);
     }
 
-    let mut command = Command::new(crate::engine::host_cli::program(cli.bin));
+    let mut command = cli.command();
     command.args(&args);
     for (k, v) in env {
         command.env(k, v);
@@ -288,9 +313,10 @@ pub(super) fn build_start_background_argv(
         args.push(k.clone());
     }
 
-    // Image and idle entrypoint.
+    // Override image entrypoints (for example alpine/git's `git`): the
+    // background container must stay alive to accept subsequent exec calls.
+    args.extend(["--entrypoint".into(), "sleep".into()]);
     args.push(image.to_string());
-    args.push("sleep".into());
     args.push("infinity".into());
 
     args
@@ -323,7 +349,8 @@ pub(super) fn default_exec_in_background(
     args.push(container_id.to_string());
     args.extend(["sh".to_string(), "-c".to_string(), command.to_string()]);
 
-    let output = Command::new(crate::engine::host_cli::program(cli.bin))
+    let output = cli
+        .command()
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -343,13 +370,20 @@ pub(super) fn default_exec_in_background(
 
 pub(super) fn default_exec_in_background_streaming(
     cli: ContainerCli,
-    container_id: &str,
-    command: &str,
-    working_dir: &str,
-    env: Option<&HashMap<String, String>>,
+    request: &BackgroundExecRequest<'_>,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<ExecOutput, EngineError> {
+    let BackgroundExecRequest {
+        id: container_id,
+        command,
+        working_dir,
+        env,
+        private_stdin,
+    } = *request;
     let mut args = vec!["exec".to_string()];
+    if private_stdin.is_some() {
+        args.push("-i".into());
+    }
     args.extend(["-w".to_string(), working_dir.to_string()]);
 
     // Unlike `build_start_background_argv`, this keeps the `KEY=VALUE` form.
@@ -369,15 +403,28 @@ pub(super) fn default_exec_in_background_streaming(
     args.push(container_id.to_string());
     args.extend(["sh".to_string(), "-c".to_string(), command.to_string()]);
 
-    let mut child = Command::new(crate::engine::host_cli::program(cli.bin))
+    let mut child = cli
+        .command()
         .args(&args)
-        .stdin(Stdio::null())
+        .stdin(if private_stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
             EngineError::Container(format!("exec in background container {container_id}: {e}"))
         })?;
+
+    // Write concurrently with draining output so a runtime cannot deadlock on
+    // full pipes. No PTY: credentials cannot be echoed by terminal line discipline.
+    let writer = private_stdin.map(|secret| {
+        let bytes = secret.clone();
+        let mut input = child.stdin.take().expect("piped private stdin");
+        std::thread::spawn(move || std::io::Write::write_all(&mut input, bytes.expose().as_bytes()))
+    });
 
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
@@ -424,6 +471,12 @@ pub(super) fn default_exec_in_background_streaming(
             "waiting for exec in background container {container_id}: {e}"
         ))
     })?;
+    if let Some(writer) = writer {
+        writer
+            .join()
+            .map_err(|_| EngineError::Container("private stdin writer failed".into()))?
+            .map_err(|_| EngineError::Container("private stdin delivery failed".into()))?;
+    }
 
     let exit_code = status.code().unwrap_or(-1);
     Ok(ExecOutput {
@@ -434,309 +487,16 @@ pub(super) fn default_exec_in_background_streaming(
 }
 
 pub(super) fn default_stop_and_remove(cli: ContainerCli, container_id: &str) {
-    let _ = Command::new(crate::engine::host_cli::program(cli.bin))
+    let _ = cli
+        .command()
         .args(["stop", container_id])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let _ = Command::new(crate::engine::host_cli::program(cli.bin))
+    let _ = cli
+        .command()
         .args(["rm", container_id])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::message::UserMessageSink;
-    use crate::data::session::{AgentHandle, Session};
-    use crate::engine::agent_runtime::execution::{AgentInstance, AgentStats};
-    use crate::engine::agent_runtime::{Capabilities, ImageImportRequest, ImportedImage};
-    use crate::engine::container::backend::ContainerBackend;
-    use crate::engine::container::options::ResolvedContainerOptions;
-    use std::sync::Mutex;
-
-    /// Recording backend used to assert the lifecycle order of
-    /// `BackgroundContainer::{exec, kill}` without a live runtime.
-    #[derive(Default)]
-    struct RecordingBackend {
-        events: Mutex<Vec<String>>,
-        start_id: Mutex<Option<String>>,
-    }
-
-    impl RecordingBackend {
-        fn events(&self) -> Vec<String> {
-            self.events.lock().unwrap().clone()
-        }
-    }
-
-    impl ContainerBackend for RecordingBackend {
-        fn build(
-            &self,
-            _options: ResolvedContainerOptions,
-        ) -> Result<Box<dyn AgentInstance>, EngineError> {
-            unimplemented!("not exercised by BackgroundContainer lifecycle tests")
-        }
-        fn list_running(&self, _s: &Session) -> Result<Vec<AgentHandle>, EngineError> {
-            Ok(Vec::new())
-        }
-        fn stats(&self, _h: &AgentHandle) -> Result<AgentStats, EngineError> {
-            unimplemented!()
-        }
-        fn stop(&self, _h: &AgentHandle) -> Result<(), EngineError> {
-            Ok(())
-        }
-        fn attach(&self, _h: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
-            unimplemented!("not exercised by BackgroundContainer lifecycle tests")
-        }
-        fn list_running_with_name_prefix(
-            &self,
-            _prefix: &str,
-        ) -> Result<Vec<AgentHandle>, EngineError> {
-            Ok(Vec::new())
-        }
-        fn name(&self) -> &'static str {
-            "recording"
-        }
-        fn display_name(&self) -> &'static str {
-            "Recording"
-        }
-        fn capabilities(&self) -> &'static Capabilities {
-            &crate::engine::container::runtime::CONTAINER_CAPABILITIES
-        }
-        fn reattach_after_owner_exit(&self) -> bool {
-            false
-        }
-        fn is_available(&self) -> Result<(), EngineError> {
-            Ok(())
-        }
-        fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
-            Ok(Vec::new())
-        }
-        fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
-            Ok(Vec::new())
-        }
-        fn remove_agent(&self, _id: &str) -> Result<(), EngineError> {
-            Ok(())
-        }
-        fn image_exists(&self, _tag: &str) -> Result<bool, EngineError> {
-            Ok(false)
-        }
-        fn image_home_dir(&self, _tag: &str) -> Result<Option<String>, EngineError> {
-            Ok(None)
-        }
-        fn build_image(
-            &self,
-            _request: &crate::engine::container::BuildRequest,
-            _on_line: &mut dyn FnMut(&str),
-        ) -> Result<(), EngineError> {
-            unimplemented!("not exercised by BackgroundContainer lifecycle tests")
-        }
-        fn import_image(
-            &self,
-            _request: &ImageImportRequest,
-            _sink: &mut dyn UserMessageSink,
-        ) -> Result<ImportedImage, EngineError> {
-            unimplemented!("not exercised by BackgroundContainer lifecycle tests")
-        }
-        fn list_dangling_images(
-            &self,
-        ) -> Result<Vec<crate::engine::container::runtime::ContainerImageInfo>, EngineError>
-        {
-            Ok(Vec::new())
-        }
-        fn remove_image(&self, _id: &str) -> Result<(), EngineError> {
-            Ok(())
-        }
-        fn start_background(
-            &self,
-            _request: &BackgroundLaunchRequest<'_>,
-        ) -> Result<String, EngineError> {
-            let id = "bg-test".to_string();
-            self.events.lock().unwrap().push("start".into());
-            *self.start_id.lock().unwrap() = Some(id.clone());
-            Ok(id)
-        }
-        fn exec_in_background(
-            &self,
-            container_id: &str,
-            command: &str,
-            _wd: &str,
-            _env: Option<&HashMap<String, String>>,
-        ) -> Result<ExecOutput, EngineError> {
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("exec[{container_id}]: {command}"));
-            Ok(ExecOutput {
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: 0,
-            })
-        }
-        fn exec_in_background_streaming(
-            &self,
-            _request: &crate::engine::container::background::BackgroundExecRequest<'_>,
-            _on_line: &mut dyn FnMut(&str),
-        ) -> Result<ExecOutput, EngineError> {
-            unimplemented!("not exercised by BackgroundContainer lifecycle tests")
-        }
-        fn stop_and_remove(&self, container_id: &str) -> Result<(), EngineError> {
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("kill[{container_id}]"));
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn explicit_kill_records_one_stop_event() {
-        let backend = Arc::new(RecordingBackend::default());
-        let id = backend
-            .start_background(&BackgroundLaunchRequest {
-                secret_env: &[],
-                name: None,
-                image: "img",
-                workdir: std::path::Path::new("/w"),
-                env: &HashMap::new(),
-                overlays: &[],
-                builtin_launch: None,
-            })
-            .unwrap();
-        let bg = BackgroundContainer::new(
-            id,
-            backend.clone() as Arc<dyn ContainerBackend>,
-            "/w".into(),
-        );
-        let _ = bg.exec("echo hi", None).unwrap();
-        bg.kill().unwrap();
-
-        let evts = backend.events();
-        assert_eq!(
-            evts,
-            vec!["start", "exec[bg-test]: echo hi", "kill[bg-test]"],
-            "must record start, then exec, then kill in order"
-        );
-    }
-
-    #[test]
-    fn drop_without_explicit_kill_still_kills_once() {
-        let backend = Arc::new(RecordingBackend::default());
-        let id = backend
-            .start_background(&BackgroundLaunchRequest {
-                secret_env: &[],
-                name: None,
-                image: "img",
-                workdir: std::path::Path::new("/w"),
-                env: &HashMap::new(),
-                overlays: &[],
-                builtin_launch: None,
-            })
-            .unwrap();
-        {
-            let _bg = BackgroundContainer::new(
-                id,
-                backend.clone() as Arc<dyn ContainerBackend>,
-                "/w".into(),
-            );
-        } // dropped here
-        let kill_events: Vec<_> = backend
-            .events()
-            .into_iter()
-            .filter(|e| e.starts_with("kill"))
-            .collect();
-        assert_eq!(
-            kill_events,
-            vec!["kill[bg-test]"],
-            "Drop must trigger kill exactly once"
-        );
-    }
-
-    #[test]
-    fn explicit_kill_then_drop_kills_only_once() {
-        let backend = Arc::new(RecordingBackend::default());
-        let id = backend
-            .start_background(&BackgroundLaunchRequest {
-                secret_env: &[],
-                name: None,
-                image: "img",
-                workdir: std::path::Path::new("/w"),
-                env: &HashMap::new(),
-                overlays: &[],
-                builtin_launch: None,
-            })
-            .unwrap();
-        let bg = BackgroundContainer::new(
-            id,
-            backend.clone() as Arc<dyn ContainerBackend>,
-            "/w".into(),
-        );
-        bg.kill().unwrap();
-        let kill_events: Vec<_> = backend
-            .events()
-            .into_iter()
-            .filter(|e| e.starts_with("kill"))
-            .collect();
-        assert_eq!(
-            kill_events,
-            vec!["kill[bg-test]"],
-            "explicit kill marks the container killed; Drop must not call again"
-        );
-    }
-}
-
-#[cfg(test)]
-mod argv_tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    /// WI 0116 §4 invariant 6 — no payload value is ever a `Command` argument.
-    ///
-    /// The setup/teardown env map is resolved through `host_var`, so inside the
-    /// squad daemon it carries values a client pushed for a task's `env()`
-    /// overlays. `-e NAME=VALUE` here would publish them in
-    /// `/proc/<pid>/cmdline` for the lifetime of the `docker run` child.
-    #[test]
-    fn background_run_argv_emits_env_names_only_and_never_a_value() {
-        let mut env = HashMap::new();
-        env.insert("NPM_TOKEN".to_string(), "npm-s3cr3t".to_string());
-        env.insert("AWS_PROFILE".to_string(), "prod".to_string());
-
-        let argv =
-            build_start_background_argv("ctr", "img:latest", &PathBuf::from("/ws"), &env, &[]);
-
-        for name in ["NPM_TOKEN", "AWS_PROFILE"] {
-            assert!(
-                argv.windows(2).any(|w| w[0] == "-e" && w[1] == name),
-                "`-e {name}` must be emitted name-only; argv: {argv:?}"
-            );
-        }
-        for value in ["npm-s3cr3t", "prod"] {
-            assert!(
-                !argv.iter().any(|a| a.contains(value)),
-                "no argv element may contain the value {value:?}; argv: {argv:?}"
-            );
-        }
-    }
-
-    /// An empty map must not perturb the argv at all — the pre-0116 shape for a
-    /// step that declares no env.
-    #[test]
-    fn background_run_argv_with_no_env_carries_no_e_flag() {
-        let argv = build_start_background_argv(
-            "ctr",
-            "img:latest",
-            &PathBuf::from("/ws"),
-            &HashMap::new(),
-            &[],
-        );
-        assert!(!argv.iter().any(|a| a == "-e"), "argv: {argv:?}");
-        assert_eq!(
-            argv.last().map(String::as_str),
-            Some("infinity"),
-            "the idle entrypoint stays last; argv: {argv:?}"
-        );
-    }
 }

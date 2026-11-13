@@ -83,16 +83,20 @@ pub struct ImageBuildContext {
 }
 impl ImageBuildContext {
     pub fn for_session(session: &crate::data::session::Session, default_agent: &str) -> Self {
-        Self::for_repo(session.git_root(), session.repo_config(), default_agent)
+        Self::for_repo(
+            session.git_root(),
+            &session.effective_config(),
+            default_agent,
+        )
     }
     pub fn for_repo(
         git_root: &std::path::Path,
-        config: &crate::data::config::RepoConfig,
+        config: &crate::data::config::EffectiveConfig,
         default_agent: &str,
     ) -> Self {
         Self {
             git_root: git_root.to_path_buf(),
-            project_dockerfile: config.dockerfile_path_or_default(git_root),
+            project_dockerfile: config.dockerfile_path(git_root),
             default_agent: default_agent.to_string(),
         }
     }
@@ -225,36 +229,7 @@ impl AgentImagePreparer {
     ) -> Self {
         Self::with_inputs(ImageSources::default(), false, runtime, data_home, context)
     }
-    #[cfg(test)]
-    pub(crate) fn replace_sources(&mut self, sources: ImageSources) {
-        self.image_sources = sources;
-        self.plans.clear();
-        self.validated_policy = None;
-    }
-    #[cfg(test)]
-    pub(crate) fn image_sources(&self) -> &ImageSources {
-        &self.image_sources
-    }
-    #[cfg(test)]
-    pub(crate) fn with_build_stores(
-        mut self,
-        locks: ImageBuildLockStore,
-        receipts: PendingBuiltImageStore,
-    ) -> Self {
-        self.build_locks = locks;
-        self.pending_builds = receipts;
-        self
-    }
-    #[cfg(test)]
-    pub(crate) fn with_local_builder(mut self, builder: Arc<dyn LocalImageBuilder>) -> Self {
-        self.local_builder = Some(builder);
-        self
-    }
-    #[cfg(test)]
-    pub(crate) fn with_image_importer(mut self, importer: Arc<dyn ImageImporter>) -> Self {
-        self.image_importer = importer;
-        self
-    }
+
     pub fn cancel_token(&self) -> crate::engine::oci::CancelToken {
         self.cancel.clone()
     }
@@ -270,7 +245,9 @@ impl AgentImagePreparer {
     }
     fn builder(&mut self) -> Arc<dyn LocalImageBuilder> {
         self.local_builder
-            .get_or_insert_with(|| Arc::new(HostLocalImageBuilder::default()))
+            .get_or_insert_with(|| {
+                Arc::new(HostLocalImageBuilder::with_env(self.definition_env.clone()))
+            })
             .clone()
     }
     fn plan(&mut self, tag: &str, agent: &str) -> ImagePlan {
@@ -283,12 +260,9 @@ impl AgentImagePreparer {
                     .get(tag)
                     .or(self.image_sources.default.as_ref())
                     .map(|spec| (spec.kind(), spec.reference_or(tag)));
-                // The same acquisition env the backend pulls with
-                // (`BuiltinBackend` import, `Env::for_image_acquisition`): source
-                // resolution and the pull must see one Docker endpoint, proxy and
-                // credential set, so neither reads the session snapshot alone.
-                let env = Env::for_image_acquisition(&self.image_sources.registries);
-                let resolved = ImageSourceResolver::new(&self.image_sources, &env)
+                // Resolution and acquisition use the same instance snapshot,
+                // including its endpoint, proxy and credential variables.
+                let resolved = ImageSourceResolver::new(&self.image_sources, &self.definition_env)
                     .with_builder_enabled(self.builder_enabled)
                     .resolve_for_image(
                         tag,
@@ -458,6 +432,3 @@ impl AgentImagePreparer {
 }
 
 mod prepare;
-
-#[cfg(test)]
-mod tests;

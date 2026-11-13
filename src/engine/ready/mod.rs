@@ -1,10 +1,7 @@
 //! `engine::ready` — `ReadyEngine`. Multi-phase state machine for `awman ready`.
 
 use crate::data::config::resolved_builtin::ResolvedBuiltinConfig;
-#[cfg(test)]
-use crate::data::image_build_lock::ImageBuildLockStore;
-#[cfg(test)]
-use crate::data::image_build_state::PendingBuiltImageStore;
+
 use crate::data::session::{AgentName, Session};
 use crate::data::setup_step::{ReadyStep, SetupStep};
 use crate::data::step_status::StepStatus;
@@ -14,12 +11,11 @@ use crate::engine::agent_runtime::{
 };
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
-#[cfg(test)]
-use crate::engine::image_prep::builder::LocalImageBuilder;
-#[cfg(test)]
-use crate::engine::oci::ImageSources;
+
 use crate::engine::overlay::OverlayEngine;
 use std::sync::Arc;
+#[cfg(test)]
+mod contracts;
 pub mod frontend;
 pub mod host_agent;
 mod phases;
@@ -65,7 +61,7 @@ pub struct ReadyEngine {
     /// in `security.md`.
     host_agent: Arc<dyn ReadyHostPing>,
     /// `options.agent` resolved once, on the first step, and read by every
-    /// later phase (the host ping included) so one `ready` run never mixes
+    /// later phase (its host ping included) so one `ready` run never mixes
     /// two versions of a definition.
     definition: Option<crate::engine::agent::ResolvedAgent>,
     preparer: crate::engine::image_prep::AgentImagePreparer,
@@ -139,6 +135,7 @@ impl ReadyEngine {
                 false => ReadyImageAction::Build,
             };
         let cancel = preparer.cancel_token();
+        let host_env = session.env().clone();
         Self {
             session,
             git_engine,
@@ -149,7 +146,7 @@ impl ReadyEngine {
             phase: ReadyPhase::Preflight,
             summary,
             pre_audit_dockerfile_hash: None,
-            host_agent: Arc::new(HostAgentPinger::new()),
+            host_agent: Arc::new(HostAgentPinger::with_env(host_env)),
             definition: None,
             preparer,
             image_policy,
@@ -183,63 +180,9 @@ impl ReadyEngine {
         engine
     }
 
-    /// Replace the session-derived image sources. Test-only: production
-    /// sources and builder enablement both come from the session's
-    /// effective config, so they cannot disagree.
-    #[cfg(test)]
-    pub fn with_image_sources(mut self, sources: ImageSources) -> Self {
-        self.preparer.replace_sources(sources);
-        self
-    }
-
-    /// Inject a recording builder for daemon-free ready tests.
-    #[cfg(test)]
-    pub fn with_local_builder(mut self, builder: Arc<dyn LocalImageBuilder>) -> Self {
-        self.preparer = self.preparer.with_local_builder(builder);
-        self
-    }
-
-    #[cfg(test)]
-    pub fn with_image_importer(mut self, importer: Arc<dyn ImageImporter>) -> Self {
-        self.preparer = self.preparer.with_image_importer(importer);
-        self
-    }
-
-    #[cfg(test)]
-    pub fn with_host_ping(mut self, ping: Arc<dyn ReadyHostPing>) -> Self {
-        self.host_agent = ping;
-        self
-    }
-
-    /// Inject private lock and receipt roots for hermetic ready tests.
-    #[cfg(test)]
-    pub fn with_build_stores(
-        mut self,
-        locks: ImageBuildLockStore,
-        receipts: PendingBuiltImageStore,
-    ) -> Self {
-        self.preparer = self.preparer.with_build_stores(locks, receipts);
-        self
-    }
-
     /// Cancellation handle for an in-flight ready import. Dropping an import
     /// future also cancels it, so async deadlines work on a current-thread runtime.
     pub fn cancel_token(&self) -> crate::engine::oci::CancelToken {
         self.preparer.cancel_token()
-    }
-}
-#[cfg(test)]
-pub(crate) mod tests;
-
-#[cfg(test)]
-impl ReadyEngine {
-    pub(crate) fn into_image_test_parts(
-        self,
-    ) -> (
-        Arc<Session>,
-        crate::engine::image_prep::AgentImagePreparer,
-        crate::engine::image_prep::BuildPolicy,
-    ) {
-        (self.session, self.preparer, self.image_policy)
     }
 }

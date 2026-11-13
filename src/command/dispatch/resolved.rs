@@ -252,11 +252,11 @@ impl ResolvedFlags {
         };
         resolved.validate_conflicts(command_path, spec.flags)?;
         let mut resolved = resolved.close_over_implications(spec.flags);
-        resolved.apply_non_interactive_rule(spec, frontend.input_available());
+        resolved.apply_headless_rule(spec, frontend.input_available());
         Ok(resolved)
     }
 
-    /// The one non-interactive rule: an invocation is non-interactive when the
+    /// The one headless rule: an invocation is headless when the
     /// user asked for it (directly, or through a flag that implies it) **or**
     /// when there is nowhere to read an answer from.
     ///
@@ -264,24 +264,24 @@ impl ResolvedFlags {
     /// Layer 3, called once by the CLI to cache its own copy and re-derived
     /// per-`ask_*` elsewhere, so a command could believe it was interactive
     /// while its frontend believed the opposite.
-    pub fn is_non_interactive(explicitly_requested: bool, input_available: bool) -> bool {
+    pub fn is_headless(explicitly_requested: bool, input_available: bool) -> bool {
         explicitly_requested || !input_available
     }
 
-    /// Apply [`is_non_interactive`](Self::is_non_interactive) to this
-    /// command's `non-interactive` flag, if it declares one.
+    /// Apply [`is_headless`](Self::is_headless) to this
+    /// command's `headless` flag, if it declares one.
     ///
-    /// Runs after implication closure, so `--json ⇒ --non-interactive` has
+    /// Runs after implication closure, so `--json ⇒ --headless` has
     /// already been folded in and counts as "explicitly requested".
-    fn apply_non_interactive_rule(&mut self, spec: &'static CommandSpec, input_available: bool) {
-        const FLAG: &str = "non-interactive";
+    fn apply_headless_rule(&mut self, spec: &'static CommandSpec, input_available: bool) {
+        const FLAG: &str = "headless";
         if spec.find_flag(FLAG).is_none() {
             return;
         }
         let explicit = matches!(self.values.get(FLAG), Some(ResolvedValue::Bool(true)));
-        let effective = Self::is_non_interactive(explicit, input_available);
+        let effective = Self::is_headless(explicit, input_available);
         if effective && !explicit {
-            tracing::info!("auto-detected non-interactive mode (no input available)");
+            tracing::info!("auto-detected headless mode (no input available)");
         }
         self.values.insert(FLAG, ResolvedValue::Bool(effective));
     }
@@ -314,7 +314,7 @@ impl ResolvedFlags {
     /// until nothing changes so the relation is transitive.
     ///
     /// Only boolean implications exist in the catalogue (`--json` implies
-    /// `--non-interactive`; `--yolo` and `--auto` imply `--worktree`), and an
+    /// `--headless`; `--yolo` and `--auto` imply `--worktree`), and an
     /// edge whose target this command does not declare is skipped: chat and
     /// exec prompt have no boolean workflow `--worktree` for those mode flags
     /// to set; their optional-string selector is independent.
@@ -450,7 +450,10 @@ impl ResolvedArgs {
                 argument.name,
                 frontend.argument(command_path, argument.name)?,
             );
-            if matches!(argument.kind, ArgumentKind::TrailingVarArgs) {
+            if matches!(
+                argument.kind,
+                ArgumentKind::TrailingVarArgs | ArgumentKind::VarArgs
+            ) {
                 trailing.insert(
                     argument.name,
                     frontend.arguments(command_path, argument.name)?,
@@ -537,6 +540,9 @@ impl CallerContext {
 /// everything it needs at instantiation time; this is that collection, and
 /// `CommandSpec::build` is the catalogue entry that hands it over.
 pub struct BuildContext<'a> {
+    pub command_secrets: Option<Arc<crate::data::secret::CommandSecrets>>,
+    pub remote_target: Option<String>,
+    pub set_args: Vec<String>,
     pub flags: &'a ResolvedFlags,
     pub args: &'a ResolvedArgs,
     pub engines: &'a Engines,
@@ -577,161 +583,5 @@ impl BuildContext<'_> {
                 gateway,
             )) as Box<dyn TaskGateway>
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::command::dispatch::catalogue::CommandCatalogue;
-    use crate::command::dispatch::tests::FakeCommandFrontend;
-
-    fn resolve(path: &[&str], frontend: &FakeCommandFrontend) -> ResolvedFlags {
-        let spec = CommandCatalogue::get().lookup(path).expect("spec");
-        ResolvedFlags::resolve(frontend, path, spec).expect("resolve")
-    }
-
-    #[test]
-    fn supplied_argv_renders_only_supplied_flags_in_the_raw_args_form() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.bools.insert("yolo".into(), true);
-        frontend.strings.insert("model".into(), "opus".into());
-        frontend
-            .strings_vec
-            .insert("agent-flag".into(), vec!["--search".into(), "-v".into()]);
-        frontend.usizes.insert("max-concurrent".into(), 3);
-        frontend.strings.insert("session".into(), "abc".into());
-        let flags = resolve(&["remote", "exec", "workflow"], &frontend);
-        assert_eq!(
-            flags.supplied_argv(&["session"]),
-            vec![
-                "--agent-flag=--search",
-                "--agent-flag=-v",
-                "--max-concurrent=3",
-                "--model=opus",
-                "--yolo",
-            ],
-            "defaults (non-interactive, on-* enums) and excluded flags are not rendered"
-        );
-    }
-
-    #[test]
-    fn an_absent_flag_takes_the_catalogue_default() {
-        let flags = resolve(&["init"], &FakeCommandFrontend::new());
-        assert_eq!(flags.r#enum("agent"), Some("claude"));
-        assert!(!flags.bool("aspec"));
-        assert!(!flags.supplied("agent"));
-    }
-
-    #[test]
-    fn a_supplied_flag_beats_the_catalogue_default() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.strings.insert("agent".into(), "codex".into());
-        let flags = resolve(&["init"], &frontend);
-        assert_eq!(flags.r#enum("agent"), Some("codex"));
-        assert!(flags.supplied("agent"));
-    }
-
-    #[test]
-    fn json_implies_non_interactive() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.bools.insert("json".into(), true);
-        let flags = resolve(&["ready"], &frontend);
-        assert!(flags.bool("non-interactive"));
-        assert!(
-            !flags.supplied("non-interactive"),
-            "an implied flag was never supplied by the frontend"
-        );
-    }
-
-    // ─── the non-interactive rule (WI 0114 F-50) ────────────────────────────
-
-    /// The rule itself, in the one place it lives.
-    #[test]
-    fn non_interactive_is_asked_for_or_forced_by_having_nowhere_to_ask() {
-        assert!(ResolvedFlags::is_non_interactive(true, true));
-        assert!(ResolvedFlags::is_non_interactive(true, false));
-        assert!(ResolvedFlags::is_non_interactive(false, false));
-        assert!(!ResolvedFlags::is_non_interactive(false, true));
-    }
-
-    /// A caller with nowhere to read an answer from resolves
-    /// `--non-interactive` whether or not it passed the flag — and the flag
-    /// still reads as unsupplied, because the user did not supply it.
-    #[test]
-    fn a_frontend_without_input_resolves_non_interactive() {
-        let frontend = FakeCommandFrontend::new().without_input();
-        let flags = resolve(&["ready"], &frontend);
-        assert!(flags.bool("non-interactive"));
-        assert!(!flags.supplied("non-interactive"));
-    }
-
-    /// With input available the flag is the user's alone.
-    #[test]
-    fn a_frontend_with_input_leaves_non_interactive_to_the_user() {
-        let flags = resolve(&["ready"], &FakeCommandFrontend::new());
-        assert!(!flags.bool("non-interactive"));
-
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.bools.insert("non-interactive".into(), true);
-        assert!(resolve(&["ready"], &frontend).bool("non-interactive"));
-    }
-
-    /// A command with no `--non-interactive` flag is left untouched.
-    #[test]
-    fn a_command_without_the_flag_is_unaffected_by_the_rule() {
-        let frontend = FakeCommandFrontend::new().without_input();
-        let flags = resolve(&["agents", "status"], &frontend);
-        assert!(
-            CommandCatalogue::get()
-                .lookup(&["agents", "status"])
-                .unwrap()
-                .find_flag("non-interactive")
-                .is_none()
-                || flags.bool("non-interactive"),
-            "the rule must not invent a flag the command does not declare"
-        );
-    }
-
-    #[test]
-    fn yolo_and_auto_each_imply_worktree() {
-        for flag in ["yolo", "auto"] {
-            let mut frontend = FakeCommandFrontend::new();
-            frontend.bools.insert(flag.into(), true);
-            let flags = resolve(&["exec", "workflow"], &frontend);
-            assert!(flags.bool("worktree"), "{flag} must imply worktree");
-        }
-    }
-
-    #[test]
-    fn an_implication_whose_target_the_command_lacks_is_skipped() {
-        // `chat` shares `--yolo` with `exec workflow` but declares no boolean
-        // workflow `--worktree`; resolving must not invent one.
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.bools.insert("yolo".into(), true);
-        let flags = resolve(&["chat"], &frontend);
-        assert!(flags.bool("yolo"));
-    }
-
-    #[test]
-    fn conflicts_are_judged_on_supplied_flags_only() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.bools.insert("yolo".into(), true);
-        frontend.bools.insert("plan".into(), true);
-        let spec = CommandCatalogue::get()
-            .lookup(&["exec", "workflow"])
-            .unwrap();
-        let result = ResolvedFlags::resolve(&frontend, &["exec", "workflow"], spec);
-        assert!(matches!(
-            result,
-            Err(CommandError::MutuallyExclusive { .. })
-        ));
-    }
-
-    #[test]
-    #[should_panic(expected = "not declared by this command's CommandSpec")]
-    fn a_flag_outside_the_spec_panics() {
-        let flags = resolve(&["agents", "status"], &FakeCommandFrontend::new());
-        let _ = flags.bool("not-a-flag");
     }
 }

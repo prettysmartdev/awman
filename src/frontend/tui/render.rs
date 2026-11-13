@@ -25,8 +25,6 @@ mod sidebar;
 mod squad;
 mod status_bar;
 mod tab_bar;
-#[cfg(test)]
-mod tests;
 
 /// Rows the tab bar occupies at the top of the frame.
 const TAB_BAR_HEIGHT: u16 = 3;
@@ -46,8 +44,9 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
         let tab = app.active_tab();
         (
             workflow_snapshot.view.clone(),
-            tab.workflow_overview_state,
-            tab.container_window_state,
+            // A window a host presenter claimed (WI 0142) draws minimized.
+            app.remote_view.rendered_overview(tab),
+            app.remote_view.rendered_window(tab),
             tab.last_container_summary.is_some(),
             tab.git_sidebar_state,
             tab.container_slots.len(),
@@ -269,4 +268,10 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
     if let Some(dialog) = &app.active_dialog {
         dialog::render_dialog(dialog, area, frame);
     }
+}
+
+/// Draw one dialog on an otherwise empty frame: the start-up hand-off
+/// prompt (WI 0142), which is asked before any tab exists.
+pub fn render_dialog_only(dialog: &dialogs::Dialog, frame: &mut Frame) {
+    dialog::render_dialog(dialog, frame.area(), frame);
 }

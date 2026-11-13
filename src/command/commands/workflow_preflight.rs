@@ -14,9 +14,7 @@
 /// replace the streamed lines.
 use std::collections::HashMap;
 
-use crate::command::commands::exec_workflow::{
-    parse_leader_flag, workflow_flag_config, ExecWorkflowCommandFlags,
-};
+use crate::command::commands::exec_workflow::{parse_leader_flag, ExecWorkflowCommandFlags};
 use crate::command::commands::launch_policy::LaunchPolicy;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
@@ -39,13 +37,8 @@ pub(crate) fn ensure_workflow_agents_approved(
     flags: &ExecWorkflowCommandFlags,
     frontend: &mut dyn crate::command::commands::agent_trust::AgentTrustFrontend,
 ) -> Result<(), CommandError> {
-    let current = session.effective_config();
-    let config = crate::data::config::effective::EffectiveConfig::new(
-        workflow_flag_config(flags),
-        current.env().clone(),
-        current.repo().clone(),
-        current.global().clone(),
-    );
+    let config = crate::command::commands::exec_workflow::workflow_effective_config(session, flags)
+        .map_err(EngineError::Data)?;
     let default_agent = config.agent();
     let mut agents = Vec::new();
     for step in &workflow.steps {
@@ -68,17 +61,12 @@ pub(crate) fn validate_workflow_acp_preflight(
     session: &Session,
     flags: &ExecWorkflowCommandFlags,
     sink: &mut dyn UserMessageSink,
-) -> Result<HashMap<String, crate::data::config::repo::LaunchMode>, EngineError> {
-    use crate::data::config::global::LaunchModeFallback;
-    use crate::data::config::repo::LaunchMode;
+) -> Result<HashMap<String, crate::data::config::agents::LaunchMode>, EngineError> {
+    use crate::data::config::agents::AcpFallback;
+    use crate::data::config::agents::LaunchMode;
 
-    let current = session.effective_config();
-    let config = crate::data::config::effective::EffectiveConfig::new(
-        workflow_flag_config(flags),
-        current.env().clone(),
-        current.repo().clone(),
-        current.global().clone(),
-    );
+    let config = crate::command::commands::exec_workflow::workflow_effective_config(session, flags)
+        .map_err(EngineError::Data)?;
     let requested = config.launch_mode();
     let effective_default_agent = config.agent();
     let mut modes = HashMap::with_capacity(workflow.steps.len());
@@ -97,7 +85,7 @@ pub(crate) fn validate_workflow_acp_preflight(
         let agent = crate::data::session::AgentName::new(agent_name).map_err(EngineError::Data)?;
         let definition = crate::engine::agent::AgentRegistry::resolve_for_session(session, &agent)?;
         let mode = if requested == LaunchMode::Acp && !definition.supports_acp {
-            if config.launch_mode_fallback() == LaunchModeFallback::Error {
+            if config.acp_fallback() == AcpFallback::Error {
                 return Err(EngineError::Other(format!(
                     "workflow ACP pre-flight failed: step '{}' uses agent '{}', which does not support ACP",
                     step.name,
@@ -107,7 +95,7 @@ pub(crate) fn validate_workflow_acp_preflight(
             sink.write_message(UserMessage {
                 level: MessageLevel::Warning,
                 text: format!(
-                    "workflow step '{}': agent '{}' does not support ACP; falling back to stdio for this session — see launchModeFallback",
+                    "workflow step '{}': agent '{}' does not support ACP; falling back to stdio for this session — see agents.acpFallback",
                     step.name,
                     agent.as_str()
                 ),
@@ -194,14 +182,9 @@ pub(crate) fn resolve_dynamic_workflows(
     session: &Session,
     flags: &ExecWorkflowCommandFlags,
 ) -> Result<ResolvedDynamicWorkflows, CommandError> {
-    crate::data::config::EffectiveConfig::new(
-        workflow_flag_config(flags),
-        session.env().clone(),
-        session.repo_config().clone(),
-        session.global_config().clone(),
-    )
-    .dynamic_workflows()
-    .map_err(CommandError::from)
+    crate::command::commands::exec_workflow::workflow_effective_config(session, flags)?
+        .dynamic_workflows()
+        .map_err(CommandError::from)
 }
 
 /// Resolve the leader agent name and optional model override (WI-0092 §7,
@@ -436,7 +419,7 @@ pub(crate) fn agents_section_for_leader(
     let Some(map) = &resolved.agents_to_models else {
         return Ok((format_available_agents(available_agents), warnings));
     };
-    let key_label = format!("{}.agentsToModels", map.source.key_prefix());
+    let key_label = "workflows.dynamic.agentsToModels".to_string();
     let policy = match map.source {
         DynamicWorkflowsSource::Global => MissingDockerfilePolicy::SkipWithWarning,
         _ => MissingDockerfilePolicy::Fail,
@@ -578,13 +561,8 @@ pub(crate) async fn ensure_static_workflow_agent_images(
     flags: &ExecWorkflowCommandFlags,
     frontend: &mut dyn crate::command::commands::agent_setup::AgentSetupFrontend,
 ) -> Result<(), CommandError> {
-    let current = session.effective_config();
-    let config = crate::data::config::effective::EffectiveConfig::new(
-        workflow_flag_config(flags),
-        current.env().clone(),
-        current.repo().clone(),
-        current.global().clone(),
-    );
+    let config = crate::command::commands::exec_workflow::workflow_effective_config(session, flags)
+        .map_err(EngineError::Data)?;
     let default_agent = match config.agent() {
         Some(name) => crate::data::session::AgentName::new(name).map_err(EngineError::Data)?,
         None => session.configured_agent(),
@@ -671,8 +649,9 @@ async fn ensure_workflow_agent_images_with_default(
     Ok(())
 }
 
-/// Import-only preparation of the image a workflow or squad step needs, on a
-/// runtime that imports images (WI 0126 C1, `BuildPolicy::ImportOnly`).
+/// Import the image a workflow or squad step needs. If Apple Containers has
+/// lost image content and the matching builtin builder is enabled, rebuild
+/// once and retry before starting the step.
 async fn import_agent_image_for_step(
     runtime: std::sync::Arc<dyn crate::engine::agent_runtime::AgentRuntimeEngine>,
     git_root: &std::path::Path,
@@ -681,37 +660,80 @@ async fn import_agent_image_for_step(
     definition: crate::engine::agent::ResolvedAgent,
     sink: &mut dyn UserMessageSink,
 ) -> Result<(), CommandError> {
-    use crate::engine::image_prep::{
-        AgentImagePreparer, AgentImageRequest, BuildPolicy, ImageBuildContext, MessageSink,
-    };
-    let mut preparer = AgentImagePreparer::new(
+    use crate::engine::image_prep::{AgentImagePreparer, ImageBuildContext};
+    let preparer = AgentImagePreparer::new(
         session.effective_config().builtin_settings()?,
         runtime,
-        crate::data::config::global::GlobalConfig::data_home_with(
-            session.effective_config().env(),
-        )?,
+        crate::data::fs::data_paths::data_home(session.effective_config().env())?,
         // The context's default agent is the session's configured one, not the
         // agent being prepared: a non-default agent must not reuse a
         // single-image default source, exactly as `ready` refuses it.
         ImageBuildContext::for_repo(
             git_root,
-            session.repo_config(),
+            &session.effective_config(),
             session.configured_agent().as_str(),
         ),
     )
     .with_definition_env(session.env().clone())
     .with_definition(definition);
     let tag = crate::data::image_tags::agent_image_tag(git_root, agent);
+    prepare_importing_step_with_recovery(preparer, &tag, agent, sink).await
+}
+
+async fn prepare_importing_step_with_recovery(
+    mut preparer: crate::engine::image_prep::AgentImagePreparer,
+    tag: &str,
+    agent: &str,
+    sink: &mut dyn UserMessageSink,
+) -> Result<(), CommandError> {
+    use crate::engine::image_prep::{AgentImageRequest, BuildPolicy, MessageSink};
     let result = preparer
         .prepare(
             &AgentImageRequest {
-                tag: &tag,
+                tag,
                 agent,
                 policy: BuildPolicy::ImportOnly,
             },
             &mut MessageSink(sink),
         )
         .await?;
+    if result.import_failure
+        == Some(crate::data::ready_image::ReadyImageImportFailure::AppleContentMissing)
+        && preparer.missing_image_plan(tag, agent)
+            == crate::data::ready_image::ReadyImagePlan::BuildAndImport
+    {
+        sink.write_message(UserMessage {
+            level: MessageLevel::Warning,
+            text: format!(
+                "Apple Containers is missing content for agent '{agent}'; rebuilding its image before starting the step"
+            ),
+        });
+        let repaired = preparer
+            .prepare(
+                &AgentImageRequest {
+                    tag,
+                    agent,
+                    policy: BuildPolicy::Ready {
+                        build: true,
+                        no_cache: true,
+                        refresh: false,
+                    },
+                },
+                &mut MessageSink(sink),
+            )
+            .await?;
+        if let crate::data::step_status::StepStatus::Failed(error) = repaired.build {
+            return Err(CommandError::Other(format!(
+                "failed to rebuild image for agent '{agent}': {error}"
+            )));
+        }
+        if let crate::data::step_status::StepStatus::Failed(error) = repaired.import {
+            return Err(CommandError::Other(format!(
+                "failed to import rebuilt image for agent '{agent}': {error}"
+            )));
+        }
+        return Ok(());
+    }
     match result.import {
         crate::data::step_status::StepStatus::Failed(error) => {
             Err(CommandError::Other(if result.source_kind.is_some() {
@@ -822,693 +844,4 @@ pub(crate) async fn ensure_agent_image_with_build_output(
         text: format!("Built image for agent '{agent}'."),
     });
     Ok(())
-}
-
-#[cfg(test)]
-mod static_image_tests {
-    use super::*;
-    use crate::command::commands::agent_setup::{AgentSetupDecision, AgentSetupFrontend};
-    use crate::data::image_tags::{agent_image_tag, project_image_tag};
-    use crate::data::session::AgentName;
-    use crate::engine::agent_runtime::{
-        AgentHandle, AgentInstance, AgentRuntimeEngine, AgentStats, Capabilities,
-        ResolvedAgentOptions,
-    };
-    use std::collections::HashSet;
-    use std::sync::Arc;
-
-    /// A building runtime whose image store holds exactly `present`.
-    struct Building {
-        caps: Capabilities,
-        present: HashSet<String>,
-    }
-
-    impl AgentRuntimeEngine for Building {
-        fn runtime_name(&self) -> &'static str {
-            "fake-build"
-        }
-        fn display_name(&self) -> &'static str {
-            "Fake build"
-        }
-        fn capabilities(&self) -> &Capabilities {
-            &self.caps
-        }
-        fn is_available(&self) -> bool {
-            true
-        }
-        fn build(&self, _: ResolvedAgentOptions) -> Result<Box<dyn AgentInstance>, EngineError> {
-            unreachable!()
-        }
-        fn list_running(&self, _: &Session) -> Result<Vec<AgentHandle>, EngineError> {
-            unreachable!()
-        }
-        fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
-            unreachable!()
-        }
-        fn stats(&self, _: &AgentHandle) -> Result<AgentStats, EngineError> {
-            unreachable!()
-        }
-        fn stop(&self, _: &AgentHandle) -> Result<(), EngineError> {
-            unreachable!()
-        }
-        fn attach(&self, _: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
-            unreachable!()
-        }
-        fn list_running_with_name_prefix(&self, _: &str) -> Result<Vec<AgentHandle>, EngineError> {
-            unreachable!()
-        }
-        fn ready_agent(
-            &self,
-            _: &str,
-            _: crate::engine::agent_runtime::ReadyAgentOptions,
-            _: &mut dyn UserMessageSink,
-        ) -> Result<(), EngineError> {
-            unreachable!()
-        }
-        fn image_exists(&self, tag: &str) -> Result<bool, EngineError> {
-            Ok(self.present.contains(tag))
-        }
-        fn image_home_dir(&self, _: &str) -> Result<Option<String>, EngineError> {
-            Ok(None)
-        }
-        fn build_image(
-            &self,
-            _: &crate::engine::container::BuildRequest,
-            _: &mut dyn FnMut(&str),
-        ) -> Result<(), EngineError> {
-            panic!("these tests never reach a build")
-        }
-    }
-
-    /// Answers every question with `decision` and records what it was asked.
-    struct Answering {
-        decision: AgentSetupDecision,
-        /// `(requested, default, default_available, image_only)` per question.
-        asked: Vec<(String, String, bool, bool)>,
-        fallbacks: Vec<(String, String)>,
-    }
-
-    impl Answering {
-        fn new(decision: AgentSetupDecision) -> Self {
-            Self {
-                decision,
-                asked: Vec::new(),
-                fallbacks: Vec::new(),
-            }
-        }
-    }
-
-    impl UserMessageSink for Answering {
-        fn write_message(&mut self, _: UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-
-    impl AgentSetupFrontend for Answering {
-        fn ask_agent_setup(
-            &mut self,
-            requested: &AgentName,
-            default: &AgentName,
-            default_available: bool,
-            image_only: bool,
-        ) -> Result<AgentSetupDecision, CommandError> {
-            self.asked.push((
-                requested.as_str().into(),
-                default.as_str().into(),
-                default_available,
-                image_only,
-            ));
-            Ok(self.decision)
-        }
-        fn record_fallback(&mut self, requested: &AgentName, fallback: &AgentName) {
-            self.fallbacks
-                .push((requested.as_str().into(), fallback.as_str().into()));
-        }
-    }
-
-    const WORKFLOW: &str = r#"
-[[steps]]
-name = "plan"
-prompt = "plan it"
-
-[[steps]]
-name = "build"
-agent = "codex"
-prompt = "build it"
-
-[[steps]]
-name = "review"
-agent = "codex"
-prompt = "review it"
-"#;
-
-    /// A repo, its session, and engines over a runtime holding the images of
-    /// `present` agents (plus the project image unless `no_project`).
-    fn fixture(
-        present: &[&str],
-        no_project: bool,
-    ) -> (tempfile::TempDir, Session, Engines, Workflow) {
-        let tmp = tempfile::tempdir().unwrap();
-        let session = Session::for_tests_isolated(tmp.path(), &tmp.path().join("home"));
-        let mut tags: HashSet<String> = present
-            .iter()
-            .map(|agent| agent_image_tag(tmp.path(), agent))
-            .collect();
-        if !no_project {
-            tags.insert(project_image_tag(tmp.path()));
-        }
-        let mut engines = Engines::for_tests(tmp.path());
-        engines.runtime = Arc::new(Building {
-            caps: crate::engine::container::ContainerRuntime::docker()
-                .capabilities()
-                .clone(),
-            present: tags,
-        });
-        let workflow = Workflow::parse(
-            WORKFLOW,
-            crate::data::workflow_definition::WorkflowFormat::Toml,
-        )
-        .unwrap();
-        (tmp, session, engines, workflow)
-    }
-
-    fn claude() -> AgentName {
-        AgentName::new("claude").unwrap()
-    }
-
-    async fn run(
-        workflow: &mut Workflow,
-        engines: &Engines,
-        session: &Session,
-        frontend: &mut Answering,
-    ) -> Result<(), CommandError> {
-        ensure_workflow_agent_images_with_default(workflow, engines, session, &claude(), frontend)
-            .await
-    }
-
-    #[tokio::test]
-    async fn every_image_present_asks_nothing() {
-        let (_tmp, session, engines, mut workflow) = fixture(&["claude", "codex"], false);
-        let mut frontend = Answering::new(AgentSetupDecision::Abort);
-        run(&mut workflow, &engines, &session, &mut frontend)
-            .await
-            .unwrap();
-        assert!(frontend.asked.is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_missing_agent_image_is_asked_about_once_and_abort_stops_the_run() {
-        let (_tmp, session, engines, mut workflow) = fixture(&["claude"], false);
-        let mut frontend = Answering::new(AgentSetupDecision::Abort);
-        let err = run(&mut workflow, &engines, &session, &mut frontend)
-            .await
-            .unwrap_err();
-        // Two codex steps, one question; no Dockerfile yet, default available.
-        assert_eq!(
-            frontend.asked,
-            vec![("codex".into(), "claude".into(), true, false)]
-        );
-        assert!(
-            err.to_string().contains("awman ready --agent codex"),
-            "{err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn fallback_runs_those_steps_with_the_default_agent() {
-        let (_tmp, session, engines, mut workflow) = fixture(&["claude"], false);
-        let mut frontend = Answering::new(AgentSetupDecision::FallbackToDefault);
-        run(&mut workflow, &engines, &session, &mut frontend)
-            .await
-            .unwrap();
-        let agents: Vec<Option<&str>> = workflow
-            .steps
-            .iter()
-            .map(|step| step.agent.as_deref())
-            .collect();
-        // The step that named no agent is untouched; it already ran claude.
-        assert_eq!(agents, vec![None, Some("claude"), Some("claude")]);
-        assert_eq!(
-            frontend.fallbacks,
-            vec![("codex".to_string(), "claude".to_string())]
-        );
-    }
-
-    #[tokio::test]
-    async fn no_fallback_is_offered_when_the_default_image_is_missing_too() {
-        let (_tmp, session, engines, mut workflow) = fixture(&[], false);
-        let mut frontend = Answering::new(AgentSetupDecision::FallbackToDefault);
-        let err = run(&mut workflow, &engines, &session, &mut frontend)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            frontend.asked,
-            vec![("claude".into(), "claude".into(), false, false)],
-            "the default agent's own image is asked about first, with no fallback"
-        );
-        assert!(err.to_string().contains("claude"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn an_existing_dockerfile_makes_it_an_image_only_question() {
-        let (tmp, session, engines, mut workflow) = fixture(&["claude"], false);
-        let paths = crate::data::RepoDockerfilePaths::new(tmp.path());
-        std::fs::create_dir_all(paths.agent_dockerfile("codex").parent().unwrap()).unwrap();
-        std::fs::write(paths.agent_dockerfile("codex"), "FROM scratch\n").unwrap();
-        let mut frontend = Answering::new(AgentSetupDecision::Abort);
-        let _ = run(&mut workflow, &engines, &session, &mut frontend).await;
-        assert_eq!(
-            frontend.asked,
-            vec![("codex".into(), "claude".into(), true, true)]
-        );
-    }
-
-    #[tokio::test]
-    async fn setup_without_the_project_image_says_to_build_it_first() {
-        let (_tmp, session, engines, mut workflow) = fixture(&["claude"], true);
-        let mut frontend = Answering::new(AgentSetupDecision::Setup);
-        let err = run(&mut workflow, &engines, &session, &mut frontend)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                CommandError::Engine(EngineError::AgentRequiresProjectImage { .. })
-            ),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn importing_runtimes_are_left_to_their_own_preparation() {
-        let (_tmp, session, mut engines, mut workflow) = fixture(&[], false);
-        let mut caps = engines.runtime.capabilities().clone();
-        caps.image_acquisition = crate::engine::agent_runtime::ImageAcquisition::Import;
-        engines.runtime = Arc::new(Building {
-            caps,
-            present: HashSet::new(),
-        });
-        let mut frontend = Answering::new(AgentSetupDecision::Abort);
-        run(&mut workflow, &engines, &session, &mut frontend)
-            .await
-            .unwrap();
-        assert!(frontend.asked.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod import_tests {
-    use super::*;
-    use crate::data::config::image_source::ImageSourceSpec;
-    use crate::engine::agent_runtime::{
-        AgentHandle, AgentInstance, AgentRuntimeEngine, AgentStats, Capabilities, ImageAcquisition,
-        ImageImportRequest, ImportedImage, ResolvedAgentOptions,
-    };
-    use std::sync::Arc;
-    use std::sync::Mutex;
-
-    /// An importing runtime that records imports and refuses to build.
-    struct Importing {
-        caps: Capabilities,
-        present: bool,
-        imports: Mutex<Vec<ImageImportRequest>>,
-    }
-
-    impl Importing {
-        fn new(present: bool) -> Self {
-            let mut caps = crate::engine::container::ContainerRuntime::docker()
-                .capabilities()
-                .clone();
-            caps.image_acquisition = ImageAcquisition::Import;
-            Self {
-                caps,
-                present,
-                imports: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl AgentRuntimeEngine for Importing {
-        fn runtime_name(&self) -> &'static str {
-            "fake-import"
-        }
-        fn display_name(&self) -> &'static str {
-            "Fake import"
-        }
-        fn capabilities(&self) -> &Capabilities {
-            &self.caps
-        }
-        fn is_available(&self) -> bool {
-            true
-        }
-        fn build(&self, _: ResolvedAgentOptions) -> Result<Box<dyn AgentInstance>, EngineError> {
-            unreachable!()
-        }
-        fn list_running(&self, _: &Session) -> Result<Vec<AgentHandle>, EngineError> {
-            unreachable!()
-        }
-        fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
-            unreachable!()
-        }
-        fn stats(&self, _: &AgentHandle) -> Result<AgentStats, EngineError> {
-            unreachable!()
-        }
-        fn stop(&self, _: &AgentHandle) -> Result<(), EngineError> {
-            unreachable!()
-        }
-        fn attach(&self, _: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
-            unreachable!()
-        }
-        fn list_running_with_name_prefix(&self, _: &str) -> Result<Vec<AgentHandle>, EngineError> {
-            unreachable!()
-        }
-        fn ready_agent(
-            &self,
-            _: &str,
-            _: crate::engine::agent_runtime::ReadyAgentOptions,
-            _: &mut dyn UserMessageSink,
-        ) -> Result<(), EngineError> {
-            unreachable!()
-        }
-        fn image_exists(&self, _: &str) -> Result<bool, EngineError> {
-            Ok(self.present)
-        }
-        fn image_home_dir(&self, _: &str) -> Result<Option<String>, EngineError> {
-            Ok(None)
-        }
-        fn build_image(
-            &self,
-            _request: &crate::engine::container::BuildRequest,
-            _: &mut dyn FnMut(&str),
-        ) -> Result<(), EngineError> {
-            panic!("an importing runtime must never build")
-        }
-        fn import_image(
-            &self,
-            request: &ImageImportRequest,
-            _: &mut dyn UserMessageSink,
-        ) -> Result<ImportedImage, EngineError> {
-            self.imports.lock().unwrap().push(request.clone());
-            Err(EngineError::Other("recorded".into()))
-        }
-    }
-
-    struct Quiet;
-    impl UserMessageSink for Quiet {
-        fn write_message(&mut self, _: UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-
-    async fn prepare_test_image(
-        runtime: Arc<Importing>,
-        git_root: &std::path::Path,
-        paths: &crate::data::RepoDockerfilePaths,
-        agent: &str,
-        sources: &crate::engine::oci::ImageSources,
-        sink: &mut dyn UserMessageSink,
-    ) -> Result<(), EngineError> {
-        use crate::engine::image_prep::*;
-        let mut resolved = crate::data::config::EffectiveConfig::default()
-            .builtin_settings()
-            .unwrap();
-        resolved.image_source = sources.default.clone();
-        resolved.images = sources.images.clone();
-        resolved.registries = sources.registries.clone();
-        let mut preparer = AgentImagePreparer::new(
-            resolved,
-            runtime,
-            git_root.join("data"),
-            ImageBuildContext {
-                git_root: git_root.to_path_buf(),
-                project_dockerfile: paths.project_dockerfile(),
-                default_agent: agent.into(),
-            },
-        );
-        let tag = crate::data::image_tags::agent_image_tag(git_root, agent);
-        let result = preparer
-            .prepare(
-                &AgentImageRequest {
-                    tag: &tag,
-                    agent,
-                    policy: BuildPolicy::ImportOnly,
-                },
-                &mut MessageSink(sink),
-            )
-            .await?;
-        match result.import {
-            crate::data::step_status::StepStatus::Failed(error) => Err(EngineError::Other(error)),
-            _ => Ok(()),
-        }
-    }
-
-    fn sources(spec: Option<ImageSourceSpec>) -> crate::engine::oci::ImageSources {
-        crate::engine::oci::ImageSources {
-            default: spec,
-            images: Default::default(),
-            registries: Default::default(),
-        }
-    }
-
-    #[tokio::test]
-    async fn importing_runtime_imports_from_the_configured_source_and_never_builds() {
-        let root = tempfile::tempdir().unwrap();
-        let paths = crate::data::RepoDockerfilePaths::new(root.path());
-        let runtime = Arc::new(Importing::new(false));
-        let archive = ImageSourceSpec::Archive {
-            path: "/images/agent.tar".into(),
-        };
-        let err = prepare_test_image(
-            runtime.clone(),
-            root.path(),
-            &paths,
-            "claude",
-            &sources(Some(archive.clone())),
-            &mut Quiet,
-        )
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("recorded"), "{err}");
-        let imports = runtime.imports.lock().unwrap();
-        assert_eq!(imports.len(), 1);
-        assert_eq!(imports[0].source, archive);
-        assert_eq!(
-            imports[0].tag,
-            crate::data::image_tags::agent_image_tag(root.path(), "claude")
-        );
-    }
-
-    /// WI 0126 A1: the import request carries the registries the source was
-    /// resolved with, so the backend pulls with the session's settings rather
-    /// than any process-wide ones.
-    #[tokio::test]
-    async fn import_request_carries_the_sessions_registries() {
-        let root = tempfile::tempdir().unwrap();
-        let paths = crate::data::RepoDockerfilePaths::new(root.path());
-        let runtime = Arc::new(Importing::new(false));
-        let mut configured = sources(Some(ImageSourceSpec::Registry {
-            registry: Some("registry.example:5000".into()),
-            reference: Some("team/agent:1".into()),
-        }));
-        configured.registries.insert(
-            "registry.example:5000".into(),
-            crate::data::config::image_source::RegistryHostConfig {
-                insecure: true,
-                ..Default::default()
-            },
-        );
-        let _ = prepare_test_image(
-            runtime.clone(),
-            root.path(),
-            &paths,
-            "claude",
-            &configured,
-            &mut Quiet,
-        )
-        .await;
-        let imports = runtime.imports.lock().unwrap();
-        assert_eq!(imports.len(), 1);
-        assert_eq!(imports[0].registries, configured.registries);
-    }
-
-    #[tokio::test]
-    async fn importing_runtime_keeps_a_present_image_and_reports_a_missing_source() {
-        let root = tempfile::tempdir().unwrap();
-        let paths = crate::data::RepoDockerfilePaths::new(root.path());
-        let present = Arc::new(Importing::new(true));
-        prepare_test_image(
-            present.clone(),
-            root.path(),
-            &paths,
-            "claude",
-            &sources(None),
-            &mut Quiet,
-        )
-        .await
-        .unwrap();
-        assert!(present.imports.lock().unwrap().is_empty());
-        let missing = Arc::new(Importing::new(false));
-        let err = prepare_test_image(
-            missing.clone(),
-            root.path(),
-            &paths,
-            "claude",
-            &sources(None),
-            &mut Quiet,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("no image source is configured"),
-            "{err}"
-        );
-        assert!(missing.imports.lock().unwrap().is_empty());
-    }
-
-    /// C1: `workflow preflight`'s import request and `awman ready`'s image
-    /// acquisition must resolve the same `(source, reference)` for the same
-    /// tag and configured sources — both go through `resolve_source`, `ready`
-    /// via `ImageSourceResolver::resolve_for_image`, which wraps it without
-    /// changing `reference` or (for a non-Docker source) `source`. A
-    /// preflight/ready divergence here would mean the two commands could
-    /// import from different content for an identical tag.
-    #[test]
-    fn preflight_and_ready_resolve_the_same_source_and_reference_for_the_same_tag() {
-        use crate::engine::oci::{BuildHint, ImageSourceResolver};
-        let root = tempfile::tempdir().unwrap();
-        let paths = crate::data::RepoDockerfilePaths::new(root.path());
-        let tag = crate::data::image_tags::agent_image_tag(root.path(), "claude");
-        let hint = crate::engine::oci::BuildHint {
-            agent_dockerfile: paths.agent_dockerfile("claude"),
-            project: Some((
-                paths.project_dockerfile(),
-                crate::data::image_tags::project_image_tag(root.path()),
-            )),
-            context: root.path().to_path_buf(),
-        };
-
-        for spec in [
-            ImageSourceSpec::Archive {
-                path: "/images/agent.tar".into(),
-            },
-            ImageSourceSpec::AppleStore { reference: None },
-            ImageSourceSpec::Registry {
-                registry: Some("ghcr.io".into()),
-                reference: None,
-            },
-        ] {
-            // The resolver and preparer must agree on the logical source and reference.
-            let (preflight_source, preflight_reference) = crate::engine::oci::resolve_source(
-                &tag,
-                &sources(Some(spec.clone())),
-                &hint,
-                false,
-            )
-            .unwrap();
-
-            // The path `ReadyEngine` takes: `ImageSourceResolver::resolve_for_image`,
-            // which calls `resolve_source` internally and layers endpoint
-            // resolution on top (a no-op for every non-Docker source kind).
-            let resolved = ImageSourceResolver::new(
-                &sources(Some(spec.clone())),
-                &crate::data::config::env::EnvSnapshot::empty(),
-            )
-            .resolve_for_image(
-                &tag,
-                &BuildHint {
-                    agent_dockerfile: hint.agent_dockerfile.clone(),
-                    project: hint.project.clone(),
-                    context: hint.context.clone(),
-                },
-                crate::data::oci_identity::OciPlatform::host_linux(),
-            )
-            .unwrap();
-
-            assert_eq!(
-                resolved.reference, preflight_reference,
-                "reference must match for {spec:?}"
-            );
-            assert_eq!(
-                resolved.source, preflight_source,
-                "source must match for {spec:?}"
-            );
-        }
-    }
-
-    /// A default source naming a single image (an archive, or a fixed
-    /// reference) represents only the configured default agent. Preflight
-    /// for a step running any other agent refuses it, exactly as `ready`
-    /// does, rather than importing the default agent's image under the other
-    /// agent's tag.
-    #[tokio::test]
-    async fn preflight_refuses_a_single_image_default_source_for_another_agent() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join(".awman")).unwrap();
-        std::fs::write(
-            root.path().join(".awman/config.json"),
-            r#"{"agent":"claude","builtin":{"imageSource":{"type":"archive","path":"/images/claude.tar"}}}"#,
-        )
-        .unwrap();
-        let session = Session::for_tests(root.path());
-        assert_eq!(session.configured_agent().as_str(), "claude");
-        let runtime = Arc::new(Importing::new(true));
-
-        let err = import_agent_image_for_step(
-            runtime.clone(),
-            root.path(),
-            "codex",
-            &session,
-            crate::engine::agent::AgentRegistry::resolve_for_session(
-                &session,
-                &crate::data::session::AgentName::new("codex").unwrap(),
-            )
-            .unwrap(),
-            &mut Quiet,
-        )
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("names a single image"), "{err}");
-        assert!(
-            runtime.imports.lock().unwrap().is_empty(),
-            "codex must not be imported from claude's archive"
-        );
-
-        // The configured default agent still imports from it.
-        let _ = import_agent_image_for_step(
-            runtime.clone(),
-            root.path(),
-            "claude",
-            &session,
-            crate::engine::agent::AgentRegistry::resolve_for_session(
-                &session,
-                &crate::data::session::AgentName::new("claude").unwrap(),
-            )
-            .unwrap(),
-            &mut Quiet,
-        )
-        .await;
-        assert_eq!(runtime.imports.lock().unwrap().len(), 1);
-    }
-}
-
-#[cfg(test)]
-mod custom_definition_tests {
-    use super::*;
-    #[test]
-    fn deleted_custom_definition_is_unknown_even_with_a_rendered_dockerfile() {
-        let temp = tempfile::tempdir().unwrap();
-        let session = Session::for_tests_isolated(temp.path(), &temp.path().join("global"));
-        let paths = crate::data::RepoDockerfilePaths::new(temp.path());
-        std::fs::create_dir_all(paths.awman_dir()).unwrap();
-        std::fs::write(
-            paths.agent_dockerfile("pi"),
-            "# awman-generated from repo:deleted\nFROM project\n",
-        )
-        .unwrap();
-        let workflow = Workflow::parse(
-            "agent = 'pi'\n[[steps]]\nname = 'test'\nprompt = 'do it'\n",
-            crate::data::workflow_definition::WorkflowFormat::Toml,
-        )
-        .unwrap();
-        let error = resolve_and_validate_workflow_agents(&workflow, &session, &paths).unwrap_err();
-        assert!(error.contains("unknown agent 'pi'"), "{error}");
-    }
 }

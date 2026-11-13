@@ -28,13 +28,13 @@ pub(crate) fn find_work_item_file(
     git_root: &std::path::Path,
     number: u32,
 ) -> Option<std::path::PathBuf> {
+    if let Some(path) = session.inline_work_item() {
+        return Some(path.to_path_buf());
+    }
     // The session's own repo config, not a fresh load (F-31): the session
     // already merged it, and a second read here could answer from a file the
     // command was not built against.
-    let dir = session
-        .effective_config()
-        .repo()
-        .work_items_dir_or_default(git_root);
+    let dir = session.effective_config().work_items_dir(git_root);
     let prefix = format!("{:04}-", number);
     std::fs::read_dir(&dir)
         .ok()?
@@ -55,12 +55,7 @@ pub(crate) struct IssueTempFile {
     pub(crate) path: PathBuf,
 }
 
-impl IssueTempFile {
-    #[cfg(test)]
-    pub(crate) fn path(&self) -> &std::path::Path {
-        &self.path
-    }
-}
+impl IssueTempFile {}
 
 impl Drop for IssueTempFile {
     fn drop(&mut self) {
@@ -88,11 +83,14 @@ pub(crate) struct IssueOverlayBuild {
 /// container.
 ///
 /// Signature takes `&dyn IssueSource` and `&Issue` — no concrete provider types.
+/// The temp directory comes from the session's `env` snapshot, never the
+/// process environment.
 pub(crate) fn issue_source_overlay(
     source: &dyn crate::engine::issue::IssueSource,
     issue: &crate::engine::issue::Issue,
     git_root: &std::path::Path,
     work_items_dir: &std::path::Path,
+    env: &crate::data::config::env::EnvSnapshot,
 ) -> std::io::Result<IssueOverlayBuild> {
     let slug = source.title_slug(issue);
     let content = source.format_as_markdown(issue);
@@ -100,7 +98,7 @@ pub(crate) fn issue_source_overlay(
 
     let pid = std::process::id();
     let temp_filename = format!("awman-issue-{pid}-{slug}.md");
-    let temp_path = std::env::temp_dir().join(&temp_filename);
+    let temp_path = env.temp_dir().join(&temp_filename);
     std::fs::write(&temp_path, &content)?;
     let temp_file = IssueTempFile {
         path: temp_path.clone(),

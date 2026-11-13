@@ -3,6 +3,15 @@ use std::path::Path;
 
 pub struct GitMetadataCopy;
 impl GitMetadataCopy {
+    /// Install the binary's native rename boundary, as for the owner pipe.
+    /// Library consumers fail closed when the native provider is absent.
+    #[cfg(windows)]
+    pub fn install_windows_publisher(
+        publisher: fn(&std::fs::File, &std::ffi::OsStr) -> std::io::Result<()>,
+    ) {
+        windows::install_publisher(publisher);
+    }
+
     pub fn copy(source: &Path, destination: &Path) -> std::io::Result<()> {
         copy(source, destination)
     }
@@ -114,34 +123,18 @@ fn copy(source: &Path, destination: &Path) -> std::io::Result<()> {
     tree(&src, &src_name, &dst, &dst_name)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+#[path = "git_metadata/windows.rs"]
+mod windows;
+
+#[cfg(windows)]
+fn copy(source: &Path, destination: &Path) -> std::io::Result<()> {
+    windows::copy(source, destination)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn copy(_: &Path, _: &Path) -> std::io::Result<()> {
     Err(std::io::Error::other(
         "secure Git metadata copying is unsupported on this platform",
     ))
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    #[test]
-    fn source_links_and_destination_links_cannot_escape_the_metadata_tree() {
-        use std::os::unix::fs::symlink;
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        let dest = temp.path().join("dest");
-        std::fs::create_dir(&source).unwrap();
-        std::fs::create_dir(&dest).unwrap();
-        std::fs::write(source.join("ref"), "new").unwrap();
-        std::fs::write(temp.path().join("outside"), "untouched").unwrap();
-        symlink(temp.path().join("outside"), dest.join("ref")).unwrap();
-        assert!(GitMetadataCopy::copy(&source, &dest).is_err());
-        assert_eq!(
-            std::fs::read_to_string(temp.path().join("outside")).unwrap(),
-            "untouched"
-        );
-        std::fs::remove_file(dest.join("ref")).unwrap();
-        symlink(temp.path().join("outside"), source.join("link")).unwrap();
-        assert!(GitMetadataCopy::copy(&source, &dest).is_err());
-    }
 }

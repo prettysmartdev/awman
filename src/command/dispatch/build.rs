@@ -8,13 +8,13 @@
 //! `from_input` constructor, so the construction logic itself lives with the
 //! command in `src/command/commands/`, never here.
 //!
-//! A command with several subcommands (`agents`, `config`, `api`, `squad`, `new`,
+//! A command with several subcommands (`agents`, `config`, `daemon`, `squad`, `new`,
 //! `remote`, `specs`) registers the *same* function on every leaf: its
 //! `from_input` selects the subcommand from
 //! [`CallerContext::leaf`](crate::command::dispatch::CallerContext::leaf).
 
 use crate::command::commands::agents::AgentsCommand;
-use crate::command::commands::api_server::ApiServerCommand;
+use crate::command::commands::attach::AttachCommand;
 use crate::command::commands::chat::ChatCommand;
 use crate::command::commands::clean::CleanCommand;
 use crate::command::commands::config::ConfigCommand;
@@ -25,10 +25,20 @@ use crate::command::commands::new::NewCommand;
 use crate::command::commands::ready::ReadyCommand;
 use crate::command::commands::remote::RemoteCommand;
 use crate::command::commands::specs::SpecsCommand;
-use crate::command::commands::squad::attach::SquadAttachCommand;
 use crate::command::commands::squad::commands::SquadCommand;
 use crate::command::dispatch::{BuildContext, BuiltCommand};
 use crate::command::error::CommandError;
+
+pub fn queue(ctx: &BuildContext<'_>) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::Queue(
+        crate::command::worker::pick::QueueCommand::from_input(ctx)?,
+    ))
+}
+pub fn queue_pick(ctx: &BuildContext<'_>) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::QueuePick(
+        crate::command::worker::pick::QueuePickCommand::from_input(ctx)?,
+    ))
+}
 
 /// The signature every `CommandSpec::build` holds.
 pub type CommandBuilder = fn(&BuildContext) -> Result<BuiltCommand, CommandError>;
@@ -44,6 +54,17 @@ pub fn unsupported(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     Err(CommandError::unknown_command(&ctx.path()))
 }
 
+/// `view` (WI 0142): a frontend entry point, never run through `Dispatch`.
+/// The binary hands its flags to the TUI (`ViewCommand::run` with the TUI's
+/// `ViewEntry`); a command box or relay that names it is refused here after
+/// its flags are validated.
+pub fn view(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
+    crate::command::commands::view::ViewArgs::from_input(ctx)?;
+    Err(CommandError::Other(
+        crate::command::commands::view::NOT_DISPATCHED.into(),
+    ))
+}
+
 pub fn init(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     Ok(BuiltCommand::Init(InitCommand::from_input(ctx)?))
 }
@@ -54,6 +75,10 @@ pub fn ready(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
 
 pub fn chat(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     Ok(BuiltCommand::Chat(ChatCommand::from_input(ctx)?))
+}
+
+pub fn attach(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::Attach(AttachCommand::from_input(ctx)?))
 }
 
 pub fn specs(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
@@ -68,6 +93,12 @@ pub fn config(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     Ok(BuiltCommand::Config(ConfigCommand::from_input(ctx)?))
 }
 
+pub fn worker_link(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::WorkerLink(
+        crate::command::commands::worker::WorkerLinkCommand::from_input(ctx)?,
+    ))
+}
+
 pub fn exec_prompt(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     Ok(BuiltCommand::ExecPrompt(ExecPromptCommand::from_input(
         ctx,
@@ -80,8 +111,10 @@ pub fn exec_workflow(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     )?))
 }
 
-pub fn api_server(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
-    Ok(BuiltCommand::ApiServer(ApiServerCommand::from_input(ctx)?))
+pub fn daemon(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::Daemon(
+        crate::command::commands::daemon::lifecycle::DaemonCommand::from_input(ctx)?,
+    ))
 }
 
 pub fn squad(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
@@ -89,9 +122,9 @@ pub fn squad(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
 }
 
 pub fn squad_attach(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
-    Ok(BuiltCommand::SquadAttach(SquadAttachCommand::from_input(
-        ctx,
-    )?))
+    let target = ctx.args.require("name")?;
+    let attach = AttachCommand::from_task_input(ctx, &target)?;
+    Ok(BuiltCommand::Attach(attach))
 }
 
 pub fn remote(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
@@ -104,4 +137,16 @@ pub fn new(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
 
 pub fn clean(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     Ok(BuiltCommand::Clean(CleanCommand::from_input(ctx)?))
+}
+
+pub fn daemon_api(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::DaemonApi(
+        crate::command::commands::daemon::api::DaemonApiCommand::from_input(ctx)?,
+    ))
+}
+
+pub fn link(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::Link(
+        crate::command::commands::link::LinkCommand::from_input(ctx)?,
+    ))
 }

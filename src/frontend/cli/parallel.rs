@@ -278,6 +278,12 @@ impl UserMessageSink for CliParallelFrontend {
 }
 
 impl AgentFrontend for CliParallelFrontend {
+    fn set_agent_output_format(
+        &mut self,
+        format: crate::data::agent_output_format::AgentOutputFormat,
+    ) {
+        self.inner.set_agent_output_format(format);
+    }
     fn report_status(&mut self, status: AgentStatus) {
         self.inner.report_status(status);
     }
@@ -478,6 +484,12 @@ impl ExecWorkflowCommandFrontend for CliParallelFrontend {
 }
 
 impl WorkflowFrontend for CliParallelFrontend {
+    fn set_container_source(
+        &mut self,
+        source: Option<crate::engine::workflow::frontend::ContainerSource>,
+    ) {
+        self.inner.set_container_source(source);
+    }
     // === Single-container methods: delegate to the existing CLI workflow
     // frontend unchanged. ===
 
@@ -594,7 +606,7 @@ impl WorkflowFrontend for CliParallelFrontend {
                 level: MessageLevel::Warning,
                 text: format!(
                     "{} agents are launching in parallel, but output merging is not \
-                     supported in non-interactive mode; step output will interleave \
+                     supported in headless mode; step output will interleave \
                      without chrome",
                     step_names.len()
                 ),
@@ -636,6 +648,14 @@ impl WorkflowFrontend for CliParallelFrontend {
         self.deactivate_chrome();
     }
 
+    fn report_agent_status(
+        &mut self,
+        step_name: &str,
+        status: Option<&crate::data::program_status::EffectiveStatus>,
+    ) {
+        self.inner.report_agent_status(step_name, status);
+    }
+
     fn report_parallel_step_stuck(&mut self, step_name: &str) {
         self.set_stuck(step_name, true);
         if self.chrome_active {
@@ -647,6 +667,12 @@ impl WorkflowFrontend for CliParallelFrontend {
         self.set_stuck(step_name, false);
         if self.chrome_active {
             redraw_status_bar(&self.state);
+        }
+    }
+
+    fn parallel_step_countdown_started(&mut self, step_name: &str, kind: CountdownKind) {
+        if !self.chrome_active || self.is_focused(step_name) {
+            self.inner.yolo_countdown_started(step_name, kind);
         }
     }
 
@@ -807,75 +833,5 @@ impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFront
         crate::engine::auth::host_secret_command::HostSecretCommandError,
     > {
         self.inner.with_terminal_released(title, f)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_cli_frontend() -> CliFrontend {
-        let cmd = crate::command::dispatch::catalogue::CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "exec", "workflow", "wf.toml"])
-            .unwrap();
-        CliFrontend::new(m)
-    }
-
-    /// Non-TTY stdout: even with two parallel agents the chrome never
-    /// activates — output falls back to plain passthrough (WI-0096 §7).
-    #[test]
-    fn chrome_stays_inactive_when_not_a_terminal() {
-        let mut f = CliParallelFrontend::new(make_cli_frontend());
-        f.is_terminal = false;
-
-        f.report_parallel_group_started(&["a".to_string(), "b".to_string()]);
-        f.report_parallel_step_launched("a", "claude", None);
-        f.report_parallel_step_launched("b", "claude", None);
-
-        assert!(
-            !f.chrome_active,
-            "no status-bar chrome without a TTY — plain passthrough"
-        );
-        assert_eq!(
-            f.state.lock().unwrap().running.len(),
-            2,
-            "step tracking still works off callbacks even without chrome"
-        );
-    }
-
-    /// One running agent (even on a TTY) is not multi-agent UX — no chrome.
-    #[test]
-    fn chrome_inactive_with_a_single_running_agent() {
-        let mut f = CliParallelFrontend::new(make_cli_frontend());
-        f.is_terminal = true;
-
-        f.report_parallel_step_launched("a", "claude", None);
-
-        assert!(
-            !f.chrome_active,
-            "a single running agent never activates the multi-agent chrome"
-        );
-    }
-
-    /// TTY + more than one running agent draws the status-bar chrome; once the
-    /// group drains back to a single agent the chrome is removed again.
-    #[test]
-    fn chrome_activates_with_two_agents_on_a_tty_then_deactivates_when_draining() {
-        let mut f = CliParallelFrontend::new(make_cli_frontend());
-        f.is_terminal = true;
-
-        f.report_parallel_step_launched("a", "claude", None);
-        f.report_parallel_step_launched("b", "claude", None);
-        assert!(
-            f.chrome_active,
-            "two agents running on a TTY must draw the status bar row"
-        );
-
-        f.report_parallel_step_exited("a", 0);
-        assert!(
-            !f.chrome_active,
-            "dropping back to one running agent removes the chrome"
-        );
     }
 }

@@ -1,0 +1,30 @@
+{
+  "name": "@awman/edge",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src test vitest.config.ts scripts && node scripts/verify-config.mjs",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run lint && npm run test",
+    "verify:assets": "node scripts/verify-assets.mjs",
+    "dev": "wrangler dev",
+    "deploy": "npm run verify:assets && wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.6.1",
+    "@cloudflare/workers-types": "5.20261109.1",
+    "@eslint/js": "10.0.1",
+    "@types/node": "22.19.15",
+    "eslint": "10.14.0",
+    "parse5": "8.1.1",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.72.2",
+    "vitest": "4.1.0",
+    "wrangler": "4.159.0"
+  }
+}

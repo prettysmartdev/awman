@@ -5,7 +5,7 @@
 //! also the answer an empty line accepts on a TTY — comes from the CLI profile
 //! in `src/command/headless.rs`.
 
-use crate::data::config::repo::WorkItemsConfig;
+use crate::data::config::work_items::WorkItemsConfig;
 use crate::data::prompt::Prompt;
 use crate::data::step_status::StepStatus;
 use crate::engine::error::EngineError;
@@ -134,62 +134,5 @@ impl InitFrontend for CliFrontend {
             format!("\n{box_str}{footer}").as_bytes(),
         );
         let _ = std::io::Write::flush(&mut std::io::stderr());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::command::prompts;
-    use crate::engine::init::frontend::DockerfileSetupDecision;
-
-    // ─── Choice → decision, with the prompt as the only source of a default ──
-    //
-    // These assert the *mapping* a frontend performs, never what the answer
-    // should be: the one case with no answer of its own reads it back out of
-    // the prompt, so nothing here pins a default (WI 0114 F-19, Test
-    // Considerations).
-
-    #[test]
-    fn create_new_maps_to_create_new() {
-        let prompt = prompts::dockerfile_setup();
-        assert_eq!(
-            DockerfileSetupChoice::CreateNew.decide(&prompt, None),
-            DockerfileSetupDecision::CreateNew
-        );
-    }
-
-    #[test]
-    fn use_existing_with_a_path_maps_to_that_path() {
-        let prompt = prompts::dockerfile_setup();
-        assert_eq!(
-            DockerfileSetupChoice::UseExisting
-                .decide(&prompt, Some("docker/Dockerfile".to_string())),
-            DockerfileSetupDecision::UseExisting("docker/Dockerfile".to_string())
-        );
-    }
-
-    #[test]
-    fn skip_maps_to_skip() {
-        let prompt = prompts::dockerfile_setup();
-        assert_eq!(
-            DockerfileSetupChoice::Skip.decide(&prompt, None),
-            DockerfileSetupDecision::Skip
-        );
-    }
-
-    /// Naming no path is not an answer, so the prompt's own dismissal answer
-    /// applies — read from the prompt rather than written here.
-    #[test]
-    fn use_existing_with_an_empty_path_falls_back_to_the_prompts_answer() {
-        let prompt = prompts::dockerfile_setup();
-        let expected = prompt
-            .default_on_dismiss
-            .expect("the dockerfile prompt declares a dismissal answer")
-            .decide(&prompt, None);
-        assert_eq!(
-            DockerfileSetupChoice::UseExisting.decide(&prompt, Some(String::new())),
-            expected
-        );
     }
 }

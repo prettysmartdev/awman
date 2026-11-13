@@ -25,7 +25,7 @@ impl MountScopeFrontend for CliFrontend {
             git_root.display()
         );
         let mut buf = String::new();
-        if std::io::stdin().read_line(&mut buf).is_err() {
+        if super::helpers::read_input_line(&mut buf).is_err() {
             return Ok(MountScopeDecision::Abort);
         }
         Ok(match buf.trim() {

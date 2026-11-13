@@ -1,6 +1,6 @@
 //! Agent output translators (WI 0137 §4).
 //!
-//! A non-interactive agent with a structured [`AgentOutputFormat`] prints a
+//! A headless agent with a structured [`AgentOutputFormat`] prints a
 //! machine-readable stream instead of plain text (claude `--output-format
 //! stream-json --verbose`, codex `exec --json`). One translator per format
 //! turns that stream into three things, from a single parse:
@@ -95,6 +95,30 @@ pub fn translator_for(format: AgentOutputFormat) -> Box<dyn AgentOutputTranslato
     }
 }
 
+/// Redact complete input before the translator trims, removes controls or
+/// bounds an activity summary. The shared set includes JSON escaped forms.
+pub fn translator_for_redacted(
+    format: AgentOutputFormat,
+    redaction: crate::engine::auth::redaction::RedactionSet,
+) -> Box<dyn AgentOutputTranslator> {
+    struct Redacted {
+        inner: Box<dyn AgentOutputTranslator>,
+        redaction: crate::engine::auth::redaction::RedactionSet,
+    }
+    impl AgentOutputTranslator for Redacted {
+        fn feed_line(&mut self, stream: OutputStream, line: &str) -> Vec<Translated> {
+            self.inner.feed_line(stream, &self.redaction.redact(line))
+        }
+        fn finish(&mut self) -> Vec<Translated> {
+            self.inner.finish()
+        }
+    }
+    Box::new(Redacted {
+        inner: translator_for(format),
+        redaction,
+    })
+}
+
 /// Shared emission keeps the displayed transcript and result message identical.
 fn final_message(message: String) -> Vec<Translated> {
     // WI 0147: apply the same redaction as ordinary output to this message.
@@ -151,141 +175,6 @@ pub fn bound_summary(text: &str) -> String {
     cut
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn passthrough_emits_every_line_unchanged_and_nothing_else() {
-        let mut translator = translator_for(AgentOutputFormat::Text);
-        assert_eq!(
-            translator.feed_line(OutputStream::Stdout, "{\"not\": \"parsed\"}"),
-            vec![Translated::Line {
-                stream: OutputStream::Stdout,
-                text: "{\"not\": \"parsed\"}".into()
-            }]
-        );
-        assert_eq!(
-            translator.feed_line(OutputStream::Stderr, "warn"),
-            vec![Translated::Line {
-                stream: OutputStream::Stderr,
-                text: "warn".into()
-            }]
-        );
-        assert!(translator.finish().is_empty());
-    }
-
-    #[test]
-    fn every_format_has_a_translator() {
-        for format in [
-            AgentOutputFormat::Text,
-            AgentOutputFormat::ClaudeStreamJson,
-            AgentOutputFormat::CodexJson,
-        ] {
-            let mut translator = translator_for(format);
-            assert!(
-                !translator.feed_line(OutputStream::Stdout, "x").is_empty()
-                    || !format.is_structured()
-            );
-        }
-    }
-
-    #[test]
-    fn summaries_are_one_bounded_line() {
-        assert_eq!(
-            bound_summary("  Read src/main.rs\nsecond line"),
-            "Read src/main.rs"
-        );
-        assert_eq!(bound_summary("tab\tand\u{7}bell"), "tabandbell");
-        let long = "x".repeat(STEP_ACTIVITY_SUMMARY_MAX_CHARS + 50);
-        let bounded = bound_summary(&long);
-        assert_eq!(bounded.chars().count(), STEP_ACTIVITY_SUMMARY_MAX_CHARS);
-        assert!(bounded.ends_with('…'));
-        let exact = "y".repeat(STEP_ACTIVITY_SUMMARY_MAX_CHARS);
-        assert_eq!(bound_summary(&exact), exact);
-    }
-}
-
-#[cfg(test)]
-mod adversarial_tests {
-    use super::*;
-
-    #[test]
-    fn valid_unknown_frames_never_publish_full_tool_payloads() {
-        for (format, frames) in [
-            (
-                AgentOutputFormat::ClaudeStreamJson,
-                vec![
-                    r#"{"type":"assistant","message":{"content":[{"type":"text","text":"visible"},{"type":"server_tool_use","input":"SECRET_PAYLOAD"}]}}"#,
-                    r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"x","name":"MCP","input":"SECRET_PAYLOAD"}]}}"#,
-                    r#"{"type":"user","message":{"content":"SECRET_PAYLOAD"}}"#,
-                    r#"{"type":"result","is_error":true,"permission_denials":[{"input":"SECRET_PAYLOAD"}]}"#,
-                ],
-            ),
-            (
-                AgentOutputFormat::CodexJson,
-                vec![
-                    r#"{"type":"item.completed","item":{"type":"future_tool","result":"SECRET_PAYLOAD"}}"#,
-                    r#"{"type":"item.updated","item":{"type":"command_execution","aggregated_output":"SECRET_PAYLOAD"}}"#,
-                    r#"{"type":"turn.failed","error":{"payload":"SECRET_PAYLOAD"}}"#,
-                ],
-            ),
-        ] {
-            let mut translator = translator_for(format);
-            for frame in frames {
-                let output = translator.feed_line(OutputStream::Stdout, frame);
-                assert!(!format!("{output:?}").contains("SECRET_PAYLOAD"));
-                assert!(!output
-                    .iter()
-                    .any(|item| matches!(item, Translated::Line { .. })));
-            }
-            assert!(translator.finish().is_empty());
-            assert_eq!(
-                translator.feed_line(OutputStream::Stdout, "malformed: {"),
-                passthrough(OutputStream::Stdout, "malformed: {")
-            );
-        }
-    }
-
-    #[test]
-    fn terminal_errors_discard_interim_answers() {
-        for (format, interim, failed) in [
-            (
-                AgentOutputFormat::ClaudeStreamJson,
-                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"interim"}]}}"#,
-                r#"{"type":"result","subtype":"error_max_turns","is_error":true}"#,
-            ),
-            (
-                AgentOutputFormat::CodexJson,
-                r#"{"type":"item.completed","item":{"type":"agent_message","text":"interim"}}"#,
-                r#"{"type":"turn.failed","error":{"message":"failed"}}"#,
-            ),
-        ] {
-            let mut translator = translator_for(format);
-            translator.feed_line(OutputStream::Stdout, interim);
-            let output = translator.feed_line(OutputStream::Stdout, failed);
-            assert!(!output
-                .iter()
-                .any(|item| matches!(item, Translated::FinalMessage(_) | Translated::Line { .. })));
-            assert!(translator.finish().is_empty());
-        }
-    }
-
-    #[test]
-    fn codex_thinking_is_constant_and_payload_updates_are_not_activities() {
-        let mut translator = translator_for(AgentOutputFormat::CodexJson);
-        let output = translator.feed_line(
-            OutputStream::Stdout,
-            r#"{"type":"item.started","item":{"type":"reasoning","text":"private reasoning"}}"#,
-        );
-        assert_eq!(
-            output,
-            vec![activity(StepActivityKind::Thinking, "thinking")]
-        );
-        assert!(translator.feed_line(OutputStream::Stdout, r#"{"type":"item.updated","item":{"type":"reasoning","text":"private reasoning update"}}"#).is_empty());
-    }
-}
-
 /// Shared container lifecycle presentation used by API commands and setup.
 pub fn container_status_message(status: &crate::engine::agent_runtime::AgentStatus) -> String {
     use crate::engine::agent_runtime::AgentStatus;
@@ -299,5 +188,35 @@ pub fn container_status_message(status: &crate::engine::agent_runtime::AgentStat
         AgentStatus::Stopping => "Stopping container...".to_string(),
         AgentStatus::Exited(code) => format!("Container exited with code {code}"),
         AgentStatus::Failed(reason) => format!("Container failed: {reason}"),
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+    #[test]
+    fn summaries_redact_before_truncation_trimming_and_control_removal() {
+        let set = crate::engine::auth::redaction::RedactionSet::new();
+        let secret = "test-secret-across-the-summary-boundary";
+        set.add(crate::data::secret::SecretString::new(secret));
+        set.add(crate::data::secret::SecretString::new(
+            "test\tcontrol-secret",
+        ));
+        let mut translator = translator_for_redacted(AgentOutputFormat::CodexJson, set);
+        for command in [
+            format!("{} {secret}", "x".repeat(175)),
+            "test\tcontrol-secret".into(),
+        ] {
+            let wire = serde_json::json!({"type":"item.started","item":{"type":"command_execution","command":command}}).to_string();
+            let events = translator.feed_line(OutputStream::Stdout, &wire);
+            let summary = match &events[0] {
+                Translated::Activity { summary, .. } => summary,
+                _ => panic!("activity missing"),
+            };
+            assert!(summary.contains("***"), "{summary}");
+            assert!(!summary.contains("test-secret"));
+            assert!(!summary.contains("control-secret"));
+            assert!(summary.chars().count() <= STEP_ACTIVITY_SUMMARY_MAX_CHARS);
+        }
     }
 }

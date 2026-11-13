@@ -1,0 +1,298 @@
+//! Listener state shared with the frontend; no listener is bound in Layer 2.
+use crate::command::error::CommandError;
+use crate::data::config::{
+    daemon::NetworkSettings,
+    network::{ListenAddr, ListenerName, ListenerTransport},
+};
+use crate::engine::auth::{tls::TlsIdentity, AuthEngine};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerDesired {
+    pub name: ListenerName,
+    pub enabled: bool,
+    pub listen: ListenAddr,
+    pub transport: ListenerTransport,
+    pub tls: Option<TlsIdentity>,
+    pub bind_generation: u64,
+}
+impl ListenerDesired {
+    pub fn tls_server_config(&self) -> Result<std::sync::Arc<rustls::ServerConfig>, CommandError> {
+        self.tls
+            .as_ref()
+            .ok_or_else(|| CommandError::Other("network listener requires TLS".into()))?
+            .material
+            .rustls_server_config()
+            .map_err(Into::into)
+    }
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListenersDesired {
+    pub generation: u64,
+    pub listeners: BTreeMap<ListenerName, ListenerDesired>,
+}
+impl ListenersDesired {
+    pub fn new(
+        settings: &NetworkSettings,
+        tls: Option<TlsIdentity>,
+        previous: Option<&Self>,
+    ) -> Self {
+        let generation = previous.map_or(0, |p| p.generation + 1);
+        let listeners = settings
+            .listeners
+            .iter()
+            .map(|(name, l)| {
+                let old = previous.and_then(|p| p.listeners.get(name));
+                let bind_generation = old.map_or(generation, |p| {
+                    if bind_identity(&p.listen, p.transport, p.enabled)
+                        != bind_identity(&l.listen, l.transport, l.enabled)
+                    {
+                        generation
+                    } else {
+                        p.bind_generation
+                    }
+                });
+                (
+                    name.clone(),
+                    ListenerDesired {
+                        name: name.clone(),
+                        enabled: l.enabled,
+                        listen: l.listen.clone(),
+                        transport: l.transport,
+                        tls: (l.transport == ListenerTransport::Tls)
+                            .then(|| tls.clone())
+                            .flatten(),
+                        bind_generation,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            generation,
+            listeners,
+        }
+    }
+}
+/// What identifies a listener's bind. Any change replaces the bind (a new
+/// `bind_generation`) and, for an enabled listener, ends its browser grants
+/// and reauthorization generation ([`browser_revocations_between`]).
+fn bind_identity(
+    listen: &ListenAddr,
+    transport: ListenerTransport,
+    enabled: bool,
+) -> (&ListenAddr, ListenerTransport, bool) {
+    (listen, transport, enabled)
+}
+pub fn prepare_tls(
+    auth: &AuthEngine,
+    paths: &crate::data::fs::daemon_paths::DaemonPaths,
+    settings: &NetworkSettings,
+) -> Result<Option<TlsIdentity>, CommandError> {
+    let tls: Vec<_> = settings
+        .listeners
+        .values()
+        .filter(|l| l.enabled && l.transport == ListenerTransport::Tls)
+        .collect();
+    if tls.is_empty() {
+        return Ok(None);
+    }
+    let ips = tls.iter().filter_map(|l| l.listen.ip()).collect::<Vec<_>>();
+    let mut extra = tls
+        .iter()
+        .flat_map(|l| l.tls_sans.clone())
+        .collect::<Vec<_>>();
+    for l in tls {
+        if l.listen.ip().is_none() {
+            extra.push(
+                crate::data::config::network::TlsSan::parse(
+                    l.listen.to_string().rsplit_once(':').unwrap().0,
+                )
+                .map_err(|e| CommandError::Other(e.to_string()))?,
+            );
+        }
+    }
+    Ok(Some(auth.ensure_network_tls(paths, &ips, &extra)?.0))
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalTransport {
+    UnixSocket,
+    NamedPipe,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalListenerRecord {
+    pub transport: LocalTransport,
+    pub address: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenerRecord {
+    pub name: ListenerName,
+    pub enabled: bool,
+    pub listen: String,
+    pub bound: Option<std::net::SocketAddr>,
+    pub transport: ListenerTransport,
+    pub tls: Option<TlsStatus>,
+    pub error: Option<String>,
+    pub features: Vec<crate::data::daemon_state::FeatureName>,
+    pub api_keys: usize,
+    pub browser_links: bool,
+    pub allowed_origins: Vec<crate::data::config::network::BrowserOrigin>,
+    pub browser_grants: usize,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenerStatus {
+    pub local: Option<LocalListenerRecord>,
+    pub network: BTreeMap<ListenerName, ListenerRecord>,
+}
+pub struct NetworkControl {
+    pub(crate) hosting: std::sync::atomic::AtomicBool,
+    pub(crate) applied:
+        tokio::sync::watch::Sender<(u64, Vec<crate::command::daemon_api::core::ReloadEffect>)>,
+    pub(crate) tx: tokio::sync::watch::Sender<ListenersDesired>,
+    browser_revocations: std::sync::RwLock<std::sync::Arc<dyn BrowserRevocationSink>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserRevocation {
+    OriginRemoved(crate::data::config::network::BrowserOrigin),
+    Disabled,
+    EngineRemoved,
+    TransportChanged,
+    ListenerRemoved,
+    /// Same name, new bind (address or port): a new listener generation.
+    Rebound,
+}
+
+/// Reload hook for browser grants. The browser-auth lane supplies the store-backed implementation.
+pub trait BrowserRevocationSink: Send + Sync {
+    fn revoke(&self, listener: &str, reason: BrowserRevocation);
+}
+
+#[derive(Default)]
+struct NoopBrowserRevocationSink;
+impl BrowserRevocationSink for NoopBrowserRevocationSink {
+    fn revoke(&self, _: &str, _: BrowserRevocation) {}
+}
+
+impl NetworkControl {
+    pub fn new(desired: ListenersDesired) -> Self {
+        let (tx, _) = tokio::sync::watch::channel(desired);
+        Self {
+            tx,
+            hosting: std::sync::atomic::AtomicBool::new(false),
+            applied: tokio::sync::watch::channel((0, Vec::new())).0,
+            browser_revocations: std::sync::RwLock::new(std::sync::Arc::new(
+                NoopBrowserRevocationSink,
+            )),
+        }
+    }
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<ListenersDesired> {
+        self.tx.subscribe()
+    }
+
+    pub fn set_browser_revocation_sink(&self, sink: std::sync::Arc<dyn BrowserRevocationSink>) {
+        *self.browser_revocations.write().unwrap() = sink;
+    }
+
+    pub fn revoke_browser_grants(&self, changes: Vec<(String, BrowserRevocation)>) {
+        let sink = self.browser_revocations.read().unwrap().clone();
+        for (listener, reason) in changes {
+            sink.revoke(&listener, reason);
+        }
+    }
+}
+
+pub fn browser_revocations_between(
+    old: &NetworkSettings,
+    new: &NetworkSettings,
+) -> Vec<(String, BrowserRevocation)> {
+    let mut changes = Vec::new();
+    for (name, before) in &old.listeners {
+        let after = new.listeners.get(name);
+        for origin in &before.allowed_origins {
+            if !after.is_some_and(|l| l.allowed_origins.contains(origin)) {
+                changes.push((
+                    name.clone(),
+                    BrowserRevocation::OriginRemoved(origin.clone()),
+                ));
+            }
+        }
+        if before.enabled && !after.is_some_and(|l| l.enabled) {
+            changes.push((
+                name.clone(),
+                if after.is_some() {
+                    BrowserRevocation::Disabled
+                } else {
+                    BrowserRevocation::ListenerRemoved
+                },
+            ));
+        }
+        if before
+            .features
+            .contains(&crate::data::daemon_state::FeatureName::Engine)
+            && !after.is_some_and(|l| {
+                l.features
+                    .contains(&crate::data::daemon_state::FeatureName::Engine)
+            })
+        {
+            changes.push((name.clone(), BrowserRevocation::EngineRemoved));
+        }
+        if let Some(after) = after {
+            if before.transport != after.transport {
+                changes.push((name.clone(), BrowserRevocation::TransportChanged));
+            } else if before.enabled
+                && after.enabled
+                && bind_identity(&before.listen, before.transport, before.enabled)
+                    != bind_identity(&after.listen, after.transport, after.enabled)
+            {
+                // Same name, new address or port: the old generation must not
+                // authorize on the new bind.
+                changes.push((name.clone(), BrowserRevocation::Rebound));
+            }
+        }
+    }
+    changes
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsStatus {
+    pub fingerprint_sha256: String,
+    pub sans: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::config::network::builtin_listener;
+
+    /// SR-07: the same listener name on a new address is a new bind
+    /// generation, and that replacement also ends its browser grants.
+    #[test]
+    fn a_rebind_to_a_new_address_is_a_new_generation_that_ends_browser_grants() {
+        let mut listener = builtin_listener("loopback").unwrap();
+        listener.enabled = true;
+        let before = NetworkSettings {
+            listeners: BTreeMap::from([("loopback".into(), listener)]),
+        };
+        let mut after = before.clone();
+        after.listeners.get_mut("loopback").unwrap().listen =
+            ListenAddr::parse("127.0.0.1:9878").unwrap();
+        let old = ListenersDesired::new(&before, None, None);
+        let new = ListenersDesired::new(&after, None, Some(&old));
+        assert_ne!(
+            old.listeners["loopback"].bind_generation,
+            new.listeners["loopback"].bind_generation
+        );
+        assert_eq!(
+            browser_revocations_between(&before, &after),
+            vec![("loopback".to_string(), BrowserRevocation::Rebound)]
+        );
+        // An unchanged bind keeps its generation and its grants.
+        let same = ListenersDesired::new(&after, None, Some(&new));
+        assert_eq!(
+            same.listeners["loopback"].bind_generation,
+            new.listeners["loopback"].bind_generation
+        );
+        assert!(browser_revocations_between(&after, &after).is_empty());
+    }
+}

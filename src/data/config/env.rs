@@ -7,45 +7,45 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{OnceLock, RwLock};
 
-/// `AWMAN_CONFIG_HOME` — overrides the global config home directory.
-pub const AWMAN_CONFIG_HOME: &str = "AWMAN_CONFIG_HOME";
+use serde_json::Value;
 
-/// `AWMAN_API_ROOT` — overrides the API storage root directory.
-pub const AWMAN_API_ROOT: &str = "AWMAN_API_ROOT";
+use crate::data::config::fields::{self, KeyError, RESERVED_ENV};
+use crate::data::config::overrides::ConfigOverrides;
 
-/// `AWMAN_SQUAD_ROOT` — overrides the squad storage root directory.
-pub const AWMAN_SQUAD_ROOT: &str = "AWMAN_SQUAD_ROOT";
+/// `AWMAN_HOME` — the one root for awman's config and data (see
+/// `data::fs::data_paths`). Replaces `AWMAN_CONFIG_HOME`, `AWMAN_API_ROOT`,
+/// `AWMAN_SQUAD_ROOT` and `AWMAN_ATTACH_DIR`.
+pub use crate::data::fs::data_paths::AWMAN_HOME;
 
-/// `AWMAN_OVERLAYS` — comma-separated list of overlay specs.
+/// `AWMAN_OVERLAYS` — the env form of the `overlays` config key. It is not a
+/// hand-named variable: the key table derives exactly this name for
+/// `overlays`, and the constant only exists for the call sites that name it.
 pub const AWMAN_OVERLAYS: &str = "AWMAN_OVERLAYS";
 
-/// `AWMAN_REMOTE_ADDR` — overrides remote server address.
-pub const AWMAN_REMOTE_ADDR: &str = "AWMAN_REMOTE_ADDR";
-
-/// `AWMAN_REMOTE_SESSION` — sticky session id for remote operations.
+/// `AWMAN_REMOTE_SESSION` — sticky session id for remote operations, the env
+/// form of `--session`. A session id is not a setting, so this is not config.
 pub const AWMAN_REMOTE_SESSION: &str = "AWMAN_REMOTE_SESSION";
 
-/// `AWMAN_API_KEY` — API key for the remote API server.
-pub const AWMAN_API_KEY: &str = "AWMAN_API_KEY";
+/// The prefix every awman variable shares. A captured `AWMAN_*` variable that
+/// is not a [`PROCESS_VARS`] entry and not in the [`AWMAN_TEST_PREFIX`]
+/// namespace is a config variable: its name is derived from the key table
+/// (`agents.stuckTimeout` → `AWMAN_AGENTS_STUCK_TIMEOUT`).
+pub const AWMAN_PREFIX: &str = "AWMAN_";
 
-/// `AWMAN_SQUAD_KEY` — bearer key the CLI and TUI authenticate to the squad
-/// daemon with. Minted on the daemon's first start and printed once as a
-/// shell-export snippet; see `awman squad start`.
-pub const AWMAN_SQUAD_KEY: &str = "AWMAN_SQUAD_KEY";
+/// The test-only namespace (`AWMAN_TEST_ISOLATION`, …). Never config.
+pub const AWMAN_TEST_PREFIX: &str = "AWMAN_TEST_";
 
 /// `GITHUB_TOKEN` — optional token used by the GitHub issue provider.
 pub const GITHUB_TOKEN: &str = "GITHUB_TOKEN";
 
 /// Trusted host Git transport overrides, preserved by remote-session push-back.
+pub const AWMAN_LEASE_CREDENTIAL_FILE: &str = "AWMAN_LEASE_CREDENTIAL_FILE";
+/// WI 0145: the push-session credential socket the hidden Git helper relays
+/// to. A path only; the credential stays in daemon memory.
+pub const AWMAN_GIT_CREDENTIAL_SOCKET: &str = "AWMAN_GIT_CREDENTIAL_SOCKET";
+
 pub const GIT_SSH_COMMAND: &str = "GIT_SSH_COMMAND";
 pub const GIT_SSH: &str = "GIT_SSH";
-
-/// `AWMAN_MAX_CONCURRENT_AGENTS` — overrides the max-concurrent-agents cap
-/// for workflow execution.
-pub const AWMAN_MAX_CONCURRENT_AGENTS: &str = "AWMAN_MAX_CONCURRENT_AGENTS";
-
-/// `AWMAN_LAUNCH_MODE` — overrides the repository launch mode.
-pub const AWMAN_LAUNCH_MODE: &str = "AWMAN_LAUNCH_MODE";
 
 /// `XDG_CONFIG_HOME` — XDG base directory for user-specific configuration.
 pub const XDG_CONFIG_HOME: &str = "XDG_CONFIG_HOME";
@@ -57,21 +57,8 @@ pub const XDG_DATA_HOME: &str = "XDG_DATA_HOME";
 /// printed alongside a freshly minted squad key; never to execute anything.
 pub const SHELL: &str = "SHELL";
 
-/// `AWMAN_ATTACH_DIR` — overrides the directory attach sockets live in
-/// (`~/.awman/attach/` by default). Used by tests and relocated setups; both
-/// the serving and the attaching process must derive it the same way, which
-/// is what makes a socket discoverable across processes of the same user.
-pub const AWMAN_ATTACH_DIR: &str = "AWMAN_ATTACH_DIR";
-
-/// `AWMAN_API_VERBOSE_SETUP` — set to a falsy value (`0`, `false`, `no`,
-/// `off`) to demote the API server's per-session setup chatter from `info` to
-/// `debug`, so operators can silence it while keeping it reachable through
-/// `RUST_LOG`. Verbose is the default.
-pub const AWMAN_API_VERBOSE_SETUP: &str = "AWMAN_API_VERBOSE_SETUP";
-
-/// `PATH` — the executable search path. awman never reads it to resolve a
-/// binary itself; it is declared because an OS process manager starting a
-/// daemon must be handed it explicitly (see [`ForwardedEnv`]).
+/// `PATH` — the executable search path. Host spawns resolve it from the
+/// invoking instance's snapshot; daemon bootstrap also forwards it explicitly.
 pub const PATH: &str = "PATH";
 
 /// `HOME` — the user's home directory. Declared for the same reason as
@@ -114,10 +101,39 @@ pub const AWMAN_TEST_BUILTIN: &str = "AWMAN_TEST_BUILTIN";
 /// `engine::workflow::timing::yolo_countdown_duration`.
 pub const AWMAN_TEST_YOLO_COUNTDOWN_MS: &str = "AWMAN_TEST_YOLO_COUNTDOWN_MS";
 
-/// `AWMAN_BUILTIN_STATE_DIR` — overrides the builtin runtime's private state
-/// directory (default `<data home>/builtin`). Keep it short: control sockets
-/// live beneath it.
-pub const AWMAN_BUILTIN_STATE_DIR: &str = "AWMAN_BUILTIN_STATE_DIR";
+/// `AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS` — under [`AWMAN_TEST_ISOLATION`], a
+/// shorter `AgentDone` countdown (WI 0141) in milliseconds; see
+/// `engine::workflow::timing::agent_done_countdown_duration`.
+pub const AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS: &str = "AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS";
+
+/// Every `AWMAN_*` name awman reads as a **process variable** rather than as
+/// config: the storage root, the session id, the squad bearer key and the
+/// test switches. None of these is ever resolved against the key table, and
+/// no derived config name may equal one (`derived_names_never_collide_with_a_process_variable`).
+/// `fields::RESERVED_ENV` is the key table's copy of this list; a test keeps
+/// the two equal.
+pub const PROCESS_VARS: &[&str] = &[
+    AWMAN_HOME,
+    AWMAN_REMOTE_SESSION,
+    AWMAN_LEASE_CREDENTIAL_FILE,
+    AWMAN_GIT_CREDENTIAL_SOCKET,
+    AWMAN_TEST_ISOLATION,
+    AWMAN_TEST_DOCKER,
+    AWMAN_TEST_APPLE_CONTAINER,
+    AWMAN_TEST_SBX,
+    AWMAN_TEST_BUILTIN,
+    AWMAN_TEST_YOLO_COUNTDOWN_MS,
+    AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS,
+];
+
+/// Whether `name` is an `AWMAN_*` config variable (as opposed to a process
+/// variable, a test switch, or something else entirely).
+pub fn is_config_var_name(name: &str) -> bool {
+    name.starts_with(AWMAN_PREFIX)
+        && !name.starts_with(AWMAN_TEST_PREFIX)
+        && !PROCESS_VARS.contains(&name)
+        && !RESERVED_ENV.contains(&name)
+}
 
 /// `MSB_PATH` — Microsandbox's worker-binary override. awman never honours it:
 /// the builtin runtime refuses to start while it (or any other name in
@@ -183,6 +199,9 @@ pub const AMBIENT_MSB_OVERRIDES: &[&str] = &[
 /// `npipe://`). Read only when a `docker-local` image source names no host.
 pub const DOCKER_HOST: &str = "DOCKER_HOST";
 
+/// `DOCKER_CONTEXT` — Docker CLI context, which takes precedence over its host.
+pub const DOCKER_CONTEXT: &str = "DOCKER_CONTEXT";
+
 /// `DOCKER_CERT_PATH` — directory holding `ca.pem`, `cert.pem`, `key.pem` for
 /// a TLS Docker Engine endpoint.
 pub const DOCKER_CERT_PATH: &str = "DOCKER_CERT_PATH";
@@ -209,8 +228,9 @@ pub const RUST_LOG: &str = "RUST_LOG";
 /// This is the **bootstrap class** — values the daemon needs before it can
 /// open its storage root or start listening. **[`ForwardedEnv::NAMES`] is a
 /// non-secret allowlist, and nothing that could hold a secret may ever be
-/// added to it.** [`AWMAN_API_KEY`] / [`AWMAN_SQUAD_KEY`] are deliberately
-/// absent: this list is serialized into a plist on disk and passed as
+/// added to it.** `AWMAN_SQUAD_KEY` is deliberately absent, and so is every
+/// config variable of a `sensitive` key (`AWMAN_REMOTE_TARGETS_<NAME>_API_KEY`):
+/// this list is serialized into a plist on disk and passed as
 /// `--setenv` arguments on a visible `systemd-run` invocation, and a bearer
 /// key belongs in none of those places. The daemon authenticates against the
 /// key *hash* it reads from the storage root, so it needs no key of its own.
@@ -230,47 +250,73 @@ pub const RUST_LOG: &str = "RUST_LOG";
 pub struct ForwardedEnv;
 
 impl ForwardedEnv {
-    /// The allowlist, in the order a job's environment is rendered.
+    /// The fixed allowlist, in the order a job's environment is rendered.
+    /// Config variables (`AWMAN_*` derived from the key table) follow it; see
+    /// [`ForwardedEnv::from_process`].
     pub const NAMES: &'static [&'static str] = &[
         PATH,
         HOME,
         RUST_LOG,
-        AWMAN_CONFIG_HOME,
-        AWMAN_API_ROOT,
-        AWMAN_SQUAD_ROOT,
+        AWMAN_HOME,
         XDG_CONFIG_HOME,
         XDG_DATA_HOME,
-        AWMAN_OVERLAYS,
-        AWMAN_MAX_CONCURRENT_AGENTS,
-        AWMAN_LAUNCH_MODE,
     ];
 
     /// The subset of [`ForwardedEnv::NAMES`] actually set in this process, in
-    /// list order.
+    /// list order, then every non-sensitive `AWMAN_*` config variable set in
+    /// this process, sorted by name — so a daemon started by launchd or
+    /// systemd resolves the same config the shell that started it would.
     pub fn from_process() -> Vec<(String, String)> {
-        Self::NAMES
+        let mut out: Vec<(String, String)> = Self::NAMES
             .iter()
             .filter_map(|name| std::env::var(name).ok().map(|v| ((*name).to_string(), v)))
-            .collect()
+            .collect();
+        let mut config: Vec<(String, String)> = awman_vars_os()
+            .into_iter()
+            .filter(|(name, _)| Self::forwards_config_var(name))
+            .collect();
+        config.sort();
+        out.extend(config);
+        out
+    }
+
+    /// Whether a config variable may ride the bootstrap class: it must be a
+    /// known, non-sensitive key. An unknown name forwards nothing (it would
+    /// be ignored anyway), and a secret never reaches a plist or an argv.
+    fn forwards_config_var(name: &str) -> bool {
+        is_config_var_name(name)
+            && fields::resolve_env(name, &|_| Vec::new()).is_some_and(|r| !r.key.sensitive)
     }
 }
 
-/// Frozen snapshot of every env var awman reads.
+/// Frozen, memory-only environment, working directory and arguments.
 ///
-/// `EnvSnapshot::from_process()` captures the current process's environment
-/// once. Tests construct snapshots directly via `EnvSnapshot::default()` or
+/// [`Env::from_process`] captures the current process once. This type has no
+/// serialization implementation. Tests construct snapshots via `Self::default()` or
 /// `EnvSnapshot::with_overrides(…)`.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq)]
 pub struct EnvSnapshot {
     values: HashMap<String, String>,
+    // Native entries preserve non-UTF-8 values when the builtin frontend captures
+    // its own process. Neither this type nor these fields implement serde.
+    native: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    cwd: PathBuf,
+    argv: Vec<std::ffi::OsString>,
+    /// Process captures may read the daemon's in-memory task overlay for
+    /// explicitly requested host payloads. Frontend-supplied snapshots may not.
+    process_overlay: bool,
+}
+
+impl std::fmt::Debug for EnvSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EnvSnapshot { env: <redacted>, cwd: <redacted>, argv: <redacted> }")
+    }
 }
 
 impl EnvSnapshot {
     /// Construct an empty snapshot.
     pub fn empty() -> Self {
-        Self {
-            values: HashMap::new(),
-        }
+        Self::default()
     }
 
     /// Build a snapshot from a list of `(key, value)` pairs. Useful in tests.
@@ -284,37 +330,223 @@ impl EnvSnapshot {
         for (k, v) in entries {
             values.insert(k.into(), v.into());
         }
-        Self { values }
+        let mut native: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+            values.iter().map(|(k, v)| (k.into(), v.into())).collect();
+        native.sort_by(|a, b| a.0.cmp(&b.0));
+        Self {
+            values,
+            native,
+            ..Self::default()
+        }
+    }
+
+    /// Instance input, held only in memory. There is deliberately no serde impl.
+    pub fn from_full_env(env: std::collections::BTreeMap<String, String>) -> Self {
+        Self::with_overrides(env)
+    }
+
+    pub fn from_instance_env(env: Vec<(String, String)>, cwd: PathBuf, argv: Vec<String>) -> Self {
+        Self::with_overrides(env).with_invocation(cwd, argv)
+    }
+
+    pub fn with_invocation(mut self, cwd: PathBuf, argv: Vec<String>) -> Self {
+        self.cwd = cwd;
+        self.argv = argv.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn cwd(&self) -> &std::path::Path {
+        &self.cwd
+    }
+    pub fn argv(&self) -> &[std::ffi::OsString] {
+        &self.argv
+    }
+
+    pub fn var_names(&self) -> Vec<&str> {
+        let mut names: Vec<_> = self.values.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
+    pub fn to_hello_env(&self) -> crate::data::frontend_protocol::HelloEnv {
+        crate::data::frontend_protocol::HelloEnv::from_pairs(
+            self.values.iter().map(|(k, v)| (k.clone(), v.clone())),
+        )
+    }
+    /// Environment for lease Git, including config probes. Never inherit Git
+    /// configuration, tracing, repository selection, askpass or SSH commands.
+    /// SSH may use the owner's agent and normal ~/.ssh/config in batch mode.
+    pub fn for_lease_git(&self) -> Self {
+        const ALLOWED: &[&str] = &[
+            "PATH",
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "SystemRoot",
+            "PATHEXT",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "SSH_AUTH_SOCK",
+        ];
+        // Windows environment names are case-insensitive. In particular,
+        // SYSTEMROOT must survive scrubbing for Winsock's provider loading.
+        let allowed = |key: &str| {
+            ALLOWED.iter().any(|name| {
+                if cfg!(windows) {
+                    name.eq_ignore_ascii_case(key)
+                } else {
+                    *name == key
+                }
+            })
+        };
+        let mut clean = self.clone();
+        clean
+            .native
+            .retain(|(key, _)| key.to_str().is_some_and(&allowed));
+        clean.values.retain(|key, _| allowed(key));
+        for (key, value) in [
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ] {
+            clean.values.insert(key.into(), value.into());
+            clean.native.push((key.into(), value.into()));
+        }
+        clean.process_overlay = false;
+        clean
+    }
+    pub fn lease_credential_file(&self) -> Option<PathBuf> {
+        self.get_os(AWMAN_LEASE_CREDENTIAL_FILE).map(PathBuf::from)
+    }
+    pub fn git_credential_socket(&self) -> Option<PathBuf> {
+        self.get_os(AWMAN_GIT_CREDENTIAL_SOCKET).map(PathBuf::from)
+    }
+    pub fn spawn_env(&self) -> impl Iterator<Item = (&std::ffi::OsStr, &std::ffi::OsStr)> {
+        self.native
+            .iter()
+            .map(|(k, v)| (k.as_os_str(), v.as_os_str()))
+    }
+    pub fn path_dirs(&self) -> Vec<PathBuf> {
+        let path = self.get_os(PATH);
+        if let Some(path) = path {
+            return std::env::split_paths(path).collect();
+        }
+        // execvp's default search when PATH is absent. An explicitly empty
+        // PATH still means cwd; neither case may consult the daemon's PATH.
+        #[cfg(unix)]
+        {
+            std::env::split_paths(if cfg!(target_os = "macos") {
+                "/usr/bin:/bin:/usr/sbin:/sbin"
+            } else {
+                "/bin:/usr/bin"
+            })
+            .collect()
+        }
+        #[cfg(not(unix))]
+        {
+            Vec::new()
+        }
+    }
+    pub fn temp_dir(&self) -> PathBuf {
+        for key in if cfg!(windows) {
+            &["TMP", "TEMP", "USERPROFILE"][..]
+        } else {
+            &["TMPDIR"][..]
+        } {
+            if let Some(path) = self.get_os(key).filter(|v| !v.is_empty()) {
+                let path = PathBuf::from(path);
+                return if path.is_relative() && !self.cwd.as_os_str().is_empty() {
+                    self.cwd.join(path)
+                } else {
+                    path
+                };
+            }
+        }
+        PathBuf::from(if cfg!(windows) {
+            r"C:\Windows\Temp"
+        } else {
+            "/tmp"
+        })
+    }
+
+    /// CLI routing identity. Context overrides host as it does in Docker's CLI.
+    pub fn runtime_endpoint(&self) -> (Option<String>, Option<String>) {
+        (
+            self.get(DOCKER_CONTEXT)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned),
+            self.docker_host(),
+        )
     }
 
     /// Return the raw value of a single var, if set.
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.values.get(key).map(|s| s.as_str())
+        self.values
+            .get(key)
+            .or_else(|| {
+                cfg!(windows)
+                    .then(|| {
+                        self.values
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(key))
+                            .map(|(_, value)| value)
+                    })
+                    .flatten()
+            })
+            .map(|s| s.as_str())
     }
 
-    /// `AWMAN_CONFIG_HOME` as a `PathBuf` if set.
-    pub fn config_home(&self) -> Option<PathBuf> {
-        self.get(AWMAN_CONFIG_HOME).map(PathBuf::from)
+    /// Resolve a container passthrough value. A daemon process snapshot sees
+    /// a task's live overlay; an instance snapshot stays confined to the
+    /// launching frontend's environment.
+    pub fn host_payload(&self, key: &str) -> Option<String> {
+        if self.process_overlay {
+            let guard = daemon_overlay().read().unwrap_or_else(|e| e.into_inner());
+            if let Some(value) = guard.get(key) {
+                return Some(value.clone());
+            }
+        }
+        self.get(key).map(str::to_owned)
     }
 
-    /// `AWMAN_API_ROOT` as a `PathBuf` if set.
-    pub fn api_root(&self) -> Option<PathBuf> {
-        self.get(AWMAN_API_ROOT).map(PathBuf::from)
+    pub fn get_os(&self, key: &str) -> Option<&std::ffi::OsStr> {
+        self.native
+            .iter()
+            .find(|(name, _)| {
+                name == key || (cfg!(windows) && name.to_string_lossy().eq_ignore_ascii_case(key))
+            })
+            .map(|(_, value)| value.as_os_str())
     }
 
-    /// `AWMAN_SQUAD_ROOT` as a `PathBuf` if set.
-    pub fn squad_root(&self) -> Option<PathBuf> {
-        self.get(AWMAN_SQUAD_ROOT).map(PathBuf::from)
+    /// `AWMAN_HOME` as a `PathBuf`, if set and non-empty.
+    pub fn awman_home(&self) -> Option<PathBuf> {
+        self.get(AWMAN_HOME)
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from)
     }
 
-    /// `AWMAN_OVERLAYS` raw string if set.
-    pub fn overlays(&self) -> Option<&str> {
-        self.get(AWMAN_OVERLAYS)
-    }
-
-    /// `AWMAN_REMOTE_ADDR` if set.
-    pub fn remote_addr(&self) -> Option<&str> {
-        self.get(AWMAN_REMOTE_ADDR)
+    /// Every captured `AWMAN_*` **config** variable (see
+    /// [`is_config_var_name`]), sorted by name. Nothing here has been checked
+    /// against the key table yet; [`ConfigOverrides::from_env`] does that.
+    pub fn config_vars(&self) -> Vec<(String, String)> {
+        let mut vars: Vec<(String, String)> = self
+            .values
+            .iter()
+            .filter(|(name, _)| is_config_var_name(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        vars.sort();
+        vars
     }
 
     /// `AWMAN_REMOTE_SESSION` if set.
@@ -322,40 +554,14 @@ impl EnvSnapshot {
         self.get(AWMAN_REMOTE_SESSION)
     }
 
-    /// `AWMAN_API_KEY` if set.
-    pub fn api_key(&self) -> Option<&str> {
-        self.get(AWMAN_API_KEY)
-    }
-
-    /// `AWMAN_SQUAD_KEY` if set and non-empty.
-    pub fn squad_key(&self) -> Option<&str> {
-        self.get(AWMAN_SQUAD_KEY).filter(|v| !v.is_empty())
-    }
-
     /// `GITHUB_TOKEN` if set and non-empty.
     pub fn github_token(&self) -> Option<&str> {
         self.get(GITHUB_TOKEN).filter(|v| !v.is_empty())
     }
 
-    /// `AWMAN_MAX_CONCURRENT_AGENTS` parsed as a `usize`, if set and valid.
-    pub fn max_concurrent_agents(&self) -> Option<usize> {
-        self.get(AWMAN_MAX_CONCURRENT_AGENTS)?.parse().ok()
-    }
-
     /// `SHELL` if set and non-empty.
     pub fn shell(&self) -> Option<&str> {
         self.get(SHELL).filter(|v| !v.is_empty())
-    }
-
-    /// `AWMAN_LAUNCH_MODE` parsed as a launch mode, if set to a recognized
-    /// value. Invalid environment values are ignored, matching the tolerant
-    /// behavior of other typed environment accessors.
-    pub fn launch_mode(&self) -> Option<crate::data::config::repo::LaunchMode> {
-        match self.get(AWMAN_LAUNCH_MODE)? {
-            "stdio" => Some(crate::data::config::repo::LaunchMode::Stdio),
-            "acp" => Some(crate::data::config::repo::LaunchMode::Acp),
-            _ => None,
-        }
     }
 
     /// `XDG_CONFIG_HOME` as a `PathBuf` if set and non-empty.
@@ -376,13 +582,6 @@ impl EnvSnapshot {
     /// resolves it at capture time; an empty snapshot has none.
     pub fn home_dir(&self) -> Option<PathBuf> {
         self.get(HOME).filter(|v| !v.is_empty()).map(PathBuf::from)
-    }
-
-    /// `AWMAN_ATTACH_DIR` as a `PathBuf` if set and non-empty.
-    pub fn attach_dir(&self) -> Option<PathBuf> {
-        self.get(AWMAN_ATTACH_DIR)
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
     }
 
     /// Whether `AWMAN_TEST_ISOLATION` is set to `1`, `true`, `yes` or `on`
@@ -427,11 +626,17 @@ impl EnvSnapshot {
             .map(std::time::Duration::from_millis)
     }
 
-    /// `AWMAN_BUILTIN_STATE_DIR`, when set and non-empty.
-    pub fn builtin_state_dir(&self) -> Option<PathBuf> {
-        self.get(AWMAN_BUILTIN_STATE_DIR)
-            .filter(|v| !v.trim().is_empty())
-            .map(PathBuf::from)
+    /// The `AgentDone` countdown `AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS` asks for,
+    /// under the same rules as [`Self::test_yolo_countdown`].
+    pub fn test_agent_done_countdown(&self) -> Option<std::time::Duration> {
+        if !self.test_isolation() {
+            return None;
+        }
+        self.get(AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS)?
+            .trim()
+            .parse()
+            .ok()
+            .map(std::time::Duration::from_millis)
     }
 
     /// The [`AMBIENT_MSB_OVERRIDES`] present in this snapshot, in list order.
@@ -440,7 +645,9 @@ impl EnvSnapshot {
         AMBIENT_MSB_OVERRIDES
             .iter()
             .copied()
-            .filter(|name| self.get(name).is_some())
+            .filter(|name| {
+                self.get(name).is_some() || self.native.iter().any(|(key, _)| key == *name)
+            })
             .collect()
     }
 
@@ -475,102 +682,114 @@ impl EnvSnapshot {
             )
         })
     }
+}
 
-    /// Whether the API server logs per-session setup lines at `info` rather
-    /// than `debug`. `true` unless `AWMAN_API_VERBOSE_SETUP` is set to one of
-    /// `0`, `false`, `no`, `off` (case- and whitespace-insensitive).
-    pub fn api_verbose_setup(&self) -> bool {
-        match self.get(AWMAN_API_VERBOSE_SETUP) {
-            Some(v) => !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            ),
-            None => true,
+// ── The override channel: `AWMAN_*` config variables and `--set` ──────────
+
+impl ConfigOverrides {
+    /// Parse `--set key=value` arguments (the `key=value` text of each, in
+    /// command-line order). Each key is resolved against the key table and its
+    /// value parsed by the key's type, exactly like `awman config set`: lists
+    /// are comma-separated, maps are `k=v,k2=v2`, `null` resets the key to its
+    /// default. When a key is given twice the last one wins (the pairs are
+    /// applied in order).
+    pub fn parse_set_args(args: &[String]) -> Result<Self, KeyError> {
+        let mut pairs = Vec::with_capacity(args.len());
+        for arg in args {
+            let (path, raw) = arg.split_once('=').ok_or_else(|| KeyError::Value {
+                path: arg.trim().to_string(),
+                reason: "expected --set <key>=<value>".into(),
+            })?;
+            let path = path.trim();
+            let resolved = fields::resolve(path)?;
+            let value = fields::parse_input(resolved.key, raw)?;
+            pairs.push((resolved.path, value));
         }
+        Ok(Self::new(pairs))
     }
+
+    /// The env layer: every `AWMAN_*` config variable in `env`, resolved
+    /// against the key table and parsed by the key's type.
+    ///
+    /// `known_names` answers the map names present in the merged files under a
+    /// map section (`workServers`, `remote.targets`, `agents.flags`), so a
+    /// variable such as `AWMAN_WORK_SERVERS_IN_FACT_URL` binds to an existing
+    /// `in-fact` entry; an unmatched name creates a new, lower-cased entry.
+    ///
+    /// A name that matches no key is not config: it is ignored with a
+    /// warning. That covers the hand-named variables of earlier releases,
+    /// which are simply unknown now. An empty value
+    /// counts as unset. A known name with a bad value is an error naming the
+    /// variable.
+    pub fn from_env(
+        env: &EnvSnapshot,
+        known_names: impl Fn(&str) -> Vec<String>,
+    ) -> Result<Self, KeyError> {
+        let mut pairs: Vec<(String, Value)> = Vec::new();
+        for (var, raw) in env.config_vars() {
+            if raw.trim().is_empty() {
+                continue;
+            }
+            let Some(resolved) = fields::resolve_env(&var, &known_names) else {
+                tracing::warn!("ignoring {var}: it names no config key (see `awman config show`)");
+                continue;
+            };
+            let value = fields::parse_input(resolved.key, &raw).map_err(|e| match e {
+                KeyError::Value { reason, .. } => KeyError::Value {
+                    path: format!("{} (from {var})", resolved.path),
+                    reason,
+                },
+                other => other,
+            })?;
+            pairs.push((resolved.path, value));
+        }
+        Ok(Self::new(pairs))
+    }
+}
+
+/// Every `AWMAN_*` variable of this process whose name and value are UTF-8.
+/// `std::env::vars` panics on a non-UTF-8 entry anywhere in the environment;
+/// a non-UTF-8 config value cannot be parsed anyway, so it is skipped.
+fn awman_vars_os() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(name, _)| name.starts_with(AWMAN_PREFIX))
+        .collect()
 }
 
 /// Namespace for capturing process-environment snapshots.
 pub struct Env;
 
 impl Env {
-    /// The bearer keys a snapshot resolves through [`host_var`] rather than
-    /// straight from the process environment.
-    ///
-    /// These two are *published* into a running process, not merely inherited
-    /// by it. The process that mints a squad key is the TUI (or CLI) that
-    /// started the daemon, and it cannot be told to `export` the key
-    /// afterwards, so `SquadSupervisor::provision_key` writes the key into the
-    /// Layer 0 daemon overlay instead. Every later reader builds a *new*
-    /// supervisor from a *fresh* snapshot — `Dispatch::admit`, `squad attach`,
-    /// the TUI's `refresh_squad_key` — so a snapshot that read only
-    /// `std::env::var` would not see it, `provision_key` would return `None`,
-    /// and the daemon would answer 401 to the very process that minted its key
-    /// (WI 0114 F-47).
-    ///
-    /// Only these two. Everything else in the snapshot is a property of *this*
-    /// process — its storage roots, its launch mode, its shell — which nothing
-    /// publishes at run time and which therefore keeps reading the real
-    /// environment.
-    const PUBLISHED_KEYS: &'static [&'static str] = &[AWMAN_API_KEY, AWMAN_SQUAD_KEY];
-
-    /// Capture every awman-relevant env var from the current process.
-    ///
-    /// Reads are limited to the known constants above so that the snapshot
-    /// is deterministic and minimal.
+    /// Capture the full native process environment and invocation. Host children
+    /// can clear their environment and rebuild it without losing unknown names
+    /// or non-UTF-8 values. Config reads still use the typed accessors above.
     pub fn from_process() -> EnvSnapshot {
-        let keys = [
-            AWMAN_CONFIG_HOME,
-            AWMAN_API_ROOT,
-            AWMAN_SQUAD_ROOT,
-            AWMAN_OVERLAYS,
-            AWMAN_REMOTE_ADDR,
-            AWMAN_REMOTE_SESSION,
-            AWMAN_API_KEY,
-            AWMAN_SQUAD_KEY,
-            GITHUB_TOKEN,
-            AWMAN_MAX_CONCURRENT_AGENTS,
-            AWMAN_LAUNCH_MODE,
-            XDG_CONFIG_HOME,
-            XDG_DATA_HOME,
-            SHELL,
-            AWMAN_ATTACH_DIR,
-            AWMAN_API_VERBOSE_SETUP,
-            AWMAN_TEST_ISOLATION,
-            AWMAN_TEST_DOCKER,
-            AWMAN_TEST_APPLE_CONTAINER,
-            AWMAN_TEST_SBX,
-            AWMAN_TEST_BUILTIN,
-            AWMAN_TEST_YOLO_COUNTDOWN_MS,
-            AWMAN_BUILTIN_STATE_DIR,
-            DOCKER_HOST,
-            DOCKER_CERT_PATH,
-            DOCKER_TLS_VERIFY,
-        ];
-        let mut values = HashMap::new();
-        // The home directory is resolved here, once, so nothing above Layer 0
-        // consults the ambient environment (or the passwd database) for it.
-        if let Some(home) = dirs::home_dir() {
-            values.insert(HOME.to_string(), home.to_string_lossy().into_owned());
-        }
-        for k in keys {
-            let read = if Self::PUBLISHED_KEYS.contains(&k) {
-                host_var(k)
-            } else {
-                std::env::var(k).ok()
-            };
-            if let Some(v) = read {
-                values.insert(k.to_string(), v);
+        let mut native: Vec<_> = std::env::vars_os().collect();
+        native.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut values: HashMap<String, String> = native
+            .iter()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v.to_str()?.to_owned())))
+            .collect();
+        // Typed home lookup historically also used the OS account database.
+        // Preserve that fallback without injecting a new variable into children.
+        if !values.contains_key(HOME) {
+            if let Some(home) = dirs::home_dir() {
+                values.insert(HOME.into(), home.to_string_lossy().into_owned());
             }
         }
-        // These SDK overrides are presence-sensitive, and may be non-UTF-8.
-        // Store a marker because their contents are never used by awman.
         for &name in AMBIENT_MSB_OVERRIDES {
             if host_var_os(name).is_some() {
-                values.insert(name.to_string(), String::new());
+                values.entry(name.into()).or_default();
             }
         }
-        EnvSnapshot { values }
+        EnvSnapshot {
+            values,
+            native,
+            cwd: std::env::current_dir().unwrap_or_default(),
+            argv: std::env::args_os().collect(),
+            process_overlay: true,
+        }
     }
 
     /// Capture only the source transport settings and explicitly named auth
@@ -606,6 +825,8 @@ impl Env {
         }
         for name in names {
             if let Some(value) = host_var(name) {
+                snapshot.native.retain(|(key, _)| key != name);
+                snapshot.native.push((name.into(), value.clone().into()));
                 snapshot.values.insert(name.into(), value);
             }
         }
@@ -648,7 +869,7 @@ pub fn test_isolation_active() -> bool {
 //
 // `std::env::var` remains correct — and is deliberately kept — for awman's own
 // invariants (storage-root resolution, launch mode, and every `EnvSnapshot`
-// key but the two in [`Env::PUBLISHED_KEYS`]): those are properties of *this*
+// key but the two in the daemon overlay): those are properties of *this*
 // process, not values a daemon's client can supply.
 
 /// The daemon's payload environment. Empty in every process that never calls
@@ -726,106 +947,6 @@ pub fn update_daemon_overlay(f: impl FnOnce(&mut HashMap<String, String>)) -> Da
 pub fn daemon_overlay_snapshot() -> DaemonEnvMap {
     let guard = daemon_overlay().read().unwrap_or_else(|e| e.into_inner());
     DaemonEnvMap(guard.clone())
-}
-
-/// Serialises every test in the crate that reads or writes the process-wide
-/// [`DAEMON_OVERLAY`] — `cargo test` runs every `#[cfg(test)] mod tests` in
-/// this crate inside the *same* binary, so a static like `DAEMON_OVERLAY` is
-/// genuinely shared across module boundaries and across threads, not just
-/// within one file. Any test elsewhere in the crate that calls
-/// [`set_daemon_overlay`] must take this lock first.
-#[cfg(test)]
-pub(crate) static DAEMON_OVERLAY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-#[cfg(test)]
-static CONFIG_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Exclusive ownership of the process-wide [`AWMAN_CONFIG_HOME`] for the
-/// guard's lifetime, restoring the previous value on drop.
-///
-/// The same "one binary, one process" point as [`DAEMON_OVERLAY_TEST_LOCK`]
-/// applies, and it is easy to miss: five modules used to guard this variable
-/// with a mutex of their own, which serialises each module against itself and
-/// nothing else — the same as no lock at all. A `clean` or `overlay` test
-/// could repoint the config home out from under `dispatch`'s daemon
-/// bootstrap, so `Engines::for_daemon` read a config it was never given and
-/// built the wrong runtime tier, and out from under the workflow phase tests,
-/// so `ContextDirResolver::from_process_env` resolved a directory they never
-/// created. Every test that mutates the variable goes through this type.
-#[cfg(test)]
-pub(crate) struct ConfigHomeGuard {
-    /// Held for the guard's lifetime to keep the lock; never read.
-    _lock: std::sync::MutexGuard<'static, ()>,
-    previous: Option<std::ffi::OsString>,
-}
-
-#[cfg(test)]
-impl ConfigHomeGuard {
-    /// Take the lock and point [`AWMAN_CONFIG_HOME`] at `home`.
-    pub(crate) fn set(home: impl AsRef<std::path::Path>) -> Self {
-        // Recover a poisoned lock rather than propagating the poison: a test
-        // that panicked while holding it has already reported its own
-        // failure, and cascading a `PoisonError` into every other
-        // config-home test buries the real cause behind a wall of noise.
-        let _lock = CONFIG_HOME_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let previous = std::env::var_os(AWMAN_CONFIG_HOME);
-        std::env::set_var(AWMAN_CONFIG_HOME, home.as_ref());
-        Self { _lock, previous }
-    }
-}
-
-/// Exclusive ownership of the config-home lock plus a snapshot of other
-/// process variables that resolve configuration (`XDG_*`, forwarded
-/// `AWMAN_*` names), restored on drop. Tests that mutate those variables, or
-/// that compare against paths derived from the process environment, take
-/// this so a concurrent [`ConfigHomeGuard`] test cannot interleave.
-#[cfg(test)]
-pub(crate) struct ProcessEnvGuard {
-    /// Held for the guard's lifetime to keep the lock; never read.
-    _lock: std::sync::MutexGuard<'static, ()>,
-    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-}
-
-#[cfg(test)]
-impl ProcessEnvGuard {
-    /// Take the config-home lock and snapshot `names` for restoring on drop.
-    pub(crate) fn acquire(names: &[&'static str]) -> Self {
-        let _lock = CONFIG_HOME_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let saved = names
-            .iter()
-            .map(|name| (*name, std::env::var_os(name)))
-            .collect();
-        Self { _lock, saved }
-    }
-}
-
-#[cfg(test)]
-impl Drop for ProcessEnvGuard {
-    fn drop(&mut self) {
-        for (name, value) in self.saved.drain(..) {
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-impl Drop for ConfigHomeGuard {
-    fn drop(&mut self) {
-        // Restoring here rather than at the end of the test body is what
-        // keeps a panicking test from leaking its temporary config home —
-        // usually an already-deleted directory — onto the test that runs next.
-        match self.previous.take() {
-            Some(value) => std::env::set_var(AWMAN_CONFIG_HOME, value),
-            None => std::env::remove_var(AWMAN_CONFIG_HOME),
-        }
-    }
 }
 
 /// A set of host environment values bound for (or held by) the squad daemon.
@@ -934,521 +1055,5 @@ impl std::fmt::Debug for DaemonEnvMap {
         f.debug_struct("DaemonEnvMap")
             .field("names", &self.names())
             .finish()
-    }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ── AWMAN_ATTACH_DIR (F-37) ──────────────────────────────────────────
-
-    #[test]
-    fn home_dir_comes_from_the_snapshot_only() {
-        assert!(EnvSnapshot::empty().home_dir().is_none());
-        assert!(EnvSnapshot::with_overrides([(HOME, "")])
-            .home_dir()
-            .is_none());
-        assert_eq!(
-            EnvSnapshot::with_overrides([(HOME, "/home/a")]).home_dir(),
-            Some(PathBuf::from("/home/a"))
-        );
-    }
-
-    #[test]
-    fn attach_dir_returns_none_when_absent() {
-        assert!(EnvSnapshot::empty().attach_dir().is_none());
-    }
-
-    #[test]
-    fn attach_dir_returns_none_when_empty_string() {
-        let snap = EnvSnapshot::with_overrides([(AWMAN_ATTACH_DIR, "")]);
-        assert!(
-            snap.attach_dir().is_none(),
-            "an empty value must fall back to the default directory, not resolve \
-             sockets against a relative path"
-        );
-    }
-
-    #[test]
-    fn attach_dir_returns_the_path_when_set() {
-        let snap = EnvSnapshot::with_overrides([(AWMAN_ATTACH_DIR, "/tmp/sockets")]);
-        assert_eq!(snap.attach_dir(), Some(PathBuf::from("/tmp/sockets")));
-    }
-
-    // ── AWMAN_API_VERBOSE_SETUP (F-37) ───────────────────────────────────
-    //
-    // The falsy set and the default are the contract this moved out of
-    // `api_server/session_setup.rs`; they must not drift.
-
-    #[test]
-    fn api_verbose_setup_defaults_to_true_when_absent() {
-        assert!(EnvSnapshot::empty().api_verbose_setup());
-    }
-
-    #[test]
-    fn api_verbose_setup_is_false_for_every_falsy_spelling() {
-        for raw in [
-            "0",
-            "false",
-            "no",
-            "off",
-            "FALSE",
-            "No",
-            "OFF",
-            " off ",
-            "\tfalse\n",
-        ] {
-            let snap = EnvSnapshot::with_overrides([(AWMAN_API_VERBOSE_SETUP, raw)]);
-            assert!(
-                !snap.api_verbose_setup(),
-                "{raw:?} must disable verbose setup logging"
-            );
-        }
-    }
-
-    #[test]
-    fn api_verbose_setup_is_true_for_anything_else() {
-        for raw in ["1", "true", "yes", "on", "", "anything"] {
-            let snap = EnvSnapshot::with_overrides([(AWMAN_API_VERBOSE_SETUP, raw)]);
-            assert!(
-                snap.api_verbose_setup(),
-                "{raw:?} must leave verbose setup logging on"
-            );
-        }
-    }
-
-    #[test]
-    fn xdg_config_home_returns_none_when_absent() {
-        let snap = EnvSnapshot::empty();
-        assert!(snap.xdg_config_home().is_none());
-    }
-
-    #[test]
-    fn xdg_config_home_returns_none_when_empty_string() {
-        let snap = EnvSnapshot::with_overrides([(XDG_CONFIG_HOME, "")]);
-        assert!(snap.xdg_config_home().is_none());
-    }
-
-    #[test]
-    fn xdg_data_home_returns_none_when_absent() {
-        let snap = EnvSnapshot::empty();
-        assert!(snap.xdg_data_home().is_none());
-    }
-
-    #[test]
-    fn xdg_data_home_returns_none_when_empty_string() {
-        let snap = EnvSnapshot::with_overrides([(XDG_DATA_HOME, "")]);
-        assert!(snap.xdg_data_home().is_none());
-    }
-
-    #[test]
-    fn github_token_returns_only_non_empty_values() {
-        assert_eq!(
-            EnvSnapshot::with_overrides([(GITHUB_TOKEN, "token")]).github_token(),
-            Some("token")
-        );
-        assert!(EnvSnapshot::with_overrides([(GITHUB_TOKEN, "")])
-            .github_token()
-            .is_none());
-    }
-
-    #[test]
-    fn env_from_process_captures_xdg_config_and_data_home() {
-        let _env = ProcessEnvGuard::acquire(&[XDG_CONFIG_HOME, XDG_DATA_HOME]);
-        let cfg_val = "/tmp/awman-test-xdg-cfg-0086";
-        let data_val = "/tmp/awman-test-xdg-data-0086";
-        std::env::set_var(XDG_CONFIG_HOME, cfg_val);
-        std::env::set_var(XDG_DATA_HOME, data_val);
-        let snap = Env::from_process();
-        assert_eq!(
-            snap.xdg_config_home(),
-            Some(PathBuf::from(cfg_val)),
-            "from_process() must capture XDG_CONFIG_HOME"
-        );
-        assert_eq!(
-            snap.xdg_data_home(),
-            Some(PathBuf::from(data_val)),
-            "from_process() must capture XDG_DATA_HOME"
-        );
-    }
-
-    /// Invariant 12: in a process whose overlay is empty (every process that
-    /// never calls `set_daemon_overlay`, and this process once the guard
-    /// below clears it), `host_var` must be byte-for-byte
-    /// `std::env::var(name).ok()` — including `Some("")` for a variable set
-    /// to the empty string.
-    #[test]
-    fn host_var_matches_std_env_var_when_the_overlay_is_empty() {
-        let _lock = DAEMON_OVERLAY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        set_daemon_overlay(DaemonEnvMap::new());
-        let name = "AWMAN_TEST_HOST_VAR_PARITY_0116";
-        std::env::remove_var(name);
-
-        assert_eq!(host_var(name), None);
-        assert_eq!(host_var(name), std::env::var(name).ok());
-
-        std::env::set_var(name, "process-value");
-        assert_eq!(host_var(name), Some("process-value".to_string()));
-        assert_eq!(host_var(name), std::env::var(name).ok());
-
-        // `Some("")` is a real, distinct answer from `None` — parity must
-        // hold there too, not just for a non-empty value.
-        std::env::set_var(name, "");
-        assert_eq!(host_var(name), Some(String::new()));
-        assert_eq!(host_var(name), std::env::var(name).ok());
-
-        std::env::remove_var(name);
-        set_daemon_overlay(DaemonEnvMap::new());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn host_var_os_preserves_non_utf8_and_overlay_precedence() {
-        use std::os::unix::ffi::OsStringExt;
-        let _lock = DAEMON_OVERLAY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let previous = daemon_overlay_snapshot();
-        let name = "AWMAN_TEST_NON_UTF8_OVERRIDE_0121";
-        let value = std::ffi::OsString::from_vec(vec![0xff]);
-        std::env::set_var(name, &value);
-        assert_eq!(host_var_os(name), Some(value));
-        update_daemon_overlay(|vars| {
-            vars.insert(name.into(), "overlay".into());
-        });
-        assert_eq!(host_var_os(name), Some("overlay".into()));
-        std::env::remove_var(name);
-        set_daemon_overlay(previous);
-    }
-
-    /// The overlay is checked first and wins over whatever the process
-    /// environment holds for the same name.
-    #[test]
-    fn host_var_prefers_the_overlay_over_the_process_environment() {
-        let _lock = DAEMON_OVERLAY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        set_daemon_overlay(DaemonEnvMap::new());
-        let name = "AWMAN_TEST_HOST_VAR_OVERLAY_WINS_0116";
-        std::env::set_var(name, "process-value");
-
-        let mut overlay = DaemonEnvMap::new();
-        overlay.insert(name, "overlay-value");
-        set_daemon_overlay(overlay);
-
-        assert_eq!(host_var(name), Some("overlay-value".to_string()));
-        assert_ne!(
-            host_var(name),
-            std::env::var(name).ok(),
-            "the overlay must win, so parity with std::env::var breaks here on purpose"
-        );
-
-        std::env::remove_var(name);
-        set_daemon_overlay(DaemonEnvMap::new());
-    }
-
-    /// `DaemonEnvMap`'s hand-written `Debug` must print names only, under
-    /// both `{:?}` and `{:#?}`, for values chosen specifically because they
-    /// would be easy to spot if they leaked.
-    #[test]
-    fn daemon_env_map_debug_prints_names_never_values() {
-        let map = DaemonEnvMap::from_pairs([
-            ("A_NAME", "s3cret \"quoted\" value"),
-            ("B_NAME", "back\\slash and space"),
-        ]);
-
-        let compact = format!("{map:?}");
-        assert_eq!(compact, r#"DaemonEnvMap { names: ["A_NAME", "B_NAME"] }"#);
-
-        let pretty = format!("{map:#?}");
-        for forbidden in ["s3cret", "quoted", "back\\slash", "and space"] {
-            assert!(
-                !compact.contains(forbidden),
-                "{compact:?} leaked {forbidden:?}"
-            );
-            assert!(
-                !pretty.contains(forbidden),
-                "{pretty:?} leaked {forbidden:?}"
-            );
-        }
-    }
-
-    // ── Builtin runtime env (WI 0119) ─────────────────────────────────────
-
-    #[test]
-    fn ambient_msb_overrides_are_detected_and_never_forwarded() {
-        let env = EnvSnapshot::with_overrides([(MSB_HOME, ""), (MSB_PATH, "/x/msb")]);
-        assert_eq!(env.ambient_msb_overrides(), vec![MSB_PATH, MSB_HOME]);
-        assert!(EnvSnapshot::empty().ambient_msb_overrides().is_empty());
-        for name in AMBIENT_MSB_OVERRIDES {
-            assert!(
-                !ForwardedEnv::NAMES.contains(name),
-                "{name} must not be forwarded"
-            );
-        }
-    }
-
-    #[test]
-    fn documented_ambient_msb_override_list_matches_the_constant() {
-        let documentation = include_str!("../../../aspec/uxui/cli.md");
-        let section = documentation
-            .split_once("The builtin runtime rejects ambient ")
-            .expect("CLI documentation contains the builtin ambient override paragraph")
-            .1
-            .split_once("overrides instead of loading")
-            .expect("CLI paragraph ends after the override list")
-            .0;
-        let documented: Vec<&str> = section
-            .split('`')
-            .filter(|word| word.starts_with("MSB_"))
-            .collect();
-        assert_eq!(documented, AMBIENT_MSB_OVERRIDES);
-    }
-
-    #[test]
-    fn all_ambient_msb_names_are_captured_from_process() {
-        let _lock = DAEMON_OVERLAY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let previous_overlay = daemon_overlay_snapshot();
-        set_daemon_overlay(DaemonEnvMap::new());
-        let previous: Vec<_> = AMBIENT_MSB_OVERRIDES
-            .iter()
-            .map(|name| (*name, std::env::var_os(name)))
-            .collect();
-        for &name in AMBIENT_MSB_OVERRIDES {
-            std::env::set_var(name, "set");
-        }
-        assert_eq!(
-            Env::from_process().ambient_msb_overrides(),
-            AMBIENT_MSB_OVERRIDES
-        );
-        for (name, value) in previous {
-            if let Some(value) = value {
-                std::env::set_var(name, value);
-            } else {
-                std::env::remove_var(name);
-            }
-        }
-        set_daemon_overlay(previous_overlay);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn non_utf8_ambient_msb_path_is_captured_from_process() {
-        use std::os::unix::ffi::OsStringExt;
-        let _lock = DAEMON_OVERLAY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let previous_overlay = daemon_overlay_snapshot();
-        set_daemon_overlay(DaemonEnvMap::new());
-        let previous = std::env::var_os(MSB_PATH);
-        std::env::set_var(MSB_PATH, std::ffi::OsString::from_vec(vec![0xff]));
-        assert_eq!(Env::from_process().ambient_msb_overrides(), vec![MSB_PATH]);
-        if let Some(value) = previous {
-            std::env::set_var(MSB_PATH, value);
-        } else {
-            std::env::remove_var(MSB_PATH);
-        }
-        set_daemon_overlay(previous_overlay);
-    }
-
-    #[test]
-    fn builtin_and_docker_accessors() {
-        let env = EnvSnapshot::with_overrides([
-            (AWMAN_TEST_BUILTIN, "yes"),
-            (AWMAN_BUILTIN_STATE_DIR, "/s"),
-            (DOCKER_HOST, " tcp://h:2376 "),
-            (DOCKER_CERT_PATH, "/certs"),
-            (DOCKER_TLS_VERIFY, "1"),
-        ]);
-        assert!(env.test_builtin());
-        assert_eq!(env.builtin_state_dir(), Some(PathBuf::from("/s")));
-        assert_eq!(env.docker_host().as_deref(), Some("tcp://h:2376"));
-        assert_eq!(env.docker_cert_path(), Some(PathBuf::from("/certs")));
-        assert!(env.docker_tls_verify());
-
-        let empty = EnvSnapshot::with_overrides([
-            (AWMAN_BUILTIN_STATE_DIR, ""),
-            (DOCKER_HOST, ""),
-            (DOCKER_TLS_VERIFY, ""),
-        ]);
-        assert!(!empty.test_builtin());
-        assert_eq!(empty.builtin_state_dir(), None);
-        assert_eq!(empty.docker_host(), None);
-        assert!(!empty.docker_tls_verify());
-    }
-
-    // ── ForwardedEnv (WI 0114 F-29) ──────────────────────────────────────
-
-    /// A bearer key must never be serialized into the plist: it is a file on
-    /// disk, and the daemon authenticates against the on-disk key *hash*
-    /// instead. `PATH` must be forwarded — without it launchd's minimal one
-    /// leaves the daemon unable to find `docker`.
-    #[test]
-    fn no_bearer_key_is_ever_forwarded_to_a_daemon_job() {
-        assert!(!ForwardedEnv::NAMES.contains(&AWMAN_SQUAD_KEY));
-        assert!(!ForwardedEnv::NAMES.contains(&AWMAN_API_KEY));
-        assert!(ForwardedEnv::NAMES.contains(&"PATH"));
-        assert!(ForwardedEnv::NAMES.contains(&AWMAN_SQUAD_ROOT));
-        // WI 0116 §2: the payload's own overlay spec now rides the bootstrap
-        // class too, so a daemon started by systemd/launchd resolves the
-        // same overlays the shell that ran `squad start` would have.
-        assert!(ForwardedEnv::NAMES.contains(&AWMAN_OVERLAYS));
-    }
-
-    #[test]
-    fn test_isolation_parses_truthy_values_only() {
-        for (value, want) in [
-            ("1", true),
-            (" TRUE ", true),
-            ("yes", true),
-            ("on", true),
-            ("0", false),
-            ("false", false),
-            ("memory", false),
-            ("", false),
-        ] {
-            let env = EnvSnapshot::with_overrides([(AWMAN_TEST_ISOLATION, value)]);
-            assert_eq!(env.test_isolation(), want, "AWMAN_TEST_ISOLATION={value:?}");
-        }
-        assert!(!EnvSnapshot::empty().test_isolation());
-    }
-
-    /// The countdown override is a test-isolation knob only: without
-    /// `AWMAN_TEST_ISOLATION` it is ignored, whatever it holds.
-    #[test]
-    fn test_yolo_countdown_is_honoured_only_under_test_isolation() {
-        use std::time::Duration;
-        let isolated = |value: &str| {
-            EnvSnapshot::with_overrides([
-                (AWMAN_TEST_ISOLATION, "1"),
-                (AWMAN_TEST_YOLO_COUNTDOWN_MS, value),
-            ])
-            .test_yolo_countdown()
-        };
-        assert_eq!(isolated("250"), Some(Duration::from_millis(250)));
-        assert_eq!(isolated(" 0 "), Some(Duration::ZERO));
-        assert_eq!(isolated("soon"), None);
-        assert_eq!(isolated("-5"), None);
-        let normal = EnvSnapshot::with_overrides([(AWMAN_TEST_YOLO_COUNTDOWN_MS, "250")]);
-        assert_eq!(normal.test_yolo_countdown(), None);
-        assert_eq!(EnvSnapshot::empty().test_yolo_countdown(), None);
-    }
-
-    /// Unit tests are isolated whatever the environment says: they cannot be
-    /// run in a way that reaches the developer's keychain or service manager.
-    #[test]
-    fn unit_tests_are_always_isolated() {
-        assert!(test_isolation_active());
-    }
-
-    /// `ForwardedEnv::from_process()` must emit only the names actually set in this
-    /// process, and in `ForwardedEnv::NAMES`'s own order — not insertion order of
-    /// whichever happen to be set, and not alphabetical.
-    #[test]
-    fn forwarded_env_returns_only_set_names_in_list_order() {
-        let _env = ProcessEnvGuard::acquire(&[
-            AWMAN_OVERLAYS,
-            AWMAN_MAX_CONCURRENT_AGENTS,
-            AWMAN_LAUNCH_MODE,
-        ]);
-
-        std::env::remove_var(AWMAN_OVERLAYS);
-        std::env::set_var(AWMAN_MAX_CONCURRENT_AGENTS, "7");
-        std::env::remove_var(AWMAN_LAUNCH_MODE);
-
-        let result = ForwardedEnv::from_process();
-
-        assert!(
-            !result.iter().any(|(n, _)| n == AWMAN_OVERLAYS),
-            "an unset name must not appear at all: {result:?}"
-        );
-        assert!(
-            !result.iter().any(|(n, _)| n == AWMAN_LAUNCH_MODE),
-            "an unset name must not appear at all: {result:?}"
-        );
-        assert!(
-            result
-                .iter()
-                .any(|(n, v)| n == AWMAN_MAX_CONCURRENT_AGENTS && v == "7"),
-            "a set name must appear with its value: {result:?}"
-        );
-
-        let names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
-        let expected_order: Vec<&str> = ForwardedEnv::NAMES
-            .iter()
-            .copied()
-            .filter(|candidate| names.contains(candidate))
-            .collect();
-        assert_eq!(
-            names, expected_order,
-            "ForwardedEnv::from_process() must preserve ForwardedEnv::NAMES's own order"
-        );
-    }
-}
-
-#[cfg(test)]
-mod published_key_tests {
-    use super::*;
-
-    /// The regression F-47 introduced and this restores: the process that mints
-    /// a squad key publishes it into the daemon overlay, and every *later*
-    /// reader in that process resolves it through a fresh `EnvSnapshot`. If
-    /// `Env::from_process` read only `std::env::var`, the second supervisor in
-    /// the minting process would see no key at all.
-    #[test]
-    fn a_snapshot_taken_after_a_key_is_published_sees_that_key() {
-        let _lock = DAEMON_OVERLAY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let previous = daemon_overlay_snapshot();
-
-        update_daemon_overlay(|vars| {
-            vars.insert(AWMAN_SQUAD_KEY.to_string(), "minted-squad-key".to_string());
-            vars.insert(AWMAN_API_KEY.to_string(), "minted-api-key".to_string());
-        });
-
-        let snapshot = Env::from_process();
-        assert_eq!(
-            snapshot.squad_key(),
-            Some("minted-squad-key"),
-            "a snapshot built after the mint must carry the published squad key"
-        );
-        assert_eq!(
-            snapshot.api_key(),
-            Some("minted-api-key"),
-            "a snapshot built after the mint must carry the published API key"
-        );
-
-        set_daemon_overlay(previous);
-    }
-
-    /// The counterpart: nothing *but* the two published keys is resolved
-    /// through the overlay, so a daemon client cannot redirect this process's
-    /// storage root by pushing an `env(VAR)` payload named like one of awman's
-    /// own invariants.
-    #[test]
-    fn the_overlay_cannot_redirect_a_storage_root() {
-        let _lock = DAEMON_OVERLAY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let previous = daemon_overlay_snapshot();
-        let real_root = std::env::var(AWMAN_SQUAD_ROOT).ok();
-
-        update_daemon_overlay(|vars| {
-            vars.insert(AWMAN_SQUAD_ROOT.to_string(), "/attacker/root".to_string());
-        });
-
-        let snapshot = Env::from_process();
-        assert_eq!(
-            snapshot.get(AWMAN_SQUAD_ROOT),
-            real_root.as_deref(),
-            "the overlay must not reach awman's own invariants"
-        );
-
-        set_daemon_overlay(previous);
     }
 }

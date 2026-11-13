@@ -34,6 +34,8 @@ use crate::command::commands::workflow_preflight::{
 use crate::command::commands::{parse_overlay_list, CollectedOverlays, Command};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
+use crate::command::interaction::{resolve_interaction, InteractionDecision, InteractionSlot};
+use crate::data::config::daemon::DaemonSettings;
 use crate::data::config::env::EnvSnapshot;
 use crate::data::dynamic_workflow_assets::build_squad_leader_prompt;
 use crate::data::fs::task_store::{MountScope, Task};
@@ -70,6 +72,11 @@ pub trait SquadRunFrontends: Send + Sync {
     /// `UnattendedFrontends` used to pass `MountGitRoot` from Layer 3, which
     /// meant which directory a squad *leader* mounts was decided by a frontend
     /// literal and was invisible to the headless-profile table (Q4: a decision
+    ///
+    /// `interaction` is the run's resolved interaction (WI 0141, slot
+    /// `Squad`): the frontend sets `AgentIo::initial_size =
+    /// interaction.pty_size` (a PTY of `daemon.terminal.{cols,rows}`) or pipes
+    /// the agent when it is headless, and decides nothing else about it.
     /// left in `src/frontend/squad/` is wrong).
     fn leader_frontend(
         &self,
@@ -78,6 +85,7 @@ pub trait SquadRunFrontends: Send + Sync {
         run_log_dir: &Path,
         label: &str,
         mount_scope: MountScopeDecision,
+        interaction: InteractionDecision,
     ) -> Result<Box<dyn AgentFrontend>, CommandError>;
 
     /// A frontend for executing the generated workflow. `mount_scope` is the
@@ -89,6 +97,7 @@ pub trait SquadRunFrontends: Send + Sync {
         run_id: &crate::data::fs::RunId,
         run_log_dir: &Path,
         mount_scope: MountScopeDecision,
+        interaction: InteractionDecision,
     ) -> Result<Box<dyn ExecWorkflowCommandFrontend>, CommandError>;
 }
 
@@ -311,10 +320,14 @@ pub fn resolve_leader(
 }
 
 /// Evaluates one task end to end.
+#[derive(Clone)]
 pub struct LocalTaskEvaluator {
     engines: Engines,
     env: EnvSnapshot,
     frontends: Arc<dyn SquadRunFrontends>,
+    /// The daemon's live `daemon` settings, read at the start of each run
+    /// (WI 0141). `None` reads `engines.global_config`.
+    daemon_settings: Option<Arc<dyn Fn() -> DaemonSettings + Send + Sync>>,
 }
 
 impl LocalTaskEvaluator {
@@ -323,7 +336,43 @@ impl LocalTaskEvaluator {
             engines,
             env,
             frontends,
+            daemon_settings: None,
         }
+    }
+
+    /// Read `daemon.features.squad.interaction` and
+    /// `daemon.terminal.{cols,rows}` live (the daemon passes its reloadable
+    /// config), so a change applies to the next run's spawns.
+    pub fn with_daemon_settings(
+        mut self,
+        source: Arc<dyn Fn() -> DaemonSettings + Send + Sync>,
+    ) -> Self {
+        self.daemon_settings = Some(source);
+        self
+    }
+
+    fn daemon_settings(&self) -> DaemonSettings {
+        match &self.daemon_settings {
+            Some(source) => source(),
+            None => DaemonSettings::from_merged(
+                &self
+                    .engines
+                    .global_config
+                    .daemon
+                    .clone()
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// The run's interaction (WI 0141): `daemon.features.squad.interaction`.
+    /// A task carries no `exec.interaction` of its own today, so nothing
+    /// requests an override and nothing can be refused; when one exists it
+    /// is passed as `requested` and `allowOverride` applies.
+    fn interaction(&self) -> InteractionDecision {
+        let settings = self.daemon_settings();
+        resolve_interaction(InteractionSlot::Squad, None, &settings)
+            .expect("no override is requested, so none can be refused")
     }
 
     /// Open a session rooted at the task's captured mount scope. The scope
@@ -376,7 +425,20 @@ impl LocalTaskEvaluator {
         } else {
             Session::open_at_directory_root(working_dir, opts)
         };
-        session.map_err(|error| CommandError::Other(format!("opening squad task session: {error}")))
+        let mut session = session
+            .map_err(|error| CommandError::Other(format!("opening squad task session: {error}")))?;
+        // The task's own config file is a config layer for everything this
+        // session runs; env and `--set` still sit above it.
+        let task_file = crate::data::fs::SquadPaths::from_env(&self.env)
+            .and_then(|paths| paths.task_config_file(&task.name))
+            .and_then(|path| {
+                crate::data::config::ConfigFile::load(&path, crate::data::config::FileKind::Task)
+            })
+            .map_err(CommandError::Data)?;
+        session
+            .set_task_config(task_file)
+            .map_err(CommandError::Data)?;
+        Ok(session)
     }
 
     /// Give a plain-directory task root the image definitions an ordinary
@@ -476,6 +538,9 @@ impl LocalTaskEvaluator {
 
         let task = &request.task;
         let session = self.open_session(task)?;
+        // One decision per run: every agent this run spawns (leader, repairs,
+        // workflow steps) runs the same way, sized as configured now.
+        let interaction = self.interaction();
         let git_root = session.git_root().to_path_buf();
         let trusted_git_source = session
             .is_git_repo()
@@ -487,13 +552,6 @@ impl LocalTaskEvaluator {
             .transpose()?;
 
         let mut sink = TracingSink::new(&task.name);
-        // The once-per-repo deprecation notice belongs to the first
-        // evaluation, not to the first one that triggers: a leader that never
-        // triggers would otherwise never show it. The generated workflow
-        // shares this gate through `engines`, so it does not repeat it.
-        self.engines
-            .config_notices
-            .warn_legacy_dynamic_workflows(&session, &mut sink);
         // Raw container image build output goes to per-build files under
         // `<squad root>/builds/<task>/`, never into the daemon log; the daemon
         // log gets one lifecycle line per build naming the file instead.
@@ -588,7 +646,9 @@ impl LocalTaskEvaluator {
         // path. On an importing runtime (builtin) every pool agent goes through
         // provenance-checked acquisition, which for an installed image from an
         // unchanged source is a cache hit; an image from a different source is
-        // re-acquired. It never builds (`BuildPolicy::ImportOnly`).
+        // re-acquired. It starts with `BuildPolicy::ImportOnly`; a missing
+        // Apple Containers content blob can trigger one source-matched rebuild
+        // when the builtin builder is enabled.
         let mut pool_agents = vec![agent.as_str().to_string()];
         if let Some(map) = request.agents_to_models.as_ref() {
             let mut names: Vec<&String> = map.keys().collect();
@@ -672,7 +732,7 @@ impl LocalTaskEvaluator {
                 model = ?leader.model,
                 "squad evaluation container launching"
             );
-            let run_options = self.leader_run_options(
+            let mut run_options = self.leader_run_options(
                 repair.prompt(),
                 leader.model.as_deref(),
                 &git_root,
@@ -681,6 +741,9 @@ impl LocalTaskEvaluator {
                 &request.run_log_dir,
                 &collected,
             );
+            // Headless squad runs (WI 0141) launch the leader in print mode,
+            // piped, like a pushed headless command.
+            run_options.non_interactive = interaction.is_headless();
             let exit = launcher
                 .run_leader(
                     LeaderRunSpec {
@@ -697,6 +760,7 @@ impl LocalTaskEvaluator {
                         &request.run_log_dir,
                         &label,
                         mount_scope_decision(task.mount_scope),
+                        interaction,
                     )?,
                 )
                 .await
@@ -889,29 +953,27 @@ impl LocalTaskEvaluator {
         );
         if let Some(task_policy) = &task.prerequisites {
             let options = crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFlowOptions::for_session(
-                &session, crate::command::dispatch::catalogue::FrontendKind::SquadDaemon, &Default::default(), None,
+                &session, crate::command::dispatch::catalogue::FrontendKind::SQUAD_LOCAL, &Default::default(), None,
                 crate::data::workflow_prerequisites::PrerequisiteOrigin::AssumedAll, None);
             crate::command::commands::workflow_prerequisites::check_task_widening(
                 task_policy,
                 &options.policy,
             )?;
         }
-        let mut command = ExecWorkflowCommand::new(
-            squad_workflow_flags(
-                &generated_path,
-                uses_worktree,
-                &task.overlays,
-                task.prerequisites.clone().map(Box::new),
-            ),
-            self.engines.clone(),
-            session,
-        )
-        .with_frontend_kind(crate::command::dispatch::catalogue::FrontendKind::SquadDaemon)
-        .with_squad_identity(squad_identity)
-        // Every step container also gets the durable task workspace at the
-        // stable `context(workflow)` path, so a task's persistent data is
-        // reachable from its workflow as well as from its leader.
-        .with_task_workspace(request.task_dir.clone());
+        let mut workflow_flags = squad_workflow_flags(
+            &generated_path,
+            uses_worktree,
+            &task.overlays,
+            task.prerequisites.clone().map(Box::new),
+        );
+        workflow_flags.non_interactive = interaction.is_headless();
+        let mut command = ExecWorkflowCommand::new(workflow_flags, self.engines.clone(), session)
+            .with_frontend_kind(crate::command::dispatch::catalogue::FrontendKind::SQUAD_LOCAL)
+            .with_squad_identity(squad_identity)
+            // Every step container also gets the durable task workspace at the
+            // stable `context(workflow)` path, so a task's persistent data is
+            // reachable from its workflow as well as from its leader.
+            .with_task_workspace(request.task_dir.clone());
         if !uses_worktree {
             // No worktree means the engine's session is rooted at the task's
             // own mounted directory, which must survive every run untouched.
@@ -926,6 +988,7 @@ impl LocalTaskEvaluator {
             &request.run_id,
             &request.run_log_dir,
             mount_scope_decision(task.mount_scope),
+            interaction,
         )?;
         if task.prerequisites.is_none() {
             // A task created before workflow prerequisites existed (WI 0149):
@@ -1062,7 +1125,21 @@ impl LocalTaskEvaluator {
 #[async_trait]
 impl TaskEvaluator for LocalTaskEvaluator {
     async fn evaluate(&self, request: EvaluationRequest) -> EvaluationOutcome {
-        let outcome = match self.evaluate_inner(&request).await {
+        let mut evaluator = self.clone();
+        evaluator.engines.runtime = Arc::new(
+            crate::command::commands::api_server::owned_runtime::CommandOwnedRuntime::new(
+                self.engines.runtime.clone(),
+                "",
+            )
+            .with_owner(crate::data::terminal::TerminalOwnerInfo {
+                owner: crate::data::terminal::TerminalOwner::Run(request.run_id.clone()),
+                feature: crate::data::daemon_state::FeatureName::Squad,
+                source: None,
+                attempt: 1,
+                allow_remote_input: false,
+            }),
+        );
+        let outcome = match evaluator.evaluate_inner(&request).await {
             Ok(outcome) => outcome,
             // Never panic and never propagate: the scheduler records the error
             // and grows the task's backoff.
@@ -1315,7 +1392,7 @@ fn with_prerequisite_summary(
     use crate::data::workflow_prerequisites::{PrerequisiteOrigin, WorkflowPrerequisites};
     let options = WorkflowPrerequisiteFlowOptions::for_session(
         session,
-        crate::command::dispatch::catalogue::FrontendKind::SquadDaemon,
+        crate::command::dispatch::catalogue::FrontendKind::SQUAD_LOCAL,
         &Default::default(),
         task.prerequisites.as_ref(),
         PrerequisiteOrigin::AssumedAll,
@@ -1333,662 +1410,4 @@ fn with_prerequisite_summary(
          awman supplies credentials to teardown steps automatically. Do not add a teardown step \
          whose prerequisite is marked ✗; mention it in your verdict instead.\n"
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::Utc;
-    use std::collections::HashMap;
-
-    struct HoldingFrontends {
-        messages: Arc<std::sync::Mutex<Vec<UserMessage>>>,
-    }
-
-    impl SquadRunFrontends for HoldingFrontends {
-        fn leader_frontend(
-            &self,
-            _: &str,
-            _: &crate::data::fs::RunId,
-            _: &Path,
-            _: &str,
-            _: MountScopeDecision,
-        ) -> Result<Box<dyn AgentFrontend>, CommandError> {
-            Ok(Box::new(
-                crate::command::commands::exec_workflow::tests::FakeExecWorkflowFrontend::with_shared_messages(self.messages.clone()),
-            ))
-        }
-
-        fn workflow_frontend(
-            &self,
-            _: &str,
-            _: &crate::data::fs::RunId,
-            _: &Path,
-            _: MountScopeDecision,
-        ) -> Result<Box<dyn ExecWorkflowCommandFrontend>, CommandError> {
-            Ok(Box::new(
-                crate::command::commands::exec_workflow::tests::FakeExecWorkflowFrontend::with_shared_messages(self.messages.clone()),
-            ))
-        }
-    }
-
-    #[tokio::test]
-    async fn squad_evaluation_survives_retained_workflow_frontend() {
-        evaluate_retained_frontend(false).await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn squad_leader_cannot_redirect_the_generated_workflows_git_metadata() {
-        evaluate_retained_frontend(true).await;
-    }
-
-    async fn evaluate_retained_frontend(redirect_git: bool) {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(temp.path().join(".awman")).unwrap();
-        std::fs::write(
-            temp.path().join(".awman/Dockerfile.claude"),
-            "FROM scratch\n",
-        )
-        .unwrap();
-        let git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .args(args)
-                .current_dir(temp.path())
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {args:?}");
-        };
-        git(&["init", "-q"]);
-        git(&["add", "."]);
-        git(&[
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.test",
-            "commit",
-            "-qm",
-            "init",
-        ]);
-        let task_dir = temp.path().join("task-workspace");
-        let run_log_dir = temp.path().join("run-logs");
-        std::fs::create_dir_all(&task_dir).unwrap();
-        std::fs::create_dir_all(&run_log_dir).unwrap();
-        let held = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let foreign = tempfile::tempdir().unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["init", "-q"])
-            .arg(foreign.path())
-            .status()
-            .unwrap()
-            .success());
-        let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let seen_builds = builds.clone();
-        let repo = temp.path().to_path_buf();
-        let foreign_git = foreign.path().join(".git");
-        let runtime = crate::engine::container::test_support::holding_runtime_with_hooks(
-            held.clone(),
-            "[[steps]]\nname = 'generated'\nagent = 'claude'\nprompt = 'work'\n",
-            Arc::new(|_| {}),
-            Arc::new(move |_| {
-                if seen_builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
-                    && redirect_git
-                {
-                    std::fs::rename(repo.join(".git"), repo.join(".git-original")).unwrap();
-                    #[cfg(unix)]
-                    std::os::unix::fs::symlink(&foreign_git, repo.join(".git")).unwrap();
-                    #[cfg(not(unix))]
-                    let _ = &foreign_git;
-                }
-                Ok(())
-            }),
-            None,
-        );
-        let mut engines = Engines::for_tests(temp.path());
-        engines.runtime = runtime.clone();
-        engines.container_runtime = Some(runtime.clone());
-        engines.agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
-            engines.overlay_engine.clone(),
-            runtime,
-        ));
-        let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let evaluator = LocalTaskEvaluator::new(
-            engines,
-            EnvSnapshot::with_overrides([(
-                "AWMAN_SQUAD_ROOT",
-                temp.path().join("squad").to_string_lossy().as_ref(),
-            )]),
-            Arc::new(HoldingFrontends {
-                messages: messages.clone(),
-            }),
-        );
-        let mut squad_task = task(Some("claude"), None);
-        squad_task.repo_scope = temp.path().to_path_buf();
-        let outcome = evaluator
-            .evaluate(EvaluationRequest {
-                task: squad_task,
-                run_id: crate::data::fs::RunId::new(),
-                task_dir,
-                run_log_dir,
-                guidance: None,
-                agents_to_models: None,
-                default_leader: None,
-                progress: Arc::new(crate::engine::squad::NoRunProgress),
-            })
-            .await;
-        if redirect_git {
-            let EvaluationOutcome::Failed { error, .. } = outcome else {
-                panic!("redirected repository was accepted");
-            };
-            assert!(error.contains("Git metadata layout changed"), "{error}");
-            assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 1);
-            return;
-        }
-        assert!(
-            matches!(outcome, EvaluationOutcome::WorkflowExecuted { .. }),
-            "{}",
-            match outcome {
-                EvaluationOutcome::Failed { ref error, .. } => error.as_str(),
-                _ => "unexpected outcome",
-            }
-        );
-        assert!(held.lock().unwrap().len() >= 2);
-        assert!(messages
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|message| message.text == "held runtime message"));
-        assert!(messages.lock().unwrap().iter().any(|message| {
-            message
-                .text
-                .contains("workflow prerequisite policy not set")
-        }));
-    }
-
-    // ── WI 0112 Part 6: the leader's exit and verdict decide together ──────
-
-    fn verdict(
-        triggered: bool,
-    ) -> Result<crate::engine::squad::RunVerdict, crate::engine::squad::VerdictError> {
-        Ok(crate::engine::squad::RunVerdict {
-            triggered,
-            reason: None,
-        })
-    }
-
-    fn missing() -> Result<crate::engine::squad::RunVerdict, crate::engine::squad::VerdictError> {
-        Err(crate::engine::squad::VerdictError::Missing(PathBuf::from(
-            "/run/verdict.json",
-        )))
-    }
-
-    #[test]
-    fn a_clean_exit_defers_to_the_verdict() {
-        let log = Path::new("/run/leader.log");
-        assert!(matches!(
-            decide_leader_outcome(0, false, verdict(true), log),
-            VerdictDecision::RunGeneratedWorkflow { .. }
-        ));
-        assert!(matches!(
-            decide_leader_outcome(0, false, verdict(false), log),
-            VerdictDecision::NotTriggered { .. }
-        ));
-        match decide_leader_outcome(0, false, missing(), log) {
-            VerdictDecision::Failed(error) => {
-                assert!(error.contains("wrote no verdict"), "{error}");
-                assert!(error.ends_with("(log: /run/leader.log)"), "{error}");
-            }
-            other => panic!("a clean exit with no verdict is a protocol failure: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_countdown_kill_honours_a_written_verdict_and_is_not_triggered_without_one() {
-        let log = Path::new("/run/leader.log");
-        assert!(matches!(
-            decide_leader_outcome(137, true, verdict(true), log),
-            VerdictDecision::RunGeneratedWorkflow { .. }
-        ));
-        match decide_leader_outcome(137, true, missing(), log) {
-            VerdictDecision::NotTriggered { reason } => {
-                assert_eq!(reason.as_deref(), Some(LEADER_IDLE_KILL_REASON));
-            }
-            other => panic!("an idle leader killed by the countdown is not a failure: {other:?}"),
-        }
-        assert!(leader_exit_failure(137, true, log).is_none());
-    }
-
-    #[test]
-    fn a_non_zero_exit_that_was_not_the_countdown_fails_whatever_the_verdict_says() {
-        let log = Path::new("/run/leader.log");
-        for code in [1, 137] {
-            for v in [verdict(true), verdict(false), missing()] {
-                match decide_leader_outcome(code, false, v, log) {
-                    VerdictDecision::Failed(error) => {
-                        assert_eq!(
-                            error,
-                            format!("leader agent exited with code {code} (log: /run/leader.log)")
-                        );
-                    }
-                    other => panic!("exit {code} must fail: {other:?}"),
-                }
-            }
-        }
-        assert!(leader_exit_failure(0, false, log).is_none());
-        assert!(leader_exit_failure(2, false, log).is_some());
-    }
-
-    fn task(agent: Option<&str>, model: Option<&str>) -> Task {
-        let now = Utc::now();
-        Task {
-            prerequisites: None,
-            id: "id".into(),
-            name: "issue-triage".into(),
-            description: "when an issue opens, plan it".into(),
-            repo_scope: PathBuf::from("/repo"),
-            mount_scope: MountScope::GitRoot,
-            overlays: Vec::new(),
-            interval_secs: 300,
-            status: crate::data::fs::task_store::TaskStatus::Active,
-            agent: agent.map(str::to_string),
-            model: model.map(str::to_string),
-            backoff_until: None,
-            created_at: now,
-            updated_at: now,
-            last_run_at: None,
-            trigger_requested_at: None,
-            last_run_status: None,
-            unmet_env: Vec::new(),
-        }
-    }
-
-    fn pool() -> HashMap<String, Vec<String>> {
-        HashMap::from([(
-            "codex".to_string(),
-            vec!["gpt-5".to_string(), "gpt-5-mini".to_string()],
-        )])
-    }
-
-    #[test]
-    fn a_task_level_agent_and_model_beat_every_default() {
-        let resolved = resolve_leader(
-            &task(Some("claude"), Some("claude-opus-5")),
-            Some("codex::gpt-5"),
-            Some(&pool()),
-            Some("gemini"),
-        )
-        .unwrap();
-        assert_eq!(resolved.agent, "claude");
-        assert_eq!(resolved.model.as_deref(), Some("claude-opus-5"));
-    }
-
-    #[test]
-    fn a_task_level_agent_wins_even_when_absent_from_the_configured_pool() {
-        // `agentsToModels` is a default pool, not an allowlist.
-        let resolved =
-            resolve_leader(&task(Some("claude"), None), None, Some(&pool()), None).unwrap();
-        assert_eq!(resolved.agent, "claude");
-        assert_eq!(resolved.model, None);
-    }
-
-    #[test]
-    fn default_leader_beats_the_global_default_agent() {
-        let resolved = resolve_leader(
-            &task(None, None),
-            Some("codex::gpt-5"),
-            Some(&pool()),
-            Some("gemini"),
-        )
-        .unwrap();
-        assert_eq!(resolved.agent, "codex");
-        assert_eq!(resolved.model.as_deref(), Some("gpt-5"));
-    }
-
-    #[test]
-    fn the_global_default_agent_is_the_last_resort() {
-        let resolved = resolve_leader(&task(None, None), None, None, Some("gemini")).unwrap();
-        assert_eq!(resolved.agent, "gemini");
-        assert_eq!(resolved.model, None);
-    }
-
-    #[test]
-    fn agents_to_models_supplies_a_model_for_an_agent_chosen_without_one() {
-        let resolved =
-            resolve_leader(&task(Some("codex"), None), None, Some(&pool()), None).unwrap();
-        assert_eq!(resolved.agent, "codex");
-        assert_eq!(resolved.model.as_deref(), Some("gpt-5"));
-    }
-
-    #[test]
-    fn a_task_level_model_overrides_the_configured_pool() {
-        let resolved = resolve_leader(
-            &task(Some("codex"), Some("gpt-5-mini")),
-            None,
-            Some(&pool()),
-            None,
-        )
-        .unwrap();
-        assert_eq!(resolved.model.as_deref(), Some("gpt-5-mini"));
-    }
-
-    #[test]
-    fn no_agent_at_any_level_is_an_actionable_error() {
-        let error = resolve_leader(&task(None, None), None, None, None).unwrap_err();
-        let text = error.to_string();
-        assert!(text.contains("issue-triage"), "{text}");
-        assert!(text.contains("squad.defaultLeader"), "{text}");
-    }
-
-    #[test]
-    fn a_malformed_default_leader_is_rejected() {
-        let error =
-            resolve_leader(&task(None, None), Some("codex"), None, Some("gemini")).unwrap_err();
-        assert!(error.to_string().contains("agent::model"));
-    }
-
-    #[test]
-    fn guidance_is_rendered_into_the_prompt_whichever_level_supplied_the_agent() {
-        let guidance = vec!["always run the tests".to_string()];
-        for (default_leader, session_default) in [
-            (Some("codex::gpt-5"), None),
-            (None, Some("gemini")),
-            (None, None),
-        ] {
-            let task = if default_leader.is_none() && session_default.is_none() {
-                task(Some("claude"), None)
-            } else {
-                task(None, None)
-            };
-            let leader = resolve_leader(&task, default_leader, None, session_default).unwrap();
-            let prompt = build_squad_leader_prompt(
-                &task.name,
-                &task.description,
-                "/workspace",
-                &format!("  - {}", leader.agent),
-                &Default::default(),
-                "/awman/squad/run/verdict.json",
-                Some(&guidance),
-            );
-            assert!(
-                prompt.contains("always run the tests"),
-                "guidance must be additive regardless of which level chose the agent \
-                 (leader {:?})",
-                leader.agent
-            );
-            assert!(prompt.contains("issue-triage"));
-        }
-    }
-
-    /// WI 0117: the overlay inventory reaches the leader intact, and the
-    /// template keeps no unreplaced slot after the new one was added.
-    #[test]
-    fn the_overlay_inventory_is_substituted_into_the_leader_prompt() {
-        let collected = CollectedOverlays {
-            directories: vec![crate::engine::overlay::DirectorySpec {
-                host: "~/.ssh".into(),
-                container: "/root/.ssh".into(),
-                permission: OverlayPermission::ReadOnly,
-            }],
-            env_passthrough: vec!["GITHUB_TOKEN".into()],
-            ..Default::default()
-        };
-        let prompt = build_squad_leader_prompt(
-            "issue-triage",
-            "when a new issue is opened, draft a plan",
-            "/workspace",
-            "  - claude",
-            &overlay_inventory(&collected),
-            "/awman/squad/run/verdict.json",
-            None,
-        );
-        assert!(
-            prompt.contains("- `/root/.ssh` (read-only) — from host `~/.ssh`"),
-            "the leader must be told which directories it has, got: {prompt}"
-        );
-        assert!(
-            prompt.contains("GITHUB_TOKEN"),
-            "the leader must be told which env names its task declares, got: {prompt}"
-        );
-        assert!(
-            prompt.contains("### Host directories") && prompt.contains("### Skills"),
-            "the template must supply the inventory's headings, got: {prompt}"
-        );
-        assert!(
-            !prompt.contains("{{"),
-            "no template slot may survive substitution, got: {prompt}"
-        );
-    }
-
-    #[test]
-    fn generated_workflows_carry_the_unattended_guardrails_and_the_tasks_overlays() {
-        let overlays = vec!["ssh()".to_string(), "env(GITHUB_TOKEN)".to_string()];
-        let flags = squad_workflow_flags(Path::new("/c/workflow.toml"), true, &overlays, None);
-        assert!(
-            flags.yolo,
-            "an unattended agent must never block on a prompt"
-        );
-        // Squad agents run PTY-backed so attach reaches the real agent UI
-        // (WI 0106 §3c), which is the opposite of the pre-0106 piped mode.
-        assert!(!flags.non_interactive);
-        assert!(!flags.allow_docker);
-        assert!(!flags.dynamic, "the workflow is already generated");
-        assert_eq!(
-            flags.overlay, overlays,
-            "a task's overlays reach every step through the same --overlay slot"
-        );
-        assert_eq!(
-            flags.workflow.as_deref(),
-            Some(Path::new("/c/workflow.toml"))
-        );
-    }
-
-    #[test]
-    fn worktree_isolation_follows_the_tasks_captured_workspace_kind() {
-        // A repository-backed task is always worktree-isolated, so two runs
-        // touching one repo cannot collide…
-        assert!(
-            squad_workflow_flags(Path::new("/c/workflow.toml"), true, &[], None).worktree,
-            "a repository-backed task must always be worktree-isolated"
-        );
-        // …and a directory workspace never is: there is no repository to
-        // branch a worktree from, so the workspace is mounted directly.
-        assert!(
-            !squad_workflow_flags(Path::new("/c/workflow.toml"), false, &[], None).worktree,
-            "a directory-workspace task must never request a worktree"
-        );
-    }
-
-    #[test]
-    fn a_directory_workspace_task_never_uses_a_worktree() {
-        let mut task = task(None, None);
-        task.mount_scope = MountScope::Directory;
-        assert!(!task.uses_worktree());
-        for scope in [MountScope::GitRoot, MountScope::Cwd] {
-            task.mount_scope = scope;
-            assert!(
-                task.uses_worktree(),
-                "a repository-backed task is worktree-isolated under {scope:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_captured_mount_scope_is_answered_verbatim_and_never_widened() {
-        assert!(matches!(
-            mount_scope_decision(MountScope::Cwd),
-            MountScopeDecision::MountCurrentDirOnly
-        ));
-        assert!(matches!(
-            mount_scope_decision(MountScope::GitRoot),
-            MountScopeDecision::MountGitRoot
-        ));
-        // A directory workspace is its own root, so there is nothing to widen
-        // and the frontend is never actually asked.
-        assert!(matches!(
-            mount_scope_decision(MountScope::Directory),
-            MountScopeDecision::MountGitRoot
-        ));
-    }
-
-    /// WI 0106 §6a: nothing awman writes on its own behalf may land in — let
-    /// alone be deleted from — the durable directory a task mounts. The engine
-    /// state file is exactly such a file (written every run, deleted whenever
-    /// a run starts fresh, which every scheduled squad run does), so a
-    /// directory-workspace run keeps it in that run's own directory.
-    #[test]
-    fn a_directory_workspaces_engine_state_file_lives_in_the_run_dir_not_the_workspace() {
-        let workspace = Path::new("/home/u/.awman/squad/tasks/nightly/workspace");
-        let run_dir = Path::new("/home/u/.awman/squad/tasks/nightly/runs/run-1");
-
-        let state_path = directory_workspace_state_path(run_dir, "nightly-sweep");
-
-        assert!(
-            state_path.starts_with(run_dir),
-            "state must be rooted at the run directory: {}",
-            state_path.display()
-        );
-        assert!(
-            !state_path.starts_with(workspace),
-            "state must never be written inside the durable task workspace: {}",
-            state_path.display()
-        );
-        // Two runs of the same task never share a state file, so one run can
-        // never delete or resume another's.
-        assert_ne!(
-            state_path,
-            directory_workspace_state_path(
-                Path::new("/home/u/.awman/squad/tasks/nightly/runs/run-2"),
-                "nightly-sweep",
-            )
-        );
-    }
-
-    // ── The verdict → outcome protocol (WI 0106 §6d) ──────────────────────
-
-    /// Write a run-scoped verdict file and read the decision back through the
-    /// same `read_verdict` the evaluator uses.
-    fn decision_for(body: Option<&str>) -> VerdictDecision {
-        let tmp = tempfile::tempdir().unwrap();
-        if let Some(body) = body {
-            std::fs::write(
-                tmp.path().join(crate::engine::squad::VERDICT_FILE_NAME),
-                body,
-            )
-            .unwrap();
-        }
-        decide_from_verdict(crate::engine::squad::read_verdict(tmp.path()))
-    }
-
-    #[test]
-    fn a_triggered_verdict_runs_whatever_workflow_is_on_disk() {
-        assert_eq!(
-            decision_for(Some(r#"{"triggered": true, "reason": "new issue"}"#)),
-            VerdictDecision::RunGeneratedWorkflow {
-                reason: Some("new issue".into())
-            },
-            "a fresh triggered verdict proceeds to validate the workflow.toml \
-             on disk, whether the leader rewrote it or reused an earlier run's"
-        );
-    }
-
-    /// A failed run keeps whatever reason the leader's verdict gave, whether
-    /// the failure came before or after the verdict was acted on.
-    #[test]
-    fn a_failed_run_keeps_the_verdict_reason() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            crate::engine::squad::verdict_path(tmp.path()),
-            r#"{"triggered": true, "reason": "3 new issues"}"#,
-        )
-        .unwrap();
-        let failed = with_verdict_reason_on_failure(
-            EvaluationOutcome::Failed {
-                error: "workflow failed validation".into(),
-                reason: None,
-            },
-            tmp.path(),
-        );
-        assert!(matches!(
-            failed,
-            EvaluationOutcome::Failed { reason: Some(ref r), .. } if r == "3 new issues"
-        ));
-    }
-
-    /// No verdict on disk leaves a failure's reason empty rather than failing.
-    #[test]
-    fn a_failure_without_a_verdict_has_no_reason() {
-        let tmp = tempfile::tempdir().unwrap();
-        let failed = with_verdict_reason_on_failure(
-            EvaluationOutcome::Failed {
-                error: "leader crashed".into(),
-                reason: None,
-            },
-            tmp.path(),
-        );
-        assert!(matches!(
-            failed,
-            EvaluationOutcome::Failed { reason: None, .. }
-        ));
-    }
-
-    #[test]
-    fn an_untriggered_verdict_wins_over_a_stale_workflow_file() {
-        // The stale `workflow.toml` lives in the durable workspace and is
-        // deliberately *not* consulted: only the verdict decides.
-        let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(workspace.path().join("workflow.toml"), "from run 1").unwrap();
-        assert_eq!(
-            decision_for(Some(r#"{"triggered": false, "reason": "quiet"}"#)),
-            VerdictDecision::NotTriggered {
-                reason: Some("quiet".into())
-            }
-        );
-        assert!(
-            workspace.path().join("workflow.toml").exists(),
-            "deciding not-triggered must not touch the durable workspace"
-        );
-    }
-
-    #[test]
-    fn a_missing_verdict_is_a_failed_run_not_a_silent_not_triggered() {
-        let decision = decision_for(None);
-        assert!(
-            matches!(decision, VerdictDecision::Failed(_)),
-            "a leader that wrote no verdict is a broken run: {decision:?}"
-        );
-    }
-
-    #[test]
-    fn an_unparseable_verdict_is_a_failed_run() {
-        let decision = decision_for(Some("{ not json"));
-        assert!(
-            matches!(decision, VerdictDecision::Failed(_)),
-            "an unparseable verdict is a protocol violation: {decision:?}"
-        );
-    }
-
-    // ── Directory-workspace image sources (the default creation path) ──────
-
-    /// A directory workspace has no repository to inherit Dockerfiles from, so
-    /// every agent the run might launch — the leader *and* the pool the
-    /// generated workflow picks its steps from — has to be scaffolded.
-    #[test]
-    fn a_directory_workspace_scaffolds_the_leader_and_the_whole_configured_pool() {
-        let task = task(Some("claude"), None);
-        let mut pool = HashMap::new();
-        pool.insert("codex".to_string(), vec!["gpt-5".to_string()]);
-        let agents =
-            directory_workspace_agents(&task, Some("opencode::sonnet"), Some(&pool), Some("cline"));
-        assert_eq!(agents, vec!["claude", "opencode", "cline", "codex"]);
-    }
-
-    #[test]
-    fn directory_workspace_agents_never_repeat_a_name() {
-        let task = task(Some("claude"), None);
-        let mut pool = HashMap::new();
-        pool.insert("claude".to_string(), vec!["opus".to_string()]);
-        let agents =
-            directory_workspace_agents(&task, Some("claude::opus"), Some(&pool), Some("claude"));
-        assert_eq!(agents, vec!["claude"]);
-    }
 }

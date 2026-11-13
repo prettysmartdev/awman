@@ -1,5 +1,7 @@
 # Work Item: Task
 
+> Testing policy update (WI144): test commands, harness paths and test counts in this historical record are superseded by [the current testing contract](/aspec/devops/testing.md). Use manifest suites and `make validate-native` for native acceptance. Removed test sources and raw evidence bundles are available only in Git history; they must not be restored as test patterns.
+
 Title: Complete the builtin Microsandbox runtime and close all WI 0119 verification gaps
 Issue: n/a
 

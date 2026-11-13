@@ -1,5 +1,7 @@
 # WI 0121 evidence register (sections J.1 and J.3)
 
+> Testing policy update (WI144): test commands, harness paths and test counts in this historical record are superseded by [the current testing contract](/aspec/devops/testing.md). Use manifest suites and `make validate-native` for native acceptance. Removed test sources and raw evidence bundles are available only in Git history; they must not be restored as test patterns.
+
 **Scope amendment (2026-09-28):** the user removed all signing and notarization
 requirements. This includes release credentials and explicit ad-hoc signing
 steps. Earlier reports/logs retain their historical wording; those requirements

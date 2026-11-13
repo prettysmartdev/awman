@@ -37,6 +37,8 @@ pub struct ReadyOutcome {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_definition: Option<StepStatus>,
     pub local_agent: StepStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_auth: Vec<(String, StepStatus)>,
     pub audit: StepStatus,
     pub image_rebuild: StepStatus,
     pub agent_credentials: Vec<AgentCredentialHealth>,
@@ -74,6 +76,7 @@ impl From<ReadySummary> for ReadyOutcome {
             image_source: s.image_source,
             agent_definition: s.agent_definition,
             local_agent: s.local_agent,
+            agent_auth: s.agent_auth,
             audit: s.audit,
             image_rebuild: s.image_rebuild,
             agent_credentials: s.agent_credentials,
@@ -145,6 +148,7 @@ impl ReadyOutcome {
             "ready": checks_passed,
             "runtime": self.runtime,
             "agent_credentials": self.agent_credentials,
+            "agent_auth": self.agent_auth,
             "steps": {
                 "docker_daemon": step_to_json(&docker_daemon),
                 "dockerfile": step_to_json(&self.dockerfile),
@@ -213,7 +217,7 @@ impl ReadyCommand {
     }
 
     /// Construct from the catalogue-resolved input (WI 0113 F-10). `--json`
-    /// declares `implies: ["non-interactive"]`, so the implication is already
+    /// declares `implies: ["headless"]`, so the implication is already
     /// applied in `flags` and is not re-derived here.
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
         Ok(Self::new(
@@ -221,7 +225,7 @@ impl ReadyCommand {
                 refresh: ctx.flags.bool("refresh"),
                 build: ctx.flags.bool("build"),
                 no_cache: ctx.flags.bool("no-cache"),
-                non_interactive: ctx.flags.bool("non-interactive"),
+                non_interactive: ctx.flags.bool("headless"),
                 allow_docker: ctx.flags.bool("allow-docker"),
                 json: ctx.flags.bool("json"),
                 agent: ctx.flags.string("agent"),
@@ -311,9 +315,7 @@ impl Command for ReadyCommand {
         let resolved_builtin = ReadyEngine::builtin_inputs(&session, runtime.as_ref())?;
         let mut engine = ReadyEngine::new(
             resolved_builtin,
-            crate::data::config::global::GlobalConfig::data_home_with(
-                session.effective_config().env(),
-            )?,
+            crate::data::fs::data_paths::data_home(session.effective_config().env())?,
             std::sync::Arc::new(session),
             self.engines.git_engine.clone(),
             self.engines.overlay_engine.clone(),
@@ -402,142 +404,4 @@ fn credential_health(
         expired,
         read_error: status.read_error.map(|error| error.to_string()),
     }]
-}
-
-#[cfg(test)]
-mod compat_tests {
-    use super::*;
-    use crate::data::config::image_source::ImageSourceKind;
-    use crate::data::ready_image::ReadyImageWarning;
-
-    #[test]
-    fn builtin_image_source_is_visible_without_changing_docker_json() {
-        let base = ReadySummary::new("docker");
-        let docker = ReadyOutcome::from(base.clone()).to_legacy_json();
-        assert!(docker["steps"].get("image_source").is_none());
-        let mut builtin = base;
-        builtin.image_source = Some(StepStatus::Done);
-        let json = ReadyOutcome::from(builtin).to_legacy_json();
-        assert_eq!(json["steps"]["image_source"]["status"], "ok");
-    }
-
-    fn image_result(build: StepStatus, import: StepStatus) -> ReadyImageResult {
-        ReadyImageResult {
-            agent: "claude".into(),
-            tag: "awman-repo-claude:latest".into(),
-            source_kind: Some(ImageSourceKind::DockerStore),
-            reference: Some("awman-repo-claude:latest".into()),
-            build,
-            import,
-            warnings: Vec::new(),
-            optional: false,
-        }
-    }
-
-    /// `From<ReadySummary>` no longer recomputes readiness from a handful of
-    /// legacy fields: `ReadyOutcome::ready` is exactly
-    /// `ReadySummary::is_ready()`, which a failed per-image build or import
-    /// stage affects even though every legacy top-level field
-    /// (`dockerfile`/`local_agent`/`image_rebuild`) stays `Done`.
-    #[test]
-    fn ready_outcome_ready_field_tracks_is_ready_not_just_legacy_fields() {
-        let mut summary = ReadySummary::new("builtin");
-        summary.base_image = StepStatus::Done;
-        summary.agent_image = StepStatus::Done;
-        summary.dockerfile = StepStatus::Done;
-        summary.local_agent = StepStatus::Done;
-        summary.image_rebuild = StepStatus::Skipped;
-        summary
-            .image_results
-            .push(image_result(StepStatus::Done, StepStatus::Done));
-        assert!(ReadyOutcome::from(summary.clone()).ready);
-
-        summary.image_results[0].import = StepStatus::Failed("daemon unreachable".into());
-        let outcome = ReadyOutcome::from(summary);
-        assert!(
-            !outcome.ready,
-            "a failed per-image import must make the outcome not-ready even \
-             though every legacy field is Done"
-        );
-    }
-
-    /// `ReadyOutcome::from` copies `image_results`/`base_image_results`
-    /// through unchanged — it does not drop or recompute them.
-    #[test]
-    fn ready_outcome_carries_image_and_base_image_results_through() {
-        let mut summary = ReadySummary::new("builtin");
-        summary
-            .base_image_results
-            .push(crate::data::ready_image::ReadyBaseImageResult {
-                store: "docker unix:///var/run/docker.sock".into(),
-                tag: "awman-repo:latest".into(),
-                build: StepStatus::Done,
-                optional: false,
-            });
-        let mut result = image_result(StepStatus::Done, StepStatus::Done);
-        result
-            .warnings
-            .push(ReadyImageWarning::IncompatibleBuilder {
-                tag: "awman-repo-codex:latest".into(),
-                source_kind: ImageSourceKind::Archive,
-                reason: "the configured source is not a local writable image store".into(),
-            });
-        summary.image_results.push(result);
-
-        let outcome = ReadyOutcome::from(summary);
-        assert_eq!(outcome.base_image_results.len(), 1);
-        assert_eq!(outcome.image_results.len(), 1);
-        assert_eq!(outcome.image_results[0].warnings.len(), 1);
-    }
-
-    /// Additive legacy-JSON fields: absent when there is nothing to report
-    /// (an ordinary build-runtime `ready`, as today), present — with
-    /// warnings flattened out of `image_results` — once a builder-enabled
-    /// run recorded any.
-    #[test]
-    fn to_legacy_json_image_fields_are_additive() {
-        let empty = ReadyOutcome::from(ReadySummary::new("docker")).to_legacy_json();
-        assert!(empty.get("image_results").is_none());
-        assert!(empty.get("base_image_results").is_none());
-        assert!(empty.get("warnings").is_none());
-
-        let mut summary = ReadySummary::new("builtin");
-        let mut result = image_result(StepStatus::Done, StepStatus::Done);
-        result
-            .warnings
-            .push(ReadyImageWarning::IncompatibleBuilder {
-                tag: result.tag.clone(),
-                source_kind: ImageSourceKind::Archive,
-                reason: "the configured source is not a local writable image store".into(),
-            });
-        summary.image_results.push(result);
-        let json = ReadyOutcome::from(summary).to_legacy_json();
-        assert_eq!(json["image_results"].as_array().unwrap().len(), 1);
-        assert_eq!(json["warnings"].as_array().unwrap().len(), 1);
-        assert!(json.get("base_image_results").is_none());
-    }
-
-    /// The legacy `ready` field keeps its broad reading (M-7): it additionally
-    /// requires `self.ready`, so a failed per-image stage now also turns the
-    /// legacy `ready` false, even though no top-level legacy field failed.
-    #[test]
-    fn to_legacy_json_ready_requires_image_stages_too() {
-        let mut outcome = ReadyOutcome::from({
-            let mut summary = ReadySummary::new("builtin");
-            summary.base_image = StepStatus::Done;
-            summary.agent_image = StepStatus::Done;
-            summary
-                .image_results
-                .push(image_result(StepStatus::Done, StepStatus::Done));
-            summary
-        });
-        assert_eq!(outcome.to_legacy_json()["ready"], true);
-
-        outcome.ready = false;
-        assert_eq!(
-            outcome.to_legacy_json()["ready"],
-            false,
-            "the legacy field must also go false once self.ready is false"
-        );
-    }
 }

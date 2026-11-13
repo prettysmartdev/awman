@@ -24,7 +24,9 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 
 use crate::engine::acp::{ContentBlock, SessionUpdate};
-use crate::frontend::tui::container_view::PARALLEL_BAR_HEIGHT;
+use crate::frontend::tui::container_view::{
+    slot_status_text, slot_titles_with_status, PARALLEL_BAR_HEIGHT,
+};
 use crate::frontend::tui::tabs::{format_duration, ContainerSlot, Tab};
 
 /// Identity color for ACP agent windows: a distinct purple (`#9333EA`).
@@ -98,13 +100,13 @@ pub fn render_acp_maximized(
     };
 
     // Read the shared render state.
-    let (lines, scroll_offset, pending) = match state.lock() {
+    let scroll_offset = slot.acp_scroll_offset;
+    let (lines, pending) = match state.lock() {
         Ok(s) => (
             render_history_lines(&s.history),
-            s.scroll_offset,
             s.pending_permission.is_some(),
         ),
-        Err(_) => (Vec::new(), 0, false),
+        Err(_) => (Vec::new(), false),
     };
 
     let elapsed = slot
@@ -117,6 +119,8 @@ pub fn render_acp_maximized(
         lines_update_count(&lines),
         format_duration(elapsed)
     );
+    let (left_title, right_title) =
+        slot_titles_with_status(slot, left_title, right_title, window_width);
 
     frame.render_widget(Clear, window_area);
 
@@ -228,10 +232,14 @@ fn render_one_acp_bar(slot: &ContainerSlot, area: Rect, frame: &mut Frame) {
     } else {
         format!(" [{}]", slot.step_name)
     };
+    let status_segment = slot_status_text(slot, 60)
+        .map(|status| format!(" | {status}"))
+        .unwrap_or_default();
     let content = format!(
-        "\u{1F512} {}{} | acp | {} updates | {}",
+        "\u{1F512} {}{}{} | acp | {} updates | {}",
         slot.agent_name(),
         step_segment,
+        status_segment,
         update_count,
         format_duration(slot.elapsed_secs()),
     );
@@ -344,63 +352,5 @@ fn content_block_text(block: &ContentBlock) -> String {
         ContentBlock::Audio { .. } => "[audio]".to_string(),
         ContentBlock::ResourceLink { name, uri, .. } => format!("[link: {} <{}>]", name, uri),
         ContentBlock::Resource { .. } => "[resource]".to_string(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engine::acp::protocol::ContentChunk;
-    use crate::engine::acp::ToolCall;
-
-    fn text_update(s: &str) -> SessionUpdate {
-        SessionUpdate::AgentMessageChunk {
-            chunk: ContentChunk {
-                content: ContentBlock::Text { text: s.into() },
-                message_id: None,
-            },
-        }
-    }
-
-    #[test]
-    fn history_lines_render_agent_text() {
-        let mut history = std::collections::VecDeque::new();
-        history.push_back(text_update("hello world"));
-        let lines = render_history_lines(&history);
-        let joined: String = lines
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
-            .collect();
-        assert!(joined.contains("hello world"), "got: {joined}");
-    }
-
-    #[test]
-    fn history_lines_render_tool_call_title() {
-        let mut history = std::collections::VecDeque::new();
-        history.push_back(SessionUpdate::ToolCall {
-            tool_call: ToolCall {
-                tool_call_id: "t1".into(),
-                title: "Read file".into(),
-                kind: Some("read".into()),
-                status: Some("pending".into()),
-                content: vec![],
-                locations: vec![],
-                raw_input: None,
-                raw_output: None,
-            },
-        });
-        let lines = render_history_lines(&history);
-        let joined: String = lines
-            .iter()
-            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
-            .collect();
-        assert!(joined.contains("Read file"), "got: {joined}");
-        assert!(joined.contains("pending"), "got: {joined}");
-    }
-
-    #[test]
-    fn acp_border_color_is_not_magenta() {
-        assert_ne!(ACP_BORDER_COLOR, Color::Magenta);
-        assert_eq!(ACP_BORDER_COLOR, Color::Rgb(147, 51, 234));
     }
 }

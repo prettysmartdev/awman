@@ -86,7 +86,7 @@ enable it, or let a host integration enable it ephemerally, without widening awm
 - **Local listener only by default.** The `/v1/engine/*` routes are served on the network listener only when `engine` is **persistently** enabled *and* listed in `daemon.network.features`. Even then they are explicitly out of scope until a remote frontend has its own security review. The docs say so.
 - **Config** (scope `global`, rows in the 0139 key table):
   ```json
-  "daemon": { "features": { "engine": { "enabled": false, "allowEphemeral": true, "idleTimeout": "15m", "maxConcurrentJobs": 4 } } }
+  "daemon": { "features": { "engine": { "enabled": false, "allowEphemeral": true, "idleTimeout": "15m", "maxConcurrentJobs": 8 } } }
   ```
   `awman config set daemon.features.engine.enabled true` turns it on persistently and applies live to a running daemon (0139 §4).
 - **Ephemeral enablement** (0140): a local frontend's hand-off (0142) may send `PATCH /v1/features/engine {enabled: true, ephemeral: true}`, a core route on the local listener.
@@ -95,6 +95,14 @@ enable it, or let a host integration enable it ephemerally, without widening awm
   - `allowEphemeral: false` forbids it, and hand-offs then fall back to builtin under `auto` (0142).
   - `awman daemon status` and `GET /v1/status` show the feature state `ephemeral` (with the reason, e.g. `rex`), `on`, `off` or `draining`.
 - **Executor share.** Engine sessions' commands go through the shared executor under `daemon.features.engine.maxConcurrentJobs`, inside the host-wide `daemon.maxConcurrentJobs`, with round-robin claims across features, so a flood of `worker` jobs can't starve interactive sessions and vice versa.
+  Both limits default to 8; explicit configuration remains authoritative.
+  Interactive TUI commands that cannot immediately reserve a slot show an
+  **Engine capacity reached** modal with engine and host usage. The user can
+  increase the exhausted limits by one (persist globally and apply live before
+  retrying admission), wait for capacity, or cancel. Esc cancels; Enter does
+  not implicitly increase limits. Waiting and pending prompts are cancellable
+  when the tab closes. Admission uses the shared executor across instances,
+  not the frontend's tab count, and prompts run without blocking the host pump.
 - **Interaction.** Engine sessions are always `interactive`: agents run in a PTY at the frontend's terminal size, and dialogs are relayed to frontends in Part B instead of taking yolo answers. Yolo sessions keep their countdowns, exactly as in-process. The per-feature interaction settings in 0141 are independent of this behavior.
 
 #### 2. Instance model and lifecycle (parity)

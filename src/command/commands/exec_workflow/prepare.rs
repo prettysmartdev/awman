@@ -209,7 +209,7 @@ pub(crate) struct PreparedRun {
     /// Kept alive for the duration of the run; its Drop removes the issue temp
     /// file. `None` for non-issue invocations.
     pub(crate) issue_temp_file: Option<IssueTempFile>,
-    pub(crate) launch_modes: HashMap<String, crate::data::config::repo::LaunchMode>,
+    pub(crate) launch_modes: HashMap<String, crate::data::config::agents::LaunchMode>,
     /// Skip the persisted-state resume prompt below. Set only by the dynamic
     /// resume path, which has already asked the user a strictly better version
     /// of the same question (WI-0115 §2).
@@ -237,6 +237,10 @@ pub(crate) async fn execute_prepared_with_outputs(
     cancel: &tokio_util::sync::CancellationToken,
     output_dir: Option<&Path>,
 ) -> Result<ExecWorkflowOutcome, CommandError> {
+    if engines.agent_engine.is_lease_workspace() {
+        crate::command::worker::policy::validate_workflow(&prepared.workflow)
+            .map_err(CommandError::Other)?;
+    }
     if let Some(dir) = output_dir {
         crate::data::fs::command_outputs::prepare_output_dir(dir, false).map_err(|e| {
             CommandError::Other(format!(
@@ -371,6 +375,7 @@ pub(crate) async fn execute_prepared_with_outputs(
         original_session
     };
     session.set_flags(workflow_flag_config(flags));
+    session.add_overrides(workflow_flag_overrides(flags))?;
 
     // 9. Run the engine with three-phase coordination.
     let yolo = flags.yolo;
@@ -480,6 +485,7 @@ pub(crate) async fn execute_prepared_with_outputs(
             engine = engine.mirror_into_session(Arc::clone(session));
         }
         engine.set_yolo(yolo);
+        engine.set_non_interactive(flags.non_interactive);
         engine.set_ci_destination(prerequisites.remote("origin").map(|r| r.redacted));
         engine.set_ci_host_binaries(prerequisites.flow.options().custom_agent_binaries.clone());
         engine.set_cancellation(cancel.clone());
@@ -507,7 +513,7 @@ pub(crate) async fn execute_prepared_with_outputs(
         // setup/teardown shell step runs as a foreground, PTY-attached
         // container they can watch and type into, like an agent step.
         // Everything else — the API server, the squad daemon, a
-        // `--non-interactive` CLI — keeps the headless background container.
+        // `--headless` CLI — keeps the headless background container.
         // A squad-generated workflow is always headless, whichever frontend
         // is driving it.
         let interactive_phase_steps = prerequisites.redaction.is_empty()
@@ -623,6 +629,10 @@ pub(crate) async fn execute_prepared_with_outputs(
                                 .iter()
                                 .find(|(i, _)| *i == idx)
                                 .and_then(|(_, g)| g.transport.as_ref()),
+                            git_cache_seed: _setup_grants
+                                .iter()
+                                .find(|(i, _)| *i == idx)
+                                .and_then(|(_, g)| g.git_cache_seed.as_ref()),
                         }
                         .build(step, env, overlays)
                     };
@@ -810,6 +820,10 @@ pub(crate) async fn execute_prepared_with_outputs(
                                 .iter()
                                 .find(|(i, _)| *i == idx)
                                 .and_then(|(_, g)| g.transport.as_ref()),
+                            git_cache_seed: _teardown_grants
+                                .iter()
+                                .find(|(i, _)| *i == idx)
+                                .and_then(|(_, g)| g.git_cache_seed.as_ref()),
                         }
                         .build(step, env, overlays)
                     };
@@ -1093,6 +1107,10 @@ async fn run_merge_fix_agent(
         }
     };
     session.set_flags(workflow_flag_config(flags));
+    if let Err(e) = session.add_overrides(workflow_flag_overrides(flags)) {
+        warn(format!("merge-fix: {e}"));
+        return false;
+    }
 
     let prompt = match merge_fix_prompt(&session.effective_config(), failure, work_item) {
         Ok(prompt) => prompt,
@@ -1158,22 +1176,57 @@ async fn run_merge_fix_agent(
     }
 }
 
+/// Settings the workflow flags still carry that are config keys now
+/// (`agents.launchMode`, `workflows.maxConcurrentSteps`), as `--set`-layer
+/// overrides.
+pub(crate) fn workflow_flag_overrides(
+    flags: &ExecWorkflowCommandFlags,
+) -> crate::data::config::ConfigOverrides {
+    let mut pairs = Vec::new();
+    if let Some(mode) = flags.launch_mode {
+        pairs.push((
+            "agents.launchMode".to_string(),
+            serde_json::to_value(mode).expect("launch mode serializes"),
+        ));
+    }
+    if let Some(n) = flags.max_concurrent {
+        pairs.push((
+            "workflows.maxConcurrentSteps".to_string(),
+            serde_json::Value::from(n),
+        ));
+    }
+    crate::data::config::ConfigOverrides::new(pairs)
+}
+
+/// The invoking session's effective config with the workflow flags applied.
+pub(crate) fn workflow_effective_config(
+    session: &Session,
+    flags: &ExecWorkflowCommandFlags,
+) -> Result<crate::data::config::EffectiveConfig, crate::data::error::DataError> {
+    let current = session.effective_config();
+    let mut layers = current.layers().clone();
+    layers.set.0.extend(workflow_flag_overrides(flags).0);
+    crate::data::config::EffectiveConfig::resolve(
+        layers,
+        workflow_flag_config(flags),
+        current.env().clone(),
+    )
+}
+
 pub(crate) fn workflow_flag_config(
     flags: &ExecWorkflowCommandFlags,
 ) -> crate::data::config::FlagConfig {
     crate::data::config::FlagConfig {
         agent: flags.agent.clone(),
         model: flags.model.clone(),
-        launch_mode: flags.launch_mode,
         yolo: Some(flags.yolo),
         auto: Some(flags.auto),
-        non_interactive: Some(flags.non_interactive),
+        headless: Some(flags.non_interactive),
         overlays_raw: (!flags.overlay.is_empty()).then_some(flags.overlay.clone()),
         work_item: flags
             .work_item
             .as_deref()
             .and_then(|raw| raw.parse::<u32>().ok()),
-        max_concurrent_agents: flags.max_concurrent,
         leader: flags.leader.clone(),
         ..Default::default()
     }
@@ -1344,6 +1397,42 @@ pub(crate) fn resolve_phase_image(
 /// One call per entry — that's the whole point post-WI-0082: each step's
 /// container sees only the entry's own overlays plus the standing sources,
 /// not the union of all phase entries' overlays.
+#[derive(Default)]
+pub(crate) struct PhaseEnvironment {
+    pub(super) env: std::collections::HashMap<String, String>,
+    pub(super) secret_env: Vec<(String, crate::data::secret::SecretString)>,
+}
+
+impl std::ops::Deref for PhaseEnvironment {
+    type Target = std::collections::HashMap<String, String>;
+    fn deref(&self) -> &Self::Target {
+        &self.env
+    }
+}
+impl std::ops::DerefMut for PhaseEnvironment {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.env
+    }
+}
+
+impl PhaseEnvironment {
+    fn resolve(
+        names: &[String],
+        secrets: Option<&crate::data::secret::CommandSecrets>,
+        host: impl Fn(&str) -> Option<String>,
+    ) -> Self {
+        let mut env = Self::default();
+        for name in names {
+            if let Some(value) = secrets.and_then(|s| s.get(name)) {
+                env.secret_env.push((name.clone(), value.clone()));
+            } else if let Some(value) = host(name) {
+                env.env.insert(name.clone(), value);
+            }
+        }
+        env
+    }
+}
+
 pub(crate) fn collect_single_entry_overlays(
     engines: &Engines,
     session: &Session,
@@ -1353,7 +1442,7 @@ pub(crate) fn collect_single_entry_overlays(
 ) -> Result<
     (
         Vec<crate::engine::container::options::OverlaySpec>,
-        std::collections::HashMap<String, String>,
+        PhaseEnvironment,
     ),
     CommandError,
 > {
@@ -1368,8 +1457,8 @@ pub(crate) fn collect_single_entry_overlays(
     // rebuilt yet, in which case mounting at the Dockerfile-derived path
     // silently breaks credential passthrough.
     let dockerfile_path = session
-        .repo_config()
-        .dockerfile_path_or_default(session.git_root());
+        .effective_config()
+        .dockerfile_path(session.git_root());
     // detect_home_from_dockerfile silently returns None when the file is
     // missing — surface that as a warning so a misconfigured `dockerfile`
     // key doesn't cause overlays to fall back to a default container home
@@ -1409,12 +1498,12 @@ pub(crate) fn collect_single_entry_overlays(
             ))
         })?;
 
-    let mut env = std::collections::HashMap::new();
-    for var_name in &collected.env_passthrough {
-        if let Some(val) = crate::data::config::env::host_var(var_name) {
-            env.insert(var_name.clone(), val);
-        }
-    }
+    let command_secrets = engines.command_secrets();
+    let env = PhaseEnvironment::resolve(
+        &collected.env_passthrough,
+        command_secrets.as_deref(),
+        crate::data::config::env::host_var,
+    );
 
     Ok((overlay_specs, env))
 }
@@ -1435,7 +1524,7 @@ pub(crate) fn collect_single_entry_overlays(
 pub(crate) type PhaseOverlayResult = Result<
     (
         Vec<crate::engine::container::options::OverlaySpec>,
-        std::collections::HashMap<String, String>,
+        PhaseEnvironment,
     ),
     CommandError,
 >;
@@ -1548,6 +1637,7 @@ pub(crate) async fn finish_cancelled_cleanup(
                     interactive: false,
                     secret_env: &[],
                     transport: None,
+                    git_cache_seed: None,
                 }
                 .build(step, env, overlays)
             })
@@ -1579,31 +1669,30 @@ impl crate::engine::workflow::factory::AgentExecutionFactory for CleanupOnlyFact
 }
 
 #[cfg(test)]
-mod compat_tests {
+mod command_secrets_tests {
     use super::*;
+    use crate::data::secret::{CommandSecrets, SecretString};
 
     #[test]
-    fn import_setup_uses_runnable_agent_image_while_build_keeps_project_image() {
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let session = Session::for_tests_isolated(root.path(), home.path());
-        let project = crate::data::image_tags::project_image_tag(root.path());
-        let agent = crate::data::image_tags::agent_image_tag(root.path(), "claude");
-        assert_eq!(
-            resolve_phase_image(
-                &session,
-                root.path(),
-                crate::engine::agent_runtime::ImageAcquisition::Build
+    fn phase_env_uses_requested_caller_values_before_host_without_literal_secrets() {
+        let secrets = CommandSecrets::new([
+            ("TOKEN".into(), SecretString::new("test-secret-phase")),
+            (
+                "PRIVATE".into(),
+                SecretString::new("test-secret-unrequested"),
             ),
-            project
+        ])
+        .unwrap();
+        let env = PhaseEnvironment::resolve(
+            &["TOKEN".into(), "HOST_ONLY".into()],
+            Some(&secrets),
+            |_| Some("host-value".into()),
         );
-        assert_eq!(
-            resolve_phase_image(
-                &session,
-                root.path(),
-                crate::engine::agent_runtime::ImageAcquisition::Import
-            ),
-            agent
-        );
+        assert_eq!(env.secret_env.len(), 1);
+        assert_eq!(env.secret_env[0].0, "TOKEN");
+        assert_eq!(env.secret_env[0].1.expose(), "test-secret-phase");
+        assert!(!env.env.contains_key("TOKEN"));
+        assert!(!env.env.contains_key("PRIVATE"));
+        assert_eq!(env.env["HOST_ONLY"], "host-value");
     }
 }

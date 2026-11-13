@@ -32,6 +32,11 @@ use crate::engine::container::timing::{DEFAULT_GRACE_TIMEOUT, DEFAULT_STUCK_TIME
 /// - `Building`, `Pulling` and `Stopping` are not emitted by any backend
 ///   today. Image build and import progress travels through the
 ///   `UserMessageSink` / image-preparation sink instead.
+/// - OSC 7501 attention events travel on `StuckEvent`, on every bridged
+///   runtime. Accepted reports supersede silence while records remain; clear
+///   resumes silence from the clear. The reporting latch survives RIS and
+///   lasts until execution end or the next step/container. Sandbox publishes
+///   reports only, without silence/grace detection. Startup grace is unchanged.
 ///
 /// [`AgentExecution::wait`]: crate::engine::agent_runtime::AgentExecution::wait
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,12 +96,12 @@ pub struct AgentIo {
     /// (`try_inject_stdin`) push into the matching sender.
     pub stdin_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     /// PTY resize requests from the frontend. `Some` for interactive
-    /// frontends (TUI, CLI with TTY), `None` for non-interactive (CLI
-    /// `--non-interactive`, API). When `None`, the engine uses
+    /// frontends (TUI, CLI with TTY), `None` for headless (CLI
+    /// `--headless`, API). When `None`, the engine uses
     /// `Stdio::piped()` for the agent process.
     pub resize: Option<tokio::sync::mpsc::UnboundedReceiver<(u16, u16)>>,
     /// Initial PTY size at spawn time. `Some` for interactive frontends,
-    /// `None` for non-interactive. When `None`, the engine uses
+    /// `None` for headless. When `None`, the engine uses
     /// `Stdio::piped()`.
     pub initial_size: Option<(u16, u16)>,
 }
@@ -108,6 +113,19 @@ pub struct AgentIo {
 /// all agent I/O — stdout, stderr, and stdin.
 #[async_trait]
 pub trait AgentFrontend: UserMessageSink + Send {
+    fn terminal_launch(&self) -> Option<crate::engine::agent_runtime::execution::TerminalLaunch> {
+        None
+    }
+    fn terminal_source(&self) -> Option<crate::data::execution_event::EventSource> {
+        None
+    }
+    /// Engine launch configuration; wrappers may supply the resolved option
+    /// for runtimes whose launch plans do not carry bridge configuration.
+    fn program_status_config(
+        &self,
+    ) -> crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig {
+        Default::default()
+    }
     fn report_status(&mut self, status: AgentStatus);
     fn report_progress(&mut self, progress: AgentProgress);
 
@@ -163,6 +181,17 @@ pub trait AgentFrontend: UserMessageSink + Send {
 /// handle in its own stateful proxy.
 #[async_trait]
 impl<F: AgentFrontend + ?Sized> AgentFrontend for std::sync::Arc<std::sync::Mutex<Box<F>>> {
+    fn terminal_launch(&self) -> Option<crate::engine::agent_runtime::execution::TerminalLaunch> {
+        self.lock().unwrap().terminal_launch()
+    }
+    fn terminal_source(&self) -> Option<crate::data::execution_event::EventSource> {
+        self.lock().unwrap().terminal_source()
+    }
+    fn program_status_config(
+        &self,
+    ) -> crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig {
+        self.lock().unwrap().program_status_config()
+    }
     fn report_status(&mut self, status: AgentStatus) {
         self.lock().unwrap().report_status(status);
     }

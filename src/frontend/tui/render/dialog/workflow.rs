@@ -21,14 +21,18 @@ pub(crate) fn render_control_board(
     .iter()
     .filter(|x| **x)
     .count() as u16;
-    let failed = !state.failure_lines.is_empty();
+    // A failure board belongs to an exited container. Older daemons also
+    // put live agent reports in failure_lines; those are status information,
+    // even when the report itself says "error" or "blocked".
+    let failed = !state.can_dismiss && !state.failure_lines.is_empty();
     let base_height: u16 = if state.can_finish { 14 } else { 12 };
     // A failure banner adds its detail lines plus a blank separator.
-    let failure_height = if failed {
+    let failure_height = if !state.failure_lines.is_empty() {
         state.failure_lines.len() as u16 + 2
     } else {
         0
     };
+    let status_height = u16::from(state.status_line.is_some());
     // The retry line, plus a spacer when a continue reason sits right above it.
     let retry_label = state
         .retry_failed_step
@@ -62,16 +66,22 @@ pub(crate) fn render_control_board(
         .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()) + 6)
         .max()
         .unwrap_or(0) as u16;
+    let status_w = state
+        .status_line
+        .as_deref()
+        .map(|s| unicode_width::UnicodeWidthStr::width(s) as u16 + 6)
+        .unwrap_or(0);
     let step_w = unicode_width::UnicodeWidthStr::width(state.step_name.as_str()) as u16 + 10;
     let width = max_reason_w
         .max(max_failure_w)
+        .max(status_w)
         .max(step_w)
         .max(retry_w)
         .max(56)
         .min(area.width.saturating_sub(4));
     let dialog_area = dialogs::centered_fixed(
         width,
-        (base_height + extra_reasons + failure_height + retry_height)
+        (base_height + extra_reasons + failure_height + status_height + retry_height)
             .min(area.height.saturating_sub(2)),
         area,
     );
@@ -120,8 +130,14 @@ pub(crate) fn render_control_board(
         Span::raw(if failed { " Failed step: " } else { " Step: " }),
         Span::styled(&state.step_name, step_style),
     ])];
-    if failed {
-        let err_style = Style::default().fg(Color::Red);
+    if let Some(status) = &state.status_line {
+        lines.push(Line::from(Span::styled(
+            format!("   {status}"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if !state.failure_lines.is_empty() {
+        let err_style = Style::default().fg(if failed { Color::Red } else { Color::Yellow });
         for line in &state.failure_lines {
             lines.push(Line::from(Span::styled(format!("   {line}"), err_style)));
         }
@@ -244,7 +260,12 @@ pub(crate) fn render_yolo_countdown(
     } else {
         "\u{1f918}"
     };
-    let title = format!("{} Yolo in {}s", emoji, state.remaining_secs);
+    let fails = crate::frontend::program_status_text::countdown_fails_step(state.kind);
+    let title = if fails {
+        format!("{} Step fails in {}s", emoji, state.remaining_secs)
+    } else {
+        format!("{} Yolo in {}s", emoji, state.remaining_secs)
+    };
     let step_w = unicode_width::UnicodeWidthStr::width(state.step_name.as_str()) as u16;
     let width = step_w
         .saturating_add(20)
@@ -252,9 +273,17 @@ pub(crate) fn render_yolo_countdown(
         .min(area.width.saturating_sub(4));
     let dialog_area = dialogs::centered_fixed(width, 9, area);
     let inner = dialogs::render_dialog_frame(&title, Color::Magenta, dialog_area, frame);
+    use crate::engine::workflow::actions::CountdownKind;
+    let line = match state.kind {
+        // The silence and retry countdowns keep their long-standing wording.
+        CountdownKind::StuckStep | CountdownKind::FailureRetry => {
+            format!("Auto-advancing in {}s", state.remaining_secs)
+        }
+        kind => crate::frontend::program_status_text::countdown_label(kind, state.remaining_secs),
+    };
     let text = format!(
-        "  Step: {}\n  Auto-advancing in {}s\n\n  [Esc] Cancel   [Ctrl-W] Control board",
-        state.step_name, state.remaining_secs
+        "  Step: {}\n  {}\n\n  [Esc] Cancel   [Ctrl-W] Control board",
+        state.step_name, line
     );
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
@@ -287,4 +316,55 @@ pub(crate) fn render_step_confirm(
         )),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+#[cfg(test)]
+mod contracts {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn running_reports_from_older_daemons_do_not_render_as_failed_steps() {
+        for running in [true, false] {
+            // No status_line: this is the payload an older daemon sends.
+            let state = serde_json::from_value(serde_json::json!({
+                "step_name": "audit-actions-and-ia", "focused_step_name": "audit-actions-and-ia",
+                "can_launch_next": true, "can_continue_current": false,
+                "can_restart": true, "can_go_back": true, "can_finish": false,
+                "continue_unavailable_reason": null, "cancel_to_previous_unavailable_reason": null,
+                "finish_workflow_unavailable_reason": null, "restart_unavailable_reason": null,
+                "can_dismiss": running, "launch_next_label": null,
+                "parallel_peer_count": 0, "parallel_peers_running": 0,
+                "failure_lines": [if running { "Agent is working" } else { "Exit code: 1" }],
+                "retry_failed_step": null, "in_parallel_group": false
+            }))
+            .unwrap();
+            let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+            terminal
+                .draw(|frame| render_control_board(&state, frame.area(), frame))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert_eq!(text.contains("step failed"), !running, "{text}");
+            assert_eq!(text.contains("Restart failed step"), !running, "{text}");
+            assert!(text.contains(if running {
+                "Agent is working"
+            } else {
+                "Exit code: 1"
+            }));
+            let detail = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .find(|cell| cell.symbol() == if running { "A" } else { "E" })
+                .unwrap();
+            assert_eq!(detail.fg, if running { Color::Yellow } else { Color::Red });
+        }
+    }
 }

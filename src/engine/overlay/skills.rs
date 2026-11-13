@@ -20,7 +20,7 @@ impl OverlayEngine {
         if !include_all && names.is_empty() {
             return Ok(vec![]);
         }
-        let definition = resolve_definition(agent, git_root);
+        let definition = resolve_definition(&self.snapshot(), agent, git_root);
         self.skill_overlays_for(
             definition.as_deref(),
             agent,
@@ -43,7 +43,7 @@ impl OverlayEngine {
         git_root: &Path,
     ) -> Result<Vec<OverlaySpec>, EngineError> {
         self.skill_overlays_for_with_env(
-            &crate::data::config::env::Env::from_process(),
+            &self.snapshot(),
             definition,
             agent,
             include_all,

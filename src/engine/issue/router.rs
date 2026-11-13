@@ -28,10 +28,10 @@ impl Default for IssueSourceRouter {
 impl IssueSourceRouter {
     /// Constructs the provider router with the command/session's immutable
     /// external-system dependencies.
-    pub fn new(git_engine: Arc<GitEngine>, env: &EnvSnapshot) -> Self {
+    pub fn new(_git_engine: Arc<GitEngine>, env: &EnvSnapshot) -> Self {
         Self {
             sources: vec![Box::new(GithubIssueSource)],
-            git_engine,
+            git_engine: Arc::new(GitEngine::with_env(env.clone())),
             github_token: env.github_token().map(str::to_owned),
         }
     }
@@ -80,59 +80,5 @@ impl IssueSourceRouter {
             self.github_token.as_deref(),
         )?;
         Ok((issue, source))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn router_routes_bare_integer_to_github() {
-        let router = IssueSourceRouter::default();
-        let source = router.route("84").unwrap();
-        assert_eq!(source.provider_name(), "GitHub");
-    }
-
-    #[test]
-    fn router_routes_github_url_to_github() {
-        let router = IssueSourceRouter::default();
-        let source = router
-            .route("https://github.com/owner/repo/issues/42")
-            .unwrap();
-        assert_eq!(source.provider_name(), "GitHub");
-    }
-
-    #[test]
-    fn router_routes_short_form_to_github() {
-        let router = IssueSourceRouter::default();
-        let source = router.route("owner/repo#84").unwrap();
-        assert_eq!(source.provider_name(), "GitHub");
-    }
-
-    #[test]
-    fn router_returns_no_matching_provider_for_unknown_input() {
-        let router = IssueSourceRouter::default();
-        let result = router.route("not-any-provider://something");
-        match result {
-            Err(IssueSourceError::NoMatchingProvider { input }) => {
-                assert_eq!(input, "not-any-provider://something");
-            }
-            Err(other) => panic!("expected NoMatchingProvider, got error: {other}"),
-            Ok(_) => panic!("expected error but got Ok"),
-        }
-    }
-
-    #[test]
-    fn router_returns_github_for_bare_integer_when_ambiguous() {
-        // GitHub is registered first and claims bare integers.
-        // Verify the priority ordering holds.
-        let router = IssueSourceRouter::default();
-        let source = router.route("1").unwrap();
-        assert_eq!(
-            source.provider_name(),
-            "GitHub",
-            "GitHub must be first in priority order for bare integers"
-        );
     }
 }

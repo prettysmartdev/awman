@@ -73,7 +73,7 @@ identity, SSH key, GitHub token) the task may use; on the command line, set them
 with the `--prerequisite-*` flags. Do not add `env(GITHUB_TOKEN)` or `ssh()`
 overlays just so workflows can push and open pull requests.
 
-Task policies are layered over the global `squad.workflows.prerequisites`
+Task policies are layered over the global former squad prerequisite setting
 defaults: a task that changes only its SSH policy still inherits the global
 token sources. Requests that arrive through the squad daemon's HTTP routes obey
 the same global `workflows.prerequisites.allowApiClientGrants` ceiling as API
@@ -87,7 +87,7 @@ workspace's `config.json` cannot define trusted prerequisite host commands.
 | `--workspace <default\|path>` | Bind the task to its durable default workspace, or to an existing custom folder/repository. If omitted, the default workspace is used. `--repo <path>` remains a legacy synonym for a custom workspace. |
 | `--overlay <spec>` | Add a `dir()`, `ssh()`, `env()`, or `skill()` overlay to every container for this task. Repeat the flag for multiple overlays; malformed syntax is rejected when the task is created. See [Overlays](08-overlays.md). |
 | `--interval <duration>` | How often the task is evaluated (default `6h`). |
-| `--agent <name>` / `--model <name>` | Override the agent/model used for this task's evaluations, taking priority over the global `squad` config (see [Configuring squad](#configuring-squad) below). |
+| `--agent <name>` / `--model <name>` | Override the agent/model used for this task's evaluations, taking priority over the global squad settings (`workflows.dynamic.*`) (see [Configuring squad](#configuring-squad) below). |
 | `--agent-models <agent>=<model>[,<model>…]` | Give this task its own pool of agents and models, written to its `config.json`. Repeat the flag for more agents. See [Choosing a task's agents and models](#choosing-a-tasks-agents-and-models). |
 | `--mount-scope <cwd\|gitroot>` | Only meaningful for a custom workspace that is a Git repository root, where both values name that same root (default `gitroot`). Captured once and never changed later. Every other workspace — the default durable workspace, a plain directory, or a subdirectory of a repository — is mounted directly, as given. |
 | `--prerequisite-identity <value>` | Set the task's commit identity policy: `host`, `deny`, or `Name <email>`. |
@@ -95,7 +95,7 @@ workspace's `config.json` cannot define trusted prerequisite host commands.
 | `--prerequisite-token <value>` | Set the GitHub token policy: `env:NAME`, `acquire` or `deny`. The daemon resolves an allowed source when a workflow needs it. |
 | `--prerequisite-unresolved <warn\|fail>` | Decide whether an unattended run continues with unresolved workflow requirements or fails before workflow execution. |
 | `--interview` | Collect the task fields through the interactive interview, including the multiline description, workspace choice, and overlays. Needs a terminal: through a pipe, each question fails with "interactive input unavailable" rather than choosing an answer for you. |
-| `-n, --non-interactive` | Never prompt: refuse anything that would need a confirmation instead of asking. Cannot be combined with `--interview`. |
+| `-n, --headless` | Never prompt: refuse anything that would need a confirmation instead of asking. Cannot be combined with `--interview`. |
 
 Task names are lowercase slugs: letters `a`–`z`, digits `0`–`9`, and
 hyphens, starting and ending with a letter or digit. A name with uppercase
@@ -140,10 +140,10 @@ awman squad edit issue-triage \
 | `--overlay <spec>` | Replace the task's overlay list. Repeat the flag for several; the given set replaces the stored one rather than adding to it. |
 | `--clear-overlays` | Remove every overlay from the task. |
 | `--agent-models <agent>=<model>[,<model>…]` | Replace the task's agent pool. Repeat the flag for more agents. |
-| `--clear-agent-models` | Remove the task's own agent pool, so it inherits the global `squad` settings again. |
+| `--clear-agent-models` | Remove the task's own agent pool, so it inherits the global squad settings again. |
 | `--prerequisite-identity <value>` / `--prerequisite-ssh <value>` / `--prerequisite-token <value>` / `--prerequisite-unresolved <warn\|fail>` | Change the task's workflow prerequisite policy. Each credential flag changes only that credential's task policy. |
 | `--interview` | Collect the fields interactively, each prefilled with the task's current value. |
-| `-n, --non-interactive` | Never prompt. Cannot be combined with `--interview`. |
+| `-n, --headless` | Never prompt. Cannot be combined with `--interview`. |
 
 **A task's name, workspace, and mount scope cannot be edited.** They are captured
 once when the task is created and define its identity, its data directory, its
@@ -215,22 +215,24 @@ inside a task's detail modal, after a `[y]es / [n]o` confirmation.
 
 ### Choosing a task's agents and models
 
-By default a task uses whatever agents and models the global `squad` block
-allows. A task can instead carry its own pool, stored in its own config file:
+By default a task uses whatever agents and models the global
+`workflows.dynamic.agentsToModels` setting allows. A task can instead carry its own pool, stored in its own config file:
 
 ```text
-~/.awman/squad/tasks/<name>/config.json
+<AWMAN_HOME>/squad/tasks/<name>/config.json
 ```
 
-That file has the same shape as every other awman config file, and only its
-`squad` block matters:
+That file has the same shape as every other awman config file, and holds
+task-scope keys only (see [Configuration](07-configuration.md#per-task-squad-settings)):
 
 ```json
 {
-  "squad": {
-    "agentsToModels": {
-      "claude": ["claude-opus-4-8", "claude-sonnet-4-6"],
-      "codex": ["gpt-5"]
+  "workflows": {
+    "dynamic": {
+      "agentsToModels": {
+        "claude": ["claude-opus-4-8", "claude-sonnet-4-6"],
+        "codex": ["gpt-5"]
+      }
     }
   }
 }
@@ -247,15 +249,15 @@ awman squad add --name issue-triage --description "…" \
 
 …or answer the questions in the interactive interview, which asks:
 
-1. **Whether to use the global squad settings** — only when a global `squad`
-   block exists. Answering yes writes no task config and the task inherits that
-   block, exactly as tasks did before per-task configs existed.
+1. **Whether to use the global squad settings** — only when the global config defines squad agents and models.
+   Answering yes writes no task config and the task inherits those
+   settings, exactly as tasks did before per-task configs existed.
 2. **Extra models for the leader agent** — one at a time, blank to finish.
 3. **Extra agents this task may use**, each followed by its own models.
 
 Answering "no more" to everything writes no file at all.
 
-Fields the task file omits are inherited from the global block, so a task can
+Keys the task file omits are inherited from the repo and global files, so a task can
 narrow its agent pool while keeping the standing `guidance` every task gets; see
 [Configuration: Per-task squad settings](07-configuration.md#per-task-squad-settings).
 
@@ -369,6 +371,11 @@ host environment variable the squad daemon must hand to that task's
 containers. Squad tracks, for every such name across every task, whether it
 currently holds a value, and warns you when it doesn't.
 
+Coverage includes overlays from the task's flags, its workspace and task
+configuration files, global configuration, and `AWMAN_OVERLAYS`. Comma-separated
+overlay lists are supported. Configuration edits appear on the next coverage
+refresh; missing names are shown on task cards and in task details.
+
 ### How the daemon gets its environment
 
 The squad daemon is a long-lived background process — often started once, at
@@ -387,7 +394,7 @@ socket), so once your shell is caught up this costs nothing and no secret
 crosses the wire. Exporting a variable and then running *any* squad command —
 not just `awman squad env --push` — is enough for the daemon to pick it up.
 
-The one exception is `awman squad status`: it's a lightweight liveness probe
+The one exception is `awman daemon status`: it's a lightweight liveness probe
 and deliberately pushes nothing, so checking status never has the side effect
 of arming a task.
 
@@ -503,7 +510,7 @@ If nothing was stored to begin with, that line instead reads
 
 ### Persisting values across a restart
 
-By default (`squad.envPersistence: "keychain"` — see [Configuration: Squad
+By default (`daemon.features.squad.envPersistence` is `keychain` — see [Configuration: Squad
 daemon configuration](07-configuration.md#squad-daemon-configuration)), squad
 stores the values it holds for `env()` names in the OS keychain, so a daemon
 the OS restarts on your behalf — launchd at login, systemd after a crash —
@@ -521,7 +528,7 @@ awman-squad -a daemon-env -w` (macOS) or `secret-tool lookup service
 awman-squad account daemon-env` (Linux), with no prompt. That unprompted read
 is exactly what lets the daemon come back armed without asking you for
 anything at login. If that trade isn't one you want on a particular machine,
-set `squad.envPersistence` to `"none"` there.
+set `daemon.features.squad.envPersistence` to `none` there.
 
 Only names some task actually declares are ever requested, held, or stored.
 A daemon with no tasks requires nothing, transmits nothing, and persists
@@ -531,14 +538,14 @@ If the keychain isn't usable — `secret-tool` not installed, a locked login
 keychain, no keychain backend on the platform, or a keychain call that fails
 outright — the daemon falls back to persisting nothing rather than failing to
 start. `awman squad env` reports this in its header as
-`persistence: unavailable(<reason>)`, and `awman squad status` appends
+`persistence: unavailable(<reason>)`, and `awman daemon status` appends
 `; env persistence unavailable(<reason>)` to its one-line summary so you see
 it without having to go looking. This isn't a failure: squad keeps
 working exactly as it did before persistence existed, and every regular
 `awman squad` command still resupplies the daemon as described above — the
 only thing lost is a value surviving an OS-initiated restart. If you'd rather
 never see the fallback and never have anything persisted, set
-`squad.envPersistence` to `"none"` explicitly; an explicit `"none"` is never
+`daemon.features.squad.envPersistence` to `none` explicitly; an explicit `none` is never
 warned about.
 
 To remove a stored item, `awman clean` is the recommended route: it
@@ -762,12 +769,13 @@ seconds:
 |--------|---------|
 | Grey | No squad daemon is running |
 | Yellow | A daemon is running but this awman cannot get an answer from it — no bearer key for it (see [Authenticating to the daemon](#authenticating-to-the-daemon)), a connection refused, a timeout, or any other error |
-| Red | Reachable, and some task's most recent run failed |
+| Red | Reachable, and some active task's most recent run failed |
 | Yellow | Reachable, nothing failed, and some task has an `env()` name the daemon doesn't currently hold a value for — see [Task environment values](#task-environment-values) |
 | Blue | Reachable, and a task is executing right now |
 | Green | Reachable, nothing failed, nothing running, nothing unmet |
 
-The first matching row wins from the top: a failure outranks an
+Paused tasks retain their run history but their past failures do not turn the
+indicator red. The first matching row wins from the top: an active task's failure outranks an
 unmet variable, which outranks a running task. Yellow means "worth a look, not
 broken" in both of its cases, which can never coincide. A keychain fallback
 (see [Persisting values across a restart](#persisting-values-across-a-restart))
@@ -922,36 +930,39 @@ guardrails to every run rather than leaving them optional:
 
 ## Configuring squad
 
-An optional `squad` block in the **global** config
-(`~/.awman/config.json`) sets which agents and models your squad may use, and
-the standing instructions every task evaluation must follow:
+Squad has no settings block of its own. In the **global** config
+(`~/.awman/config.json`), the `workflows.dynamic` keys set which agents and
+models your squad may use and the standing instructions every task evaluation
+must follow, and `daemon.features.squad` tunes the daemon:
 
 ```json
 {
-  "squad": {
-    "agentsToModels": {
-      "claude": ["claude-opus-4-8", "claude-sonnet-4-6"]
-    },
-    "maxConcurrentEvaluations": 2,
-    "defaultLeader": "claude::claude-opus-4-8",
-    "guidance": ["Keep automated changes focused."]
-  }
+  "workflows": {
+    "dynamic": {
+      "agentsToModels": {
+        "claude": ["claude-opus-4-8", "claude-sonnet-4-6"]
+      },
+      "defaultLeader": "claude::claude-opus-4-8",
+      "guidance": ["Keep automated changes focused."]
+    }
+  },
+  "daemon": { "features": { "squad": { "maxConcurrentEvaluations": 2 } } }
 }
 ```
 
 | Key | Meaning |
 |-----|---------|
-| `agentsToModels` | The agents and models squad is allowed to schedule. A task's own `--agent`/`--model` override still wins if set; this is the default pool, not a hard allowlist against per-task overrides. |
-| `maxConcurrentEvaluations` | How many task evaluations can run at once across the whole daemon. |
-| `defaultLeader` | The `agent::model` used for a task's evaluation when the task doesn't specify its own. |
-| `guidance` | Standing instructions applied to **every** task evaluation and every workflow it generates — the same mechanism as [dynamic workflow guidance](06-dynamic-workflows.md#guidance), injected as a bulleted "Developer Guidance" block in the agent's prompt. |
+| `workflows.dynamic.agentsToModels` | The agents and models squad is allowed to schedule. A task's own `--agent`/`--model` override still wins if set; this is the default pool, not a hard allowlist against per-task overrides. |
+| `daemon.features.squad.maxConcurrentEvaluations` | How many task evaluations can run at once across the whole daemon. |
+| `workflows.dynamic.defaultLeader` | The `agent::model` used for a task's evaluation when the task doesn't specify its own. |
+| `workflows.dynamic.guidance` | Standing instructions applied to **every** task evaluation and every workflow it generates — the same mechanism as [dynamic workflow guidance](06-dynamic-workflows.md#guidance), injected as a bulleted "Developer Guidance" block in the agent's prompt. |
 
 This is all global rather than per-repo, because your squad watches
 tasks across every repo you point it at. Editing this block takes
 effect on the daemon's next scheduling tick — no restart needed. If a live
 reload finds malformed or unreadable global config, the scheduler reports the
 config error once per distinct error and does not admit new evaluations on
-that tick. `awman squad status` also shows the current reload error until a
+that tick. `awman daemon status` also shows the current reload error until a
 valid reload clears it. It continues to observe existing runs and resumes scheduling after
 a valid config reload; if the error later recurs, it is reported again. The
 scheduler does not silently substitute defaults or keep a last-known-good
@@ -962,300 +973,52 @@ for the full field reference, validation rules, and how to edit it with
 
 ---
 
-## squad and `awman api`
+## The shared daemon
 
-The squad daemon and the `awman api` server are both long-lived processes
-that hold the same shared database open, so **only one of them can run on a
-machine at a time**. Starting either one while the other is running fails
-immediately, before any port is bound or the database is opened, and the
-error names the other process and its PID.
-
-To switch from one to the other:
+Squad is a feature of the shared awman daemon. The TUI can start the daemon
+when a squad view needs it; for a long-running setup, enable the feature and
+start the daemon explicitly:
 
 ```sh
-# Currently running awman api, want to use squad instead
-awman api kill
-awman squad start
-
-# Currently running squad, want to use awman api instead
-awman squad stop
-awman api start --port 9876 --workdirs /path/to/repo
+awman config set daemon.features.squad.enabled true
+awman daemon start --background
+awman daemon status
 ```
 
-Any squad CLI command or TUI entry point that needs the daemon (bare
-`awman squad`, `squad add`/`list`/`show`/etc., opening the squad tab) starts it
-automatically if it isn't already running — you don't have to run
-`awman squad start` yourself first, unless you want to pass daemon-specific
-flags like `--port`. See [API server and squad daemon](09-api-and-remote-mode.md#api-server-and-squad-daemon)
-for the same guarantee from the API server's side.
+The daemon can run squad, worker, and engine features together. Enable or
+disable each feature with
+`awman config set daemon.features.<name>.enabled true|false`; details are in
+[The daemon](16-daemon.md). Use `awman daemon stop` to let running work drain,
+or `awman daemon stop --now` to cancel running worker and squad jobs first.
+Daemon output is available with `awman daemon logs` and
+`awman daemon logs --follow`.
 
----
+Task and run records remain in the shared database under
+`~/.awman/data/awman.db`. Squad task output and workspace files remain under
+`~/.awman/squad/`; the daemon log is under `~/.awman/daemon/`.
 
-## Daemon lifecycle
+## Authenticating network clients
 
-`squad start`/`stop`/`status`/`logs` manage the daemon directly, mirroring
-`awman api`:
+The squad CLI and TUI use the owner-only local listener and need no API key.
+Network access is configured at the daemon level and uses named API keys.
+Create and list keys through the local API client:
 
 ```sh
-awman squad start              # explicit start (usually unnecessary — see above)
-awman squad status             # liveness and PID
-awman squad logs               # the daemon's log output (-f to follow)
-awman squad stop               # alias: awman squad kill
+awman daemon api keys.create name=build-host
+awman daemon api keys.list
 ```
 
-Daemon runtime files live under `~/.awman/squad/`, a sibling of `~/.awman/api/`:
-
-```text
-~/.awman/squad/
-  awman.pid
-  awman.log
-  squad_key.hash
-```
-
-Task and run records live in the same
-shared database as API mode, at `~/.awman/data/awman.db` — see
-[Storage layout](09-api-and-remote-mode.md#storage-layout).
-
-### Logs for the daemon and its agents
-
-`awman squad logs` tails the daemon log. It contains the chronological squad
-lifecycle — administrator actions, task decisions, container launches, workflow
-steps, worktrees, and outcomes — but not the raw output of agents.
-
-The scheduler's own 30-second heartbeat is deliberately not logged: a line
-every half minute, forever, buried the lines that say something actually
-happened. What *is* logged on a tick is one line per currently running agent —
-its task, container, agent, model, image, and elapsed time — and nothing at all
-when no agent is running. Use `awman squad status` for the scheduler's
-liveness (its last tick and how many evaluations are in flight).
-
-Each run keeps the output of each container in its own file:
-
-```text
-~/.awman/squad/tasks/<name>/runs/<run-id>/<container-name>.log
-```
-
-The evaluation agent and every generated-workflow agent container use this
-layout. A workflow's setup and teardown steps write to the same directory,
-one file per step in execution order:
-
-```text
-~/.awman/squad/tasks/<name>/runs/<run-id>/setup-<n>-<step>.log
-~/.awman/squad/tasks/<name>/runs/<run-id>/teardown-<n>-<step>.log
-```
-
-`<n>` is the step's position in its phase and `<step>` is derived from the
-step's description (`setup-1-clone-repo.log`, `teardown-2-create-pr.log`).
-Each file starts with a header naming the step, then carries the command's
-full stdout and stderr; an `on_failure` remediation attempt is appended to
-the original step's file under a separator, so a step's whole history reads
-top to bottom in one place.
-
-All of these files are written as the run progresses, so output remains
-available even if a run stops unexpectedly. The daemon log and these per-step
-logs are separate: use the latter when you need an agent's or a step's
-detailed output.
-
-When any step fails — setup, agent, or teardown — the daemon log records it
-as an error line that names the file to open, in the same `log_path=…` form
-used when a container launches:
-
-```text
-ERROR squad setup step failed task=nightly run_id=… step=clone_repo exit_code=128 log_path=/home/you/.awman/squad/tasks/nightly/runs/…/setup-1-clone-repo.log
-```
-
-A failed evaluation's error text (as shown by `awman squad show <name>` and
-by the task detail modal in the TUI) ends with the leader's log path for the
-same reason, and a failed run's closing `squad task run finished` line names
-the run directory even when the failure happened before any step ran.
-
-Container *image build* output is kept out of the daemon log the same way.
-Each build a task triggers writes its full output to its own file:
-
-```text
-~/.awman/squad/builds/<name>/<run-id>-<n>.log
-```
-
-The daemon log records one lifecycle line when a build starts and one when it
-finishes or fails, each naming the image and the path of that build's log
-file.
-
-At the end of an evaluation, the leader records whether the task was
-triggered for that specific run. An older `workflow.toml` by itself is not
-enough to trigger a later run: an explicit not-triggered result wins, and a
-missing or invalid result is reported as a failed evaluation.
-
-### When the daemon does not come up
-
-Anything that starts the daemon for you — the squad tab, a `squad` CLI
-command — waits ten seconds for it to publish its endpoint, then reports one of
-two failures. They mean different things:
-
-- **"squad daemon started but did not publish its endpoint within 10 seconds."**
-  The daemon ran and something went wrong inside it. The reason is in
-  `~/.awman/squad/awman.log`; read it with `awman squad logs`.
-- **"the squad daemon process never started."** The OS process manager
-  (launchd on macOS, systemd on Linux) accepted the request but ran nothing, so
-  there is no daemon output to read. Start it in the foreground with
-  `awman squad start` — with a terminal attached, the daemon prints directly to
-  it — and check the job itself:
-
-  ```sh
-  launchctl print gui/$(id -u)/io.awman.squad   # macOS
-  systemctl --user status awman-squad           # Linux
-  ```
-
-  On macOS, a job switched off under **System Settings › General › Login Items
-  & Extensions** stays off; re-enable it there, or run
-  `launchctl bootout gui/$(id -u)/io.awman.squad` and start squad again.
-
-A background daemon writes its output to `~/.awman/squad/awman.log` on every
-platform, including when the OS process manager is unavailable and awman falls
-back to starting the process itself. If launchd or systemd declines to run the
-job, the reason it gave is recorded in that same log.
-
----
-
-## Authenticating to the daemon
-
-squad serves its task data over a small HTTP surface on loopback, and the
-CLI and TUI are clients of it. By default that surface requires a bearer key.
-
-### The key and `AWMAN_SQUAD_KEY`
-
-The first time the daemon starts, it mints a key, stores only its SHA-256 hash
-in `~/.awman/squad/squad_key.hash`, and prints the plaintext **once** together
-with the shell snippet that makes it usable:
-
-```
-╔════════════════════════════════════════════════════════════════════╗
-║  squad API key (store this — it will not be shown again)            ║
-║  954ec30c6719074e0ea952588461d079f97675424b8ecb53b5cbe76a9f06c96b  ║
-╚════════════════════════════════════════════════════════════════════╝
-
-Add this to ~/.zshrc so the awman CLI and TUI can authenticate to squad:
-
-    export AWMAN_SQUAD_KEY=954ec30c6719074e0ea952588461d079f97675424b8ecb53b5cbe76a9f06c96b
-```
-
-Add that line to your shell startup file and reload it. Every later
-`awman squad` command — and the squad TUI tab — reads `AWMAN_SQUAD_KEY` from the
-environment and sends it as the bearer token. Without it the daemon answers
-`401 Unauthorized`.
-
-The process that mints the key also sets `AWMAN_SQUAD_KEY` for **itself**, so it
-keeps working before you have exported anything. This matters most in the TUI:
-the session that starts the daemon is the one session you cannot retroactively
-export a variable into, and without this it would be the only one unable to talk
-to the squad it just started. The injection lasts for that process only — a new
-terminal still needs the line in your startup file.
-
-The snippet is tailored to your shell: zsh gets `~/.zshrc`, bash gets
-`~/.bashrc`, and fish gets `set -gx AWMAN_SQUAD_KEY …` for
-`~/.config/fish/config.fish`.
-
-The box-drawn banner above is the CLI's own rendering; the daemon itself only
-ever hands a frontend the key, the shell, and the export line, and each
-frontend draws them its own way. In the TUI this appears as a modal in the
-TUI's own dialog style (no box-drawing characters — the modal's border is
-the frame), whose text can't be selected with the mouse:
-
-```
-╭ squad authentication ────────────────────────────────────────────────╮
-│                                                                       │
-│  squad API key (store this — it will not be shown again):            │
-│                                                                       │
-│    954ec30c6719074e0ea952588461d079f97675424b8ecb53b5cbe76a9f06c96b  │
-│                                                                       │
-│  Add this to ~/.zshrc so the awman CLI and TUI can authenticate to    │
-│  squad:                                                               │
-│                                                                       │
-│    export AWMAN_SQUAD_KEY=954ec30c6719074e0ea952588461d079f97675424… │
-│                                                                       │
-╰───────────────────────────────────────────────────────────────────────╯
-```
-
-Press `c` to copy just the key to the clipboard, or `z` to copy the shell
-snippet (e.g. `export AWMAN_SQUAD_KEY=…`) — either can be pressed as many
-times as you like before dismissing the modal with `Enter`.
-
-### When the key is missing
-
-Only the hash is stored, so a lost key cannot be recovered. Both frontends say
-so rather than letting it surface as a bare `401`.
-
-From the CLI, any `awman squad` subcommand that needs the daemon refuses up
-front:
-
-```
-awman: squad requires a bearer key and none is set in this shell.
-
-The key is shown only once, when it is minted, and only its hash is stored — so
-it cannot be read back. Set AWMAN_SQUAD_KEY if you saved it, or mint a new one
-with:
-    awman squad start --refresh-key
-which invalidates the previous key, so any shell still exporting it must be
-updated too.
-```
-
-In the TUI, opening the squad tab raises the recovery instead of opening a tab
-that could only ever show a 401:
-
-```
-╭ squad authentication ──────────────────────────────────────────────────╮
-│                                                                        │
-│   The squad daemon requires a key, and this session has none.          │
-│                                                                        │
-│   AWMAN_SQUAD_KEY is not set here, and squad's key was shown           │
-│   only once when it was minted — only its hash is stored, so           │
-│   the key itself cannot be read back.                                  │
-│                                                                        │
-│   Mint a new key and restart the squad daemon onto it?                 │
-│   Any other shell still exporting the old key will stop working.       │
-│                                                                        │
-│   [y] mint a new key and restart squad   [n / Esc] cancel              │
-│                                                                        │
-╰────────────────────────────────────────────────────────────────────────╯
-```
-
-**y** mints a new key, restarts the daemon onto it, injects it into the running
-session, opens the squad tab, and then shows you the key and its shell snippet —
-the same display a first run gives. **n** or **Esc** opens no squad tab and says
-so in the status bar; the daemon is left running and untouched.
-
-Minting a new key invalidates the old one, so any other shell still exporting it
-stops working until you update it.
-
-To do the same thing from a terminal:
+The plaintext key is returned only by `keys.create`. Store it in the remote
+client configuration. To rotate it, create a replacement, update clients, then
+delete the previous key by its `key_…` ID:
 
 ```sh
-awman squad stop
-awman squad start --refresh-key   # prints a fresh key and snippet, then exits
-awman squad start
+awman daemon api keys.delete id=key_…
 ```
 
-### Running without a key — `--dangerously-skip-auth`
-
-If you would rather not manage a key at all:
-
-```sh
-awman squad start --dangerously-skip-auth
-```
-
-This mints no key, writes no hash, and accepts unauthenticated requests. It is
-a reasonable choice on a single-user machine because **the squad daemon binds to
-127.0.0.1 exclusively** — there is no flag to expose it on another interface,
-so nothing off the machine can reach it. What it does give up is isolation from
-other local processes and users on the same host: any of them can drive squad,
-which means launching agent containers against your repo. Prefer the key on
-shared or multi-user machines.
-
-The flag applies to the run it is passed to. It leaves any existing
-`squad_key.hash` untouched, so a later plain `awman squad start` requires a key
-again. While a skip-auth daemon is running, the CLI and TUI notice and send no
-bearer token rather than minting a key you would never see.
-
----
+The network listener is TLS-only and may be unavailable in builds where it is
+not wired yet. See [The daemon: Network listener](16-daemon.md#network-listener)
+for configuration and security details.
 
 ## Watching what your squad is running
 

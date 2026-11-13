@@ -7,6 +7,12 @@ awman has two execution modes:
 
 This guide covers TUI mode.
 
+awman's browser frontend connects to a daemon on the same machine. Its controls
+and shortcuts follow the TUI where the browser permits them; browser-reserved
+keys such as **Ctrl+T** and **Ctrl+W** use **Alt+T** and **Alt+W** alternatives,
+and some actions use visible buttons. Text inputs keep their normal editing
+keys. See the [Web App guide](20-webapp.md#shortcuts) for details.
+
 ---
 
 ## Startup
@@ -28,6 +34,35 @@ non-Git directory: awman keeps that directory as the tab's working directory
 and starts the same live status view there.
 
 In both cases, terminal raw mode, alternate screen, and mouse capture are enabled on entry and restored unconditionally on exit, even if awman crashes.
+
+### Builtin or daemon engine
+
+The TUI can run its work in its own process or on the daemon's engine (see [The Engine and Frontends](19-engine-and-frontends.md)). It looks and behaves identically on either; everything in this guide applies to both.
+
+### Status in your terminal's tab bar
+
+Terminals that support OSC 7501 can show awman's activity in their own tab bar,
+even when awman is in the background. The status covers all awman tabs: waiting
+for input takes priority, followed by errors, working, idle, and done. An
+authentication prompt appears as waiting for authentication. The terminal may
+also show individual agents and their messages. Status is cleared when awman
+exits. awman probes the terminal at startup and emits reports only when it
+receives an OSC 7501 reply before the terminal's primary-device response and
+within the probe window. If the response arrives first, no reply arrives, or
+the probe times out, emission stays off for that TUI run. Unsupported
+terminals keep working normally. Emission is also disabled when no raw input
+terminal is available.
+
+A bare Escape uses a short key-disambiguation delay. An incomplete CSI or OSC
+introducer may wait up to one second so a delayed probe reply is consumed;
+Alt+[ and Alt+] use that same window. Once a reply's identifying bytes arrive,
+fragmented replies remain filtered even after the startup probe expires.
+
+awman detects terminal support automatically. To disable this for one run, use
+`awman --set tui.programStatus.emit=false` or set
+`AWMAN_TUI_PROGRAM_STATUS_EMIT=false`. You can also save
+`tui.programStatus.emit=false` in global or repository configuration. Emission
+is disabled for `TERM=dumb` and when output is redirected.
 
 ---
 
@@ -66,11 +101,47 @@ indicator — a circle whose colour is the squad daemon's health (grey not
 running, green healthy, yellow unreachable, blue a task is running, red a
 task's last run failed). See [The squad indicator](12-squad.md#the-squad-indicator).
 
+## Work queue panel
+
+The TUI has a work queue panel bound to **Ctrl+Q**. Its controls are **↑ / ↓**
+and **PageUp / PageDown** to move through rows, **Enter** to view item details,
+**p** to pick an item, **r** to refresh, and **Esc** to close the panel or
+return from the details view. Each row shows the item's title, its work
+server, labels, priority and age, and a **for you** marker when the item is
+assigned to this worker's owner. Queue listings can include a Markdown body
+preview; servers without previews show the summary. When new items arrive while
+the panel is closed, the status bar shows a badge such as
+`2 new work items · 1 for you`. If one of several work servers cannot be
+reached, the panel keeps listing the others and shows that server's error.
+
+A picked run opens in its own tab, titled with the item's title and its
+server (`Add OAuth login · infact`). If you close
+a tab while its lease is active, choose whether to release the item, cancel
+the run, or leave it running. The engine instance owns the prepared lease and
+reports its final result after execution and publication.
+
+The panel is controlled by the repository setting `tui.worker.enabled`, which
+defaults to `false` and is read when the TUI starts:
+
+```sh
+awman config set tui.worker.enabled true
+```
+
+To enable it for one run only, start the TUI with
+`awman --set tui.worker.enabled=true`.
+
+When enabled, the worker reuses a running daemon's registration or registers a
+manual worker for the instance lifetime. If the daemon starts or stops pulling
+while the TUI is open, the TUI switches over between runs, so a server never
+has two workers for the same machine. When a terminal uses XON/XOFF flow control, it may
+consume Ctrl+Q before awman receives it. See [Workers and Work Servers](17-workers-and-work-servers.md)
+for work server configuration and queue commands.
+
 ---
 
 ## Git Sidebar
 
-Press **Ctrl+G** to toggle the Git Sidebar — a live view of staged and unstaged changes in the current repository. The sidebar appears on the right side of the TUI and displays changed files with line change counts.
+Press **Ctrl+G** to toggle the Git Sidebar — a live view of staged and unstaged changes in the current repository. The sidebar appears on the right side of the TUI and displays changed files with line change counts. Its total additions and deletions are followed by the current branch, for example `+20 -85 (main)`.
 
 The sidebar's border always carries a title summarizing the repository state, like a condensed `git status`:
 
@@ -98,9 +169,9 @@ The sidebar's border always carries a title summarizing the repository state, li
 
 ### Opening and closing
 
-When the sidebar is **open**, press **Ctrl+G** again to close it. The execution window expands to fill the space, and a compact `+X -Y` summary appears in the bottom status bar showing the total additions and deletions across all files.
+When the sidebar is **open**, press **Ctrl+G** again to close it. The execution window expands to fill the space, and a compact `+X -Y (branch)` summary appears in the bottom status bar showing the total additions and deletions across all files and the current branch.
 
-When the sidebar is **closed**, the `+X -Y` summary is always visible on the right side of the status bar (when there are changes to display).
+When the sidebar is **closed**, the `+X -Y (branch)` summary is visible on the right side of the status bar when there is room. It uses the tab's current repository or worktree, and shows `HEAD` for a detached checkout.
 
 ### File list
 
@@ -190,13 +261,13 @@ API use, so it rejects what they would reject rather than carrying a bad value
 into the command:
 
 ```
-chat --launch-mode banana
+chat --set agents.launchMode=banana
 ```
 ```
-invalid value for flag 'launch-mode' on ["chat"]: 'banana' is not one of ["stdio", "acp"]
+invalid value for `agents.launchMode`: expected one of stdio, acp, got "banana"
 ```
 
-A non-numeric value for a numeric flag (`squad start --port abc`) is rejected
+A non-numeric value for a numeric flag is rejected
 the same way. In both cases the text you typed stays in the box so you can fix
 just the bad part instead of retyping the whole command. A `-`-prefixed token
 is never accepted as a flag's value (`--agent -c` is a missing value for
@@ -377,7 +448,7 @@ This mirrors tmux's copy-mode behavior: scrolling enters historical view, reachi
 
 Mouse click, drag, and drag-release events are never forwarded to the agent. They always perform awman's native text selection, ensuring you can always select and copy text from the container overlay, even when the agent has mouse tracking enabled.
 
-Scrollback holds up to 10,000 lines by default (`terminal_scrollback_lines` in [Configuration](07-configuration.md)). While scrolled, the title bar shows `↑ scrollback (N / M lines)` where `N` is your current offset and `M` is the total depth.
+Scrollback holds up to 10,000 lines by default (`tui.scrollbackLines` in [Configuration](07-configuration.md)). While scrolled, the title bar shows `↑ scrollback (N / M lines)` where `N` is your current offset and `M` is the total depth.
 
 awman always intercepts **Ctrl+Y**; with no active selection it does nothing, and the agent never receives it.
 
@@ -560,9 +631,9 @@ Press **Ctrl+,** from anywhere in the TUI, or type `config show` in the command 
 ```
 ╭──────────────────────────────── awman config ─────────────────────────────────╮
 │  Field                              Global        Repo           Effective     │
-│  agent                              claude                       claude        │
-│  runtime                            docker                       docker        │
-│  terminal_scrollback_lines          10000         5000           5000          │
+│  agents.default                     claude                       claude        │
+│  runtime.kind                       docker                       docker        │
+│  tui.scrollbackLines                10000         5000           5000          │
 │  ...                                                                           │
 │  workflows.dynamic.agentsToModels                 2 agents ma…   2 agents ma…  │
 │▶ workflows.dynamic.agentsToModels.…               claude-opus…   claude-opus…  │
@@ -589,13 +660,13 @@ Press **Ctrl+,** from anywhere in the TUI, or type `config show` in the command 
 
 While editing, the value is edited inline in its table cell with a visible `|` cursor; **← / →**, **Home / End**, **Backspace**, and **Delete** work as expected. Values longer than the cell scroll horizontally so the cursor never leaves view. Row navigation is frozen until you save or cancel.
 
-A detail pane below the table always shows the full, untruncated value of the selected row's focused column — long values wrap across multiple lines there, and while editing it mirrors the complete edit buffer. Beneath it, a hint line shows the accepted value format for the field (e.g. `one of: claude, codex, …` for `agent`, `positive integer` for numeric fields, `comma-separated list` for list fields).
+A detail pane below the table always shows the full, untruncated value of the selected row's focused column — long values wrap across multiple lines there, and while editing it mirrors the complete edit buffer. Beneath it, a hint line shows the accepted value format for the field (e.g. `one of: claude, codex, …` for `agents.default`, `positive integer` for numeric fields, `comma-separated list` for list fields).
 
 Each edit is validated and written immediately when you press **Enter** (surrounding whitespace is trimmed first). If the value is invalid (an unknown agent name, a non-numeric value for a numeric field, a malformed `agent::model` leader) or the config file cannot be written, nothing is saved: the dialog stays in edit mode with your input intact and shows the reason in red where the format hint normally appears, so you can correct the value instead of retyping it. Press **Esc** to abandon the rejected edit. After a successful save the table refreshes with the selected row preserved, so consecutive edits don't send you back to the top.
 
-Editing targets the column the selection is on: the **Global** column writes `$HOME/.awman/config.json`, the **Repo** column writes `GITROOT/.awman/config.json`. Scope-restricted fields snap automatically — starting an edit on the Global column of a repo-only field moves the edit to the Repo column with a status-bar note, and vice versa for global-only fields (like `runtime`). Dynamic workflow settings can be edited in either column.
+Editing targets the column the selection is on: the **Global** column writes the global config (`$AWMAN_HOME/config.json`, default `~/.awman/config.json`), the **Repo** column writes `GITROOT/.awman/config.json`. Scope-restricted fields snap automatically — starting an edit on the Global column of a repo-only field moves the edit to the Repo column with a status-bar note, and vice versa for global-only fields (like `runtime.kind`). Dynamic workflow settings can be edited in either column.
 
-Fields marked read-only — such as `auto_agent_auth_accepted` — are shown dimmed; pressing **Enter** on one shows `This field is read-only` in the status bar.
+Fields marked read-only — such as map and object headers — are shown dimmed; pressing **Enter** on one shows `This field is read-only` in the status bar.
 
 There are more fields than fit at once — the table scrolls automatically to keep the selected row visible as you move past the bottom or top of the visible window.
 
@@ -619,7 +690,7 @@ The [leader guidance list](06-dynamic-workflows.md#guidance) — project-specifi
 - **Ctrl+N** appends a new entry to the selected scope in a single step: type the instruction text and press **Enter**. **Esc** cancels. Unlike `agentsToModels`, there's no key to type first — the index is assigned automatically as the next position in the selected list.
 - Saving an **empty** value on an entry row removes it; the remaining entries shift down and re-index, and the row list refreshes to reflect the new indices.
 
-The same per-entry edits work on the command line: `awman config set workflows.dynamic.guidance.0 "Never spawn more than two agents in parallel."` or pass `--global` to edit global config.
+The same per-entry edits work on the command line: `awman config set workflows.dynamic.guidance "Never spawn more than two agents in parallel."` (a list value; separate several entries with commas) or pass `--global` to edit global config.
 
 ---
 
@@ -636,6 +707,14 @@ If the tab cannot be opened — the path is not a directory, or its
 created and a **could not open new tab** modal shows the error. Press
 **Enter** or **Esc** to dismiss it.
 
+When the daemon engine is at capacity, the new tab shows an **Engine capacity
+reached** warning before its startup command runs. Both the engine limit and
+the shared daemon limit default to **8** jobs. The warning shows current usage
+and offers **i** to increase the full limits by one, save them globally, apply
+them immediately, and continue; **w** to wait for a slot; or **c** / **Esc** to
+cancel the command. Existing configured limits are respected. The same warning
+appears when another command needs a slot while the engine is full.
+
 ```
 Ctrl+T          open a new tab (prompts for working directory)
 Ctrl+A          switch to the previous tab
@@ -643,7 +722,28 @@ Ctrl+D          switch to the next tab
 Ctrl+C, Ctrl+T  (multiple tabs open) close the current tab
 ```
 
-The tab bar shows each tab's project name, current or last command, and an arrow (`➡`) on the active tab. The active tab's bottom border is suppressed so it visually opens into the content area.
+The tab bar shows each tab's project name, current or last command, and an arrow (`➡`) on the active tab. The active tab's bottom border is suppressed so it visually opens into the content area. When the agent reports its program status, a glyph appears before the tab label:
+
+| Glyph | Reported status | Tab colour |
+|-------|-----------------|------------|
+| `◐` | Working; includes reported progress when available, for example `◐ 42%`. | Blue |
+| `?` | Blocked on a question. | Yellow |
+| `🔒` | Blocked on permission or authentication. | Yellow |
+| `✓` | Done. | Green |
+| `✗` | Error. | Red |
+| *(none)* | Idle. | Green |
+| *(none)* | No status report. | Usual tab colour |
+
+A yolo countdown overrides these colours. A reporting agent is never marked
+stuck: it does not turn yellow from silence or get the `⚠️` silence prefix.
+An agent that does not report keeps the usual colours and the silence warning.
+
+The container window title and minimized status bar also show the reported
+glyph and state, followed by the blocked kind (when present) and the agent's
+message. For example, `🔒 blocked: permission — Allow this edit?`. The message
+is displayed as plain text with invisible/control characters removed and is
+shortened to fit. A quiet agent that continues to report `working` may show
+`working · silent 12m`; this is informational and does not mark the tab stuck.
 
 All tabs share one width: wide enough for the longest tab label (at least 20 columns), or, when that many tabs don't fit, the terminal width divided evenly between them (at least 12 columns each). Names that don't fit are truncated with `…` — at 20 columns that leaves 14 characters of the name.
 
@@ -759,7 +859,7 @@ bindings, and attaching to a running task.
 
 ## Stuck detection
 
-If a running container produces no output for longer than the stuck timeout (30 seconds by default; `agentStuckTimeout` in [Configuration](07-configuration.md)), the tab turns yellow and the subcommand label gains a `⚠️` prefix (e.g. `⚠️ chat`). The warning clears automatically when you:
+If a running container produces no output for longer than the stuck timeout (30 seconds by default; `agents.stuckTimeout` in [Configuration](07-configuration.md)), the tab turns yellow and the subcommand label gains a `⚠️` prefix (e.g. `⚠️ chat`). This silence rule applies when the agent is not reporting program status. An agent that reports `working` remains judged by its reports even if its output is quiet; the TUI may show the informational `working · silent …` note, but does not mark it stuck. A `done`, `blocked`, or `error` report likewise takes precedence over silence. The warning clears automatically when you:
 
 - Switch to the yellow tab
 - Press any key while the tab is active
@@ -781,6 +881,7 @@ For workflow tabs, awman goes further: the [workflow control board](05-workflows
 | **Ctrl+A** | Switch to the previous tab |
 | **Ctrl+D** | Switch to the next tab |
 | **Ctrl+G** | Toggle Git Sidebar (live view of repository changes) |
+| **Ctrl+Q** | Open the work queue panel when the TUI worker is enabled |
 | **Ctrl+Shift+C** | Copy the workflow context host directory (only while the current tab has an active workflow context overlay) |
 | **Ctrl+M** | Toggle container window between maximized, minimized, and hidden |
 | **Ctrl+O** | Minimize / maximize the Workflow Overview (independent of Ctrl+M) |

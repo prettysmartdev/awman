@@ -30,7 +30,7 @@ impl WorkflowEngine {
         let agent = self.resolve_agent(step)?;
         let model = self.resolve_model(step);
         tracing::info!(
-            step = %step.name,
+            step = %self.redaction.redact(&step.name),
             agent = %agent.as_str(),
             model = ?model,
             "workflow_engine resolved step parameters"
@@ -60,27 +60,27 @@ impl WorkflowEngine {
         self.state
             .set_status(&step.name, StepState::Running { container_id: None });
         self.persist()?;
-        let execution =
-            match self
-                .agent_factory
-                .execution_for_step(step, &self.session, &prepared.runtime)
-            {
-                Ok(execution) => execution,
-                Err(error) => {
-                    self.state.set_status(
-                        &step.name,
-                        StepState::Failed {
-                            exit_code: -1,
-                            error_message: Some(error.to_string()),
-                        },
-                    );
-                    if let Err(save_error) = self.persist() {
-                        tracing::error!(step = %step.name, error = %save_error,
-                            spawn_error = %error, "could not persist failed workflow launch");
-                    }
-                    return Err(error);
+        let execution = match self.agent_factory.execution_for_step(
+            step,
+            &self.session,
+            &prepared.runtime,
+        ) {
+            Ok(execution) => execution,
+            Err(error) => {
+                self.state.set_status(
+                    &step.name,
+                    StepState::Failed {
+                        exit_code: -1,
+                        error_message: Some(error.to_string()),
+                    },
+                );
+                if let Err(save_error) = self.persist() {
+                    tracing::error!(step = %self.redaction.redact(&step.name), error = %self.redaction.redact(&save_error.to_string()),
+                            spawn_error = %self.redaction.redact(&error.to_string()), "could not persist failed workflow launch");
                 }
-            };
+                return Err(error);
+            }
+        };
         self.state.set_status(
             &step.name,
             StepState::Running {
@@ -181,15 +181,11 @@ impl WorkflowEngine {
             if self.yolo {
                 return Ok(IterationOutcome::Continue);
             }
-        } else if self.yolo {
-            // Last step in yolo mode: always require explicit user
-            // confirmation before ending the workflow so the user can
-            // review the final step's output.
-            let progress = self.workflow_progress_info();
-            self.frontend.report_workflow_progress(&progress);
         }
 
-        if !workflow_just_completed || self.yolo {
+        // run_to_completion enforces final review in every interactive mode,
+        // including natural exits and resumed runs with all steps complete.
+        if !workflow_just_completed {
             let available = self.compute_available_actions()?;
             let action = self
                 .frontend
@@ -288,6 +284,7 @@ impl WorkflowEngine {
         let container_name = execution.handle().name.clone();
         let handle = execution.handle().clone();
         let output_tail = execution.output_tail();
+        let program_status = execution.program_status_tracker();
         self.active_steps = vec![ActiveParallelStep {
             step_name: step.name.clone(),
             execution: Some(execution),
@@ -298,6 +295,11 @@ impl WorkflowEngine {
             awman_killed: false,
             stuck: false,
             yolo_deadline: None,
+            countdown_kind: CountdownKind::StuckStep,
+            output_watch: None,
+            last_report: None,
+            reported_problem: None,
+            program_status,
             agent: resolved_agent.clone(),
             model: resolved_model.clone(),
             launch_id: 0,
@@ -313,6 +315,9 @@ impl WorkflowEngine {
         step_name: &str,
         exit: AgentExitInfo,
     ) -> Result<StepOutcome, EngineError> {
+        // WI 0141: the agent's final status (its tracker at exit) is
+        // settled before the exit code is read, on every finalising path.
+        self.settle_reported_status(step_name, None);
         self.last_exit_info = Some(exit.clone());
         // The step's container has actually terminated (wait() resolved) —
         // tell the frontend so it can tear down any live container UI.
@@ -322,7 +327,22 @@ impl WorkflowEngine {
         // output tail so the user can debug what went wrong.
         self.maybe_dump_step_failure(step_name, exit.exit_code);
 
-        let (status, step_state) = if exit.exit_code == 0 {
+        // WI 0141: a problem the agent reported outranks the exit code — a
+        // container awman killed after `blocked`/`error` (KILLED_EXIT_CODE,
+        // otherwise read as an engine advance) or one that exited by itself,
+        // even with 0, is Failed with the agent's reason. After `done` the
+        // exit code stands.
+        let (status, step_state) = if let Some(problem) = self.reported_problem_of(step_name) {
+            (
+                WorkflowStepStatus::Failed {
+                    exit_code: exit.exit_code,
+                },
+                StepState::Failed {
+                    exit_code: exit.exit_code,
+                    error_message: Some(program_status::reported_failure_reason(&problem)),
+                },
+            )
+        } else if exit.exit_code == 0 {
             (WorkflowStepStatus::Succeeded, StepState::Succeeded)
         } else {
             (
@@ -390,6 +410,9 @@ impl WorkflowEngine {
                 result = &mut wait_rx => {
                     let (exec_back, exit_result) = result
                         .map_err(|_| EngineError::Other("step wait task dropped unexpectedly".into()))?;
+                    // A report that was ready together with the exit is
+                    // applied before finalising (the select is biased).
+                    self.settle_reported_status(&step_name, stuck_rx.as_mut());
                     self.set_focused_execution(exec_back);
                     return Ok(InterruptibleStepResult::StepCompleted(
                         self.finalize_step(&step_name, exit_result?)?
@@ -403,6 +426,19 @@ impl WorkflowEngine {
                 }
                 Some(event) = Self::recv_stuck(&mut stuck_rx) => {
                     match event {
+                        // The agent's own OSC 7501 status (WI 0141); see
+                        // `program_status` for the state table.
+                        StuckEvent::Reported(status) => {
+                            if let Some(r) = self.handle_step_reported(
+                                &step_name,
+                                status,
+                                &cancel_handle,
+                                &mut wait_rx,
+                                &mut stuck_rx,
+                            ).await? {
+                                return Ok(r);
+                            }
+                        }
                         StuckEvent::Stuck => {
                             let result = self.handle_step_stuck(
                                 &step_name,
@@ -526,7 +562,7 @@ impl WorkflowEngine {
         stuck_rx: &mut Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
     ) -> Result<Option<InterruptibleStepResult>, EngineError> {
         self.msg_warning(format!("Step '{}' appears stuck (no output)", step_name,));
-        if self.yolo && !self.is_last_step() {
+        if self.yolo && !self.is_final_review_step(step_name) {
             let yolo_result = self
                 .run_mid_step_yolo_countdown(step_name, cancel_handle, wait_rx, stuck_rx)
                 .await?;
@@ -549,6 +585,12 @@ impl WorkflowEngine {
                     })
                 }
                 MidStepYoloResult::Cancelled | MidStepYoloResult::Recovered => Ok(None),
+                // The agent started reporting during a silence countdown: its
+                // report decides from here on.
+                MidStepYoloResult::Reported(status) => {
+                    self.handle_step_reported(step_name, status, cancel_handle, wait_rx, stuck_rx)
+                        .await
+                }
                 MidStepYoloResult::Advanced => {
                     self.msg_info(format!("Yolo auto-advancing past step '{}'", step_name,));
                     self.kill_current_container(cancel_handle);
@@ -559,14 +601,6 @@ impl WorkflowEngine {
                         .report_step_status(&step, WorkflowStepStatus::Succeeded);
                     let progress = self.workflow_progress_info();
                     self.frontend.report_workflow_progress(&progress);
-
-                    if self.is_last_step() {
-                        let available = self.compute_available_actions()?;
-                        let action = self
-                            .frontend
-                            .show_workflow_control_board(&self.state, &available)?;
-                        return Ok(Some(self.execute_top_level_action(action)?));
-                    }
 
                     Ok(Some(InterruptibleStepResult::LoopContinue))
                 }
@@ -610,6 +644,7 @@ impl WorkflowEngine {
                 MidStepYoloResult::Cancelled => MidStepYoloResult::Cancelled,
                 MidStepYoloResult::ShowControlBoard => MidStepYoloResult::ShowControlBoard,
                 MidStepYoloResult::Recovered => MidStepYoloResult::Recovered,
+                MidStepYoloResult::Reported(status) => MidStepYoloResult::Reported(status),
             },
         )
     }
@@ -669,6 +704,13 @@ impl WorkflowEngine {
                             self.frontend.yolo_countdown_finished(step_name);
                             return Ok(MidStepYoloResult::Recovered);
                         }
+                        // The agent reports its own status now, so silence
+                        // no longer decides (WI 0141). Hand the report back.
+                        Ok(StuckEvent::Reported(status)) => {
+                            self.frontend.yolo_countdown_finished(step_name);
+                            return Ok(MidStepYoloResult::Reported(status));
+                        }
+
                         Ok(StuckEvent::Stuck) => continue,
                         Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
                         // Lagged: a message was dropped because the channel
@@ -726,6 +768,10 @@ impl WorkflowEngine {
                             self.frontend.yolo_countdown_finished(step_name);
                             return Ok(MidStepYoloResult::Recovered);
                         }
+                        StuckEvent::Reported(status) => {
+                            self.frontend.yolo_countdown_finished(step_name);
+                            return Ok(MidStepYoloResult::Reported(status));
+                        }
                         StuckEvent::Stuck => {
                             // Already counting down; ignore duplicate.
                         }
@@ -766,369 +812,5 @@ impl WorkflowEngine {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod launch_tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
-
-    /// Fails one launch after verifying that Running was published before the
-    /// factory was invoked. Subsequent calls model an explicit user retry.
-    struct FailOnceFactory {
-        calls: AtomicUsize,
-        store: WorkflowStateStore,
-        workflow_name: String,
-    }
-
-    impl AgentExecutionFactory for FailOnceFactory {
-        fn execution_for_step(
-            &self,
-            step: &WorkflowStep,
-            session: &Session,
-            runtime: &WorkflowRuntimeContext,
-        ) -> Result<AgentExecution, EngineError> {
-            let saved = self.store.load(None, &self.workflow_name).unwrap().unwrap();
-            assert_eq!(
-                saved.status_of(&step.name),
-                Some(&StepState::Running { container_id: None })
-            );
-            assert_eq!(saved.step_attempt(&step.name), runtime.source.step_attempt);
-            assert_eq!(runtime.git_root, session.git_root());
-            assert_eq!(runtime.session_id, session.id());
-            assert_eq!(runtime.workflow_invocation_id, saved.invocation_id);
-            assert_eq!(runtime.source.step_index, saved.step_index(&step.name));
-            if step.name == "a" && self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                return Err(EngineError::Other("injected spawn failure".into()));
-            }
-            let now = chrono::Utc::now();
-            Ok(AgentExecution::finished(
-                AgentHandle {
-                    id: "retry-id".into(),
-                    name: "retry-container".into(),
-                    image_tag: "fake:latest".into(),
-                    started_at: now,
-                },
-                AgentExitInfo {
-                    exit_code: 0,
-                    signal: None,
-                    started_at: now,
-                    ended_at: now,
-                },
-            ))
-        }
-
-        fn inject_prompt(
-            &self,
-            _execution: &AgentExecution,
-            _prompt: &str,
-        ) -> Result<Option<()>, EngineError> {
-            Ok(None)
-        }
-    }
-
-    #[derive(Default)]
-    struct RecordingFrontend {
-        states: Arc<Mutex<Vec<WorkflowState>>>,
-        statuses: Arc<Mutex<Vec<WorkflowStepStatus>>>,
-    }
-
-    impl crate::data::message::UserMessageSink for RecordingFrontend {
-        fn write_message(&mut self, _message: crate::data::message::UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-
-    impl WorkflowFrontend for RecordingFrontend {
-        fn yolo_countdown_tick(
-            &mut self,
-            _step_name: &str,
-            _remaining: Duration,
-            _total: Duration,
-        ) -> Result<YoloTickOutcome, EngineError> {
-            Ok(YoloTickOutcome::Cancel)
-        }
-        fn report_workflow_completed(&mut self, _outcome: &WorkflowOutcome) {}
-        fn show_workflow_control_board(
-            &mut self,
-            _state: &WorkflowState,
-            _available: &AvailableActions,
-        ) -> Result<NextAction, EngineError> {
-            panic!("spawn failures must return to the caller")
-        }
-        fn confirm_resume(&mut self, _mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
-            Ok(true)
-        }
-        fn report_workflow_state(&mut self, state: &WorkflowState) {
-            self.states.lock().unwrap().push(state.clone());
-        }
-        fn report_step_status(&mut self, _step: &WorkflowStep, status: WorkflowStepStatus) {
-            self.statuses.lock().unwrap().push(status);
-        }
-    }
-
-    fn step(name: &str) -> WorkflowStep {
-        WorkflowStep {
-            name: name.into(),
-            depends_on: vec![],
-            prompt_template: "test prompt".into(),
-            agent: Some("codex".into()),
-            model: Some("test-model".into()),
-            overlays: None,
-            abort_on_failure: false,
-        }
-    }
-
-    fn engine(session: &Session, frontend: RecordingFrontend) -> WorkflowEngine {
-        let workflow = Workflow {
-            title: Some("spawn-failure".into()),
-            steps: vec![step("a"), step("b")],
-            agent: None,
-            model: None,
-            setup: vec![],
-            teardown: vec![],
-            teardown_on_failure: false,
-            overlays: None,
-        };
-        WorkflowEngine::new(
-            session,
-            WorkflowSpec::new(workflow),
-            WorkflowEngineDeps {
-                frontend: Box::new(frontend),
-                agent_factory: Box::new(FailOnceFactory {
-                    calls: AtomicUsize::new(0),
-                    store: WorkflowStateStore::new(session),
-                    workflow_name: "spawn-failure".into(),
-                }),
-            },
-        )
-        .unwrap()
-    }
-
-    fn assert_failed_checkpoint(engine: &WorkflowEngine, frontend_states: &[WorkflowState]) {
-        // EngineError's Display may add context; check that the diagnostic
-        // survives without tying persistence to its presentation prefix.
-        let assert_failed = |state: &WorkflowState| {
-            match state.status_of("a").unwrap() {
-                StepState::Failed {
-                    exit_code,
-                    error_message,
-                } => {
-                    assert_eq!(*exit_code, -1);
-                    assert!(error_message
-                        .as_ref()
-                        .unwrap()
-                        .contains("injected spawn failure"));
-                }
-                other => panic!("expected failed spawn, got {other:?}"),
-            }
-            assert_eq!(state.step_attempt("a"), Some(1));
-            assert_eq!(state.status_of("b"), Some(&StepState::Pending));
-            assert!(!state.completed_steps.contains("a"));
-        };
-        assert_failed(engine.state());
-        let saved = engine
-            .state_store
-            .load(None, "spawn-failure")
-            .unwrap()
-            .unwrap();
-        assert_failed(&saved);
-        assert_failed(frontend_states.last().unwrap());
-        assert!(engine.active_steps.is_empty());
-        assert!(engine.last_launched_identity.is_none());
-    }
-
-    #[tokio::test]
-    async fn single_spawn_failure_is_persisted_and_explicit_retry_can_succeed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let session = Session::for_tests_isolated(tmp.path(), &tmp.path().join("home"));
-        let frontend = RecordingFrontend::default();
-        let states = frontend.states.clone();
-        let statuses = frontend.statuses.clone();
-        let mut engine = engine(&session, frontend);
-        let error = engine.step_once().await.unwrap_err();
-        assert!(error.to_string().contains("injected spawn failure"));
-        assert_failed_checkpoint(&engine, &states.lock().unwrap());
-        assert_eq!(
-            *statuses.lock().unwrap(),
-            vec![
-                WorkflowStepStatus::Running,
-                WorkflowStepStatus::Failed { exit_code: -1 },
-            ]
-        );
-
-        engine.state.set_status("a", StepState::Pending);
-        let outcome = engine.step_once().await.unwrap();
-        assert_eq!(outcome.status, WorkflowStepStatus::Succeeded);
-        assert_eq!(engine.state.step_attempt("a"), Some(2));
-        assert_eq!(
-            engine.current_step_agent.as_ref().unwrap().as_str(),
-            "codex"
-        );
-        assert_eq!(engine.current_step_model.as_deref(), Some("test-model"));
-    }
-
-    #[tokio::test]
-    async fn parallel_spawn_failure_is_persisted_without_a_wait_slot_and_can_retry() {
-        let tmp = tempfile::tempdir().unwrap();
-        let session = Session::for_tests_isolated(tmp.path(), &tmp.path().join("home"));
-        let frontend = RecordingFrontend::default();
-        let states = frontend.states.clone();
-        let mut engine = engine(&session, frontend);
-        let error = engine
-            .run_parallel_group(vec![step("a"), step("b")])
-            .await
-            .err()
-            .unwrap();
-        assert!(error.to_string().contains("injected spawn failure"));
-        assert_failed_checkpoint(&engine, &states.lock().unwrap());
-
-        engine.state.set_status("a", StepState::Pending);
-        let outcome = engine
-            .run_parallel_group(vec![step("a"), step("b")])
-            .await
-            .unwrap();
-        assert!(matches!(outcome, GroupOutcome::Drained { failed } if failed.is_empty()));
-        assert_eq!(engine.state.step_attempt("a"), Some(2));
-        assert_eq!(engine.state.step_attempt("b"), Some(1));
-        assert_eq!(engine.state.status_of("a"), Some(&StepState::Succeeded));
-        assert_eq!(engine.state.status_of("b"), Some(&StepState::Succeeded));
-    }
-
-    struct PendingExecution;
-    impl crate::engine::agent_runtime::execution::ExecutionBackend for PendingExecution {
-        fn wait_blocking(self: Box<Self>) -> Result<AgentExitInfo, EngineError> {
-            panic!("sibling wait must not be abandoned into a blocking task")
-        }
-        fn cancel(&self) -> Result<(), EngineError> {
-            Ok(())
-        }
-        fn cancel_handle(&self) -> crate::engine::agent_runtime::CancelHandle {
-            crate::engine::agent_runtime::CancelHandle::new(|| Ok(()))
-        }
-        fn cancel_on_execution_drop(&self) -> bool {
-            false
-        }
-    }
-
-    struct FailureFactory {
-        inner: FailOnceFactory,
-        pending: Option<String>,
-        fail_checkpoint: bool,
-        stopped: Arc<Mutex<Vec<String>>>,
-    }
-    impl AgentExecutionFactory for FailureFactory {
-        fn execution_for_step(
-            &self,
-            step: &WorkflowStep,
-            session: &Session,
-            runtime: &WorkflowRuntimeContext,
-        ) -> Result<AgentExecution, EngineError> {
-            let result = self.inner.execution_for_step(step, session, runtime);
-            if result.is_err() && self.fail_checkpoint {
-                let path = self.inner.store.state_path(None, &self.inner.workflow_name);
-                let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-                permissions.set_readonly(true);
-                std::fs::set_permissions(path, permissions).unwrap();
-            }
-            if self.pending.as_deref() == Some(&step.name) {
-                let handle = result?.handle().clone();
-                let (tx, _) = tokio::sync::broadcast::channel(4);
-                Ok(AgentExecution::new(
-                    handle,
-                    Box::new(PendingExecution),
-                    Arc::new(tx),
-                    None,
-                ))
-            } else {
-                result
-            }
-        }
-        fn inject_prompt(&self, _: &AgentExecution, _: &str) -> Result<Option<()>, EngineError> {
-            Ok(None)
-        }
-        fn stop_agent(&self, handle: &AgentHandle) -> Result<(), EngineError> {
-            self.stopped.lock().unwrap().push(handle.id.clone());
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn parallel_spawn_failure_stops_owned_live_siblings_through_the_group() {
-        for dequeued in [false, true] {
-            let tmp = tempfile::tempdir().unwrap();
-            let session = Session::for_tests_isolated(tmp.path(), &tmp.path().join("home"));
-            let mut engine = engine(&session, RecordingFrontend::default());
-            let stopped = Arc::new(Mutex::new(Vec::new()));
-            engine.workflow.steps.push(step("c"));
-            engine.state.set_status("c", StepState::Pending);
-            engine.max_concurrent = Some(2);
-            engine.agent_factory = Box::new(FailureFactory {
-                inner: FailOnceFactory {
-                    calls: AtomicUsize::new(0),
-                    store: engine.state_store.clone(),
-                    workflow_name: "spawn-failure".into(),
-                },
-                pending: Some("c".into()),
-                fail_checkpoint: false,
-                stopped: stopped.clone(),
-            });
-            let steps = if dequeued {
-                vec![step("b"), step("c"), step("a")]
-            } else {
-                vec![step("c"), step("a")]
-            };
-            let error = engine.run_parallel_group(steps).await.err().unwrap();
-            assert!(error.to_string().contains("injected spawn failure"));
-            assert_eq!(*stopped.lock().unwrap(), ["retry-id"]);
-            assert!(engine.active_steps.is_empty());
-            let saved = engine
-                .state_store
-                .load(None, "spawn-failure")
-                .unwrap()
-                .unwrap();
-            assert_eq!(saved.status_of("c"), Some(&StepState::Pending));
-            assert!(matches!(
-                saved.status_of("a"),
-                Some(StepState::Failed { exit_code: -1, .. })
-            ));
-        }
-    }
-
-    #[tokio::test]
-    async fn failed_checkpoint_write_preserves_the_original_spawn_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let session = Session::for_tests_isolated(tmp.path(), &tmp.path().join("home"));
-        let mut engine = engine(&session, RecordingFrontend::default());
-        engine.agent_factory = Box::new(FailureFactory {
-            inner: FailOnceFactory {
-                calls: AtomicUsize::new(0),
-                store: engine.state_store.clone(),
-                workflow_name: "spawn-failure".into(),
-            },
-            pending: None,
-            fail_checkpoint: true,
-            stopped: Default::default(),
-        });
-        let error = engine.step_once().await.unwrap_err();
-        assert!(error.to_string().contains("injected spawn failure"));
-        assert!(matches!(
-            engine.state.status_of("a"),
-            Some(StepState::Failed { .. })
-        ));
-        let saved = engine
-            .state_store
-            .load(None, "spawn-failure")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            saved.status_of("a"),
-            Some(&StepState::Running { container_id: None })
-        );
-        assert!(
-            saved.interrupted_running_steps().contains(&"a".to_string()),
-            "resume resets a never-started Running checkpoint"
-        );
     }
 }

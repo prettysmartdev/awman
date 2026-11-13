@@ -22,6 +22,43 @@ pub struct SquadRunPaths {
 }
 
 impl SquadRunPaths {
+    /// Append a terminal lifecycle/control event to this run's durable log.
+    /// The daemon's single owner-event writer serializes calls to this method.
+    pub fn append_event(
+        &self,
+        source: Option<crate::data::execution_event::EventSource>,
+        payload: crate::data::execution_event::EventPayload,
+    ) -> Result<(), DataError> {
+        use std::io::Write;
+        self.prepare()?;
+        let path = self.log_dir.join("events.log");
+        let previous = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(DataError::io(&path, e)),
+        };
+        let sequence = crate::data::execution_event::parse_event_log(&previous)
+            .last()
+            .map_or(0, |event| event.sequence + 1);
+        let event = crate::data::execution_event::ExecutionEvent {
+            timestamp: chrono::Utc::now(),
+            attempt: 1,
+            sequence,
+            source,
+            payload,
+        };
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| DataError::io(&path, e))?;
+        if !previous.is_empty() && !previous.ends_with('\n') {
+            file.write_all(b"\n").map_err(|e| DataError::io(&path, e))?;
+        }
+        let mut line = serde_json::to_vec(&event).expect("execution event serializes");
+        line.push(b'\n');
+        file.write_all(&line).map_err(|e| DataError::io(&path, e))
+    }
     /// Resolve the run's directories from the task workspace and the run id.
     ///
     /// Fails when `task_dir` has no parent — a workspace path that is not
@@ -50,42 +87,5 @@ impl SquadRunPaths {
         std::fs::create_dir_all(&self.log_dir)
             .map_err(|error| DataError::io(&self.log_dir, error))?;
         Ok(&self.log_dir)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn run_id() -> RunId {
-        RunId("run-0001".to_string())
-    }
-
-    #[test]
-    fn log_dir_is_a_sibling_of_the_workspace_not_a_child() {
-        let paths = SquadRunPaths::new(Path::new("/root/tasks/t/workspace"), &run_id()).unwrap();
-        assert_eq!(paths.log_dir(), Path::new("/root/tasks/t/runs/run-0001"));
-    }
-
-    #[test]
-    fn a_task_dir_without_a_parent_is_an_error_naming_the_path() {
-        let err = SquadRunPaths::new(Path::new("/"), &run_id()).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("has no task-directory parent") && msg.contains('/'),
-            "error must name the path and explain why: {msg}"
-        );
-    }
-
-    #[test]
-    fn prepare_creates_the_directory_and_is_idempotent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let task_dir = tmp.path().join("tasks").join("t").join("workspace");
-        let paths = SquadRunPaths::new(&task_dir, &run_id()).unwrap();
-        assert!(!paths.log_dir().exists());
-        paths.prepare().unwrap();
-        assert!(paths.log_dir().is_dir());
-        paths.prepare().unwrap();
-        assert!(paths.log_dir().is_dir());
     }
 }

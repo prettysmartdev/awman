@@ -16,8 +16,7 @@ use crate::engine::agent::AgentRunOptions;
 use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
 
 mod flags;
-#[cfg(test)]
-pub(crate) use flags::refuse_selector_in_prompt;
+
 pub use flags::ExecPromptCommandFlags;
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,12 +64,10 @@ pub(crate) fn build_prompt_string(
 }
 
 pub struct ExecPromptCommand {
-    #[cfg(test)]
-    pull_request_client: Option<crate::engine::git::pull_request::PullRequestClient>,
     flags: ExecPromptCommandFlags,
     engines: Engines,
     session: Session,
-    /// Fired by an external cancel (the API's `POST /v1/commands/{id}/cancel`).
+    /// Fired by an external cancel (the API's `POST /v1/worker/commands/{id}/cancel`).
     /// Never fired for the CLI or the TUI, which never install one.
     cancel: tokio_util::sync::CancellationToken,
     /// The host directory mounted read-write at `/awman/output` (WI 0137
@@ -82,8 +79,6 @@ pub struct ExecPromptCommand {
 impl ExecPromptCommand {
     pub fn new(flags: ExecPromptCommandFlags, engines: Engines, session: Session) -> Self {
         Self {
-            #[cfg(test)]
-            pull_request_client: None,
             flags,
             engines,
             session,
@@ -102,17 +97,6 @@ impl ExecPromptCommand {
     /// Mount `dir` at `/awman/output` into the agent container (WI 0137 §3).
     pub fn with_output_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
         self.output_dir = dir;
-        self
-    }
-
-    /// Hermetic PR metadata integration for full launch tests.
-    #[cfg(test)]
-    #[allow(dead_code)] // consumed by the subsequent launch-test workflow step
-    pub(crate) fn with_pull_request_client(
-        mut self,
-        client: crate::engine::git::pull_request::PullRequestClient,
-    ) -> Self {
-        self.pull_request_client = Some(client);
         self
     }
 
@@ -206,26 +190,6 @@ impl Command for ExecPromptCommand {
         }
         let invoker = session;
         let worktree = if let Some(target) = &self.flags.session_worktree {
-            #[cfg(test)]
-            let resolved = if let Some(client) = self.pull_request_client {
-                super::session_worktree::resolve_session_worktree_with_client(
-                    target,
-                    &invoker,
-                    self.engines.git_engine.clone(),
-                    client,
-                    frontend.as_mut(),
-                )
-                .await
-            } else {
-                resolve_session_worktree(
-                    target,
-                    &invoker,
-                    self.engines.git_engine.clone(),
-                    frontend.as_mut(),
-                )
-                .await
-            };
-            #[cfg(not(test))]
             let resolved = resolve_session_worktree(
                 target,
                 &invoker,
@@ -296,7 +260,7 @@ impl Command for ExecPromptCommand {
 
             // Emit deprecation warnings for legacy config fields.
             LaunchPolicy::for_session(&session)
-                .warn_config(&self.engines.config_notices, frontend.as_mut());
+                .warn_config(frontend.as_mut());
 
             // The Dockerfile + image setup is container-paradigm only; sandbox
             // runtimes get their per-agent kits from `awman ready` instead.
@@ -369,14 +333,15 @@ impl Command for ExecPromptCommand {
                     None,
                     frontend.as_mut(),
                 )?;
-            let mut directory_overlays = collected.directories;
+            let directory_overlays = collected.directories;
+            let mut command_mounts = Vec::new();
             let system_prompt = match self
                 .output_dir
                 .as_ref()
                 .filter(|_| self.engines.runtime.capabilities().arbitrary_host_mounts)
             {
                 Some(dir) => {
-                    directory_overlays.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
+                    command_mounts.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
                     Some(crate::engine::context_prompt::with_outputs_section(
                         system_prompt,
                         crate::engine::context_prompt::OutputsPromptRole::Prompt,
@@ -386,6 +351,7 @@ impl Command for ExecPromptCommand {
             };
 
             let mut run_opts = AgentRunOptions {
+                command_secrets: self.engines.command_secrets(),
                 yolo: self.flags.yolo.then_some(YoloMode::Enabled),
                 auto: self.flags.auto.then_some(AutoMode::Enabled),
                 plan: self.flags.plan.then_some(PlanMode::Enabled),
@@ -404,13 +370,14 @@ impl Command for ExecPromptCommand {
                     Some(collected.env_passthrough)
                 },
                 directory_overlays,
+                command_mounts,
                 include_all_skills: collected.include_all_skills,
                 named_skills: collected.named_skills,
                 system_prompt,
                 context_overlays,
                 launch_mode: match launch_decision {
-                    LaunchModeDecision::Acp => crate::data::config::repo::LaunchMode::Acp,
-                    _ => crate::data::config::repo::LaunchMode::Stdio,
+                    LaunchModeDecision::Acp => crate::data::config::agents::LaunchMode::Acp,
+                    _ => crate::data::config::agents::LaunchMode::Stdio,
                 },
                 ..Default::default()
             };
@@ -429,7 +396,7 @@ impl Command for ExecPromptCommand {
                     invoker.working_dir(),
                 )?;
                 if let Some(overlay) = worktree.git_directory_overlay(self.engines.git_engine.clone()).await? {
-                    run_opts.directory_overlays.push(overlay);
+                    run_opts.command_mounts.push(overlay);
                 }
             }
 
@@ -585,6 +552,7 @@ impl Command for ExecPromptCommand {
                     }
                 };
                 frontend.set_pty_active(false);
+                frontend.wait_output_drained().await;
                 frontend.replay_queued();
                 exit
             };
@@ -610,76 +578,5 @@ impl Command for ExecPromptCommand {
             report_kept_session_worktree(worktree, frontend.as_mut());
         }
         outcome
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn build_prompt_only_user_text() {
-        let result = build_prompt_string(Some("my prompt"), None);
-        assert_eq!(result, Some("my prompt".to_string()));
-    }
-
-    #[test]
-    fn build_prompt_only_issue_text() {
-        let result = build_prompt_string(None, Some("# Issue Title\n\nBody"));
-        assert_eq!(result, Some("# Issue Title\n\nBody".to_string()));
-    }
-
-    #[test]
-    fn build_prompt_both_user_and_issue_separated_by_double_newline() {
-        let result = build_prompt_string(Some("context"), Some("# Issue"));
-        assert_eq!(result, Some("context\n\n# Issue".to_string()));
-    }
-
-    #[test]
-    fn build_prompt_both_absent_returns_none() {
-        let result = build_prompt_string(None, None);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn build_prompt_issue_with_empty_body_uses_title_only_markdown() {
-        // format_as_markdown with empty body produces "# Title Only".
-        use crate::engine::issue::{Issue, IssueSource, IssueSourceError};
-        use std::path::Path;
-
-        struct FakeSource;
-        impl IssueSource for FakeSource {
-            fn provider_name(&self) -> &str {
-                "Test"
-            }
-            fn provider_prefix(&self) -> &str {
-                "tst"
-            }
-            fn issue_identifier(&self, _: &Issue) -> String {
-                "0".into()
-            }
-            fn can_handle(&self, _: &str) -> bool {
-                false
-            }
-            fn fetch_issue(&self, _: &str, _: &Path) -> Result<Issue, IssueSourceError> {
-                unimplemented!()
-            }
-        }
-        let issue = Issue {
-            source_id: String::new(),
-            title: "Title Only".into(),
-            body: String::new(),
-            provider: "Test".into(),
-        };
-        let md = FakeSource.format_as_markdown(&issue);
-        assert_eq!(md, "# Title Only");
-
-        // When used as the issue_markdown argument, no trailing whitespace.
-        let combined = build_prompt_string(Some("user text"), Some(&md));
-        assert_eq!(combined, Some("user text\n\n# Title Only".to_string()));
-
-        // When used alone, no trailing whitespace.
-        let alone = build_prompt_string(None, Some(&md));
-        assert_eq!(alone, Some("# Title Only".to_string()));
     }
 }

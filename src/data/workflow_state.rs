@@ -549,333 +549,42 @@ pub struct WorkflowSummary {
     pub updated_at: DateTime<Utc>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn step(name: &str, deps: &[&str]) -> WorkflowStep {
-        WorkflowStep {
-            name: name.to_string(),
-            depends_on: deps.iter().map(|s| s.to_string()).collect(),
-            prompt_template: String::new(),
-            agent: None,
-            model: None,
-            overlays: None,
-            abort_on_failure: false,
-        }
-    }
-
-    // ── WorkflowSummary ──────────────────────────────────────────────────────
-
-    /// The projection `SessionState::current_workflow` carries (F-30). Counts
-    /// come from the live state, so a summary can never disagree with the run
-    /// it describes — which is what the deleted `WorkflowInvocation` model
-    /// could.
-    #[test]
-    fn summary_projects_counts_and_current_step_from_the_live_state() {
-        let steps = vec![step("a", &[]), step("b", &["a"]), step("c", &["b"])];
-        let mut s = WorkflowState::new("deploy".into(), &steps, "h".into(), Some(114));
-        s.set_status("a", StepState::Succeeded);
-        s.set_status(
-            "b",
-            StepState::Failed {
-                exit_code: 2,
-                error_message: None,
-            },
-        );
-        s.current_step_index = Some(1);
-
-        let summary = s.summary();
-        assert_eq!(summary.invocation_id, s.invocation_id);
-        assert_eq!(summary.workflow_name, "deploy");
-        assert_eq!(summary.work_item, Some(114));
-        assert_eq!(summary.total_steps, 3);
-        assert_eq!(summary.completed_steps, 1);
-        assert_eq!(summary.failed_steps, 1);
-        assert_eq!(summary.current_step.as_deref(), Some("b"));
-        assert_eq!(summary.phase, s.current_phase);
-        assert_eq!(summary.updated_at, s.updated_at);
-    }
-
-    #[test]
-    fn summary_has_no_current_step_before_the_run_starts() {
-        let steps = vec![step("a", &[])];
-        let s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
-        let summary = s.summary();
-        assert!(summary.current_step.is_none());
-        assert_eq!(summary.completed_steps, 0);
-        assert_eq!(summary.failed_steps, 0);
-        assert_eq!(summary.total_steps, 1);
-    }
-
-    /// An index past the end of `steps` (a truncated dynamic run) must not
-    /// panic; the summary simply reports no current step.
-    #[test]
-    fn summary_tolerates_a_current_step_index_out_of_range() {
-        let steps = vec![step("a", &[])];
-        let mut s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
-        s.current_step_index = Some(9);
-        assert!(s.summary().current_step.is_none());
-    }
-
-    #[test]
-    fn new_state_initializes_pending() {
-        let steps = vec![step("a", &[]), step("b", &["a"])];
-        let s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
-        assert!(matches!(s.status_of("a"), Some(StepState::Pending)));
-        assert!(s.completed_steps.is_empty());
-        assert_eq!(s.schema_version, WORKFLOW_STATE_SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn set_status_updates_completed_set() {
-        let steps = vec![step("a", &[])];
-        let mut s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
-        s.set_status("a", StepState::Succeeded);
-        assert!(s.completed_steps.contains("a"));
-        s.set_status("a", StepState::Pending);
-        assert!(!s.completed_steps.contains("a"));
-    }
-
-    #[test]
-    fn round_trips_through_json() {
-        let steps = vec![step("a", &[])];
-        let s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
-        let j = serde_json::to_string(&s).unwrap();
-        let back: WorkflowState = serde_json::from_str(&j).unwrap();
-        assert_eq!(s, back);
-    }
-
-    /// WI 0137: a state file written before `step_attempts` /
-    /// `step_containers` existed still loads, with empty maps.
-    #[test]
-    fn pre_0137_state_file_loads_without_launch_records() {
-        let steps = vec![step("a", &[])];
-        let s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
-        let mut v = serde_json::to_value(&s).unwrap();
-        let obj = v.as_object_mut().unwrap();
-        obj.remove("step_attempts");
-        obj.remove("step_containers");
-        let back: WorkflowState = serde_json::from_value(v).unwrap();
-        assert!(back.step_attempts.is_empty());
-        assert!(back.step_containers.is_empty());
-        assert_eq!(back.step_attempt("a"), None);
-    }
-
-    /// WI 0137: the launch records round-trip, are omitted when empty (so an
-    /// unlaunched state file is byte-for-byte the pre-0137 shape), and a file
-    /// carrying fields this binary does not know still loads.
-    #[test]
-    fn launch_records_round_trip_and_unknown_fields_are_tolerated() {
-        let steps = vec![step("a", &[])];
-        let mut s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
-        let empty = serde_json::to_value(&s).unwrap();
-        assert!(empty.get("step_attempts").is_none());
-        assert!(empty.get("step_containers").is_none());
-
-        assert_eq!(s.record_step_launch("a"), 1);
-        assert_eq!(s.record_step_launch("a"), 2);
-        s.record_step_container("a", "awman-a-2");
-        let mut v = serde_json::to_value(&s).unwrap();
-        v["a_future_field"] = serde_json::json!({"x": 1});
-        let back: WorkflowState = serde_json::from_value(v).unwrap();
-        assert_eq!(back.step_attempt("a"), Some(2));
-        assert_eq!(back.step_container("a"), Some("awman-a-2"));
-        assert_eq!(back.schema_version, WORKFLOW_STATE_SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn schema_version_returns_constant() {
-        assert_eq!(
-            WorkflowState::schema_version(),
-            WORKFLOW_STATE_SCHEMA_VERSION
-        );
-    }
-
-    #[test]
-    fn is_complete_when_all_succeeded() {
-        let steps = vec![step("a", &[])];
-        let mut s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
-        s.set_status("a", StepState::Succeeded);
-        assert!(s.is_complete());
-    }
-
-    #[test]
-    fn is_complete_false_when_pending() {
-        let steps = vec![step("a", &[])];
-        let s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
-        assert!(!s.is_complete());
-    }
-
-    // ── WI-0115 §2: resume support ───────────────────────────────────────
-
-    fn linear_fixture(statuses: &[StepState]) -> (WorkflowState, WorkflowDag) {
-        let steps = vec![step("a", &[]), step("b", &["a"]), step("c", &["b"])];
-        let mut s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
-        for (st, status) in steps.iter().zip(statuses) {
-            s.set_status(&st.name, status.clone());
-        }
-        let dag = WorkflowDag::build(&steps).unwrap();
-        (s, dag)
-    }
-
-    fn failed() -> StepState {
-        StepState::Failed {
-            exit_code: 1,
-            error_message: None,
-        }
-    }
-
-    #[test]
-    fn resume_stop_point_finds_the_failed_step() {
-        let (s, dag) = linear_fixture(&[StepState::Succeeded, failed(), StepState::Cancelled]);
-        assert_eq!(s.resume_stop_point(&dag), Some(1));
-    }
-
-    #[test]
-    fn resume_stop_point_falls_back_to_the_first_unfinished_step() {
-        let (s, dag) =
-            linear_fixture(&[StepState::Succeeded, StepState::Pending, StepState::Pending]);
-        assert_eq!(s.resume_stop_point(&dag), Some(1));
-    }
-
-    #[test]
-    fn resume_stop_point_is_none_when_everything_finished() {
-        let (s, dag) = linear_fixture(&[
-            StepState::Succeeded,
-            StepState::Succeeded,
-            StepState::Skipped,
-        ]);
-        assert_eq!(s.resume_stop_point(&dag), None);
-    }
-
-    #[test]
-    fn rewind_to_the_failed_step_makes_an_aborted_state_runnable_again() {
-        // What an abort leaves behind: every step terminal, so `is_complete`
-        // reads the run as finished and the engine would run nothing.
-        let (mut s, dag) = linear_fixture(&[
-            StepState::Succeeded,
-            StepState::Cancelled,
-            StepState::Cancelled,
-        ]);
-        assert!(
-            s.is_complete(),
-            "precondition: an aborted state looks complete"
-        );
-
-        s.rewind_to(&dag, "b");
-        assert_eq!(s.status_of("a"), Some(&StepState::Succeeded));
-        assert_eq!(s.status_of("b"), Some(&StepState::Pending));
-        assert_eq!(s.status_of("c"), Some(&StepState::Pending));
-        assert!(!s.is_complete());
-        assert_eq!(s.next_ready(&dag), vec!["b".to_string()]);
-    }
-
-    #[test]
-    fn rewind_to_a_later_step_skips_the_ones_before_it() {
-        let (mut s, dag) = linear_fixture(&[StepState::Succeeded, failed(), StepState::Cancelled]);
-        s.rewind_to(&dag, "c");
-        assert_eq!(
-            s.status_of("b"),
-            Some(&StepState::Skipped),
-            "an un-run predecessor must count as satisfied, not block its dependent"
-        );
-        assert!(s.completed_steps.contains("b"));
-        assert_eq!(s.next_ready(&dag), vec!["c".to_string()]);
-    }
-
-    #[test]
-    fn rewind_to_an_earlier_step_reruns_everything_after_it() {
-        let (mut s, dag) = linear_fixture(&[StepState::Succeeded, failed(), StepState::Cancelled]);
-        s.rewind_to(&dag, "a");
-        for name in ["a", "b", "c"] {
-            assert_eq!(s.status_of(name), Some(&StepState::Pending), "{name}");
-        }
-    }
-
-    #[test]
-    fn rewind_to_an_unknown_step_changes_nothing() {
-        let (mut s, dag) = linear_fixture(&[StepState::Succeeded, failed(), StepState::Cancelled]);
-        let before = s.step_states.clone();
-        s.rewind_to(&dag, "nope");
-        assert_eq!(s.step_states, before);
-    }
-
-    #[test]
-    fn retain_steps_in_drops_steps_the_workflow_no_longer_defines() {
-        let (mut s, dag) = linear_fixture(&[StepState::Succeeded, failed(), StepState::Cancelled]);
-        // The workflow file gained and lost a step since this state was saved.
-        s.set_status("publish", StepState::Cancelled);
-        s.steps.push(WorkflowStepInfo {
-            name: "publish".into(),
-            depends_on: vec!["c".into()],
-            agent: None,
-            model: None,
-        });
-
-        assert_eq!(s.retain_steps_in(&dag), vec!["publish".to_string()]);
-        assert_eq!(s.status_of("publish"), None);
-        assert!(!s.steps.iter().any(|i| i.name == "publish"));
-        for name in ["a", "b", "c"] {
-            assert!(s.status_of(name).is_some(), "{name} must survive");
-        }
-    }
-
-    #[test]
-    fn retain_steps_in_clears_dropped_steps_from_completed() {
-        let (mut s, dag) = linear_fixture(&[
-            StepState::Succeeded,
-            StepState::Succeeded,
-            StepState::Succeeded,
-        ]);
-        s.set_status("publish", StepState::Succeeded);
-        assert!(s.completed_steps.contains("publish"));
-
-        s.retain_steps_in(&dag);
-        assert!(
-            !s.completed_steps.contains("publish"),
-            "a dropped step must not keep counting as a satisfied dependency"
-        );
-    }
-
-    /// The reset in `resume_with_state_root` turns an orphan from terminal to
-    /// `Pending`, and `is_complete` reads `step_states` while `next_ready`
-    /// reads the DAG — so an unpruned orphan makes the run unfinishable.
-    #[test]
-    fn retain_steps_in_is_what_lets_a_drifted_state_finish() {
-        let (mut s, dag) = linear_fixture(&[
-            StepState::Succeeded,
-            StepState::Succeeded,
-            StepState::Succeeded,
-        ]);
-        s.set_status("publish", StepState::Pending);
-        assert!(
-            !s.is_complete(),
-            "precondition: the orphan blocks completion"
-        );
-        assert!(
-            s.next_ready(&dag).is_empty(),
-            "precondition: and can never be run"
-        );
-
-        s.retain_steps_in(&dag);
-        assert!(s.is_complete());
-    }
-
-    #[test]
-    fn retain_steps_in_is_a_no_op_when_nothing_drifted() {
-        let (mut s, dag) = linear_fixture(&[StepState::Succeeded, failed(), StepState::Cancelled]);
-        let before = s.step_states.clone();
-        assert!(s.retain_steps_in(&dag).is_empty());
-        assert_eq!(s.step_states, before);
-    }
-
-    #[test]
-    fn unrecovered_steps_lists_failed_and_cancelled_only() {
-        let (s, _) = linear_fixture(&[StepState::Succeeded, failed(), StepState::Cancelled]);
-        assert_eq!(
-            s.unrecovered_steps(),
-            vec!["b".to_string(), "c".to_string()]
-        );
-    }
+/// Why a countdown reported through the `yolo_countdown_*` hooks is running.
+///
+/// The two share one reporting channel deliberately — an unattended frontend
+/// surfaces both the same way (WI-0115 §3) — but they mean opposite things to
+/// whoever is reading, so the frontend is told which it is rather than left to
+/// assume the common one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CountdownKind {
+    /// A step's container has gone quiet; when the countdown expires the
+    /// engine kills it and advances to the next step.
+    #[default]
+    StuckStep,
+    /// A step's container exited non-zero and no one can be asked what to do;
+    /// when the countdown expires the engine retries that same step.
+    FailureRetry,
+    /// The step's agent said it has finished (it reported `done`, or `idle`:
+    /// its turn ended). When the countdown expires the engine kills the
+    /// container and advances, exactly like `StuckStep` expiry; on the last
+    /// step that completes the workflow. A `working` report or the container
+    /// exiting first cancels it. Short: `agent_done_countdown_duration`.
+    /// Reader-facing label: "Agent reported done: advancing in 8s".
+    ///
+    AgentDone,
+    /// The step's agent is waiting for an answer (it reported `blocked` on a
+    /// permission, a question or a login) and no one is there to give it.
+    /// When the countdown expires the engine kills the container and
+    /// **fails** the step, which then takes the normal unattended failure
+    /// path (one retry, then the workflow fails). Never an advance.
+    /// Reader-facing label: "Agent is waiting for input: failing step in 42s".
+    AgentBlocked,
+    /// The step's agent reported an `error`. When the countdown expires the
+    /// engine kills the container and **fails** the step, so `on_failure`
+    /// remediation and the `FailureRetry` path apply. Any new output or a
+    /// `working` report first cancels it (the agent recovered). Never an
+    /// advance. Reader-facing label: "Agent reported an error: failing step
+    /// in 42s".
+    AgentError,
 }

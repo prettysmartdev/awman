@@ -6,17 +6,42 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use super::transport::{CredentialSource, HostGitTransport, TransportGuard};
 use super::{CommitIdentity, GitCommand, GitEngine, GitFrontend};
-use crate::data::config::env::{host_var_os, GIT_SSH, GIT_SSH_COMMAND};
+use crate::data::git_transport::{GitTransportOp, SafeRemote};
 use crate::data::message::{MessageLevel, UserMessage};
 use crate::engine::error::EngineError;
 
 type Result<T> = std::result::Result<T, EngineError>;
 
 pub struct RemotePushGit {
+    env: crate::data::config::env::EnvSnapshot,
     private: tempfile::TempDir,
     repo: PathBuf,
     original: Option<(PathBuf, PathBuf)>,
+    transport: HostGitTransport,
+    remote: SafeRemote,
+    local_guard: Option<TransportGuard>,
+}
+
+/// Checked before and throughout every host Git operation of a lease.
+#[derive(Clone)]
+pub struct LeaseGitGuard {
+    pub cancel: tokio_util::sync::CancellationToken,
+    pub expiry: Option<tokio::sync::watch::Receiver<chrono::DateTime<chrono::Utc>>>,
+    pub deadline: chrono::DateTime<chrono::Utc>,
+}
+impl LeaseGitGuard {
+    pub fn check(&self) -> Result<()> {
+        let deadline = self
+            .expiry
+            .as_ref()
+            .map_or(self.deadline, |expiry| *expiry.borrow());
+        if self.cancel.is_cancelled() || chrono::Utc::now() >= deadline {
+            return Err(EngineError::Git("lease Git cancelled or expired".into()));
+        }
+        Ok(())
+    }
 }
 
 /// Repository metadata locations captured before any workflow agent runs.
@@ -32,10 +57,23 @@ fn io(error: std::io::Error) -> EngineError {
     EngineError::Git(format!("isolating push-back metadata: {error}"))
 }
 
+fn io_at(path: &Path, error: std::io::Error) -> EngineError {
+    EngineError::Git(format!(
+        "isolating push-back metadata at {}: {error}",
+        path.display()
+    ))
+}
+
 // Reject symlinks and special files, including directory symlinks. In particular,
 // never import objects/info/alternates, config, hooks, attributes or split indexes.
 fn copy_regular(source: &Path, dest: &Path) -> Result<()> {
-    crate::data::fs::git_metadata::GitMetadataCopy::copy(source, dest).map_err(io)
+    crate::data::fs::git_metadata::GitMetadataCopy::copy(source, dest).map_err(|error| {
+        EngineError::Git(format!(
+            "isolating push-back metadata copying {} to {}: {error}",
+            source.display(),
+            dest.display()
+        ))
+    })
 }
 
 impl GitEngine {
@@ -50,7 +88,7 @@ impl GitEngine {
 
     pub fn capture_workflow_git_source(&self, repo: &Path) -> Result<WorkflowGitSource> {
         let common = fs::canonicalize(self.git_common_dir(repo)?).map_err(io)?;
-        let output = super::host_command::command(repo)
+        let output = super::host_command::command(self.env(), repo)
             .args(["rev-parse", "--absolute-git-dir"])
             .current_dir(repo)
             .output()
@@ -99,6 +137,67 @@ impl GitEngine {
     }
 
     fn isolate_transport(&self, repo: &Path, metadata: &Path, url: &str) -> Result<RemotePushGit> {
+        self.isolate_transport_with(
+            repo,
+            metadata,
+            url,
+            HostGitTransport::user(CredentialSource::Ambient).allow_local(),
+        )
+    }
+
+    pub fn isolate_remote_push_with_transport(
+        &self,
+        repo: &Path,
+        url: &str,
+        transport: HostGitTransport,
+    ) -> Result<RemotePushGit> {
+        let metadata = repo.join(".git");
+        if !fs::symlink_metadata(&metadata).map_err(io)?.is_dir() {
+            return Err(EngineError::Git(
+                "remote clone must have a real .git directory".into(),
+            ));
+        }
+        self.isolate_transport_with(repo, &metadata, url, transport)
+    }
+
+    pub fn isolate_remote_push_guarded(
+        &self,
+        repo: &Path,
+        url: &str,
+        transport: HostGitTransport,
+        guard: TransportGuard,
+    ) -> Result<RemotePushGit> {
+        let metadata = repo.join(".git");
+        if !fs::symlink_metadata(&metadata).map_err(io)?.is_dir() {
+            return Err(EngineError::Git(
+                "remote clone must have a real .git directory".into(),
+            ));
+        }
+        self.isolate_transport_with_guard(repo, &metadata, url, transport, Some(guard))
+    }
+
+    fn isolate_transport_with(
+        &self,
+        repo: &Path,
+        metadata: &Path,
+        url: &str,
+        transport: HostGitTransport,
+    ) -> Result<RemotePushGit> {
+        self.isolate_transport_with_guard(repo, metadata, url, transport, None)
+    }
+    fn isolate_transport_with_guard(
+        &self,
+        repo: &Path,
+        metadata: &Path,
+        url: &str,
+        transport: HostGitTransport,
+        local_guard: Option<TransportGuard>,
+    ) -> Result<RemotePushGit> {
+        if let Some(guard) = &local_guard {
+            guard.check()?;
+        }
+        transport.check_url(url)?;
+        let repo = fs::canonicalize(repo).map_err(io)?;
         // A sibling of the clone is outside its bind mount even when the
         // server's TMPDIR was configured inside the repository.
         let parent = repo
@@ -107,30 +206,37 @@ impl GitEngine {
         let private = tempfile::Builder::new()
             .prefix("awman-push-")
             .tempdir_in(parent)
-            .map_err(io)?;
+            .map_err(|error| io_at(parent, error))?;
         let git = RemotePushGit {
+            env: self.env().clone(),
             private,
             repo: repo.to_path_buf(),
             original: None,
+            transport,
+            remote: SafeRemote::from_url(url),
+            local_guard,
         };
         let dir = git.private.path();
-        fs::create_dir_all(dir.join("objects")).map_err(io)?;
-        fs::create_dir_all(dir.join("refs")).map_err(io)?;
+        fs::create_dir_all(dir.join("objects"))
+            .map_err(|error| io_at(&dir.join("objects"), error))?;
+        fs::create_dir_all(dir.join("refs")).map_err(|error| io_at(&dir.join("refs"), error))?;
         copy_regular(&metadata.join("HEAD"), &dir.join("HEAD"))?;
         for name in ["refs", "packed-refs", "shallow"] {
             let source = metadata.join(name);
-            if source.try_exists().map_err(io)? {
+            if source.try_exists().map_err(|error| io_at(&source, error))? {
                 copy_regular(&source, &dir.join(name))?;
             }
         }
         if !fs::symlink_metadata(metadata.join("objects"))
-            .map_err(io)?
+            .map_err(|error| io_at(&metadata.join("objects"), error))?
             .is_dir()
         {
             return Err(EngineError::Git("unsafe Git objects directory".into()));
         }
-        for entry in fs::read_dir(metadata.join("objects")).map_err(io)? {
-            let entry = entry.map_err(io)?;
+        for entry in fs::read_dir(metadata.join("objects"))
+            .map_err(|error| io_at(&metadata.join("objects"), error))?
+        {
+            let entry = entry.map_err(|error| io_at(&metadata.join("objects"), error))?;
             if entry.file_name() != "info" {
                 copy_regular(&entry.path(), &dir.join("objects").join(entry.file_name()))?;
             }
@@ -140,7 +246,7 @@ impl GitEngine {
             dir.join("config"),
             "[core]\nrepositoryformatversion = 0\nbare = false\n",
         )
-        .map_err(io)?;
+        .map_err(|error| io_at(&dir.join("config"), error))?;
         let mut sink = crate::data::message::RecordingMessageSink::new();
         git.run(&["config", "remote.origin.url", url], false, &mut sink)?;
         git.run(
@@ -159,13 +265,20 @@ impl GitEngine {
         copy_regular(&metadata.join("config"), &local)?;
         {
             for key in ["user.name", "user.email", "extensions.objectformat"] {
-                let output = Command::new("git")
+                let mut probe = crate::engine::host_cli::command(&self.env.for_lease_git(), "git");
+                probe
                     .args(["config", "--no-includes", "--file"])
-                    .arg(&local)
+                    // Keep Git's path parser away from Windows verbatim paths.
+                    .arg("source-config")
                     .args(["--get", key])
-                    .current_dir(dir)
-                    .output()
-                    .map_err(io)?;
+                    .current_dir(dir);
+                let output = git
+                    .local_guard
+                    .clone()
+                    .unwrap_or_else(|| {
+                        TransportGuard::new(tokio_util::sync::CancellationToken::new())
+                    })
+                    .output(&mut probe)?;
                 if output.status.success() {
                     let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if key == "extensions.objectformat" {
@@ -181,15 +294,32 @@ impl GitEngine {
                         )?;
                     }
                     git.run(&["config", key, &value], false, &mut sink)?;
+                } else if output.status.code() != Some(1) {
+                    // Exit 1 means the key is absent. A read/parse error must
+                    // not silently discard identity or the object format.
+                    return Err(EngineError::Git(format!(
+                        "read isolated Git config: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )));
                 }
             }
         }
-        fs::remove_file(&local).map_err(io)?;
+        fs::remove_file(&local).map_err(|error| io_at(&local, error))?;
         Ok(git)
     }
 }
 
 impl RemotePushGit {
+    /// Use the lease transport for this push-back's `ls-remote` and push.
+    pub fn with_lease_transport(
+        mut self,
+        transport: super::lease_transport::LeaseTransport,
+    ) -> Self {
+        self.env = self.env.for_lease_git();
+        self.transport = transport.host_transport();
+        self
+    }
+
     pub fn metadata_dir(&self) -> &Path {
         self.private.path()
     }
@@ -247,32 +377,53 @@ impl RemotePushGit {
         Ok(())
     }
     fn run(&self, args: &[&str], transport: bool, sink: &mut dyn GitFrontend) -> Result<Output> {
-        let display = GitCommand::new(args);
-        sink.command_started(&display);
-        let mut command = Command::new("git");
+        self.run_guarded(args, transport, sink, None)
+    }
+
+    /// The Git command (before subcommand arguments) for one operation on
+    /// the private metadata. Every transport call (`ls-remote`, `push`) is
+    /// built by [`HostGitTransport::command`], exactly like clone and
+    /// setup fetch for that session or lease; everything else uses the
+    /// local hardening below. Public so its isolation (environment, pinned
+    /// settings, helper) can be inspected without running it.
+    pub fn command(&self, transport: bool) -> Result<Command> {
+        self.command_guarded(
+            transport,
+            &self
+                .local_guard
+                .clone()
+                .unwrap_or_else(|| TransportGuard::new(tokio_util::sync::CancellationToken::new())),
+        )
+    }
+    fn command_guarded(&self, transport: bool, guard: &TransportGuard) -> Result<Command> {
+        const PUSH_SETTINGS: [&str; 4] = [
+            "-c",
+            "push.followTags=false",
+            "-c",
+            "push.recurseSubmodules=no",
+        ];
+        let mut command = if transport {
+            self.transport
+                .command_guarded(&self.env, self.private.path(), "origin", guard)?
+        } else {
+            super::host_command::command_guarded(
+                &self.env.for_lease_git(),
+                self.private.path(),
+                guard,
+            )?
+        };
+        command.args(PUSH_SETTINGS);
         command
-            .args([
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "commit.gpgSign=false",
-                "-c",
-                "push.gpgSign=false",
-                "-c",
-                "push.followTags=false",
-                "-c",
-                "push.recurseSubmodules=no",
-                "-c",
-                "maintenance.auto=false",
-                "-c",
-                "gc.auto=0",
-            ])
-            .args(args)
             .current_dir(self.private.path())
-            .env("GIT_DIR", self.private.path())
-            .env("GIT_WORK_TREE", &self.repo)
+            // Git parses these paths itself; Rust's Windows canonical paths
+            // use the verbatim prefix, which Git's repository discovery does
+            // not accept here. Both locations are siblings, so relative paths
+            // avoid translating or weakening the pinned filesystem paths.
+            .env("GIT_DIR", ".")
+            .env(
+                "GIT_WORK_TREE",
+                Path::new("..").join(self.repo.file_name().expect("clone has a parent")),
+            )
             .env("GIT_NO_REPLACE_OBJECTS", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env_remove("GIT_INDEX_FILE")
@@ -284,12 +435,37 @@ impl RemotePushGit {
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1");
         }
-        // The host's chosen SSH executable/options remain trusted; add BatchMode
-        // when no explicit override was selected, so ssh cannot prompt either.
-        if transport && host_var_os(GIT_SSH_COMMAND).is_none() && host_var_os(GIT_SSH).is_none() {
-            command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+        Ok(command)
+    }
+    fn run_guarded(
+        &self,
+        args: &[&str],
+        transport: bool,
+        sink: &mut dyn GitFrontend,
+        guard: Option<&LeaseGitGuard>,
+    ) -> Result<Output> {
+        if let Some(guard) = guard {
+            guard.check()?;
         }
-        let output = bounded_output(&mut command, std::time::Duration::from_secs(120))?;
+        if transport {
+            let mut transport_guard = guard
+                .map(TransportGuard::from)
+                .unwrap_or_else(|| TransportGuard::new(tokio_util::sync::CancellationToken::new()));
+            transport_guard.timeout = super::push_retry::PUSH_FIRST_ATTEMPT_TIMEOUT;
+            return self.run_transport(args, sink, &transport_guard);
+        }
+        let display = GitCommand::new(args);
+        sink.command_started(&display);
+        let mut command = self.command(false)?;
+        command.args(args);
+        let output = if let Some(local) = &self.local_guard {
+            local.output(&mut command)?
+        } else {
+            bounded_output_guarded(&mut command, std::time::Duration::from_secs(120), guard)?
+        };
+        if let Some(guard) = guard {
+            guard.check()?;
+        }
         for line in String::from_utf8_lossy(&output.stdout)
             .lines()
             .chain(String::from_utf8_lossy(&output.stderr).lines())
@@ -310,6 +486,80 @@ impl RemotePushGit {
         Ok(output)
     }
 
+    /// One `ls-remote` or `push` through the shared transport runner.
+    fn run_transport(
+        &self,
+        args: &[&str],
+        sink: &mut dyn GitFrontend,
+        guard: &TransportGuard,
+    ) -> Result<Output> {
+        let op = match args.first().copied() {
+            Some("ls-remote") => GitTransportOp::LsRemote,
+            Some("push") => GitTransportOp::Push,
+            _ => {
+                return Err(EngineError::Git(
+                    "unsupported push transport operation".into(),
+                ))
+            }
+        };
+        self.transport.run(
+            self.command_guarded(true, guard)?,
+            args,
+            op,
+            &self.remote,
+            sink,
+            guard,
+        )
+    }
+
+    /// The remote identifier this push-back publishes to (never a credential).
+    pub fn remote(&self) -> &SafeRemote {
+        &self.remote
+    }
+
+    /// Head check: where `refs/heads/<branch>` points on the remote now,
+    /// bounded by `guard` (cancellation, deadline/expiry, process timeout).
+    pub fn remote_head(
+        &self,
+        branch: &str,
+        sink: &mut dyn GitFrontend,
+        guard: &TransportGuard,
+    ) -> Result<Option<String>> {
+        let name = format!("refs/heads/{branch}");
+        let output = self.run_transport(&["ls-remote", "--refs", "origin", &name], sink, guard)?;
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| {
+                let (sha, reference) = line.split_once('\t')?;
+                (reference == name).then(|| sha.to_string())
+            }))
+    }
+
+    /// One push of `HEAD` to `refs/heads/<branch>`: never forced, never
+    /// repeated by this method. Retry and the head check between attempts
+    /// belong to [`super::push_publish::PushPublisher`].
+    pub fn push_head(
+        &self,
+        branch: &str,
+        sink: &mut dyn GitFrontend,
+        guard: &TransportGuard,
+    ) -> Result<()> {
+        let refspec = format!("HEAD:refs/heads/{branch}");
+        self.run_transport(&["push", "origin", &refspec], sink, guard)?;
+        guard.check()
+    }
+
+    /// Mirror a publication of `sha` to `branch` into the clone: its
+    /// upstream configuration and remote-tracking ref. Used after a push
+    /// and after a head check found the push had already landed (its
+    /// response was lost), so both leave the clone in the same state.
+    pub fn record_published(&self, branch: &str, sha: &str) -> Result<()> {
+        let mut sink = crate::data::message::RecordingMessageSink::new();
+        let reference = format!("refs/remotes/origin/{branch}");
+        self.run(&["update-ref", &reference, sha], false, &mut sink)?;
+        self.mirror_upstream(branch)
+    }
+
     fn text(&self, args: &[&str], transport: bool, sink: &mut dyn GitFrontend) -> Result<String> {
         Ok(
             String::from_utf8_lossy(&self.run(args, transport, sink)?.stdout)
@@ -321,6 +571,15 @@ impl RemotePushGit {
     pub fn head(&self, sink: &mut dyn GitFrontend) -> Result<String> {
         self.text(&["rev-parse", "--verify", "HEAD^{commit}"], false, sink)
     }
+    pub fn head_guarded(&self, guard: &TransportGuard) -> Result<String> {
+        let mut command = self.command_guarded(false, guard)?;
+        command.args(["rev-parse", "--verify", "HEAD^{commit}"]);
+        let output = guard.output(&mut command)?;
+        if !output.status.success() {
+            return Err(EngineError::Git("cannot resolve intended HEAD".into()));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().into())
+    }
 
     pub fn origin_sha(&self, branch: &str, sink: &mut dyn GitFrontend) -> Result<Option<String>> {
         let name = format!("refs/heads/{branch}");
@@ -329,6 +588,38 @@ impl RemotePushGit {
             let (sha, reference) = line.split_once('\t')?;
             (reference == name).then(|| sha.to_string())
         }))
+    }
+
+    pub fn origin_sha_guarded(
+        &self,
+        branch: &str,
+        sink: &mut dyn GitFrontend,
+        guard: &LeaseGitGuard,
+    ) -> Result<Option<String>> {
+        let name = format!("refs/heads/{branch}");
+        let output = self.run_guarded(
+            &["ls-remote", "--refs", "origin", &name],
+            true,
+            sink,
+            Some(guard),
+        )?;
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| {
+                let (sha, reference) = line.split_once('\t')?;
+                (reference == name).then(|| sha.to_string())
+            }))
+    }
+    pub fn push_guarded(
+        &self,
+        branch: &str,
+        sink: &mut dyn GitFrontend,
+        guard: &LeaseGitGuard,
+    ) -> Result<String> {
+        let refspec = format!("HEAD:refs/heads/{branch}");
+        self.run_guarded(&["push", "origin", &refspec], true, sink, Some(guard))?;
+        guard.check()?;
+        self.head(sink)
     }
 
     pub fn has_unpublished_commits(&self, sink: &mut dyn GitFrontend) -> Result<bool> {
@@ -347,16 +638,47 @@ impl RemotePushGit {
     }
 
     pub fn commit_leftovers(&self, message: &str, sink: &mut dyn GitFrontend) -> Result<()> {
+        self.commit_leftovers_impl(message, sink, None)
+    }
+    pub fn commit_leftovers_guarded(
+        &self,
+        message: &str,
+        sink: &mut dyn GitFrontend,
+        guard: &LeaseGitGuard,
+    ) -> Result<()> {
+        self.commit_leftovers_impl(message, sink, Some(guard))
+    }
+    fn text_guarded(
+        &self,
+        args: &[&str],
+        transport: bool,
+        sink: &mut dyn GitFrontend,
+        guard: Option<&LeaseGitGuard>,
+    ) -> Result<String> {
+        Ok(
+            String::from_utf8_lossy(&self.run_guarded(args, transport, sink, guard)?.stdout)
+                .trim()
+                .into(),
+        )
+    }
+    fn commit_leftovers_impl(
+        &self,
+        message: &str,
+        sink: &mut dyn GitFrontend,
+        guard: Option<&LeaseGitGuard>,
+    ) -> Result<()> {
         // Use host identity when local identity is absent, but never import other
         // global config (filters, signing, etc.) into work-tree operations.
         let mut fallback_used = false;
         for key in ["user.name", "user.email"] {
-            let configured = self.text(&["config", "--get", key], false, sink).ok();
+            let configured = self
+                .text_guarded(&["config", "--get", key], false, sink, guard)
+                .ok();
             if configured.as_deref().is_none_or(str::is_empty) {
-                let host = Command::new("git")
+                let host = crate::engine::host_cli::command(&self.env, "git")
                     .args(["config", "--get", key])
                     .current_dir(self.private.path())
-                    .env("GIT_DIR", self.private.path())
+                    .env("GIT_DIR", ".")
                     .output()
                     .map_err(io)?;
                 let value = String::from_utf8_lossy(&host.stdout).trim().to_string();
@@ -366,7 +688,7 @@ impl RemotePushGit {
                 } else {
                     super::FALLBACK_COMMIT_EMAIL
                 };
-                self.run(
+                self.run_guarded(
                     &[
                         "config",
                         key,
@@ -374,12 +696,13 @@ impl RemotePushGit {
                     ],
                     false,
                     sink,
+                    guard,
                 )?;
             }
         }
         let identity = CommitIdentity {
-            name: self.text(&["config", "--get", "user.name"], false, sink)?,
-            email: self.text(&["config", "--get", "user.email"], false, sink)?,
+            name: self.text_guarded(&["config", "--get", "user.name"], false, sink, guard)?,
+            email: self.text_guarded(&["config", "--get", "user.email"], false, sink, guard)?,
             fallback: fallback_used,
             overrides: Vec::new(),
         };
@@ -388,13 +711,14 @@ impl RemotePushGit {
             text: identity.describe(),
         });
         // Start at HEAD so staging reflects the worktree's current state.
-        self.run(&["read-tree", "HEAD"], false, sink)?;
-        self.run(&["add", "-A", "--", "."], false, sink)?;
+        self.run_guarded(&["read-tree", "HEAD"], false, sink, guard)?;
+        self.run_guarded(&["add", "-A", "--", "."], false, sink, guard)?;
         // --exit-code=1 means changes, so use the name list rather than swallowing
         // failures of diff as if they meant an empty index.
-        let changed = self.text(&["diff", "--cached", "--name-only"], false, sink)?;
+        let changed =
+            self.text_guarded(&["diff", "--cached", "--name-only"], false, sink, guard)?;
         if !changed.is_empty() {
-            self.run(&["commit", "-m", message], false, sink)?;
+            self.run_guarded(&["commit", "-m", message], false, sink, guard)?;
             self.save_commit()?;
         }
         Ok(())
@@ -404,12 +728,18 @@ impl RemotePushGit {
         // Copy inert commit objects/index back even if the subsequent push fails.
         // The original metadata is never used as a Git execution context.
         let metadata = self.repo.join(".git");
-        ensure_no_links(&metadata)?;
+        let (common, admin) = self
+            .original
+            .as_ref()
+            .map(|(common, admin)| (common.as_path(), admin.as_path()))
+            .unwrap_or((&metadata, &metadata));
+        ensure_no_links(common)?;
+        ensure_no_links(admin)?;
         copy_new_objects(
             &self.private.path().join("objects"),
-            &metadata.join("objects"),
+            &common.join("objects"),
         )?;
-        copy_regular(&self.private.path().join("index"), &metadata.join("index"))?;
+        copy_regular(&self.private.path().join("index"), &admin.join("index"))?;
         let head = fs::read_to_string(self.private.path().join("HEAD")).map_err(io)?;
         if let Some(reference) = head.trim().strip_prefix("ref: ") {
             if !reference.starts_with("refs/heads/")
@@ -419,10 +749,10 @@ impl RemotePushGit {
             }
             copy_regular(
                 &self.private.path().join(reference),
-                &metadata.join(reference),
+                &common.join(reference),
             )?;
         } else {
-            copy_regular(&self.private.path().join("HEAD"), &metadata.join("HEAD"))?;
+            copy_regular(&self.private.path().join("HEAD"), &admin.join("HEAD"))?;
         }
         Ok(())
     }
@@ -430,10 +760,20 @@ impl RemotePushGit {
     pub fn push(&self, branch: &str, sink: &mut dyn GitFrontend) -> Result<String> {
         let refspec = format!("HEAD:refs/heads/{branch}");
         self.run(&["push", "-u", "origin", &refspec], true, sink)?;
+        self.mirror_upstream(branch)?;
+        self.head(sink)
+    }
+
+    fn mirror_upstream(&self, branch: &str) -> Result<()> {
         // Mirror the new upstream in the clone using config-file-only operations.
         // Parsing that file does not run its hooks, helpers or includes.
-        let metadata = self.repo.join(".git");
-        ensure_no_links(&metadata)?;
+        let fallback = self.repo.join(".git");
+        let metadata = self
+            .original
+            .as_ref()
+            .map(|(common, _)| common.as_path())
+            .unwrap_or(&fallback);
+        ensure_no_links(metadata)?;
         for (key, value) in [
             (format!("branch.{branch}.remote"), "origin".to_string()),
             (
@@ -441,25 +781,39 @@ impl RemotePushGit {
                 format!("refs/heads/{branch}"),
             ),
         ] {
-            let output = Command::new("git")
+            let mut probe = crate::engine::host_cli::command(&self.env.for_lease_git(), "git");
+            probe
                 .args(["config", "--no-includes", "--file"])
-                .arg(metadata.join("config"))
+                .arg("config")
                 .args([&key, &value])
-                .current_dir(self.private.path())
-                .output()
-                .map_err(io)?;
+                // This is an explicit file-only config edit, never a worktree
+                // or transport operation against the original repository.
+                .current_dir(metadata);
+            let output = self
+                .local_guard
+                .clone()
+                .unwrap_or_else(|| TransportGuard::new(tokio_util::sync::CancellationToken::new()))
+                .output(&mut probe)?;
             if !output.status.success() {
                 return Err(EngineError::Git(
-                    String::from_utf8_lossy(&output.stderr).into(),
+                    "cannot record published branch configuration".into(),
                 ));
             }
         }
         let reference = format!("refs/remotes/origin/{branch}");
-        copy_regular(
-            &self.private.path().join(&reference),
-            &metadata.join(reference),
-        )?;
-        self.head(sink)
+        let source = self.private.path().join(&reference);
+        if !source.exists() {
+            // An up-to-date push can leave this ref packed. Materialize the
+            // resolved hash in our private metadata before the safe copy.
+            let sha = self.text(
+                &["rev-parse", "--verify", &reference],
+                false,
+                &mut crate::data::message::RecordingMessageSink::new(),
+            )?;
+            fs::create_dir_all(source.parent().expect("ref parent")).map_err(io)?;
+            fs::write(&source, format!("{sha}\n")).map_err(io)?;
+        }
+        copy_regular(&source, &metadata.join(reference))
     }
 }
 
@@ -495,7 +849,14 @@ fn copy_new_objects(source: &Path, dest: &Path) -> Result<()> {
 }
 
 /// File-backed capture avoids hanging on descendant-held stdout/stderr pipes.
-fn bounded_output(command: &mut Command, timeout: std::time::Duration) -> Result<Output> {
+fn bounded_output_guarded(
+    command: &mut Command,
+    timeout: std::time::Duration,
+    guard: Option<&LeaseGitGuard>,
+) -> Result<Output> {
+    if let Some(guard) = guard {
+        guard.check()?;
+    }
     use std::io::{Read, Seek};
     let mut stdout = tempfile::tempfile().map_err(io)?;
     let mut stderr = tempfile::tempfile().map_err(io)?;
@@ -514,7 +875,7 @@ fn bounded_output(command: &mut Command, timeout: std::time::Duration) -> Result
         if let Some(status) = child.try_wait().map_err(io)? {
             break status;
         }
-        if start.elapsed() >= timeout {
+        if start.elapsed() >= timeout || guard.is_some_and(|guard| guard.check().is_err()) {
             #[cfg(unix)]
             let _ = nix::sys::signal::killpg(
                 nix::unistd::Pid::from_raw(child.id() as i32),
@@ -522,6 +883,9 @@ fn bounded_output(command: &mut Command, timeout: std::time::Duration) -> Result
             );
             let _ = child.kill();
             let _ = child.wait();
+            if let Some(guard) = guard {
+                guard.check()?;
+            }
             return Err(EngineError::Git(
                 "host push-back Git operation timed out".into(),
             ));
@@ -545,188 +909,6 @@ fn bounded_output(command: &mut Command, timeout: std::time::Duration) -> Result
     })
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn isolated_host_commit_preserves_sha256_object_format() {
-        let root = tempfile::tempdir().unwrap();
-        let repo = root.path().join("clone");
-        std::fs::create_dir(&repo).unwrap();
-        let run = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repo)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{args:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
-        run(&["init", "-q", "-b", "main", "--object-format=sha256"]);
-        std::fs::write(repo.join("base"), "base").unwrap();
-        run(&["add", "-A"]);
-        run(&[
-            "-c",
-            "user.name=T",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "base",
-        ]);
-        let engine = super::GitEngine::new();
-        let before = engine.head_sha(&repo).unwrap();
-        assert_eq!(before.len(), 64);
-        let git = engine
-            .isolate_remote_push(&repo, "git://127.0.0.1:9/unused")
-            .unwrap();
-        let mut sink = crate::data::message::RecordingMessageSink::new();
-        assert_eq!(git.head(&mut sink).unwrap(), before);
-        std::fs::write(repo.join("edit"), "edit").unwrap();
-        git.commit_leftovers("leftovers", &mut sink).unwrap();
-        let after = git.head(&mut sink).unwrap();
-        assert_eq!(after.len(), 64);
-        assert_ne!(before, after);
-        assert_eq!(engine.head_sha(&repo).unwrap(), after);
-    }
-
-    #[test]
-    fn host_git_timeout_kills_a_stalled_process() {
-        let mut command = std::process::Command::new("sh");
-        command.args(["-c", "sleep 10"]);
-        let start = std::time::Instant::now();
-        let error =
-            super::bounded_output(&mut command, std::time::Duration::from_millis(30)).unwrap_err();
-        assert!(error.to_string().contains("timed out"));
-        assert!(start.elapsed() < std::time::Duration::from_secs(2));
-    }
-}
-
-#[cfg(test)]
-mod workflow_review_tests {
-    use super::*;
-    #[test]
-    fn isolated_workflow_transport_omits_agent_hooks_rewrites_and_pushurl() {
-        let repo = tempfile::tempdir().unwrap();
-        assert!(Command::new("git")
-            .args(["init", "-q"])
-            .arg(repo.path())
-            .status()
-            .unwrap()
-            .success());
-        let git = GitEngine::new();
-        let config = repo.path().join(".git/config");
-        fs::write(&config, "[core]\nrepositoryformatversion=0\n[remote \"origin\"]\nurl=https://approved.test/o/r\npushurl=https://evil.test/o/r\n[url \"https://evil.test/\"]\ninsteadOf=https://approved.test/\n[core]\nhooksPath=hooks\nsshCommand=evil\n").unwrap();
-        fs::write(repo.path().join(".git/hooks/pre-push"), "echo stolen").unwrap();
-        let isolated = git
-            .isolate_workflow_transport(
-                &git.capture_workflow_git_source(repo.path()).unwrap(),
-                "https://approved.test/o/r",
-            )
-            .unwrap();
-        let config = fs::read_to_string(isolated.metadata_dir().join("config")).unwrap();
-        assert!(config.contains("https://approved.test/o/r"));
-        for needle in [
-            "evil.test",
-            "insteadOf",
-            "hooksPath",
-            "sshCommand",
-            "pushurl",
-        ] {
-            assert!(!config.contains(needle));
-        }
-        assert!(!isolated.metadata_dir().join("hooks/pre-push").exists());
-        assert!(!isolated.metadata_dir().starts_with(repo.path()));
-    }
-
-    #[test]
-    fn pinned_workflow_metadata_ignores_rewritten_git_and_commondir_pointers() {
-        let root = tempfile::tempdir().unwrap();
-        let repo = root.path().join("repo");
-        let worktree = root.path().join("worktree");
-        let foreign = root.path().join("foreign");
-        for path in [&repo, &foreign] {
-            assert!(Command::new("git")
-                .args(["init", "-q"])
-                .arg(path)
-                .status()
-                .unwrap()
-                .success());
-        }
-        assert!(Command::new("git")
-            .current_dir(&repo)
-            .args([
-                "-c",
-                "user.name=Trusted",
-                "-c",
-                "user.email=trusted@test",
-                "commit",
-                "--allow-empty",
-                "-qm",
-                "initial",
-            ])
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("git")
-            .current_dir(&repo)
-            .args(["worktree", "add", "--detach", "-q"])
-            .arg(&worktree)
-            .status()
-            .unwrap()
-            .success());
-        let git = GitEngine::new();
-        let source = git.capture_workflow_git_source(&worktree).unwrap();
-        let foreign_head = fs::read(foreign.join(".git/HEAD")).unwrap();
-        fs::write(
-            foreign.join(".git/config"),
-            "[core]\nrepositoryformatversion=0\n[user]\nname=FOREIGN_CANARY\n",
-        )
-        .unwrap();
-        fs::write(
-            worktree.join(".git"),
-            format!("gitdir: {}\n", foreign.join(".git").display()),
-        )
-        .unwrap();
-        fs::write(
-            source.admin.join("commondir"),
-            format!("{}\n", foreign.join(".git").display()),
-        )
-        .unwrap();
-        let isolated = git
-            .isolate_workflow_transport(&source, "https://approved.test/o/r")
-            .unwrap();
-        assert!(!fs::read_to_string(isolated.metadata_dir().join("config"))
-            .unwrap()
-            .contains("FOREIGN_CANARY"));
-        assert_eq!(
-            fs::read(isolated.metadata_dir().join("HEAD")).unwrap(),
-            fs::read(source.admin.join("HEAD")).unwrap()
-        );
-        isolated.refresh_workflow_metadata().unwrap();
-        isolated.sync_workflow_metadata().unwrap();
-        assert_eq!(fs::read(foreign.join(".git/HEAD")).unwrap(), foreign_head);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn isolated_workflow_metadata_refuses_linked_config() {
-        let repo = tempfile::tempdir().unwrap();
-        assert!(Command::new("git")
-            .args(["init", "-q"])
-            .arg(repo.path())
-            .status()
-            .unwrap()
-            .success());
-        let git = GitEngine::new();
-        let source = git.capture_workflow_git_source(repo.path()).unwrap();
-        let foreign = tempfile::NamedTempFile::new().unwrap();
-        fs::remove_file(repo.path().join(".git/config")).unwrap();
-        std::os::unix::fs::symlink(foreign.path(), repo.path().join(".git/config")).unwrap();
-        assert!(git
-            .isolate_workflow_transport(&source, "https://approved.test/o/r")
-            .is_err());
-    }
-}
+// Unit tier: the lease guard decision. Every behaviour that runs `git`
+// (isolation, leftovers, push, cancellation of a stalled push) is in
+// `tests/component/engine/git.rs`.

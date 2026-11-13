@@ -1,0 +1,739 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WI 0144 cell evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "kind",
+    "gate",
+    "cell",
+    "suite",
+    "tier",
+    "build",
+    "platform",
+    "commit",
+    "tree",
+    "backend",
+    "shard",
+    "manifest_version",
+    "input_digest",
+    "inputs",
+    "expected_set_sha256",
+    "archive_sha256",
+    "plan_sha256",
+    "artifacts",
+    "counts",
+    "results",
+    "release_critical",
+    "outcome",
+    "classification",
+    "durations",
+    "cache",
+    "reproduce",
+    "run",
+    "started_at",
+    "finished_at",
+    "expires_at",
+    "command_exit",
+    "phases",
+    "capabilities_probed"
+  ],
+  "properties": {
+    "schema": {
+      "const": 1
+    },
+    "kind": {
+      "const": "cell"
+    },
+    "gate": {
+      "type": "string"
+    },
+    "cell": {
+      "type": "string"
+    },
+    "suite": {
+      "type": "string"
+    },
+    "tier": {
+      "type": "string"
+    },
+    "build": {
+      "type": "string"
+    },
+    "platform": {
+      "type": "string"
+    },
+    "commit": {
+      "type": "string"
+    },
+    "tree": {
+      "type": "string"
+    },
+    "backend": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "shard": {
+      "$ref": "#/$defs/Shard"
+    },
+    "manifest_version": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "input_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "inputs": {
+      "$ref": "#/$defs/Inputs"
+    },
+    "expected_set_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "archive_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "plan_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Artifact"
+      }
+    },
+    "counts": {
+      "$ref": "#/$defs/Counts"
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ResultRecord"
+      }
+    },
+    "release_critical": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ScenarioResult"
+      }
+    },
+    "outcome": {
+      "$ref": "#/$defs/Outcome"
+    },
+    "classification": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "durations": {
+      "$ref": "#/$defs/Durations"
+    },
+    "cache": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Cache"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "reproduce": {
+      "type": "string"
+    },
+    "run": {
+      "$ref": "#/$defs/Run"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "finished_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "command_exit": {
+      "type": "integer"
+    },
+    "phases": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/Outcome"
+      }
+    },
+    "capabilities_probed": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "$defs": {
+    "Outcome": {
+      "enum": [
+        "passed",
+        "failed",
+        "blocked",
+        "skipped",
+        "inconclusive",
+        "not-selected"
+      ]
+    },
+    "Shard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "of"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "of": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "Counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "expected",
+        "ran",
+        "passed",
+        "failed",
+        "skipped",
+        "blocked",
+        "quarantined_failed"
+      ],
+      "properties": {
+        "expected": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ran": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "blocked": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "quarantined_failed": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "ResultRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "test",
+        "outcome",
+        "duration_ms",
+        "classification",
+        "reason",
+        "capabilities_lost",
+        "assertions"
+      ],
+      "properties": {
+        "test": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/Outcome"
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "classification": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "capabilities_lost": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "assertions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "Artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "sha256",
+        "bytes"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "Signing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entitlements_sha256",
+        "command",
+        "identity"
+      ],
+      "properties": {
+        "entitlements_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "identity": {
+          "type": "string"
+        }
+      }
+    },
+    "Inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "source_tree",
+        "cargo_manifests",
+        "cargo_lock",
+        "toolchain",
+        "tool_digests",
+        "rust_toolchain_file",
+        "cargo_config",
+        "build_scripts",
+        "payload_manifest",
+        "features",
+        "target",
+        "profile",
+        "runner_image",
+        "fixtures",
+        "previous_release",
+        "signing",
+        "release_notes"
+      ],
+      "properties": {
+        "schema": {
+          "const": 1
+        },
+        "source_tree": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "cargo_manifests": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "cargo_lock": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "toolchain": {
+          "type": "string"
+        },
+        "tool_digests": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "rust_toolchain_file": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cargo_config": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "build_scripts": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "payload_manifest": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "features": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "target": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string"
+        },
+        "runner_image": {
+          "type": "string"
+        },
+        "fixtures": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "previous_release": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "signing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Signing"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "release_notes": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "ScenarioResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "outcome"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "outcome": {
+          "$ref": "#/$defs/Outcome"
+        }
+      }
+    },
+    "Run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "repository_id",
+        "workflow_path",
+        "workflow_revision",
+        "run_id",
+        "attempt",
+        "job",
+        "job_id",
+        "artifact_id",
+        "artifact_service_digest",
+        "url"
+      ],
+      "properties": {
+        "provider": {
+          "type": "string"
+        },
+        "repository_id": {
+          "type": "string"
+        },
+        "workflow_path": {
+          "type": "string"
+        },
+        "workflow_revision": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "job": {
+          "type": "string"
+        },
+        "job_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "artifact_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "artifact_service_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "url": {
+          "type": "string"
+        }
+      }
+    },
+    "Durations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "queue_ms",
+        "setup_ms",
+        "fixtures_ms",
+        "run_ms",
+        "total_ms",
+        "slowest",
+        "compile_ms",
+        "link_ms",
+        "cache_restore_ms",
+        "previous_release_ms",
+        "vm_boot_ms",
+        "signing_ms",
+        "upload_ms"
+      ],
+      "properties": {
+        "queue_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "setup_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "fixtures_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "run_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "slowest": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "test",
+              "ms"
+            ],
+            "properties": {
+              "test": {
+                "type": "string"
+              },
+              "ms": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        },
+        "compile_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "link_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cache_restore_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "previous_release_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "vm_boot_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "signing_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "upload_ms": {
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "Cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "hit",
+        "restored_bytes"
+      ],
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "hit": {
+          "type": "boolean"
+        },
+        "restored_bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

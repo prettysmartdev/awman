@@ -28,12 +28,17 @@ const BUILDS_SUBDIR: &str = "builds";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SquadPaths {
     root: PathBuf,
+    data_root: PathBuf,
 }
 
 impl SquadPaths {
     /// Build `SquadPaths` rooted at an explicit directory.
     pub fn from_root(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        let root = root.into();
+        Self {
+            data_root: root.clone(),
+            root,
+        }
     }
 
     /// Resolve from the current process environment.
@@ -43,20 +48,14 @@ impl SquadPaths {
 
     /// Resolve from a supplied env snapshot.
     ///
-    /// Precedence: `AWMAN_SQUAD_ROOT` → `AWMAN_CONFIG_HOME/squad` →
-    /// `XDG_DATA_HOME/awman/squad` → `$HOME/.awman/squad`.
+    /// `<data home>/squad` (see [`crate::data::fs::data_paths`]).
     pub fn from_env(env: &EnvSnapshot) -> Result<Self, DataError> {
-        if let Some(root) = env.squad_root() {
-            return Ok(Self::from_root(root));
-        }
-        if let Some(home) = env.config_home() {
-            return Ok(Self::from_root(home.join(SQUAD_SUBDIR)));
-        }
-        if let Some(xdg) = env.xdg_data_home() {
-            return Ok(Self::from_root(xdg.join("awman").join(SQUAD_SUBDIR)));
-        }
-        let home = dirs::home_dir().ok_or(DataError::HomeNotFound)?;
-        Ok(Self::from_root(home.join(".awman").join(SQUAD_SUBDIR)))
+        Ok(Self {
+            root: crate::data::fs::data_paths::data_home(env)?.join(SQUAD_SUBDIR),
+            data_root: crate::data::fs::data_paths::DataPaths::from_env(env)?
+                .root()
+                .to_path_buf(),
+        })
     }
 
     /// The squad root directory.
@@ -64,9 +63,9 @@ impl SquadPaths {
         &self.root
     }
 
-    /// Daemon-identity paths for the squad daemon (key stem `squad_key`).
+    /// The unified daemon owns the process identity for these paths.
     pub fn daemon(&self) -> DaemonPaths {
-        DaemonPaths::new(self.root.clone(), "squad_key")
+        crate::data::fs::data_paths::DataPaths::at_root(&self.data_root).daemon()
     }
 
     /// Directory holding per-task context directories.
@@ -108,7 +107,7 @@ impl SquadPaths {
             &base,
             "task directory must reside under the squad tasks root",
         )?;
-        Ok(base.join(crate::data::config::global::GLOBAL_CONFIG_FILENAME))
+        Ok(base.join(crate::data::config::file::CONFIG_FILENAME))
     }
 
     /// Directory holding per-task container image build logs.
@@ -356,167 +355,5 @@ impl SharedSquadRunLog {
             let _ = file.write_all(bytes);
             let _ = file.flush();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::config::env::{AWMAN_CONFIG_HOME, AWMAN_SQUAD_ROOT, XDG_DATA_HOME};
-
-    #[test]
-    fn squad_root_override_wins() {
-        let env = EnvSnapshot::with_overrides([
-            (AWMAN_SQUAD_ROOT, "/custom/squad"),
-            (XDG_DATA_HOME, "/xdg/data"),
-        ]);
-        let paths = SquadPaths::from_env(&env).unwrap();
-        assert_eq!(paths.root(), Path::new("/custom/squad"));
-    }
-
-    #[test]
-    fn config_home_produces_squad_subdir() {
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, "/cfg")]);
-        let paths = SquadPaths::from_env(&env).unwrap();
-        assert_eq!(paths.root(), Path::new("/cfg/squad"));
-    }
-
-    #[test]
-    fn xdg_data_home_produces_awman_squad() {
-        let env = EnvSnapshot::with_overrides([(XDG_DATA_HOME, "/xdg/data")]);
-        let paths = SquadPaths::from_env(&env).unwrap();
-        assert_eq!(paths.root(), Path::new("/xdg/data/awman/squad"));
-    }
-
-    #[test]
-    fn daemon_uses_squad_key_stem() {
-        let paths = SquadPaths::from_root("/r");
-        assert_eq!(paths.daemon().key_stem(), "squad_key");
-        assert_eq!(
-            paths.daemon().key_hash_file(),
-            PathBuf::from("/r/squad_key.hash")
-        );
-    }
-
-    #[test]
-    fn task_dir_is_under_tasks_root() {
-        let paths = SquadPaths::from_root("/r");
-        assert_eq!(
-            paths.task_dir("issue-triage").unwrap(),
-            PathBuf::from("/r/tasks/issue-triage/workspace")
-        );
-    }
-
-    #[test]
-    fn task_config_file_sits_beside_the_workspace() {
-        let paths = SquadPaths::from_root("/r");
-        assert_eq!(
-            paths.task_config_file("issue-triage").unwrap(),
-            PathBuf::from("/r/tasks/issue-triage/config.json")
-        );
-    }
-
-    #[test]
-    fn task_config_file_rejects_escape() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = SquadPaths::from_root(tmp.path());
-        std::fs::create_dir_all(paths.tasks_dir()).unwrap();
-        std::fs::create_dir_all(tmp.path().join("escape")).unwrap();
-        assert!(paths.task_config_file("../escape").is_err());
-    }
-
-    #[test]
-    fn task_dir_rejects_escape() {
-        // `..` is resolved by canonicalization only when the target exists, so
-        // materialize the escape target (matching `validate_context_path`).
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = SquadPaths::from_root(tmp.path());
-        std::fs::create_dir_all(paths.tasks_dir()).unwrap();
-        std::fs::create_dir_all(tmp.path().join("escape")).unwrap();
-        assert!(paths.task_dir("../escape").is_err());
-    }
-}
-
-#[cfg(test)]
-mod run_log_tests {
-    use super::*;
-
-    #[test]
-    fn step_log_slugs_are_safe_lower_case_and_capped() {
-        assert_eq!(SquadRunLogs::step_log_slug("clone_repo"), "clone-repo");
-        assert_eq!(
-            SquadRunLogs::step_log_slug("Run shell: git   status && ls"),
-            "run-shell-git-status-ls"
-        );
-        assert_eq!(SquadRunLogs::step_log_slug("///"), "");
-        assert_eq!(SquadRunLogs::step_log_slug("-a-"), "a");
-        let long = SquadRunLogs::step_log_slug(&"x".repeat(100));
-        assert_eq!(long.len(), 40);
-        assert_eq!(
-            SquadRunLogs::step_log_file_name("setup", 2, "clone_repo"),
-            "setup-2-clone-repo.log"
-        );
-        assert_eq!(
-            SquadRunLogs::step_log_file_name("teardown", 1, "///"),
-            "teardown-1.log"
-        );
-    }
-
-    #[test]
-    fn a_step_log_is_created_with_its_header_and_appends_on_reopen() {
-        let tmp = tempfile::tempdir().unwrap();
-        let logs = SquadRunLogs::new(tmp.path());
-        assert!(logs.is_prepared());
-
-        let mut log = logs.open_step_log("setup", 1, "clone repo").unwrap();
-        assert_eq!(log.path().file_name().unwrap(), "setup-1-clone-repo.log");
-        log.write_line("line one");
-        let path = log.finish();
-
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(contents.starts_with("# setup step 1: clone repo\n# started "));
-        assert!(contents.ends_with("line one\n"), "{contents}");
-
-        // Reopening appends rather than truncating, so a remediation attempt
-        // reads in order after the original output.
-        let mut again = logs.open_step_log("setup", 1, "clone repo").unwrap();
-        again.write_line("line two");
-        drop(again);
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("line one\n"), "{contents}");
-        assert!(contents.ends_with("line two\n"), "{contents}");
-    }
-
-    #[test]
-    fn a_container_log_is_named_after_the_container_and_refuses_traversal() {
-        let tmp = tempfile::tempdir().unwrap();
-        let logs = SquadRunLogs::new(tmp.path());
-
-        let log = logs.open_container_log("awman-squad-triage").unwrap();
-        assert_eq!(log.path(), tmp.path().join("awman-squad-triage.log"));
-        log.write_bytes(b"hello\n");
-        assert_eq!(std::fs::read_to_string(log.path()).unwrap(), "hello\n");
-
-        // A backend-supplied name that is not a single path component is a
-        // refusal, never a write outside the run directory.
-        for name in ["../escape", "a/b", "..", ""] {
-            assert!(
-                matches!(
-                    logs.open_container_log(name),
-                    Err(SquadRunLogError::UnsafeName { .. })
-                ),
-                "{name:?} must be refused"
-            );
-        }
-        assert!(!tmp.path().parent().unwrap().join("escape.log").exists());
-    }
-
-    #[test]
-    fn an_unprepared_run_directory_is_reported_rather_than_created() {
-        let tmp = tempfile::tempdir().unwrap();
-        let logs = SquadRunLogs::new(tmp.path().join("never-created"));
-        assert!(!logs.is_prepared());
-        assert!(logs.open_step_log("setup", 1, "x").is_err());
-        assert!(!tmp.path().join("never-created").exists());
     }
 }

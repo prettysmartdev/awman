@@ -1,9 +1,11 @@
 # Work Item: Enhancement
 
+> Testing policy update (WI144): test commands, harness paths and test counts in this historical record are superseded by [the current testing contract](/aspec/devops/testing.md). Use manifest suites and `make validate-native` for native acceptance. Removed test sources and raw evidence bundles are available only in Git history; they must not be restored as test patterns.
+
 Title: workflow teardown hardening
 Issue: issuelink
 
-Related: 0147 (per-session secrets, git credential helper, redaction), 0140/0143 (single daemon, worker mode).
+Related: 0145 (per-session secrets, git credential helper, redaction), 0140/0143 (single daemon, worker mode).
 
 > **To the leader implementing this work item:**
 >
@@ -254,7 +256,7 @@ Keys below are relative to `workflows.prerequisites`:
 
   A flag value is an explicit grant, so the interactive prompt for that prerequisite is skipped on a TTY too. `--yes` does **not** grant credentials.
 - **API**: preferences are expressed **only** through the same `--prerequisite-*` catalogue flags, in the existing `args` channel of `CreateCommandRequest`. There is no API-only request field (developer decision), so `Dispatch` parses and validates them identically for every frontend. This keeps grand-architecture parity: the API frontend does no validation.
-  - `--prerequisite-token secret:NAME` names a key in the command's `secrets` map once WI 0147 lands. Until then, Dispatch rejects it with a usage error ("unsupported until per-command secrets are available"). Other token sources are the server environment (`env:NAME`) and the server's global `acquire`. There is no flag for defining a host command, so a request can never supply one.
+  - `--prerequisite-token secret:NAME` names a key in the command's `secrets` map once WI 0145 lands. Until then, Dispatch rejects it with a usage error ("unsupported until per-command secrets are available"). Other token sources are the server environment (`env:NAME`) and the server's global `acquire`. There is no flag for defining a host command, so a request can never supply one.
   - Widening is checked in Layer 2, by `FrontendKind`. For `Api`, a flag that grants beyond the server's global policy (for example `--prerequisite-ssh <key>` when global `ssh.use` is `ask` or `deny`) is refused unless the server's global config sets `workflows.prerequisites.allowApiClientGrants: true` (global-only, default false). So a client cannot make the server mount its operator's `~/.ssh` unless the operator opted in. Narrowing flags (`deny`, `--prerequisite-unresolved fail`) are always accepted.
   - New event `EventPayload::WorkflowPrerequisites { phase: "start" | "before_teardown", report }` (serialised `WorkflowPrerequisiteReport`, no secret values). It is emitted before any step event, and SSE clients see it first.
   - With `unresolved: "fail"`, the command ends `failed` with `error.stage = "workflow_prerequisites"` and the report, before any container starts.
@@ -272,14 +274,14 @@ Keys below are relative to `workflows.prerequisites`:
 - `OverlayEngine::prerequisite_grant_overlays(step_kind, &grants)` (Layer 1) is the only code that turns grants into typed overlay and env options. The grand architecture gives `OverlayEngine` everything mounted from the host into a container. The Layer 2 `collect_single_entry_overlays` (`prepare.rs:1255`) only appends its result after the user and step overlays. It produces **grant overlays by step kind**:
   - `commit_changes`: identity env (`GIT_AUTHOR_*`, `GIT_COMMITTER_*`), passed as step env literals. The name and email are not secret.
   - `push_branch` SSH: single-file read-only mounts of the chosen key at `~/.ssh/awman_push_key` and (if present) `known_hosts` at `~/.ssh/known_hosts`. `GIT_SSH_COMMAND` becomes `ssh -i ~/.ssh/awman_push_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=<writable tmp copy>`. The "whole ~/.ssh" choice instead uses today's `ssh()` directory mount.
-  - `push_branch` HTTPS to a GitHub host (`step_commands.rs` builds the argv and env from a typed `PushAuth` option; Layer 2 does no string concatenation): token via env `AWMAN_GIT_TOKEN` (passed by name, never argv), with `git -c credential.helper= -c 'credential.helper=!f(){ echo username=x-access-token; echo "password=$AWMAN_GIT_TOKEN"; }; f'`. When WI 0147's socket helper exists, switch to it. The URL in `.git/config` is never rewritten.
+  - `push_branch` HTTPS to a GitHub host (`step_commands.rs` builds the argv and env from a typed `PushAuth` option; Layer 2 does no string concatenation): token via env `AWMAN_GIT_TOKEN` (passed by name, never argv), with `git -c credential.helper= -c 'credential.helper=!f(){ echo username=x-access-token; echo "password=$AWMAN_GIT_TOKEN"; }; f'`. When WI 0145's socket helper exists, switch to it. The URL in `.git/config` is never rewritten.
   - `create_pull_request`: `GH_TOKEN` env (by name), plus `GH_PROMPT_DISABLED=1` so `gh` never blocks.
   - `poll_ci` (host-side): `WorkflowEngine` receives the granted token as a typed option at construction and hands it to `CiPoller`, instead of reading `host_var("GITHUB_TOKEN")`.
 - Grants are **never** applied to:
   - `run_shell` / `run_script` steps (opaque; users keep explicit overlays);
   - `on_failure` remediation agents (`launch_on_failure_agent`); an agent must not receive the user's push key or token because a teardown step failed;
   - main workflow agent steps or the dynamic leader.
-  - A token value delivered by any grant is added to the run's redaction set. Exact-match replacement with `***` in step stdout/stderr, captured `teardown-failure-*.txt` files, squad logs and API `StdoutLine`/`StderrLine`. Coordinate with WI 0147's redaction so there is one implementation.
+  - A token value delivered by any grant is added to the run's redaction set. Exact-match replacement with `***` in step stdout/stderr, captured `teardown-failure-*.txt` files, squad logs and API `StdoutLine`/`StderrLine`. Coordinate with WI 0145's redaction so there is one implementation.
 - Container env values come from `SecretString::expose()` only at the runtime call site and go through the child process environment, never argv (the existing `-e NAME` pattern in `background.rs`).
 - Every grant mount and env name shows in the printed runtime command like other overlays (`AWMAN_GIT_TOKEN=***`).
 
@@ -337,7 +339,7 @@ Remove the host-global warning at `prepare.rs:469-495` and replace it with the `
 - **E2E**:
   - `awman exec workflow wf.toml --check-prerequisites` exit codes and output.
   - `--non-interactive --prerequisite-token env:GH_TOKEN`.
-  - The API: `WorkflowPrerequisites` event comes first in SSE, a `workflow_prerequisites` failure stage, a usage error for `--prerequisite-token secret:NAME` before 0147, and refusal of a widening `--prerequisite-ssh` unless `workflows.prerequisites.allowApiClientGrants` is set. A parity test asserts the same `--prerequisite-*` flags parse identically from CLI args, the TUI command box and API `args`.
+  - The API: `WorkflowPrerequisites` event comes first in SSE, a `workflow_prerequisites` failure stage, a usage error for `--prerequisite-token secret:NAME` before 0145, and refusal of a widening `--prerequisite-ssh` unless `workflows.prerequisites.allowApiClientGrants` is set. A parity test asserts the same `--prerequisite-*` flags parse identically from CLI args, the TUI command box and API `args`.
   - Architecture: the existing layer-dependency checks pass, and no `src/data` type contains a `SecretString`.
   - Squad: `squad add --prerequisite-ssh deny`, then `squad show` displays the policy, and the run log contains the summary.
 - **Security regression**: a repo config with `workflows.prerequisites.ssh.use: "allow"` and an `acquire` argv never mounts keys or runs the command in API, squad or non-interactive CLI (assert no spawn). No token value appears in `events.jsonl`, daemon logs, `ps`-visible argv or `prerequisite-grants.json`.
@@ -372,7 +374,7 @@ Remove the host-global warning at `prepare.rs:469-495` and replace it with the `
   - `aspec/architecture/security.md`: add the `HostSecretCommand` host-execution exception, the agent-binary refusal, the grant scoping rules and the repo-cannot-grant rule.
   - `aspec/uxui/cli.md`: the new flags.
 - **Coordinate with**:
-  - WI 0147 (per-session secrets, git credential helper, redaction): share one redaction implementation and switch the HTTPS push helper to 0147's socket helper when it lands.
+  - WI 0145 (per-session secrets, git credential helper, redaction): share one redaction implementation and switch the HTTPS push helper to 0145's socket helper when it lands.
   - WI 0141/0143 (daemon modes, worker): `PrerequisitePolicy` is mode-agnostic and reusable.
 - Update `templates/Dockerfile.project` to install `openssh-client` and `gh` by default (developer decision), so a new project satisfies the `ContainerTool` checks out of the box. Existing projects are not modified; they get the preflight warning with the exact line to add.
 
@@ -468,7 +470,7 @@ Recommended follow-up work items:
 
 - Threat review for SSH-agent forwarding and encrypted-key interaction; no agent socket forwarding is introduced here.
 - Consent for repo-sourced `ssh()` and secret `env()` overlays, which remain a separate broader authorization surface under the existing developer decision.
-- WI 0147 coordination: switch the HTTPS helper to its socket credential helper and reuse the same per-run RedactionSet.
+- WI 0145 coordination: switch the HTTPS helper to its socket credential helper and reuse the same per-run RedactionSet.
 
 Review-fixes validation passed: `cargo build --workspace`,
 `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`,

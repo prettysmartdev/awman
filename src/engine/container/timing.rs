@@ -8,9 +8,11 @@
 use std::time::Duration;
 
 /// Default stuck timeout — applied after the container has emitted its first
-/// byte of output. If no further output arrives for this long, the engine
-/// publishes `StuckEvent::Stuck` (which kicks the yolo countdown or opens
-/// the workflow control board).
+/// byte of output. Silence publishes `StuckEvent::Stuck` only when no OSC 7501
+/// records supersede it. Accepted reports latch support until execution end or
+/// a new step/container; clear (and RIS, which keeps the latch) resumes the
+/// silence clock from the clear. Startup grace is unchanged. Sandbox currently
+/// publishes reports without driving this silence timeout.
 pub const DEFAULT_STUCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default startup-grace timeout — the window between container launch and

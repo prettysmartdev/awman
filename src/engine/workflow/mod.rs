@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::data::config::effective::EffectiveConfig;
 use crate::data::execution_event::{EventSource, EventSourcePhase};
+use crate::data::program_status::EffectiveStatus;
 use crate::data::prompt::Prompt;
 use crate::data::session::{AgentHandle, AgentName, Session};
 use crate::data::workflow_dag::WorkflowDag;
@@ -46,11 +47,13 @@ use crate::engine::workflow::step_commands::PhaseStepSpec;
 use crate::engine::workflow::step_commands::StepCommandOptions;
 
 pub mod actions;
+pub mod context_files;
 pub mod factory;
 pub mod frontend;
 pub mod poll_ci;
 pub mod prerequisite_grants;
 pub mod prerequisites;
+pub mod program_status;
 pub mod step_commands;
 pub mod timing;
 
@@ -79,6 +82,9 @@ enum MidStepYoloResult<T = StepOutcome> {
     ShowControlBoard,
     /// Container recovered (StepUnstuck received).
     Recovered,
+    /// The agent sent an OSC 7501 report during a silence countdown (WI
+    /// 0141). The countdown is over; the caller handles the report.
+    Reported(Option<EffectiveStatus>),
 }
 
 /// Result of mid-step control board interaction.
@@ -226,6 +232,25 @@ struct ActiveParallelStep {
     stuck: bool,
     /// When a per-step yolo countdown is running, the instant it expires.
     yolo_deadline: Option<Instant>,
+    /// What the running countdown (`yolo_deadline`) is for: silence
+    /// (`StuckStep`) or an OSC 7501 report (`AgentDone` / `AgentBlocked` /
+    /// `AgentError`). Meaningless while `yolo_deadline` is `None`.
+    countdown_kind: CountdownKind,
+    /// Watches for output during a parallel `AgentError` countdown.
+    output_watch: Option<program_status::OutputWatch>,
+    /// The agent's latest OSC 7501 status (WI 0141), shown on boards opened
+    /// for this step. `None` before any report or after a clear.
+    last_report: Option<EffectiveStatus>,
+    /// Set while the agent's latest report is a problem (`blocked`/`error`);
+    /// cleared by `working`, `done`, `idle` or a clear (output during an
+    /// `AgentError` countdown only cancels the countdown). A step whose container ends while this is
+    /// set is Failed with the agent's message, whatever its exit code.
+    reported_problem: Option<EffectiveStatus>,
+    /// The execution's OSC 7501 tracker, kept so the final status can be
+    /// read when the container exits even after the execution moved into
+    /// its wait future (a report queued or still debounced at exit counts).
+    program_status:
+        Option<crate::engine::agent_runtime::program_status::SharedProgramStatusTracker>,
     agent: AgentName,
     model: Option<String>,
     /// Which launch of this step the slot belongs to. The parallel path
@@ -310,7 +335,7 @@ pub struct WorkflowEngine {
     /// Containers currently alive. The single-step path keeps exactly one
     /// entry (the focused step); the parallel path keeps up to `max_concurrent`.
     active_steps: Vec<ActiveParallelStep>,
-    /// Resolved once at construction from `effective_max_concurrent_agents()`.
+    /// Resolved once at construction from `max_concurrent_steps()`.
     /// `None` means unlimited.
     max_concurrent: Option<usize>,
     current_step_name: Option<String>,
@@ -320,6 +345,7 @@ pub struct WorkflowEngine {
     work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
     workflow_context_permission: Option<OverlayPermission>,
     yolo: bool,
+    non_interactive: bool,
     abort_on_failure_triggered: bool,
     last_exit_info: Option<AgentExitInfo>,
     /// Automatic credential refresh/retry is permitted once per workflow step.
@@ -347,10 +373,16 @@ pub struct WorkflowEngine {
     /// handle rather than the engine's own clone, which is what makes the
     /// mirror visible to anyone else.
     session_mirror: Option<Arc<tokio::sync::RwLock<Session>>>,
+    /// Monotonic time for decisions measured inside the engine (the
+    /// `AgentError` output-settle window). [`crate::data::clock::system_clock`]
+    /// unless a caller installs another with [`WorkflowEngine::with_clock`].
+    clock: crate::data::clock::SharedClock,
     /// Fired by an external cancel request (the API's
-    /// `POST /v1/commands/{id}/cancel`). Never fired unless a caller installs
+    /// `POST /v1/worker/commands/{id}/cancel`). Never fired unless a caller installs
     /// one with [`WorkflowEngine::set_cancellation`].
     cancel: CancellationToken,
+    // Declared last so active executions are dropped before this lease.
+    _scratch_lease: std::fs::File,
 }
 
 impl WorkflowEngine {
@@ -484,7 +516,7 @@ impl WorkflowEngine {
             state_store_for(session, state_root),
             work_item_context,
             deps,
-        )
+        )?
         .with_ci_token(ci_token))
     }
 
@@ -528,7 +560,7 @@ impl WorkflowEngine {
     }
 
     /// The resolved per-workflow concurrency cap (`None` = unlimited). Resolved
-    /// once at construction from `effective_max_concurrent_agents()`. Frontends
+    /// once at construction from `max_concurrent_steps()`. Frontends
     /// read this to size the Workflow Overview / parallel UX.
     pub fn max_concurrent(&self) -> Option<usize> {
         self.max_concurrent
@@ -536,6 +568,25 @@ impl WorkflowEngine {
 
     pub fn set_yolo(&mut self, yolo: bool) {
         self.yolo = yolo;
+    }
+
+    /// Explicit unattended execution bypasses final review even on a frontend
+    /// that normally supports interaction.
+    pub fn set_non_interactive(&mut self, non_interactive: bool) {
+        self.non_interactive = non_interactive;
+    }
+
+    fn requires_final_review(&self) -> bool {
+        !self.non_interactive && self.frontend.supports_interactive_recovery()
+    }
+
+    fn is_final_review_step(&self, name: &str) -> bool {
+        self.requires_final_review()
+            && self
+                .workflow
+                .steps
+                .iter()
+                .all(|step| step.name == name || self.state.completed_steps.contains(&step.name))
     }
 
     /// Install the Layer 2 copy for the questions asked about a running
@@ -718,7 +769,7 @@ impl WorkflowEngine {
                 frontend,
                 agent_factory,
             },
-        )
+        )?
         .with_ci_token(ci_token))
     }
 
@@ -732,7 +783,16 @@ impl WorkflowEngine {
         state_store: WorkflowStateStore,
         work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         deps: WorkflowEngineDeps,
-    ) -> Self {
+    ) -> Result<Self, EngineError> {
+        let scratch_lease =
+            crate::data::fs::context_dirs::ContextDirResolver::from_env(session.env())
+                .and_then(|resolver| resolver.workflow_lease(state.invocation_id))
+                .map_err(|error| {
+                    tracing::warn!(%error, "workflow scratch lease is unavailable");
+                    EngineError::Data(crate::data::error::DataError::Other(
+                        "workflow scratch is unavailable".into(),
+                    ))
+                })?;
         let WorkflowEngineDeps {
             mut frontend,
             agent_factory,
@@ -740,14 +800,14 @@ impl WorkflowEngine {
         let workflow_context_permission =
             workflow_context_permission_from_overlay_strings(workflow.overlays.as_deref());
         let effective_config = session.effective_config();
-        let max_concurrent = effective_config.effective_max_concurrent_agents();
+        let max_concurrent = effective_config.max_concurrent_steps();
         tracing::debug!(
             ?max_concurrent,
             "workflow_engine resolved max_concurrent_agents"
         );
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         frontend.attach_engine(EngineHandles::requests(tx));
-        Self {
+        Ok(Self {
             session: session.clone(),
             ci_token: None,
             ci_destination: None,
@@ -770,6 +830,7 @@ impl WorkflowEngine {
             work_item_context,
             workflow_context_permission,
             yolo: false,
+            non_interactive: false,
             abort_on_failure_triggered: false,
             last_exit_info: None,
             auth_retries_used: HashSet::new(),
@@ -778,8 +839,17 @@ impl WorkflowEngine {
             parallel_group_prompts: None,
             engine_rx: Some(rx),
             session_mirror: None,
+            clock: crate::data::clock::system_clock(),
             cancel: CancellationToken::new(),
-        }
+            _scratch_lease: scratch_lease,
+        })
+    }
+
+    /// Use `clock` for time the engine measures itself (default: the system
+    /// clock). Tests pass a `ManualClock` to step over the settle window.
+    pub fn with_clock(mut self, clock: crate::data::clock::SharedClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Mirror this run's summary into `session`'s `SessionState` after every
@@ -878,6 +948,12 @@ impl WorkflowEngine {
             if self.cancel_requested() {
                 return self.cancel_run();
             }
+            if self.state.is_complete() && self.requires_final_review() {
+                match self.review_completed_workflow().await? {
+                    IterationOutcome::Ended(outcome) => return Ok(outcome),
+                    IterationOutcome::Continue => continue,
+                }
+            }
             if self.state.is_complete() {
                 let progress = self.workflow_progress_info();
                 self.frontend.report_workflow_progress(&progress);
@@ -891,13 +967,13 @@ impl WorkflowEngine {
             }
 
             // Determine the current parallel group: every step whose
-            // dependencies are already satisfied (source-file order). When more
-            // than one is ready and the concurrency cap is not pinned to 1, run
-            // them through the parallel-group path; otherwise fall back to the
-            // single-step interactive path (behaviourally identical to the
-            // pre-WI-0096 sequential engine).
+            // dependencies are already satisfied (source-file order). A cap
+            // of 1 uses the single-step path except for the interactive final
+            // group, whose members must stay alive together for review.
             let ready = self.next_ready_steps()?;
-            let use_parallel = ready.len() > 1 && self.max_concurrent != Some(1);
+            let final_review_group = self.is_final_review_group(&ready);
+            let use_parallel =
+                ready.len() > 1 && (self.max_concurrent != Some(1) || final_review_group);
 
             if use_parallel {
                 match self.run_parallel_group(ready).await? {
@@ -1231,4 +1307,4 @@ pub fn workflow_name_for(workflow: &Workflow) -> String {
 }
 
 #[cfg(test)]
-mod tests;
+mod contracts;

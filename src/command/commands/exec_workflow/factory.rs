@@ -83,6 +83,11 @@ fn attributed<T>(
 
 #[async_trait]
 impl AgentFrontend for AgentFrontendProxy {
+    fn terminal_source(&self) -> Option<crate::data::execution_event::EventSource> {
+        self.source
+            .as_ref()
+            .and_then(|source| source.lock().ok().map(|s| s.clone()))
+    }
     fn report_status(&mut self, status: crate::engine::agent_runtime::frontend::AgentStatus) {
         let is_running = matches!(
             &status,
@@ -189,7 +194,7 @@ pub(crate) struct CommandLayerFactory {
     /// host directory for every step. `None` for an ordinary `exec workflow`.
     pub(crate) task_workspace: Option<PathBuf>,
     /// Fixed by workflow pre-flight before any step can launch.
-    pub(crate) launch_modes: Arc<HashMap<String, crate::data::config::repo::LaunchMode>>,
+    pub(crate) launch_modes: Arc<HashMap<String, crate::data::config::agents::LaunchMode>>,
     /// Resolves each step's `agentFlags`; see [`workflow_agent_flags`].
     pub(crate) agent_flags: EffectiveConfig,
     /// Mounted read-write at `/awman/output` into every step container
@@ -210,16 +215,13 @@ pub(crate) fn workflow_agent_flags(
     target_agent: Option<String>,
     cli: Option<Vec<String>>,
 ) -> EffectiveConfig {
-    EffectiveConfig::new(
-        crate::data::config::FlagConfig {
+    invoking
+        .effective_config()
+        .with_flags(crate::data::config::FlagConfig {
             agent: target_agent,
             agent_flags: cli,
             ..Default::default()
-        },
-        invoking.env().clone(),
-        invoking.repo_config().clone(),
-        invoking.global_config().clone(),
-    )
+        })
 }
 
 /// A workflow launch must never wait indefinitely for a host credential
@@ -338,14 +340,15 @@ impl CommandLayerFactory {
             runtime.step_agent.as_str(),
         );
         // Every step shares the command's one outputs directory (WI 0137 §3).
-        let mut directory_overlays = collected.directories;
+        let directory_overlays = collected.directories;
+        let mut command_mounts = Vec::new();
         let system_prompt = match self
             .output_dir
             .as_ref()
             .filter(|_| self.engines.runtime.capabilities().arbitrary_host_mounts)
         {
             Some(dir) => {
-                directory_overlays.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
+                command_mounts.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
                 Some(crate::engine::context_prompt::with_outputs_section(
                     system_prompt,
                     crate::engine::context_prompt::OutputsPromptRole::Step(&step.name),
@@ -354,6 +357,7 @@ impl CommandLayerFactory {
             None => system_prompt,
         };
         let run_opts = AgentRunOptions {
+            command_secrets: self.engines.command_secrets(),
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
             plan: self.flags.plan.then_some(PlanMode::Enabled),
@@ -362,7 +366,7 @@ impl CommandLayerFactory {
             // and therefore cannot satisfy that contract; ordinary `exec
             // workflow` continues to honour its per-step ACP configuration.
             launch_mode: if self.squad_identity.is_some() {
-                crate::data::config::repo::LaunchMode::Stdio
+                crate::data::config::agents::LaunchMode::Stdio
             } else {
                 self.launch_modes
                     .get(&step.name)
@@ -385,6 +389,7 @@ impl CommandLayerFactory {
                 Some(collected.env_passthrough)
             },
             directory_overlays,
+            command_mounts,
             include_all_skills: collected.include_all_skills,
             named_skills: collected.named_skills,
             image_tag_override: Some(correct_tag),
@@ -465,7 +470,7 @@ impl CommandLayerFactory {
         let instance = self.engines.runtime.build(resolved)?;
         let proxy = AgentFrontendProxy::new(
             self.shared.clone(),
-            run_opts.launch_mode == crate::data::config::repo::LaunchMode::Acp,
+            run_opts.launch_mode == crate::data::config::agents::LaunchMode::Acp,
         )
         .with_source(runtime.source.clone());
         instance.run_with_frontend(Box::new(proxy))

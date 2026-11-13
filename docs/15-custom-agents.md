@@ -1,6 +1,6 @@
 # Custom Agents
 
-awman ships with seven built-in agents: `claude`, `codex`, `opencode`, `gemini`, `copilot`, `cline` and `antigravity`. A **custom agent** lets you add any other command-line coding agent without waiting for awman to support it. You describe the agent in a small TOML file — how to install it, how to launch it, which flags it understands — and awman treats it like any other agent: `awman chat --agent pi`, `awman config set agent pi`, a `agent = "pi"` workflow step, and so on.
+awman ships with seven built-in agents: `claude`, `codex`, `opencode`, `gemini`, `copilot`, `cline` and `antigravity`. A **custom agent** lets you add any other command-line coding agent without waiting for awman to support it. You describe the agent in a small TOML file — how to install it, how to launch it, which flags it understands — and awman treats it like any other agent: `awman chat --agent pi`, `awman config set agents.default pi`, a `agent = "pi"` workflow step, and so on.
 
 Custom agents still run only inside containers. Nothing about a definition lets the agent run on your host (the one optional exception, the `[ping]` host check, is covered in [The optional host check](#the-optional-host-check-ping) and is always shown to you before you approve it).
 
@@ -85,7 +85,7 @@ A definition is a TOML file with `schema = 1`. Unknown keys are rejected, so a t
 | Key | Type | Meaning |
 |-----|------|---------|
 | `command` | string array | **Required.** The interactive entrypoint, as argv. `command[0]` is a bare binary name or an absolute container path. No shell is involved |
-| `non_interactive` | string | Token appended for `-n` / `exec` / workflow steps (for example `"-p"` or `"run"`). Omit it if the agent has no non-interactive mode |
+| `non_interactive` | string | Token appended for `-n` / `--headless` / `exec` / workflow steps (for example `"-p"` or `"run"`). Omit it if the agent has no non-interactive mode |
 | `output_format` | string | Structured output protocol for non-interactive API runs: `text` (default), `claude_stream_json` or `codex_json` |
 | `interactive_only_flags` | string array | Flags appended only to interactive launches |
 | `seed_prompt` | string or table | How the initial prompt is passed: `"positional"` (default) or `{ flag = "--prompt" }` |
@@ -237,7 +237,7 @@ If the header is still present but the body differs from what the definition wou
 
 ## Runtimes
 
-Custom agents run on **Docker**, **Apple Containers** and **builtin-experimental**. They do **not** run on **Docker Sandboxes** (`docker-sbx-experimental`) yet; `awman ready` fails the agent-image step with a clear message if your runtime is Docker Sandboxes. See [Runtimes](11-runtimes.md).
+Custom agents run on **Docker**, **Apple Containers** and **builtin**. They do **not** run on **Docker Sandboxes** (`sbx`) yet; `awman ready` fails the agent-image step with a clear message if your runtime is Docker Sandboxes. See [Runtimes](11-runtimes.md).
 
 ---
 
@@ -263,7 +263,7 @@ In the TUI the same review appears in a scrollable dialog: long commands wrap, �
 
 - **`y`** records the approval and continues.
 - **`n`**, Esc or end-of-input stops with `agent definition '<name>' was not approved` (exit 1).
-- **No one to ask** — `--non-interactive`/`-n`, `--json`, no terminal, the HTTP API, or a squad task — never prompts. The command fails with `agent definition '<name>' (<path>) has not been approved for this repo; run 'awman ready --agent <name>' interactively to review it` (exit 2, or HTTP 403 through the API). `--yes` does not approve anything.
+- **No one to ask** — `--headless`/`-n`, `--json`, no terminal, the HTTP API, or a squad task — never prompts. The command fails with `agent definition '<name>' (<path>) has not been approved for this repo; run 'awman ready --agent <name>' interactively to review it` (exit 2, or HTTP 403 through the API). `--yes` does not approve anything.
 
 An unknown agent name exits with status 4 and lists the known agents; a definition that fails validation exits with status 1 and lists every problem.
 
@@ -317,12 +317,12 @@ Once a definition is approved and its image built, the agent works anywhere a bu
 ```sh
 awman ready --agent pi          # review, approve, build the image
 awman chat --agent pi
-awman config set agent pi       # make it this repo's default
-awman config set --global agent pi
+awman config set agents.default pi       # make it this repo's default
+awman config set agents.default pi --global
 awman init --agent pi           # init a repo with it (definition must already exist)
 ```
 
-In workflows, set `agent = "pi"` on a step. awman checks and asks for approval of every distinct agent before the workflow starts. `config set agent` accepts built-in names plus custom agents defined in the scope you are writing to (repo config also accepts global ones); otherwise it fails with the list of valid agents and `define one with: awman new agent <name>`.
+In workflows, set `agent = "pi"` on a step. awman checks and asks for approval of every distinct agent before the workflow starts. `config set agents.default` accepts built-in names plus custom agents defined in the scope you are writing to (repo config also accepts global ones); otherwise it fails with the list of valid agents and `define one with: awman new agent <name>`.
 
 **Workflows and non-interactive mode.** Non-interactive runs rely on `run.non_interactive`. An agent whose definition has none has no print mode to switch to, so in a workflow step it may not exit on its own; you may need to finish or quit the step yourself. Prefer agents with a non-interactive mode for unattended workflows.
 

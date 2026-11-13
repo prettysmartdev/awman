@@ -29,7 +29,7 @@ awman init                 # sets up Claude Code
 awman init --agent codex   # or pick another agent
 ```
 
-The agent you pass (`claude` by default) becomes the repo default; change it later with `awman config set agent <name>`. Init then asks you to:
+The agent you pass (`claude` by default) becomes the repo default; change it later with `awman config set agents.default <name>`. Init then asks you to:
 
 1. **Choose a project Dockerfile** — only if the repo has none: create `Dockerfile.dev` from the template (recommended), use an existing Dockerfile, or skip.
 2. **Run the agent audit** — say yes. An agent inspects your codebase and fills `Dockerfile.dev` with the exact toolchain your project needs.
@@ -86,16 +86,18 @@ That's it — you have an isolated agent working in your repo.
 | GitHub Releases | Download the asset for your platform, `chmod +x`, move onto `PATH` |
 | From source | `git clone https://github.com/prettysmartdev/awman.git && cd awman && make install` (Rust 1.94+) |
 
-Release assets: `awman-linux-amd64`, `awman-linux-arm64`, `awman-macos-arm64`, `awman-windows-amd64.exe`. Intel Macs are not supported.
+Release assets: `awman-linux-amd64`, `awman-linux-arm64`, `awman-macos-arm64`, `awman-windows-amd64.exe`, plus `SHA256SUMS` (see [Runtimes](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions) to verify downloads). Intel Macs are not supported.
 
-The **experimental builtin microVM runtime** (macOS on Apple Silicon only in this release) is compiled into awman itself, so installing awman is the only install step for it: no Docker, `container`, or `sbx` is required to run agents. The `awman-macos-arm64` release binary includes it and is ad-hoc signed with the hypervisor entitlement it needs; see [The macOS binary, Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions) if macOS refuses to open a downloaded copy. Enable it explicitly in your global config with `awman config set --global runtime builtin-experimental`, then follow [Getting an agent image](11-runtimes.md#getting-an-agent-image). By default `awman ready` imports an image you built elsewhere. To build and import in one command instead, point the image source at a local store and enable the builder:
+The **experimental builtin microVM runtime** (macOS on Apple Silicon only in this release) is compiled into awman itself, so installing awman is the only install step for it: no Docker, `container`, or `sbx` is required to run agents. The `awman-macos-arm64` release binary includes it and is ad-hoc signed with the hypervisor entitlement it needs; see [The macOS binary, Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions) if macOS refuses to open a downloaded copy. Enable it explicitly in your global config with `awman config set runtime.kind builtin`, then follow [Getting an agent image](11-runtimes.md#getting-an-agent-image). By default `awman ready` imports an image you built elsewhere. To build and import in one command instead, point the image source at a local store and enable the builder:
 
 ```json
 {
-  "runtime": "builtin-experimental",
-  "builtin": {
-    "builder": { "enabled": true },
-    "imageSource": { "type": "docker-local" }
+  "runtime": {
+    "kind": "builtin",
+    "builtin": {
+      "builder": { "enabled": true },
+      "imageSource": { "type": "docker-local" }
+    }
   }
 }
 ```
@@ -114,9 +116,9 @@ Then `awman ready` builds the Dockerfiles in that Docker Engine (`apple-local` u
 | Flag | Effect |
 |------|--------|
 | `--refresh` | Re-run the agent audit and update `Dockerfile.dev` (use after toolchain changes) |
-| `--build` | Force-rebuild the images, including every agent in `.awman/` (builtin runtime: re-import them all from the configured image sources, building first when `builtin.builder.enabled` is on and the source is a local store) |
+| `--build` | Force-rebuild the images, including every agent in `.awman/` (builtin runtime: re-import them all from the configured image sources, building first when `runtime.builtin.builder.enabled` is on and the source is a local store) |
 | `--no-cache` | Disable the layer cache for any build that runs (builtin runtime: also re-import from the source) |
-| `-n`, `--non-interactive` | Run the verification agent in non-interactive mode |
+| `-n`, `--headless` | Run the verification agent in non-interactive mode |
 | `--json` | Print structured JSON instead of human output (implies `-n`) |
 | `--allow-docker` | Mount the host Docker socket into the agent container (not supported by the builtin runtime) |
 | `--agent <name>` | Check and build this agent instead of the repo default; reviews and approves a [custom agent](15-custom-agents.md) definition that needs approval |

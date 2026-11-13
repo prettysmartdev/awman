@@ -1,6 +1,9 @@
 //! Binary-clean exec and launcher-hosted attach. The attach client never owns
 //! the target lifecycle. Lag/disconnect is an error, never fabricated exit 0.
 use super::{driver::*, paths::BuiltinPaths};
+use crate::engine::agent_runtime::program_status::{
+    ProgramStatusBridgeConfig, ProgramStatusStream, ProgramStatusTracker,
+};
 use crate::engine::container::attach_protocol::{
     parse_resize, read_frame, resize_payload, write_chunked_bounded, write_frame,
     write_frame_bounded, Tag, WRITE_TIMEOUT as ATTACH_WRITE_TIMEOUT,
@@ -248,10 +251,43 @@ impl ExecBridge {
                 .map_err(|_| failed())?;
             io.stdin_tx.send(b"\n".to_vec()).map_err(|_| failed())?;
         }
+        let status_config = ProgramStatusBridgeConfig {
+            answer_queries: io.initial_size.is_some(),
+            ..frontend.program_status_config()
+        };
         drop(io.stdin_tx);
         let control = session.control.clone();
+        let terminal = match (
+            io.initial_size,
+            frontend.terminal_launch(),
+            control.terminal_stdin(),
+        ) {
+            (Some((cols, rows)), Some(launch), Some(stdin)) => {
+                let resize_control = control.clone();
+                Some((
+                    launch.clone(),
+                    launch.register(
+                        cols,
+                        rows,
+                        crate::engine::terminal_hub::TerminalInput {
+                            stdin,
+                            resize: Some(Arc::new(move |cols, rows| {
+                                let _ = resize_control.send(Control::Resize(cols, rows));
+                            })),
+                        },
+                    ),
+                ))
+            }
+            _ => None,
+        };
         let server = if let Some(path) = attach_path {
-            Some(AttachServer::bind(&path, &session)?)
+            Some(AttachServer::bind(
+                &path,
+                &session,
+                terminal
+                    .as_ref()
+                    .map(|(launch, terminal)| (launch.hub.clone(), terminal.id().clone())),
+            )?)
         } else {
             None
         };
@@ -266,9 +302,14 @@ impl ExecBridge {
         });
         let input_abort = input_task.abort_handle();
         let resize_control = control.clone();
+        let resize_terminal = terminal.clone();
         let resize_task = tokio::spawn(async move {
             if let Some(mut resize) = io.resize {
                 while let Some((cols, rows)) = resize.recv().await {
+                    if let Some((launch, terminal)) = &resize_terminal {
+                        let _ = launch.hub.set_default_size(terminal.id(), cols, rows);
+                        continue;
+                    }
                     let _ = resize_control.send(Control::Resize(cols, rows));
                 }
             }
@@ -276,6 +317,7 @@ impl ExecBridge {
         let resize_abort = resize_task.abort_handle();
         let tail = Arc::new(OutputTail::with_default_capacity());
         let output_activity = OutputActivity::new();
+        let program_status = ProgramStatusTracker::shared();
         let cleanup_claimed = Arc::new(AtomicBool::new(false));
         let (stop_result, mut grace_stop) = tokio::sync::watch::channel(None);
         let stop_result = Arc::new(stop_result);
@@ -301,6 +343,7 @@ impl ExecBridge {
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: cancel_grace,
                 poll_interval: crate::engine::container::io_bridge::STUCK_POLL_INTERVAL,
+                program_status: Some(program_status.clone()),
             },
             &output_activity,
         );
@@ -317,6 +360,9 @@ impl ExecBridge {
         let released = io_release.clone();
         let mut sinks = Some((io.stdout, io.stderr));
         let mut prompt_files = ObservedPromptFiles(prompt_files);
+        let mut stdout_status = ProgramStatusStream::new(program_status.clone(), status_config);
+        let mut stderr_status = ProgramStatusStream::new(program_status.clone(), status_config);
+        let query_control = control.clone();
         let event_task = tokio::spawn(async move {
             let mut events = session.events;
             let outcome = loop {
@@ -330,17 +376,29 @@ impl ExecBridge {
                 };
                 match event {
                     Ok(ExecEvent::Stdout(bytes)) => {
-                        output_tail.push_bytes(&bytes);
                         output_activity.touch();
+                        let bytes = stdout_status.feed(&bytes, |reply| {
+                            let _ = query_control.send(Control::Stdin(reply.to_vec()));
+                        });
+                        output_tail.push_bytes(&bytes);
+                        if let Some((_, terminal)) = &terminal {
+                            terminal.push_output(&bytes);
+                        }
                         if let Some((stdout, _)) = &sinks {
-                            let _ = stdout.send(bytes);
+                            let _ = stdout.send(bytes.into_owned());
                         }
                     }
                     Ok(ExecEvent::Stderr(bytes)) => {
-                        output_tail.push_bytes(&bytes);
                         output_activity.touch();
+                        let bytes = stderr_status.feed(&bytes, |reply| {
+                            let _ = query_control.send(Control::Stdin(reply.to_vec()));
+                        });
+                        output_tail.push_bytes(&bytes);
+                        if let Some((_, terminal)) = &terminal {
+                            terminal.push_output(&bytes);
+                        }
                         if let Some((_, stderr)) = &sinks {
-                            let _ = stderr.send(bytes);
+                            let _ = stderr.send(bytes.into_owned());
                         }
                     }
                     Ok(ExecEvent::Exited(code)) => {
@@ -381,6 +439,19 @@ impl ExecBridge {
                     }
                 }
             };
+            for (stream, is_stderr) in [(&mut stdout_status, false), (&mut stderr_status, true)] {
+                let bytes = stream.finish();
+                output_tail.push_bytes(&bytes);
+                if let Some((_, terminal)) = &terminal {
+                    terminal.push_output(&bytes);
+                }
+                if let Some((stdout, stderr)) = &sinks {
+                    let _ = if is_stderr { stderr } else { stdout }.send(bytes);
+                }
+            }
+            if let Some((_, terminal)) = &terminal {
+                terminal.exit(outcome.as_ref().map_or(-1, |info| info.exit_code));
+            }
             drop(sinks);
             drop(frontend_weak);
             input_task.abort();
@@ -466,7 +537,8 @@ impl ExecBridge {
             }),
             stuck,
             Some(tail),
-        ))
+        )
+        .with_program_status(program_status))
     }
 }
 
@@ -486,7 +558,14 @@ impl Drop for AttachServer {
     }
 }
 impl AttachServer {
-    fn bind(path: &Path, session: &ExecSession) -> Result<Self, EngineError> {
+    fn bind(
+        path: &Path,
+        session: &ExecSession,
+        terminal: Option<(
+            Arc<crate::engine::terminal_hub::TerminalHub>,
+            crate::data::ids::TerminalId,
+        )>,
+    ) -> Result<Self, EngineError> {
         use std::os::unix::fs::PermissionsExt;
         // Never unlink a live or unknown endpoint. The SDK refuses duplicate names;
         // an existing attach endpoint is a failed start, requiring explicit cleanup.
@@ -503,6 +582,14 @@ impl AttachServer {
         let control = session.control.clone();
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
+                if let Some((hub, id)) = &terminal {
+                    tokio::spawn(crate::engine::container::attach_socket::serve_hub_client(
+                        stream,
+                        hub.clone(),
+                        id.clone(),
+                    ));
+                    continue;
+                }
                 let receiver = events.subscribe();
                 let control = control.clone();
                 tokio::spawn(serve_client(stream, receiver, control));
@@ -521,6 +608,8 @@ async fn serve_client(
     control: Arc<dyn ExecControl>,
 ) {
     let (mut reader, mut writer) = stream.into_split();
+    let mut stdout_scanner = crate::engine::agent_runtime::program_status::Osc7501Scanner::new();
+    let mut stderr_scanner = crate::engine::agent_runtime::program_status::Osc7501Scanner::new();
     loop {
         // A frame can arrive in fragments. Keep this future alive while
         // events are forwarded; recreating it in select! discards partially
@@ -542,6 +631,13 @@ async fn serve_client(
                         return;
                     }
                     let (tag,bytes,terminal)=match event {Ok(ExecEvent::Stdout(b))=>(Tag::Output,b,false),Ok(ExecEvent::Stderr(b))=>(Tag::Stderr,b,false),Ok(ExecEvent::Exited(c))=>(Tag::Exit,c.to_le_bytes().to_vec(),true),_=>(Tag::Failed,Vec::new(),true)};
+                    if terminal {
+                        for (tag, scanner) in [(Tag::Output, &mut stdout_scanner), (Tag::Stderr, &mut stderr_scanner)] {
+                            let pending = scanner.finish();
+                            if !pending.is_empty() && write_chunked_bounded(&mut writer, tag, &pending, ATTACH_WRITE_TIMEOUT).await.is_err() { return; }
+                        }
+                    }
+                    let bytes = match tag { Tag::Output => stdout_scanner.feed(&bytes).forward, Tag::Stderr => stderr_scanner.feed(&bytes).forward, _ => std::borrow::Cow::Borrowed(bytes.as_slice()) };
                     let error=write_chunked_bounded(&mut writer,tag,&bytes,ATTACH_WRITE_TIMEOUT).await.is_err();
                     if error||terminal{return;}
                 }
@@ -580,9 +676,10 @@ impl AgentInstance for AttachInstance {
         let stream =
             tokio::net::UnixStream::from_std(stream).map_err(|e| EngineError::io(&path, e))?;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let control: Arc<dyn ExecControl> = Arc::new(AttachControl(tx));
+        let (terminal_stdin, terminal_input) = crate::engine::terminal_hub::input_channel();
+        let control: Arc<dyn ExecControl> = Arc::new(AttachControl(tx, terminal_stdin));
         let (broadcast, events) = tokio::sync::broadcast::channel(4096);
-        tokio::spawn(client(stream, rx, broadcast.clone()));
+        tokio::spawn(client(stream, rx, broadcast.clone(), terminal_input));
         {
             let mut frontend = frontend;
             let io = frontend.take_io();
@@ -606,8 +703,14 @@ impl AgentInstance for AttachInstance {
         }
     }
 }
-struct AttachControl(tokio::sync::mpsc::UnboundedSender<Control>);
+struct AttachControl(
+    tokio::sync::mpsc::UnboundedSender<Control>,
+    tokio::sync::mpsc::Sender<Vec<u8>>,
+);
 impl ExecControl for AttachControl {
+    fn terminal_stdin(&self) -> Option<tokio::sync::mpsc::Sender<Vec<u8>>> {
+        Some(self.1.clone())
+    }
     fn send(&self, command: Control) -> Result<(), EngineError> {
         self.0.send(command).map_err(|_| failed())
     }
@@ -616,6 +719,7 @@ async fn client(
     stream: tokio::net::UnixStream,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<Control>,
     events: tokio::sync::broadcast::Sender<ExecEvent>,
+    mut terminal_input: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) {
     let (mut reader, mut writer) = stream.into_split();
     loop {
@@ -623,6 +727,9 @@ async fn client(
         tokio::pin!(frame);
         loop {
             tokio::select! {
+                Some(bytes) = terminal_input.recv() => {
+                    if write_frame(&mut writer, Tag::Stdin, &bytes).await.is_err() { let _ = events.send(ExecEvent::Failed); return; }
+                }
                 frame=&mut frame=>{
                     let (event,terminal)=match frame {Ok((Tag::Output,b))=>(ExecEvent::Stdout(b),false),Ok((Tag::Stderr,b))=>(ExecEvent::Stderr(b),false),Ok((Tag::Exit,b)) if b.len()==4=>(ExecEvent::Exited(i32::from_le_bytes(b.try_into().unwrap())),true),_=>(ExecEvent::Failed,true)};
                     let _=events.send(event);if terminal{return;} break;
@@ -635,525 +742,3 @@ async fn client(
         }
     }
 }
-
-/// The builtin runtime for the cross-runtime frontend-release check
-/// (`agent_runtime::conformance`).
-#[cfg(test)]
-pub(crate) fn conformance_launcher() -> crate::engine::agent_runtime::conformance::Launcher {
-    tests::conformance_launcher()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::AsyncWriteExt;
-    struct RecordingControl(tokio::sync::mpsc::UnboundedSender<Control>);
-    impl ExecControl for RecordingControl {
-        fn send(&self, command: Control) -> Result<(), EngineError> {
-            self.0.send(command).map_err(|_| failed())
-        }
-    }
-
-    /// The builtin exec bridge over a fake guest exec stream: a prompt agent
-    /// has already exited; a long-running one exits on `finish`.
-    pub(super) fn conformance_launcher() -> crate::engine::agent_runtime::conformance::Launcher {
-        type Guest = (
-            tokio::sync::broadcast::Sender<ExecEvent>,
-            tokio::sync::mpsc::UnboundedReceiver<Control>,
-        );
-        let running: Arc<Mutex<Vec<Guest>>> = Arc::new(Mutex::new(Vec::new()));
-        let finishing = running.clone();
-        crate::engine::agent_runtime::conformance::Launcher {
-            name: "builtin",
-            launch: Box::new(move |mut frontend, long, prompt_files| {
-                let (broadcast, events) = tokio::sync::broadcast::channel(16);
-                let (commands, received) = tokio::sync::mpsc::unbounded_channel();
-                if long {
-                    running.lock().unwrap().push((broadcast.clone(), received));
-                } else {
-                    let _ = broadcast.send(ExecEvent::Exited(0));
-                }
-                let io = frontend.take_io();
-                ExecBridge::new(ExecBridgeOptions {
-                    handle: AgentHandle {
-                        id: "conformance".into(),
-                        name: "conformance".into(),
-                        image_tag: "test".into(),
-                        started_at: chrono::Utc::now(),
-                    },
-                    session: ExecSession {
-                        events,
-                        broadcast,
-                        control: Arc::new(RecordingControl(commands)),
-                    },
-                    cleanup: None,
-                    attach_path: None,
-                    persistent_stdin: false,
-                    seeded_prompt: None,
-                    leases: Vec::new(),
-                    prompt_files,
-                    io,
-                    cancel_grace: DEFAULT_CANCEL_GRACE,
-                })
-                .run(frontend)
-                .unwrap()
-            }),
-            finish: Box::new(move || {
-                for (guest, _) in finishing.lock().unwrap().drain(..) {
-                    let _ = guest.send(ExecEvent::Exited(0));
-                }
-            }),
-        }
-    }
-
-    #[tokio::test]
-    async fn options_forward_seeded_input_without_retaking_frontend_io() {
-        use crate::engine::container::builtin::testing::{eventually, frontend, recorder, Sent};
-        let (mut frontend, peer) = frontend(None);
-        // The TestFrontend panics if take_io is called twice.
-        let io = frontend.take_io();
-        let (control, log) = recorder();
-        let (broadcast, events) = tokio::sync::broadcast::channel(16);
-        let mut execution = ExecBridge::new(ExecBridgeOptions {
-            handle: AgentHandle {
-                id: "options".into(),
-                name: "options".into(),
-                image_tag: "test".into(),
-                started_at: chrono::Utc::now(),
-            },
-            session: ExecSession {
-                events,
-                broadcast: broadcast.clone(),
-                control,
-            },
-            cleanup: None,
-            attach_path: None,
-            persistent_stdin: false,
-            seeded_prompt: Some("a seeded prompt".into()),
-            leases: Vec::new(),
-            prompt_files: Vec::new(),
-            io,
-            cancel_grace: DEFAULT_CANCEL_GRACE,
-        })
-        .run(frontend)
-        .unwrap();
-        drop(peer.stdin);
-        eventually("seed then EOF", || {
-            *log.lock().unwrap()
-                == [
-                    Sent::Stdin(b"a seeded prompt".to_vec()),
-                    Sent::Stdin(b"\n".to_vec()),
-                    Sent::Eof,
-                ]
-        })
-        .await;
-        assert!(!execution.try_inject_stdin(b"later").unwrap());
-        assert!(broadcast.send(ExecEvent::Exited(4)).is_ok());
-        assert_eq!(execution.wait().await.unwrap().exit_code, 4);
-    }
-    #[tokio::test]
-    async fn partial_attach_frames_survive_simultaneous_output_and_input() {
-        let (server, mut peer) = tokio::net::UnixStream::pair().unwrap();
-        let (events, receiver) = tokio::sync::broadcast::channel(16);
-        let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let task = tokio::spawn(serve_client(
-            server,
-            receiver,
-            Arc::new(RecordingControl(commands)),
-        ));
-        peer.write_all(&[Tag::Stdin as u8, 3, 0]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(events.send(ExecEvent::Stdout(b"out".to_vec())).is_ok());
-        assert_eq!(
-            read_frame(&mut peer).await.unwrap(),
-            (Tag::Output, b"out".to_vec())
-        );
-        peer.write_all(&[0, 0, 0, 255, 1]).await.unwrap();
-        let input = tokio::time::timeout(Duration::from_secs(2), received.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(input, Control::Stdin(bytes) if bytes == [0, 255, 1]));
-        task.abort();
-
-        let (socket, mut peer) = tokio::net::UnixStream::pair().unwrap();
-        let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (events, mut received) = tokio::sync::broadcast::channel(16);
-        let task = tokio::spawn(client(socket, receiver, events));
-        peer.write_all(&[Tag::Stderr as u8, 3, 0]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        commands.send(Control::Stdin(b"in".to_vec())).unwrap();
-        assert_eq!(
-            read_frame(&mut peer).await.unwrap(),
-            (Tag::Stdin, b"in".to_vec())
-        );
-        peer.write_all(&[0, 0, 0, 255, 1]).await.unwrap();
-        let output = tokio::time::timeout(Duration::from_secs(2), received.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(output, ExecEvent::Stderr(bytes) if bytes == [0, 255, 1]));
-        task.abort();
-    }
-    #[tokio::test]
-    async fn attach_routes_binary_streams_resize_and_real_exit() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("attach.sock");
-        let (broadcast, events) = tokio::sync::broadcast::channel(16);
-        let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let session = ExecSession {
-            events,
-            broadcast,
-            control: Arc::new(RecordingControl(commands)),
-        };
-        let server = AttachServer::bind(&path, &session).unwrap();
-        let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
-        write_frame(&mut stream, Tag::Stdin, &[0, 255, 13])
-            .await
-            .unwrap();
-        let command = tokio::time::timeout(Duration::from_secs(2), received.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(command, Control::Stdin(bytes) if bytes == [0,255,13]));
-        write_frame(&mut stream, Tag::Resize, &[80, 0, 24, 0])
-            .await
-            .unwrap();
-        let command = tokio::time::timeout(Duration::from_secs(2), received.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(command, Control::Resize(80, 24)));
-        assert!(session
-            .broadcast
-            .send(ExecEvent::Stderr(vec![0, 255, 10]))
-            .is_ok());
-        assert!(session.broadcast.send(ExecEvent::Exited(37)).is_ok());
-        assert_eq!(
-            read_frame(&mut stream).await.unwrap(),
-            (Tag::Stderr, vec![0, 255, 10])
-        );
-        assert_eq!(
-            read_frame(&mut stream).await.unwrap(),
-            (Tag::Exit, 37_i32.to_le_bytes().to_vec())
-        );
-        server.finish();
-        assert!(!path.exists());
-    }
-    #[tokio::test]
-    async fn lagging_attach_client_gets_failure_and_never_a_clean_exit() {
-        let (server, mut peer) = tokio::net::UnixStream::pair().unwrap();
-        let (broadcast, receiver) = tokio::sync::broadcast::channel(2);
-        let (commands, _received) = tokio::sync::mpsc::unbounded_channel();
-        // Fill a two-slot channel before the client task can read it. A
-        // terminal exit follows the lost protocol bytes deliberately.
-        for byte in 0..8u8 {
-            let _ = broadcast.send(ExecEvent::Stdout(vec![byte]));
-        }
-        let _ = broadcast.send(ExecEvent::Exited(0));
-        let task = tokio::spawn(serve_client(
-            server,
-            receiver,
-            Arc::new(RecordingControl(commands)),
-        ));
-        assert_eq!(
-            read_frame(&mut peer).await.unwrap(),
-            (Tag::Failed, Vec::new())
-        );
-        tokio::time::timeout(Duration::from_secs(2), task)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(read_frame(&mut peer).await.is_err());
-    }
-    #[tokio::test]
-    async fn lagging_primary_frontend_reports_transport_failure_not_guest_exit() {
-        let (broadcast, events) = tokio::sync::broadcast::channel(2);
-        let (commands, _received) = tokio::sync::mpsc::unbounded_channel();
-        for byte in 0..8u8 {
-            let _ = broadcast.send(ExecEvent::Stdout(vec![byte]));
-        }
-        let _ = broadcast.send(ExecEvent::Exited(0));
-        let (frontend, peer) = crate::engine::container::builtin::testing::frontend(None);
-        let mut execution = {
-            let mut frontend = frontend;
-            let io = frontend.take_io();
-            ExecBridge::new(ExecBridgeOptions {
-                handle: AgentHandle {
-                    id: "lagging".into(),
-                    name: "lagging".into(),
-                    image_tag: "test".into(),
-                    started_at: chrono::Utc::now(),
-                },
-                session: ExecSession {
-                    events,
-                    broadcast,
-                    control: Arc::new(RecordingControl(commands)),
-                },
-                cleanup: None,
-                attach_path: None,
-                persistent_stdin: false,
-                seeded_prompt: None,
-                leases: Vec::new(),
-                prompt_files: Vec::new(),
-                io,
-                cancel_grace: DEFAULT_CANCEL_GRACE,
-            })
-            .run(frontend)
-        }
-        .unwrap();
-        let error = execution.wait().await.unwrap_err().to_string();
-        assert!(error.contains("lagged"), "{error}");
-        assert!(peer.statuses.lock().unwrap().iter().any(
-            |status| matches!(status, AgentStatus::Failed(message) if message.contains("lagged"))
-        ));
-    }
-    /// Delays its own drop so a bridge that releases the frontend only after
-    /// publishing the exit is caught deterministically.
-    struct SlowDropFrontend(Box<dyn AgentFrontend>);
-    impl Drop for SlowDropFrontend {
-        fn drop(&mut self) {
-            std::thread::sleep(Duration::from_millis(200));
-        }
-    }
-    impl crate::data::message::UserMessageSink for SlowDropFrontend {
-        fn write_message(&mut self, message: crate::data::message::UserMessage) {
-            self.0.write_message(message);
-        }
-        fn replay_queued(&mut self) {
-            self.0.replay_queued();
-        }
-    }
-    #[async_trait::async_trait]
-    impl AgentFrontend for SlowDropFrontend {
-        fn report_status(&mut self, status: AgentStatus) {
-            self.0.report_status(status);
-        }
-        fn report_progress(
-            &mut self,
-            progress: crate::engine::agent_runtime::frontend::AgentProgress,
-        ) {
-            self.0.report_progress(progress);
-        }
-        fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
-            self.0.take_io()
-        }
-        fn grace_timeout(&self) -> Duration {
-            self.0.grace_timeout()
-        }
-        fn stuck_timeout(&self) -> Duration {
-            self.0.stuck_timeout()
-        }
-    }
-    /// The bridge releases the frontend and its I/O sinks before `wait()`
-    /// resolves.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn frontend_is_released_before_wait_resolves() {
-        let (broadcast, events) = tokio::sync::broadcast::channel(16);
-        let (commands, _received) = tokio::sync::mpsc::unbounded_channel();
-        let _ = broadcast.send(ExecEvent::Exited(0));
-        let (frontend, peer) = crate::engine::container::builtin::testing::frontend(None);
-        let frontend = Box::new(SlowDropFrontend(frontend));
-        let mut execution = {
-            let mut frontend = frontend;
-            let io = frontend.take_io();
-            ExecBridge::new(ExecBridgeOptions {
-                handle: AgentHandle {
-                    id: "release".into(),
-                    name: "release".into(),
-                    image_tag: "test".into(),
-                    started_at: chrono::Utc::now(),
-                },
-                session: ExecSession {
-                    events,
-                    broadcast,
-                    control: Arc::new(RecordingControl(commands)),
-                },
-                cleanup: None,
-                attach_path: None,
-                persistent_stdin: false,
-                seeded_prompt: None,
-                leases: Vec::new(),
-                prompt_files: Vec::new(),
-                io,
-                cancel_grace: DEFAULT_CANCEL_GRACE,
-            })
-            .run(frontend)
-        }
-        .unwrap();
-        assert_eq!(execution.wait().await.unwrap().exit_code, 0);
-        // The frontend shares `statuses` with the peer; once it is dropped the
-        // peer holds the only reference. (Arc drops after the slow `Drop`.)
-        assert_eq!(Arc::strong_count(&peer.statuses), 1);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn frontend_is_released_when_wait_future_is_dropped() {
-        let (broadcast, events) = tokio::sync::broadcast::channel(16);
-        let _keepalive = broadcast.clone();
-        let (commands, _received) = tokio::sync::mpsc::unbounded_channel();
-        let (frontend, mut peer) = crate::engine::container::builtin::testing::frontend(None);
-        let mut execution = {
-            let mut frontend = Box::new(SlowDropFrontend(frontend));
-            let io = frontend.take_io();
-            ExecBridge::new(ExecBridgeOptions {
-                handle: AgentHandle {
-                    id: "dropped-wait".into(),
-                    name: "dropped-wait".into(),
-                    image_tag: "test".into(),
-                    started_at: chrono::Utc::now(),
-                },
-                session: ExecSession {
-                    events,
-                    broadcast,
-                    control: Arc::new(RecordingControl(commands)),
-                },
-                cleanup: None,
-                attach_path: None,
-                persistent_stdin: false,
-                seeded_prompt: None,
-                leases: Vec::new(),
-                prompt_files: Vec::new(),
-                io,
-                cancel_grace: DEFAULT_CANCEL_GRACE,
-            })
-            .run(frontend)
-        }
-        .unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), execution.wait())
-                .await
-                .is_err()
-        );
-        assert_eq!(Arc::strong_count(&peer.statuses), 1);
-        // The guest is still running (no exit event), yet the frontend's
-        // stdout and stderr senders are already released: both streams end.
-        for stream in [&mut peer.stdout, &mut peer.stderr] {
-            let closed = tokio::time::timeout(Duration::from_secs(2), stream.recv()).await;
-            assert!(
-                matches!(closed, Ok(None)),
-                "I/O sink still held: {closed:?}"
-            );
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dropped_wait_keeps_event_teardown_and_removes_attach_socket_on_exit() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("attach.sock");
-        let (broadcast, events) = tokio::sync::broadcast::channel(16);
-        let _keepalive = broadcast.clone();
-        let (commands, _received) = tokio::sync::mpsc::unbounded_channel();
-        let (frontend, _) = crate::engine::container::builtin::testing::frontend(None);
-        let mut execution = {
-            let mut frontend = frontend;
-            let io = frontend.take_io();
-            ExecBridge::new(ExecBridgeOptions {
-                handle: AgentHandle {
-                    id: "dropped-wait-attach".into(),
-                    name: "dropped-wait-attach".into(),
-                    image_tag: "test".into(),
-                    started_at: chrono::Utc::now(),
-                },
-                session: ExecSession {
-                    events,
-                    broadcast: broadcast.clone(),
-                    control: Arc::new(RecordingControl(commands)),
-                },
-                cleanup: None,
-                attach_path: Some(path.clone()),
-                persistent_stdin: false,
-                seeded_prompt: None,
-                leases: Vec::new(),
-                prompt_files: Vec::new(),
-                io,
-                cancel_grace: DEFAULT_CANCEL_GRACE,
-            })
-            .run(frontend)
-        }
-        .unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), execution.wait())
-                .await
-                .is_err()
-        );
-        assert!(path.exists(), "listener must stay live until guest exit");
-        let _ = broadcast.send(ExecEvent::Exited(0));
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while path.exists() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("event task did not finish and remove attach socket");
-    }
-    #[tokio::test]
-    async fn attach_disconnect_never_signals_target() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("attach.sock");
-        let (broadcast, events) = tokio::sync::broadcast::channel(16);
-        let (commands, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let session = ExecSession {
-            events,
-            broadcast,
-            control: Arc::new(RecordingControl(commands)),
-        };
-        let server = AttachServer::bind(&path, &session).unwrap();
-        let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
-        write_frame(&mut stream, Tag::Stdin, b"ready")
-            .await
-            .unwrap();
-        received.recv().await.unwrap();
-        drop(stream);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(30), received.recv())
-                .await
-                .is_err()
-        );
-        server.finish();
-    }
-    #[tokio::test]
-    async fn frames_preserve_binary_stderr_and_exit() {
-        let (mut writer, mut reader) = tokio::io::duplex(128);
-        write_frame(&mut writer, Tag::Stderr, &[0, 255, 13, 10])
-            .await
-            .unwrap();
-        assert_eq!(
-            read_frame(&mut reader).await.unwrap(),
-            (Tag::Stderr, vec![0, 255, 13, 10])
-        );
-        write_frame(&mut writer, Tag::Exit, &37_i32.to_le_bytes())
-            .await
-            .unwrap();
-        assert_eq!(
-            read_frame(&mut reader).await.unwrap(),
-            (Tag::Exit, 37_i32.to_le_bytes().to_vec())
-        );
-    }
-    #[tokio::test]
-    async fn oversized_frames_are_rejected_before_allocation() {
-        let (mut writer, mut reader) = tokio::io::duplex(128);
-        writer.write_u8(Tag::Output as u8).await.unwrap();
-        writer
-            .write_u32_le((crate::engine::container::attach_protocol::MAX_FRAME + 1) as u32)
-            .await
-            .unwrap();
-        assert!(read_frame(&mut reader).await.is_err());
-    }
-    #[tokio::test]
-    async fn full_attach_buffer_times_out_instead_of_hanging() {
-        let (mut writer, _reader) = tokio::io::duplex(1);
-        let error = write_frame_bounded(
-            &mut writer,
-            Tag::Output,
-            &[42; 1024],
-            Duration::from_millis(20),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-    }
-}
-
-#[cfg(test)]
-mod bridge_tests;

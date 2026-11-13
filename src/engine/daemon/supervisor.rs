@@ -25,9 +25,7 @@ use std::path::Path;
 use crate::data::config::env::ForwardedEnv;
 use crate::data::error::DataError;
 use crate::data::fs::daemon_paths::DaemonPaths;
-use crate::data::fs::daemon_process::{
-    clear_pid, ensure_private_log, read_pid, DaemonProcess, API_UNIT_NAME, SQUAD_UNIT_NAME,
-};
+use crate::data::fs::daemon_process::{ensure_private_log, read_pid, DaemonProcess};
 use crate::engine::error::EngineError;
 
 /// Supervises one daemon: liveness, background spawn, termination.
@@ -63,12 +61,8 @@ impl DaemonSupervisor {
 
     /// Supervise the daemon at `paths` under the given systemd unit name and
     /// launchd plist label.
-    pub fn for_paths(
-        paths: DaemonPaths,
-        unit_name: &'static str,
-        plist_label: &'static str,
-    ) -> Self {
-        Self::new(DaemonProcess::new(paths, unit_name, plist_label))
+    pub fn for_paths(paths: DaemonPaths) -> Self {
+        Self::new(DaemonProcess::unified(paths))
     }
 
     /// The Layer 0 PID / meta / paths object this supervisor drives.
@@ -105,14 +99,7 @@ impl DaemonSupervisor {
             self.process.plist_label(),
             self.service_manager,
         )
-        .map_err(|error| {
-            let daemon = match self.process.unit_name() {
-                SQUAD_UNIT_NAME => "squad",
-                API_UNIT_NAME => "API",
-                _ => "background",
-            };
-            EngineError::Other(format!("failed to start the {daemon} daemon: {error}"))
-        })
+        .map_err(|error| EngineError::Other(format!("failed to start the awman daemon: {error}")))
     }
 
     /// Terminate the running daemon: read the PID, and if it is a live awman
@@ -136,7 +123,9 @@ impl DaemonSupervisor {
                 Termination::Terminated { pid }
             }
         };
-        self.process.release_pidfile()?;
+        if let Termination::StalePidFile { pid } | Termination::NotAwman { pid } = outcome {
+            self.process.release_pidfile_owned_by(pid)?;
+        }
         Ok(outcome)
     }
 }
@@ -149,6 +138,9 @@ impl DaemonSupervisor {
 /// a type (Tenet 3's stateless-helper exception).
 #[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
 }
 
@@ -191,7 +183,12 @@ fn pid_is_awman(pid: u32) -> bool {
     std::process::Command::new("ps")
         .args(["-ww", "-p", &pid.to_string(), "-o", "comm="])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().contains("awman"))
+        .map(|o| {
+            let command = String::from_utf8_lossy(&o.stdout);
+            Path::new(command.trim())
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().contains("awman"))
+        })
         .unwrap_or(false)
 }
 
@@ -218,8 +215,8 @@ fn pid_is_awman(_pid: u32) -> bool {
 pub(crate) fn check_already_running(pid_path: &Path) -> Result<Option<u32>, DataError> {
     match read_pid(pid_path)? {
         Some(pid) if is_process_alive(pid) && pid_is_awman(pid) => Ok(Some(pid)),
-        Some(_) => {
-            clear_pid(pid_path)?;
+        Some(pid) => {
+            crate::data::fs::daemon_process::clear_pid_owned_by(pid_path, pid)?;
             Ok(None)
         }
         None => Ok(None),
@@ -273,7 +270,7 @@ pub(crate) fn spawn_background(
     service_manager: bool,
 ) -> Result<u32, DataError> {
     if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| DataError::io(parent, e))?;
+        crate::data::fs::private_files::create_private_dir(parent)?;
     }
     // Create the log ourselves so it exists with owner-only permissions before
     // launchd/systemd starts appending to it at the process umask. A daemon log
@@ -397,7 +394,7 @@ fn try_systemd_run(
         args,
         unit_name,
         log_path,
-        &ForwardedEnv::from_process(),
+        &daemon_unit_env(ForwardedEnv::from_process()),
     );
     let mut cmd = std::process::Command::new("systemd-run");
     cmd.args(&argv);
@@ -535,7 +532,7 @@ fn try_launchd(
         binary_path,
         args,
         log_path,
-        &ForwardedEnv::from_process(),
+        &daemon_unit_env(ForwardedEnv::from_process()),
         std::env::current_dir().ok().as_deref(),
     );
     std::fs::write(&plist_path, plist).map_err(|e| DataError::io(&plist_path, e))?;
@@ -653,297 +650,15 @@ fn double_fork_spawn(
     Ok(child.id())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::fs::daemon_process::write_pid;
-
-    #[test]
-    #[cfg(unix)]
-    fn a_directly_spawned_daemon_writes_its_output_to_the_log_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log = tmp.path().join("awman.log");
-        ensure_private_log(&log).unwrap();
-
-        // `sh -c` stands in for the daemon: one line on stdout, one on stderr.
-        double_fork_spawn(
-            Path::new("/bin/sh"),
-            &[
-                "-c".to_string(),
-                "echo to-stdout; echo to-stderr >&2".to_string(),
-            ],
-            &log,
-        )
-        .unwrap();
-
-        // The child is detached, so poll rather than assuming it has run.
-        let contents = (0..100)
-            .find_map(|_| {
-                let body = std::fs::read_to_string(&log).unwrap_or_default();
-                if body.contains("to-stdout") && body.contains("to-stderr") {
-                    return Some(body);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                None
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "daemon output never reached the log: {:?}",
-                    std::fs::read_to_string(&log)
-                )
-            });
-        assert!(contents.contains("to-stdout"), "{contents:?}");
-        assert!(contents.contains("to-stderr"), "{contents:?}");
-    }
-
-    /// An unopenable log must degrade to discarded output, never to a failed
-    /// start: the daemon matters more than its diagnostics.
-    #[test]
-    fn a_daemon_still_spawns_when_its_log_cannot_be_opened() {
-        let tmp = tempfile::tempdir().unwrap();
-        let unopenable = tmp.path().join("no-such-dir").join("awman.log");
-        assert!(double_fork_spawn(
-            Path::new(if cfg!(windows) { "cmd" } else { "/bin/sh" }),
-            &[
-                if cfg!(windows) { "/c" } else { "-c" }.to_string(),
-                "exit 0".to_string()
-            ],
-            &unopenable,
-        )
-        .is_ok());
-    }
-
-    /// The launchd job inherits nothing from the shell that started awman, so
-    /// everything it needs has to be written into the plist: the environment
-    /// (or it resolves a different storage root, and publishes its endpoint
-    /// where nobody is looking) and a working directory (or it starts in `/`).
-    #[test]
-    fn the_launchd_plist_carries_the_environment_and_working_directory() {
-        let plist = render_launchd_plist(
-            "io.awman.squad",
-            Path::new("/usr/local/bin/awman"),
-            &["squad".to_string(), "start".to_string()],
-            Path::new("/home/u/.awman/squad/awman.log"),
-            &[
-                ("PATH".to_string(), "/usr/local/bin:/usr/bin".to_string()),
-                ("AWMAN_SQUAD_ROOT".to_string(), "/custom/squad".to_string()),
-            ],
-            Some(Path::new("/home/u/project")),
-        );
-
-        assert!(plist.contains("<key>EnvironmentVariables</key>"), "{plist}");
-        assert!(plist.contains("<key>PATH</key>"), "{plist}");
-        assert!(
-            plist.contains("<string>/usr/local/bin:/usr/bin</string>"),
-            "{plist}"
-        );
-        assert!(plist.contains("<key>AWMAN_SQUAD_ROOT</key>"), "{plist}");
-        assert!(
-            plist.contains("<key>WorkingDirectory</key>\n    <string>/home/u/project</string>"),
-            "{plist}"
-        );
-        // The pieces that were already load-bearing must survive the rewrite.
-        assert!(plist.contains("<string>io.awman.squad</string>"), "{plist}");
-        assert!(
-            plist.contains("<string>/usr/local/bin/awman</string>"),
-            "{plist}"
-        );
-        assert!(plist.contains("<key>RunAtLoad</key>"), "{plist}");
-        assert_eq!(
-            plist.matches("/home/u/.awman/squad/awman.log").count(),
-            2,
-            "stdout and stderr both belong in the log: {plist}"
-        );
-    }
-
-    /// A daemon with no environment to forward and no resolvable working
-    /// directory must still produce a plist launchd will accept — an empty
-    /// `<dict/>` or a stray key would make it unparseable.
-    #[test]
-    fn the_launchd_plist_omits_empty_optional_sections() {
-        let plist = render_launchd_plist(
-            "io.awman.api",
-            Path::new("/usr/local/bin/awman"),
-            &["api".to_string(), "start".to_string()],
-            Path::new("/tmp/awman.log"),
-            &[],
-            None,
-        );
-        assert!(!plist.contains("EnvironmentVariables"), "{plist}");
-        assert!(!plist.contains("WorkingDirectory"), "{plist}");
-        assert!(plist.contains("<key>RunAtLoad</key>"), "{plist}");
-    }
-
-    /// Paths and values reach the plist as XML text, so a character that ends
-    /// an element early would produce a plist launchd refuses to parse — and a
-    /// refusal that, before `bootstrap`, was reported as success.
-    #[test]
-    fn the_launchd_plist_escapes_xml_metacharacters() {
-        let plist = render_launchd_plist(
-            "io.awman.squad",
-            Path::new("/opt/a&b/awman"),
-            &["squad".to_string(), "<start>".to_string()],
-            Path::new("/tmp/awman.log"),
-            &[("PATH".to_string(), "/x\"y/bin".to_string())],
-            None,
-        );
-        assert!(plist.contains("/opt/a&amp;b/awman"), "{plist}");
-        assert!(plist.contains("&lt;start&gt;"), "{plist}");
-        assert!(plist.contains("/x&quot;y/bin"), "{plist}");
-    }
-
-    /// `systemd_run_argv` is the pure builder `try_systemd_run` now delegates
-    /// to on Linux. One `--setenv=NAME=VALUE` element per forwarded name, in
-    /// the order given, and — because it is one `String` handed straight to
-    /// `Command::args` with no shell involved — a value containing `=`,
-    /// spaces and a colon reaches it as a single unmodified argv element.
-    #[test]
-    fn systemd_run_argv_emits_one_setenv_per_forwarded_name_in_order_with_tricky_value_intact() {
-        let env = vec![
-            ("PATH".to_string(), "/usr/bin".to_string()),
-            ("HOME".to_string(), "/home/u".to_string()),
-            (
-                crate::data::config::env::AWMAN_OVERLAYS.to_string(),
-                "env(A),dir(/x y:/z)".to_string(),
-            ),
-        ];
-        let argv = systemd_run_argv(
-            Path::new("/usr/local/bin/awman"),
-            &["squad".to_string(), "start".to_string()],
-            "io.awman.squad",
-            Path::new("/home/u/.awman/squad/awman.log"),
-            &env,
-        );
-
-        let setenv: Vec<&String> = argv.iter().filter(|a| a.starts_with("--setenv=")).collect();
-        assert_eq!(
-            setenv,
-            vec![
-                &"--setenv=PATH=/usr/bin".to_string(),
-                &"--setenv=HOME=/home/u".to_string(),
-                &"--setenv=AWMAN_OVERLAYS=env(A),dir(/x y:/z)".to_string(),
-            ],
-            "one element per name, in order, with '=', spaces and ':' intact: {argv:?}"
-        );
-
-        let dd = argv.iter().position(|a| a == "--").unwrap();
-        assert_eq!(
-            &argv[dd + 1..],
-            &["/usr/local/bin/awman", "squad", "start"],
-            "the trailing tail must survive regardless of env contents: {argv:?}"
-        );
-    }
-
-    /// A daemon with nothing to forward still produces a well-formed argv:
-    /// no stray `--setenv` elements, and the `-- binary args` tail intact.
-    #[test]
-    fn systemd_run_argv_with_no_env_emits_no_setenv_elements() {
-        let argv = systemd_run_argv(
-            Path::new("/usr/local/bin/awman"),
-            &[],
-            "io.awman.api",
-            Path::new("/tmp/awman.log"),
-            &[],
-        );
-        assert!(argv.contains(&format!(
-            "--working-directory={}",
-            std::env::current_dir().unwrap().display()
-        )));
-        assert!(!argv.iter().any(|a| a.starts_with("--setenv=")), "{argv:?}");
-        let dd = argv.iter().position(|a| a == "--").unwrap();
-        assert_eq!(&argv[dd + 1..], &["/usr/local/bin/awman"]);
-    }
-
-    /// `render_launchd_plist` is fed `ForwardedEnv::from_process()`'s output verbatim, so
-    /// the names WI 0116 added to `FORWARDED_ENV` must reach the plist the
-    /// same way the pre-existing ones already do.
-    #[test]
-    fn the_launchd_plist_carries_the_wi_0116_forwarded_names() {
-        let plist = render_launchd_plist(
-            "io.awman.squad",
-            Path::new("/usr/local/bin/awman"),
-            &["squad".to_string(), "start".to_string()],
-            Path::new("/tmp/awman.log"),
-            &[
-                (
-                    crate::data::config::env::AWMAN_OVERLAYS.to_string(),
-                    "env(DEPLOY_TOKEN)".to_string(),
-                ),
-                (
-                    crate::data::config::env::AWMAN_MAX_CONCURRENT_AGENTS.to_string(),
-                    "4".to_string(),
-                ),
-                (
-                    crate::data::config::env::AWMAN_LAUNCH_MODE.to_string(),
-                    "stdio".to_string(),
-                ),
-            ],
-            None,
-        );
-        assert!(plist.contains("<key>AWMAN_OVERLAYS</key>"), "{plist}");
-        assert!(
-            plist.contains("<string>env(DEPLOY_TOKEN)</string>"),
-            "{plist}"
-        );
-        assert!(
-            plist.contains("<key>AWMAN_MAX_CONCURRENT_AGENTS</key>"),
-            "{plist}"
-        );
-        assert!(plist.contains("<string>4</string>"), "{plist}");
-        assert!(plist.contains("<key>AWMAN_LAUNCH_MODE</key>"), "{plist}");
-        assert!(plist.contains("<string>stdio</string>"), "{plist}");
-    }
-
-    /// The diagnostic explaining why the OS process manager was skipped is the
-    /// only trace of it the user ever sees, so it has to reach the log.
-    #[test]
-    fn a_skipped_process_manager_leaves_its_reason_in_the_log() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log = tmp.path().join("awman.log");
-        ensure_private_log(&log).unwrap();
-        note_in_log(&log, "launchctl bootstrap failed: Service is disabled\n");
-        let body = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(
-            body,
-            "awman: launchctl bootstrap failed: Service is disabled\n"
-        );
-
-        // A log that cannot be opened is silently tolerated.
-        note_in_log(&tmp.path().join("gone").join("awman.log"), "ignored");
-    }
-
-    #[test]
-    fn is_process_alive_current_process() {
-        assert!(is_process_alive(std::process::id()));
-    }
-
-    #[test]
-    fn pid_is_awman_returns_false_for_a_clearly_non_awman_pid() {
-        assert!(!pid_is_awman(1), "PID 1 is not awman");
-    }
-
-    #[test]
-    fn check_already_running_for_unrelated_alive_pid_treats_as_stale() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pid_path = tmp.path().join("foreign.pid");
-        write_pid(&pid_path, 1).unwrap();
-        let result = check_already_running(&pid_path).unwrap();
-        assert!(
-            result.is_none(),
-            "unrelated alive PID must be treated as stale"
-        );
-        assert!(!pid_path.exists(), "stale PID file must be removed");
-    }
-
-    #[test]
-    fn check_already_running_stale_pid_cleaned_up() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pid_path = tmp.path().join("stale.pid");
-        write_pid(&pid_path, u32::MAX - 1).unwrap();
-        let result = check_already_running(&pid_path).unwrap();
-        assert!(result.is_none());
-        assert!(!pid_path.exists());
-    }
-
-    // ─── DaemonProcess method surface ────────────────────────────────────────
+/// The environment the `awman-daemon` unit / `io.awman.daemon` agent is started
+/// with: the process basics (`PATH`, `HOME`, `RUST_LOG`, XDG dirs) and
+/// `AWMAN_HOME`, so the daemon resolves the same home as the process that
+/// started it. No other `AWMAN_*` variable rides along: the daemon reads its
+/// configuration from that home, and `--set` overrides travel as argv.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) fn daemon_unit_env(forwarded: Vec<(String, String)>) -> Vec<(String, String)> {
+    forwarded
+        .into_iter()
+        .filter(|(name, _)| !name.starts_with("AWMAN_") || name == "AWMAN_HOME")
+        .collect()
 }

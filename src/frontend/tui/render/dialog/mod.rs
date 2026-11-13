@@ -12,6 +12,10 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
         dialogs::Dialog::CloseTabConfirm => {
             dialogs::render_close_tab_confirm(area, frame);
         }
+        dialogs::Dialog::QueuePanel(state) => queue::render_queue_panel(state, area, frame),
+        dialogs::Dialog::LeaseCloseConfirm(state) => {
+            queue::render_lease_close_confirm(state, area, frame)
+        }
         dialogs::Dialog::WorkflowCancelConfirm => {
             dialogs::render_workflow_cancel_confirm(area, frame);
         }
@@ -91,8 +95,10 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
         dialogs::Dialog::SquadTaskHistory(state) => {
             render_squad_history(state, area, frame);
         }
-        dialogs::Dialog::SquadStartConfirm => squad::render_start_confirm(area, frame),
-        dialogs::Dialog::SquadKeyMissing => squad::render_key_missing(area, frame),
+        dialogs::Dialog::SquadStartConfirm {
+            enable_config,
+            start_daemon,
+        } => squad::render_start_confirm(*enable_config, *start_daemon, area, frame),
         dialogs::Dialog::SquadRemoveConfirm { name } => {
             squad::render_remove_confirm(name, area, frame)
         }
@@ -128,16 +134,14 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
 
 mod input;
 mod misc;
+mod queue;
 mod review;
 mod squad;
 mod workflow;
 
 // `render/tests.rs` drives these two directly; the ConfigShow table is worth
 // asserting on without going through the whole dialog dispatch.
-#[cfg(test)]
-pub(super) use input::cursor_window;
-#[cfg(test)]
-pub(super) use input::render_config_show as render_config_show_for_tests;
+
 // The squad detail and history modals are called from arms that stayed in the
 // match above (they were already extracted before this split).
 use input::render_config_show;

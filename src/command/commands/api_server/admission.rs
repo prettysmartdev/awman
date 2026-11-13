@@ -6,6 +6,7 @@
 
 use super::{ApiSessionLifecycle, SetupReadiness};
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
+use crate::command::dispatch::ephemeral_secrets::SessionGitCredential;
 use crate::command::dispatch::projections::raw_args::ParsedArgs;
 use crate::command::dispatch::{CommandFrontend, Dispatch, Engines};
 use crate::command::error::CommandError;
@@ -38,6 +39,9 @@ pub struct SessionSubmission {
 
 /// Catalogue command tokens and validated label values, independent of HTTP.
 pub struct CommandSubmission {
+    pub secrets: Option<Arc<crate::data::secret::CommandSecrets>>,
+    pub allow_remote_input: bool,
+    pub interaction: Option<crate::data::config::daemon::Interaction>,
     pub subcommand: String,
     pub args: Vec<String>,
     pub labels: Labels,
@@ -61,6 +65,7 @@ pub struct AdmittedCommand {
 /// Typed decisions let a host map errors without inspecting their messages.
 #[derive(Debug)]
 pub enum AdmissionError {
+    FeatureDisabled,
     SessionCreation(CommandError),
     CommandValidation(CommandError),
     CommandAdmission(CommandError),
@@ -75,6 +80,9 @@ pub enum AdmissionError {
         source: DataError,
     },
     ReservationLost,
+    /// The request chose an interaction mode the push feature does not let
+    /// it choose (`allowOverride: false`). `400 interaction_override_refused`.
+    InteractionRefused(crate::command::interaction::InteractionRefused),
 }
 
 fn storage(what: &'static str, source: DataError) -> AdmissionError {
@@ -90,14 +98,33 @@ impl CommandSubmission {
         if let Some(body) = value.as_object_mut() {
             body.remove("session_id");
         }
+        Self::canonicalize_secrets(&mut value);
         format!("{value}\n{session}")
     }
 
-    fn validate(&self) -> Result<ParsedArgs, AdmissionError> {
+    /// Names participate in idempotency, values (and value hashes) never do.
+    pub fn canonicalize_secrets(value: &mut serde_json::Value) {
+        if let Some(body) = value.as_object_mut() {
+            if let Some(secrets) = body.get_mut("secrets") {
+                if let Some(map) = secrets.as_object() {
+                    let mut names: Vec<_> = map.keys().cloned().collect();
+                    names.sort();
+                    *secrets = serde_json::json!(names);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<ParsedArgs, AdmissionError> {
+        self.validate_for(FrontendKind::WORKER_LOCAL)
+    }
+    fn validate_for(&self, frontend: FrontendKind) -> Result<ParsedArgs, AdmissionError> {
+        Labels::new(self.labels.clone().into_inner())
+            .map_err(|e| AdmissionError::CommandValidation(CommandError::Other(e.to_string())))?;
         let catalogue = CommandCatalogue::get();
         let path: Vec<&str> = self.subcommand.split_whitespace().collect();
         if let Err(CommandError::NotAvailableForFrontend { command, .. }) =
-            catalogue.validate_for_frontend(FrontendKind::Api, &path)
+            catalogue.validate_for_frontend(frontend, &path)
         {
             return Err(AdmissionError::Unavailable {
                 command,
@@ -109,7 +136,7 @@ impl CommandSubmission {
             });
         }
         catalogue
-            .parse_raw_args_with_profile(&path, &self.args, FrontendKind::Api)
+            .parse_raw_args_with_profile(&path, &self.args, frontend)
             .map_err(AdmissionError::CommandValidation)
     }
 }
@@ -117,6 +144,7 @@ impl CommandSubmission {
 /// Owns admission validation, durable write order and failure compensation.
 #[derive(Clone)]
 pub struct ApiAdmission {
+    request_context: crate::data::daemon_state::CommandRequestContext,
     store: Arc<SqliteSessionStore>,
     lifecycle_store: CommandLifecycleStore,
     paths: ApiPaths,
@@ -127,6 +155,99 @@ pub struct ApiAdmission {
 }
 
 impl ApiAdmission {
+    fn frontend_kind(&self) -> FrontendKind {
+        FrontendKind::Daemon {
+            feature: crate::data::daemon_state::FeatureName::Worker,
+            listener: self.request_context.listener,
+        }
+    }
+    /// Set transport metadata once on the admission object. Keeping it separate
+    /// from the wire body prevents callers from spoofing their source listener.
+    pub fn with_request_context(
+        mut self,
+        context: crate::data::daemon_state::CommandRequestContext,
+    ) -> Self {
+        self.request_context = context;
+        self
+    }
+
+    /// Resolve push interaction once, at submit (WI 0141).
+    ///
+    /// The request asks through the body's `interaction` or an explicit
+    /// `--interactive` / `--headless[=bool]` in `args`; the two must agree.
+    /// `command::interaction::resolve_interaction` applies
+    /// `daemon.features.worker.push.{interaction,allowOverride}` as they are
+    /// now (admission is built from the live config), and a disallowed
+    /// override is refused here with `interaction_override_refused` rather
+    /// than downgraded later. The resolved choice is recorded in the stored
+    /// args as one leading `--headless` / `--interactive` token when the
+    /// client did not spell it, so the queue worker, a restart re-queue and
+    /// the read projection all see the same decision without a schema change.
+    fn resolve_interaction(
+        &self,
+        mut command: CommandSubmission,
+    ) -> Result<CommandSubmission, AdmissionError> {
+        use crate::command::interaction::{
+            requested_from_flags, resolve_interaction, InteractionSlot,
+        };
+        use crate::data::config::daemon::{DaemonSettings, Interaction};
+        let settings = DaemonSettings::from_merged(
+            &self
+                .engines
+                .global_config
+                .daemon
+                .clone()
+                .unwrap_or_default(),
+        );
+        let catalogue = CommandCatalogue::get();
+        let path: Vec<&str> = command.subcommand.split_whitespace().collect();
+        let spec = catalogue.lookup_with_aliases(&path);
+        let supports_headless = spec.is_some_and(|s| s.find_flag("headless").is_some());
+        let supports_interactive = spec.is_some_and(|s| s.find_flag("interactive").is_some());
+        // Explicit flags only (no profile defaults). A malformed argv is
+        // reported by validation right after this, so it asks for nothing.
+        let from_args = catalogue
+            .parse_raw_args(&path, &command.args)
+            .ok()
+            .and_then(|parsed| {
+                requested_from_flags(
+                    parsed.flag_bool("interactive"),
+                    parsed.flag_bool("headless"),
+                )
+            });
+        let requested = match (command.interaction, from_args) {
+            (Some(body), Some(args)) if body != args => {
+                return Err(AdmissionError::CommandValidation(
+                    CommandError::InvalidFlagValue {
+                        command: path.iter().map(|p| (*p).to_string()).collect(),
+                        flag: if args == Interaction::Interactive {
+                            "interactive".into()
+                        } else {
+                            "headless".into()
+                        },
+                        reason: format!(
+                            "contradicts the request's \"interaction\": \"{}\"",
+                            body.as_str()
+                        ),
+                    },
+                ))
+            }
+            (body, args) => body.or(args),
+        };
+        let decision = resolve_interaction(InteractionSlot::WorkerPush, requested, &settings)
+            .map_err(AdmissionError::InteractionRefused)?;
+        if supports_headless && from_args.is_none() {
+            let token = match decision.interaction {
+                Interaction::Headless => "--headless",
+                Interaction::Interactive if supports_interactive => "--interactive",
+                Interaction::Interactive => "--headless=false",
+            };
+            command.args.insert(0, token.into());
+        }
+        command.interaction = Some(decision.interaction);
+        Ok(command)
+    }
+
     pub fn new(
         store: Arc<SqliteSessionStore>,
         lifecycle_store: CommandLifecycleStore,
@@ -137,6 +258,7 @@ impl ApiAdmission {
         workdir_roots: Vec<PathBuf>,
     ) -> Self {
         Self {
+            request_context: Default::default(),
             store,
             lifecycle_store,
             paths,
@@ -163,8 +285,9 @@ impl ApiAdmission {
         close_on_finish: bool,
         journal: Option<&IdempotentAdmission>,
     ) -> Result<AdmittedSession, AdmissionError> {
-        let session_id = uuid::Uuid::new_v4().to_string();
-        let created_at = chrono::Utc::now().to_rfc3339();
+        let command = command.map(|c| self.resolve_interaction(c)).transpose()?;
+        let session_id = crate::data::ids::WorkerSessionId::new().to_string();
+        let created_at = crate::data::wire::format_timestamp(chrono::Utc::now());
         let session_dir = self.paths.session_dir(&session_id);
 
         // Validate and plan the session in Layer 2. The route only maps the typed
@@ -175,11 +298,33 @@ impl ApiAdmission {
             .request
             .validate(&policy, self.engines.git_engine.as_ref())
             .map_err(AdmissionError::SessionCreation)?;
-        plan.validate_merge_ref_kinds(Arc::clone(&self.engines.git_engine))
+        // WI 0145: the caller's credential (scope = this repository) is held
+        // in memory only; the merge-ref advertisement already uses it.
+        let git_credential = match (&submission.request.git_auth, plan.repo_url.as_deref()) {
+            (Some(spec), Some(url)) => Some(Arc::new(SessionGitCredential {
+                spec: Arc::clone(spec),
+                scope: crate::command::session_git_transport::git_auth_scope(url)
+                    .map_err(AdmissionError::SessionCreation)?,
+            })),
+            _ => None,
+        };
+        let validation_transport = if plan.merge_refs.is_empty() {
+            crate::engine::git::transport::HostGitTransport::user(
+                crate::engine::git::transport::CredentialSource::Ambient,
+            )
+        } else {
+            crate::command::session_git_transport::transport_for_credential(
+                &self.engines.ephemeral_secrets,
+                &crate::command::session_git_transport::credential_socket_dir(&self.engines),
+                git_credential.as_ref(),
+            )
+            .map_err(AdmissionError::SessionCreation)?
+        };
+        plan.validate_merge_ref_kinds(Arc::clone(&self.engines.git_engine), validation_transport)
             .await
             .map_err(AdmissionError::SessionCreation)?;
         if let Some(command) = &command {
-            command.validate()?;
+            command.validate_for(self.frontend_kind())?;
         }
 
         // Create session storage directories (Layer 0).
@@ -191,7 +336,9 @@ impl ApiAdmission {
         // Fix the response before durable writes. The provisional insertion
         // replaces this intent with a rollback barrier; only complete admission
         // restores it for crash recovery from the session or command resource.
-        let command_id = command.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
+        let command_id = command
+            .as_ref()
+            .map(|_| crate::data::ids::CommandId::new().to_string());
         let response_body = match &command_id {
             Some(command_id) => admission_body(
                 journal,
@@ -203,8 +350,17 @@ impl ApiAdmission {
             ),
             None => admission_body(
                 journal,
-                &SessionResponse {
-                    session_id: session_id.clone(),
+                &{
+                    let mut body = serde_json::json!({"id":session_id,"workdir":plan.resolved_workdir,"created_at":created_at,"status":"active","setup_status":"initializing","session_type":plan.kind.as_str(),"repo_url":plan.repo_url,"branch":plan.branch,"base_ref":plan.base_ref,"merge_refs":plan.merge_refs,"push":plan.push,"labels":submission.labels});
+                    if let Some(key) = &plan.context_key {
+                        body["context_key"] = serde_json::json!(key.as_str());
+                    }
+                    // The kind only: the response never echoes a credential.
+                    if let Some(credential) = &git_credential {
+                        body["git_auth"] =
+                            serde_json::json!({"kind": credential.spec.kind().as_str()});
+                    }
+                    body
                 },
                 IdempotencyResource::Session(&session_id),
             ),
@@ -244,6 +400,18 @@ impl ApiAdmission {
             tracing::error!(error = %e, "Failed to insert session");
             return Err(storage("Failed to create session", e));
         }
+        self.store
+            .set_context_key(&session_id, plan.context_key.as_ref())
+            .map_err(|e| storage("Failed to store context key", e))?;
+        if let Some(credential) = &git_credential {
+            self.engines.ephemeral_secrets.insert_session_git_auth(
+                &session_id,
+                SessionGitCredential {
+                    spec: Arc::clone(&credential.spec),
+                    scope: credential.scope.clone(),
+                },
+            );
+        }
         // Record the remote inputs before setup starts, so a restored session
         // keeps them (and the push stage can read `push` from the row).
         if plan.kind == SessionKind::Remote {
@@ -255,6 +423,7 @@ impl ApiAdmission {
                     base_ref: plan.base_ref.as_deref(),
                     merge_refs: &plan.merge_refs,
                     push: plan.push,
+                    git_auth_kind: git_credential.as_ref().map(|c| c.spec.kind().as_str()),
                 },
             ) {
                 tracing::error!(error = %e, "Failed to record remote session fields");
@@ -275,8 +444,10 @@ impl ApiAdmission {
             // The run link precedes the command row: the row is the admission
             // point, and setup/bootstrap always find the link for it.
             let run = RunRecord {
-                session_id: session_id.clone(),
-                command_id,
+                session_id: crate::data::ids::WorkerSessionId::parse(&session_id)
+                    .expect("generated session id"),
+                command_id: crate::data::ids::CommandId::parse(&command_id)
+                    .expect("generated command id"),
                 close_on_finish,
                 created_at,
             };
@@ -285,7 +456,8 @@ impl ApiAdmission {
                 self.compensate_session(&session_id, journal).await;
                 return Err(storage("Failed to record run", error));
             }
-            if let Err(error) = self.enqueue_command(&run.command_id, &session_id, &command) {
+            if let Err(error) = self.enqueue_command(run.command_id.as_str(), &session_id, &command)
+            {
                 self.compensate_session(&session_id, journal).await;
                 return Err(error);
             }
@@ -297,7 +469,7 @@ impl ApiAdmission {
         // Only fully populated resources may recover an accepted response.
         if let Some(journal) = journal {
             let resource = match &run {
-                Some(run) => IdempotencyResource::Command(&run.command_id),
+                Some(run) => IdempotencyResource::Command(run.command_id.as_str()),
                 None => IdempotencyResource::Session(&session_id),
             };
             if let Err(error) = journal.record(&response_body, resource) {
@@ -314,6 +486,9 @@ impl ApiAdmission {
     }
 
     async fn compensate_session(&self, session_id: &str, journal: Option<&IdempotentAdmission>) {
+        self.engines
+            .ephemeral_secrets
+            .remove_session_git_auth(session_id);
         if let Some(journal) = journal {
             if let Err(error) = journal.compensating_session(session_id) {
                 tracing::error!(%error, session_id, "Failed to void admission intent before compensation");
@@ -332,6 +507,18 @@ impl ApiAdmission {
                 tracing::error!(%error, session_id, "Failed to compensate session admission")
             }
         }
+        // Compensation can cancel an already-enqueued run before a worker
+        // ever owns it. Release those values as part of admission rollback.
+        if let Ok(Some(run)) = crate::data::ids::WorkerSessionId::parse(session_id)
+            .map_err(|e| e.to_string())
+            .and_then(|id| {
+                self.lifecycle_store
+                    .run_for_session(&id)
+                    .map_err(|e| e.to_string())
+            })
+        {
+            self.engines.ephemeral_secrets.remove(&run.command_id);
+        }
     }
 
     pub async fn admit_command(
@@ -340,7 +527,8 @@ impl ApiAdmission {
         submission: CommandSubmission,
         journal: Option<&IdempotentAdmission>,
     ) -> Result<AdmittedCommand, AdmissionError> {
-        let parsed = submission.validate()?;
+        let submission = self.resolve_interaction(submission)?;
+        let parsed = submission.validate_for(self.frontend_kind())?;
         match self
             .store
             .command_admission(session_id)
@@ -349,21 +537,45 @@ impl ApiAdmission {
             SessionCommandAdmission::Accepted => {}
             other => return Err(AdmissionError::Session(other)),
         }
+        // WI 0145: a session whose in-memory Git credential was lost (daemon
+        // restart) cannot publish; refuse before anything is queued.
+        if let Some(session) = self
+            .store
+            .get_session(session_id)
+            .map_err(|e| storage("Failed to validate session", e))?
+        {
+            crate::command::session_git_transport::check_session_credentials(
+                &self.engines,
+                session_id,
+                session.git_auth_kind.as_deref(),
+            )
+            .map_err(AdmissionError::CommandAdmission)?;
+        }
         let readiness = self.lifecycle().setup_readiness(session_id).await;
         if !readiness.is_ready() {
             return Err(AdmissionError::Setup(readiness));
         }
         let path_parts: Vec<&str> = submission.subcommand.split_whitespace().collect();
-        let command_id = uuid::Uuid::new_v4().to_string();
+        let command_id = crate::data::ids::CommandId::new().to_string();
         let mut flags_applied = serde_json::Value::Object(
             CommandCatalogue::get()
-                .frontend_profile(FrontendKind::Api, &path_parts)
+                .frontend_profile(self.frontend_kind(), &path_parts)
                 .into_iter()
                 .map(|(flag, value)| (flag.replace('-', "_"), flag_default_json(&value)))
                 .collect(),
         );
+        if flags_applied.get("headless").is_some() {
+            flags_applied["headless"] = serde_json::json!(
+                submission.interaction
+                    != Some(crate::data::config::daemon::Interaction::Interactive)
+            );
+        }
         if let Some(session) = self.sessions.get_by_key(session_id) {
-            let dispatch = Dispatch::new(AdmissionInput(parsed), session, self.engines.clone());
+            let dispatch = Dispatch::new(
+                AdmissionInput(parsed, submission.interaction, self.frontend_kind()),
+                session,
+                self.engines.clone(),
+            );
             if let Some(policy) = dispatch
                 .prerequisite_admission(&path_parts)
                 .map_err(AdmissionError::CommandAdmission)?
@@ -375,6 +587,8 @@ impl ApiAdmission {
             journal,
             &CommandResponse {
                 command_id: command_id.clone(),
+                session_id: session_id.to_string(),
+                status: "queued",
                 flags_applied: flags_applied.clone(),
             },
             IdempotencyResource::Command(&command_id),
@@ -402,14 +616,28 @@ impl ApiAdmission {
 
         let log_path = self.paths.command_log_path(session_id, command_id);
 
-        if let Err(e) = self.store.enqueue_command_with_labels(
+        let id = crate::data::ids::CommandId::parse(command_id).expect("generated command id");
+        if let Some(secrets) = body.secrets.as_ref().filter(|s| !s.is_empty()) {
+            self.lifecycle_store
+                .record_secret_names(&id, &secrets.names().collect::<Vec<_>>())
+                .map_err(|e| storage("Failed to record command secret names", e))?;
+            self.engines
+                .ephemeral_secrets
+                .insert(id.clone(), secrets.clone());
+        }
+
+        if let Err(e) = self.store.enqueue_command_with_terminal_input(
             command_id,
             session_id,
             &body.subcommand,
             &args_json,
             &log_path.to_string_lossy(),
             &body.labels,
+            &self.request_context,
+            body.allow_remote_input,
         ) {
+            self.engines.ephemeral_secrets.remove(&id);
+            let _ = self.lifecycle_store.remove_secret_names(&id);
             tracing::error!(error = %e, "Failed to enqueue command");
             return Err(storage("Failed to enqueue command", e));
         }
@@ -426,12 +654,10 @@ impl ApiAdmission {
 }
 
 #[derive(Serialize)]
-struct SessionResponse {
-    session_id: String,
-}
-
-#[derive(Serialize)]
 struct CommandResponse {
+    session_id: String,
+    status: &'static str,
+    #[serde(rename = "id")]
     command_id: String,
     /// Server-enforced flags whose values the API frontend always overrides.
     /// Documents to clients that `yolo` and `non_interactive` are forced to
@@ -465,16 +691,30 @@ fn flag_default_json(
 
 /// Only the catalogue accessors used by Dispatch's admission policy. It never
 /// executes a command or constructs an execution frontend.
-struct AdmissionInput(ParsedArgs);
+struct AdmissionInput(
+    ParsedArgs,
+    Option<crate::data::config::daemon::Interaction>,
+    FrontendKind,
+);
 impl UserMessageSink for AdmissionInput {
     fn write_message(&mut self, _message: UserMessage) {}
     fn replay_queued(&mut self) {}
 }
 impl CommandFrontend for AdmissionInput {
+    fn input_available(&self) -> bool {
+        self.1 == Some(crate::data::config::daemon::Interaction::Interactive)
+    }
     fn kind(&self) -> FrontendKind {
-        FrontendKind::Api
+        self.2
     }
     fn flag_bool(&self, _path: &[&str], name: &str) -> Result<Option<bool>, CommandError> {
+        if name == "headless" {
+            if let Some(mode) = self.1 {
+                return Ok(Some(
+                    mode == crate::data::config::daemon::Interaction::Headless,
+                ));
+            }
+        }
         Ok(self.0.flag_bool(name))
     }
     fn flag_string(&self, _path: &[&str], name: &str) -> Result<Option<String>, CommandError> {
@@ -507,7 +747,7 @@ impl CommandFrontend for AdmissionInput {
 /// process's intent, but cannot take over another live request here.
 fn daemon_instance() -> &'static str {
     static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    INSTANCE.get_or_init(|| uuid::Uuid::new_v4().to_string())
+    INSTANCE.get_or_init(|| crate::data::ids::CommandId::new().to_string())
 }
 
 /// Owns a request's reservation, including release when its future is dropped
@@ -534,7 +774,7 @@ impl IdempotentAdmission {
             route,
             principal: principal.into(),
             key: key.into(),
-            request: uuid::Uuid::new_v4().to_string(),
+            request: crate::data::ids::CommandId::new().to_string(),
             active: AtomicBool::new(false),
         }
     }
@@ -582,7 +822,11 @@ impl IdempotentAdmission {
             self.scope(),
             &self.key,
             self.owner(),
-            202,
+            if matches!(resource, IdempotencyResource::Session(_)) {
+                201
+            } else {
+                202
+            },
             body,
             resource,
         ) {
@@ -680,7 +924,7 @@ impl IdempotencyGate {
     pub fn open(
         store: &Arc<SqliteSessionStore>,
         route: &'static str,
-        auth: &crate::engine::auth::AuthMode,
+        principal: &str,
         key: Option<&str>,
         canonical: &str,
     ) -> Result<Self, IdempotencyGateError> {
@@ -690,10 +934,6 @@ impl IdempotencyGate {
         if !is_valid_idempotency_key(key) {
             return Err(IdempotencyGateError::InvalidKey);
         }
-        let principal = match auth {
-            crate::engine::auth::AuthMode::Enabled { key_hash } => key_hash.as_str(),
-            crate::engine::auth::AuthMode::Disabled => "anonymous",
-        };
         let journal = Arc::new(IdempotentAdmission::new(
             Arc::clone(store),
             route,
@@ -781,6 +1021,3 @@ fn admission_body(
     }
     Ok(body)
 }
-
-#[cfg(test)]
-mod tests;

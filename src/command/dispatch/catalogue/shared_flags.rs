@@ -16,7 +16,7 @@ use super::*;
 // local `exec workflow`, minus flags that make no sense remotely (`--workdir`
 // is implicit, `--worktree` is a local-session concern, and `--json` shapes the
 // local outcome, which the server reports itself). Plus remote-transport
-// flags (`--remote-addr`, `--session`, `--api-key`, `--follow`). Every kept
+// flags (`--session`, `--follow`), with the target selected by global `--remote`. Every kept
 // flag is forwarded to the server; an excluded one is an unknown flag, so it
 // is refused rather than silently dropped.
 //
@@ -27,33 +27,11 @@ use super::*;
 pub(super) const REMOTE_EXEC_EXCLUDED_FLAG_NAMES: &[&str] =
     &["workdir", "worktree", "branch", "pr", "json"];
 
-pub(super) const REMOTE_TRANSPORT_FLAGS: [FlagSpec; 4] = [
-    FlagSpec {
-        long: "remote-addr",
-        short: None,
-        help: "Address of the remote awman API host.",
-        kind: FlagKind::OptionalString,
-        default: FlagDefault::None,
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
+pub(super) const REMOTE_TRANSPORT_FLAGS: [FlagSpec; 2] = [
     FlagSpec {
         long: "session",
         short: None,
         help: "Session ID to use on the remote host.",
-        kind: FlagKind::OptionalString,
-        default: FlagDefault::None,
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "api-key",
-        short: None,
-        help: "API key for the remote awman API host.",
         kind: FlagKind::OptionalString,
         default: FlagDefault::None,
         frontends: FrontendVisibility::All,
@@ -139,6 +117,22 @@ pub(super) const fn build_remote_flags<const N: usize>(
     while j < base.len() {
         if !const_str_in_list(base[j].long, excluded) {
             out[idx] = base[j];
+            // Local implications are applied by the receiving exec command.
+            let mut k = 0;
+            let mut excluded_count = 0;
+            while k < base[j].implies.len() {
+                if const_str_in_list(base[j].implies[k], excluded) {
+                    excluded_count += 1;
+                }
+                k += 1;
+            }
+            if excluded_count > 0 {
+                assert!(
+                    excluded_count == base[j].implies.len(),
+                    "mixed remote implications need an explicit projection"
+                );
+                out[idx].implies = &[];
+            }
             idx += 1;
         }
         j += 1;
@@ -162,11 +156,11 @@ pub(super) const REMOTE_EXEC_PROMPT_FLAGS: [FlagSpec; REMOTE_EXEC_PROMPT_TOTAL] 
 
 /// Shared agent-run flags for `chat` and `exec prompt` (without workflow-only
 /// flags). Mode flags `yolo` / `auto` / `plan` are mutually exclusive.
-pub(super) const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 10] = [
+pub(super) const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 9] = [
     FlagSpec {
-        long: "non-interactive",
+        long: "headless",
         short: Some('n'),
-        help: "Run the agent in non-interactive (print) mode.",
+        help: "Run the agent headless (print mode).",
         kind: FlagKind::Bool,
         default: FlagDefault::Bool(false),
         frontends: FrontendVisibility::All,
@@ -191,17 +185,6 @@ pub(super) const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 10] = [
         help: "Mount the host Docker daemon socket into the agent container.",
         kind: FlagKind::Bool,
         default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "launch-mode",
-        short: None,
-        help: "Launch the agent over stdio or ACP.",
-        kind: FlagKind::Enum(&["stdio", "acp"]),
-        default: FlagDefault::None,
         frontends: FrontendVisibility::All,
         conflicts_with: &[],
         implies: &[],
@@ -254,7 +237,8 @@ pub(super) const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 10] = [
     FlagSpec {
         long: "overlay",
         short: None,
-        help: "Mount a host directory into the agent container. Repeatable.",
+        help:
+            "Mount a directory or context(repo@<key>[:ro|rw]) into the agent container. Repeatable.",
         kind: FlagKind::VecString,
         default: FlagDefault::EmptyVec,
         frontends: FrontendVisibility::All,
@@ -321,6 +305,26 @@ pub enum SessionWorktreeTarget {
     Existing(String),
 }
 
+/// `--interactive`: run the agent in a PTY. It is already the CLI/TUI
+/// default; it exists so a request to the daemon's worker (`POST
+/// /v1/worker/commands`) can ask for a PTY over the push default of
+/// `headless`, where `daemon.features.worker.push.allowOverride` permits (WI
+/// 0141). Declared on `exec prompt` and `exec workflow` only (and so on their
+/// `remote exec` forms). The conflict is declared on this side alone: `chat`
+/// and `ready` share `--headless`'s spec and have no `--interactive`, and the
+/// conflict is symmetric in both clap and the raw-args projection.
+pub(super) const INTERACTIVE_FLAG: [FlagSpec; 1] = [FlagSpec {
+    long: "interactive",
+    short: None,
+    help: "Run the agent interactively in a terminal (PTY). Overrides a daemon worker's \
+           headless default where the worker allows it.",
+    kind: FlagKind::Bool,
+    default: FlagDefault::Bool(false),
+    frontends: FrontendVisibility::All,
+    conflicts_with: &["headless"],
+    implies: &[],
+    optional: true,
+}];
 /// Agent-run flags for `exec prompt` — extends the common flags with
 /// `--issue` and persistent session-worktree selectors.
 /// `--issue` remains exclusive to `exec prompt`.
@@ -347,12 +351,15 @@ pub(super) const CHAT_FLAGS: [FlagSpec;
     concat_flags(&[&AGENT_RUN_FLAGS_NO_WORKTREE, &SESSION_WORKTREE_FLAGS]);
 
 pub(super) const EXEC_PROMPT_FLAGS: [FlagSpec;
-    AGENT_RUN_FLAGS_NO_WORKTREE.len() + EXEC_PROMPT_EXTRA_FLAGS.len() + SESSION_WORKTREE_FLAGS.len()] =
-    concat_flags(&[
-        &AGENT_RUN_FLAGS_NO_WORKTREE,
-        &EXEC_PROMPT_EXTRA_FLAGS,
-        &SESSION_WORKTREE_FLAGS,
-    ]);
+    AGENT_RUN_FLAGS_NO_WORKTREE.len()
+        + EXEC_PROMPT_EXTRA_FLAGS.len()
+        + INTERACTIVE_FLAG.len()
+        + SESSION_WORKTREE_FLAGS.len()] = concat_flags(&[
+    &AGENT_RUN_FLAGS_NO_WORKTREE,
+    &EXEC_PROMPT_EXTRA_FLAGS,
+    &INTERACTIVE_FLAG,
+    &SESSION_WORKTREE_FLAGS,
+]);
 
 /// `--work-item`, which `exec workflow` lists before everything else.
 pub(super) const EXEC_WORKFLOW_LEADING_FLAGS: [FlagSpec; 1] = [FlagSpec {
@@ -367,7 +374,7 @@ pub(super) const EXEC_WORKFLOW_LEADING_FLAGS: [FlagSpec; 1] = [FlagSpec {
     optional: true,
 }];
 
-/// `--worktree`, which `exec workflow` lists between `--launch-mode` and
+/// `--worktree`, which `exec workflow` lists between `--allow-docker` and
 /// `--yolo` — the position the flag has always had in `--help`.
 pub(super) const EXEC_WORKFLOW_WORKTREE_FLAG: [FlagSpec; 1] = [FlagSpec {
     long: "worktree",
@@ -382,7 +389,7 @@ pub(super) const EXEC_WORKFLOW_WORKTREE_FLAG: [FlagSpec; 1] = [FlagSpec {
 }];
 
 /// The flags `exec workflow` adds after the base set.
-pub(super) const EXEC_WORKFLOW_TRAILING_FLAGS: [FlagSpec; 7] = [
+pub(super) const EXEC_WORKFLOW_TRAILING_FLAGS: [FlagSpec; 6] = [
     FlagSpec {
         long: "issue",
         short: None,
@@ -416,17 +423,6 @@ pub(super) const EXEC_WORKFLOW_TRAILING_FLAGS: [FlagSpec; 7] = [
         help: "Agent and model for the dynamic leader, as agent::model \
                (e.g. claude::claude-opus-4-8). Only valid with --dynamic.",
         kind: FlagKind::OptionalString,
-        default: FlagDefault::None,
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "max-concurrent",
-        short: None,
-        help: "Cap on concurrently-running workflow steps (must be >= 1).",
-        kind: FlagKind::UsizeAtLeastOne,
         default: FlagDefault::None,
         frontends: FrontendVisibility::All,
         conflicts_with: &[],
@@ -548,9 +544,10 @@ pub(super) const CHECK_PREREQUISITES_FLAG: [FlagSpec; 1] = [FlagSpec {
 /// base run, so the base set is spliced rather than concatenated. The order is
 /// exactly what the literal had, because it is the order `--help` and the
 /// generated command reference print.
-pub(super) const EXEC_WORKFLOW_FLAGS: [FlagSpec; 25] = concat_flags(&[
+pub(super) const EXEC_WORKFLOW_FLAGS: [FlagSpec; 24] = concat_flags(&[
     &EXEC_WORKFLOW_LEADING_FLAGS,
     AGENT_RUN_BEFORE_WORKTREE,
+    &INTERACTIVE_FLAG,
     &EXEC_WORKFLOW_WORKTREE_FLAG,
     AGENT_RUN_AFTER_WORKTREE,
     &EXEC_WORKFLOW_TRAILING_FLAGS,
@@ -564,7 +561,7 @@ pub(super) const EXEC_WORKFLOW_FLAGS: [FlagSpec; 25] = concat_flags(&[
         default: FlagDefault::Bool(false),
         frontends: FrontendVisibility::All,
         conflicts_with: &[],
-        implies: &["non-interactive"],
+        implies: &["headless"],
         optional: true,
     }],
 ]);
@@ -616,11 +613,11 @@ pub(super) const EXEC_WORKFLOW_BASE: [FlagSpec; AGENT_RUN_FLAGS_NO_WORKTREE.len(
     override_flags(&AGENT_RUN_FLAGS_NO_WORKTREE, &EXEC_WORKFLOW_BASE_OVERRIDES);
 
 /// The base agent-run flags that precede `--worktree` in `exec workflow`:
-/// `--non-interactive`, `--plan`, `--allow-docker`, `--launch-mode`.
-const AGENT_RUN_BEFORE_WORKTREE: &[FlagSpec] = EXEC_WORKFLOW_BASE.split_at(4).0;
+/// `--headless`, `--plan`, `--allow-docker`.
+const AGENT_RUN_BEFORE_WORKTREE: &[FlagSpec] = EXEC_WORKFLOW_BASE.split_at(3).0;
 /// The rest of them: `--yolo`, `--auto`, `--agent`, `--model`, `--overlay`,
 /// `--agent-flag`.
-const AGENT_RUN_AFTER_WORKTREE: &[FlagSpec] = EXEC_WORKFLOW_BASE.split_at(4).1;
+const AGENT_RUN_AFTER_WORKTREE: &[FlagSpec] = EXEC_WORKFLOW_BASE.split_at(3).1;
 
 /// Concatenate flag arrays in order.
 ///

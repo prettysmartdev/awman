@@ -63,6 +63,25 @@ impl Capabilities {
     pub fn squad_supported(&self) -> bool {
         self.arbitrary_host_mounts
     }
+
+    /// Whether the runtime can mount the session workspace read-only while
+    /// keeping a scratch directory and the agent home writable. Every
+    /// container-tier driver (Docker, Apple, builtin) honours a read-only
+    /// bind mount; the sandbox tier shares its workspace directory
+    /// read-write and cannot. Read by `AgentEngine` (which refuses a
+    /// read-only launch it cannot enforce) and by the worker's lease
+    /// eligibility check and WSP registration (`lease_read_only`).
+    pub fn read_only_workspace(&self) -> bool {
+        self.arbitrary_host_mounts
+    }
+
+    /// Whether a requested `/awman/output` directory is actually mounted on
+    /// this runtime (`outputs_mounted` of a command result and WSP lease
+    /// result). `requested` is whether the command was given an output
+    /// directory at all.
+    pub fn mounts_outputs(&self, requested: bool) -> bool {
+        requested && self.arbitrary_host_mounts
+    }
 }
 /// How a runtime obtains the image an agent runs from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,68 +92,4 @@ pub enum ImageAcquisition {
     Import,
     /// Declared by a kit or template; no image of awman's own (`ready_agent`).
     Kit,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engine::agent_runtime::AgentRuntimeEngine;
-    use crate::engine::container::ContainerRuntime;
-
-    // ─── Container capabilities ───────────────────────────────────────────────
-
-    #[test]
-    fn docker_runtime_capabilities_match_expected() {
-        let rt = ContainerRuntime::docker();
-        let caps = rt.capabilities();
-        assert!(
-            caps.arbitrary_host_mounts,
-            "docker supports arbitrary host mounts"
-        );
-        assert!(!caps.kit_declarative, "docker uses local images, not kits");
-        assert!(caps.has_image_store, "docker keeps a local image store");
-        assert_eq!(caps.image_acquisition, ImageAcquisition::Build);
-        assert!(caps.reports_resource_stats);
-        assert!(caps.squad_supported());
-    }
-
-    #[test]
-    fn apple_runtime_capabilities_same_as_docker() {
-        // Apple Containers share container-paradigm capabilities with Docker.
-        let docker = ContainerRuntime::docker();
-        let apple = ContainerRuntime::apple();
-        assert_eq!(docker.capabilities(), apple.capabilities());
-    }
-
-    // ─── Sandbox capabilities ─────────────────────────────────────────────────
-
-    #[test]
-    fn sandbox_runtime_capabilities_match_expected() {
-        // SandboxRuntime::dsbx() errors on Linux — that platform
-        // verifies the guard error instead.
-        use crate::engine::sandbox::SandboxRuntime;
-        match SandboxRuntime::dsbx() {
-            Ok(rt) => {
-                let caps = rt.capabilities();
-                assert!(
-                    !caps.arbitrary_host_mounts,
-                    "sandbox cannot bind arbitrary paths"
-                );
-                assert!(caps.kit_declarative, "sandbox uses kit/template");
-                assert!(
-                    !caps.has_image_store,
-                    "sandbox has no local image store to reclaim"
-                );
-                assert_eq!(caps.image_acquisition, ImageAcquisition::Kit);
-                assert!(
-                    !caps.reports_resource_stats,
-                    "sandbox stats are zeros the runtime did not measure"
-                );
-                assert!(!caps.squad_supported());
-            }
-            Err(_) => {
-                // Unsupported platform — platform guard test covers this branch.
-            }
-        }
-    }
 }

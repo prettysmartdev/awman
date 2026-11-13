@@ -25,7 +25,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::engine::error::{EngineError, ImageRetryClass};
 
@@ -235,25 +235,40 @@ pub(crate) fn finish(err: EngineError) -> EngineError {
     }
 }
 
-/// Deadline bookkeeping for one acquisition.
+/// The monotonic clock deadlines read unless a caller injects another.
+static SYSTEM_CLOCK: crate::data::clock::SystemClock = crate::data::clock::SystemClock;
+
+/// Deadline bookkeeping for one acquisition, on an injectable monotonic
+/// clock (the system clock in production, a `ManualClock` in tests).
 #[derive(Debug, Clone, Copy)]
 pub struct Deadline {
-    started: Instant,
+    clock: &'static dyn crate::data::clock::Clock,
+    started: Duration,
     budget: Duration,
 }
 
 impl Deadline {
     pub fn start(budget: Duration) -> Self {
+        Self::start_on(budget, &SYSTEM_CLOCK)
+    }
+
+    /// A deadline measured on `clock` (virtual time in tests).
+    pub fn start_on(budget: Duration, clock: &'static dyn crate::data::clock::Clock) -> Self {
         Self {
-            started: Instant::now(),
+            clock,
+            started: clock.monotonic(),
             budget,
         }
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.clock.monotonic().saturating_sub(self.started)
     }
 
     /// Time left, `None` when the budget is exhausted.
     pub fn remaining(&self) -> Option<Duration> {
         self.budget
-            .checked_sub(self.started.elapsed())
+            .checked_sub(self.elapsed())
             .filter(|left| !left.is_zero())
     }
 
@@ -426,397 +441,4 @@ pub fn redact(text: &str, secrets: &[&str]) -> String {
         }
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex;
-
-    #[test]
-    fn late_success_and_cancelled_success_are_rejected() {
-        let budget = Duration::from_millis(10);
-        let err = run_bounded(
-            RetryPolicy::NONE,
-            Deadline::start(budget),
-            &CancelToken::new(),
-            &*no_sleep(),
-            |_| {
-                std::thread::sleep(Duration::from_millis(30));
-                Ok(37)
-            },
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("deadline"), "{err}");
-        let token = CancelToken::new();
-        let err = run_bounded(
-            RetryPolicy::NONE,
-            Deadline::start(Duration::from_secs(1)),
-            &token,
-            &*no_sleep(),
-            |_| {
-                token.cancel();
-                Ok(37)
-            },
-        )
-        .unwrap_err();
-        assert!(is_cancelled(&err));
-    }
-
-    #[test]
-    fn controlled_reader_rejects_bytes_returned_after_expiry() {
-        struct Slow;
-        impl std::io::Read for Slow {
-            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-                std::thread::sleep(Duration::from_millis(30));
-                bytes[0] = 42;
-                Ok(1)
-            }
-        }
-        let control = OperationControl::new(
-            CancelToken::new(),
-            Deadline::start(Duration::from_millis(10)),
-        );
-        let err = std::io::copy(&mut control.reader(Slow), &mut std::io::sink()).unwrap_err();
-        assert!(err.to_string().contains("deadline"), "{err}");
-    }
-
-    fn no_sleep() -> Box<Sleeper<'static>> {
-        Box::new(|_| {})
-    }
-
-    #[test]
-    fn backoff_doubles_and_caps() {
-        let p = RetryPolicy {
-            max_attempts: 10,
-            deadline: Duration::from_secs(100),
-            initial_backoff: Duration::from_secs(1),
-            max_backoff: Duration::from_secs(5),
-        };
-        assert_eq!(p.backoff(1), Duration::ZERO);
-        assert_eq!(p.backoff(2), Duration::from_secs(1));
-        assert_eq!(p.backoff(3), Duration::from_secs(2));
-        assert_eq!(p.backoff(4), Duration::from_secs(4));
-        assert_eq!(p.backoff(5), Duration::from_secs(5));
-        assert_eq!(p.backoff(40), Duration::from_secs(5));
-    }
-
-    #[test]
-    fn only_transport_failures_are_retryable() {
-        for diagnostic in [
-            "connection reset",
-            "certificate tls handshake unknownissuer invalid peer hostname client setup failed",
-            "tls-proxy:latest /tmp/acq-P6TlSt/archive.tar",
-            "entirely different diagnostic",
-        ] {
-            assert!(is_retryable(
-                &ImageRetryClass::Transient.failure(diagnostic.into())
-            ));
-            assert!(!is_retryable(
-                &ImageRetryClass::Permanent.failure(diagnostic.into())
-            ));
-            assert!(!is_retryable(&EngineError::Network(diagnostic.into())));
-        }
-        assert!(!is_retryable(&EngineError::Auth("denied".into())));
-        assert!(!is_retryable(&EngineError::Config("bad".into())));
-        assert!(!is_retryable(&EngineError::Container("not found".into())));
-        assert!(!is_retryable(&EngineError::ImageDigestMismatch {
-            reference: "r".into(),
-            expected: "a".into(),
-            actual: "b".into()
-        }));
-        assert!(!is_retryable(&EngineError::ImagePlatformMismatch {
-            reference: "r".into(),
-            wanted: "a".into(),
-            found: "b".into()
-        }));
-        assert!(!is_retryable(&EngineError::ImageArchiveRejected {
-            path: "/x".into(),
-            reason: "zstd".into()
-        }));
-        assert!(!is_retryable(&EngineError::InsufficientDiskSpace {
-            path: "/x".into(),
-            needed: 1,
-            available: 0
-        }));
-        assert!(!is_retryable(&cancelled()));
-    }
-
-    #[test]
-    fn diagnostic_changes_and_redaction_do_not_change_attempt_counts() {
-        for class in [ImageRetryClass::Transient, ImageRetryClass::Permanent] {
-            for diagnostic in [
-                "disconnected",
-                "tls certificate handshake",
-                "tls-agent:latest",
-            ] {
-                let mut attempts = 0;
-                let err = run_bounded(
-                    RetryPolicy {
-                        initial_backoff: Duration::ZERO,
-                        ..RetryPolicy::DEFAULT
-                    },
-                    Deadline::start(Duration::from_secs(60)),
-                    &CancelToken::new(),
-                    &|_| {},
-                    |_| {
-                        attempts += 1;
-                        Err::<(), _>(map_diagnostic(class.failure(diagnostic.into()), |text| {
-                            redact(&text, &["tls-agent"])
-                        }))
-                    },
-                )
-                .unwrap_err();
-                assert_eq!(
-                    attempts,
-                    if class == ImageRetryClass::Transient {
-                        3
-                    } else {
-                        1
-                    }
-                );
-                assert_eq!(is_retryable(&err), class == ImageRetryClass::Transient);
-                assert!(!err.to_string().contains("tls-agent"));
-            }
-        }
-    }
-
-    #[test]
-    fn cancellation_and_deadlines_outrank_both_source_classes() {
-        for class in [ImageRetryClass::Transient, ImageRetryClass::Permanent] {
-            let cancel = CancelToken::new();
-            let mut calls = 0;
-            let err = run_bounded(
-                RetryPolicy::DEFAULT,
-                Deadline::start(Duration::from_secs(60)),
-                &cancel,
-                &|_| {},
-                |_| {
-                    calls += 1;
-                    cancel.cancel();
-                    Err::<(), _>(class.failure("source failure".into()))
-                },
-            )
-            .unwrap_err();
-            assert_eq!(calls, 1);
-            assert!(is_cancelled(&err));
-
-            let mut calls = 0;
-            let err = run_bounded(
-                RetryPolicy::DEFAULT,
-                Deadline::start(Duration::from_millis(1)),
-                &CancelToken::new(),
-                &|_| {},
-                |_| {
-                    calls += 1;
-                    std::thread::sleep(Duration::from_millis(10));
-                    Err::<(), _>(class.failure("source failure".into()))
-                },
-            )
-            .unwrap_err();
-            assert!(calls <= 1);
-            assert!(matches!(err, EngineError::Network(ref text) if text.contains("deadline")));
-        }
-    }
-
-    #[test]
-    fn run_bounded_retries_transport_failures_up_to_the_cap() {
-        let calls = Mutex::new(Vec::new());
-        let sleeps = Mutex::new(Vec::new());
-        let sleep = |d: Duration| sleeps.lock().unwrap().push(d);
-        let policy = RetryPolicy {
-            max_attempts: 3,
-            ..RetryPolicy::DEFAULT
-        };
-        let err = run_bounded(
-            policy,
-            Deadline::start(Duration::from_secs(60)),
-            &CancelToken::new(),
-            &sleep,
-            |n| {
-                calls.lock().unwrap().push(n);
-                Err::<(), _>(ImageRetryClass::Transient.failure("connection reset".into()))
-            },
-        )
-        .unwrap_err();
-        assert_eq!(*calls.lock().unwrap(), vec![1, 2, 3]);
-        let sleeps = sleeps.lock().unwrap();
-        assert_eq!(sleeps.iter().sum::<Duration>(), Duration::from_secs(3));
-        assert!(sleeps
-            .iter()
-            .all(|slice| *slice <= Duration::from_millis(20)));
-        assert!(err.to_string().contains("after 3 of 3 attempts"), "{err}");
-    }
-
-    #[test]
-    fn run_bounded_stops_at_the_first_final_failure() {
-        let calls = Mutex::new(0);
-        let err = run_bounded(
-            RetryPolicy::DEFAULT,
-            Deadline::start(Duration::from_secs(60)),
-            &CancelToken::new(),
-            &*no_sleep(),
-            |_| {
-                *calls.lock().unwrap() += 1;
-                Err::<(), _>(EngineError::Auth("denied with credentials".into()))
-            },
-        )
-        .unwrap_err();
-        assert_eq!(*calls.lock().unwrap(), 1);
-        assert!(matches!(err, EngineError::Auth(m) if m == "denied with credentials"));
-    }
-
-    #[test]
-    fn run_bounded_succeeds_on_a_later_attempt() {
-        let calls = Mutex::new(0);
-        let value = run_bounded(
-            RetryPolicy::DEFAULT,
-            Deadline::start(Duration::from_secs(60)),
-            &CancelToken::new(),
-            &*no_sleep(),
-            |n| {
-                *calls.lock().unwrap() += 1;
-                if n < 2 {
-                    Err(ImageRetryClass::Transient.failure("disconnected".into()))
-                } else {
-                    Ok(n)
-                }
-            },
-        )
-        .unwrap();
-        assert_eq!(value, 2);
-    }
-
-    #[test]
-    fn cancellation_wins_before_and_between_attempts() {
-        let token = CancelToken::new();
-        token.cancel();
-        let err = run_bounded(
-            RetryPolicy::DEFAULT,
-            Deadline::start(Duration::from_secs(60)),
-            &token,
-            &*no_sleep(),
-            |_| Ok::<(), _>(()),
-        )
-        .unwrap_err();
-        assert!(is_cancelled(&err));
-
-        let token = CancelToken::new();
-        let calls = Mutex::new(0);
-        let err = run_bounded(
-            RetryPolicy::DEFAULT,
-            Deadline::start(Duration::from_secs(60)),
-            &token,
-            &|_| token.cancel(),
-            |_| {
-                *calls.lock().unwrap() += 1;
-                Err::<(), _>(ImageRetryClass::Transient.failure("reset".into()))
-            },
-        )
-        .unwrap_err();
-        assert!(is_cancelled(&err));
-        assert_eq!(*calls.lock().unwrap(), 1);
-    }
-
-    #[test]
-    fn cancellation_interrupts_a_long_production_backoff() {
-        let token = CancelToken::new();
-        let signal = token.clone();
-        let canceller = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(30));
-            signal.cancel();
-        });
-        let started = Instant::now();
-        let error = run_bounded(
-            RetryPolicy {
-                initial_backoff: Duration::from_secs(3),
-                ..RetryPolicy::DEFAULT
-            },
-            Deadline::start(Duration::from_secs(10)),
-            &token,
-            &std::thread::sleep,
-            |_| Err::<(), _>(ImageRetryClass::Transient.failure("disconnected".into())),
-        )
-        .unwrap_err();
-        assert!(is_cancelled(&error));
-        assert!(started.elapsed() < Duration::from_millis(500));
-        canceller.join().unwrap();
-    }
-
-    #[test]
-    fn an_exhausted_deadline_stops_retrying() {
-        let calls = Mutex::new(0);
-        let err = run_bounded(
-            RetryPolicy {
-                max_attempts: 5,
-                initial_backoff: Duration::from_secs(10),
-                ..RetryPolicy::DEFAULT
-            },
-            Deadline::start(Duration::from_secs(5)),
-            &CancelToken::new(),
-            &*no_sleep(),
-            |_| {
-                *calls.lock().unwrap() += 1;
-                Err::<(), _>(ImageRetryClass::Transient.failure("reset".into()))
-            },
-        )
-        .unwrap_err();
-        assert_eq!(*calls.lock().unwrap(), 1, "a 10s backoff does not fit 5s");
-        assert!(matches!(err, EngineError::ImageSourceFailure { .. }));
-        let expired = Deadline::start(Duration::ZERO);
-        assert!(expired.expired());
-        assert_eq!(expired.request_timeout(None), Duration::from_millis(1));
-    }
-
-    #[test]
-    fn redaction_replaces_known_secrets_only() {
-        let text = "proxy http://user:SENTINEL-pw-9f3@proxy:3128 refused; token SENTINEL-tok";
-        let out = redact(text, &["SENTINEL-pw-9f3", "SENTINEL-tok", "ab"]);
-        assert_eq!(
-            out,
-            "proxy http://user:[redacted]@proxy:3128 refused; token [redacted]"
-        );
-        assert_eq!(redact("nothing", &[]), "nothing");
-    }
-}
-
-#[cfg(test)]
-mod behavior_review_tests {
-    use super::*;
-
-    #[test]
-    fn unreachable_network_kinds_retry_to_the_attempt_cap() {
-        for kind in [
-            std::io::ErrorKind::NetworkUnreachable,
-            std::io::ErrorKind::HostUnreachable,
-            std::io::ErrorKind::NetworkDown,
-        ] {
-            assert!(transient_io_kind(kind));
-            let mut calls = 0;
-            let err = run_bounded(
-                RetryPolicy::DEFAULT,
-                Deadline::start(Duration::from_secs(60)),
-                &CancelToken::new(),
-                &|_| {},
-                |_| {
-                    calls += 1;
-                    Err::<(), _>(ImageRetryClass::Transient.failure(format!("{kind:?}")))
-                },
-            )
-            .unwrap_err();
-            assert_eq!(calls, 3);
-            assert!(is_retryable(&err));
-        }
-        assert!(!transient_io_kind(std::io::ErrorKind::PermissionDenied));
-    }
-
-    #[test]
-    fn request_timeout_and_rate_limit_statuses_remain_final() {
-        for status in [
-            reqwest::StatusCode::REQUEST_TIMEOUT,
-            reqwest::StatusCode::TOO_MANY_REQUESTS,
-        ] {
-            assert_eq!(ImageRetryClass::status(status), ImageRetryClass::Permanent);
-        }
-    }
 }

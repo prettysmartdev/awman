@@ -1,6 +1,6 @@
 //! `InitFrontend` trait — defined by Layer 1, implemented by Layer 3.
 
-use crate::data::config::repo::WorkItemsConfig;
+use crate::data::config::work_items::WorkItemsConfig;
 use crate::data::prompt::Prompt;
 use crate::engine::agent::AgentImageFrontend;
 use crate::engine::error::EngineError;

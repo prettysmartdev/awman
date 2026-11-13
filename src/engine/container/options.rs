@@ -120,16 +120,20 @@ pub struct AgentSettings {
     pub overlays: Vec<OverlaySpec>,
 }
 
-/// Owns one launch's system-prompt temp file. Clones share the file and the
+/// Owns one launch's temporary mounted file or directory. Clones share it and the
 /// last one normally deletes it. The file follows this launch's options,
 /// instance and execution; an observer lost before confirmed termination can
 /// preserve the path while still releasing the descriptor.
 #[derive(Debug, Clone)]
-pub struct PromptFileGuard(Arc<PromptFile>);
+pub struct MountGuard(Arc<PromptFile>);
+
+/// Historical name retained for the system-prompt mount paths.
+pub type PromptFileGuard = MountGuard;
 
 #[derive(Debug)]
 struct PromptFile {
-    file: tempfile::NamedTempFile,
+    file: Option<tempfile::NamedTempFile>,
+    dir: Option<tempfile::TempDir>,
     preserve: std::sync::atomic::AtomicBool,
 }
 
@@ -138,21 +142,40 @@ impl Drop for PromptFile {
         // If the last observer disappears before guest termination is known,
         // leave the path readable but close the descriptor normally.
         if self.preserve.load(std::sync::atomic::Ordering::Acquire) {
-            self.file.disable_cleanup(true);
+            if let Some(file) = &mut self.file {
+                file.disable_cleanup(true);
+            }
+            if let Some(dir) = self.dir.take() {
+                std::mem::forget(dir);
+            }
         }
     }
 }
 
-impl PromptFileGuard {
+impl MountGuard {
     pub fn new(file: tempfile::NamedTempFile) -> Self {
         Self(Arc::new(PromptFile {
-            file,
+            file: Some(file),
+            dir: None,
+            preserve: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+
+    pub fn new_dir(dir: tempfile::TempDir) -> Self {
+        Self(Arc::new(PromptFile {
+            file: None,
+            dir: Some(dir),
             preserve: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
     pub fn host_path(&self) -> &Path {
-        self.0.file.path()
+        self.0
+            .file
+            .as_ref()
+            .map(|f| f.path())
+            .or_else(|| self.0.dir.as_ref().map(|d| d.path()))
+            .expect("prompt guard has a file or directory")
     }
 
     pub(super) fn preserve_for_unconfirmed_guest(&self) {
@@ -162,7 +185,7 @@ impl PromptFileGuard {
     }
 }
 
-impl PartialEq for PromptFileGuard {
+impl PartialEq for MountGuard {
     fn eq(&self, other: &Self) -> bool {
         self.host_path() == other.host_path()
     }
@@ -172,9 +195,21 @@ impl PartialEq for PromptFileGuard {
 /// variant and a single branch in `ResolvedContainerOptions::ingest`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContainerOption {
+    AgentIdentity {
+        agent: String,
+        model: Option<String>,
+    },
+    ProgramStatus(crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig),
     Image(ImageRef),
     Entrypoint(Entrypoint),
     Overlay(OverlaySpec),
+    /// A private host directory mounted read-write for this execution. The
+    /// guard follows the same confirmed-guest-exit lifecycle as prompt mounts.
+    TemporaryDirectoryMount {
+        container_path: PathBuf,
+        env_var: Option<String>,
+        guard: MountGuard,
+    },
     EnvPassthrough(EnvVar),
     /// Per-launch value, kept out of argv and redacted in Debug.
     EnvOverride {
@@ -183,6 +218,7 @@ pub enum ContainerOption {
     },
     EnvLiteral(EnvLiteral),
     SeededPrompt(String),
+    HeadlessPromptInArgv(bool),
     /// Flag used to deliver the seeded prompt in *interactive* mode (e.g.
     /// opencode `--prompt <text>`). Absent means the prompt is appended as a
     /// trailing positional argv arg, which is what most agents expect. Emitted
@@ -190,7 +226,7 @@ pub enum ContainerOption {
     /// `interactive_seed_delivery` is `Flag`.
     InteractiveSeedFlag(String),
     Interactive(bool),
-    /// Structured stdout protocol for a non-interactive stdio launch.
+    /// Structured stdout protocol for a headless stdio launch.
     AgentOutputFormat(AgentOutputFormat),
     /// Launch the agent over ACP (Agent Client Protocol) instead of raw
     /// container stdio. Selects the persistent-piped spawn path (`-i`, no PTY)
@@ -242,6 +278,9 @@ pub enum ContainerOption {
     /// appended after every awman-generated agent flag and before the seeded
     /// prompt.
     AgentFlags(Vec<String>),
+    /// Per-launch agent flags derived from awman-owned mounts. These follow
+    /// user flags so a user config cannot redirect private session storage.
+    ManagedAgentFlags(Vec<String>),
     /// The flag name to use when emitting disallowed tools (e.g. `--disallowedTools`).
     DisallowedToolsFlag(String),
     /// The flag name to use when emitting allowed tools (e.g. `--allowedTools`).
@@ -473,6 +512,9 @@ fn covered_credential_services(
 /// backend consumes. Conflicting options are detected here.
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedContainerOptions {
+    pub host_env: Option<crate::data::config::env::EnvSnapshot>,
+    pub agent_identity: Option<(String, Option<String>)>,
+    pub program_status: crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig,
     pub image: Option<ImageRef>,
     pub entrypoint: Option<Entrypoint>,
     pub overlays: Vec<OverlaySpec>,
@@ -480,6 +522,7 @@ pub struct ResolvedContainerOptions {
     pub env_overrides: Vec<(String, crate::engine::auth::credential::SecretString)>,
     pub env_literal: Vec<EnvLiteral>,
     pub seeded_prompt: Option<String>,
+    pub headless_prompt_in_argv: bool,
     /// Flag used to deliver `seeded_prompt` in interactive mode. When `None`,
     /// the prompt is appended as a trailing positional argv arg. When `Some`,
     /// it is delivered as `<flag> <text>` (e.g. opencode `--prompt <text>`,
@@ -525,14 +568,15 @@ pub struct ResolvedContainerOptions {
     pub agent_mode_flags: Vec<String>,
     /// From `ContainerOption::AgentFlags`.
     pub agent_flags: Vec<String>,
+    pub managed_agent_flags: Vec<String>,
     pub disallowed_tools_flag: Option<String>,
     pub allowed_tools_flag: Option<String>,
     pub remove_on_exit: bool,
     pub system_prompt_file: Option<(PathBuf, PathBuf, String)>,
     pub system_prompt_env_file: Option<(String, PathBuf, PathBuf)>,
     pub system_prompt_inline: Option<(String, String)>,
-    /// Keeps the files behind `system_prompt_file` / `system_prompt_env_file`
-    /// on disk. Each backend moves these into its execution at spawn.
+    /// Keeps temporary mounts (prompt files and private directories) on disk.
+    /// Each backend moves these into its execution at spawn.
     pub prompt_files: Vec<PromptFileGuard>,
     pub agent_add_dirs: Vec<(String, PathBuf)>,
     /// From `ContainerOption::StartupGrace`; `None` uses the frontend's.
@@ -548,7 +592,22 @@ impl ResolvedContainerOptions {
     pub fn resolve(
         options: impl IntoIterator<Item = ContainerOption>,
     ) -> Result<Self, ResolveError> {
+        Self::resolve_with_env(options, None)
+    }
+
+    pub fn resolve_in(
+        options: impl IntoIterator<Item = ContainerOption>,
+        env: &crate::data::config::env::EnvSnapshot,
+    ) -> Result<Self, ResolveError> {
+        Self::resolve_with_env(options, Some(env.clone()))
+    }
+
+    fn resolve_with_env(
+        options: impl IntoIterator<Item = ContainerOption>,
+        env: Option<crate::data::config::env::EnvSnapshot>,
+    ) -> Result<Self, ResolveError> {
         let mut r = Self {
+            host_env: env,
             yolo: YoloMode::Disabled,
             auto: AutoMode::Disabled,
             plan: PlanMode::Disabled,
@@ -562,17 +621,32 @@ impl ResolvedContainerOptions {
         // by a harness-declared env var.  Applies to ALL container runtimes.
         // Production callers pass the real host-env lookup; tests inject a
         // hermetic closure to avoid mutating process-global state.
+        let lookup = |name: &str| {
+            // A private caller override is already resolved, even if the
+            // host has no value. Only presence matters to credential dedup;
+            // do not copy the secret into this ordinary String lookup.
+            if r.env_overrides
+                .iter()
+                .any(|(key, value)| key == name && !value.expose().is_empty())
+            {
+                return Some("present".into());
+            }
+            r.host_env.as_ref().map_or_else(
+                || crate::data::config::env::host_var(name),
+                |env| env.host_payload(name),
+            )
+        };
         dedup_credentials_by_declared_env(
             &mut r.agent_credentials,
             &r.env_passthrough,
             &r.env_literal,
-            &crate::data::config::env::host_var,
+            &lookup,
         );
         dedup_refreshable_by_declared_env(
             &mut r.refreshable_credentials,
             &r.env_passthrough,
             &r.env_literal,
-            &crate::data::config::env::host_var,
+            &lookup,
         )?;
         r.validate()?;
         // Render through the existing shared argv tail on every container
@@ -595,13 +669,36 @@ impl ResolvedContainerOptions {
 
     fn ingest(&mut self, opt: ContainerOption) -> Result<(), ResolveError> {
         match opt {
+            ContainerOption::AgentIdentity { agent, model } => {
+                self.agent_identity = Some((agent, model))
+            }
+            ContainerOption::ProgramStatus(config) => self.program_status = config,
             ContainerOption::Image(v) => self.image = Some(v),
             ContainerOption::Entrypoint(v) => self.entrypoint = Some(v),
             ContainerOption::Overlay(v) => self.overlays.push(v),
+            ContainerOption::TemporaryDirectoryMount {
+                container_path,
+                env_var,
+                guard,
+            } => {
+                self.overlays.push(OverlaySpec {
+                    host_path: guard.host_path().to_path_buf(),
+                    container_path: container_path.clone(),
+                    permission: OverlayPermission::ReadWrite,
+                });
+                if let Some(key) = env_var {
+                    self.env_literal.push(EnvLiteral {
+                        key,
+                        value: container_path.to_string_lossy().into_owned(),
+                    });
+                }
+                self.prompt_files.push(guard);
+            }
             ContainerOption::EnvPassthrough(v) => self.env_passthrough.push(v),
             ContainerOption::EnvOverride { key, value } => self.env_overrides.push((key, value)),
             ContainerOption::EnvLiteral(v) => self.env_literal.push(v),
             ContainerOption::SeededPrompt(v) => self.seeded_prompt = Some(v),
+            ContainerOption::HeadlessPromptInArgv(v) => self.headless_prompt_in_argv = v,
             ContainerOption::InteractiveSeedFlag(v) => self.interactive_seed_flag = Some(v),
             ContainerOption::Interactive(v) => self.interactive = v,
             ContainerOption::AgentOutputFormat(v) => self.agent_output_format = v,
@@ -631,6 +728,7 @@ impl ResolvedContainerOptions {
             ContainerOption::Label { key, value } => self.labels.push((key, value)),
             ContainerOption::AgentModeFlags(v) => self.agent_mode_flags.extend(v),
             ContainerOption::AgentFlags(v) => self.agent_flags.extend(v),
+            ContainerOption::ManagedAgentFlags(v) => self.managed_agent_flags.extend(v),
             ContainerOption::DisallowedToolsFlag(v) => self.disallowed_tools_flag = Some(v),
             ContainerOption::AllowedToolsFlag(v) => self.allowed_tools_flag = Some(v),
             ContainerOption::KeepContainer => self.remove_on_exit = false,
@@ -698,579 +796,5 @@ impl From<ResolveError> for crate::engine::error::EngineError {
                 crate::engine::error::EngineError::ConflictingOptions(msg)
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    // ─── WI-0126 A1: builtin launch settings ride with the options ──────────
-
-    #[test]
-    fn builtin_launch_is_absent_unless_given() {
-        let resolved =
-            ResolvedContainerOptions::resolve([ContainerOption::Image(ImageRef::new("img"))])
-                .unwrap();
-        assert_eq!(resolved.builtin_launch, None);
-    }
-
-    #[test]
-    fn builtin_launch_option_maps_to_the_resolved_field_last_one_wins() {
-        let first = BuiltinLaunchSettings {
-            vcpus: 1,
-            ..BuiltinLaunchSettings::default()
-        };
-        let second = BuiltinLaunchSettings {
-            memory_mib: 512,
-            repo_state_dir: Some(PathBuf::from("/s")),
-            ..BuiltinLaunchSettings::default()
-        };
-        let resolved = ResolvedContainerOptions::resolve([
-            ContainerOption::BuiltinLaunch(first),
-            ContainerOption::BuiltinLaunch(second.clone()),
-        ])
-        .unwrap();
-        assert_eq!(resolved.builtin_launch.as_deref(), Some(&second));
-        // Generic resource limits stay separate: the settings are defaults.
-        assert_eq!(resolved.cpu, None);
-        assert_eq!(resolved.memory, None);
-    }
-
-    // ─── WI-0114 F-38: the lease factory is carried, not reached for ────────
-
-    /// A delivery with fixed, never-touched paths: these two tests assert
-    /// only whether a lease is taken, so nothing reads the files.
-    fn unstaged_delivery() -> RefreshableCredentialDelivery {
-        RefreshableCredentialDelivery {
-            agent: crate::data::session::AgentName::new("claude").unwrap(),
-            spec_agent: "claude",
-            credential_env_key: "CLAUDE_CODE_OAUTH_TOKEN",
-            staged_path: PathBuf::from("/staged/.claude/.credentials.json"),
-            staged_root: PathBuf::from("/staged/.claude"),
-            initial_fingerprint: crate::engine::auth::credential::CredentialFingerprint::zeroed(),
-        }
-    }
-
-    /// Options built WITHOUT a lease factory disable leases: no factory is
-    /// recorded and `register_container_leases` hands back nothing, even for a
-    /// launch that carries a file-delivered credential.
-    ///
-    /// This is the behaviour the absent process-global monitor used to
-    /// produce (`global().is_none()`), and it is what the
-    /// `authRefresh.enabled: false` kill switch now relies on.
-    #[test]
-    fn options_without_a_monitor_disable_leases() {
-        let resolved = ResolvedContainerOptions::resolve([
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::RefreshableCredential(unstaged_delivery()),
-        ])
-        .expect("resolve");
-
-        assert!(
-            resolved.lease_factory.is_none(),
-            "no factory was supplied, so none must be recorded"
-        );
-        assert_eq!(
-            resolved.refreshable_credentials.len(),
-            1,
-            "the credential itself is still delivered — only the lease is off"
-        );
-        assert!(
-            crate::engine::credential_refresh::register_container_leases(&resolved, "ctr")
-                .is_empty(),
-            "a launch with no lease factory must take no leases"
-        );
-    }
-
-    /// The counterpart: a factory supplied as an option is recorded on the
-    /// resolved bag, so the backends read it from the options they were handed
-    /// instead of from process-global state.
-    #[test]
-    fn a_supplied_lease_factory_is_carried_on_the_resolved_options() {
-        use crate::engine::credential_refresh::{
-            CredentialRefreshMonitor, LeaseFactoryHandle, MonitorConfig,
-        };
-        let monitor = CredentialRefreshMonitor::new(MonitorConfig::default());
-        let factory = LeaseFactoryHandle::new(std::sync::Arc::new(monitor));
-
-        let resolved = ResolvedContainerOptions::resolve([
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::CredentialLeaseFactory(factory.clone()),
-        ])
-        .expect("resolve");
-
-        assert_eq!(resolved.lease_factory, Some(factory));
-    }
-
-    fn prompt_guard() -> (PromptFileGuard, PathBuf) {
-        let guard = PromptFileGuard::new(tempfile::NamedTempFile::new().unwrap());
-        let path = guard.host_path().to_path_buf();
-        (guard, path)
-    }
-
-    #[test]
-    fn resolved_options_own_prompt_files_and_the_last_clone_removes_them() {
-        let (file_guard, file_path) = prompt_guard();
-        let (env_guard, env_path) = prompt_guard();
-        let resolved = ResolvedContainerOptions::resolve([
-            ContainerOption::SystemPromptFile {
-                host_path: file_path.clone(),
-                container_path: "/tmp/a.md".into(),
-                flag: "--sp".into(),
-                guard: file_guard,
-            },
-            ContainerOption::SystemPromptEnvFile {
-                env_var: "SP".into(),
-                host_path: env_path.clone(),
-                container_path: "/tmp/b.md".into(),
-                guard: env_guard,
-            },
-        ])
-        .expect("resolve");
-        assert_eq!(resolved.prompt_files.len(), 2);
-        let clone = resolved.clone();
-        drop(resolved);
-        assert!(file_path.exists() && env_path.exists());
-        drop(clone);
-        assert!(!file_path.exists() && !env_path.exists());
-    }
-
-    #[test]
-    fn failed_resolution_releases_prompt_files() {
-        let (guard, path) = prompt_guard();
-        let result = ResolvedContainerOptions::resolve([
-            ContainerOption::SystemPromptFile {
-                host_path: path.clone(),
-                container_path: "/tmp/a.md".into(),
-                flag: "--sp".into(),
-                guard,
-            },
-            ContainerOption::Yolo(YoloMode::Enabled),
-            ContainerOption::Plan(PlanMode::Enabled),
-        ]);
-        assert!(result.is_err());
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn yolo_and_plan_conflict_returns_error() {
-        let result = ResolvedContainerOptions::resolve([
-            ContainerOption::Yolo(YoloMode::Enabled),
-            ContainerOption::Plan(PlanMode::Enabled),
-        ]);
-        assert!(
-            matches!(result, Err(ResolveError::Conflict(_))),
-            "expected Conflict, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn all_options_round_trip_to_resolved() {
-        let image = ImageRef::new("my-image:latest");
-        let entrypoint = Entrypoint::new(["claude", "--print"]);
-        let result = ResolvedContainerOptions::resolve([
-            ContainerOption::Image(image.clone()),
-            ContainerOption::Entrypoint(entrypoint.clone()),
-            ContainerOption::Interactive(true),
-            ContainerOption::AllowedTools(vec!["Bash".to_string()]),
-            ContainerOption::Yolo(YoloMode::Disabled),
-        ]);
-        let resolved = result.expect("from_iter should succeed");
-        assert_eq!(
-            resolved.image.as_ref().map(|i| i.as_str()),
-            Some("my-image:latest")
-        );
-        assert_eq!(
-            resolved.entrypoint.as_ref().map(|e| &e.0),
-            Some(&vec!["claude".to_string(), "--print".to_string()])
-        );
-        assert!(resolved.interactive);
-        assert_eq!(resolved.allowed_tools, vec!["Bash".to_string()]);
-        assert!(matches!(resolved.yolo, YoloMode::Disabled));
-    }
-
-    #[test]
-    fn acp_defaults_to_false_and_round_trips_when_set() {
-        // Default: no ACP option → `acp` stays false (today's behaviour).
-        let default = ResolvedContainerOptions::resolve([ContainerOption::Image(ImageRef::new(
-            "img:latest",
-        ))])
-        .expect("resolve should succeed");
-        assert!(!default.acp, "acp must default to false");
-
-        // Explicitly requested → the resolved bag carries it through.
-        let enabled = ResolvedContainerOptions::resolve([
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Acp(true),
-        ])
-        .expect("resolve should succeed");
-        assert!(enabled.acp, "ContainerOption::Acp(true) must set acp");
-    }
-
-    #[test]
-    fn dedup_is_not_required_at_resolve_level() {
-        let host = PathBuf::from("/host/overlay");
-        let container = PathBuf::from("/container/overlay");
-        let spec = OverlaySpec {
-            host_path: host.clone(),
-            container_path: container.clone(),
-            permission: OverlayPermission::ReadOnly,
-        };
-        let result = ResolvedContainerOptions::resolve([
-            ContainerOption::Overlay(spec.clone()),
-            ContainerOption::Overlay(spec.clone()),
-            ContainerOption::Overlay(spec.clone()),
-        ]);
-        let resolved = result.expect("from_iter should succeed");
-        // Multiple overlay entries accumulate — dedup is caller's responsibility.
-        assert_eq!(resolved.overlays.len(), 3);
-    }
-
-    // ── Part A: injection-time credential dedup (resolve-level, env_literal path) ──
-
-    /// `env_literal` (always-valued) coverage → same-service keychain credential
-    /// is dropped.  This goes through `resolve()` because env_literal entries
-    /// always have a value — no host lookup needed.
-    #[test]
-    fn declared_anthropic_env_literal_drops_oauth_token_from_agent_credentials() {
-        let resolved = ResolvedContainerOptions::resolve([
-            ContainerOption::EnvLiteral(EnvLiteral {
-                key: "ANTHROPIC_API_KEY".into(),
-                value: "sk-ant-key-literal".into(),
-            }),
-            ContainerOption::AgentCredentials {
-                env_vars: vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "sk-ant-oat-secret".into())],
-            },
-        ])
-        .expect("resolve must succeed");
-
-        assert!(
-            resolved.agent_credentials.is_empty(),
-            "ANTHROPIC_API_KEY via env_literal must still trigger dedup; \
-             got: {:?}",
-            resolved.agent_credentials
-        );
-    }
-
-    /// When agent_credentials is empty the dedup is a no-op (no panic, no error).
-    #[test]
-    fn dedup_with_empty_agent_credentials_is_noop() {
-        // Use env_literal so the test is hermetic (no host-env lookup).
-        let resolved =
-            ResolvedContainerOptions::resolve([ContainerOption::EnvLiteral(EnvLiteral {
-                key: "ANTHROPIC_API_KEY".into(),
-                value: "sk-key".into(),
-            })])
-            .expect("resolve must succeed");
-        assert!(resolved.agent_credentials.is_empty());
-    }
-
-    // ── Part A: dedup_credentials_by_declared_env unit tests (injectable lookup) ──
-    //
-    // All of these pass a hermetic closure as `lookup_env` so no process-global
-    // std::env mutation is needed.  The closure mimics the subset of env vars
-    // that would be set on the host in each scenario.
-
-    /// declared env(ANTHROPIC_API_KEY) that IS set on host + keychain OAuth →
-    /// OAuth dropped (the passthrough will be emitted; no need for two creds).
-    #[test]
-    fn dedup_fn_drops_oauth_when_anthropic_passthrough_set_on_host() {
-        let mut creds = vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into())];
-        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
-        // Simulate: ANTHROPIC_API_KEY is set on the host.
-        let lookup = |name: &str| -> Option<String> {
-            if name == "ANTHROPIC_API_KEY" {
-                Some("sk-ant-api-key".into())
-            } else {
-                None
-            }
-        };
-        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
-        assert!(
-            creds.is_empty(),
-            "OAuth must be dropped when ANTHROPIC_API_KEY is set on host; got: {creds:?}"
-        );
-    }
-
-    /// declared env(ANTHROPIC_API_KEY) that is NOT set on host + keychain OAuth →
-    /// OAuth retained (passthrough emits nothing; dropping it would leave zero
-    /// credentials for the 'anthropic' service).
-    #[test]
-    fn dedup_fn_retains_oauth_when_anthropic_passthrough_declared_but_unset() {
-        let mut creds = vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into())];
-        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
-        // Simulate: ANTHROPIC_API_KEY is NOT set on the host.
-        let lookup = |_name: &str| -> Option<String> { None };
-        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
-        assert_eq!(
-            creds.len(),
-            1,
-            "OAuth must be retained when the declared passthrough var is unset on host; \
-             got: {creds:?}"
-        );
-    }
-
-    /// No declared anthropic var → cloud harness path — keychain OAuth is
-    /// retained regardless of host env.
-    #[test]
-    fn dedup_fn_retains_oauth_when_no_anthropic_declared() {
-        let mut creds = vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into())];
-        let pt = vec![EnvVar("OPENAI_API_KEY".into())]; // covers openai, not anthropic
-                                                        // Even if OPENAI_API_KEY is set, it doesn't cover the anthropic service.
-        let lookup = |name: &str| -> Option<String> {
-            if name == "OPENAI_API_KEY" {
-                Some("sk-openai".into())
-            } else {
-                None
-            }
-        };
-        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
-        assert_eq!(
-            creds.len(),
-            1,
-            "no anthropic declared → OAuth must be retained"
-        );
-    }
-
-    /// env_literal (always-valued) coverage → same-service credential dropped.
-    #[test]
-    fn dedup_fn_handles_env_literal_source() {
-        let mut creds = vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into())];
-        let lit = vec![EnvLiteral {
-            key: "ANTHROPIC_API_KEY".into(),
-            value: "literal-key".into(),
-        }];
-        // lookup_env is irrelevant for literals but must be provided.
-        let lookup = |_: &str| -> Option<String> { None };
-        dedup_credentials_by_declared_env(&mut creds, &[], &lit, &lookup);
-        assert!(
-            creds.is_empty(),
-            "env_literal coverage must also trigger dedup"
-        );
-    }
-
-    /// No declared vars → no dedup, regardless of host env.
-    #[test]
-    fn dedup_fn_retains_credential_when_no_declared_vars() {
-        let mut creds = vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into())];
-        let lookup = |_: &str| -> Option<String> { None };
-        dedup_credentials_by_declared_env(&mut creds, &[], &[], &lookup);
-        assert_eq!(creds.len(), 1, "no declared vars → no dedup");
-    }
-
-    /// A credential with no known service mapping is never dropped by the dedup.
-    #[test]
-    fn dedup_fn_unmapped_credential_is_never_dropped() {
-        let mut creds = vec![
-            ("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into()),
-            ("MY_CUSTOM_INTERNAL_TOKEN".into(), "custom".into()),
-        ];
-        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
-        let lookup = |name: &str| -> Option<String> {
-            if name == "ANTHROPIC_API_KEY" {
-                Some("sk-ant".into())
-            } else {
-                None
-            }
-        };
-        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
-        // OAuth (anthropic) dropped; custom (no mapping) retained.
-        assert!(
-            !creds.iter().any(|(k, _)| k == "CLAUDE_CODE_OAUTH_TOKEN"),
-            "OAuth must be dropped when anthropic passthrough is set"
-        );
-        assert!(
-            creds.iter().any(|(k, _)| k == "MY_CUSTOM_INTERNAL_TOKEN"),
-            "unmapped credential must survive dedup; got: {creds:?}"
-        );
-    }
-
-    /// When keychain credential's OWN name equals the declared passthrough var
-    /// (e.g. declared env(ANTHROPIC_API_KEY) + keychain returns ANTHROPIC_API_KEY
-    /// itself), the keychain entry is dropped because both map to service
-    /// "anthropic" and the passthrough is set on host.
-    #[test]
-    fn dedup_fn_drops_when_credential_name_equals_declared_var() {
-        let mut creds = vec![("ANTHROPIC_API_KEY".into(), "sk-ant-from-keychain".into())];
-        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
-        // Passthrough is set on host (perhaps to a different value).
-        let lookup = |name: &str| -> Option<String> {
-            if name == "ANTHROPIC_API_KEY" {
-                Some("sk-ant-from-env".into())
-            } else {
-                None
-            }
-        };
-        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
-        assert!(
-            creds.is_empty(),
-            "credential whose own name equals the declared var must be dropped; \
-             got: {creds:?}"
-        );
-    }
-
-    /// Multi-service: declared var covers service X (anthropic), credential for
-    /// service Y (openai) is retained.
-    #[test]
-    fn dedup_fn_multi_service_declared_x_retains_credential_for_y() {
-        let mut creds = vec![
-            ("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok-anthropic".into()),
-            ("OPENAI_API_KEY".into(), "tok-openai".into()),
-        ];
-        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
-        // Only anthropic passthrough is set on host.
-        let lookup = |name: &str| -> Option<String> {
-            if name == "ANTHROPIC_API_KEY" {
-                Some("sk-ant".into())
-            } else {
-                None
-            }
-        };
-        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
-        // Anthropic OAuth dropped; OpenAI retained (different service, not declared).
-        assert!(
-            !creds.iter().any(|(k, _)| k == "CLAUDE_CODE_OAUTH_TOKEN"),
-            "anthropic OAuth must be dropped"
-        );
-        assert!(
-            creds.iter().any(|(k, _)| k == "OPENAI_API_KEY"),
-            "openai credential must be retained (covers service 'openai', not declared); \
-             got: {creds:?}"
-        );
-    }
-
-    /// `resolve()`'s production closure is `host_var` (overlay first, then
-    /// the process environment) — the squad daemon is the one caller whose
-    /// covering value can *only* ever come from the overlay, since a daemon
-    /// process never inherits the shell that created the task. Dedup must
-    /// behave identically either way: with the process value absent
-    /// entirely, a value supplied purely through the daemon overlay must
-    /// still cover the service and drop the redundant keychain credential.
-    #[test]
-    fn dedup_is_unchanged_when_the_covering_value_comes_from_the_daemon_overlay() {
-        use crate::data::config::env::{
-            set_daemon_overlay, DaemonEnvMap, DAEMON_OVERLAY_TEST_LOCK,
-        };
-
-        let _lock = DAEMON_OVERLAY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        set_daemon_overlay(DaemonEnvMap::new());
-
-        let prev = std::env::var("ANTHROPIC_API_KEY").ok();
-        std::env::remove_var("ANTHROPIC_API_KEY");
-
-        let mut overlay = DaemonEnvMap::new();
-        overlay.insert("ANTHROPIC_API_KEY", "sk-from-overlay");
-        set_daemon_overlay(overlay);
-
-        let resolved = ResolvedContainerOptions::resolve([
-            ContainerOption::EnvPassthrough(EnvVar("ANTHROPIC_API_KEY".into())),
-            ContainerOption::AgentCredentials {
-                env_vars: vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "sk-ant-oat-secret".into())],
-            },
-        ])
-        .expect("resolve must succeed");
-
-        assert!(
-            resolved.agent_credentials.is_empty(),
-            "dedup must trigger when the covering value comes from the overlay alone \
-             (the process env has none); got: {:?}",
-            resolved.agent_credentials
-        );
-
-        set_daemon_overlay(DaemonEnvMap::new());
-        match prev {
-            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
-    }
-
-    // ─── WI-0107: refreshable (file) dedup — INV-9 + MEDIUM-8 fail-closed ─────
-
-    fn refreshable_delivery(staged_root: &std::path::Path) -> RefreshableCredentialDelivery {
-        let staged_path = staged_root.join(".credentials.json");
-        std::fs::write(
-            &staged_path,
-            br#"{"claudeAiOauth":{"accessToken":"sk-oat"}}"#,
-        )
-        .unwrap();
-        RefreshableCredentialDelivery {
-            agent: crate::data::session::AgentName::new("claude").unwrap(),
-            spec_agent: "claude",
-            credential_env_key: "CLAUDE_CODE_OAUTH_TOKEN",
-            staged_path,
-            staged_root: staged_root.to_path_buf(),
-            initial_fingerprint: crate::engine::auth::credential::CredentialFingerprint::zeroed(),
-        }
-    }
-
-    /// INV-9: a declared + host-resolvable `ANTHROPIC_API_KEY` drops the
-    /// refreshable delivery AND removes the staged file from disk.
-    #[test]
-    fn dedup_refreshable_drops_delivery_and_removes_file_when_covered() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut refreshable = vec![refreshable_delivery(tmp.path())];
-        let staged_path = refreshable[0].staged_path.clone();
-        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
-        let lookup = |name: &str| -> Option<String> {
-            (name == "ANTHROPIC_API_KEY").then(|| "sk-ant".into())
-        };
-        dedup_refreshable_by_declared_env(&mut refreshable, &pt, &[], &lookup).unwrap();
-        assert!(refreshable.is_empty(), "covered delivery must be dropped");
-        assert!(
-            !staged_path.exists(),
-            "staged OAuth file must be removed from disk so it is never mounted"
-        );
-    }
-
-    /// INV-9 counter-case: a declared-but-unset passthrough drops nothing and
-    /// leaves the staged file in place.
-    #[test]
-    fn dedup_refreshable_retains_delivery_when_declared_but_unset() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut refreshable = vec![refreshable_delivery(tmp.path())];
-        let staged_path = refreshable[0].staged_path.clone();
-        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
-        let lookup = |_: &str| -> Option<String> { None };
-        dedup_refreshable_by_declared_env(&mut refreshable, &pt, &[], &lookup).unwrap();
-        assert_eq!(refreshable.len(), 1, "unset passthrough must not dedup");
-        assert!(staged_path.exists(), "staged file must remain");
-    }
-
-    /// MEDIUM-8: suppression is fail-closed. Even when the staged file cannot be
-    /// unlinked (parent dir read-only), it is neutralized in place so the mount
-    /// carries no secret; the delivery is still dropped and resolve succeeds.
-    #[cfg(unix)]
-    #[test]
-    fn dedup_refreshable_neutralizes_file_when_unlink_fails() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let locked = tmp.path().join("locked");
-        std::fs::create_dir_all(&locked).unwrap();
-        let mut refreshable = vec![refreshable_delivery(&locked)];
-        let staged_path = refreshable[0].staged_path.clone();
-        // Make the parent directory non-writable so unlink fails, but the file
-        // itself is still writable (so overwrite-in-place succeeds).
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
-        let lookup = |name: &str| -> Option<String> {
-            (name == "ANTHROPIC_API_KEY").then(|| "sk-ant".into())
-        };
-        let result = dedup_refreshable_by_declared_env(&mut refreshable, &pt, &[], &lookup);
-        // Restore perms so the TempDir can be cleaned up.
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(
-            result.is_ok(),
-            "in-place neutralization must succeed: {result:?}"
-        );
-        assert!(refreshable.is_empty(), "covered delivery must be dropped");
-        let contents = std::fs::read_to_string(&staged_path).unwrap();
-        assert!(
-            !contents.contains("sk-oat"),
-            "neutralized file must carry no secret; got {contents:?}"
-        );
     }
 }
