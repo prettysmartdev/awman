@@ -540,6 +540,7 @@ impl CallerContext {
 /// everything it needs at instantiation time; this is that collection, and
 /// `CommandSpec::build` is the catalogue entry that hands it over.
 pub struct BuildContext<'a> {
+    pub command_secrets: Option<Arc<crate::data::secret::CommandSecrets>>,
     pub remote_target: Option<String>,
     pub set_args: Vec<String>,
     pub flags: &'a ResolvedFlags,

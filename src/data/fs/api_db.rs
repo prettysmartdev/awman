@@ -51,6 +51,10 @@ pub struct SessionRecord {
     pub merge_refs: Vec<String>,
     /// For `remote` sessions, whether a successful command pushes the branch.
     pub push: bool,
+    /// WI 0145: the kind (`token`/`basic`) of a caller-supplied session Git
+    /// credential. A marker only: the credential itself is never persisted,
+    /// so a row with a marker and no in-memory credential is `credentials_lost`.
+    pub git_auth_kind: Option<String>,
 }
 
 /// The remote-session inputs recorded on a row right after it is inserted
@@ -63,6 +67,8 @@ pub struct RemoteSessionFields<'a> {
     pub base_ref: Option<&'a str>,
     pub merge_refs: &'a [String],
     pub push: bool,
+    /// WI 0145: the kind marker of the session credential, never its value.
+    pub git_auth_kind: Option<&'a str>,
 }
 
 /// The columns a new session row is created with.
@@ -350,7 +356,7 @@ pub mod failure_stages {
     pub const TEARDOWN: &str = "teardown";
     pub const MERGE: &str = "merge";
     pub const PUSH: &str = "push";
-    /// Lease Git authentication (clone, fetch, ls-remote or push).
+    /// Host Git authentication (clone, fetch, ls-remote or push).
     pub const GIT_AUTH: &str = "git_auth";
 }
 
@@ -358,12 +364,16 @@ pub mod failure_stages {
 /// they describe engine outcomes and post-command stages, and the queue
 /// worker assigns them.
 pub mod failure_codes {
-    /// A lease Git operation was refused for its credentials (WI 0143).
+    /// A host Git operation was refused for its credentials (WI 0143).
     /// Stage [`super::failure_stages::GIT_AUTH`]. Never retried.
     pub const GIT_AUTH_FAILED: &str = "git_auth_failed";
     /// A lease push got no response from the remote within the lease window
     /// (bounded retries exhausted). Stage [`super::failure_stages::PUSH`].
     pub const PUSH_UNREACHABLE: &str = "push_unreachable";
+    /// The session was created with `git_auth`, but the daemon no longer
+    /// holds that in-memory credential (it restarted). Stage
+    /// [`super::failure_stages::GIT_AUTH`]. Never retried: open a new session.
+    pub const CREDENTIALS_LOST: &str = "credentials_lost";
     /// A main-phase step failed (`WorkflowOutcome::Failed`).
     pub const STEP_FAILED: &str = "step_failed";
     /// A non-execution command returned a nonzero exit status.
@@ -598,6 +608,8 @@ impl SqliteSessionStore {
         // JSON array of branch names; NULL means none.
         Self::add_column_if_missing(conn, "sessions", "merge_refs", "TEXT")?;
         Self::add_column_if_missing(conn, "sessions", "push", "INTEGER NOT NULL DEFAULT 0")?;
+        // WI 0145: kind marker of an in-memory session credential (no value).
+        Self::add_column_if_missing(conn, "sessions", "git_auth_kind", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "worker_id", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "queued_at", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "result", "TEXT")?;
@@ -760,14 +772,15 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let affected = conn.execute(
             "UPDATE sessions SET repo_url = ?1, branch = ?2, base_ref = ?3, \
-                                 merge_refs = ?4, push = ?5 \
-             WHERE id = ?6",
+                                 merge_refs = ?4, push = ?5, git_auth_kind = ?6 \
+             WHERE id = ?7",
             params![
                 fields.repo_url,
                 fields.branch,
                 fields.base_ref,
                 merge_refs,
                 fields.push,
+                fields.git_auth_kind,
                 id
             ],
         )?;
@@ -794,7 +807,7 @@ impl SqliteSessionStore {
         let mut stmt = conn.prepare(
             "SELECT id, workdir, created_at, status, closed_at, \
                     setup_status, session_type, cloned_path, \
-                    repo_url, branch, base_ref, merge_refs, push \
+                    repo_url, branch, base_ref, merge_refs, push, git_auth_kind \
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], session_record_from_row)?;
@@ -826,7 +839,7 @@ impl SqliteSessionStore {
         let mut stmt = conn.prepare(
             "SELECT id, workdir, created_at, status, closed_at, \
                     setup_status, session_type, cloned_path, \
-                    repo_url, branch, base_ref, merge_refs, push \
+                    repo_url, branch, base_ref, merge_refs, push, git_auth_kind \
              FROM sessions ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], session_record_from_row)?;
@@ -848,7 +861,7 @@ impl SqliteSessionStore {
         let mut stmt = conn.prepare(
             "SELECT id, workdir, created_at, status, closed_at, \
                     setup_status, session_type, cloned_path, \
-                    repo_url, branch, base_ref, merge_refs, push \
+                    repo_url, branch, base_ref, merge_refs, push, git_auth_kind \
              FROM sessions WHERE status = ?1 ORDER BY created_at",
         )?;
         let rows = stmt.query_map(params![status.as_str()], session_record_from_row)?;
@@ -939,7 +952,7 @@ impl SqliteSessionStore {
         labels: &[LabelSelector],
     ) -> Result<Vec<SessionRecord>, DataError> {
         let mut sql = String::from(
-            "SELECT id,workdir,created_at,status,closed_at,setup_status,session_type,cloned_path,repo_url,branch,base_ref,merge_refs,push FROM sessions s WHERE 1=1",
+            "SELECT id,workdir,created_at,status,closed_at,setup_status,session_type,cloned_path,repo_url,branch,base_ref,merge_refs,push,git_auth_kind FROM sessions s WHERE 1=1",
         );
         let mut args: Vec<Value> = Vec::new();
         if let Some(status) = status {
@@ -998,7 +1011,7 @@ impl SqliteSessionStore {
         let mut stmt = conn.prepare(
             "SELECT id, workdir, created_at, status, closed_at, \
                     setup_status, session_type, cloned_path, \
-                    repo_url, branch, base_ref, merge_refs, push \
+                    repo_url, branch, base_ref, merge_refs, push, git_auth_kind \
              FROM sessions \
              WHERE setup_status IN ('initializing', 'cloning_repository', \
                                     'setting_up_branch', 'merging_refs', 'running_ready') \
@@ -1777,6 +1790,7 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
             .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
             .unwrap_or_default(),
         push: row.get(12)?,
+        git_auth_kind: row.get(13)?,
     })
 }
 

@@ -25,6 +25,7 @@ pub struct EventBus {
 
 #[derive(Default)]
 struct Publication {
+    redaction: crate::engine::auth::redaction::RedactionSet,
     next_sequence: u64,
     finished: bool,
     log: Option<mpsc::UnboundedSender<ExecutionEvent>>,
@@ -32,6 +33,9 @@ struct Publication {
 }
 
 impl EventBus {
+    pub fn redaction(&self) -> crate::engine::auth::redaction::RedactionSet {
+        self.sender().redaction()
+    }
     /// A bus for the first attempt of a command.
     pub fn new(capacity: usize) -> Self {
         Self::for_attempt(capacity, FIRST_ATTEMPT)
@@ -153,6 +157,13 @@ impl SourceStamp {
 }
 
 impl EventBusSender {
+    pub fn redaction(&self) -> crate::engine::auth::redaction::RedactionSet {
+        self.publication
+            .lock()
+            .expect("publication lock")
+            .redaction
+            .clone()
+    }
     /// Hold this guard for the duration of a frontend dialog.
     pub fn awaiting_input(&self) -> Option<crate::engine::worker::heartbeat::AwaitingInputGuard> {
         self.awaiting_input.as_ref().map(|signal| signal.hold())
@@ -214,6 +225,7 @@ impl EventBusSender {
         let mut publication = self.publication.lock().expect("publication lock poisoned");
         self.publish(&mut publication, status);
         self.publish(&mut publication, EventPayload::Done);
+        publication.redaction.clear();
     }
 
     fn publish(&self, publication: &mut Publication, payload: EventPayload) {
@@ -221,11 +233,14 @@ impl EventBusSender {
             return;
         }
         publication.finished = matches!(payload, EventPayload::Done);
+        let payload = publication.redaction.redact_event(payload);
         let event = ExecutionEvent {
             timestamp: chrono::Utc::now(),
             attempt: self.attempt,
             sequence: publication.next_sequence,
-            source: self.source(),
+            source: self
+                .source()
+                .and_then(|source| publication.redaction.redact_source(source)),
             payload,
         };
         publication.next_sequence += 1;
@@ -236,5 +251,40 @@ impl EventBusSender {
             .followers
             .retain(|tx| tx.send(event.clone()).is_ok());
         let _ = self.tx.send(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sender_clones_redact_before_log_ordered_and_broadcast_consumers() {
+        let bus = EventBus::new(16);
+        let mut log = bus.subscribe_log();
+        let mut ordered = bus.subscribe_ordered();
+        let mut broadcast = bus.subscribe();
+        let sender = bus.sender();
+        let clone = sender.clone();
+        clone
+            .redaction()
+            .add(crate::data::secret::SecretString::new("test-secret-bus"));
+        let mut source = EventSource::phase(crate::data::execution_event::EventSourcePhase::Main);
+        source.step_name = Some("test-secret-bus".into());
+        let sender = sender.with_source(source);
+        sender.emit(EventPayload::StdoutLine(
+            "test-secret-bus test-secret-bus".into(),
+        ));
+        for event in [
+            log.recv().await.unwrap(),
+            ordered.recv().await.unwrap(),
+            broadcast.recv().await.unwrap(),
+        ] {
+            assert!(
+                matches!(event.payload, EventPayload::StdoutLine(ref line) if line == "*** ***")
+            );
+            assert_eq!(event.sequence, 0);
+            assert_eq!(event.source.unwrap().step_name.as_deref(), Some("***"));
+        }
     }
 }

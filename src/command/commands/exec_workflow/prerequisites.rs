@@ -101,6 +101,10 @@ impl ExecWorkflowCommand {
     }
 }
 
+/// Stable message prefix (WI 0145) of a `push_branch`/`pull_branch` step of a
+/// `git_auth` session targeting another repository.
+pub(crate) const SESSION_GIT_AUTH_SCOPE_MISMATCH: &str = "session_git_auth_scope_mismatch";
+
 /// Per-step command options, keyed by phase and step index.
 pub(crate) type StepCommandOptionsByStep = Vec<((PhaseKind, usize), StepCommandOptions)>;
 
@@ -127,6 +131,8 @@ pub(crate) fn apply_grant_overlays(
         .and_then(|rt| rt.image_home_dir(image_tag));
     let mut keep = Vec::new();
     let mut options = Vec::new();
+    // Match the session scope before granting a private in-container helper.
+    let session_socket = engines.ephemeral_secrets.container_git_socket();
     for (index, (kind, remote)) in kinds.iter().enumerate() {
         let Some(Ok((overlays, env))) = resolved.get_mut(index) else {
             continue;
@@ -149,6 +155,14 @@ pub(crate) fn apply_grant_overlays(
             phase,
             container_home: container_home.as_deref(),
             remote: remote_url.as_ref(),
+            session_git_socket: session_socket
+                .as_ref()
+                .filter(|listener| {
+                    remote_url
+                        .as_ref()
+                        .is_some_and(|r| listener.matches_url(&r.redacted))
+                })
+                .map(|listener| listener.as_ref()),
         };
         let grant = match engines
             .overlay_engine
@@ -164,9 +178,37 @@ pub(crate) fn apply_grant_overlays(
                         kind.label()
                     ),
                 });
+                resolved[index] = Err(CommandError::Other(format!(
+                    "workflow prerequisite grants unavailable: {e}"
+                )));
                 continue;
             }
         };
+        if session_socket.is_some()
+            && session_socket.as_ref().is_some_and(|listener| {
+                !remote_url
+                    .as_ref()
+                    .is_some_and(|r| listener.matches_url(&r.redacted))
+            })
+            && matches!(
+                kind,
+                PrerequisiteStepKind::PushBranch | PrerequisiteStepKind::PullBranch
+            )
+            && grant.push_auth == crate::engine::workflow::step_commands::PushAuth::None
+            && remote_url.as_ref().is_some_and(|r| {
+                let lower = r.redacted.to_ascii_lowercase();
+                lower.starts_with("https://") || lower.starts_with("http://")
+            })
+        {
+            if let Some(slot) = resolved.get_mut(index) {
+                *slot = Err(CommandError::Other(format!(
+                    "{SESSION_GIT_AUTH_SCOPE_MISMATCH}: {} step {index} ({}) targets a repository outside the session credential's scope",
+                    phase.label(),
+                    kind.label()
+                )));
+            }
+            continue;
+        }
         if grant.is_empty() {
             continue;
         }

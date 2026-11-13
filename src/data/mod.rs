@@ -89,4 +89,5 @@ pub mod frontend_protocol;
 pub mod instance_snapshot;
 pub mod secret;
 
+pub mod git_transport;
 pub mod launch_context;

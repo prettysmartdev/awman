@@ -181,6 +181,8 @@ pub enum AutoMode {
 /// Options governing how an agent container is invoked.
 #[derive(Debug, Default, Clone)]
 pub struct AgentRunOptions {
+    /// Caller values are used only for explicit env overlay names.
+    pub command_secrets: Option<Arc<crate::data::secret::CommandSecrets>>,
     pub yolo: Option<crate::engine::container::options::YoloMode>,
     pub auto: Option<crate::engine::container::options::AutoMode>,
     pub plan: Option<crate::engine::container::options::PlanMode>,
@@ -228,6 +230,22 @@ pub struct AgentRunOptions {
 
 /// Extra user arguments appended to `agent`'s launch command: the run's
 /// explicit `--agent-flag` list, else the session's effective `agentFlags`.
+impl AgentRunOptions {
+    pub fn secret_env(&self) -> Vec<(String, crate::data::secret::SecretString)> {
+        self.env_passthrough
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|name| {
+                self.command_secrets
+                    .as_ref()?
+                    .get(name)
+                    .map(|value| (name.clone(), value.clone()))
+            })
+            .collect()
+    }
+}
+
 fn resolve_agent_flags(session: &Session, agent: &AgentName, run: &AgentRunOptions) -> Vec<String> {
     match &run.agent_flags {
         Some(values) => values.clone(),
@@ -876,6 +894,14 @@ impl AgentEngine {
             }
             options.push(ContainerOption::EnvPassthrough(EnvVar(name.clone())));
         }
+        // Secret overrides never enter EnvSnapshot or literal env options.
+        // The backend passes only `-e NAME` in argv, with the value in the
+        // runtime child environment; an unrequested name is never injected.
+        options.extend(
+            run.secret_env()
+                .into_iter()
+                .map(|(key, value)| ContainerOption::EnvOverride { key, value }),
+        );
 
         // Per-agent static env vars, from the one per-agent table.
         for (key, value) in &def.static_env {
@@ -1060,6 +1086,11 @@ impl AgentEngine {
         // *different* one than the engine was built with could resolve
         // sandbox options and then build them on a container runtime.
         if self.runtime.capabilities().kit_declarative {
+            if !run.secret_env().is_empty() {
+                return Err(EngineError::Config(
+                    "command secrets require a container runtime".into(),
+                ));
+            }
             let mut options = self.build_sandbox_options(session, agent, run)?;
             if !credentials.env_vars.is_empty() {
                 options.push(SandboxOption::AgentCredentials {

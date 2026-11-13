@@ -175,6 +175,11 @@ impl SessionSetup {
 
     /// Persist a terminal status to the session row.
     fn persist_status(&self, status: SessionSetupStatus) {
+        if status == SessionSetupStatus::Failed {
+            self.engines
+                .ephemeral_secrets
+                .remove_session_git_auth(&self.session_id);
+        }
         let _ = self.store.update_setup_status(&self.session_id, status);
     }
 
@@ -216,7 +221,29 @@ impl SessionSetup {
         stage: &str,
         error: &str,
     ) {
+        self.fail_remote_coded(presenter, stage, None, error).await
+    }
+
+    /// [`Self::fail_remote`] with an explicit stable `setup_error.code`.
+    async fn fail_remote_coded(
+        &self,
+        presenter: &mut dyn SessionSetupPresenter,
+        stage: &str,
+        code: Option<&str>,
+        error: &str,
+    ) {
         self.mark_failed(presenter, stage, error);
+        if let Some(code) = code {
+            self.state(|s| {
+                if let Some(error) = &mut s.error {
+                    error.code = Some(code.to_string());
+                }
+            });
+        }
+        // A failed setup never runs a command: release the credential now.
+        self.engines
+            .ephemeral_secrets
+            .remove_session_git_auth(&self.session_id);
         self.delete_clone().await;
         self.persist_status(SessionSetupStatus::Failed);
         self.finish(presenter).await;
@@ -226,12 +253,33 @@ impl SessionSetup {
     /// remote session's clone, persist `"failed"`, then finish.
     async fn fail_cancelled(&self, presenter: &mut dyn SessionSetupPresenter) {
         tracing::info!(session_id = %self.session_id, "Session setup cancelled");
+        self.engines
+            .ephemeral_secrets
+            .remove_session_git_auth(&self.session_id);
         self.mark_failed(presenter, SETUP_CANCELLED_STAGE, "session setup cancelled");
         if self.plan.kind == SessionKind::Remote {
             self.delete_clone().await;
         }
         self.persist_status(SessionSetupStatus::Failed);
         self.finish(presenter).await;
+    }
+
+    /// The session's transport (WI 0145): its in-memory credential through
+    /// the daemon socket when the row carries a `git_auth` marker.
+    fn session_transport(
+        &self,
+    ) -> Result<crate::engine::git::transport::HostGitTransport, crate::command::error::CommandError>
+    {
+        let marker = self
+            .store
+            .get_session(&self.session_id)
+            .map_err(crate::command::error::CommandError::Data)?
+            .and_then(|row| row.git_auth_kind);
+        crate::command::session_git_transport::session_transport(
+            &self.engines,
+            &self.session_id,
+            marker.as_deref(),
+        )
     }
 
     /// One cancellation check point: `true` once the token has fired, after
@@ -275,7 +323,9 @@ impl SessionSetup {
         self.enter_status(SessionSetupStatus::CloningRepository);
         let msg = format!(
             "Cloning {}...",
-            self.plan.repo_url.as_deref().unwrap_or("repository")
+            crate::data::git_transport::SafeRemote::from_url(
+                self.plan.repo_url.as_deref().unwrap_or("")
+            )
         );
         self.stage(presenter, "cloning_repository", &msg);
         presenter.log(&format!(
@@ -291,7 +341,7 @@ impl SessionSetup {
             .expect("remote sessions have cloned_path");
         tracing::info!(
             session_id = %session_id,
-            repo_url = %url,
+            repo_url = %crate::data::git_transport::SafeRemote::from_url(&url),
             dest = %dest.display(),
             "Cloning remote repository (default branch)"
         );
@@ -302,9 +352,30 @@ impl SessionSetup {
         // `origin/<name>` to the branch and merge stages below. A cancel kills
         // the clone, which may otherwise wait on an unresponsive origin forever.
         let cancel = self.cancel.clone();
+        let transport = match self.session_transport() {
+            Ok(transport) => transport,
+            Err(error) => {
+                // `credentials_lost` (or an unreadable row): nothing is cloned.
+                self.fail_remote_coded(
+                    presenter,
+                    error.stage(),
+                    Some(error.code()),
+                    &error.to_string(),
+                )
+                .await;
+                return Err(());
+            }
+        };
         let clone_result = self
             .blocking_git("clone", move |git| {
-                git.clone_repo_logged(&url, None, &dest_for_clone, &mut *clone_sink, &cancel)
+                git.clone_with_transport(
+                    &url,
+                    None,
+                    &dest_for_clone,
+                    &transport,
+                    &mut *clone_sink,
+                    &crate::engine::git::transport::TransportGuard::new(cancel),
+                )
             })
             .await;
         if self.cancelled_here(presenter).await {
@@ -312,7 +383,16 @@ impl SessionSetup {
         }
         if let Err(e) = clone_result {
             tracing::error!(session_id = %session_id, error = %e, "Clone failed");
-            self.fail_remote(presenter, "clone", &e.to_string()).await;
+            self.fail_remote(
+                presenter,
+                if matches!(e, EngineError::GitAuth { .. }) {
+                    "git_auth"
+                } else {
+                    "clone"
+                },
+                &e.to_string(),
+            )
+            .await;
             return Err(());
         }
         tracing::info!(session_id = %session_id, "Repository cloned");
@@ -369,7 +449,16 @@ impl SessionSetup {
         ));
         if let Err(e) = self.merge_refs(presenter, &dest).await {
             tracing::error!(session_id = %session_id, error = %e, "Merging refs failed");
-            self.fail_remote(presenter, "merging_refs", &e).await;
+            self.fail_remote(
+                presenter,
+                if matches!(e, EngineError::GitAuth { .. }) {
+                    "git_auth"
+                } else {
+                    "merging_refs"
+                },
+                &e.to_string(),
+            )
+            .await;
             return Err(());
         }
         Ok(())
@@ -429,14 +518,34 @@ impl SessionSetup {
         &self,
         presenter: &mut dyn SessionSetupPresenter,
         dest: &std::path::Path,
-    ) -> Result<(), String> {
+    ) -> Result<(), EngineError> {
+        let (repo, url, refs, cancel) = (
+            dest.to_path_buf(),
+            self.plan.repo_url.clone().unwrap_or_default(),
+            self.plan.merge_refs.clone(),
+            self.cancel.clone(),
+        );
+        let mut fetch_sink = presenter.git_log_sink();
+        let transport = self
+            .session_transport()
+            .map_err(|e| EngineError::Config(e.to_string()))?;
+        self.blocking_git("fetch", move |git| {
+            git.fetch_missing_merge_refs(
+                &repo,
+                &url,
+                &refs,
+                &transport,
+                &mut *fetch_sink,
+                &crate::engine::git::transport::TransportGuard::new(cancel),
+            )
+        })
+        .await?;
         // The clone may have no `user.name` / `user.email` (a fresh server);
         // the engine supplies awman's fallback for exactly the missing keys.
         let identity = {
             let dest = dest.to_path_buf();
             self.blocking_git("merge", move |git| git.commit_identity(&dest))
-                .await
-                .map_err(|e| e.to_string())?
+                .await?
         };
         presenter.log(&identity.describe());
 
@@ -450,8 +559,7 @@ impl SessionSetup {
                 .blocking_git("merge", move |git| {
                     git.merge_ref_logged(&dest, &r, &id, &mut *sink)
                 })
-                .await
-                .map_err(|e| e.to_string())?;
+                .await?;
             let message = match outcome {
                 MergeRefOutcome::Merged { sha } => {
                     format!("Merged origin/{merge_ref} ({})", &sha[..sha.len().min(8)])
@@ -472,6 +580,26 @@ impl SessionSetup {
     /// failed), the snapshot is on disk, and the frontend has been told to
     /// retire its per-session machinery.
     pub async fn run(&self, presenter: &mut dyn SessionSetupPresenter) {
+        // Covers every failed return, dropped future and unwind after clone.
+        struct RetireFailed<'a>(&'a SessionSetup);
+        impl Drop for RetireFailed<'_> {
+            fn drop(&mut self) {
+                let ready = self
+                    .0
+                    .setup_state
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .status
+                    == SessionSetupStatus::Ready;
+                if !ready {
+                    self.0
+                        .engines
+                        .ephemeral_secrets
+                        .remove_session_git_auth(&self.0.session_id);
+                }
+            }
+        }
+        let _retire_failed = RetireFailed(self);
         let session_id = &self.session_id;
 
         // Delay setup work briefly so the frontend's acknowledgement (the API's
@@ -486,7 +614,7 @@ impl SessionSetup {
             session_id = %session_id,
             session_type = %self.plan.kind,
             workdir = %self.plan.resolved_workdir.display(),
-            repo_url = self.plan.repo_url.as_deref().unwrap_or(""),
+            repo_url = %crate::data::git_transport::SafeRemote::from_url(self.plan.repo_url.as_deref().unwrap_or("")),
             branch = self.plan.branch.as_deref().unwrap_or(""),
             "Beginning session setup"
         );

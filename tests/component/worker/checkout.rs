@@ -101,3 +101,46 @@ fn checkout_refuses_tag_and_missing_merge_refs_after_owned_remote_lookup() {
     }
     sandbox.finish();
 }
+
+#[test]
+fn lease_clone_auth_failure_keeps_operation_remote_and_stable_auth_class() {
+    let sandbox = support::sandbox(
+        "worker::checkout::lease_clone_auth_failure_keeps_operation_remote_and_stable_auth_class",
+    );
+    sandbox.require::<awman_test_support::capability::LocalGit>();
+    sandbox.require::<awman_test_support::capability::Loopback>();
+    let repo = RepoBuilder::new(&sandbox, "seed").file("a", "a").init();
+    repo.bare_remote("origin");
+    let secret = "test-secret-lease-auth-password";
+    let remote =
+        awman_test_support::fakes::FakeGitHttp::builder(&sandbox, &sandbox.root().join("remotes"))
+            .basic_auth("user", secret)
+            .start();
+    let url = remote.url("origin.git");
+    let transport = LeaseTransport::default();
+    let git = GitEngine::with_env(support::env_snapshot(&sandbox));
+    let spec = awman_wsp::Repo {
+        url: url.clone(),
+        base_ref: "main".into(),
+        branch: "lease/result".into(),
+        merge_refs: vec![],
+        credentials: None,
+    };
+    let workspace =
+        LeaseWorkspace::prepare(&sandbox.work().join("leases"), &LeaseId::new()).unwrap();
+    let mut sink = RecordingMessageSink::new();
+    let error = LeaseCheckout::new(&git, &transport)
+        .run(&workspace, &spec, &mut sink, &CancellationToken::new())
+        .unwrap_err();
+    assert!(
+        matches!(&error, awman::engine::error::EngineError::GitAuth { operation, remote, .. }
+        if operation == "clone" && remote == awman::data::git_transport::SafeRemote::from_url(&url).as_str())
+    );
+    assert_eq!(
+        awman::command::session_git_transport::git_failure_code(&error),
+        Some(("git_auth", "git_auth_failed"))
+    );
+    assert!(!error.to_string().contains(secret));
+    assert!(!format!("{:?}", sink.all()).contains(secret));
+    workspace.remove().unwrap();
+}

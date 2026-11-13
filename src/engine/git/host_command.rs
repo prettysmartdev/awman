@@ -16,6 +16,39 @@ pub(super) fn command(snapshot: &EnvSnapshot, cwd: &Path) -> Command {
 }
 
 pub(super) fn discovery_command(snapshot: &EnvSnapshot, cwd: &Path) -> Command {
+    // Legacy local callers have their own error handling. The guarded path
+    // used for publication must propagate probe failures before any work.
+    discovery_command_guarded(
+        snapshot,
+        cwd,
+        &super::transport::TransportGuard::new(tokio_util::sync::CancellationToken::new()),
+    )
+    .unwrap_or_else(|_| {
+        let mut refused = crate::engine::host_cli::command(snapshot, "git");
+        refused.arg("--awman-config-probe-failed");
+        refused
+    })
+}
+
+pub(super) fn command_guarded(
+    snapshot: &EnvSnapshot,
+    cwd: &Path,
+    guard: &super::transport::TransportGuard,
+) -> Result<Command, crate::engine::error::EngineError> {
+    let mut command = discovery_command_guarded(snapshot, cwd, guard)?;
+    if cwd.join(".git").exists() {
+        command
+            .arg("-c")
+            .arg(format!("core.worktree={}", cwd.display()));
+    }
+    Ok(command)
+}
+
+fn discovery_command_guarded(
+    snapshot: &EnvSnapshot,
+    cwd: &Path,
+    guard: &super::transport::TransportGuard,
+) -> Result<Command, crate::engine::error::EngineError> {
     let mut command = crate::engine::host_cli::command(snapshot, "git");
     command
         .current_dir(cwd)
@@ -43,21 +76,40 @@ pub(super) fn discovery_command(snapshot: &EnvSnapshot, cwd: &Path) -> Command {
     // Attribute names are arbitrary. Disable every configured executable
     // content driver, including those selected by .git/info/attributes.
     // `git config` only reads settings; it does not execute their values.
-    if let Ok(output) = crate::engine::host_cli::command(snapshot, "git")
+    let mut probe = crate::engine::host_cli::command(snapshot, "git");
+    probe
         .args(["config", "--null", "--name-only", "--get-regexp", "^(filter\\..*\\.(clean|smudge|process)|diff\\..*\\.(command|textconv)|merge\\..*\\.driver)$"])
         .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null()).current_dir(cwd).output()
-    {
-        for key in output.stdout.split(|byte| *byte == 0).filter(|key| !key.is_empty()) {
+        .stdin(std::process::Stdio::null()).current_dir(cwd);
+    let output = guard.output(&mut probe)?;
+    if matches!(output.status.code(), Some(0 | 1)) {
+        for key in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|key| !key.is_empty())
+        {
             let key = String::from_utf8_lossy(key);
-            let value = if key.starts_with("merge.") { "false" } else { "" };
+            let value = if key.starts_with("merge.") {
+                "false"
+            } else {
+                ""
+            };
             command.arg("-c").arg(format!("{key}={value}"));
-            if let Some(name) = key.strip_prefix("filter.").and_then(|s| s.rsplit_once('.').map(|p| p.0)) {
-                command.arg("-c").arg(format!("filter.{name}.required=false"));
+            if let Some(name) = key
+                .strip_prefix("filter.")
+                .and_then(|s| s.rsplit_once('.').map(|p| p.0))
+            {
+                command
+                    .arg("-c")
+                    .arg(format!("filter.{name}.required=false"));
             }
         }
+    } else {
+        return Err(crate::engine::error::EngineError::Git(
+            "cannot read content driver configuration".into(),
+        ));
     }
-    command
+    Ok(command)
 }
 
 /// Repository-scoped settings that select an executable, a credential
@@ -65,7 +117,7 @@ pub(super) fn discovery_command(snapshot: &EnvSnapshot, cwd: &Path) -> Command {
 /// `.git/config`, so a repo-local (or worktree-local) value for any of these
 /// is refused before host git talks to a remote. Global settings are the
 /// user's own and stay in force.
-const UNTRUSTED_TRANSPORT_KEYS: &str = "^(core\\.(sshcommand|gitproxy|askpass)|credential\\..*helper|remote\\..*\\.(vcs|uploadpack|receivepack|proxy)|http\\..*(proxy|sslverify|sslcainfo|sslcapath|sslcert|sslkey|cookiefile|curloptresolve))$";
+const UNTRUSTED_TRANSPORT_KEYS: &str = "^(core\\.(sshcommand|gitproxy|askpass)|credential\\..*helper|remote\\..*\\.(vcs|uploadpack|receivepack|proxy)|http\\..*(extraheader|proxy|sslverify|sslcainfo|sslcapath|sslcert|sslkey|cookiefile|curloptresolve))$";
 
 /// Upper bound for one host network git operation (`ls-remote`, `fetch`).
 pub(super) const NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -80,9 +132,22 @@ pub(super) fn transport_command(
     cwd: &Path,
     remote: &str,
 ) -> Result<Command, crate::engine::error::EngineError> {
-    let mut command = command(snapshot, cwd);
+    transport_command_guarded(
+        snapshot,
+        cwd,
+        remote,
+        &super::transport::TransportGuard::new(tokio_util::sync::CancellationToken::new()),
+    )
+}
+pub(super) fn transport_command_guarded(
+    snapshot: &EnvSnapshot,
+    cwd: &Path,
+    remote: &str,
+    guard: &super::transport::TransportGuard,
+) -> Result<Command, crate::engine::error::EngineError> {
+    let mut command = command_guarded(snapshot, cwd, guard)?;
     let mut user_ssh_command = false;
-    for (scope, key) in config_keys_with_scope(snapshot, cwd, UNTRUSTED_TRANSPORT_KEYS)? {
+    for (scope, key) in config_keys_with_scope(snapshot, cwd, UNTRUSTED_TRANSPORT_KEYS, guard)? {
         if !matches!(scope.as_str(), "global" | "system" | "command") {
             return Err(crate::engine::error::EngineError::Git(format!(
                 "refusing to contact remote '{remote}': repository configuration sets `{key}` ({scope} scope), which could run a program or redirect credentials on the host. Remove it from the repository's Git config (or move it to your global config) and retry."
@@ -114,8 +179,10 @@ fn config_keys_with_scope(
     snapshot: &EnvSnapshot,
     cwd: &Path,
     pattern: &str,
+    guard: &super::transport::TransportGuard,
 ) -> Result<Vec<(String, String)>, crate::engine::error::EngineError> {
-    let output = crate::engine::host_cli::command(snapshot, "git")
+    let mut probe = crate::engine::host_cli::command(snapshot, "git");
+    probe
         .args([
             "config",
             "--show-scope",
@@ -127,18 +194,16 @@ fn config_keys_with_scope(
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::null())
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| crate::engine::error::EngineError::Git(format!("invoke `git config`: {e}")))?;
+        .current_dir(cwd);
+    let output = guard.output(&mut probe)?;
     // Exit 1 means no key matched.
     match output.status.code() {
         Some(0) => {}
         Some(1) => return Ok(Vec::new()),
         _ => {
-            return Err(crate::engine::error::EngineError::Git(format!(
-                "cannot read repository configuration: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )))
+            return Err(crate::engine::error::EngineError::Git(
+                "cannot read repository configuration".into(),
+            ))
         }
     }
     let fields: Vec<String> = output

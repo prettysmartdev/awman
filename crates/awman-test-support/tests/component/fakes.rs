@@ -122,3 +122,104 @@ fn fake_work_server_conforms() {
         server.shutdown().await;
     });
 }
+
+#[test]
+fn fake_git_http_refuses_missing_and_wrong_auth_and_accepts_the_correct_identity() {
+    let sandbox = sandbox(
+        "fakes::fake_git_http_refuses_missing_and_wrong_auth_and_accepts_the_correct_identity",
+    );
+    sandbox.require::<awman_test_support::capability::LocalGit>();
+    sandbox.require::<awman_test_support::capability::Loopback>();
+    let repo = RepoBuilder::new(&sandbox, "src").file("a", "a").init();
+    repo.bare_remote("origin");
+    let password = "test-secret-http-password";
+    let server = FakeGitHttp::builder(&sandbox, &sandbox.root().join("remotes"))
+        .basic_auth("correct", password)
+        .start();
+    let url = server.url("origin.git");
+    let refused = sandbox.command("git").args(["ls-remote", &url]).run();
+    assert!(!refused.exit.success());
+    let credential = sandbox.root().join("credential");
+    let wrong = "test-secret-wrong-http-password";
+    sandbox.redact(wrong);
+    std::fs::write(&credential, format!("username=correct\npassword={wrong}\n")).unwrap();
+    let helper = format!("credential.helper=!cat '{}'", credential.display());
+    let refused = sandbox
+        .command("git")
+        .args(["-c", &helper, "ls-remote", &url])
+        .run();
+    assert!(!refused.exit.success());
+    std::fs::write(
+        &credential,
+        format!("username=correct\npassword={password}\n"),
+    )
+    .unwrap();
+    sandbox
+        .command("git")
+        .args(["-c", &helper, "ls-remote", &url])
+        .run()
+        .assert_success();
+    assert!(server
+        .requests()
+        .iter()
+        .any(|u| u.as_deref() == Some("correct")));
+    assert!(server.requests().iter().any(Option::is_none));
+    assert!(!format!("{:?}", server.requests()).contains(password));
+}
+
+#[test]
+fn fake_git_http_faults_drop_requests_and_apply_a_push_whose_response_is_lost() {
+    let sandbox = sandbox(
+        "fakes::fake_git_http_faults_drop_requests_and_apply_a_push_whose_response_is_lost",
+    );
+    sandbox.require::<awman_test_support::capability::LocalGit>();
+    sandbox.require::<awman_test_support::capability::Loopback>();
+    let repo = RepoBuilder::new(&sandbox, "src").file("a", "a").init();
+    let bare = repo.bare_remote("origin");
+    // The first request gets no response; the next one is served.
+    let server = FakeGitHttp::builder(&sandbox, &sandbox.root().join("remotes"))
+        .fail_before_response(1)
+        .start();
+    let url = server.url("origin.git");
+    let dropped = sandbox.command("git").args(["ls-remote", &url]).run();
+    assert!(!dropped.exit.success());
+    sandbox
+        .command("git")
+        .args(["ls-remote", &url])
+        .run()
+        .assert_success();
+    drop(server);
+    // The push is applied, but the client never learns it.
+    let server = FakeGitHttp::builder(&sandbox, &sandbox.root().join("remotes"))
+        .drop_after_receive_pack()
+        .start();
+    let url = server.url("origin.git");
+    repo.write("b", "b").commit("b");
+    let push = sandbox
+        .command("git")
+        // This probes one application of the fault. Git/libcurl can replay
+        // POST internally on a reused connection; the engine suite separately
+        // verifies that the production transport prevents that replay.
+        .args([
+            "-c",
+            "http.version=HTTP/1.1",
+            "-c",
+            "http.extraHeader=Connection: close",
+            "push",
+            &url,
+            "HEAD:refs/heads/main",
+        ])
+        .current_dir(repo.path())
+        .run();
+    assert!(!push.exit.success());
+    assert_eq!(server.receive_packs(), 1);
+    let published = sandbox
+        .command("git")
+        .args(["--git-dir", bare.to_str().unwrap(), "rev-parse", "main"])
+        .run();
+    published.assert_success();
+    assert_eq!(
+        String::from_utf8_lossy(&published.stdout).trim(),
+        repo.head()
+    );
+}

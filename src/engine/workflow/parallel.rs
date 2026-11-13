@@ -400,7 +400,7 @@ impl WorkflowEngine {
                         .report_parallel_step_exited(&name, KILLED_EXIT_CODE);
                 }
                 if let Err(save_error) = self.persist() {
-                    tracing::error!(step = %step.name, error = %save_error,
+                    tracing::error!(step = %self.redaction.redact(&step.name), error = %self.redaction.redact(&save_error.to_string()),
                         "could not persist parallel launch failure cleanup");
                 }
                 return Err(error);
@@ -1243,7 +1243,7 @@ impl WorkflowEngine {
                     .parallel_step_yolo_countdown_finished(&slot.step_name);
             }
             if let Err(error) = self.agent_factory.stop_agent(&slot.handle) {
-                tracing::error!(step = %slot.step_name, error = %error,
+                tracing::error!(step = %self.redaction.redact(&slot.step_name), error = %self.redaction.redact(&error.to_string()),
                     "final workflow agent could not be stopped");
                 stop_error.get_or_insert(error);
             } else {

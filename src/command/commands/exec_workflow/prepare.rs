@@ -629,6 +629,10 @@ pub(crate) async fn execute_prepared_with_outputs(
                                 .iter()
                                 .find(|(i, _)| *i == idx)
                                 .and_then(|(_, g)| g.transport.as_ref()),
+                            git_cache_seed: _setup_grants
+                                .iter()
+                                .find(|(i, _)| *i == idx)
+                                .and_then(|(_, g)| g.git_cache_seed.as_ref()),
                         }
                         .build(step, env, overlays)
                     };
@@ -816,6 +820,10 @@ pub(crate) async fn execute_prepared_with_outputs(
                                 .iter()
                                 .find(|(i, _)| *i == idx)
                                 .and_then(|(_, g)| g.transport.as_ref()),
+                            git_cache_seed: _teardown_grants
+                                .iter()
+                                .find(|(i, _)| *i == idx)
+                                .and_then(|(_, g)| g.git_cache_seed.as_ref()),
                         }
                         .build(step, env, overlays)
                     };
@@ -1389,6 +1397,42 @@ pub(crate) fn resolve_phase_image(
 /// One call per entry — that's the whole point post-WI-0082: each step's
 /// container sees only the entry's own overlays plus the standing sources,
 /// not the union of all phase entries' overlays.
+#[derive(Default)]
+pub(crate) struct PhaseEnvironment {
+    pub(super) env: std::collections::HashMap<String, String>,
+    pub(super) secret_env: Vec<(String, crate::data::secret::SecretString)>,
+}
+
+impl std::ops::Deref for PhaseEnvironment {
+    type Target = std::collections::HashMap<String, String>;
+    fn deref(&self) -> &Self::Target {
+        &self.env
+    }
+}
+impl std::ops::DerefMut for PhaseEnvironment {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.env
+    }
+}
+
+impl PhaseEnvironment {
+    fn resolve(
+        names: &[String],
+        secrets: Option<&crate::data::secret::CommandSecrets>,
+        host: impl Fn(&str) -> Option<String>,
+    ) -> Self {
+        let mut env = Self::default();
+        for name in names {
+            if let Some(value) = secrets.and_then(|s| s.get(name)) {
+                env.secret_env.push((name.clone(), value.clone()));
+            } else if let Some(value) = host(name) {
+                env.env.insert(name.clone(), value);
+            }
+        }
+        env
+    }
+}
+
 pub(crate) fn collect_single_entry_overlays(
     engines: &Engines,
     session: &Session,
@@ -1398,7 +1442,7 @@ pub(crate) fn collect_single_entry_overlays(
 ) -> Result<
     (
         Vec<crate::engine::container::options::OverlaySpec>,
-        std::collections::HashMap<String, String>,
+        PhaseEnvironment,
     ),
     CommandError,
 > {
@@ -1454,12 +1498,12 @@ pub(crate) fn collect_single_entry_overlays(
             ))
         })?;
 
-    let mut env = std::collections::HashMap::new();
-    for var_name in &collected.env_passthrough {
-        if let Some(val) = crate::data::config::env::host_var(var_name) {
-            env.insert(var_name.clone(), val);
-        }
-    }
+    let command_secrets = engines.command_secrets();
+    let env = PhaseEnvironment::resolve(
+        &collected.env_passthrough,
+        command_secrets.as_deref(),
+        crate::data::config::env::host_var,
+    );
 
     Ok((overlay_specs, env))
 }
@@ -1480,7 +1524,7 @@ pub(crate) fn collect_single_entry_overlays(
 pub(crate) type PhaseOverlayResult = Result<
     (
         Vec<crate::engine::container::options::OverlaySpec>,
-        std::collections::HashMap<String, String>,
+        PhaseEnvironment,
     ),
     CommandError,
 >;
@@ -1593,6 +1637,7 @@ pub(crate) async fn finish_cancelled_cleanup(
                     interactive: false,
                     secret_env: &[],
                     transport: None,
+                    git_cache_seed: None,
                 }
                 .build(step, env, overlays)
             })
@@ -1620,5 +1665,34 @@ impl crate::engine::workflow::factory::AgentExecutionFactory for CleanupOnlyFact
         _: &str,
     ) -> Result<Option<()>, EngineError> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod command_secrets_tests {
+    use super::*;
+    use crate::data::secret::{CommandSecrets, SecretString};
+
+    #[test]
+    fn phase_env_uses_requested_caller_values_before_host_without_literal_secrets() {
+        let secrets = CommandSecrets::new([
+            ("TOKEN".into(), SecretString::new("test-secret-phase")),
+            (
+                "PRIVATE".into(),
+                SecretString::new("test-secret-unrequested"),
+            ),
+        ])
+        .unwrap();
+        let env = PhaseEnvironment::resolve(
+            &["TOKEN".into(), "HOST_ONLY".into()],
+            Some(&secrets),
+            |_| Some("host-value".into()),
+        );
+        assert_eq!(env.secret_env.len(), 1);
+        assert_eq!(env.secret_env[0].0, "TOKEN");
+        assert_eq!(env.secret_env[0].1.expose(), "test-secret-phase");
+        assert!(!env.env.contains_key("TOKEN"));
+        assert!(!env.env.contains_key("PRIVATE"));
+        assert_eq!(env.env["HOST_ONLY"], "host-value");
     }
 }

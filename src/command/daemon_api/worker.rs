@@ -2,7 +2,9 @@
 use crate::command::commands::api_server::admission::ApiAdmission;
 use crate::command::commands::api_server::event_bus::EventBus;
 use crate::command::commands::api_server::session_setup::SessionSetupBus;
-use crate::command::commands::api_server::{ApiSessionLifecycle, CommandCanceller, TokenRegistry};
+use crate::command::commands::api_server::{
+    ApiSessionLifecycle, CancelOutcome, CommandCanceller, TokenRegistry,
+};
 use crate::data::api_lifecycle_store::CommandLifecycleStore;
 use crate::data::fs::api_db::SqliteSessionStore;
 use crate::data::fs::api_paths::ApiPaths;
@@ -118,7 +120,15 @@ pub async fn sessions_delete(
     id: &WorkerSessionId,
 ) -> Result<crate::command::commands::api_server::CloseOutcome, crate::command::error::CommandError>
 {
-    api.lifecycle().close(id.as_str()).await
+    let outcome = api.lifecycle().close(id.as_str()).await?;
+    if let Ok(commands) = api.store.list_commands_for_session(id.as_str(), i64::MAX) {
+        for command in commands.into_iter().filter(|c| c.status.is_terminal()) {
+            api.engines
+                .ephemeral_secrets
+                .remove(&CommandId::parse(&command.id).expect("persisted command id"));
+        }
+    }
+    Ok(outcome)
 }
 pub fn sessions_queue(
     api: &WorkerApi,
@@ -207,14 +217,22 @@ pub async fn commands_cancel(
     crate::command::commands::api_server::CancelOutcome,
     crate::command::commands::api_server::runtime::CancelSessionError,
 > {
-    api.lifecycle()
+    let outcome = api
+        .lifecycle()
         .cancel_command(
             id.as_str(),
             &api.canceller,
             &api.setup_cancels,
             &api.lifecycle_store,
         )
-        .await
+        .await?;
+    if matches!(
+        &outcome,
+        CancelOutcome::Cancelled(_) | CancelOutcome::AlreadyTerminal(_)
+    ) {
+        api.engines.ephemeral_secrets.remove(id);
+    }
+    Ok(outcome)
 }
 pub fn commands_workflow(
     api: &WorkerApi,

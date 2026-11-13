@@ -41,9 +41,29 @@ pub(crate) struct Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Misbehave instead of (or while) answering; `None` answers normally.
+    pub fault: Option<ConnectionFault>,
+}
+
+/// How a fake server misbehaves on one connection. Every wait ends as soon
+/// as the client closes its side, and at the latest after the bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionFault {
+    /// Close the connection without any response byte.
+    Drop,
+    /// Send nothing and hold the connection open until the client leaves.
+    Stall(Duration),
+    /// Send the status line and headers, then hold the connection open
+    /// without the body until the client leaves.
+    HeadersThenStall(Duration),
 }
 
 impl Response {
+    pub fn fault(mut self, fault: ConnectionFault) -> Response {
+        self.fault = Some(fault);
+        self
+    }
+
     pub fn new(status: u16) -> Response {
         Response {
             status,
@@ -151,6 +171,21 @@ fn serve_connection(stream: TcpStream, handler: Handler) {
             .is_some_and(|v| v.eq_ignore_ascii_case("close"));
         let head = request.method == "HEAD";
         let response = handler(request);
+        match response.fault {
+            None => {}
+            Some(ConnectionFault::Drop) => return,
+            Some(ConnectionFault::Stall(bound)) => return hold_open(reader.get_ref(), bound),
+            Some(ConnectionFault::HeadersThenStall(bound)) => {
+                if write_head(&mut writer, &response).is_ok() {
+                    hold_open(reader.get_ref(), bound);
+                }
+                return;
+            }
+        }
+        let close = close
+            || response
+                .get_header("connection")
+                .is_some_and(|v| v.eq_ignore_ascii_case("close"));
         if write_response(&mut writer, &response, head).is_err() || close {
             return;
         }
@@ -255,6 +290,32 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
+/// Block until the peer closes its side (or sends more), at most `bound`.
+fn hold_open(stream: &TcpStream, bound: Duration) {
+    let _ = stream.set_read_timeout(Some(bound));
+    let mut byte = [0u8; 1];
+    let _ = (&*stream).read(&mut byte);
+}
+
+/// The status line and headers of `response`, announcing a body that never
+/// follows (at least one byte).
+fn write_head(writer: &mut impl Write, response: &Response) -> std::io::Result<()> {
+    let mut out = format!(
+        "HTTP/1.1 {} {}\r\n",
+        response.status,
+        reason(response.status)
+    );
+    for (k, v) in &response.headers {
+        if !k.eq_ignore_ascii_case("content-length") {
+            out.push_str(&format!("{k}: {v}\r\n"));
+        }
+    }
+    let length = response.body.len().max(1);
+    out.push_str(&format!("Content-Length: {length}\r\n\r\n"));
+    writer.write_all(out.as_bytes())?;
+    writer.flush()
+}
+
 fn write_response(writer: &mut impl Write, response: &Response, head: bool) -> std::io::Result<()> {
     let mut out = format!(
         "HTTP/1.1 {} {}\r\n",
@@ -314,6 +375,7 @@ pub(crate) fn request(
         status,
         headers,
         body,
+        fault: None,
     })
 }
 

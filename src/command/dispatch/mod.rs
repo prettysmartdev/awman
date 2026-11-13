@@ -41,6 +41,7 @@ use crate::data::session::Session;
 pub mod build;
 pub mod catalogue;
 pub mod engines;
+pub mod ephemeral_secrets;
 pub mod frontend_action;
 pub mod outcomes;
 pub mod parsed_input;
@@ -339,9 +340,16 @@ impl<F: CommandFrontend> Dispatch<F> {
         }
     }
 
-    /// Let an external cancel stop the dispatched command: `token` reaches
-    /// the command as `BuildContext::cancel`. The CLI, TUI and squad never
-    /// call this, so their commands see a token that never fires.
+    /// Scope values to this invocation's engine bundle, never to its Session.
+    pub fn with_command_secrets(
+        mut self,
+        secrets: Option<Arc<crate::data::secret::CommandSecrets>>,
+    ) -> Self {
+        self.engines.ephemeral_secrets = Arc::new(self.engines.ephemeral_secrets.scoped(secrets));
+        self
+    }
+
+    /// Let an external cancel stop the dispatched command.
     pub fn with_cancellation(mut self, token: tokio_util::sync::CancellationToken) -> Self {
         self.cancel = token;
         self
@@ -505,6 +513,7 @@ impl<F: CommandFrontend> Dispatch<F> {
             caller: CallerContext::new(&canonical, self.frontend.kind()),
             cancel: self.cancel.clone(),
             output_dir: self.output_dir.clone(),
+            command_secrets: self.engines.command_secrets(),
         };
         (spec.build)(&ctx)
     }
@@ -556,6 +565,7 @@ impl<F: CommandFrontend> Dispatch<F> {
             caller: CallerContext::new(&canonical, self.frontend.kind()),
             cancel: self.cancel.clone(),
             output_dir: self.output_dir.clone(),
+            command_secrets: self.engines.command_secrets(),
         };
         let parsed = prerequisites::parse_prerequisite_flags(&ctx, with_check)?;
         prerequisites::check_flag_widening(

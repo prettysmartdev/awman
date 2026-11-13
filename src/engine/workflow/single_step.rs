@@ -30,7 +30,7 @@ impl WorkflowEngine {
         let agent = self.resolve_agent(step)?;
         let model = self.resolve_model(step);
         tracing::info!(
-            step = %step.name,
+            step = %self.redaction.redact(&step.name),
             agent = %agent.as_str(),
             model = ?model,
             "workflow_engine resolved step parameters"
@@ -60,27 +60,27 @@ impl WorkflowEngine {
         self.state
             .set_status(&step.name, StepState::Running { container_id: None });
         self.persist()?;
-        let execution =
-            match self
-                .agent_factory
-                .execution_for_step(step, &self.session, &prepared.runtime)
-            {
-                Ok(execution) => execution,
-                Err(error) => {
-                    self.state.set_status(
-                        &step.name,
-                        StepState::Failed {
-                            exit_code: -1,
-                            error_message: Some(error.to_string()),
-                        },
-                    );
-                    if let Err(save_error) = self.persist() {
-                        tracing::error!(step = %step.name, error = %save_error,
-                            spawn_error = %error, "could not persist failed workflow launch");
-                    }
-                    return Err(error);
+        let execution = match self.agent_factory.execution_for_step(
+            step,
+            &self.session,
+            &prepared.runtime,
+        ) {
+            Ok(execution) => execution,
+            Err(error) => {
+                self.state.set_status(
+                    &step.name,
+                    StepState::Failed {
+                        exit_code: -1,
+                        error_message: Some(error.to_string()),
+                    },
+                );
+                if let Err(save_error) = self.persist() {
+                    tracing::error!(step = %self.redaction.redact(&step.name), error = %self.redaction.redact(&save_error.to_string()),
+                            spawn_error = %self.redaction.redact(&error.to_string()), "could not persist failed workflow launch");
                 }
-            };
+                return Err(error);
+            }
+        };
         self.state.set_status(
             &step.name,
             StepState::Running {

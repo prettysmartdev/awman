@@ -493,6 +493,15 @@ async fn run_remote_exec(
                             text: format!("[{phase}] {message}"),
                         });
                     }
+                    // WI 0145: one line per scheduled push retry.
+                    payload @ EventPayload::PushRetry { .. } => {
+                        if let Some(text) = payload.to_plain_text() {
+                            self.sink.write_message(UserMessage {
+                                level: MessageLevel::Warning,
+                                text: format!("[push] {text}"),
+                            });
+                        }
+                    }
                     EventPayload::WorkflowStepTransition {
                         step_name,
                         step_index,

@@ -309,6 +309,12 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         | CommandError::SessionFieldRemoteOnly { .. }
         | CommandError::SessionFieldRequiresBranch { .. }
         | CommandError::SessionRefInvalid { .. }
+        | CommandError::GitAuthUnsupportedUrl { .. }
+        | CommandError::GitAuthUnsupportedPlatform
+        | CommandError::GitAuthInvalid { .. }
+        | CommandError::GitAuthFailed { .. }
+        | CommandError::CredentialsLost
+        | CommandError::CommandSecretsLost
         | CommandError::AgentNotFound { .. }
         | CommandError::AgentNoLongerRunning { .. }
         | CommandError::AgentNotRunning { .. }

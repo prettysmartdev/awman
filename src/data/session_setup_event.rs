@@ -75,6 +75,7 @@ impl SessionSetupState {
         self.error = Some(SessionSetupError {
             stage: stage.to_string(),
             message: message.to_string(),
+            code: None,
         });
     }
 
@@ -131,10 +132,14 @@ pub struct ReadyStepEntry {
     pub status: StepStatus,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SessionSetupError {
     pub stage: String,
     pub message: String,
+    /// An explicit stable code (WI 0145 `credentials_lost`). When absent the
+    /// code is derived from `stage` (see [`SessionSetupError::code`]).
+    #[serde(default)]
+    pub code: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,5 +188,71 @@ impl SessionSetupStatus {
             Self::Ready => "ready",
             Self::Failed => "failed",
         }
+    }
+}
+
+impl SessionSetupError {
+    /// Derived from the typed stage so existing setup-state constructors stay valid.
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref().or_else(|| {
+            (self.stage == crate::data::fs::api_db::failure_stages::GIT_AUTH)
+                .then_some(crate::data::fs::api_db::failure_codes::GIT_AUTH_FAILED)
+        })
+    }
+
+    /// Recording a terminal failure with a stable code of its own.
+    pub fn with_code(stage: &str, code: &str, message: &str) -> Self {
+        Self {
+            stage: stage.into(),
+            message: message.into(),
+            code: Some(code.into()),
+        }
+    }
+}
+impl Serialize for SessionSetupError {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut fields = serializer.serialize_struct(
+            "SessionSetupError",
+            if self.code().is_some() { 3 } else { 2 },
+        )?;
+        fields.serialize_field("stage", &self.stage)?;
+        fields.serialize_field("message", &self.message)?;
+        if let Some(code) = self.code() {
+            fields.serialize_field("code", code)?;
+        }
+        fields.end()
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    #[test]
+    fn auth_setup_code_survives_persistence_and_other_setup_errors_remain_compatible() {
+        for (stage, code) in [("git_auth", Some("git_auth_failed")), ("clone", None)] {
+            let error = SessionSetupError {
+                stage: stage.into(),
+                message: "safe".into(),
+                code: None,
+            };
+            let value = serde_json::to_value(&error).unwrap();
+            assert_eq!(value.get("code").and_then(|c| c.as_str()), code);
+            let decoded: SessionSetupError = serde_json::from_value(value).unwrap();
+            assert_eq!(decoded.code(), code);
+        }
+    }
+
+    #[test]
+    fn an_explicit_credentials_lost_code_wins_over_the_stage_and_survives_persistence() {
+        let error = SessionSetupError::with_code(
+            "git_auth",
+            "credentials_lost",
+            "the daemon restarted; open a new session",
+        );
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(value["code"], "credentials_lost");
+        let decoded: SessionSetupError = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.code(), Some("credentials_lost"));
     }
 }

@@ -892,6 +892,7 @@ impl ContainerBackend for BuiltinBackend {
                 command,
                 working_dir,
                 env,
+                private_stdin: None,
             },
             &mut |_| {},
         )
@@ -930,9 +931,16 @@ impl ContainerBackend for BuiltinBackend {
                 // Like `docker exec`, setup/teardown run as the image USER.
                 user: state.user,
                 env: vars.into_iter().collect(),
+                stdin: request.private_stdin.is_some(),
                 ..Default::default()
             },
         )?;
+        if let Some(input) = request.private_stdin {
+            session.control.send(super::driver::Control::Stdin(
+                input.expose().as_bytes().to_vec(),
+            ))?;
+            session.control.send(super::driver::Control::Eof)?;
+        }
         // Blocking receiver is isolated from the caller's Tokio context.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {

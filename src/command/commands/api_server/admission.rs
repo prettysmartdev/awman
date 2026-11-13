@@ -6,6 +6,7 @@
 
 use super::{ApiSessionLifecycle, SetupReadiness};
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
+use crate::command::dispatch::ephemeral_secrets::SessionGitCredential;
 use crate::command::dispatch::projections::raw_args::ParsedArgs;
 use crate::command::dispatch::{CommandFrontend, Dispatch, Engines};
 use crate::command::error::CommandError;
@@ -38,6 +39,7 @@ pub struct SessionSubmission {
 
 /// Catalogue command tokens and validated label values, independent of HTTP.
 pub struct CommandSubmission {
+    pub secrets: Option<Arc<crate::data::secret::CommandSecrets>>,
     pub allow_remote_input: bool,
     pub interaction: Option<crate::data::config::daemon::Interaction>,
     pub subcommand: String,
@@ -96,7 +98,21 @@ impl CommandSubmission {
         if let Some(body) = value.as_object_mut() {
             body.remove("session_id");
         }
+        Self::canonicalize_secrets(&mut value);
         format!("{value}\n{session}")
+    }
+
+    /// Names participate in idempotency, values (and value hashes) never do.
+    pub fn canonicalize_secrets(value: &mut serde_json::Value) {
+        if let Some(body) = value.as_object_mut() {
+            if let Some(secrets) = body.get_mut("secrets") {
+                if let Some(map) = secrets.as_object() {
+                    let mut names: Vec<_> = map.keys().cloned().collect();
+                    names.sort();
+                    *secrets = serde_json::json!(names);
+                }
+            }
+        }
     }
 
     pub(crate) fn validate(&self) -> Result<ParsedArgs, AdmissionError> {
@@ -282,7 +298,29 @@ impl ApiAdmission {
             .request
             .validate(&policy, self.engines.git_engine.as_ref())
             .map_err(AdmissionError::SessionCreation)?;
-        plan.validate_merge_ref_kinds(Arc::clone(&self.engines.git_engine))
+        // WI 0145: the caller's credential (scope = this repository) is held
+        // in memory only; the merge-ref advertisement already uses it.
+        let git_credential = match (&submission.request.git_auth, plan.repo_url.as_deref()) {
+            (Some(spec), Some(url)) => Some(Arc::new(SessionGitCredential {
+                spec: Arc::clone(spec),
+                scope: crate::command::session_git_transport::git_auth_scope(url)
+                    .map_err(AdmissionError::SessionCreation)?,
+            })),
+            _ => None,
+        };
+        let validation_transport = if plan.merge_refs.is_empty() {
+            crate::engine::git::transport::HostGitTransport::user(
+                crate::engine::git::transport::CredentialSource::Ambient,
+            )
+        } else {
+            crate::command::session_git_transport::transport_for_credential(
+                &self.engines.ephemeral_secrets,
+                &crate::command::session_git_transport::credential_socket_dir(&self.engines),
+                git_credential.as_ref(),
+            )
+            .map_err(AdmissionError::SessionCreation)?
+        };
+        plan.validate_merge_ref_kinds(Arc::clone(&self.engines.git_engine), validation_transport)
             .await
             .map_err(AdmissionError::SessionCreation)?;
         if let Some(command) = &command {
@@ -312,7 +350,15 @@ impl ApiAdmission {
             ),
             None => admission_body(
                 journal,
-                &serde_json::json!({"id":session_id,"workdir":plan.resolved_workdir,"created_at":created_at,"status":"active","setup_status":"initializing","session_type":plan.kind.as_str(),"repo_url":plan.repo_url,"branch":plan.branch,"base_ref":plan.base_ref,"merge_refs":plan.merge_refs,"push":plan.push,"labels":submission.labels}),
+                &{
+                    let mut body = serde_json::json!({"id":session_id,"workdir":plan.resolved_workdir,"created_at":created_at,"status":"active","setup_status":"initializing","session_type":plan.kind.as_str(),"repo_url":plan.repo_url,"branch":plan.branch,"base_ref":plan.base_ref,"merge_refs":plan.merge_refs,"push":plan.push,"labels":submission.labels});
+                    // The kind only: the response never echoes a credential.
+                    if let Some(credential) = &git_credential {
+                        body["git_auth"] =
+                            serde_json::json!({"kind": credential.spec.kind().as_str()});
+                    }
+                    body
+                },
                 IdempotencyResource::Session(&session_id),
             ),
         };
@@ -351,6 +397,15 @@ impl ApiAdmission {
             tracing::error!(error = %e, "Failed to insert session");
             return Err(storage("Failed to create session", e));
         }
+        if let Some(credential) = &git_credential {
+            self.engines.ephemeral_secrets.insert_session_git_auth(
+                &session_id,
+                SessionGitCredential {
+                    spec: Arc::clone(&credential.spec),
+                    scope: credential.scope.clone(),
+                },
+            );
+        }
         // Record the remote inputs before setup starts, so a restored session
         // keeps them (and the push stage can read `push` from the row).
         if plan.kind == SessionKind::Remote {
@@ -362,6 +417,7 @@ impl ApiAdmission {
                     base_ref: plan.base_ref.as_deref(),
                     merge_refs: &plan.merge_refs,
                     push: plan.push,
+                    git_auth_kind: git_credential.as_ref().map(|c| c.spec.kind().as_str()),
                 },
             ) {
                 tracing::error!(error = %e, "Failed to record remote session fields");
@@ -424,6 +480,9 @@ impl ApiAdmission {
     }
 
     async fn compensate_session(&self, session_id: &str, journal: Option<&IdempotentAdmission>) {
+        self.engines
+            .ephemeral_secrets
+            .remove_session_git_auth(session_id);
         if let Some(journal) = journal {
             if let Err(error) = journal.compensating_session(session_id) {
                 tracing::error!(%error, session_id, "Failed to void admission intent before compensation");
@@ -442,6 +501,18 @@ impl ApiAdmission {
                 tracing::error!(%error, session_id, "Failed to compensate session admission")
             }
         }
+        // Compensation can cancel an already-enqueued run before a worker
+        // ever owns it. Release those values as part of admission rollback.
+        if let Ok(Some(run)) = crate::data::ids::WorkerSessionId::parse(session_id)
+            .map_err(|e| e.to_string())
+            .and_then(|id| {
+                self.lifecycle_store
+                    .run_for_session(&id)
+                    .map_err(|e| e.to_string())
+            })
+        {
+            self.engines.ephemeral_secrets.remove(&run.command_id);
+        }
     }
 
     pub async fn admit_command(
@@ -459,6 +530,20 @@ impl ApiAdmission {
         {
             SessionCommandAdmission::Accepted => {}
             other => return Err(AdmissionError::Session(other)),
+        }
+        // WI 0145: a session whose in-memory Git credential was lost (daemon
+        // restart) cannot publish; refuse before anything is queued.
+        if let Some(session) = self
+            .store
+            .get_session(session_id)
+            .map_err(|e| storage("Failed to validate session", e))?
+        {
+            crate::command::session_git_transport::check_session_credentials(
+                &self.engines,
+                session_id,
+                session.git_auth_kind.as_deref(),
+            )
+            .map_err(AdmissionError::CommandAdmission)?;
         }
         let readiness = self.lifecycle().setup_readiness(session_id).await;
         if !readiness.is_ready() {
@@ -525,6 +610,16 @@ impl ApiAdmission {
 
         let log_path = self.paths.command_log_path(session_id, command_id);
 
+        let id = crate::data::ids::CommandId::parse(command_id).expect("generated command id");
+        if let Some(secrets) = body.secrets.as_ref().filter(|s| !s.is_empty()) {
+            self.lifecycle_store
+                .record_secret_names(&id, &secrets.names().collect::<Vec<_>>())
+                .map_err(|e| storage("Failed to record command secret names", e))?;
+            self.engines
+                .ephemeral_secrets
+                .insert(id.clone(), secrets.clone());
+        }
+
         if let Err(e) = self.store.enqueue_command_with_terminal_input(
             command_id,
             session_id,
@@ -535,6 +630,8 @@ impl ApiAdmission {
             &self.request_context,
             body.allow_remote_input,
         ) {
+            self.engines.ephemeral_secrets.remove(&id);
+            let _ = self.lifecycle_store.remove_secret_names(&id);
             tracing::error!(error = %e, "Failed to enqueue command");
             return Err(storage("Failed to enqueue command", e));
         }

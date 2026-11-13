@@ -49,7 +49,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 /// Both daemon and foreground hosts re-execute the same private helper.
-pub(super) fn credential_helper_program(
+pub(crate) fn credential_helper_program(
 ) -> std::io::Result<crate::engine::worker::credential_helper::HelperProgram> {
     std::env::current_exe().map(crate::engine::worker::credential_helper::HelperProgram::awman)
 }

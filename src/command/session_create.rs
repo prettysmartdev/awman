@@ -51,6 +51,9 @@ pub struct SessionCreateRequest {
     pub merge_refs: Vec<String>,
     /// Remote only. Push the session branch after a successful command.
     pub push: bool,
+    /// Remote `https://` only (WI 0145). The caller's Git credential for
+    /// this session, kept in daemon memory and never persisted.
+    pub git_auth: Option<std::sync::Arc<crate::data::git_transport::GitAuthSpec>>,
 }
 
 /// The security policy a [`SessionCreateRequest`] is validated against. Carries
@@ -227,6 +230,7 @@ impl SessionCreatePlan {
     pub async fn validate_merge_ref_kinds(
         &self,
         git: std::sync::Arc<crate::engine::git::GitEngine>,
+        transport: crate::engine::git::transport::HostGitTransport,
     ) -> Result<(), CommandError> {
         if self.merge_refs.is_empty() {
             return Ok(());
@@ -235,9 +239,26 @@ impl SessionCreatePlan {
             return Ok(());
         };
         let refs = self.merge_refs.clone();
-        let invalid = tokio::task::spawn_blocking(move || git.tag_only_merge_ref(&url, &refs))
-            .await
-            .map_err(|e| CommandError::Other(e.to_string()))??;
+        let invalid = tokio::task::spawn_blocking(move || {
+            git.tag_only_merge_ref(
+                &url,
+                &refs,
+                &transport,
+                &crate::engine::git::transport::TransportGuard::new(
+                    tokio_util::sync::CancellationToken::new(),
+                ),
+            )
+        })
+        .await
+        .map_err(|e| CommandError::Other(e.to_string()))?
+        .map_err(|error| match error {
+            error @ crate::engine::error::EngineError::GitAuth { .. } => {
+                CommandError::GitAuthFailed {
+                    message: error.to_string(),
+                }
+            }
+            error => CommandError::from(error),
+        })?;
         if let Some(value) = invalid {
             return Err(CommandError::SessionRefInvalid {
                 field: "merge_refs",
@@ -284,6 +305,9 @@ impl SessionCreateRequest {
             SessionKind::Local => {
                 // The WI 0133 fields only act on awman's own clone. `repo_url`
                 // and `branch` stay silently ignored here, as they always were.
+                if self.git_auth.is_some() {
+                    return Err(CommandError::SessionFieldRemoteOnly { field: "git_auth" });
+                }
                 if self.base_ref.is_some() {
                     return Err(CommandError::SessionFieldRemoteOnly { field: "base_ref" });
                 }
@@ -334,6 +358,17 @@ impl SessionCreateRequest {
                 if repo_url.trim().is_empty() {
                     return Err(CommandError::SessionRepoUrlEmpty);
                 }
+                if crate::data::git_transport::SafeRemote::url_has_credentials(&repo_url)
+                    || crate::data::git_transport::SafeRemote::url_has_parameters(&repo_url)
+                {
+                    return Err(CommandError::SessionRefInvalid {
+                        field: "repo_url",
+                        value: crate::data::git_transport::SafeRemote::from_url(&repo_url)
+                            .to_string(),
+                        reason: "userinfo, query strings and fragments are not accepted; use git_auth or host Git credentials"
+                            .into(),
+                    });
+                }
                 let lower = repo_url.to_lowercase();
                 let scheme_ok = policy
                     .allowed_schemes
@@ -341,6 +376,9 @@ impl SessionCreateRequest {
                     .any(|scheme| lower.starts_with(scheme.as_str()));
                 if !scheme_ok {
                     return Err(CommandError::SessionRepoUrlInvalidScheme { url: repo_url });
+                }
+                if self.git_auth.is_some() {
+                    crate::command::session_git_transport::git_auth_scope(&repo_url)?;
                 }
                 let branch = match self.branch.as_deref().map(str::trim) {
                     Some(b) => {

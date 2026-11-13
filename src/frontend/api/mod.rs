@@ -2,6 +2,8 @@
 
 pub mod browser;
 pub mod command_frontend;
+mod command_secrets;
+mod git_auth;
 // WI 0142: `/v1/engine/*` HTTP adapter and the `awman.frontend.v1` WebSocket (filled by engine-api-routes).
 pub mod engine;
 pub mod error;

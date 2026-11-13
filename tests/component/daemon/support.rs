@@ -45,6 +45,10 @@ impl Api {
     pub async fn restart(sandbox: &TestSandbox) -> Self {
         Self::boot(sandbox, json!({})).await
     }
+    /// [`Self::restart`] with the same extra configuration as the first start.
+    pub async fn restart_with_config(sandbox: &TestSandbox, extra: Value) -> Self {
+        Self::boot(sandbox, extra).await
+    }
     async fn boot(sandbox: &TestSandbox, extra: Value) -> Self {
         let listener = sandbox.ports().tcp_listener();
         let addr = listener.local_addr().unwrap();

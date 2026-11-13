@@ -622,6 +622,15 @@ impl ResolvedContainerOptions {
         // Production callers pass the real host-env lookup; tests inject a
         // hermetic closure to avoid mutating process-global state.
         let lookup = |name: &str| {
+            // A private caller override is already resolved, even if the
+            // host has no value. Only presence matters to credential dedup;
+            // do not copy the secret into this ordinary String lookup.
+            if r.env_overrides
+                .iter()
+                .any(|(key, value)| key == name && !value.expose().is_empty())
+            {
+                return Some("present".into());
+            }
             r.host_env.as_ref().map_or_else(
                 || crate::data::config::env::host_var(name),
                 |env| env.host_payload(name),

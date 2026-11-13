@@ -503,6 +503,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "async-trait",
+ "awman-host-shims",
  "awman-test-support",
  "awman-wsp",
  "axum",
@@ -632,6 +633,7 @@ name = "awman-test-support"
 version = "0.0.0"
 dependencies = [
  "awman-wsp",
+ "base64 0.23.1",
  "flate2",
  "libc",
  "nix 0.31.3",

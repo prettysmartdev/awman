@@ -549,6 +549,11 @@ impl WorkflowPrerequisiteFlow {
         options.repo_acquire_approved = self.repo_acquire_approved();
         options.can_ask = can_ask;
         options.existing_grants = existing_grants;
+        options.session_git_scope = self
+            .engines
+            .ephemeral_secrets
+            .container_git_socket()
+            .map(|listener| listener.scope().clone());
         options.notes = self.notes();
         let cache = self
             .data_home
@@ -640,6 +645,14 @@ impl WorkflowPrerequisiteFlow {
         let report = Self::run_preflight_with_messages(&preflight, frontend);
         let resolved_needs = preflight.resolved_prerequisites(&report);
         let redaction = RedactionSet::new();
+        self.engines
+            .ephemeral_secrets
+            .register_current_git_redaction(&redaction);
+        if let Some(secrets) = self.engines.command_secrets() {
+            for secret in secrets.values() {
+                redaction.add(secret.clone());
+            }
+        }
         let outcome = self.resolve(&resolved_needs, report, &redaction, frontend)?;
         let remotes = self.remotes_for(&resolved_needs);
         Ok(PreparedPrerequisites {
@@ -754,6 +767,12 @@ impl WorkflowPrerequisiteFlow {
                 }
                 WorkflowPrerequisite::PushAuthSsh { remote, .. } => {
                     self.resolve_ssh(&check, remote, &mut grants, frontend, can_ask)?
+                }
+                WorkflowPrerequisite::PushAuthHttps { remote, .. }
+                    if self.remote_url(remote).is_some_and(|url| self.engines.ephemeral_secrets.container_git_socket().is_some_and(|listener| listener.matches_url(&url.redacted)))
+                        && check.needed_by.iter().all(|step| matches!(step.kind, crate::data::workflow_prerequisites::PrerequisiteStepKind::PushBranch | crate::data::workflow_prerequisites::PrerequisiteStepKind::PullBranch)) =>
+                {
+                    Resolution::Satisfied(Some("session Git credential available through the private helper".into()))
                 }
                 WorkflowPrerequisite::GitHubToken { host }
                 | WorkflowPrerequisite::PushAuthHttps { host, .. } => {
@@ -1172,6 +1191,18 @@ impl WorkflowPrerequisiteFlow {
     // ─── GitHub token ───────────────────────────────────────────────────────
 
     fn env_grant(&self, host: &str, var: &str) -> Option<TokenGrant> {
+        if let Some(secret) = self
+            .engines
+            .command_secrets()
+            .and_then(|secrets| secrets.get(var).cloned())
+        {
+            return Some(TokenGrant {
+                secret,
+                source: TokenGrantSource::ApiSecret(var.to_string()),
+                host: host.to_string(),
+                acquire: None,
+            });
+        }
         self.resolver(host).env_token(var).map(|secret| TokenGrant {
             secret,
             source: TokenGrantSource::Env(var.to_string()),

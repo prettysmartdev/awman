@@ -18,8 +18,8 @@ pub enum WorkerEngineError {
     /// of this server must be cancelled and claiming must stop.
     #[error("the work server link was revoked")]
     LinkRevoked,
-    #[error("lease Git authentication failed")]
-    GitAuth,
+    #[error("git {operation} to {remote}: authentication failed")]
+    GitAuth { operation: String, remote: String },
     /// No (valid) response from the server; safe to retry.
     #[error("work server transport failed")]
     Transport(String),

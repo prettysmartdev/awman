@@ -7,7 +7,8 @@ use std::time::Duration;
 use super::cancel::TokenRegistry;
 use super::event_bus::EventBus;
 use super::push_back::{
-    push_after_success, push_baseline, PushBackError, PushBackOutcome, PushEventSink,
+    capture_baseline, publish_after_success, PushBackContext, PushBackError, PushBackOutcome,
+    PushEventSink,
 };
 use super::runtime::ApiSessionLifecycle;
 use crate::command::dispatch::{CommandOutcome, Dispatch, Engines};
@@ -402,6 +403,30 @@ impl QueuedCommandResult {
     }
 
     async fn publish(
+        &self,
+        store: &SqliteSessionStore,
+        paths: &ApiPaths,
+        command: &CommandRecord,
+        sender: &super::event_bus::EventBusSender,
+    ) {
+        if sender.redaction().is_empty() {
+            self.publish_redacted(store, paths, command, sender).await;
+            return;
+        }
+        let mut result: CommandResult =
+            serde_json::from_str(&self.result_json).expect("typed command result");
+        sender.redaction().redact_result(&mut result);
+        let redacted = Self {
+            exit_code: self.exit_code,
+            status: self.status,
+            result_json: serde_json::to_string(&result).expect("typed command result"),
+        };
+        redacted
+            .publish_redacted(store, paths, command, sender)
+            .await;
+    }
+
+    async fn publish_redacted(
         &self,
         store: &SqliteSessionStore,
         paths: &ApiPaths,
@@ -976,6 +1001,77 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         let session_id = cmd.session_id.clone();
         let subcommand = cmd.subcommand.clone();
 
+        let secret_id =
+            crate::data::ids::CommandId::parse(&command_id).expect("persisted command id");
+        // Cancellation wins the claim race even if queued secrets were retired.
+        if let Ok(Some(requested)) = self.lifecycle_store.cancel_requested_at(&secret_id) {
+            cancel.cancel();
+            let completion = QueuedCommandResult::new(
+                &Err(crate::command::error::CommandError::Other(
+                    "command cancelled".into(),
+                )),
+                &Ok(PushBackOutcome::NotConfigured),
+            )
+            .cancelled(&requested);
+            self.finish_without_log(&cmd, completion).await;
+            return;
+        }
+        let command_secrets = match self
+            .lifecycle_store
+            .secret_names(&secret_id)
+            .map_err(crate::command::error::CommandError::Data)
+            .and_then(|names| {
+                self.engines
+                    .ephemeral_secrets
+                    .for_execution(&secret_id, names.as_deref())
+            }) {
+            Ok(secrets) => secrets,
+            Err(error) => {
+                let completion =
+                    QueuedCommandResult::new(&Err(error), &Ok(PushBackOutcome::NotConfigured))
+                        .map_result(|r| {
+                            if let Some(failure) = &mut r.failure {
+                                failure.stage = "preflight".into();
+                            }
+                        });
+                self.finish_without_log(&cmd, completion).await;
+                return;
+            }
+        };
+
+        // WI 0145: a command of a `git_auth` session queued before a restart
+        // cannot publish with the caller's credential, and must never fall
+        // back to the host's: fail before any setup or container.
+        let session_record = match self.store.get_session(&session_id) {
+            Ok(Some(record)) => Some(record),
+            result => {
+                let error = match result {
+                    Err(e) => crate::command::error::CommandError::Data(e),
+                    _ => crate::command::error::CommandError::Other(
+                        "session credential policy unavailable".into(),
+                    ),
+                };
+                self.finish_without_log(
+                    &cmd,
+                    QueuedCommandResult::new(&Err(error), &Ok(PushBackOutcome::NotConfigured)),
+                )
+                .await;
+                return;
+            }
+        };
+        if let Err(error) = crate::command::session_git_transport::check_session_credentials(
+            &self.engines,
+            &session_id,
+            session_record
+                .as_ref()
+                .and_then(|row| row.git_auth_kind.as_deref()),
+        ) {
+            let completion =
+                QueuedCommandResult::new(&Err(error), &Ok(PushBackOutcome::NotConfigured));
+            self.finish_without_log(&cmd, completion).await;
+            return;
+        }
+
         // A cancel recorded before this worker owned the command (it lost the
         // race with the claim) still applies.
         let cancel_requested_at = self
@@ -1068,6 +1164,15 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             .lease_event_bus
             .clone()
             .unwrap_or_else(|| Arc::new(EventBus::for_attempt(4096, cmd.attempt)));
+
+        if let Some(secrets) = &command_secrets {
+            for secret in secrets.values() {
+                event_bus.redaction().add(secret.clone());
+            }
+        }
+        self.engines
+            .ephemeral_secrets
+            .register_session_redaction(&session_id, &event_bus.redaction());
 
         // Spawn logfile writer task. The two log files are owned by a Layer 0
         // writer so this frontend performs no filesystem calls of its own.
@@ -1218,23 +1323,26 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             .flatten();
 
         // Capture before dispatch: explicit workflow teardown may publish itself.
+        // The command's own token bounds the remote head check and push-back
+        // (retry backoff included), so a cancel stops them promptly (F1).
+        let push_cancel = cancel.clone();
         let baseline = match self.store.get_session(&session_id) {
-            Ok(Some(record)) => {
-                let git = Arc::clone(&self.engines.git_engine);
-                tokio::task::spawn_blocking(move || push_baseline(&git, &record))
+            Ok(Some(record)) => match self.push_context(&record, &push_cancel) {
+                Ok(ctx) => {
+                    capture_baseline(
+                        (*self.engines.git_engine).clone(),
+                        record,
+                        ctx,
+                        PushEventSink(event_bus.sender()),
+                    )
                     .await
-                    .unwrap_or_else(|e| {
-                        Err(PushBackError {
-                            stage: "push",
-                            message: e.to_string(),
-                        })
-                    })
-            }
+                }
+                Err(error) => Err(error),
+            },
             Ok(None) => Ok(None),
-            Err(e) => Err(PushBackError {
-                stage: "push",
-                message: e.to_string(),
-            }),
+            Err(e) => Err(PushBackError::from(crate::engine::error::EngineError::Git(
+                e.to_string(),
+            ))),
         };
 
         // WI 0143: the command is a push-origin job of the worker's one job
@@ -1245,6 +1353,27 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         // Every container the command launches is named after it, so a
         // restart can find and stop what a cancelled command left running.
         let mut engines = self.engines.clone();
+        // WI 0145: container `push_branch`/`pull_branch` of a `git_auth`
+        // session reach the credential through a per-command socket.
+        let container_git_socket = match self.container_git_socket(&session_id) {
+            Ok(socket) => socket,
+            Err(error) => {
+                let completion =
+                    QueuedCommandResult::new(&Err(error), &Ok(PushBackOutcome::NotConfigured));
+                completion
+                    .publish(&self.store, &self.paths, &cmd, &event_bus.sender())
+                    .await;
+                let _ = log_writer.await;
+                self.cleanup_event_bus(&command_id).await;
+                self.post_execution_check(&session_id, &command_id).await;
+                return;
+            }
+        };
+        engines.ephemeral_secrets = Arc::new(
+            engines
+                .ephemeral_secrets
+                .with_container_git_socket(container_git_socket.clone()),
+        );
         engines.runtime = Arc::new(
             super::owned_runtime::CommandOwnedRuntime::new(
                 Arc::clone(&engines.runtime),
@@ -1265,6 +1394,7 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         // that mounts it creates (or, for `exec prompt`, clears) it.
         let dispatch = Dispatch::new(frontend, session, engines)
             .with_cancellation(cancel)
+            .with_command_secrets(command_secrets)
             .with_output_dir(self.paths.command_output_dir(&session_id, &command_id));
         tracing::info!(
             worker_id = %self.worker_id,
@@ -1320,7 +1450,6 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 tracing::error!(
                     worker_id = %self.worker_id,
                     command_id = %command_id,
-                    panic = %panic_msg,
                     "Command task panicked"
                 );
                 Err(crate::command::error::CommandError::Other(format!(
@@ -1353,41 +1482,34 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         let push_outcome = if command_succeeded_for_push(&result) && cancelled_before_push.is_none()
         {
             match self.store.get_session(&session_id) {
-                Ok(Some(record)) => {
-                    let git = Arc::clone(&self.engines.git_engine);
-                    let subcommand = subcommand.clone();
-                    let args = args.clone();
-                    let sender = event_bus.sender();
-                    tokio::task::spawn_blocking(move || {
-                        let baseline = baseline?;
-                        push_after_success(
-                            &git,
-                            &record,
-                            &subcommand,
-                            &args,
+                Ok(Some(record)) => match (baseline, self.push_context(&record, &push_cancel)) {
+                    (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+                    (Ok(baseline), Ok(ctx)) => {
+                        publish_after_success(
+                            (*self.engines.git_engine).clone(),
+                            record,
+                            subcommand.clone(),
+                            args.clone(),
                             baseline,
-                            &mut PushEventSink(sender),
+                            ctx,
+                            PushEventSink(event_bus.sender()),
                         )
-                    })
-                    .await
-                    .unwrap_or_else(|error| {
-                        Err(PushBackError {
-                            stage: "push",
-                            message: format!("push task failed: {error}"),
-                        })
-                    })
-                }
+                        .await
+                    }
+                },
                 Ok(None) => Ok(PushBackOutcome::NotConfigured),
-                Err(error) => Err(PushBackError {
-                    stage: "push",
-                    message: format!("failed to read session push configuration: {error}"),
-                }),
+                Err(error) => Err(PushBackError::from(crate::engine::error::EngineError::Git(
+                    format!("failed to read session push configuration: {error}"),
+                ))),
             }
         } else {
             Ok(PushBackOutcome::NotConfigured)
         };
+        // The command (and its teardown containers) has finished: close its
+        // container credential socket and remove the directory.
+        drop(container_git_socket);
         if let Err(error) = &push_outcome {
-            tracing::error!(command_id = %command_id, error = %error.message, "Push-back failed");
+            tracing::error!(command_id = %command_id, stage = error.stage, code = error.code(), "Push-back failed");
         }
 
         if let Some(jobs) = &self.jobs {
@@ -1433,8 +1555,8 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         .await;
         let git_result = match git_result {
             Ok(Ok(value)) => value,
-            error => {
-                tracing::warn!(?error, %command_id, "Could not collect command git result");
+            _ => {
+                tracing::warn!(%command_id, "Could not collect command git result");
                 None
             }
         };
@@ -1481,14 +1603,13 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 status = status.as_str(),
                 exit_code = ?exit_code,
                 success = false,
-                error = push_outcome.as_ref().err().map(|e| e.message.clone())
-                    .or_else(|| result.as_ref().err().map(ToString::to_string)).unwrap_or_default(),
                 "Command execution finished with failure"
             );
         }
 
         if let Err(ref e) = result {
-            tracing::error!(command_id = %command_id, error = %e, "Command failed");
+            // Text is logged only by the subscriber after bus redaction.
+            tracing::error!(command_id = %command_id, stage = e.stage(), code = e.code(), "Command failed");
         }
 
         // Write final metadata.
@@ -1522,12 +1643,65 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         self.post_execution_check(&session_id, &command_id).await;
     }
 
+    /// Bounds of this command's push-back: its cancellation token and its
+    /// session's transport (the caller credential through the daemon socket
+    /// for a `git_auth` session, else the host's own Git configuration).
+    fn push_context(
+        &self,
+        record: &crate::data::fs::api_db::SessionRecord,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<PushBackContext, PushBackError> {
+        Ok(PushBackContext {
+            cancel: cancel.clone(),
+            deadline: None,
+            transport: crate::command::session_git_transport::session_transport(
+                &self.engines,
+                &record.id,
+                record.git_auth_kind.as_deref(),
+            )?,
+        })
+    }
+
+    /// The container credential listener of a `git_auth` session's command
+    /// (teardown/setup `push_branch`, `pull_branch`). Lives for the command.
+    fn container_git_socket(
+        &self,
+        session_id: &str,
+    ) -> Result<
+        Option<Arc<crate::engine::git::credential_socket::CacheSocketListener>>,
+        crate::command::error::CommandError,
+    > {
+        let Some(credential) = self.engines.ephemeral_secrets.session_git_auth(session_id) else {
+            return Ok(None);
+        };
+        match crate::engine::git::credential_socket::CacheSocketListener::start(
+            &crate::command::session_git_transport::credential_socket_dir(&self.engines),
+            Arc::clone(&credential.spec),
+            credential.scope.clone(),
+        ) {
+            Ok(listener) => Ok(Some(Arc::new(listener))),
+            Err(error) => {
+                let _ = error;
+                Err(crate::command::error::CommandError::Other("session_git_auth_unavailable_in_container: could not start the command credential socket".into()))
+            }
+        }
+    }
+
     /// Complete a command that failed before its log writer started.
     async fn finish_without_log(&self, cmd: &CommandRecord, completion: QueuedCommandResult) {
         let bus = self
             .lease_event_bus
             .clone()
             .unwrap_or_else(|| Arc::new(EventBus::for_attempt(16, cmd.attempt)));
+        let id = crate::data::ids::CommandId::parse(&cmd.id).expect("persisted command id");
+        self.engines
+            .ephemeral_secrets
+            .register_session_redaction(&cmd.session_id, &bus.redaction());
+        if let Some(secrets) = self.engines.ephemeral_secrets.get(&id) {
+            for secret in secrets.values() {
+                bus.redaction().add(secret.clone());
+            }
+        }
         self.event_buses
             .lock()
             .await
@@ -1550,6 +1724,9 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
     }
 
     async fn cleanup_event_bus(&self, command_id: &str) {
+        self.engines
+            .ephemeral_secrets
+            .remove(&crate::data::ids::CommandId::parse(command_id).expect("persisted command id"));
         let buses = Arc::clone(&self.event_buses);
         let cmd_id = command_id.to_string();
         tokio::spawn(async move {
@@ -1748,6 +1925,8 @@ fn spawn_tracing_subscriber(
                     | EventPayload::StderrLine(_)
                     | EventPayload::StatusMessage { .. }
                     | EventPayload::StepActivity { .. }
+                    // WI 0145: retries are client events, like status lines.
+                    | EventPayload::PushRetry { .. }
                     | EventPayload::WorkflowPrerequisites { .. }
                     | EventPayload::WorkflowState(_) => {}
                     // WI 0141 status and terminal events are for clients, not the
@@ -1769,4 +1948,79 @@ fn spawn_tracing_subscriber(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod command_secrets_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn completion_row_sidecar_and_rebuilt_terminal_events_are_redacted() {
+        let sandbox = awman_test_support::TestSandbox::for_test(awman_test_support::TestCase::component("command::queue_worker::completion_row_sidecar_and_rebuilt_terminal_events_are_redacted"));
+        let secret = "test-secret-persist";
+        sandbox.redact(secret);
+        let paths = ApiPaths::from_root(sandbox.work().join("api"));
+        let store = SqliteSessionStore::open_from_paths(&paths).unwrap();
+        let sid = crate::data::ids::WorkerSessionId::new();
+        let cid = crate::data::ids::CommandId::new();
+        store
+            .insert_session(
+                sid.as_str(),
+                sandbox.work().to_str().unwrap(),
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+        paths
+            .prepare_command_dir(sid.as_str(), cid.as_str())
+            .unwrap();
+        store
+            .enqueue_command(cid.as_str(), sid.as_str(), "exec prompt", "[]", "unused")
+            .unwrap();
+        let command = store.claim_next_command("worker").unwrap().unwrap();
+        let bus = EventBus::new(16);
+        bus.redaction()
+            .add(crate::data::secret::SecretString::new(secret));
+        let completion = QueuedCommandResult::build(
+            &Err(crate::command::error::CommandError::Other(secret.into())),
+            &Ok(PushBackOutcome::NotConfigured),
+            ResultContributions {
+                final_message: Some(secret.into()),
+                ..Default::default()
+            },
+        );
+        store.with_conn(|conn| { conn.execute_batch("CREATE TRIGGER fail_completion BEFORE UPDATE ON commands BEGIN SELECT RAISE(FAIL, 'fixture'); END;")?; Ok(()) }).unwrap();
+        completion
+            .publish(&store, &paths, &command, &bus.sender())
+            .await;
+        let sidecar = paths
+            .read_command_completion(sid.as_str(), cid.as_str())
+            .unwrap()
+            .unwrap();
+        assert!(!sidecar.result_json.contains(secret));
+        assert!(sidecar.result_json.contains("***"));
+        store
+            .with_conn(|conn| {
+                conn.execute_batch("DROP TRIGGER fail_completion")?;
+                Ok(())
+            })
+            .unwrap();
+        let bus = EventBus::new(16);
+        bus.redaction()
+            .add(crate::data::secret::SecretString::new(secret));
+        completion
+            .publish(&store, &paths, &command, &bus.sender())
+            .await;
+        let row = store.get_command(cid.as_str()).unwrap().unwrap();
+        assert!(!row.result.as_ref().unwrap().contains(secret));
+        assert!(!serde_json::to_string(&terminal_payload(&row))
+            .unwrap()
+            .contains(secret));
+        CommandLogWriter::append_terminal(&paths, &row, terminal_payload(&row)).unwrap();
+        for path in [
+            paths.command_events_log_path(sid.as_str(), cid.as_str()),
+            paths.command_log_path(sid.as_str(), cid.as_str()),
+        ] {
+            assert!(!std::fs::read_to_string(path).unwrap().contains(secret));
+        }
+    }
 }

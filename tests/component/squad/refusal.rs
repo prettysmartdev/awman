@@ -120,6 +120,7 @@ async fn sandbox_refusal_precedes_task_allocation_and_every_runtime_call() {
         workflow_state_store: Arc::new(WorkflowStateStore::at_git_root(sandbox.work())),
         credential_monitor: None,
         global_config: Arc::new(Default::default()),
+        ephemeral_secrets: Arc::new(Default::default()),
     };
     let error = require_container_tier(&engines).unwrap_err().to_string();
     assert_eq!(error, "squad requires a container runtime. The configured runtime \"docker-sbx-experimental\" cannot mount squad's task directories or run workflow setup/teardown steps. Set runtime to \"docker\" or \"apple-containers\" to use squad.");

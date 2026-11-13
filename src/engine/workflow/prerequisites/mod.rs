@@ -47,6 +47,8 @@ pub struct PrerequisitePreflightOptions {
     pub repo_acquire_approved: bool,
     pub can_ask: bool,
     pub existing_grants: Option<PrerequisiteGrants>,
+    /// Caller-authorized credential scope, available to phase containers.
+    pub session_git_scope: Option<crate::engine::git::lease_transport::CredentialScope>,
     pub notes: Vec<String>,
     pub probe_budget: Duration,
 }
@@ -93,6 +95,7 @@ impl PrerequisitePreflightOptions {
             repo_acquire_approved: false,
             can_ask: false,
             existing_grants: None,
+            session_git_scope: None,
             notes: Vec::new(),
             probe_budget: PROBE_BUDGET,
         }

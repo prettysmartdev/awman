@@ -41,6 +41,10 @@ impl CommandLifecycleStore {
                     command_id   TEXT PRIMARY KEY,
                     requested_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS command_secret_names (
+                    command_id TEXT PRIMARY KEY,
+                    names_json TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS runs (
                     session_id      TEXT PRIMARY KEY,
                     command_id      TEXT NOT NULL UNIQUE,
@@ -51,6 +55,53 @@ impl CommandLifecycleStore {
             Ok(())
         })?;
         Ok(Self { store })
+    }
+
+    /// Values have no storage path. Write this marker before queue visibility,
+    /// so a crash can never silently run a command without its caller secrets.
+    pub fn record_secret_names(
+        &self,
+        command: &CommandId,
+        names: &[&str],
+    ) -> Result<(), DataError> {
+        let json = serde_json::to_string(names).expect("secret names JSON");
+        self.store.with_conn(|conn| {
+            conn.execute("INSERT OR REPLACE INTO command_secret_names (command_id, names_json) VALUES (?1, ?2)", params![command, json])?;
+            Ok(())
+        })
+    }
+
+    pub fn secret_names(&self, command: &CommandId) -> Result<Option<Vec<String>>, DataError> {
+        self.store.with_conn(|conn| {
+            let json: Option<String> = conn
+                .query_row(
+                    "SELECT names_json FROM command_secret_names WHERE command_id=?1",
+                    params![command],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            json.map(|json| {
+                serde_json::from_str(&json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            })
+            .transpose()
+            .map_err(Into::into)
+        })
+    }
+
+    pub fn remove_secret_names(&self, command: &CommandId) -> Result<(), DataError> {
+        self.store.with_conn(|conn| {
+            conn.execute(
+                "DELETE FROM command_secret_names WHERE command_id=?1",
+                params![command],
+            )?;
+            Ok(())
+        })
     }
 
     /// Mark a still-queued command `cancelled` (exit 130). `Ok(true)` when a

@@ -15,6 +15,8 @@ use std::sync::Arc;
 /// Real admission/lifecycle over a private database, without starting workers.
 /// Uses only ordinary production constructors, never the test-support feature.
 pub struct AdmissionFixture {
+    pub engines: Engines,
+    pub sessions: Arc<SessionManager>,
     pub store: Arc<SqliteSessionStore>,
     pub admission: ApiAdmission,
     pub lifecycle: ApiSessionLifecycle,
@@ -38,12 +40,14 @@ impl AdmissionFixture {
             store.clone(),
             CommandLifecycleStore::open(store.clone()).unwrap(),
             paths.clone(),
-            engines,
-            sessions,
+            engines.clone(),
+            sessions.clone(),
             vec![sandbox.work().canonicalize().unwrap()],
             vec![],
         );
         Self {
+            engines,
+            sessions,
             store,
             admission,
             lifecycle,
@@ -77,6 +81,7 @@ impl AdmissionFixture {
 
 pub fn prompt(text: &str) -> CommandSubmission {
     CommandSubmission {
+        secrets: None,
         allow_remote_input: false,
         interaction: None,
         subcommand: "exec prompt".into(),

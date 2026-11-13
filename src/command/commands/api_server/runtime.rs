@@ -316,9 +316,20 @@ impl WorkerServices {
                 setup_state.status = SessionSetupStatus::Failed;
                 setup_state.current_stage =
                     Some("Server restarted during session setup".to_string());
-                setup_state.error = Some(SessionSetupError {
-                    stage: "server_restart".to_string(),
-                    message: "Server restarted during session setup".to_string(),
+                // WI 0145: a `git_auth` session's credential did not survive
+                // the restart either; say so with the stable code.
+                setup_state.error = Some(if rec.git_auth_kind.is_some() {
+                    SessionSetupError::with_code(
+                        crate::data::fs::api_db::failure_stages::GIT_AUTH,
+                        crate::data::fs::api_db::failure_codes::CREDENTIALS_LOST,
+                        "the daemon restarted during session setup and this session's Git credentials were lost; open a new session",
+                    )
+                } else {
+                    SessionSetupError {
+                        stage: "server_restart".to_string(),
+                        message: "Server restarted during session setup".to_string(),
+                        code: None,
+                    }
                 });
                 if let Err(error) = paths.save_setup_state(&rec.id, &setup_state) {
                     tracing::warn!(session_id = %rec.id, %error, "Failed to save interrupted setup state");
@@ -556,19 +567,6 @@ impl ApiSessionLifecycle {
         }
     }
 
-    pub fn setup_error(
-        &self,
-        session: &crate::data::fs::api_db::SessionRecord,
-    ) -> Option<SessionSetupError> {
-        (session.setup_status == SessionSetupStatus::Failed)
-            .then(|| {
-                self.paths
-                    .read_setup_state(&session.id)
-                    .and_then(|state| state.error)
-            })
-            .flatten()
-    }
-
     /// An in-memory snapshot wins over disk, which wins over the legacy row.
     pub fn session_status_view(
         &self,
@@ -769,6 +767,8 @@ impl ApiSessionLifecycle {
                 &chrono::Utc::now().to_rfc3339(),
                 &run_setup_error_result(readiness.error()),
             )?;
+            // The run can never execute: release its command secrets now.
+            self.engines.ephemeral_secrets.remove(&run.command_id);
         }
         let command = self.store.get_command(run.command_id.as_str())?;
         if command.as_ref().is_some_and(|c| {
@@ -819,6 +819,12 @@ impl ApiSessionLifecycle {
             .update_session_status(session_id, SessionStatus::Closing)?;
         // Step 2: cancel any queued jobs that entered before the gate closed.
         let cancelled = self.store.cancel_queued_for_session(session_id)?;
+        // Cancelled before a worker owned them: their secrets go now.
+        for id in &cancelled {
+            if let Ok(id) = crate::data::ids::CommandId::parse(id) {
+                self.engines.ephemeral_secrets.remove(&id);
+            }
+        }
         // Step 3: a running command owns the drain; worker post-check reenters
         // this same method once it finishes.
         if let Some(running) = self.store.running_command_for_session(session_id)? {
@@ -879,6 +885,10 @@ impl ApiSessionLifecycle {
         }
         self.store
             .close_session_force(session_id, &chrono::Utc::now().to_rfc3339())?;
+        // WI 0145: the session's in-memory Git credential ends with it.
+        self.engines
+            .ephemeral_secrets
+            .remove_session_git_auth(session_id);
         if let Some(session) = self.sessions.get_by_key(session_id) {
             let id = session.read().await.id();
             self.sessions.remove_by_key(session_id, id)?;
@@ -961,12 +971,23 @@ pub fn run_setup_error_result(setup_error: Option<&serde_json::Value>) -> String
         .and_then(|e| e.get("message"))
         .and_then(|m| m.as_str())
         .unwrap_or("Session setup failed");
+    let code = setup_error
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str());
+    // `git_auth_failed` and `credentials_lost` keep their own code.
+    let auth_code = [
+        failure_codes::GIT_AUTH_FAILED,
+        failure_codes::CREDENTIALS_LOST,
+    ]
+    .into_iter()
+    .find(|known| code == Some(*known));
+    let auth = auth_code.is_some();
     serde_json::to_string(&CommandResult {
         exit_code: Some(1),
         outcome: Some(crate::data::execution_event::CommandStatusKind::Error),
         failure: Some(CommandFailure {
-            stage: "setup".into(),
-            code: failure_codes::SETUP_FAILED.into(),
+            stage: if auth { "git_auth" } else { "setup" }.into(),
+            code: auth_code.unwrap_or(failure_codes::SETUP_FAILED).into(),
             message: message.into(),
             step: None,
         }),
@@ -1167,5 +1188,25 @@ fn readiness_from_state(
         other => SetupReadiness::Pending {
             status: other.as_str().to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod setup_error_result_tests {
+    use super::run_setup_error_result;
+
+    #[test]
+    fn credential_codes_of_a_failed_setup_reach_the_run_result() {
+        for (code, stage, expected) in [
+            (Some("git_auth_failed"), "git_auth", "git_auth_failed"),
+            (Some("credentials_lost"), "git_auth", "credentials_lost"),
+            (None, "setup", "setup_failed"),
+        ] {
+            let setup_error = serde_json::json!({"stage": "x", "message": "m", "code": code});
+            let result: serde_json::Value =
+                serde_json::from_str(&run_setup_error_result(Some(&setup_error))).unwrap();
+            assert_eq!(result["failure"]["stage"], stage);
+            assert_eq!(result["failure"]["code"], expected);
+        }
     }
 }

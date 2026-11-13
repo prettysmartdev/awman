@@ -18,6 +18,10 @@ pub struct GrantTarget<'a> {
     pub phase: PhaseKind,
     pub container_home: Option<&'a str>,
     pub remote: Option<&'a GitRemoteUrl>,
+    /// WI 0145: the running command's container credential socket directory
+    /// (a `git_auth` push session). Mounted for `push_branch` and
+    /// `pull_branch` when no grant supplies credentials for the remote.
+    pub session_git_socket: Option<&'a crate::engine::git::credential_socket::CacheSocketListener>,
 }
 
 pub struct GrantOverlays {
@@ -25,6 +29,8 @@ pub struct GrantOverlays {
     pub overlays: Vec<OverlaySpec>,
     pub env_literals: Vec<(String, String)>,
     pub secret_env: Vec<(String, SecretString)>,
+    /// Seed the phase container's in-memory Git cache through private stdin.
+    pub git_cache_seed: Option<SecretString>,
     pub push_auth: PushAuth,
     pub display: Vec<String>,
     pub(crate) scratch: Option<tempfile::TempDir>,
@@ -37,13 +43,17 @@ impl GrantOverlays {
             overlays: Vec::new(),
             env_literals: Vec::new(),
             secret_env: Vec::new(),
+            git_cache_seed: None,
             push_auth: PushAuth::None,
             display: Vec::new(),
             scratch: None,
         }
     }
     pub fn is_empty(&self) -> bool {
-        self.overlays.is_empty() && self.env_literals.is_empty() && self.secret_env.is_empty()
+        self.overlays.is_empty()
+            && self.env_literals.is_empty()
+            && self.secret_env.is_empty()
+            && self.git_cache_seed.is_none()
     }
     pub fn secret_names(&self) -> Vec<&str> {
         self.secret_env

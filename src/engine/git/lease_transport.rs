@@ -1,10 +1,8 @@
-//! The shared host Git transport for pulled leases.
+//! Lease credentials and adapters to the shared host Git transport.
 //!
-//! Every network Git operation of a lease (clone, setup fetch, merge-ref and
-//! push-back `ls-remote`, push) is built by one function,
-//! [`lease_transport_command`]; `RemotePushGit::with_lease_transport` routes
-//! its push-back `ls-remote` and push through it too. It applies one
-//! configuration:
+//! Every network Git operation delegates to [`HostGitTransport`], shared
+//! with push sessions. [`lease_transport_command`] remains an inspection
+//! adapter for callers of the 0143 interface. A lease applies one configuration:
 //!
 //! - no system or global Git configuration (`GIT_CONFIG_NOSYSTEM=1`,
 //!   `GIT_CONFIG_GLOBAL=/dev/null`), so neither the host's credential helpers
@@ -30,8 +28,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
 
-use super::auth_classify::GitFailureClass;
-use super::{host_command, GitCommand, GitEngine, GitFrontend};
+use super::transport::{CredentialHelper, CredentialSource, HostGitTransport, TransportGuard};
+use super::{GitEngine, GitFrontend};
 use crate::data::config::env::EnvSnapshot;
 use crate::data::secret::SecretString;
 use crate::engine::error::EngineError;
@@ -172,7 +170,7 @@ impl HelperProgram {
         Self { program, args }
     }
 
-    fn helper_value(&self, nonce: &str) -> String {
+    pub(crate) fn helper_value(&self, nonce: &str) -> String {
         let mut value = format!("!{}", shell_quote(&self.program.to_string_lossy()));
         for arg in &self.args {
             value.push(' ');
@@ -191,15 +189,91 @@ fn shell_quote(s: &str) -> String {
 /// Which remote a helper answers for: protocol, host (with port) and the
 /// repository path, as Git sends it with `credential.useHttpPath=true`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CredentialScope {
+pub struct CredentialScope {
     protocol: String,
     host: String,
     path: String,
 }
 
+impl CredentialScope {
+    /// The scope of an `http(s)://` repository URL; `None` for any other URL.
+    pub fn for_http_url(url: &str) -> Option<Self> {
+        let parsed = reqwest::Url::parse(url).ok()?;
+        if !matches!(parsed.scheme(), "https" | "http") {
+            return None;
+        }
+        parsed.host_str()?;
+        // Git's credential parser preserves explicit default ports, IDN
+        // spelling and dot segments. URL normalization is not its wire format.
+        let rest = url.split_once("://")?.1;
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        if authority.contains('@') || url.contains(['?', '#']) {
+            return None;
+        }
+        Some(Self {
+            protocol: parsed.scheme().into(),
+            host: authority.to_ascii_lowercase(),
+            path: credential_path(path)?,
+        })
+    }
+
+    /// Whether a Git credential request (`protocol=`, `host=`, `path=` lines)
+    /// is for this repository: protocol and host compare case-insensitively,
+    /// the path exactly. With `require_path`, a request without a path is
+    /// refused; otherwise a request without one matches by host only.
+    pub fn answers(&self, request: &BTreeMap<String, String>, require_path: bool) -> bool {
+        let same = |key: &str, ours: &str| {
+            request
+                .get(key)
+                .is_some_and(|v| v.eq_ignore_ascii_case(ours))
+        };
+        let path = match request.get("path") {
+            Some(asked) => *asked == self.path,
+            None => !require_path,
+        };
+        same("protocol", &self.protocol) && same("host", &self.host) && path
+    }
+
+    pub fn protocol(&self) -> &str {
+        &self.protocol
+    }
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+    pub fn matches_url(&self, url: &str) -> bool {
+        Self::for_http_url(url).as_ref() == Some(self)
+    }
+}
+
+/// Parse Git credential protocol lines (`key=value`) up to a blank line or EOF.
+pub fn read_credential_request(
+    input: &mut dyn BufRead,
+) -> std::io::Result<BTreeMap<String, String>> {
+    let mut request = BTreeMap::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if input.read_line(&mut line)? == 0 {
+            break;
+        }
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = trimmed.split_once('=') {
+            request.insert(k.to_string(), v.to_string());
+        }
+    }
+    Ok(request)
+}
+
 /// A repository path the way Git's credential protocol carries it:
 /// percent-decoded, without leading or trailing `/`.
-fn credential_path(path: &str) -> String {
+fn credential_path(path: &str) -> Option<String> {
+    let path = path.trim_matches('/');
     let bytes = path.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -215,9 +289,9 @@ fn credential_path(path: &str) -> String {
         decoded.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&decoded)
-        .trim_matches('/')
-        .to_string()
+    String::from_utf8(decoded)
+        .ok()
+        .filter(|s| !s.contains(['\r', '\n', '\0']))
 }
 
 /// Which repository URLs a lease may use.
@@ -239,17 +313,9 @@ fn check_url(url: &str, policy: LeaseUrlPolicy) -> Result<Option<CredentialScope
     awman_wsp::repo_url::validate(url).map_err(cfg_err)?;
     if let Ok(parsed) = reqwest::Url::parse(url) {
         if matches!(parsed.scheme(), "https" | "http") {
-            let host = parsed
-                .host_str()
-                .ok_or_else(|| cfg_err("lease repository URL has no host"))?;
-            let authority = parsed
-                .port()
-                .map_or_else(|| host.to_string(), |port| format!("{host}:{port}"));
-            return Ok(Some(CredentialScope {
-                protocol: parsed.scheme().into(),
-                host: authority,
-                path: credential_path(parsed.path()),
-            }));
+            return CredentialScope::for_http_url(url)
+                .map(Some)
+                .ok_or_else(|| cfg_err("lease repository URL has an invalid credential scope"));
         }
     }
     Ok(None)
@@ -436,7 +502,7 @@ pub fn answer_credential_request(
     };
     // Protocol and host compare case-insensitively; the path exactly.
     let path_matches = match (request.get("path"), stored.get("path")) {
-        (Some(asked), Some(approved)) => credential_path(asked) == *approved,
+        (Some(asked), Some(approved)) => asked == *approved,
         _ => false,
     };
     if stored.get("nonce") != Some(&nonce)
@@ -485,13 +551,33 @@ impl LeaseTransport {
         check_url(url, self.policy).map(|_| ())
     }
 
-    /// Defense in depth for arbitrary remote output, including Basic encodings.
+    pub fn host_transport(&self) -> HostGitTransport {
+        HostGitTransport::isolated(
+            self.helper
+                .as_ref()
+                .map_or(CredentialSource::Anonymous, |h| {
+                    CredentialSource::Helper(h.clone())
+                }),
+            self.policy.allow_local,
+        )
+    }
     pub fn redact(&self, text: &str) -> String {
+        self.helper
+            .as_ref()
+            .map_or_else(|| text.to_owned(), |h| h.redact(text))
+    }
+}
+
+impl CredentialHelper for LeaseCredentialHelper {
+    fn git_config_args(&self) -> Vec<String> {
+        self.git_config_args()
+    }
+    fn env(&self) -> Vec<(String, String)> {
+        self.env()
+    }
+    fn redact(&self, text: &str) -> String {
         use base64::Engine as _;
-        let Some(helper) = &self.helper else {
-            return text.to_owned();
-        };
-        let Ok(contents) = std::fs::read_to_string(helper.file()) else {
+        let Ok(contents) = std::fs::read_to_string(self.file()) else {
             return "Git diagnostic unavailable".into();
         };
         let values: BTreeMap<_, _> = contents
@@ -513,29 +599,10 @@ impl LeaseTransport {
         }
         safe
     }
+}
 
-    /// Apply the isolation and helper to `command` (shared by every lease
-    /// operation, including `RemotePushGit`'s transport calls).
-    pub fn apply(&self, command: &mut Command) {
-        command
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env_remove("GIT_ASKPASS")
-            .env_remove("SSH_ASKPASS")
-            .args(["-c", "credential.interactive=false"]);
-        if !self.policy.allow_local {
-            command.args(["-c", "protocol.file.allow=never"]);
-        }
-        match &self.helper {
-            Some(helper) => {
-                command.args(helper.git_config_args()).envs(helper.env());
-            }
-            None => {
-                command.args(["-c", "credential.helper="]);
-            }
-        }
-    }
+pub(super) fn validate_transport_url(url: &str, allow_local: bool) -> Result<()> {
+    check_url(url, LeaseUrlPolicy { allow_local }).map(|_| ())
 }
 
 /// A host Git command for a lease network operation against `remote`:
@@ -547,111 +614,7 @@ pub fn lease_transport_command(
     remote: &str,
     transport: &LeaseTransport,
 ) -> Result<Command> {
-    let mut command = host_command::transport_command(&snapshot.for_lease_git(), cwd, remote)?;
-    transport.apply(&mut command);
-    Ok(command)
-}
-
-/// Run `command` (display `args`) with a null stdin and file-captured
-/// output; kill its process group on `cancel` or after `timeout`. A
-/// non-zero exit is classified into `GitAuth`/`GitTransport`/`GitRejected`.
-fn run_lease(
-    mut command: Command,
-    args: &[&str],
-    operation: &str,
-    sink: &mut dyn GitFrontend,
-    cancel: &CancellationToken,
-    timeout: Duration,
-) -> Result<std::process::Output> {
-    use std::io::{Read, Seek};
-    let display = GitCommand::new(args);
-    sink.command_started(&display);
-    let io = |e: std::io::Error| EngineError::Git(format!("invoke `{}`: {e}", display.display()));
-    let mut stdout = tempfile::tempfile().map_err(io)?;
-    let mut stderr = tempfile::tempfile().map_err(io)?;
-    command
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(stdout.try_clone().map_err(io)?)
-        .stderr(stderr.try_clone().map_err(io)?);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    if cancel.is_cancelled() {
-        return Err(cfg_err("lease Git cancelled"));
-    }
-    let trace = super::auth_classify::ResponseTrace::attach(&mut command)?;
-    let mut child = command.spawn().map_err(io)?;
-    let started = std::time::Instant::now();
-    let mut timed_out;
-    let status = loop {
-        let cancelled = cancel.is_cancelled();
-        timed_out = started.elapsed() >= timeout;
-        if cancelled || timed_out {
-            #[cfg(unix)]
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(child.id() as i32),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-            let _ = child.kill();
-            let status = child.wait().map_err(io)?;
-            if cancelled {
-                return Err(EngineError::Git(format!(
-                    "`{}` cancelled",
-                    display.display()
-                )));
-            }
-            break status;
-        }
-        match child.try_wait().map_err(io)? {
-            Some(status) => break status,
-            None => std::thread::sleep(Duration::from_millis(10)),
-        }
-    };
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    stdout
-        .rewind()
-        .and_then(|_| stdout.read_to_end(&mut out))
-        .map_err(io)?;
-    stderr
-        .rewind()
-        .and_then(|_| stderr.read_to_end(&mut err))
-        .map_err(io)?;
-    let output = std::process::Output {
-        status,
-        stdout: out,
-        stderr: err,
-    };
-    // Never expose arbitrary transport stderr to logs: a remote can echo
-    // credentials. Preserve it only for classification, emit stable outcomes.
-    if !output.status.success() {
-        sink.write_message(crate::data::message::UserMessage {
-            level: crate::data::message::MessageLevel::Warning,
-            text: format!(
-                "lease Git {operation} failed ({:?})",
-                trace.classify(&String::from_utf8_lossy(&output.stderr), timed_out)
-            ),
-        });
-    }
-    if timed_out || !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let message = if timed_out {
-            format!("timed out after {} seconds", timeout.as_secs())
-        } else {
-            "lease Git remote operation failed".into()
-        };
-        let class = trace.classify(&stderr, timed_out);
-        let message = if class == GitFailureClass::Transport {
-            "connection failed before a remote response (DNS, connect or reset)".into()
-        } else {
-            message
-        };
-        return Err(class.into_error(operation, message));
-    }
-    Ok(output)
+    transport.host_transport().command(snapshot, cwd, remote)
 }
 
 impl GitEngine {
@@ -665,22 +628,14 @@ impl GitEngine {
         sink: &mut dyn GitFrontend,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        transport.check_url(url)?;
-        let parent = dest
-            .parent()
-            .ok_or_else(|| EngineError::Git("clone destination has no parent".into()))?;
-        std::fs::create_dir_all(parent).map_err(|e| EngineError::io(parent, e))?;
-        let dest = dest
-            .to_str()
-            .ok_or_else(|| EngineError::Git("clone destination is not UTF-8".into()))?;
-        let mut args = vec!["clone", "--no-recurse-submodules"];
-        if let Some(branch) = branch {
-            args.extend(["-b", branch]);
-        }
-        args.extend(["--", url, dest]);
-        let command = lease_transport_command(self.env(), parent, "origin", transport)?;
-        run_lease(command, &args, "clone", sink, cancel, LEASE_NETWORK_TIMEOUT)?;
-        Ok(())
+        self.clone_with_transport(
+            url,
+            branch,
+            dest,
+            &transport.host_transport(),
+            sink,
+            &TransportGuard::new(cancel.clone()),
+        )
     }
 
     /// `git fetch origin <refspecs…>` in `repo` through the lease transport.
@@ -692,11 +647,15 @@ impl GitEngine {
         sink: &mut dyn GitFrontend,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        let mut args = vec!["fetch", "--no-recurse-submodules", "origin"];
-        args.extend(refspecs.iter().map(String::as_str));
-        let command = lease_transport_command(self.env(), repo, "origin", transport)?;
-        run_lease(command, &args, "fetch", sink, cancel, LEASE_NETWORK_TIMEOUT)?;
-        Ok(())
+        let url = self.remote_url(repo, "origin")?;
+        self.fetch_with_transport(
+            repo,
+            &url,
+            refspecs,
+            &transport.host_transport(),
+            sink,
+            &TransportGuard::new(cancel.clone()),
+        )
     }
 
     /// `git ls-remote --heads --tags <url>` through the lease transport:
@@ -708,22 +667,11 @@ impl GitEngine {
         sink: &mut dyn GitFrontend,
         cancel: &CancellationToken,
     ) -> Result<BTreeMap<String, String>> {
-        transport.check_url(url)?;
-        let scratch = tempfile::tempdir().map_err(|e| EngineError::Git(e.to_string()))?;
-        let command = lease_transport_command(self.env(), scratch.path(), "origin", transport)?;
-        let args = ["ls-remote", "--heads", "--tags", "--", url];
-        let output = run_lease(
-            command,
-            &args,
-            "ls-remote",
+        self.ls_remote_with_transport(
+            url,
+            &transport.host_transport(),
             sink,
-            cancel,
-            LEASE_NETWORK_TIMEOUT,
-        )?;
-        Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|l| l.split_once('\t'))
-            .map(|(sha, r)| (r.to_string(), sha.to_string()))
-            .collect())
+            &TransportGuard::new(cancel.clone()),
+        )
     }
 }

@@ -19,7 +19,6 @@ use crate::data::error::DataError;
 use crate::data::execution_event::ExecutionEvent;
 use crate::data::fs::api_db::{FailedStep, PullRequestRef};
 use crate::data::fs::api_paths::ApiPaths;
-use crate::data::workflow_state::WorkflowState;
 
 /// Owns the filesystem side of a command's live workflow state so the API
 /// frontend never touches the filesystem itself. Synchronous because the
@@ -223,7 +222,7 @@ impl CommandStateWriter {
             .filter(|path| path.is_dir())
     }
 
-    pub fn write(&self, state: &WorkflowState) -> Result<(), DataError> {
+    pub fn write(&self, state: &impl serde::Serialize) -> Result<(), DataError> {
         self.paths
             .write_command_workflow_state(&self.session_id, &self.command_id, state)
     }
