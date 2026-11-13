@@ -35,6 +35,14 @@ impl FeatureSet {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Operation {
+    CoreContextsList,
+    CoreContextFilesGet,
+    CoreContextFilesPut,
+    CoreContextFilesDelete,
+    WorkerCommandsContextChanges,
+    WorkerCommandsContext,
+    WorkerCommandsContextFile,
+
     EngineInstancesList,
     EngineInstancesCreate,
     EngineInstancesGet,
@@ -122,6 +130,14 @@ pub enum Operation {
 impl Operation {
     pub fn owner(self) -> Feature {
         match self {
+            Self::CoreContextsList => Feature::Core,
+            Self::CoreContextFilesGet => Feature::Core,
+            Self::CoreContextFilesPut => Feature::Core,
+            Self::CoreContextFilesDelete => Feature::Core,
+            Self::WorkerCommandsContextChanges => Feature::Worker,
+            Self::WorkerCommandsContext => Feature::Worker,
+            Self::WorkerCommandsContextFile => Feature::Worker,
+
             Self::EngineInstancesList
             | Self::EngineInstancesCreate
             | Self::EngineInstancesGet
@@ -206,6 +222,14 @@ impl Operation {
     }
     pub fn name(self) -> &'static str {
         match self {
+            Self::CoreContextsList => "core.contexts.list",
+            Self::CoreContextFilesGet => "core.contexts.files.get",
+            Self::CoreContextFilesPut => "core.contexts.files.put",
+            Self::CoreContextFilesDelete => "core.contexts.files.delete",
+            Self::WorkerCommandsContextChanges => "worker.commands.context_changes",
+            Self::WorkerCommandsContext => "worker.commands.context",
+            Self::WorkerCommandsContextFile => "worker.commands.context_file",
+
             Self::EngineInstancesList => "engine.instances.list",
             Self::EngineInstancesCreate => "engine.instances.create",
             Self::EngineInstancesGet => "engine.instances.get",
@@ -424,6 +448,18 @@ impl Operation {
                         Feature::Worker => false,
                     }
             }
+        }
+    }
+}
+
+impl Operation {
+    pub fn requires_feature(self) -> Option<Feature> {
+        match self {
+            Self::CoreContextsList
+            | Self::CoreContextFilesGet
+            | Self::CoreContextFilesPut
+            | Self::CoreContextFilesDelete => Some(Feature::Worker),
+            _ => None,
         }
     }
 }

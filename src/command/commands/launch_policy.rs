@@ -205,12 +205,26 @@ impl<'a> LaunchPolicy<'a> {
         workflow_step_info: Option<&WorkflowStepInfo>,
         sink: &mut dyn UserMessageSink,
     ) -> Result<(Vec<ContextOverlay>, Option<String>), CommandError> {
+        let mut specs = specs.to_vec();
+        if matches!(
+            self.session.repo_context(),
+            crate::data::session::RepoContextBinding::Staged(_)
+        ) && !specs.iter().any(|s| s.scope == ContextScope::Repo)
+        {
+            specs.push(ContextOverlaySpec {
+                key: None,
+                scope: ContextScope::Repo,
+                permission: crate::data::config::overlays::OverlayPermission::ReadWrite,
+            });
+        }
         if specs.is_empty() {
             return Ok((vec![], None));
         }
 
-        let resolver = ContextDirResolver::from_process_env()
-            .map_err(|e| CommandError::Other(format!("context dir resolver: {e}")))?;
+        let resolver = ContextDirResolver::from_env(self.session.env()).map_err(|e| {
+            tracing::warn!(%e, "context resolver failed");
+            CommandError::Other("context directory is unavailable".into())
+        })?;
 
         // Read once, not once per spec: `remote_url` shells out to git.
         let remote_url = self.remote_url();
@@ -219,14 +233,28 @@ impl<'a> LaunchPolicy<'a> {
         let mut builder = ContextPromptBuilder::new();
         let mut saw_repo_fallback: Option<std::path::PathBuf> = None;
 
-        for spec in specs {
+        for spec in &specs {
             let (host_path, container_path) = match spec.scope {
                 ContextScope::Global => {
                     let p = resolver.global_dir();
                     (p, std::path::PathBuf::from("/awman/context/global"))
                 }
                 ContextScope::Repo => {
-                    let p = resolver.repo_dir(remote_url.as_deref(), self.session.git_root());
+                    let resolved = crate::command::context::scope::RepoContextScope::new(
+                        &resolver,
+                        self.session,
+                    )
+                    .resolve(spec.key.as_ref(), remote_url.as_deref());
+                    if let Some(ignored) = resolved.ignored_overlay_key {
+                        sink.write_message(UserMessage {
+                            level: MessageLevel::Warning,
+                            text: format!(
+                                "context overlay key {} is overridden by the session binding",
+                                ignored.as_str()
+                            ),
+                        });
+                    }
+                    let p = resolved.host_dir;
                     // Detect the `_local/...` fallback so we can surface an Info
                     // message naming the resolved dir.
                     if let Some(suffix) = p.iter().rev().nth(1).and_then(|c| c.to_str()) {
@@ -244,13 +272,16 @@ impl<'a> LaunchPolicy<'a> {
                 }
             };
 
+            crate::data::fs::context_dirs::validate_context_path(resolver.awman_home(), &host_path)
+                .map_err(|e| {
+                    tracing::warn!(%e, "context overlay path refused");
+                    CommandError::Other("context overlay directory is unavailable".into())
+                })?;
             if let Err(e) = ContextDirResolver::ensure_exists(&host_path) {
+                tracing::warn!(%e, "context overlay directory creation failed");
                 sink.write_message(UserMessage {
                     level: MessageLevel::Warning,
-                    text: format!(
-                        "context overlay: failed to create directory {}: {e}",
-                        host_path.display()
-                    ),
+                    text: "context overlay: failed to create directory".into(),
                 });
                 continue;
             }
@@ -286,12 +317,10 @@ impl<'a> LaunchPolicy<'a> {
         }
 
         if let Some(path) = saw_repo_fallback {
+            tracing::debug!(path = %path.display(), "context repo uses local fallback");
             sink.write_message(UserMessage {
                 level: MessageLevel::Info,
-                text: format!(
-                    "context(repo): no git remote configured; using local fallback directory {}",
-                    path.display()
-                ),
+                text: "context(repo): no git remote configured; using local fallback at /awman/context/repo".into(),
             });
         }
 

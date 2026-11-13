@@ -2,6 +2,8 @@
 //! live here; HTTP and terminal frontends adapt the typed PullHandle.
 mod capabilities;
 pub mod events;
+pub mod lease_context;
+pub mod lease_workflow_context;
 pub mod pick;
 pub mod policy;
 mod provision;
@@ -74,6 +76,9 @@ struct Active {
     control: HeartbeatControl,
     finish: Mutex<Finish>,
     outputs: Mutex<Option<BTreeMap<String, String>>>,
+    context_stage: Mutex<Option<crate::engine::worker::lease_context::LeaseContextStage>>,
+    context_changes: Mutex<Option<awman_wsp::ContextChanges>>,
+    workflow_context: Mutex<Option<awman_wsp::WorkflowContextResult>>,
     done: CancellationToken,
 }
 
@@ -459,6 +464,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                         .release(
                             &reference,
                             &ReleaseRequest {
+                                context_changes: None,
                                 reason: ReleaseReason::Shutdown,
                                 message: Some("worker restarted".into()),
                                 result: None,
@@ -480,6 +486,11 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
         }
         let root = crate::data::worker::paths::work_root(&self.data_paths(), &self.settings());
         crate::engine::worker::lease_workspace::remove_orphaned_lease_dirs(&root, &[]);
+        if let Ok(resolver) =
+            crate::data::fs::context_dirs::ContextDirResolver::from_env(self.shared.sessions.env())
+        {
+            lease_context::remove_orphans(&resolver, &[]);
+        }
         self.cleanup_retired()?;
         Ok(())
     }
@@ -796,6 +807,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                     .release(
                         &LeaseRef::of(&lease),
                         &ReleaseRequest {
+                            context_changes: None,
                             reason: if self.core_shutdown.is_cancelled()
                                 || self.shutting_down.load(Ordering::SeqCst)
                             {
@@ -826,6 +838,10 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                 if self.running(name) >= server.max_concurrent_jobs {
                     local_change = true;
                     return Err("work server capacity changed during claim".into());
+                }
+                if foreground {
+                    lease_context::admit(&lease.item, &[])?;
+                    lease_workflow_context::admit(&lease.item, &[])?;
                 }
                 let labels = self
                     .worker_labels(server.labels.clone(), server.interaction)
@@ -859,6 +875,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                         .release(
                             &LeaseRef::of(&lease),
                             &ReleaseRequest {
+                                context_changes: None,
                                 reason: if local_change {
                                     ReleaseReason::UserDeclined
                                 } else {
@@ -1002,6 +1019,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                 .release(
                     &LeaseRef::of(&lease),
                     &ReleaseRequest {
+                        context_changes: None,
                         reason: ReleaseReason::Error,
                         message: Some("could not persist lease".into()),
                         result: None,
@@ -1402,5 +1420,17 @@ impl<F: ApiCommandFrontendFactory + 'static> PullHandle for PullHandleAdapter<F>
         run.active.done.cancel();
         self.0.active.lock().unwrap().remove(id.as_str());
         result.map_err(WorkerError::Upstream)
+    }
+}
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        if let Ok(stage) = self.context_stage.get_mut() {
+            if let Some(stage) = stage.take() {
+                if let Err(error) = stage.remove() {
+                    tracing::warn!(%error, "could not remove staged lease context");
+                }
+            }
+        }
     }
 }

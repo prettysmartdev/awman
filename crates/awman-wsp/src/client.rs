@@ -311,6 +311,7 @@ impl Client {
                     .release(
                         &identity.id,
                         &ReleaseRequest::<serde_json::Value> {
+                            context_changes: None,
                             reason: ReleaseReason::Ineligible,
                             message: Some("unsupported or invalid lease requirements".into()),
                             result: None,

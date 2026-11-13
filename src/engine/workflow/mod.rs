@@ -47,6 +47,7 @@ use crate::engine::workflow::step_commands::PhaseStepSpec;
 use crate::engine::workflow::step_commands::StepCommandOptions;
 
 pub mod actions;
+pub mod context_files;
 pub mod factory;
 pub mod frontend;
 pub mod poll_ci;
@@ -380,6 +381,8 @@ pub struct WorkflowEngine {
     /// `POST /v1/worker/commands/{id}/cancel`). Never fired unless a caller installs
     /// one with [`WorkflowEngine::set_cancellation`].
     cancel: CancellationToken,
+    // Declared last so active executions are dropped before this lease.
+    _scratch_lease: std::fs::File,
 }
 
 impl WorkflowEngine {
@@ -513,7 +516,7 @@ impl WorkflowEngine {
             state_store_for(session, state_root),
             work_item_context,
             deps,
-        )
+        )?
         .with_ci_token(ci_token))
     }
 
@@ -766,7 +769,7 @@ impl WorkflowEngine {
                 frontend,
                 agent_factory,
             },
-        )
+        )?
         .with_ci_token(ci_token))
     }
 
@@ -780,7 +783,16 @@ impl WorkflowEngine {
         state_store: WorkflowStateStore,
         work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         deps: WorkflowEngineDeps,
-    ) -> Self {
+    ) -> Result<Self, EngineError> {
+        let scratch_lease =
+            crate::data::fs::context_dirs::ContextDirResolver::from_env(session.env())
+                .and_then(|resolver| resolver.workflow_lease(state.invocation_id))
+                .map_err(|error| {
+                    tracing::warn!(%error, "workflow scratch lease is unavailable");
+                    EngineError::Data(crate::data::error::DataError::Other(
+                        "workflow scratch is unavailable".into(),
+                    ))
+                })?;
         let WorkflowEngineDeps {
             mut frontend,
             agent_factory,
@@ -795,7 +807,7 @@ impl WorkflowEngine {
         );
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         frontend.attach_engine(EngineHandles::requests(tx));
-        Self {
+        Ok(Self {
             session: session.clone(),
             ci_token: None,
             ci_destination: None,
@@ -829,7 +841,8 @@ impl WorkflowEngine {
             session_mirror: None,
             clock: crate::data::clock::system_clock(),
             cancel: CancellationToken::new(),
-        }
+            _scratch_lease: scratch_lease,
+        })
     }
 
     /// Use `clock` for time the engine measures itself (default: the system

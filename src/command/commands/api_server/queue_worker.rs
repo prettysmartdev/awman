@@ -1314,6 +1314,15 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             }
         };
 
+        let context_tracker = crate::command::context::change_tracker::ContextChangeTracker::begin(
+            &self.paths,
+            &*session.read().await,
+            &self.engines.git_engine,
+            &session_id,
+            &command_id,
+            cmd.attempt,
+        );
+        let mut context_finish = ContextFinishGuard(Some(context_tracker));
         let checkout_root = session.read().await.git_root().to_path_buf();
         let git = Arc::clone(&self.engines.git_engine);
         let root = checkout_root.clone();
@@ -1635,8 +1644,14 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         if let Err(error) = self.paths.remove_command_cleanup(&session_id, &command_id) {
             tracing::warn!(%error, "Failed to retire command cleanup recipe");
         }
-        completion
-            .publish(&self.store, &self.paths, &cmd, &event_bus.sender())
+        context_finish
+            .publish(
+                &completion,
+                &self.store,
+                &self.paths,
+                &cmd,
+                &event_bus.sender(),
+            )
             .await;
         let _ = log_writer.await;
         self.cleanup_event_bus(&command_id).await;
@@ -1950,9 +1965,131 @@ fn spawn_tracing_subscriber(
     });
 }
 
+/// Every terminal path, including a panic, finalizes the attempt's snapshot.
+struct ContextFinishGuard(Option<crate::command::context::change_tracker::ContextChangeTracker>);
+impl ContextFinishGuard {
+    async fn publish(
+        &mut self,
+        completion: &QueuedCommandResult,
+        store: &SqliteSessionStore,
+        paths: &ApiPaths,
+        command: &CommandRecord,
+        events: &crate::command::commands::api_server::event_bus::EventBusSender,
+    ) {
+        self.finish();
+        completion.publish(store, paths, command, events).await;
+    }
+    fn finish(&mut self) {
+        if let Some(tracker) = self.0.take() {
+            tracker.finish();
+        }
+    }
+}
+impl Drop for ContextFinishGuard {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 #[cfg(test)]
 mod command_secrets_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn terminal_publication_freezes_context_before_cleanup_or_later_writes() {
+        use crate::data::{
+            context::{CommandContextRecord, ContextKey},
+            session::{RepoContextBinding, Session, SessionOpenOptions},
+        };
+        let sandbox = awman_test_support::TestSandbox::for_test(awman_test_support::TestCase::component("command::queue_worker::terminal_publication_freezes_context_before_cleanup_or_later_writes"));
+        let env = crate::data::config::env::EnvSnapshot::from_instance_env(
+            sandbox
+                .env()
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect(),
+            sandbox.work().to_path_buf(),
+            vec![],
+        );
+        let paths = ApiPaths::from_root(sandbox.work().join("api"));
+        let store = SqliteSessionStore::open_from_paths(&paths).unwrap();
+        let sid = crate::data::ids::WorkerSessionId::new();
+        let cid = crate::data::ids::CommandId::new();
+        store
+            .insert_session(
+                sid.as_str(),
+                sandbox.work().to_str().unwrap(),
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+        store
+            .enqueue_command(cid.as_str(), sid.as_str(), "exec prompt", "[]", "unused")
+            .unwrap();
+        let command = store.claim_next_command("worker").unwrap().unwrap();
+        let mut session = Session::open_at_directory_root(
+            sandbox.work().to_path_buf(),
+            SessionOpenOptions {
+                env: Some(env.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let key = ContextKey::parse("terminal").unwrap();
+        session.set_repo_context(RepoContextBinding::Keyed(key.clone()));
+        let resolver = crate::data::fs::context_dirs::ContextDirResolver::from_env(&env).unwrap();
+        let dir = resolver.keyed_repo_dir(&key);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracker = crate::command::context::change_tracker::ContextChangeTracker::begin(
+            &paths,
+            &session,
+            &crate::engine::git::GitEngine::with_env(env),
+            sid.as_str(),
+            cid.as_str(),
+            command.attempt,
+        );
+        let mut guard = ContextFinishGuard(Some(tracker));
+        std::fs::write(dir.join("first"), b"first job").unwrap();
+        let bus = EventBus::new(32);
+        let mut events = bus.subscribe();
+        let completion = QueuedCommandResult::from_result(crate::data::fs::api_db::CommandResult {
+            outcome: Some(crate::data::execution_event::CommandStatusKind::Done),
+            exit_code: Some(0),
+            ..Default::default()
+        });
+        // This is the same boundary execute_command uses, before awaited log
+        // draining and session cleanup. Keep the guard alive across the barrier.
+        guard
+            .publish(&completion, &store, &paths, &command, &bus.sender())
+            .await;
+        let terminal = events.try_recv().unwrap();
+        assert!(matches!(
+            terminal.payload,
+            EventPayload::CommandStatus { .. }
+        ));
+        assert!(store
+            .get_command(cid.as_str())
+            .unwrap()
+            .unwrap()
+            .status
+            .is_terminal());
+        let persisted = CommandContextRecord::read_final(&paths, sid.as_str(), cid.as_str())
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(&persisted, CommandContextRecord::Final { changes, .. } if changes.len() == 1 && changes[0].path == "first")
+        );
+        std::fs::write(dir.join("next"), b"next job").unwrap();
+        drop(guard);
+        assert_eq!(
+            CommandContextRecord::read_final(&paths, sid.as_str(), cid.as_str()).unwrap(),
+            Some(persisted)
+        );
+    }
 
     #[tokio::test]
     async fn completion_row_sidecar_and_rebuilt_terminal_events_are_redacted() {

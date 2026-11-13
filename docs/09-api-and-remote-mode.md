@@ -630,6 +630,13 @@ This is the complete route table. Request and response details for the worker pu
 | `GET` | `/v1/worker/commands/{id}/workflow` | worker | feature | Workflow state |
 | `GET` | `/v1/worker/commands/{id}/outputs` | worker | feature | List files the agent wrote under `/awman/output` |
 | `GET` | `/v1/worker/commands/{id}/outputs/{*path}` | worker | feature | Download one output file |
+| `GET` | `/v1/worker/commands/{id}/context_changes` | worker | feature | Files the command added, modified or deleted in its repo context |
+| `GET` | `/v1/worker/commands/{id}/context` | worker | feature | List the workflow scratch notes of a command |
+| `GET` | `/v1/worker/commands/{id}/context/files/{*path}` | worker | feature | Download one workflow scratch note |
+| `GET` | `/v1/contexts/{key}` | core | feature | List the files of a keyed repo context |
+| `GET` | `/v1/contexts/{key}/files/{*path}` | core | feature | Download one keyed context file |
+| `PUT` | `/v1/contexts/{key}/files/{*path}` | core | feature | Create or replace one keyed context file |
+| `DELETE` | `/v1/contexts/{key}/files/{*path}` | core | feature | Delete one keyed context file (`204`) |
 | `POST` | `/v1/worker/runs` | worker | feature | Create a session and run a command in one request |
 | `GET` | `/v1/worker/servers` | worker | owner/local | List configured work server status |
 | `GET` | `/v1/worker/servers/{name}` | worker | owner/local | Read one configured work server status |
@@ -902,6 +909,8 @@ Setup (cloning, for a remote session, then the same checks and image preparation
 | `base_ref` | Branch, tag or commit the new session branch is created from. Defaults to `origin`'s default branch. If `branch` already exists on `origin`, setup fails (omit `base_ref` to continue it). |
 | `merge_refs` | Branch names on `origin`, merged into the session branch in order before the session becomes `ready`. |
 | `push` | When `true`, the session branch is committed and pushed to `origin` after each successful `exec` workflow or prompt command. Default `false`. |
+
+**Repo context key** — a session body of either type can carry an optional `context_key`, such as `"context_key": "team-notes"`. The session's repo context then lives in the [keyed directory](#context-api) for that key instead of the one inferred from the repository's `origin`, so sessions on different clones or remotes can share notes. The key must match `^[a-z0-9][a-z0-9._-]{0,127}$`; an invalid key returns HTTP 400 `invalid_request` and creates no session. The key is echoed in the session's create and detail responses and survives a daemon restart. A `context_key` selects the directory only: the agent sees it when the command's overlays include `context(repo)` (see [Keyed repo context](08-overlays.md#keyed-repo-context)).
 
 For a remote session, the optional `git_auth` object supplies credentials for
 clone, setup fetch, remote-ref lookup and host-side push-back:
@@ -1777,6 +1786,66 @@ Returns `{"items":[...],"next_cursor":…}`, newest first. Each entry has the sa
 
 ---
 
+### Context API
+
+A **keyed repo context** is a directory of notes that you name with a key rather than deriving from a Git remote. The Context API lets a client seed it before a run and read back what agents wrote. Agents reach it through a `context(repo@<key>)` overlay or a session `context_key`; see [Keyed repo context](08-overlays.md#keyed-repo-context).
+
+The daemon advertises `context_api` in `/v1/status` `capabilities` when these routes are available. A key matches `^[a-z0-9][a-z0-9._-]{0,127}$`; file paths are relative, use `/` separators, and may not contain `..`, `.` or empty segments, a leading `/`, a backslash, a colon, or control characters. Bad keys and paths return HTTP 400 `invalid_request`. Symbolic links are never followed, listed or served.
+
+| Method | Path | Result |
+|--------|------|--------|
+| `GET` | `/v1/contexts/{key}` | A [list response](#api-conventions) of `{ path, size_bytes, sha256, modified_at }`. An unknown key is an empty list and creates nothing. Pages with `limit` and `cursor`. |
+| `GET` | `/v1/contexts/{key}/files/{path}` | The file bytes, with `ETag: "<sha256>"`. A missing file returns 404 `not_found`. |
+| `PUT` | `/v1/contexts/{key}/files/{path}` | The raw request body becomes the file. `201` when created, `200` when replaced; the body is the file's metadata and the response carries its new `ETag`. |
+| `DELETE` | `/v1/contexts/{key}/files/{path}` | `204`; 404 `not_found` when the file does not exist. |
+
+```sh
+curl -sk -X PUT https://localhost:9876/v1/contexts/team-notes/files/architecture.md \
+  -H 'Authorization: Bearer <api-key>' \
+  --data-binary @architecture.md
+
+curl -sk https://localhost:9876/v1/contexts/team-notes \
+  -H 'Authorization: Bearer <api-key>'
+```
+
+Downloads are attachments served as `application/octet-stream` with a scriptless sandbox policy.
+
+**Conditional writes.** Send `If-Match` with a `PUT` or `DELETE` so you do not overwrite a change you have not seen. Its value is the file's SHA-256 from a listing or `ETag` (quotes optional), or `*` to require that the file exists. If the file's current hash differs, or the file does not exist, the request returns HTTP 412 `precondition_failed` and changes nothing. Weak ETags (`W/…`) return 400. Without `If-Match` the write is unconditional; path and size limits still apply. A `PUT` whose parent path is an existing file returns 409 `conflict`.
+
+**Size caps.** A file is at most 1 MiB; a key holds at most 16 MiB in at most 1,000 files. A larger request body or a write that would exceed the key's totals returns HTTP 413 `context_too_large`. A directory that an agent left over these totals also answers `context_too_large` on listing; delete files through the API to bring it back under the caps. Unconditional writes and `If-Match: *` can replace or delete an oversized agent-written file without downloading it. Hash conditions require a file within the download cap.
+
+On Windows, context API mutations and pulled repo-context staging are unavailable until safe filesystem mutations are supported; reads remain available.
+
+**Concurrent writers.** Requests through the API are serialized per key, so each write and its `If-Match` check are atomic. Agents running in containers write to the directory directly and are not covered by `If-Match`: when two commands use the same key read-write, the last writer wins for each file. Use `context(repo@<key>:ro)` for parallel jobs and compare listings or `context_changes` to detect a clash.
+
+#### Command context changes
+
+`GET /v1/worker/commands/{id}/context_changes` reports what a command did to its session's repo context (the session's `context_key` directory, or the origin-inferred one). Each item has a `path`, a `change` of `added`, `modified` or `deleted`, and, except for deletions, `size_bytes` and `sha256`. The listing pages like any [list response](#api-conventions). While the command runs it is a live comparison against the state when the command started; once the command finishes, the result is fixed and later edits do not appear. A command that has not started, a rerun's earlier attempt, and commands with no repo context return an empty list. The route returns 404 `command_not_found` for an unknown command and 503 `unavailable` when the comparison could not be recorded. A key given only in an overlay is not tracked; set the session `context_key` to track a key.
+
+#### Workflow scratch notes
+
+The `workflow_context` capability advertises read access to the shared notes that workflow steps write to `/awman/context/workflow`. They are read-only through the API and are available while the command runs.
+
+| Method | Path | Result |
+|--------|------|--------|
+| `GET` | `/v1/worker/commands/{id}/context` | A list response of `{ path, size_bytes, sha256, modified_at }` for every regular file, with `limit` and `cursor` paging. |
+| `GET` | `/v1/worker/commands/{id}/context/files/{path}` | The file bytes with a quoted SHA-256 `ETag`. |
+
+```sh
+curl -sk https://localhost:9876/v1/worker/commands/<command-id>/context \
+  -H 'Authorization: Bearer <api-key>'
+```
+
+The dynamic leader's planning scratch and `exec prompt` overlays are not exposed by these routes; they serve the workflow steps' pinned invocation.
+
+A resumed workflow reuses its invocation's scratch directory, including files from earlier attempts or commands. A rerun with a fresh invocation has a separate directory. Names must satisfy the same portable path rules as repo context; names with colons, trailing dots or spaces, reserved Windows names, or excessive depth are omitted from listings.
+
+The notes belong to the command's workflow run, so they stay readable after the command finishes, including when it fails or is cancelled. Downloads of files over 16 MiB return 413 `context_too_large`, and a listing whose files total more than 256 MiB, takes more than two seconds, or exceeds 100,000 entries returns 503 `unavailable`. A missing file returns 404 `not_found`; unknown commands return 404 `command_not_found`; a command that did not run a workflow, or whose notes were rerun over, lists as empty. Responses are inert downloads like [outputs](#list-and-retrieve-command-outputs).
+
+**Retention.** There is no setting for scratch-note retention; it follows the session. At daemon startup, sessions closed more than 24 hours earlier are purged (see [Session cleanup](#session-cleanup)), and the scratch notes of the purged commands are deleted with them. Closing a session, or a command ending in `error` or `cancelled`, does not shorten that period, and a long-running daemon that has not restarted keeps records longer. After the notes are removed, listing the command's notes returns an empty list rather than an error, and downloading a file returns 404 `not_found`. `awman clean` leaves scratch notes that a surviving session still uses. All invocations recorded by a command, including earlier attempts, follow this retention period. Cleanup waits until a resumed foreground or API workflow releases its scratch directory; a corrupt command pin does not prevent cleanup of other commands.
+
+---
+
 ### Error responses
 
 Idempotent replays preserve the originally stored response bytes. Errors cached by a server version before the `error_codes` feature may lack `code` until the key expires (24 hours).
@@ -1800,6 +1869,9 @@ Match on `code`, not on the `error` text. Existing messages are preserved for co
 | `request_too_large` | 413 | The request body exceeds the limit |
 | `output_not_found` | 404 | The output file is unavailable |
 | `output_too_large` | 413 | The output exceeds the download limit |
+| `context_too_large` | 413 | A [context](#context-api) file or key is over its size caps, or a workflow note is over the download limit |
+| `precondition_failed` | 412 | A context `PUT` or `DELETE` whose `If-Match` does not match the file's current hash, or names a file that does not exist |
+| `conflict` | 409 | A context write whose parent path is an existing file |
 | `unsupported_media_type` | 415 | The request content type is unsupported |
 | `origin_not_allowed` | 403 | A browser `Origin` that is not in the receiving listener's `allowedOrigins` (no CORS headers are sent) |
 | `host_mismatch` | 421 | A plain-HTTP loopback request whose `Host` is not exactly the listener's configured address |

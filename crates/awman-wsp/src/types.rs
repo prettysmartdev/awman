@@ -1,5 +1,5 @@
 //! JSON messages shared by work servers and workers.
-use crate::Affinity;
+use crate::{Affinity, ContextChanges, ItemContext, ItemWorkflowContext, WorkflowContextResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -121,6 +121,10 @@ pub enum WorkKind {
 /// strictly, so a requirement it does not know is refused rather than skipped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ItemContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_context: Option<ItemWorkflowContext>,
     #[serde(default)]
     pub summary: Option<String>,
     pub id: String,
@@ -331,6 +335,10 @@ pub struct EventBatch<E> {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LeaseResult<R> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_changes: Option<ContextChanges>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_context: Option<WorkflowContextResult>,
     pub result: R,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outputs: Option<BTreeMap<String, String>>,
@@ -349,6 +357,8 @@ pub enum ReleaseReason {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReleaseRequest<R> {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_changes: Option<ContextChanges>,
     pub reason: ReleaseReason,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -393,11 +403,14 @@ impl ApiError {
             "unauthorized" => 401,
             "not_found" | "worker_not_found" => 404,
             "expired" => 410,
+            "context_too_large" => 413,
             _ => 400,
         }
     }
 }
 pub mod codes {
+    pub const CONTEXT_TOO_LARGE: &str = "context_too_large";
+    pub const CONTEXT_INVALID: &str = "context_invalid";
     pub const TAKEN: &str = "taken";
     pub const LEASE_LOST: &str = "lease_lost";
     pub const INELIGIBLE: &str = "ineligible";
@@ -408,6 +421,8 @@ pub mod codes {
     pub const LINK_DENIED: &str = "access_denied";
 }
 pub mod features {
+    pub const LEASE_CONTEXT: &str = "lease_context";
+    pub const LEASE_WORKFLOW_CONTEXT: &str = "lease_workflow_context";
     pub const TERMINAL: &str = "terminal";
     pub const INTERACTIVE: &str = "interactive";
     pub const PROMPT: &str = "prompt";
@@ -422,6 +437,8 @@ pub mod features {
     pub const LEASE_GIT_AUTH_FAILURE: &str = "lease_git_auth_failure";
     pub const LEASE_PUSH_RETRY: &str = "lease_push_retry";
     pub const ALL: &[&str] = &[
+        LEASE_CONTEXT,
+        LEASE_WORKFLOW_CONTEXT,
         TERMINAL,
         INTERACTIVE,
         PROMPT,

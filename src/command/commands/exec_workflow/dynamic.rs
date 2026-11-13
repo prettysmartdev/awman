@@ -531,6 +531,7 @@ impl ExecWorkflowCommand {
                 .with_git(&self.engines.git_engine)
                 .resolve_context_overlays(
                     &[crate::command::commands::ContextOverlaySpec {
+                        key: None,
                         scope: crate::data::config::overlays::ContextScope::Workflow,
                         permission: crate::data::config::overlays::OverlayPermission::ReadWrite,
                     }],

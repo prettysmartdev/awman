@@ -70,6 +70,8 @@ pub enum SkillSpec {
 /// A parsed context overlay specification (scope + permission).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextOverlaySpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<crate::data::context::ContextKey>,
     pub scope: ContextScope,
     pub permission: OverlayPermission,
 }
@@ -273,7 +275,7 @@ fn parse_single_typed_overlay(expr: &str) -> Result<TypedOverlay, String> {
                 return Err("context() requires a scope argument: context(global), context(repo), or context(workflow)".to_string());
             }
             let parts: Vec<&str> = args.splitn(2, ':').collect();
-            let scope_str = parts[0].trim();
+            let (scope_str, raw_key) = parts[0].trim().split_once('@').map_or((parts[0].trim(), None), |(scope, key)| (scope, Some(key)));
             let scope = match scope_str {
                 "global" => ContextScope::Global,
                 "repo" => ContextScope::Repo,
@@ -284,6 +286,11 @@ fn parse_single_typed_overlay(expr: &str) -> Result<TypedOverlay, String> {
                          supported scopes: global, repo, workflow"
                     ));
                 }
+            };
+            let key = match raw_key {
+                Some(_) if scope != ContextScope::Repo => return Err("a context key is allowed only with repo scope".into()),
+                Some(raw) => Some(crate::data::context::ContextKey::parse(raw).map_err(|e| e.to_string())?),
+                None => None,
             };
             let permission = if let Some(perm_str) = parts.get(1).map(|s| s.trim()) {
                 match perm_str {
@@ -298,7 +305,7 @@ fn parse_single_typed_overlay(expr: &str) -> Result<TypedOverlay, String> {
             } else {
                 OverlayPermission::ReadWrite
             };
-            Ok(TypedOverlay::Context(ContextOverlaySpec { scope, permission }))
+            Ok(TypedOverlay::Context(ContextOverlaySpec { scope, permission, key }))
         }
         _ => Err(format!(
             "unknown overlay type '{tag}' in '{expr}'; supported types: dir, skill, ssh, env, context"
@@ -475,3 +482,26 @@ impl EffectiveConfig {
 // ─── WI-0087: context() overlay parsing ──────────────────────────────────────
 
 // ─── WI-0087: EffectiveConfig::collected_overlays with context overlays ─────────────────
+
+#[cfg(test)]
+mod context_key_tests {
+    use super::*;
+    #[test]
+    fn keyed_repo_overlay_uses_the_shared_grammar() {
+        let parsed = parse_overlay_list("context(repo@my-key:ro)").unwrap();
+        let TypedOverlay::Context(spec) = &parsed[0] else {
+            panic!("expected context");
+        };
+        assert_eq!(spec.scope, ContextScope::Repo);
+        assert_eq!(spec.permission, OverlayPermission::ReadOnly);
+        assert_eq!(spec.key.as_ref().unwrap().as_str(), "my-key");
+        for raw in [
+            "context(global@key)",
+            "context(workflow@key)",
+            "context(repo@)",
+            "context(repo@BAD)",
+        ] {
+            assert!(parse_overlay_list(raw).is_err(), "{raw}");
+        }
+    }
+}

@@ -7,10 +7,11 @@ description = "Work Server Protocol v1 types and client for awman"
 
 [features]
 default = []
-mock = ["dep:axum", "dep:uuid"]
+mock = ["dep:axum", "dep:uuid", "dep:sha2"]
 terminal = ["dep:tokio-tungstenite", "dep:futures-util"]
 
 [dependencies]
+sha2 = { workspace = true, optional = true }
 base64 = "0.23"
 uuid = { version = "1", features = ["v4", "serde"], optional = true }
 axum = { version = "0.8", features = ["ws"], optional = true }

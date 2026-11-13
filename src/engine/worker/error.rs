@@ -4,6 +4,8 @@ use awman_wsp::codes;
 
 #[derive(Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WorkerEngineError {
+    #[error("{message}")]
+    Context { code: &'static str, message: String },
     /// `409 lease_lost`: the lease expired and was re-issued. The caller must
     /// stop the run, cancel its containers and discard its result.
     #[error("the work server reports the lease was lost")]

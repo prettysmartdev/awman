@@ -3,6 +3,8 @@
 
 pub mod affinity;
 pub mod client;
+pub mod context;
+pub use context::*;
 pub mod conformance;
 pub mod labels;
 #[cfg(feature = "mock")]

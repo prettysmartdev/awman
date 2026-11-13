@@ -236,6 +236,12 @@ impl WorkerServices {
                 tracing::info!(session_id = %sid, commands = cmd_count, "Purging stale closed session");
             }
         }
+        if let Ok(resolver) =
+            crate::data::fs::context_dirs::ContextDirResolver::from_env(&config.env)
+        {
+            crate::command::context::retention::ScratchRetention::new(paths.clone(), resolver)
+                .sweep_at_startup(&store);
+        }
         match lifecycle_store.prune_orphans() {
             Ok(0) => {}
             Ok(pruned) => tracing::info!(pruned, "Pruned lifecycle rows of purged sessions"),
@@ -279,6 +285,10 @@ impl WorkerServices {
                     },
                 ) {
                     Ok(mut session) => {
+                        crate::command::context::session_binding::apply(
+                            &mut session,
+                            rec.context_key.as_deref(),
+                        );
                         if rec.session_type == "remote" {
                             if let Some(cloned) = rec.cloned_path.as_deref() {
                                 // Rows written before WI 0133 have no repo_url/branch

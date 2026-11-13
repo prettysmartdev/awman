@@ -110,6 +110,11 @@ fn context(collected: &CollectedOverlays) -> String {
                 ContextScope::Repo => ("context(repo)", "/awman/context/repo"),
                 ContextScope::Workflow => unreachable!("filtered out above"),
             };
+            let name = if let Some(key) = &spec.key {
+                format!("context(repo@{})", key.as_str())
+            } else {
+                name.to_owned()
+            };
             format!(
                 "- `{name}` → `{path}` ({})",
                 permission_word(spec.permission)

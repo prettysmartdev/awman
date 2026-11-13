@@ -85,6 +85,8 @@ async fn regression_3e8d7e6c_reissued_lease_fences_every_old_epoch_call() {
     assert_eq!(session.post_events(&old, &[]).await.unwrap_err(), LeaseLost);
     assert_eq!(session.credentials(&old).await.unwrap_err(), LeaseLost);
     let result = LeaseResult {
+        context_changes: None,
+        workflow_context: None,
         result: CommandResult::default(),
         outputs: None,
         outputs_mounted: false,
