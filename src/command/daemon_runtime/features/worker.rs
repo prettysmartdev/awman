@@ -272,16 +272,29 @@ impl<F: ApiCommandFrontendFactory + 'static> DaemonFeature for WorkerFeature<F> 
         if let Some(pull) = self.pull.get() {
             pull.stop_now().await;
         }
-        for task in self.aborts.lock().unwrap().drain(..) {
+        let setup_tasks = std::mem::take(&mut *self.shared.task_handles.lock().await);
+        for task in &setup_tasks {
             task.abort();
         }
-        for task in self.shared.task_handles.lock().await.iter() {
-            task.abort();
+        // Aborting schedules destruction; it does not release SQLite/files
+        // synchronously. Join setup tasks before reporting shutdown complete.
+        for task in setup_tasks {
+            let _ = task.await;
         }
         if let Some(task) = self.pool_abort.lock().unwrap().take() {
             task.abort();
         }
         self.drain().await;
+        // The pool owns the worker JoinHandles. Once it has stopped, wait
+        // for its aborted workers to actually drop their state too. Collect
+        // after stopping the pool so no worker can be added behind this list.
+        let workers = std::mem::take(&mut *self.aborts.lock().unwrap());
+        for task in &workers {
+            task.abort();
+        }
+        while workers.iter().any(|task| !task.is_finished()) {
+            tokio::task::yield_now().await;
+        }
     }
     fn status(&self) -> FeatureStatus {
         let queued = self

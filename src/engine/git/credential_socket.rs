@@ -42,7 +42,7 @@ use super::transport::CredentialHelper;
 use crate::data::git_transport::GitAuthSpec;
 use crate::engine::error::EngineError;
 
-/// Environment variable naming the host helper's socket (a path, never a secret).
+/// Environment variable naming the host helper endpoint (never a secret).
 pub const GIT_CREDENTIAL_SOCKET_ENV: &str = crate::data::config::env::AWMAN_GIT_CREDENTIAL_SOCKET;
 /// Where a command's container listener directory is mounted.
 pub const CONTAINER_CREDENTIAL_DIR: &str = "/awman/git-credential";
@@ -481,10 +481,10 @@ fn socket_path(dir: &Path, name: &str) -> PathBuf {
     #[cfg(windows)]
     {
         let _ = (dir, name);
-        PathBuf::from(format!(
-            r"\\.\pipe\awman-git-{}",
-            uuid::Uuid::new_v4().simple()
-        ))
+        // Git for Windows invokes helpers through MSYS, which translates
+        // path-like environment values. Carry an opaque name across that
+        // boundary and add the native pipe namespace inside the helper.
+        PathBuf::from(format!("awman-git-{}", uuid::Uuid::new_v4().simple()))
     }
     #[cfg(not(windows))]
     {

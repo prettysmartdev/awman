@@ -507,8 +507,9 @@ mod transport_contract_tests {
                         .unwrap()
                         .contains("test-secret-adapter"));
                     if matches!(event.payload, EventPayload::PushRetry { .. }) {
+                        let cancelled_at = std::time::Instant::now();
                         stop.cancel();
-                        break;
+                        break cancelled_at;
                     }
                 }
             });
@@ -523,7 +524,6 @@ mod transport_contract_tests {
             .unwrap();
             std::fs::write(clone.join("command-result"), format!("next {operation}")).unwrap();
             mode.store(operation, Ordering::SeqCst);
-            let start = std::time::Instant::now();
             let error = publish_after_success(
                 git.clone(),
                 record.clone(),
@@ -535,9 +535,11 @@ mod transport_contract_tests {
             )
             .await
             .unwrap_err();
-            watcher.await.unwrap();
+            let cancelled_at = watcher.await.unwrap();
             assert_eq!(error.code(), "cancelled");
-            assert!(start.elapsed() < Duration::from_secs(2));
+            // Bound cancellation latency, excluding the metadata copy,
+            // commit and first remote attempt before cancellation is requested.
+            assert!(cancelled_at.elapsed() < Duration::from_secs(2));
             assert_eq!(http.receive_packs(), 1, "no push after cancellation");
         }
     }

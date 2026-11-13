@@ -54,6 +54,14 @@ fn docker_and_apple_deliver_git_cache_credentials_only_on_private_stdin() {
         container.seed_git_credentials(&seed).unwrap();
         container.kill().unwrap();
         let calls = fake.calls();
+        let launch = calls
+            .iter()
+            .find(|call| call.argv.first().is_some_and(|arg| arg == "run"))
+            .unwrap();
+        assert_eq!(
+            &launch.argv[launch.argv.len() - 4..],
+            ["--entrypoint", "sleep", "fixture:local", "infinity"]
+        );
         let exec = calls
             .iter()
             .find(|call| call.argv.first().is_some_and(|a| a == "exec"))

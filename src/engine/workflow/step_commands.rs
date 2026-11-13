@@ -22,7 +22,7 @@ pub enum PushAuth {
         env_var: String,
     },
     /// WI 0145: a push session's caller credential through the command's
-    /// mounted `credential-cache` socket (`socket` is the container path).
+    /// private `credential-cache` socket (`socket` is the container path).
     /// The container needs only Git; the listener answers for the session's
     /// repository host only.
     SessionSocket {

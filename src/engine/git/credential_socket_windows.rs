@@ -9,7 +9,7 @@ pub(super) fn serve(
     _same_uid: bool,
     stop: Arc<AtomicBool>,
 ) -> Result<Serving> {
-    let path = path.to_path_buf();
+    let path = pipe_path(path)?;
     let active = Arc::new(AtomicBool::new(false));
     let serving = active.clone();
     let (ready, started) = std::sync::mpsc::sync_channel(1);
@@ -95,6 +95,7 @@ pub(super) fn exchange(socket: &Path, body: &[u8]) -> Result<Vec<u8>> {
     if body.len() as u64 > MAX_REQUEST_BYTES {
         return Err(cfg_err("credential request too large"));
     }
+    let socket = pipe_path(socket)?;
     // The helper is synchronous and can also be embedded in a Tokio caller.
     std::thread::scope(|scope| {
         scope
@@ -106,7 +107,8 @@ pub(super) fn exchange(socket: &Path, body: &[u8]) -> Result<Vec<u8>> {
                 runtime.block_on(async {
                     tokio::time::timeout(IO_TIMEOUT, async {
                         let mut pipe = loop {
-                            match tokio::net::windows::named_pipe::ClientOptions::new().open(socket)
+                            match tokio::net::windows::named_pipe::ClientOptions::new()
+                                .open(&socket)
                             {
                                 Ok(pipe) => break pipe,
                                 Err(error) if error.raw_os_error() == Some(231) => {
@@ -134,4 +136,17 @@ pub(super) fn exchange(socket: &Path, body: &[u8]) -> Result<Vec<u8>> {
             .join()
             .map_err(|_| cfg_err("credential pipe client failed"))?
     })
+}
+
+fn pipe_path(endpoint: &Path) -> Result<PathBuf> {
+    let name = endpoint
+        .to_str()
+        .ok_or_else(|| cfg_err("invalid credential pipe name"))?;
+    let nonce = name
+        .strip_prefix("awman-git-")
+        .ok_or_else(|| cfg_err("invalid credential pipe name"))?;
+    if nonce.len() != 32 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(cfg_err("invalid credential pipe name"));
+    }
+    Ok(PathBuf::from(format!(r"\\.\pipe\{name}")))
 }

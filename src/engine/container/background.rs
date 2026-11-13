@@ -203,7 +203,7 @@ pub(super) fn default_start_background(
     let mut args = build_start_background_argv(&name, image, workdir, env, overlays);
     // Insert names before the image; values exist only in the CLI child env.
     for (key, _) in secret_env {
-        args.splice(args.len() - 3..args.len() - 3, ["-e".into(), key.clone()]);
+        args.splice(args.len() - 2..args.len() - 2, ["-e".into(), key.clone()]);
     }
 
     let mut command = cli.command();
@@ -313,9 +313,10 @@ pub(super) fn build_start_background_argv(
         args.push(k.clone());
     }
 
-    // Image and idle entrypoint.
+    // Override image entrypoints (for example alpine/git's `git`): the
+    // background container must stay alive to accept subsequent exec calls.
+    args.extend(["--entrypoint".into(), "sleep".into()]);
     args.push(image.to_string());
-    args.push("sleep".into());
     args.push("infinity".into());
 
     args
