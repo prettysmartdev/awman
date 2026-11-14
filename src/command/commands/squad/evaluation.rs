@@ -1233,7 +1233,6 @@ fn squad_workflow_flags(
         overlay: overlays.to_vec(),
         agent_flags: None,
         max_concurrent: None,
-        issue_source: Default::default(),
         dynamic: false,
         on_dirty_merge_target: None,
         on_merge_failure: None,

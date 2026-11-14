@@ -47,6 +47,7 @@ pub struct ExecWorkflowCommandFlags {
     /// invocations with `None` produce the existing missing-required-argument
     /// error.
     pub workflow: Option<PathBuf>,
+    /// Raw `--work-item` reference, as the user wrote it (WI 0147).
     pub work_item: Option<String>,
     pub non_interactive: bool,
     pub plan: bool,
@@ -62,7 +63,6 @@ pub struct ExecWorkflowCommandFlags {
     /// config `agentFlags` apply.
     pub agent_flags: Option<Vec<String>>,
     pub max_concurrent: Option<usize>,
-    pub issue_source: crate::engine::issue::IssueSourceFlags,
     /// When true, a leader agent designs and runs a workflow for the work item.
     /// Implies `--yolo`, `--worktree`, and `context(workflow)`.
     pub dynamic: bool,
@@ -189,7 +189,7 @@ pub trait ExecWorkflowCommandFrontend:
     /// workflow starts; the rest return immediately.
     fn notify_dynamic_workflow_resume_unavailable(
         &mut self,
-        work_item: u32,
+        work_item: &str,
         reason: &str,
     ) -> Result<(), CommandError>;
 }
@@ -217,6 +217,7 @@ pub struct WorkflowResumePrompt {
     /// The work item this run is bound to, when there is one.
     pub work_item: Option<u32>,
     /// The worktree the previous run left behind, when the run used one.
+    pub work_item_key: Option<String>,
     pub worktree_path: Option<PathBuf>,
     /// True when this is a `--dynamic` resume, meaning accepting it also skips
     /// a leader-design pass.
@@ -279,12 +280,23 @@ impl WorkflowResumePrompt {
             fresh_label,
             workflow_name,
             work_item,
+            work_item_key: None,
             worktree_path,
             dynamic,
             completed_steps,
             total_steps,
             start_points,
         }
+    }
+
+    pub fn with_work_item_key(mut self, key: Option<String>) -> Self {
+        if let Some(key) = &key {
+            if self.work_item.is_none() {
+                self.body.insert_str(0, &format!("Work item: {key}\n\n"));
+            }
+        }
+        self.work_item_key = key;
+        self
     }
 
     /// The unattended answer: pick up at the step the previous run stopped on,
@@ -438,9 +450,6 @@ impl ExecWorkflowCommand {
                 &ctx.path(),
             )?,
             max_concurrent: None, // `--set workflows.maxConcurrentSteps=…` (WI 0139)
-            issue_source: crate::engine::issue::IssueSourceFlags {
-                issue: ctx.flags.string("issue"),
-            },
             dynamic: ctx.flags.bool("dynamic"),
             leader: ctx.flags.string("leader"),
             on_dirty_merge_target: crate::command::dispatch::parse_on_dirty_merge_target(
@@ -456,7 +465,7 @@ impl ExecWorkflowCommand {
                 &ctx.path(),
             )?,
         };
-        validate_dynamic_flags(&flags)?;
+        validate_dynamic_flags(&flags, ctx.session.inline_work_item().is_some())?;
         if !flags.dynamic && flags.workflow.is_none() {
             return Err(CommandError::missing_required_argument(
                 &ctx.path(),
@@ -536,7 +545,6 @@ mod dynamic;
 mod execute;
 mod factory;
 
-mod issue;
 mod merge_fix_prompt;
 mod phase_container;
 mod prepare;
@@ -551,7 +559,6 @@ mod contract_tests;
 // lets each one say `use super::*;` and see the others, exactly as they all
 // saw each other when this was one file.
 pub(super) use factory::*;
-pub(super) use issue::*;
 pub(super) use prepare::*;
 pub(super) use prerequisites::*;
 

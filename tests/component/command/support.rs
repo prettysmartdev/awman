@@ -88,5 +88,6 @@ pub fn prompt(text: &str) -> CommandSubmission {
         subcommand: "exec prompt".into(),
         args: vec![text.into()],
         labels: Labels::empty(),
+        work_item: None,
     }
 }

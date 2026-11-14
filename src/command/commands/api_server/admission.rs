@@ -45,6 +45,9 @@ pub struct CommandSubmission {
     pub subcommand: String,
     pub args: Vec<String>,
     pub labels: Labels,
+    /// Inline work item (WI 0147); validated here and staged privately when
+    /// the command is enqueued.
+    pub work_item: Option<crate::data::work_item::InlineWorkItemInput>,
 }
 
 /// Durable admission plus the plan the host presents during asynchronous setup.
@@ -135,9 +138,39 @@ impl CommandSubmission {
                     .collect(),
             });
         }
-        catalogue
+        let parsed = catalogue
             .parse_raw_args_with_profile(&path, &self.args, frontend)
-            .map_err(AdmissionError::CommandValidation)
+            .map_err(AdmissionError::CommandValidation)?;
+        self.validate_inline_work_item(&parsed, &catalogue.canonical_path(&path))?;
+        Ok(parsed)
+    }
+
+    /// An inline work item is read-only input to a command that reads one. It
+    /// replaces `--work-item`, never accompanies it. The parsed flag is
+    /// checked, not argv text, because prompt text is data.
+    fn validate_inline_work_item(
+        &self,
+        parsed: &ParsedArgs,
+        canonical: &[&str],
+    ) -> Result<(), AdmissionError> {
+        let Some(work_item) = &self.work_item else {
+            return Ok(());
+        };
+        let reject =
+            |reason: String| AdmissionError::CommandValidation(CommandError::Other(reason));
+        if !matches!(canonical, ["exec", "prompt" | "workflow"]) {
+            return Err(reject(format!(
+                "work_item is only accepted for exec prompt and exec workflow, not `{}`",
+                self.subcommand
+            )));
+        }
+        if parsed.has_flag("work-item") {
+            return Err(reject(
+                "work_item and --work-item are mutually exclusive: send one work item source"
+                    .into(),
+            ));
+        }
+        work_item.validate().map_err(reject)
     }
 }
 
@@ -617,10 +650,21 @@ impl ApiAdmission {
         let log_path = self.paths.command_log_path(session_id, command_id);
 
         let id = crate::data::ids::CommandId::parse(command_id).expect("generated command id");
+        // Stage an inline work item privately before the row exists. The
+        // queued command id is the durable anchor that finds it again.
+        let inline_store = super::inline_work_item::InlineWorkItemStore::new(self.paths.clone());
+        if let Some(work_item) = &body.work_item {
+            inline_store
+                .stage(session_id, command_id, work_item)
+                .map_err(|e| storage("Failed to stage the inline work item", e))?;
+        }
         if let Some(secrets) = body.secrets.as_ref().filter(|s| !s.is_empty()) {
             self.lifecycle_store
                 .record_secret_names(&id, &secrets.names().collect::<Vec<_>>())
-                .map_err(|e| storage("Failed to record command secret names", e))?;
+                .map_err(|e| {
+                    inline_store.discard(session_id, command_id);
+                    storage("Failed to record command secret names", e)
+                })?;
             self.engines
                 .ephemeral_secrets
                 .insert(id.clone(), secrets.clone());
@@ -636,6 +680,7 @@ impl ApiAdmission {
             &self.request_context,
             body.allow_remote_input,
         ) {
+            inline_store.discard(session_id, command_id);
             self.engines.ephemeral_secrets.remove(&id);
             let _ = self.lifecycle_store.remove_secret_names(&id);
             tracing::error!(error = %e, "Failed to enqueue command");

@@ -411,6 +411,10 @@ pub struct Session {
     repo_context: RepoContextBinding,
     id: SessionId,
     inline_work_item: Option<PathBuf>,
+    /// The typed form of a pushed API inline work item (title and stable
+    /// source id); its body is `inline_work_item`. `None` for the path-only
+    /// pulled-lease input.
+    staged_work_item: Option<crate::data::work_item::StagedInlineWorkItem>,
     session_type: SessionType,
     git_root: PathBuf,
     definition_root: PathBuf,
@@ -543,6 +547,8 @@ impl Session {
     ///   a security control;
     /// - the repo `agent`, which decides the agent a step runs when it names
     ///   none (and so which agent `--agent-flag` targets);
+    /// - the repo `workItems` block, so references, providers and the draft
+    ///   template resolve exactly as they did for the invoking checkout;
     /// - the env, flags and global config, so a relocated `AWMAN_HOME`
     ///   is honoured exactly as the invoker honoured it.
     /// - the definition root, so uncommitted agent definitions and their
@@ -592,6 +598,10 @@ impl Session {
                 .get_or_insert_with(Default::default)
                 .default = invoker_agent;
         }
+        // Work item settings (source, providers, dir, template) are the
+        // invoker's: a branch checkout must not redirect where drafts are
+        // published or which tracker a step's references resolve against.
+        layers.repo.work_items = invoker_layers.repo.work_items.clone();
         layers.global = invoker_layers.global.clone();
         layers.env = invoker_layers.env.clone();
         session.config =
@@ -617,6 +627,7 @@ impl Session {
         Ok(Self {
             id: SessionId::new(),
             inline_work_item: invoker.inline_work_item.clone(),
+            staged_work_item: invoker.staged_work_item.clone(),
             repo_context: invoker.repo_context.clone(),
             session_type: SessionType::Local {
                 workdir: working_dir,
@@ -663,6 +674,7 @@ impl Session {
         Ok(Self {
             id: SessionId::new(),
             inline_work_item: None,
+            staged_work_item: None,
             repo_context: RepoContextBinding::Inferred,
             session_type: SessionType::Local {
                 workdir: working_dir,
@@ -684,6 +696,15 @@ impl Session {
 
     pub fn set_inline_work_item(&mut self, path: PathBuf) {
         self.inline_work_item = Some(path);
+    }
+    /// Attach a pushed inline work item with its caller-supplied title and
+    /// stable source id, so the resolver never has to synthesize them.
+    pub fn set_staged_work_item(&mut self, staged: crate::data::work_item::StagedInlineWorkItem) {
+        self.inline_work_item = Some(staged.body_path.clone());
+        self.staged_work_item = Some(staged);
+    }
+    pub fn staged_work_item(&self) -> Option<&crate::data::work_item::StagedInlineWorkItem> {
+        self.staged_work_item.as_ref()
     }
     pub fn inline_work_item(&self) -> Option<&Path> {
         self.inline_work_item.as_deref()

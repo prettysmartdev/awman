@@ -152,6 +152,25 @@ impl ContextDirResolver {
     pub fn keyed_tmp_dir(&self) -> PathBuf {
         self.awman_home.join("context/repo/_keyed/.tmp")
     }
+    /// Paths of one work item draft: `<repo context dir>/scratch/work-items/<uuid>.md`
+    /// on the host, `/awman/context/repo/scratch/work-items/<uuid>.md` in the
+    /// container. Pure path construction; creation checks containment.
+    pub fn work_item_draft_paths(
+        &self,
+        remote_url: Option<&str>,
+        git_root: &Path,
+        id: uuid::Uuid,
+    ) -> crate::data::fs::work_item_draft::WorkItemDraftPaths {
+        let file = format!("{id}.md");
+        crate::data::fs::work_item_draft::WorkItemDraftPaths {
+            host_path: self
+                .repo_dir(remote_url, git_root)
+                .join("scratch")
+                .join("work-items")
+                .join(&file),
+            container_path: PathBuf::from("/awman/context/repo/scratch/work-items").join(file),
+        }
+    }
     pub fn lease_repo_root(&self) -> PathBuf {
         self.awman_home.join("context/repo/_lease")
     }

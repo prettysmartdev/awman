@@ -12,6 +12,7 @@ pub mod admission;
 pub mod cancel;
 pub mod command_log_stream;
 pub mod event_bus;
+pub mod inline_work_item;
 pub mod owned_runtime;
 pub mod push_back;
 pub mod push_job;

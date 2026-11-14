@@ -26,7 +26,36 @@ awman exec workflow --dynamic --work-item 42
 awman exec workflow --dynamic --work-item 42 --leader claude::claude-opus-4-8
 ```
 
-`--work-item` is required with `--dynamic`. Without it, awman cannot provide the leader agent with the work item it is designing the workflow for.
+`--work-item` is required with `--dynamic`. Without it, awman cannot provide the leader agent with the work item it is designing the workflow for, and the command fails before launch.
+
+## Work item inputs
+
+Pass a local work item or an external reference through the same flag:
+
+```sh
+# A local numbered file, using workItems.source = "local"
+awman exec workflow --dynamic --work-item 42
+
+# Explicit GitHub issue, independent of the configured default
+awman exec workflow --dynamic --work-item github:42
+
+# Explicit local path
+awman exec workflow --dynamic --work-item docs/requests/import.md
+```
+
+A bare value is resolved according to `workItems.source`: `local` looks in
+`workItems.dir`, `github` looks on the repository's GitHub `origin`, and
+`http:<name>` uses that globally configured HTTP provider. Explicit local
+paths, GitHub references (`github:<N>`, `#<N>`, `owner/repo#N`, or a GitHub
+issue URL), and HTTP provider IDs or URLs select their source directly. A
+missing or unreadable item is an error; dynamic workflows do not start without
+their required input. See [Work item source configuration](07-configuration.md#work-item-sources).
+
+For ordinary `exec workflow` runs, the resolved item's content is available
+to workflow templates as `{{work_item_content}}`; numbered items also
+provide `{{work_item_number}}` and `{{work_item}}`. Use
+`{{work_item_section:[Name]}}` to include a named section. These variables
+come from the resolved work item, whether it is local or remote.
 
 ## Workflow prerequisites
 

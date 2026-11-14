@@ -507,12 +507,17 @@ After creating the file, prompts for a brief summary of the work, then launches 
 
 In the TUI, a freeform text box dialog opens for the summary input. Use **Ctrl+Enter** to submit or **Esc** to cancel.
 
-### Creating a spec from a GitHub issue
+### Creating a local spec from a GitHub issue
+
+These examples use the default `workItems.source = "local"`, so the issue
+seeds a new local spec. If your configured creation target is that same
+GitHub repository, awman prevents duplicating the issue and recommends
+`specs amend` instead.
 
 ```sh
-awman new spec --issue 84                                                      # bare number
-awman new spec --issue prettysmartdev/awman#84                                 # owner/repo shorthand
-awman new spec --issue https://github.com/prettysmartdev/awman/issues/84      # full URL
+awman new spec --work-item github:84                                               # issue 84 on origin
+awman new spec --work-item prettysmartdev/awman#84                                 # owner/repo shorthand
+awman new spec --work-item https://github.com/prettysmartdev/awman/issues/84      # full URL
 ```
 
 Fetches the GitHub issue and launches an agent to generate a structured work item spec from its content. Combined with `--interview`, the issue description is pre-populated in the text box for editing before the agent runs.
@@ -1053,8 +1058,7 @@ Each step's `status` is `ok`, `skipped`, `warn`, `failed`, `pending` or `running
 | `--worktree` | — | — | ✓ | Run in an isolated, managed Git worktree (a switch on this command) |
 | `--auto` | ✓ | ✓ | ✓ | Auto-approve file edits, prompt for shell commands |
 | `--yolo` | ✓ | ✓ | ✓ | Fully autonomous mode |
-| `--work-item <N>` | — | — | ✓ | Work item number for template variable substitution |
-| `--issue <N\|URL>` | — | ✓ | ✓ | Use a GitHub issue as the prompt / work item input — see [GitHub Integration](10-github-integration.md) |
+| `--work-item <REF>` | — | ✓ | ✓ | Supply a local or external work item; see [GitHub Integration](10-github-integration.md) |
 | `--dynamic` | — | — | ✓ | Have a leader agent design the workflow; implies `--yolo`, `--worktree`, `context(workflow)` |
 | `--leader <agent::model>` | — | — | ✓ | Leader agent and model for `--dynamic` |
 | `--on-existing-worktree`, `--on-dirty-merge-target`, `--on-merge-failure` | — | — | ✓ | Answer worktree lifecycle questions up front — see [Workflows](05-workflows.md#worktrees) |

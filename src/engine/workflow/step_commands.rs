@@ -437,7 +437,13 @@ pub fn substitute_teardown_step(
         TeardownStep::CreatePullRequest { title, body, base } => {
             let resolved_title = match title {
                 Some(t) => Some(sub(t, ctx)),
-                None => ctx.map(|wi| format!("Implement awman/work-item-{:04}", wi.number)),
+                None => ctx.map(|wi| {
+                    if wi.title.is_empty() {
+                        format!("Implement awman/work-item-{}", wi.key)
+                    } else {
+                        wi.title.clone()
+                    }
+                }),
             };
             let resolved_body = match body {
                 Some(b) => Some(sub(b, ctx)),

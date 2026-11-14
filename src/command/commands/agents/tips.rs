@@ -25,7 +25,7 @@ pub const TIPS: &[&str] = &[
     "`awman chat --plan` starts the agent in read-only plan mode.",
     "`awman chat --agent gemini --model <model>` overrides the agent and model for one session.",
     "`awman exec prompt \"<text>\"` sends a one-shot prompt to the agent.",
-    "`awman exec prompt --issue 42` uses a GitHub issue as the prompt.",
+    "`awman exec prompt --work-item github:42` uses a GitHub issue as the prompt.",
     "`--yolo` enables fully autonomous mode; `--auto` enables auto permission mode.",
     "`--agent-flag=--verbose` passes an extra argument straight to the agent command.",
     "`--set agents.launchMode=acp` launches the agent over ACP instead of a raw terminal.",
@@ -33,7 +33,7 @@ pub const TIPS: &[&str] = &[
     // ── Workflows ────────────────────────────────────────────────────────────
     "`awman exec workflow <file>` (or `awman exec wf`) runs a multi-step workflow.",
     "`awman exec workflow <file> --work-item 0042` fills workflow templates from a work item.",
-    "`awman exec workflow <file> --issue 42` runs a workflow against a GitHub issue.",
+    "`awman exec workflow <file> --work-item owner/repo#42` runs a workflow against a GitHub issue.",
     "`awman exec workflow --dynamic --work-item 0042` lets a leader agent design the workflow.",
     "`awman exec workflow <file> --worktree` runs in an isolated Git worktree.",
     "`--yolo` and `--auto` on a workflow imply `--worktree`, keeping your checkout untouched.",
@@ -49,7 +49,7 @@ pub const TIPS: &[&str] = &[
     "Use Shift+← / Shift+→ to scroll workflow stages that don't fit on screen.",
     // ── Specs and skills ─────────────────────────────────────────────────────
     "`awman new spec` creates a work item from `aspec/work-items/0000-template.md`.",
-    "`awman new spec --issue 42` turns a GitHub issue into a work item spec.",
+    "`awman new spec --work-item github:42` turns a GitHub issue into a work item spec.",
     "`awman specs amend 0042` updates a completed work item to match what was actually built.",
     "`awman new skill` creates a skill; add `--global` to share it with every repo.",
     "`awman new skill --pull github.com/obra/superpowers` pulls a published skills library.",

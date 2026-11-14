@@ -32,8 +32,8 @@ pub struct FlagConfig {
     pub overlays_raw: Option<Vec<String>>,
     /// `--remote-session <id>`.
     pub remote_session: Option<String>,
-    /// `--work-item <N>`.
-    pub work_item: Option<u32>,
+    /// Raw `--work-item <reference>`, resolved by the command.
+    pub work_item: Option<String>,
     /// `--agent-flag <ARG>` (repeatable): extra arguments for the agent this
     /// invocation launches. Replaces that agent's `agents.flags` config entry.
     pub agent_flags: Option<Vec<String>>,

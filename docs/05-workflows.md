@@ -28,8 +28,8 @@ awman exec workflow aspec/workflows/implement-hard.toml
 # Run a workflow and associate a work item for template variable substitution
 awman exec workflow aspec/workflows/implement-hard.toml --work-item 0027
 
-# Run a workflow against a GitHub issue
-awman exec workflow aspec/workflows/implement-hard.toml --issue 84
+# Run a workflow against a GitHub issue, regardless of workItems.source
+awman exec workflow aspec/workflows/implement-hard.toml --work-item github:84
 
 # Run a workflow without a work item
 awman exec workflow aspec/workflows/dependency-upgrade.toml
@@ -38,7 +38,7 @@ awman exec workflow aspec/workflows/dependency-upgrade.toml
 awman exec workflow --dynamic --work-item 42
 ```
 
-Use `exec workflow` to run any workflow file. If you don't want to write a workflow file yourself, see [Dynamic Workflows](06-dynamic-workflows.md) — `--dynamic` launches a leader agent that designs a purpose-built workflow for your work item and then executes it automatically. The work item is optional — associate one with `--work-item` if you want template variable substitution, or with `--issue` to use a GitHub issue directly. See [API mode](09-api-and-remote-mode.md) for usage in CI and scripting contexts. For more on GitHub integration, see [GitHub Integration](10-github-integration.md).
+Use `exec workflow` to run any workflow file. If you don't want to write a workflow file yourself, see [Dynamic Workflows](06-dynamic-workflows.md) — `--dynamic` launches a leader agent that designs a purpose-built workflow for its required work item and then executes it automatically. A regular workflow can run without a work item; associate one with `--work-item` for template substitution. A missing or unreadable reference is an error, and dynamic workflows require an item. See [API mode](09-api-and-remote-mode.md) for usage in CI and scripting contexts. For GitHub issues, see [GitHub Integration](10-github-integration.md).
 
 The TUI shows the **Workflow Overview** between the execution window and the command box, with one coloured box per step. After each step completes, a confirmation dialog appears — press **Enter** to advance, **q** to pause. State is saved to disk so you can resume later.
 
@@ -816,7 +816,7 @@ Template variables are substituted in step `prompt` values and in the string fie
 | `{{work_item_content}}` | Full text of the work item Markdown file |
 | `{{work_item_section:[Name]}}` | Content of the named `## Name` section from the work item file (case-insensitive heading match, trailing colons stripped) |
 
-All variables need a work item: pass `--work-item` or `--issue`. Without one, `{{work_item*}}` placeholders are replaced with empty strings and a warning is emitted.
+When a work item is supplied, its content and available number are substituted for these variables. Without an item, `{{work_item*}}` placeholders are replaced with empty strings and a warning is emitted. A reference that does not resolve is an error; awman does not continue with an empty substitute.
 
 A section that the work item does not have is replaced with an empty string. Any other `{{...}}` text is left as written.
 
@@ -904,7 +904,7 @@ awman ready --agent codex
 
 This check applies to the Docker and Apple Containers runtimes, which build images; when the runtime itself is unreachable, the run reports that instead. A [dynamic workflow](06-dynamic-workflows.md) checks the generated workflow's agents after the leader finishes and builds any missing image from `.awman/Dockerfile.<agent>` before the first step; a failed build stops the run.
 
-**Builtin runtime.** Image preparation for workflows (and squad) is import-only: it never starts a host build, even when `runtime.builtin.builder.enabled` is true, but it re-acquires an image that was installed from a different source than the one now configured (an installed image with no configured source is kept). A step that runs an agent other than the repo's default one stops when `runtime.builtin.imageSource` names a single image (an archive, or a fixed `reference`): give that agent its own `runtime.builtin.images` entry. In a worktree, the repo's `runtime.builtin` settings and default `agents.default` come from the checkout you launched from, not the worktree's commit. If a required agent image is not imported, the run stops and tells you to prepare it with `awman ready` (or to configure an image source). Setup and teardown steps run in the imported agent image of the repo's configured agent (or in the `runtime.baseImage` you set, which must also be imported). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
+**Builtin runtime.** Image preparation for workflows (and squad) is import-only: it never starts a host build, even when `runtime.builtin.builder.enabled` is true, but it re-acquires an image that was installed from a different source than the one now configured (an installed image with no configured source is kept). A step that runs an agent other than the repo's default one stops when `runtime.builtin.imageSource` names a single image (an archive, or a fixed `reference`): give that agent its own `runtime.builtin.images` entry. In a worktree, the repo's `runtime.builtin` settings, default `agents.default` and `workItems` settings come from the checkout you launched from, not the worktree's commit. If a required agent image is not imported, the run stops and tells you to prepare it with `awman ready` (or to configure an image source). Setup and teardown steps run in the imported agent image of the repo's configured agent (or in the `runtime.baseImage` you set, which must also be imported). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
 
 ### Unknown agents
 
@@ -1031,7 +1031,7 @@ The main `exec workflow` flags (see the [Command Reference](14-command-reference
 
 | Flag | Description |
 |------|-------------|
-| `--work-item <N>` / `--issue <REF>` | Supply a work item (a local spec, or a GitHub issue number, URL or `owner/repo#N`) for [template variables](#template-variables) |
+| `--work-item <REF>` | Supply a local or external work item for [template variables](#template-variables). Bare values follow `workItems.source`; explicit local, GitHub and HTTP references select their source |
 | `--agent <NAME>` | Default agent for steps that don't name one (a workflow-level `agent` takes precedence) |
 | `--model <NAME>` | Default model for steps that don't set one (a workflow-level `model` takes precedence) |
 | `--agent-flag=<ARG>` | Extra argument for the default agent's command, replacing its `agents.flags` entry. Repeatable |

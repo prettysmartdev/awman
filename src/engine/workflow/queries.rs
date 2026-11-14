@@ -208,11 +208,8 @@ impl WorkflowEngine {
             steps.push((step.name.clone(), state));
         }
 
-        let work_item_number = self.work_item_context.as_ref().map(|c| c.number);
-        let work_item_title = self
-            .work_item_context
-            .as_ref()
-            .and_then(|c| c.content.lines().next().map(|l| l.trim().to_string()));
+        let work_item_number = self.work_item_context.as_ref().and_then(|c| c.number);
+        let work_item_title = self.work_item_context.as_ref().map(|c| c.title.clone());
 
         Some(CtxStepInfo {
             workflow_title: title,

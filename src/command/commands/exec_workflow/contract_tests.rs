@@ -125,7 +125,7 @@ fn minimal_recovery_traces_prioritize_failure_over_unfinished_work() {
 
 #[test]
 fn work_item_numbers_reject_overflow_and_keep_hostile_text_as_data() {
-    use super::issue::parse_work_item_number;
+    use crate::command::work_item::parse_work_item_number;
     for (input, expected) in [
         ("WI-0144", Some(144)),
         ("144; codex", Some(144)),
@@ -138,8 +138,8 @@ fn work_item_numbers_reject_overflow_and_keep_hostile_text_as_data() {
 }
 
 #[test]
-fn work_item_lookup_uses_session_scope_and_inline_content_without_executing_it() {
-    use super::issue::find_work_item_file;
+fn work_item_lookup_uses_session_scope_without_executing_content() {
+    use crate::command::work_item::find_work_item_file;
     use crate::data::session::{Session, SessionOpenOptions};
     use awman_test_support::TestSandbox;
     let s = TestSandbox::named("work_item_lookup");
@@ -158,7 +158,7 @@ fn work_item_lookup_uses_session_scope_and_inline_content_without_executing_it()
             })
             .collect(),
     );
-    let mut session = Session::open_at_git_root(
+    let session = Session::open_at_git_root(
         s.work(),
         s.work(),
         SessionOpenOptions {
@@ -168,14 +168,10 @@ fn work_item_lookup_uses_session_scope_and_inline_content_without_executing_it()
     )
     .unwrap();
     assert_eq!(
-        find_work_item_file(&session, &s.work(), 144),
-        Some(item.clone())
+        find_work_item_file(&session, &s.work(), 144).unwrap(),
+        item.clone()
     );
-    assert!(find_work_item_file(&session, &s.work(), 145).is_none());
-    let inline = s.tmp().join("inline.md");
-    std::fs::write(&inline, "untrusted inline work").unwrap();
-    session.set_inline_work_item(inline.clone());
-    assert_eq!(find_work_item_file(&session, &s.work(), 144), Some(inline));
+    assert!(find_work_item_file(&session, &s.work(), 145).is_err());
     assert_eq!(
         std::fs::read_to_string(item).unwrap(),
         "# Task\n$(codex) `claude` ; gemini\n"

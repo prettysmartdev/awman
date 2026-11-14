@@ -205,3 +205,143 @@ fn idempotency_key_boundaries_and_server_failure_release_are_explicit() {
         IdempotencyGate::Fresh(_)
     ));
 }
+
+fn inline_prompt(
+    args: &[&str],
+) -> awman::command::commands::api_server::admission::CommandSubmission {
+    let mut command = prompt("go");
+    command.args = args.iter().map(|a| a.to_string()).collect();
+    command.work_item = Some(awman::data::work_item::InlineWorkItemInput {
+        title: "Fix login".into(),
+        body: "SECRET inline body".into(),
+        id: Some("PROJ-9".into()),
+    });
+    command
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_work_item_is_staged_privately_and_never_stored_in_the_row() {
+    let s = crate::support::sandbox(
+        "command::admission::inline_work_item_is_staged_privately_and_never_stored_in_the_row",
+    );
+    let f = AdmissionFixture::new(&s);
+    let session = f
+        .admission
+        .admit_session(f.local(&s), None, false, None)
+        .await
+        .unwrap();
+    f.store
+        .update_setup_status(&session.session_id, SessionSetupStatus::Ready)
+        .unwrap();
+    let command = f
+        .admission
+        .admit_command(&session.session_id, inline_prompt(&["go"]), None)
+        .await
+        .unwrap();
+    let row = f.store.get_command(&command.command_id).unwrap().unwrap();
+    let stored = format!("{:?}{:?}", row.decode_args().unwrap(), row.subcommand);
+    assert!(
+        !stored.contains("SECRET"),
+        "body leaked into the row: {stored}"
+    );
+    assert!(!command.response_body.contains("SECRET"));
+
+    let store = awman::command::commands::api_server::inline_work_item::InlineWorkItemStore::new(
+        f.paths.clone(),
+    );
+    let staged = store
+        .load(&session.session_id, &command.command_id)
+        .unwrap()
+        .expect("staged for the queued command");
+    assert!(staged.source_id.starts_with("inline:push:"));
+    assert!(staged.source_id.ends_with(":PROJ-9"));
+    assert_eq!(
+        std::fs::read_to_string(&staged.body_path).unwrap(),
+        "SECRET inline body"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inline_work_item_with_a_work_item_flag_is_refused_before_anything_is_queued() {
+    let s = crate::support::sandbox(
+        "command::admission::inline_work_item_with_a_work_item_flag_is_refused_before_anything_is_queued",
+    );
+    let f = AdmissionFixture::new(&s);
+    let session = f
+        .admission
+        .admit_session(f.local(&s), None, false, None)
+        .await
+        .unwrap();
+    f.store
+        .update_setup_status(&session.session_id, SessionSetupStatus::Ready)
+        .unwrap();
+    for args in [
+        vec!["--work-item", "42", "go"],
+        vec!["--work-item=github:42", "go"],
+    ] {
+        match f
+            .admission
+            .admit_command(&session.session_id, inline_prompt(&args), None)
+            .await
+        {
+            Err(AdmissionError::CommandValidation(e)) => {
+                assert!(e.to_string().contains("mutually exclusive"), "{e}")
+            }
+            other => panic!("expected a validation error, got {:?}", other.err()),
+        }
+    }
+    // Prompt text that merely mentions the flag is data, not a flag.
+    f.admission
+        .admit_command(
+            &session.session_id,
+            inline_prompt(&["--", "explain --work-item 42"]),
+            None,
+        )
+        .await
+        .unwrap();
+    // A blank title is refused.
+    let mut blank = inline_prompt(&["go"]);
+    blank.work_item.as_mut().unwrap().title = "  ".into();
+    assert!(matches!(
+        f.admission
+            .admit_command(&session.session_id, blank, None)
+            .await,
+        Err(AdmissionError::CommandValidation(_))
+    ));
+    assert_eq!(
+        f.store
+            .list_commands_for_session(&session.session_id, 10)
+            .unwrap()
+            .len(),
+        1,
+        "only the data-prompt command was queued"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removed_issue_flag_is_refused_with_the_replacement_in_api_args() {
+    let s = crate::support::sandbox(
+        "command::admission::removed_issue_flag_is_refused_with_the_replacement_in_api_args",
+    );
+    let f = AdmissionFixture::new(&s);
+    let session = f
+        .admission
+        .admit_session(f.local(&s), None, false, None)
+        .await
+        .unwrap();
+    f.store
+        .update_setup_status(&session.session_id, SessionSetupStatus::Ready)
+        .unwrap();
+    let mut command = prompt("go");
+    command.args = vec!["--issue".into(), "42".into(), "go".into()];
+    match f
+        .admission
+        .admit_command(&session.session_id, command, None)
+        .await
+    {
+        Err(AdmissionError::CommandValidation(e)) => {
+            assert!(e.to_string().contains("--work-item github:"), "{e}")
+        }
+        other => panic!("expected the replacement error, got {:?}", other.err()),
+    }
+}

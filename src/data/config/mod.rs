@@ -66,7 +66,10 @@ pub use runtime::{RuntimeConfig, RuntimeKind, RuntimeSelection, UnknownRuntimeVa
 pub use squad::SquadConfig;
 pub use state::RepoState;
 pub use tui::TuiConfig;
-pub use work_items::WorkItemsConfig;
+pub use work_items::{
+    validate_provider_name, WorkItemConfigError, WorkItemProviderConfig, WorkItemSource,
+    WorkItemsConfig,
+};
 pub use work_servers::{
     normalize_work_server_name, ClaimMode, ResolvedWorkServer, WorkServerConfig,
 };

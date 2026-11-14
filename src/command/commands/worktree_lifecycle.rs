@@ -370,17 +370,20 @@ impl WorktreeLifecycle {
     /// (WI 0114 F-51). Naming is a property of the run, so it is decided here,
     /// once, and `open` is called once.
     pub fn name_for(
-        issue_slug: Option<&str>,
-        work_item: Option<u32>,
+        work_item: Option<&crate::command::work_item::ResolvedWorkItem>,
         workflow_path: &Path,
     ) -> WorktreeName {
-        // `--issue` outranks `--work-item`, which outranks the workflow file:
-        // the more specific the user was, the more specific the branch name.
-        if let Some(slug) = issue_slug {
-            return WorktreeName::Workflow(slug.to_string());
-        }
-        if let Some(number) = work_item {
-            return WorktreeName::WorkItem(number);
+        if let Some(item) = work_item {
+            if item.is_local() {
+                return match item.number {
+                    Some(number) => WorktreeName::WorkItem(number),
+                    None => WorktreeName::Workflow(item.key.clone()),
+                };
+            }
+            // Include identity so unrelated items with equal titles cannot
+            // share a branch, worktree, or resume state.
+            let slug = item.slug.as_deref().unwrap_or("work-item");
+            return WorktreeName::Workflow(format!("{slug}-{}", item.key));
         }
         WorktreeName::Workflow(
             workflow_path

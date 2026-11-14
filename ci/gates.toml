@@ -263,7 +263,7 @@ contracts = ["unit-awman"]
 requires = []
 paths = []
 always = true
-filter = "test(/^command::commands::exec_workflow::contract_tests::/)"
+filter = "test(/^command::commands::exec_workflow::contract_tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/)"
 
 [suites.component-core-internals]
 tier = "component"
@@ -274,7 +274,7 @@ contracts = ["component-core-internals"]
 requires = []
 paths = []
 always = true
-filter = "not (test(/^command::commands::exec_workflow::contract_tests::/))"
+filter = "not (test(/^command::commands::exec_workflow::contract_tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/))"
 
 
 

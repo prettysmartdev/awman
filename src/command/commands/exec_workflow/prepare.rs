@@ -13,6 +13,43 @@ use crate::data::config::effective::EffectiveConfig;
 use crate::data::session::AgentName;
 use crate::engine::workflow::{PhaseStepRef, RemediationAgentSpec};
 
+pub(crate) fn notify_dynamic_unavailable(
+    item: &WorkItemContext,
+    reason: &str,
+    frontend: &mut dyn ExecWorkflowCommandFrontend,
+) -> Result<(), CommandError> {
+    let identity = item
+        .number
+        .map(|n| format!("{n:04}"))
+        .unwrap_or_else(|| item.key.clone());
+    frontend.notify_dynamic_workflow_resume_unavailable(&identity, reason)
+}
+
+/// Report content drift without redesigning the saved workflow.
+pub(crate) fn report_work_item_drift(
+    current: &WorkItemContext,
+    saved: &crate::data::workflow_state::WorkflowState,
+    sink: &mut dyn UserMessageSink,
+) {
+    let text = match saved.work_item_content_hash.as_deref() {
+        Some(hash) if hash != current.content_hash => Some(format!(
+            "Work item {} changed since the saved workflow was designed; resuming the saved workflow.",
+            current.key,
+        )),
+        None => Some(format!(
+            "The saved workflow for work item {} has no content hash; change detection is unavailable.",
+            current.key,
+        )),
+        _ => None,
+    };
+    if let Some(text) = text {
+        sink.write_message(UserMessage {
+            level: MessageLevel::Warning,
+            text,
+        });
+    }
+}
+
 /// Emit the deprecation warning for `agent`, if its vendor has deprecated it.
 ///
 /// The wording is the one per-agent table's
@@ -93,13 +130,13 @@ pub(crate) fn offer_state_resume(
     store: &crate::data::workflow_state_store::WorkflowStateStore,
     workflow: &Workflow,
     workflow_name: &str,
-    work_item: Option<u32>,
+    work_item: Option<&WorkItemContext>,
     worktree_path: Option<&Path>,
     frontend: &mut dyn ExecWorkflowCommandFrontend,
 ) -> Result<StateResumeOutcome, CommandError> {
     let proceed = StateResumeOutcome::Proceed { resumed: false };
     let drop_state = |frontend: &mut dyn ExecWorkflowCommandFrontend| {
-        if let Err(e) = store.delete(work_item, workflow_name) {
+        if let Err(e) = store.delete_for_key(work_item.map(|wi| wi.key.as_str()), workflow_name) {
             frontend.write_message(UserMessage {
                 level: MessageLevel::Warning,
                 text: format!("exec workflow: failed to delete workflow state file: {e}"),
@@ -107,7 +144,7 @@ pub(crate) fn offer_state_resume(
         }
     };
 
-    let mut saved = match store.load(work_item, workflow_name) {
+    let mut saved = match store.load_for_key(work_item.map(|wi| wi.key.as_str()), workflow_name) {
         Ok(Some(saved)) => saved,
         Ok(None) => return Ok(proceed),
         Err(e) => {
@@ -120,6 +157,17 @@ pub(crate) fn offer_state_resume(
             return Ok(proceed);
         }
     };
+
+    if let Some(current) = work_item {
+        current.validate_saved_identity(&saved)?;
+    } else if saved.work_item_source_id.is_some()
+        || saved.work_item_key.is_some()
+        || saved.work_item.is_some()
+    {
+        return Err(CommandError::Other(
+            "saved workflow belongs to a different work item; refusing to resume".into(),
+        ));
+    }
 
     let dag = match crate::data::workflow_dag::WorkflowDag::build(&workflow.steps) {
         Ok(dag) => dag,
@@ -155,15 +203,19 @@ pub(crate) fn offer_state_resume(
 
     let prompt = WorkflowResumePrompt::new(
         workflow_name.to_string(),
-        work_item,
+        work_item.and_then(|wi| wi.number),
         worktree_path.map(|p| p.to_path_buf()),
         false,
         completed_step_count(&saved),
         saved.step_states.len(),
         start_points,
-    );
+    )
+    .with_work_item_key(work_item.map(|wi| wi.key.clone()));
     match frontend.ask_workflow_resume(&prompt)? {
         WorkflowResumeDecision::ResumeFrom(start) => {
+            if let Some(current) = work_item {
+                report_work_item_drift(current, &saved, frontend);
+            }
             // Rewind before the engine loads the file, so a run that ended on
             // a failure or an abort — every step terminal — is runnable again.
             saved.rewind_to(&dag, &start);
@@ -196,6 +248,7 @@ pub(crate) struct PreparedRun {
     pub(crate) workflow: Workflow,
     pub(crate) workflow_path: PathBuf,
     pub(crate) work_item_context: Option<WorkItemContext>,
+    pub(crate) work_item_overlay: Option<TypedOverlay>,
     pub(crate) cli_typed: Vec<TypedOverlay>,
     pub(crate) mount_path: PathBuf,
     pub(crate) worktree_path: Option<PathBuf>,
@@ -206,9 +259,6 @@ pub(crate) struct PreparedRun {
     /// The pre-worktree session. `execute_prepared` re-roots it at the worktree
     /// when `worktree_path` is set.
     pub(crate) original_session: Session,
-    /// Kept alive for the duration of the run; its Drop removes the issue temp
-    /// file. `None` for non-issue invocations.
-    pub(crate) issue_temp_file: Option<IssueTempFile>,
     pub(crate) launch_modes: HashMap<String, crate::data::config::agents::LaunchMode>,
     /// Skip the persisted-state resume prompt below. Set only by the dynamic
     /// resume path, which has already asked the user a strictly better version
@@ -253,6 +303,7 @@ pub(crate) async fn execute_prepared_with_outputs(
         mut workflow,
         workflow_path,
         work_item_context,
+        work_item_overlay,
         cli_typed,
         mount_path,
         worktree_path,
@@ -261,11 +312,12 @@ pub(crate) async fn execute_prepared_with_outputs(
         git_root_for_scope,
         cwd,
         original_session,
-        issue_temp_file: _issue_temp_file,
         launch_modes,
         skip_state_resume_prompt,
         prerequisites,
     } = prepared;
+    let mut phase_cli_typed = cli_typed.clone();
+    phase_cli_typed.extend(work_item_overlay.clone());
     let mut prerequisites = prerequisites;
     // The pre-teardown re-check probes the checkout the steps really mount.
     prerequisites.flow.set_worktree(worktree_path.clone());
@@ -308,7 +360,7 @@ pub(crate) async fn execute_prepared_with_outputs(
                 &store,
                 &workflow,
                 &workflow_name,
-                work_item_context.as_ref().map(|c| c.number),
+                work_item_context.as_ref(),
                 worktree_path.as_deref(),
                 frontend,
             )
@@ -437,6 +489,7 @@ pub(crate) async fn execute_prepared_with_outputs(
             flags: Arc::clone(&flags_arc),
             cli_typed_overlays: cli_typed.clone(),
             work_item_context,
+            work_item_overlay,
             image_git_root: git_root_for_scope.clone(),
             workflow_overlays: workflow_overlays_for_factory,
             squad_identity: squad_identity.cloned(),
@@ -446,9 +499,7 @@ pub(crate) async fn execute_prepared_with_outputs(
             output_dir: output_dir.map(Path::to_path_buf),
         };
         let cleanup_workflow = workflow.clone();
-        let cleanup_work_item = engine_work_item_context
-            .as_ref()
-            .map(|wi| (wi.number, wi.content.clone()));
+        let cleanup_work_item_context = engine_work_item_context.clone();
         let mut engine = match WorkflowEngine::resume(
             &session,
             crate::engine::workflow::WorkflowSpec::new(workflow)
@@ -523,7 +574,8 @@ pub(crate) async fn execute_prepared_with_outputs(
         shared.lock().unwrap().record_cancel_cleanup(
             &crate::data::workflow_cleanup::WorkflowCleanup {
                 workflow: cleanup_workflow,
-                work_item: cleanup_work_item,
+                work_item: None,
+                work_item_context: cleanup_work_item_context,
                 workdir: session.working_dir().to_path_buf(),
                 mount_path: mount_path.clone(),
                 state_root: workflow_state_root.map(Path::to_path_buf),
@@ -532,7 +584,7 @@ pub(crate) async fn execute_prepared_with_outputs(
                     &git_root_for_scope,
                     engines.runtime.capabilities().image_acquisition,
                 ),
-                cli_overlays: cli_typed.clone(),
+                cli_overlays: phase_cli_typed.clone(),
                 worktree_git_mount: worktree_git_mount
                     .as_ref()
                     .map(|m| (m.host_path.clone(), m.container_path.clone(), m.permission)),
@@ -557,7 +609,7 @@ pub(crate) async fn execute_prepared_with_outputs(
             let mut resolved = resolve_phase_overlays(
                 engines,
                 &session,
-                &cli_typed,
+                &phase_cli_typed,
                 &setup_entry_overlays,
                 worktree_git_mount.as_ref(),
                 &base_image,
@@ -764,7 +816,7 @@ pub(crate) async fn execute_prepared_with_outputs(
                 let mut resolved = resolve_phase_overlays(
                     engines,
                     &session,
-                    &cli_typed,
+                    &phase_cli_typed,
                     &teardown_entry_overlays,
                     worktree_git_mount.as_ref(),
                     &base_image,
@@ -985,10 +1037,6 @@ pub(crate) async fn execute_prepared_with_outputs(
         });
         return Err(err);
     }
-
-    // `_issue_temp_file`'s Drop impl removes the temp file when this
-    // function returns — covers both this success path and every early
-    // error return above.
 
     Ok(ExecWorkflowOutcome {
         prerequisites: None,
@@ -1223,10 +1271,7 @@ pub(crate) fn workflow_flag_config(
         auto: Some(flags.auto),
         headless: Some(flags.non_interactive),
         overlays_raw: (!flags.overlay.is_empty()).then_some(flags.overlay.clone()),
-        work_item: flags
-            .work_item
-            .as_deref()
-            .and_then(|raw| raw.parse::<u32>().ok()),
+        work_item: flags.work_item.clone(),
         leader: flags.leader.clone(),
         ..Default::default()
     }
@@ -1560,9 +1605,39 @@ pub(crate) fn resolve_phase_overlays(
 pub(crate) async fn finish_cancelled_cleanup(
     engines: &Engines,
     original_session: &Session,
-    cleanup: crate::data::workflow_cleanup::WorkflowCleanup,
+    mut cleanup: crate::data::workflow_cleanup::WorkflowCleanup,
     frontend: SharedWorkflowFrontend,
 ) -> Result<(), CommandError> {
+    // Private execution input is recreated after a restart, since the
+    // original temp file was owned by the cancelled invocation.
+    let recovery_input = cleanup
+        .work_item_context
+        .as_ref()
+        .filter(|context| context.key.starts_with("remote-"))
+        .map(|context| {
+            let item = crate::command::work_item::ResolvedWorkItem {
+                origin: crate::command::work_item::WorkItemOrigin::Remote {
+                    source_id: context.source_id.clone(),
+                    provider: "recovery".into(),
+                },
+                number: context.number,
+                key: context.key.clone(),
+                title: context.title.clone(),
+                slug: None,
+                content: context.content.clone(),
+                issue: None,
+            };
+            crate::command::work_item::prepare_work_item_input(&item, original_session)
+        })
+        .transpose()?;
+    if let Some(input) = &recovery_input {
+        cleanup.cli_overlays.retain(|overlay| {
+            !matches!(overlay,
+            TypedOverlay::Directory(directory)
+                if directory.container == input.container_path.to_string_lossy())
+        });
+        cleanup.cli_overlays.extend(input.overlay.clone());
+    }
     let session = Session::open_worktree_for(
         cleanup.workdir.clone(),
         cleanup.workdir.clone(),
@@ -1589,11 +1664,11 @@ pub(crate) async fn finish_cancelled_cleanup(
     let mut engine = WorkflowEngine::resume(
         &session,
         crate::engine::workflow::WorkflowSpec::new(cleanup.workflow)
-            .with_work_item_context(
+            .with_work_item_context(cleanup.work_item_context.or_else(|| {
                 cleanup
                     .work_item
-                    .map(|(number, content)| WorkItemContext { number, content }),
-            )
+                    .map(|(number, content)| WorkItemContext::from_legacy(number, content))
+            }))
             .with_state_root(cleanup.state_root),
         crate::engine::workflow::WorkflowEngineDeps {
             frontend: frontend.clone().into_workflow_frontend(),

@@ -49,6 +49,40 @@ impl WorkflowStateStore {
         self.dir().join(filename)
     }
 
+    pub fn state_path_for_key(
+        &self,
+        key: Option<&str>,
+        workflow_name: &str,
+    ) -> Result<PathBuf, DataError> {
+        if let Some(key) = key {
+            crate::data::fs::workflow_dirs::validate_work_item_key(key)?;
+        }
+        let repo_hash = &sha256_hex(self.git_root.to_string_lossy().as_bytes())[..8];
+        let name = sanitize_name_for_filename(workflow_name);
+        let filename = match key {
+            Some(key) => format!("{repo_hash}-{key}-{name}.json"),
+            None => format!("{repo_hash}-{name}.json"),
+        };
+        Ok(self.dir().join(filename))
+    }
+
+    pub fn load_for_key(
+        &self,
+        key: Option<&str>,
+        workflow_name: &str,
+    ) -> Result<Option<WorkflowState>, DataError> {
+        Self::read_state_path(&self.state_path_for_key(key, workflow_name)?)
+    }
+
+    pub fn delete_for_key(&self, key: Option<&str>, workflow_name: &str) -> Result<(), DataError> {
+        let path = self.state_path_for_key(key, workflow_name)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(DataError::io(&path, e)),
+        }
+    }
+
     /// Load a workflow's state by name. Returns `Ok(None)` when no state file
     /// exists.
     pub fn load(
@@ -84,7 +118,11 @@ impl WorkflowStateStore {
     pub fn save(&self, state: &WorkflowState) -> Result<PathBuf, DataError> {
         let dir = self.dir();
         std::fs::create_dir_all(&dir).map_err(|e| DataError::io(&dir, e))?;
-        let path = self.state_path(state.work_item, &state.workflow_name);
+        let legacy_key = state.work_item.map(|n| format!("{n:04}"));
+        let path = self.state_path_for_key(
+            state.work_item_key.as_deref().or(legacy_key.as_deref()),
+            &state.workflow_name,
+        )?;
         let json = serde_json::to_string_pretty(state)
             .map_err(|e| DataError::ConfigSerialize { source: e })?;
         write_config_file_atomically(&path, &json)?;

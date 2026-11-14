@@ -201,3 +201,282 @@ fn lookup_resolves_every_leaf_and_refuses_unknown_paths() {
     assert!(catalogue.lookup(&["not-a-command"]).is_none());
     assert!(catalogue.lookup(&["config", "not-a-command"]).is_none());
 }
+
+// ── WI 0147: `--work-item` replaces `--issue` ───────────────────────────────
+
+const ISSUE_REPLACEMENT: &str = "--issue was replaced by --work-item; use --work-item github:42";
+
+/// The commands that name a work item with `--work-item`.
+const WORK_ITEM_COMMANDS: &[&[&str]] = &[
+    &["exec", "prompt"],
+    &["exec", "workflow"],
+    &["new", "spec"],
+    &["remote", "exec", "prompt"],
+    &["remote", "exec", "workflow"],
+];
+
+fn flag_names(path: &[&str]) -> Vec<&'static str> {
+    CommandCatalogue::get()
+        .lookup(path)
+        .unwrap_or_else(|| panic!("missing {path:?}"))
+        .flags
+        .iter()
+        .map(|flag| flag.long)
+        .collect()
+}
+
+fn args(tokens: &[&str]) -> Vec<String> {
+    tokens.iter().map(|token| token.to_string()).collect()
+}
+
+fn replacement_reason(error: CommandError) -> String {
+    match error {
+        CommandError::InvalidFlagValue { flag, reason, .. } if flag == "issue" => reason,
+        other => panic!("expected the --issue replacement error, got {other:?}"),
+    }
+}
+
+#[test]
+fn issue_flag_is_absent_from_every_command_and_work_item_is_shared() {
+    let catalogue = CommandCatalogue::get();
+    for (path, spec) in leaves() {
+        assert!(
+            spec.find_flag("issue").is_none(),
+            "{path:?} still declares --issue"
+        );
+        for flag in spec.flags {
+            assert!(
+                !flag.conflicts_with.contains(&"issue"),
+                "{path:?} --{} still conflicts with --issue",
+                flag.long
+            );
+            if flag.long == "work-item" {
+                assert!(flag.conflicts_with.is_empty(), "{path:?} --work-item");
+            }
+        }
+    }
+    let shared = catalogue
+        .lookup(&["exec", "prompt"])
+        .unwrap()
+        .find_flag("work-item")
+        .unwrap();
+    for path in WORK_ITEM_COMMANDS {
+        let flag = catalogue
+            .lookup(path)
+            .unwrap()
+            .find_flag("work-item")
+            .unwrap_or_else(|| panic!("{path:?} lacks --work-item"));
+        assert_eq!(flag.help, shared.help, "{path:?}");
+        assert!(flag.optional, "{path:?}");
+    }
+    for form in [
+        "local:",
+        "github:",
+        "owner/repo#",
+        "http:",
+        "workItems.source",
+    ] {
+        assert!(shared.help.contains(form), "help must describe {form}");
+    }
+    // `remote exec prompt` may be a work item alone, like `exec prompt`.
+    let parsed = catalogue
+        .parse_raw_args(
+            &["remote", "exec", "prompt"],
+            &args(&["--work-item", "PROJ-7"]),
+        )
+        .unwrap();
+    assert_eq!(parsed.flag_string("work-item").as_deref(), Some("PROJ-7"));
+    assert_eq!(parsed.argument("prompt"), None);
+}
+
+#[test]
+fn exec_prompt_flags_are_the_base_set_plus_work_item() {
+    assert_eq!(
+        flag_names(&["exec", "prompt"]),
+        [
+            "headless",
+            "plan",
+            "allow-docker",
+            "yolo",
+            "auto",
+            "agent",
+            "model",
+            "overlay",
+            "agent-flag",
+            "work-item",
+            "interactive",
+            "branch",
+            "pr",
+            "worktree",
+        ]
+    );
+    // Remote derivation drops the local-only selectors and adds transport.
+    assert_eq!(
+        flag_names(&["remote", "exec", "prompt"]),
+        [
+            "session",
+            "follow",
+            "headless",
+            "plan",
+            "allow-docker",
+            "yolo",
+            "auto",
+            "agent",
+            "model",
+            "overlay",
+            "agent-flag",
+            "work-item",
+            "interactive",
+        ]
+    );
+    // It composes with 0151's session-worktree selectors.
+    let parsed = CommandCatalogue::get()
+        .parse_raw_args(
+            &["exec", "prompt"],
+            &args(&[
+                "--branch",
+                "feature",
+                "--work-item",
+                "local:7",
+                "review",
+                "this",
+            ]),
+        )
+        .unwrap();
+    assert_eq!(parsed.flag_string("branch").as_deref(), Some("feature"));
+    assert_eq!(parsed.flag_string("work-item").as_deref(), Some("local:7"));
+    assert_eq!(parsed.argument("prompt").as_deref(), Some("review this"));
+}
+
+#[test]
+fn exec_workflow_flags_keep_their_documented_order() {
+    let expected = [
+        "work-item",
+        "headless",
+        "plan",
+        "allow-docker",
+        "interactive",
+        "worktree",
+        "yolo",
+        "auto",
+        "agent",
+        "model",
+        "overlay",
+        "agent-flag",
+        "dynamic",
+        "leader",
+        "on-dirty-merge-target",
+        "on-merge-failure",
+        "on-existing-worktree",
+        "prerequisite-identity",
+        "prerequisite-ssh",
+        "prerequisite-token",
+        "prerequisite-unresolved",
+        "check-prerequisites",
+        "json",
+    ];
+    assert_eq!(flag_names(&["exec", "workflow"]), expected);
+    let remote: Vec<&str> = ["session", "follow"]
+        .into_iter()
+        .chain(
+            expected
+                .into_iter()
+                .filter(|name| !["worktree", "json"].contains(name)),
+        )
+        .collect();
+    assert_eq!(flag_names(&["remote", "exec", "workflow"]), remote);
+}
+
+#[test]
+fn issue_flag_names_its_replacement_on_every_frontend() {
+    let catalogue = CommandCatalogue::get();
+    for path in WORK_ITEM_COMMANDS {
+        for frontend in [
+            FrontendKind::Cli,
+            FrontendKind::Tui,
+            FrontendKind::WORKER_LOCAL,
+        ] {
+            if catalogue.validate_for_frontend(frontend, path).is_err() {
+                continue;
+            }
+            let error = catalogue
+                .parse_raw_args_with_profile(path, &args(&["--issue", "42"]), frontend)
+                .unwrap_err();
+            assert_eq!(
+                replacement_reason(error),
+                ISSUE_REPLACEMENT,
+                "{path:?} {frontend:?}"
+            );
+        }
+    }
+    // The suggestion carries the value: a bare number or `#N` becomes
+    // `github:N`; an explicit form is already valid as written.
+    for (value, suggestion) in [
+        ("--issue=#7", "github:7"),
+        ("--issue=owner/repo#3", "owner/repo#3"),
+        (
+            "--issue=https://github.com/o/r/issues/9",
+            "https://github.com/o/r/issues/9",
+        ),
+        ("--issue", "github:42"),
+    ] {
+        let error = catalogue
+            .parse_raw_args(&["exec", "workflow"], &args(&[value]))
+            .unwrap_err();
+        assert_eq!(
+            replacement_reason(error),
+            format!("--issue was replaced by --work-item; use --work-item {suggestion}")
+        );
+    }
+    // The TUI command box goes through the same parser.
+    let error = awman::command::dispatch::parsed_input::parse("new spec --issue 42", catalogue)
+        .unwrap_err();
+    assert_eq!(replacement_reason(error), ISSUE_REPLACEMENT);
+    // The CLI reports it before clap, global flags and all.
+    assert_eq!(
+        catalogue
+            .removed_flag_hint([
+                "awman", "--remote", "host", "remote", "exec", "workflow", "--issue", "42"
+            ])
+            .as_deref(),
+        Some(ISSUE_REPLACEMENT)
+    );
+}
+
+#[test]
+fn issue_inside_prompt_text_is_not_a_flag() {
+    let catalogue = CommandCatalogue::get();
+    for tokens in [
+        &["--", "mention", "--issue", "42"][..],
+        &["fix", "--issue", "42"][..],
+        &["fix --issue 42"][..],
+    ] {
+        let parsed = catalogue
+            .parse_raw_args(&["exec", "prompt"], &args(tokens))
+            .unwrap();
+        assert!(
+            parsed.argument("prompt").unwrap().contains("--issue"),
+            "{tokens:?}"
+        );
+        let argv: Vec<&str> = ["awman", "exec", "prompt"]
+            .iter()
+            .chain(tokens)
+            .copied()
+            .collect();
+        assert_eq!(catalogue.removed_flag_hint(argv), None, "{tokens:?}");
+    }
+}
+
+#[test]
+fn remote_exec_forwards_the_work_item_unparsed() {
+    use awman::engine::remote::client::ExecArg;
+    let forwarded = vec!["--work-item=PROJ-12".to_string()];
+    let request = ExecArg::Prompt(None).into_request(&forwarded);
+    assert_eq!(request.subcommand, "exec prompt");
+    assert_eq!(
+        request.args, forwarded,
+        "no prompt positional without prompt text"
+    );
+    let request = ExecArg::Prompt(Some("go".into())).into_request(&forwarded);
+    assert_eq!(request.args, ["--work-item=PROJ-12", "--", "go"]);
+}

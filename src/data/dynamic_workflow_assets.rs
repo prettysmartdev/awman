@@ -15,7 +15,7 @@
 /// `<context_dir>/workflow-usage.md`.
 pub const WORKFLOW_USAGE_MD: &str = include_str!("../assets/dynamic/workflow-usage.md");
 
-/// The leader prompt template. Substituted with `{{work_item_number}}`,
+/// The leader prompt template. Substituted with `{{work_item_identity}}`,
 /// `{{work_item_path}}`, `{{available_agents}}`, `{{max_concurrent_steps}}`
 /// and `{{developer_guidance}}` before being delivered.
 pub const LEADER_PROMPT_MD: &str = include_str!("../assets/dynamic/leader-prompt.md");
@@ -82,7 +82,7 @@ pub fn build_squad_leader_prompt(
 /// Construct the leader prompt by substituting the runtime template variables
 /// into [`LEADER_PROMPT_MD`].
 pub fn build_leader_prompt(
-    work_item_number: &str,
+    work_item_identity: &str,
     work_item_path: &str,
     available_agents: &str,
     max_concurrent_steps: Option<usize>,
@@ -93,12 +93,33 @@ pub fn build_leader_prompt(
         None => "no limit".to_string(),
     };
     let developer_guidance = build_developer_guidance(guidance);
-    LEADER_PROMPT_MD
-        .replace("{{work_item_number}}", work_item_number)
-        .replace("{{work_item_path}}", work_item_path)
-        .replace("{{available_agents}}", available_agents)
-        .replace("{{max_concurrent_steps}}", &max_concurrent_steps)
-        .replace("{{developer_guidance}}", &developer_guidance)
+    // Substitute only the original template: inserted text is prompt data,
+    // even when it contains characters that look like another placeholder.
+    let values = [
+        ("work_item_identity", work_item_identity),
+        ("work_item_path", work_item_path),
+        ("available_agents", available_agents),
+        ("max_concurrent_steps", max_concurrent_steps.as_str()),
+        ("developer_guidance", developer_guidance.as_str()),
+    ];
+    let mut out = String::new();
+    let mut rest = LEADER_PROMPT_MD;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let Some(end) = rest[start..].find("}}") else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let end = start + end + 2;
+        let name = &rest[start + 2..end - 2];
+        match values.iter().find(|(key, _)| *key == name) {
+            Some((_, value)) => out.push_str(value),
+            None => out.push_str(&rest[start..end]),
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Render resolved `workflows.dynamic.guidance` entries as the bullet
@@ -153,5 +174,22 @@ pub fn substitute_workflow_prerequisites(prompt: &str, summary: &str) -> String 
             .collect()
     } else {
         prompt.replace(WORKFLOW_PREREQUISITES_PLACEHOLDER, summary)
+    }
+}
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn leader_accepts_nonnumeric_identity_and_does_not_reinterpret_insertions() {
+        let prompt = build_leader_prompt(
+            "remote-1234567890abcdef12345678",
+            "/workspace/{{available_agents}}.md",
+            "claude",
+            Some(2),
+            None,
+        );
+        assert!(prompt.contains("work item remote-1234567890abcdef12345678"));
+        assert!(prompt.contains("/workspace/{{available_agents}}.md"));
+        assert!(!prompt.contains("{{work_item_identity}}"));
     }
 }

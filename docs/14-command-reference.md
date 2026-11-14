@@ -105,7 +105,7 @@ Available via: CLI, TUI
 
 | Argument | Kind | Required | Help |
 |---|---|---|---|
-| `work_item` | string | yes | Work item number (e.g. 0025). |
+| `work_item` | string | yes | Work item to amend: a number in the configured workItems.source, or any explicit --work-item form (local:<N>, a path, github:<N>, owner/repo#<N>, a URL, http:<provider>:<id>). |
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
@@ -289,7 +289,7 @@ Available via: CLI, TUI, API
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a directory or context(repo@<key>[:ro\|rw]) into the agent container. Repeatable. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
-| `--issue` | string (optional) | — | — | — | CLI, TUI, API | GitHub issue number, URL, or owner/repo#N to use as the prompt. |
+| `--work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
 | `--interactive` | bool | false | — | `--headless` | CLI, TUI, API | Run the agent interactively in a terminal (PTY). Overrides a daemon worker's headless default where the worker allows it. |
 | `--branch` | string (optional) | — | — | `--pr`, `--worktree` | CLI, TUI | Run in a worktree for this branch. |
 | `--pr` | string (optional) | — | — | `--branch`, `--worktree` | CLI, TUI | Run in a worktree for this GitHub pull request. |
@@ -309,7 +309,7 @@ Available via: CLI, TUI, API
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
-| `--work-item` | string (optional) | — | — | `--issue` | CLI, TUI, API | Optional work item number. |
+| `--work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
 | `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the agent headless (print mode). |
 | `--plan` | bool | false | — | `--yolo` | CLI, TUI, API | Run the agent in plan mode (read-only). |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Mount the host Docker daemon socket into the agent container. |
@@ -321,7 +321,6 @@ Available via: CLI, TUI, API
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a directory or context(repo@<key>[:ro\|rw]) into the agent container. Repeatable. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
-| `--issue` | string (optional) | — | — | `--work-item` | CLI, TUI, API | GitHub issue number, URL, or owner/repo#N to use as work item input. |
 | `--dynamic` | bool | false | — | — | CLI, TUI, API | Have a leader agent design and run a workflow for --work-item. Implies --yolo, --worktree, and context(workflow); the positional workflow path must be omitted. |
 | `--leader` | string (optional) | — | — | — | CLI, TUI, API | Agent and model for the dynamic leader, as agent::model (e.g. claude::claude-opus-4-8). Only valid with --dynamic. |
 | `--on-dirty-merge-target` | enum: ask, commit, stash, fail | — | — | — | CLI, TUI, API | What to do when the merge target has uncommitted changes before a worktree branch is merged back. |
@@ -672,7 +671,7 @@ Runs without a working agent runtime — reachable even when the configured runt
 |---|---|---|---|---|---|---|
 | `--session` | string (optional) | — | — | — | CLI, TUI, API | Session ID to use on the remote host. |
 | `-f, --follow` | bool | false | — | — | CLI, TUI, API | Stream logs via SSE until the command completes. |
-| `--work-item` | string (optional) | — | — | `--issue` | CLI, TUI, API | Optional work item number. |
+| `--work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
 | `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the agent headless (print mode). |
 | `--plan` | bool | false | — | `--yolo` | CLI, TUI, API | Run the agent in plan mode (read-only). |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Mount the host Docker daemon socket into the agent container. |
@@ -683,7 +682,6 @@ Runs without a working agent runtime — reachable even when the configured runt
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a directory or context(repo@<key>[:ro\|rw]) into the agent container. Repeatable. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
-| `--issue` | string (optional) | — | — | `--work-item` | CLI, TUI, API | GitHub issue number, URL, or owner/repo#N to use as work item input. |
 | `--dynamic` | bool | false | — | — | CLI, TUI, API | Have a leader agent design and run a workflow for --work-item. Implies --yolo, --worktree, and context(workflow); the positional workflow path must be omitted. |
 | `--leader` | string (optional) | — | — | — | CLI, TUI, API | Agent and model for the dynamic leader, as agent::model (e.g. claude::claude-opus-4-8). Only valid with --dynamic. |
 | `--on-dirty-merge-target` | enum: ask, commit, stash, fail | — | — | — | CLI, TUI, API | What to do when the merge target has uncommitted changes before a worktree branch is merged back. |
@@ -705,7 +703,7 @@ Runs without a working agent runtime — reachable even when the configured runt
 
 | Argument | Kind | Required | Help |
 |---|---|---|---|
-| `prompt` | trailing args | yes | The prompt text to send to the agent. |
+| `prompt` | trailing args | no | The prompt text to send to the agent. |
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
@@ -720,7 +718,7 @@ Runs without a working agent runtime — reachable even when the configured runt
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a directory or context(repo@<key>[:ro\|rw]) into the agent container. Repeatable. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
-| `--issue` | string (optional) | — | — | — | CLI, TUI, API | GitHub issue number, URL, or owner/repo#N to use as the prompt. |
+| `--work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
 | `--interactive` | bool | false | — | `--headless` | CLI, TUI, API | Run the agent interactively in a terminal (PTY). Overrides a daemon worker's headless default where the worker allows it. |
 
 ---
@@ -741,7 +739,7 @@ Available via: CLI, TUI
 |---|---|---|---|---|---|---|
 | `--interview` | bool | false | — | — | CLI, TUI, API | Use interview mode. |
 | `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the interview agent headless (print mode). |
-| `--issue` | string (optional) | — | — | — | CLI, TUI, API | GitHub issue number, URL, or owner/repo#N to use as spec input. |
+| `--work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
 
 ### `awman new workflow`
 

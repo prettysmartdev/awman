@@ -43,7 +43,8 @@ use crate::data::config::resolved_builtin::ResolvedBuiltinConfig;
 use crate::data::config::runtime::{RuntimeSelection, UnknownRuntimeValue};
 use crate::data::config::state::RepoState;
 use crate::data::config::work_items::{
-    WorkItemsConfig, DEFAULT_WORK_ITEMS_DIR, DEFAULT_WORK_ITEM_TEMPLATE,
+    WorkItemConfigError, WorkItemProviderConfig, WorkItemSource, WorkItemsConfig,
+    DEFAULT_WORK_ITEMS_DIR, DEFAULT_WORK_ITEM_TEMPLATE,
 };
 use crate::data::config::work_servers::ResolvedWorkServer;
 use crate::data::config::workflows::GUIDANCE_MAX_ENTRIES;
@@ -275,6 +276,15 @@ impl EffectiveConfig {
         flags: FlagConfig,
         env: EnvSnapshot,
     ) -> Result<Self, DataError> {
+        for overrides in [&layers.env, &layers.set] {
+            if let Some((path, _)) = overrides.iter().find(|(path, _)| {
+                path == "workItems.providers" || path.starts_with("workItems.providers.")
+            }) {
+                return Err(DataError::Other(format!(
+                    "{path} cannot be supplied by environment variables or --set; configure providers in the global config file"
+                )));
+            }
+        }
         let (merged_value, provenance) = merge(&layers)?;
         // A name that differs from another only by `-` versus `_` would give
         // one env name two members; reject it across layers and overrides.
@@ -707,6 +717,58 @@ impl EffectiveConfig {
                 .work_items_dir(git_root)
                 .join(DEFAULT_WORK_ITEM_TEMPLATE),
         }
+    }
+
+    /// Resolve the configured default work item source, validating that a
+    /// selected HTTP provider exists in trusted global configuration.
+    pub fn work_item_source(&self) -> Result<WorkItemSource, WorkItemConfigError> {
+        let source = self
+            .merged
+            .work_items
+            .as_ref()
+            .and_then(|work_items| work_items.source.clone())
+            .unwrap_or_default();
+        match &source {
+            WorkItemSource::Invalid(value) => Err(WorkItemConfigError::UnknownSource {
+                value: value.clone(),
+            }),
+            WorkItemSource::Http { name } => {
+                let providers = self.work_item_providers()?;
+                if providers.contains_key(name) {
+                    Ok(source)
+                } else {
+                    Err(WorkItemConfigError::UnknownProvider { name: name.clone() })
+                }
+            }
+            _ => Ok(source),
+        }
+    }
+
+    /// Trusted provider definitions from the loaded global file only.
+    pub fn work_item_providers(
+        &self,
+    ) -> Result<BTreeMap<String, WorkItemProviderConfig>, WorkItemConfigError> {
+        let providers = self
+            .layers
+            .global
+            .work_items
+            .as_ref()
+            .and_then(|work_items| work_items.providers.clone())
+            .unwrap_or_default();
+        for (name, provider) in &providers {
+            provider.validate(name)?;
+        }
+        Ok(providers)
+    }
+
+    /// Deferred configuration problems that work-item operations will also
+    /// return as typed errors. Loading remains possible so users can repair
+    /// an unknown source without losing the rest of their configuration.
+    pub fn load_warnings(&self) -> Vec<String> {
+        self.work_item_source()
+            .err()
+            .map(|error| vec![format!("workItems.source: {error}")])
+            .unwrap_or_default()
     }
 
     /// `workflows.maxConcurrentSteps` (`None` = unlimited).
@@ -1251,6 +1313,11 @@ fn apply_override(
 ) -> Result<(), DataError> {
     let resolved = fields::resolve(path).map_err(|e| DataError::Other(e.to_string()))?;
     fields::validate_value(resolved.key, &value).map_err(|e| DataError::Other(e.to_string()))?;
+    if path == "workItems.source" {
+        let raw = value.as_str().unwrap_or_default();
+        crate::data::config::work_items::WorkItemSource::parse(raw)
+            .map_err(|e| DataError::Other(e.to_string()))?;
+    }
     set_leaf(target, path, resolved.key, value, layer, provenance);
     Ok(())
 }

@@ -69,6 +69,11 @@ impl WorkflowDirs {
         Self::repo_dir_for(git_root).join(format!("dynamic-{work_item:04}.toml"))
     }
 
+    pub fn dynamic_workflow_path_for_key(git_root: &Path, key: &str) -> Result<PathBuf, DataError> {
+        validate_work_item_key(key)?;
+        Ok(Self::repo_dir_for(git_root).join(format!("dynamic-{key}.toml")))
+    }
+
     /// Create the global workflows directory on disk, if missing.
     pub fn ensure_global(&self) -> Result<PathBuf, DataError> {
         let dir = self.global_dir();
@@ -83,5 +88,23 @@ impl WorkflowDirs {
         };
         std::fs::create_dir_all(&dir).map_err(|e| DataError::io(&dir, e))?;
         Ok(Some(dir))
+    }
+}
+
+pub fn validate_work_item_key(key: &str) -> Result<(), DataError> {
+    let numeric = !key.is_empty() && key.len() <= 10 && key.bytes().all(|b| b.is_ascii_digit());
+    let hashed = key
+        .strip_prefix("remote-")
+        .or_else(|| key.strip_prefix("local-"))
+        .is_some_and(|hash| {
+            hash.len() == 24
+                && hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+    if numeric || hashed {
+        Ok(())
+    } else {
+        Err(DataError::Other("invalid work item state key".into()))
     }
 }

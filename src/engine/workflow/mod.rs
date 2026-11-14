@@ -501,13 +501,18 @@ impl WorkflowEngine {
         } = spec;
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
         let workflow_hash = compute_workflow_hash(&workflow);
-        let work_item_number = work_item_context.as_ref().map(|c| c.number);
-        let state = WorkflowState::new(
+        let work_item_number = work_item_context.as_ref().and_then(|c| c.number);
+        let mut state = WorkflowState::new(
             workflow_name_for(&workflow),
             &workflow.steps,
             workflow_hash,
             work_item_number,
         );
+        if let Some(context) = &work_item_context {
+            state.work_item_key = Some(context.key.clone());
+            state.work_item_source_id = Some(context.source_id.clone());
+            state.work_item_content_hash = Some(context.content_hash.clone());
+        }
         Ok(Self::assemble(
             session,
             workflow,
@@ -649,12 +654,26 @@ impl WorkflowEngine {
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
         let store = state_store_for(session, state_root);
         let workflow_name = workflow_name_for(&workflow);
-        let work_item_number = work_item_context.as_ref().map(|c| c.number);
-        let saved = store.load(work_item_number, &workflow_name)?;
+        let work_item_number = work_item_context.as_ref().and_then(|c| c.number);
+        let saved = store.load_for_key(
+            work_item_context.as_ref().map(|c| c.key.as_str()),
+            &workflow_name,
+        )?;
 
         let workflow_hash = compute_workflow_hash(&workflow);
+        let fresh_work_item_design = saved.is_none();
         let mut state = match saved {
             Some(saved) => {
+                if let Some(context) = &work_item_context {
+                    context.validate_saved_identity(&saved)?;
+                } else if saved.work_item_source_id.is_some()
+                    || saved.work_item_key.is_some()
+                    || saved.work_item.is_some()
+                {
+                    return Err(EngineError::WorkflowResumeIncompatible(
+                        "saved workflow belongs to a different work item".into(),
+                    ));
+                }
                 if saved.schema_version > WORKFLOW_STATE_SCHEMA_VERSION {
                     return Err(EngineError::UnsupportedWorkflowSchemaVersion {
                         found: saved.schema_version,
@@ -683,6 +702,14 @@ impl WorkflowEngine {
                 work_item_number,
             ),
         };
+
+        if let Some(context) = &work_item_context {
+            state.work_item_key = Some(context.key.clone());
+            state.work_item_source_id = Some(context.source_id.clone());
+            if fresh_work_item_design {
+                state.work_item_content_hash = Some(context.content_hash.clone());
+            }
+        }
 
         // Drop step entries the workflow no longer defines. A saved state is
         // matched to the workflow by hash, and the user may have accepted the

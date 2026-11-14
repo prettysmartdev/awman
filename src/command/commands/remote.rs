@@ -59,7 +59,8 @@ pub struct RemoteExecWorkflowFlags {
 
 #[derive(Debug, Clone)]
 pub struct RemoteExecPromptFlags {
-    pub prompt: String,
+    /// The prompt text. `None` only when `--work-item` is forwarded.
+    pub prompt: Option<String>,
     pub remote_addr: Option<String>,
     pub session: Option<String>,
     pub follow: bool,
@@ -259,14 +260,30 @@ impl RemoteCommand {
                     forwarded: forwarded_exec_flags(ctx),
                 })
             }
-            ["remote", "exec", "prompt"] => RemoteSubcommand::ExecPrompt(RemoteExecPromptFlags {
-                prompt: ctx.args.require("prompt")?,
-                remote_addr: ctx.remote_target.clone(),
-                session: ctx.flags.string("session"),
-                follow: ctx.flags.bool("follow"),
-                api_key: None,
-                forwarded: forwarded_exec_flags(ctx),
-            }),
+            ["remote", "exec", "prompt"] => {
+                // As on `exec prompt`, `--work-item` alone is a valid prompt.
+                // Its value is forwarded as written (in `forwarded`) and
+                // resolved by the server against its own repo config.
+                let prompt = ctx
+                    .args
+                    .get("prompt")
+                    .filter(|prompt| !prompt.trim().is_empty())
+                    .map(str::to_string);
+                if prompt.is_none() && ctx.flags.string("work-item").is_none() {
+                    return Err(CommandError::missing_required_argument(
+                        &["remote", "exec", "prompt"],
+                        "prompt",
+                    ));
+                }
+                RemoteSubcommand::ExecPrompt(RemoteExecPromptFlags {
+                    prompt,
+                    remote_addr: ctx.remote_target.clone(),
+                    session: ctx.flags.string("session"),
+                    follow: ctx.flags.bool("follow"),
+                    api_key: None,
+                    forwarded: forwarded_exec_flags(ctx),
+                })
+            }
             ["remote", "session", "start"] => {
                 RemoteSubcommand::SessionStart(RemoteSessionStartFlags {
                     session_type: ctx.flags.require_str("type")?,

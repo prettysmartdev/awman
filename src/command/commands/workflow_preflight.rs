@@ -129,7 +129,10 @@ pub(crate) fn validate_workflow_acp_preflight(
 /// Runs for every `exec workflow` invocation (dynamic or not). The non-dynamic
 /// missing-`workflow`-path error is handled separately in the dispatcher so the
 /// existing missing-required-argument message is preserved.
-pub(crate) fn validate_dynamic_flags(flags: &ExecWorkflowCommandFlags) -> Result<(), CommandError> {
+pub(crate) fn validate_dynamic_flags(
+    flags: &ExecWorkflowCommandFlags,
+    has_inline_work_item: bool,
+) -> Result<(), CommandError> {
     if flags.dynamic && flags.workflow.is_some() {
         return Err(CommandError::Other(
             "cannot specify a workflow file path with --dynamic; the path is \
@@ -142,7 +145,8 @@ pub(crate) fn validate_dynamic_flags(flags: &ExecWorkflowCommandFlags) -> Result
             "--leader is only valid with --dynamic".into(),
         ));
     }
-    if flags.dynamic && flags.work_item.is_none() {
+    // A pushed inline work item (API `work_item`) stands in for `--work-item`.
+    if flags.dynamic && flags.work_item.is_none() && !has_inline_work_item {
         return Err(CommandError::Other("--dynamic requires --work-item".into()));
     }
     if flags.dynamic && flags.plan {
@@ -844,4 +848,49 @@ pub(crate) async fn ensure_agent_image_with_build_output(
         text: format!("Built image for agent '{agent}'."),
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod dynamic_flag_tests {
+    use super::*;
+
+    fn dynamic_flags(work_item: Option<&str>) -> ExecWorkflowCommandFlags {
+        ExecWorkflowCommandFlags {
+            prerequisites: Default::default(),
+            squad_task_prerequisites: None,
+            workflow: None,
+            work_item: work_item.map(str::to_string),
+            non_interactive: true,
+            plan: false,
+            allow_docker: false,
+            worktree: true,
+            yolo: true,
+            auto: false,
+            agent: None,
+            model: None,
+            launch_mode: None,
+            overlay: Vec::new(),
+            agent_flags: None,
+            max_concurrent: None,
+            dynamic: true,
+            leader: None,
+            on_dirty_merge_target: None,
+            on_merge_failure: None,
+            on_existing_worktree: None,
+        }
+    }
+
+    #[test]
+    fn dynamic_preflight_accepts_an_inline_work_item_in_place_of_the_flag() {
+        // The CLI still requires `--work-item`...
+        let error = validate_dynamic_flags(&dynamic_flags(None), false).unwrap_err();
+        assert!(error.to_string().contains("--dynamic requires --work-item"));
+        // ...an API command that carries `work_item` does not need one.
+        validate_dynamic_flags(&dynamic_flags(None), true).unwrap();
+        validate_dynamic_flags(&dynamic_flags(Some("github:7")), false).unwrap();
+        // Every other rule still applies with inline input.
+        let mut flags = dynamic_flags(None);
+        flags.plan = true;
+        assert!(validate_dynamic_flags(&flags, true).is_err());
+    }
 }

@@ -182,6 +182,8 @@ pub(crate) struct CommandLayerFactory {
     pub(crate) flags: Arc<ExecWorkflowCommandFlags>,
     pub(crate) cli_typed_overlays: Vec<TypedOverlay>,
     pub(crate) work_item_context: Option<WorkItemContext>,
+    /// Resolver-authored private input; never promote a user directory here.
+    pub(crate) work_item_overlay: Option<TypedOverlay>,
     /// The original repository git root (not the worktree). Used for image tag
     /// derivation so worktree-based runs use the correct project image.
     pub(crate) image_git_root: PathBuf,
@@ -342,6 +344,9 @@ impl CommandLayerFactory {
         // Every step shares the command's one outputs directory (WI 0137 §3).
         let directory_overlays = collected.directories;
         let mut command_mounts = Vec::new();
+        if let Some(TypedOverlay::Directory(directory)) = &self.work_item_overlay {
+            command_mounts.push(directory.clone());
+        }
         let system_prompt = match self
             .output_dir
             .as_ref()

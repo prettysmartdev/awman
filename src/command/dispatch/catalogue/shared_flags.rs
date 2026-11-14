@@ -325,13 +325,24 @@ pub(super) const INTERACTIVE_FLAG: [FlagSpec; 1] = [FlagSpec {
     implies: &[],
     optional: true,
 }];
-/// Agent-run flags for `exec prompt` — extends the common flags with
-/// `--issue` and persistent session-worktree selectors.
-/// `--issue` remains exclusive to `exec prompt`.
-pub(super) const EXEC_PROMPT_EXTRA_FLAGS: [FlagSpec; 1] = [FlagSpec {
-    long: "issue",
+
+/// Help for `--work-item`: every reference form the resolver accepts, so the
+/// grammar is described once for `exec prompt`, `exec workflow` and `new spec`.
+pub(super) const WORK_ITEM_HELP: &str =
+    "Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in \
+     the configured workItems.source. Explicit forms ignore that setting: \
+     local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), \
+     owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a \
+     configured workItems.providers baseUrl.";
+
+/// `--work-item` (WI 0147), the one flag that names a work item on every
+/// command that takes one. It replaced `--issue`, whose bare value meant a
+/// GitHub issue; see `REPLACED_FLAGS` in `mod.rs`. A remote command forwards
+/// the value as written, so the server resolves it against its own config.
+pub(super) const WORK_ITEM_FLAG: [FlagSpec; 1] = [FlagSpec {
+    long: "work-item",
     short: None,
-    help: "GitHub issue number, URL, or owner/repo#N to use as the prompt.",
+    help: WORK_ITEM_HELP,
     kind: FlagKind::OptionalString,
     default: FlagDefault::None,
     frontends: FrontendVisibility::All,
@@ -339,8 +350,7 @@ pub(super) const EXEC_PROMPT_EXTRA_FLAGS: [FlagSpec; 1] = [FlagSpec {
     implies: &[],
     optional: true,
 }];
-
-/// Agent-run flags for `exec prompt` — common flags plus `--issue` and
+/// Agent-run flags for `exec prompt` — common flags plus `--work-item` and
 /// persistent session-worktree selectors.
 ///
 /// Derived rather than copied (WI 0114 F-51): the base flags were written
@@ -352,27 +362,17 @@ pub(super) const CHAT_FLAGS: [FlagSpec;
 
 pub(super) const EXEC_PROMPT_FLAGS: [FlagSpec;
     AGENT_RUN_FLAGS_NO_WORKTREE.len()
-        + EXEC_PROMPT_EXTRA_FLAGS.len()
+        + WORK_ITEM_FLAG.len()
         + INTERACTIVE_FLAG.len()
         + SESSION_WORKTREE_FLAGS.len()] = concat_flags(&[
     &AGENT_RUN_FLAGS_NO_WORKTREE,
-    &EXEC_PROMPT_EXTRA_FLAGS,
+    &WORK_ITEM_FLAG,
     &INTERACTIVE_FLAG,
     &SESSION_WORKTREE_FLAGS,
 ]);
 
 /// `--work-item`, which `exec workflow` lists before everything else.
-pub(super) const EXEC_WORKFLOW_LEADING_FLAGS: [FlagSpec; 1] = [FlagSpec {
-    long: "work-item",
-    short: None,
-    help: "Optional work item number.",
-    kind: FlagKind::OptionalString,
-    default: FlagDefault::None,
-    frontends: FrontendVisibility::All,
-    conflicts_with: &["issue"],
-    implies: &[],
-    optional: true,
-}];
+pub(super) const EXEC_WORKFLOW_LEADING_FLAGS: [FlagSpec; 1] = WORK_ITEM_FLAG;
 
 /// `--worktree`, which `exec workflow` lists between `--allow-docker` and
 /// `--yolo` — the position the flag has always had in `--help`.
@@ -389,18 +389,7 @@ pub(super) const EXEC_WORKFLOW_WORKTREE_FLAG: [FlagSpec; 1] = [FlagSpec {
 }];
 
 /// The flags `exec workflow` adds after the base set.
-pub(super) const EXEC_WORKFLOW_TRAILING_FLAGS: [FlagSpec; 6] = [
-    FlagSpec {
-        long: "issue",
-        short: None,
-        help: "GitHub issue number, URL, or owner/repo#N to use as work item input.",
-        kind: FlagKind::OptionalString,
-        default: FlagDefault::None,
-        frontends: FrontendVisibility::All,
-        conflicts_with: &["work-item"],
-        implies: &[],
-        optional: true,
-    },
+pub(super) const EXEC_WORKFLOW_TRAILING_FLAGS: [FlagSpec; 5] = [
     FlagSpec {
         long: "dynamic",
         short: None,
@@ -544,7 +533,7 @@ pub(super) const CHECK_PREREQUISITES_FLAG: [FlagSpec; 1] = [FlagSpec {
 /// base run, so the base set is spliced rather than concatenated. The order is
 /// exactly what the literal had, because it is the order `--help` and the
 /// generated command reference print.
-pub(super) const EXEC_WORKFLOW_FLAGS: [FlagSpec; 24] = concat_flags(&[
+pub(super) const EXEC_WORKFLOW_FLAGS: [FlagSpec; 23] = concat_flags(&[
     &EXEC_WORKFLOW_LEADING_FLAGS,
     AGENT_RUN_BEFORE_WORKTREE,
     &INTERACTIVE_FLAG,

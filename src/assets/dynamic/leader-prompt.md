@@ -2,7 +2,7 @@ You are a workflow architect. Produce exactly one file:
 
     /awman/context/workflow/workflow.toml
 
-It must be a valid TOML workflow that, when executed by awman, directs a team of agents to complete work item {{work_item_number}}.
+It must be a valid TOML workflow that, when executed by awman, directs a team of agents to complete work item {{work_item_identity}}.
 
 Do not modify source files. Do not run tests. Do not implement the work item yourself. The workflow file is your only deliverable. Stop as soon as it is written.
 
@@ -20,7 +20,7 @@ Read this reference in your context directory before writing anything:
 
 ## Work Item
 
-Work item {{work_item_number}}, at:
+Work item {{work_item_identity}}, at:
 
     {{work_item_path}}
 
