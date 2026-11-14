@@ -706,13 +706,73 @@ async fn retry_head_check_and_push_share_one_process_budget() {
         .run(&CancellationToken::new(), &mut NoGate, &observer)
         .await
         .unwrap_err();
-    assert_eq!(error.kind, PushFailureKind::Unreachable);
+    assert_eq!(error.kind, PushFailureKind::Unreachable, "{error:?}");
     let elapsed = observer.0.lock().unwrap().unwrap().elapsed();
     assert!(
         elapsed < Duration::from_millis(1250),
         "shared 900ms budget took {elapsed:?}"
     );
     assert_eq!(error.attempts, 2);
+    assert_eq!(http.receive_packs(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_local_probe_exhausting_the_retry_budget_does_not_start_another_attempt() {
+    let s = sandbox("engine::git_push_retry::a_local_probe_exhausting_the_retry_budget_does_not_start_another_attempt");
+    let w = world(&s);
+    let http = w.server(|b| b.fail_before_response(1));
+    struct HoldLocal<'a> {
+        sandbox: &'a TestSandbox,
+        fake: Mutex<Option<awman_test_support::fakes::FakeCli>>,
+    }
+    impl PushObserver for HoldLocal<'_> {
+        fn retry(&self, _: &PushRetry) {
+            let mut fake = self.fake.lock().unwrap();
+            assert!(fake.is_none(), "a local timeout must not schedule a retry");
+            let git = self.sandbox.install_fake(support::fake_cli_exe(), "git");
+            git.on(&[]).hold_until_released();
+            *fake = Some(git);
+        }
+    }
+    let observer = HoldLocal {
+        sandbox: &s,
+        fake: Mutex::new(None),
+    };
+    // Prepare this before installing the fake: the initial local timeout
+    // must remain terminal Other, never a reason to retry network work.
+    let mut initial_policy = policy();
+    initial_policy.first_attempt_timeout = Duration::from_secs(1);
+    let initial = w.publisher(&http.url("origin.git"), initial_policy);
+    let mut p = policy();
+    p.retry_attempt_timeout = Duration::from_secs(1);
+    let error = w
+        .publisher(&http.url("origin.git"), p)
+        .run(&CancellationToken::new(), &mut NoGate, &observer)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, PushFailureKind::Unreachable, "{error:?}");
+    assert_eq!(error.attempts, 2);
+    let calls = observer
+        .fake
+        .lock()
+        .unwrap()
+        .as_ref()
+        .expect("retry reached the local probe")
+        .calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(
+        calls[0].argv.first().is_some_and(|arg| arg == "config"),
+        "{calls:?}"
+    );
+    let initial_observer = Observer::default();
+    let error = initial
+        .run(&CancellationToken::new(), &mut NoGate, &initial_observer)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, PushFailureKind::Other, "{error:?}");
+    assert_eq!(error.attempts, 1);
+    assert!(initial_observer.retries.lock().unwrap().is_empty());
+    assert_eq!(http.requests().len(), 1);
     assert_eq!(http.receive_packs(), 0);
 }
 

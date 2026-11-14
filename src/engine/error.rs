@@ -48,6 +48,11 @@ pub enum EngineError {
     #[error("git operation failed: {0}")]
     Git(String),
 
+    /// A local probe exhausted its process budget; this is not evidence of a
+    /// transport failure and must never itself authorize another push attempt.
+    #[error("git operation failed: local Git operation timed out")]
+    GitLocalTimeout,
+
     /// Host Git transport: the remote refused the credentials. Never
     /// retried; the command layer reports `failure.stage: "git_auth"`,
     /// `failure.code: "git_auth_failed"`.

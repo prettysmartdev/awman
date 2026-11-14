@@ -384,7 +384,7 @@ impl TransportGuard {
                 drop(job.take());
                 let _ = child.wait();
                 self.check()?;
-                return Err(EngineError::Git("local Git operation timed out".into()));
+                return Err(EngineError::GitLocalTimeout);
             }
             if let Some(status) = child.try_wait().map_err(io)? {
                 break status;
