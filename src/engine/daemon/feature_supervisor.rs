@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+type SharedTask = Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>;
 #[derive(Debug, Clone)]
 pub struct Backoff {
     pub initial: Duration,
@@ -30,13 +31,14 @@ impl Default for Backoff {
 struct Run {
     stop: CancellationToken,
     now: CancellationToken,
-    task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    task: SharedTask,
 }
 pub struct FeatureSupervisor {
     feature: Arc<dyn DaemonFeature>,
     core: Arc<Core>,
     state: watch::Sender<SupervisedState>,
     run: Mutex<Option<Run>>,
+    stopping: Mutex<Option<SharedTask>>,
     transition: tokio::sync::Mutex<()>,
     backoff: Backoff,
     pending_enable: Mutex<Option<(EnabledBy, Option<String>)>>,
@@ -56,6 +58,7 @@ impl FeatureSupervisor {
             core,
             state,
             run: Mutex::new(None),
+            stopping: Mutex::new(None),
             transition: tokio::sync::Mutex::new(()),
             backoff,
             pending_enable: Mutex::new(None),
@@ -187,7 +190,7 @@ impl FeatureSupervisor {
         // awaiting the feature task so drain cannot orphan a running task.
         run.stop.cancel();
         let supervisor = self.clone();
-        tokio::spawn(async move {
+        let stopping = tokio::spawn(async move {
             let stopped_now = tokio::select! {
                 biased;
                 _ = run.now.cancelled() => { supervisor.feature.stop_now().await; true },
@@ -222,12 +225,23 @@ impl FeatureSupervisor {
                 }
             }
         });
+        *self.stopping.lock().unwrap() = Some(Arc::new(tokio::sync::Mutex::new(Some(stopping))));
     }
     pub async fn wait_stopped(&self) {
         let mut state = self.subscribe();
         while state.borrow_and_update().state != FeatureState::Off {
             if state.changed().await.is_err() {
                 break;
+            }
+        }
+        // Publishing Off wakes waiters before the transition task drops its
+        // supervisor, feature and database references. Join it as well. Keep
+        // the shared lock through the join so concurrent waiters agree.
+        let stopping = self.stopping.lock().unwrap().clone();
+        if let Some(stopping) = stopping {
+            let mut task = stopping.lock().await;
+            if let Some(task) = task.take() {
+                let _ = task.await;
             }
         }
     }
