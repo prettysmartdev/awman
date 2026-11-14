@@ -447,10 +447,9 @@ async fn interview_creates_the_issue_from_the_draft_even_after_a_failed_agent() 
     agent_running(&w.docker, &mut task).await;
     assert_path_before_launch(&log);
     let draft = log.draft_path().expect("draft path");
-    assert!(
-        draft.starts_with(w.sandbox.awman_home().join("context/repo")),
-        "{draft:?}"
-    );
+    // The resolver canonicalizes the home, including Windows' verbatim prefix.
+    let repo_context = std::fs::canonicalize(w.sandbox.awman_home().join("context/repo")).unwrap();
+    assert!(draft.starts_with(&repo_context), "{draft:?}");
     let seeded = std::fs::read_to_string(&draft).unwrap();
     assert!(seeded.contains("Number: []"), "{seeded}");
     // The agent sees the draft through a read-write context(repo) mount.
