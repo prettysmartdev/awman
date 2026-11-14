@@ -721,8 +721,8 @@ async fn remote_input_is_staged_owner_only_with_an_unpredictable_name() {
     let first = prepare_work_item_input(&item, &w.session).unwrap();
     let second = prepare_work_item_input(&item, &w.session).unwrap();
     assert_eq!(
-        first.container_path,
-        PathBuf::from(format!("/awman/work-items/{}.md", item.key))
+        first.container_path.to_str().unwrap(),
+        format!("/awman/work-items/{}.md", item.key)
     );
     assert!(first.overlay.is_some());
     let a = first.private_file.as_ref().unwrap().path().to_path_buf();
@@ -745,8 +745,8 @@ async fn remote_input_is_staged_owner_only_with_an_unpredictable_name() {
     let local = w.resolve("local:42").await.unwrap();
     let prepared = prepare_work_item_input(&local, &w.session).unwrap();
     assert_eq!(
-        prepared.container_path,
-        PathBuf::from("/workspace/aspec/work-items/0042-the-answer.md")
+        prepared.container_path.to_str().unwrap(),
+        "/workspace/aspec/work-items/0042-the-answer.md"
     );
     assert!(prepared.overlay.is_none() && prepared.private_file.is_none());
     drop(second);

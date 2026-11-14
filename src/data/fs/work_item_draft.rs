@@ -566,6 +566,11 @@ mod imp {
                     path: host.to_path_buf(),
                 })
             }
+            Ok(m) if !m.is_file() => {
+                return Err(DraftReadError::NotRegular {
+                    path: host.to_path_buf(),
+                })
+            }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(DraftReadError::Missing)

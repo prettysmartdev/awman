@@ -282,9 +282,9 @@ mod tests {
         assert_ne!(a.source_id, b.source_id);
         // A caller id equal to a command id (or to the `command:` form) never
         // shares that command's identity.
-        for id in ["c1", "command:c1"] {
+        for (index, id) in ["c1", "command:c1"].into_iter().enumerate() {
             let c = store
-                .stage("s1", &format!("x-{id}"), &input(Some(id)))
+                .stage("s1", &format!("x-{index}"), &input(Some(id)))
                 .unwrap();
             assert_ne!(c.source_id, a.source_id, "{id}");
         }

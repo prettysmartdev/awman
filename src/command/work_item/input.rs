@@ -8,7 +8,7 @@
 //! the whole run (leader, every step, teardown, cancellation); dropping it
 //! deletes the staged file.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::data::config::env::EnvSnapshot;
 use crate::data::config::overlays::{DirectorySpec, OverlayPermission, TypedOverlay};
@@ -72,7 +72,10 @@ pub fn prepare_work_item_input(
     };
     match &item.origin {
         WorkItemOrigin::Local { path } => Ok(PreparedWorkItemInput {
-            container_path: Path::new("/workspace").join(repo_relative_display(git_root, path)),
+            container_path: PathBuf::from(format!(
+                "/workspace/{}",
+                repo_relative_display(git_root, path)
+            )),
             context,
             overlay: None,
             private_file: None,
@@ -81,7 +84,7 @@ pub fn prepare_work_item_input(
             let parent = private_work_item_parent(session.env())?;
             let private_file = PrivateWorkItemFile::create(&parent, &item.content)?;
             let container_path =
-                Path::new(CONTAINER_WORK_ITEMS_DIR).join(format!("{}.md", item.key));
+                PathBuf::from(format!("{CONTAINER_WORK_ITEMS_DIR}/{}.md", item.key));
             let overlay = TypedOverlay::Directory(DirectorySpec {
                 host: private_file.path().display().to_string(),
                 container: container_path.display().to_string(),

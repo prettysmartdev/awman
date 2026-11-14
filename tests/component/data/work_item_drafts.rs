@@ -19,7 +19,9 @@ fn new_draft(sandbox: &awman_test_support::TestSandbox, seed: &str) -> WorkItemD
 
 #[test]
 fn draft_paths_live_in_the_repo_context_overlay() {
-    let resolver = ContextDirResolver::at_home("/home/u/.awman");
+    let sandbox =
+        support::sandbox("data::work_item_drafts::draft_paths_live_in_the_repo_context_overlay");
+    let resolver = ContextDirResolver::at_home(sandbox.tmp().join("home"));
     let id = uuid::Uuid::new_v4();
     let paths = resolver.work_item_draft_paths(
         Some("https://github.com/Acme/Widgets.git"),
@@ -29,10 +31,12 @@ fn draft_paths_live_in_the_repo_context_overlay() {
     assert!(paths
         .host_path
         .ends_with(format!("acme/widgets/scratch/work-items/{id}.md")));
-    assert!(paths.host_path.starts_with("/home/u/.awman/context/repo"));
+    assert!(paths
+        .host_path
+        .starts_with(resolver.awman_home().join("context/repo")));
     assert_eq!(
-        paths.container_path,
-        Path::new(&format!("/awman/context/repo/scratch/work-items/{id}.md"))
+        paths.container_path.to_str().unwrap(),
+        format!("/awman/context/repo/scratch/work-items/{id}.md")
     );
 }
 

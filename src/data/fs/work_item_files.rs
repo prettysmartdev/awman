@@ -145,6 +145,15 @@ pub fn read_local_work_item(
     };
     let (_, canonical) = confined(git_root, &joined)?;
 
+    // Windows cannot open directories as ordinary files. Classify them before
+    // opening, and still check the opened descriptor below for replacements.
+    if !std::fs::metadata(&canonical)
+        .map_err(|e| io_error(&joined, e))?
+        .is_file()
+    {
+        return Err(LocalWorkItemFileError::NotRegular { path: joined });
+    }
+
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]

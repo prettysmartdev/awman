@@ -168,7 +168,7 @@ impl ContextDirResolver {
                 .join("scratch")
                 .join("work-items")
                 .join(&file),
-            container_path: PathBuf::from("/awman/context/repo/scratch/work-items").join(file),
+            container_path: PathBuf::from(format!("/awman/context/repo/scratch/work-items/{file}")),
         }
     }
     pub fn lease_repo_root(&self) -> PathBuf {

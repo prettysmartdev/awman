@@ -312,7 +312,9 @@ fn world(id: &'static str, repo_config: serde_json::Value, files: &[(&str, &str)
     // Host CLI isolation admits a fake only inside the snapshot's temp root;
     // the sandbox's fake binaries sit beside its scratch directory.
     let temp_root = sandbox.root().display().to_string();
-    sandbox.env_mut().set("TMPDIR", &temp_root);
+    for key in ["TMPDIR", "TMP", "TEMP"] {
+        sandbox.env_mut().set(key, &temp_root);
+    }
     let env = support::env_snapshot(&sandbox);
     let session = Session::open_at_git_root(
         root.clone(),

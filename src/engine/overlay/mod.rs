@@ -671,8 +671,9 @@ impl OverlayEngine {
         cwd: &Path,
         container_home: Option<&str>,
     ) -> Result<OverlaySpec, EngineError> {
-        // Allow container paths starting with ~/ (expanded below).
-        if !Path::new(&spec.container).is_absolute() && !spec.container.starts_with("~/") {
+        // Containers use Unix paths even when the host is Windows. Allow
+        // paths starting with ~/ too (expanded below).
+        if !spec.container.starts_with('/') && !spec.container.starts_with("~/") {
             return Err(EngineError::Other(format!(
                 "overlay container path '{}' must be absolute",
                 spec.container
