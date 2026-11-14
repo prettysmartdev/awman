@@ -36,8 +36,6 @@ pub trait ChatCommandFrontend:
 }
 
 pub struct ChatCommand {
-    #[cfg(test)]
-    pull_request_client: Option<crate::engine::git::pull_request::PullRequestClient>,
     flags: ChatCommandFlags,
     engines: Engines,
     session: Session,
@@ -46,23 +44,10 @@ pub struct ChatCommand {
 impl ChatCommand {
     pub fn new(flags: ChatCommandFlags, engines: Engines, session: Session) -> Self {
         Self {
-            #[cfg(test)]
-            pull_request_client: None,
             flags,
             engines,
             session,
         }
-    }
-
-    /// Hermetic PR metadata integration for full launch tests.
-    #[cfg(test)]
-    #[allow(dead_code)] // consumed by the subsequent launch-test workflow step
-    pub(crate) fn with_pull_request_client(
-        mut self,
-        client: crate::engine::git::pull_request::PullRequestClient,
-    ) -> Self {
-        self.pull_request_client = Some(client);
-        self
     }
 
     pub fn flags(&self) -> &ChatCommandFlags {
@@ -102,26 +87,6 @@ impl Command for ChatCommand {
 
         let invoker = session;
         let worktree = if let Some(target) = &self.flags.session_worktree {
-            #[cfg(test)]
-            let resolved = if let Some(client) = self.pull_request_client {
-                super::session_worktree::resolve_session_worktree_with_client(
-                    target,
-                    &invoker,
-                    self.engines.git_engine.clone(),
-                    client,
-                    frontend.as_mut(),
-                )
-                .await
-            } else {
-                resolve_session_worktree(
-                    target,
-                    &invoker,
-                    self.engines.git_engine.clone(),
-                    frontend.as_mut(),
-                )
-                .await
-            };
-            #[cfg(not(test))]
             let resolved = resolve_session_worktree(
                 target,
                 &invoker,
@@ -214,8 +179,7 @@ impl Command for ChatCommand {
                 .collected_overlays(cli_typed, None, None)?;
 
             // Emit deprecation warnings for legacy config fields.
-            LaunchPolicy::for_session(&session)
-                .warn_config(&self.engines.config_notices, frontend.as_mut());
+            LaunchPolicy::for_session(&session).warn_config(frontend.as_mut());
 
             // 3. Ensure the agent is available. The Dockerfile + image setup is
             //    container-paradigm only; kit-declarative (sandbox) runtimes get
@@ -301,6 +265,7 @@ impl Command for ChatCommand {
 
             // 6. Build the run options from flags + credentials.
             let mut run_opts = AgentRunOptions {
+                command_secrets: self.engines.command_secrets(),
                 yolo: self.flags.yolo.then_some(YoloMode::Enabled),
                 auto: self.flags.auto.then_some(AutoMode::Enabled),
                 plan: self.flags.plan.then_some(PlanMode::Enabled),
@@ -319,8 +284,8 @@ impl Command for ChatCommand {
                 system_prompt,
                 context_overlays,
                 launch_mode: match launch_decision {
-                    LaunchModeDecision::Acp => crate::data::config::repo::LaunchMode::Acp,
-                    _ => crate::data::config::repo::LaunchMode::Stdio,
+                    LaunchModeDecision::Acp => crate::data::config::agents::LaunchMode::Acp,
+                    _ => crate::data::config::agents::LaunchMode::Stdio,
                 },
                 ..Default::default()
             };
@@ -435,6 +400,7 @@ impl Command for ChatCommand {
                 frontend.set_stuck_sender(execution.stuck_sender());
                 let exit = execution.wait().await;
                 frontend.set_pty_active(false);
+                frontend.wait_output_drained().await;
                 frontend.replay_queued();
                 exit
             };
@@ -467,57 +433,4 @@ pub(crate) async fn ensure_agent_setup(
         .ensure_available_for_session(session, agent, &mut adapter)
         .await
         .map_err(CommandError::from)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolve_agent_uses_explicit_flag_over_session_default() {
-        let tmp = tempfile::tempdir().unwrap();
-        let session = Session::for_tests(tmp.path());
-        let agent = LaunchPolicy::for_session(&session)
-            .resolve_agent(&Some("codex".to_string()))
-            .unwrap();
-        assert_eq!(
-            agent.as_str(),
-            "codex",
-            "explicit flag must win over session default"
-        );
-    }
-
-    #[test]
-    fn resolve_agent_falls_back_to_claude_when_no_flag_or_default() {
-        let tmp = tempfile::tempdir().unwrap();
-        let session = Session::for_tests(tmp.path());
-        // No explicit flag, session has no default → falls back to "claude".
-        let agent = LaunchPolicy::for_session(&session)
-            .resolve_agent(&None)
-            .unwrap();
-        assert_eq!(agent.as_str(), "claude", "must fall back to claude");
-    }
-
-    #[test]
-    fn resolve_agent_invalid_name_returns_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let session = Session::for_tests(tmp.path());
-        // Empty string is not a valid agent name.
-        let result = LaunchPolicy::for_session(&session).resolve_agent(&Some(String::new()));
-        assert!(result.is_err(), "empty agent name must return error");
-    }
-
-    #[test]
-    fn resolve_agent_uses_session_default_when_no_flag() {
-        // We cannot easily inject a session default without writing config;
-        // this verifies the fallback path doesn't panic when default_agent()
-        // returns None (the no-config case already tested above).
-        let tmp = tempfile::tempdir().unwrap();
-        let session = Session::for_tests(tmp.path());
-        let agent = LaunchPolicy::for_session(&session)
-            .resolve_agent(&None)
-            .unwrap();
-        // In the absence of config the only valid result is "claude".
-        assert_eq!(agent.as_str(), "claude");
-    }
 }

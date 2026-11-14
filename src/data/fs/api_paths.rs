@@ -12,7 +12,6 @@ use crate::data::fs::config_file::write_config_file_atomically;
 use crate::data::fs::daemon_paths::DaemonPaths;
 use crate::data::fs::data_paths::DataPaths;
 use crate::data::session_setup_event::SessionSetupState;
-use crate::data::workflow_state::WorkflowState;
 
 /// Filename of the API sqlite database.
 pub const API_DB_FILENAME: &str = "awman.db";
@@ -22,9 +21,6 @@ const API_SUBDIR: &str = "api";
 
 /// Subdirectory holding per-session command logs.
 const SESSIONS_SUBDIR: &str = "sessions";
-
-/// Subdirectory holding TLS materials.
-const TLS_SUBDIR: &str = "tls";
 
 /// Resolves every path under the API storage root.
 ///
@@ -59,24 +55,10 @@ impl ApiPaths {
 
     /// Same as [`from_process_env`] but reads from a supplied env snapshot.
     ///
-    /// Precedence for the API root: `AWMAN_API_ROOT` → `AWMAN_CONFIG_HOME/api`
-    /// → `XDG_DATA_HOME/awman/api` → `$HOME/.awman/api`. The database is
-    /// resolved separately via `DataPaths` (`<data_home>/data/awman.db`), so it
-    /// relocates in lockstep with every other relocatable path rather than
-    /// tracking `AWMAN_API_ROOT`.
+    /// The API root is `<data home>/api`; the database is `<data home>/data/awman.db`
+    /// (see [`crate::data::fs::data_paths`]).
     pub fn from_env(env: &EnvSnapshot) -> Result<Self, DataError> {
-        let root = if let Some(root) = env.api_root() {
-            root
-        } else if let Some(home) = env.config_home() {
-            home.join(API_SUBDIR)
-        } else if let Some(xdg) = env.xdg_data_home() {
-            xdg.join("awman").join(API_SUBDIR)
-        } else {
-            dirs::home_dir()
-                .ok_or(DataError::HomeNotFound)?
-                .join(".awman")
-                .join(API_SUBDIR)
-        };
+        let root = crate::data::fs::data_paths::data_home(env)?.join(API_SUBDIR);
         let data_root = DataPaths::from_env(env)?.root().to_path_buf();
         Ok(Self { root, data_root })
     }
@@ -88,7 +70,7 @@ impl ApiPaths {
 
     /// Daemon-identity paths for the API daemon (key stem `api_key`).
     pub fn daemon(&self) -> DaemonPaths {
-        DaemonPaths::new(self.root.clone(), "api_key")
+        self.data_paths().daemon()
     }
 
     /// The shared data paths (locating the database).
@@ -141,7 +123,7 @@ impl ApiPaths {
 
     /// TLS material directory.
     pub fn tls_dir(&self) -> PathBuf {
-        self.root.join(TLS_SUBDIR)
+        self.daemon().tls_dir()
     }
 
     /// PEM-encoded TLS certificate.
@@ -240,7 +222,8 @@ impl ApiPaths {
 
     /// Create the root directory (and parents) on disk.
     pub fn ensure_root(&self) -> Result<(), DataError> {
-        std::fs::create_dir_all(&self.root).map_err(|e| DataError::io(&self.root, e))
+        std::fs::create_dir_all(&self.root).map_err(|e| DataError::io(&self.root, e))?;
+        self.daemon().ensure_root()
     }
 
     // ── Session / command storage surface (Layer 0) ──────────────────────────
@@ -343,7 +326,7 @@ impl ApiPaths {
         &self,
         session_id: &str,
         command_id: &str,
-        state: &WorkflowState,
+        state: &impl serde::Serialize,
     ) -> Result<(), DataError> {
         let path = self.command_workflow_state_path(session_id, command_id);
         let tmp_path = path.with_extension("json.tmp");
@@ -463,170 +446,17 @@ impl ApiPaths {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::command_status::CommandStatus;
-    use crate::data::config::env::{EnvSnapshot, AWMAN_API_ROOT, AWMAN_CONFIG_HOME, XDG_DATA_HOME};
-
-    #[test]
-    fn command_completion_round_trips_and_removal_is_idempotent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = ApiPaths::from_root(tmp.path());
-        assert_eq!(paths.read_command_completion("s", "c").unwrap(), None);
-        let completion = CommandCompletion {
-            attempt: 2,
-            status: CommandStatus::Error,
-            exit_code: 7,
-            result_json: r#"{"exit_code":7}"#.into(),
-            finished_at: "2026-10-30T00:00:00+00:00".into(),
-        };
-        // The command directory need not exist yet.
-        paths
-            .write_command_completion("s", "c", &completion)
-            .unwrap();
-        assert_eq!(
-            paths.read_command_completion("s", "c").unwrap(),
-            Some(completion)
-        );
-        let raw = std::fs::read_to_string(paths.command_completion_path("s", "c")).unwrap();
-        assert!(raw.contains(r#""status":"error""#), "{raw}");
-        paths.remove_command_completion("s", "c").unwrap();
-        paths.remove_command_completion("s", "c").unwrap();
-        assert_eq!(paths.read_command_completion("s", "c").unwrap(), None);
+impl ApiPaths {
+    pub fn command_invocation_pin_path(&self, session_id: &str, command_id: &str) -> PathBuf {
+        self.command_dir(session_id, command_id)
+            .join("invocation.json")
     }
-
-    #[test]
-    fn malformed_command_completion_is_an_error_not_absence() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = ApiPaths::from_root(tmp.path());
-        paths.prepare_command_dir("s", "c").unwrap();
-        std::fs::write(paths.command_completion_path("s", "c"), "{").unwrap();
-        assert!(paths.read_command_completion("s", "c").is_err());
+    pub fn command_context_start_path(&self, session_id: &str, command_id: &str) -> PathBuf {
+        self.command_dir(session_id, command_id)
+            .join("context_start.json")
     }
-
-    #[test]
-    fn from_env_returns_xdg_data_home_awman_api_when_xdg_set() {
-        let env = EnvSnapshot::with_overrides([(XDG_DATA_HOME, "/xdg/data")]);
-        let paths = ApiPaths::from_env(&env).unwrap();
-        assert_eq!(paths.root(), std::path::Path::new("/xdg/data/awman/api"));
-    }
-
-    #[test]
-    fn from_env_awman_api_root_wins_over_xdg_data_home() {
-        let env = EnvSnapshot::with_overrides([
-            (AWMAN_API_ROOT, "/custom/api"),
-            (XDG_DATA_HOME, "/xdg/data"),
-        ]);
-        let paths = ApiPaths::from_env(&env).unwrap();
-        assert_eq!(paths.root(), std::path::Path::new("/custom/api"));
-    }
-
-    #[test]
-    fn from_env_falls_back_to_home_awman_api() {
-        // No overrides — must fall back to $HOME/.awman/api.
-        let env = EnvSnapshot::empty();
-        let paths = ApiPaths::from_env(&env).unwrap();
-        let root = paths.root();
-        assert!(
-            root.ends_with(".awman/api"),
-            "fallback root must end with .awman/api; got: {root:?}"
-        );
-    }
-
-    #[test]
-    fn from_env_awman_config_home_produces_api_subdir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
-        let paths = ApiPaths::from_env(&env).unwrap();
-        assert_eq!(paths.root(), tmp.path().join("api"));
-    }
-
-    // ── Layer 0 storage methods (WI-0097 Finding C) ──────────────────────────
-
-    use crate::data::session_setup_event::{SessionSetupState, SessionSetupStatus};
-
-    #[test]
-    fn save_setup_state_round_trips_json() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = ApiPaths::from_root(tmp.path());
-
-        let mut state = SessionSetupState::new();
-        state.status = SessionSetupStatus::RunningReady;
-        state.current_stage = Some("cloning".to_string());
-
-        paths.save_setup_state("sess-1", &state).expect("save");
-
-        // The file lands at the documented path.
-        assert!(paths.session_setup_state_path("sess-1").exists());
-
-        let read = paths.read_setup_state("sess-1").expect("read back state");
-        assert_eq!(read.status, SessionSetupStatus::RunningReady);
-        assert_eq!(read.current_stage.as_deref(), Some("cloning"));
-    }
-
-    #[test]
-    fn save_setup_state_creates_session_dir_when_absent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = ApiPaths::from_root(tmp.path());
-        // No prior prepare_session_dirs — save must create the dir itself.
-        assert!(!paths.session_dir("fresh").exists());
-
-        paths
-            .save_setup_state("fresh", &SessionSetupState::new())
-            .expect("save into non-existent session dir");
-        assert!(paths.session_setup_state_path("fresh").exists());
-    }
-
-    #[test]
-    fn read_setup_state_absent_is_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = ApiPaths::from_root(tmp.path());
-        assert!(paths.read_setup_state("nope").is_none());
-    }
-
-    #[test]
-    fn prepare_session_dirs_creates_full_set_and_is_idempotent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = ApiPaths::from_root(tmp.path());
-
-        // First call materializes the session dir and every subdir.
-        paths.prepare_session_dirs("s").expect("first prepare");
-        let session_dir = paths.session_dir("s");
-        for sub in ["jobs", "commands", "worktree", "agent-settings"] {
-            assert!(
-                session_dir.join(sub).is_dir(),
-                "prepare_session_dirs must create {sub}/"
-            );
-        }
-        assert_eq!(
-            paths.session_worktree_dir("s"),
-            session_dir.join("worktree")
-        );
-        assert_eq!(
-            paths.session_agent_settings_dir("s"),
-            session_dir.join("agent-settings")
-        );
-
-        // Second call on the existing tree must succeed (idempotent).
-        paths
-            .prepare_session_dirs("s")
-            .expect("prepare_session_dirs must be idempotent");
-        for sub in ["jobs", "commands", "worktree", "agent-settings"] {
-            assert!(session_dir.join(sub).is_dir());
-        }
-    }
-
-    #[test]
-    fn prepare_command_dir_creates_command_output_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = ApiPaths::from_root(tmp.path());
-
-        paths
-            .prepare_command_dir("s", "c")
-            .expect("prepare command dir");
-        assert!(paths.command_dir("s", "c").is_dir());
-        // Idempotent.
-        paths.prepare_command_dir("s", "c").expect("idempotent");
+    pub fn command_context_changes_path(&self, session_id: &str, command_id: &str) -> PathBuf {
+        self.command_dir(session_id, command_id)
+            .join("context_changes.json")
     }
 }

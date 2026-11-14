@@ -1,0 +1,460 @@
+[
+  {
+    "delta": "tab_opened",
+    "value": {
+      "tab_id": "tab_7e6d5c4b3a291807f6e5d4c3b2a19080",
+      "session": {
+        "session_id": "e1f2a3b4-c5d6-4e7f-8a9b-0c1d2e3f4a5b",
+        "session_type": {
+          "type": "local",
+          "workdir": "/Users/me/src/awman"
+        },
+        "cwd": "/Users/me/src/awman/web",
+        "git_root": "/Users/me/src/awman",
+        "default_agent": null,
+        "labels": {}
+      },
+      "kind": "normal",
+      "label": {
+        "text": "web",
+        "color": "default"
+      },
+      "execution_phase": {
+        "phase": "idle"
+      },
+      "current_workflow": null,
+      "current_container": null,
+      "workflow": null,
+      "workflow_invocation_id": null,
+      "context_path": null,
+      "worktree_path": null,
+      "slots": [],
+      "focused_slot": null,
+      "yolo": null,
+      "yolo_mode": false,
+      "stuck": false,
+      "git_summary": null,
+      "status_log": [],
+      "agents_dashboard": null,
+      "last_container_summary": null,
+      "annotations": {}
+    }
+  },
+  {
+    "delta": "tab_label",
+    "value": {
+      "tab_id": "tab_7e6d5c4b3a291807f6e5d4c3b2a19080",
+      "label": {
+        "text": "web (ready)",
+        "color": "done"
+      }
+    }
+  },
+  {
+    "delta": "phase",
+    "value": {
+      "tab_id": "tab_7e6d5c4b3a291807f6e5d4c3b2a19080",
+      "phase": {
+        "phase": "done",
+        "command": "ready",
+        "exit_code": 0
+      },
+      "current_workflow": null,
+      "current_container": null
+    }
+  },
+  {
+    "delta": "workflow",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "view": {
+        "steps": [
+          {
+            "name": "plan",
+            "status": "done",
+            "agent": "claude",
+            "model": "opus",
+            "depends_on": [],
+            "kind": "agent"
+          },
+          {
+            "name": "implement",
+            "status": "running",
+            "agent": "claude",
+            "model": "opus",
+            "depends_on": [
+              "plan"
+            ],
+            "kind": "agent"
+          },
+          {
+            "name": "review",
+            "status": "pending",
+            "agent": "codex",
+            "model": null,
+            "depends_on": [
+              "implement"
+            ],
+            "kind": "agent"
+          }
+        ],
+        "current_step": "implement",
+        "max_concurrent": 2,
+        "reported": {
+          "plan": "done"
+        }
+      },
+      "invocation_id": "9f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a",
+      "context_path": "/Users/me/src/awman/.awman/context",
+      "worktree_path": null
+    }
+  },
+  {
+    "delta": "group_started",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    }
+  },
+  {
+    "delta": "slot_launched",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "slot": {
+        "slot_id": "c3d4e5f6-a7b8-4c9d-9e0f-1a2b3c4d5e6f",
+        "step_name": "review",
+        "agent_display_name": "Codex",
+        "model": null,
+        "container_name": "awman-codex-c3d4e5f6",
+        "terminal_id": "term_8a9b0c1d2e3f405162738495a6b7c8d9",
+        "acp": null,
+        "started_at": "2026-11-09T09:30:00Z",
+        "stats": null,
+        "program_status": null,
+        "stuck": false,
+        "countdown_kind": "stuck_step",
+        "yolo": null,
+        "sandboxed": false,
+        "phase_step_title": null,
+        "dormant": false
+      }
+    }
+  },
+  {
+    "delta": "slot_container_name",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "slot_id": "c3d4e5f6-a7b8-4c9d-9e0f-1a2b3c4d5e6f",
+      "container_name": "awman-codex-c3d4e5f6-2"
+    }
+  },
+  {
+    "delta": "slot_stats",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "slot_id": "7d0f5e2c-3b1a-4c9d-8e6f-2a1b3c4d5e6f",
+      "stats": {
+        "name": "awman-claude-7d0f5e2c",
+        "cpu_percent": 33.3,
+        "memory_mb": 640
+      }
+    }
+  },
+  {
+    "delta": "slot_stuck",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "slot_id": "7d0f5e2c-3b1a-4c9d-8e6f-2a1b3c4d5e6f",
+      "stuck": true
+    }
+  },
+  {
+    "delta": "slot_countdown_kind",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "slot_id": "7d0f5e2c-3b1a-4c9d-8e6f-2a1b3c4d5e6f",
+      "kind": "agent_blocked"
+    }
+  },
+  {
+    "delta": "slot_yolo",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "slot_id": "7d0f5e2c-3b1a-4c9d-8e6f-2a1b3c4d5e6f",
+      "state": {
+        "step_name": "implement",
+        "remaining_secs": 42,
+        "kind": "agent_blocked"
+      }
+    }
+  },
+  {
+    "delta": "slot_acp_update",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "slot_id": "7d0f5e2c-3b1a-4c9d-8e6f-2a1b3c4d5e6f",
+      "update": {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "call_1",
+        "status": "pending",
+        "title": "Write src/lib.rs"
+      }
+    }
+  },
+  {
+    "delta": "slot_acp_permission",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "slot_id": "7d0f5e2c-3b1a-4c9d-8e6f-2a1b3c4d5e6f",
+      "request": {
+        "requestId": 42,
+        "sessionId": "acp-session-1",
+        "toolCall": {
+          "toolCallId": "call_1",
+          "status": "pending",
+          "title": "Write src/lib.rs"
+        },
+        "options": [
+          {
+            "optionId": "allow",
+            "name": "Allow once",
+            "kind": "allow_once"
+          },
+          {
+            "optionId": "reject",
+            "name": "Reject",
+            "kind": "reject_once"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "delta": "focused_slot",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "slot_id": "c3d4e5f6-a7b8-4c9d-9e0f-1a2b3c4d5e6f"
+    }
+  },
+  {
+    "delta": "slot_exited",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "slot_id": "c3d4e5f6-a7b8-4c9d-9e0f-1a2b3c4d5e6f",
+      "exit_code": 0
+    }
+  },
+  {
+    "delta": "group_finished",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    }
+  },
+  {
+    "delta": "yolo",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "state": {
+        "step_name": "implement",
+        "remaining_secs": 42,
+        "kind": "agent_done"
+      }
+    }
+  },
+  {
+    "delta": "yolo_mode",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "on": true
+    }
+  },
+  {
+    "delta": "stuck",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "stuck": true
+    }
+  },
+  {
+    "delta": "git_summary",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "summary": {
+        "branch": "wi-0159",
+        "files": [
+          {
+            "path": "web/src/lib/client/types.ts",
+            "change": "added",
+            "added": 950,
+            "removed": 0,
+            "binary": false
+          },
+          {
+            "path": "web/public/icon.png",
+            "change": "modified",
+            "added": 0,
+            "removed": 0,
+            "binary": true
+          }
+        ],
+        "added": 950,
+        "removed": 0
+      }
+    }
+  },
+  {
+    "delta": "status_line",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "line": {
+        "level": "success",
+        "text": "step implement done"
+      }
+    }
+  },
+  {
+    "delta": "status_log_reset",
+    "value": {
+      "tab_id": "tab_0f9e8d7c6b5a49382716051f2e3d4c5b"
+    }
+  },
+  {
+    "delta": "agents_dashboard",
+    "value": {
+      "tab_id": "tab_0f9e8d7c6b5a49382716051f2e3d4c5b",
+      "data": {
+        "overview": {
+          "agents": [
+            {
+              "name": "claude",
+              "running": 1
+            }
+          ]
+        },
+        "watching": true
+      }
+    }
+  },
+  {
+    "delta": "last_container_summary",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "summary": {
+        "agent_display_name": "Codex",
+        "container_name": "awman-codex-c3d4e5f6-2",
+        "avg_cpu": "8.1%",
+        "avg_memory": "402MB",
+        "total_time": "1m 12s",
+        "exit_code": 0
+      }
+    }
+  },
+  {
+    "delta": "annotations",
+    "value": {
+      "target": {
+        "target": "instance"
+      },
+      "annotations": {
+        "web/origin": "https://awman.prettysmart.dev",
+        "web/pinned": "true"
+      }
+    }
+  },
+  {
+    "delta": "annotations",
+    "value": {
+      "target": {
+        "target": "tab",
+        "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90"
+      },
+      "annotations": {
+        "web/tab": "renamed"
+      }
+    }
+  },
+  {
+    "delta": "annotations",
+    "value": {
+      "target": {
+        "target": "terminal",
+        "terminal_id": "term_4e5f60718293a4b5c6d7e8f901a2b3c4"
+      },
+      "annotations": {
+        "web/term": "x"
+      }
+    }
+  },
+  {
+    "delta": "annotations",
+    "value": {
+      "target": {
+        "target": "frontend",
+        "frontend_id": "fe_9a8b7c6d5e4f30211203f4e5d6c7b8a9"
+      },
+      "annotations": {
+        "web/device": "tablet"
+      }
+    }
+  },
+  {
+    "delta": "frontend_attached",
+    "value": {
+      "frontend_id": "fe_1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a",
+      "kind": "web",
+      "role": "secondary",
+      "annotations": {},
+      "connected_at": "2026-11-09T09:32:00Z",
+      "view": "all",
+      "reconnecting": false
+    }
+  },
+  {
+    "delta": "frontend_detached",
+    "value": {
+      "frontend_id": "fe_1d2c3b4a5f6e7d8c9b0a1f2e3d4c5b6a",
+      "reason": "socket closed"
+    }
+  },
+  {
+    "delta": "squad_health",
+    "value": "unreachable"
+  },
+  {
+    "delta": "active_tab_hint",
+    "value": {
+      "tab_id": "tab_7e6d5c4b3a291807f6e5d4c3b2a19080"
+    }
+  },
+  {
+    "delta": "dialog_pending",
+    "value": {
+      "dialog_id": "dlg_99887766554433221100ffeeddccbbaa",
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "request": {
+        "kind": "text_input",
+        "title": "Branch name",
+        "prompt": "New branch:",
+        "default_text": "wi-0159"
+      },
+      "raised_at": "2026-11-09T09:31:00Z"
+    }
+  },
+  {
+    "delta": "dialog_resolved",
+    "value": {
+      "dialog_id": "dlg_99887766554433221100ffeeddccbbaa"
+    }
+  },
+  {
+    "delta": "dialog_resolved",
+    "value": {
+      "dialog_id": "dlg_6a7b8c9d0e1f20314253647586970a1b"
+    }
+  },
+  {
+    "delta": "tab_closed",
+    "value": {
+      "tab_id": "tab_7e6d5c4b3a291807f6e5d4c3b2a19080"
+    }
+  }
+]

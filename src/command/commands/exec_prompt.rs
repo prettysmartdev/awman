@@ -16,8 +16,7 @@ use crate::engine::agent::AgentRunOptions;
 use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
 
 mod flags;
-#[cfg(test)]
-pub(crate) use flags::refuse_selector_in_prompt;
+
 pub use flags::ExecPromptCommandFlags;
 
 #[derive(Debug, Clone, Serialize)]
@@ -51,26 +50,28 @@ async fn ensure_exec_prompt_agent_setup(
 }
 
 /// Build the final prompt string by combining an optional user-provided text
-/// and an optional issue markdown block. Exposed for unit testing.
+/// and optional resolved work item content. Content is prompt data only.
 pub(crate) fn build_prompt_string(
     user_prompt: Option<&str>,
-    issue_markdown: Option<&str>,
+    work_item_content: Option<&str>,
 ) -> Option<String> {
-    match (user_prompt, issue_markdown) {
+    match (user_prompt, work_item_content) {
         (Some(user), Some(issue)) => Some(format!("{user}\n\n{issue}")),
         (Some(user), None) => Some(user.to_string()),
+        // The prompt is the agent CLI's last positional argument. Work item
+        // text comes from the repository, so it must never be parsed as an
+        // option (`--dangerously-skip-permissions`, `--flag=value`).
+        (None, Some(issue)) if issue.starts_with('-') => Some(format!("Work item:\n\n{issue}")),
         (None, Some(issue)) => Some(issue.to_string()),
         (None, None) => None,
     }
 }
 
 pub struct ExecPromptCommand {
-    #[cfg(test)]
-    pull_request_client: Option<crate::engine::git::pull_request::PullRequestClient>,
     flags: ExecPromptCommandFlags,
     engines: Engines,
     session: Session,
-    /// Fired by an external cancel (the API's `POST /v1/commands/{id}/cancel`).
+    /// Fired by an external cancel (the API's `POST /v1/worker/commands/{id}/cancel`).
     /// Never fired for the CLI or the TUI, which never install one.
     cancel: tokio_util::sync::CancellationToken,
     /// The host directory mounted read-write at `/awman/output` (WI 0137
@@ -82,8 +83,6 @@ pub struct ExecPromptCommand {
 impl ExecPromptCommand {
     pub fn new(flags: ExecPromptCommandFlags, engines: Engines, session: Session) -> Self {
         Self {
-            #[cfg(test)]
-            pull_request_client: None,
             flags,
             engines,
             session,
@@ -102,17 +101,6 @@ impl ExecPromptCommand {
     /// Mount `dir` at `/awman/output` into the agent container (WI 0137 §3).
     pub fn with_output_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
         self.output_dir = dir;
-        self
-    }
-
-    /// Hermetic PR metadata integration for full launch tests.
-    #[cfg(test)]
-    #[allow(dead_code)] // consumed by the subsequent launch-test workflow step
-    pub(crate) fn with_pull_request_client(
-        mut self,
-        client: crate::engine::git::pull_request::PullRequestClient,
-    ) -> Self {
-        self.pull_request_client = Some(client);
         self
     }
 
@@ -146,45 +134,35 @@ impl Command for ExecPromptCommand {
             }
         }
 
-        // Validate that at least one of prompt and --issue is provided.
-        if self.flags.prompt.is_none() && self.flags.issue_source.issue.is_none() {
-            return Err(CommandError::Other(
-                "exec prompt: either a prompt argument or --issue must be provided".to_string(),
-            ));
-        }
-
-        // Resolve issue if --issue was provided.
-        let issue_markdown = if let Some(ref issue_ref) = self.flags.issue_source.issue {
-            let router = crate::engine::issue::router::IssueSourceRouter::new(
-                std::sync::Arc::clone(&self.engines.git_engine),
-                session.env(),
-            );
-            match router.fetch_issue_with_progress(issue_ref, session.git_root(), &mut *frontend) {
-                Ok((issue, source)) => {
-                    let md = source.format_as_markdown(&issue);
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Info,
-                        text: format!("exec prompt: fetched issue '{}'", issue.title),
-                    });
-                    Some(md)
-                }
-                Err(e) => {
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Error,
-                        text: format!("exec prompt: failed to fetch issue: {e}"),
-                    });
-                    return Err(CommandError::Other(e.to_string()));
-                }
+        // Resolve --work-item through the shared resolver (WI 0147). Any
+        // resolution failure is a hard error before a container starts; the
+        // resolver reports the source and title itself.
+        let work_item_content = match crate::command::work_item::WorkItemResolver::new(
+            session.clone(),
+            std::sync::Arc::clone(&self.engines.git_engine),
+        )
+        .resolve(self.flags.work_item.as_deref(), &mut *frontend)
+        .await
+        {
+            Ok(item) => item.map(|item| item.content),
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec prompt: failed to resolve work item: {e}"),
+                });
+                return Err(e.into());
             }
-        } else {
-            None
         };
 
-        // Construct the final prompt string. The earlier validation above
-        // guarantees at least one input is present, so this cannot be None.
+        // Resolve first so staged inline input can supply the prompt too.
         let final_prompt =
-            build_prompt_string(self.flags.prompt.as_deref(), issue_markdown.as_deref())
-                .expect("validated above: at least one of prompt or --issue must be present");
+            build_prompt_string(self.flags.prompt.as_deref(), work_item_content.as_deref())
+                .ok_or_else(|| {
+                    CommandError::Other(
+                        "exec prompt: either a prompt argument or --work-item must be provided"
+                            .into(),
+                    )
+                })?;
 
         let agent = match LaunchPolicy::for_session(&session).resolve_agent(&self.flags.agent) {
             Ok(a) => a,
@@ -206,26 +184,6 @@ impl Command for ExecPromptCommand {
         }
         let invoker = session;
         let worktree = if let Some(target) = &self.flags.session_worktree {
-            #[cfg(test)]
-            let resolved = if let Some(client) = self.pull_request_client {
-                super::session_worktree::resolve_session_worktree_with_client(
-                    target,
-                    &invoker,
-                    self.engines.git_engine.clone(),
-                    client,
-                    frontend.as_mut(),
-                )
-                .await
-            } else {
-                resolve_session_worktree(
-                    target,
-                    &invoker,
-                    self.engines.git_engine.clone(),
-                    frontend.as_mut(),
-                )
-                .await
-            };
-            #[cfg(not(test))]
             let resolved = resolve_session_worktree(
                 target,
                 &invoker,
@@ -296,7 +254,7 @@ impl Command for ExecPromptCommand {
 
             // Emit deprecation warnings for legacy config fields.
             LaunchPolicy::for_session(&session)
-                .warn_config(&self.engines.config_notices, frontend.as_mut());
+                .warn_config(frontend.as_mut());
 
             // The Dockerfile + image setup is container-paradigm only; sandbox
             // runtimes get their per-agent kits from `awman ready` instead.
@@ -369,14 +327,15 @@ impl Command for ExecPromptCommand {
                     None,
                     frontend.as_mut(),
                 )?;
-            let mut directory_overlays = collected.directories;
+            let directory_overlays = collected.directories;
+            let mut command_mounts = Vec::new();
             let system_prompt = match self
                 .output_dir
                 .as_ref()
                 .filter(|_| self.engines.runtime.capabilities().arbitrary_host_mounts)
             {
                 Some(dir) => {
-                    directory_overlays.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
+                    command_mounts.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
                     Some(crate::engine::context_prompt::with_outputs_section(
                         system_prompt,
                         crate::engine::context_prompt::OutputsPromptRole::Prompt,
@@ -386,6 +345,7 @@ impl Command for ExecPromptCommand {
             };
 
             let mut run_opts = AgentRunOptions {
+                command_secrets: self.engines.command_secrets(),
                 yolo: self.flags.yolo.then_some(YoloMode::Enabled),
                 auto: self.flags.auto.then_some(AutoMode::Enabled),
                 plan: self.flags.plan.then_some(PlanMode::Enabled),
@@ -404,13 +364,14 @@ impl Command for ExecPromptCommand {
                     Some(collected.env_passthrough)
                 },
                 directory_overlays,
+                command_mounts,
                 include_all_skills: collected.include_all_skills,
                 named_skills: collected.named_skills,
                 system_prompt,
                 context_overlays,
                 launch_mode: match launch_decision {
-                    LaunchModeDecision::Acp => crate::data::config::repo::LaunchMode::Acp,
-                    _ => crate::data::config::repo::LaunchMode::Stdio,
+                    LaunchModeDecision::Acp => crate::data::config::agents::LaunchMode::Acp,
+                    _ => crate::data::config::agents::LaunchMode::Stdio,
                 },
                 ..Default::default()
             };
@@ -429,7 +390,7 @@ impl Command for ExecPromptCommand {
                     invoker.working_dir(),
                 )?;
                 if let Some(overlay) = worktree.git_directory_overlay(self.engines.git_engine.clone()).await? {
-                    run_opts.directory_overlays.push(overlay);
+                    run_opts.command_mounts.push(overlay);
                 }
             }
 
@@ -585,6 +546,7 @@ impl Command for ExecPromptCommand {
                     }
                 };
                 frontend.set_pty_active(false);
+                frontend.wait_output_drained().await;
                 frontend.replay_queued();
                 exit
             };
@@ -615,71 +577,22 @@ impl Command for ExecPromptCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::build_prompt_string;
 
     #[test]
-    fn build_prompt_only_user_text() {
-        let result = build_prompt_string(Some("my prompt"), None);
-        assert_eq!(result, Some("my prompt".to_string()));
-    }
-
-    #[test]
-    fn build_prompt_only_issue_text() {
-        let result = build_prompt_string(None, Some("# Issue Title\n\nBody"));
-        assert_eq!(result, Some("# Issue Title\n\nBody".to_string()));
-    }
-
-    #[test]
-    fn build_prompt_both_user_and_issue_separated_by_double_newline() {
-        let result = build_prompt_string(Some("context"), Some("# Issue"));
-        assert_eq!(result, Some("context\n\n# Issue".to_string()));
-    }
-
-    #[test]
-    fn build_prompt_both_absent_returns_none() {
-        let result = build_prompt_string(None, None);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn build_prompt_issue_with_empty_body_uses_title_only_markdown() {
-        // format_as_markdown with empty body produces "# Title Only".
-        use crate::engine::issue::{Issue, IssueSource, IssueSourceError};
-        use std::path::Path;
-
-        struct FakeSource;
-        impl IssueSource for FakeSource {
-            fn provider_name(&self) -> &str {
-                "Test"
-            }
-            fn provider_prefix(&self) -> &str {
-                "tst"
-            }
-            fn issue_identifier(&self, _: &Issue) -> String {
-                "0".into()
-            }
-            fn can_handle(&self, _: &str) -> bool {
-                false
-            }
-            fn fetch_issue(&self, _: &str, _: &Path) -> Result<Issue, IssueSourceError> {
-                unimplemented!()
-            }
+    fn work_item_text_alone_never_starts_with_an_option_dash() {
+        for content in ["--dangerously-skip-permissions", "-p=x\nrest"] {
+            let prompt = build_prompt_string(None, Some(content)).unwrap();
+            assert!(!prompt.starts_with('-'), "{prompt:?}");
+            assert!(prompt.ends_with(content));
         }
-        let issue = Issue {
-            source_id: String::new(),
-            title: "Title Only".into(),
-            body: String::new(),
-            provider: "Test".into(),
-        };
-        let md = FakeSource.format_as_markdown(&issue);
-        assert_eq!(md, "# Title Only");
-
-        // When used as the issue_markdown argument, no trailing whitespace.
-        let combined = build_prompt_string(Some("user text"), Some(&md));
-        assert_eq!(combined, Some("user text\n\n# Title Only".to_string()));
-
-        // When used alone, no trailing whitespace.
-        let alone = build_prompt_string(None, Some(&md));
-        assert_eq!(alone, Some("# Title Only".to_string()));
+        assert_eq!(
+            build_prompt_string(None, Some("# Title\n\nbody")).as_deref(),
+            Some("# Title\n\nbody")
+        );
+        assert_eq!(
+            build_prompt_string(Some("do it"), Some("-x")).as_deref(),
+            Some("do it\n\n-x")
+        );
     }
 }

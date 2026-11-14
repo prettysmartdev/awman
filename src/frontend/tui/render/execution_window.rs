@@ -375,6 +375,9 @@ fn render_agents_table(
             let glyph_color = match state {
                 AgentState::Running => Color::Green,
                 AgentState::Stuck => Color::Yellow,
+                AgentState::Waiting => Color::Yellow,
+                AgentState::Errored => Color::Red,
+                AgentState::Done => Color::Green,
                 AgentState::Stopped => Color::DarkGray,
             };
             Row::new(cells.iter().enumerate().map(|(i, cell)| {

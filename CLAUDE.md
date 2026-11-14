@@ -28,7 +28,8 @@ All decisions — architecture, behavior, security, UX, and implementation — a
 ```
 make all      # build the awman binary
 make install  # build + install to /usr/local/bin/
-make test     # run all tests
+make test     # run the manifest local gate
+make validate-native # Apple Silicon acceptance and evidence packet
 ```
 
 ## Architecture Constraints
@@ -48,9 +49,10 @@ make test     # run all tests
 
 ## Testing
 
-- Every module/function: unit tests validating inputs and outputs
-- Cross-component flows: integration tests
-- Full CLI behavior: end-to-end tests
+- Follow `aspec/devops/testing.md` and `ci/gates.toml`. Cover important user journeys and failure boundaries at the lowest useful tier; test counts and one-to-one replacement are not coverage goals.
+- Use `awman-test-support` for private state, owned processes, deadlines and typed capabilities. Never depend on a developer's HOME or host agents.
+- Keep pure tests small. Prove cross-component behavior through production interfaces and reserve real external systems for explicitly granted boundary and native tiers.
+- Every suite and gate must be registered. Missing infrastructure is blocked evidence, never a passing skip. Do not reintroduce pre-WI144 harnesses or fallback workflows.
 
 ## Configuration
 

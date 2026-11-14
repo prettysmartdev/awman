@@ -6,20 +6,7 @@ use serde_json::Value;
 pub const JSONRPC_VERSION: &str = "2.0";
 pub const ACP_PROTOCOL_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum JsonRpcId {
-    Number(i64),
-    String(String),
-}
-
-impl Default for JsonRpcId {
-    fn default() -> Self {
-        // Only used for a serde-skipped, locally-attached request id. ACP
-        // wire messages never rely on this placeholder.
-        Self::Number(0)
-    }
-}
+pub use crate::data::acp_protocol::JsonRpcId;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JsonRpcRequest<T> {
@@ -154,152 +141,27 @@ pub struct PromptResponse {
     pub stop_reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContentBlock {
-    Text {
-        text: String,
-    },
-    Image {
-        data: String,
-        mime_type: String,
-    },
-    Audio {
-        data: String,
-        mime_type: String,
-    },
-    ResourceLink {
-        name: String,
-        uri: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        mime_type: Option<String>,
-    },
-    Resource {
-        resource: Value,
-    },
-}
+pub use crate::data::acp_protocol::ContentBlock;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ContentChunk {
-    pub content: ContentBlock,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message_id: Option<String>,
-}
+pub use crate::data::acp_protocol::ContentChunk;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolCall {
-    pub tool_call_id: String,
-    pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-    #[serde(default)]
-    pub content: Vec<Value>,
-    #[serde(default)]
-    pub locations: Vec<ToolCallLocation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_input: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_output: Option<Value>,
-}
+pub use crate::data::acp_protocol::ToolCall;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolCallUpdate {
-    pub tool_call_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<Vec<Value>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub locations: Option<Vec<ToolCallLocation>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_input: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_output: Option<Value>,
-}
+pub use crate::data::acp_protocol::ToolCallUpdate;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolCallLocation {
-    pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line: Option<u32>,
-}
+pub use crate::data::acp_protocol::ToolCallLocation;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanEntry {
-    pub content: String,
-    pub priority: String,
-    pub status: String,
-}
+pub use crate::data::acp_protocol::PlanEntry;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AvailableCommand {
-    pub name: String,
-    pub description: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input: Option<Value>,
-}
+pub use crate::data::acp_protocol::AvailableCommand;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "sessionUpdate", rename_all = "snake_case")]
-pub enum SessionUpdate {
-    AgentMessageChunk {
-        #[serde(flatten)]
-        chunk: ContentChunk,
-    },
-    AgentThoughtChunk {
-        #[serde(flatten)]
-        chunk: ContentChunk,
-    },
-    ToolCall {
-        #[serde(flatten)]
-        tool_call: ToolCall,
-    },
-    ToolCallUpdate {
-        #[serde(flatten)]
-        tool_call: ToolCallUpdate,
-    },
-    Plan {
-        entries: Vec<PlanEntry>,
-    },
-    AvailableCommandsUpdate {
-        available_commands: Vec<AvailableCommand>,
-    },
-}
+pub use crate::data::acp_protocol::SessionUpdate;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionUpdateNotification {
-    pub session_id: String,
-    pub update: SessionUpdate,
-}
+pub use crate::data::acp_protocol::SessionUpdateNotification;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PermissionOption {
-    pub option_id: String,
-    pub name: String,
-    pub kind: String,
-}
+pub use crate::data::acp_protocol::PermissionOption;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PermissionRequest {
-    /// The JSON-RPC id to pass to `AcpSession::respond_permission`.
-    #[serde(skip)]
-    pub request_id: JsonRpcId,
-    pub session_id: String,
-    pub tool_call: ToolCallUpdate,
-    pub options: Vec<PermissionOption>,
-}
+pub use crate::data::acp_protocol::PermissionRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionDecision {
@@ -483,182 +345,5 @@ pub fn summarize_update(update: &SessionUpdate) -> String {
         SessionUpdate::AvailableCommandsUpdate { available_commands } => {
             format!("available commands: {}", available_commands.len())
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn text_chunk() -> ContentChunk {
-        ContentChunk {
-            content: ContentBlock::Text {
-                text: "hello".into(),
-            },
-            message_id: Some("m1".into()),
-        }
-    }
-    fn tool() -> ToolCall {
-        ToolCall {
-            tool_call_id: "tool-1".into(),
-            title: "Read".into(),
-            kind: Some("read".into()),
-            status: Some("pending".into()),
-            content: vec![],
-            locations: vec![],
-            raw_input: None,
-            raw_output: None,
-        }
-    }
-    fn update() -> ToolCallUpdate {
-        ToolCallUpdate {
-            tool_call_id: "tool-1".into(),
-            kind: None,
-            status: Some("completed".into()),
-            title: None,
-            content: None,
-            locations: None,
-            raw_input: None,
-            raw_output: None,
-        }
-    }
-    #[test]
-    fn every_supported_session_update_round_trips_as_one_line() {
-        let updates = vec![
-            SessionUpdate::AgentMessageChunk {
-                chunk: text_chunk(),
-            },
-            SessionUpdate::AgentThoughtChunk {
-                chunk: text_chunk(),
-            },
-            SessionUpdate::ToolCall { tool_call: tool() },
-            SessionUpdate::ToolCallUpdate {
-                tool_call: update(),
-            },
-            SessionUpdate::Plan {
-                entries: vec![PlanEntry {
-                    content: "do it".into(),
-                    priority: "high".into(),
-                    status: "pending".into(),
-                }],
-            },
-            SessionUpdate::AvailableCommandsUpdate {
-                available_commands: vec![AvailableCommand {
-                    name: "help".into(),
-                    description: "help".into(),
-                    input: None,
-                }],
-            },
-        ];
-        for update in updates {
-            let line = encode_line(&update).unwrap();
-            let mut framer = LineFramer::default();
-            let frame = framer.push(&line).pop().unwrap().unwrap();
-            assert_eq!(
-                serde_json::from_value::<SessionUpdate>(frame).unwrap(),
-                update
-            );
-        }
-    }
-
-    #[test]
-    fn line_framer_caps_an_endless_unterminated_line() {
-        // An agent that streams bytes forever with no newline must not grow the
-        // framer's buffer without bound; the buffer is capped and a warning is
-        // emitted instead of an OOM.
-        let mut framer = LineFramer::default();
-        let chunk = vec![b'a'; 1024 * 1024];
-        let mut warned = false;
-        // Push ~2x the cap worth of no-newline bytes.
-        for _ in 0..(2 * MAX_ACP_LINE_BYTES / chunk.len() + 1) {
-            for frame in framer.push(&chunk) {
-                assert!(frame.is_err(), "no complete frame can parse from garbage");
-                warned = true;
-            }
-        }
-        assert!(warned, "over-cap line must surface a warning frame");
-    }
-
-    #[test]
-    fn line_framer_realigns_after_discarding_an_over_long_line() {
-        // After discarding an over-long line, the next newline resynchronises
-        // framing and a following valid frame still parses.
-        let mut framer = LineFramer::default();
-        let huge = vec![b'x'; MAX_ACP_LINE_BYTES + 16];
-        let warnings = framer.push(&huge);
-        assert!(warnings.iter().any(|f| f.is_err()), "cap must warn");
-        // Terminate the discarded line, then send a real frame on the next line.
-        let good = SessionUpdate::Plan { entries: vec![] };
-        let mut tail = vec![b'\n'];
-        tail.extend_from_slice(&encode_line(&good).unwrap());
-        let frames = framer.push(&tail);
-        let parsed = frames
-            .into_iter()
-            .find_map(|f| f.ok())
-            .expect("valid frame after realignment");
-        assert_eq!(
-            serde_json::from_value::<SessionUpdate>(parsed).unwrap(),
-            good
-        );
-    }
-
-    #[test]
-    fn sanitize_terminal_text_strips_control_but_keeps_newline_and_tab() {
-        let dirty = "safe\x1b]52;c;paste\x07\ttab\nmore\x00end";
-        let clean = sanitize_terminal_text(dirty);
-        assert!(!clean.contains('\x1b'), "ESC must be stripped: {clean:?}");
-        assert!(!clean.contains('\x07'), "BEL must be stripped: {clean:?}");
-        assert!(!clean.contains('\x00'), "NUL must be stripped: {clean:?}");
-        assert!(
-            clean.contains('\t') && clean.contains('\n'),
-            "keep \\t and \\n"
-        );
-    }
-
-    #[test]
-    fn summarize_update_is_readable_and_sanitized_not_debug_json() {
-        let s = summarize_update(&SessionUpdate::AgentMessageChunk {
-            chunk: ContentChunk {
-                content: ContentBlock::Text {
-                    text: "hi\x1bthere".into(),
-                },
-                message_id: None,
-            },
-        });
-        assert!(s.starts_with("agent: "), "summary: {s}");
-        assert!(!s.contains('\x1b'), "summary must be sanitized: {s:?}");
-        assert!(!s.contains('{'), "summary must not be Debug JSON: {s:?}");
-    }
-
-    #[test]
-    fn approve_fails_closed_when_no_allow_option_offered() {
-        // Only reject-style options → approve must NOT pick one; it Cancels.
-        let only_reject = vec![PermissionOption {
-            option_id: "no".into(),
-            name: "Reject".into(),
-            kind: "reject_once".into(),
-        }];
-        assert_eq!(
-            PermissionDecision::approve(&only_reject),
-            PermissionDecision::Cancelled
-        );
-        // An allow option present → approve selects it.
-        let with_allow = vec![
-            PermissionOption {
-                option_id: "no".into(),
-                name: "Reject".into(),
-                kind: "reject_once".into(),
-            },
-            PermissionOption {
-                option_id: "yes".into(),
-                name: "Allow".into(),
-                kind: "allow_once".into(),
-            },
-        ];
-        assert_eq!(
-            PermissionDecision::approve(&with_allow),
-            PermissionDecision::Selected {
-                option_id: "yes".into()
-            }
-        );
     }
 }

@@ -129,10 +129,19 @@ pub trait AgentLaunchFrontend:
     /// says so there, which is visible in review; a silent default is not.
     fn set_pty_active(&mut self, active: bool);
 
+    /// Wait for a relayed command's stdout and stderr readers before releasing
+    /// the status text queued while the agent owned the terminal.
+    fn wait_output_drained(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+
     /// Called after the agent container launches. The sender is the broadcast
     /// channel from the container's stuck detector; the TUI stores it so the
     /// tab can subscribe for stuck-colouring. CLI and API frontends ignore it,
     /// so this one keeps its no-op default.
+    /// OSC 7501 `StuckEvent::Reported` is intentionally ignored by setup frontends.
     fn set_stuck_sender(
         &mut self,
         _sender: std::sync::Arc<

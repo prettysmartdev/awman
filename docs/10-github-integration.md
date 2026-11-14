@@ -1,124 +1,171 @@
 # GitHub Integration
 
-The `--issue` flag runs awman commands directly against a GitHub issue, without creating a local work item file first: A separate `--pr` flag on `chat` and `exec prompt` opens a pull request in a worktree; see [Pull requests for `--pr`](#pull-requests-for---pr).
+awman treats GitHub issues as work items through the shared `--work-item`
+option and the `workItems.source` setting. You can use an issue as input for
+`exec prompt` or a workflow, create a new issue with `new spec`, and edit an
+existing issue with `specs amend`. A separate `--pr` option on `chat` and
+`exec prompt` opens a pull request in a worktree; see
+[Pull requests for `--pr`](#pull-requests-for---pr).
 
-| Command | What the issue becomes |
+## Choose GitHub as the default source
+
+Set this in the repository config to make bare numbers refer to issues in the
+repository's GitHub `origin`:
+
+```sh
+awman config set workItems.source github
+```
+
+Or select GitHub explicitly for an individual command, regardless of the
+configured default:
+
+| Reference | Example |
 |---|---|
-| `awman new spec --issue 84` | Input for a new, numbered work item spec |
-| `awman exec workflow my-workflow --issue 84` | The workflow's work item (`{{work_item_content}}`, `{{work_item_number}}`, …) |
-| `awman exec prompt --issue 84` | The agent's prompt |
-| `awman exec prompt "extra context" --issue 84` | Appended to your prompt |
+| GitHub issue number | `github:84` or `#84` (uses `origin`) |
+| Repository shorthand | `prettysmartdev/awman#84` |
+| GitHub issue URL | `https://github.com/prettysmartdev/awman/issues/84` |
 
----
+With `workItems.source = "github"`, a bare number such as `84` also selects
+issue 84 on `origin`. A bare number requires `origin` to point to GitHub. For
+explicit references, the owner and repository come from the reference.
+Supported GitHub remotes include HTTPS, `git@github.com:...`, and
+`ssh://git@github.com/...` forms. Issue URLs must be on `github.com`.
 
-## Issue references
+Use `github:<N>` when you want a value to clearly select GitHub even if the
+repository defaults to local work item files. See
+[work item source configuration](07-configuration.md#work-item-sources) for
+all source values and trusted HTTP providers.
 
-`--issue` accepts three forms:
+## Use an issue as input
 
-| Form | Example | Resolved how |
-|---|---|---|
-| Bare number | `84` | Owner and repo come from the current repo's `origin` remote |
-| Shorthand | `prettysmartdev/awman#84` | Owner and repo taken from the reference; the local remote is not read |
-| URL | `https://github.com/prettysmartdev/awman/issues/84` | Owner, repo and number parsed from the path |
+```sh
+# Run a prompt based on an issue
+awman exec prompt --work-item github:84
 
-A bare number requires `origin` to point at `github.com`. awman recognises `https://github.com/owner/repo(.git)`, `git@github.com:owner/repo.git` and `ssh://git@github.com/owner/repo.git` remotes, with the host in any case. Issue URLs passed to `--issue` must be `https://` (or `http://`) `github.com` URLs; other hosts are rejected.
+# Add your own framing before the issue content
+awman exec prompt "Review this for security issues" --work-item github:84
 
----
+# Supply the issue to a workflow and its work item template variables
+awman exec workflow aspec/workflows/plan.toml --work-item github:84
+```
 
-## How issues are fetched
+The issue title and body are made available as the work item. Workflows can
+use `{{work_item_content}}`, `{{work_item_title}}`, and the other documented
+[work item inputs](06-dynamic-workflows.md#work-item-inputs). Dynamic workflows
+require a work item; if none is supplied, the command fails before launch.
 
-Issues are fetched on the host, never inside a container:
+## Create an issue with `new spec`
 
-1. **GitHub CLI.** awman first runs `gh issue view <N> --repo <owner>/<repo> --json number,title,body,url`. If `gh` is installed and authenticated, this is all that happens.
-2. **GitHub REST API.** If `gh` is missing or fails, awman calls `GET https://api.github.com/repos/<owner>/<repo>/issues/<N>`. When `GITHUB_TOKEN` is set in your environment, the request is authenticated, so private repos work and the rate limit is 5,000 requests/hour. Without it, only public repos work, at 60 requests/hour.
+With `workItems.source = "github"`, `new spec` creates an issue instead of a
+numbered local file. Start a new issue from the configured template:
 
-awman prints which of the two it is running. The token is never logged.
+```sh
+awman new spec
+```
 
-### Authentication
+Without `--interview`, awman creates the issue immediately from the new spec
+content. The created issue URL and number are reported. Before anything is
+published, awman names the destination (for example
+`creating a github work item in github:acme/widgets`). If you dismiss a question
+(Ctrl+C or closing the dialog), nothing is created. To review and shape
+the content in an interview, use:
 
-Either authenticate the GitHub CLI once:
+```sh
+awman new spec --interview
+```
+
+During an interview, awman publishes edits to the new issue while the agent is
+running. Creation happens on the first meaningful edit. awman says so before the
+agent starts (`draft edits are published to <destination> while the agent
+runs`). If you abandon the
+interview after an issue has been created, that issue may contain only part of
+the intended spec. The issue URL is printed: report the partial issue and
+close it if you do not intend to finish it.
+
+You can also seed a new spec from an existing GitHub issue by passing its
+reference with `--work-item` while the configured creation target is local or
+another provider. If the seed is already in the configured target, awman
+refuses to duplicate it and suggests `awman specs amend <ref>` instead.
+
+## Amend an existing issue
+
+```sh
+awman specs amend github:84
+```
+
+The issue's current title and raw body seed an editable draft. awman prints the
+issue URL and draft path before the agent starts, then publishes edits while
+the agent runs. If you abandon an amend, the issue may contain a partial
+update; use the reported URL to review it and close the issue if it should not
+remain open. A failed upload keeps the draft path available for recovery. awman retries a
+failed upload after one second, then waits twice as long after each further
+failure, up to five minutes; a successful upload resets the delay. If the agent
+cannot be launched at all, the unedited draft is deleted.
+
+Remote edit drafts are stored under
+`.awman/context/scratch/work-items/` in the repository context. You can
+delete a draft file there after confirming that you no longer need it. A
+successful edit removes its draft automatically.
+
+## Review issue content as untrusted input
+
+Issue titles and bodies are written by their authors. In public repositories,
+they can contain prompt injection that asks an agent to ignore your
+instructions, reveal secrets, or take unrelated actions. Review the issue and
+limit the credentials, overlays, tools, and repository access available to
+the run. `--yolo` does not make issue content trustworthy; the same warning
+applies when running without approval prompts.
+
+## Authentication
+
+Authenticate the GitHub CLI:
 
 ```sh
 gh auth login
 ```
 
-or export a token:
+Or set `GITHUB_TOKEN` in the environment. A fine-grained personal access token
+needs read access to **Issues** for fetching and write access to create or
+update issues. awman never prints the token.
 
-```sh
-export GITHUB_TOKEN="ghp_..."
-```
-
-A fine-grained personal access token needs read access to **Issues** on the repositories you fetch from. Create one at [github.com/settings/tokens](https://github.com/settings/tokens).
+Issue fetches use the GitHub CLI when available and authenticated, with the
+GitHub REST API as a fallback. Private repositories require authentication;
+public repositories can be fetched without a token subject to GitHub's
+unauthenticated rate limits.
 
 ### Tokens for workflow pull requests and CI
 
-Fetching issues and authenticating workflow teardown steps are separate. You do not need `env(GITHUB_TOKEN)` or `ssh()` overlays for `push_branch`, `create_pull_request` or `poll_ci`: before a workflow starts, awman checks the remote and offers a credential source when a step needs one — a host variable (`GH_TOKEN` or `GITHUB_TOKEN` by default), `gh auth token`, a pasted token, or the configured `workflows.prerequisites.githubToken.acquire.argv` command. If you decline, the workflow stops by default; `--prerequisite-unresolved warn` lets it continue with a warning.
+Fetching issues and authenticating workflow teardown steps are separate. You
+do not need `env(GITHUB_TOKEN)` or `ssh()` overlays for `push_branch`,
+`create_pull_request` or `poll_ci`: before a workflow starts, awman checks the
+remote and offers a credential source when a step needs one — a host variable
+(`GH_TOKEN` or `GITHUB_TOKEN` by default), `gh auth token`, a pasted token, or
+the configured `workflows.prerequisites.githubToken.acquire.argv` command. If
+you decline, the workflow stops by default; `--prerequisite-unresolved warn`
+lets it continue with a warning.
 
-A granted token goes only to the step that needs it: an HTTPS `push_branch` gets Git push authentication and `create_pull_request` gets `GH_TOKEN` for `gh`. `poll_ci` uses an authenticated host `gh` when available, otherwise the granted token. Tokens are redacted from workflow output and never written to the remembered-decision file. The agent image still needs `gh` installed for `create_pull_request`.
+A granted token goes only to the step that needs it: an HTTPS `push_branch`
+gets Git push authentication and `create_pull_request` gets `GH_TOKEN` for
+`gh`. `poll_ci` uses an authenticated host `gh` when available, otherwise the
+granted token. Tokens are redacted from workflow output and never written to
+the remembered-decision file. The agent image still needs `gh` installed for
+`create_pull_request`.
 
-For GitHub Enterprise, a token is consented for the remote's exact host. Interactive acquisition runs `gh auth token --hostname HOST` and verifies against `https://HOST/api/v3/user`. Unattended Enterprise runs need an explicit `--prerequisite-token env:NAME` or a remembered decision for that host; a github.com token policy never sends a token to another host.
+For GitHub Enterprise, a token is consented for the remote's exact host.
+Interactive acquisition runs `gh auth token --hostname HOST` and verifies
+against `https://HOST/api/v3/user`. Unattended Enterprise runs need an explicit
+`--prerequisite-token env:NAME` or a remembered decision for that host; a
+github.com token policy never sends a token to another host.
 
-See [Workflow prerequisite checks](05-workflows.md#workflow-prerequisite-checks) for the full flow.
-
----
-
-## Command behavior
-
-### `new spec --issue <ref>`
-
-Creates a work item in your configured work items directory, named `<NNNN>-ghb<issue>-<title-slug>.md`. `NNNN` is the next free work item number (not the issue number); `ghb<issue>-<title-slug>` identifies the issue, with the title slug cut to 40 characters.
-
-```
-Issue:  #84 "GitHub Integration Part 1"
-File:   0023-ghb84-github-integration-part-1.md
-```
-
-The issue's title and body are sent to the spec interview agent as if you had run `new spec --interview` and submitted them unchanged. Add `--interview` to review and edit the issue text before the agent runs:
-
-```sh
-awman new spec --issue 84 --interview
-```
-
-### `exec workflow <workflow> --issue <ref>`
-
-Runs the workflow with the issue as its work item. The issue is written to a temporary file on the host and mounted read-only at `<work-items-dir>/<issue-number>-ghb<issue>-<title-slug>.md` inside the container; the file is deleted when the command exits. All `{{work_item_*}}` template variables are populated from it.
-
-`--issue` and `--work-item` are mutually exclusive.
-
-With `--worktree` (or `--yolo`/`--auto`, which imply it), the worktree's branch is named after the issue:
-
-```sh
-awman exec workflow my-workflow --issue 84 --worktree
-# branch: awman/workflow-ghb84-github-integration-part-1
-```
-
-If that worktree already exists, awman asks whether to resume, recreate or stop; answer up front with `--on-existing-worktree`. See [Worktrees](05-workflows.md#worktrees).
-
-### `exec prompt --issue <ref>`
-
-Sends the issue to the agent as the prompt. The positional prompt is optional when `--issue` is given. When both are given, your text comes first, then the issue:
-
-```sh
-awman exec prompt "Review this for security issues" --issue 84
-```
-
-The agent receives:
-
-```
-Review this for security issues
-
-# GitHub Integration Part 1
-
-<issue body>
-```
-
-No files are created.
-
----
+See [Workflow prerequisite checks](05-workflows.md#workflow-prerequisite-checks)
+for the full flow.
 
 ## Pull requests for `--pr`
 
-`awman chat --pr <ref>` and `awman exec prompt --pr <ref>` run the session in a worktree for a GitHub pull request. See [Agent Sessions](03-agent-sessions.md#--branch---pr-and---worktree) for the worktree behavior.
+`awman chat --pr <ref>` and `awman exec prompt --pr <ref>` run the session in a
+worktree for a GitHub pull request. See
+[Agent Sessions](03-agent-sessions.md#--branch---pr-and---worktree) for the
+worktree behavior.
 
 ### Accepted formats
 
@@ -128,53 +175,37 @@ No files are created.
 | github.com URL | `--pr https://github.com/acme/widgets/pull/482` |
 | `owner/repo#N` | `--pr acme/widgets#482` |
 
-A bare number uses your `origin` remote, which must be on github.com. For the other two forms, the pull request's repository must match one of your repository's configured remotes (`origin` is preferred if several match); a pull request from an unrelated repository is refused. Only `https://github.com/` pull request URLs are accepted: issue URLs, `http://`, other hosts, and URLs with queries or fragments are rejected.
+A bare number uses your `origin` remote, which must be on github.com. For the
+other two forms, the pull request's repository must match one of your
+repository's configured remotes (`origin` is preferred if several match); a
+pull request from an unrelated repository is refused. Only
+`https://github.com/` pull request URLs are accepted: issue URLs, `http://`,
+other hosts, and URLs with queries or fragments are rejected.
 
 ### How the pull request is looked up
 
-Like issues, the lookup runs on the host. awman first runs `gh pr view` against `github.com` explicitly (a `GH_HOST` pointing at a GitHub Enterprise server is not used for these lookups) and, if `gh` is missing or fails, falls back to the GitHub REST API. Authenticate once with `gh auth login`, or export `GITHUB_TOKEN`. Without a token, public repositories still work (at GitHub's unauthenticated rate limit); private repositories need authentication. A missing or unauthorized pull request fails with a hint to run `gh auth login` or set `GITHUB_TOKEN`.
+Like issues, the lookup runs on the host. awman first runs `gh pr view` against
+`github.com` explicitly (a `GH_HOST` pointing at a GitHub Enterprise server is
+not used for these lookups) and, if `gh` is missing or fails, falls back to
+the GitHub REST API. Authenticate once with `gh auth login`, or export
+`GITHUB_TOKEN`. Without a token, public repositories still work (at GitHub's
+unauthenticated rate limit); private repositories need authentication. A
+missing or unauthorized pull request fails with a hint to run `gh auth login`
+or set `GITHUB_TOKEN`.
 
 ### Fork and deleted-branch pull requests
 
-- **Same repository.** The worktree uses the PR's head branch, so pushes from the session update the PR.
-- **From a fork, or head branch deleted.** The worktree uses a local branch named `pr/<N>`, created from GitHub's pull ref. It does not track the fork's branch, so pushing to `origin` will not update the pull request. awman warns about this; to push to the fork, add the fork as a remote and push there yourself.
+- **Same repository.** The worktree uses the PR's head branch, so pushes from
+  the session update the PR.
+- **From a fork, or head branch deleted.** The worktree uses a local branch
+  named `pr/<N>`, created from GitHub's pull ref. It does not track the fork's
+  branch, so pushing to `origin` will not update the pull request. awman warns
+  about this; to push to the fork, add the fork as a remote and push there
+  yourself.
 - **Closed or merged.** awman warns and continues with the PR's code.
 
-Worktrees for pull requests are kept in a `pr-<N>` directory; reopen one with `--worktree pr-<N>`.
-
----
-
-## Errors
-
-Errors are prefixed with the command, for example `exec prompt: failed to fetch issue: …`, followed by one of:
-
-| Message | Cause and fix |
-|---|---|
-| `GitHub: no GitHub remote detected for this repository` | A bare number was given but `origin` is missing or not on github.com. Use `owner/repo#N` or a URL, or add a GitHub `origin`. |
-| `GitHub: invalid issue reference '<input>': <hint>` | The reference is not a number, `owner/repo#N`, or a `github.com/<owner>/<repo>/issues/<N>` URL. |
-| `GitHub: issue not found: <url>` | Wrong number or repo, or a private repo without authentication. |
-| ``GitHub: unauthorized — ensure gh is authenticated (`gh auth login`) or GITHUB_TOKEN is set`` | The REST API refused the request. Authenticate as above. |
-| `GitHub: API rate limit exceeded` | Unauthenticated limit reached. Authenticate, or wait. |
-| `GitHub: network error: <detail>` | api.github.com could not be reached. |
-
----
-
-## Examples
-
-```sh
-# Spec from an issue, editing the text first
-awman new spec --issue 42 --interview
-
-# Planning workflow driven by an issue
-awman exec workflow aspec/workflows/plan.toml --issue 42
-
-# Your framing plus the issue
-awman exec prompt "Security review: check for SQL injection, XSS, and auth bypass" --issue 42
-
-# Private repo in another org
-export GITHUB_TOKEN="ghp_..."
-awman exec prompt --issue owner/private-repo#99
-```
+Worktrees for pull requests are kept in a `pr-<N>` directory; reopen one with
+`--worktree pr-<N>`.
 
 ---
 

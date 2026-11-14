@@ -11,19 +11,22 @@
 //! reporting, or container-frontend hooks.
 
 pub(crate) mod agents;
+mod attach;
 pub(crate) mod helpers;
+pub(crate) mod queue;
 pub(crate) mod render;
 
 pub(crate) mod squad;
 pub(crate) mod squad_attach;
 
-mod api_server;
 mod chat;
 mod clean;
+mod daemon;
 mod exec_prompt;
 mod exec_workflow;
 mod init;
 mod ready;
+pub(crate) mod relay;
 
 // Engine-level frontend trait impls used by multiple commands.
 mod acp_frontend;
@@ -35,3 +38,5 @@ mod mount_scope;
 mod workflow_frontend_marker;
 pub(crate) mod workflow_prerequisites;
 mod worktree_lifecycle_marker;
+
+pub mod link;

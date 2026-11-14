@@ -1,138 +1,209 @@
-//! `IssueSourceRouter` — selects the correct `IssueSource` at runtime.
-
-use std::path::Path;
-use std::sync::Arc;
-
-use crate::data::config::env::{Env, EnvSnapshot};
-use crate::data::message::UserMessageSink;
+//! Deterministic routing of explicit parsed references. Layer 2 selects defaults.
+use super::{
+    http::{canonical_work_item_url, url_matches_base},
+    GithubIssueSource, HttpIssueSource, Issue, IssueSource, IssueSourceError,
+};
+use crate::data::{
+    config::{env::EnvSnapshot, work_items::WorkItemProviderConfig},
+    message::UserMessageSink,
+    work_item_ref::{GithubRepository, WorkItemRef},
+};
 use crate::engine::git::GitEngine;
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
-use super::github::GithubIssueSource;
-use super::{Issue, IssueSource, IssueSourceError};
-
+pub struct RoutedIssueSource {
+    pub provider: String,
+    pub input: String,
+    pub source: Arc<dyn IssueSource>,
+}
+struct HttpEntry {
+    validation: HttpIssueSource,
+    source: Arc<dyn IssueSource>,
+}
 pub struct IssueSourceRouter {
-    sources: Vec<Box<dyn IssueSource>>,
-    git_engine: Arc<GitEngine>,
-    github_token: Option<String>,
+    github: Arc<dyn IssueSource>,
+    github_origin: GithubIssueSource,
+    http: BTreeMap<String, HttpEntry>,
+    /// Providers whose definition the transport refuses, with the reason. One
+    /// bad entry fails only references that could reach it, never `github:`
+    /// or another provider's `http:<name>:<id>`.
+    invalid: BTreeMap<String, String>,
 }
-
-impl Default for IssueSourceRouter {
-    /// Constructs a router with all built-in providers registered.
-    /// GitHub is first (claims bare integers). Future providers are added after.
-    fn default() -> Self {
-        let env = Env::from_process();
-        Self::new(Arc::new(GitEngine::new()), &env)
-    }
-}
-
 impl IssueSourceRouter {
-    /// Constructs the provider router with the command/session's immutable
-    /// external-system dependencies.
-    pub fn new(git_engine: Arc<GitEngine>, env: &EnvSnapshot) -> Self {
-        Self {
-            sources: vec![Box::new(GithubIssueSource)],
-            git_engine,
-            github_token: env.github_token().map(str::to_owned),
+    pub fn new(
+        git_engine: Arc<GitEngine>,
+        env: &EnvSnapshot,
+        providers: &BTreeMap<String, WorkItemProviderConfig>,
+    ) -> Result<Self, IssueSourceError> {
+        let github = Arc::new(GithubIssueSource::new(git_engine.clone(), env.clone()));
+        let mut http: BTreeMap<String, Arc<dyn IssueSource>> = BTreeMap::new();
+        for (name, config) in providers {
+            // An invalid definition is recorded by `with_sources`; it gets a
+            // placeholder transport that is never reachable.
+            let source: Arc<dyn IssueSource> = match HttpIssueSource::new(name, config, env) {
+                Ok(source) => Arc::new(source),
+                Err(_) => github.clone(),
+            };
+            http.insert(name.clone(), source);
         }
+        Self::with_sources(git_engine, env, providers, github, http)
     }
-
-    /// Returns the first provider whose `can_handle(input)` returns true.
-    pub fn route(&self, input: &str) -> Result<&dyn IssueSource, IssueSourceError> {
-        for source in &self.sources {
-            if source.can_handle(input) {
-                return Ok(source.as_ref());
+    /// Replace transport implementations while retaining production URL policy.
+    pub fn with_sources(
+        git_engine: Arc<GitEngine>,
+        env: &EnvSnapshot,
+        providers: &BTreeMap<String, WorkItemProviderConfig>,
+        github: Arc<dyn IssueSource>,
+        mut http: BTreeMap<String, Arc<dyn IssueSource>>,
+    ) -> Result<Self, IssueSourceError> {
+        if !providers.keys().eq(http.keys()) {
+            return Err(super::transport::error(
+                "HTTP",
+                "transport registry must contain exactly the configured provider names",
+            ));
+        }
+        let mut entries = BTreeMap::new();
+        let mut invalid = BTreeMap::new();
+        for (name, config) in providers {
+            let source = http.remove(name).expect("registry keys checked above");
+            match HttpIssueSource::new(name, config, env) {
+                Ok(validation) => {
+                    entries.insert(name.clone(), HttpEntry { validation, source });
+                }
+                Err(error) => {
+                    invalid.insert(name.clone(), error.to_string());
+                }
             }
         }
-        Err(IssueSourceError::NoMatchingProvider {
-            input: input.to_string(),
+        Ok(Self {
+            github,
+            github_origin: GithubIssueSource::new(git_engine, env.clone()),
+            http: entries,
+            invalid,
         })
     }
-
-    /// Convenience: route, then fetch. Returns both the Issue and the source.
-    pub fn fetch_issue(
-        &self,
-        input: &str,
-        git_root: &Path,
-    ) -> Result<(Issue, &dyn IssueSource), IssueSourceError> {
-        let source = self.route(input)?;
-        let issue = source.fetch_issue_with_engine(
-            input,
-            git_root,
-            &self.git_engine,
-            self.github_token.as_deref(),
-        )?;
-        Ok((issue, source))
+    pub fn github(&self) -> Arc<dyn IssueSource> {
+        self.github.clone()
     }
-
-    /// Like `fetch_issue`, but writes progress messages to the sink.
-    pub fn fetch_issue_with_progress(
-        &self,
-        input: &str,
-        git_root: &Path,
-        sink: &mut dyn UserMessageSink,
-    ) -> Result<(Issue, &dyn IssueSource), IssueSourceError> {
-        let source = self.route(input)?;
-        let issue = source.fetch_issue_with_engine_progress(
-            input,
-            git_root,
-            sink,
-            &self.git_engine,
-            self.github_token.as_deref(),
-        )?;
-        Ok((issue, source))
+    pub fn github_repository(&self, git_root: &Path) -> Result<GithubRepository, IssueSourceError> {
+        self.github_origin.origin_repository(git_root)
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn router_routes_bare_integer_to_github() {
-        let router = IssueSourceRouter::default();
-        let source = router.route("84").unwrap();
-        assert_eq!(source.provider_name(), "GitHub");
-    }
-
-    #[test]
-    fn router_routes_github_url_to_github() {
-        let router = IssueSourceRouter::default();
-        let source = router
-            .route("https://github.com/owner/repo/issues/42")
-            .unwrap();
-        assert_eq!(source.provider_name(), "GitHub");
-    }
-
-    #[test]
-    fn router_routes_short_form_to_github() {
-        let router = IssueSourceRouter::default();
-        let source = router.route("owner/repo#84").unwrap();
-        assert_eq!(source.provider_name(), "GitHub");
-    }
-
-    #[test]
-    fn router_returns_no_matching_provider_for_unknown_input() {
-        let router = IssueSourceRouter::default();
-        let result = router.route("not-any-provider://something");
-        match result {
-            Err(IssueSourceError::NoMatchingProvider { input }) => {
-                assert_eq!(input, "not-any-provider://something");
-            }
-            Err(other) => panic!("expected NoMatchingProvider, got error: {other}"),
-            Ok(_) => panic!("expected error but got Ok"),
+    /// The recorded refusal for provider `name`, if its definition is invalid.
+    fn refused(&self, name: &str) -> Result<(), IssueSourceError> {
+        match self.invalid.get(name) {
+            Some(reason) => Err(super::transport::error(&format!("http:{name}"), reason)),
+            None => Ok(()),
         }
     }
-
-    #[test]
-    fn router_returns_github_for_bare_integer_when_ambiguous() {
-        // GitHub is registered first and claims bare integers.
-        // Verify the priority ordering holds.
-        let router = IssueSourceRouter::default();
-        let source = router.route("1").unwrap();
-        assert_eq!(
-            source.provider_name(),
-            "GitHub",
-            "GitHub must be first in priority order for bare integers"
-        );
+    pub fn http(&self, name: &str) -> Result<Arc<dyn IssueSource>, IssueSourceError> {
+        self.refused(name)?;
+        self.http
+            .get(name)
+            .map(|entry| entry.source.clone())
+            .ok_or_else(|| IssueSourceError::NoMatchingProvider {
+                input: format!("http:{name}"),
+            })
+    }
+    pub fn route(&self, reference: &WorkItemRef) -> Result<RoutedIssueSource, IssueSourceError> {
+        match reference {
+            WorkItemRef::Github { repository, number } => {
+                if *number == 0 {
+                    return Err(super::transport::error(
+                        "github",
+                        "issue number must be positive",
+                    ));
+                }
+                let input = match repository {
+                    Some(repo) => format!("{}/{}#{number}", repo.owner, repo.repo),
+                    None => number.to_string(),
+                };
+                Ok(RoutedIssueSource {
+                    provider: "github".into(),
+                    input,
+                    source: self.github(),
+                })
+            }
+            WorkItemRef::Http { provider, id } => {
+                self.refused(provider)?;
+                let entry = self.http.get(provider).ok_or_else(|| {
+                    IssueSourceError::NoMatchingProvider {
+                        input: format!("http:{provider}"),
+                    }
+                })?;
+                Ok(RoutedIssueSource {
+                    provider: format!("http:{provider}"),
+                    input: entry.validation.url_for_id(id)?.into(),
+                    source: entry.source.clone(),
+                })
+            }
+            WorkItemRef::HttpUrl(url) => {
+                let input = canonical_work_item_url(url)?;
+                // An invalid provider might be the one that owns this URL, so
+                // URL routing fails closed while any definition is refused.
+                if let Some(name) = self.invalid.keys().next() {
+                    self.refused(name)?;
+                }
+                let mut candidates: Vec<_> = self
+                    .http
+                    .iter()
+                    .filter(|(_, entry)| url_matches_base(entry.validation.base_url(), url))
+                    .collect();
+                let specificity = |entry: &HttpEntry| {
+                    entry
+                        .validation
+                        .base_url()
+                        .path_segments()
+                        .into_iter()
+                        .flatten()
+                        .filter(|part| !part.is_empty())
+                        .count()
+                };
+                candidates.sort_by_key(|(_, entry)| std::cmp::Reverse(specificity(entry)));
+                let Some((name, entry)) = candidates.first() else {
+                    return Err(IssueSourceError::NoMatchingProvider { input });
+                };
+                let mut tied: Vec<_> = candidates
+                    .iter()
+                    .take_while(|(_, other)| specificity(other) == specificity(entry))
+                    .map(|(name, _)| format!("http:{name}"))
+                    .collect();
+                if tied.len() > 1 {
+                    tied.sort();
+                    return Err(IssueSourceError::AmbiguousProvider { providers: tied });
+                }
+                Ok(RoutedIssueSource {
+                    provider: format!("http:{name}"),
+                    input,
+                    source: entry.source.clone(),
+                })
+            }
+            _ => Err(IssueSourceError::InvalidRef {
+                provider: "work item".into(),
+                input: String::new(),
+                hint: "Layer 2 must resolve local and bare references before provider routing"
+                    .into(),
+            }),
+        }
+    }
+    pub fn fetch_issue(
+        &self,
+        reference: &WorkItemRef,
+        git_root: &Path,
+    ) -> Result<(Issue, Arc<dyn IssueSource>), IssueSourceError> {
+        let routed = self.route(reference)?;
+        let issue = routed.source.fetch_issue(&routed.input, git_root)?;
+        Ok((issue, routed.source))
+    }
+    pub fn fetch_issue_with_progress(
+        &self,
+        reference: &WorkItemRef,
+        git_root: &Path,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<(Issue, Arc<dyn IssueSource>), IssueSourceError> {
+        let routed = self.route(reference)?;
+        let issue = routed
+            .source
+            .fetch_issue_with_progress(&routed.input, git_root, sink)?;
+        Ok((issue, routed.source))
     }
 }

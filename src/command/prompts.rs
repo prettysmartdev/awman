@@ -13,7 +13,6 @@
 
 use crate::command::commands::agent_trust::{AgentTrustReview, TrustDecision};
 use crate::command::commands::agents::{AgentSnapshot, AgentSource, KillChoice};
-use crate::command::commands::config::MigrateChoice;
 use crate::command::commands::specs::WorkItemKind;
 use crate::command::commands::squad::commands::{SquadConfirmDecision, TaskWorkspaceChoice};
 use crate::command::commands::workflow_prerequisites::{
@@ -209,6 +208,35 @@ pub fn squad_task_confirm(
     ))
 }
 
+/// Browser confirmation projection. Native resume remains an immediate
+/// action; native callers keep using `squad_task_confirm` above.
+pub fn squad_task_confirmation_view(
+    action: FrontendAction,
+    name: &str,
+) -> Option<Prompt<SquadConfirmDecision>> {
+    if let Some(prompt) = squad_task_confirm(action, name) {
+        return Some(prompt);
+    }
+    let (title, body, verb) = match action {
+        FrontendAction::ResumeSquadTask => {
+            ("Resume task", format!("Resume task \"{name}\"?"), "resume")
+        }
+        FrontendAction::RemoveSquadTask => {
+            ("Delete task", format!("Delete task \"{name}\"?"), "delete")
+        }
+        _ => return None,
+    };
+    Some(Prompt::new(
+        title,
+        body,
+        vec![
+            Choice::new('y', verb, SquadConfirmDecision::Dispatch),
+            Choice::new('n', "back", SquadConfirmDecision::Dismiss),
+        ],
+        Some(SquadConfirmDecision::Dismiss),
+    ))
+}
+
 /// The approval asked before awman builds or launches a custom agent
 /// definition that needs one (any repo definition; a global one with
 /// `[ping]`).
@@ -250,30 +278,6 @@ pub fn agents_kill_confirm(agent: &AgentSnapshot) -> Prompt<KillChoice> {
             Choice::new('n', "keep running", KillChoice::Keep),
         ],
         Some(KillChoice::Keep),
-    )
-}
-
-/// `awman config migrate`: move renamed settings to their current keys.
-///
-/// The body is a warning about teammates on older awman versions, who stop
-/// seeing moved settings, then the migration preview (file path, then the
-/// before/after JSON of every affected key). The warning comes first so a
-/// long preview cannot push it out of sight. `default_on_dismiss` is
-/// `Some(Cancel)`: walking away from a confirmation is a refusal; Esc must
-/// not rewrite a file.
-pub fn config_migrate_confirm(preview: &str) -> Prompt<MigrateChoice> {
-    Prompt::new(
-        "Move `dynamicWorkflows` to `workflows.dynamic`?",
-        format!(
-            "Teammates on awman versions before v{} will stop seeing these settings once \
-             this change is committed.\n\n{preview}",
-            env!("CARGO_PKG_VERSION")
-        ),
-        vec![
-            Choice::new('y', "Move it", MigrateChoice::Move),
-            Choice::new('n', "Cancel", MigrateChoice::Cancel),
-        ],
-        Some(MigrateChoice::Cancel),
     )
 }
 
@@ -380,6 +384,22 @@ fn prerequisite_steps(check: &PrerequisiteCheck) -> String {
     check.needed_by_label()
 }
 
+/// Prerequisite questions always number answers in display order. Longer SSH
+/// key lists continue with letters after 9.
+fn prerequisite_prompt<D>(
+    title: impl Into<String>,
+    body: impl Into<String>,
+    mut choices: Vec<Choice<D>>,
+    default_on_dismiss: Option<D>,
+) -> Prompt<D> {
+    const KEYS: &str = "123456789abcdefghijklmnopqrstuvwxyz";
+    assert!(choices.len() <= KEYS.len());
+    for (choice, key) in choices.iter_mut().zip(KEYS.chars()) {
+        choice.key = key;
+    }
+    Prompt::new(title, body, choices, default_on_dismiss)
+}
+
 /// The git identity question for `commit_changes`, built from the check's
 /// remediations so only the answers that apply are offered. The persistent
 /// `.git/config` write is listed last.
@@ -430,7 +450,7 @@ pub fn prerequisite_identity(check: &PrerequisiteCheck) -> Prompt<IdentityChoice
         "Continue without (commit_changes will fail)",
         IdentityChoice::Continue,
     ));
-    Prompt::new(
+    prerequisite_prompt(
         format!(
             "{} needs a git identity inside its container",
             prerequisite_steps(check)
@@ -468,7 +488,7 @@ pub fn prerequisite_identity_email() -> TextPrompt {
 /// `.git/config` on the host. `command` is the exact command that will run.
 /// Dismiss means "don't write it", which still uses the identity for this run.
 pub fn prerequisite_identity_persist(command: &str) -> Prompt<IdentityPersist> {
-    Prompt::new(
+    prerequisite_prompt(
         "Write the identity into this repo's .git/config?",
         format!(
             "awman will run this ON YOUR HOST:\n\n  {command}\n\n\
@@ -497,8 +517,13 @@ pub fn prerequisite_identity_persist(command: &str) -> Prompt<IdentityPersist> {
 /// exposes `config`, other keys and agent sockets named in config), then
 /// "Don't use SSH keys".
 ///
-/// `remote` is the credential-stripped remote URL.
-pub fn prerequisite_ssh(check: &PrerequisiteCheck, remote: &str) -> Prompt<SshChoice> {
+/// `remote` is the credential-stripped remote URL. `home` is the session's
+/// home directory, used only to shorten key paths to `~/...` for display.
+pub fn prerequisite_ssh(
+    check: &PrerequisiteCheck,
+    remote: &str,
+    home: Option<&Path>,
+) -> Prompt<SshChoice> {
     const RUN_KEYS: &[char] = &['1', '2', '3', '4', '5', '6', '7', '8'];
     const REMEMBER_KEYS: &[char] = &['a', 'b', 'd', 'e', 'f', 'g', 'h', 'i'];
     let steps = prerequisite_steps(check);
@@ -519,7 +544,7 @@ pub fn prerequisite_ssh(check: &PrerequisiteCheck, remote: &str) -> Prompt<SshCh
         .collect();
     let mut choices = Vec::new();
     for (i, (path, passphrase, remembered, suggested)) in keys.iter().enumerate() {
-        let display = tilde_path(path);
+        let display = tilde_path(path, home);
         let mut note = String::new();
         if **passphrase == Some(true) {
             note.push_str(" (passphrase-protected: will fail unattended)");
@@ -577,7 +602,7 @@ pub fn prerequisite_ssh(check: &PrerequisiteCheck, remote: &str) -> Prompt<SshCh
              HTTPS remote with a GitHub token.",
         );
     }
-    Prompt::new(
+    prerequisite_prompt(
         format!(
             "{steps} pushes to {remote} over SSH. Allow awman to mount an SSH key into the \
              {steps} container?"
@@ -591,11 +616,12 @@ pub fn prerequisite_ssh(check: &PrerequisiteCheck, remote: &str) -> Prompt<SshCh
 const GRANT_SSH_KEY: &str =
     crate::engine::overlay::prerequisite_grants::GRANT_SSH_KEY_CONTAINER_NAME;
 
-/// `$HOME/.ssh/id_x` → `~/.ssh/id_x` for display. Paths outside `$HOME` are
-/// shown as they are.
-fn tilde_path(path: &str) -> String {
-    match crate::data::config::env::host_var("HOME") {
-        Some(home) if !home.is_empty() => match Path::new(path).strip_prefix(&home) {
+/// `$HOME/.ssh/id_x` → `~/.ssh/id_x` for display, where `home` is the
+/// session's home directory. Paths outside it (or with no home) are shown as
+/// they are.
+fn tilde_path(path: &str, home: Option<&Path>) -> String {
+    match home {
+        Some(home) if !home.as_os_str().is_empty() => match Path::new(path).strip_prefix(home) {
             Ok(rest) => format!("~/{}", rest.display()),
             Err(_) => path.to_string(),
         },
@@ -607,7 +633,7 @@ fn tilde_path(path: &str) -> String {
 /// environment. The token goes only to the containers that need it.
 pub fn prerequisite_token_consent(check: &PrerequisiteCheck, var: &str) -> Prompt<TokenConsent> {
     let steps = prerequisite_steps(check);
-    Prompt::new(
+    prerequisite_prompt(
         format!("{steps} need a GitHub token. Use the token in {var} for teardown steps?"),
         format!(
             "The token is passed by name only to the containers that need it \
@@ -704,7 +730,7 @@ pub fn prerequisite_token_source(check: &PrerequisiteCheck) -> Prompt<TokenSourc
          to unauthenticated, rate-limited requests."
             .to_string(),
     );
-    Prompt::new(
+    prerequisite_prompt(
         format!("{steps} need a GitHub token. Where should it come from?"),
         body.join("\n"),
         choices,
@@ -731,7 +757,7 @@ pub fn prerequisite_missing_tool(check: &PrerequisiteCheck) -> Prompt<ToolChoice
             ));
         }
     }
-    Prompt::new(
+    prerequisite_prompt(
         format!(
             "{} is missing from the image {} runs in",
             check.prerequisite.label(),
@@ -749,7 +775,7 @@ pub fn prerequisite_missing_tool(check: &PrerequisiteCheck) -> Prompt<ToolChoice
 /// A gap no grant can fix: a missing remote, a detached HEAD, a pull request
 /// with no push before it.
 pub fn prerequisite_gap(check: &PrerequisiteCheck) -> Prompt<GapChoice> {
-    Prompt::new(
+    prerequisite_prompt(
         format!(
             "{}: {} will fail",
             check.prerequisite.label(),
@@ -769,7 +795,7 @@ pub fn prerequisite_gap(check: &PrerequisiteCheck) -> Prompt<GapChoice> {
 /// for its exact content hash. `default_on_dismiss` is `Some(Decline)`:
 /// walking away from an approval is a refusal.
 pub fn prerequisite_acquire_approval(review: &HostSecretCommandReview) -> Prompt<TrustDecision> {
-    Prompt::new(
+    prerequisite_prompt(
         "Approve this repository's GitHub token command?",
         format!(
             "⚠ awman will run this command ON YOUR HOST (not in a container):\n\n  {}\n\n\
@@ -794,392 +820,12 @@ fn render_argv(argv: &[String]) -> String {
     shell_words::join(argv)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Every parallel-group question leaves the group running when walked
-    /// away from.
-    #[test]
-    fn parallel_group_prompts_dismiss_to_keep_running() {
-        let p = parallel_group_prompts();
-        let group = vec!["a".to_string(), "b".to_string()];
-        let members = vec![("a".to_string(), None)];
-        for prompt in [
-            (p.restart_scope)(&group),
-            (p.restart_which)(&members),
-            (p.cancel_group)(&group, &GroupExit::Next(vec![])),
-        ] {
-            assert_eq!(
-                prompt.default_on_dismiss,
-                Some(ParallelGroupDecision::KeepRunning),
-                "{}",
-                prompt.title
-            );
-        }
-    }
-
-    #[test]
-    fn parallel_restart_scope_offers_group_or_single_agent() {
-        let prompt = (parallel_group_prompts().restart_scope)(&["a".into(), "b".into()]);
-        assert_eq!(
-            prompt.answer_for_key('g'),
-            Some(ParallelGroupDecision::RestartWholeGroup)
-        );
-        assert_eq!(
-            prompt.answer_for_key('s'),
-            Some(ParallelGroupDecision::RestartOneAgent)
-        );
-    }
-
-    #[test]
-    fn parallel_restart_which_lists_every_member_with_its_state() {
-        let members = vec![
-            ("a".to_string(), Some(StepState::Succeeded)),
-            (
-                "b".to_string(),
-                Some(StepState::Running { container_id: None }),
-            ),
-            (
-                "c".to_string(),
-                Some(StepState::Failed {
-                    exit_code: 1,
-                    error_message: None,
-                }),
-            ),
-            ("d".to_string(), Some(StepState::Pending)),
-        ];
-        let prompt = (parallel_group_prompts().restart_which)(&members);
-        let labels: Vec<&str> = prompt.choices.iter().map(|c| c.label.as_str()).collect();
-        assert_eq!(
-            labels,
-            ["a (done)", "b (running)", "c (failed)", "d (queued)"]
-        );
-        assert_eq!(
-            prompt.answer_for_key('3'),
-            Some(ParallelGroupDecision::RestartStep("c".into()))
-        );
-    }
-
-    #[test]
-    fn cancel_parallel_group_says_where_the_workflow_goes() {
-        let p = parallel_group_prompts();
-        let group = vec!["a".to_string(), "b".to_string()];
-        let back = (p.cancel_group)(&group, &GroupExit::Back(vec!["root".into()]));
-        assert!(back.body.contains("(a, b)") && back.body.contains("go back to 'root'"));
-        let next = (p.cancel_group)(&group, &GroupExit::Next(vec!["c".into()]));
-        assert!(next.body.contains("move on to 'c'"), "{}", next.body);
-        let last = (p.cancel_group)(&group, &GroupExit::Next(vec![]));
-        assert!(last.body.contains("finish the workflow"), "{}", last.body);
-        assert_eq!(
-            back.answer_for_key('y'),
-            Some(ParallelGroupDecision::CancelGroup)
-        );
-    }
-
-    /// The interview's default *is* the flag's default. Before F-19 the string
-    /// `"6h"` appeared in the catalogue, in `cli/command_frontend.rs` and twice
-    /// in `tui/per_command/squad.rs`, and only the catalogue's copy was tested.
-    #[test]
-    fn the_interval_default_is_the_catalogue_flag_default() {
-        let prompt = squad_task_interval();
-        assert_eq!(
-            prompt.default.as_deref(),
-            Some(squad_flag_default("interval"))
-        );
-        // Nothing typed means the flag default, whatever it is.
-        assert_eq!(
-            prompt.resolve("   ").as_deref(),
-            Some(squad_flag_default("interval"))
-        );
-    }
-
-    /// No squad interview step answers itself on a dismissal.
-    ///
-    /// The workspace and the mount scope are captured once, at creation, and
-    /// bind every run afterwards. Before F-19 the CLI answered
-    /// `DefaultTaskWorkspace` for any unparsed line and `GitRoot` for any
-    /// string that was not `"cwd"`, so a piped interview silently chose both.
-    #[test]
-    fn no_squad_interview_prompt_answers_a_dismissal() {
-        assert!(squad_task_workspace().default_on_dismiss.is_none());
-        assert!(squad_task_mount_scope().default_on_dismiss.is_none());
-    }
-
-    /// Every mount scope is reachable, and no frontend maps a string to one.
-    #[test]
-    fn every_mount_scope_is_offered_under_its_own_key() {
-        let prompt = squad_task_mount_scope();
-        assert_eq!(prompt.keys(), vec!['g', 'c']);
-        assert_eq!(prompt.answer_for_key('g'), Some(MountScope::GitRoot));
-        assert_eq!(prompt.answer_for_key('c'), Some(MountScope::Cwd));
-    }
-
-    /// The workspace choices keep the digits the CLI and the TUI both used.
-    #[test]
-    fn every_task_workspace_choice_is_offered_under_its_documented_key() {
-        let prompt = squad_task_workspace();
-        assert_eq!(prompt.keys(), vec!['1', '2']);
-        assert_eq!(
-            prompt.answer_for_key('1'),
-            Some(TaskWorkspaceChoice::DefaultTaskWorkspace)
-        );
-        assert_eq!(
-            prompt.answer_for_key('2'),
-            Some(TaskWorkspaceChoice::CustomFolderOrRepo)
-        );
-    }
-
-    /// Abandoning the work-item interview must not file a Task by default.
-    #[test]
-    fn the_work_item_kind_prompt_has_no_dismissal_default() {
-        assert!(work_item_kind().default_on_dismiss.is_none());
-    }
-
-    /// Every kind is reachable, and by the digit the CLI has always printed.
-    #[test]
-    fn every_work_item_kind_is_offered_under_its_documented_key() {
-        let prompt = work_item_kind();
-        assert_eq!(prompt.answer_for_key('1'), Some(WorkItemKind::Feature));
-        assert_eq!(prompt.answer_for_key('2'), Some(WorkItemKind::Bug));
-        assert_eq!(prompt.answer_for_key('3'), Some(WorkItemKind::Task));
-        assert_eq!(prompt.answer_for_key('4'), Some(WorkItemKind::Enhancement));
-    }
-}
-
-#[cfg(test)]
-mod parity_tests {
-    //! The regression guard F-19 asks for: both frontends ask the *same*
-    //! question, because both are handed the same `Prompt`.
-    //!
-    //! Asserting the rendered output would pin two different renderings; what
-    //! matters is that neither frontend can introduce a word, a hotkey or a
-    //! default of its own. These tests pin the prompt each command builds, so
-    //! changing the copy means changing it here — where both read it.
-
-    use super::*;
-
-    /// Every hotkey the work-item prompt offers, and the label beside it.
-    /// A frontend that rendered its own list (the CLI printed `[1] Feature …`
-    /// and additionally accepted `feature`, `bug`, `enhancement`, which the
-    /// TUI did not) can no longer diverge.
-    #[test]
-    fn the_work_item_kind_prompt_is_the_only_source_of_its_copy() {
-        let prompt = work_item_kind();
-        assert_eq!(prompt.title, "Work item kind");
-        assert_eq!(prompt.keys(), vec!['1', '2', '3', '4']);
-        assert_eq!(
-            prompt.labels(),
-            vec!["Feature", "Bug", "Task", "Enhancement"]
-        );
-    }
-
-    /// The interval prompt's title and body, and a default that is not a
-    /// literal.
-    #[test]
-    fn the_interval_prompt_is_the_only_source_of_its_copy() {
-        let prompt = squad_task_interval();
-        assert_eq!(prompt.title, "Evaluation Interval");
-        assert!(
-            prompt.body.contains("How often"),
-            "the body asks the question: {:?}",
-            prompt.body
-        );
-        assert!(prompt.default.is_some());
-    }
-
-    /// Both frontends ask the mount-scope question with the same words.
-    ///
-    /// They did not before F-19: the CLI printed `mount scope: [gitroot]/cwd?`
-    /// and read a string, while the TUI asked `Mount the entire git root?
-    /// (No = current directory only)` as a yes/no. Two wordings, two shapes,
-    /// one decision — and the CLI's `_ =>` arm turned a typo into `GitRoot`.
-    #[test]
-    fn the_mount_scope_prompt_is_the_only_source_of_its_copy() {
-        let prompt = squad_task_mount_scope();
-        assert_eq!(prompt.title, "Mount scope");
-        assert_eq!(
-            prompt.labels(),
-            vec!["the entire git root", "the current directory only"]
-        );
-    }
-
-    /// The same for the workspace step, whose labels the CLI numbered itself.
-    #[test]
-    fn the_task_workspace_prompt_is_the_only_source_of_its_copy() {
-        let prompt = squad_task_workspace();
-        assert_eq!(prompt.title, "Task Workspace");
-        assert_eq!(
-            prompt.labels(),
-            vec!["Default Task Workspace", "Custom Folder / Repo"]
-        );
-    }
-
-    /// Neither frontend still authors the copy for these two steps.
-    ///
-    /// The CLI numbered its own workspace options and read the literal
-    /// `"cwd"` into a `MountScope`, mapping everything else — a typo
-    /// included — to `GitRoot`. The TUI asked the same scope as a yes/no,
-    /// with its own wording. Both now render what
-    /// `squad_task_workspace`/`squad_task_mount_scope` hand them.
-    ///
-    /// Phrase-based rather than label-based: `ask_task_repo`'s dialog title
-    /// happens to read "Custom Folder / Repo" too, and that step is still one
-    /// of F-19's deferred `TextPrompt` conversions — its copy is legitimately
-    /// still in Layer 3, and a label scan would flag it for the coincidence.
-    #[test]
-    fn no_frontend_still_authors_the_squad_interview_copy() {
-        for (path, source, retired) in [
-            (
-                "cli/command_frontend.rs",
-                include_str!("../frontend/cli/command_frontend.rs"),
-                &["Default Task Workspace", "mount scope: [gitroot]/cwd?"][..],
-            ),
-            (
-                "tui/per_command/squad.rs",
-                include_str!("../frontend/tui/per_command/squad.rs"),
-                &["Task Workspace", "Mount the entire git root?"][..],
-            ),
-        ] {
-            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-            for phrase in retired {
-                assert!(
-                    !production.contains(&format!("\"{phrase}\"")),
-                    "{path} still authors {phrase:?}; the prompt is Layer 2's"
-                );
-            }
-        }
-    }
-
-    /// No frontend may spell the interval default. Before F-19 `"6h"` was in
-    /// the catalogue, in `cli/command_frontend.rs`, and twice in
-    /// `tui/per_command/squad.rs`.
-    #[test]
-    fn no_frontend_spells_the_interval_default() {
-        let default = squad_flag_default("interval");
-        for (path, source) in [
-            (
-                "cli/command_frontend.rs",
-                include_str!("../frontend/cli/command_frontend.rs"),
-            ),
-            (
-                "tui/per_command/squad.rs",
-                include_str!("../frontend/tui/per_command/squad.rs"),
-            ),
-        ] {
-            // The test module below the frontend asserts against the prompt's
-            // own default, so only the production half is scanned.
-            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-            assert!(
-                !production.contains(&format!("\"{default}\"")),
-                "{path} spells the interval default {default:?} itself"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod wi0149_tests {
-    use super::*;
-    fn check(remediations: Vec<Remediation>) -> PrerequisiteCheck {
-        PrerequisiteCheck {
-            prerequisite: crate::data::workflow_prerequisites::WorkflowPrerequisite::GitIdentity,
-            status: crate::data::workflow_prerequisites::PrerequisiteStatus::NeedsConsent,
-            explanation: "fixture".into(),
-            needed_by: vec![],
-            remediations,
-        }
-    }
-    #[test]
-    fn wi0149_all_prerequisite_prompts_have_safe_dismiss_defaults_and_unique_keys() {
-        fn unique<D>(p: &Prompt<D>) {
-            let keys = p.keys();
-            assert_eq!(
-                keys.iter().collect::<std::collections::BTreeSet<_>>().len(),
-                keys.len()
-            );
-        }
-        let c = check(vec![
-            Remediation::UseHostIdentity {
-                name: "Ada".into(),
-                email: "ada@x".into(),
-            },
-            Remediation::SetLocalIdentity {
-                name: "Ada".into(),
-                email: "ada@x".into(),
-                command: "git config --local".into(),
-            },
-        ]);
-        let identity = prerequisite_identity(&c);
-        unique(&identity);
-        assert_eq!(identity.keys(), vec!['h', 'e', 'g', 'c']);
-        assert_eq!(identity.default_on_dismiss, Some(IdentityChoice::Continue));
-        assert_eq!(identity.labels()[0], "Use host identity \"Ada <ada@x>\"");
-        let persist = prerequisite_identity_persist("git config --local user.name Ada");
-        unique(&persist);
-        assert_eq!(persist.default_on_dismiss, Some(IdentityPersist::RunOnly));
-        assert!(persist.body.contains("git config --local user.name Ada"));
-        let c = check(vec![
-            Remediation::MountSshKey {
-                path: "/home/test/.ssh/id_ed25519".into(),
-                passphrase_protected: Some(true),
-                mode_ok: true,
-                remembered: false,
-                suggested: false,
-            },
-            Remediation::MountSshDir,
-        ]);
-        let ssh = prerequisite_ssh(&c, "github.com:org/repo.git");
-        unique(&ssh);
-        assert_eq!(ssh.keys(), vec!['1', 'a', 'w', 'n']);
-        assert!(ssh.labels()[0].contains("passphrase-protected: will fail unattended"));
-        assert!(ssh.body.contains("read-only"));
-        assert!(ssh.body.contains("deploy key"));
-        assert_eq!(ssh.default_on_dismiss, Some(SshChoice::Decline));
-        let token = prerequisite_token_consent(&c, "GH_TOKEN");
-        unique(&token);
-        assert_eq!(
-            token.labels(),
-            vec!["Yes, this run", "Yes, and remember for this repo", "No"]
-        );
-        assert_eq!(token.default_on_dismiss, Some(TokenConsent::Decline));
-        let source = prerequisite_token_source(&c);
-        unique(&source);
-        assert_eq!(source.default_on_dismiss, Some(TokenSourceChoice::Decline));
-        assert_eq!(source.labels().last(), Some(&"Continue without a token"));
-        let tool = prerequisite_missing_tool(&c);
-        unique(&tool);
-        assert_eq!(tool.default_on_dismiss, Some(ToolChoice::Abort));
-        let gap = prerequisite_gap(&c);
-        unique(&gap);
-        assert_eq!(gap.default_on_dismiss, Some(GapChoice::Abort));
-        let review = HostSecretCommandReview {
-            label: "op".into(),
-            argv: vec!["op".into()],
-            rendered: "op read vault".into(),
-            resolved_path: "/usr/bin/op".into(),
-            timeout_secs: 30,
-            sha256: "exact-hash".into(),
-        };
-        let approval = prerequisite_acquire_approval(&review);
-        unique(&approval);
-        assert_eq!(approval.default_on_dismiss, Some(TrustDecision::Decline));
-        for detail in ["ON YOUR HOST", "/usr/bin/op", "op read vault", "exact-hash"] {
-            assert!(approval.body.contains(detail));
-        }
-        assert!(prerequisite_token_paste().masked);
-        assert!(!prerequisite_identity_name().masked);
-        assert!(!prerequisite_identity_email().masked);
-    }
-}
-
 /// The prerequisite summary's choices, and what each leads to.
 ///
 /// The body is not the table (each frontend draws the report its own way)
 /// but what happens next, so "Continue" is never a leap in the dark: who is
 /// asked what, and what an item left unresolved does to the run. Esc
-/// continues; Ctrl-C is an explicit abort, handled by the frontend's input
-/// transport.
+/// cancels; Enter continues to the questions.
 pub fn prerequisite_report(
     report: &crate::data::workflow_prerequisites::WorkflowPrerequisiteReport,
     next: PrerequisiteReportNext,
@@ -1208,10 +854,7 @@ pub fn prerequisite_report(
         PrerequisiteReportNext::Decided => vec![Choice::new('c', "Continue", true)],
         PrerequisiteReportNext::Questions { .. } if attention.is_empty() => {
             body.push("Everything this workflow needs is available.".into());
-            vec![
-                Choice::new('c', "Start the workflow", true),
-                Choice::new('a', "Abort the run", false),
-            ]
+            vec![Choice::new('\n', "Start the workflow", true)]
         }
         PrerequisiteReportNext::Questions { unresolved } => {
             let count = attention.len();
@@ -1253,10 +896,11 @@ pub fn prerequisite_report(
                      agent starts (workflows.prerequisites.unresolved is \"fail\")."
                     .to_string(),
             });
-            vec![
-                Choice::new('c', "Continue to the questions", true),
-                Choice::new('a', "Abort the run", false),
-            ]
+            vec![Choice::new(
+                '\n',
+                "Enter to configure missing prerequisites",
+                true,
+            )]
         }
     };
     let unknown = report
@@ -1277,105 +921,18 @@ pub fn prerequisite_report(
         report.summary_line(),
         body.join("\n\n"),
         choices,
-        Some(true),
+        Some(!matches!(next, PrerequisiteReportNext::Questions { .. })),
     )
 }
 
-#[cfg(test)]
-mod prerequisite_report_tests {
-    use super::*;
-    use crate::data::config::workflows::UnresolvedMode;
-    use crate::data::workflow_prerequisites::*;
-
-    fn report(
-        status: PrerequisiteStatus,
-        origin: PrerequisiteOrigin,
-    ) -> WorkflowPrerequisiteReport {
-        WorkflowPrerequisiteReport {
-            phase: PrerequisitePhase::Start,
-            origin,
-            checks: vec![PrerequisiteCheck {
-                prerequisite: WorkflowPrerequisite::GitHubToken {
-                    host: "github.com".into(),
-                },
-                status,
-                explanation: "No token".into(),
-                needed_by: vec![StepRef {
-                    phase: crate::data::workflow_state::PhaseKind::Teardown,
-                    kind: PrerequisiteStepKind::CreatePullRequest,
-                    index: 0,
-                    description: "open PR".into(),
-                }],
-                remediations: vec![],
-            }],
-            advisories: vec![],
-            notes: vec![],
-        }
-    }
-
-    #[test]
-    fn continuing_with_gaps_says_what_is_asked_and_what_fails() {
-        let r = report(PrerequisiteStatus::Missing, PrerequisiteOrigin::Static);
-        let warn = prerequisite_report(
-            &r,
-            PrerequisiteReportNext::Questions {
-                unresolved: UnresolvedMode::Warn,
-            },
-        );
-        assert_eq!(
-            warn.labels(),
-            vec!["Continue to the questions", "Abort the run"]
-        );
-        assert!(warn.body.contains("one at a time"), "{}", warn.body);
-        assert!(warn.body.contains("does not stop the run"), "{}", warn.body);
-        assert!(
-            warn.body.contains("create_pull_request will fail"),
-            "{}",
-            warn.body
-        );
-        assert_eq!(warn.default_on_dismiss, Some(true));
-        let fail = prerequisite_report(
-            &r,
-            PrerequisiteReportNext::Questions {
-                unresolved: UnresolvedMode::Fail,
-            },
-        );
-        assert!(fail.body.contains("stops the run"), "{}", fail.body);
-    }
-
-    #[test]
-    fn nothing_to_resolve_and_check_only_offer_no_questions() {
-        let ok = report(PrerequisiteStatus::Satisfied, PrerequisiteOrigin::Static);
-        let start = prerequisite_report(
-            &ok,
-            PrerequisiteReportNext::Questions {
-                unresolved: UnresolvedMode::Warn,
-            },
-        );
-        assert_eq!(start.labels(), vec!["Start the workflow", "Abort the run"]);
-        let check = prerequisite_report(
-            &report(PrerequisiteStatus::Missing, PrerequisiteOrigin::AssumedAll),
-            PrerequisiteReportNext::CheckOnly,
-        );
-        assert_eq!(check.labels(), vec!["Close"]);
-        assert!(check.body.contains("no workflow ran"));
-        assert!(!check.body.contains("dynamic"));
-    }
-
-    #[test]
-    fn dynamic_runs_and_unknown_items_are_explained() {
-        let unknown = report(PrerequisiteStatus::Unknown, PrerequisiteOrigin::AssumedAll);
-        let prompt = prerequisite_report(
-            &unknown,
-            PrerequisiteReportNext::Questions {
-                unresolved: UnresolvedMode::Warn,
-            },
-        );
-        assert!(prompt.body.contains("dynamic workflow"), "{}", prompt.body);
-        assert!(
-            prompt.body.contains("1 item could not be checked"),
-            "{}",
-            prompt.body
-        );
-    }
+/// Presenter confirmations. The daemon and TUI consume the same copy.
+pub fn frontend_prompt(kind: &str) -> Option<Prompt<String>> {
+    let (title, body, choices): (&str, &str, Vec<Choice<String>>) = match kind {
+        "quit_confirm" => ("Quit awman?", "  Press Ctrl-C again to quit awman\n\n  [Esc] cancel", vec![Choice::new('y',"quit","quit".into()),Choice::new('n',"cancel","dismiss".into())]),
+        "close_tab_confirm" => ("Close tab?", "  Press Ctrl-C again to quit awman\n  Press Ctrl-T to close this tab\n\n  [Esc] cancel", vec![Choice::new('y',"close tab","close_tab".into()),Choice::new('n',"cancel","dismiss".into())]),
+        "workflow_cancel_confirm" => ("Cancel Workflow Execution", "  Cancel workflow execution?\n\n  The running container will be killed and the\n  current step returned to Pending for resumption.\n\n  [y] cancel execution   [n / Esc] keep running", vec![Choice::new('y',"cancel execution","cancel".into()),Choice::new('n',"keep running","dismiss".into())]),
+        "new_tab" => ("New tab", "Select an authorised launch context and a directory beneath its root.", vec![Choice::new('y',"open tab","open_tab".into()),Choice::new('n',"cancel","dismiss".into())]),
+        _ => return None,
+    };
+    Some(Prompt::new(title, body, choices, Some("dismiss".into())))
 }

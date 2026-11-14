@@ -6,10 +6,6 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::command::commands::squad::daemon::{
-    SquadDaemon, SquadDaemonSubcommand, SquadLogsFlags, SquadStartFlags, SquadStatusFlags,
-    SquadStopFlags,
-};
 use crate::command::commands::squad::env_sync::sync_env;
 use crate::command::commands::squad::gateway::{
     CreateTask, DaemonStatus, EnvCoverage, TaskDetail, TaskGateway, UpdateTask,
@@ -19,8 +15,8 @@ use crate::command::commands::Command;
 use crate::command::dispatch::frontend_action::FrontendAction;
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
-use crate::data::config::env::host_var;
-use crate::data::config::global::GlobalConfig;
+use crate::data::config::env::EnvSnapshot;
+use crate::data::config::ConfigFile;
 use crate::data::fs::daemon_env::{EnvPersistence, EnvVarState};
 use crate::data::fs::task_store::{MountScope, Task, TaskStatus, TaskWorkspace};
 use crate::data::fs::SquadPaths;
@@ -58,12 +54,6 @@ pub enum SquadConfirmDecision {
     Dismiss,
 }
 
-#[derive(Debug, Clone)]
-pub struct SquadServeConfig {
-    pub port: u16,
-    pub dangerously_skip_auth: bool,
-}
-
 #[async_trait]
 pub trait SquadCommandFrontend:
     UserMessageSink
@@ -71,42 +61,6 @@ pub trait SquadCommandFrontend:
     + Send
     + Sync
 {
-    /// The unattended frontends the daemon's evaluator drives leader agents
-    /// and workflows with. Only the host that can actually serve the daemon
-    /// supplies them; every other frontend answers `None` and is refused a
-    /// foreground start.
-    fn squad_run_frontends(
-        &self,
-    ) -> Option<std::sync::Arc<dyn crate::command::commands::squad::evaluation::SquadRunFrontends>>
-    {
-        None
-    }
-
-    /// Serve the bootstrapped daemon until shutdown. Layer 2 has already
-    /// opened the store, reconciled orphaned runs and started the scheduler;
-    /// the frontend builds a router over `_handles`, binds, and serves.
-    async fn serve_squad_daemon(
-        &mut self,
-        _handles: crate::command::commands::squad::daemon_runtime::SquadDaemonHandles,
-    ) -> Result<(), CommandError> {
-        Err(CommandError::NotAvailableForFrontend {
-            command: "squad start".into(),
-            frontend: "this".into(),
-        })
-    }
-
-    /// Disclose a squad bearer key this process just minted.
-    ///
-    /// Called by `Dispatch` immediately after the gateway is resolved, and
-    /// exactly once per key: the plaintext exists nowhere else, so a frontend
-    /// that drops it has lost it. The default does nothing, which is right
-    /// only for a frontend with no user in front of it (the daemon's own).
-    fn show_key_setup(
-        &mut self,
-        _setup: &crate::command::commands::squad::supervisor::SquadKeySetup,
-    ) {
-    }
-
     // ── Task-creation interview (BLOCKER-3, §9.3) ──────────────────────
     //
     // These COLLECT input; they must not validate or reject an answer — that
@@ -141,8 +95,10 @@ pub trait SquadCommandFrontend:
 
     /// The custom workspace path. Only asked when
     /// [`ask_task_workspace_choice`](Self::ask_task_workspace_choice) chose
-    /// [`TaskWorkspaceChoice::Custom`].
-    fn ask_task_repo(&mut self) -> Result<PathBuf, CommandError> {
+    /// [`TaskWorkspaceChoice::Custom`]. `current_dir` is the invoking
+    /// session's working directory, the answer when the user just presses
+    /// Enter; `None` when the session carries none.
+    fn ask_task_repo(&mut self, _current_dir: Option<&Path>) -> Result<PathBuf, CommandError> {
         Err(interview_unavailable())
     }
 
@@ -290,10 +246,9 @@ pub struct SquadAddRequest {
 }
 
 pub enum SquadSubcommand {
-    Start(SquadStartFlags),
-    Stop(SquadStopFlags),
-    Status(SquadStatusFlags),
-    Logs(SquadLogsFlags),
+    /// Bare `awman squad --headless`: the squad feature's summary, from the
+    /// running daemon when there is one.
+    Status,
     Add(SquadAddRequest),
     /// Change an existing task (WI 0110). `interview` collects `update`'s
     /// fields through the frontend instead of taking them from flags.
@@ -369,21 +324,10 @@ pub struct EnvReport {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", content = "payload")]
 pub enum SquadOutcome {
-    Started {
-        port: u16,
-        background: bool,
-        refreshed_key: bool,
-    },
-    Stopped {
-        stopped_pid: Option<u32>,
-    },
     Status(DaemonStatus),
-    Logs {
-        log_path: String,
-    },
-    Task(Task),
+    Task(#[serde(serialize_with = "crate::command::daemon_api::squad::task_wire::serialize")] Task),
     Detail(TaskDetail),
-    Tasks(Vec<Task>),
+    Tasks(#[serde(serialize_with = "crate::command::daemon_api::squad::task_list_wire")] Vec<Task>),
     /// A task asked to run ahead of its schedule by `squad trigger`. It
     /// names the task so a frontend can confirm *which* one was triggered
     /// without holding onto the request, and is distinct from
@@ -399,7 +343,9 @@ pub enum SquadOutcome {
     /// A task as it stands after `squad edit` (WI 0110). Distinct from
     /// [`SquadOutcome::Task`] so a frontend can say "updated" rather than
     /// "created" without inspecting anything.
-    Updated(Task),
+    Updated(
+        #[serde(serialize_with = "crate::command::daemon_api::squad::task_wire::serialize")] Task,
+    ),
     Removed {
         name: String,
         /// The persistent task directory that was deleted, when one was.
@@ -421,6 +367,11 @@ pub struct SquadCommand {
     /// a `SquadCommandFrontend::is_local_user_session` override each frontend
     /// answered for itself.
     local_user: bool,
+    /// The invoking session's environment snapshot. Its cwd is what a task
+    /// workspace is checked against for mounting a parent directory, and its
+    /// values are "this shell" in the `squad env` report. Empty unless set
+    /// with [`Self::with_env`] (`from_input` always does).
+    env: EnvSnapshot,
 }
 
 impl SquadCommand {
@@ -445,7 +396,14 @@ impl SquadCommand {
             gateway,
             engines,
             local_user,
+            env: EnvSnapshot::empty(),
         }
+    }
+
+    /// The invoking session's environment (cwd and values).
+    pub fn with_env(mut self, env: EnvSnapshot) -> Self {
+        self.env = env;
+        self
     }
 
     pub fn subcommand(&self) -> &SquadSubcommand {
@@ -479,19 +437,7 @@ impl SquadCommand {
     /// (`"gitroot"`) and both `--port`s come from the catalogue.
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
         let sub = match ctx.caller.leaf() {
-            "start" => SquadSubcommand::Start(SquadStartFlags {
-                port: ctx.flags.require_u16("port")?,
-                background: ctx.flags.bool("background"),
-                refresh_key: ctx.flags.bool("refresh-key"),
-                dangerously_skip_auth: ctx.flags.bool("dangerously-skip-auth"),
-            }),
-            "stop" => SquadSubcommand::Stop(SquadStopFlags),
-            // Carries the gateway so Layer 2 can overlay live scheduler counts
-            // onto the pidfile-derived liveness (§9.4).
-            "squad" | "status" => SquadSubcommand::Status(SquadStatusFlags),
-            "logs" => SquadSubcommand::Logs(SquadLogsFlags {
-                follow: ctx.flags.bool("follow"),
-            }),
+            "squad" => SquadSubcommand::Status,
             "add" => SquadSubcommand::Add(squad_add_request(ctx)?),
             "edit" => SquadSubcommand::Edit {
                 name: ctx.args.require("name")?,
@@ -519,7 +465,8 @@ impl SquadCommand {
             ctx.boxed_gateway(),
             ctx.engines.clone(),
             ctx.caller.local_user(),
-        ))
+        )
+        .with_env(ctx.session.env().clone()))
     }
 }
 
@@ -533,7 +480,7 @@ fn squad_add_request(ctx: &BuildContext) -> Result<SquadAddRequest, CommandError
     // `-n` never reaches the interview (the catalogue makes the two flags
     // conflict); it governs the one confirmation scripted creation can still
     // raise — the parent-directory mount scope.
-    let non_interactive = ctx.flags.bool("non-interactive");
+    let non_interactive = ctx.flags.bool("headless");
     if ctx.flags.bool("interview") {
         return Ok(SquadAddRequest {
             interview: true,
@@ -698,56 +645,34 @@ impl Command for SquadCommand {
             gateway,
             engines,
             local_user,
+            env,
         } = self;
+        // An empty cwd means the snapshot carries none (as `current_dir`
+        // failing did before): no parent-mount comparison is possible.
+        let cwd = Some(env.cwd().to_path_buf()).filter(|dir| !dir.as_os_str().is_empty());
         match sub {
-            SquadSubcommand::Start(flags) => {
-                SquadDaemon::new(SquadDaemonSubcommand::Start(flags), engines)
-                    .run(&mut *frontend)
-                    .await
-            }
-            SquadSubcommand::Stop(flags) => {
-                SquadDaemon::new(SquadDaemonSubcommand::Stop(flags), engines)
-                    .run(&mut *frontend)
-                    .await
-            }
-            SquadSubcommand::Status(flags) => {
-                // Liveness, PID and bound address come from the pidfile/sidecar
-                // (correct even when the daemon is down). A gateway is injected
-                // only when the daemon has published its endpoint, so its
-                // presence is the "daemon reachable" signal: overlay the live
-                // scheduler counts from `gateway.status()`. A stopped daemon
-                // means no gateway (no HTTP call); a present-but-failing gateway
-                // degrades to the pidfile-only answer rather than failing (§9.4).
-                let outcome = SquadDaemon::new(SquadDaemonSubcommand::Status(flags), engines)
-                    .run(&mut *frontend)
-                    .await?;
-                let SquadOutcome::Status(mut status) = outcome else {
-                    unreachable!("status subcommand yields a status outcome");
+            SquadSubcommand::Status => {
+                // The squad feature's summary comes from the running daemon;
+                // without one (no gateway) the answer is "not running".
+                let mut status = DaemonStatus {
+                    running: false,
+                    pid: None,
+                    bound_addr: None,
+                    task_count: 0,
+                    active_count: 0,
+                    last_tick: None,
+                    in_flight: 0,
+                    config_error: None,
+                    env_persistence: None,
+                    unmet_env: Vec::new(),
                 };
                 if let Some(gateway) = &gateway {
-                    if let Ok(live) = gateway.status().await {
-                        status.running = live.running;
-                        status.task_count = live.task_count;
-                        status.active_count = live.active_count;
-                        status.last_tick = live.last_tick;
-                        status.in_flight = live.in_flight;
-                        // Both are daemon-only facts (WI 0116 §5a, §6b): the
-                        // pidfile sidecar cannot know either, and leaving them
-                        // at their defaults would silently report full
-                        // coverage for a daemon that just said otherwise.
-                        status.env_persistence = live.env_persistence;
-                        status.unmet_env = live.unmet_env;
-                    }
+                    status = gateway.status().await?;
                 }
                 Ok(SquadOutcome::Status(status))
             }
-            SquadSubcommand::Logs(flags) => {
-                SquadDaemon::new(SquadDaemonSubcommand::Logs(flags), engines)
-                    .run(&mut *frontend)
-                    .await
-            }
             sub => {
-                let gateway = gateway.ok_or_else(|| CommandError::Other("squad tasks are served by the squad daemon; start it with `awman squad start`".into()))?;
+                let gateway = gateway.ok_or_else(|| CommandError::Other("squad tasks are served by the awman daemon; start it with `awman daemon start`".into()))?;
                 match sub {
                     SquadSubcommand::Add(request) => {
                         // In interview mode Layer 2 collects every field through
@@ -767,7 +692,7 @@ impl Command for SquadCommand {
                                     frontend.as_mut(),
                                     local_user,
                                     &req.workspace,
-                                    std::env::current_dir().ok().as_deref(),
+                                    cwd.as_deref(),
                                     request.non_interactive,
                                 )?;
                                 req
@@ -776,6 +701,7 @@ impl Command for SquadCommand {
                                 frontend.as_mut(),
                                 engines.git_engine.as_ref(),
                                 &engines.global_config,
+                                cwd.as_deref(),
                             )?,
                         };
                         let mut req = req;
@@ -785,6 +711,7 @@ impl Command for SquadCommand {
                                 &engines,
                                 local_user,
                                 &req.workspace,
+                                cwd.as_deref(),
                             )?;
                         }
                         let task = gateway.create(req).await?;
@@ -821,6 +748,7 @@ impl Command for SquadCommand {
                                 &engines,
                                 local_user,
                                 &TaskWorkspace::Custom(current.repo_scope.clone()),
+                                cwd.as_deref(),
                             )? {
                                 update.prerequisites = Some(policy);
                             }
@@ -905,7 +833,7 @@ impl Command for SquadCommand {
                             sync_env(gateway.as_ref(), true).await;
                         }
                         let coverage = gateway.env_coverage().await?;
-                        Ok(SquadOutcome::Env(env_report(&coverage, cleared)))
+                        Ok(SquadOutcome::Env(env_report(&coverage, cleared, &env)))
                     }
                     _ => unreachable!("daemon commands handled above"),
                 }
@@ -932,6 +860,7 @@ fn ask_task_prerequisites(
     engines: &Engines,
     local_user: bool,
     workspace: &TaskWorkspace,
+    cwd: Option<&Path>,
 ) -> Result<Option<crate::data::config::workflows::PrerequisitePolicy>, CommandError> {
     if !local_user || !frontend.can_ask_prerequisites() {
         return Ok(None);
@@ -939,10 +868,11 @@ fn ask_task_prerequisites(
     let dir = match workspace {
         TaskWorkspace::Custom(path) if path.is_dir() => path.clone(),
         // The default workspace does not exist yet; the questions are about
-        // the host's keys and tokens, so the current directory stands in.
-        _ => match std::env::current_dir() {
-            Ok(dir) => dir,
-            Err(_) => return Ok(None),
+        // the host's keys and tokens, so the session's current directory
+        // stands in.
+        _ => match cwd {
+            Some(dir) => dir.to_path_buf(),
+            None => return Ok(None),
         },
     };
     crate::command::commands::workflow_prerequisites::collect_task_prerequisites(
@@ -956,7 +886,8 @@ fn ask_task_prerequisites(
 fn collect_task_interview(
     frontend: &mut dyn SquadCommandFrontend,
     git_engine: &GitEngine,
-    global_config: &GlobalConfig,
+    global_config: &ConfigFile,
+    cwd: Option<&Path>,
 ) -> Result<CreateTask, CommandError> {
     let name = frontend.ask_task_name()?;
     let description = frontend.ask_task_description()?;
@@ -964,7 +895,7 @@ fn collect_task_interview(
         frontend.ask_task_interval(&crate::command::prompts::squad_task_interval())?;
     let interval_secs =
         crate::command::dispatch::parse_squad_interval(&["squad", "add"], &interval_raw)?;
-    let workspace = collect_workspace_choice(frontend, git_engine)?;
+    let workspace = collect_workspace_choice(frontend, git_engine, cwd)?;
     let overlays = collect_overlays(frontend)?;
     let agent = frontend.ask_task_agent()?;
     let model = frontend.ask_task_model()?;
@@ -1013,11 +944,12 @@ fn collect_task_interview(
 /// interview is only as long as the user makes it.
 fn collect_agent_pool(
     frontend: &mut dyn SquadCommandFrontend,
-    global_config: &GlobalConfig,
+    global_config: &ConfigFile,
     task_agent: Option<&str>,
 ) -> Result<BTreeMap<String, Vec<String>>, CommandError> {
     // The config this command was built with, not a fresh read (F-31).
-    let global = global_config.squad.clone();
+    let global = Some(crate::data::config::SquadConfig::from_global(global_config))
+        .filter(crate::data::config::SquadConfig::has_dynamic_settings);
     if global.is_some() && frontend.ask_use_global_squad_config()? {
         return Ok(BTreeMap::new());
     }
@@ -1079,7 +1011,7 @@ fn read_task_agent_pool(name: &str) -> Result<BTreeMap<String, Vec<String>>, Com
     // outside its schema and must not change what the interview accepts.
     let paths = SquadPaths::from_process_env()?;
     Ok(
-        crate::data::config::global::task_own_squad_config(&paths, name)?
+        crate::data::config::squad::task_own_squad_config(&paths, name)?
             .and_then(|squad| squad.agents_to_models)
             .map(|map| map.into_iter().collect())
             .unwrap_or_default(),
@@ -1096,7 +1028,7 @@ fn collect_task_edit_interview(
     frontend: &mut dyn SquadCommandFrontend,
     current: &Task,
     current_pool: &BTreeMap<String, Vec<String>>,
-    global_config: &GlobalConfig,
+    global_config: &ConfigFile,
 ) -> Result<UpdateTask, CommandError> {
     let mut update = UpdateTask::default();
 
@@ -1162,6 +1094,7 @@ fn update_agent_or<'a>(update: &'a UpdateTask, current: &'a Task) -> Option<&'a 
 fn collect_workspace_choice(
     frontend: &mut dyn SquadCommandFrontend,
     git_engine: &GitEngine,
+    current_dir: Option<&Path>,
 ) -> Result<TaskWorkspace, CommandError> {
     if matches!(
         frontend.ask_task_workspace_choice(&crate::command::prompts::squad_task_workspace())?,
@@ -1169,9 +1102,8 @@ fn collect_workspace_choice(
     ) {
         return Ok(TaskWorkspace::Default);
     }
-    let current_dir = std::env::current_dir().ok();
     loop {
-        let path = frontend.ask_task_repo()?;
+        let path = frontend.ask_task_repo(current_dir)?;
         let canonical = match std::fs::canonicalize(&path) {
             Ok(canonical) => canonical,
             // Not "warn and offer to keep": there is nothing at this path to
@@ -1189,7 +1121,7 @@ fn collect_workspace_choice(
                 canonical.display()
             )));
         }
-        if let Some(cwd) = current_dir.as_deref() {
+        if let Some(cwd) = current_dir {
             if workspace_is_parent_of(&canonical, cwd)
                 && !frontend.confirm_parent_directory_workspace(&canonical, cwd)?
             {
@@ -1284,289 +1216,6 @@ fn collect_overlays(frontend: &mut dyn SquadCommandFrontend) -> Result<Vec<Strin
     Ok(overlays)
 }
 
-#[cfg(test)]
-mod workspace_choice_tests {
-    use super::*;
-    use std::collections::VecDeque;
-
-    use crate::data::message::{UserMessage, UserMessageSink};
-
-    struct WorkspaceFrontend {
-        paths: VecDeque<PathBuf>,
-        keep_non_git: VecDeque<bool>,
-        non_git_prompts: usize,
-    }
-
-    impl WorkspaceFrontend {
-        fn custom(paths: impl IntoIterator<Item = PathBuf>, keep_non_git: Vec<bool>) -> Self {
-            Self {
-                paths: paths.into_iter().collect(),
-                keep_non_git: keep_non_git.into(),
-                non_git_prompts: 0,
-            }
-        }
-    }
-
-    impl UserMessageSink for WorkspaceFrontend {
-        fn write_message(&mut self, _message: UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-
-    impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
-        for WorkspaceFrontend
-    {
-    }
-    #[async_trait]
-    impl SquadCommandFrontend for WorkspaceFrontend {
-        fn ask_task_workspace_choice(
-            &mut self,
-            _prompt: &Prompt<TaskWorkspaceChoice>,
-        ) -> Result<TaskWorkspaceChoice, CommandError> {
-            Ok(TaskWorkspaceChoice::CustomFolderOrRepo)
-        }
-
-        fn ask_task_repo(&mut self) -> Result<PathBuf, CommandError> {
-            self.paths.pop_front().ok_or_else(|| {
-                CommandError::Other(
-                    "test frontend was asked for an unexpected replacement workspace".into(),
-                )
-            })
-        }
-
-        fn confirm_non_git_workspace(&mut self, _path: &Path) -> Result<bool, CommandError> {
-            self.non_git_prompts += 1;
-            self.keep_non_git.pop_front().ok_or_else(|| {
-                CommandError::Other(
-                    "test frontend was asked for an unexpected non-git confirmation".into(),
-                )
-            })
-        }
-    }
-
-    fn git_init(dir: &Path) {
-        let status = std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(dir)
-            .status()
-            .expect("git must be available to exercise repository detection");
-        assert!(status.success(), "git init failed in {}", dir.display());
-    }
-
-    #[test]
-    fn a_real_git_repository_root_is_accepted_without_a_non_git_warning() {
-        let tmp = tempfile::tempdir().unwrap();
-        git_init(tmp.path());
-        let mut frontend = WorkspaceFrontend::custom([tmp.path().to_path_buf()], vec![]);
-
-        let workspace = collect_workspace_choice(&mut frontend, &GitEngine::new()).unwrap();
-        assert_eq!(
-            workspace,
-            TaskWorkspace::Custom(tmp.path().canonicalize().unwrap())
-        );
-        assert_eq!(frontend.non_git_prompts, 0);
-    }
-
-    /// A bare `.git` directory with no repository inside it is what an
-    /// ancestor-walking `.git`-exists probe would call a repository. The real
-    /// detector (`GitEngine::resolve_root`, the same one the run path uses)
-    /// rejects it, so creation must warn rather than silently capturing a
-    /// worktree-isolated scope that would fail at launch.
-    #[test]
-    fn a_malformed_git_marker_is_not_treated_as_a_repository() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join(".git")).unwrap();
-        let mut frontend = WorkspaceFrontend::custom([tmp.path().to_path_buf()], vec![true]);
-
-        let workspace = collect_workspace_choice(&mut frontend, &GitEngine::new()).unwrap();
-        assert_eq!(
-            workspace,
-            TaskWorkspace::Custom(tmp.path().canonicalize().unwrap())
-        );
-        assert_eq!(
-            frontend.non_git_prompts, 1,
-            "a malformed .git marker must still raise the not-a-repository warning"
-        );
-    }
-
-    #[test]
-    fn non_git_custom_workspace_warns_and_loops_when_user_changes_their_choice() {
-        let tmp = tempfile::tempdir().unwrap();
-        let first = tmp.path().join("first");
-        let second = tmp.path().join("second");
-        std::fs::create_dir(&first).unwrap();
-        std::fs::create_dir(&second).unwrap();
-        let mut frontend =
-            WorkspaceFrontend::custom([first.clone(), second.clone()], vec![false, true]);
-
-        let workspace = collect_workspace_choice(&mut frontend, &GitEngine::new()).unwrap();
-        assert_eq!(
-            workspace,
-            TaskWorkspace::Custom(second.canonicalize().unwrap())
-        );
-        assert_eq!(
-            frontend.non_git_prompts, 2,
-            "the declined warning must return to the path prompt"
-        );
-    }
-
-    #[test]
-    fn nonexistent_custom_workspace_is_rejected_without_a_keep_prompt() {
-        let tmp = tempfile::tempdir().unwrap();
-        let missing = tmp.path().join("does-not-exist");
-        let mut frontend = WorkspaceFrontend::custom([missing.clone()], vec![]);
-
-        let error = collect_workspace_choice(&mut frontend, &GitEngine::new()).unwrap_err();
-        assert!(error.to_string().contains("does not exist"), "{error}");
-        assert_eq!(frontend.non_git_prompts, 0);
-    }
-}
-
-#[cfg(test)]
-mod scripted_workspace_scope_tests {
-    use super::*;
-
-    use crate::data::message::{UserMessage, UserMessageSink};
-
-    /// A frontend that answers like a user's own shell session: it is asked,
-    /// and it says no.
-    struct RefusingLocalFrontend {
-        asked: usize,
-    }
-
-    impl UserMessageSink for RefusingLocalFrontend {
-        fn write_message(&mut self, _message: UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-
-    impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
-        for RefusingLocalFrontend
-    {
-    }
-    #[async_trait]
-    impl SquadCommandFrontend for RefusingLocalFrontend {
-        fn confirm_parent_directory_workspace(
-            &mut self,
-            _path: &Path,
-            _current_dir: &Path,
-        ) -> Result<bool, CommandError> {
-            self.asked += 1;
-            Ok(false)
-        }
-    }
-
-    /// The daemon's frontend: it cannot ask, and its working directory has
-    /// nothing to do with the caller's, so it must not re-apply the policy.
-    struct DaemonFrontend;
-
-    impl UserMessageSink for DaemonFrontend {
-        fn write_message(&mut self, _message: UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-
-    impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
-        for DaemonFrontend
-    {
-    }
-    #[async_trait]
-    impl SquadCommandFrontend for DaemonFrontend {}
-
-    #[test]
-    fn a_scripted_parent_directory_workspace_is_refused_when_the_user_declines() {
-        let tmp = tempfile::tempdir().unwrap();
-        let parent = tmp.path().canonicalize().unwrap();
-        let child = parent.join("child");
-        std::fs::create_dir(&child).unwrap();
-
-        let mut frontend = RefusingLocalFrontend { asked: 0 };
-        let error = confirm_scripted_workspace_scope(
-            &mut frontend,
-            true,
-            &TaskWorkspace::Custom(parent.clone()),
-            Some(&child),
-            false,
-        )
-        .unwrap_err();
-
-        assert!(
-            error.to_string().contains("parent directory"),
-            "scripted creation must refuse an unconfirmed parent mount: {error}"
-        );
-        assert_eq!(frontend.asked, 1);
-    }
-
-    #[test]
-    fn a_scripted_workspace_inside_the_current_directory_is_never_questioned() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        let child = root.join("child");
-        std::fs::create_dir(&child).unwrap();
-        let mut frontend = RefusingLocalFrontend { asked: 0 };
-        confirm_scripted_workspace_scope(
-            &mut frontend,
-            true,
-            &TaskWorkspace::Custom(child.clone()),
-            Some(&child),
-            false,
-        )
-        .unwrap();
-        assert_eq!(frontend.asked, 0);
-        confirm_scripted_workspace_scope(
-            &mut frontend,
-            true,
-            &TaskWorkspace::Default,
-            Some(&child),
-            false,
-        )
-        .unwrap();
-        assert_eq!(frontend.asked, 0);
-    }
-
-    /// `-n` means never ask. The widening must be refused outright rather than
-    /// prompted for, so a scripted run neither blocks nor widens silently.
-    #[test]
-    fn non_interactive_refuses_a_parent_directory_workspace_without_asking() {
-        let tmp = tempfile::tempdir().unwrap();
-        let parent = tmp.path().canonicalize().unwrap();
-        let child = parent.join("child");
-        std::fs::create_dir(&child).unwrap();
-
-        let mut frontend = RefusingLocalFrontend { asked: 0 };
-        let error = confirm_scripted_workspace_scope(
-            &mut frontend,
-            true,
-            &TaskWorkspace::Custom(parent),
-            Some(&child),
-            true,
-        )
-        .unwrap_err();
-
-        assert!(error.to_string().contains("parent directory"), "{error}");
-        assert_eq!(
-            frontend.asked, 0,
-            "--non-interactive must refuse without putting a question to anyone"
-        );
-    }
-
-    #[test]
-    fn the_daemon_does_not_re_apply_the_clients_mount_scope_policy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let parent = tmp.path().canonicalize().unwrap();
-        let child = parent.join("child");
-        std::fs::create_dir(&child).unwrap();
-
-        confirm_scripted_workspace_scope(
-            &mut DaemonFrontend,
-            // The daemon is not the user's own session: `CallerContext`
-            // reports `local_user == false` for `FrontendKind::Api`.
-            false,
-            &TaskWorkspace::Custom(parent),
-            Some(&child),
-            false,
-        )
-        .expect("the daemon must accept what the client already authorised");
-    }
-}
-
 /// Remove a task's persistent directory when confirmed. Resolves the path
 /// through the `validate_under_root`-guarded `SquadPaths::task_dir`, asks
 /// the frontend (unless `-y`), and deletes only on a `true` answer. A missing
@@ -1656,11 +1305,11 @@ fn warn_unmet_env(frontend: &mut dyn SquadCommandFrontend, task: &Task, change: 
 
 /// Turn the daemon's coverage into §6d's report.
 ///
-/// Pure over the coverage plus this process's own environment, so the whole
+/// Pure over the coverage plus the invoking session's environment, so the whole
 /// table is decided in one place and neither frontend has to reason about
 /// digests. The only thing this shell's values are used for is the `SOURCE`
 /// column's `this shell` case — a digest comparison, never a printed value.
-fn env_report(coverage: &EnvCoverage, cleared: Option<bool>) -> EnvReport {
+fn env_report(coverage: &EnvCoverage, cleared: Option<bool>, env: &EnvSnapshot) -> EnvReport {
     let salt = Salt::from_hex(&coverage.salt);
     let rows = coverage
         .required
@@ -1678,9 +1327,10 @@ fn env_report(coverage: &EnvCoverage, cleared: Option<bool>) -> EnvReport {
             // is what the user needs to know, and the comparison never moves
             // a value anywhere — only a digest of one.
             let from_this_shell = match (&salt, &entry.digest) {
-                (Some(salt), Some(digest)) => host_var(&entry.name)
+                (Some(salt), Some(digest)) => env
+                    .get(&entry.name)
                     .filter(|value| !value.is_empty())
-                    .is_some_and(|value| &coverage_digest(salt, &entry.name, &value) == digest),
+                    .is_some_and(|value| &coverage_digest(salt, &entry.name, value) == digest),
                 _ => false,
             };
             let source = if from_this_shell {
@@ -1705,233 +1355,5 @@ fn env_report(coverage: &EnvCoverage, cleared: Option<bool>) -> EnvReport {
         persistence: Some(coverage.persistence.clone()),
         cleared,
         rows,
-    }
-}
-
-#[cfg(test)]
-mod unmet_env_warning_tests {
-    use super::*;
-    use chrono::Utc;
-
-    use std::sync::{Arc, Mutex};
-
-    use crate::data::fs::task_store::{MountScope, TaskStatus};
-    use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
-
-    /// Records everything the command writes to the frontend's message sink.
-    /// Both the CLI and the TUI implement this sink, which is exactly why the
-    /// warning is composed here and not in either frontend: they render the
-    /// same bytes.
-    #[derive(Clone, Default)]
-    struct RecordingFrontend {
-        messages: Arc<Mutex<Vec<UserMessage>>>,
-    }
-
-    impl UserMessageSink for RecordingFrontend {
-        fn write_message(&mut self, message: UserMessage) {
-            self.messages.lock().unwrap().push(message);
-        }
-        fn replay_queued(&mut self) {}
-    }
-
-    impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend
-        for RecordingFrontend
-    {
-    }
-    #[async_trait]
-    impl SquadCommandFrontend for RecordingFrontend {}
-
-    fn task(name: &str, unmet: &[&str]) -> Task {
-        let now = Utc::now();
-        Task {
-            prerequisites: None,
-            id: name.into(),
-            name: name.into(),
-            description: "a task".into(),
-            repo_scope: PathBuf::from("/repo"),
-            mount_scope: MountScope::GitRoot,
-            overlays: vec!["env(ANTHROPIC_KEY)".into()],
-            interval_secs: 600,
-            status: TaskStatus::Active,
-            agent: None,
-            model: None,
-            backoff_until: None,
-            created_at: now,
-            updated_at: now,
-            last_run_at: None,
-            trigger_requested_at: None,
-            last_run_status: None,
-            unmet_env: unmet.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
-    fn warn(task: &Task, change: TaskChange) -> Vec<UserMessage> {
-        let mut frontend = RecordingFrontend::default();
-        let recorded = frontend.messages.clone();
-        warn_unmet_env(&mut frontend, task, change);
-        let messages = recorded.lock().unwrap().clone();
-        messages
-    }
-
-    /// §6a, `squad add`. The exact template, including its indentation — the
-    /// work item's own spacing, kept verbatim so the CLI and the TUI cannot
-    /// drift apart.
-    #[test]
-    fn creating_a_task_that_names_an_unset_variable_warns_with_the_exact_text() {
-        let messages = warn(
-            &task("nightly-triage", &["ANTHROPIC_KEY"]),
-            TaskChange::Created,
-        );
-
-        assert_eq!(messages.len(), 1, "exactly one message, never a repetition");
-        assert_eq!(messages[0].level, MessageLevel::Warning);
-        assert_eq!(
-            messages[0].text,
-            "\u{26a0} Task \"nightly-triage\" was created, but the squad daemon has no value \
-             for ANTHROPIC_KEY.\n\n  Its containers will start without it until it is \
-             supplied. To fix:\n      read -rs ANTHROPIC_KEY && export ANTHROPIC_KEY      # in any shell; \
-             keeps it out of shell history\n      \
-             awman squad env --push       # or just run any awman squad command\n\n  \
-             Check state at any time with `awman squad env`."
-        );
-    }
-
-    /// The same warning with the `squad edit` verb, and `{first_name}` is the
-    /// first of the joined names.
-    #[test]
-    fn editing_a_task_warns_with_the_updated_verb_and_joins_several_names() {
-        let messages = warn(
-            &task("nightly-triage", &["NPM_TOKEN", "AWS_PROFILE"]),
-            TaskChange::Updated,
-        );
-
-        assert_eq!(messages.len(), 1);
-        assert!(
-            messages[0].text.starts_with(
-                "\u{26a0} Task \"nightly-triage\" was updated, but the squad \
-                              daemon has no value for NPM_TOKEN, AWS_PROFILE."
-            ),
-            "{:?}",
-            messages[0].text
-        );
-        assert!(
-            messages[0]
-                .text
-                .contains("read -rs NPM_TOKEN && export NPM_TOKEN"),
-            "the supply line names the first of them: {:?}",
-            messages[0].text
-        );
-    }
-
-    /// **The warning is a warning, never a rejection.** `warn_unmet_env`
-    /// returns nothing and can fail nothing: the caller has already created or
-    /// updated the task by the time it runs, and goes on to return it. Refusing
-    /// to create a task because the current shell is under-equipped would lose
-    /// the user their task — its own kind of silent failure.
-    #[test]
-    fn the_warning_returns_nothing_and_can_refuse_nothing() {
-        let task = task("nightly-triage", &["ANTHROPIC_KEY"]);
-        let messages = warn(&task, TaskChange::Created);
-        // The only effect is one message; the task is untouched and is what
-        // `SquadOutcome::Task` carries back to the frontend.
-        assert_eq!(messages.len(), 1);
-        assert_eq!(task.unmet_env, vec!["ANTHROPIC_KEY".to_string()]);
-        let outcome = SquadOutcome::Task(task.clone());
-        match outcome {
-            SquadOutcome::Task(returned) => assert_eq!(returned.name, "nightly-triage"),
-            other => panic!("creation yields the created task: {other:?}"),
-        }
-    }
-
-    /// A fully covered task says nothing at all.
-    #[test]
-    fn nothing_is_written_when_the_returned_task_has_no_unmet_name() {
-        assert!(warn(&task("nightly-triage", &[]), TaskChange::Created).is_empty());
-        assert!(warn(&task("nightly-triage", &[]), TaskChange::Updated).is_empty());
-    }
-}
-
-#[cfg(test)]
-mod wi0149_tests {
-    use super::super::gateway::{LocalTaskGateway, SharedTaskGateway};
-    use super::*;
-    use crate::data::config::flags::{PrerequisiteFlags, SshFlag};
-    use crate::data::config::workflows::{CredentialUse, PrerequisitePolicy};
-    use crate::data::fs::{task_store::TaskStore, SquadPaths};
-    use crate::data::message::{UserMessage, UserMessageSink};
-    use crate::engine::squad::{env_state::DaemonEnvState, scheduler::SchedulerStatus};
-    use std::sync::{Arc, Mutex};
-    #[derive(Default)]
-    struct Frontend;
-    impl UserMessageSink for Frontend {
-        fn write_message(&mut self, _: UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-    impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend for Frontend {}
-    #[async_trait]
-    impl SquadCommandFrontend for Frontend {}
-    #[tokio::test]
-    async fn wi0149_squad_add_ssh_deny_round_trips_to_show_decisions_only() {
-        let tmp = tempfile::tempdir().unwrap();
-        let engines = Engines::for_tests(tmp.path());
-        let store = Arc::new(TaskStore::open(&tmp.path().join("tasks.db")).unwrap());
-        store.migrate().unwrap();
-        let gateway: Arc<dyn TaskGateway> = Arc::new(LocalTaskGateway::new(
-            store,
-            engines.clone(),
-            Arc::new(Mutex::new(SchedulerStatus::default())),
-            SquadPaths::from_root(tmp.path().join("squad")),
-            Arc::new(DaemonEnvState::without_store()),
-        ));
-        let policy = PrerequisitePolicy::from_flags(&PrerequisiteFlags {
-            ssh: Some(SshFlag::Deny),
-            ..Default::default()
-        });
-        let request = CreateTask {
-            name: "prerequisite-test".into(),
-            description: "test".into(),
-            workspace: TaskWorkspace::Default,
-            mount_scope: crate::data::fs::task_store::MountScope::Directory,
-            interval_secs: 60,
-            agent: None,
-            model: None,
-            overlays: vec![],
-            agents_to_models: Default::default(),
-            prerequisites: Some(policy),
-        };
-        let result = SquadCommand::new(
-            SquadSubcommand::Add(SquadAddRequest {
-                interview: false,
-                non_interactive: true,
-                prefilled: Some(request),
-            }),
-            Some(Box::new(SharedTaskGateway(gateway.clone()))),
-            engines.clone(),
-        )
-        .run_with_frontend(Box::new(Frontend))
-        .await
-        .unwrap();
-        assert!(matches!(result, SquadOutcome::Task(_)));
-        let shown = SquadCommand::new(
-            SquadSubcommand::Show("prerequisite-test".into()),
-            Some(Box::new(SharedTaskGateway(gateway))),
-            engines,
-        )
-        .run_with_frontend(Box::new(Frontend))
-        .await
-        .unwrap();
-        let SquadOutcome::Detail(detail) = shown else {
-            panic!("{shown:?}");
-        };
-        let policy = detail.task.prerequisites.unwrap();
-        assert_eq!(policy.ssh.use_, CredentialUse::Deny);
-        assert!(
-            crate::command::commands::workflow_prerequisites::policy_lines(&policy)
-                .iter()
-                .any(|line| line.to_lowercase().contains("ssh") && line.contains("deny"))
-        );
-        assert!(!serde_json::to_string(&policy)
-            .unwrap()
-            .contains("ghp_fake_wi0149"));
     }
 }

@@ -1,5 +1,7 @@
 # Work Item: Task
 
+> Testing policy update (WI144): test commands, harness paths and test counts in this historical record are superseded by [the current testing contract](/aspec/devops/testing.md). Use manifest suites and `make validate-native` for native acceptance. Removed test sources and raw evidence bundles are available only in Git history; they must not be restored as test patterns.
+
 Title: grand architecture refactor — final parity validation, docs and aspec refresh
 Issue: n/a — eighth and final work item implementing `aspec/architecture/2026-grand-architecture.md`
 

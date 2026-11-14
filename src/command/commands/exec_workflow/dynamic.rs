@@ -5,6 +5,11 @@
 //! of `exec_workflow`, so it reaches that module's private items unchanged.
 
 use super::*;
+use crate::data::program_status::EffectiveStatus;
+use crate::engine::workflow::program_status::{
+    countdown_duration, describe_status, reported_failure_reason, respond_to_report,
+    ReportedResponse,
+};
 
 // ─── Dynamic-workflow resume (WI-0115 §2) ────────────────────────────────────
 
@@ -28,6 +33,7 @@ pub(crate) enum DynamicDiscoveryMiss {
     /// A previous run left something behind, but it cannot be reconstructed.
     /// The string says what is missing, phrased for the user.
     Unusable(String),
+    IdentityMismatch(String),
 }
 
 /// Look for a resumable dynamic run inside a worktree or remote clone.
@@ -39,20 +45,21 @@ pub(crate) enum DynamicDiscoveryMiss {
 /// user over because it means a run *was* there and something ate half of it.
 pub(crate) fn discover_previous_dynamic_run(
     state_git_root: &Path,
-    work_item: u32,
+    work_item: &WorkItemContext,
 ) -> Result<PreviousDynamicRun, DynamicDiscoveryMiss> {
     use crate::data::fs::WorkflowDirs;
     use crate::data::workflow_state_store::WorkflowStateStore;
     use DynamicDiscoveryMiss::{NothingToResume, Unusable};
 
-    let workflow_path = WorkflowDirs::dynamic_workflow_path(state_git_root, work_item);
+    let workflow_path = WorkflowDirs::dynamic_workflow_path_for_key(state_git_root, &work_item.key)
+        .map_err(|e| Unusable(e.to_string()))?;
     if !workflow_path.exists() {
         // A run that finished cleanly deletes its saved workflow but keeps its
         // (all-succeeded) state file, so a kept worktree lands here routinely.
         // Only a state file with work still left in it means something is
         // genuinely missing.
         return Err(
-            match unresumed_dynamic_state_exists(state_git_root, work_item) {
+            match unresumed_dynamic_state_exists(state_git_root, &work_item.key) {
                 true => Unusable(format!(
                     "no saved workflow.toml at {} — the previous run's generated workflow is gone",
                     workflow_path.display()
@@ -68,18 +75,24 @@ pub(crate) fn discover_previous_dynamic_run(
 
     let workflow_name = crate::engine::workflow::workflow_name_for(&workflow);
     let store = WorkflowStateStore::at_git_root(state_git_root.to_path_buf());
-    let state = match store.load(Some(work_item), &workflow_name) {
+    let state = match store.load_for_key(Some(&work_item.key), &workflow_name) {
         Ok(Some(s)) => s,
         Ok(None) => {
             return Err(Unusable(format!(
                 "no saved workflow state for '{workflow_name}' at {} — there is no progress to \
                  resume from",
-                store.state_path(Some(work_item), &workflow_name).display()
-            )))
+                store
+                    .state_path_for_key(Some(&work_item.key), &workflow_name)
+                    .map_err(|e| Unusable(e.to_string()))?
+                    .display()
+            )));
         }
         Err(e) => return Err(Unusable(format!("reading the saved workflow state: {e}"))),
     };
 
+    work_item
+        .validate_saved_identity(&state)
+        .map_err(|e| DynamicDiscoveryMiss::IdentityMismatch(e.to_string()))?;
     Ok(PreviousDynamicRun {
         workflow,
         workflow_path,
@@ -95,9 +108,9 @@ pub(crate) fn discover_previous_dynamic_run(
 /// named after the workflow title, which is exactly what the missing
 /// `workflow.toml` would have told us — so this scans the workflows directory
 /// for the work item's state file rather than guessing the title.
-pub(crate) fn unresumed_dynamic_state_exists(state_git_root: &Path, work_item: u32) -> bool {
+pub(crate) fn unresumed_dynamic_state_exists(state_git_root: &Path, key: &str) -> bool {
     let dir = crate::data::fs::WorkflowDirs::repo_dir_for(state_git_root);
-    let marker = format!("-{work_item:04}-");
+    let marker = format!("-{key}-");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return false;
     };
@@ -154,6 +167,7 @@ pub(crate) struct DynamicExecution {
     workflow: Workflow,
     workflow_path: PathBuf,
     work_item_context: WorkItemContext,
+    work_item_overlay: Option<TypedOverlay>,
     /// Session rooted at the worktree or remote clone; agent/image validation uses it.
     worktree_session: Session,
     paths: crate::data::RepoDockerfilePaths,
@@ -176,10 +190,15 @@ pub(crate) struct DynamicExecution {
 /// run in progress.
 pub(crate) fn save_dynamic_workflow_copy(
     state_git_root: &Path,
-    work_item: u32,
+    work_item: &WorkItemContext,
     generated_path: &Path,
 ) {
-    let dest = crate::data::fs::WorkflowDirs::dynamic_workflow_path(state_git_root, work_item);
+    let Ok(dest) = crate::data::fs::WorkflowDirs::dynamic_workflow_path_for_key(
+        state_git_root,
+        &work_item.key,
+    ) else {
+        return;
+    };
     let result = dest
         .parent()
         .map(std::fs::create_dir_all)
@@ -204,19 +223,20 @@ pub(crate) fn save_dynamic_workflow_copy(
 /// produces a spurious "cannot be resumed" notice on the next invocation.
 pub(crate) fn clear_dynamic_resume_artifacts(
     state_git_root: &Path,
-    work_item: u32,
+    work_item: &WorkItemContext,
     workflow_name: &str,
 ) {
-    let _ = std::fs::remove_file(crate::data::fs::WorkflowDirs::dynamic_workflow_path(
-        state_git_root,
-        work_item,
-    ));
+    if let Ok(path) =
+        crate::data::fs::WorkflowDirs::dynamic_workflow_path_for_key(state_git_root, &work_item.key)
+    {
+        let _ = std::fs::remove_file(path);
+    }
     let store = crate::data::workflow_state_store::WorkflowStateStore::at_git_root(
         state_git_root.to_path_buf(),
     );
-    if let Err(e) = store.delete(Some(work_item), workflow_name) {
+    if let Err(e) = store.delete_for_key(Some(&work_item.key), workflow_name) {
         tracing::warn!(
-            work_item,
+            work_item = %work_item.key,
             workflow = %workflow_name,
             error = %e,
             "failed to delete the finished dynamic run's workflow state"
@@ -240,6 +260,10 @@ pub(crate) enum LeaderDriveOutcome {
     Restart,
     /// An external cancel request stopped the leader container.
     Cancelled,
+    /// The leader reported a problem over OSC 7501 (WI 0141) and either its
+    /// `AgentBlocked`/`AgentError` countdown expired or it exited without
+    /// recovering. Never an advance; the string is the agent's reason.
+    Failed(String),
 }
 
 /// Outcome of the Workflow Control Board while it is driven from the dynamic
@@ -268,6 +292,7 @@ impl ExecWorkflowCommand {
     pub(crate) async fn run_dynamic(
         self,
         frontend: Box<dyn ExecWorkflowCommandFrontend>,
+        work_item: Option<crate::command::work_item::ResolvedWorkItem>,
     ) -> Result<ExecWorkflowOutcome, CommandError> {
         let mut frontend = SharedWorkflowFrontend::new(frontend);
 
@@ -277,37 +302,14 @@ impl ExecWorkflowCommand {
         let mut effective_flags = self.flags.clone();
         apply_dynamic_implied_flags(&mut effective_flags);
 
-        // ── Resolve the work item file + content (REQUIRED for dynamic). ────
-        let wi_str = self
-            .flags
-            .work_item
-            .as_deref()
-            .expect("validated: --dynamic requires --work-item");
-        let wi_number = parse_work_item_number(wi_str).ok_or_else(|| {
-            CommandError::Other(format!(
-                "could not parse a work item number from {wi_str:?}"
-            ))
-        })?;
+        let item = work_item.ok_or(crate::command::work_item::WorkItemError::MissingInput)?;
         let base_session = self.session.clone();
         let git_root_for_scope = base_session.git_root().to_path_buf();
         let cwd = base_session.working_dir().to_path_buf();
-        let wi_file = find_work_item_file(&base_session, &git_root_for_scope, wi_number)
-            .ok_or_else(|| {
-                CommandError::Other(format!(
-                    "work item file for {wi_number:04} not found; dynamic mode cannot design a \
-                 workflow without the work item content"
-                ))
-            })?;
-        let wi_content = std::fs::read_to_string(&wi_file).map_err(|e| {
-            CommandError::Other(format!(
-                "failed to read work item file {}: {e}",
-                wi_file.display()
-            ))
-        })?;
-        let work_item_context = WorkItemContext {
-            number: wi_number,
-            content: wi_content,
-        };
+        let prepared_input =
+            crate::command::work_item::prepare_work_item_input(&item, &base_session)?;
+        let work_item_context = prepared_input.context.clone();
+        let wi_key = item.key.clone();
 
         // ── Workflow prerequisites BEFORE the leader (WI 0149). The workflow
         //    does not exist yet, so assume it may use every teardown kind; the
@@ -315,7 +317,7 @@ impl ExecWorkflowCommand {
         let mut prerequisites = match self
             .start_prerequisites(
                 &crate::data::workflow_prerequisites::WorkflowPrerequisites::assume_all(),
-                format!("dynamic-{wi_number:04}"),
+                format!("dynamic-{wi_key}"),
                 &frontend,
             )
             .await?
@@ -324,10 +326,7 @@ impl ExecWorkflowCommand {
             PrerequisiteStart::CheckOnly(outcome) => return Ok(outcome),
         };
 
-        frontend.with(|frontend| {
-            LaunchPolicy::for_session(&self.session)
-                .warn_config(&self.engines.config_notices, frontend)
-        });
+        frontend.with(|frontend| LaunchPolicy::for_session(&self.session).warn_config(frontend));
 
         // ── Worktree prepare BEFORE launching the leader (WI-0092 §5). ──────
         let remote_clone = base_session.session_type().is_remote();
@@ -340,10 +339,10 @@ impl ExecWorkflowCommand {
             None
         } else {
             let git_root = base_session.git_root().to_path_buf();
-            Some(WorktreeLifecycle::for_work_item(
+            Some(WorktreeLifecycle::open(
                 Arc::clone(&self.engines.git_engine),
                 git_root,
-                wi_number,
+                &WorktreeLifecycle::name_for(Some(&item), Path::new("dynamic")),
             )?)
         };
 
@@ -365,9 +364,9 @@ impl ExecWorkflowCommand {
         let resume_plan = if !offer_resume {
             None
         } else {
-            match frontend
-                .with(|frontend| self.offer_dynamic_resume(resume_root, wi_number, frontend))?
-            {
+            match frontend.with(|frontend| {
+                self.offer_dynamic_resume(resume_root, &work_item_context, frontend)
+            })? {
                 DynamicResumeOutcome::Resume(plan) => Some(plan),
                 DynamicResumeOutcome::Fresh => None,
                 DynamicResumeOutcome::Cancelled => {
@@ -375,12 +374,12 @@ impl ExecWorkflowCommand {
                         level: MessageLevel::Info,
                         text: format!(
                             "exec workflow: cancelled; the previous dynamic run for work item \
-                         {wi_number:04} is unchanged."
+                         {wi_key} is unchanged."
                         ),
                     });
                     return Ok(ExecWorkflowOutcome {
                         prerequisites: None,
-                        workflow: format!("dynamic-{wi_number:04}"),
+                        workflow: format!("dynamic-{wi_key}"),
                         exit_code: None,
                         worktree_used: false,
                     });
@@ -455,7 +454,7 @@ impl ExecWorkflowCommand {
             frontend.write_message(UserMessage {
                 level: MessageLevel::Info,
                 text: format!(
-                    "Resuming the previous dynamic workflow for work item {wi_number:04} \
+                    "Resuming the previous dynamic workflow for work item {wi_key} \
                      from step '{start_step}'"
                 ),
             });
@@ -466,6 +465,7 @@ impl ExecWorkflowCommand {
                     workflow,
                     workflow_path,
                     work_item_context,
+                    work_item_overlay: prepared_input.overlay.clone(),
                     worktree_session: leader_session,
                     paths,
                     git_root_for_scope,
@@ -484,7 +484,11 @@ impl ExecWorkflowCommand {
                 .await?;
             // A resumed run that finishes clean is as done as a fresh one.
             if outcome.exit_code == Some(0) {
-                clear_dynamic_resume_artifacts(&state_git_root, wi_number, &workflow_name);
+                clear_dynamic_resume_artifacts(
+                    &state_git_root,
+                    &prepared_input.context,
+                    &workflow_name,
+                );
             }
             return Ok(outcome);
         }
@@ -509,11 +513,7 @@ impl ExecWorkflowCommand {
             })
             .map_err(|e| attribute_leader_error(&dynamic, e))?;
 
-        // The work item path the leader sees is inside the mounted checkout.
-        let wi_relative = wi_file
-            .strip_prefix(&git_root_for_scope)
-            .unwrap_or(&wi_file);
-        let leader_work_item_path = std::path::Path::new("/workspace").join(wi_relative);
+        let leader_work_item_path = &prepared_input.container_path;
 
         // ── Resolve the context(workflow) overlay for the leader. ───────────
         let (leader_context_overlays, leader_system_prompt) =
@@ -521,6 +521,7 @@ impl ExecWorkflowCommand {
                 .with_git(&self.engines.git_engine)
                 .resolve_context_overlays(
                     &[crate::command::commands::ContextOverlaySpec {
+                        key: None,
                         scope: crate::data::config::overlays::ContextScope::Workflow,
                         permission: crate::data::config::overlays::OverlayPermission::ReadWrite,
                     }],
@@ -586,12 +587,22 @@ impl ExecWorkflowCommand {
         .await
         .map_err(|e| attribute_leader_error(&dynamic, e))?;
 
+        let session_max_concurrent_steps =
+            crate::command::commands::exec_workflow::workflow_effective_config(
+                &self.session,
+                &self.flags,
+            )
+            .map_err(CommandError::from)?
+            .max_concurrent_steps();
         let guidance = dynamic.guidance_texts();
         let leader_prompt = crate::data::dynamic_workflow_assets::build_leader_prompt(
-            &format!("{wi_number:04}"),
+            &item
+                .number
+                .map(|n| format!("{n:04}"))
+                .unwrap_or_else(|| wi_key.clone()),
             &leader_work_item_path.display().to_string(),
             &agents_section,
-            dynamic.max_concurrent_steps.as_ref().map(|s| s.value),
+            session_max_concurrent_steps,
             guidance.as_deref(),
         );
         let leader_prompt = crate::data::dynamic_workflow_assets::substitute_workflow_prerequisites(
@@ -628,11 +639,7 @@ impl ExecWorkflowCommand {
         let mut repair = WorkflowRepairLoop::new(generated_path.clone(), leader_prompt.clone());
         let validated_workflow = loop {
             if self.cancel.is_cancelled() {
-                return Ok(self.cancelled_during_leader(
-                    &shared,
-                    wi_number,
-                    worktree_path.is_some(),
-                ));
+                return Ok(self.cancelled_during_leader(&shared, &wi_key, worktree_path.is_some()));
             }
             let label = repair.label();
             let current_prompt = repair.prompt().to_string();
@@ -646,6 +653,7 @@ impl ExecWorkflowCommand {
                     &git_root_for_scope,
                     leader_context_overlays.clone(),
                     leader_system_prompt.clone(),
+                    prepared_input.overlay.as_ref(),
                     &label,
                     &mut engine_rx,
                 )
@@ -655,7 +663,7 @@ impl ExecWorkflowCommand {
                 LeaderDriveOutcome::Cancelled => {
                     return Ok(self.cancelled_during_leader(
                         &shared,
-                        wi_number,
+                        &wi_key,
                         worktree_path.is_some(),
                     ));
                 }
@@ -664,20 +672,30 @@ impl ExecWorkflowCommand {
                         "dynamic workflow aborted during the leader step".into(),
                     ));
                 }
+                LeaderDriveOutcome::Failed(reason) => {
+                    return Err(CommandError::Other(format!(
+                        "dynamic workflow leader failed: {reason}"
+                    )));
+                }
                 LeaderDriveOutcome::Paused => {
                     // Clean stop at the leader step — no error, worktree left in
                     // place. Re-running the command starts a fresh leader.
+                    let retry = match self.flags.work_item.as_deref() {
+                        Some(reference) => format!(
+                            "Re-run `awman exec workflow --dynamic --work-item {reference}`"
+                        ),
+                        None => "Restart the submitted command".into(),
+                    };
                     shared.lock().unwrap().write_message(UserMessage {
                         level: MessageLevel::Info,
                         text: format!(
-                            "Dynamic workflow paused at the leader step. Re-run \
-                             `awman exec workflow --dynamic --work-item {wi_number}` to resume \
+                            "Dynamic workflow paused at the leader step. {retry} to resume \
                              with a fresh leader."
                         ),
                     });
                     return Ok(ExecWorkflowOutcome {
                         prerequisites: None,
-                        workflow: format!("dynamic-{wi_number:04}"),
+                        workflow: format!("dynamic-{wi_key}"),
                         exit_code: None,
                         worktree_used: worktree_path.is_some(),
                     });
@@ -731,7 +749,7 @@ impl ExecWorkflowCommand {
 
         // Stash the generated workflow inside the checkout so a failed run can
         // be resumed without a second leader-design pass (WI-0115 §2).
-        save_dynamic_workflow_copy(&state_git_root, wi_number, &generated_path);
+        save_dynamic_workflow_copy(&state_git_root, &work_item_context, &generated_path);
 
         // Captured before the workflow moves into the execution tail: the state
         // file is keyed by workflow name, and the cleanup below needs it.
@@ -743,6 +761,7 @@ impl ExecWorkflowCommand {
                 workflow: validated_workflow,
                 workflow_path: generated_path,
                 work_item_context,
+                work_item_overlay: prepared_input.overlay.clone(),
                 worktree_session: leader_session,
                 paths,
                 git_root_for_scope,
@@ -761,7 +780,11 @@ impl ExecWorkflowCommand {
         // A clean finish means there is nothing left to resume; drop *both*
         // halves so the next run on this work item starts from a fresh design.
         if outcome.exit_code == Some(0) {
-            clear_dynamic_resume_artifacts(&state_git_root, wi_number, &dynamic_workflow_name);
+            clear_dynamic_resume_artifacts(
+                &state_git_root,
+                &prepared_input.context,
+                &dynamic_workflow_name,
+            );
         }
         Ok(outcome)
     }
@@ -780,7 +803,7 @@ impl ExecWorkflowCommand {
     pub(crate) fn offer_dynamic_resume(
         &self,
         run_root: &Path,
-        work_item: u32,
+        work_item: &WorkItemContext,
         frontend: &mut dyn ExecWorkflowCommandFrontend,
     ) -> Result<DynamicResumeOutcome, CommandError> {
         if !run_root.exists() {
@@ -791,8 +814,11 @@ impl ExecWorkflowCommand {
         let previous = match discover_previous_dynamic_run(&state_root, work_item) {
             Ok(p) => p,
             Err(DynamicDiscoveryMiss::NothingToResume) => return Ok(DynamicResumeOutcome::Fresh),
+            Err(DynamicDiscoveryMiss::IdentityMismatch(reason)) => {
+                return Err(CommandError::Other(reason));
+            }
             Err(DynamicDiscoveryMiss::Unusable(reason)) => {
-                frontend.notify_dynamic_workflow_resume_unavailable(work_item, &reason)?;
+                notify_dynamic_unavailable(work_item, &reason, frontend)?;
                 return Ok(DynamicResumeOutcome::Fresh);
             }
         };
@@ -800,9 +826,10 @@ impl ExecWorkflowCommand {
         let dag = match crate::data::workflow_dag::WorkflowDag::build(&previous.workflow.steps) {
             Ok(dag) => dag,
             Err(e) => {
-                frontend.notify_dynamic_workflow_resume_unavailable(
+                notify_dynamic_unavailable(
                     work_item,
                     &format!("the saved workflow's step graph is no longer valid: {e}"),
+                    frontend,
                 )?;
                 return Ok(DynamicResumeOutcome::Fresh);
             }
@@ -810,26 +837,24 @@ impl ExecWorkflowCommand {
 
         let start_points = workflow_resume_start_points(&dag, &previous.state);
         if start_points.is_empty() {
-            frontend.notify_dynamic_workflow_resume_unavailable(
-                work_item,
-                "the previous dynamic workflow ran every step to completion; there is nothing \
-                 to resume",
-            )?;
+            notify_dynamic_unavailable(work_item, "the previous dynamic workflow ran every step to completion; there is nothing to resume", frontend)?;
             return Ok(DynamicResumeOutcome::Fresh);
         }
 
         let prompt = WorkflowResumePrompt::new(
             crate::engine::workflow::workflow_name_for(&previous.workflow),
-            Some(work_item),
+            work_item.number,
             Some(run_root.to_path_buf()),
             true,
             completed_step_count(&previous.state),
             previous.state.step_states.len(),
             start_points,
-        );
+        )
+        .with_work_item_key(Some(work_item.key.clone()));
 
         match frontend.ask_workflow_resume(&prompt)? {
             WorkflowResumeDecision::ResumeFrom(start_step) => {
+                report_work_item_drift(work_item, &previous.state, frontend);
                 Ok(DynamicResumeOutcome::Resume(Box::new(DynamicResumePlan {
                     workflow: previous.workflow,
                     workflow_path: previous.workflow_path,
@@ -846,7 +871,7 @@ impl ExecWorkflowCommand {
                     state_root.clone(),
                 );
                 let name = crate::engine::workflow::workflow_name_for(&previous.workflow);
-                if let Err(e) = store.delete(Some(work_item), &name) {
+                if let Err(e) = store.delete_for_key(Some(&work_item.key), &name) {
                     frontend.write_message(UserMessage {
                         level: MessageLevel::Warning,
                         text: format!("exec workflow: failed to delete stale workflow state: {e}"),
@@ -890,6 +915,7 @@ impl ExecWorkflowCommand {
             workflow,
             workflow_path,
             work_item_context,
+            work_item_overlay,
             worktree_session,
             paths,
             git_root_for_scope,
@@ -991,6 +1017,7 @@ impl ExecWorkflowCommand {
             workflow,
             workflow_path,
             work_item_context: Some(work_item_context),
+            work_item_overlay,
             cli_typed,
             mount_path,
             worktree_path,
@@ -999,7 +1026,6 @@ impl ExecWorkflowCommand {
             git_root_for_scope,
             cwd,
             original_session: base_session,
-            issue_temp_file: None,
             launch_modes,
             skip_state_resume_prompt,
             prerequisites,
@@ -1024,7 +1050,7 @@ impl ExecWorkflowCommand {
     fn cancelled_during_leader(
         &self,
         shared: &SharedWorkflowFrontend,
-        wi_number: u32,
+        wi_key: &str,
         worktree_used: bool,
     ) -> ExecWorkflowOutcome {
         {
@@ -1037,7 +1063,7 @@ impl ExecWorkflowCommand {
         }
         ExecWorkflowOutcome {
             prerequisites: None,
-            workflow: format!("dynamic-{wi_number:04}"),
+            workflow: format!("dynamic-{wi_key}"),
             exit_code: Some(crate::data::command_status::CANCELLED_EXIT_CODE),
             worktree_used,
         }
@@ -1057,6 +1083,7 @@ impl ExecWorkflowCommand {
         image_git_root: &std::path::Path,
         context_overlays: Vec<crate::engine::overlay::ContextOverlay>,
         system_prompt: Option<String>,
+        work_item_overlay: Option<&TypedOverlay>,
         label: &str,
         engine_rx: &mut tokio::sync::mpsc::UnboundedReceiver<EngineRequest>,
     ) -> Result<LeaderDriveOutcome, CommandError> {
@@ -1064,7 +1091,10 @@ impl ExecWorkflowCommand {
 
         // The leader shares the command's outputs directory with the steps it
         // designs (WI 0137 §3); it is created here, never cleared.
-        let mut directory_overlays = Vec::new();
+        let mut command_mounts = Vec::new();
+        if let Some(TypedOverlay::Directory(directory)) = work_item_overlay {
+            command_mounts.push(directory.clone());
+        }
         let system_prompt = match self
             .output_dir
             .as_ref()
@@ -1077,7 +1107,7 @@ impl ExecWorkflowCommand {
                         dir.display()
                     ))
                 })?;
-                directory_overlays.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
+                command_mounts.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
                 Some(crate::engine::context_prompt::with_outputs_section(
                     system_prompt,
                     crate::engine::context_prompt::OutputsPromptRole::Leader,
@@ -1086,7 +1116,22 @@ impl ExecWorkflowCommand {
             None => system_prompt,
         };
 
+        let mut cli_overlays = Vec::new();
+        for overlay in &self.flags.overlay {
+            cli_overlays.extend(parse_overlay_list(overlay).map_err(|reason| {
+                CommandError::InvalidOverlaySpec {
+                    spec: overlay.clone(),
+                    reason,
+                }
+            })?);
+        }
+        let collected =
+            self.session
+                .effective_config()
+                .collected_overlays(cli_overlays, None, None)?;
         let run_opts = AgentRunOptions {
+            command_secrets: self.engines.command_secrets(),
+            env_passthrough: Some(collected.env_passthrough),
             yolo: Some(YoloMode::Enabled),
             initial_prompt: Some(prompt.to_string()),
             model: model.map(|m| m.to_string()),
@@ -1097,7 +1142,7 @@ impl ExecWorkflowCommand {
                 image_git_root,
                 agent.as_str(),
             )),
-            directory_overlays,
+            command_mounts,
             system_prompt,
             context_overlays,
             // From the invoking session, not the worktree `session` (see
@@ -1207,7 +1252,81 @@ impl ExecWorkflowCommand {
             stop_leader();
             LeaderDriveOutcome::Cancelled
         };
+        // WI 0141: the leader's last reported problem (`blocked`/`error`),
+        // and a report a countdown handed back for a fresh decision.
+        let mut reported_problem: Option<EffectiveStatus> = None;
+        let mut pending_report: Option<Option<EffectiveStatus>> = None;
         let outcome = loop {
+            // The leader reports its own status: the same table a workflow
+            // step gets (`engine::workflow::program_status`). The leader
+            // always runs under yolo, so there is no board to open.
+            if let Some(status) = pending_report.take() {
+                shared
+                    .lock()
+                    .unwrap()
+                    .report_agent_status(label, status.as_ref());
+                reported_problem = status.as_ref().filter(|s| s.state.is_problem()).cloned();
+                let attended = shared.lock().unwrap().supports_interactive_recovery();
+                let response = respond_to_report(status.as_ref(), true, attended);
+                if let Some(s) = &status {
+                    narrate_leader_report(&shared, label, s, response);
+                }
+                let ReportedResponse::Countdown(kind) = response else {
+                    continue;
+                };
+                let countdown = run_leader_yolo_countdown(
+                    &shared,
+                    &mut wait_rx,
+                    &mut stuck_rx,
+                    engine_rx,
+                    &self.cancel,
+                    label,
+                    kind,
+                )
+                .await;
+                if self.cancel.is_cancelled() {
+                    break stop_for_cancel();
+                }
+                match countdown {
+                    LeaderCountdownOutcome::Advance => {
+                        stop_leader();
+                        match &reported_problem {
+                            Some(p) => {
+                                break LeaderDriveOutcome::Failed(reported_failure_reason(p))
+                            }
+                            None => break LeaderDriveOutcome::Advanced,
+                        }
+                    }
+                    LeaderCountdownOutcome::Completed(code) => {
+                        shared.lock().unwrap().report_container_exited(code);
+                        match &reported_problem {
+                            Some(p) => {
+                                break LeaderDriveOutcome::Failed(reported_failure_reason(p))
+                            }
+                            None => break LeaderDriveOutcome::Advanced,
+                        }
+                    }
+                    LeaderCountdownOutcome::Recovered => {
+                        if kind == CountdownKind::AgentError {
+                            reported_problem = None;
+                        }
+                        continue;
+                    }
+                    LeaderCountdownOutcome::Superseded(next) => {
+                        pending_report = Some(next);
+                        continue;
+                    }
+                    LeaderCountdownOutcome::Dismissed => continue,
+                    LeaderCountdownOutcome::Cancelled => break stop_for_cancel(),
+                    LeaderCountdownOutcome::ShowControlBoard => {
+                        let choice = show_leader_control_board(&shared, label);
+                        match apply_leader_control_outcome(choice, &cancel, &shared) {
+                            Some(o) => break o,
+                            None => continue,
+                        }
+                    }
+                }
+            }
             tokio::select! {
                 biased;
                 code = &mut wait_rx => {
@@ -1215,7 +1334,11 @@ impl ExecWorkflowCommand {
                         .lock()
                         .unwrap()
                         .report_container_exited(code.unwrap_or(-1));
-                    break LeaderDriveOutcome::Advanced;
+                    // A problem the leader reported outranks its exit code.
+                    match &reported_problem {
+                        Some(p) => break LeaderDriveOutcome::Failed(reported_failure_reason(p)),
+                        None => break LeaderDriveOutcome::Advanced,
+                    }
                 }
                 // After `wait_rx` (the loop is biased): a leader that already
                 // exited is reported first.
@@ -1230,6 +1353,7 @@ impl ExecWorkflowCommand {
                                 engine_rx,
                                 &self.cancel,
                                 label,
+                                CountdownKind::StuckStep,
                             )
                             .await;
                             // A cancel during the countdown (or one racing its
@@ -1247,12 +1371,15 @@ impl ExecWorkflowCommand {
                                     shared.lock().unwrap().report_container_exited(code);
                                     break LeaderDriveOutcome::Advanced;
                                 }
-                                LeaderCountdownOutcome::Recovered => continue,
-                                LeaderCountdownOutcome::Cancelled => break stop_for_cancel(),
-                                LeaderCountdownOutcome::Abort => {
-                                    stop_leader();
-                                    break LeaderDriveOutcome::Aborted;
+                                LeaderCountdownOutcome::Recovered
+                                | LeaderCountdownOutcome::Dismissed => continue,
+                                // The leader started reporting mid-countdown:
+                                // its report decides from here on.
+                                LeaderCountdownOutcome::Superseded(next) => {
+                                    pending_report = Some(next);
+                                    continue;
                                 }
+                                LeaderCountdownOutcome::Cancelled => break stop_for_cancel(),
                                 // Ctrl-W during the countdown: cancel the
                                 // countdown and open the WCB in its place.
                                 LeaderCountdownOutcome::ShowControlBoard => {
@@ -1263,6 +1390,10 @@ impl ExecWorkflowCommand {
                                     }
                                 }
                             }
+                        }
+                        Ok(StuckEvent::Reported(status)) => {
+                            pending_report = Some(status);
+                            continue;
                         }
                         Ok(StuckEvent::Unstuck) => continue,
                         Ok(StuckEvent::StartupGraceExpired) => {
@@ -1277,7 +1408,10 @@ impl ExecWorkflowCommand {
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             let code = (&mut wait_rx).await.unwrap_or(-1);
                             shared.lock().unwrap().report_container_exited(code);
-                            break LeaderDriveOutcome::Advanced;
+                            match &reported_problem {
+                                Some(p) => break LeaderDriveOutcome::Failed(reported_failure_reason(p)),
+                                None => break LeaderDriveOutcome::Advanced,
+                            }
                         }
                     }
                 }
@@ -1323,8 +1457,10 @@ pub(crate) fn show_leader_control_board(
         can_launch_next: true,
         launch_next_label: Some("Start dynamic workflow".to_string()),
         can_restart_current_step: true,
+        can_pause: true,
         can_abort: true,
         can_dismiss: true,
+        focused_step: Some(label.to_string()),
         ..Default::default()
     };
 
@@ -1373,24 +1509,77 @@ pub(crate) fn apply_leader_control_outcome(
 
 /// Result of the leader yolo countdown.
 pub(crate) enum LeaderCountdownOutcome {
-    /// Countdown expired or user advanced — kill the container and proceed.
+    /// Countdown expired or user advanced — kill the container and proceed
+    /// (or, for an `AgentBlocked`/`AgentError` countdown, fail the leader).
     Advance,
     /// The leader container exited on its own (with this exit code) during
     /// the countdown.
     Completed(i32),
-    /// The leader resumed output (`Unstuck`) — cancel the countdown.
+    /// The leader resumed output (`Unstuck`) — cancel the countdown. Only a
+    /// silence or `AgentError` countdown recovers on output.
     Recovered,
-    /// The user aborted.
-    Abort,
+    /// The user dismissed the countdown (Esc): keep the leader running,
+    /// nothing advances.
+    Dismissed,
+    /// The leader sent an OSC 7501 report calling for a different response.
+    Superseded(Option<EffectiveStatus>),
     /// The user pressed Ctrl-W — cancel the countdown and open the WCB.
     ShowControlBoard,
     /// The command was cancelled during the countdown.
     Cancelled,
 }
 
-/// Drive the 60-second yolo countdown for the leader step, reusing the same
-/// `WorkflowFrontend::yolo_countdown_tick` pipeline as a workflow step. The
-/// right-arrow / advance action carries the "Start dynamic workflow" label via
+/// Narrate a leader report the way the workflow engine narrates a step's.
+fn narrate_leader_report(
+    shared: &SharedWorkflowFrontend,
+    label: &str,
+    status: &EffectiveStatus,
+    response: ReportedResponse,
+) {
+    let what = describe_status(status);
+    let (level, text) = match response {
+        ReportedResponse::Countdown(kind) => {
+            let secs = countdown_duration(kind).as_secs();
+            if kind == CountdownKind::AgentDone {
+                (
+                    MessageLevel::Info,
+                    format!("Leader '{label}': agent reported {what}; advancing in {secs}s"),
+                )
+            } else {
+                (
+                    MessageLevel::Warning,
+                    format!("Leader '{label}': agent reported {what}; failing in {secs}s"),
+                )
+            }
+        }
+        ReportedResponse::NeedsYou => (
+            MessageLevel::Warning,
+            format!(
+                "Leader '{label}' needs you: agent reported {what}. Answer in the container \
+                 or use the control board (Ctrl-W)"
+            ),
+        ),
+        ReportedResponse::AwaitRepair => (
+            MessageLevel::Warning,
+            format!(
+                "Leader '{label}': agent reported {what}; waiting for repair or a control-board action (Ctrl-W)"
+            ),
+        ),
+        ReportedResponse::Resume
+        | ReportedResponse::ConfirmAdvance
+        | ReportedResponse::ProblemBoard => return,
+    };
+    shared
+        .lock()
+        .unwrap()
+        .write_message(UserMessage { level, text });
+}
+
+/// Drive a leader countdown, reusing the same
+/// `WorkflowFrontend::yolo_countdown_tick` pipeline as a workflow step:
+/// 60 seconds for silence (`StuckStep`) and the agent-problem kinds, the
+/// short `AgentDone` duration after a `done` report. The right-arrow /
+/// advance action carries the "Start dynamic workflow" label via
 /// [`AvailableActions::launch_next_label`].
 pub(crate) async fn run_leader_yolo_countdown(
     shared: &SharedWorkflowFrontend,
@@ -1401,18 +1590,18 @@ pub(crate) async fn run_leader_yolo_countdown(
     engine_rx: &mut tokio::sync::mpsc::UnboundedReceiver<EngineRequest>,
     cancel: &tokio_util::sync::CancellationToken,
     step_name: &str,
+    kind: CountdownKind,
 ) -> LeaderCountdownOutcome {
     use crate::engine::agent_runtime::execution::StuckEvent;
     use crate::engine::workflow::actions::YoloTickOutcome;
-    use crate::engine::workflow::timing::yolo_countdown_duration;
 
-    let total = yolo_countdown_duration();
+    let total = countdown_duration(kind);
     let tick = Duration::from_millis(200);
     let mut remaining = total;
     shared
         .lock()
         .unwrap()
-        .yolo_countdown_started(step_name, CountdownKind::StuckStep);
+        .yolo_countdown_started(step_name, kind);
 
     let outcome = loop {
         let tick_result = shared
@@ -1422,7 +1611,7 @@ pub(crate) async fn run_leader_yolo_countdown(
         match tick_result {
             Ok(YoloTickOutcome::Continue) => {}
             Ok(YoloTickOutcome::AdvanceNow) => break LeaderCountdownOutcome::Advance,
-            Ok(YoloTickOutcome::Cancel) => break LeaderCountdownOutcome::Abort,
+            Ok(YoloTickOutcome::Cancel) => break LeaderCountdownOutcome::Dismissed,
             Err(_) => break LeaderCountdownOutcome::Advance,
         }
         if remaining.is_zero() {
@@ -1437,7 +1626,19 @@ pub(crate) async fn run_leader_yolo_countdown(
             _ = cancel.cancelled() => break LeaderCountdownOutcome::Cancelled,
             ev = stuck_rx.recv() => {
                 match ev {
-                    Ok(StuckEvent::Unstuck) => break LeaderCountdownOutcome::Recovered,
+                    Ok(StuckEvent::Reported(status)) => {
+                        let attended = shared.lock().unwrap().supports_interactive_recovery();
+                        if respond_to_report(status.as_ref(), true, attended)
+                            != ReportedResponse::Countdown(kind)
+                        {
+                            break LeaderCountdownOutcome::Superseded(status);
+                        }
+                    }
+                    Ok(StuckEvent::Unstuck)
+                        if matches!(kind, CountdownKind::StuckStep | CountdownKind::AgentError) =>
+                    {
+                        break LeaderCountdownOutcome::Recovered
+                    }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
@@ -1456,4 +1657,136 @@ pub(crate) async fn run_leader_yolo_countdown(
 
     shared.lock().unwrap().yolo_countdown_finished(step_name);
     outcome
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::*;
+    use crate::data::fs::hash::sha256_hex;
+    use crate::data::workflow_state::WorkflowState;
+    use crate::data::workflow_state_store::WorkflowStateStore;
+    use awman_test_support::{TestCase, TestSandbox};
+
+    fn context(key: String, source_id: &str, body: &str) -> WorkItemContext {
+        WorkItemContext {
+            number: Some(7),
+            key,
+            title: "Seven".into(),
+            source_id: source_id.into(),
+            content_hash: sha256_hex(body.as_bytes()),
+            content: body.into(),
+        }
+    }
+    fn saved_run(root: &Path, context: &WorkItemContext) {
+        let raw = "[[steps]]\nname = 'run'\nprompt = 'implement'\n";
+        let workflow =
+            Workflow::parse(raw, crate::data::workflow_definition::WorkflowFormat::Toml).unwrap();
+        let mut state = WorkflowState::new(
+            crate::engine::workflow::workflow_name_for(&workflow),
+            &workflow.steps,
+            "hash".into(),
+            context.number,
+        );
+        state.work_item_key = Some(context.key.clone());
+        state.work_item_source_id = Some(context.source_id.clone());
+        state.work_item_content_hash = Some(context.content_hash.clone());
+        WorkflowStateStore::at_git_root(root).save(&state).unwrap();
+        let path = crate::data::fs::WorkflowDirs::dynamic_workflow_path_for_key(root, &context.key)
+            .unwrap();
+        std::fs::write(path, raw).unwrap();
+    }
+    #[test]
+    fn local_and_github_seven_have_independent_resume_artifacts() {
+        let s = TestSandbox::for_test(TestCase::component(
+            "dynamic::resolver_tests::local_and_github_seven_have_independent_resume_artifacts",
+        ));
+        let local = context(
+            "0007".into(),
+            "local:aspec/work-items/0007-seven.md",
+            "local",
+        );
+        let github = context(
+            crate::command::work_item::remote_work_item_key("https://github.com/o/r/issues/7"),
+            "https://github.com/o/r/issues/7",
+            "remote",
+        );
+        saved_run(&s.work(), &local);
+        assert!(matches!(
+            discover_previous_dynamic_run(&s.work(), &github),
+            Err(DynamicDiscoveryMiss::NothingToResume)
+        ));
+        saved_run(&s.work(), &github);
+        assert_eq!(
+            discover_previous_dynamic_run(&s.work(), &local)
+                .unwrap()
+                .state
+                .work_item_source_id
+                .as_deref(),
+            Some(local.source_id.as_str())
+        );
+        assert_eq!(
+            discover_previous_dynamic_run(&s.work(), &github)
+                .unwrap()
+                .state
+                .work_item_source_id
+                .as_deref(),
+            Some(github.source_id.as_str())
+        );
+        clear_dynamic_resume_artifacts(
+            &s.work(),
+            &github,
+            &crate::engine::workflow::workflow_name_for(
+                &discover_previous_dynamic_run(&s.work(), &github)
+                    .unwrap()
+                    .workflow,
+            ),
+        );
+        assert!(discover_previous_dynamic_run(&s.work(), &local).is_ok());
+        assert!(matches!(
+            discover_previous_dynamic_run(&s.work(), &github),
+            Err(DynamicDiscoveryMiss::NothingToResume)
+        ));
+        s.finish();
+    }
+    #[test]
+    fn resume_refuses_a_full_identity_mismatch_even_when_the_key_matches() {
+        let s = TestSandbox::for_test(TestCase::component("dynamic::resolver_tests::resume_refuses_a_full_identity_mismatch_even_when_the_key_matches"));
+        let original = context("0007".into(), "local:one/0007-seven.md", "original");
+        saved_run(&s.work(), &original);
+        let changed = context(original.key.clone(), "local:two/0007-seven.md", "changed");
+        assert!(matches!(
+            discover_previous_dynamic_run(&s.work(), &changed),
+            Err(DynamicDiscoveryMiss::IdentityMismatch(_))
+        ));
+        s.finish();
+    }
+    #[derive(Default)]
+    struct Messages(Vec<UserMessage>);
+    impl UserMessageSink for Messages {
+        fn write_message(&mut self, message: UserMessage) {
+            self.0.push(message);
+        }
+        fn replay_queued(&mut self) {}
+    }
+    #[test]
+    fn changed_content_is_reported_without_changing_the_saved_design() {
+        let s = TestSandbox::for_test(TestCase::component("dynamic::resolver_tests::changed_content_is_reported_without_changing_the_saved_design"));
+        let original = context("0007".into(), "local:0007-seven.md", "original");
+        saved_run(&s.work(), &original);
+        let changed = context(original.key.clone(), &original.source_id, "changed");
+        let previous = discover_previous_dynamic_run(&s.work(), &changed).unwrap();
+        let mut messages = Messages::default();
+        report_work_item_drift(&changed, &previous.state, &mut messages);
+        assert_eq!(messages.0.len(), 1);
+        assert!(messages.0[0].text.contains("changed"));
+        assert_eq!(
+            previous.state.work_item_content_hash.as_deref(),
+            Some(original.content_hash.as_str())
+        );
+        let mut legacy = previous.state;
+        legacy.work_item_content_hash = None;
+        report_work_item_drift(&changed, &legacy, &mut messages);
+        assert!(messages.0[1].text.contains("unavailable"));
+        s.finish();
+    }
 }

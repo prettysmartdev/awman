@@ -38,14 +38,6 @@ impl Tab {
         self.container_slots.get(self.focused_slot_idx)
     }
 
-    /// Focused slot's vt100 parser. Panics when no slot exists — test-only
-    /// convenience for feeding PTY bytes and probing the grid.
-    #[cfg(test)]
-    pub fn focused_parser_mut(&mut self) -> &mut vt100::Parser {
-        let idx = self.focused_slot_idx;
-        &mut self.container_slots[idx].vt100_parser
-    }
-
     /// Drain the shared parallel-slot event queue and update `container_slots`
     /// accordingly (WI-0096 §12). Events are processed in the order the engine
     /// emitted them, so an "exited then dequeued" pair in the same tick evicts
@@ -226,6 +218,11 @@ impl Tab {
                 }
             }
             ContainerSlotEvent::Exited { step_name } => self.evict_slot(&step_name),
+            ContainerSlotEvent::Reported { step_name, status } => {
+                if let Some(slot) = self.slot_mut(&step_name) {
+                    slot.set_program_status(status);
+                }
+            }
             ContainerSlotEvent::Stuck { step_name } => {
                 if let Some(slot) = self.slot_mut(&step_name) {
                     slot.stuck = true;
@@ -234,6 +231,11 @@ impl Tab {
             ContainerSlotEvent::Unstuck { step_name } => {
                 if let Some(slot) = self.slot_mut(&step_name) {
                     slot.stuck = false;
+                }
+            }
+            ContainerSlotEvent::CountdownKind { step_name, kind } => {
+                if let Some(slot) = self.slot_mut(&step_name) {
+                    slot.countdown_kind = kind;
                 }
             }
             ContainerSlotEvent::YoloStarted {
@@ -250,10 +252,12 @@ impl Tab {
                 remaining_secs,
             } => {
                 if let Some(slot) = self.slot_mut(&step_name) {
+                    let kind = slot.countdown_kind;
                     if let Ok(mut guard) = slot.yolo_state.lock() {
                         *guard = Some(YoloState {
                             step_name,
                             remaining_secs,
+                            kind,
                         });
                     }
                 }
@@ -314,6 +318,7 @@ impl Tab {
                 }
                 slot.region_scroll
                     .process(&mut slot.vt100_parser, &filtered.bytes);
+                slot.last_output_at = Instant::now();
                 received_any = true;
             }
         }

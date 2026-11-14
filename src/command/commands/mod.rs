@@ -11,13 +11,17 @@ pub mod agent_setup;
 pub mod agent_trust;
 pub mod agents;
 pub mod api_server;
+pub mod attach;
 pub mod chat;
 pub mod clean;
 pub mod command_trait;
 pub mod config;
+pub mod daemon;
 pub mod exec_prompt;
 pub mod exec_workflow;
 pub mod squad;
+// WI 0142: hidden `awman view` secondary-frontend entry point (filled by engine-handoff).
+pub mod view;
 pub mod workflow_preflight;
 pub mod workflow_prerequisites;
 // `HttpCore` is Layer 1 (WI 0114 F-28) — the tree's one `reqwest::Client`
@@ -41,6 +45,7 @@ pub mod remote_client;
 pub(crate) mod session_worktree;
 pub mod skill_library;
 pub mod specs;
+pub mod worker;
 pub mod worktree_lifecycle;
 pub(crate) mod worktree_overlay;
 
@@ -56,3 +61,5 @@ pub use crate::data::config::overlays::{
     parse_overlay_list, parse_overlay_spec, CollectedOverlays, ContextOverlaySpec, ContextScope,
     SkillSpec, TypedOverlay,
 };
+
+pub mod link;

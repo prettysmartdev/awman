@@ -22,7 +22,9 @@ impl Command for ExecWorkflowCommand {
         }
         // Early flag validation (Layer 2) — runs before any IO for both the
         // dynamic and non-dynamic paths. Surfaces an error message and aborts.
-        if let Err(e) = validate_dynamic_flags(&self.flags) {
+        if let Err(e) =
+            validate_dynamic_flags(&self.flags, self.session.inline_work_item().is_some())
+        {
             frontend.write_message(UserMessage {
                 level: MessageLevel::Error,
                 text: format!("exec workflow: {e}"),
@@ -30,9 +32,18 @@ impl Command for ExecWorkflowCommand {
             return Err(e);
         }
 
+        // Resolve against the invoking checkout before prerequisites, worktree
+        // preparation, setup, or any agent launch. Fail closed on every error.
+        let work_item = crate::command::work_item::WorkItemResolver::new(
+            self.session.clone(),
+            Arc::clone(&self.engines.git_engine),
+        )
+        .resolve(self.flags.work_item.as_deref(), &mut *frontend)
+        .await?;
+
         // Dynamic mode: a leader agent designs the workflow, then it executes.
         if self.flags.dynamic {
-            return self.run_dynamic(frontend).await;
+            return self.run_dynamic(frontend, work_item).await;
         }
         let mut frontend = SharedWorkflowFrontend::new(frontend);
 
@@ -126,10 +137,7 @@ impl Command for ExecWorkflowCommand {
         }
 
         // Emit deprecation warnings for legacy config fields.
-        frontend.with(|frontend| {
-            LaunchPolicy::for_session(&self.session)
-                .warn_config(&self.engines.config_notices, frontend)
-        });
+        frontend.with(|frontend| LaunchPolicy::for_session(&self.session).warn_config(frontend));
 
         if self.flags.yolo && self.flags.worktree {
             frontend.write_message(UserMessage {
@@ -184,111 +192,16 @@ impl Command for ExecWorkflowCommand {
             }
         };
 
-        // 3. Load work item context from --work-item or --issue.
-        // `_issue_temp_file` keeps the temp file alive for the duration of
-        // this function — its Drop impl deletes the file regardless of how
-        // the function exits (success, error, panic).
-        let issue_title_slug: Option<String>;
-        let _issue_temp_file: Option<IssueTempFile>;
-        let issue_overlay: Option<TypedOverlay>;
-
-        let work_item_context = if let Some(ref issue_ref) = self.flags.issue_source.issue {
-            // --issue: fetch issue and construct work item context from it.
-            let router = crate::engine::issue::router::IssueSourceRouter::new(
-                std::sync::Arc::clone(&self.engines.git_engine),
-                self.session.env(),
-            );
-            match frontend.with(|frontend| {
-                router.fetch_issue_with_progress(issue_ref, &git_root_for_scope, frontend)
-            }) {
-                Ok((issue, source)) => {
-                    let work_items_dir = self
-                        .session
-                        .repo_config()
-                        .work_items_dir_or_default(&git_root_for_scope);
-                    let build = match issue_source_overlay(
-                        source,
-                        &issue,
-                        &git_root_for_scope,
-                        &work_items_dir,
-                    ) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            frontend.write_message(UserMessage {
-                                level: MessageLevel::Error,
-                                text: format!(
-                                    "exec workflow: failed to write issue temp file: {e}"
-                                ),
-                            });
-                            return Err(CommandError::Other(format!(
-                                "writing issue temp file: {e}"
-                            )));
-                        }
-                    };
-
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Info,
-                        text: format!(
-                            "exec workflow: fetched issue '{}' ({})",
-                            issue.title, issue.source_id
-                        ),
-                    });
-
-                    issue_overlay = Some(build.overlay);
-                    issue_title_slug = Some(build.slug);
-                    let number = build.number;
-                    let content = build.content;
-                    _issue_temp_file = Some(build.temp_file);
-                    Some(WorkItemContext { number, content })
-                }
-                Err(e) => {
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Error,
-                        text: format!("exec workflow: failed to fetch issue: {e}"),
-                    });
-                    return Err(CommandError::Other(e.to_string()));
-                }
-            }
-        } else if let Some(wi_str) = &self.flags.work_item {
-            issue_title_slug = None;
-            _issue_temp_file = None;
-            issue_overlay = None;
-            match parse_work_item_number(wi_str) {
-                Some(number) => {
-                    let path = find_work_item_file(&self.session, &git_root_for_scope, number);
-                    match path.and_then(|p| std::fs::read_to_string(&p).ok()) {
-                        Some(content) => Some(WorkItemContext { number, content }),
-                        None => {
-                            frontend.write_message(crate::data::message::UserMessage {
-                                level: crate::data::message::MessageLevel::Warning,
-                                text: format!(
-                                    "work item file for {:04} not found; \
-                                     {{{{work_item_*}}}} placeholders will be empty",
-                                    number
-                                ),
-                            });
-                            None
-                        }
-                    }
-                }
-                None => {
-                    frontend.write_message(crate::data::message::UserMessage {
-                        level: crate::data::message::MessageLevel::Warning,
-                        text: format!(
-                            "could not parse work item number from {:?}; \
-                             {{{{work_item_*}}}} placeholders will be empty",
-                            wi_str
-                        ),
-                    });
-                    None
-                }
-            }
-        } else {
-            issue_title_slug = None;
-            _issue_temp_file = None;
-            issue_overlay = None;
-            None
-        };
+        // Keep private remote input alive through steps, teardown and cancellation.
+        // Local input continues to use the file in the mounted checkout.
+        let prepared_input = work_item
+            .as_ref()
+            .map(|item| crate::command::work_item::prepare_work_item_input(item, &self.session))
+            .transpose()?;
+        let work_item_context = prepared_input.as_ref().map(|input| input.context.clone());
+        let work_item_overlay = prepared_input
+            .as_ref()
+            .and_then(|input| input.overlay.clone());
         // 4. Worktree prepare (if --worktree is set).
         // When a worktree is used, capture its path so the session below is
         // rooted at the worktree checkout rather than the main repo.
@@ -308,18 +221,7 @@ impl Command for ExecWorkflowCommand {
         let worktree_lifecycle = if self.flags.worktree && !self.session.session_type().is_remote()
         {
             let git_root = self.session.git_root().to_path_buf();
-            // `--issue` names the worktree after the issue slug, `--work-item`
-            // after the number, otherwise the workflow filename. The choice is
-            // `WorktreeLifecycle::name_for`'s; this opens it once (F-51).
-            let worktree_name = WorktreeLifecycle::name_for(
-                issue_title_slug.as_deref(),
-                self.flags
-                    .work_item
-                    .is_some()
-                    .then(|| work_item_context.as_ref().map(|ctx| ctx.number))
-                    .flatten(),
-                &workflow_path,
-            );
+            let worktree_name = WorktreeLifecycle::name_for(work_item.as_ref(), &workflow_path);
             let lifecycle = match WorktreeLifecycle::open(
                 Arc::clone(&self.engines.git_engine),
                 git_root,
@@ -354,7 +256,7 @@ impl Command for ExecWorkflowCommand {
                         &store,
                         &workflow,
                         &workflow_name,
-                        work_item_context.as_ref().map(|c| c.number),
+                        work_item_context.as_ref(),
                         Some(lifecycle.worktree_path()),
                         frontend,
                     )
@@ -442,9 +344,6 @@ impl Command for ExecWorkflowCommand {
                     }
                 }
             }
-            if let Some(overlay) = issue_overlay {
-                all.push(overlay);
-            }
             all
         };
 
@@ -472,6 +371,7 @@ impl Command for ExecWorkflowCommand {
             workflow,
             workflow_path,
             work_item_context,
+            work_item_overlay,
             cli_typed,
             mount_path,
             worktree_path,
@@ -480,7 +380,6 @@ impl Command for ExecWorkflowCommand {
             git_root_for_scope,
             cwd,
             original_session: self.session,
-            issue_temp_file: _issue_temp_file,
             launch_modes,
             skip_state_resume_prompt: state_resume_settled,
             prerequisites,
@@ -514,39 +413,5 @@ pub(crate) fn existing_worktree_choice(
         (Some(d), _) => ExistingWorktreeChoice::Explicit(d),
         (None, true) => ExistingWorktreeChoice::ResumeAccepted,
         (None, false) => ExistingWorktreeChoice::Ask,
-    }
-}
-
-#[cfg(test)]
-mod existing_worktree_choice_tests {
-    use super::existing_worktree_choice;
-    use crate::command::commands::worktree_lifecycle::{
-        ExistingWorktreeChoice as C, ExistingWorktreeDecision as D,
-    };
-
-    #[test]
-    fn explicit_choice_overrides_accepted_dynamic_resume() {
-        use crate::command::headless::HeadlessDefaults;
-
-        for decision in [D::Resume, D::Recreate, D::Fail] {
-            assert_eq!(
-                existing_worktree_choice(Some(decision), true),
-                C::Explicit(decision)
-            );
-        }
-        assert_eq!(existing_worktree_choice(None, true), C::ResumeAccepted);
-        assert_eq!(existing_worktree_choice(None, false), C::Ask);
-
-        // ResumeAccepted is resolved by the host: API fails even for saved
-        // dynamic state, while unattended squad and piped CLI keep resuming.
-        assert_eq!(HeadlessDefaults::api().existing_worktree(), D::Fail);
-        assert_eq!(
-            HeadlessDefaults::squad(
-                crate::command::commands::mount_scope::MountScopeDecision::MountGitRoot
-            )
-            .existing_worktree(),
-            D::Resume
-        );
-        assert_eq!(HeadlessDefaults::cli().existing_worktree(), D::Resume);
     }
 }

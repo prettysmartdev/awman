@@ -18,8 +18,10 @@ pub(super) const REMOTE: CommandSpec = CommandSpec {
     build: crate::command::dispatch::build::unsupported,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
-    requires_runtime: true,
+    requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[&REMOTE_SESSION, &REMOTE_EXEC],
 };
 
@@ -36,8 +38,10 @@ pub(super) const REMOTE_EXEC: CommandSpec = CommandSpec {
     build: crate::command::dispatch::build::unsupported,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
-    requires_runtime: true,
+    requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[&REMOTE_EXEC_WORKFLOW, &REMOTE_EXEC_PROMPT],
 };
 
@@ -59,8 +63,10 @@ pub(super) const REMOTE_EXEC_WORKFLOW: CommandSpec = CommandSpec {
     build: crate::command::dispatch::build::remote,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
-    requires_runtime: true,
+    requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -72,18 +78,21 @@ pub(super) const REMOTE_EXEC_PROMPT: CommandSpec = CommandSpec {
     arguments: &[ArgumentSpec {
         name: "prompt",
         // Greedy trailing positional (see EXEC_PROMPT): joins remaining tokens
-        // into one prompt string, spec-driven for every frontend.
+        // into one prompt string, spec-driven for every frontend. Optional,
+        // as on `exec prompt`: `--work-item` alone is a valid prompt.
         help: "The prompt text to send to the agent.",
         kind: ArgumentKind::TrailingVarArgs,
-        optional: false,
+        optional: true,
     }],
     flags: &REMOTE_EXEC_PROMPT_FLAGS,
     api_allowed: false,
     build: crate::command::dispatch::build::remote,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
-    requires_runtime: true,
+    requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -100,8 +109,10 @@ pub(super) const REMOTE_SESSION: CommandSpec = CommandSpec {
     build: crate::command::dispatch::build::unsupported,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
-    requires_runtime: true,
+    requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[&REMOTE_SESSION_START, &REMOTE_SESSION_KILL],
 };
 
@@ -116,34 +127,14 @@ pub(super) const REMOTE_SESSION_START: CommandSpec = CommandSpec {
     build: crate::command::dispatch::build::remote,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
-    requires_runtime: true,
+    requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
-pub(super) const REMOTE_SESSION_START_FLAGS: [FlagSpec; 6] = [
-    FlagSpec {
-        long: "remote-addr",
-        short: None,
-        help: "Address of the remote awman API host.",
-        kind: FlagKind::OptionalString,
-        default: FlagDefault::None,
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "api-key",
-        short: None,
-        help: "API key for the remote awman API host.",
-        kind: FlagKind::OptionalString,
-        default: FlagDefault::None,
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
+pub(super) const REMOTE_SESSION_START_FLAGS: [FlagSpec; 4] = [
     FlagSpec {
         long: "type",
         short: None,
@@ -208,32 +199,11 @@ pub(super) const REMOTE_SESSION_KILL: CommandSpec = CommandSpec {
     build: crate::command::dispatch::build::remote,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
-    requires_runtime: true,
+    requires_runtime: false,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
-pub(super) const REMOTE_SESSION_KILL_FLAGS: [FlagSpec; 2] = [
-    FlagSpec {
-        long: "remote-addr",
-        short: None,
-        help: "Address of the remote awman API host.",
-        kind: FlagKind::OptionalString,
-        default: FlagDefault::None,
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "api-key",
-        short: None,
-        help: "API key for the remote awman API host.",
-        kind: FlagKind::OptionalString,
-        default: FlagDefault::None,
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-];
+pub(super) const REMOTE_SESSION_KILL_FLAGS: [FlagSpec; 0] = [];

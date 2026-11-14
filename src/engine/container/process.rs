@@ -71,8 +71,9 @@ pub(super) fn no_post_wait() {}
 /// A backend is a `ContainerCli` plus its own `list`/`stats`/`stop` parsing.
 /// Adding a third CLI-shaped runtime should mean adding a constant here, not
 /// a third copy of [`spawn_piped`].
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct ContainerCli {
+    pub env: Option<Arc<crate::data::config::env::EnvSnapshot>>,
     /// The binary invoked for `run`, `stop` and `rm`.
     pub bin: &'static str,
     /// Ownership label stamped on every awman-spawned container so a backend's
@@ -97,7 +98,21 @@ impl std::fmt::Debug for ContainerCli {
 }
 
 impl ContainerCli {
+    pub(super) fn in_env(mut self, env: crate::data::config::env::EnvSnapshot) -> Self {
+        self.env = Some(Arc::new(env));
+        self
+    }
+    pub(super) fn snapshot(&self) -> std::borrow::Cow<'_, crate::data::config::env::EnvSnapshot> {
+        match &self.env {
+            Some(env) => std::borrow::Cow::Borrowed(env),
+            None => std::borrow::Cow::Owned(crate::engine::host_cli::process_env()),
+        }
+    }
+    pub(super) fn command(&self) -> Command {
+        crate::engine::host_cli::command(&self.snapshot(), self.bin)
+    }
     pub(super) const DOCKER: ContainerCli = ContainerCli {
+        env: None,
         bin: "docker",
         label: "awman=true",
         start_delay: Duration::ZERO,
@@ -105,6 +120,7 @@ impl ContainerCli {
     };
 
     pub(super) const APPLE: ContainerCli = ContainerCli {
+        env: None,
         bin: "container",
         label: "awman=true",
         start_delay: crate::engine::container::timing::APPLE_CONTAINER_START_DELAY,
@@ -116,6 +132,11 @@ impl ContainerCli {
 
 /// What a [`AttachHook`] is handed once the PTY bridge is wired up.
 pub(super) struct AttachHookCtx<'a> {
+    pub env: &'a crate::data::config::env::EnvSnapshot,
+    pub terminal: Option<(
+        Arc<crate::engine::terminal_hub::TerminalHub>,
+        crate::data::ids::TerminalId,
+    )>,
     /// The container's name — the key the socket path is derived from.
     pub container_name: &'a str,
     /// Live tap on the container's output. Already installed on the
@@ -150,9 +171,10 @@ pub(super) fn bridge_config_for(
     stuck_timeout: Duration,
 ) -> BridgeConfig {
     let container_name = name.0.clone();
-    let bin = cli.bin;
+    let cancel_cli = cli.clone();
     let cancel: CancelFn = Arc::new(move || {
-        let _ = Command::new(crate::engine::host_cli::program(bin))
+        let _ = cancel_cli
+            .command()
             .args(["stop", &container_name])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -167,6 +189,8 @@ pub(super) fn bridge_config_for(
             crate::engine::agent_runtime::output_tail::OutputTail::with_default_capacity(),
         ),
         output_broadcast: None,
+        terminal: None,
+        program_status: Default::default(),
     }
 }
 
@@ -226,11 +250,15 @@ impl AgentInstance for ContainerInstance {
         self: Box<Self>,
         mut frontend: Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend>,
     ) -> Result<AgentExecution, EngineError> {
-        let cli = self.cli;
+        let cli = self.cli.clone();
         let post_bridge = self.post_bridge;
         let argv = super::docker::build_run_argv(&self.name, &self.image, &self.options)?;
         let started_at = chrono::Utc::now();
-        let seeded = self.options.seeded_prompt.clone();
+        let seeded = if self.options.headless_prompt_in_argv && !self.options.interactive {
+            None
+        } else {
+            self.options.seeded_prompt.clone()
+        };
         let handle = handle_now(&self.id, &self.name, &self.image);
 
         if self.options.agent_output_format.is_structured() {
@@ -250,9 +278,20 @@ impl AgentInstance for ContainerInstance {
             .startup_grace
             .unwrap_or_else(|| frontend.grace_timeout());
         let stuck_timeout = frontend.stuck_timeout();
+        // WI 0141 §3: tell the user which requested host-terminal variables
+        // were not passed (`build_run_argv` also traces it).
+        if let Some(notice) = super::docker::host_terminal_env_notice(&self.options) {
+            frontend.write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Warning,
+                text: notice,
+            });
+        }
         let io = frontend.take_io();
 
-        let mut bridge_cfg = bridge_config_for(cli, &self.name, grace_timeout, stuck_timeout);
+        let mut bridge_cfg =
+            bridge_config_for(cli.clone(), &self.name, grace_timeout, stuck_timeout);
+        bridge_cfg.program_status = self.options.program_status;
+        bridge_cfg.terminal = frontend.terminal_launch();
         if self.options.full_transcript {
             bridge_cfg.output_tail =
                 Arc::new(crate::engine::agent_runtime::output_tail::OutputTail::unbounded());
@@ -281,7 +320,7 @@ impl AgentInstance for ContainerInstance {
             return spawn_piped_interactive(cli, self, req);
         }
 
-        // Piped path: non-interactive or no PTY.
+        // Piped path: headless or no PTY.
         spawn_piped(cli, self, req)
     }
 }
@@ -320,9 +359,9 @@ fn piped_command(
     argv: &[String],
     options: &ResolvedContainerOptions,
 ) -> Command {
-    let mut cmd = Command::new(crate::engine::host_cli::program(cli.bin));
+    let mut cmd = cli.command();
     cmd.args(argv);
-    for (k, v) in &options.agent_credentials {
+    for (k, v) in super::docker::screened_agent_credentials(options) {
         cmd.env(k, v);
     }
     for (k, v) in super::docker::resolve_env_passthrough(options) {
@@ -371,7 +410,7 @@ pub(super) fn spawn_pty_bridged(
     req: SpawnRequest,
     post_bridge: Option<AttachHook>,
 ) -> Result<AgentExecution, EngineError> {
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use portable_pty::{native_pty_system, PtySize};
 
     let SpawnRequest {
         io,
@@ -399,7 +438,8 @@ pub(super) fn spawn_pty_bridged(
         })
         .map_err(|e| EngineError::Container(format!("openpty: {e}")))?;
 
-    let mut cmd = CommandBuilder::new(crate::engine::host_cli::program(cli.bin));
+    let snapshot = cli.snapshot();
+    let mut cmd = crate::engine::host_cli::pty_command(&snapshot, cli.bin);
     for arg in &argv {
         cmd.arg(arg);
     }
@@ -409,7 +449,7 @@ pub(super) fn spawn_pty_bridged(
     // argument vector. The passthrough values cannot rely on ambient
     // inheritance — inside the squad daemon they live in the Layer 0 overlay,
     // not in the daemon's own process environment.
-    for (k, v) in &instance.options.agent_credentials {
+    for (k, v) in super::docker::screened_agent_credentials(&instance.options) {
         cmd.env(k, v);
     }
     for (k, v) in super::docker::resolve_env_passthrough(&instance.options) {
@@ -435,14 +475,28 @@ pub(super) fn spawn_pty_bridged(
         Arc::new(tx)
     });
     if let Some(tx) = &output_broadcast {
-        bridge_cfg.output_broadcast = Some(Arc::clone(tx));
+        if bridge_cfg.terminal.is_none() {
+            bridge_cfg.output_broadcast = Some(Arc::clone(tx));
+        }
     }
+    let terminal_launch = bridge_cfg.terminal.clone();
 
     let (master_arc, bridge) =
         crate::engine::container::io_bridge::bridge_pty(io, pair, bridge_cfg)?;
 
     let attach_socket = match (post_bridge, output_broadcast) {
         (Some(hook), Some(output_broadcast)) => hook(AttachHookCtx {
+            env: &snapshot,
+            terminal: terminal_launch.and_then(|launch| {
+                let id = launch
+                    .handle
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()?
+                    .id()
+                    .clone();
+                Some((launch.hub, id))
+            }),
             container_name: &instance.name.0,
             output_broadcast,
             stdin_injector: bridge.stdin_injector.clone(),
@@ -468,7 +522,8 @@ pub(super) fn spawn_pty_bridged(
         Box::new(backend),
         bridge.stuck_tx,
         Some(bridge.output_tail),
-    ))
+    )
+    .with_program_status(bridge.program_status))
 }
 
 /// Spawn `<bin> run` with piped stdio and bridge through `AgentIo`.
@@ -486,14 +541,14 @@ pub(super) fn spawn_piped(
         bridge_cfg,
     } = req;
 
-    let mut cmd = piped_command(cli, &argv, &instance.options);
+    let mut cmd = piped_command(cli.clone(), &argv, &instance.options);
 
     // Move leases into the backend; assert one exists before spawn (INV-6).
     let leases = std::mem::take(&mut instance.leases);
     let prompt_files = std::mem::take(&mut instance.options.prompt_files);
     assert_leases_before_spawn(&instance.options, &leases);
 
-    let mut child = spawn_child(cli, &mut cmd)?;
+    let mut child = spawn_child(cli.clone(), &mut cmd)?;
 
     // Write seeded prompt into stdin channel before the writer task starts.
     if let Some(prompt) = seeded {
@@ -503,12 +558,12 @@ pub(super) fn spawn_piped(
 
     let bridge = crate::engine::container::io_bridge::bridge_piped(io, &mut child, bridge_cfg);
 
-    // Non-interactive (piped) path: drop the engine's stdin_injector so the
+    // Headless (piped) path: drop the engine's stdin_injector so the
     // writer task sees EOF after draining the seeded prompt and closes the
     // child's stdin pipe. Without this, an agent that probes stdin for EOF
     // would hang waiting for input that will never come.
     // `try_inject_stdin` falls back to launching a fresh container — which
-    // is the correct behaviour for a non-interactive run that has already
+    // is the correct behaviour for a headless run that has already
     // consumed its single prompt.
     drop(bridge.stdin_injector);
 
@@ -529,7 +584,8 @@ pub(super) fn spawn_piped(
         Box::new(backend),
         bridge.stuck_tx,
         Some(bridge.output_tail),
-    ))
+    )
+    .with_program_status(bridge.program_status))
 }
 
 /// Spawn `<bin> run -i` (no PTY) with piped stdio for an ACP session and bridge
@@ -542,7 +598,7 @@ pub(super) fn spawn_piped(
 /// alive. That keeps the container's stdin pipe open so the ACP driver can
 /// write JSON-RPC request lines (via `try_inject_stdin`) across a full
 /// bidirectional exchange, instead of the one-write-then-EOF an ordinary
-/// non-interactive run performs.
+/// headless run performs.
 ///
 /// No seeded prompt is written to stdin here: an ACP session delivers its
 /// prompt over the JSON-RPC channel (`session/prompt`), so writing raw text to
@@ -567,14 +623,14 @@ pub(super) fn spawn_piped_interactive(
         bridge_cfg,
     } = req;
 
-    let mut cmd = piped_command(cli, &argv, &instance.options);
+    let mut cmd = piped_command(cli.clone(), &argv, &instance.options);
 
     // Move leases into the backend; assert one exists before spawn (INV-6).
     let leases = std::mem::take(&mut instance.leases);
     let prompt_files = std::mem::take(&mut instance.options.prompt_files);
     assert_leases_before_spawn(&instance.options, &leases);
 
-    let mut child = spawn_child(cli, &mut cmd)?;
+    let mut child = spawn_child(cli.clone(), &mut cmd)?;
 
     let bridge = crate::engine::container::io_bridge::bridge_piped(io, &mut child, bridge_cfg);
 
@@ -599,7 +655,8 @@ pub(super) fn spawn_piped_interactive(
         Box::new(backend),
         bridge.stuck_tx,
         Some(bridge.output_tail),
-    ))
+    )
+    .with_program_status(bridge.program_status))
 }
 
 /// `<bin> stop <name>` then `<bin> rm <name>`, both best-effort. `stop` SIGTERMs
@@ -608,13 +665,15 @@ pub(super) fn spawn_piped_interactive(
 ///
 /// The one place the stop-then-remove pair is written: `ContainerExecution`'s
 /// cancel paths and `ContainerBackend::stop` all route through it.
-pub(super) fn stop_and_remove(bin: &str, name: &str) {
-    let _ = Command::new(crate::engine::host_cli::program(bin))
+pub(super) fn stop_and_remove(cli: &ContainerCli, name: &str) {
+    let _ = cli
+        .command()
         .args(["stop", name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let _ = Command::new(crate::engine::host_cli::program(bin))
+    let _ = cli
+        .command()
         .args(["rm", name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -655,7 +714,7 @@ pub(super) struct ContainerExecution {
     /// drop. Not read directly — held purely for its `Drop`.
     #[allow(dead_code)]
     leases: Vec<CredentialLease>,
-    /// This launch's mounted system-prompt files. Released when the child
+    /// This launch's temporary mounts. Released when the child
     /// exits: `wait_blocking` consumes this backend then, and an unwaited drop
     /// hands them to a thread that outlasts the child.
     prompt_files: Vec<PromptFileGuard>,
@@ -663,7 +722,7 @@ pub(super) struct ContainerExecution {
 
 impl Drop for ContainerExecution {
     /// An execution dropped unwaited leaves its container running for a later
-    /// reattach, and the guest can still read its mounted prompt files. Keep
+    /// reattach, and the guest can still read its temporary mounts. Keep
     /// them until the CLI child exits. When awman exits first the thread dies
     /// with it and the files stay on disk for that guest.
     fn drop(&mut self) {
@@ -751,15 +810,15 @@ impl ExecutionBackend for ContainerExecution {
     }
 
     fn cancel(&self) -> Result<(), EngineError> {
-        stop_and_remove(self.cli.bin, &self.container_name);
+        stop_and_remove(&self.cli, &self.container_name);
         Ok(())
     }
 
     fn cancel_handle(&self) -> crate::engine::agent_runtime::execution::CancelHandle {
-        let bin = self.cli.bin;
+        let cli = self.cli.clone();
         let name = self.container_name.clone();
         crate::engine::agent_runtime::execution::CancelHandle::new(move || {
-            stop_and_remove(bin, &name);
+            stop_and_remove(&cli, &name);
             Ok(())
         })
     }
@@ -768,794 +827,5 @@ impl ExecutionBackend for ContainerExecution {
         // Docker containers are explicitly reattachable after their owner
         // exits. A dropped, never-awaited execution must not remove one.
         false
-    }
-}
-
-/// This module's runtimes for the cross-runtime frontend-release check
-/// (`agent_runtime::conformance`).
-#[cfg(all(test, unix))]
-pub(super) fn conformance_launchers() -> Vec<crate::engine::agent_runtime::conformance::Launcher> {
-    tests::conformance_launchers()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engine::container::options::{ContainerOption, ResolvedContainerOptions};
-
-    type OutputReceivers = (
-        tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-        tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-    );
-
-    struct IoProbeFrontend {
-        receivers: Arc<Mutex<Option<OutputReceivers>>>,
-        initial_size: Option<(u16, u16)>,
-    }
-    impl crate::data::message::UserMessageSink for IoProbeFrontend {
-        fn write_message(&mut self, _: crate::data::message::UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-    #[async_trait::async_trait]
-    impl crate::engine::agent_runtime::frontend::AgentFrontend for IoProbeFrontend {
-        fn report_status(&mut self, _: crate::engine::agent_runtime::frontend::AgentStatus) {}
-        fn report_progress(&mut self, _: crate::engine::agent_runtime::frontend::AgentProgress) {}
-        fn take_io(&mut self) -> AgentIo {
-            let (stdout, stdout_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (stderr, stderr_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-            let (resize, initial_size) = if self.initial_size.is_some() {
-                let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                (Some(rx), self.initial_size)
-            } else {
-                (None, None)
-            };
-            *self.receivers.lock().unwrap() = Some((stdout_rx, stderr_rx));
-            AgentIo {
-                stdout,
-                stderr,
-                stdin_tx,
-                stdin_rx,
-                resize,
-                initial_size,
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn docker_and_apple_close_io_and_cancel_dropped_wait_on_piped_and_pty_paths() {
-        for original in [ContainerCli::DOCKER, ContainerCli::APPLE] {
-            for initial_size in [None, Some((80, 24))] {
-                for drop_wait in [false, true] {
-                    let temp = tempfile::tempdir().unwrap();
-                    let log = temp.path().join("calls");
-                    let script = format!(
-                        "#!/bin/sh\necho \"$1\" >> {}\nif [ \"$1\" = run ]; then sleep 0.15; fi\n",
-                        log.display()
-                    );
-                    let cli = ContainerCli {
-                        bin: fake_cli(&write_fake_cli(temp.path(), &script)).bin,
-                        ..original
-                    };
-                    let receivers = Arc::new(Mutex::new(None));
-                    let mut execution = test_instance(
-                        cli,
-                        vec![ContainerOption::Image(ImageRef::new("img:latest"))],
-                    )
-                    .run_with_frontend(Box::new(IoProbeFrontend {
-                        receivers: receivers.clone(),
-                        initial_size,
-                    }))
-                    .unwrap();
-                    if drop_wait {
-                        assert!(
-                            tokio::time::timeout(Duration::from_millis(20), execution.wait())
-                                .await
-                                .is_err()
-                        );
-                    } else {
-                        execution.wait().await.unwrap();
-                    }
-                    let (mut stdout, mut stderr) = receivers.lock().unwrap().take().unwrap();
-                    // Drain rather than expect silence: dropping portable-pty's
-                    // writer sends "\n" + EOF, which the line discipline can
-                    // echo as "\r\n" if the child still holds the slave.
-                    tokio::time::timeout(Duration::from_secs(3), async {
-                        while stdout.recv().await.is_some() {}
-                        while stderr.recv().await.is_some() {}
-                    })
-                    .await
-                    .expect("container bridge did not release output senders");
-                    let calls = tokio::time::timeout(Duration::from_secs(2), async {
-                        loop {
-                            let calls = std::fs::read_to_string(&log).unwrap_or_default();
-                            if calls.lines().any(|line| line == "run")
-                                && (!drop_wait
-                                    || (calls.lines().any(|line| line == "stop")
-                                        && calls.lines().any(|line| line == "rm")))
-                            {
-                                break calls;
-                            }
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
-                    })
-                    .await
-                    .expect("container command did not complete expected lifecycle");
-                    assert_eq!(calls.lines().any(|line| line == "stop"), drop_wait);
-                    assert_eq!(calls.lines().any(|line| line == "rm"), drop_wait);
-                }
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn dropping_unwaited_docker_execution_preserves_reattachable_container() {
-        let temp = tempfile::tempdir().unwrap();
-        let log = temp.path().join("calls");
-        let script = format!(
-            "#!/bin/sh\necho \"$1\" >> {}\nif [ \"$1\" = run ]; then sleep 0.1; fi\n",
-            log.display()
-        );
-        let cli = ContainerCli {
-            bin: fake_cli(&write_fake_cli(temp.path(), &script)).bin,
-            ..ContainerCli::DOCKER
-        };
-        let execution = test_instance(
-            cli,
-            vec![ContainerOption::Image(ImageRef::new("img:latest"))],
-        )
-        .run_with_frontend(Box::new(IoProbeFrontend {
-            receivers: Arc::new(Mutex::new(None)),
-            initial_size: None,
-        }))
-        .unwrap();
-        drop(execution);
-        // Wait for the fake CLI to record `run` rather than sleeping a fixed
-        // time: under a loaded full-suite run, starting the script can take
-        // longer than any short fixed delay.
-        let read_calls = || std::fs::read_to_string(&log).unwrap_or_default();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !read_calls().lines().any(|line| line == "run")
-            && std::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        // Then give a wrongful stop/rm the same window the test always allowed.
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let calls = read_calls();
-        assert!(calls.lines().any(|line| line == "run"), "{calls}");
-        assert!(!calls.lines().any(|line| line == "stop"), "{calls}");
-        assert!(!calls.lines().any(|line| line == "rm"), "{calls}");
-    }
-
-    fn resolve(opts: Vec<ContainerOption>) -> ResolvedContainerOptions {
-        ResolvedContainerOptions::resolve(opts).expect("resolve")
-    }
-
-    #[test]
-    fn container_cli_constants_carry_only_the_per_backend_difference() {
-        assert_eq!(ContainerCli::DOCKER.bin, "docker");
-        assert_eq!(ContainerCli::APPLE.bin, "container");
-        assert_eq!(ContainerCli::DOCKER.label, ContainerCli::APPLE.label);
-        assert_eq!(ContainerCli::DOCKER.start_delay, Duration::ZERO);
-        assert_eq!(
-            ContainerCli::APPLE.start_delay,
-            crate::engine::container::timing::APPLE_CONTAINER_START_DELAY
-        );
-    }
-
-    #[test]
-    fn bridge_config_takes_its_start_delay_from_the_cli() {
-        let name = ContainerName::new("awman-cfg-test");
-        let docker = bridge_config_for(
-            ContainerCli::DOCKER,
-            &name,
-            Duration::from_secs(1),
-            Duration::from_secs(2),
-        );
-        assert_eq!(docker.container_start_delay, Duration::ZERO);
-        assert_eq!(docker.grace_timeout, Duration::from_secs(1));
-        assert_eq!(docker.stuck_timeout, Duration::from_secs(2));
-        assert!(docker.cancel_on_grace_expired.is_some());
-        assert!(docker.output_broadcast.is_none());
-
-        let apple = bridge_config_for(
-            ContainerCli::APPLE,
-            &name,
-            Duration::from_secs(1),
-            Duration::from_secs(2),
-        );
-        assert_eq!(
-            apple.container_start_delay,
-            crate::engine::container::timing::APPLE_CONTAINER_START_DELAY
-        );
-    }
-
-    /// A stand-in CLI whose `bin` is a script on disk. `bin` is `&'static str`,
-    /// so the temp path is leaked — the process is about to end anyway, and it
-    /// keeps `ContainerCli` a plain `Copy` constant in production.
-    fn fake_cli(path: &std::path::Path) -> ContainerCli {
-        ContainerCli {
-            bin: Box::leak(path.to_string_lossy().into_owned().into_boxed_str()),
-            label: "awman=true",
-            start_delay: Duration::ZERO,
-            post_wait: no_post_wait,
-        }
-    }
-
-    #[cfg(unix)]
-    fn write_fake_cli(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join("fake-cli");
-        std::fs::write(&path, body).unwrap();
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&path, permissions).unwrap();
-        // A concurrent test forking anywhere in this process can inherit the
-        // write descriptor `fs::write` held, so `execve` reports the script as
-        // busy (`ETXTBSY`) until that fork execs. Probe until one exec succeeds:
-        // after that no writer remains and nothing reopens the file for write.
-        for attempt in 0.. {
-            match std::process::Command::new(&path)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                Ok(mut probe) => {
-                    let _ = probe.kill();
-                    let _ = probe.wait();
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 100 => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => panic!("fake cli never became executable: {e}"),
-            }
-        }
-        path
-    }
-
-    #[cfg(unix)]
-    fn piped_test_request(
-        argv: Vec<String>,
-        seeded: Option<String>,
-    ) -> (SpawnRequest, AgentHandle) {
-        use tokio::sync::mpsc;
-
-        let (stdout_tx, _stdout_rx) = mpsc::unbounded_channel();
-        let (stderr_tx, _stderr_rx) = mpsc::unbounded_channel();
-        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel();
-        let io = AgentIo {
-            stdout: stdout_tx,
-            stderr: stderr_tx,
-            stdin_tx,
-            stdin_rx,
-            resize: None,
-            initial_size: None,
-        };
-        let handle = AgentHandle {
-            id: "spawn-test".into(),
-            image_tag: "img:latest".into(),
-            name: "spawn-test".into(),
-            started_at: chrono::Utc::now(),
-        };
-        let bridge_cfg = BridgeConfig {
-            grace_timeout: Duration::from_secs(60),
-            stuck_timeout: Duration::from_secs(60),
-            container_start_delay: Duration::ZERO,
-            cancel_on_grace_expired: None,
-            output_tail: Arc::new(
-                crate::engine::agent_runtime::output_tail::OutputTail::with_default_capacity(),
-            ),
-            output_broadcast: None,
-        };
-        (
-            SpawnRequest {
-                io,
-                argv,
-                seeded,
-                started_at: chrono::Utc::now(),
-                handle: handle.clone(),
-                bridge_cfg,
-            },
-            handle,
-        )
-    }
-
-    #[cfg(unix)]
-    fn test_instance(cli: ContainerCli, opts: Vec<ContainerOption>) -> Box<ContainerInstance> {
-        let image = ImageRef::new("img:latest");
-        let name = ContainerName::new("spawn-test");
-        Box::new(ContainerInstance::new(
-            cli,
-            image,
-            name,
-            resolve(opts),
-            Vec::new(),
-            None,
-        ))
-    }
-
-    /// Docker and Apple Containers, each over a fake CLI whose `run` sleeps
-    /// briefly or for a long time.
-    #[cfg(unix)]
-    pub(crate) fn conformance_launchers() -> Vec<crate::engine::agent_runtime::conformance::Launcher>
-    {
-        use crate::engine::agent_runtime::conformance::Launcher;
-        [
-            ("docker", ContainerCli::DOCKER),
-            ("apple", ContainerCli::APPLE),
-        ]
-        .into_iter()
-        .map(|(name, original)| {
-            let temp = Arc::new(tempfile::tempdir().unwrap());
-            Launcher {
-                name,
-                launch: Box::new(move |frontend, long, prompt_files| {
-                    let dir = temp.path().join(if long { "long" } else { "short" });
-                    std::fs::create_dir_all(&dir).unwrap();
-                    let script = if long {
-                        "#!/bin/sh\nif [ \"$1\" = run ]; then sleep 0.3; fi\n"
-                    } else {
-                        "#!/bin/sh\nif [ \"$1\" = run ]; then sleep 0.01; fi\n"
-                    };
-                    let cli = ContainerCli {
-                        bin: fake_cli(&write_fake_cli(&dir, script)).bin,
-                        ..original
-                    };
-                    let mut options = vec![ContainerOption::Image(ImageRef::new("img:latest"))];
-                    options.extend(prompt_files.into_iter().map(prompt_option));
-                    test_instance(cli, options)
-                        .run_with_frontend(frontend)
-                        .unwrap()
-                }),
-                // The fake `run` ends by itself.
-                finish: Box::new(|| {}),
-            }
-        })
-        .collect()
-    }
-
-    #[cfg(unix)]
-    fn prompt_option(guard: PromptFileGuard) -> ContainerOption {
-        ContainerOption::SystemPromptFile {
-            host_path: guard.host_path().to_path_buf(),
-            container_path: "/tmp/awman-ctx-prompt-test.md".into(),
-            flag: "--sp".into(),
-            guard,
-        }
-    }
-
-    #[cfg(unix)]
-    fn written_prompt(text: &str) -> (ContainerOption, std::path::PathBuf) {
-        use std::io::Write as _;
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        file.write_all(text.as_bytes()).unwrap();
-        let path = file.path().to_path_buf();
-        (prompt_option(PromptFileGuard::new(file)), path)
-    }
-
-    /// A stand-in guest: `run` records the host prompt path it was given in
-    /// `started` (so a test can see it is running), blocks until `gate`
-    /// exists (`stop` creates it), lingers so an early release would be seen,
-    /// then reads its mounted prompt into `read`. It ignores the hangup a
-    /// dropped PTY master delivers, as a CLI whose container outlives the
-    /// drop does.
-    #[cfg(unix)]
-    fn gated_cli(dir: &std::path::Path) -> ContainerCli {
-        let dir_text = dir.display();
-        let script = format!(
-            "#!/bin/sh\ntrap '' HUP\n\
-             if [ \"$1\" = stop ]; then : > {dir_text}/gate; fi\n\
-             if [ \"$1\" = run ]; then\n\
-             for a in \"$@\"; do case \"$a\" in *:/tmp/awman-ctx-prompt-*:ro) src=\"${{a%%:*}}\";; esac; done\n\
-             printf '%s' \"$src\" > {dir_text}/started.tmp && mv {dir_text}/started.tmp {dir_text}/started\n\
-             until [ -e {dir_text}/gate ]; do sleep 0.01; done\n\
-             sleep 0.1\n\
-             cat \"$src\" > {dir_text}/read\n\
-             fi\n"
-        );
-        fake_cli(&write_fake_cli(dir, &script))
-    }
-
-    #[cfg(unix)]
-    fn frontend_with(initial_size: Option<(u16, u16)>) -> Box<IoProbeFrontend> {
-        Box::new(IoProbeFrontend {
-            receivers: Arc::new(Mutex::new(None)),
-            initial_size,
-        })
-    }
-
-    /// The guest read the whole prompt, and only afterwards was it released.
-    #[cfg(unix)]
-    async fn assert_guest_read_then_released(
-        dir: &std::path::Path,
-        path: &std::path::Path,
-        text: &str,
-        context: &str,
-    ) {
-        let read = dir.join("read");
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while path.exists() || !read.exists() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("{context}: guest never read, or file never released"));
-        assert_eq!(std::fs::read_to_string(&read).unwrap(), text, "{context}");
-    }
-
-    #[cfg(unix)]
-    #[derive(Clone, Copy, Debug)]
-    enum ExitPath {
-        Completion,
-        Cancel,
-        DroppedWait,
-        DroppedExecution,
-    }
-
-    /// Every way a run ends, on both spawn paths: the guest can still read its
-    /// prompt at its very end, and the file is gone afterwards.
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn prompt_file_outlives_the_guest_and_no_longer_on_every_exit_path() {
-        for initial_size in [None, Some((80, 24))] {
-            for exit in [
-                ExitPath::Completion,
-                ExitPath::Cancel,
-                ExitPath::DroppedWait,
-                ExitPath::DroppedExecution,
-            ] {
-                let context = format!("{exit:?}, pty={}", initial_size.is_some());
-                let temp = tempfile::tempdir().unwrap();
-                let gate = temp.path().join("gate");
-                let (option, path) = written_prompt("the prompt");
-                let mut execution = test_instance(
-                    gated_cli(temp.path()),
-                    vec![ContainerOption::Image(ImageRef::new("img")), option],
-                )
-                .run_with_frontend(frontend_with(initial_size))
-                .unwrap();
-                assert!(path.exists(), "{context}");
-                match exit {
-                    ExitPath::Completion => {
-                        std::fs::write(&gate, "").unwrap();
-                        execution.wait().await.unwrap();
-                        assert!(!path.exists(), "{context}: retained after wait");
-                    }
-                    ExitPath::Cancel => {
-                        execution.cancel_handle().unwrap().cancel().unwrap();
-                        execution.wait().await.unwrap();
-                        assert!(!path.exists(), "{context}: retained after wait");
-                    }
-                    ExitPath::DroppedWait => {
-                        assert!(
-                            tokio::time::timeout(Duration::from_millis(20), execution.wait())
-                                .await
-                                .is_err(),
-                            "{context}"
-                        );
-                    }
-                    ExitPath::DroppedExecution => {
-                        drop(execution);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        assert!(path.exists(), "{context}: released under a live guest");
-                        std::fs::write(&gate, "").unwrap();
-                        assert_guest_read_then_released(temp.path(), &path, "the prompt", &context)
-                            .await;
-                        continue;
-                    }
-                }
-                assert_guest_read_then_released(temp.path(), &path, "the prompt", &context).await;
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn prompt_file_is_released_when_the_launch_never_runs() {
-        // An unlaunched instance.
-        let temp = tempfile::tempdir().unwrap();
-        let (option, path) = written_prompt("p");
-        let instance = test_instance(
-            gated_cli(temp.path()),
-            vec![ContainerOption::Image(ImageRef::new("img")), option],
-        );
-        assert!(path.exists());
-        drop(instance);
-        assert!(!path.exists(), "retained by a dropped instance");
-
-        // A spawn failure, on both spawn paths.
-        for initial_size in [None, Some((80, 24))] {
-            let (option, path) = written_prompt("p");
-            let result = test_instance(
-                fake_cli(&temp.path().join("missing-cli")),
-                vec![ContainerOption::Image(ImageRef::new("img")), option],
-            )
-            .run_with_frontend(frontend_with(initial_size));
-            assert!(result.is_err());
-            assert!(!path.exists(), "retained after a spawn failure");
-        }
-    }
-
-    #[cfg(unix)]
-    fn prompt_engine(
-        tmp: &std::path::Path,
-    ) -> (
-        crate::engine::agent::AgentEngine,
-        crate::data::session::Session,
-    ) {
-        let overlay = crate::engine::overlay::OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp),
-        );
-        (
-            crate::engine::agent::AgentEngine::new(
-                Arc::new(overlay),
-                Arc::new(crate::engine::container::ContainerRuntime::docker()),
-            ),
-            crate::data::session::Session::for_tests_isolated(tmp, &tmp.join("global")),
-        )
-    }
-
-    #[cfg(unix)]
-    fn engine_launch(
-        engine: &crate::engine::agent::AgentEngine,
-        session: &crate::data::session::Session,
-        text: &str,
-    ) -> (Vec<ContainerOption>, std::path::PathBuf) {
-        let options = engine
-            .build_options(
-                session,
-                &crate::data::session::AgentName::new("claude").unwrap(),
-                &crate::engine::agent::AgentRunOptions {
-                    system_prompt: Some(text.to_string()),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let path = options
-            .iter()
-            .find_map(|option| match option {
-                ContainerOption::SystemPromptFile { guard, .. } => {
-                    Some(guard.host_path().to_path_buf())
-                }
-                _ => None,
-            })
-            .expect("claude delivers its prompt by file");
-        (options, path)
-    }
-
-    /// Descriptors this process holds on `path`, deleted or not.
-    #[cfg(target_os = "linux")]
-    fn open_handles(path: &std::path::Path) -> usize {
-        std::fs::read_dir("/proc/self/fd")
-            .unwrap()
-            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
-            .filter(|target| {
-                target
-                    .to_string_lossy()
-                    .starts_with(&*path.to_string_lossy())
-            })
-            .count()
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn sequential_runs_through_one_engine_return_to_baseline() {
-        let temp = tempfile::tempdir().unwrap();
-        let (engine, session) = prompt_engine(temp.path());
-        let cli = fake_cli(&write_fake_cli(temp.path(), "#!/bin/sh\nexit 0\n"));
-        for _ in 0..16 {
-            let (options, path) = engine_launch(&engine, &session, "the prompt");
-            assert!(path.exists());
-            let mut execution = test_instance(cli, options)
-                .run_with_frontend(frontend_with(None))
-                .unwrap();
-            execution.wait().await.unwrap();
-            assert!(!path.exists(), "a completed run retained its prompt file");
-            #[cfg(target_os = "linux")]
-            assert_eq!(
-                open_handles(&path),
-                0,
-                "a completed run retained its handle"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_runs_through_one_engine_keep_only_their_own_files() {
-        let temp = tempfile::tempdir().unwrap();
-        let (engine, session) = prompt_engine(temp.path());
-        let dirs = [temp.path().join("first"), temp.path().join("second")];
-        let (first_options, first_path) = engine_launch(&engine, &session, "first prompt");
-        let (second_options, second_path) = engine_launch(&engine, &session, "second prompt");
-        assert_ne!(first_path, second_path);
-        let mut runs = Vec::new();
-        for (dir, options) in dirs.iter().zip([first_options, second_options]) {
-            std::fs::create_dir_all(dir).unwrap();
-            runs.push(
-                test_instance(gated_cli(dir), options)
-                    .run_with_frontend(frontend_with(None))
-                    .unwrap(),
-            );
-        }
-        // Both guests are running at once, each mounted with its own file.
-        for (dir, path) in dirs.iter().zip([&first_path, &second_path]) {
-            assert_eq!(
-                wait_for_started(dir).await,
-                path.display().to_string(),
-                "a running guest was handed another run's prompt file"
-            );
-        }
-        assert!(first_path.exists() && second_path.exists());
-        std::fs::write(dirs[0].join("gate"), "").unwrap();
-        runs[0].wait().await.unwrap();
-        assert_guest_read_then_released(&dirs[0], &first_path, "first prompt", "first").await;
-        assert!(
-            second_path.exists(),
-            "finishing one run removed the other running run's file"
-        );
-        #[cfg(target_os = "linux")]
-        assert_eq!(
-            open_handles(&first_path),
-            0,
-            "the finished run kept its handle"
-        );
-        std::fs::write(dirs[1].join("gate"), "").unwrap();
-        runs[1].wait().await.unwrap();
-        assert_guest_read_then_released(&dirs[1], &second_path, "second prompt", "second").await;
-    }
-
-    /// Wait for a `gated_cli` guest to start; returns the prompt path it got.
-    #[cfg(unix)]
-    async fn wait_for_started(dir: &std::path::Path) -> String {
-        let started = dir.join("started");
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !started.exists() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the guest never started");
-        std::fs::read_to_string(started).unwrap()
-    }
-
-    /// The ACP path must retain its stdin injector for the whole session; the
-    /// one-shot piped path must not. This is the behaviour the two backends
-    /// each used to assert (or, in Apple's case, not assert) separately.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn spawn_piped_interactive_keeps_stdin_injector_after_seeded_write() {
-        let tmp = tempfile::tempdir().unwrap();
-        // A stand-in for `<bin> run`: keep stdin open long enough for this test
-        // to distinguish the persistent ACP path from the one-shot
-        // `spawn_piped` path, which drops its injector after seeding.
-        let cli = fake_cli(&write_fake_cli(tmp.path(), "#!/bin/sh\nsleep 1\n"));
-
-        let image = ImageRef::new("img:latest");
-        let instance = test_instance(
-            cli,
-            vec![
-                ContainerOption::Image(image),
-                ContainerOption::Interactive(true),
-                ContainerOption::Acp(true),
-            ],
-        );
-        let (req, _handle) = piped_test_request(
-            vec!["run".into(), "-i".into(), "img:latest".into()],
-            // The optional seed is accepted for signature parity; a later
-            // injection must still work in ACP mode.
-            Some("seeded".into()),
-        );
-
-        let mut execution = spawn_piped_interactive(cli, instance, req).unwrap();
-        assert!(
-            execution.try_inject_stdin(b"seeded\n").unwrap(),
-            "ACP spawn must retain stdin_injector after the optional seed"
-        );
-        let exit = execution.wait().await.unwrap();
-        assert_eq!(exit.exit_code, 0);
-    }
-
-    /// The one-shot piped path drops its injector so the child sees EOF.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn spawn_piped_drops_the_stdin_injector_after_seeding() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cli = fake_cli(&write_fake_cli(tmp.path(), "#!/bin/sh\ncat >/dev/null\n"));
-
-        let image = ImageRef::new("img:latest");
-        let instance = test_instance(cli, vec![ContainerOption::Image(image)]);
-        let (req, _handle) = piped_test_request(
-            vec!["run".into(), "img:latest".into()],
-            Some("hello".into()),
-        );
-
-        let mut execution = spawn_piped(cli, instance, req).unwrap();
-        assert!(
-            !execution.try_inject_stdin(b"more\n").unwrap(),
-            "one-shot piped spawn must have dropped its stdin_injector"
-        );
-        // The seeded prompt reached the child, which then saw EOF and exited.
-        let exit = execution.wait().await.unwrap();
-        assert_eq!(exit.exit_code, 0);
-    }
-
-    /// A missing binary is reported as a runtime-unavailable error naming that
-    /// backend's binary — the message both backends used to build by hand.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn spawn_piped_reports_a_missing_binary_as_runtime_unavailable() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cli = fake_cli(&tmp.path().join("definitely-not-installed"));
-
-        let image = ImageRef::new("img:latest");
-        let instance = test_instance(cli, vec![ContainerOption::Image(image)]);
-        let (req, _handle) = piped_test_request(vec!["run".into()], None);
-
-        let err = match spawn_piped(cli, instance, req) {
-            Ok(_) => panic!("spawn must fail when the binary does not exist"),
-            Err(err) => err,
-        };
-        match err {
-            EngineError::ContainerRuntimeUnavailable { binary } => {
-                assert_eq!(binary, cli.bin)
-            }
-            other => panic!("expected ContainerRuntimeUnavailable, got {other:?}"),
-        }
-    }
-
-    /// WI 0116 §1/D1, the second half of the fix: `build_run_argv` emits the
-    /// name only, so something has to put the value where the container CLI can
-    /// find it. Inside the squad daemon that value lives in the Layer 0 overlay
-    /// and *not* in the daemon's own environment, so ambient inheritance —
-    /// which is what carried a passthrough before WI 0116 — cannot reach it.
-    #[test]
-    fn piped_command_carries_the_passthrough_value_on_the_child_never_in_argv() {
-        use crate::data::config::env::{
-            set_daemon_overlay, DaemonEnvMap, DAEMON_OVERLAY_TEST_LOCK,
-        };
-        use crate::engine::container::options::EnvVar;
-
-        let _guard = DAEMON_OVERLAY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let name = "AWMAN_TEST_PROCESS_OVERLAY_ONLY";
-        std::env::remove_var(name);
-        set_daemon_overlay(DaemonEnvMap::from_pairs([(name, "overlay-secret")]));
-
-        let options = resolve(vec![
-            ContainerOption::Image(crate::engine::container::options::ImageRef::new(
-                "img:latest",
-            )),
-            ContainerOption::EnvPassthrough(EnvVar(name.into())),
-        ]);
-        let argv = vec!["run".to_string(), "-e".to_string(), name.to_string()];
-        let cmd = piped_command(ContainerCli::DOCKER, &argv, &options);
-
-        let injected: Vec<(String, String)> = cmd
-            .get_envs()
-            .filter_map(|(k, v)| {
-                Some((
-                    k.to_string_lossy().into_owned(),
-                    v?.to_string_lossy().into_owned(),
-                ))
-            })
-            .collect();
-        assert!(
-            injected.contains(&(name.to_string(), "overlay-secret".to_string())),
-            "the value must be set on the child's environment; got {injected:?}"
-        );
-        assert!(
-            !cmd.get_args()
-                .any(|a| a.to_string_lossy().contains("overlay-secret")),
-            "and it must never appear in argv"
-        );
-
-        set_daemon_overlay(DaemonEnvMap::new());
     }
 }

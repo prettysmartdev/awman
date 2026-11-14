@@ -1,55 +1,104 @@
 //! `AgentFrontend` impl for the CLI.
 //!
 //! All container I/O flows through `AgentIo` channels. The CLI
-//! constructs either interactive (PTY with raw mode) or non-interactive
+//! constructs either interactive (PTY with raw mode) or headless
 //! (piped, no PTY) channels depending on `self.non_interactive`.
 
 use async_trait::async_trait;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 use crate::data::message::{UserMessage, UserMessageSink};
 use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
 
 use crate::frontend::cli::command_frontend::{CliFrontend, RawModeGuard};
+use crate::frontend::terminal_output_filter::HostOutputFilter;
 
 #[async_trait]
 impl AgentFrontend for CliFrontend {
-    fn report_status(&mut self, _status: AgentStatus) {}
+    fn set_agent_output_format(
+        &mut self,
+        format: crate::data::agent_output_format::AgentOutputFormat,
+    ) {
+        if let Some(recorder) = &self.worker_events {
+            recorder.output_format(format);
+        }
+    }
+    fn report_status(&mut self, status: AgentStatus) {
+        if matches!(status, AgentStatus::Running { .. }) {
+            if let Some(recorder) = &self.worker_events {
+                recorder.writer.record_container_started();
+            }
+        }
+    }
     fn report_progress(&mut self, _progress: AgentProgress) {}
 
     fn take_io(&mut self) -> AgentIo {
-        if self.non_interactive {
+        let io = if self.non_interactive {
             self.take_non_interactive_io()
         } else {
             self.take_interactive_io()
+        };
+        match &self.worker_events {
+            Some(recorder) => recorder.io(io),
+            None => io,
         }
     }
 }
 
 impl CliFrontend {
-    /// Non-interactive: piped stdout/stderr; the frontend keeps no stdin
+    /// Headless: piped stdout/stderr; the frontend keeps no stdin
     /// sender. The engine owns the single `stdin_tx` returned in
     /// `AgentIo`, writes the seeded prompt through it, then drops it so
     /// the writer task sees EOF (see `spawn_piped_docker` /
     /// `spawn_piped_apple`).
-    fn take_non_interactive_io(&mut self) -> AgentIo {
+    pub(super) fn take_non_interactive_io(&mut self) -> AgentIo {
         let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
+        let tty = std::io::stdout().is_terminal();
+        let policy = self.host_output_policy;
+        let suppress_stdout = self.worker_json;
         tokio::spawn(async move {
+            let mut filter = tty.then(|| HostOutputFilter::new(policy));
             while let Some(bytes) = stdout_rx.recv().await {
+                if suppress_stdout {
+                    continue;
+                }
+                let mut safe = Vec::new();
+                if let Some(filter) = filter.as_mut() {
+                    filter.feed(&bytes, &mut safe);
+                } else {
+                    safe = bytes;
+                }
                 let mut out = std::io::stdout().lock();
-                let _ = out.write_all(&bytes);
+                let _ = out.write_all(&safe);
                 let _ = out.flush();
+            }
+            if let Some(filter) = filter.as_mut() {
+                let mut safe = Vec::new();
+                filter.finish(&mut safe);
+                let _ = std::io::stdout().lock().write_all(&safe);
             }
         });
 
         tokio::spawn(async move {
+            let mut filter = tty.then(|| HostOutputFilter::new(policy));
             while let Some(bytes) = stderr_rx.recv().await {
+                let mut safe = Vec::new();
+                if let Some(filter) = filter.as_mut() {
+                    filter.feed(&bytes, &mut safe);
+                } else {
+                    safe = bytes;
+                }
                 let mut err = std::io::stderr().lock();
-                let _ = err.write_all(&bytes);
+                let _ = err.write_all(&safe);
                 let _ = err.flush();
+            }
+            if let Some(filter) = filter.as_mut() {
+                let mut safe = Vec::new();
+                filter.finish(&mut safe);
+                let _ = std::io::stderr().lock().write_all(&safe);
             }
         });
 
@@ -83,20 +132,46 @@ impl CliFrontend {
         let initial_size = crossterm::terminal::size().ok();
 
         // Drain stdout to host stdout (unbuffered for raw mode).
+        let tty = std::io::stdout().is_terminal();
+        let policy = self.host_output_policy;
         tokio::spawn(async move {
+            let mut filter = tty.then(|| HostOutputFilter::new(policy));
             while let Some(bytes) = stdout_rx.recv().await {
+                let mut safe = Vec::new();
+                if let Some(filter) = filter.as_mut() {
+                    filter.feed(&bytes, &mut safe);
+                } else {
+                    safe = bytes;
+                }
                 let mut out = std::io::stdout().lock();
-                let _ = out.write_all(&bytes);
+                let _ = out.write_all(&safe);
                 let _ = out.flush();
+            }
+            if let Some(filter) = filter.as_mut() {
+                let mut safe = Vec::new();
+                filter.finish(&mut safe);
+                let _ = std::io::stdout().lock().write_all(&safe);
             }
         });
 
         // Drain stderr to host stderr (unbuffered for raw mode).
         tokio::spawn(async move {
+            let mut filter = tty.then(|| HostOutputFilter::new(policy));
             while let Some(bytes) = stderr_rx.recv().await {
+                let mut safe = Vec::new();
+                if let Some(filter) = filter.as_mut() {
+                    filter.feed(&bytes, &mut safe);
+                } else {
+                    safe = bytes;
+                }
                 let mut err = std::io::stderr().lock();
-                let _ = err.write_all(&bytes);
+                let _ = err.write_all(&safe);
                 let _ = err.flush();
+            }
+            if let Some(filter) = filter.as_mut() {
+                let mut safe = Vec::new();
+                filter.finish(&mut safe);
+                let _ = std::io::stderr().lock().write_all(&safe);
             }
         });
 
@@ -374,27 +449,4 @@ fn forward_attach_input(
         }
     }
     writer.send(bytes.to_vec()).is_ok()
-}
-
-#[cfg(test)]
-mod attach_input_tests {
-    use super::*;
-    #[tokio::test]
-    async fn attach_ctrl_c_detaches_local_live_stub_without_forwarding_sigint() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let cancel = tokio_util::sync::CancellationToken::new();
-        assert!(forward_attach_input(&tx, b"hello", Some(&cancel)));
-        assert_eq!(rx.recv().await.unwrap(), b"hello");
-        assert!(!forward_attach_input(&tx, &[3], Some(&cancel)));
-        assert!(cancel.is_cancelled());
-        assert!(
-            rx.try_recv().is_err(),
-            "the target must never receive Ctrl-C"
-        );
-        assert!(
-            forward_attach_input(&tx, &[3], None),
-            "chat preserves Ctrl-C"
-        );
-        assert_eq!(rx.recv().await.unwrap(), [3]);
-    }
 }

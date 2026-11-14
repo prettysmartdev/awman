@@ -25,6 +25,7 @@ use crate::data::session_status::SessionStatus;
 /// Persistable session metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRecord {
+    pub context_key: Option<String>,
     pub id: String,
     pub workdir: String,
     pub created_at: String,
@@ -51,6 +52,10 @@ pub struct SessionRecord {
     pub merge_refs: Vec<String>,
     /// For `remote` sessions, whether a successful command pushes the branch.
     pub push: bool,
+    /// WI 0145: the kind (`token`/`basic`) of a caller-supplied session Git
+    /// credential. A marker only: the credential itself is never persisted,
+    /// so a row with a marker and no in-memory credential is `credentials_lost`.
+    pub git_auth_kind: Option<String>,
 }
 
 /// The remote-session inputs recorded on a row right after it is inserted
@@ -63,6 +68,8 @@ pub struct RemoteSessionFields<'a> {
     pub base_ref: Option<&'a str>,
     pub merge_refs: &'a [String],
     pub push: bool,
+    /// WI 0145: the kind marker of the session credential, never its value.
+    pub git_auth_kind: Option<&'a str>,
 }
 
 /// The columns a new session row is created with.
@@ -101,6 +108,10 @@ pub enum SessionCommandAdmission {
 /// Persistable command metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandRecord {
+    pub listener_name: Option<String>,
+    pub allow_remote_input: bool,
+    pub listener: String,
+    pub trace_parent: Option<String>,
     pub id: String,
     pub session_id: String,
     pub subcommand: String,
@@ -295,11 +306,11 @@ pub struct CommandResult {
     /// Kept, deprecated: use `failure.stage`. Filled exactly as before WI
     /// 0137 (additive versioning): `"workflow_prerequisites"` for an
     /// unresolved prerequisite, `"push"` for a push-back failure, `"setup"`
-    /// for a `/v1/runs` setup failure, and absent otherwise (and on cancel).
+    /// for a `/v1/worker/runs` setup failure, and absent otherwise (and on cancel).
     /// Where it is present it equals `failure.stage`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
-    /// Kept, deprecated: a `/v1/runs` setup failure's own `{stage, message}`
+    /// Kept, deprecated: a `/v1/worker/runs` setup failure's own `{stage, message}`
     /// (WI 0135). Setup failures also carry `failure.stage = "setup"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_error: Option<serde_json::Value>,
@@ -337,10 +348,33 @@ pub struct CommandFailure {
     pub step: Option<String>,
 }
 
+/// `CommandFailure::stage` values (the stages listed on [`CommandFailure::stage`]
+/// plus WI 0143's lease Git authentication stage).
+pub mod failure_stages {
+    pub const SETUP: &str = "setup";
+    pub const PREFLIGHT: &str = "preflight";
+    pub const STEP: &str = "step";
+    pub const TEARDOWN: &str = "teardown";
+    pub const MERGE: &str = "merge";
+    pub const PUSH: &str = "push";
+    /// Host Git authentication (clone, fetch, ls-remote or push).
+    pub const GIT_AUTH: &str = "git_auth";
+}
+
 /// `CommandFailure::code` values that no `CommandError` variant produces:
 /// they describe engine outcomes and post-command stages, and the queue
 /// worker assigns them.
 pub mod failure_codes {
+    /// A host Git operation was refused for its credentials (WI 0143).
+    /// Stage [`super::failure_stages::GIT_AUTH`]. Never retried.
+    pub const GIT_AUTH_FAILED: &str = "git_auth_failed";
+    /// A lease push got no response from the remote within the lease window
+    /// (bounded retries exhausted). Stage [`super::failure_stages::PUSH`].
+    pub const PUSH_UNREACHABLE: &str = "push_unreachable";
+    /// The session was created with `git_auth`, but the daemon no longer
+    /// holds that in-memory credential (it restarted). Stage
+    /// [`super::failure_stages::GIT_AUTH`]. Never retried: open a new session.
+    pub const CREDENTIALS_LOST: &str = "credentials_lost";
     /// A main-phase step failed (`WorkflowOutcome::Failed`).
     pub const STEP_FAILED: &str = "step_failed";
     /// A non-execution command returned a nonzero exit status.
@@ -349,9 +383,9 @@ pub mod failure_codes {
     pub const TEARDOWN_FAILED: &str = "teardown_failed";
     /// Remote-session push-back failed.
     pub const PUSH_FAILED: &str = "push_failed";
-    /// `/v1/runs` session setup failed before the command ran.
+    /// `/v1/worker/runs` session setup failed before the command ran.
     pub const SETUP_FAILED: &str = "setup_failed";
-    /// Stopped by `POST /v1/commands/{id}/cancel`.
+    /// Stopped by `POST /v1/worker/commands/{id}/cancel`.
     pub const CANCELLED: &str = "cancelled";
     /// The workflow was aborted (`WorkflowOutcome::Aborted`).
     pub const ABORTED: &str = "aborted";
@@ -492,7 +526,7 @@ where
 ///
 /// Opening the store creates the database and runs migrations idempotently.
 pub struct SqliteSessionStore {
-    conn: Mutex<Connection>,
+    conn: std::sync::Arc<Mutex<Connection>>,
 }
 
 impl SqliteSessionStore {
@@ -517,8 +551,11 @@ impl SqliteSessionStore {
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         Self::migrate(&conn)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: std::sync::Arc::new(Mutex::new(conn)),
         })
+    }
+    pub(crate) fn shared_connection(&self) -> std::sync::Arc<Mutex<Connection>> {
+        self.conn.clone()
     }
 
     /// Convenience constructor that opens at the path resolved from `paths`.
@@ -572,6 +609,9 @@ impl SqliteSessionStore {
         // JSON array of branch names; NULL means none.
         Self::add_column_if_missing(conn, "sessions", "merge_refs", "TEXT")?;
         Self::add_column_if_missing(conn, "sessions", "push", "INTEGER NOT NULL DEFAULT 0")?;
+        // WI 0145: kind marker of an in-memory session credential (no value).
+        Self::add_column_if_missing(conn, "sessions", "git_auth_kind", "TEXT")?;
+        Self::add_column_if_missing(conn, "sessions", "context_key", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "worker_id", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "queued_at", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "result", "TEXT")?;
@@ -579,6 +619,20 @@ impl SqliteSessionStore {
         // COLUMN, so pre-0136 commands read back as attempt 1. That is the
         // backfill; no separate UPDATE is needed.
         Self::add_column_if_missing(conn, "commands", "attempt", "INTEGER NOT NULL DEFAULT 1")?;
+        Self::add_column_if_missing(
+            conn,
+            "commands",
+            "listener",
+            "TEXT NOT NULL DEFAULT 'local'",
+        )?;
+        Self::add_column_if_missing(conn, "commands", "trace_parent", "TEXT")?;
+        Self::add_column_if_missing(conn, "commands", "listener_name", "TEXT")?;
+        Self::add_column_if_missing(
+            conn,
+            "commands",
+            "allow_remote_input",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         // WI 0138: old databases may contain the retired status. Convert rows
         // in place without touching queued_at or rowid, which define claim order.
         conn.execute(
@@ -616,6 +670,7 @@ impl SqliteSessionStore {
         Self::add_column_if_missing(conn, "idempotency_keys", "intent_body", "TEXT")?;
         Self::add_column_if_missing(conn, "idempotency_keys", "resource_kind", "TEXT")?;
         Self::add_column_if_missing(conn, "idempotency_keys", "resource_id", "TEXT")?;
+        crate::data::fs::schema_version::migrate_ids(conn)?;
         Ok(())
     }
 
@@ -719,14 +774,15 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let affected = conn.execute(
             "UPDATE sessions SET repo_url = ?1, branch = ?2, base_ref = ?3, \
-                                 merge_refs = ?4, push = ?5 \
-             WHERE id = ?6",
+                                 merge_refs = ?4, push = ?5, git_auth_kind = ?6 \
+             WHERE id = ?7",
             params![
                 fields.repo_url,
                 fields.branch,
                 fields.base_ref,
                 merge_refs,
                 fields.push,
+                fields.git_auth_kind,
                 id
             ],
         )?;
@@ -753,7 +809,7 @@ impl SqliteSessionStore {
         let mut stmt = conn.prepare(
             "SELECT id, workdir, created_at, status, closed_at, \
                     setup_status, session_type, cloned_path, \
-                    repo_url, branch, base_ref, merge_refs, push \
+                    repo_url, branch, base_ref, merge_refs, push, git_auth_kind, context_key \
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], session_record_from_row)?;
@@ -765,7 +821,7 @@ impl SqliteSessionStore {
 
     /// Classify whether a session may accept a newly-submitted command, based
     /// on its lifecycle state. This is the state-transition guard that used to
-    /// live inline in the API `POST /v1/commands` handler; it belongs on the
+    /// live inline in the API `POST /v1/worker/commands` handler; it belongs on the
     /// store that owns the `status` column so every frontend enforces it
     /// identically. Frontends map the typed outcome to a transport status.
     pub fn command_admission(
@@ -785,7 +841,7 @@ impl SqliteSessionStore {
         let mut stmt = conn.prepare(
             "SELECT id, workdir, created_at, status, closed_at, \
                     setup_status, session_type, cloned_path, \
-                    repo_url, branch, base_ref, merge_refs, push \
+                    repo_url, branch, base_ref, merge_refs, push, git_auth_kind, context_key \
              FROM sessions ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], session_record_from_row)?;
@@ -807,7 +863,7 @@ impl SqliteSessionStore {
         let mut stmt = conn.prepare(
             "SELECT id, workdir, created_at, status, closed_at, \
                     setup_status, session_type, cloned_path, \
-                    repo_url, branch, base_ref, merge_refs, push \
+                    repo_url, branch, base_ref, merge_refs, push, git_auth_kind, context_key \
              FROM sessions WHERE status = ?1 ORDER BY created_at",
         )?;
         let rows = stmt.query_map(params![status.as_str()], session_record_from_row)?;
@@ -898,7 +954,7 @@ impl SqliteSessionStore {
         labels: &[LabelSelector],
     ) -> Result<Vec<SessionRecord>, DataError> {
         let mut sql = String::from(
-            "SELECT id,workdir,created_at,status,closed_at,setup_status,session_type,cloned_path,repo_url,branch,base_ref,merge_refs,push FROM sessions s WHERE 1=1",
+            "SELECT id,workdir,created_at,status,closed_at,setup_status,session_type,cloned_path,repo_url,branch,base_ref,merge_refs,push,git_auth_kind,context_key FROM sessions s WHERE 1=1",
         );
         let mut args: Vec<Value> = Vec::new();
         if let Some(status) = status {
@@ -923,7 +979,7 @@ impl SqliteSessionStore {
         filter: &CommandListFilter<'_>,
     ) -> Result<Vec<CommandRecord>, DataError> {
         let mut sql = String::from(
-            "SELECT c.id,c.session_id,c.subcommand,c.args,c.status,c.exit_code,c.started_at,c.finished_at,c.log_path,c.worker_id,c.queued_at,c.result,c.attempt FROM commands c WHERE 1=1",
+            "SELECT c.id,c.session_id,c.subcommand,c.args,c.status,c.exit_code,c.started_at,c.finished_at,c.log_path,c.worker_id,c.queued_at,c.result,c.attempt,c.listener,c.trace_parent,c.allow_remote_input,c.listener_name FROM commands c WHERE 1=1",
         );
         let mut args: Vec<Value> = Vec::new();
         if let Some(session) = filter.session_id {
@@ -957,7 +1013,7 @@ impl SqliteSessionStore {
         let mut stmt = conn.prepare(
             "SELECT id, workdir, created_at, status, closed_at, \
                     setup_status, session_type, cloned_path, \
-                    repo_url, branch, base_ref, merge_refs, push \
+                    repo_url, branch, base_ref, merge_refs, push, git_auth_kind, context_key \
              FROM sessions \
              WHERE setup_status IN ('initializing', 'cloning_repository', \
                                     'setting_up_branch', 'merging_refs', 'running_ready') \
@@ -1049,11 +1105,28 @@ impl SqliteSessionStore {
         Ok(())
     }
 
+    /// A pulled lease owns its executor permit before this row exists.
+    /// Insert as running atomically; it never enters the push queue.
+    pub fn insert_running_lease_command(
+        &self,
+        id: &str,
+        session: &str,
+        command: &str,
+        args: &str,
+        allow_remote_input: bool,
+    ) -> Result<(), DataError> {
+        self.lock().execute(
+            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, started_at, worker_id, allow_remote_input) VALUES (?1, ?2, ?3, ?4, 'running', '', ?5, 'pull', ?6)",
+            params![id, session, command, args, chrono::Utc::now().to_rfc3339(), allow_remote_input],
+        )?;
+        Ok(())
+    }
+
     pub fn get_command(&self, id: &str) -> Result<Option<CommandRecord>, DataError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, subcommand, args, status, exit_code, \
-                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt
+                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent, allow_remote_input, listener_name
              FROM commands WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], command_record_from_row)?;
@@ -1376,9 +1449,9 @@ impl SqliteSessionStore {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at)
-             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6)",
-            params![id, session_id, subcommand, args, log_path, now],
+            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at, listener, trace_parent)
+             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7, ?8)",
+            params![id, session_id, subcommand, args, log_path, now,"local",Option::<String>::None],
         )?;
         Ok(())
     }
@@ -1395,6 +1468,44 @@ impl SqliteSessionStore {
         log_path: &str,
         labels: &Labels,
     ) -> Result<(), DataError> {
+        self.enqueue_command_with_context(
+            id,
+            session_id,
+            subcommand,
+            args,
+            log_path,
+            labels,
+            &Default::default(),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_command_with_context(
+        &self,
+        id: &str,
+        session_id: &str,
+        subcommand: &str,
+        args: &str,
+        log_path: &str,
+        labels: &Labels,
+        context: &crate::data::daemon_state::CommandRequestContext,
+    ) -> Result<(), DataError> {
+        self.enqueue_command_with_terminal_input(
+            id, session_id, subcommand, args, log_path, labels, context, false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_command_with_terminal_input(
+        &self,
+        id: &str,
+        session_id: &str,
+        subcommand: &str,
+        args: &str,
+        log_path: &str,
+        labels: &Labels,
+        context: &crate::data::daemon_state::CommandRequestContext,
+        allow_remote_input: bool,
+    ) -> Result<(), DataError> {
         let now = chrono::Utc::now().to_rfc3339();
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -1409,9 +1520,9 @@ impl SqliteSessionStore {
             )?;
         }
         tx.execute(
-            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at)
-             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6)",
-            params![id, session_id, subcommand, args, log_path, now],
+            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at, listener, trace_parent, allow_remote_input, listener_name)
+             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![id, session_id, subcommand, args, log_path, now,context.listener.as_str(),context.trace_parent, allow_remote_input, context.listener_name],
         )?;
         tx.commit()?;
         Ok(())
@@ -1438,7 +1549,7 @@ impl SqliteSessionStore {
                  LIMIT 1
              )
              RETURNING id, session_id, subcommand, args, status, exit_code,
-                       started_at, finished_at, log_path, worker_id, queued_at, result, attempt",
+                       started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent, allow_remote_input, listener_name",
         )?;
         let mut rows = stmt.query_map(params![worker_id, now], command_record_from_row)?;
         match rows.next() {
@@ -1496,7 +1607,7 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, subcommand, args, status, exit_code,
-                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt
+                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent, allow_remote_input, listener_name
              FROM commands
              WHERE session_id = ?1
              ORDER BY queued_at DESC, rowid DESC
@@ -1539,7 +1650,7 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, subcommand, args, status, exit_code,
-                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt
+                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent, allow_remote_input, listener_name
              FROM commands
              WHERE session_id = ?1 AND status = 'running'
              LIMIT 1",
@@ -1567,6 +1678,9 @@ impl SqliteSessionStore {
         Ok(ids)
     }
 
+    /// Re-queue pushed commands a dead worker left `running`. Pulled-lease
+    /// rows (`worker_id = 'pull'`) are never re-queued: they cannot run
+    /// without their lease, and a live TUI or CLI host may still own one.
     pub fn recover_stale_commands(&self, timeout_secs: u64) -> Result<Vec<String>, DataError> {
         let cutoff = chrono::Utc::now() - chrono::Duration::seconds(timeout_secs as i64);
         let cutoff_str = cutoff.to_rfc3339();
@@ -1574,7 +1688,8 @@ impl SqliteSessionStore {
         let ids: Vec<String> = {
             let mut stmt = conn.prepare(
                 "SELECT id FROM commands
-                 WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1",
+                 WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1
+                   AND worker_id IS NOT 'pull'",
             )?;
             let rows = stmt
                 .query_map(params![cutoff_str], |row| row.get(0))?
@@ -1584,7 +1699,8 @@ impl SqliteSessionStore {
         conn.execute(
             "UPDATE commands SET status = 'queued', worker_id = NULL, started_at = NULL,
                  attempt = attempt + 1
-             WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1",
+             WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1
+                   AND worker_id IS NOT 'pull'",
             params![cutoff_str],
         )?;
         Ok(ids)
@@ -1676,11 +1792,17 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
             .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
             .unwrap_or_default(),
         push: row.get(12)?,
+        git_auth_kind: row.get(13)?,
+        context_key: row.get(14)?,
     })
 }
 
 fn command_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> {
     Ok(CommandRecord {
+        listener_name: row.get(16)?,
+        allow_remote_input: row.get(15)?,
+        listener: row.get(13)?,
+        trace_parent: row.get(14)?,
         id: row.get(0)?,
         session_id: row.get(1)?,
         subcommand: row.get(2)?,
@@ -1698,7 +1820,7 @@ fn command_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandR
 }
 
 fn labels_from_map(map: BTreeMap<String, String>) -> Result<Labels, DataError> {
-    Labels::new(map).map_err(|e| DataError::Other(format!("invalid labels in API database: {e}")))
+    Ok(Labels::from_stored(map))
 }
 
 fn append_label_predicates(
@@ -1795,1177 +1917,16 @@ fn parse_timestamp(value: &str) -> Result<chrono::DateTime<chrono::Utc>, DataErr
         .map_err(|e| DataError::Other(format!("invalid RFC3339 timestamp '{value}': {e}")))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::command_status::CommandStatus;
-
-    #[test]
-    fn decode_args_names_the_command_for_invalid_stored_args() {
-        let (_tmp, store) = make_store();
-        store.insert_session("s", "/work", "then").unwrap();
-        store
-            .enqueue_command("ok", "s", "exec prompt", r#"["a","b"]"#, "log")
-            .unwrap();
-        let ok = store.get_command("ok").unwrap().unwrap();
-        assert_eq!(ok.decode_args().unwrap(), ["a", "b"]);
-        for (id, args) in [("bad", "not json"), ("object", "{}"), ("mixed", "[1]")] {
-            store
-                .enqueue_command(id, "s", "exec prompt", args, "log")
-                .unwrap();
-            let error = store
-                .get_command(id)
-                .unwrap()
-                .unwrap()
-                .decode_args()
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.contains(&format!("command {id}: stored args")),
-                "{error}"
-            );
-        }
-    }
-
-    #[test]
-    fn finalize_running_command_requires_running_and_the_same_attempt() {
-        let (_tmp, store) = make_store();
-        store.insert_session("s", "/work", "then").unwrap();
-        store
-            .enqueue_command("c", "s", "exec prompt", "[]", "log")
-            .unwrap();
-        let completion = CommandCompletion {
-            attempt: 1,
-            status: CommandStatus::Done,
-            exit_code: 0,
-            result_json: "{}".into(),
-            finished_at: "finished".into(),
-        };
-        // Queued: nothing to finalize.
-        assert!(!store.finalize_running_command("c", &completion).unwrap());
-        store.claim_next_command("w").unwrap().unwrap();
-        let stale = CommandCompletion {
-            attempt: 9,
-            ..completion.clone()
-        };
-        assert!(!store.finalize_running_command("c", &stale).unwrap());
-        assert!(store.finalize_running_command("c", &completion).unwrap());
-        let row = store.get_command("c").unwrap().unwrap();
-        assert_eq!(row.status.as_str(), "done");
-        assert_eq!(row.finished_at.as_deref(), Some("finished"));
-        // Exactly once: a terminal row is never rewritten.
-        assert!(!store.finalize_running_command("c", &completion).unwrap());
-    }
-
-    fn make_store() -> (tempfile::TempDir, SqliteSessionStore) {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = SqliteSessionStore::open(tmp.path()).unwrap();
-        (tmp, store)
-    }
-
-    // ─── open / migrations ────────────────────────────────────────────────────
-
-    #[test]
-    fn open_fresh_db_succeeds() {
-        let (_tmp, _store) = make_store();
-        // If we reach here without panic/error, the open + migration succeeded.
-    }
-
-    #[test]
-    fn labels_round_trip_and_filter_sessions_and_commands() {
-        let (_tmp, store) = make_store();
-        store
-            .insert_session("s-label", "/work", "2026-01-01T00:00:00Z")
-            .unwrap();
-        store
-            .insert_command("c-label", "s-label", "chat", "[]", "/tmp/log")
-            .unwrap();
-        store
-            .insert_session("s-partial", "/work-2", "2026-01-02T00:00:00Z")
-            .unwrap();
-        store
-            .insert_command("c-partial", "s-partial", "chat", "[]", "/tmp/log-2")
-            .unwrap();
-        let labels = Labels::new(BTreeMap::from([
-            ("env".to_owned(), "prod".to_owned()),
-            ("tier".to_owned(), "api".to_owned()),
-        ]))
-        .unwrap();
-        store
-            .set_labels(LabelOwner::Session, "s-label", &labels)
-            .unwrap();
-        store
-            .set_labels(LabelOwner::Command, "c-label", &labels)
-            .unwrap();
-        let partial = Labels::new(BTreeMap::from([("env".to_owned(), "prod".to_owned())])).unwrap();
-        store
-            .set_labels(LabelOwner::Session, "s-partial", &partial)
-            .unwrap();
-        store
-            .set_labels(LabelOwner::Command, "c-partial", &partial)
-            .unwrap();
-        assert_eq!(
-            store.labels_for(LabelOwner::Session, "s-label").unwrap(),
-            labels
-        );
-        assert_eq!(
-            store
-                .labels_for_many(LabelOwner::Command, &["c-label".into(), "missing".into()])
-                .unwrap()["c-label"],
-            labels
-        );
-        let selectors = [
-            LabelSelector::parse("env=prod").unwrap(),
-            LabelSelector::parse("tier").unwrap(),
-        ];
-        assert_eq!(
-            store
-                .list_sessions_filtered(Some(SessionStatus::Active), None, &selectors)
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            store
-                .list_sessions_filtered(Some(SessionStatus::Active), None, &[selectors[0].clone()])
-                .unwrap()
-                .len(),
-            2,
-            "one selector matches both rows"
-        );
-        assert_eq!(
-            store
-                .list_commands_filtered(&CommandListFilter {
-                    session_id: Some("s-label"),
-                    status: Some(CommandStatus::Pending),
-                    labels: &selectors,
-                    limit: 10
-                })
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            store
-                .list_commands_filtered(&CommandListFilter {
-                    session_id: None,
-                    status: Some(CommandStatus::Pending),
-                    labels: &[selectors[0].clone()],
-                    limit: 10
-                })
-                .unwrap()
-                .len(),
-            2,
-            "one selector matches both commands"
-        );
-    }
-
-    #[test]
-    fn idempotency_replays_until_24_hour_expiry_and_is_scope_isolated() {
-        let (_tmp, store) = make_store();
-        let commands = IdempotencyScope {
-            route: "/v1/commands",
-            principal: "key-a",
-        };
-        let other_principal = IdempotencyScope {
-            route: "/v1/commands",
-            principal: "key-b",
-        };
-        let other_route = IdempotencyScope {
-            route: "/v1/runs",
-            principal: "key-a",
-        };
-        let owner = IdempotencyOwner {
-            instance: "daemon",
-            request: "request-1",
-        };
-        let retry = IdempotencyOwner {
-            instance: "daemon",
-            request: "request-2",
-        };
-        let t0 = "2026-01-01T00:00:00Z";
-
-        assert_eq!(
-            store
-                .idempotency_begin(commands, "key", "body", t0, owner)
-                .unwrap(),
-            IdempotencyBegin::Fresh
-        );
-        assert!(store
-            .idempotency_complete(commands, "key", owner, 202, r#"{"command_id":"c1"}"#)
-            .unwrap());
-        assert_eq!(
-            store
-                .idempotency_begin(commands, "key", "body", "2026-01-01T23:59:59Z", retry)
-                .unwrap(),
-            IdempotencyBegin::Replay {
-                status: 202,
-                body: r#"{"command_id":"c1"}"#.into()
-            }
-        );
-
-        // The deterministic timestamp is the injected clock: just beyond
-        // +24h the completed reservation is pruned and the key can be admitted.
-        assert_eq!(
-            store
-                .idempotency_begin(commands, "key", "body", "2026-01-02T00:00:01Z", retry)
-                .unwrap(),
-            IdempotencyBegin::Fresh
-        );
-        assert_eq!(
-            store
-                .idempotency_begin(other_principal, "key", "body", t0, owner)
-                .unwrap(),
-            IdempotencyBegin::Fresh
-        );
-        assert_eq!(
-            store
-                .idempotency_begin(other_route, "key", "body", t0, owner)
-                .unwrap(),
-            IdempotencyBegin::Fresh
-        );
-    }
-
-    #[test]
-    fn idempotency_replays_mismatches_expires_and_releases() {
-        let (_tmp, store) = make_store();
-        let scope = IdempotencyScope {
-            route: "/v1/commands",
-            principal: "local",
-        };
-        let a = IdempotencyOwner {
-            instance: "daemon-1",
-            request: "a",
-        };
-        let b = IdempotencyOwner {
-            instance: "daemon-1",
-            request: "b",
-        };
-        let t0 = "2026-01-01T00:00:00Z";
-        assert_eq!(
-            store
-                .idempotency_begin(scope, "key", "hash", t0, a)
-                .unwrap(),
-            IdempotencyBegin::Fresh
-        );
-        assert_eq!(
-            store
-                .idempotency_begin(scope, "key", "hash", t0, b)
-                .unwrap(),
-            IdempotencyBegin::InFlight
-        );
-        assert_eq!(
-            store
-                .idempotency_begin(scope, "key", "other", t0, b)
-                .unwrap(),
-            IdempotencyBegin::Mismatch
-        );
-        // A live owner is never displaced, however long it takes.
-        assert_eq!(
-            store
-                .idempotency_begin(scope, "key", "hash", "2026-01-01T00:05:00Z", b)
-                .unwrap(),
-            IdempotencyBegin::InFlight
-        );
-        assert!(!store
-            .idempotency_complete(scope, "key", b, 202, "{}")
-            .unwrap());
-        assert!(store
-            .idempotency_complete(scope, "key", a, 202, r#"{"ok":true}"#)
-            .unwrap());
-        assert_eq!(
-            store
-                .idempotency_begin(scope, "key", "hash", t0, b)
-                .unwrap(),
-            IdempotencyBegin::Replay {
-                status: 202,
-                body: r#"{"ok":true}"#.into()
-            }
-        );
-        // A completed key stays bound to its body for the whole TTL.
-        assert_eq!(
-            store
-                .idempotency_begin(scope, "key", "new", "2026-01-01T00:01:01Z", b)
-                .unwrap(),
-            IdempotencyBegin::Mismatch
-        );
-        // Release is owner-fenced and leaves completed responses alone.
-        store.idempotency_release(scope, "key", a).unwrap();
-        assert!(matches!(
-            store
-                .idempotency_begin(scope, "key", "hash", t0, b)
-                .unwrap(),
-            IdempotencyBegin::Replay { .. }
-        ));
-        assert_eq!(
-            store
-                .idempotency_begin(scope, "other", "x", "2026-01-01T00:02:00Z", a)
-                .unwrap(),
-            IdempotencyBegin::Fresh
-        );
-        store.idempotency_release(scope, "other", b).unwrap();
-        assert_eq!(
-            store
-                .idempotency_begin(scope, "other", "x", "2026-01-01T00:02:00Z", b)
-                .unwrap(),
-            IdempotencyBegin::InFlight
-        );
-        store.idempotency_release(scope, "other", a).unwrap();
-        assert_eq!(
-            store
-                .idempotency_begin(scope, "other", "y", "2026-01-01T00:02:00Z", b)
-                .unwrap(),
-            IdempotencyBegin::Fresh
-        );
-        // A reservation left by an exited daemon that admitted nothing is
-        // handed over; its old owner can then no longer complete it.
-        let restarted = IdempotencyOwner {
-            instance: "daemon-2",
-            request: "c",
-        };
-        assert_eq!(
-            store
-                .idempotency_begin(scope, "other", "z", "2026-01-01T00:02:30Z", restarted)
-                .unwrap(),
-            IdempotencyBegin::Fresh
-        );
-        assert!(!store
-            .idempotency_complete(scope, "other", b, 202, "{}")
-            .unwrap());
-        assert_eq!(
-            store
-                .prune_idempotency_keys(24, "2026-01-03T00:02:00Z")
-                .unwrap(),
-            2
-        );
-    }
-
-    #[test]
-    fn open_is_idempotent_on_populated_db() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Open twice on the same directory — migrations must be idempotent.
-        let store1 = SqliteSessionStore::open(tmp.path()).unwrap();
-        store1
-            .insert_session("s1", "/work", "2024-01-01T00:00:00Z")
-            .unwrap();
-        drop(store1);
-
-        let store2 = SqliteSessionStore::open(tmp.path()).unwrap();
-        let records = store2.list_sessions().unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].id, "s1");
-    }
-
-    // ─── Session CRUD ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn session_insert_and_get() {
-        let (_tmp, store) = make_store();
-        store
-            .insert_session("s1", "/work", "2024-01-01T00:00:00Z")
-            .unwrap();
-
-        let record = store.get_session("s1").unwrap().expect("session not found");
-        assert_eq!(record.id, "s1");
-        assert_eq!(record.workdir, "/work");
-        assert_eq!(record.created_at, "2024-01-01T00:00:00Z");
-        assert_eq!(record.status.as_str(), "active");
-        assert!(record.closed_at.is_none());
-    }
-
-    #[test]
-    fn get_session_returns_none_when_not_found() {
-        let (_tmp, store) = make_store();
-        let result = store.get_session("nonexistent").unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn list_sessions_returns_all_inserted() {
-        let (_tmp, store) = make_store();
-        store
-            .insert_session("s1", "/a", "2024-01-01T00:00:00Z")
-            .unwrap();
-        store
-            .insert_session("s2", "/b", "2024-01-02T00:00:00Z")
-            .unwrap();
-        store
-            .insert_session("s3", "/c", "2024-01-03T00:00:00Z")
-            .unwrap();
-
-        let records = store.list_sessions().unwrap();
-        assert_eq!(records.len(), 3);
-        let ids: Vec<&str> = records.iter().map(|r| r.id.as_str()).collect();
-        assert!(ids.contains(&"s1"));
-        assert!(ids.contains(&"s2"));
-        assert!(ids.contains(&"s3"));
-    }
-
-    #[test]
-    fn close_session_changes_status_and_sets_closed_at() {
-        let (_tmp, store) = make_store();
-        store
-            .insert_session("s1", "/work", "2024-01-01T00:00:00Z")
-            .unwrap();
-
-        let closed = store.close_session("s1", "2024-01-02T00:00:00Z").unwrap();
-        assert!(closed);
-
-        let record = store.get_session("s1").unwrap().unwrap();
-        assert_eq!(record.status.as_str(), "closed");
-        assert_eq!(record.closed_at.as_deref(), Some("2024-01-02T00:00:00Z"));
-    }
-
-    #[test]
-    fn close_session_already_closed_returns_false() {
-        let (_tmp, store) = make_store();
-        store
-            .insert_session("s1", "/work", "2024-01-01T00:00:00Z")
-            .unwrap();
-        store.close_session("s1", "2024-01-02T00:00:00Z").unwrap();
-
-        // Closing again should return false (no rows updated).
-        let closed_again = store.close_session("s1", "2024-01-03T00:00:00Z").unwrap();
-        assert!(!closed_again);
-    }
-
-    #[test]
-    fn count_active_sessions() {
-        let (_tmp, store) = make_store();
-        assert_eq!(store.count_active_sessions().unwrap(), 0);
-
-        store
-            .insert_session("s1", "/a", "2024-01-01T00:00:00Z")
-            .unwrap();
-        store
-            .insert_session("s2", "/b", "2024-01-02T00:00:00Z")
-            .unwrap();
-        assert_eq!(store.count_active_sessions().unwrap(), 2);
-
-        store.close_session("s1", "2024-01-03T00:00:00Z").unwrap();
-        assert_eq!(store.count_active_sessions().unwrap(), 1);
-    }
-
-    #[test]
-    fn list_sessions_by_status_active() {
-        let (_tmp, store) = make_store();
-        store
-            .insert_session("s1", "/a", "2024-01-01T00:00:00Z")
-            .unwrap();
-        store
-            .insert_session("s2", "/b", "2024-01-02T00:00:00Z")
-            .unwrap();
-        store.close_session("s1", "2024-01-03T00:00:00Z").unwrap();
-
-        let active = store
-            .list_sessions_by_status(Some(SessionStatus::Active))
-            .unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(active[0].id, "s2");
-
-        let closed = store
-            .list_sessions_by_status(Some(SessionStatus::Closed))
-            .unwrap();
-        assert_eq!(closed.len(), 1);
-        assert_eq!(closed[0].id, "s1");
-    }
-
-    // ─── Command CRUD ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn command_insert_and_get() {
-        let (_tmp, store) = make_store();
-        store
-            .insert_session("s1", "/work", "2024-01-01T00:00:00Z")
-            .unwrap();
-        store
-            .insert_command("c1", "s1", "chat", "[]", "/logs/c1.log")
-            .unwrap();
-
-        let cmd = store.get_command("c1").unwrap().expect("command not found");
-        assert_eq!(cmd.id, "c1");
-        assert_eq!(cmd.session_id, "s1");
-        assert_eq!(cmd.subcommand, "chat");
-        assert_eq!(cmd.status.as_str(), "queued");
-        assert_eq!(cmd.log_path, "/logs/c1.log");
-        assert!(cmd.exit_code.is_none());
-    }
-
-    #[test]
-    fn update_command_started_sets_status_running() {
-        let (_tmp, store) = make_store();
-        store
-            .insert_session("s1", "/work", "2024-01-01T00:00:00Z")
-            .unwrap();
-        store
-            .insert_command("c1", "s1", "chat", "[]", "/logs/c1.log")
-            .unwrap();
-
-        store
-            .update_command_started("c1", "2024-01-01T01:00:00Z")
-            .unwrap();
-
-        let cmd = store.get_command("c1").unwrap().unwrap();
-        assert_eq!(cmd.status.as_str(), "running");
-        assert_eq!(cmd.started_at.as_deref(), Some("2024-01-01T01:00:00Z"));
-    }
-
-    #[test]
-    fn update_command_finished_sets_status_and_exit_code() {
-        let (_tmp, store) = make_store();
-        store
-            .insert_session("s1", "/work", "2024-01-01T00:00:00Z")
-            .unwrap();
-        store
-            .insert_command("c1", "s1", "chat", "[]", "/logs/c1.log")
-            .unwrap();
-        store
-            .update_command_started("c1", "2024-01-01T01:00:00Z")
-            .unwrap();
-
-        store
-            .update_command_finished("c1", CommandStatus::Done, Some(0), "2024-01-01T02:00:00Z")
-            .unwrap();
-
-        let cmd = store.get_command("c1").unwrap().unwrap();
-        assert_eq!(cmd.status.as_str(), "done");
-        assert_eq!(cmd.exit_code, Some(0));
-        assert_eq!(cmd.finished_at.as_deref(), Some("2024-01-01T02:00:00Z"));
-    }
-
-    #[test]
-    fn count_running_commands() {
-        let (_tmp, store) = make_store();
-        store
-            .insert_session("s1", "/work", "2024-01-01T00:00:00Z")
-            .unwrap();
-        assert_eq!(store.count_running_commands().unwrap(), 0);
-
-        store
-            .insert_command("c1", "s1", "chat", "[]", "/logs/c1.log")
-            .unwrap();
-        store
-            .update_command_started("c1", "2024-01-01T01:00:00Z")
-            .unwrap();
-        assert_eq!(store.count_running_commands().unwrap(), 1);
-
-        store
-            .update_command_finished("c1", CommandStatus::Done, Some(0), "2024-01-01T02:00:00Z")
-            .unwrap();
-        assert_eq!(store.count_running_commands().unwrap(), 0);
-    }
-
-    #[test]
-    fn has_running_command_for_session() {
-        let (_tmp, store) = make_store();
-        store
-            .insert_session("s1", "/work", "2024-01-01T00:00:00Z")
-            .unwrap();
-        store
-            .insert_command("c1", "s1", "chat", "[]", "/logs/c1.log")
-            .unwrap();
-
-        // Pending counts as "in-flight".
-        assert!(store.has_running_command_for_session("s1").unwrap());
-        // Finish the command.
-        store
-            .update_command_started("c1", "2024-01-01T01:00:00Z")
-            .unwrap();
-        store
-            .update_command_finished("c1", CommandStatus::Done, Some(0), "2024-01-01T02:00:00Z")
-            .unwrap();
-        assert!(!store.has_running_command_for_session("s1").unwrap());
-    }
-
-    // ─── WI 0136: attempt column ──────────────────────────────────────────────
-
-    fn insert_running(store: &SqliteSessionStore, id: &str) {
-        store
-            .with_conn(|conn| {
-                conn.execute(
-                    "INSERT INTO commands (id, session_id, subcommand, args, status, log_path,
-                             started_at, worker_id, queued_at)
-                     VALUES (?1, 's1', 'exec prompt', '[]', 'running', '/logs/x',
-                             '2020-01-01T00:00:00Z', 'dead-worker', '2020-01-01T00:00:00Z')",
-                    params![id],
-                )
-                .map_err(DataError::from)
-            })
-            .unwrap();
-    }
-
-    #[test]
-    fn new_commands_start_at_attempt_one() {
-        let (_tmp, store) = make_store();
-        store
-            .insert_session("s1", "/w", "2026-01-01T00:00:00Z")
-            .unwrap();
-        store
-            .enqueue_command("c1", "s1", "chat", "[]", "/l")
-            .unwrap();
-        assert_eq!(store.get_command("c1").unwrap().unwrap().attempt, 1);
-        let claimed = store.claim_next_command("w").unwrap().unwrap();
-        assert_eq!(claimed.attempt, 1);
-    }
-
-    #[test]
-    fn recover_stale_commands_increments_attempt_each_time() {
-        let (_tmp, store) = make_store();
-        store
-            .insert_session("s1", "/w", "2026-01-01T00:00:00Z")
-            .unwrap();
-        insert_running(&store, "crash");
-        assert_eq!(store.recover_stale_commands(1).unwrap(), ["crash"]);
-        let row = store.get_command("crash").unwrap().unwrap();
-        assert_eq!((row.status.as_str(), row.attempt), ("queued", 2));
-
-        // The re-queued claim reports the incremented attempt.
-        let claimed = store.claim_next_command("w2").unwrap().unwrap();
-        assert_eq!((claimed.id.as_str(), claimed.attempt), ("crash", 2));
-
-        // A second crash while running attempt 2 moves it to attempt 3.
-        store
-            .with_conn(|conn| {
-                conn.execute(
-                    "UPDATE commands SET started_at = '2020-01-01T00:00:00Z' WHERE id = 'crash'",
-                    [],
-                )
-                .map_err(DataError::from)
-            })
-            .unwrap();
-        assert_eq!(store.recover_stale_commands(1).unwrap(), ["crash"]);
-        assert_eq!(store.get_command("crash").unwrap().unwrap().attempt, 3);
-    }
-
-    #[test]
-    fn recover_stale_commands_leaves_other_rows_at_their_attempt() {
-        let (_tmp, store) = make_store();
-        store
-            .insert_session("s1", "/w", "2026-01-01T00:00:00Z")
-            .unwrap();
-        store
-            .enqueue_command("queued", "s1", "chat", "[]", "/l")
-            .unwrap();
-        assert!(store.recover_stale_commands(0).unwrap().is_empty());
-        assert_eq!(store.get_command("queued").unwrap().unwrap().attempt, 1);
-    }
-
-    #[test]
-    fn migration_backfills_attempt_one_on_pre_existing_rows() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("awman.db");
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE sessions (
-                    id TEXT PRIMARY KEY, workdir TEXT NOT NULL, created_at TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'active', closed_at TEXT
-                );
-                CREATE TABLE commands (
-                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
-                    subcommand TEXT NOT NULL, args TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending', exit_code INTEGER,
-                    started_at TEXT, finished_at TEXT, log_path TEXT NOT NULL
-                );
-                INSERT INTO sessions (id, workdir, created_at) VALUES ('s', '/w', '2023-01-01');
-                INSERT INTO commands (id, session_id, subcommand, args, status, log_path)
-                    VALUES ('old-1', 's', 'chat', '[]', 'running', '/l1'),
-                           ('old-2', 's', 'chat', '[]', 'done', '/l2');",
-            )
-            .unwrap();
-        }
-        let store = SqliteSessionStore::open(tmp.path()).unwrap();
-        for id in ["old-1", "old-2"] {
-            assert_eq!(store.get_command(id).unwrap().unwrap().attempt, 1, "{id}");
-        }
-        // Opening again is idempotent and keeps later increments.
-        store
-            .with_conn(|conn| {
-                conn.execute("UPDATE commands SET attempt = 4 WHERE id = 'old-1'", [])
-                    .map_err(DataError::from)
-            })
-            .unwrap();
-        drop(store);
-        let store = SqliteSessionStore::open(tmp.path()).unwrap();
-        assert_eq!(store.get_command("old-1").unwrap().unwrap().attempt, 4);
-        assert_eq!(store.get_command("old-2").unwrap().unwrap().attempt, 1);
-    }
-
-    #[test]
-    fn migration_normalizes_legacy_pending_and_preserves_claim_order_and_filter_alias() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("awman.db");
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE sessions (
-                    id TEXT PRIMARY KEY, workdir TEXT NOT NULL, created_at TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'active', closed_at TEXT
-                );
-                CREATE TABLE commands (
-                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
-                    subcommand TEXT NOT NULL, args TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending', exit_code INTEGER,
-                    started_at TEXT, finished_at TEXT, log_path TEXT NOT NULL,
-                    queued_at TEXT
-                );
-                INSERT INTO sessions (id, workdir, created_at)
-                    VALUES ('s-later', '/w', '2026-01-01'),
-                           ('s-first', '/w', '2026-01-01'),
-                           ('s-same-next', '/w', '2026-01-01');
-                INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at)
-                    VALUES ('later', 's-later', 'chat', '[]', 'pending', '/later', '2026-01-02T00:00:00Z'),
-                           ('first', 's-first', 'chat', '[]', 'pending', '/first', '2026-01-01T00:00:00Z'),
-                           ('same-time-next', 's-same-next', 'chat', '[]', 'pending', '/next', '2026-01-01T00:00:00Z');",
-            )
-            .unwrap();
-        }
-
-        let store = SqliteSessionStore::open(tmp.path()).unwrap();
-        let filter = CommandListFilter {
-            status: Some(CommandStatus::Pending),
-            limit: 10,
-            ..CommandListFilter::default()
-        };
-        let filtered = store.list_commands_filtered(&filter).unwrap();
-        assert_eq!(filtered.len(), 3);
-        assert!(filtered
-            .iter()
-            .all(|command| command.status == CommandStatus::Queued));
-
-        // Migration leaves both ordering columns alone: queued_at first,
-        // then the original rowid for ties.
-        for expected_id in ["first", "same-time-next", "later"] {
-            let claimed = store.claim_next_command("worker").unwrap().unwrap();
-            assert_eq!(claimed.id, expected_id);
-        }
-        assert!(store.claim_next_command("worker").unwrap().is_none());
-    }
-
-    #[test]
-    fn mixed_legacy_queue_keeps_null_first_order_across_reopens_and_old_writers() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = SqliteSessionStore::open(tmp.path()).unwrap();
-        store.insert_session("s", "/work", "2026-01-01").unwrap();
-        store
-            .with_conn(|conn| {
-                conn.execute_batch(
-                    "INSERT INTO commands(id,session_id,subcommand,args,status,log_path,queued_at)
-                VALUES ('null','s','chat','[]','pending','/l',NULL),
-                       ('queued','s','chat','[]','queued','/l','2026-01-01'),
-                       ('pending','s','chat','[]','pending','/l','2026-01-01');",
-                )?;
-                Ok(())
-            })
-            .unwrap();
-        drop(store);
-        for _ in 0..2 {
-            let store = SqliteSessionStore::open(tmp.path()).unwrap();
-            assert_eq!(store.count_queued_for_session("s").unwrap(), 3);
-            for (position, id) in ["null", "queued", "pending"].iter().enumerate() {
-                assert_eq!(
-                    store.get_command(id).unwrap().unwrap().status.as_str(),
-                    "queued"
-                );
-                assert_eq!(
-                    store.queue_position_for_command(id, "s").unwrap(),
-                    Some(position as i64)
-                );
-            }
-        }
-        let store = SqliteSessionStore::open(tmp.path()).unwrap();
-        // An old daemon can still insert pending after our migration has run.
-        store
-            .with_conn(|conn| {
-                conn.execute(
-                    "INSERT INTO commands(id,session_id,subcommand,args,status,log_path,queued_at)
-                VALUES ('late','s','chat','[]','pending','/l','2026-01-02')",
-                    [],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(
-            store.get_command("late").unwrap().unwrap().status.as_str(),
-            "queued"
-        );
-        assert_eq!(store.count_queued_for_session("s").unwrap(), 4);
-        assert_eq!(
-            store.queue_position_for_command("late", "s").unwrap(),
-            Some(3)
-        );
-        for expected in ["null", "queued", "pending", "late"] {
-            let command = store.claim_next_command("worker").unwrap().unwrap();
-            assert_eq!(command.id, expected);
-            store
-                .complete_command(expected, CommandStatus::Done, Some(0), None)
-                .unwrap();
-        }
-        assert!(store.claim_next_command("worker").unwrap().is_none());
-    }
-
-    // ─── Existing database schema compatibility ───────────────────────────────
-    //
-    // Creates a database with the established schema, inserts data, then opens
-    // it with SqliteSessionStore to verify existing on-disk records remain readable.
-
-    #[test]
-    fn cancelling_a_session_queue_covers_pending_written_after_open() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = SqliteSessionStore::open(tmp.path()).unwrap();
-        store.insert_session("s", "/work", "2026-01-01").unwrap();
-        store
-            .enqueue_command("new", "s", "chat", "[]", "/l")
-            .unwrap();
-        store
-            .enqueue_command("old", "s", "chat", "[]", "/l")
-            .unwrap();
-        store
-            .with_conn(|conn| {
-                conn.execute("UPDATE commands SET status='pending' WHERE id='old'", [])?;
-                Ok(())
-            })
-            .unwrap();
-
-        let mut cancelled = store.cancel_queued_for_session("s").unwrap();
-        cancelled.sort();
-        assert_eq!(cancelled, ["new", "old"]);
-        for id in ["new", "old"] {
-            let row = store.get_command(id).unwrap().unwrap();
-            assert_eq!(row.status, CommandStatus::Cancelled, "{id}");
-            assert!(row.finished_at.is_some(), "{id}");
-        }
-        assert!(store.claim_next_command("w").unwrap().is_none());
-        // Already terminal rows are not reported as cancelled again.
-        assert!(store.cancel_queued_for_session("s").unwrap().is_empty());
-    }
-
-    #[test]
-    fn every_stored_status_round_trips_and_unknown_values_are_named_errors() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = SqliteSessionStore::open(tmp.path()).unwrap();
-        store.insert_session("s", "/work", "2026-01-01").unwrap();
-        store.enqueue_command("c", "s", "chat", "[]", "/l").unwrap();
-        let set = |table: &str, column: &str, value: &str| {
-            store
-                .with_conn(|conn| {
-                    conn.execute(&format!("UPDATE {table} SET {column}=?1"), [value])?;
-                    Ok(())
-                })
-                .unwrap();
-        };
-
-        for status in SessionStatus::ALL {
-            set("sessions", "status", status.as_str());
-            let row = store.get_session("s").unwrap().unwrap();
-            assert_eq!(row.status, *status);
-        }
-        set("sessions", "status", "active");
-        for status in SessionSetupStatus::ALL {
-            set("sessions", "setup_status", status.as_str());
-            let row = store.get_session("s").unwrap().unwrap();
-            assert_eq!(row.setup_status, *status);
-        }
-        set("sessions", "setup_status", "ready");
-        for status in CommandStatus::ALL {
-            set("commands", "status", status.as_str());
-            let row = store.get_command("c").unwrap().unwrap();
-            assert_eq!(row.status, status.canonical());
-        }
-
-        set("commands", "status", "wat");
-        let error = store.get_command("c").unwrap_err().to_string();
-        assert!(
-            error.contains("commands.status") && error.contains("wat"),
-            "{error}"
-        );
-        set("sessions", "status", "wat");
-        let error = store.get_session("s").unwrap_err().to_string();
-        assert!(
-            error.contains("sessions.status") && error.contains("wat"),
-            "{error}"
-        );
-        set("sessions", "status", "active");
-        set("sessions", "setup_status", "wat");
-        let error = store.get_session("s").unwrap_err().to_string();
-        assert!(
-            error.contains("sessions.setup_status") && error.contains("wat"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn legacy_schema_db_is_readable_by_new_store() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("awman.db");
-
-        // Step 1: create the DB using the exact legacy schema.
-        {
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS sessions (
-                    id         TEXT PRIMARY KEY,
-                    workdir    TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    status     TEXT NOT NULL DEFAULT 'active',
-                    closed_at  TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS commands (
-                    id          TEXT PRIMARY KEY,
-                    session_id  TEXT NOT NULL REFERENCES sessions(id),
-                    subcommand  TEXT NOT NULL,
-                    args        TEXT NOT NULL,
-                    status      TEXT NOT NULL DEFAULT 'pending',
-                    exit_code   INTEGER,
-                    started_at  TEXT,
-                    finished_at TEXT,
-                    log_path    TEXT NOT NULL
-                );",
-            )
-            .unwrap();
-
-            // Insert rows as the old awman code would have.
-            conn.execute(
-                "INSERT INTO sessions (id, workdir, created_at, status) \
-                 VALUES ('legacy-id-1', '/old/repo', '2023-06-01T10:00:00Z', 'active')",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO commands (id, session_id, subcommand, args, status, log_path) \
-                 VALUES ('cmd-1', 'legacy-id-1', 'chat', '[]', 'pending', '/logs/cmd-1.log')",
-                [],
-            )
-            .unwrap();
-        }
-
-        // Step 2: open with SqliteSessionStore (triggers idempotent migration).
-        let store = SqliteSessionStore::open(tmp.path()).unwrap();
-
-        // WI 0135 lifecycle tables are additive too and can be opened on the
-        // same database created by the prior schema.
-        let lifecycle = crate::data::api_lifecycle_store::CommandLifecycleStore::open(
-            std::sync::Arc::new(SqliteSessionStore::open(tmp.path()).unwrap()),
-        )
-        .unwrap();
-        assert!(lifecycle
-            .cancel_if_queued("cmd-1", "2026-10-28T00:00:00Z")
-            .unwrap());
-
-        // Step 3: verify the legacy rows are readable.
-        let sessions = store.list_sessions().unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].id, "legacy-id-1");
-        assert_eq!(sessions[0].workdir, "/old/repo");
-        assert_eq!(sessions[0].status.as_str(), "active");
-        // WI 0133: a pre-existing row restores with no remote fields.
-        assert_eq!(sessions[0].repo_url, None);
-        assert_eq!(sessions[0].branch, None);
-        assert_eq!(sessions[0].base_ref, None);
-        assert!(sessions[0].merge_refs.is_empty());
-        assert!(!sessions[0].push);
-
-        let cmd = store.get_command("cmd-1").unwrap().unwrap();
-        assert_eq!(cmd.session_id, "legacy-id-1");
-        assert_eq!(cmd.subcommand, "chat");
-        assert_eq!(cmd.status.as_str(), "cancelled");
-        assert_eq!(
-            cmd.exit_code,
-            Some(crate::data::command_status::CANCELLED_EXIT_CODE)
-        );
-    }
-
-    // ─── WI 0133: remote session fields ───────────────────────────────────────
-
-    fn insert_remote(store: &SqliteSessionStore, id: &str) {
-        store
-            .insert_session_full(NewSessionRow {
-                id,
-                workdir: "/clones/repo",
-                created_at: "2026-10-27T00:00:00Z",
-                setup_status: SessionSetupStatus::Initializing,
-                kind: SessionKind::Remote,
-                cloned_path: Some("/clones/repo"),
-            })
-            .unwrap();
-    }
-
-    #[test]
-    fn remote_fields_round_trip() {
-        let (_tmp, store) = make_store();
-        insert_remote(&store, "r1");
-        let merge_refs = vec!["feat-a".to_string(), "feat-b".to_string()];
-        assert!(store
-            .set_remote_fields(
-                "r1",
-                RemoteSessionFields {
-                    repo_url: Some("https://host.invalid/o/r.git"),
-                    branch: Some("job-1"),
-                    base_ref: Some("v1.0"),
-                    merge_refs: &merge_refs,
-                    push: true,
-                },
-            )
-            .unwrap());
-        let rec = store.get_session("r1").unwrap().unwrap();
-        assert_eq!(
-            rec.repo_url.as_deref(),
-            Some("https://host.invalid/o/r.git")
-        );
-        assert_eq!(rec.branch.as_deref(), Some("job-1"));
-        assert_eq!(rec.base_ref.as_deref(), Some("v1.0"));
-        assert_eq!(rec.merge_refs, merge_refs);
-        assert!(rec.push);
-        // Every SELECT reads the same columns.
-        assert_eq!(store.list_sessions().unwrap()[0], rec);
-        assert_eq!(
-            store
-                .list_sessions_by_status(Some(SessionStatus::Active))
-                .unwrap()[0],
-            rec
-        );
-        assert_eq!(
-            store.list_sessions_with_in_progress_setup().unwrap()[0],
-            rec
-        );
-    }
-
-    #[test]
-    fn remote_fields_default_when_unset_and_missing_row_reports_false() {
-        let (_tmp, store) = make_store();
-        insert_remote(&store, "r2");
-        let rec = store.get_session("r2").unwrap().unwrap();
-        assert_eq!(rec.repo_url, None);
-        assert!(rec.merge_refs.is_empty());
-        assert!(!rec.push);
-        let fields = RemoteSessionFields {
-            repo_url: None,
-            branch: None,
-            base_ref: None,
-            merge_refs: &[],
-            push: false,
-        };
-        assert!(!store.set_remote_fields("nope", fields).unwrap());
-    }
-
-    #[test]
-    fn merging_refs_is_an_in_progress_setup_status() {
-        let (_tmp, store) = make_store();
-        insert_remote(&store, "r3");
-        store
-            .update_setup_status("r3", SessionSetupStatus::MergingRefs)
-            .unwrap();
-        let ids: Vec<_> = store
-            .list_sessions_with_in_progress_setup()
-            .unwrap()
-            .into_iter()
-            .map(|r| r.id)
-            .collect();
-        assert_eq!(ids, vec!["r3".to_string()]);
-    }
-
-    #[test]
-    fn command_result_serialises_pushed_as_absent_null_or_value() {
-        let base = CommandResult {
-            exit_code: Some(0),
-            ..CommandResult::default()
-        };
-        assert_eq!(serde_json::to_string(&base).unwrap(), r#"{"exit_code":0}"#);
-        let null = CommandResult {
-            pushed: Some(None),
-            ..base.clone()
-        };
-        let json = serde_json::to_string(&null).unwrap();
-        assert_eq!(json, r#"{"exit_code":0,"pushed":null}"#);
-        assert_eq!(serde_json::from_str::<CommandResult>(&json).unwrap(), null);
-        let pushed = CommandResult {
-            pushed: Some(Some(PushedRef {
-                remote: "origin".into(),
-                branch: "b".into(),
-                sha: "abc".into(),
-            })),
-            ..base.clone()
-        };
-        let json = serde_json::to_string(&pushed).unwrap();
-        assert_eq!(
-            serde_json::from_str::<CommandResult>(&json).unwrap(),
-            pushed
-        );
-        assert_eq!(
-            serde_json::from_str::<CommandResult>(r#"{"exit_code":0}"#).unwrap(),
-            base
-        );
-    }
-
-    #[test]
-    fn command_result_new_fields_are_optional_and_round_trip() {
-        use crate::data::execution_event::CommandStatusKind;
-        // A pre-0137 row (legacy fields only, including the ad-hoc
-        // `cancelled_at` / `setup_error` keys) still parses.
-        let legacy = r#"{"exit_code":130,"error":"cancelled","cancelled_at":"2026-01-01T00:00:00Z","setup_error":{"stage":"ready","message":"x"}}"#;
-        let parsed: CommandResult = serde_json::from_str(legacy).unwrap();
-        assert_eq!(parsed.cancelled_at.as_deref(), Some("2026-01-01T00:00:00Z"));
-        assert_eq!(parsed.setup_error.unwrap()["stage"], "ready");
-        assert!(parsed.outcome.is_none() && parsed.failure.is_none());
-
-        let full = CommandResult {
-            exit_code: Some(1),
-            outcome: Some(CommandStatusKind::Error),
-            failure: Some(CommandFailure {
-                stage: "teardown".into(),
-                code: failure_codes::STEP_FAILED.into(),
-                message: "Step 'tests' failed".into(),
-                step: Some("tests".into()),
-            }),
-            failed_steps: Some(vec![FailedStep {
-                name: "tests".into(),
-                index: 2,
-                phase: FailedStepPhase::Main,
-                exit_code: Some(1),
-                step_attempt: 2,
-                error: Some("boom".into()),
-            }]),
-            git: Some(GitResult {
-                branch: Some("main".into()),
-                base_sha: Some("a".into()),
-                head_sha: Some("b".into()),
-                dirty: false,
-                changed_files: vec![ChangedFile {
-                    path: "src/x.rs".into(),
-                    status: ChangedFileStatus::Modified,
-                    old_path: None,
-                    added: Some(10),
-                    deleted: Some(2),
-                }],
-                changed_files_truncated: false,
-                changed_files_error: None,
-            }),
-            pull_request: Some(PullRequestRef {
-                url: "https://github.com/o/r/pull/7".into(),
-            }),
-            final_message: Some("done".into()),
-            outputs: Some(OutputsSummary {
-                files: 2,
-                bytes: 5120,
-                incomplete: false,
-            }),
-            data: Some(serde_json::json!({"agents": []})),
-            error: Some("Step 'tests' failed".into()),
-            stage: Some("teardown".into()),
-            ..CommandResult::default()
-        };
-        let json = serde_json::to_value(&full).unwrap();
-        assert_eq!(json["outcome"], "error");
-        assert_eq!(json["failure"]["code"], "step_failed");
-        assert_eq!(json["failed_steps"][0]["phase"], "main");
-        assert_eq!(json["git"]["changed_files"][0]["status"], "modified");
-        assert!(json["git"]["changed_files"][0].get("old_path").is_none());
-        assert_eq!(json["pull_request"]["url"], "https://github.com/o/r/pull/7");
-        assert_eq!(json["outputs"]["bytes"], 5120);
-        assert!(json.get("pushed").is_none() && json.get("setup_error").is_none());
-        let back: CommandResult = serde_json::from_value(json).unwrap();
-        assert_eq!(back, full);
+impl SqliteSessionStore {
+    pub fn set_context_key(
+        &self,
+        id: &str,
+        key: Option<&crate::data::context::ContextKey>,
+    ) -> Result<(), DataError> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE sessions SET context_key=?1 WHERE id=?2",
+            params![key.map(|k| k.as_str()), id],
+        )?;
+        Ok(())
     }
 }

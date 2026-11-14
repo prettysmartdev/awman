@@ -1,0 +1,24 @@
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+body { color: var(--text); background: radial-gradient(ellipse at 5% 0%, var(--ambient-a), transparent 55%), radial-gradient(ellipse at 95% 15%, var(--ambient-b), transparent 55%), var(--bg); font: var(--text-sm)/1.5 var(--sans); -webkit-text-size-adjust: 100%; }
+:focus-visible { outline: var(--focus-width) solid var(--focus); outline-offset: 3px; }
+button { font: inherit; min-width: 36px; min-height: 36px; padding: .375rem .75rem; border: 1px solid var(--accent); border-radius: var(--radius-sm); background: var(--accent); color: var(--accent-text); cursor: pointer; touch-action: manipulation; }
+button.secondary { background: var(--surface); color: var(--text); border-color: var(--border); }
+button:hover:not(:disabled) { filter: brightness(.97); }
+button:disabled { opacity: .58; cursor: not-allowed; }
+button.danger { color: var(--danger); border-color: var(--danger); background: var(--surface); }
+button[aria-pressed=true], button[aria-selected=true] { background: var(--accent-soft); color: var(--text); border-color: var(--accent); }
+a { color: var(--accent); }
+code, pre { font-family: var(--mono); font-size: var(--text-sm); }
+h1, h2, h3, p { overflow-wrap: anywhere; }
+h1 { font-size: var(--text-xl); letter-spacing: -.025em; }
+h2 { font-size: var(--text-lg); } h3 { font-size: var(--text-md); }
+.hint, .muted { color: var(--muted); font-size: var(--text-sm); }
+.surface { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+.glass { background: var(--glass); backdrop-filter: blur(var(--glass-blur)); box-shadow: inset 0 1px var(--glass-highlight), var(--shadow-sm); }
+.stack { display: grid; gap: var(--space-3); min-width: 0; }
+.cluster { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); min-width: 0; }
+.scroll-region { min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+@media (pointer: coarse) { button { min-height: 44px; min-width: 44px; } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }

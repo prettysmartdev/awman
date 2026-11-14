@@ -20,6 +20,8 @@ pub(super) const EXEC: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[&EXEC_PROMPT, &EXEC_WORKFLOW],
 };
 
@@ -45,6 +47,8 @@ pub(super) const EXEC_PROMPT: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: true,
     subcommands: &[],
 };
 
@@ -68,5 +72,7 @@ pub(super) const EXEC_WORKFLOW: CommandSpec = CommandSpec {
     requires_container_tier: false,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: true,
     subcommands: &[],
 };

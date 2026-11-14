@@ -193,50 +193,9 @@ pub(crate) fn render_multiline_input(
     let inner_w = textarea_inner.width as usize;
     let inner_h = textarea_inner.height as usize;
 
-    // Compute visual lines from the editor text (split by '\n', then
-    // wrap each logical line at inner_w).
-    let logical_lines: Vec<&str> = editor.text.split('\n').collect();
-    let mut visual_lines: Vec<String> = Vec::new();
-    for line in &logical_lines {
-        if line.is_empty() {
-            visual_lines.push(String::new());
-        } else if inner_w == 0 {
-            visual_lines.push(line.to_string());
-        } else {
-            let chars: Vec<char> = line.chars().collect();
-            for chunk in chars.chunks(inner_w) {
-                visual_lines.push(chunk.iter().collect());
-            }
-        }
-    }
-
-    // Compute cursor position in visual-line space.
-    let text_before_cursor = &editor.text[..editor.cursor];
-    let cursor_logical: Vec<&str> = text_before_cursor.split('\n').collect();
-    let cursor_last_line = cursor_logical.last().unwrap_or(&"");
-    let cursor_col_chars = cursor_last_line.chars().count();
-    let mut cursor_visual_row: usize = 0;
-    // Walk logical lines before the cursor line.
-    for (i, line) in logical_lines.iter().enumerate() {
-        if i >= cursor_logical.len() - 1 {
-            break;
-        }
-        let line_chars = line.chars().count();
-        if line_chars == 0 || inner_w == 0 {
-            cursor_visual_row += 1;
-        } else {
-            cursor_visual_row += line_chars.div_ceil(inner_w);
-        }
-    }
-    // Add wrapped rows from the current logical line.
-    if inner_w > 0 && cursor_col_chars > 0 {
-        cursor_visual_row += cursor_col_chars / inner_w;
-    }
-    let cursor_visual_col = if inner_w > 0 {
-        cursor_col_chars % inner_w
-    } else {
-        cursor_col_chars
-    };
+    // Rendering and navigation use the same word-wrapped byte ranges.
+    let layout = editor.wrapped(inner_w);
+    let (cursor_visual_row, cursor_visual_col) = layout.cursor_position(editor.cursor);
 
     // Scroll to keep cursor visible.
     let scroll_offset = if cursor_visual_row >= inner_h {
@@ -246,11 +205,10 @@ pub(crate) fn render_multiline_input(
     };
 
     // Render visible lines.
-    let visible: Vec<Line> = visual_lines
-        .iter()
+    let visible: Vec<Line> = (0..layout.rows.len())
         .skip(scroll_offset)
         .take(inner_h)
-        .map(|s| Line::from(s.as_str()))
+        .map(|row| Line::from(layout.line(row)))
         .collect();
     frame.render_widget(
         Paragraph::new(visible).style(Style::default().fg(Color::White)),
@@ -692,8 +650,8 @@ pub(crate) fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, f
         ]),
         None => {
             // The row shape decides whether Ctrl+N adds a map or list entry.
-            use crate::command::commands::config::ConfigRowShape;
-            let selected_shape = state.rows.get(state.selected).map(|row| row.shape);
+            use crate::command::commands::config::ConfigRowKind;
+            let selected_shape = state.rows.get(state.selected).map(|row| row.shape.clone());
             let mut spans = vec![
                 key("  \u{2191}\u{2193}"),
                 Span::raw("=row  "),
@@ -705,11 +663,11 @@ pub(crate) fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, f
                 Span::raw("=edit  "),
             ];
             match selected_shape {
-                Some(ConfigRowShape::MapHeader { .. } | ConfigRowShape::MapEntry) => {
+                Some(ConfigRowKind::MapHeader { .. } | ConfigRowKind::MapEntry) => {
                     spans.push(key("Ctrl+N"));
                     spans.push(Span::raw(format!("=add {scope} mapping  ")));
                 }
-                Some(ConfigRowShape::ListHeader { .. } | ConfigRowShape::ListEntry) => {
+                Some(ConfigRowKind::ListHeader { .. } | ConfigRowKind::ListEntry) => {
                     spans.push(key("Ctrl+N"));
                     spans.push(Span::raw(format!("=add {scope} entry  ")));
                 }

@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 
 use crate::data::config::env::{Env, EnvSnapshot};
-use crate::data::config::global::GlobalConfig;
 use crate::data::error::DataError;
 use crate::data::fs::skill_library::read_library_meta;
 
@@ -36,14 +35,14 @@ pub struct SkillDirs {
 
 impl SkillDirs {
     /// Construct from the current process environment, resolving the global
-    /// home via `AWMAN_CONFIG_HOME` (when set) or `$HOME/.awman`.
+    /// home via `AWMAN_HOME` (when set) or `$HOME/.awman`.
     pub fn from_process_env(git_root: Option<PathBuf>) -> Result<Self, DataError> {
         Self::from_env(&Env::from_process(), git_root)
     }
 
     /// Same as [`from_process_env`] but reads from a supplied env snapshot.
     pub fn from_env(env: &EnvSnapshot, git_root: Option<PathBuf>) -> Result<Self, DataError> {
-        let global_home = GlobalConfig::data_home_with(env)?;
+        let global_home = crate::data::fs::data_paths::data_home(env)?;
         Ok(Self {
             global_home,
             git_root,
@@ -175,125 +174,5 @@ impl SkillDirs {
         }
         slugs.sort();
         slugs
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
-    use crate::data::fs::skill_library::{write_library_meta, SkillLibraryMeta};
-
-    /// Build a `SkillDirs` whose global home is `home`, with no git root bound.
-    fn skill_dirs_at(home: &Path) -> SkillDirs {
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, home.to_str().unwrap())]);
-        SkillDirs::from_env(&env, None).unwrap()
-    }
-
-    fn valid_meta(slug: &str) -> SkillLibraryMeta {
-        SkillLibraryMeta {
-            source: format!("https://github.com/someone/{slug}.git"),
-            owner: "someone".to_string(),
-            repo: slug.to_string(),
-            subdir: "skills".to_string(),
-            sparse: false,
-        }
-    }
-
-    #[test]
-    fn library_paths_are_under_dot_library() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dirs = skill_dirs_at(tmp.path());
-        assert_eq!(dirs.library_root(), dirs.global_dir().join(".library"));
-        assert_eq!(
-            dirs.library_dir("superpowers"),
-            dirs.global_dir().join(".library").join("superpowers")
-        );
-    }
-
-    #[test]
-    fn list_libraries_returns_empty_when_library_root_absent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dirs = skill_dirs_at(tmp.path());
-        // Deliberately never create `.library/`.
-        assert!(
-            dirs.list_libraries().is_empty(),
-            "a missing .library/ must yield an empty list, not an error"
-        );
-    }
-
-    #[test]
-    fn list_libraries_returns_only_valid_libraries_sorted() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dirs = skill_dirs_at(tmp.path());
-
-        // Two valid libraries (created out of alphabetical order on purpose).
-        write_library_meta(&dirs.library_dir("gamma"), &valid_meta("gamma")).unwrap();
-        write_library_meta(&dirs.library_dir("alpha"), &valid_meta("alpha")).unwrap();
-
-        // A directory under `.library/` that lacks `.awman.json` — must be
-        // skipped, NOT cause an error or panic.
-        std::fs::create_dir_all(dirs.library_dir("orphan")).unwrap();
-        std::fs::write(
-            dirs.library_dir("orphan").join("README.md"),
-            "not a library",
-        )
-        .unwrap();
-
-        // A stray regular file under `.library/` — must be ignored.
-        std::fs::write(dirs.library_root().join("loose.txt"), "junk").unwrap();
-
-        let libs = dirs.list_libraries();
-        assert_eq!(
-            libs,
-            vec!["alpha".to_string(), "gamma".to_string()],
-            "only valid libraries must be listed, in ascending slug order"
-        );
-    }
-
-    #[test]
-    fn list_libraries_skips_directory_with_malformed_metadata() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dirs = skill_dirs_at(tmp.path());
-
-        write_library_meta(&dirs.library_dir("good"), &valid_meta("good")).unwrap();
-
-        // A `.awman.json` that is not valid JSON must be skipped, not fatal.
-        std::fs::create_dir_all(dirs.library_dir("broken")).unwrap();
-        std::fs::write(
-            dirs.library_dir("broken").join(".awman.json"),
-            "{ this is not json",
-        )
-        .unwrap();
-
-        assert_eq!(
-            dirs.list_libraries(),
-            vec!["good".to_string()],
-            "a library with malformed metadata must be skipped"
-        );
-    }
-
-    /// A symlink under `.library/` is never a managed library, even when its
-    /// target is a perfectly valid one: refreshing hard-resets the directory,
-    /// and following the link would let that escape the managed store
-    /// (WI-0103 remediation).
-    #[cfg(unix)]
-    #[test]
-    fn list_libraries_skips_symlinked_entries() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dirs = skill_dirs_at(tmp.path());
-
-        write_library_meta(&dirs.library_dir("good"), &valid_meta("good")).unwrap();
-
-        // A valid library living outside the store, linked into it.
-        let external = tmp.path().join("external");
-        write_library_meta(&external, &valid_meta("linked")).unwrap();
-        std::os::unix::fs::symlink(&external, dirs.library_dir("linked")).unwrap();
-
-        assert_eq!(
-            dirs.list_libraries(),
-            vec!["good".to_string()],
-            "a symlinked entry must be skipped even when its target is valid"
-        );
     }
 }

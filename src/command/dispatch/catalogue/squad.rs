@@ -1,4 +1,4 @@
-//! `squad` — the task daemon and everything that talks to it.
+//! `squad` — squad task management over the daemon's squad feature.
 //!
 //! Split out of `dispatch/catalogue.rs` by WI 0114 F-51. The specs are data;
 //! `ROOT` in `mod.rs` is what assembles them into the tree.
@@ -10,12 +10,12 @@ use super::*;
 pub(super) const SQUAD: CommandSpec = CommandSpec {
     name: "squad",
     aliases: &[],
-    help: "Manage the squad task daemon and scheduled tasks.",
+    help: "Manage squad tasks (served by the daemon's squad feature).",
     long_help: None,
     arguments: &[],
     flags: &[
         FlagSpec {
-            long: "non-interactive",
+            long: "headless",
             short: Some('n'),
             help: "Print the squad status summary instead of opening the TUI.",
             kind: FlagKind::Bool,
@@ -33,7 +33,7 @@ pub(super) const SQUAD: CommandSpec = CommandSpec {
             default: FlagDefault::Bool(false),
             frontends: FrontendVisibility::All,
             conflicts_with: &[],
-            implies: &["non-interactive"],
+            implies: &["headless"],
             optional: true,
         },
     ],
@@ -45,11 +45,9 @@ pub(super) const SQUAD: CommandSpec = CommandSpec {
     // `awman squad` on a terminal opens the squad tab; every subcommand below
     // is a one-shot.
     opens_tui_when_bare: true,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[
-        &SQUAD_START,
-        &SQUAD_STOP,
-        &SQUAD_STATUS,
-        &SQUAD_LOGS,
         &SQUAD_ADD,
         &SQUAD_EDIT,
         &SQUAD_LIST,
@@ -62,135 +60,6 @@ pub(super) const SQUAD: CommandSpec = CommandSpec {
         &SQUAD_ATTACH,
         &SQUAD_ENV,
     ],
-};
-
-pub(super) const SQUAD_START: CommandSpec = CommandSpec {
-    name: "start",
-    aliases: &[],
-    help: "Start the squad daemon.",
-    long_help: None,
-    arguments: &[],
-    flags: &[
-        FlagSpec {
-            long: "port",
-            short: None,
-            help: "Port to listen on (0 selects an OS-assigned port).",
-            kind: FlagKind::U16,
-            default: FlagDefault::U16(0),
-            frontends: FrontendVisibility::All,
-            conflicts_with: &[],
-            implies: &[],
-            optional: true,
-        },
-        FlagSpec {
-            long: "background",
-            short: None,
-            help: "Daemonize via the OS process manager.",
-            kind: FlagKind::Bool,
-            default: FlagDefault::Bool(false),
-            frontends: FrontendVisibility::All,
-            conflicts_with: &[],
-            implies: &[],
-            optional: true,
-        },
-        FlagSpec {
-            long: "refresh-key",
-            short: None,
-            help: "Regenerate the squad key and print its AWMAN_SQUAD_KEY export snippet.",
-            kind: FlagKind::Bool,
-            default: FlagDefault::Bool(false),
-            frontends: FrontendVisibility::All,
-            conflicts_with: &[],
-            implies: &[],
-            optional: true,
-        },
-        FlagSpec {
-            long: "dangerously-skip-auth",
-            short: None,
-            help: "Skip key creation and authentication for this run (loopback-only).",
-            kind: FlagKind::Bool,
-            default: FlagDefault::Bool(false),
-            frontends: FrontendVisibility::All,
-            conflicts_with: &[],
-            implies: &[],
-            optional: true,
-        },
-    ],
-    api_allowed: true,
-    build: crate::command::dispatch::build::squad,
-    gateway_need: GatewayNeed::None,
-    requires_container_tier: true,
-    requires_runtime: true,
-    opens_tui_when_bare: false,
-    subcommands: &[],
-};
-
-pub(super) const SQUAD_STOP: CommandSpec = CommandSpec {
-    name: "stop",
-    aliases: &["kill"],
-    help: "Stop the squad daemon.",
-    long_help: None,
-    arguments: &[],
-    flags: &[],
-    api_allowed: true,
-    build: crate::command::dispatch::build::squad,
-    gateway_need: GatewayNeed::None,
-    requires_container_tier: true,
-    requires_runtime: true,
-    opens_tui_when_bare: false,
-    subcommands: &[],
-};
-
-pub(super) const SQUAD_STATUS: CommandSpec = CommandSpec {
-    name: "status",
-    aliases: &[],
-    help: "Show squad daemon status.",
-    long_help: None,
-    arguments: &[],
-    flags: &[FlagSpec {
-        long: "json",
-        short: None,
-        help: "Emit JSON output.",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    }],
-    api_allowed: true,
-    build: crate::command::dispatch::build::squad,
-    gateway_need: GatewayNeed::IfRunning,
-    requires_container_tier: true,
-    requires_runtime: true,
-    opens_tui_when_bare: false,
-    subcommands: &[],
-};
-
-pub(super) const SQUAD_LOGS: CommandSpec = CommandSpec {
-    name: "logs",
-    aliases: &[],
-    help: "Show the squad daemon log.",
-    long_help: None,
-    arguments: &[],
-    flags: &[FlagSpec {
-        long: "follow",
-        short: Some('f'),
-        help: "Follow the log as it grows.",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    }],
-    api_allowed: true,
-    build: crate::command::dispatch::build::squad,
-    gateway_need: GatewayNeed::None,
-    requires_container_tier: true,
-    requires_runtime: true,
-    opens_tui_when_bare: false,
-    subcommands: &[],
 };
 
 /// The task-scoped agent pool, shared verbatim by `squad add` and
@@ -220,6 +89,8 @@ pub(super) const SQUAD_ADD: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -246,6 +117,8 @@ pub(super) const SQUAD_LIST: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -279,6 +152,8 @@ pub(super) const SQUAD_SHOW: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 /// `squad edit` carries every field a task may change after creation. `name`,
@@ -302,6 +177,8 @@ pub(super) const SQUAD_EDIT: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -328,6 +205,8 @@ pub(super) const SQUAD_REMOVE: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 pub(super) const SQUAD_PAUSE: CommandSpec = CommandSpec {
@@ -343,6 +222,8 @@ pub(super) const SQUAD_PAUSE: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 pub(super) const SQUAD_RESUME: CommandSpec = CommandSpec {
@@ -358,6 +239,8 @@ pub(super) const SQUAD_RESUME: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 pub(super) const SQUAD_TRIGGER: CommandSpec = CommandSpec {
@@ -378,6 +261,8 @@ pub(super) const SQUAD_TRIGGER: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 pub(super) const SQUAD_CANCEL: CommandSpec = CommandSpec {
@@ -398,6 +283,8 @@ pub(super) const SQUAD_CANCEL: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 pub(super) const SQUAD_ATTACH: CommandSpec = CommandSpec {
@@ -406,30 +293,56 @@ pub(super) const SQUAD_ATTACH: CommandSpec = CommandSpec {
     help: "Attach to a running squad task container.",
     long_help: None,
     arguments: &[SQUAD_NAME_ARGUMENT],
-    flags: &[FlagSpec {
-        long: "container",
-        short: None,
-        help: "Running container ID when multiple are active.",
-        kind: FlagKind::String,
-        default: FlagDefault::None,
-        frontends: FrontendVisibility::CliAndTui,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    }],
+    flags: &[
+        FlagSpec {
+            long: "step",
+            short: None,
+            help: "Workflow step whose terminal to open.",
+            kind: FlagKind::String,
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::CliAndTui,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "read-only",
+            short: None,
+            help: "Never send input or resize; watch only.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::CliAndTui,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "annotation",
+            short: None,
+            help: "Integration metadata on this view, k=v (repeatable).",
+            kind: FlagKind::VecString,
+            default: FlagDefault::EmptyVec,
+            frontends: FrontendVisibility::CliAndTui,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+    ],
     api_allowed: false,
     build: crate::command::dispatch::build::squad_attach,
     gateway_need: GatewayNeed::Running,
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
 /// `squad env` — the one home for the daemon's env coverage (WI 0116 §6d).
 ///
 /// `api_allowed: false` is deliberate and is a security property, not an
-/// oversight: an API-allowed leaf can be driven through the `/v1/commands`
+/// oversight: an API-allowed leaf can be driven through the `/v1/worker/commands`
 /// `{subcommand, args}` envelope, where CLI-arg-shaped strings drift into
 /// tracing spans and error text. Payload values must never travel that way, so
 /// the whole leaf stays off the API front door. The daemon's own typed
@@ -493,6 +406,8 @@ pub(super) const SQUAD_ENV: CommandSpec = CommandSpec {
     requires_container_tier: true,
     requires_runtime: true,
     opens_tui_when_bare: false,
+    internal: false,
+    relay_allowed: false,
     subcommands: &[],
 };
 
@@ -610,12 +525,12 @@ const SQUAD_ADD_OWN_FLAGS: [FlagSpec; 12] = [
         kind: FlagKind::Bool,
         default: FlagDefault::Bool(false),
         frontends: FrontendVisibility::CliAndTui,
-        conflicts_with: &["non-interactive"],
+        conflicts_with: &["headless"],
         implies: &[],
         optional: true,
     },
     FlagSpec {
-        long: "non-interactive",
+        long: "headless",
         short: Some('n'),
         help: "Never prompt: refuse anything needing a confirmation instead of asking.",
         kind: FlagKind::Bool,
@@ -740,12 +655,12 @@ const SQUAD_EDIT_OWN_FLAGS: [FlagSpec; 12] = [
         kind: FlagKind::Bool,
         default: FlagDefault::Bool(false),
         frontends: FrontendVisibility::CliAndTui,
-        conflicts_with: &["non-interactive"],
+        conflicts_with: &["headless"],
         implies: &[],
         optional: true,
     },
     FlagSpec {
-        long: "non-interactive",
+        long: "headless",
         short: Some('n'),
         help: "Never prompt: refuse anything needing a confirmation instead of asking.",
         kind: FlagKind::Bool,

@@ -19,6 +19,9 @@ pub struct LaunchPlan {
     pub leases: Vec<crate::engine::credential_refresh::CredentialLease>,
     pub prompt_files: Vec<crate::engine::container::options::PromptFileGuard>,
     pub image_lease: std::fs::File,
+    /// Host-terminal variables the run asked for but does not get (WI 0141
+    /// §3), written to the frontend before the agent starts.
+    pub terminal_env_notice: Option<String>,
 }
 pub struct Instance {
     pub driver: Arc<dyn SandboxDriver>,
@@ -61,6 +64,12 @@ impl Instance {
         };
         self.driver.create(self.plan.spec)?;
         let mut request = self.plan.command;
+        if let Some(notice) = self.plan.terminal_env_notice.clone() {
+            frontend.write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Warning,
+                text: notice,
+            });
+        }
         // Capture channels once and pass them directly to the bridge.
         let io = frontend.take_io();
         request.tty = io.initial_size;

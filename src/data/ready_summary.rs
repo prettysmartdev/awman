@@ -24,6 +24,10 @@ pub struct ReadySummary {
     pub base_image: StepStatus,
     pub agent_image: StepStatus,
     pub local_agent: StepStatus,
+    /// Per-agent host greeting results. `local_agent` retains the aggregate
+    /// status for existing consumers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_auth: Vec<(String, StepStatus)>,
     pub audit: StepStatus,
     pub image_rebuild: StepStatus,
     pub aspec_folder: StepStatus,
@@ -62,6 +66,7 @@ impl ReadySummary {
             base_image: StepStatus::Pending,
             agent_image: StepStatus::Pending,
             local_agent: StepStatus::Pending,
+            agent_auth: Vec::new(),
             audit: StepStatus::Pending,
             image_rebuild: StepStatus::Pending,
             aspec_folder: StepStatus::Pending,
@@ -95,7 +100,6 @@ impl ReadySummary {
             ("Dockerfile".to_string(), self.dockerfile.clone()),
             ("Base image".to_string(), self.base_image.clone()),
             ("Agent image".to_string(), self.agent_image.clone()),
-            ("Local agent".to_string(), self.local_agent.clone()),
             ("Audit".to_string(), self.audit.clone()),
             ("Image rebuild".to_string(), self.image_rebuild.clone()),
             ("aspec folder".to_string(), self.aspec_folder.clone()),
@@ -104,6 +108,12 @@ impl ReadySummary {
                 self.work_items_config.clone(),
             ),
         ];
+        let auth_rows = self.auth_rows();
+        if auth_rows.is_empty() {
+            rows.insert(3, ("Local agent".to_string(), self.local_agent.clone()));
+        } else {
+            rows.splice(3..3, auth_rows);
+        }
         if let Some(status) = &self.image_source {
             rows.insert(3, ("Image source".to_string(), status.clone()));
         }
@@ -128,6 +138,55 @@ impl ReadySummary {
         }
         for health in &self.agent_credentials {
             rows.push(health.row());
+        }
+        rows
+    }
+
+    /// Group attempted greetings by outcome, success first. Optional host
+    /// checks without a ping command are reported as skipped during progress.
+    pub fn auth_rows(&self) -> Vec<(String, StepStatus)> {
+        let mut rows = Vec::new();
+        for outcome in [
+            StepStatus::Done,
+            StepStatus::Warn(String::new()),
+            StepStatus::Failed(String::new()),
+        ] {
+            let names: Vec<&str> = self
+                .agent_auth
+                .iter()
+                .filter(|(_, status)| {
+                    matches!(
+                        (&outcome, status),
+                        (StepStatus::Done, StepStatus::Done)
+                            | (StepStatus::Warn(_), StepStatus::Warn(_))
+                            | (StepStatus::Failed(_), StepStatus::Failed(_))
+                    )
+                })
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if !names.is_empty() {
+                rows.push((
+                    format!("Auth: {}", names.join(", ")),
+                    if matches!(outcome, StepStatus::Warn(_)) {
+                        // Keep timeout details visible in the final summary.
+                        StepStatus::Warn(
+                            self.agent_auth
+                                .iter()
+                                .filter_map(|(_, status)| {
+                                    if let StepStatus::Warn(reason) = status {
+                                        Some(reason.as_str())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join("; "),
+                        )
+                    } else {
+                        outcome
+                    },
+                ));
+            }
         }
         rows
     }
@@ -378,221 +437,5 @@ impl AgentCredentialHealth {
             _ => format!("Credential {}", self.agent),
         };
         (label, status)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unfinished_required_images_are_not_ready() {
-        let mut summary = ReadySummary::new("docker");
-        assert!(!summary.is_ready());
-        assert_eq!(
-            summary.not_ready_reason().as_deref(),
-            Some("Base image: pending")
-        );
-        summary.base_image = StepStatus::Done;
-        assert_eq!(
-            summary.not_ready_reason().as_deref(),
-            Some("Agent image: pending")
-        );
-        summary.agent_image = StepStatus::Done;
-        assert!(summary.is_ready());
-    }
-
-    /// A base image built only for a non-default agent is as optional as that
-    /// agent's image: its failure is reported but `ready` still succeeds. A
-    /// failed base the default agent needs fails readiness.
-    #[test]
-    fn only_a_required_base_image_failure_fails_ready() {
-        let mut summary = ReadySummary::new("builtin");
-        summary.base_image = StepStatus::Done;
-        summary.agent_image = StepStatus::Done;
-        summary.base_image_results.push(ReadyBaseImageResult {
-            store: "apple-containers".into(),
-            tag: "awman-repo:latest".into(),
-            build: StepStatus::Failed("build failed".into()),
-            optional: true,
-        });
-        assert!(summary.is_ready());
-        assert!(summary
-            .rows()
-            .iter()
-            .any(|(l, _)| l.contains("apple-containers")));
-
-        summary.base_image_results[0].optional = false;
-        assert!(!summary.is_ready());
-        assert_eq!(
-            summary.not_ready_reason().as_deref(),
-            Some("Base image in apple-containers: build failed")
-        );
-    }
-
-    #[test]
-    fn a_failed_local_agent_keeps_completed_images_ready() {
-        let mut summary = ReadySummary::new("docker");
-        summary.base_image = StepStatus::Done;
-        summary.agent_image = StepStatus::Done;
-        summary.local_agent = StepStatus::Failed("unavailable".into());
-        assert!(summary.is_ready());
-        assert!(summary.has_failures());
-    }
-
-    #[test]
-    fn build_runtimes_show_no_image_source_row() {
-        let summary = ReadySummary::new("docker");
-        assert!(summary
-            .rows()
-            .iter()
-            .all(|(label, _)| label != "Image source"));
-        let json = serde_json::to_string(&summary).unwrap();
-        assert!(!json.contains("image_source"), "{json}");
-    }
-
-    #[test]
-    fn image_source_row_follows_the_agent_image_row() {
-        let mut summary = ReadySummary::new("builtin");
-        summary.image_source = Some(StepStatus::Done);
-        let labels: Vec<String> = summary.rows().into_iter().map(|(l, _)| l).collect();
-        let agent = labels.iter().position(|l| l == "Agent image").unwrap();
-        assert_eq!(labels[agent + 1], "Image source");
-    }
-
-    fn ready_builtin() -> ReadySummary {
-        let mut summary = ReadySummary::new("builtin");
-        summary.base_image = StepStatus::Skipped;
-        summary.agent_image = StepStatus::Done;
-        summary
-    }
-
-    fn missing(summary: &mut ReadySummary, images: &[(&str, ReadyImagePlan)]) {
-        let names: Vec<&str> = images.iter().map(|(a, _)| *a).collect();
-        summary
-            .non_default_agent_images
-            .push(("Missing images".into(), StepStatus::Warn(names.join(", "))));
-        summary.missing_images = images
-            .iter()
-            .map(|(agent, plan)| MissingAgentImage {
-                agent: agent.to_string(),
-                plan: *plan,
-            })
-            .collect();
-    }
-
-    /// WI 0126 F2: each missing image's own plan picks its step; one
-    /// summary can mix them.
-    #[test]
-    fn missing_image_hint_is_derived_per_image() {
-        let mut summary = ready_builtin();
-        missing(
-            &mut summary,
-            &[
-                ("codex", ReadyImagePlan::Import),
-                ("cline", ReadyImagePlan::BuildAndImport),
-                ("gemini", ReadyImagePlan::ConfigureSource),
-                ("opencode", ReadyImagePlan::Import),
-            ],
-        );
-        // The summary-wide verb must not leak into a per-image hint.
-        summary.image_action = ReadyImageAction::Build;
-        assert_eq!(
-            summary.hint().as_deref(),
-            Some(
-                "run \"ready --build\" to import codex, opencode. run \"ready --build\" to build \
-                 and import cline. configure an image source for gemini (`builtin.imageSource` \
-                 or a `builtin.images` entry), then run \"ready --build\"."
-            )
-        );
-
-        let mut docker = ReadySummary::new("docker");
-        docker.base_image = StepStatus::Done;
-        docker.agent_image = StepStatus::Done;
-        missing(&mut docker, &[("codex", ReadyImagePlan::Build)]);
-        assert_eq!(
-            docker.hint().as_deref(),
-            Some("run \"ready --build\" to build codex.")
-        );
-    }
-
-    #[test]
-    fn a_summary_without_per_image_data_keeps_the_summary_wide_verb() {
-        let mut summary = ready_builtin();
-        summary.image_action = ReadyImageAction::BuildAndImport;
-        summary
-            .non_default_agent_images
-            .push(("Missing images".into(), StepStatus::Warn("codex".into())));
-        assert_eq!(
-            summary.hint().as_deref(),
-            Some("run \"ready --build\" to build and import all available agent images.")
-        );
-        summary.non_default_agent_images = vec![("Other agents".into(), StepStatus::Done)];
-        assert_eq!(summary.hint(), None);
-    }
-
-    fn failed_default(build: StepStatus, import: StepStatus, sourced: bool) -> ReadySummary {
-        let mut summary = ready_builtin();
-        let mut image = ReadyImageResult::new("claude", "awman-r-claude:latest");
-        image.build = build;
-        image.import = import;
-        if sourced {
-            image.source_kind =
-                Some(crate::data::config::image_source::ImageSourceKind::DockerStore);
-        }
-        summary.image_results.push(image);
-        summary
-    }
-
-    /// WI 0126 F2: a failed required image names its own next step instead
-    /// of the generic "complete the required image steps" line.
-    #[test]
-    fn a_failed_image_hint_names_its_next_step() {
-        let failed = || StepStatus::Failed("x".into());
-        let cases = [
-            (
-                failed_default(StepStatus::Skipped, failed(), false),
-                "configure an image source for claude (`builtin.imageSource` or a \
-                 `builtin.images` entry), then run \"awman ready\" again.",
-            ),
-            (
-                failed_default(failed(), StepStatus::Skipped, true),
-                "fix the claude image build, then run \"awman ready --build\" again.",
-            ),
-            (
-                failed_default(StepStatus::Done, failed(), true),
-                "the claude image was built but not imported; run \"awman ready\" again to \
-                 retry the import.",
-            ),
-            (
-                failed_default(StepStatus::Skipped, failed(), true),
-                "fix the claude image source, then run \"awman ready\" again.",
-            ),
-        ];
-        for (summary, hint) in cases {
-            assert!(!summary.is_ready());
-            assert_eq!(summary.hint().as_deref(), Some(hint));
-        }
-        // A failure no per-image result explains keeps the generic line.
-        let mut docker = ReadySummary::new("docker");
-        docker.base_image = failed();
-        assert_eq!(
-            docker.hint().as_deref(),
-            Some("complete the required image steps, then run \"awman ready\" again.")
-        );
-    }
-
-    #[test]
-    fn missing_images_serialize_only_when_present() {
-        let summary = ready_builtin();
-        let json = serde_json::to_string(&summary).unwrap();
-        assert!(!json.contains("missing_images"), "{json}");
-        let mut summary = ready_builtin();
-        missing(&mut summary, &[("codex", ReadyImagePlan::ConfigureSource)]);
-        let json = serde_json::to_value(&summary).unwrap();
-        assert_eq!(
-            json["missing_images"],
-            serde_json::json!([{"agent": "codex", "plan": "configure-source"}])
-        );
     }
 }

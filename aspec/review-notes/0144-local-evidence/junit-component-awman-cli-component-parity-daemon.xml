@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="1" skipped="0" failures="0" errors="0" uuid="4cc5ce29-d950-4ec2-be65-18d3445a4b10" timestamp="2026-11-11T21:59:09.231+00:00" time="0.766">
+    <testsuite name="awman-cli::component" tests="1" skipped="0" errors="0" failures="0">
+        <testcase name="parity::daemon::config_mutations_are_durable_and_invalid_edits_are_atomic" classname="awman-cli::component" timestamp="2026-11-11T21:59:09.243+00:00" time="0.750"/>
+    </testsuite>
+</testsuites>

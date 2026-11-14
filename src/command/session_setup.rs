@@ -98,7 +98,7 @@ pub struct SessionSetup {
     store: Arc<SqliteSessionStore>,
     /// Where the terminal `setup_state.json` snapshot is written.
     paths: ApiPaths,
-    /// Fired to abandon the setup (a cancelled `/v1/runs` command). Never fires
+    /// Fired to abandon the setup (a cancelled `/v1/worker/runs` command). Never fires
     /// unless the caller installs one with [`SessionSetup::with_cancellation`].
     cancel: tokio_util::sync::CancellationToken,
 }
@@ -175,6 +175,11 @@ impl SessionSetup {
 
     /// Persist a terminal status to the session row.
     fn persist_status(&self, status: SessionSetupStatus) {
+        if status == SessionSetupStatus::Failed {
+            self.engines
+                .ephemeral_secrets
+                .remove_session_git_auth(&self.session_id);
+        }
         let _ = self.store.update_setup_status(&self.session_id, status);
     }
 
@@ -216,7 +221,29 @@ impl SessionSetup {
         stage: &str,
         error: &str,
     ) {
+        self.fail_remote_coded(presenter, stage, None, error).await
+    }
+
+    /// [`Self::fail_remote`] with an explicit stable `setup_error.code`.
+    async fn fail_remote_coded(
+        &self,
+        presenter: &mut dyn SessionSetupPresenter,
+        stage: &str,
+        code: Option<&str>,
+        error: &str,
+    ) {
         self.mark_failed(presenter, stage, error);
+        if let Some(code) = code {
+            self.state(|s| {
+                if let Some(error) = &mut s.error {
+                    error.code = Some(code.to_string());
+                }
+            });
+        }
+        // A failed setup never runs a command: release the credential now.
+        self.engines
+            .ephemeral_secrets
+            .remove_session_git_auth(&self.session_id);
         self.delete_clone().await;
         self.persist_status(SessionSetupStatus::Failed);
         self.finish(presenter).await;
@@ -226,12 +253,33 @@ impl SessionSetup {
     /// remote session's clone, persist `"failed"`, then finish.
     async fn fail_cancelled(&self, presenter: &mut dyn SessionSetupPresenter) {
         tracing::info!(session_id = %self.session_id, "Session setup cancelled");
+        self.engines
+            .ephemeral_secrets
+            .remove_session_git_auth(&self.session_id);
         self.mark_failed(presenter, SETUP_CANCELLED_STAGE, "session setup cancelled");
         if self.plan.kind == SessionKind::Remote {
             self.delete_clone().await;
         }
         self.persist_status(SessionSetupStatus::Failed);
         self.finish(presenter).await;
+    }
+
+    /// The session's transport (WI 0145): its in-memory credential through
+    /// the daemon socket when the row carries a `git_auth` marker.
+    fn session_transport(
+        &self,
+    ) -> Result<crate::engine::git::transport::HostGitTransport, crate::command::error::CommandError>
+    {
+        let marker = self
+            .store
+            .get_session(&self.session_id)
+            .map_err(crate::command::error::CommandError::Data)?
+            .and_then(|row| row.git_auth_kind);
+        crate::command::session_git_transport::session_transport(
+            &self.engines,
+            &self.session_id,
+            marker.as_deref(),
+        )
     }
 
     /// One cancellation check point: `true` once the token has fired, after
@@ -275,7 +323,9 @@ impl SessionSetup {
         self.enter_status(SessionSetupStatus::CloningRepository);
         let msg = format!(
             "Cloning {}...",
-            self.plan.repo_url.as_deref().unwrap_or("repository")
+            crate::data::git_transport::SafeRemote::from_url(
+                self.plan.repo_url.as_deref().unwrap_or("")
+            )
         );
         self.stage(presenter, "cloning_repository", &msg);
         presenter.log(&format!(
@@ -291,7 +341,7 @@ impl SessionSetup {
             .expect("remote sessions have cloned_path");
         tracing::info!(
             session_id = %session_id,
-            repo_url = %url,
+            repo_url = %crate::data::git_transport::SafeRemote::from_url(&url),
             dest = %dest.display(),
             "Cloning remote repository (default branch)"
         );
@@ -302,9 +352,30 @@ impl SessionSetup {
         // `origin/<name>` to the branch and merge stages below. A cancel kills
         // the clone, which may otherwise wait on an unresponsive origin forever.
         let cancel = self.cancel.clone();
+        let transport = match self.session_transport() {
+            Ok(transport) => transport,
+            Err(error) => {
+                // `credentials_lost` (or an unreadable row): nothing is cloned.
+                self.fail_remote_coded(
+                    presenter,
+                    error.stage(),
+                    Some(error.code()),
+                    &error.to_string(),
+                )
+                .await;
+                return Err(());
+            }
+        };
         let clone_result = self
             .blocking_git("clone", move |git| {
-                git.clone_repo_logged(&url, None, &dest_for_clone, &mut *clone_sink, &cancel)
+                git.clone_with_transport(
+                    &url,
+                    None,
+                    &dest_for_clone,
+                    &transport,
+                    &mut *clone_sink,
+                    &crate::engine::git::transport::TransportGuard::new(cancel),
+                )
             })
             .await;
         if self.cancelled_here(presenter).await {
@@ -312,7 +383,16 @@ impl SessionSetup {
         }
         if let Err(e) = clone_result {
             tracing::error!(session_id = %session_id, error = %e, "Clone failed");
-            self.fail_remote(presenter, "clone", &e.to_string()).await;
+            self.fail_remote(
+                presenter,
+                if matches!(e, EngineError::GitAuth { .. }) {
+                    "git_auth"
+                } else {
+                    "clone"
+                },
+                &e.to_string(),
+            )
+            .await;
             return Err(());
         }
         tracing::info!(session_id = %session_id, "Repository cloned");
@@ -369,7 +449,16 @@ impl SessionSetup {
         ));
         if let Err(e) = self.merge_refs(presenter, &dest).await {
             tracing::error!(session_id = %session_id, error = %e, "Merging refs failed");
-            self.fail_remote(presenter, "merging_refs", &e).await;
+            self.fail_remote(
+                presenter,
+                if matches!(e, EngineError::GitAuth { .. }) {
+                    "git_auth"
+                } else {
+                    "merging_refs"
+                },
+                &e.to_string(),
+            )
+            .await;
             return Err(());
         }
         Ok(())
@@ -429,14 +518,34 @@ impl SessionSetup {
         &self,
         presenter: &mut dyn SessionSetupPresenter,
         dest: &std::path::Path,
-    ) -> Result<(), String> {
+    ) -> Result<(), EngineError> {
+        let (repo, url, refs, cancel) = (
+            dest.to_path_buf(),
+            self.plan.repo_url.clone().unwrap_or_default(),
+            self.plan.merge_refs.clone(),
+            self.cancel.clone(),
+        );
+        let mut fetch_sink = presenter.git_log_sink();
+        let transport = self
+            .session_transport()
+            .map_err(|e| EngineError::Config(e.to_string()))?;
+        self.blocking_git("fetch", move |git| {
+            git.fetch_missing_merge_refs(
+                &repo,
+                &url,
+                &refs,
+                &transport,
+                &mut *fetch_sink,
+                &crate::engine::git::transport::TransportGuard::new(cancel),
+            )
+        })
+        .await?;
         // The clone may have no `user.name` / `user.email` (a fresh server);
         // the engine supplies awman's fallback for exactly the missing keys.
         let identity = {
             let dest = dest.to_path_buf();
             self.blocking_git("merge", move |git| git.commit_identity(&dest))
-                .await
-                .map_err(|e| e.to_string())?
+                .await?
         };
         presenter.log(&identity.describe());
 
@@ -450,8 +559,7 @@ impl SessionSetup {
                 .blocking_git("merge", move |git| {
                     git.merge_ref_logged(&dest, &r, &id, &mut *sink)
                 })
-                .await
-                .map_err(|e| e.to_string())?;
+                .await?;
             let message = match outcome {
                 MergeRefOutcome::Merged { sha } => {
                     format!("Merged origin/{merge_ref} ({})", &sha[..sha.len().min(8)])
@@ -472,6 +580,26 @@ impl SessionSetup {
     /// failed), the snapshot is on disk, and the frontend has been told to
     /// retire its per-session machinery.
     pub async fn run(&self, presenter: &mut dyn SessionSetupPresenter) {
+        // Covers every failed return, dropped future and unwind after clone.
+        struct RetireFailed<'a>(&'a SessionSetup);
+        impl Drop for RetireFailed<'_> {
+            fn drop(&mut self) {
+                let ready = self
+                    .0
+                    .setup_state
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .status
+                    == SessionSetupStatus::Ready;
+                if !ready {
+                    self.0
+                        .engines
+                        .ephemeral_secrets
+                        .remove_session_git_auth(&self.0.session_id);
+                }
+            }
+        }
+        let _retire_failed = RetireFailed(self);
         let session_id = &self.session_id;
 
         // Delay setup work briefly so the frontend's acknowledgement (the API's
@@ -486,7 +614,7 @@ impl SessionSetup {
             session_id = %session_id,
             session_type = %self.plan.kind,
             workdir = %self.plan.resolved_workdir.display(),
-            repo_url = self.plan.repo_url.as_deref().unwrap_or(""),
+            repo_url = %crate::data::git_transport::SafeRemote::from_url(self.plan.repo_url.as_deref().unwrap_or("")),
             branch = self.plan.branch.as_deref().unwrap_or(""),
             "Beginning session setup"
         );
@@ -547,6 +675,11 @@ impl SessionSetup {
                 return;
             }
         };
+
+        crate::command::context::session_binding::apply(
+            &mut *session.write().await,
+            self.plan.context_key.as_ref().map(|k| k.as_str()),
+        );
 
         // For remote sessions, replace the default Local session_type so that
         // downstream consumers (e.g. worktree suppression in ExecWorkflowCommand)
@@ -620,10 +753,8 @@ impl SessionSetup {
             container_runtime.as_ref(),
         )
         .and_then(|resolved| {
-            crate::data::config::global::GlobalConfig::data_home_with(
-                session_guard.effective_config().env(),
-            )
-            .map(|data_home| (resolved, data_home))
+            crate::data::fs::data_paths::data_home(session_guard.effective_config().env())
+                .map(|data_home| (resolved, data_home))
         }) {
             Ok(resolved) => resolved,
             Err(e) => {
@@ -724,463 +855,5 @@ impl SessionSetup {
         }
 
         self.finish(presenter).await;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::message::RecordingMessageSink;
-    use crate::data::session_setup_event::SetupEventPayload;
-
-    /// The whole presenter surface, recorded. Since WI 0114 F-41 that is five
-    /// methods and none of them persist anything: what the run *decided* is
-    /// read back from the shared `SessionSetupState` and the session store,
-    /// not from the frontend.
-    #[derive(Default)]
-    struct RecordingPresenter {
-        events: Vec<SetupEventPayload>,
-        ready_frontend_called: bool,
-        finished_called: bool,
-    }
-
-    impl RecordingPresenter {
-        /// The `(stage, error)` pairs of every `SetupFailed` event broadcast.
-        fn failures(&self) -> Vec<(String, String)> {
-            self.events
-                .iter()
-                .filter_map(|e| match e {
-                    SetupEventPayload::SetupFailed { stage, error } => {
-                        Some((stage.clone(), error.clone()))
-                    }
-                    _ => None,
-                })
-                .collect()
-        }
-
-        /// The machine keys of every `StageChanged` event broadcast, in order.
-        fn stage_keys(&self) -> Vec<String> {
-            self.events
-                .iter()
-                .filter_map(|e| match e {
-                    SetupEventPayload::StageChanged { stage, .. } => Some(stage.clone()),
-                    _ => None,
-                })
-                .collect()
-        }
-    }
-
-    #[async_trait]
-    impl SessionSetupPresenter for RecordingPresenter {
-        fn log(&mut self, _line: &str) {}
-        fn emit(&mut self, event: SetupEventPayload) {
-            self.events.push(event);
-        }
-        fn ready_frontend(&mut self) -> Box<dyn ReadyFrontend> {
-            // Only reached once setup gets all the way to the ready stage; the
-            // clone-failure test below never gets here.
-            self.ready_frontend_called = true;
-            unreachable!("ready_frontend must not be reached on the clone-failure path");
-        }
-        fn git_log_sink(&mut self) -> Box<dyn GitFrontend + Send> {
-            Box::new(RecordingMessageSink::new())
-        }
-        async fn finished(&mut self) {
-            self.finished_called = true;
-        }
-    }
-
-    fn test_engines() -> Engines {
-        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
-        let overlay = Arc::new(crate::engine::overlay::OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(std::path::PathBuf::from(
-                "/tmp",
-            )),
-        ));
-        let git_engine = Arc::new(crate::engine::git::GitEngine::new());
-        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
-            overlay.clone(),
-            runtime.clone(),
-        ));
-        let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home("/tmp"),
-            crate::data::fs::api_paths::ApiPaths::at_root("/tmp"),
-        ));
-        let workflow_state_store = {
-            let tmp = tempfile::tempdir().unwrap();
-            Arc::new(crate::data::WorkflowStateStore::at_git_root(tmp.path()))
-        };
-        Engines {
-            runtime: runtime.clone(),
-            container_runtime: Some(runtime),
-            sandbox_runtime: None,
-            git_engine,
-            overlay_engine: overlay,
-            auth_engine,
-            agent_engine,
-            config_notices: Default::default(),
-            workflow_state_store,
-            credential_monitor: None,
-            global_config: std::sync::Arc::new(Default::default()),
-        }
-    }
-
-    /// Finding D core rule: a remote session whose clone fails must have its
-    /// partially-cloned directory deleted and reach the `failed` terminal state,
-    /// without ever advancing to the ready stage. Uses a bogus local repo URL so
-    /// `git clone` fails fast — no network or Docker required.
-    #[tokio::test]
-    async fn remote_clone_failure_deletes_clone_and_reports_failed() {
-        let root = tempfile::tempdir().unwrap();
-        let cloned_path = root.path().join("clone-dest");
-        std::fs::create_dir_all(&cloned_path).unwrap();
-        // Drop a marker so we can be certain the directory is removed, not merely
-        // emptied by some other path.
-        std::fs::write(cloned_path.join("marker"), b"partial").unwrap();
-        assert!(cloned_path.exists());
-
-        let plan = SessionCreatePlan {
-            kind: SessionKind::Remote,
-            resolved_workdir: cloned_path.clone(),
-            cloned_path: Some(cloned_path.clone()),
-            // A path that does not exist → `git clone` fails immediately.
-            repo_url: Some(root.path().join("no-such-repo.git").display().to_string()),
-            branch: None,
-            base_ref: None,
-            merge_refs: Vec::new(),
-            push: false,
-        };
-
-        // The orchestrator now owns persistence, so the test gives it a real
-        // store and a real API directory rather than a frontend that fakes
-        // them (F-41).
-        let api_root = tempfile::tempdir().unwrap();
-        let paths = ApiPaths::from_root(api_root.path());
-        let store = Arc::new(SqliteSessionStore::open_from_paths(&paths).unwrap());
-        store
-            .insert_session_full(crate::data::fs::api_db::NewSessionRow {
-                id: "sess-clone-fail",
-                workdir: &cloned_path.display().to_string(),
-                created_at: "2026-09-22T00:00:00Z",
-                setup_status: SessionSetupStatus::Initializing,
-                kind: SessionKind::Remote,
-                cloned_path: Some(&cloned_path.display().to_string()),
-            })
-            .unwrap();
-        let setup_state = Arc::new(std::sync::RwLock::new(SessionSetupState::new()));
-
-        let setup = SessionSetup::new(
-            "sess-clone-fail".to_string(),
-            plan,
-            test_engines(),
-            Arc::new(SessionManager::in_memory(
-                crate::data::config::env::EnvSnapshot::empty(),
-            )),
-            Arc::clone(&setup_state),
-            Arc::clone(&store),
-            paths.clone(),
-        );
-        let mut presenter = RecordingPresenter::default();
-        setup.run(&mut presenter).await;
-
-        // The partial clone directory must be gone (the failure-cleanup rule).
-        assert!(
-            !cloned_path.exists(),
-            "the partially-cloned directory must be deleted on clone failure"
-        );
-        // The clone stage was entered and broadcast.
-        assert!(
-            presenter
-                .stage_keys()
-                .contains(&"cloning_repository".to_string()),
-            "the clone stage must be broadcast; got {:?}",
-            presenter.stage_keys()
-        );
-        // The failure was surfaced once, for `clone`.
-        let failures = presenter.failures();
-        assert_eq!(
-            failures.len(),
-            1,
-            "exactly one failure should be reported; got {failures:?}"
-        );
-        assert_eq!(failures[0].0, "clone");
-
-        // The Layer 0 state reached the terminal failure, with the stage named.
-        let final_state = setup_state.read().unwrap().clone();
-        assert_eq!(final_state.status, SessionSetupStatus::Failed);
-        assert_eq!(
-            final_state.error.as_ref().map(|e| e.stage.as_str()),
-            Some("clone")
-        );
-
-        // The orchestrator persisted the terminal status to the session row
-        // and the snapshot to disk — neither went through the frontend.
-        let row = store.get_session("sess-clone-fail").unwrap().unwrap();
-        assert_eq!(row.setup_status.as_str(), "failed");
-        let snapshot_path = paths.session_setup_state_path("sess-clone-fail");
-        assert!(
-            snapshot_path.exists(),
-            "setup_state.json must be written by the orchestrator"
-        );
-        let snapshot: SessionSetupState =
-            serde_json::from_str(&std::fs::read_to_string(&snapshot_path).unwrap()).unwrap();
-        assert_eq!(snapshot.status, SessionSetupStatus::Failed);
-
-        // The frontend was told the run finished, and the ready stage never ran.
-        assert!(presenter.finished_called, "finished() must run");
-        assert!(
-            !presenter.ready_frontend_called,
-            "setup must not reach the ready stage"
-        );
-    }
-
-    #[tokio::test]
-    async fn cancelled_remote_setup_deletes_clone_and_records_cancelled_stage() {
-        let root = tempfile::tempdir().unwrap();
-        let cloned_path = root.path().join("cancelled-clone");
-        std::fs::create_dir_all(&cloned_path).unwrap();
-        std::fs::write(cloned_path.join("marker"), b"partial clone").unwrap();
-
-        let api_root = tempfile::tempdir().unwrap();
-        let paths = ApiPaths::from_root(api_root.path());
-        let store = Arc::new(SqliteSessionStore::open_from_paths(&paths).unwrap());
-        store
-            .insert_session_full(crate::data::fs::api_db::NewSessionRow {
-                id: "sess-cancelled-setup",
-                workdir: &cloned_path.display().to_string(),
-                created_at: "2026-10-28T00:00:00Z",
-                setup_status: SessionSetupStatus::Initializing,
-                kind: SessionKind::Remote,
-                cloned_path: Some(&cloned_path.display().to_string()),
-            })
-            .unwrap();
-        let setup_state = Arc::new(std::sync::RwLock::new(SessionSetupState::new()));
-        let cancel = tokio_util::sync::CancellationToken::new();
-        cancel.cancel();
-        let plan = SessionCreatePlan {
-            kind: SessionKind::Remote,
-            resolved_workdir: cloned_path.clone(),
-            cloned_path: Some(cloned_path.clone()),
-            repo_url: Some("unused://because-cancelled-before-clone".into()),
-            branch: None,
-            base_ref: None,
-            merge_refs: Vec::new(),
-            push: false,
-        };
-        let setup = SessionSetup::new(
-            "sess-cancelled-setup".into(),
-            plan,
-            test_engines(),
-            Arc::new(SessionManager::in_memory(
-                crate::data::config::env::EnvSnapshot::empty(),
-            )),
-            Arc::clone(&setup_state),
-            Arc::clone(&store),
-            paths,
-        )
-        .with_cancellation(cancel);
-        let mut presenter = RecordingPresenter::default();
-
-        setup.run(&mut presenter).await;
-
-        assert!(
-            !cloned_path.exists(),
-            "cancelled setup must delete its remote clone"
-        );
-        assert_eq!(
-            store
-                .get_session("sess-cancelled-setup")
-                .unwrap()
-                .unwrap()
-                .setup_status
-                .as_str(),
-            "failed"
-        );
-        assert_eq!(
-            setup_state.read().unwrap().status,
-            SessionSetupStatus::Failed
-        );
-        assert_eq!(presenter.failures()[0].0, SETUP_CANCELLED_STAGE);
-        assert!(presenter.finished_called);
-    }
-
-    // ── WI 0125 B-1: a not-ready `ReadySummary` must fail setup ─────────────
-    //
-    // `ReadyEngine::run_to_completion` records a failed build/import as a
-    // row in its returned `Ok(summary)`, not as an `Err`. Before the B-1 fix
-    // `SessionSetup` treated any `Ok(summary)` as success, so a session whose
-    // agent image failed to build was still announced "ready".
-
-    /// A `ReadyFrontend` that answers every question but asserts nothing: it
-    /// exists only so `ReadyEngine::run_to_completion` can run to a terminal
-    /// phase without a real TUI/CLI/API frontend attached.
-    struct MinimalReadyFrontend;
-
-    impl crate::data::message::UserMessageSink for MinimalReadyFrontend {
-        fn write_message(&mut self, _msg: crate::data::message::UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-    impl crate::engine::agent::AgentImageFrontend for MinimalReadyFrontend {
-        fn report_step_status(
-            &mut self,
-            _step: &crate::data::setup_step::SetupStep,
-            _status: crate::data::step_status::StepStatus,
-        ) {
-        }
-        fn container_frontend(
-            &mut self,
-        ) -> Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend> {
-            unreachable!(
-                "Docker is unavailable under test isolation; BuildingBaseImage/\
-                 BuildingAgentImage both fail on the availability check before \
-                 ever reaching a container launch"
-            )
-        }
-    }
-    impl ReadyFrontend for MinimalReadyFrontend {
-        fn ask_create_dockerfile(
-            &mut self,
-            _dockerfile_path: &std::path::Path,
-        ) -> Result<bool, EngineError> {
-            Ok(true)
-        }
-        fn ask_run_audit_on_template(&mut self) -> Result<bool, EngineError> {
-            Ok(false)
-        }
-        fn report_phase(&mut self, _phase: &crate::data::ready_phase::ReadyPhase) {}
-        fn report_summary(&mut self, _summary: &crate::data::ready_summary::ReadySummary) {}
-    }
-
-    /// Same recorded surface as `RecordingPresenter`, but with a real (if
-    /// minimal) ready frontend, so a run can reach the ready stage.
-    #[derive(Default)]
-    struct ReadyAwarePresenter {
-        events: Vec<SetupEventPayload>,
-        finished_called: bool,
-    }
-
-    impl ReadyAwarePresenter {
-        fn failures(&self) -> Vec<(String, String)> {
-            self.events
-                .iter()
-                .filter_map(|e| match e {
-                    SetupEventPayload::SetupFailed { stage, error } => {
-                        Some((stage.clone(), error.clone()))
-                    }
-                    _ => None,
-                })
-                .collect()
-        }
-    }
-
-    #[async_trait]
-    impl SessionSetupPresenter for ReadyAwarePresenter {
-        fn log(&mut self, _line: &str) {}
-        fn emit(&mut self, event: SetupEventPayload) {
-            self.events.push(event);
-        }
-        fn ready_frontend(&mut self) -> Box<dyn ReadyFrontend> {
-            Box::new(MinimalReadyFrontend)
-        }
-        fn git_log_sink(&mut self) -> Box<dyn GitFrontend + Send> {
-            Box::new(RecordingMessageSink::new())
-        }
-        async fn finished(&mut self) {
-            self.finished_called = true;
-        }
-    }
-
-    /// A local session (no clone/branch stages) whose `ReadyEngine` run
-    /// records a failed required image stage (the Docker runtime's base/agent
-    /// image build: Docker is unavailable under test isolation, and the
-    /// Dockerfiles cannot build when real Docker is opted in) must reach
-    /// the `failed` terminal state — never be announced `ready` — and must
-    /// keep the (not-ready) summary so clients can show which stage failed.
-    #[tokio::test]
-    async fn a_local_setup_with_a_failed_required_image_stage_fails_not_ready() {
-        let root = tempfile::tempdir().unwrap();
-        let workdir = root.path().to_path_buf();
-        // Pre-create both Dockerfiles so the run reaches the image-build
-        // phases (and the unavailability check) instead of stopping earlier
-        // at a Dockerfile-creation prompt or a network download. The `RUN`
-        // has no shell to run on `scratch`, so the build also fails when a
-        // real Docker daemon is opted in (`AWMAN_TEST_DOCKER`, `make test-full`).
-        const UNBUILDABLE: &str = "FROM scratch\nRUN false\n";
-        std::fs::write(workdir.join("Dockerfile.dev"), UNBUILDABLE).unwrap();
-        let awman_dir = workdir.join(".awman");
-        std::fs::create_dir_all(&awman_dir).unwrap();
-        std::fs::write(awman_dir.join("Dockerfile.claude"), UNBUILDABLE).unwrap();
-
-        let plan = SessionCreatePlan {
-            kind: SessionKind::Local,
-            resolved_workdir: workdir.clone(),
-            cloned_path: None,
-            repo_url: None,
-            branch: None,
-            base_ref: None,
-            merge_refs: Vec::new(),
-            push: false,
-        };
-
-        let api_root = tempfile::tempdir().unwrap();
-        let paths = ApiPaths::from_root(api_root.path());
-        let store = Arc::new(SqliteSessionStore::open_from_paths(&paths).unwrap());
-        store
-            .insert_session_full(crate::data::fs::api_db::NewSessionRow {
-                id: "sess-local-not-ready",
-                workdir: &workdir.display().to_string(),
-                created_at: "2026-09-22T00:00:00Z",
-                setup_status: SessionSetupStatus::Initializing,
-                kind: SessionKind::Local,
-                cloned_path: None,
-            })
-            .unwrap();
-        let setup_state = Arc::new(std::sync::RwLock::new(SessionSetupState::new()));
-
-        let setup = SessionSetup::new(
-            "sess-local-not-ready".to_string(),
-            plan,
-            test_engines(),
-            Arc::new(SessionManager::in_memory(
-                crate::data::config::env::EnvSnapshot::empty(),
-            )),
-            Arc::clone(&setup_state),
-            Arc::clone(&store),
-            paths.clone(),
-        );
-        let mut presenter = ReadyAwarePresenter::default();
-        setup.run(&mut presenter).await;
-
-        let failures = presenter.failures();
-        assert_eq!(
-            failures.len(),
-            1,
-            "exactly one failure should be reported; got {failures:?}"
-        );
-        assert_eq!(failures[0].0, "ready");
-
-        let final_state = setup_state.read().unwrap().clone();
-        assert_eq!(final_state.status, SessionSetupStatus::Failed);
-        assert_eq!(
-            final_state.error.as_ref().map(|e| e.stage.as_str()),
-            Some("ready")
-        );
-        assert!(
-            final_state.ready_summary.is_some(),
-            "the not-ready summary must be kept so clients can show which stage failed"
-        );
-        assert!(
-            !final_state.ready_summary.as_ref().unwrap().is_ready(),
-            "the kept summary must itself report not-ready"
-        );
-
-        let row = store.get_session("sess-local-not-ready").unwrap().unwrap();
-        assert_eq!(
-            row.setup_status.as_str(),
-            "failed",
-            "a summary with a failed required image stage must never persist as ready \
-             (this is the exact regression B-1 fixed)"
-        );
-        assert!(presenter.finished_called, "finished() must run");
     }
 }

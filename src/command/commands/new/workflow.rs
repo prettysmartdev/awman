@@ -35,7 +35,7 @@ pub(super) async fn run(
         // definitions directory).
         let dir = if f.global {
             let git_root = session.as_ref().map(|s| s.git_root().to_path_buf());
-            let workflow_dirs = match WorkflowDirs::from_process_env(git_root) {
+            let workflow_dirs = match WorkflowDirs::from_env(command.session.env(), git_root) {
                 Ok(d) => d,
                 Err(e) => {
                     frontend.write_message(UserMessage {

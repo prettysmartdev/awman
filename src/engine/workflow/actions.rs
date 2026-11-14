@@ -60,7 +60,8 @@ pub struct AvailableActions {
     /// scope the Workflow Control Board to the parallel context.
     pub parallel_peer_count: usize,
     /// Live peers of the focused step still running in the same parallel group
-    /// (excludes the focused step itself). Non-zero disables back/finish.
+    /// (excludes the focused step itself). Finish remains available once the
+    /// final group is ready for review.
     pub parallel_peers_running: usize,
     /// True when a container is currently running (mid-step). The engine
     /// computes this from `current_execution.is_some()` in
@@ -104,6 +105,21 @@ pub struct AvailableActions {
     /// own ([`crate::engine::workflow::frontend::WorkflowFrontend::ask_parallel_group`]).
     /// A frontend uses it only to label those actions accordingly.
     pub acts_on_parallel_group: bool,
+    /// The focused step's agent's latest OSC 7501 report (WI 0141), when it
+    /// has one. Set on every board opened while the agent reports; a board
+    /// opened *because of* a report (non-yolo `done`/`idle`, `blocked`,
+    /// `error`) always carries it. Frontends show the state, kind and `msg`
+    /// (untrusted agent text: render it as plain text, truncated).
+    ///
+    /// A board that carries a report and that the user has not touched yet
+    /// may be dismissed by the frontend (answer [`NextAction::Dismiss`]) when
+    /// the same agent later reports `working` — the engine's call is
+    /// blocking, so closing an auto-opened board is the frontend's job.
+    pub reported_status: Option<crate::data::program_status::EffectiveStatus>,
+    /// This board was opened automatically by the focused agent's report.
+    /// Explicit Ctrl-W boards may still display `reported_status`, but must
+    /// open immediately and stay open until the user answers.
+    pub opened_by_report: bool,
 }
 
 /// An answer to one of the engine's follow-up questions about a running
@@ -202,22 +218,7 @@ pub enum YoloTickOutcome {
     AdvanceNow,
 }
 
-/// Why a countdown reported through the `yolo_countdown_*` hooks is running.
-///
-/// The two share one reporting channel deliberately — an unattended frontend
-/// surfaces both the same way (WI-0115 §3) — but they mean opposite things to
-/// whoever is reading, so the frontend is told which it is rather than left to
-/// assume the common one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CountdownKind {
-    /// A step's container has gone quiet; when the countdown expires the
-    /// engine kills it and advances to the next step.
-    #[default]
-    StuckStep,
-    /// A step's container exited non-zero and no one can be asked what to do;
-    /// when the countdown expires the engine retries that same step.
-    FailureRetry,
-}
+pub use crate::data::workflow_state::CountdownKind;
 
 /// What `step_once` returned: the step that just executed plus its outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,7 +253,7 @@ pub enum WorkflowOutcome {
     },
     /// Main workflow completed but a teardown step with `abort_on_failure`
     /// failed. Post-workflow actions (worktree flows) should still run, but
-    /// non-interactive contexts should default to keeping the worktree.
+    /// headless contexts should default to keeping the worktree.
     CompletedTeardownFailed,
 }
 

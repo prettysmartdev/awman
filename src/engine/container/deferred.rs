@@ -148,6 +148,17 @@ impl ContainerBackend for DeferredBackend {
     ) -> Result<ImportedImage, EngineError> {
         self.get()?.import_image_cancellable(request, sink, cancel)
     }
+
+    fn import_image_cancellable_in(
+        &self,
+        request: &ImageImportRequest,
+        env: &crate::data::config::env::EnvSnapshot,
+        sink: &mut dyn UserMessageSink,
+        cancel: &crate::engine::oci::CancelToken,
+    ) -> Result<ImportedImage, EngineError> {
+        self.get()?
+            .import_image_cancellable_in(request, env, sink, cancel)
+    }
     fn list_dangling_images(&self) -> Result<Vec<ContainerImageInfo>, EngineError> {
         self.get()?.list_dangling_images()
     }
@@ -179,94 +190,5 @@ impl ContainerBackend for DeferredBackend {
     }
     fn stop_and_remove(&self, id: &str) -> Result<(), EngineError> {
         self.get()?.stop_and_remove(id)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[test]
-    fn fatal_builtin_configuration_errors_are_not_deferred() {
-        let result = super::super::runtime::ContainerRuntime::open_builtin(Box::new(|| {
-            Err(EngineError::Config("invalid builtin configuration".into()))
-        }));
-        assert!(matches!(result, Err(EngineError::Config(_))));
-    }
-
-    #[test]
-    fn startup_unavailability_is_retried_without_switching_runtime() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let observed = attempts.clone();
-        let runtime = super::super::runtime::ContainerRuntime::open_builtin(Box::new(move || {
-            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
-                Err(EngineError::BuiltinRuntimeUnavailable {
-                    reason: "starting".into(),
-                })
-            } else {
-                Ok(Arc::new(
-                    super::super::test_support::HoldingBackend::default(),
-                ))
-            }
-        }))
-        .expect("recoverable construction failure retains a runtime");
-        assert_eq!(runtime.runtime_name(), "builtin");
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            1,
-            "construction was attempted"
-        );
-        assert!(runtime.availability().is_ok());
-        assert!(runtime.availability().is_ok());
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            2,
-            "cache successful construction"
-        );
-    }
-
-    #[test]
-    fn a_notice_from_a_deferred_open_is_returned_once_after_it_opens() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let observed = attempts.clone();
-        let runtime = super::super::runtime::ContainerRuntime::open_builtin(Box::new(move || {
-            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
-                return Err(EngineError::BuiltinRuntimeUnavailable {
-                    reason: "starting".into(),
-                });
-            }
-            let backend = super::super::test_support::HoldingBackend::default();
-            backend.notices.lock().unwrap().push("upgraded".into());
-            Ok(Arc::new(backend))
-        }))
-        .unwrap();
-        assert!(
-            runtime.take_notices().is_empty(),
-            "draining never forces an open"
-        );
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        assert!(runtime.availability().is_ok());
-        assert_eq!(runtime.take_notices(), vec!["upgraded".to_string()]);
-        assert!(runtime.take_notices().is_empty());
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn builtin_construction_under_isolation_retains_selected_runtime() {
-        let state = tempfile::tempdir().unwrap();
-        let runtime = super::super::runtime::ContainerRuntime::builtin(
-            crate::engine::container::runtime::BuiltinRuntimeSettings {
-                state_dir: state.path().to_path_buf(),
-                ambient_overrides: vec![],
-                test_isolation: true,
-            },
-        )
-        .expect("transient startup unavailability must leave an observable runtime");
-        assert_eq!(runtime.runtime_name(), "builtin");
-        assert!(matches!(
-            runtime.availability(),
-            Err(EngineError::BuiltinRuntimeUnavailable { .. })
-        ));
     }
 }

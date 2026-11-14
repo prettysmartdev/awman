@@ -1,12 +1,14 @@
-//! `DataPaths` — the shared (non-API-specific) data root.
+//! `DataPaths` — the awman home layout and the shared data root.
 //!
-//! The sqlite database moves out of the API-mode directory (`~/.awman/api/`)
-//! into a shared `~/.awman/data/` once squad also owns tables in it. `DataPaths`
-//! resolves `<data_home>/data/awman.db` using the same precedence
-//! `GlobalConfig::data_home_with` implements (`AWMAN_CONFIG_HOME` →
-//! `XDG_DATA_HOME/awman` → `$HOME/.awman`). No new env var — the DB relocates
-//! in lockstep with every other relocatable path.
+//! Every awman path derives from two homes:
 //!
+//! | Need | `AWMAN_HOME` set | unset, XDG set | unset, no XDG |
+//! |---|---|---|---|
+//! | config home (`config.json`) | `$AWMAN_HOME` | `$XDG_CONFIG_HOME/awman` | `~/.awman` |
+//! | data home (everything else) | `$AWMAN_HOME` | `$XDG_DATA_HOME/awman` | `~/.awman` |
+//!
+//! Under the data home: `data/awman.db`, `data/repos/<hash>/state.json`,
+//! `api/`, `squad/`, `attach/`, `builtin/`, and the other data dirs.
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -14,10 +16,54 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::data::config::env::{Env, EnvSnapshot};
-use crate::data::config::global::GlobalConfig;
 use crate::data::error::DataError;
 
+/// The one process variable that relocates every awman path.
+pub const AWMAN_HOME: &str = "AWMAN_HOME";
+
+/// Subdirectory of `$HOME` used when neither `AWMAN_HOME` nor XDG is set.
+pub const HOME_SUBDIR: &str = ".awman";
+
+/// `AWMAN_HOME`, when set and non-empty.
+pub fn awman_home(env: &EnvSnapshot) -> Option<PathBuf> {
+    env.get(AWMAN_HOME)
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+/// Where `config.json` lives: `$AWMAN_HOME` → `$XDG_CONFIG_HOME/awman` → `~/.awman`.
+pub fn config_home(env: &EnvSnapshot) -> Result<PathBuf, DataError> {
+    if let Some(home) = awman_home(env) {
+        return Ok(home);
+    }
+    if let Some(xdg) = env.xdg_config_home() {
+        return Ok(xdg.join("awman"));
+    }
+    user_home(env)
+}
+
+/// Where everything else lives: `$AWMAN_HOME` → `$XDG_DATA_HOME/awman` → `~/.awman`.
+pub fn data_home(env: &EnvSnapshot) -> Result<PathBuf, DataError> {
+    if let Some(home) = awman_home(env) {
+        return Ok(home);
+    }
+    if let Some(xdg) = env.xdg_data_home() {
+        return Ok(xdg.join("awman"));
+    }
+    user_home(env)
+}
+
+fn user_home(env: &EnvSnapshot) -> Result<PathBuf, DataError> {
+    let home = env
+        .home_dir()
+        .or_else(dirs::home_dir)
+        .ok_or(DataError::HomeNotFound)?;
+    Ok(home.join(HOME_SUBDIR))
+}
+
 /// Subdirectory under the data home that hosts the shared database.
+pub const DAEMON_SUBDIR: &str = "daemon";
+
 pub const DATA_SUBDIR: &str = "data";
 
 /// Filename of the shared sqlite database. Identical to
@@ -62,13 +108,34 @@ impl DataPaths {
 
     /// Resolve from a supplied env snapshot: `<data_home>/data`.
     pub fn from_env(env: &EnvSnapshot) -> Result<Self, DataError> {
-        let data_home = GlobalConfig::data_home_with(env)?;
+        let data_home = data_home(env)?;
         Ok(Self::at_root(data_home.join(DATA_SUBDIR)))
+    }
+
+    /// Where `config.json` lives for `env` (see [`config_home`]).
+    pub fn config_home(env: &EnvSnapshot) -> Result<PathBuf, DataError> {
+        config_home(env)
     }
 
     /// The shared data root (`<data_home>/data`).
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The single daemon identity directory.
+    pub fn daemon(&self) -> crate::data::fs::daemon_paths::DaemonPaths {
+        crate::data::fs::daemon_paths::DaemonPaths::new(self.root.join(DAEMON_SUBDIR))
+    }
+
+    /// The data home this root sits in (`<data_home>`).
+    pub fn home(&self) -> &Path {
+        self.root.parent().unwrap_or(&self.root)
+    }
+
+    /// Per-repo state directory: `<root>/repos/<first 16 hex of sha256(git_root)>`.
+    pub fn repo_state_dir(&self, git_root: &Path) -> PathBuf {
+        let hash = crate::data::fs::hash::sha256_hex(git_root.to_string_lossy().as_bytes());
+        self.root.join("repos").join(&hash[..16])
     }
 
     /// Path to the shared sqlite database (`<root>/awman.db`).
@@ -284,135 +351,4 @@ fn rename_legacy_aside(
         }
     }
     Ok((sidecars, backup_kept))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::config::env::{AWMAN_CONFIG_HOME, XDG_DATA_HOME};
-
-    #[test]
-    fn from_env_uses_config_home_data_subdir() {
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, "/cfg/home")]);
-        let paths = DataPaths::from_env(&env).unwrap();
-        assert_eq!(paths.root(), Path::new("/cfg/home/data"));
-        assert_eq!(paths.db_path(), PathBuf::from("/cfg/home/data/awman.db"));
-    }
-
-    #[test]
-    fn from_env_uses_xdg_data_home() {
-        let env = EnvSnapshot::with_overrides([(XDG_DATA_HOME, "/xdg/data")]);
-        let paths = DataPaths::from_env(&env).unwrap();
-        assert_eq!(paths.root(), Path::new("/xdg/data/awman/data"));
-    }
-
-    #[test]
-    fn db_path_is_awman_db() {
-        let paths = DataPaths::at_root("/some/root/data");
-        assert_eq!(paths.db_path(), PathBuf::from("/some/root/data/awman.db"));
-    }
-
-    #[test]
-    fn migration_copies_main_db_and_sqlite_sidecars_before_renaming_legacy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let legacy_root = tmp.path().join("api");
-        let data = DataPaths::at_root(tmp.path().join("data"));
-        std::fs::create_dir_all(&legacy_root).unwrap();
-        std::fs::write(legacy_root.join(DB_FILENAME), b"main").unwrap();
-        std::fs::write(legacy_root.join("awman.db-wal"), b"wal").unwrap();
-        std::fs::write(legacy_root.join("awman.db-shm"), b"shm").unwrap();
-
-        let outcome = data.migrate_legacy_db(&legacy_root).unwrap();
-        assert!(matches!(
-            outcome,
-            MigrationOutcome::Migrated {
-                copied_bytes: 10,
-                backup_kept: true,
-                ..
-            }
-        ));
-        assert_eq!(std::fs::read(data.db_path()).unwrap(), b"main");
-        assert_eq!(
-            std::fs::read(data.root().join("awman.db-wal")).unwrap(),
-            b"wal"
-        );
-        assert_eq!(
-            std::fs::read(data.root().join("awman.db-shm")).unwrap(),
-            b"shm"
-        );
-        assert_eq!(
-            std::fs::read(legacy_root.join("awman.db.pre-migration")).unwrap(),
-            b"main"
-        );
-        assert!(!legacy_root.join(DB_FILENAME).exists());
-    }
-
-    #[test]
-    fn migration_discards_interrupted_target_and_restarts_from_legacy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let legacy_root = tmp.path().join("api");
-        let data = DataPaths::at_root(tmp.path().join("data"));
-        std::fs::create_dir_all(&legacy_root).unwrap();
-        data.ensure_root().unwrap();
-        std::fs::write(legacy_root.join(DB_FILENAME), b"authoritative").unwrap();
-        std::fs::write(data.db_path(), b"partial").unwrap();
-
-        assert!(matches!(
-            data.migrate_legacy_db(&legacy_root).unwrap(),
-            MigrationOutcome::RecoveredFromInterrupted { copied_bytes: 13 }
-        ));
-        assert_eq!(std::fs::read(data.db_path()).unwrap(), b"authoritative");
-    }
-
-    #[test]
-    fn existing_backup_is_preserved_without_failing_migration() {
-        let tmp = tempfile::tempdir().unwrap();
-        let legacy_root = tmp.path().join("api");
-        let data = DataPaths::at_root(tmp.path().join("data"));
-        std::fs::create_dir_all(&legacy_root).unwrap();
-        std::fs::write(legacy_root.join(DB_FILENAME), b"new-main").unwrap();
-        std::fs::write(legacy_root.join("awman.db.pre-migration"), b"old-main").unwrap();
-
-        assert!(matches!(
-            data.migrate_legacy_db(&legacy_root).unwrap(),
-            MigrationOutcome::Migrated {
-                backup_kept: false,
-                ..
-            }
-        ));
-        assert_eq!(
-            std::fs::read(legacy_root.join("awman.db.pre-migration")).unwrap(),
-            b"old-main"
-        );
-        assert!(!legacy_root.join(DB_FILENAME).exists());
-        assert_eq!(std::fs::read(data.db_path()).unwrap(), b"new-main");
-    }
-
-    #[test]
-    fn fresh_and_already_migrated_are_distinct() {
-        let tmp = tempfile::tempdir().unwrap();
-        let legacy_root = tmp.path().join("api");
-        let data = DataPaths::at_root(tmp.path().join("data"));
-        std::fs::create_dir_all(&legacy_root).unwrap();
-        assert_eq!(
-            data.migrate_legacy_db(&legacy_root).unwrap(),
-            MigrationOutcome::FreshInstall
-        );
-        std::fs::write(data.db_path(), b"live").unwrap();
-        assert_eq!(
-            data.migrate_legacy_db(&legacy_root).unwrap(),
-            MigrationOutcome::AlreadyMigrated
-        );
-    }
-
-    #[test]
-    fn failed_copy_preserves_legacy_and_removes_target() {
-        let tmp = tempfile::tempdir().unwrap();
-        let legacy_root = tmp.path().join("api");
-        let data = DataPaths::at_root(tmp.path().join("data"));
-        std::fs::create_dir_all(legacy_root.join(DB_FILENAME)).unwrap();
-        assert!(data.migrate_legacy_db(&legacy_root).is_err());
-        assert!(legacy_root.join(DB_FILENAME).exists());
-        assert!(!data.db_path().exists());
-    }
 }

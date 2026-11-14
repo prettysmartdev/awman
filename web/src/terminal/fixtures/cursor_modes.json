@@ -1,0 +1,61 @@
+{
+  "about": "CUP, DECSC/DECRC, hidden cursor (25l), DECCKM application cursor (1h)",
+  "expect": {
+    "alt_screen": false,
+    "app_cursor": true,
+    "bracketed_paste": false,
+    "cols": 12,
+    "cursor": {
+      "col": 6,
+      "row": 2,
+      "visible": false
+    },
+    "lines": [
+      "Ybc",
+      "",
+      "    XZ",
+      ""
+    ],
+    "mouse_mode": "none",
+    "mouse_sgr": false,
+    "rows": 4
+  },
+  "expect_from_snapshot": {
+    "alt_screen": false,
+    "app_cursor": true,
+    "bracketed_paste": false,
+    "cursor": {
+      "col": 6,
+      "row": 2,
+      "visible": false
+    },
+    "lines": [
+      "Ybc",
+      "",
+      "    XZ",
+      ""
+    ]
+  },
+  "final_snapshot": {
+    "cols": 12,
+    "has_output": true,
+    "rows": 4,
+    "screen": "G1s/MjVsG1ttG1tIG1tKWWJjG1szOzVIWFobPhtbPzFoG1s/MjAwNGw=",
+    "type": "snapshot"
+  },
+  "frames": [
+    {
+      "cols": 12,
+      "has_output": false,
+      "rows": 4,
+      "screen": "G1s/MjVoG1ttG1tIG1tKGz4bWz8xbBtbPzIwMDRs",
+      "type": "snapshot"
+    },
+    {
+      "bytes": "YWJjG1szOzVIWBs3G1sxOzFIWRs4WhtbPzI1bBtbPzFo",
+      "type": "output"
+    }
+  ],
+  "name": "cursor_modes",
+  "source": "vt100-ctt 0.17.1 (TerminalHub mirror parser); snapshot = Screen::state_formatted()"
+}

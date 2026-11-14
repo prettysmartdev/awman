@@ -6,6 +6,26 @@ awman is built around a simple principle: agents never run on your host machine.
 
 ## The containment model
 
+The browser frontend is intended for same-machine access through the daemon's
+loopback listener. The v0 web app cannot connect to a daemon on another
+machine. Browser origins are configured per listener with
+`daemon.network.listeners.<name>.allowedOrigins`; this is an origin allowlist,
+not itself authentication. A browser must also be approved with `awman link
+web-<code>`; the resulting grant can be listed or revoked through the local
+daemon API. Grants last twelve hours; a reload within that time reconnects
+without a new approval. See the [Web App guide](20-webapp.md) for setup,
+when relinking is needed, and usage reporting.
+
+The owner decides how much the loopback listener exposes. Browser grants are
+scoped to the engine on that one listener; they can never create API keys,
+change configuration or reach worker routes, and the browser cannot supply its
+own shell environment, executable paths or mount roots. If you suspect a browser
+or the hosted site has been compromised, revoke its grants with
+`awman daemon api browsers.delete id=<browser-id>`, then disable the listener
+(`awman config set daemon.network.listeners.loopback.enabled false`) or remove
+`engine` from its `features`. Both changes apply live and close that listener's
+browser connections.
+
 By default, an agent environment:
 
 - Sees only your current Git repository (mounted via bind mount or virtiofs)
@@ -17,13 +37,40 @@ This means a misbehaving agent can't access your SSH keys, can't run arbitrary c
 
 **Docker / Apple Containers:** agents run in a Linux container or lightweight VM respectively. The container is removed (`--rm`) when the session ends. Most agents receive credentials as environment variables. Claude Code is the exception: it receives a live-updated credential file (access token, expiry, and scopes only — never the refresh token) written into its staged settings directory and kept fresh for as long as the session runs. See [Live credential refresh](#live-credential-refresh) below.
 
-**Docker Sandboxes (`docker-sbx-experimental`):** agents run in a dedicated microVM with its own kernel, private Docker daemon, and private filesystem. Host escape requires a hypervisor exploit rather than a container escape. Sandboxes persist between sessions (state survives `sbx stop`); awman runs `sbx rm` only on explicit teardown. Credentials are registered at agent launch with sandbox-scoped `sbx secret set` calls (never global), so removing a sandbox removes its secrets with it. sbx is unaffected by the live credential-file refresh described below — it continues to authenticate Claude only through `ANTHROPIC_API_KEY` or an in-sandbox login. See [Runtimes](11-runtimes.md#docker-sandboxes-experimental) for setup and limitations.
+**Docker Sandboxes (`sbx`):** agents run in a dedicated microVM with its own kernel, private Docker daemon, and private filesystem. Host escape requires a hypervisor exploit rather than a container escape. Sandboxes persist between sessions (state survives `sbx stop`); awman runs `sbx rm` only on explicit teardown. Credentials are registered at agent launch with sandbox-scoped `sbx secret set` calls (never global), so removing a sandbox removes its secrets with it. sbx is unaffected by the live credential-file refresh described below — it continues to authenticate Claude only through `ANTHROPIC_API_KEY` or an in-sandbox login. See [Runtimes](11-runtimes.md#docker-sandboxes-experimental) for setup and limitations.
 
-**Builtin microVM (`builtin-experimental`, macOS on Apple Silicon only):** agents run in a per-session microVM whose hypervisor, kernel, and guest agent are embedded in the awman executable. The builtin runtime does not use a host runtime helper to start or manage VMs; the separate `docker` or `container` CLI is used only for an explicitly enabled, source-matched image build during `awman ready` or when a launch finds its agent image missing. That build uses the configured local image source and repository Dockerfiles/build context; it does not move agent execution out of the microVM. Environment overrides that could replace the builtin runtime are rejected; the error identifies the variable to unset. The VM is started by a separate awman process running the same executable, which is what holds the hypervisor access (the `com.apple.security.hypervisor` entitlement carried by awman's ad-hoc code signature); the internal `awman machine` entry point that process uses is reserved and not a public command. Sessions are removed when they end, and if the awman process that launched a session exits, the session's VM stops with it. Its private state directory must be owned by you (mode `0700`, no symlinks). Every mount into a session, including any overlay, is checked before creation and refused if it isn't a regular file or a directory — a Unix socket (such as the Docker socket), FIFO, or device node can never be bridged into the guest that way. Images are imported only from a source you configure, verified against their digests, and rejected if their layers contain path traversal, writes through symlinks, device nodes, or unsafe hard links; awman never runs Docker credential helpers, and registry credentials go only to the registry itself. Claude credentials use the same staged, refresh-token-free, mode-`0600` file as the container runtimes, delivered as a single-file mount. Agents run as the image's non-root user, which reads that file inside the guest, and a live credential refresh reaches every running session atomically.
+**Builtin microVM (`builtin`, macOS on Apple Silicon only):** agents run in a per-session microVM whose hypervisor, kernel, and guest agent are embedded in the awman executable. The builtin runtime does not use a host runtime helper to start or manage VMs; the separate `docker` or `container` CLI is used only for an explicitly enabled, source-matched image build during `awman ready` or when a launch finds its agent image missing. That build uses the configured local image source and repository Dockerfiles/build context; it does not move agent execution out of the microVM. Environment overrides that could replace the builtin runtime are rejected; the error identifies the variable to unset. The VM is started by a separate awman process running the same executable, which is what holds the hypervisor access (the `com.apple.security.hypervisor` entitlement carried by awman's ad-hoc code signature); the internal `awman machine` entry point that process uses is reserved and not a public command. Sessions are removed when they end, and if the awman process that launched a session exits, the session's VM stops with it. Its private state directory must be owned by you (mode `0700`, no symlinks). Every mount into a session, including any overlay, is checked before creation and refused if it isn't a regular file or a directory — a Unix socket (such as the Docker socket), FIFO, or device node can never be bridged into the guest that way. Images are imported only from a source you configure, verified against their digests, and rejected if their layers contain path traversal, writes through symlinks, device nodes, or unsafe hard links; awman never runs Docker credential helpers, and registry credentials go only to the registry itself. Claude credentials use the same staged, refresh-token-free, mode-`0600` file as the container runtimes, delivered as a single-file mount. Agents run as the image's non-root user, which reads that file inside the guest, and a live credential refresh reaches every running session atomically.
 
-Guest network policy is configured through `builtin.network`; the repo may only narrow the global ceiling. The policy is resolved per launch from the repo the session runs in: the repo block narrows the policy for every launch in that repo (TUI, API and squad sessions, and workflow worktrees, which keep the narrowing of the checkout you launched from even before you commit it), and no launch can widen the global ceiling. Every session reads the global ceiling from the same global config the awman process loaded, including one relocated with `AWMAN_CONFIG_HOME`. The host-side network stack enforces it without TLS interception or ambient proxies: allowlisted HTTPS is permitted only for an allowed, DNS-bound server name, hostname rules deny UDP/QUIC, and `none` gives the guest no network device. These rules are tested in real guests; see [Runtimes: Network](11-runtimes.md#network) for exactly what is and isn't inspected (encrypted HTTP `Host` and ECH inner names are not).
+Guest network policy is configured through `runtime.builtin.network`; the repo may only narrow the global ceiling. The policy is resolved per launch from the repo the session runs in: the repo block narrows the policy for every launch in that repo (TUI, API and squad sessions, and workflow worktrees, which keep the narrowing of the checkout you launched from even before you commit it), and no launch can widen the global ceiling. Every session reads the global ceiling from the same global config the awman process loaded, including one relocated with `AWMAN_CONFIG_HOME`. The host-side network stack enforces it without TLS interception or ambient proxies: allowlisted HTTPS is permitted only for an allowed, DNS-bound server name, hostname rules deny UDP/QUIC, and `none` gives the guest no network device. These rules are tested in real guests; see [Runtimes: Network](11-runtimes.md#network) for exactly what is and isn't inspected (encrypted HTTP `Host` and ECH inner names are not).
 
 See [Runtimes](11-runtimes.md#builtin-microvm-experimental).
+
+### Terminal output and host terminal variables
+
+When agent output is attached to a host terminal, awman filters terminal
+control sequences before writing it to the host. Printable text, ordinary
+cursor and colour controls (CSI), standard escape sequences, and OSC titles,
+hyperlinks, and icon names (OSC 0, 1, 2, and 8) pass through. Other OSC
+sequences are removed, including clipboard access (OSC 52), file transfer,
+palette changes, and terminal notifications (OSC 9, 99, and 777). OSC 7501
+program-status reports are removed or parsed and re-encoded from sanitised
+fields; raw reports and terminal queries are never passed through. DCS, SOS,
+PM, and APC strings are removed in full, including Kitty graphics. tmux
+passthrough wrappers are removed and their contents are scanned again by the
+same filter. Incomplete control strings are dropped at detach. This
+filter applies to TTY attach output; the TUI's in-process terminal display is
+separate.
+
+Containers do not receive these host-terminal variables, even when an overlay
+asks to pass one through: `REX_*`, `TMUX`, `TMUX_*`, `ZELLIJ`, `ZELLIJ_*`,
+`STY`, `WINDOW`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`, `TERM_SESSION_ID`,
+`WEZTERM_*`, `KITTY_*`, `ITERM_*`, `LC_TERMINAL*`, `ALACRITTY_*`, `GHOSTTY_*`,
+`VTE_VERSION`, `WT_SESSION`, and `WT_PROFILE_ID`. awman warns when it removes
+requested variables. Inside every container, `TERM` is `xterm-256color`;
+`COLORTERM` is `truecolor` only when the host had `COLORTERM` set. If an agent
+needs one of the blocked values, copy it into a differently named host
+variable before launching awman, then pass that new variable with an `env()`
+overlay.
 
 ### Live credential refresh
 
@@ -31,7 +78,7 @@ Claude Code's OAuth refresh token — the credential that could mint new access 
 
 While a Claude session is running, awman's credential-refresh monitor watches the access token's expiry. Shortly before it would expire, the monitor triggers a host-side refresh: it invokes the same sanctioned, hardcoded ready-check ping that `awman ready` uses to verify your local agent is authenticated (fixed prompt, no user input, no repository content, no working directory) — this causes your host's Claude Code installation to rotate its own Keychain entry. The monitor then atomically replaces the staged credential file for every live session with the new token, so a long-running container observes it on its next request without a restart.
 
-If the host can't refresh (asleep, logged out, offline), awman keeps the last-known-good token in place, warns loudly, and retries with backoff; it never leaves a container with no credential at all. This behavior is on by default and can be tuned or disabled — see [Control credential refresh](07-configuration.md#control-credential-refresh-authrefresh).
+If the host can't refresh (asleep, logged out, offline), awman keeps the last-known-good token in place, warns loudly, and retries with backoff; it never leaves a container with no credential at all. This behavior is on by default and can be tuned or disabled — see [Control credential refresh](07-configuration.md#control-credential-refresh-agentsauthrefresh).
 
 Every runtime command awman runs is printed before it executes; see [Command transparency](#command-transparency).
 
@@ -218,6 +265,59 @@ Workflow credential grants are scoped to the current run, repository, remote, cr
 Grants never reach `run_shell` or `run_script` steps, main agent steps, `on_failure` remediation agents, or dynamic and squad leaders. A selected SSH key is mounted read-only as `~/.ssh/awman_push_key` with `IdentitiesOnly=yes` and a private writable copy of `known_hosts`. Credentialed Git transport pins the approved URL and ignores checkout-supplied hooks, URL rewrites, credential helpers and SSH commands; HTTPS credentials are answered only for the approved host and path. A new destination needs a fresh decision.
 
 If you configure `workflows.prerequisites.githubToken.acquire.argv`, awman may run that token command on the host. It runs an argv list without a shell, with a timeout and bounded output, and the process group is cleaned up on every exit. The tool must be an installed program outside any Git checkout; known agent binaries (including configured custom agents), shells, interpreters and launch wrappers are refused. Approval binds the argv, the resolved executable and its content, and awman runs a verified private copy, so changing the installed program requires a new approval. A repository-configured command is approved by its argument-list hash before use. Approving a tool also trusts whatever it runs, so never approve one that delegates to an agent. The token is held as a secret, never written to config or logs, and redacted from all workflow output. See [Workflow prerequisites](05-workflows.md#workflow-prerequisite-checks) and [Configuration](07-configuration.md#workflow-prerequisites).
+
+### API command secrets
+
+An API command may include a `secrets` map for values requested by an
+`env(NAME)` overlay. The map is limited to 32 entries; each non-empty value is
+at most 8192 bytes and contains no NUL. Names are at most 128 bytes and must
+match `^[A-Z_][A-Z0-9_]*$`. A command secret overrides the daemon's host
+environment for that matching overlay variable. It is delivered only when the
+overlay asks for that name; repositories and workflows that request an
+environment variable are trusted recipients of its value.
+
+Command secret values are held in daemon memory, not command rows or
+idempotency records. A daemon restart drops them. A queued command that still
+has a names-only marker but no in-memory values fails before dispatch with
+`secrets_lost`; submit it again with the values. awman redacts registered
+values and common encodings from command events, logs, and structured results,
+including JSON data and map keys. This protects awman-published text and
+records; it does not sanitize arbitrary artifacts. Files in `/awman/output`
+and terminal bytes are not redacted. Do not write secrets to output files or
+print them to a terminal.
+
+Values passed through `env(NAME)` become part of the receiving process or
+container environment. The receiving runtime and its operators can inspect
+that environment, so environment delivery is not a boundary against a trusted
+recipient or runtime administrator. Exact-value redaction also cannot prevent
+deliberate exfiltration or every novel encoding. Do not treat log redaction as
+a substitute for limiting which command and workflow receives a secret.
+
+Remote API sessions may also supply `git_auth` for Git clone, fetch and
+push-back. Those credentials remain in daemon memory and are served to Git via
+a private local credential channel; they are not placed in Git process arguments or
+environment variables. Git workflow steps receive a temporary, memory-only
+credential cache scoped to the session's repository. This works across container
+and microVM boundaries without mounting a host socket. Matching push and pull
+steps also use the session credential during preflight. PR creation uses it for
+Git operations and requires a separate GitHub API token. A phase container that receives the credential is trusted
+with the reusable credential. After daemon restart, the credential is lost and
+the session fails closed with `credentials_lost`; create a new session and
+provide credentials again.
+
+---
+
+## The daemon engine
+
+When the TUI runs on the [daemon engine](19-engine-and-frontends.md), nothing about containment changes: agents still run only in containers, with the same mounts and checks.
+
+- **Same-machine browser access.** The TUI engine uses the owner-only local
+  socket or named pipe. Browser access is designed for a separate loopback
+  listener and cannot connect to a daemon on another machine. Browser grants
+  are approved by the owner on the daemon's local CLI and can be revoked
+  through the local daemon API; see the [Web App guide](20-webapp.md).
+- **Shell environment.** So that commands behave as they would in your own shell, the TUI sends its environment to the engine when it connects. The engine keeps it in memory for that instance only; it is never written to disk, config, the database or logs, and it is dropped when the instance ends. It is not passed wholesale to containers: containers receive only what they would receive from a builtin TUI.
+- **Secrets.** Secret dialog answers (such as a token you type) are sent only over the local socket and are redacted everywhere else.
 
 ---
 

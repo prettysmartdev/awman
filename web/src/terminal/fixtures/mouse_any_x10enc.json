@@ -1,0 +1,61 @@
+{
+  "about": "Any-motion tracking (1003) with default (X10-byte) encoding",
+  "expect": {
+    "alt_screen": false,
+    "app_cursor": false,
+    "bracketed_paste": false,
+    "cols": 20,
+    "cursor": {
+      "col": 4,
+      "row": 0,
+      "visible": true
+    },
+    "lines": [
+      "move",
+      "",
+      "",
+      ""
+    ],
+    "mouse_mode": "any",
+    "mouse_sgr": false,
+    "rows": 4
+  },
+  "expect_from_snapshot": {
+    "alt_screen": false,
+    "app_cursor": false,
+    "bracketed_paste": false,
+    "cursor": {
+      "col": 4,
+      "row": 0,
+      "visible": true
+    },
+    "lines": [
+      "move",
+      "",
+      "",
+      ""
+    ]
+  },
+  "final_snapshot": {
+    "cols": 20,
+    "has_output": true,
+    "rows": 4,
+    "screen": "G1s/MjVoG1ttG1tIG1tKbW92ZRs+G1s/MWwbWz8yMDA0bBtbPzEwMDNo",
+    "type": "snapshot"
+  },
+  "frames": [
+    {
+      "cols": 20,
+      "has_output": false,
+      "rows": 4,
+      "screen": "G1s/MjVoG1ttG1tIG1tKGz4bWz8xbBtbPzIwMDRs",
+      "type": "snapshot"
+    },
+    {
+      "bytes": "G1s/MTAwM2htb3Zl",
+      "type": "output"
+    }
+  ],
+  "name": "mouse_any_x10enc",
+  "source": "vt100-ctt 0.17.1 (TerminalHub mirror parser); snapshot = Screen::state_formatted()"
+}

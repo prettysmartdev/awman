@@ -1,6 +1,11 @@
 use std::env;
 
 fn main() {
+    if env::var("TARGET").is_ok_and(|target| target.ends_with("windows-msvc")) {
+        // Async command dispatch has large debug futures. Match the main-thread
+        // stack reserve used on Unix; Windows otherwise reserves only 1 MiB.
+        println!("cargo:rustc-link-arg-bin=awman=/STACK:8388608");
+    }
     println!("cargo:rustc-check-cfg=cfg(awman_builtin)");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_BUILTIN_RUNTIME");
 

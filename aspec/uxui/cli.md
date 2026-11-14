@@ -70,6 +70,31 @@ command or flag.
   correctness is declared as an implication (`implies`) rather than
   silently required.
 
+## Work item reference grammar
+
+Commands that accept a work item use the shared `--work-item <REF>` flag.
+The value is a single reference, not a comma-separated list. Its grammar is:
+
+- A bare value, resolved using `workItems.source` (`local`, `github`, or
+  `http:<provider-name>`).
+- `local:<N>` or a local Markdown path.
+- `github:<N>`, `#<N>`, `owner/repo#<N>`, or a GitHub issue URL.
+- `http:<provider-name>:<id>` or a URL belonging to that provider's
+  configured base URL.
+
+Prefixed forms (`local:`, `github:`, `http:`) are read first, so an HTTP id may
+contain `:`, `/` and `#`. A value with exactly one `/` before a `#`
+(`owner/repo#N`) is a GitHub reference: an invalid owner, repository or number
+is an error, never a local path. Errors that echo a URL omit its credentials,
+query and fragment.
+
+An explicit reference selects its source regardless of the configured
+default. A bare value never triggers source probing: resolution uses exactly
+the configured source. Unknown sources, missing items and provider errors
+fail the command; they do not fall back to local files or another provider.
+The `--issue` spelling is removed and frontends that still receive it give a
+migration hint to use `--work-item github:<N>`.
+
 ## Session worktree selectors
 
 The two single-agent session commands (interactive chat and the one-shot
@@ -124,8 +149,9 @@ approval or automatic progression. Interactive frontends share the same command
 prompts and safe dismissal defaults; unattended frontends use policy and explicit
 inputs. Remote clients cannot widen the operator's credential ceiling without a
 global opt-in. Check-only output exits 0 only when every check is satisfied,
-otherwise 1 (including unknown checks). Summary Esc continues; summary Ctrl-C
-aborts. Invalid credential inputs, refused widening and unresolved fail policies
+otherwise 1 (including unknown checks). Summary Enter continues to the questions
+and Esc or Ctrl-C cancels. Prerequisite answers use ordered numeric keys, then
+letters for longer lists. Invalid credential inputs, refused widening and unresolved fail policies
 use exit 2; explicit abort uses 130. Per-command syntax belongs in the generated
 command reference.
 
@@ -244,6 +270,17 @@ belongs to rather than inventing a new code.
   then global config, then the catalogue's built-in default. A command
   never reads configuration through a path that skips a level of this
   order.
+
+Agent status reporting is controlled by `agents.programStatus.enabled`
+(default `true`). TUI host-terminal status emission is controlled separately
+by `tui.programStatus.emit` (default `true`); it can be disabled for one run
+with `awman --set tui.programStatus.emit=false`. Daemon-managed interactive
+terminals start at `daemon.terminal.cols` × `daemon.terminal.rows` (120 × 40
+by default), and retain their size after launch. Squad and pushed-worker runs
+select `interactive` or `headless` mode through their respective
+`daemon.features.*.interaction` setting. `allowOverride` controls whether a
+run can request a different mode; the default is `true`. Configuration
+accepts the pull-worker interaction setting, but no pull worker runs currently.
 
 ## Runtime and image-source configuration
 

@@ -25,3 +25,22 @@ mod apple_xpc;
 pub mod xpc;
 #[cfg(target_os = "macos")]
 pub use apple_xpc::NativeXpc;
+
+#[cfg(windows)]
+mod local_pipe;
+#[cfg(windows)]
+pub use local_pipe::{create as owner_pipe, verify_client};
+
+#[cfg(windows)]
+mod git_process;
+#[cfg(windows)]
+pub use git_process::spawn as spawn_git;
+
+#[cfg(windows)]
+mod metadata;
+#[cfg(windows)]
+pub use metadata::publish as publish_git_metadata;
+#[cfg(windows)]
+pub fn install_metadata_publisher() {
+    awman::data::fs::git_metadata::GitMetadataCopy::install_windows_publisher(metadata::publish);
+}

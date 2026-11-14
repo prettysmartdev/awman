@@ -1,0 +1,184 @@
+/* Shell geometry and shared overlays. Component interiors belong to surfaces.css. */
+:root { --update-banner-height: 3.5rem; --stage-min: 15rem; }
+.workspace-root { min-width: 0; }
+.shell { width: 100%; max-width: var(--shell-max); margin-inline: auto; height: 100dvh; min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; grid-template-areas: 'app' 'context' 'body' 'composer'; overflow: hidden; position: relative; }
+/* The update banner is in normal flow above the app bar; the shell gives up its height. */
+body:has(> .update-banner) .shell { height: calc(100dvh - var(--update-banner-height)); }
+/* Let layout boxes shrink. Controls keep their own minimum size (touch targets). */
+.shell :is(div, section, main, header, footer, nav, aside, form, fieldset, label, span, strong, p, h2, h3, input, select, textarea) { min-width: 0; }
+.shell-app-bar { grid-area: app; display: flex; flex-wrap: nowrap; gap: var(--space-2); padding: var(--space-2); border-bottom: 1px solid var(--border); z-index: 15; }
+.desktop-tabs { flex: 1; overflow: hidden; }
+.tab-strip { padding: 0; }
+.tab-item { flex-basis: 180px; min-width: 140px; }
+.app-actions { display: flex; gap: var(--space-2); align-items: center; flex-shrink: 0; }
+.current-tab, .mobile-new, .all-tabs { display: none; }
+.shell-context-bar { grid-area: context; display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-4); border-bottom: 1px solid var(--border); }
+.context-path { flex: 1; overflow: auto; white-space: nowrap; color: var(--muted); font-family: var(--mono); font-size: var(--text-xs); }
+.context-chip { max-width: 25%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.connection-pill { padding: var(--space-1) var(--space-2); border-radius: var(--radius-pill); background: var(--surface); font-size: var(--text-xs); flex-shrink: 0; }
+.shell-agent-chip { display: none; }
+.shell-body { grid-area: body; display: flex; position: relative; min-height: 0; container: workspace / inline-size; }
+.shell-stage { flex: 1; min-height: 0; overflow: hidden; padding: var(--space-3); }
+.stage-content { height: 100%; min-height: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+.stage-heading { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
+.agent-selector { margin: 0; max-width: 55%; }
+.agent-selector select { min-height: 36px; padding: var(--space-1) var(--space-2); }
+.stage-panes { position: relative; flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); }
+.pane-divider { display: none; }
+.stage-panes[data-resizing=true] { user-select: none; cursor: col-resize; }
+.panel-minimize { flex: 0 0 auto; min-width: 44px; }
+.execution > header .panel-minimize { margin-left: auto; }
+.minimized-panels { display: flex; flex: 0 0 auto; align-items: center; gap: var(--space-2); padding: var(--space-1); overflow-x: auto; border-top: 1px solid var(--border); background: var(--surface); }
+.minimized-panels:empty { display: none; }
+.minimized-panels button { flex: 0 0 auto; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.panes-empty { align-self: center; text-align: center; color: var(--muted); }
+.stage-panes[data-execution-open=false] > .shell-execution, .stage-panes[data-containers-open=false] > .shell-containers { display: none !important; }
+@media (min-width: 768px) {
+  .stage-panes[data-execution-open=true][data-containers-open=true] { grid-template-columns: minmax(0, var(--execution-share, 1fr)) 12px minmax(0, var(--container-share, 2fr)); }
+  .stage-panes[data-execution-open=true][data-containers-open=true] > .pane-divider { display: block; }
+  .pane-divider { cursor: col-resize; touch-action: none; position: relative; border-radius: var(--radius-sm); }
+  .pane-divider::after { content: ''; position: absolute; top: 0; bottom: 0; left: 5px; width: 2px; background: var(--border); }
+  .pane-divider:hover::after, .pane-divider:focus-visible::after, [data-resizing=true] > .pane-divider::after { background: var(--accent); }
+}
+/* The agent pane never scrolls: a scrollbar would change the terminal width. */
+.shell-containers { min-height: 0; overflow: hidden; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); }
+/* One scroll region for output: the log fills the pane instead of nesting a second scroller. */
+.shell-execution { min-height: 0; overflow: auto; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: var(--space-3); display: flex; flex-direction: column; }
+.shell-execution > :is(.execution, fieldset) { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.shell-execution > fieldset > .execution { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.shell-execution .execution > .virtual-frame { flex: 1 1 0; min-height: 8rem; display: flex; flex-direction: column; }
+.shell-execution .execution > .virtual-frame > .virtual-list { flex: 1 1 auto; height: auto; min-height: 88px; }
+.shell-execution .execution > :is(header, .surface-toolbar, .summary-bar) { flex: 0 0 auto; }
+/* Bound every terminal ancestor. The internal viewport/probe remain untouched. */
+.shell-containers .container-area { display: flex; flex-direction: column; min-height: 0; height: 100%; overflow: visible; }
+.container-area[hidden], .container-slot[hidden] { display: none !important; }
+.shell-containers .container-slot { flex: 0 0 auto; min-height: 0; border: 0; border-radius: var(--radius); }
+.shell-containers .container-slot.slot-active { flex: 1; display: flex; flex-direction: column; }
+.shell-containers .terminal-panel { flex: 1; min-height: 0; height: auto; overflow: visible; }
+.shell-containers .container-slot:not(.slot-active) { display: none; }
+.shell-inspector { flex: 0 0 var(--inspector-width); width: var(--inspector-width); min-height: 0; overflow: auto; overscroll-behavior: contain; background: var(--surface); border-left: 1px solid var(--border); }
+.inspector-heading { display: flex; justify-content: space-between; align-items: center; padding: var(--space-3); border-bottom: 1px solid var(--border); }
+.inspector-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); padding: var(--space-3); }
+@container workspace (min-width: 1400px) { .shell-inspector { --inspector-width: 360px; } }
+@container workspace (max-width: 1199px) {
+  .shell-inspector { position: absolute; z-index: 12; inset: 0 0 0 auto; width: min(420px, 86%); box-shadow: var(--shadow-lg); }
+  /* The overlay must not hide stage controls or the right of the agent screen: reflow beside it. */
+  .shell-stage:has(~ .shell-inspector) { padding-right: calc(min(420px, 86%) + var(--space-3)); }
+}
+@container workspace (min-width: 1920px) {
+  .shell-inspector { --inspector-width: 400px; }
+}
+/* Composer: one row; its popover (suggestions, errors) overlays the stage above it. */
+.shell-composer { grid-area: composer; min-height: 0; position: relative; padding: var(--space-2) var(--space-4); background: var(--surface); border-top: 1px solid var(--border); z-index: 10; }
+.composer-dock { position: relative; max-width: 960px; }
+.composer textarea { resize: none; height: 44px; min-height: 44px; max-height: 16dvh; }
+.composer:has(.composer-multiline[aria-pressed=true]) textarea { height: 88px; resize: vertical; }
+.suggestions:empty { display: none; }
+.shell-more, .shell-narrow-nav { display: none; }
+.more-actions, .tab-list { display: grid; gap: var(--space-2); padding: var(--space-3); }
+.tab-list button { text-align: left; overflow-wrap: anywhere; }
+/* Notices overlay the composer row (an absolutely positioned grid item: its
+   box is the composer area), so they neither cover the terminal nor change
+   the stage height. The newest is on top; older ones show as it goes. */
+.shell-notices { position: absolute; grid-area: composer; inset: var(--space-1) var(--space-2) var(--space-1) auto; z-index: 40; display: grid; align-content: end; gap: var(--space-1); width: min(360px, calc(100% - 16px)); overflow: auto; overscroll-behavior: contain; pointer-events: none; }
+.shell-notices:empty { display: none; }
+.shell-notices > .notice { padding: var(--space-1) var(--space-2); align-items: center; }
+.shell-notices > :nth-last-child(n+2) { display: none; }
+.shell-notices .notice { pointer-events: auto; box-shadow: var(--shadow); }
+.notice { display: flex; align-items: start; justify-content: space-between; gap: var(--space-2); overflow-wrap: anywhere; }
+.notice:empty { display: none; }
+.context-menu { position: relative; }
+.menu-popover { position: absolute; z-index: 30; top: calc(100% + 8px); right: 0; width: 280px; max-width: 85vw; max-height: 60dvh; overflow: auto; padding: var(--space-2); display: grid; gap: var(--space-1); background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-lg); }
+.menu-popover button { text-align: left; }
+.menu-popover small { display: block; color: var(--muted); }
+.command-menu { display: flex; flex-direction: column; min-height: 0; }
+.command-menu input { width: 100%; flex-shrink: 0; }
+.command-results { overflow: auto; max-height: 60dvh; padding: var(--space-2); }
+.command-results h3 { color: var(--muted); font-size: var(--text-xs); text-transform: uppercase; letter-spacing: .08em; }
+.command-option { margin-bottom: var(--space-2); }
+.command-option button { width: 100%; text-align: left; }
+.command-option p { margin: var(--space-1) var(--space-2); }
+.modal-backdrop { background: #08192680; }
+.modal { border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); }
+.embedded-sheet { padding: var(--space-3); }
+.embedded-banner { background: var(--surface); border: 1px solid var(--warning); border-radius: var(--radius); max-height: 35%; overflow: auto; flex-shrink: 0; }
+.embedded-banner h2, .embedded-banner p { margin: 0; }
+.embedded-banner .actions { margin-top: var(--space-2); }
+.empty-state { padding: var(--space-5); color: var(--muted); }
+.level-warning, .label-stuck [role=tab], .label-blocked [role=tab] { color: var(--warning); }
+.label-remote [role=tab], .label-yolo [role=tab] { color: var(--remote); }
+.update-banner { position: relative; height: var(--update-banner-height); flex-wrap: nowrap; overflow: hidden; white-space: nowrap; }
+.update-banner > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.update-banner button { flex-shrink: 0; }
+/* Focus rings inside clipped or scrolling strips are drawn inset so they stay whole. */
+:is(.tab-strip, .desktop-tabs, .shell-narrow-nav, .shell-app-bar, .shell-context-bar, .agent-header, .update-banner) :focus-visible { outline-offset: -3px; }
+@media (min-width: 768px) and (max-width: 1100px) {
+  .app-actions { gap: var(--space-1); }
+  .app-actions button { padding-inline: var(--space-2); }
+  /* App menu and Tab menu entries are all in Actions; the tabs get the room. */
+  .app-actions > .desktop-action:has(> .context-menu) { display: none; }
+  .tab-item { flex-basis: 132px; min-width: 112px; }
+  /* Tabs overflow at this width: one visible route to the full list. */
+  .all-tabs { display: block; flex-shrink: 0; white-space: nowrap; }
+}
+@media (max-width: 767px) {
+  .shell { grid-template-rows: auto auto auto minmax(0, 1fr) auto auto; grid-template-areas: 'app' 'context' 'agent' 'body' 'composer' 'nav'; }
+  .shell-app-bar { gap: var(--space-1); }
+  .desktop-tabs, .desktop-action { display: none; }
+  .current-tab { display: block; flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .mobile-new { display: block; }
+  .shell-context-bar { gap: var(--space-1); padding: var(--space-1) var(--space-2); }
+  .context-path { font-size: var(--text-sm); }
+  .context-chip { display: none; }
+  .shell-agent-chip { display: block; grid-area: agent; padding: var(--space-1) var(--space-2); }
+  /* On the Agent panel the agent header already names the agent. */
+  .shell[data-narrow-panel=agent] .shell-agent-chip { display: none; }
+  .shell-agent-chip button { width: 100%; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .shell-stage { padding: var(--space-2); }
+  .stage-heading { display: none; }
+  .shell[data-narrow-panel=agent] .shell-containers { display: block; }
+  .shell[data-narrow-panel=agent] .shell-execution { display: none; }
+  .shell[data-narrow-panel=agent] .shell-execution:has(.squad) { display: flex; }
+  .shell[data-narrow-panel=output] .shell-containers { display: none; }
+  .shell[data-narrow-panel=output] .shell-execution { display: flex; }
+  .shell[data-narrow-panel=workflow] .shell-stage, .shell[data-narrow-panel=git] .shell-stage, .shell[data-narrow-panel=more] .shell-stage { display: none; }
+  .shell-inspector { display: none; position: static; width: 100%; flex: 1; border: 0; box-shadow: none; }
+  .shell[data-narrow-panel=workflow][data-inspector=workflow] .shell-inspector, .shell[data-narrow-panel=git][data-inspector=git] .shell-inspector, .shell[data-narrow-panel=more][data-inspector=queue] .shell-inspector { display: block; }
+  .shell[data-narrow-panel=more]:not([data-inspector=queue]) .shell-more { display: block; flex: 1; overflow: auto; }
+  .shell-composer { padding: var(--space-2); }
+  .shell-narrow-nav { grid-area: nav; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-top: 1px solid var(--border); padding-bottom: env(safe-area-inset-bottom); }
+  .shell-narrow-nav button { min-height: 44px; border-radius: 0; padding: var(--space-1); border: 0; background: transparent; color: var(--muted); font-size: var(--text-xs); }
+  .shell-narrow-nav button[aria-pressed=true] { color: var(--text); background: var(--accent-soft); box-shadow: inset 0 3px var(--accent); }
+  .modal { max-height: 85dvh; }
+  .shortcut-list > div { grid-template-columns: minmax(0, 1fr); }
+  .current-tab { display: flex; align-items: center; gap: var(--space-2); }
+  .current-tab > span:first-child { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+  .current-tab > span:last-child { flex-shrink: 0; }
+  /* Keep parallel-agent selection reachable even during a countdown. */
+  .stage-heading { display: flex; }
+  .stage-switch { display: none; }
+  .agent-selector { max-width: 100%; width: 100%; }
+}
+.shell-containers .terminal-panel { display: flex; flex-direction: column; }
+.shell-containers .terminal-panel > section { flex: 1; height: auto; min-height: 0; }
+.panel-guard { border: 0; padding: 0; margin: 0; }
+/* Touch: every app control is at least 44×44. */
+@media (pointer: coarse) {
+  .shell :is(button, select), .update-banner button { min-height: 44px; min-width: 44px; }
+  .agent-selector select { min-height: 44px; }
+  /* 44px controls already give the bars their height; keep padding thin so the agent keeps its rows. */
+  .shell-app-bar, .shell-context-bar { padding-block: var(--space-1); }
+}
+/*
+ * Short viewports (phone landscape, 200% zoom): the stage keeps a usable
+ * height and the page scrolls to reach the composer instead of squeezing the
+ * agent terminal to nothing.
+ */
+@media (max-height: 520px) {
+  .shell, body:has(> .update-banner) .shell { height: auto; min-height: 100dvh; overflow: visible; grid-template-rows: auto auto max(var(--stage-min), 82dvh) auto; }
+  .shell-app-bar, .shell-context-bar { padding-block: var(--space-1); }
+  .shell-stage { padding: var(--space-1) var(--space-2); }
+}
+@media (max-height: 520px) and (max-width: 767px) {
+  .shell, body:has(> .update-banner) .shell { grid-template-rows: auto auto auto max(var(--stage-min), 82dvh) auto auto; }
+}

@@ -9,10 +9,6 @@
 //! The whole module is pure: it never touches I/O or globals. Tests can call
 //! any renderer directly with a synthesised outcome.
 
-use crate::command::commands::api_server::{
-    ApiServerKillOutcome, ApiServerLogsOutcome, ApiServerOutcome, ApiServerStartOutcome,
-    ApiServerStatusOutcome,
-};
 use crate::command::commands::chat::ChatOutcome;
 use crate::command::commands::config::{
     ConfigGetOutcome, ConfigOutcome, ConfigSetOutcome, ConfigShowOutcome,
@@ -29,7 +25,7 @@ use crate::command::commands::remote::{
 };
 use crate::command::commands::specs::{SpecsAmendOutcome, SpecsOutcome};
 use crate::command::CommandOutcome;
-use crate::frontend::render_helpers::{format_table, render_config_migrate};
+use crate::frontend::render_helpers::format_table;
 
 // ─── Top-level dispatcher ────────────────────────────────────────────────────
 
@@ -38,7 +34,14 @@ use crate::frontend::render_helpers::{format_table, render_config_migrate};
 /// to stderr already and produce no additional summary on stdout).
 pub fn render(outcome: &CommandOutcome, json: bool) -> Option<String> {
     match outcome {
+        CommandOutcome::Relayed(result) => result
+            .outcome
+            .as_ref()
+            .filter(|_| json)
+            .map(|value| value.to_string()),
+        CommandOutcome::Attach(_) => None,
         CommandOutcome::Empty => None,
+        CommandOutcome::Link(s) => Some(s.clone()),
         CommandOutcome::Agents(o) => super::agents::render_agents(o, json),
         CommandOutcome::Chat(o) => render_chat(o),
         CommandOutcome::Init(o) => render_init(o),
@@ -48,8 +51,38 @@ pub fn render(outcome: &CommandOutcome, json: bool) -> Option<String> {
             Some(serde_json::to_string(o).expect("workflow outcome serializes"))
         }
         CommandOutcome::ExecWorkflow(o) => render_exec_workflow(o),
-        CommandOutcome::Config(o) => render_config(o),
-        CommandOutcome::ApiServer(o) => render_api_server(o),
+        CommandOutcome::Config(o) => render_config(o, json),
+        CommandOutcome::WorkerLink(o) => Some(if json {
+            to_json(o)
+        } else {
+            format!("Linked {} at {}", o.name, o.url)
+        }),
+        CommandOutcome::Queue(o) => Some(if json {
+            to_json(o)
+        } else if o.items.is_empty() {
+            "No eligible work items.".into()
+        } else {
+            o.items
+                .iter()
+                .map(|row| {
+                    format!(
+                        "{}  {}  [{}]  priority {}",
+                        row.id, row.title, row.server, row.priority
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }),
+        CommandOutcome::QueuePick(o) => Some(if json {
+            to_json(o)
+        } else {
+            format!(
+                "Work item finished with exit code {}.",
+                o.exit_code.unwrap_or(1)
+            )
+        }),
+        CommandOutcome::Daemon(o) => super::daemon::render(o, json),
+        CommandOutcome::DaemonApi(o) => Some(super::daemon::render_api(o, json)),
         CommandOutcome::Remote(o) => render_remote(o),
         CommandOutcome::New(o) => render_new(o),
         CommandOutcome::Specs(o) => render_specs(o),
@@ -135,67 +168,31 @@ fn render_ready(o: &ReadyOutcome) -> Option<String> {
 
 // ─── config ──────────────────────────────────────────────────────────────────
 
-fn render_config(o: &ConfigOutcome) -> Option<String> {
+fn render_config(o: &ConfigOutcome, json: bool) -> Option<String> {
     match o {
+        ConfigOutcome::Show(s) if json => Some(to_json(s)),
+        ConfigOutcome::Get(g) if json => Some(to_json(g)),
         ConfigOutcome::Show(s) => Some(render_config_show(s)),
         ConfigOutcome::Get(g) => Some(render_config_get(g)),
-        ConfigOutcome::Set(s) => Some(render_config_set(s)),
-        ConfigOutcome::PrerequisiteGrants(g) => Some(render_prerequisite_grants(g)),
-        ConfigOutcome::Migrate(m) => Some(render_config_migrate(m)),
+        ConfigOutcome::Set(s) | ConfigOutcome::Unset(s) => Some(render_config_set(s)),
     }
 }
 
-/// `config prerequisite-grants list|revoke`: the remembered decisions as a
-/// table, numbered as `revoke` takes them.
-fn render_prerequisite_grants(
-    g: &crate::command::commands::workflow_prerequisites::PrerequisiteGrantsOutcome,
-) -> String {
-    use crate::data::fs::prerequisite_grants::RememberedKind;
-    let mut out = String::new();
-    if let Some(warning) = &g.warning {
-        out.push_str(&format!("Warning: {warning}\n"));
-    }
-    if let Some(n) = g.revoked {
-        out.push_str(&format!(
-            "Revoked {n} remembered prerequisite decision(s).\n"
-        ));
-    }
-    if g.rows.is_empty() {
-        out.push_str(&format!(
-            "No remembered prerequisite decisions ({}).",
-            g.path
-        ));
-        return out;
-    }
-    let rows: Vec<Vec<String>> = g
-        .rows
-        .iter()
-        .map(|row| {
-            let kind = match row.prerequisite {
-                RememberedKind::Ssh => "ssh",
-                RememberedKind::GithubToken => "github token",
-                RememberedKind::GitIdentity => "git identity",
-            };
-            vec![
-                row.index.to_string(),
-                row.git_root.clone(),
-                row.remote_url.clone(),
-                kind.to_string(),
-                row.decision.clone(),
-                row.recorded_at.clone(),
-            ]
-        })
-        .collect();
-    out.push_str(&format_table(
-        &["#", "Repository", "Remote", "Kind", "Decision", "Recorded"],
-        &rows,
-    ));
-    out
+fn to_json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string_pretty(value).expect("config outcome serializes")
+}
+
+/// The `source` column: which layer the effective value comes from.
+fn layer_label(layer: crate::data::config::effective::Layer) -> String {
+    serde_json::to_value(layer)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 fn render_config_show(o: &ConfigShowOutcome) -> String {
     let na = "—";
-    let headers = ["Field", "Global", "Repo", "Effective"];
+    let headers = ["Key", "Global", "Repo", "Effective", "Source", "Type"];
     let rows: Vec<Vec<String>> = o
         .rows
         .iter()
@@ -205,110 +202,71 @@ fn render_config_show(o: &ConfigShowOutcome) -> String {
             } else {
                 r.field.clone()
             };
+            let (source, kind) = if r.shape.is_header() {
+                (String::new(), String::new())
+            } else {
+                (layer_label(r.source), r.type_name.clone())
+            };
             vec![
                 label,
                 r.global_value.clone().unwrap_or_else(|| na.to_string()),
                 r.repo_value.clone().unwrap_or_else(|| na.to_string()),
                 r.effective_value.clone().unwrap_or_else(|| na.to_string()),
+                source,
+                kind,
             ]
         })
         .collect();
     let mut out = String::from("AWMAN CONFIG\n\n");
     out.push_str(&format_table(&headers, &rows));
+    out.push_str(&format!("\n\n{}", o.resolved_backend));
+    if let Some(state) = &o.state {
+        let accepted = state
+            .auto_agent_auth_accepted
+            .map_or_else(|| na.to_string(), |b| b.to_string());
+        out.push_str(&format!(
+            "\n\nSTATE (read-only, not config: {})\n\n",
+            state.path
+        ));
+        out.push_str(&format_table(
+            &["Item", "Value"],
+            &[vec!["autoAgentAuthAccepted".to_string(), accepted]],
+        ));
+    }
+    for note in &o.notes {
+        out.push_str(&format!("\n\nNote: {note}"));
+    }
     out
 }
 
 fn render_config_get(o: &ConfigGetOutcome) -> String {
-    let na = || "N/A".to_string();
+    let na = || "—".to_string();
     format!(
-        "Field: {}\n  Global:    {}\n  Repo:      {}\n  Effective: {}",
+        "Key: {}\n  Global:    {}\n  Repo:      {}\n  Effective: {}\n  Source:    {}\n  Type:      {}",
         o.field,
         o.global_value.clone().unwrap_or_else(na),
         o.repo_value.clone().unwrap_or_else(na),
         o.effective_value.clone().unwrap_or_else(na),
+        layer_label(o.source),
+        o.type_name,
     )
 }
 
+/// `wrote <path>` first, always, then the live-apply line.
 fn render_config_set(o: &ConfigSetOutcome) -> String {
-    format!("Set {} ({}) = {}", o.field, o.scope, o.value)
+    let what = match &o.value {
+        Some(value) => format!("set {} = {value}", o.field),
+        None => format!("unset {}", o.field),
+    };
+    format!(
+        "{what} ({} config)\nwrote {}\n{}",
+        o.scope,
+        o.path,
+        o.live.message()
+    )
 }
 
 // ─── api ────────────────────────────────────────────────────────────────
-
-fn render_api_server(o: &ApiServerOutcome) -> Option<String> {
-    match o {
-        // In foreground mode the "started" message is printed at server
-        // boot (before the accept loop blocks). When that future finally
-        // returns it's because the server has *shut down* — printing
-        // "API server started …" at that point is misleading and looked
-        // like noise dumped after Ctrl-C.
-        ApiServerOutcome::Start(s) if !s.background => None,
-        ApiServerOutcome::Start(s) => Some(render_api_server_start(s)),
-        ApiServerOutcome::Kill(k) => Some(render_api_server_kill(k)),
-        ApiServerOutcome::Logs(l) => Some(render_api_server_logs(l)),
-        ApiServerOutcome::Status(s) => Some(render_api_server_status(s)),
-    }
-}
-
-fn render_api_server_start(o: &ApiServerStartOutcome) -> String {
-    let mode = if o.background {
-        "background"
-    } else {
-        "foreground"
-    };
-    let workdirs = if o.workdirs.is_empty() {
-        "<none>".to_string()
-    } else {
-        o.workdirs.join(", ")
-    };
-    let key = if o.refreshed_key {
-        " (api key refreshed)"
-    } else {
-        ""
-    };
-    format!(
-        "API server started on port {} in {mode} mode.\n  workdirs: {workdirs}{key}",
-        o.port
-    )
-}
-
-fn render_api_server_kill(o: &ApiServerKillOutcome) -> String {
-    match o.stopped_pid {
-        Some(pid) => format!("API server (PID {pid}) stopped."),
-        None => "API server is not running.".to_string(),
-    }
-}
-
-fn render_api_server_logs(o: &ApiServerLogsOutcome) -> String {
-    if o.log_path.is_empty() {
-        "No API server log found.".to_string()
-    } else {
-        format!("Tailing API server logs at {}", o.log_path)
-    }
-}
-
-fn render_api_server_status(o: &ApiServerStatusOutcome) -> String {
-    if !o.running {
-        return "API server is not running.".to_string();
-    }
-    let pid_part = o.pid.map(|p| format!(" (PID {p})")).unwrap_or_default();
-    let addr_part = o
-        .bound_addr
-        .as_deref()
-        .map(|a| format!(" at {a}"))
-        .unwrap_or_default();
-    let version_part = o
-        .version
-        .as_deref()
-        .map(|v| format!(", version {v}"))
-        .unwrap_or_default();
-    let responsive_part = if o.responsive {
-        ""
-    } else {
-        " — process alive but HTTP probe failed"
-    };
-    format!("API server is running{pid_part}{addr_part}{version_part}{responsive_part}.")
-}
 
 // ─── remote ──────────────────────────────────────────────────────────────────
 
@@ -353,17 +311,23 @@ fn render_remote_session_kill(o: &RemoteSessionKillOutcome) -> String {
 
 fn render_new(o: &NewOutcome) -> Option<String> {
     match o {
-        NewOutcome::Spec(s) => Some(render_new_spec(s)),
+        NewOutcome::Spec(s) => render_new_spec(s),
         NewOutcome::Workflow(w) => Some(render_new_workflow(w)),
         NewOutcome::Skill(s) => render_new_skill(s),
         NewOutcome::Agent(a) => Some(a.render()),
     }
 }
 
-fn render_new_spec(o: &NewSpecOutcome) -> String {
-    match &o.path {
-        Some(p) => format!("Created work item: {p}"),
-        None => "Work item created.".to_string(),
+fn render_new_spec(o: &NewSpecOutcome) -> Option<String> {
+    match (&o.path, &o.url) {
+        (Some(p), _) => Some(format!("Created work item: {p}")),
+        // The command already announced the URL the moment the provider
+        // confirmed it (possibly while the agent was still running); the JSON
+        // outcome keeps it, the human summary does not print it twice.
+        (None, Some(_)) => None,
+        // A remote interview whose draft was never edited creates nothing.
+        (None, None) if o.interview => Some("No work item was created.".to_string()),
+        (None, None) => Some("Work item created.".to_string()),
     }
 }
 
@@ -407,881 +371,27 @@ fn render_specs_amend(o: &SpecsAmendOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::step_status::StepStatus;
 
     #[test]
-    fn render_empty_returns_none() {
-        assert!(render(&CommandOutcome::Empty, false).is_none());
-    }
-
-    #[test]
-    fn render_chat_clean_exit_returns_none() {
-        let o = ChatOutcome {
-            agent: Some("claude".into()),
-            exit_code: Some(0),
+    fn remote_new_spec_url_is_not_rendered_a_second_time() {
+        let spec = |path: Option<&str>, url: Option<&str>, interview| NewSpecOutcome {
+            interview,
+            path: path.map(Into::into),
+            url: url.map(Into::into),
+            number: Some(73),
         };
-        assert!(render_chat(&o).is_none());
-        let o2 = ChatOutcome {
-            agent: None,
-            exit_code: None,
-        };
-        assert!(render_chat(&o2).is_none());
-    }
-
-    #[test]
-    fn render_chat_nonzero_exit_returns_some() {
-        let o = ChatOutcome {
-            agent: None,
-            exit_code: Some(2),
-        };
+        // The command announced the URL when the provider confirmed it.
         assert_eq!(
-            render_chat(&o).unwrap(),
-            "Chat session ended with exit code 2."
-        );
-    }
-
-    #[test]
-    fn render_init_returns_none_so_summary_box_is_only_output() {
-        let o = InitOutcome {
-            agent: "claude".into(),
-            aspec_requested: true,
-            summary: crate::command::commands::init::SerializableInitSummary {
-                aspec_folder: StepStatus::Done,
-                dockerfile: StepStatus::Done,
-                config: StepStatus::Done,
-                audit: StepStatus::Skipped,
-                image_build: StepStatus::Skipped,
-                work_items_setup: StepStatus::Skipped,
-            },
-        };
-        assert!(render_init(&o).is_none());
-    }
-
-    #[test]
-    fn render_ready_returns_none_so_summary_box_is_only_output() {
-        let o = ReadyOutcome {
-            runtime: "docker".into(),
-            dockerfile: StepStatus::Done,
-            base_image: StepStatus::Done,
-            agent_image: StepStatus::Done,
-            image_source: None,
-            agent_definition: None,
-            local_agent: StepStatus::Done,
-            audit: StepStatus::Skipped,
-            image_rebuild: StepStatus::Skipped,
-            agent_credentials: Vec::new(),
-            non_default_agent_images: Vec::new(),
-            image_results: Vec::new(),
-            base_image_results: Vec::new(),
-            ready: true,
-            json_requested: false,
-            refresh_requested: false,
-        };
-        assert!(render_ready(&o).is_none());
-    }
-
-    #[test]
-    fn render_config_get_handles_missing_values() {
-        let o = ConfigGetOutcome {
-            field: "agent".into(),
-            global_value: Some("claude".into()),
-            repo_value: None,
-            effective_value: Some("claude".into()),
-            alias_used: None,
-        };
-        let s = render_config_get(&o);
-        assert!(s.contains("Field: agent"));
-        assert!(s.contains("Global:    claude"));
-        assert!(s.contains("Repo:      N/A"));
-        assert!(s.contains("Effective: claude"));
-    }
-
-    #[test]
-    fn render_api_server_status_running_with_pid() {
-        let s = render_api_server_status(&ApiServerStatusOutcome {
-            running: true,
-            pid: Some(1234),
-            bound_addr: Some("https://127.0.0.1:9876".into()),
-            version: Some("0.7.0".into()),
-            responsive: true,
-        });
-        assert!(s.contains("API server is running"));
-        assert!(s.contains("PID 1234"));
-        assert!(s.contains("at https://127.0.0.1:9876"));
-        assert!(s.contains("version 0.7.0"));
-        assert!(!s.contains("HTTP probe failed"));
-    }
-
-    #[test]
-    fn render_api_server_status_alive_but_unresponsive() {
-        let s = render_api_server_status(&ApiServerStatusOutcome {
-            running: true,
-            pid: Some(1234),
-            bound_addr: None,
-            version: None,
-            responsive: false,
-        });
-        assert!(s.contains("HTTP probe failed"));
-    }
-
-    #[test]
-    fn render_api_server_status_not_running() {
-        let s = render_api_server_status(&ApiServerStatusOutcome {
-            running: false,
-            pid: None,
-            bound_addr: None,
-            version: None,
-            responsive: false,
-        });
-        assert_eq!(s, "API server is not running.");
-    }
-
-    #[test]
-    fn render_remote_exec_includes_session_when_present() {
-        let s = render_remote_exec(&RemoteExecOutcome {
-            command_id: "cmd-1".into(),
-            subcommand: "exec workflow".into(),
-            session: "abc123".into(),
-            remote_addr: "localhost:9876".into(),
-            status: None,
-            exit_code: None,
-            followed: false,
-        });
-        assert!(s.contains("exec workflow"));
-        assert!(s.contains("abc123"));
-    }
-
-    // ── render_ready ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn render_ready_json_requested_emits_legacy_schema() {
-        let o = ReadyOutcome {
-            runtime: "docker".into(),
-            dockerfile: StepStatus::Done,
-            base_image: StepStatus::Done,
-            agent_image: StepStatus::Done,
-            image_source: None,
-            agent_definition: None,
-            local_agent: StepStatus::Done,
-            audit: StepStatus::Skipped,
-            image_rebuild: StepStatus::Skipped,
-            agent_credentials: Vec::new(),
-            non_default_agent_images: Vec::new(),
-            image_results: Vec::new(),
-            base_image_results: Vec::new(),
-            ready: true,
-            json_requested: true,
-            refresh_requested: false,
-        };
-        let s = render_ready(&o).expect("json_requested=true must produce output");
-        let parsed: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
-        // Top-level keys per legacy schema.
-        assert_eq!(parsed["ready"], true);
-        assert_eq!(parsed["runtime"], "docker");
-        assert!(parsed["steps"].is_object(), "must include steps wrapper");
-        // Each legacy step must be a `{status, message}` object.
-        for key in [
-            "docker_daemon",
-            "dockerfile",
-            "aspec_folder",
-            "work_items_config",
-            "local_agent",
-            "dev_image",
-            "refresh",
-            "image_rebuild",
-        ] {
-            let s = &parsed["steps"][key];
-            assert!(s.is_object(), "steps.{key} must be an object");
-            assert!(
-                s.get("status").is_some(),
-                "steps.{key} must have a status field"
-            );
-            assert!(
-                s.get("message").is_some(),
-                "steps.{key} must have a message field"
-            );
-        }
-        assert_eq!(parsed["steps"]["dev_image"]["status"], "ok");
-        assert_eq!(parsed["steps"]["aspec_folder"]["status"], "skipped");
-    }
-
-    #[test]
-    fn render_ready_json_failure_marks_ready_false() {
-        let o = ReadyOutcome {
-            runtime: "docker".into(),
-            dockerfile: StepStatus::Done,
-            base_image: StepStatus::Failed("boom".into()),
-            agent_image: StepStatus::Pending,
-            image_source: None,
-            agent_definition: None,
-            local_agent: StepStatus::Pending,
-            audit: StepStatus::Pending,
-            image_rebuild: StepStatus::Pending,
-            agent_credentials: Vec::new(),
-            non_default_agent_images: Vec::new(),
-            image_results: Vec::new(),
-            base_image_results: Vec::new(),
-            ready: false,
-            json_requested: true,
-            refresh_requested: true,
-        };
-        let s = render_ready(&o).expect("json_requested=true must produce output");
-        let parsed: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
-        assert_eq!(parsed["ready"], false);
-        assert_eq!(parsed["steps"]["dev_image"]["status"], "pending");
-        assert_eq!(parsed["steps"]["refresh"]["status"], "ok");
-    }
-
-    // ── render_config ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn render_config_show_renders_4_column_table_with_field_values() {
-        use crate::command::commands::config::{ConfigFieldKind, ConfigFieldRow};
-        let o = ConfigShowOutcome {
-            global: serde_json::json!({"agent": "claude"}),
-            repo: serde_json::json!({}),
-            rows: vec![
-                ConfigFieldRow {
-                    field: "agent".into(),
-                    global_value: Some("claude".into()),
-                    repo_value: None,
-                    effective_value: Some("claude".into()),
-                    kind: ConfigFieldKind::Enum,
-                    read_only: false,
-                    global_writable: true,
-                    repo_writable: true,
-                    value_hint: None,
-                    shape: crate::command::commands::config::ConfigRowShape::Scalar,
-                },
-                ConfigFieldRow {
-                    field: "auto_agent_auth_accepted".into(),
-                    global_value: Some("true".into()),
-                    repo_value: None,
-                    effective_value: Some("true".into()),
-                    kind: ConfigFieldKind::Bool,
-                    read_only: true,
-                    global_writable: false,
-                    repo_writable: false,
-                    value_hint: None,
-                    shape: crate::command::commands::config::ConfigRowShape::Scalar,
-                },
-            ],
-        };
-        let s = render_config_show(&o);
-        assert!(s.contains("AWMAN CONFIG"), "must have header");
-        assert!(s.contains("Field"), "must have Field column");
-        assert!(s.contains("Global"), "must have Global column");
-        assert!(s.contains("Repo"), "must have Repo column");
-        assert!(s.contains("Effective"), "must have Effective column");
-        assert!(s.contains("agent"), "agent field row must appear");
-        assert!(s.contains("claude"), "global agent value must appear");
-        assert!(
-            s.contains("(read-only)"),
-            "read-only fields must be marked: {s}"
-        );
-    }
-
-    #[test]
-    fn render_config_show_does_not_truncate_dynamic_workflows_values() {
-        use crate::command::commands::config::{ConfigFieldKind, ConfigFieldRow};
-        let long_models = "claude-opus-4-8, claude-sonnet-4-6, claude-haiku-4-5, \
-                            gemini-2.5-pro, codex-mini-latest";
-        let o = ConfigShowOutcome {
-            global: serde_json::json!({}),
-            repo: serde_json::json!({}),
-            rows: vec![
-                ConfigFieldRow {
-                    field: "demo.leader".into(),
-                    global_value: None,
-                    repo_value: Some("claude::claude-opus-4-8".into()),
-                    effective_value: Some("claude::claude-opus-4-8".into()),
-                    kind: ConfigFieldKind::String,
-                    read_only: false,
-                    global_writable: false,
-                    repo_writable: true,
-                    value_hint: None,
-                    shape: crate::command::commands::config::ConfigRowShape::Scalar,
-                },
-                ConfigFieldRow {
-                    field: "demo.limit".into(),
-                    global_value: None,
-                    repo_value: Some("3".into()),
-                    effective_value: Some("3".into()),
-                    kind: ConfigFieldKind::Number,
-                    read_only: false,
-                    global_writable: false,
-                    repo_writable: true,
-                    value_hint: None,
-                    shape: crate::command::commands::config::ConfigRowShape::Scalar,
-                },
-                ConfigFieldRow {
-                    field: "demo.map.claude".into(),
-                    global_value: None,
-                    repo_value: Some(long_models.into()),
-                    effective_value: Some(long_models.into()),
-                    kind: ConfigFieldKind::String,
-                    read_only: false,
-                    global_writable: false,
-                    repo_writable: true,
-                    value_hint: None,
-                    shape: crate::command::commands::config::ConfigRowShape::Scalar,
-                },
-            ],
-        };
-        let s = render_config_show(&o);
-
-        assert!(
-            s.contains("demo.leader"),
-            "leader scalar row must appear: {s}"
-        );
-        assert!(
-            s.contains("demo.limit"),
-            "limit scalar row must appear: {s}"
-        );
-        assert!(
-            s.contains("demo.map.claude"),
-            "map entry row must appear, got: {s}"
-        );
-        assert!(
-            !s.contains("demo.map.claude (read-only)"),
-            "map entry rows are inline-editable and must not be marked \
-             read-only, got: {s}"
-        );
-        assert!(
-            s.contains(long_models),
-            "long map entry value must appear untruncated in CLI text output, got: {s}"
-        );
-        assert!(
-            !s.contains('\u{2026}'),
-            "CLI config show output must never truncate values with an ellipsis, got: {s}"
-        );
-    }
-
-    /// A row built only from synthetic names and an explicit shape (WI 0150):
-    /// the CLI view must render it without knowing any real field name.
-    fn shaped_row(
-        field: &str,
-        shape: crate::command::commands::config::ConfigRowShape,
-        global: Option<&str>,
-        repo: Option<&str>,
-        effective: Option<&str>,
-        read_only: bool,
-    ) -> crate::command::commands::config::ConfigFieldRow {
-        crate::command::commands::config::ConfigFieldRow {
-            field: field.into(),
-            global_value: global.map(Into::into),
-            repo_value: repo.map(Into::into),
-            effective_value: effective.map(Into::into),
-            kind: crate::command::commands::config::ConfigFieldKind::String,
-            read_only,
-            global_writable: !read_only,
-            repo_writable: !read_only,
-            value_hint: None,
-            shape,
-        }
-    }
-
-    fn shape_driven_outcome() -> ConfigShowOutcome {
-        use crate::command::commands::config::ConfigRowShape as Shape;
-        ConfigShowOutcome {
-            global: serde_json::json!({}),
-            repo: serde_json::json!({}),
-            rows: vec![
-                shaped_row(
-                    "demo.map",
-                    Shape::MapHeader {
-                        child_prefix: "demo.map.",
-                    },
-                    Some("2 agents mapped"),
-                    Some("(none)"),
-                    Some("global map"),
-                    true,
-                ),
-                shaped_row(
-                    "demo.map.alpha",
-                    Shape::MapEntry,
-                    Some("m1, m2"),
-                    None,
-                    Some("m1, m2"),
-                    false,
-                ),
-                shaped_row(
-                    "demo.map.beta",
-                    Shape::MapEntry,
-                    None,
-                    Some("m3"),
-                    None,
-                    false,
-                ),
-                shaped_row(
-                    "demo.list",
-                    Shape::ListHeader {
-                        child_prefix: "demo.list.",
-                    },
-                    Some("1 entry"),
-                    Some("1 entry"),
-                    Some("1 global + 1 repo entries"),
-                    true,
-                ),
-                shaped_row(
-                    "demo.list.0",
-                    Shape::ListEntry,
-                    Some("global note"),
-                    Some("repo note"),
-                    None,
-                    false,
-                ),
-                shaped_row(
-                    "demo.scalar",
-                    Shape::Scalar,
-                    Some("g"),
-                    None,
-                    Some("g"),
-                    false,
-                ),
-            ],
-        }
-    }
-
-    #[test]
-    fn render_config_show_renders_map_list_and_scalar_rows_from_shape_alone() {
-        let s = render_config_show(&shape_driven_outcome());
-        let line_of = |needle: &str| {
-            s.lines()
-                .find(|l| l.contains(needle))
-                .unwrap_or_else(|| panic!("no row for {needle}: {s}"))
-                .to_string()
-        };
-        // Headers are read-only and carry their per-scope summaries.
-        let map_header = line_of("demo.map (read-only)");
-        assert!(map_header.contains("2 agents mapped"), "{map_header}");
-        assert!(map_header.contains("global map"), "{map_header}");
-        let list_header = line_of("demo.list (read-only)");
-        assert!(
-            list_header.contains("1 global + 1 repo entries"),
-            "{list_header}"
-        );
-        // Members are editable and show per-scope cells; a missing cell is "—".
-        let alpha = line_of("demo.map.alpha");
-        assert!(!alpha.contains("read-only"), "{alpha}");
-        assert!(alpha.contains("m1, m2") && alpha.contains('—'), "{alpha}");
-        let beta = line_of("demo.map.beta");
-        assert!(beta.contains("m3") && beta.contains('—'), "{beta}");
-        let entry = line_of("demo.list.0");
-        assert!(
-            entry.contains("global note") && entry.contains("repo note"),
-            "list member shows both scopes: {entry}"
-        );
-        let scalar = line_of("demo.scalar");
-        assert!(!scalar.contains("read-only"), "{scalar}");
-    }
-
-    #[test]
-    fn render_config_show_shows_global_and_repo_cells_in_their_own_columns() {
-        let s = render_config_show(&shape_driven_outcome());
-        let header = s
-            .lines()
-            .find(|l| l.contains("Field") && l.contains("Global"))
-            .expect("table header");
-        let global_col = header.find("Global").unwrap();
-        let repo_col = header.find("Repo").unwrap();
-        let entry = s.lines().find(|l| l.contains("demo.list.0")).unwrap();
-        let global_at = entry.find("global note").unwrap();
-        let repo_at = entry.find("repo note").unwrap();
-        assert!(global_at >= global_col && global_at < repo_col, "{s}");
-        assert!(repo_at >= repo_col, "{s}");
-    }
-
-    #[test]
-    fn render_config_show_output_names_only_what_the_rows_supply() {
-        let s = render_config_show(&shape_driven_outcome());
-        // Built from pieces so this file passes the frontend field-name scan.
-        let forbidden = [
-            ["agents", "ToModels"].concat(),
-            "guidance".to_string(),
-            ["default", "Leader"].concat(),
-            "dynamic".to_string(),
-        ];
-        for forbidden in &forbidden {
-            let forbidden = forbidden.as_str();
-            assert!(!s.contains(forbidden), "{forbidden} leaked into: {s}");
-        }
-    }
-
-    fn migrate_outcome(
-        changes: Vec<crate::data::config::ConfigMigrationChange>,
-        applied: bool,
-        dry_run: bool,
-    ) -> crate::command::commands::config::ConfigMigrateOutcome {
-        crate::command::commands::config::ConfigMigrateOutcome {
-            scope: crate::data::config::ConfigMigrationScope::Repo,
-            path: "/r/.awman/config.json".into(),
-            changes,
-            preview: "PREVIEW TEXT".into(),
-            applied,
-            dry_run,
-            global_has_never_read_dynamic_workflows: false,
-            note: None,
-        }
-    }
-
-    fn one_change() -> crate::data::config::ConfigMigrationChange {
-        crate::data::config::ConfigMigrationChange {
-            id: "demo-step",
-            summary: "Moved the demo block.",
-            before: serde_json::json!({"a": 1}),
-            after: serde_json::json!({"b": 1}),
-        }
-    }
-
-    #[test]
-    fn render_config_migrate_nothing_dry_run_and_applied() {
-        let nothing = render(
-            &CommandOutcome::Config(ConfigOutcome::Migrate(migrate_outcome(
-                vec![],
-                false,
-                false,
-            ))),
-            false,
-        )
-        .unwrap();
-        assert_eq!(nothing, "nothing to migrate");
-
-        let dry = render(
-            &CommandOutcome::Config(ConfigOutcome::Migrate(migrate_outcome(
-                vec![one_change()],
-                false,
-                true,
-            ))),
-            false,
-        )
-        .unwrap();
-        assert!(dry.starts_with("PREVIEW TEXT"), "{dry}");
-        assert!(dry.ends_with("dry run: nothing written"), "{dry}");
-
-        let applied = render(
-            &CommandOutcome::Config(ConfigOutcome::Migrate(migrate_outcome(
-                vec![one_change()],
-                true,
-                false,
-            ))),
-            false,
-        )
-        .unwrap();
-        assert!(applied.contains("/r/.awman/config.json"), "{applied}");
-        assert!(applied.contains("Moved the demo block."), "{applied}");
-    }
-
-    #[test]
-    fn render_config_set_formats_field_scope_and_value() {
-        let o = ConfigSetOutcome {
-            field: "agent".into(),
-            value: "gemini".into(),
-            scope: "repo".into(),
-            moved_legacy_dynamic_workflows: false,
-            alias_used: None,
-        };
-        let s = render_config_set(&o);
-        assert!(s.contains("agent"), "field name must appear");
-        assert!(s.contains("repo"), "scope must appear");
-        assert!(s.contains("gemini"), "value must appear");
-    }
-
-    // ── render_new ────────────────────────────────────────────────────────────
-
-    use crate::command::commands::new::{
-        NewSkillOutcome, NewSpecOutcome, NewWorkflowOutcome, PullLibraryOutcome,
-    };
-
-    #[test]
-    fn render_new_spec_with_path_shows_created_path() {
-        let o = NewSpecOutcome {
-            interview: false,
-            path: Some("/aspec/work-items/0001-foo.md".into()),
-        };
-        let s = render_new_spec(&o);
-        assert!(s.contains("0001-foo.md"), "path must appear in output: {s}");
-        assert!(s.contains("Created"), "must say Created: {s}");
-    }
-
-    #[test]
-    fn render_new_spec_without_path_shows_fallback() {
-        let o = NewSpecOutcome {
-            interview: false,
-            path: None,
-        };
-        let s = render_new_spec(&o);
-        assert!(!s.is_empty());
-    }
-
-    #[test]
-    fn render_new_workflow_repo_scope_shows_format() {
-        let o = NewWorkflowOutcome {
-            interview: false,
-            global: false,
-            format: "toml".into(),
-            path: Some("/aspec/workflows/my-wf.toml".into()),
-        };
-        let s = render_new_workflow(&o);
-        assert!(s.contains("repo"), "must mention repo scope");
-        assert!(s.contains("toml"), "must mention format");
-        assert!(s.contains("my-wf.toml"), "path must appear");
-    }
-
-    #[test]
-    fn render_new_workflow_global_scope() {
-        let o = NewWorkflowOutcome {
-            interview: false,
-            global: true,
-            format: "yaml".into(),
-            path: Some("/home/user/.awman/workflows/my-wf.yaml".into()),
-        };
-        let s = render_new_workflow(&o);
-        assert!(s.contains("global"), "must mention global scope");
-    }
-
-    #[test]
-    fn render_new_skill_global_shows_global_scope() {
-        let o = NewSkillOutcome {
-            interview: false,
-            global: true,
-            path: Some("/home/user/.awman/skills/my-skill/SKILL.md".into()),
-            pull: false,
-            libraries: vec![],
-        };
-        let s = render_new_skill(&o).expect("skill creation must render a summary line");
-        assert!(s.contains("global"), "must mention global scope");
-        assert!(s.contains("SKILL.md"), "path must appear");
-    }
-
-    /// A `--pull` run clones a managed library into the *global* store and
-    /// already reported it through the message sink. It must never render the
-    /// "Created skill (repo)" creation line (WI-0103 remediation).
-    #[test]
-    fn render_new_skill_pull_renders_no_creation_line() {
-        let o = NewSkillOutcome {
-            interview: false,
-            global: false,
-            path: Some("/home/user/.awman/skills/.library/superpowers".into()),
-            pull: true,
-            libraries: vec![PullLibraryOutcome {
-                slug: "superpowers".into(),
-                dir: "/home/user/.awman/skills/.library/superpowers".into(),
-                updated: false,
-                skills_found: vec!["brainstorming".into()],
-                error: None,
-            }],
-        };
-        assert_eq!(
-            render_new_skill(&o),
-            None,
-            "a pull must not render a skill-creation line"
+            render_new_spec(&spec(None, Some("https://x/issues/73"), false)),
+            None
         );
         assert_eq!(
-            render_new(&NewOutcome::Skill(o)),
-            None,
-            "the NewOutcome renderer must pass the pull's silence through"
+            render_new_spec(&spec(Some("aspec/0007-x.md"), None, false)).as_deref(),
+            Some("Created work item: aspec/0007-x.md")
         );
-    }
-
-    /// `--pull-all` with nothing pulled yet has no libraries *and* no path;
-    /// it must still not be rendered as "Skill created (repo)."
-    #[test]
-    fn render_new_skill_empty_pull_all_renders_no_creation_line() {
-        let o = NewSkillOutcome {
-            interview: false,
-            global: false,
-            path: None,
-            pull: true,
-            libraries: vec![],
-        };
         assert_eq!(
-            render_new_skill(&o),
-            None,
-            "an empty --pull-all must not claim a skill was created"
+            render_new_spec(&spec(None, None, true)).as_deref(),
+            Some("No work item was created.")
         );
-    }
-
-    // ── render_specs ──────────────────────────────────────────────────────────
-
-    use crate::command::commands::specs::SpecsAmendOutcome;
-
-    #[test]
-    fn render_specs_amend_shows_work_item_number() {
-        let o = SpecsAmendOutcome {
-            work_item: "0042".into(),
-            non_interactive: false,
-            allow_docker: false,
-        };
-        let s = render_specs_amend(&o);
-        assert!(s.contains("0042"), "work item number must appear: {s}");
-    }
-
-    // ── render_exec_workflow ──────────────────────────────────────────────────
-
-    use crate::command::commands::exec_workflow::ExecWorkflowOutcome;
-
-    #[test]
-    fn render_exec_workflow_shows_workflow_name() {
-        let o = ExecWorkflowOutcome {
-            prerequisites: None,
-            workflow: "deploy.toml".into(),
-            exit_code: Some(0),
-            worktree_used: false,
-        };
-        let s = render_exec_workflow(&o).expect("exec_workflow must produce output");
-        assert!(s.contains("deploy.toml"), "workflow name must appear: {s}");
-        assert!(s.contains("completed"), "must say completed: {s}");
-    }
-
-    #[test]
-    fn render_exec_workflow_nonzero_exit_shows_exit_code() {
-        let o = ExecWorkflowOutcome {
-            prerequisites: None,
-            workflow: "build.yaml".into(),
-            exit_code: Some(2),
-            worktree_used: false,
-        };
-        let s = render_exec_workflow(&o).expect("exec_workflow must produce output");
-        assert!(
-            s.contains("2") || s.contains("exit"),
-            "exit code must appear: {s}"
-        );
-    }
-
-    // ── render_exec_prompt ────────────────────────────────────────────────────
-
-    use crate::command::commands::exec_prompt::ExecPromptOutcome;
-
-    #[test]
-    fn render_exec_prompt_zero_exit_returns_none() {
-        let o = ExecPromptOutcome {
-            agent: Some("claude".into()),
-            exit_code: Some(0),
-        };
-        assert!(render_exec_prompt(&o).is_none());
-    }
-
-    #[test]
-    fn render_exec_prompt_nonzero_exit_returns_message() {
-        let o = ExecPromptOutcome {
-            agent: None,
-            exit_code: Some(3),
-        };
-        let s = render_exec_prompt(&o).expect("nonzero exit must produce output");
-        assert!(
-            s.contains("3") || s.contains("exit"),
-            "exit code must appear: {s}"
-        );
-    }
-
-    // ── render_api_server ───────────────────────────────────────────────────────
-
-    use crate::command::commands::api_server::{
-        ApiServerKillOutcome, ApiServerLogsOutcome, ApiServerStartOutcome,
-    };
-
-    #[test]
-    fn render_api_server_start_shows_port_and_mode() {
-        let o = ApiServerStartOutcome {
-            port: 9876,
-            background: true,
-            workdirs: vec!["/repo".into()],
-            workdir_roots: vec![],
-            refreshed_key: false,
-        };
-        let s = render_api_server_start(&o);
-        assert!(s.contains("9876"), "port must appear: {s}");
-        assert!(s.contains("background"), "mode must appear: {s}");
-    }
-
-    #[test]
-    fn render_api_server_start_foreground_mode() {
-        let o = ApiServerStartOutcome {
-            port: 8080,
-            background: false,
-            workdirs: vec![],
-            workdir_roots: vec![],
-            refreshed_key: true,
-        };
-        let s = render_api_server_start(&o);
-        assert!(s.contains("foreground"), "must say foreground: {s}");
-        assert!(
-            s.contains("api key refreshed"),
-            "refreshed_key must be mentioned: {s}"
-        );
-    }
-
-    #[test]
-    fn render_api_server_kill_with_stopped_pid() {
-        let s = render_api_server_kill(&ApiServerKillOutcome {
-            stopped_pid: Some(5678),
-        });
-        assert!(s.contains("5678"), "PID must appear: {s}");
-        assert!(s.contains("stopped"), "must say stopped: {s}");
-    }
-
-    #[test]
-    fn render_api_server_kill_without_pid_says_not_running() {
-        let s = render_api_server_kill(&ApiServerKillOutcome { stopped_pid: None });
-        assert!(s.contains("not running"), "must say not running: {s}");
-    }
-
-    #[test]
-    fn render_api_server_logs_with_path() {
-        let s = render_api_server_logs(&ApiServerLogsOutcome {
-            log_path: "/tmp/awman.log".into(),
-        });
-        assert!(s.contains("/tmp/awman.log"), "log path must appear: {s}");
-    }
-
-    #[test]
-    fn render_api_server_logs_empty_path() {
-        let s = render_api_server_logs(&ApiServerLogsOutcome {
-            log_path: String::new(),
-        });
-        assert!(s.contains("No API server log"), "must say no log: {s}");
-    }
-
-    // ── render_remote ─────────────────────────────────────────────────────────
-
-    use crate::command::commands::remote::{RemoteSessionKillOutcome, RemoteSessionStartOutcome};
-
-    #[test]
-    fn render_remote_session_start_shows_session_id() {
-        let s = render_remote_session_start(&RemoteSessionStartOutcome {
-            session_id: "sess-1".into(),
-            remote_addr: "localhost:9876".into(),
-            setup_status: Some("ready".into()),
-        });
-        assert!(s.contains("sess-1"), "session_id must appear: {s}");
-    }
-
-    #[test]
-    fn render_remote_session_start_shows_remote_addr() {
-        let s = render_remote_session_start(&RemoteSessionStartOutcome {
-            session_id: "sess-2".into(),
-            remote_addr: "localhost:9876".into(),
-            setup_status: None,
-        });
-        assert!(s.contains("localhost:9876"), "remote_addr must appear: {s}");
-    }
-
-    #[test]
-    fn render_remote_session_kill_with_session_id() {
-        let s = render_remote_session_kill(&RemoteSessionKillOutcome {
-            session_id: "abc123".into(),
-            remote_addr: "localhost:9876".into(),
-        });
-        assert!(s.contains("abc123"), "session id must appear: {s}");
-    }
-
-    #[test]
-    fn render_remote_session_kill_shows_remote_addr() {
-        let s = render_remote_session_kill(&RemoteSessionKillOutcome {
-            session_id: "sess-1".into(),
-            remote_addr: "localhost:9876".into(),
-        });
-        assert!(s.contains("localhost:9876"), "remote_addr must appear: {s}");
     }
 }

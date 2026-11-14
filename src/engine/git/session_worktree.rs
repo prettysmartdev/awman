@@ -57,8 +57,12 @@ pub enum WorktreeUpdate {
 }
 
 /// Run hardened host git in `cwd` with a null stdin and captured output.
-fn run_git<S: AsRef<OsStr>>(cwd: &Path, args: &[S]) -> Result<Output, EngineError> {
-    host_command::command(cwd)
+fn run_git<S: AsRef<OsStr>>(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    cwd: &Path,
+    args: &[S],
+) -> Result<Output, EngineError> {
+    host_command::command(snapshot, cwd)
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -70,11 +74,12 @@ fn run_git<S: AsRef<OsStr>>(cwd: &Path, args: &[S]) -> Result<Output, EngineErro
 /// transport programs are refused, SSH cannot prompt, and the call is bounded
 /// by [`host_command::NETWORK_TIMEOUT`].
 fn run_git_network<S: AsRef<OsStr>>(
+    snapshot: &crate::data::config::env::EnvSnapshot,
     cwd: &Path,
     remote: &str,
     args: &[S],
 ) -> Result<Output, EngineError> {
-    let mut command = host_command::transport_command(cwd, remote)?;
+    let mut command = host_command::transport_command(snapshot, cwd, remote)?;
     command.args(args).current_dir(cwd);
     host_command::bounded_output(
         &mut command,
@@ -123,7 +128,12 @@ fn failed<S: AsRef<OsStr>>(args: &[S], output: &Output) -> EngineError {
 
 /// `git fetch --no-tags --no-recurse-submodules <remote> <refspec>` through
 /// the transport-hardened, time-bounded runner.
-fn fetch_ok(repo: &Path, remote: &str, refspec: &str) -> Result<(), EngineError> {
+fn fetch_ok(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    repo: &Path,
+    remote: &str,
+    refspec: &str,
+) -> Result<(), EngineError> {
     let args = [
         "fetch",
         "--no-tags",
@@ -131,7 +141,7 @@ fn fetch_ok(repo: &Path, remote: &str, refspec: &str) -> Result<(), EngineError>
         remote,
         refspec,
     ];
-    let output = run_git_network(repo, remote, &args)?;
+    let output = run_git_network(snapshot, repo, remote, &args)?;
     if !output.status.success() {
         return Err(failed(&args, &output));
     }
@@ -139,8 +149,12 @@ fn fetch_ok(repo: &Path, remote: &str, refspec: &str) -> Result<(), EngineError>
 }
 
 /// Run git and require success; returns trimmed stdout.
-fn git_ok<S: AsRef<OsStr>>(cwd: &Path, args: &[S]) -> Result<String, EngineError> {
-    let output = run_git(cwd, args)?;
+fn git_ok<S: AsRef<OsStr>>(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    cwd: &Path,
+    args: &[S],
+) -> Result<String, EngineError> {
+    let output = run_git(snapshot, cwd, args)?;
     if !output.status.success() {
         return Err(failed(args, &output));
     }
@@ -258,7 +272,7 @@ impl GitEngine {
         if branch == "@" || branch.contains("@{") || branch == "HEAD" {
             return Err(invalid("checkout shorthand is not a branch name"));
         }
-        let output = run_git(repo, &["check-ref-format", "--branch", branch])?;
+        let output = run_git(self.env(), repo, &["check-ref-format", "--branch", branch])?;
         if !output.status.success() {
             return Err(invalid("rejected by `git check-ref-format --branch`"));
         }
@@ -272,6 +286,7 @@ impl GitEngine {
     /// Missing repository, bare repository and unborn `HEAD` are errors.
     pub fn ensure_committed_worktree(&self, repo: &Path) -> Result<(), EngineError> {
         let output = run_git(
+            self.env(),
             repo,
             &["rev-parse", "--is-bare-repository", "--is-inside-work-tree"],
         )?;
@@ -290,7 +305,11 @@ impl GitEngine {
                 repo.display()
             )));
         }
-        let head = run_git(repo, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])?;
+        let head = run_git(
+            self.env(),
+            repo,
+            &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+        )?;
         if !head.status.success() {
             return Err(EngineError::Git(format!(
                 "{} has no commits yet; make an initial commit first",
@@ -305,7 +324,7 @@ impl GitEngine {
     /// Paths keep their native bytes.
     pub fn list_worktree_entries(&self, repo: &Path) -> Result<Vec<WorktreeEntry>, EngineError> {
         let args = ["worktree", "list", "--porcelain", "-z"];
-        let output = run_git(repo, &args)?;
+        let output = run_git(self.env(), repo, &args)?;
         if !output.status.success() {
             return Err(failed(&args, &output));
         }
@@ -340,7 +359,7 @@ impl GitEngine {
             (Some(Component::Normal(c)), None) if c == OsStr::new(name) => {}
             _ => return Err(invalid()),
         }
-        let p = WorktreePaths::from_home().map_err(EngineError::Data)?;
+        let p = WorktreePaths::from_env(self.env()).map_err(EngineError::Data)?;
         let root = canonical_or_given(git_root);
         Ok(self.pick_worktree_path(&root, p.named(&root, name), p.legacy_named(&root, name)))
     }
@@ -348,7 +367,7 @@ impl GitEngine {
     /// Names of the configured remotes (`git remote`). A failure is an error,
     /// never "no remotes".
     pub fn remote_names(&self, repo: &Path) -> Result<Vec<String>, EngineError> {
-        let stdout = git_ok(repo, &["remote"])?;
+        let stdout = git_ok(self.env(), repo, &["remote"])?;
         Ok(stdout
             .lines()
             .map(str::trim)
@@ -372,7 +391,7 @@ impl GitEngine {
         self.validate_branch_name(repo, branch)?;
         let full = format!("refs/heads/{branch}");
         let args = ["ls-remote", "--exit-code", remote, full.as_str()];
-        let output = run_git_network(repo, remote, &args)?;
+        let output = run_git_network(self.env(), repo, remote, &args)?;
         match output.status.code() {
             Some(0) => Ok(String::from_utf8_lossy(&output.stdout)
                 .lines()
@@ -391,6 +410,7 @@ impl GitEngine {
         self.validate_branch_name(repo, branch)?;
         let full = format!("refs/heads/{branch}");
         let stdout = git_ok(
+            self.env(),
             repo,
             &["for-each-ref", "--format=%(refname)", full.as_str()],
         )?;
@@ -411,7 +431,7 @@ impl GitEngine {
         let tracking = format!("refs/remotes/{remote}/{branch}");
         self.check_full_ref(repo, &tracking)?;
         let refspec = format!("+refs/heads/{branch}:{tracking}");
-        fetch_ok(repo, remote, &refspec)?;
+        fetch_ok(self.env(), repo, remote, &refspec)?;
         self.resolve_commit(repo, &tracking)
     }
 
@@ -428,7 +448,7 @@ impl GitEngine {
         let cache = format!("refs/awman/pull-heads/{remote}/{number}");
         self.check_full_ref(repo, &cache)?;
         let refspec = format!("+refs/pull/{number}/head:{cache}");
-        fetch_ok(repo, remote, &refspec)?;
+        fetch_ok(self.env(), repo, remote, &refspec)?;
         self.resolve_commit(repo, &cache)
     }
 
@@ -470,7 +490,7 @@ impl GitEngine {
             remote,
             refspec.as_str(),
         ];
-        let output = run_git_network(repo, remote, &args)?;
+        let output = run_git_network(self.env(), repo, remote, &args)?;
         if output.status.success() {
             return Ok(FetchLocalOutcome::Updated);
         }
@@ -498,12 +518,13 @@ impl GitEngine {
         fetched_commit: &str,
     ) -> Result<WorktreeUpdate, EngineError> {
         self.validate_branch_name(worktree, branch)?;
-        let head_ref = git_ok(worktree, &["symbolic-ref", "--quiet", "HEAD"]).map_err(|_| {
-            EngineError::Git(format!(
-                "{} is not on branch '{branch}'",
-                worktree.display()
-            ))
-        })?;
+        let head_ref =
+            git_ok(self.env(), worktree, &["symbolic-ref", "--quiet", "HEAD"]).map_err(|_| {
+                EngineError::Git(format!(
+                    "{} is not on branch '{branch}'",
+                    worktree.display()
+                ))
+            })?;
         if head_ref != format!("refs/heads/{branch}") {
             return Err(EngineError::Git(format!(
                 "{} has {head_ref} checked out, not branch '{branch}'",
@@ -511,6 +532,7 @@ impl GitEngine {
             )));
         }
         let status = git_ok(
+            self.env(),
             worktree,
             &["status", "--porcelain", "--untracked-files=normal"],
         )?;
@@ -524,6 +546,7 @@ impl GitEngine {
         }
         if self.is_ancestor(worktree, &head, &target)? {
             git_ok(
+                self.env(),
                 worktree,
                 &["merge", "--ff-only", "--no-edit", target.as_str()],
             )?;
@@ -562,10 +585,12 @@ impl GitEngine {
         require_vacant_path(path)?;
         self.worktree_add_new_branch(repo, path, branch, &start)?;
         git_ok(
+            self.env(),
             repo,
             &["config", &format!("branch.{branch}.remote"), remote],
         )?;
         git_ok(
+            self.env(),
             repo,
             &[
                 "config",
@@ -591,6 +616,7 @@ impl GitEngine {
         let local = format!("refs/heads/{branch}");
         let upstream = || -> Result<String, EngineError> {
             git_ok(
+                self.env(),
                 repo,
                 &["for-each-ref", "--format=%(upstream)", local.as_str()],
             )
@@ -599,6 +625,7 @@ impl GitEngine {
             return Ok(());
         }
         git_ok(
+            self.env(),
             repo,
             &[
                 "config",
@@ -634,8 +661,9 @@ impl GitEngine {
         let mut args: Vec<&OsStr> = vec![OsStr::new("worktree"), OsStr::new("add")];
         args.push(path.as_os_str());
         args.push(OsStr::new(branch));
-        git_ok(repo, &args)?;
-        let head = git_ok(path, &["symbolic-ref", "--quiet", "HEAD"]).unwrap_or_default();
+        git_ok(self.env(), repo, &args)?;
+        let head =
+            git_ok(self.env(), path, &["symbolic-ref", "--quiet", "HEAD"]).unwrap_or_default();
         if head != format!("refs/heads/{branch}") {
             return Err(EngineError::Git(format!(
                 "worktree at {} did not check out branch '{branch}' (HEAD is {}); it was left in place for inspection",
@@ -690,7 +718,7 @@ impl GitEngine {
             path.as_os_str(),
             OsStr::new(commit),
         ];
-        git_ok(repo, &args).map(|_| ())
+        git_ok(self.env(), repo, &args).map(|_| ())
     }
 
     /// `git rev-parse --verify --quiet <rev>^{commit}` → full OID.
@@ -699,7 +727,11 @@ impl GitEngine {
             return Err(EngineError::Git(format!("invalid revision '{rev}'")));
         }
         let spec = format!("{rev}^{{commit}}");
-        let output = run_git(repo, &["rev-parse", "--verify", "--quiet", spec.as_str()])?;
+        let output = run_git(
+            self.env(),
+            repo,
+            &["rev-parse", "--verify", "--quiet", spec.as_str()],
+        )?;
         let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !output.status.success() || !is_full_oid(&oid) {
             return Err(EngineError::Git(format!("'{rev}' does not name a commit")));
@@ -715,7 +747,7 @@ impl GitEngine {
         descendant: &str,
     ) -> Result<bool, EngineError> {
         let args = ["merge-base", "--is-ancestor", ancestor, descendant];
-        let output = run_git(repo, &args)?;
+        let output = run_git(self.env(), repo, &args)?;
         match output.status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
@@ -725,7 +757,7 @@ impl GitEngine {
 
     /// `git check-ref-format <full_ref>` must accept the full ref.
     fn check_full_ref(&self, repo: &Path, full_ref: &str) -> Result<(), EngineError> {
-        let output = run_git(repo, &["check-ref-format", full_ref])?;
+        let output = run_git(self.env(), repo, &["check-ref-format", full_ref])?;
         if !output.status.success() {
             return Err(EngineError::Git(format!(
                 "invalid ref '{}'",
@@ -733,55 +765,5 @@ impl GitEngine {
             )));
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_branch_detached_bare_and_prunable_records() {
-        let raw = b"worktree /main\0HEAD aaaa\0branch refs/heads/main\0\0\
-worktree /wt/a b\0HEAD bbbb\0detached\0\0\
-worktree /wt/stale\0HEAD cccc\0branch refs/heads/x/y\0prunable gitdir file points to non-existent location\0\0";
-        let entries = parse_worktree_entries(raw);
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].path, PathBuf::from("/main"));
-        assert_eq!(entries[0].branch.as_deref(), Some("main"));
-        assert_eq!(entries[1].path, PathBuf::from("/wt/a b"));
-        assert_eq!(entries[1].branch, None);
-        assert!(!entries[1].prunable);
-        assert_eq!(entries[2].branch.as_deref(), Some("x/y"));
-        assert!(entries[2].prunable);
-
-        let bare = parse_worktree_entries(b"worktree /repo.git\0bare\0\0");
-        assert!(bare[0].bare);
-    }
-
-    #[test]
-    fn remote_names_must_not_look_like_options() {
-        assert!(validate_remote_name("origin").is_ok());
-        assert!(validate_remote_name("up-stream_2").is_ok());
-        for bad in [
-            "",
-            "-x",
-            "--upload-pack=x",
-            "a b",
-            "a:b",
-            "a..b",
-            ".x",
-            "a\nb",
-        ] {
-            assert!(validate_remote_name(bad).is_err(), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn full_oid_shape() {
-        assert!(is_full_oid(&"a".repeat(40)));
-        assert!(is_full_oid(&"0".repeat(64)));
-        assert!(!is_full_oid("abc"));
-        assert!(!is_full_oid(&"A".repeat(40)));
     }
 }

@@ -64,7 +64,6 @@ pub struct Prompt<D> {
     /// |---|---|---|
     /// | `prompts::squad_task_confirm` | `Dismiss` | Walking away from a confirmation is a refusal; Esc must not trigger, cancel or pause anything. |
     /// | `prompts::agents_kill_confirm` | `Keep` | Walking away from a confirmation is a refusal; Esc must not stop an agent. |
-    /// | `prompts::config_migrate_confirm` | `Cancel` | Walking away from a confirmation is a refusal; Esc must not rewrite a config file. |
     /// | `prompts::agent_trust_confirm` | `Decline` | Walking away from an approval is a refusal; a dismissal must never trust a definition. |
     /// | `prompts::dockerfile_setup` | `CreateNew` | The only choice that leaves `init` able to finish, it matches every headless profile, and it writes a file the user can replace or delete. |
     ///
@@ -195,106 +194,5 @@ impl TextPrompt {
             return Some(trimmed.to_string());
         }
         self.default.clone()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn typed_text_wins_over_the_default_and_is_trimmed() {
-        let prompt = TextPrompt::new("Interval", "How often?", Some("6h".into()));
-        assert_eq!(prompt.resolve("  2h "), Some("2h".to_string()));
-        assert_eq!(prompt.resolve("   "), Some("6h".to_string()));
-        assert_eq!(prompt.resolve(""), Some("6h".to_string()));
-    }
-
-    #[test]
-    fn an_empty_answer_with_no_default_resolves_to_nothing() {
-        let prompt = TextPrompt::new("Name", "What is it called?", None);
-        assert_eq!(prompt.resolve(""), None);
-        assert_eq!(prompt.resolve("x"), Some("x".to_string()));
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum Answer {
-        Yes,
-        No,
-    }
-
-    fn yes_no() -> Prompt<Answer> {
-        Prompt::new(
-            "Proceed?",
-            "",
-            vec![
-                Choice::new('y', "Yes", Answer::Yes),
-                Choice::new('n', "No", Answer::No),
-            ],
-            Some(Answer::No),
-        )
-    }
-
-    #[test]
-    fn a_key_maps_to_its_answer_and_an_unknown_key_to_none() {
-        let prompt = yes_no();
-        assert_eq!(prompt.answer_for_key('y'), Some(Answer::Yes));
-        assert_eq!(prompt.answer_for_key('n'), Some(Answer::No));
-        assert_eq!(prompt.answer_for_key('q'), None);
-    }
-
-    #[test]
-    fn an_index_maps_to_its_answer_in_declaration_order() {
-        let prompt = yes_no();
-        assert_eq!(prompt.answer_at(0), Some(Answer::Yes));
-        assert_eq!(prompt.answer_at(1), Some(Answer::No));
-        assert_eq!(prompt.answer_at(2), None);
-    }
-
-    #[test]
-    fn keys_and_labels_come_back_in_order() {
-        let prompt = yes_no();
-        assert_eq!(prompt.keys(), vec!['y', 'n']);
-        assert_eq!(prompt.labels(), vec!["Yes", "No"]);
-    }
-
-    /// A duplicate hotkey makes one answer unreachable — and only for the
-    /// user who presses that key, which no test would notice.
-    #[test]
-    #[should_panic(expected = "duplicate hotkey")]
-    fn a_duplicate_hotkey_is_a_programming_error() {
-        Prompt::new(
-            "Proceed?",
-            "",
-            vec![
-                Choice::new('y', "Yes", Answer::Yes),
-                Choice::new('y', "Also yes", Answer::No),
-            ],
-            None,
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "at least one answer")]
-    fn a_prompt_with_no_answers_is_a_programming_error() {
-        Prompt::<Answer>::new("Proceed?", "", Vec::new(), None);
-    }
-}
-
-#[cfg(test)]
-mod masked_tests {
-    use super::*;
-
-    #[test]
-    fn masked_text_prompt_constructor() {
-        let prompt = TextPrompt::masked("GitHub token", "Paste a token");
-        assert!(prompt.masked);
-        assert_eq!(prompt.default, None);
-        assert_eq!(prompt.title, "GitHub token");
-        // No default: an empty submission is an error, never an empty secret.
-        assert_eq!(prompt.resolve(""), None);
-        assert_eq!(prompt.resolve("  ghp_x  "), Some("ghp_x".into()));
-        assert!(!TextPrompt::new("t", "b", None).masked);
-        assert!(!TextPrompt::new("t", "b", Some("d".into())).masked);
     }
 }

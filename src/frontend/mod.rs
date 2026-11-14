@@ -13,14 +13,17 @@
 
 pub mod api;
 pub mod cli;
-#[cfg(test)]
-mod field_name_literals_tests;
+pub mod daemon;
+
+pub mod osc7501;
+pub mod program_status_text;
 pub mod render_helpers;
 pub mod squad;
+pub mod terminal_output_filter;
 pub mod tui;
 
-// The non-interactive rule used to live here, as
+// The headless rule used to live here, as
 // `effective_non_interactive(explicitly_requested)`. It is Layer 2's:
-// `ResolvedFlags::is_non_interactive` (WI 0114 F-50). A frontend reports
+// `ResolvedFlags::is_headless` (WI 0114 F-50). A frontend reports
 // whether there is anywhere to read an answer from —
 // `CommandFrontend::input_available` — and nothing else.

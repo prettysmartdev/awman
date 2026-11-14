@@ -36,12 +36,7 @@ pub struct AcpTransportFrontend {
     io: Option<AgentIo>,
 }
 
-impl AcpTransportFrontend {
-    #[cfg(test)]
-    pub(crate) fn into_io_for_test(mut self) -> AgentIo {
-        self.io.take().expect("test ACP frontend has no AgentIo")
-    }
-}
+impl AcpTransportFrontend {}
 
 impl AcpTransport {
     pub fn channel() -> (AcpTransportFrontend, Self) {
@@ -462,88 +457,5 @@ fn warning(sink: &SharedSink, text: String) {
             level: MessageLevel::Warning,
             text,
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::message::{RecordingMessageSink, UserMessage};
-    use crate::engine::acp::protocol::ContentBlock;
-
-    struct CapturingSink(Arc<Mutex<Vec<UserMessage>>>);
-    impl UserMessageSink for CapturingSink {
-        fn write_message(&mut self, msg: UserMessage) {
-            self.0.lock().unwrap().push(msg);
-        }
-        fn replay_queued(&mut self) {}
-    }
-
-    #[tokio::test]
-    async fn malformed_line_is_a_warning_and_later_update_arrives() {
-        let (frontend, transport) = AcpTransport::channel();
-        let io = frontend.into_io_for_test();
-        let messages = Arc::new(Mutex::new(Vec::new()));
-        let mut client = AcpClient::new(transport, Box::new(CapturingSink(messages.clone())));
-        let mut updates = client.take_updates();
-        io.stdout.send(b"not json\n".to_vec()).unwrap();
-        io.stdout.send(serde_json::to_vec(&serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ok"}}}})).unwrap()).unwrap();
-        io.stdout.send(vec![b'\n']).unwrap();
-        let update = updates.recv().await.unwrap();
-        assert_eq!(
-            update,
-            crate::engine::acp::protocol::SessionUpdate::AgentMessageChunk {
-                chunk: crate::engine::acp::protocol::ContentChunk {
-                    content: ContentBlock::Text { text: "ok".into() },
-                    message_id: None
-                }
-            }
-        );
-        assert!(messages.lock().unwrap().iter().any(|message| {
-            message.level == MessageLevel::Warning
-                && message.text.contains("ignoring malformed line")
-        }));
-    }
-
-    #[tokio::test]
-    async fn two_concurrent_requests_keep_their_ids() {
-        let (frontend, transport) = AcpTransport::channel();
-        let mut io = frontend.into_io_for_test();
-        let client = Arc::new(AcpClient::new(
-            transport,
-            Box::new(RecordingMessageSink::new()),
-        ));
-        let a = {
-            let c = client.clone();
-            tokio::spawn(async move { c.request("one", serde_json::json!({})).await.unwrap() })
-        };
-        let b = {
-            let c = client.clone();
-            tokio::spawn(async move { c.request("two", serde_json::json!({})).await.unwrap() })
-        };
-        let first: Value = serde_json::from_slice(&io.stdin_rx.recv().await.unwrap()).unwrap();
-        let second: Value = serde_json::from_slice(&io.stdin_rx.recv().await.unwrap()).unwrap();
-        let first_id = first["id"].clone();
-        let second_id = second["id"].clone();
-        io.stdout
-            .send(
-                format!(
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"value\":\"second\"}}}}\n",
-                    second_id
-                )
-                .into_bytes(),
-            )
-            .unwrap();
-        io.stdout
-            .send(
-                format!(
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"value\":\"first\"}}}}\n",
-                    first_id
-                )
-                .into_bytes(),
-            )
-            .unwrap();
-        assert_eq!(a.await.unwrap()["value"], "first");
-        assert_eq!(b.await.unwrap()["value"], "second");
     }
 }

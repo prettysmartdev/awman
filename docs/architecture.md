@@ -30,7 +30,7 @@ Three tenets:
 | 3 `frontend` | Layers 0–3; engine types and frontend traits only — engine behaviour is reached through Layer 2 |
 | 4 `main.rs`, `lib.rs` | anything |
 
-`make architecture-lint` (`tools/architecture-lint.sh`) enforces these rules and runs in CI and in `make pre-push`. `tools/test-architecture-lint.sh` checks the lint itself against fixture trees.
+`make architecture-lint` (`tools/architecture-lint.sh`) enforces these rules and runs in CI and in `make pre-push`. The component tools suite checks the lint against private fixture trees and scanner failures.
 
 ---
 
@@ -106,7 +106,7 @@ All business logic. Commands call engines, read and write Layer 0, and talk to t
 - **`Command` trait** (`commands/command_trait.rs`) — `run_with_frontend(self, frontend) -> Result<Outcome, CommandError>`. Each command (`commands/`: `chat`, `exec_prompt`, `exec_workflow/`, `init`, `ready`, `config`, `new/`, `specs`, `agents/`, `squad/`, `remote`, `api_server`, `clean`) declares its own frontend trait and typed outcome. Shared steps that ask the user — `worktree_lifecycle`, `mount_scope`, `agent_setup`, `agent_auth`, `agent_trust`, `workflow_prerequisites` — have their own frontend traits. `launch_policy.rs` decides how an agent is launched (which agent, stdio or ACP, context directories).
 - **Answers and copy** — `headless.rs` (`HeadlessDefaults`: what a question is answered with when nobody is there to ask, per frontend) and `prompts.rs` (the text of every prompt).
 - **Startup and sessions** — `startup.rs` (`Startup`: migrations, config load, Git root, `Session`, engines), `session_create.rs` and `session_setup.rs` (API session validation and setup).
-- **Daemon bootstrap** — `ApiServerRuntime` (`commands/api_server/runtime.rs`) and `SquadDaemonHandles` (`commands/squad/daemon_runtime.rs`) prepare the daemons before a frontend serves them.
+- **Daemon bootstrap** — `command/daemon_runtime` owns one daemon process, database and executor for squad, worker push/pull and the singleton engine. Frontends serve the shared local and network routes.
 - **`CommandError`** (`error.rs`) wraps `EngineError` and `DataError`.
 
 ---
@@ -134,7 +134,7 @@ Each frontend implements the per-command frontend traits and renders outcomes. N
 4. Run `Startup` to open the `Session` and build `Engines`, and package them in a `RuntimeContext`.
 5. Route: no subcommand opens the TUI; bare `awman squad` on a terminal opens the TUI on the squad tab; anything else runs in the CLI.
 
-The API server and squad daemon start from their commands (`api start`, `squad start`), not from `main.rs`.
+The shared daemon starts from `awman daemon start`; its worker, squad, and engine features run in that process.
 
 ---
 

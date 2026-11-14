@@ -1,0 +1,332 @@
+[
+  {
+    "kind": "yes_no",
+    "title": "Push branch?",
+    "body": "Push wi-0159 to origin?"
+  },
+  {
+    "kind": "yes_no_cancel",
+    "title": "Save changes?",
+    "body": "Keep the worktree?"
+  },
+  {
+    "kind": "text_input",
+    "title": "Branch name",
+    "prompt": "New branch:",
+    "default_text": "wi-0159"
+  },
+  {
+    "kind": "secret_input",
+    "title": "GitHub token",
+    "prompt": "Paste a token:"
+  },
+  {
+    "kind": "terminal_release",
+    "title": "Running gh auth login",
+    "terminal_id": null
+  },
+  {
+    "kind": "terminal_restore"
+  },
+  {
+    "kind": "multiline_input",
+    "title": "Describe the task",
+    "prompt": "Description:",
+    "default_text": null
+  },
+  {
+    "kind": "list_picker",
+    "title": "Pick a workflow",
+    "items": [
+      "implement-work-item",
+      "review"
+    ]
+  },
+  {
+    "kind": "kind_select",
+    "title": "Work item kind",
+    "options": [
+      [
+        "feature",
+        "Feature"
+      ],
+      [
+        "bug",
+        "Bug fix"
+      ]
+    ]
+  },
+  {
+    "kind": "workflow_control_board",
+    "step_name": "implement",
+    "can_launch_next": true,
+    "can_continue_current": false,
+    "can_restart": true,
+    "can_go_back": false,
+    "can_finish": true,
+    "continue_unavailable_reason": "next step uses a different agent",
+    "cancel_to_previous_unavailable_reason": null,
+    "finish_workflow_unavailable_reason": null,
+    "restart_unavailable_reason": null,
+    "can_dismiss": true,
+    "launch_next_label": null,
+    "focused_step_name": "implement",
+    "parallel_peer_count": 0,
+    "parallel_peers_running": 0,
+    "failure_lines": [],
+    "retry_failed_step": null,
+    "in_parallel_group": false
+  },
+  {
+    "kind": "workflow_yolo_countdown",
+    "step_name": "implement",
+    "remaining_secs": 42,
+    "countdown_kind": "stuck_step"
+  },
+  {
+    "kind": "workflow_step_confirm",
+    "completed_step": "plan",
+    "next_step": "implement"
+  },
+  {
+    "kind": "agent_setup",
+    "agent_name": "codex",
+    "image_only": false,
+    "has_fallback": true,
+    "fallback_name": "claude"
+  },
+  {
+    "kind": "mount_scope",
+    "git_root": "/Users/me/src/awman",
+    "cwd": "/Users/me/src/awman/web"
+  },
+  {
+    "kind": "agent_auth",
+    "agent_name": "claude",
+    "env_vars": [
+      "ANTHROPIC_API_KEY"
+    ]
+  },
+  {
+    "kind": "quit_confirm"
+  },
+  {
+    "kind": "close_tab_confirm"
+  },
+  {
+    "kind": "workflow_cancel_confirm"
+  },
+  {
+    "kind": "config_show",
+    "rows": [
+      {
+        "field": "agent",
+        "global": "claude",
+        "repo": "",
+        "effective": "claude",
+        "read_only": false,
+        "global_writable": true,
+        "repo_writable": true,
+        "value_hint": null,
+        "shape": "scalar"
+      },
+      {
+        "field": "env",
+        "global": "",
+        "repo": "",
+        "effective": "",
+        "read_only": false,
+        "global_writable": true,
+        "repo_writable": true,
+        "value_hint": null,
+        "shape": {
+          "map_header": {
+            "child_prefix": "env."
+          }
+        }
+      },
+      {
+        "field": "env.FOO",
+        "global": "bar",
+        "repo": "",
+        "effective": "bar",
+        "read_only": false,
+        "global_writable": true,
+        "repo_writable": true,
+        "value_hint": "text",
+        "shape": "map_entry"
+      }
+    ],
+    "selected": 0,
+    "rejected": {
+      "field": "agent",
+      "value": "nope",
+      "global": true,
+      "reason": "unknown agent"
+    }
+  },
+  {
+    "kind": "loading",
+    "title": "Building image…"
+  },
+  {
+    "kind": "custom",
+    "title": "Merge worktree?",
+    "body": "Choose a merge mode.",
+    "keys": [
+      [
+        "m",
+        "Merge"
+      ],
+      [
+        "s",
+        "Squash"
+      ],
+      [
+        "k",
+        "Keep"
+      ]
+    ]
+  },
+  {
+    "kind": "review",
+    "title": "Trust agent definition",
+    "body": {
+      "kind": "exact",
+      "value": "docker run --rm awman-claude"
+    },
+    "note": "Read to the end to approve",
+    "keys": [
+      [
+        "a",
+        "Approve"
+      ],
+      [
+        "d",
+        "Decline"
+      ]
+    ],
+    "gated_keys": [
+      "a"
+    ],
+    "dismiss_label": "Decline"
+  },
+  {
+    "kind": "review",
+    "title": "config migrate",
+    "body": {
+      "kind": "prose",
+      "value": "{\n  \"agent\": \"claude\"\n}"
+    },
+    "note": "",
+    "keys": [
+      [
+        "y",
+        "Apply"
+      ]
+    ],
+    "gated_keys": [],
+    "dismiss_label": null
+  },
+  {
+    "kind": "review",
+    "title": "Workflow prerequisites",
+    "body": {
+      "kind": "prerequisites",
+      "value": {
+        "phase": "start",
+        "origin": "static",
+        "checks": [
+          {
+            "prerequisite": {
+              "type": "git_identity"
+            },
+            "status": "needs_consent",
+            "explanation": "commits need a git identity",
+            "needed_by": [
+              {
+                "phase": "teardown",
+                "kind": "commit_changes",
+                "index": 0,
+                "description": "commit changes"
+              }
+            ],
+            "remediations": [
+              {
+                "type": "use_host_identity",
+                "name": "Me",
+                "email": "me@example.com"
+              },
+              {
+                "type": "enter_identity"
+              },
+              {
+                "type": "abort"
+              }
+            ]
+          },
+          {
+            "prerequisite": {
+              "type": "git_hub_token",
+              "host": "github.com"
+            },
+            "status": "missing",
+            "explanation": "creating a pull request needs a token",
+            "needed_by": [
+              {
+                "phase": "teardown",
+                "kind": "create_pull_request",
+                "index": 2,
+                "description": "open PR"
+              }
+            ],
+            "remediations": [
+              {
+                "type": "use_env_token",
+                "var": "GITHUB_TOKEN",
+                "remembered": false
+              },
+              {
+                "type": "run_gh_auth_token",
+                "argv": [
+                  "gh",
+                  "auth",
+                  "token"
+                ],
+                "resolved_path": "/opt/homebrew/bin/gh",
+                "logged_in": true
+              },
+              {
+                "type": "continue"
+              }
+            ]
+          }
+        ],
+        "advisories": [],
+        "notes": [
+          "identity from repo config"
+        ]
+      }
+    },
+    "note": "",
+    "keys": [
+      [
+        "c",
+        "Continue"
+      ],
+      [
+        "x",
+        "Abort"
+      ]
+    ],
+    "gated_keys": [],
+    "dismiss_label": "Continue"
+  },
+  {
+    "kind": "key_setup_notice",
+    "title": "Squad key",
+    "body": "Save this key now.",
+    "copy_key": "sk_example",
+    "copy_zshrc_snippet": "export AWMAN_SQUAD_KEY=sk_example"
+  }
+]

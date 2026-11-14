@@ -4,7 +4,7 @@
 //! lifecycle (`run`/`create`/`stop`/`rm`), listing (`sbx ls --json`),
 //! exec, and the interactive PTY-bridged launch ([`run_interactive`]).
 //!
-//! Every non-interactive `sbx` invocation goes through [`super::spawn`]; the
+//! Every headless `sbx` invocation goes through [`super::spawn`]; the
 //! interactive `sbx run` PTY session is bridged by [`super::io_bridge`] after
 //! its argv is announced on the sink.
 
@@ -35,11 +35,13 @@ use crate::engine::sandbox::options::ResolvedSandboxOptions;
 const APPLY_SCRIPT_VM_PATH: &str = "/home/agent/.awman/apply-session-config.sh";
 
 #[derive(Debug, Default)]
-pub(in crate::engine::sandbox) struct DSbxBackend;
+pub(in crate::engine::sandbox) struct DSbxBackend {
+    env: crate::data::config::env::EnvSnapshot,
+}
 
 impl DSbxBackend {
-    pub(in crate::engine::sandbox) fn new() -> Self {
-        Self
+    pub(in crate::engine::sandbox) fn with_env(env: crate::data::config::env::EnvSnapshot) -> Self {
+        Self { env }
     }
 }
 
@@ -47,12 +49,14 @@ impl SandboxBackend for DSbxBackend {
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
         // `sbx stop` pauses the VM and preserves its persistent volume.
         // Best-effort: a non-zero exit (already stopped) is not an error.
-        let _ = SbxCommand::new(["stop", &handle.name]).run_quiet();
+        let _ = SbxCommand::new(["stop", &handle.name])
+            .in_env(&self.env)
+            .run_quiet();
         Ok(())
     }
 
     fn list_running(&self) -> Result<Vec<AgentHandle>, EngineError> {
-        list_awman_sandboxes()
+        list_awman_sandboxes(&self.env)
     }
 
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
@@ -103,8 +107,14 @@ fn resolve_sandbox_name(opts: &ResolvedSandboxOptions) -> String {
         .unwrap_or_else(|| sandbox_name_for(&opts.workspace_dir, &opts.agent_id))
 }
 
-fn kit_dir_for(agent: &str) -> Result<PathBuf, EngineError> {
-    Ok(SandboxKitPaths::from_process_env()?.kit_dir(agent))
+fn kit_dir_for(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    agent: &str,
+) -> Result<PathBuf, EngineError> {
+    Ok(
+        SandboxKitPaths::at_home(crate::data::fs::data_paths::config_home(snapshot)?)
+            .kit_dir(agent),
+    )
 }
 
 /// The sbx kit kind for `agent`. Sandbox-class runtimes run first-party
@@ -119,8 +129,10 @@ fn kit_kind_for(agent: &str) -> SbxKitKind {
 // ─── Listing ────────────────────────────────────────────────────────────────
 
 /// All awman-owned sandbox handles from `sbx ls`.
-fn list_awman_sandboxes() -> Result<Vec<AgentHandle>, EngineError> {
-    Ok(try_list_all_sandbox_names()?
+fn list_awman_sandboxes(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+) -> Result<Vec<AgentHandle>, EngineError> {
+    Ok(try_list_all_sandbox_names(snapshot)?
         .into_iter()
         .filter(|n| n.starts_with("awman-"))
         .map(|name| AgentHandle {
@@ -135,12 +147,19 @@ fn list_awman_sandboxes() -> Result<Vec<AgentHandle>, EngineError> {
 /// Every sandbox name `sbx ls` reports (awman-owned or not). Tolerant of both
 /// the `--json` mode and the plain table fallback; returns an empty list when
 /// `sbx` is unavailable or not logged in.
-pub(super) fn list_all_sandbox_names() -> Vec<String> {
-    try_list_all_sandbox_names().unwrap_or_default()
+pub(super) fn list_all_sandbox_names_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+) -> Vec<String> {
+    try_list_all_sandbox_names(snapshot).unwrap_or_default()
 }
 
-fn try_list_all_sandbox_names() -> Result<Vec<String>, EngineError> {
-    if let Ok(out) = SbxCommand::new(["ls", "--json"]).run_quiet() {
+fn try_list_all_sandbox_names(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+) -> Result<Vec<String>, EngineError> {
+    if let Ok(out) = SbxCommand::new(["ls", "--json"])
+        .in_env(snapshot)
+        .run_quiet()
+    {
         if out.success() {
             let names = parse_ls_json(&out.stdout);
             if !names.is_empty() || out.stdout.trim() == "[]" {
@@ -149,7 +168,7 @@ fn try_list_all_sandbox_names() -> Result<Vec<String>, EngineError> {
         }
     }
     crate::engine::host_cli::check_collection_cancel()?;
-    let output = SbxCommand::new(["ls"]).run_quiet()?;
+    let output = SbxCommand::new(["ls"]).in_env(snapshot).run_quiet()?;
     Ok(parse_ls_table(&output.stdout))
 }
 
@@ -191,8 +210,10 @@ fn parse_ls_table(stdout: &str) -> Vec<String> {
         .collect()
 }
 
-fn sandbox_name_exists(name: &str) -> bool {
-    list_all_sandbox_names().iter().any(|n| n == name)
+fn sandbox_name_exists(snapshot: &crate::data::config::env::EnvSnapshot, name: &str) -> bool {
+    list_all_sandbox_names_in(snapshot)
+        .iter()
+        .any(|n| n == name)
 }
 
 // ─── Interactive launch ─────────────────────────────────────────────────────
@@ -208,13 +229,20 @@ pub(in crate::engine::sandbox) fn run_interactive(
     options: ResolvedSandboxOptions,
     mut frontend: Box<dyn AgentFrontend>,
 ) -> Result<AgentExecution, EngineError> {
+    let snapshot = options
+        .host_env
+        .clone()
+        .unwrap_or_else(crate::engine::host_cli::process_env);
     options.validate_tool_restrictions()?;
     let agent = require_agent(&options)?;
     let name = resolve_sandbox_name(&options);
-    let kit_dir = kit_dir_for(&agent)?;
+    let kit_dir = kit_dir_for(&snapshot, &agent)?;
 
     // 1. Per-launch session config (no credential values).
     DSbxSessionConfig::write_for(&options, &options.workspace_dir)?;
+    if let Some(notice) = DSbxSessionConfig::host_terminal_notice(&options) {
+        warn(&mut *frontend, notice);
+    }
 
     // 2. Surface unsupported / withheld options.
     if options.cpu_limit.is_some() {
@@ -244,10 +272,11 @@ pub(in crate::engine::sandbox) fn run_interactive(
     //    sandbox-scoped, which requires the sandbox to exist. First launch
     //    runs `sbx create --kit ...` (announced); later launches skip
     //    straight to auth.
-    let created = if sandbox_name_exists(&name) {
+    let created = if sandbox_name_exists(&snapshot, &name) {
         false
     } else {
         SbxCommand::new(create_argv(&name, &agent, &kit_dir, &options))
+            .in_env(&snapshot)
             .run_announced(&mut *frontend)?;
         true
     };
@@ -257,17 +286,17 @@ pub(in crate::engine::sandbox) fn run_interactive(
     //    (scoped secrets apply immediately; global ones only at creation —
     //    awman never sets global secrets), then keychain-resolved credentials
     //    (announced + redacted throughout).
-    let auth_result = auth::auto_auth_env_overlays(
+    let auth_result = auth::auto_auth_env_overlays_in(
+        &snapshot,
         &agent,
         &name,
-        &options.env_passthrough,
-        &options.env_literal,
-        &crate::data::config::env::host_var,
-        &auth::secret_registered_for_service,
+        (&options.env_passthrough, &options.env_literal),
+        &|name| snapshot.get(name).map(str::to_owned),
+        &|service| auth::secret_registered_for_service_in(&snapshot, service),
         &mut *frontend,
     )
     .and_then(|_overlay_registered| {
-        auth::inject_credentials(&options.agent_credentials, &name, &mut *frontend)
+        auth::inject_credentials_in(&snapshot, &options.agent_credentials, &name, &mut *frontend)
     });
     if let Err(e) = auth_result {
         // A failure after a successful create leaves the sandbox behind on
@@ -305,7 +334,7 @@ pub(in crate::engine::sandbox) fn run_interactive(
             &mut *frontend,
             &format!("{SBX_BIN} {}", argv.join(" ")),
         );
-        match SbxCommand::new(argv).run_quiet() {
+        match SbxCommand::new(argv).in_env(&snapshot).run_quiet() {
             Ok(out) if out.success() => {}
             _ => warn(
                 &mut *frontend,
@@ -338,12 +367,20 @@ pub(in crate::engine::sandbox) fn run_interactive(
         &format!("{SBX_BIN} {}", argv.join(" ")),
     );
 
+    frontend = crate::engine::agent_runtime::execution::with_program_status_frontend(
+        frontend,
+        options.program_status,
+    );
     let io = frontend.take_io();
     let seed = stdin_seed(&agent, &options);
+    let context = LaunchContext {
+        env: snapshot,
+        name,
+    };
     if io.initial_size.is_some() {
-        spawn_pty_bridged(name, argv, seed, started_at, handle, io, frontend)
+        spawn_pty_bridged(context, argv, seed, started_at, handle, io, frontend)
     } else {
-        spawn_piped(name, argv, seed, started_at, handle, io, frontend)
+        spawn_piped(context, argv, seed, started_at, handle, io, frontend)
     }
 }
 
@@ -413,7 +450,7 @@ fn push_workspace_positional(argv: &mut Vec<String>, options: &ResolvedSandboxOp
 }
 
 /// Agent args appended after the `--` delimiter, mirroring the argv the
-/// container path builds after the entrypoint: non-interactive
+/// container path builds after the entrypoint: headless
 /// subcommand/flag, mode flags (yolo/auto/plan), model flag, user `agentFlags`,
 /// then the seeded prompt (a bare positional would be parsed by sbx as a workspace PATH).
 /// Only `kind: agent` kits take agent args — awman owns their entrypoint,
@@ -438,7 +475,9 @@ fn agent_args_for(
         return Vec::new();
     }
     let mut args = Vec::new();
-    if !options.interactive {
+    if options.interactive {
+        args.extend(def.interactive_only_flags.iter().cloned());
+    } else {
         if let Some(flag) = &def.non_interactive_flag {
             args.push(flag.clone());
         }
@@ -455,13 +494,25 @@ fn agent_args_for(
     }
     args.extend(options.agent_flags.iter().cloned());
     if let Some(prompt) = &options.seeded_prompt {
+        if options.interactive {
+            if let crate::engine::agent::InteractiveSeedDelivery::Flag(flag) =
+                &def.interactive_seed_delivery
+            {
+                args.push(flag.clone());
+            }
+        }
         args.push(prompt.clone());
     }
     args
 }
 
-fn spawn_pty_bridged(
+struct LaunchContext {
+    env: crate::data::config::env::EnvSnapshot,
     name: String,
+}
+
+fn spawn_pty_bridged(
+    context: LaunchContext,
     argv: Vec<String>,
     seeded: Option<String>,
     started_at: chrono::DateTime<Utc>,
@@ -469,7 +520,11 @@ fn spawn_pty_bridged(
     io: crate::engine::agent_runtime::frontend::AgentIo,
     frontend: Box<dyn AgentFrontend>,
 ) -> Result<AgentExecution, EngineError> {
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    let LaunchContext {
+        env: snapshot,
+        name,
+    } = context;
+    use portable_pty::{native_pty_system, PtySize};
 
     let (cols, rows) = io.initial_size.expect("PTY path requires initial_size");
     let pty_system = native_pty_system();
@@ -482,9 +537,21 @@ fn spawn_pty_bridged(
         })
         .map_err(|e| EngineError::Sandbox(format!("openpty: {e}")))?;
 
-    let mut cmd = CommandBuilder::new(crate::engine::host_cli::program(SBX_BIN));
+    let mut cmd = crate::engine::host_cli::pty_command(&snapshot, SBX_BIN);
     for arg in &argv {
         cmd.arg(arg);
+    }
+    let (remove, set) = agent_client_env(snapshot.spawn_env().map(|(k, v)| {
+        (
+            k.to_string_lossy().into_owned(),
+            v.to_string_lossy().into_owned(),
+        )
+    }));
+    for name in remove {
+        cmd.env_remove(name);
+    }
+    for (name, value) in set {
+        cmd.env(name, value);
     }
     let child = pair
         .slave
@@ -499,9 +566,15 @@ fn spawn_pty_bridged(
         let _ = io.stdin_tx.send(b"\r".to_vec());
     }
 
-    let (master_arc, bridge) = io_bridge::bridge_pty(io, pair)?;
+    let (master_arc, bridge) = io_bridge::bridge_pty(
+        io,
+        pair,
+        frontend.program_status_config(),
+        frontend.terminal_launch(),
+    )?;
 
     let backend = DSbxExecution {
+        env: snapshot,
         child: None,
         pty_child: Some(child),
         pty_master: Some(master_arc),
@@ -514,16 +587,38 @@ fn spawn_pty_bridged(
     };
     // Sandbox-class runtimes have no container output tail; failure-log capture
     // is a container-paradigm feature.
-    Ok(AgentExecution::new(
-        handle,
-        Box::new(backend),
-        bridge.stuck_tx,
-        None,
-    ))
+    Ok(
+        AgentExecution::new(handle, Box::new(backend), bridge.stuck_tx, None)
+            .with_program_status(bridge.program_status),
+    )
+}
+
+/// WI 0141 §3: the environment of the host `sbx run` client through which
+/// the agent's session starts — the process whose terminal environment the
+/// session inherits. Host-terminal variables are removed and `TERM` (plus
+/// `COLORTERM` only when the host set it) is normalised, so the sandbox
+/// agent never sees the host's terminal identity. Returns `(remove, set)`.
+fn agent_client_env(
+    host: impl IntoIterator<Item = (String, String)>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    use crate::engine::container::host_env_denylist::{
+        container_terminal_env, is_host_terminal_var,
+    };
+    let mut remove = Vec::new();
+    let mut colorterm = None;
+    for (name, value) in host {
+        if name == "COLORTERM" {
+            colorterm = Some(value);
+            remove.push(name);
+        } else if is_host_terminal_var(&name) {
+            remove.push(name);
+        }
+    }
+    (remove, container_terminal_env(colorterm.as_deref()))
 }
 
 fn spawn_piped(
-    name: String,
+    context: LaunchContext,
     argv: Vec<String>,
     seeded: Option<String>,
     started_at: chrono::DateTime<Utc>,
@@ -531,10 +626,24 @@ fn spawn_piped(
     io: crate::engine::agent_runtime::frontend::AgentIo,
     frontend: Box<dyn AgentFrontend>,
 ) -> Result<AgentExecution, EngineError> {
-    use std::process::{Command, Stdio};
+    let LaunchContext {
+        env: snapshot,
+        name,
+    } = context;
+    use std::process::Stdio;
 
-    let mut cmd = Command::new(crate::engine::host_cli::program(SBX_BIN));
+    let mut cmd = crate::engine::host_cli::command(&snapshot, SBX_BIN);
     cmd.args(&argv);
+    let (remove, set) = agent_client_env(snapshot.spawn_env().map(|(k, v)| {
+        (
+            k.to_string_lossy().into_owned(),
+            v.to_string_lossy().into_owned(),
+        )
+    }));
+    for name in remove {
+        cmd.env_remove(name);
+    }
+    cmd.envs(set);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -557,12 +666,13 @@ fn spawn_piped(
         let _ = io.stdin_tx.send(b"\n".to_vec());
     }
 
-    let bridge = io_bridge::bridge_piped(io, &mut child);
+    let bridge = io_bridge::bridge_piped(io, &mut child, frontend.program_status_config());
     // Drop the injector so the writer task closes the child's stdin after the
     // seeded prompt drains (matches the container piped path).
     drop(bridge.stdin_injector);
 
     let backend = DSbxExecution {
+        env: snapshot,
         child: Some(child),
         pty_child: None,
         pty_master: None,
@@ -573,12 +683,10 @@ fn spawn_piped(
         sink: Some(frontend),
         wait_sink: None,
     };
-    Ok(AgentExecution::new(
-        handle,
-        Box::new(backend),
-        bridge.stuck_tx,
-        None,
-    ))
+    Ok(
+        AgentExecution::new(handle, Box::new(backend), bridge.stuck_tx, None)
+            .with_program_status(bridge.program_status),
+    )
 }
 
 // ─── Execution backend ──────────────────────────────────────────────────────
@@ -588,6 +696,7 @@ fn spawn_piped(
 const FAILURE_TAIL_LINES: usize = 30;
 
 struct DSbxExecution {
+    env: crate::data::config::env::EnvSnapshot,
     child: Option<std::process::Child>,
     pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     pty_master: Option<io_bridge::PtyMaster>,
@@ -712,986 +821,20 @@ impl ExecutionBackend for DSbxExecution {
 
     fn cancel(&self) -> Result<(), EngineError> {
         // Cancel preserves the persistent volume — `sbx stop`, never `sbx rm`.
-        let _ = SbxCommand::new(["stop", &self.sandbox_name]).run_quiet();
+        let _ = SbxCommand::new(["stop", &self.sandbox_name])
+            .in_env(&self.env)
+            .run_quiet();
         Ok(())
     }
 
     fn cancel_handle(&self) -> crate::engine::agent_runtime::execution::CancelHandle {
         let name = self.sandbox_name.clone();
+        let snapshot = self.env.clone();
         crate::engine::agent_runtime::execution::CancelHandle::new(move || {
-            let _ = SbxCommand::new(["stop", &name]).run_quiet();
+            let _ = SbxCommand::new(["stop", &name])
+                .in_env(&snapshot)
+                .run_quiet();
             Ok(())
         })
-    }
-}
-
-/// dsbx for the cross-runtime frontend-release check
-/// (`agent_runtime::conformance`).
-#[cfg(all(test, unix))]
-pub(crate) fn conformance_launcher() -> crate::engine::agent_runtime::conformance::Launcher {
-    tests::conformance_launcher()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    /// dsbx over a plain child process (its `sbx run` stands in): a prompt
-    /// agent exits at once; a long-running one is killed on `finish`.
-    #[cfg(unix)]
-    pub(super) fn conformance_launcher() -> crate::engine::agent_runtime::conformance::Launcher {
-        let running: Arc<std::sync::Mutex<Vec<u32>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let finishing = running.clone();
-        crate::engine::agent_runtime::conformance::Launcher {
-            name: "dsbx",
-            launch: Box::new(move |frontend, long, _prompt_files| {
-                let child = std::process::Command::new("sleep")
-                    .arg(if long { "30" } else { "0.01" })
-                    .spawn()
-                    .unwrap();
-                let pid = child.id();
-                if long {
-                    running.lock().unwrap().push(pid);
-                }
-                let backend = DSbxExecution {
-                    child: Some(child),
-                    pty_child: None,
-                    pty_master: None,
-                    stdin_injector: None,
-                    sandbox_name: format!("awman-dsbx-conformance-{pid}"),
-                    started_at: Utc::now(),
-                    output: Arc::new(std::sync::Mutex::new(io_bridge::OutputCapture::default())),
-                    sink: Some(frontend),
-                    wait_sink: None,
-                };
-                let (stuck_tx, _) = tokio::sync::broadcast::channel(4);
-                AgentExecution::new(
-                    AgentHandle {
-                        id: pid.to_string(),
-                        name: format!("awman-dsbx-conformance-{pid}"),
-                        image_tag: "test".into(),
-                        started_at: Utc::now(),
-                    },
-                    Box::new(backend),
-                    Arc::new(stuck_tx),
-                    None,
-                )
-            }),
-            finish: Box::new(move || {
-                for pid in finishing.lock().unwrap().drain(..) {
-                    let _ = std::process::Command::new("sh")
-                        .args(["-c", &format!("kill -9 {pid}")])
-                        .status();
-                }
-            }),
-        }
-    }
-
-    use crate::engine::sandbox::naming::worktree_hash;
-    use crate::engine::sandbox::options::SandboxOption;
-
-    fn opts(list: Vec<SandboxOption>) -> ResolvedSandboxOptions {
-        ResolvedSandboxOptions::resolve(list)
-    }
-
-    // ─── Identity ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn name_is_correct() {
-        assert_eq!(DSbxBackend::new().name(), "docker-sbx-experimental");
-    }
-
-    #[test]
-    fn cli_binary_is_sbx() {
-        assert_eq!(DSbxBackend::new().cli_binary(), "sbx");
-    }
-
-    // ─── Naming ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn worktree_hash_is_deterministic() {
-        let p = Path::new("/work/tree/a");
-        assert_eq!(worktree_hash(p), worktree_hash(p));
-        assert_ne!(worktree_hash(p), worktree_hash(Path::new("/work/tree/b")));
-    }
-
-    #[test]
-    fn worktree_hash_is_stable_across_releases() {
-        // Pinned FNV-1a value: if this changes, every existing persistent
-        // sandbox would be orphaned on upgrade. Do not change the algorithm.
-        assert_eq!(worktree_hash(Path::new("/work/tree/a")), "f94dc1c0");
-    }
-
-    #[test]
-    fn resolve_sandbox_name_prefers_explicit() {
-        let o = opts(vec![
-            SandboxOption::AgentId("claude".into()),
-            SandboxOption::SandboxName("awman-custom-claude".into()),
-        ]);
-        assert_eq!(resolve_sandbox_name(&o), "awman-custom-claude");
-    }
-
-    #[test]
-    fn resolve_sandbox_name_generates_when_absent() {
-        let o = opts(vec![SandboxOption::AgentId("gemini".into())]);
-        let name = resolve_sandbox_name(&o);
-        assert!(name.starts_with("awman-"));
-        assert!(name.ends_with("-gemini"));
-    }
-
-    // ─── Outside-workspace overlay rejection ───────────────────────────────
-
-    #[test]
-    fn outside_workspace_overlay_is_rejected_with_clear_error() {
-        use crate::engine::container::options::{OverlayPermission, OverlaySpec};
-
-        use crate::data::message::UserMessage;
-        use crate::engine::agent_runtime::frontend::{
-            AgentFrontend, AgentIo, AgentProgress, AgentStatus,
-        };
-
-        struct NullFrontend;
-        impl crate::data::message::UserMessageSink for NullFrontend {
-            fn write_message(&mut self, _: UserMessage) {}
-            fn replay_queued(&mut self) {}
-        }
-        impl AgentFrontend for NullFrontend {
-            fn report_status(&mut self, _: AgentStatus) {}
-            fn report_progress(&mut self, _: AgentProgress) {}
-            fn take_io(&mut self) -> AgentIo {
-                let (stdout, _) = tokio::sync::mpsc::unbounded_channel();
-                let (stderr, _) = tokio::sync::mpsc::unbounded_channel();
-                let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-                AgentIo {
-                    stdout,
-                    stderr,
-                    stdin_tx,
-                    stdin_rx,
-                    resize: None,
-                    initial_size: None,
-                }
-            }
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let options = ResolvedSandboxOptions::resolve(vec![
-            SandboxOption::AgentId("claude".into()),
-            SandboxOption::WorkspaceDir(tmp.path().to_path_buf()),
-            SandboxOption::ExtraOverlay(OverlaySpec {
-                host_path: "/somewhere/else/reference".into(),
-                container_path: "/mnt/reference".into(),
-                permission: OverlayPermission::ReadOnly,
-            }),
-        ]);
-        match run_interactive(options, Box::new(NullFrontend)) {
-            Err(EngineError::Sandbox(msg)) => {
-                assert!(
-                    msg.contains("/somewhere/else/reference")
-                        && msg.contains("outside the workspace"),
-                    "error must name the overlay and the reason: {msg}"
-                );
-            }
-            Err(e) => panic!("expected Sandbox error for outside-workspace overlay, got: {e:?}"),
-            Ok(_) => panic!("expected Sandbox error for outside-workspace overlay, got Ok"),
-        }
-    }
-
-    // ─── Launch without auth overlay warns (auto-auth wiring) ──────────────
-    //
-    // run_interactive must surface the manual-auth warning for a mixin agent
-    // launched with no env(...) auth overlay. Auto-auth runs after the
-    // `sbx create` step (scoped secrets need an existing sandbox), so a fake
-    // sbx must carry the launch that far.
-
-    #[cfg(unix)]
-    #[test]
-    fn launch_without_auth_overlay_warns_manual_auth() {
-        use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
-        use crate::engine::agent_runtime::frontend::{
-            AgentFrontend, AgentIo, AgentProgress, AgentStatus,
-        };
-        use std::sync::{Arc, Mutex};
-
-        let messages: Arc<Mutex<Vec<UserMessage>>> = Arc::new(Mutex::new(Vec::new()));
-
-        struct RecordingFrontend {
-            messages: Arc<Mutex<Vec<UserMessage>>>,
-        }
-        impl UserMessageSink for RecordingFrontend {
-            fn write_message(&mut self, msg: UserMessage) {
-                self.messages.lock().unwrap().push(msg);
-            }
-            fn replay_queued(&mut self) {}
-        }
-        impl AgentFrontend for RecordingFrontend {
-            fn report_status(&mut self, _: AgentStatus) {}
-            fn report_progress(&mut self, _: AgentProgress) {}
-            fn take_io(&mut self) -> AgentIo {
-                let (stdout, _) = tokio::sync::mpsc::unbounded_channel();
-                let (stderr, _) = tokio::sync::mpsc::unbounded_channel();
-                let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-                AgentIo {
-                    stdout,
-                    stderr,
-                    stdin_tx,
-                    stdin_rx,
-                    resize: None,
-                    initial_size: None,
-                }
-            }
-        }
-
-        crate::engine::sandbox::dsbx::test_support::with_fake_sbx(
-            "#!/bin/sh\ncase \"$1\" in ls) echo '[]';; *) cat > /dev/null 2>&1;; esac\n",
-            || {
-                let tmp = tempfile::tempdir().unwrap();
-                let frontend = Box::new(RecordingFrontend {
-                    messages: messages.clone(),
-                });
-                let options = ResolvedSandboxOptions::resolve(vec![
-                    SandboxOption::AgentId("claude".into()),
-                    SandboxOption::WorkspaceDir(tmp.path().to_path_buf()),
-                ]);
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    let _ = run_interactive(options, frontend);
-                });
-            },
-        );
-
-        let msgs = messages.lock().unwrap();
-        assert!(
-            msgs.iter().any(|m| {
-                m.level == MessageLevel::Warning
-                    && m.text.contains("no env(...) overlay")
-                    && m.text.contains("ANTHROPIC_API_KEY")
-                    && m.text.contains("Launching anyway")
-            }),
-            "mixin launch without auth overlays must warn that auth is manual; \
-             messages: {:?}",
-            *msgs
-        );
-    }
-
-    // ─── Argv construction ─────────────────────────────────────────────────
-
-    #[test]
-    fn create_argv_has_kit_and_positional_workspace() {
-        let o = opts(vec![
-            SandboxOption::AgentId("claude".into()),
-            SandboxOption::WorkspaceDir("/wt".into()),
-            SandboxOption::MemoryGb(8),
-        ]);
-        let argv = create_argv("awman-h-claude", "claude", Path::new("/kits/claude"), &o);
-        assert_eq!(argv[0], "create");
-        assert!(argv
-            .windows(2)
-            .any(|w| w[0] == "--kit" && w[1] == "/kits/claude"));
-        assert!(argv
-            .windows(2)
-            .any(|w| w[0] == "--name" && w[1] == "awman-h-claude"));
-        assert!(argv.windows(2).any(|w| w[0] == "--memory" && w[1] == "8g"));
-        // `sbx create` has no `--workspace-dir` flag: the workspace is a
-        // positional path immediately after the agent.
-        assert!(
-            !argv.iter().any(|a| a == "--workspace-dir"),
-            "sbx create has no --workspace-dir flag: {argv:?}"
-        );
-        assert!(
-            argv.windows(2).any(|w| w[0] == "claude" && w[1] == "/wt"),
-            "workspace must be a positional after the agent: {argv:?}"
-        );
-        assert_eq!(argv.last().unwrap(), "/wt");
-    }
-
-    #[test]
-    fn create_argv_without_workspace_omits_positional() {
-        let o = opts(vec![SandboxOption::AgentId("claude".into())]);
-        let argv = create_argv("awman-h-claude", "claude", Path::new("/kits/claude"), &o);
-        assert_eq!(
-            argv.last().unwrap(),
-            "claude",
-            "no workspace set → agent is the final arg (sbx defaults to cwd): {argv:?}"
-        );
-    }
-
-    #[test]
-    fn run_argv_uses_positional_name_without_kit_or_name_flag() {
-        let o = opts(vec![SandboxOption::AgentId("claude".into())]);
-        let argv = run_argv("awman-h-claude", "claude", &o);
-        // `sbx run SANDBOX [-- AGENT_ARGS...]` — `--name` is creation-only and
-        // sbx rejects it when the sandbox already exists; the agent must not
-        // be appended either (sbx would parse it as a workspace PATH).
-        assert_eq!(argv, vec!["run", "awman-h-claude"]);
-    }
-
-    #[test]
-    fn seeded_prompt_appended_after_delimiter_only_for_agent_kind() {
-        // cline is a `kind: agent` kit → prompt appended after `--` (a bare
-        // positional would be parsed by sbx as a workspace PATH).
-        let cline = opts(vec![
-            SandboxOption::AgentId("cline".into()),
-            SandboxOption::Interactive(true),
-            SandboxOption::SeededPrompt("do the thing".into()),
-        ]);
-        let argv = run_argv("awman-h-cline", "cline", &cline);
-        assert_eq!(argv.last().unwrap(), "do the thing");
-        assert_eq!(
-            argv[argv.len() - 2],
-            "--",
-            "prompt must follow the -- delimiter"
-        );
-
-        // claude is a `kind: mixin` kit → prompt delivered via stdin.
-        let claude = opts(vec![
-            SandboxOption::AgentId("claude".into()),
-            SandboxOption::SeededPrompt("do the thing".into()),
-        ]);
-        let argv = run_argv("awman-h-claude", "claude", &claude);
-        assert!(!argv.iter().any(|a| a == "do the thing"));
-        assert!(!argv.iter().any(|a| a == "--"));
-    }
-
-    // ─── WI follow-up: session config re-applied on existing sandboxes ─────
-    //
-    // `commands.startup` only runs at VM boot. When the sandbox already
-    // exists, run_interactive must exec the apply script before `sbx run` so
-    // a changed session.json (e.g. a new --model) reaches the agent even if
-    // the VM never reboots between launches.
-
-    #[cfg(unix)]
-    #[test]
-    fn existing_sandbox_reapplies_session_config_before_run() {
-        use crate::data::message::{UserMessage, UserMessageSink};
-        use crate::engine::agent_runtime::frontend::{
-            AgentFrontend, AgentIo, AgentProgress, AgentStatus,
-        };
-        use std::sync::{Arc, Mutex};
-
-        struct RecordingFrontend {
-            messages: Arc<Mutex<Vec<UserMessage>>>,
-        }
-        impl UserMessageSink for RecordingFrontend {
-            fn write_message(&mut self, msg: UserMessage) {
-                self.messages.lock().unwrap().push(msg);
-            }
-            fn replay_queued(&mut self) {}
-        }
-        impl AgentFrontend for RecordingFrontend {
-            fn report_status(&mut self, _: AgentStatus) {}
-            fn report_progress(&mut self, _: AgentProgress) {}
-            fn take_io(&mut self) -> AgentIo {
-                let (stdout, _) = tokio::sync::mpsc::unbounded_channel();
-                let (stderr, _) = tokio::sync::mpsc::unbounded_channel();
-                let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-                AgentIo {
-                    stdout,
-                    stderr,
-                    stdin_tx,
-                    stdin_rx,
-                    resize: None,
-                    initial_size: None,
-                }
-            }
-        }
-
-        let messages: Arc<Mutex<Vec<UserMessage>>> = Arc::new(Mutex::new(Vec::new()));
-        // `ls` reports the sandbox as already existing → no `sbx create`,
-        // and the re-apply exec must run before `sbx run`.
-        crate::engine::sandbox::dsbx::test_support::with_fake_sbx(
-            "#!/bin/sh\n\
-             case \"$1\" in\n\
-               ls) echo '[{\"name\":\"awman-test-claude\"}]';;\n\
-               *) cat > /dev/null 2>&1; exit 0;;\n\
-             esac\n",
-            || {
-                let tmp = tempfile::tempdir().unwrap();
-                let options = ResolvedSandboxOptions::resolve(vec![
-                    SandboxOption::AgentId("claude".into()),
-                    SandboxOption::SandboxName("awman-test-claude".into()),
-                    SandboxOption::WorkspaceDir(tmp.path().to_path_buf()),
-                ]);
-                let frontend = Box::new(RecordingFrontend {
-                    messages: messages.clone(),
-                });
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    let _ = run_interactive(options, frontend);
-                });
-            },
-        );
-
-        let msgs = messages.lock().unwrap();
-        assert!(
-            msgs.iter().any(|m| {
-                m.text.contains("sbx exec")
-                    && m.text.contains(APPLY_SCRIPT_VM_PATH)
-                    && m.text.contains("WORKDIR=")
-            }),
-            "existing sandbox must announce the session-config re-apply exec; \
-             messages: {:?}",
-            *msgs
-        );
-        assert!(
-            !msgs.iter().any(|m| m.text.contains("sbx create")),
-            "existing sandbox must not be re-created; messages: {:?}",
-            *msgs
-        );
-    }
-
-    // ─── ls parsing ────────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_ls_json_array_and_object() {
-        let arr = r#"[{"name":"awman-h-claude"},{"name":"other"}]"#;
-        assert_eq!(parse_ls_json(arr), vec!["awman-h-claude", "other"]);
-        let obj = r#"{"sandboxes":[{"Name":"awman-x-codex"}]}"#;
-        assert_eq!(parse_ls_json(obj), vec!["awman-x-codex"]);
-    }
-
-    #[test]
-    fn parse_ls_table_skips_header_and_filters_prefix() {
-        let table = "NAME            STATUS\nawman-h-claude  running\nnginx           running\n";
-        assert_eq!(parse_ls_table(table), vec!["awman-h-claude"]);
-    }
-
-    #[test]
-    fn parse_ls_json_empty_array() {
-        assert_eq!(parse_ls_json("[]"), Vec::<String>::new());
-    }
-
-    #[test]
-    fn parse_ls_json_invalid_is_empty() {
-        assert_eq!(parse_ls_json("not json"), Vec::<String>::new());
-    }
-
-    #[test]
-    fn parse_ls_table_empty_output_gives_empty_list() {
-        assert_eq!(parse_ls_table(""), Vec::<String>::new());
-    }
-
-    // ─── Naming determinism ───────────────────────────────────────────────
-
-    #[test]
-    fn sandbox_name_same_inputs_same_output_multiple_calls() {
-        let o = opts(vec![
-            SandboxOption::AgentId("claude".into()),
-            SandboxOption::WorkspaceDir("/projects/myapp".into()),
-        ]);
-        let n1 = resolve_sandbox_name(&o);
-        let n2 = resolve_sandbox_name(&o);
-        assert_eq!(n1, n2, "sandbox name must be deterministic");
-    }
-
-    #[test]
-    fn sandbox_name_different_agents_differ() {
-        let a = opts(vec![
-            SandboxOption::AgentId("claude".into()),
-            SandboxOption::WorkspaceDir("/wt".into()),
-        ]);
-        let b = opts(vec![
-            SandboxOption::AgentId("gemini".into()),
-            SandboxOption::WorkspaceDir("/wt".into()),
-        ]);
-        assert_ne!(
-            resolve_sandbox_name(&a),
-            resolve_sandbox_name(&b),
-            "different agents must produce different sandbox names"
-        );
-    }
-
-    #[test]
-    fn sandbox_name_different_workspaces_differ() {
-        let a = opts(vec![
-            SandboxOption::AgentId("claude".into()),
-            SandboxOption::WorkspaceDir("/wt/a".into()),
-        ]);
-        let b = opts(vec![
-            SandboxOption::AgentId("claude".into()),
-            SandboxOption::WorkspaceDir("/wt/b".into()),
-        ]);
-        assert_ne!(
-            resolve_sandbox_name(&a),
-            resolve_sandbox_name(&b),
-            "different workspaces must produce different sandbox names"
-        );
-    }
-
-    // ─── Argv — all variants ───────────────────────────────────────────────
-
-    #[test]
-    fn create_argv_without_memory_omits_memory_flag() {
-        let o = opts(vec![
-            SandboxOption::AgentId("claude".into()),
-            SandboxOption::WorkspaceDir("/wt".into()),
-        ]);
-        let argv = create_argv("awman-h-claude", "claude", Path::new("/kits/claude"), &o);
-        assert!(
-            !argv.iter().any(|a| a == "--memory"),
-            "no --memory when MemoryGb not set"
-        );
-    }
-
-    #[test]
-    fn run_argv_without_seeded_prompt_ends_with_sandbox_name() {
-        let o = opts(vec![SandboxOption::AgentId("gemini".into())]);
-        let argv = run_argv("awman-h-gemini", "gemini", &o);
-        assert_eq!(argv, vec!["run", "awman-h-gemini"]);
-    }
-
-    // ─── Agent args: model / mode flags / non-interactive (kind: agent) ────
-
-    #[test]
-    fn model_flag_appended_after_delimiter_for_agent_kits() {
-        use crate::engine::container::options::ModelFlagForm;
-        let o = opts(vec![
-            SandboxOption::AgentId("cline".into()),
-            SandboxOption::Interactive(true),
-            SandboxOption::Model {
-                flag: ModelFlagForm::Argument("anthropic/claude-opus-4-6".into()),
-            },
-        ]);
-        let argv = run_argv("awman-h-cline", "cline", &o);
-        assert_eq!(
-            argv,
-            vec![
-                "run",
-                "awman-h-cline",
-                "--",
-                "--model",
-                "anthropic/claude-opus-4-6"
-            ],
-            "agent-kit model must be delivered as agent args after `--`"
-        );
-    }
-
-    #[test]
-    fn model_shorthand_appended_as_single_token() {
-        use crate::engine::container::options::ModelFlagForm;
-        let o = opts(vec![
-            SandboxOption::AgentId("cline".into()),
-            SandboxOption::Interactive(true),
-            SandboxOption::Model {
-                flag: ModelFlagForm::Shorthand("--model=sonnet".into()),
-            },
-        ]);
-        let argv = run_argv("awman-h-cline", "cline", &o);
-        assert_eq!(argv, vec!["run", "awman-h-cline", "--", "--model=sonnet"]);
-    }
-
-    #[test]
-    fn model_not_appended_for_mixin_kits() {
-        use crate::engine::container::options::ModelFlagForm;
-        // Mixins take no agent args — model flows through session.json and
-        // the kit's apply script instead.
-        let o = opts(vec![
-            SandboxOption::AgentId("claude".into()),
-            SandboxOption::Interactive(true),
-            SandboxOption::Model {
-                flag: ModelFlagForm::Argument("claude-opus-4-6".into()),
-            },
-        ]);
-        let argv = run_argv("awman-h-claude", "claude", &o);
-        assert_eq!(argv, vec!["run", "awman-h-claude"]);
-    }
-
-    #[test]
-    fn mode_flags_appended_before_model_and_prompt_for_agent_kits() {
-        use crate::engine::container::options::ModelFlagForm;
-        let o = opts(vec![
-            SandboxOption::AgentId("cline".into()),
-            SandboxOption::Interactive(true),
-            SandboxOption::AgentModeFlags(vec!["--yolo".into()]),
-            SandboxOption::Model {
-                flag: ModelFlagForm::Argument("gpt-5".into()),
-            },
-            SandboxOption::SeededPrompt("fix it".into()),
-        ]);
-        let argv = run_argv("awman-h-cline", "cline", &o);
-        assert_eq!(
-            argv,
-            vec![
-                "run",
-                "awman-h-cline",
-                "--",
-                "--yolo",
-                "--model",
-                "gpt-5",
-                "fix it"
-            ]
-        );
-    }
-
-    #[test]
-    fn agent_flags_appended_after_model_and_before_prompt_for_agent_kits() {
-        use crate::engine::container::options::ModelFlagForm;
-        let o = opts(vec![
-            SandboxOption::AgentId("cline".into()),
-            SandboxOption::Interactive(true),
-            SandboxOption::Model {
-                flag: ModelFlagForm::Argument("gpt-5".into()),
-            },
-            SandboxOption::AgentFlags(vec!["--debug".into()]),
-            SandboxOption::SeededPrompt("fix it".into()),
-        ]);
-        let argv = run_argv("awman-h-cline", "cline", &o);
-        assert_eq!(
-            argv,
-            vec![
-                "run",
-                "awman-h-cline",
-                "--",
-                "--model",
-                "gpt-5",
-                "--debug",
-                "fix it"
-            ]
-        );
-    }
-
-    #[test]
-    fn non_interactive_prepends_definition_flag_for_agent_kits() {
-        // cline's non-interactive shape is the `task` subcommand — it must be
-        // the first agent arg, before flags and the prompt, mirroring the
-        // container path's `entrypoint_for`.
-        let o = opts(vec![
-            SandboxOption::AgentId("cline".into()),
-            SandboxOption::Interactive(false),
-            SandboxOption::SeededPrompt("do it".into()),
-        ]);
-        let argv = run_argv("awman-h-cline", "cline", &o);
-        assert_eq!(argv, vec!["run", "awman-h-cline", "--", "task", "do it"]);
-    }
-
-    #[test]
-    fn non_interactive_adds_no_token_for_an_agent_kit_without_one() {
-        // Every first-party `kind: agent` kit declares a non-interactive
-        // token; this needs a test-only definition (the former maki shape).
-        // maki has no non-interactive flag → no extra token.
-        let o = opts(vec![
-            SandboxOption::AgentId("maki".into()),
-            SandboxOption::Interactive(false),
-            SandboxOption::SeededPrompt("do it".into()),
-        ]);
-        let mut def = crate::engine::agent::custom::crush_fixture();
-        def.non_interactive_flag = None;
-        assert_eq!(agent_args_for(&def, &o), vec!["do it"]);
-    }
-
-    // Seeded prompts for mixin vs agent kit agents (full table check)
-    #[test]
-    fn all_mixin_agents_do_not_append_prompt_to_argv() {
-        let mixin_agents = ["claude", "codex", "gemini", "copilot", "opencode"];
-        for agent in &mixin_agents {
-            let o = opts(vec![
-                SandboxOption::AgentId((*agent).into()),
-                SandboxOption::SeededPrompt("the prompt".into()),
-            ]);
-            let argv = run_argv("awman-h-x", agent, &o);
-            assert!(
-                !argv.iter().any(|a| a == "the prompt"),
-                "mixin agent {agent}: seeded prompt must NOT be appended to argv"
-            );
-        }
-    }
-
-    #[test]
-    fn all_agent_kit_agents_append_prompt_after_delimiter() {
-        let agent_kits = ["antigravity", "cline"];
-        for agent in &agent_kits {
-            let o = opts(vec![
-                SandboxOption::AgentId((*agent).into()),
-                SandboxOption::Interactive(true),
-                SandboxOption::SeededPrompt("the prompt".into()),
-            ]);
-            let argv = run_argv("awman-h-x", agent, &o);
-            assert_eq!(
-                argv.last().unwrap(),
-                "the prompt",
-                "agent-kit {agent}: seeded prompt must be the final agent arg"
-            );
-            assert_eq!(
-                argv[argv.len() - 2],
-                "--",
-                "agent-kit {agent}: prompt must follow the -- delimiter or sbx \
-                 parses it as a workspace PATH"
-            );
-        }
-    }
-
-    // ─── CPU limit warning via run_interactive ────────────────────────────
-    //
-    // `run_interactive` warns about CpuLimit before it tries to spawn `sbx`.
-    // The warning must be in the sink even when `sbx` is not installed.
-    // We use a thread-safe shared message log via Arc<Mutex<_>> so we can
-    // inspect it after run_interactive takes ownership of the frontend.
-
-    #[cfg(unix)]
-    #[test]
-    fn cpu_limit_produces_warning_in_run_interactive() {
-        use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
-        use crate::engine::agent_runtime::frontend::{
-            AgentFrontend, AgentIo, AgentProgress, AgentStatus,
-        };
-        use std::sync::{Arc, Mutex};
-
-        let messages: Arc<Mutex<Vec<UserMessage>>> = Arc::new(Mutex::new(Vec::new()));
-
-        struct RecordingFrontend {
-            messages: Arc<Mutex<Vec<UserMessage>>>,
-        }
-        impl UserMessageSink for RecordingFrontend {
-            fn write_message(&mut self, msg: UserMessage) {
-                self.messages.lock().unwrap().push(msg);
-            }
-            fn replay_queued(&mut self) {}
-        }
-        impl AgentFrontend for RecordingFrontend {
-            fn report_status(&mut self, _: AgentStatus) {}
-            fn report_progress(&mut self, _: AgentProgress) {}
-            fn take_io(&mut self) -> AgentIo {
-                let (stdout, _) = tokio::sync::mpsc::unbounded_channel();
-                let (stderr, _) = tokio::sync::mpsc::unbounded_channel();
-                let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-                AgentIo {
-                    stdout,
-                    stderr,
-                    stdin_tx,
-                    stdin_rx,
-                    resize: None,
-                    initial_size: None,
-                }
-            }
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let frontend = Box::new(RecordingFrontend {
-            messages: messages.clone(),
-        });
-        let options = ResolvedSandboxOptions::resolve(vec![
-            SandboxOption::AgentId("claude".into()),
-            SandboxOption::WorkspaceDir(tmp.path().to_path_buf()),
-            SandboxOption::CpuLimit(2.0),
-        ]);
-        // The warning is written before the spawn attempt. The `sbx` on PATH
-        // is a stub that fails, so the launch stops at its first call instead
-        // of reaching a real `sbx`, which would create a real sandbox. A
-        // runtime is needed in case the launch gets as far as the bridge's
-        // task spawns.
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        crate::engine::sandbox::dsbx::test_support::with_fake_sbx("#!/bin/sh\nexit 1\n", || {
-            rt.block_on(async {
-                let _ = run_interactive(options, frontend);
-            });
-        });
-
-        let msgs = messages.lock().unwrap();
-        assert!(
-            msgs.iter().any(|m| {
-                m.level == MessageLevel::Warning
-                    && m.text.contains("CPU")
-                    && m.text.contains("not supported")
-            }),
-            "must produce a Warning about unsupported CPU limits; messages: {:?}",
-            *msgs
-        );
-    }
-
-    // ─── Failed launch replays sbx output to the sink ──────────────────────
-    //
-    // When `sbx run` exits non-zero (kit compose error, login failure, …),
-    // wait_blocking must replay the captured output into the message sink so
-    // the failure is diagnosable from the execution window without re-running
-    // sbx by hand.
-
-    #[cfg(unix)]
-    #[test]
-    fn non_zero_exit_replays_sbx_output_to_sink() {
-        use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
-        use crate::engine::agent_runtime::frontend::{
-            AgentFrontend, AgentIo, AgentProgress, AgentStatus,
-        };
-        use std::sync::{Arc, Mutex};
-
-        struct RecordingFrontend {
-            messages: Arc<Mutex<Vec<UserMessage>>>,
-        }
-        impl UserMessageSink for RecordingFrontend {
-            fn write_message(&mut self, msg: UserMessage) {
-                self.messages.lock().unwrap().push(msg);
-            }
-            fn replay_queued(&mut self) {}
-        }
-        impl AgentFrontend for RecordingFrontend {
-            fn report_status(&mut self, _: AgentStatus) {}
-            fn report_progress(&mut self, _: AgentProgress) {}
-            fn take_io(&mut self) -> AgentIo {
-                let (stdout, _) = tokio::sync::mpsc::unbounded_channel();
-                let (stderr, _) = tokio::sync::mpsc::unbounded_channel();
-                let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-                AgentIo {
-                    stdout,
-                    stderr,
-                    stdin_tx,
-                    stdin_rx,
-                    resize: None,
-                    initial_size: None,
-                }
-            }
-        }
-
-        let messages: Arc<Mutex<Vec<UserMessage>>> = Arc::new(Mutex::new(Vec::new()));
-        // `ls` reports no sandboxes, `create` succeeds, only `run` fails — the
-        // failure being replayed must be the agent launch itself.
-        crate::engine::sandbox::dsbx::test_support::with_fake_sbx(
-            "#!/bin/sh\n\
-             case \"$1\" in\n\
-               ls) echo '[]';;\n\
-               run) echo 'ERROR: failed to run sandbox: compose kits: boom' >&2; exit 1;;\n\
-               *) cat > /dev/null 2>&1; exit 0;;\n\
-             esac\n",
-            || {
-                let tmp = tempfile::tempdir().unwrap();
-                let options = ResolvedSandboxOptions::resolve(vec![
-                    SandboxOption::AgentId("claude".into()),
-                    SandboxOption::WorkspaceDir(tmp.path().to_path_buf()),
-                ]);
-                let frontend = Box::new(RecordingFrontend {
-                    messages: messages.clone(),
-                });
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                let exit = rt.block_on(async {
-                    let mut execution = run_interactive(options, frontend)
-                        .expect("piped launch must spawn the fake sbx");
-                    execution.wait().await.expect("wait must succeed")
-                });
-                assert_eq!(exit.exit_code, 1);
-            },
-        );
-
-        let msgs = messages.lock().unwrap();
-        assert!(
-            msgs.iter().any(|m| {
-                m.level == MessageLevel::Error && m.text.contains("sbx exited with code 1")
-            }),
-            "must announce the failed exit with its code; messages: {:?}",
-            *msgs
-        );
-        assert!(
-            msgs.iter().any(|m| {
-                m.level == MessageLevel::Error
-                    && m.text.contains("failed to run sandbox: compose kits: boom")
-            }),
-            "must replay sbx's own error output; messages: {:?}",
-            *msgs
-        );
-    }
-
-    // ─── WI-0091: stdin seed routing (prompt delivered exactly once) ──────
-
-    #[test]
-    fn stdin_seed_present_for_mixin_kits_only() {
-        let prompt = "fix the bug";
-        for agent in ["claude", "codex", "gemini", "copilot", "opencode"] {
-            let o = opts(vec![
-                SandboxOption::AgentId(agent.into()),
-                SandboxOption::SeededPrompt(prompt.into()),
-            ]);
-            assert_eq!(
-                stdin_seed(agent, &o).as_deref(),
-                Some(prompt),
-                "mixin {agent}: stdin is the only delivery path, seed must be present"
-            );
-        }
-        for agent in ["antigravity", "cline"] {
-            let o = opts(vec![
-                SandboxOption::AgentId(agent.into()),
-                SandboxOption::SeededPrompt(prompt.into()),
-            ]);
-            assert_eq!(
-                stdin_seed(agent, &o),
-                None,
-                "agent-kit {agent}: prompt is positional, stdin seed would deliver it twice"
-            );
-        }
-    }
-
-    #[test]
-    fn stdin_seed_none_without_prompt() {
-        let o = opts(vec![SandboxOption::AgentId("claude".into())]);
-        assert_eq!(stdin_seed("claude", &o), None);
-    }
-
-    // ─── WI-0091: unsupported-feature notes surfaced as warnings ──────────
-
-    #[cfg(unix)]
-    #[test]
-    fn unsupported_notes_produce_warnings_in_run_interactive() {
-        use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
-        use crate::engine::agent_runtime::frontend::{
-            AgentFrontend, AgentIo, AgentProgress, AgentStatus,
-        };
-        use std::sync::{Arc, Mutex};
-
-        let messages: Arc<Mutex<Vec<UserMessage>>> = Arc::new(Mutex::new(Vec::new()));
-
-        struct RecordingFrontend {
-            messages: Arc<Mutex<Vec<UserMessage>>>,
-        }
-        impl UserMessageSink for RecordingFrontend {
-            fn write_message(&mut self, msg: UserMessage) {
-                self.messages.lock().unwrap().push(msg);
-            }
-            fn replay_queued(&mut self) {}
-        }
-        impl AgentFrontend for RecordingFrontend {
-            fn report_status(&mut self, _: AgentStatus) {}
-            fn report_progress(&mut self, _: AgentProgress) {}
-            fn take_io(&mut self) -> AgentIo {
-                let (stdout, _) = tokio::sync::mpsc::unbounded_channel();
-                let (stderr, _) = tokio::sync::mpsc::unbounded_channel();
-                let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
-                AgentIo {
-                    stdout,
-                    stderr,
-                    stdin_tx,
-                    stdin_rx,
-                    resize: None,
-                    initial_size: None,
-                }
-            }
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let frontend = Box::new(RecordingFrontend {
-            messages: messages.clone(),
-        });
-        let options = ResolvedSandboxOptions::resolve(vec![
-            SandboxOption::AgentId("claude".into()),
-            SandboxOption::WorkspaceDir(tmp.path().to_path_buf()),
-            SandboxOption::UnsupportedNote(
-                "skill mounts are not supported under the sandbox runtime".into(),
-            ),
-        ]);
-        // The warning is written before the spawn attempt. The `sbx` on PATH
-        // is a stub that fails, so the launch stops at its first call instead
-        // of reaching a real `sbx`, which would create a real sandbox. A
-        // runtime is needed in case the launch gets as far as the bridge's
-        // task spawns.
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        crate::engine::sandbox::dsbx::test_support::with_fake_sbx("#!/bin/sh\nexit 1\n", || {
-            rt.block_on(async {
-                let _ = run_interactive(options, frontend);
-            });
-        });
-
-        let msgs = messages.lock().unwrap();
-        assert!(
-            msgs.iter()
-                .any(|m| { m.level == MessageLevel::Warning && m.text.contains("skill mounts") }),
-            "unsupported notes must surface as warnings before launch; messages: {:?}",
-            *msgs
-        );
     }
 }

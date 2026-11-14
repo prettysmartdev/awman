@@ -26,6 +26,7 @@ use crate::engine::agent_runtime::execution::{
 };
 use crate::engine::container::agent_argv::AgentArgv;
 use crate::engine::container::backend::ContainerBackend;
+use crate::engine::container::host_env_denylist::{is_host_terminal_var, scrub_run_env};
 use crate::engine::container::options::{ContainerName, ImageRef, ResolvedContainerOptions};
 use crate::engine::container::process::{ContainerCli, ContainerInstance};
 use crate::engine::credential_refresh::register_container_leases;
@@ -34,23 +35,17 @@ use crate::engine::error::EngineError;
 const AGENT_LIST_FORMAT: &str = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
 
 // The fixture overrides only listing calls on its own thread.
-fn listing_command() -> Command {
-    #[cfg(all(test, unix))]
-    if let Some(path) = docker_listing_tests::CLI.with(|cli| cli.borrow().clone()) {
-        // The fixture is a freshly written shell script. Concurrent test
-        // forks can briefly inherit its write descriptor and make execve
-        // return ETXTBSY; run it through the stable system shell instead.
-        let mut command = Command::new("/bin/sh");
-        command.arg(path);
-        return command;
-    }
-    Command::new(crate::engine::host_cli::program("docker"))
+fn listing_command(cli: ContainerCli) -> Command {
+    cli.command()
 }
 
 /// Query Docker once for each ownership route, then merge by id. The name
 /// query keeps compatibility with legacy awman containers created before
 /// the ownership label was added.
-fn list_owned_containers(stopped: bool) -> Result<Vec<AgentHandle>, EngineError> {
+fn list_owned_containers(
+    cli: ContainerCli,
+    stopped: bool,
+) -> Result<Vec<AgentHandle>, EngineError> {
     let mut handles = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for ownership_filter in ["label=awman=true", "name=awman-"] {
@@ -64,7 +59,7 @@ fn list_owned_containers(stopped: bool) -> Result<Vec<AgentHandle>, EngineError>
         }
         args.extend(["--format", AGENT_LIST_FORMAT]);
         let output = crate::engine::host_cli::checked_output(
-            listing_command()
+            listing_command(cli.clone())
                 .args(args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null()),
@@ -110,9 +105,9 @@ fn parse_agent_listing(
         .collect()
 }
 
-fn query_agent_listing(args: &[&str]) -> Result<Vec<AgentHandle>, EngineError> {
+fn query_agent_listing(cli: ContainerCli, args: &[&str]) -> Result<Vec<AgentHandle>, EngineError> {
     let output = crate::engine::host_cli::checked_output(
-        listing_command()
+        listing_command(cli.clone())
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::null()),
@@ -130,13 +125,36 @@ fn query_agent_listing(args: &[&str]) -> Result<Vec<AgentHandle>, EngineError> {
 const AWMAN_LABEL: &str = ContainerCli::DOCKER.label;
 
 #[derive(Debug, Default)]
-pub(super) struct DockerBackend;
+pub(super) struct DockerBackend {
+    env: Option<crate::data::config::env::EnvSnapshot>,
+}
+
+impl DockerBackend {
+    pub(super) fn new(env: crate::data::config::env::EnvSnapshot) -> Self {
+        Self { env: Some(env) }
+    }
+    fn cli(&self) -> ContainerCli {
+        let cli = ContainerCli::DOCKER;
+        match &self.env {
+            Some(env) => cli.in_env(env.clone()),
+            None => cli,
+        }
+    }
+}
 
 impl ContainerBackend for DockerBackend {
     fn build(
         &self,
-        options: ResolvedContainerOptions,
+        mut options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        if options.host_env.is_none() {
+            options.host_env = self.env.clone();
+        }
+        let cli = options
+            .host_env
+            .as_ref()
+            .map(|env| self.cli().in_env(env.clone()))
+            .unwrap_or_else(|| self.cli());
         let image = options
             .image
             .clone()
@@ -155,26 +173,21 @@ impl ContainerBackend for DockerBackend {
         // hook is needed (`ContainerBackend::attach` below opens
         // `docker attach`). Apple, which has no such verb, passes one.
         Ok(Box::new(ContainerInstance::new(
-            ContainerCli::DOCKER,
-            image,
-            name,
-            options,
-            leases,
-            None,
+            cli, image, name, options, leases, None,
         )))
     }
 
     fn list_running(&self, _session: &Session) -> Result<Vec<AgentHandle>, EngineError> {
-        list_owned_containers(false)
+        list_owned_containers(self.cli(), false)
     }
 
     fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
-        list_owned_containers(false)
+        list_owned_containers(self.cli(), false)
     }
 
     fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
         // Keep the ownership label and the legacy name-prefix route in sync.
-        list_owned_containers(true)
+        list_owned_containers(self.cli(), true)
     }
 
     fn list_dangling_images(
@@ -182,7 +195,9 @@ impl ContainerBackend for DockerBackend {
     ) -> Result<Vec<crate::engine::container::runtime::ContainerImageInfo>, EngineError> {
         use crate::engine::container::runtime::ContainerImageInfo;
         let format = "{{.ID}}\t{{.Repository}}:{{.Tag}}\t{{.Size}}";
-        let output = Command::new(crate::engine::host_cli::program("docker"))
+        let output = self
+            .cli()
+            .command()
             .args([
                 "images",
                 "--filter",
@@ -227,7 +242,8 @@ impl ContainerBackend for DockerBackend {
 
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
         let output = crate::engine::host_cli::checked_output(
-            Command::new(crate::engine::host_cli::program("docker"))
+            self.cli()
+                .command()
                 .args([
                     "stats",
                     "--no-stream",
@@ -251,19 +267,23 @@ impl ContainerBackend for DockerBackend {
 
     fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
         Ok(Box::new(AttachInstance {
+            cli: self.cli(),
             handle: handle.clone(),
         }))
     }
 
     fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError> {
-        query_agent_listing(&[
-            "ps",
-            "--no-trunc",
-            "--filter",
-            &format!("name={prefix}"),
-            "--format",
-            AGENT_LIST_FORMAT,
-        ])
+        query_agent_listing(
+            self.cli(),
+            &[
+                "ps",
+                "--no-trunc",
+                "--filter",
+                &format!("name={prefix}"),
+                "--format",
+                AGENT_LIST_FORMAT,
+            ],
+        )
     }
 
     fn name(&self) -> &'static str {
@@ -283,33 +303,30 @@ impl ContainerBackend for DockerBackend {
     }
 
     fn is_available(&self) -> Result<(), EngineError> {
-        host_cli_backend::cli_is_available(
-            ContainerCli::DOCKER,
-            &["info", "--format", "{{.ServerVersion}}"],
-        )
+        host_cli_backend::cli_is_available(self.cli(), &["info", "--format", "{{.ServerVersion}}"])
     }
 
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
-        host_cli_backend::cli_stop_checked(ContainerCli::DOCKER, &handle.id)
+        host_cli_backend::cli_stop_checked(self.cli(), &handle.id)
     }
 
     fn remove_agent(&self, id: &str) -> Result<(), EngineError> {
-        host_cli_backend::cli_remove(ContainerCli::DOCKER, "rm", id)
+        host_cli_backend::cli_remove(self.cli(), "rm", id)
     }
 
     fn image_exists(&self, tag: &str) -> Result<bool, EngineError> {
-        host_cli_backend::cli_image_exists(ContainerCli::DOCKER, tag)
+        host_cli_backend::cli_image_exists(self.cli(), tag)
     }
 
     fn run_probe(
         &self,
         request: &crate::engine::container::backend::ProbeRequest<'_>,
     ) -> Result<String, EngineError> {
-        host_cli_backend::cli_run_probe(ContainerCli::DOCKER, request)
+        host_cli_backend::cli_run_probe(self.cli(), request)
     }
 
     fn image_id(&self, tag: &str) -> Result<Option<String>, EngineError> {
-        host_cli_backend::cli_image_id(ContainerCli::DOCKER, tag)
+        host_cli_backend::cli_image_id(self.cli(), tag)
     }
 
     fn build_image(
@@ -323,14 +340,7 @@ impl ContainerBackend for DockerBackend {
         let context = request.context.as_path();
         let no_cache = request.no_cache;
 
-        host_cli_backend::cli_build_image(
-            ContainerCli::DOCKER,
-            tag,
-            dockerfile,
-            context,
-            no_cache,
-            on_line,
-        )
+        host_cli_backend::cli_build_image(self.cli(), tag, dockerfile, context, no_cache, on_line)
     }
 
     fn import_image(
@@ -345,7 +355,7 @@ impl ContainerBackend for DockerBackend {
     }
 
     fn remove_image(&self, id: &str) -> Result<(), EngineError> {
-        host_cli_backend::cli_remove(ContainerCli::DOCKER, "rmi", id)
+        host_cli_backend::cli_remove(self.cli(), "rmi", id)
     }
 
     /// Docker and Apple Containers have no builtin launch settings; the
@@ -355,7 +365,7 @@ impl ContainerBackend for DockerBackend {
         request: &background::BackgroundLaunchRequest<'_>,
     ) -> Result<String, EngineError> {
         background::default_start_background(
-            ContainerCli::DOCKER,
+            self.cli(),
             request.name,
             request.image,
             request.workdir,
@@ -372,7 +382,7 @@ impl ContainerBackend for DockerBackend {
         working_dir: &str,
         env: Option<&HashMap<String, String>>,
     ) -> Result<ExecOutput, EngineError> {
-        background::default_exec_in_background(ContainerCli::DOCKER, id, command, working_dir, env)
+        background::default_exec_in_background(self.cli(), id, command, working_dir, env)
     }
 
     fn exec_in_background_streaming(
@@ -380,38 +390,27 @@ impl ContainerBackend for DockerBackend {
         request: &crate::engine::container::background::BackgroundExecRequest<'_>,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<ExecOutput, EngineError> {
-        let id = request.id;
-        let command = request.command;
-        let working_dir = request.working_dir;
-        let env = request.env;
-
-        background::default_exec_in_background_streaming(
-            ContainerCli::DOCKER,
-            id,
-            command,
-            working_dir,
-            env,
-            on_line,
-        )
+        background::default_exec_in_background_streaming(self.cli(), request, on_line)
     }
 
     fn stop_and_remove(&self, id: &str) -> Result<(), EngineError> {
-        background::default_stop_and_remove(ContainerCli::DOCKER, id);
+        background::default_stop_and_remove(self.cli(), id);
         Ok(())
     }
 
     fn image_home_dir(&self, tag: &str) -> Result<Option<String>, EngineError> {
-        Ok(docker_image_home_dir(tag))
+        Ok(docker_image_home_dir(self.cli(), tag))
     }
 }
 
 /// Read `HOME` from `tag`'s image config via `docker image inspect`. `None` when
 /// the image is missing, the CLI is unreachable, or no `HOME` is declared.
-fn docker_image_home_dir(tag: &str) -> Option<String> {
+fn docker_image_home_dir(cli: ContainerCli, tag: &str) -> Option<String> {
     // Print one env entry per line so we can scan for `HOME=…` without
     // parsing JSON. `docker image inspect` exits 0 even when User/Env are
     // empty; the format expansion just produces nothing then.
-    let output = Command::new(crate::engine::host_cli::program("docker"))
+    let output = cli
+        .command()
         .args([
             "image",
             "inspect",
@@ -456,6 +455,8 @@ pub(super) fn attach_bridge_config(
             crate::engine::agent_runtime::output_tail::OutputTail::with_default_capacity(),
         ),
         output_broadcast: None,
+        terminal: None,
+        program_status: Default::default(),
     }
 }
 
@@ -482,6 +483,7 @@ pub(super) fn kill_local_exec(pid: Option<u32>) {
 /// `docker attach` session to PID 1's existing terminal and bridges it through
 /// the same PTY/piped machinery a fresh `docker run` uses.
 struct AttachInstance {
+    cli: ContainerCli,
     handle: AgentHandle,
 }
 
@@ -510,7 +512,8 @@ impl AgentInstance for AttachInstance {
         let grace_timeout = frontend.grace_timeout();
         let stuck_timeout = frontend.stuck_timeout();
         let io = frontend.take_io();
-        let bridge_cfg = attach_bridge_config(grace_timeout, stuck_timeout);
+        let mut bridge_cfg = attach_bridge_config(grace_timeout, stuck_timeout);
+        bridge_cfg.program_status = frontend.program_status_config();
 
         // `docker attach` reconnects to the container's primary process (the
         // agent launched by `docker run -it`), rather than creating a sibling
@@ -525,10 +528,17 @@ impl AgentInstance for AttachInstance {
         // local client, and SIGKILL is never proxied).
         let argv = vec!["attach".to_string(), handle.id.clone()];
         if io.initial_size.is_some() {
-            return spawn_pty_bridged_attach(io, argv, started_at, handle, bridge_cfg);
+            return spawn_pty_bridged_attach(
+                self.cli.clone(),
+                io,
+                argv,
+                started_at,
+                handle,
+                bridge_cfg,
+            );
         }
 
-        spawn_piped_attach(io, argv, started_at, handle, bridge_cfg)
+        spawn_piped_attach(self.cli.clone(), io, argv, started_at, handle, bridge_cfg)
     }
 }
 
@@ -536,13 +546,14 @@ impl AgentInstance for AttachInstance {
 /// frontend's `AgentIo`. Mirrors `spawn_pty_bridged_docker` but substitutes
 /// the exec argv and produces an `AttachExecution`.
 fn spawn_pty_bridged_attach(
+    cli: ContainerCli,
     io: crate::engine::agent_runtime::frontend::AgentIo,
     argv: Vec<String>,
     started_at: chrono::DateTime<chrono::Utc>,
     handle: crate::data::session::AgentHandle,
     bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
 ) -> Result<AgentExecution, EngineError> {
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use portable_pty::{native_pty_system, PtySize};
 
     let (cols, rows) = io.initial_size.expect("PTY path requires initial_size");
     let pty_system = native_pty_system();
@@ -555,7 +566,8 @@ fn spawn_pty_bridged_attach(
         })
         .map_err(|e| EngineError::Container(format!("openpty: {e}")))?;
 
-    let mut cmd = CommandBuilder::new(crate::engine::host_cli::program("docker"));
+    let snapshot = cli.snapshot();
+    let mut cmd = crate::engine::host_cli::pty_command(&snapshot, "docker");
     for arg in &argv {
         cmd.arg(arg);
     }
@@ -583,20 +595,22 @@ fn spawn_pty_bridged_attach(
         Box::new(backend),
         bridge.stuck_tx,
         Some(bridge.output_tail),
-    ))
+    )
+    .with_program_status(bridge.program_status))
 }
 
 /// Spawn `docker attach` with piped stdio and bridge through `AgentIo`. Mirrors
 /// `spawn_piped_docker` but substitutes the exec argv and produces an
 /// `AttachExecution`.
 fn spawn_piped_attach(
+    cli: ContainerCli,
     io: crate::engine::agent_runtime::frontend::AgentIo,
     argv: Vec<String>,
     started_at: chrono::DateTime<chrono::Utc>,
     handle: crate::data::session::AgentHandle,
     bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
 ) -> Result<AgentExecution, EngineError> {
-    let mut cmd = Command::new(crate::engine::host_cli::program("docker"));
+    let mut cmd = cli.command();
     cmd.args(&argv);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -614,7 +628,7 @@ fn spawn_piped_attach(
     let child_pid = Some(child.id());
 
     let bridge = crate::engine::container::io_bridge::bridge_piped(io, &mut child, bridge_cfg);
-    // Non-interactive attach: close the child's stdin after the bridge wires up
+    // Headless attach: close the child's stdin after the bridge wires up
     // so a shell that reads to EOF exits cleanly (matches the run piped path).
     drop(bridge.stdin_injector);
 
@@ -632,7 +646,8 @@ fn spawn_piped_attach(
         Box::new(backend),
         bridge.stuck_tx,
         Some(bridge.output_tail),
-    ))
+    )
+    .with_program_status(bridge.program_status))
 }
 
 /// Execution backend for an attach session. Identical to `DockerExecution`
@@ -754,13 +769,20 @@ impl ExecutionBackend for AttachExecution {
 /// included: that is bit-for-bit today's `std::env::var(..).is_ok()` gate, and
 /// changing it would silently alter CLI/TUI behaviour for a variable that is
 /// deliberately set to the empty string.
-pub(super) fn resolve_env_passthrough(options: &ResolvedContainerOptions) -> Vec<(String, String)> {
+fn resolve_env_passthrough_raw(options: &ResolvedContainerOptions) -> Vec<(String, String)> {
     let mut values: Vec<_> = options
         .env_passthrough
         .iter()
         .filter(|envvar| is_env_var_name(&envvar.0))
         .filter_map(|envvar| {
-            crate::data::config::env::host_var(&envvar.0).map(|value| (envvar.0.clone(), value))
+            options
+                .host_env
+                .as_ref()
+                .map_or_else(
+                    || crate::data::config::env::host_var(&envvar.0),
+                    |env| env.host_payload(&envvar.0),
+                )
+                .map(|value| (envvar.0.clone(), value))
         })
         .collect();
     for (key, value) in &options.env_overrides {
@@ -770,6 +792,79 @@ pub(super) fn resolve_env_passthrough(options: &ResolvedContainerOptions) -> Vec
         }
     }
     values
+}
+
+/// [`resolve_env_passthrough_raw`] minus host-terminal variables (WI 0141 §3).
+///
+/// `TERM` and `COLORTERM` are also removed here: the container gets them from
+/// [`terminal_env_literals`], never from the host.
+pub(super) fn resolve_env_passthrough(options: &ResolvedContainerOptions) -> Vec<(String, String)> {
+    resolve_env_passthrough_raw(options)
+        .into_iter()
+        .filter(|(name, _)| !is_screened_run_var(name))
+        .collect()
+}
+
+/// A name the run must never set from the host or an option source: a
+/// host-terminal variable, or `TERM`/`COLORTERM`, which only the normalised
+/// [`scrubbed_env_literals`] may set (WI 0141 §3).
+fn is_screened_run_var(name: &str) -> bool {
+    is_host_terminal_var(name) || name == "TERM" || name == "COLORTERM"
+}
+
+/// The agent credentials minus screened names. Credential env vars come from
+/// agent definitions and run options, so they pass the same deny-list as
+/// every other source; ordinary credential names are unaffected. Used by the
+/// argv builder and by every spawn path that sets their values.
+pub(super) fn screened_agent_credentials(
+    options: &ResolvedContainerOptions,
+) -> Vec<(String, String)> {
+    options
+        .agent_credentials
+        .iter()
+        .filter(|(name, _)| !is_screened_run_var(name))
+        .cloned()
+        .collect()
+}
+
+/// The `KEY=VALUE` literals for a run: the options' `env_literal`s plus the
+/// terminal variables, scrubbed by the one deny-list call for this backend.
+pub(super) fn scrubbed_env_literals(options: &ResolvedContainerOptions) -> Vec<(String, String)> {
+    let literals = options
+        .env_literal
+        .iter()
+        .map(|l| (l.key.clone(), l.value.clone()))
+        .collect();
+    scrub_run_env(
+        literals,
+        options
+            .host_env
+            .as_ref()
+            .map_or_else(
+                || crate::data::config::env::host_var("COLORTERM"),
+                |env| env.get("COLORTERM").map(str::to_owned),
+            )
+            .as_deref(),
+    )
+    .kept
+}
+
+/// The user-facing notice for host-terminal variables an overlay or the agent
+/// asked for that were not passed, or `None`. The run path writes it to the
+/// frontend; [`build_run_argv`] also logs it.
+pub fn host_terminal_env_notice(options: &ResolvedContainerOptions) -> Option<String> {
+    let mut requested = resolve_env_passthrough_raw(options);
+    requested.extend(
+        options
+            .env_literal
+            .iter()
+            .map(|l| (l.key.clone(), l.value.clone())),
+    );
+    requested.extend(options.agent_credentials.iter().cloned());
+    if let Some((env_var, _, container_path)) = &options.system_prompt_env_file {
+        requested.push((env_var.clone(), container_path.display().to_string()));
+    }
+    scrub_run_env(requested, None).notice()
 }
 
 /// Whether a passthrough name is a usable environment variable name.
@@ -810,7 +905,7 @@ pub(super) fn build_run_argv(
         // agent receives it without piping; stdin stays inherited for the user.
         args.push("-it".into());
     } else if options.seeded_prompt.is_some() {
-        // Non-interactive with a seeded prompt: pipe stdin so we can write the
+        // Headless with a seeded prompt: pipe stdin so we can write the
         // prompt, then close it. No PTY — allocating one fails when there is no
         // host TTY (ENOTTY / "Inappropriate ioctl for device").
         args.push("-i".into());
@@ -876,12 +971,17 @@ pub(super) fn build_run_argv(
         args.push(name);
     }
     // Env literals — unlike env_passthrough above, these keep the `KEY=VALUE`
-    // form. Literal values are constants awman itself supplies (e.g.
-    // `COPILOT_OFFLINE=true`), never a user secret, so there is nothing here
+    // form. Literal values are constants awman itself supplies, never a user secret, so there is nothing here
     // that argv's world-readability could expose.
-    for lit in &options.env_literal {
+    // Host-terminal variables are dropped and TERM/COLORTERM normalised here
+    // (WI 0141 §3). Every env source (passthrough, literals, credentials,
+    // the system-prompt variable) passes the same screen.
+    if let Some(notice) = host_terminal_env_notice(options) {
+        tracing::warn!("{notice}");
+    }
+    for (key, value) in scrubbed_env_literals(options) {
         args.push("-e".into());
-        args.push(format!("{}={}", lit.key, lit.value));
+        args.push(format!("{key}={value}"));
     }
     // Agent credentials are env-vars by another name. Emit the NAME ONLY
     // (`-e KEY`); the value is set on the spawned CLI child's own environment
@@ -890,9 +990,9 @@ pub(super) fn build_run_argv(
     // the argument vector, so it never appears in `ps` / `/proc/<pid>/cmdline`
     // while the client process runs. Both the docker CLI and the Apple
     // `container` CLI (which shares this argv builder) support this form.
-    for (k, _v) in &options.agent_credentials {
+    for (k, _v) in screened_agent_credentials(options) {
         args.push("-e".into());
-        args.push(k.clone());
+        args.push(k);
     }
 
     // Allow Docker socket: mount and add docker group.
@@ -945,8 +1045,12 @@ pub(super) fn build_run_argv(
             host_path.display(),
             container_path.display(),
         ));
-        args.push("-e".into());
-        args.push(format!("{}={}", env_var, container_path.display()));
+        // The variable name comes from an agent definition: screened like
+        // every other env source (WI 0141 §3).
+        if !is_screened_run_var(env_var) {
+            args.push("-e".into());
+            args.push(format!("{}={}", env_var, container_path.display()));
+        }
     }
 
     // The image is the final positional arg.
@@ -1075,1107 +1179,89 @@ pub(super) fn clear_stdio_nonblocking() {
 }
 
 #[cfg(test)]
-mod tests {
+mod command_secrets_tests {
     use super::*;
-    use crate::engine::container::options::{
-        ContainerOption, EnvVar, ImageRef, OverlayPermission, OverlaySpec, ResolvedContainerOptions,
-    };
-    use std::path::PathBuf;
-
-    fn resolve(opts: Vec<ContainerOption>) -> ResolvedContainerOptions {
-        ResolvedContainerOptions::resolve(opts).unwrap()
-    }
+    use crate::data::secret::{CommandSecrets, SecretString};
+    use crate::engine::agent::AgentRunOptions;
+    use std::sync::Arc;
 
     #[test]
-    fn build_run_argv_minimal() {
-        let resolved = resolve(vec![ContainerOption::Image(ImageRef::new("img:latest"))]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert_eq!(argv[0], "run");
-        assert!(argv.contains(&"--rm".to_string()));
-        assert!(argv.contains(&"--label".to_string()));
-        assert!(argv.contains(&AWMAN_LABEL.to_string()));
-        // Image is the final positional arg.
-        assert_eq!(argv.last().map(String::as_str), Some("img:latest"));
-    }
-
-    /// WI 0101 §2.2: `ContainerOption::SessionLabel` became the general
-    /// `Label { key, value }`. `awman=true` must still come first, then exactly
-    /// one `--label k=v` per accumulated entry, in ingest order.
-    #[test]
-    fn build_run_argv_emits_the_awman_label_then_one_flag_per_supplied_label() {
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Label {
-                key: "awman.session".into(),
-                value: "sid-1".into(),
-            },
-            ContainerOption::Label {
-                key: "awman.squad.task".into(),
-                value: "issue-triage".into(),
-            },
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        let labels: Vec<&String> = argv
-            .iter()
-            .enumerate()
-            .filter(|(i, a)| a.as_str() == "--label" && *i + 1 < argv.len())
-            .map(|(i, _)| &argv[i + 1])
-            .collect();
-        assert_eq!(
-            labels,
-            vec![
-                &AWMAN_LABEL.to_string(),
-                &"awman.session=sid-1".to_string(),
-                &"awman.squad.task=issue-triage".to_string(),
-            ],
-            "argv was: {argv:?}"
-        );
-        assert_eq!(
-            argv.iter().filter(|a| a.as_str() == "--label").count(),
-            3,
-            "one --label flag per label, no more"
-        );
-    }
-
-    /// Regression guard for the pre-refactor behaviour: a lone session label
-    /// still renders exactly as it did when it had its own dedicated field.
-    #[test]
-    fn build_run_argv_renders_a_lone_session_label_exactly_as_before_the_refactor() {
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Label {
-                key: "awman.session".into(),
-                value: "abc-123".into(),
-            },
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        let awman = argv
-            .iter()
-            .position(|a| a == AWMAN_LABEL)
-            .expect("the hardcoded awman=true label must be present");
-        assert_eq!(argv[awman + 1], "--label");
-        assert_eq!(
-            argv[awman + 2],
-            "awman.session=abc-123",
-            "the session label must immediately follow awman=true"
-        );
-    }
-
-    #[test]
-    fn build_run_argv_emits_only_the_awman_label_when_no_labels_are_supplied() {
-        let resolved = resolve(vec![ContainerOption::Image(ImageRef::new("img:latest"))]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert_eq!(argv.iter().filter(|a| a.as_str() == "--label").count(), 1);
-    }
-
-    #[test]
-    fn build_run_argv_includes_overlay_volumes() {
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Overlay(OverlaySpec {
-                host_path: PathBuf::from("/h/p"),
-                container_path: PathBuf::from("/c/p"),
-                permission: OverlayPermission::ReadOnly,
-            }),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert!(argv
-            .windows(2)
-            .any(|w| w[0] == "-v" && w[1] == "/h/p:/c/p:ro"));
-    }
-
-    #[test]
-    fn build_run_argv_env_passthrough_only_when_set() {
-        use crate::engine::container::options::EnvLiteral;
-
-        std::env::set_var("AWMAN_TEST_ENV_DOCKER", "v1");
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::EnvPassthrough(EnvVar("AWMAN_TEST_ENV_DOCKER".into())),
-            ContainerOption::EnvPassthrough(EnvVar("AWMAN_TEST_NEVER_SET_DOCKER".into())),
-            ContainerOption::EnvLiteral(EnvLiteral {
-                key: "MY_KEY".into(),
-                value: "my_value".into(),
-            }),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert!(
-            argv.windows(2)
-                .any(|w| w[0] == "-e" && w[1] == "AWMAN_TEST_ENV_DOCKER"),
-            "passthrough must be emitted as name-only `-e AWMAN_TEST_ENV_DOCKER`; argv: {argv:?}"
-        );
-        assert!(
-            !argv.iter().any(|a| a == "AWMAN_TEST_ENV_DOCKER=v1"),
-            "the passthrough value must never ride argv as NAME=VALUE; argv: {argv:?}"
-        );
-        assert!(
-            !argv
-                .iter()
-                .any(|a| a.contains("AWMAN_TEST_NEVER_SET_DOCKER")),
-            "an unset passthrough name must emit nothing at all; argv: {argv:?}"
-        );
-        assert!(
-            argv.windows(2)
-                .any(|w| w[0] == "-e" && w[1] == "MY_KEY=my_value"),
-            "a literal must still be emitted as -e KEY=VALUE, unlike passthrough; argv: {argv:?}"
-        );
-        std::env::remove_var("AWMAN_TEST_ENV_DOCKER");
-    }
-
-    /// WI 0116 §1/D1 — the regression this work item exists to end.
-    ///
-    /// A squad daemon holds a task's `env()` value in the Layer 0 overlay, not
-    /// in its own process environment. Gating the `-e` on `std::env::var`
-    /// emitted nothing at all there, so the container started silently without
-    /// the variable. The gate is `host_var`, so the name must be emitted; the
-    /// value must be reachable through `resolve_env_passthrough` (which the
-    /// spawn paths set on the child) and must never appear in argv.
-    #[test]
-    fn build_run_argv_passes_through_a_name_held_only_in_the_daemon_overlay() {
-        use crate::data::config::env::{
-            set_daemon_overlay, DaemonEnvMap, DAEMON_OVERLAY_TEST_LOCK,
-        };
-
-        let _guard = DAEMON_OVERLAY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // Unique name, and explicitly *not* in the process environment: this is
-        // the daemon's situation exactly.
-        let name = "AWMAN_TEST_DOCKER_OVERLAY_ONLY";
-        std::env::remove_var(name);
-        set_daemon_overlay(DaemonEnvMap::from_pairs([(name, "overlay-secret")]));
-
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::EnvPassthrough(EnvVar(name.into())),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-
-        assert!(
-            argv.windows(2).any(|w| w[0] == "-e" && w[1] == name),
-            "a name held only in the daemon overlay must still emit `-e {name}`; argv: {argv:?}"
-        );
-        assert!(
-            !argv.iter().any(|a| a.contains("overlay-secret")),
-            "the overlay value must never reach argv; argv: {argv:?}"
-        );
-        assert_eq!(
-            resolve_env_passthrough(&resolved),
-            vec![(name.to_string(), "overlay-secret".to_string())],
-            "the spawn paths take the value from here and set it on the child",
-        );
-
-        set_daemon_overlay(DaemonEnvMap::new());
-    }
-
-    /// A task created before `env()` validated its argument still carries
-    /// whatever it was given, and these names now reach `Command::env` on the
-    /// spawn paths (review-security F11).
-    #[test]
-    fn resolve_env_passthrough_drops_a_name_that_is_not_an_environment_variable_name() {
-        use crate::data::config::env::{
-            set_daemon_overlay, DaemonEnvMap, DAEMON_OVERLAY_TEST_LOCK,
-        };
-
-        let _guard = DAEMON_OVERLAY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // The overlay, not the process environment: the OS itself refuses to
-        // set a variable whose name contains `=`, which is part of why such a
-        // name must never become a `Command::env` key.
-        let bad = "AWMAN_TEST_DOCKER=INVALID";
-        set_daemon_overlay(DaemonEnvMap::from_pairs([(bad, "v")]));
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::EnvPassthrough(EnvVar(bad.into())),
-        ]);
-        assert!(
-            resolve_env_passthrough(&resolved).is_empty(),
-            "a malformed key must never reach Command::env"
-        );
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert!(!argv.iter().any(|a| a.contains(bad)), "argv: {argv:?}");
-        set_daemon_overlay(DaemonEnvMap::new());
-    }
-
-    /// D15 — `Some("")` still emits, for bit-for-bit parity with the old
-    /// `std::env::var(..).is_ok()` gate. Only the *push* path treats an empty
-    /// value as absent.
-    #[test]
-    fn resolve_env_passthrough_keeps_a_variable_set_to_the_empty_string() {
-        let name = "AWMAN_TEST_DOCKER_EMPTY_PASSTHROUGH";
-        std::env::set_var(name, "");
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::EnvPassthrough(EnvVar(name.into())),
-        ]);
-        assert_eq!(
-            resolve_env_passthrough(&resolved),
-            vec![(name.to_string(), String::new())]
-        );
-        std::env::remove_var(name);
-    }
-
-    #[test]
-    fn build_run_argv_allow_docker_mounts_socket() {
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::AllowDocker(true),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert!(argv
-            .iter()
-            .any(|a| a.contains("docker.sock") || a.contains("docker_engine")));
-    }
-
-    #[test]
-    fn build_run_argv_entrypoint_appended_after_image() {
-        use crate::engine::container::options::Entrypoint;
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Entrypoint(Entrypoint::new(["claude", "--print"])),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        let img_pos = argv.iter().position(|a| a == "img:latest").unwrap();
-        let claude_pos = argv.iter().position(|a| a == "claude").unwrap();
-        let print_pos = argv.iter().position(|a| a == "--print").unwrap();
-        assert!(img_pos < claude_pos, "entrypoint must come after image");
-        assert!(claude_pos < print_pos, "entrypoint args must be in order");
-    }
-
-    #[test]
-    fn build_run_argv_rw_overlay_has_no_ro_suffix() {
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Overlay(OverlaySpec {
-                host_path: PathBuf::from("/h/rw"),
-                container_path: PathBuf::from("/c/rw"),
-                permission: OverlayPermission::ReadWrite,
-            }),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        let vol_arg = argv
-            .windows(2)
-            .find(|w| w[0] == "-v")
-            .map(|w| w[1].clone())
-            .unwrap();
-        assert_eq!(
-            vol_arg, "/h/rw:/c/rw",
-            "RW overlay must not have :ro suffix"
-        );
-    }
-
-    #[test]
-    fn build_run_argv_env_literal_always_included() {
-        use crate::engine::container::options::EnvLiteral;
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::EnvLiteral(EnvLiteral {
-                key: "MY_KEY".into(),
-                value: "my_value".into(),
-            }),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert!(argv
-            .windows(2)
-            .any(|w| w[0] == "-e" && w[1] == "MY_KEY=my_value"));
-    }
-
-    #[test]
-    fn build_run_argv_seeded_prompt_adds_i_flag_not_it() {
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::SeededPrompt("hello world".into()),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert!(
-            argv.contains(&"-i".to_string()),
-            "seeded prompt needs -i flag"
-        );
-        assert!(
-            !argv.contains(&"-it".to_string()),
-            "seeded prompt must NOT add -it"
-        );
-    }
-
-    #[test]
-    fn build_run_argv_seeded_prompt_with_interactive_uses_it_and_positional_arg() {
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Interactive(true),
-            ContainerOption::SeededPrompt("hello".into()),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert!(
-            argv.contains(&"-it".to_string()),
-            "interactive+seeded must use -it for PTY"
-        );
-        assert!(
-            !argv.contains(&"-i".to_string()),
-            "interactive+seeded must NOT use bare -i"
-        );
-        assert_eq!(
-            argv.last().map(|s| s.as_str()),
-            Some("hello"),
-            "seeded prompt must be last positional arg"
-        );
-    }
-
-    #[test]
-    fn build_run_argv_interactive_seed_flag_delivers_prompt_via_flag_not_positional() {
-        // opencode-shaped delivery: a seed flag is present, so the prompt must
-        // be emitted as `<flag> <text>` rather than a bare positional (which
-        // opencode would treat as a project dir and open() → ENAMETOOLONG).
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Interactive(true),
-            ContainerOption::SeededPrompt("do the task".into()),
-            ContainerOption::InteractiveSeedFlag("--prompt".into()),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert!(
-            argv.windows(2)
-                .any(|w| w[0] == "--prompt" && w[1] == "do the task"),
-            "seed flag must deliver the prompt as `--prompt <text>`; got {argv:?}"
-        );
-        // The prompt must never appear as a lone positional immediately after
-        // the image (which is what breaks opencode).
-        let img_idx = argv.iter().position(|a| a == "img:latest").unwrap();
-        assert_ne!(
-            argv.get(img_idx + 1).map(|s| s.as_str()),
-            Some("do the task"),
-            "prompt must not be a bare positional after the image; got {argv:?}"
-        );
-    }
-
-    #[test]
-    fn build_run_argv_interactive_acp_emits_i_not_it() {
-        // ACP framing must never pass through a PTY, so an interactive ACP run
-        // allocates `-i` (piped stdin, no `-t`) rather than `-it`.
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Interactive(true),
-            ContainerOption::Acp(true),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert!(
-            argv.contains(&"-i".to_string()),
-            "interactive ACP run needs -i; argv: {argv:?}"
-        );
-        assert!(
-            !argv.contains(&"-it".to_string()),
-            "interactive ACP run must NOT allocate a PTY via -it; argv: {argv:?}"
-        );
-    }
-
-    #[test]
-    fn build_run_argv_non_interactive_acp_still_emits_i() {
-        // A headless (`-n`) ACP run still needs stdin piped open for the
-        // bidirectional JSON-RPC exchange.
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Acp(true),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert!(
-            argv.contains(&"-i".to_string()),
-            "non-interactive ACP run still needs -i; argv: {argv:?}"
-        );
-        assert!(
-            !argv.contains(&"-it".to_string()),
-            "ACP run must never use -it; argv: {argv:?}"
-        );
-    }
-
-    #[test]
-    fn build_run_argv_acp_does_not_deliver_seeded_prompt_as_positional() {
-        // The ACP prompt travels over JSON-RPC (`session/prompt`), never argv.
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Interactive(true),
-            ContainerOption::Acp(true),
-            ContainerOption::SeededPrompt("do the task".into()),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert!(
-            !argv.iter().any(|a| a == "do the task"),
-            "ACP must not append the seeded prompt as an argv positional; argv: {argv:?}"
-        );
-    }
-
-    #[test]
-    fn build_run_argv_acp_emits_nothing_after_the_entrypoint() {
-        // Regression for the "corrupted ACP argv" blocker: an ACP launch that
-        // also carries a non-interactive subcommand flag and agent mode flags
-        // (as every `exec workflow` / `--non-interactive` / `--yolo` ACP launch
-        // does) must NOT graft any of them onto `cline --acp` — the ACP argv is
-        // complete at the entrypoint. Before the fix this produced
-        // `cline --acp task --yolo`, silently corrupting the JSON-RPC launch.
-        use crate::engine::container::options::Entrypoint;
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Entrypoint(Entrypoint::new(["cline", "--acp"])),
-            ContainerOption::Acp(true),
-            ContainerOption::AgentModeFlags(vec!["--yolo".into()]),
-            ContainerOption::SeededPrompt("do the task".into()),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        let img_pos = argv.iter().position(|a| a == "img:latest").unwrap();
-        assert_eq!(
-            &argv[img_pos + 1..],
-            &["cline".to_string(), "--acp".to_string()],
-            "ACP argv must end exactly at the entrypoint, with no stdio flags \
-             (task/--yolo/prompt) appended; argv: {argv:?}"
-        );
-    }
-
-    #[test]
-    fn build_run_argv_agent_flags_follow_awman_flags_and_precede_the_prompt() {
-        use crate::engine::container::options::{Entrypoint, ModelFlagForm};
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Entrypoint(Entrypoint::new(["codex"])),
-            ContainerOption::Interactive(true),
-            ContainerOption::AgentModeFlags(vec![
-                "--dangerously-bypass-approvals-and-sandbox".into()
-            ]),
-            ContainerOption::Model {
-                flag: ModelFlagForm::Argument("gpt-5".into()),
-            },
-            ContainerOption::AgentFlags(vec![
-                "--no-daemon".into(),
-                "--config".into(),
-                "a=b".into(),
-            ]),
-            ContainerOption::SeededPrompt("do the task".into()),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        let img_pos = argv.iter().position(|a| a == "img:latest").unwrap();
-        assert_eq!(
-            &argv[img_pos + 1..],
-            &[
-                "codex",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--model",
-                "gpt-5",
-                "--no-daemon",
-                "--config",
-                "a=b",
-                "do the task",
-            ]
-            .map(String::from),
-        );
-    }
-
-    #[test]
-    fn build_run_argv_acp_keeps_only_agent_flags_after_the_entrypoint() {
-        use crate::engine::container::options::Entrypoint;
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Entrypoint(Entrypoint::new(["cline", "--acp"])),
-            ContainerOption::Acp(true),
-            ContainerOption::AgentModeFlags(vec!["--yolo".into()]),
-            ContainerOption::AgentFlags(vec!["--verbose".into()]),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        let img_pos = argv.iter().position(|a| a == "img:latest").unwrap();
-        assert_eq!(
-            &argv[img_pos + 1..],
-            &["cline", "--acp", "--verbose"].map(String::from),
-        );
-    }
-
-    /// Regression guard for the security constraint (aspec/architecture/
-    /// security.md): the ACP argv path must introduce NO new host exposure —
-    /// no published ports, no host/custom `--network`, no added mounts beyond
-    /// what a non-ACP run of the same options would already emit.
-    #[test]
-    fn build_run_argv_acp_introduces_no_ports_or_network_flags() {
-        let acp = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Interactive(true),
-            ContainerOption::Acp(true),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &acp,
-        )
-        .unwrap();
-        for banned in ["-p", "--publish", "--network", "--net", "--add-host"] {
-            assert!(
-                !argv.iter().any(|a| a == banned),
-                "ACP argv must never contain {banned}; argv: {argv:?}"
-            );
-        }
-
-        // And the ACP flag must not add any `-v` mount that a plain
-        // interactive run of the same options wouldn't already produce.
-        let plain = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Interactive(true),
-        ]);
-        let plain_argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &plain,
-        )
-        .unwrap();
-        let count_v = |v: &[String]| v.iter().filter(|a| a.as_str() == "-v").count();
-        assert_eq!(
-            count_v(&argv),
-            count_v(&plain_argv),
-            "ACP must not introduce any new -v mount; acp: {argv:?} plain: {plain_argv:?}"
-        );
-    }
-
-    #[test]
-    fn build_run_argv_interactive_adds_it_flag() {
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Interactive(true),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert!(
-            argv.contains(&"-it".to_string()),
-            "interactive run needs -it flag"
-        );
-    }
-
-    #[test]
-    fn build_run_argv_working_dir_adds_w_flag() {
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::WorkingDir(PathBuf::from("/workspace")),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert!(argv
-            .windows(2)
-            .any(|w| w[0] == "-w" && w[1] == "/workspace"));
-    }
-
-    #[test]
-    fn build_run_argv_container_name_present_in_argv() {
-        use crate::engine::container::options::ContainerName as CN;
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Name(CN::new("my-container")),
-        ]);
-        let argv = build_run_argv(
-            &CN::new("my-container"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert!(
-            argv.windows(2)
-                .any(|w| w[0] == "--name" && w[1] == "my-container"),
-            "container name must appear as --name <name>"
-        );
-    }
-
-    #[test]
-    fn build_run_argv_yolo_does_not_add_extra_docker_flag() {
-        // Yolo mode is encoded in the agent's overlay settings (settings.json),
-        // NOT as a docker run flag. The argv builder must not add any flag for it.
-        use crate::engine::container::options::YoloMode;
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Yolo(YoloMode::Enabled),
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert!(
-            !argv.iter().any(|a| a.contains("yolo")),
-            "yolo must not add a docker flag"
-        );
-        assert!(
-            !argv.iter().any(|a| a.contains("bypass")),
-            "yolo must not add a bypass flag"
-        );
-    }
-
-    #[test]
-    fn image_home_dir_returns_none_for_unknown_image() {
-        // Missing image: `docker image inspect` exits non-zero so the helper
-        // must surface `None` rather than panic. Works regardless of whether
-        // the docker daemon is reachable, because `Command::output` errors
-        // collapse to `None` too.
-        let backend = DockerBackend;
-        let bogus = "awman-test-image-that-does-not-exist:tag-xyz123";
-        assert!(backend.image_home_dir(bogus).unwrap().is_none());
-    }
-
-    #[test]
-    fn parse_memory_mb_handles_various_units() {
-        assert!((parse_memory_mb("200MiB / 1GiB") - 200.0).abs() < 0.1);
-        assert!((parse_memory_mb("1.5GiB / 4GiB") - 1536.0).abs() < 0.1);
-    }
-
-    #[test]
-    fn parse_cpu_percent_strips_percent() {
-        assert!((parse_cpu_percent("5.23%") - 5.23).abs() < 0.001);
-    }
-
-    // ── WI-0098 Finding A: agent credential values must never enter argv ──────
-    //
-    // `build_run_argv` emits credentials as the NAME-ONLY form `-e KEY`; the
-    // value is set on the spawned CLI child's own environment (see the spawn
-    // paths) so nothing secret is visible via `ps` / `/proc/<pid>/cmdline`.
-    // These tests assert the value is absent from the built argv while still
-    // being carried out-of-band on the resolved options (the source the spawn
-    // code feeds to `Command::env`). `build_run_argv` is shared verbatim by the
-    // Apple backend, so this coverage applies to both container backends.
-
-    fn credential_opts(pairs: &[(&str, &str)]) -> ResolvedContainerOptions {
-        resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::AgentCredentials {
-                env_vars: pairs
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-                    .collect(),
-            },
-        ])
-    }
-
-    #[test]
-    fn build_run_argv_agent_credentials_use_name_only_form() {
-        let resolved = credential_opts(&[("ANTHROPIC_API_KEY", "sk-secret-value")]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        // The name-only `-e KEY` pair must be present.
-        assert!(
-            argv.windows(2)
-                .any(|w| w[0] == "-e" && w[1] == "ANTHROPIC_API_KEY"),
-            "credential must be emitted as name-only `-e ANTHROPIC_API_KEY`; argv: {argv:?}"
-        );
-        // The secret value must appear nowhere in argv, in any form.
-        assert!(
-            !argv.iter().any(|a| a.contains("sk-secret-value")),
-            "credential VALUE must never appear in argv; argv: {argv:?}"
-        );
-        assert!(
-            !argv
-                .iter()
-                .any(|a| a == "ANTHROPIC_API_KEY=sk-secret-value"),
-            "the `KEY=VALUE` argv form must not be used for credentials; argv: {argv:?}"
-        );
-    }
-
-    #[test]
-    fn build_run_argv_credential_value_with_equals_stays_out_of_argv() {
-        // A value containing `=` must survive the env-inheritance path and must
-        // never leak into argv.
-        let resolved = credential_opts(&[("TOKEN", "a=b=c")]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert!(
-            argv.windows(2).any(|w| w[0] == "-e" && w[1] == "TOKEN"),
-            "credential name must still be present as `-e TOKEN`; argv: {argv:?}"
-        );
-        assert!(
-            !argv.iter().any(|a| a.contains("a=b=c")),
-            "credential value containing `=` must not appear in argv; argv: {argv:?}"
-        );
-        // Carried out-of-band, verbatim, for the child-process env map.
-        assert_eq!(
-            resolved.agent_credentials,
-            vec![("TOKEN".to_string(), "a=b=c".to_string())],
-            "the value must be preserved verbatim on the options for `Command::env`"
-        );
-    }
-
-    #[test]
-    fn build_run_argv_credential_value_with_newline_stays_out_of_argv() {
-        let resolved = credential_opts(&[("MULTILINE", "line1\nline2")]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        assert!(
-            argv.windows(2).any(|w| w[0] == "-e" && w[1] == "MULTILINE"),
-            "credential name must be present as `-e MULTILINE`; argv: {argv:?}"
-        );
-        assert!(
-            !argv.iter().any(|a| a.contains('\n')),
-            "no argv element may contain a newline from the credential value; argv: {argv:?}"
-        );
-        assert_eq!(
-            resolved.agent_credentials,
-            vec![("MULTILINE".to_string(), "line1\nline2".to_string())],
-            "the newline-bearing value must be preserved verbatim for `Command::env`"
-        );
-    }
-
-    #[test]
-    fn build_run_argv_multiple_credentials_all_name_only() {
-        let resolved = credential_opts(&[("KEY_A", "aaa"), ("KEY_B", "bbb")]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        )
-        .unwrap();
-        for name in ["KEY_A", "KEY_B"] {
-            assert!(
-                argv.windows(2).any(|w| w[0] == "-e" && w[1] == name),
-                "{name} must be emitted name-only; argv: {argv:?}"
-            );
-        }
-        for value in ["aaa", "bbb"] {
-            assert!(
-                !argv.iter().any(|a| a.contains(value)),
-                "credential value {value} must never appear in argv; argv: {argv:?}"
-            );
-        }
-    }
-}
-
-#[cfg(all(test, unix))]
-mod docker_listing_tests {
-    use super::*;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-    thread_local! {
-        pub(super) static CLI: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
-    }
-
-    struct FakeDocker {
-        dir: tempfile::TempDir,
-    }
-
-    impl FakeDocker {
-        fn new() -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let cli = dir.path().join("docker");
-            fs::write(
-                &cli,
-                r##"#!/bin/sh
-printf '%s\n' "$@" >> "$(dirname "$0")/argv"
-mode=$(cat "$(dirname "$0")/mode")
-case "$mode" in
-  unavailable) echo "cannot connect to the docker daemon" >&2; exit 1 ;;
-  nonzero) echo "query rejected" >&2; exit 17 ;;
-  second-fails)
-    case " $* " in *" name=awman- "*) echo "legacy query failed" >&2; exit 9 ;; esac
-    printf 'first-id\tawman-current\timage:v1\tbad-time\n'
-    exit 0
-    ;;
-  empty) exit 0 ;;
-  rows)
-    case " $* " in
-      *" label=awman=true "*)
-        printf 'row-one\tawman-current\timage:v1\tbad-time\n'
-        printf 'row-one\tawman-current\timage:v1\tbad-time\n'
-        printf 'short-row\tmissing-fields\n'
-        printf '\tawman-empty-id\timage:v1\tbad-time\n'
-        printf 'row-empty-name\t\timage:v1\tbad-time\n'
-        ;;
-      *)
-        printf 'row-one\tawman-current\timage:v1\tbad-time\n'
-        printf 'legacy-id\tawman-legacy\timage:v0\tbad-time\n'
-        ;;
-    esac
-    ;;
-esac
-"##,
-            )
-            .unwrap();
-            fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
-            fs::write(dir.path().join("mode"), "empty").unwrap();
-            CLI.with(|slot| assert!(slot.replace(Some(cli)).is_none()));
-            Self { dir }
-        }
-
-        fn mode(&self, mode: &str) {
-            fs::write(self.dir.path().join("mode"), mode).unwrap();
-        }
-    }
-
-    impl Drop for FakeDocker {
-        fn drop(&mut self) {
-            CLI.with(|slot| slot.replace(None));
-        }
-    }
-
-    #[test]
-    fn listing_override_is_local_to_its_thread() {
-        let fake = FakeDocker::new();
-        let command = listing_command();
-        assert_eq!(command.get_program(), "/bin/sh");
-        assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            [fake.dir.path().join("docker").as_os_str()]
-        );
-        let other = std::thread::spawn(|| listing_command().get_program().to_os_string())
-            .join()
-            .unwrap();
-        assert_ne!(other, "/bin/sh");
-    }
-
-    #[test]
-    fn ownership_listing_handles_empty_errors_partial_failure_malformed_rows_and_dedup() {
-        let fake = FakeDocker::new();
-        let backend = DockerBackend;
-
-        fake.mode("empty");
-        assert!(backend.list_running_all().unwrap().is_empty());
-
-        fake.mode("unavailable");
-        assert!(matches!(
-            backend.list_running_all(),
-            Err(EngineError::Container(message)) if message.contains("cannot connect")
-        ));
-
-        fake.mode("nonzero");
-        assert!(matches!(
-            backend.list_running_all(),
-            Err(EngineError::Container(message)) if message.contains("query rejected")
-        ));
-
-        fake.mode("second-fails");
-        assert!(matches!(
-            backend.list_running_all(),
-            Err(EngineError::Container(message)) if message.contains("legacy query failed")
-        ));
-
-        fake.mode("rows");
-        let listed = backend.list_running_all().unwrap();
-        assert_eq!(
-            listed
-                .iter()
-                .map(|agent| agent.id.as_str())
-                .collect::<Vec<_>>(),
-            ["row-one", "legacy-id"]
-        );
-        assert_eq!(listed[1].name, "awman-legacy");
-    }
-
-    #[test]
-    fn all_listing_routes_preserve_query_filters_and_failures() {
-        let fake = FakeDocker::new();
-        let backend = DockerBackend;
-        for route in 0..3 {
-            let list = || match route {
-                0 => backend.list_running_all(),
-                1 => backend.list_stopped(),
-                _ => backend.list_running_with_name_prefix("awman-squad-task-"),
-            };
-            for mode in ["empty", "unavailable", "nonzero", "rows", "second-fails"] {
-                fake.mode(mode);
-                fs::write(fake.dir.path().join("argv"), "").unwrap();
-                let result = list();
-                match mode {
-                    "empty" => assert!(result.unwrap().is_empty()),
-                    "unavailable" | "nonzero" => assert!(result.is_err()),
-                    "second-fails" if route < 2 => assert!(result.is_err()),
-                    _ => assert!(!result.unwrap().is_empty()),
-                }
-                let argv = fs::read_to_string(fake.dir.path().join("argv")).unwrap();
-                let args: Vec<&str> = argv.lines().collect();
-                assert_eq!(args[0], "ps");
-                assert!(args.contains(&"--no-trunc"));
-                assert_eq!(args.contains(&"-a"), route == 1);
-                assert_eq!(args.contains(&"status=exited"), route == 1);
-                assert_eq!(args.contains(&"status=dead"), route == 1);
-                if route == 2 {
-                    assert!(args.contains(&"name=awman-squad-task-"));
-                } else {
-                    assert!(args.contains(&"label=awman=true"));
-                    if !matches!(mode, "unavailable" | "nonzero") {
-                        assert!(args.contains(&"name=awman-"));
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod explicit_phase_env_review_tests {
-    use super::*;
-    use crate::engine::auth::credential::SecretString;
-    use crate::engine::container::options::{ContainerOption, EnvVar};
-    #[test]
-    fn explicit_values_win_over_different_or_absent_ambient_values_without_entering_argv() {
-        use crate::data::config::env::{
-            set_daemon_overlay, DaemonEnvMap, DAEMON_OVERLAY_TEST_LOCK,
-        };
-        let _lock = DAEMON_OVERLAY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let key = "AWMAN_WI0149_EXPLICIT_OVERRIDE";
-        for ambient in [None, Some("ambient_token")] {
-            set_daemon_overlay(DaemonEnvMap::from_pairs(ambient.map(|v| (key, v))));
-            let options = ResolvedContainerOptions::resolve(vec![
-                ContainerOption::Image(ImageRef::new("fixture")),
-                ContainerOption::EnvPassthrough(EnvVar(key.into())),
-                ContainerOption::EnvOverride {
-                    key: key.into(),
-                    value: SecretString::new("selected_token"),
-                },
+    fn requested_command_secrets_override_host_env_with_name_only_runtime_argv() {
+        let secrets = Arc::new(
+            CommandSecrets::new([
+                ("TOKEN".into(), SecretString::new("test-secret-container")),
+                (
+                    "UNREQUESTED".into(),
+                    SecretString::new("test-secret-unrequested"),
+                ),
             ])
-            .unwrap();
-            assert_eq!(
-                resolve_env_passthrough(&options),
-                [(key.into(), "selected_token".into())]
-            );
-            let argv = build_run_argv(
-                &ContainerName::new("fixture"),
-                &ImageRef::new("fixture"),
-                &options,
-            )
-            .unwrap();
-            assert!(argv.windows(2).any(|w| w == ["-e", key]));
-            assert!(!format!("{argv:?} {options:?}").contains("selected_token"));
-        }
-        set_daemon_overlay(DaemonEnvMap::new());
+            .unwrap(),
+        );
+        let run = AgentRunOptions {
+            command_secrets: Some(secrets),
+            env_passthrough: Some(vec!["TOKEN".into(), "HOST_ONLY".into()]),
+            ..Default::default()
+        };
+        let options = ResolvedContainerOptions {
+            host_env: Some(crate::data::config::env::EnvSnapshot::with_overrides([
+                ("TOKEN", "host-token"),
+                ("HOST_ONLY", "host-value"),
+            ])),
+            env_passthrough: vec![
+                crate::engine::container::options::EnvVar("TOKEN".into()),
+                crate::engine::container::options::EnvVar("HOST_ONLY".into()),
+            ],
+            env_overrides: run.secret_env(),
+            ..Default::default()
+        };
+        let values = resolve_env_passthrough(&options);
+        assert_eq!(
+            values.iter().find(|(name, _)| name == "TOKEN").unwrap().1,
+            "test-secret-container"
+        );
+        assert!(values
+            .iter()
+            .any(|(name, value)| name == "HOST_ONLY" && value == "host-value"));
+        assert!(!values.iter().any(|(name, _)| name == "UNREQUESTED"));
+        let args = build_run_argv(
+            &ContainerName("test-container".into()),
+            &ImageRef("test-image".into()),
+            &options,
+        )
+        .unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["-e", "TOKEN"]));
+        assert!(!format!("{args:?} {options:?}").contains("test-secret"));
     }
-}
-
-#[cfg(test)]
-mod timestamp_review_tests {
-    use super::*;
 
     #[test]
-    fn malformed_creation_time_keeps_the_legacy_observation_time_fallback() {
-        let before = chrono::Utc::now();
-        let handles = parse_agent_listing(
-            b"id\tawman-agent\timage:v1\tbad-time\n",
-            &mut Default::default(),
+    fn private_env_overlay_suppresses_host_provider_credentials_even_without_host_env() {
+        use crate::engine::container::options::{ContainerOption, EnvVar};
+        let options = ResolvedContainerOptions::resolve_in(
+            [
+                ContainerOption::EnvPassthrough(EnvVar("ANTHROPIC_API_KEY".into())),
+                ContainerOption::EnvOverride {
+                    key: "ANTHROPIC_API_KEY".into(),
+                    value: SecretString::new("test-secret-caller-provider"),
+                },
+                ContainerOption::AgentCredentials {
+                    env_vars: vec![(
+                        "CLAUDE_CODE_OAUTH_TOKEN".into(),
+                        "test-secret-host-provider".into(),
+                    )],
+                },
+            ],
+            &crate::data::config::env::EnvSnapshot::with_overrides(
+                std::iter::empty::<(&str, &str)>(),
+            ),
+        )
+        .unwrap();
+        assert!(options.agent_credentials.is_empty());
+        assert_eq!(
+            resolve_env_passthrough(&options),
+            [(
+                "ANTHROPIC_API_KEY".into(),
+                "test-secret-caller-provider".into()
+            )]
         );
-        let after = chrono::Utc::now();
-        assert_eq!(handles.len(), 1);
-        assert!((before..=after).contains(&handles[0].started_at));
     }
 }

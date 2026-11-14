@@ -6,16 +6,19 @@
 //! (mutually-exclusive flags, type errors, implications), and returns a typed
 //! [`BuiltCommand`] enum containing the constructed `*Command` struct.
 
+use crate::command::commands::link::{LinkCommand, LinkFrontend};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
 use crate::command::commands::agents::{AgentsCommand, AgentsCommandFrontend};
-use crate::command::commands::api_server::{ApiServerCommand, ApiServerCommandFrontend};
+use crate::command::commands::attach::{AttachCommand, AttachCommandFrontend};
 use crate::command::commands::chat::{ChatCommand, ChatCommandFrontend};
 use crate::command::commands::clean::{CleanCommand, CleanCommandFrontend};
 use crate::command::commands::config::{ConfigCommand, ConfigCommandFrontend};
+use crate::command::commands::daemon::api::{DaemonApiCommand, DaemonApiCommandFrontend};
+use crate::command::commands::daemon::lifecycle::{DaemonCommand, DaemonCommandFrontend};
 use crate::command::commands::exec_prompt::{ExecPromptCommand, ExecPromptCommandFrontend};
 use crate::command::commands::exec_workflow::{ExecWorkflowCommand, ExecWorkflowCommandFrontend};
 use crate::command::commands::init::{InitCommand, InitCommandFrontend};
@@ -27,7 +30,8 @@ use crate::command::commands::squad::attach::{SquadAttachCommand, SquadAttachFro
 use crate::command::commands::squad::commands::{SquadCommand, SquadCommandFrontend};
 use crate::command::commands::squad::gateway::TaskGateway;
 use crate::command::commands::squad::runtime_guard::require_container_tier;
-use crate::command::commands::squad::supervisor::SquadGatewayResolver;
+use crate::command::commands::squad::supervisor::DaemonResolver;
+use crate::command::commands::worker::WorkerLinkCommand;
 use crate::command::commands::Command;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind, GatewayNeed};
 use crate::command::error::CommandError;
@@ -37,6 +41,7 @@ use crate::data::session::Session;
 pub mod build;
 pub mod catalogue;
 pub mod engines;
+pub mod ephemeral_secrets;
 pub mod frontend_action;
 pub mod outcomes;
 pub mod parsed_input;
@@ -51,12 +56,75 @@ pub use parsed_input::ParsedCommandBoxInput;
 pub use resolved::{BuildContext, CallerContext, ResolvedArgs, ResolvedFlags};
 pub use runtime_context::RuntimeContext;
 
+/// Presentation facts supplied by a CLI. Backend selection and the wire
+/// conversation remain in Dispatch; the adapter only renders their results.
+#[derive(Debug, Clone, Copy)]
+pub struct CliRelayFacts {
+    pub stdin_is_tty: bool,
+    pub stdout_is_tty: bool,
+    pub term_size: crate::data::frontend_protocol::TermSize,
+}
+
+/// CLI completion without losing a remote command's exit code or outcome.
+pub enum CliCompletion {
+    Local(Box<Result<CommandOutcome, CommandError>>),
+    Relayed(crate::data::frontend_protocol::CommandResultWire),
+}
+
+impl CliCompletion {
+    fn local(result: Result<CommandOutcome, CommandError>) -> Self {
+        Self::Local(Box::new(result))
+    }
+}
+
+/// The rendering half of a CLI relay. No daemon discovery, command parsing,
+/// admission or fallback policy is implemented by this trait's adapters.
+pub trait CliRelayFrontend: UserMessageSink + Send + Sync + 'static {
+    fn relay_bytes(&mut self, stream: crate::data::frontend_protocol::OutputStream, bytes: &[u8]);
+    fn relay_facts(&self) -> CliRelayFacts;
+    fn relay_notice(&mut self, text: &str);
+    fn relay_output(
+        &mut self,
+        stream: crate::data::frontend_protocol::OutputStream,
+        message: crate::data::message::UserMessage,
+    );
+    fn relay_dialog(
+        &mut self,
+        request: crate::data::dialog::DialogRequest,
+        interrupted: &tokio_util::sync::CancellationToken,
+    ) -> crate::data::dialog::DialogResponse;
+}
+
 // ─── CommandFrontend trait ──────────────────────────────────────────────────
 
 /// Frontend trait that supplies flag values to Dispatch. Extended by per-
 /// command frontend traits (e.g. [`crate::command::commands::exec_workflow::ExecWorkflowCommandFrontend`])
 /// for command-specific Q&A and reporting.
 pub trait CommandFrontend: UserMessageSink + Send + Sync {
+    fn pick_queue_item(
+        &mut self,
+        _items: &[crate::command::daemon_api::worker_pull::QueueRow],
+    ) -> Result<Option<String>, CommandError> {
+        Err(CommandError::Other(
+            "this frontend has no queue picker".into(),
+        ))
+    }
+    fn confirm_queue_checkout(
+        &mut self,
+        _prompt: &crate::data::prompt::Prompt<crate::command::worker::queue_source::CheckoutChoice>,
+    ) -> crate::command::worker::queue_source::CheckoutChoice {
+        crate::command::worker::queue_source::CheckoutChoice::FreshClone
+    }
+    fn bind_worker_run(
+        &mut self,
+        _input: ParsedCommandBoxInput,
+        _events: crate::command::commands::api_server::event_bus::EventBusSender,
+        _writer: crate::data::fs::api_command_log::CommandStateWriter,
+    ) -> Result<(), CommandError> {
+        Err(CommandError::Other(
+            "this frontend cannot host a worker run".into(),
+        ))
+    }
     /// Which frontend this is.
     ///
     /// The one fact about itself a frontend declares. Everything that used to
@@ -65,18 +133,36 @@ pub trait CommandFrontend: UserMessageSink + Send + Sync {
     /// (WI 0114 F-49). No default: a new frontend must say what it is.
     fn kind(&self) -> FrontendKind;
 
+    /// Policy resolved by Layer 2 for any frontend writer that presents agent
+    /// bytes on a host terminal.
+    fn set_host_output_policy(&mut self, _policy: crate::data::terminal::HostOutputPolicy) {}
+
     /// Whether there is somewhere to read an answer from right now.
     ///
     /// The frontend reports the *fact*; Layer 2 applies the rule
-    /// ([`ResolvedFlags::is_non_interactive`]). For the CLI the fact is
+    /// ([`ResolvedFlags::is_headless`]). For the CLI the fact is
     /// whether stdin is a terminal, which only the CLI can see; for every
     /// other frontend it follows from the kind, which is why the default
     /// answers from [`FrontendKind::can_ask_a_human`].
     ///
     /// Before WI 0114 F-50 the rule itself lived in Layer 3, in
     /// `frontend::effective_non_interactive`, and each frontend re-applied it.
+    fn confirm_browser_link(&mut self) -> Result<bool, CommandError> {
+        Ok(false)
+    }
+
+    fn read_link_token(&mut self) -> Result<String, CommandError> {
+        Err(CommandError::Other("token input unavailable".into()))
+    }
+
     fn input_available(&self) -> bool {
         self.kind().can_ask_a_human()
+    }
+
+    /// Read one secret from stdin for a command that explicitly requested
+    /// `--token -`. Only the local CLI implements this input channel.
+    fn read_stdin_secret(&mut self) -> Result<String, CommandError> {
+        Err(CommandError::Other("--token - requires CLI stdin".into()))
     }
 
     fn flag_bool(&self, command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError>;
@@ -117,11 +203,14 @@ pub trait DispatchFrontend:
     + InitCommandFrontend
     + ReadyCommandFrontend
     + ChatCommandFrontend
+    + AttachCommandFrontend
     + AgentsCommandFrontend
     + ConfigCommandFrontend
     + ExecPromptCommandFrontend
     + ExecWorkflowCommandFrontend
-    + ApiServerCommandFrontend
+    + DaemonCommandFrontend
+    + DaemonApiCommandFrontend
+    + LinkFrontend
     + SquadCommandFrontend
     + SquadAttachFrontend
     + RemoteCommandFrontend
@@ -137,11 +226,14 @@ impl<T> DispatchFrontend for T where
         + InitCommandFrontend
         + ReadyCommandFrontend
         + ChatCommandFrontend
+        + AttachCommandFrontend
         + AgentsCommandFrontend
         + ConfigCommandFrontend
         + ExecPromptCommandFrontend
         + ExecWorkflowCommandFrontend
-        + ApiServerCommandFrontend
+        + DaemonCommandFrontend
+        + DaemonApiCommandFrontend
+        + LinkFrontend
         + SquadCommandFrontend
         + SquadAttachFrontend
         + RemoteCommandFrontend
@@ -158,15 +250,21 @@ impl<T> DispatchFrontend for T where
 /// There are deliberately no `Auth` or `Download` arms: neither command is in
 /// the catalogue, so neither is reachable, and WI 0114 F-35 deletes both.
 pub enum BuiltCommand {
+    Attach(AttachCommand),
     Init(InitCommand),
     Ready(ReadyCommand),
     Chat(ChatCommand),
     Specs(SpecsCommand),
     Agents(AgentsCommand),
     Config(ConfigCommand),
+    WorkerLink(WorkerLinkCommand),
+    Queue(crate::command::worker::pick::QueueCommand),
+    QueuePick(crate::command::worker::pick::QueuePickCommand),
     ExecPrompt(ExecPromptCommand),
     ExecWorkflow(ExecWorkflowCommand),
-    ApiServer(ApiServerCommand),
+    Daemon(DaemonCommand),
+    DaemonApi(DaemonApiCommand),
+    Link(LinkCommand),
     Squad(SquadCommand),
     SquadAttach(SquadAttachCommand),
     Remote(RemoteCommand),
@@ -211,14 +309,25 @@ pub struct Dispatch<F: CommandFrontend> {
     cancel: tokio_util::sync::CancellationToken,
     /// Handed to the built command through `BuildContext::output_dir`.
     output_dir: Option<std::path::PathBuf>,
+    picked_lease: Option<(
+        crate::command::worker::queue_source::SharedQueueSource,
+        crate::data::worker::queue::PickRun,
+    )>,
 }
 
 impl<F: CommandFrontend> Dispatch<F> {
-    pub fn new(frontend: F, session: Arc<RwLock<Session>>, engines: Engines) -> Self {
+    pub fn new(mut frontend: F, session: Arc<RwLock<Session>>, engines: Engines) -> Self {
         // The credential monitor is attached to `engines.agent_engine` when
         // the bundle is assembled (F-38); a disabled `authRefresh` leaves it
         // absent, making lease registration a no-op and preserving legacy
         // env-var delivery.
+        if let Ok(session) = session.try_read() {
+            frontend.set_host_output_policy(
+                crate::command::host_output::resolve_host_output_policy(
+                    &session.effective_config(),
+                ),
+            );
+        }
         Self {
             catalogue: CommandCatalogue::get(),
             frontend,
@@ -227,14 +336,31 @@ impl<F: CommandFrontend> Dispatch<F> {
             squad_gateway: None,
             cancel: tokio_util::sync::CancellationToken::new(),
             output_dir: None,
+            picked_lease: None,
         }
     }
 
-    /// Let an external cancel stop the dispatched command: `token` reaches
-    /// the command as `BuildContext::cancel`. The CLI, TUI and squad never
-    /// call this, so their commands see a token that never fires.
+    /// Scope values to this invocation's engine bundle, never to its Session.
+    pub fn with_command_secrets(
+        mut self,
+        secrets: Option<Arc<crate::data::secret::CommandSecrets>>,
+    ) -> Self {
+        self.engines.ephemeral_secrets = Arc::new(self.engines.ephemeral_secrets.scoped(secrets));
+        self
+    }
+
+    /// Let an external cancel stop the dispatched command.
     pub fn with_cancellation(mut self, token: tokio_util::sync::CancellationToken) -> Self {
         self.cancel = token;
+        self
+    }
+
+    pub fn with_picked_lease(
+        mut self,
+        source: crate::command::worker::queue_source::SharedQueueSource,
+        run: crate::data::worker::queue::PickRun,
+    ) -> Self {
+        self.picked_lease = Some((source, run));
         self
     }
 
@@ -298,7 +424,7 @@ impl<F: CommandFrontend> Dispatch<F> {
     /// Callers used to gate this on `path.first() == Some("squad")`, a
     /// command-name fact restated in Layer 3 (WI 0114 F-15). `gateway_need`
     /// is the same fact where the catalogue can maintain it.
-    pub fn with_squad_gateway(mut self, gateway: Arc<dyn TaskGateway>) -> Self {
+    pub fn with_task_gateway(mut self, gateway: Arc<dyn TaskGateway>) -> Self {
         self.squad_gateway = Some(gateway);
         self
     }
@@ -318,6 +444,34 @@ impl<F: CommandFrontend> Dispatch<F> {
         ResolvedFlags::resolve(&self.frontend, &canonical, spec)
     }
 
+    /// Apply this invocation's global `--set key=value` flags to the session
+    /// clone one command is built with.
+    ///
+    /// The CLI's `--set` is part of argv, so `main` already applied it to the
+    /// process session at startup. The TUI command box and API `args` carry a
+    /// `--set` per command: it changes that one command's session, never the
+    /// tab's or the server's.
+    fn apply_set_overrides(
+        &self,
+        path: &[&str],
+        session: &mut Session,
+    ) -> Result<(), CommandError> {
+        if self.frontend.kind() == FrontendKind::Cli {
+            return Ok(());
+        }
+        let set = self.frontend.flag_strings(path, catalogue::SET_FLAG)?;
+        if set.is_empty() {
+            return Ok(());
+        }
+        let overrides = crate::data::config::overrides::ConfigOverrides::parse_set_args(&set)
+            .map_err(|e| CommandError::InvalidFlagValue {
+                command: path.iter().map(|p| (*p).to_string()).collect(),
+                flag: catalogue::SET_FLAG.into(),
+                reason: e.to_string(),
+            })?;
+        session.add_overrides(overrides).map_err(CommandError::from)
+    }
+
     /// Read flags from the frontend and construct the typed `*Command`. No
     /// engine work happens at this point — the command is "ready to run".
     ///
@@ -333,12 +487,17 @@ impl<F: CommandFrontend> Dispatch<F> {
         let args = ResolvedArgs::resolve(&self.frontend, &canonical, spec.arguments)?;
         // Read the session from the shared state so every command operates
         // in the correct working directory (tab-specific in the TUI).
-        let session = self
+        let mut session = self
             .session
             .try_read()
             .map_err(|_| CommandError::Other("session is write-locked".into()))?
             .clone();
+        self.apply_set_overrides(&canonical, &mut session)?;
         let ctx = BuildContext {
+            remote_target: self.frontend.flag_string(&canonical, "remote")?,
+            set_args: crate::data::config::overrides::forwardable_set_args(
+                &self.frontend.flag_strings(&canonical, "set")?,
+            ),
             flags: &flags,
             args: &args,
             engines: &self.engines,
@@ -354,6 +513,7 @@ impl<F: CommandFrontend> Dispatch<F> {
             caller: CallerContext::new(&canonical, self.frontend.kind()),
             cancel: self.cancel.clone(),
             output_dir: self.output_dir.clone(),
+            command_secrets: self.engines.command_secrets(),
         };
         (spec.build)(&ctx)
     }
@@ -392,6 +552,10 @@ impl<F: CommandFrontend> Dispatch<F> {
         context_flags.squad_prerequisites = !with_check;
         session.set_flags(context_flags);
         let ctx = BuildContext {
+            remote_target: self.frontend.flag_string(&canonical, "remote")?,
+            set_args: crate::data::config::overrides::forwardable_set_args(
+                &self.frontend.flag_strings(&canonical, "set")?,
+            ),
             flags: &flags,
             args: &args,
             engines: &self.engines,
@@ -401,6 +565,7 @@ impl<F: CommandFrontend> Dispatch<F> {
             caller: CallerContext::new(&canonical, self.frontend.kind()),
             cancel: self.cancel.clone(),
             output_dir: self.output_dir.clone(),
+            command_secrets: self.engines.command_secrets(),
         };
         let parsed = prerequisites::parse_prerequisite_flags(&ctx, with_check)?;
         prerequisites::check_flag_widening(
@@ -451,8 +616,16 @@ impl<F: CommandFrontend> Dispatch<F> {
         let Ok(session) = self.session.try_read() else {
             return LaunchDisplay::unknown();
         };
+        // The TUI draws this before the command future starts. Use the same
+        // fresh files and per-command overrides that run_command will use.
+        let mut preview = session.clone();
+        if preview.reload_config().is_err()
+            || self.apply_set_overrides(&canonical, &mut preview).is_err()
+        {
+            return LaunchDisplay::unknown();
+        }
         let agent_flag = spec.find_flag("agent").and_then(|_| flags.string("agent"));
-        let agent_display_name = crate::command::commands::LaunchPolicy::for_session(&session)
+        let agent_display_name = crate::command::commands::LaunchPolicy::for_session(&preview)
             .resolve_agent(&agent_flag)
             .map(|name| name.into_string())
             .unwrap_or_else(|_| agent_flag.unwrap_or_default());
@@ -492,20 +665,9 @@ impl<F: DispatchFrontend> Dispatch<F> {
         if spec.gateway_need == GatewayNeed::None || self.squad_gateway.is_some() {
             return Ok(());
         }
-        // The live process environment, not the session's startup snapshot: a
-        // key minted earlier in this process is published into the former (see
-        // `SquadSupervisor`), and the snapshot predates it.
-        let resolver =
-            SquadGatewayResolver::from_env(&crate::data::config::env::Env::from_process())?;
-        let gateway = resolver.gateway_for(spec.gateway_need).await?;
-        // The only moment the plaintext key exists outside the daemon's hash
-        // file. A frontend that cannot show it drops it (see the trait's
-        // default), which is why this is offered before the command runs
-        // rather than folded into its output.
-        if let Some(setup) = resolver.take_key_setup() {
-            self.frontend.show_key_setup(&setup);
-        }
-        self.squad_gateway = gateway;
+        let env = self.session.read().await.env().clone();
+        let resolver = DaemonResolver::from_env(&env)?;
+        self.squad_gateway = resolver.gateway_for(spec.gateway_need).await?;
         Ok(())
     }
 
@@ -516,9 +678,32 @@ impl<F: DispatchFrontend> Dispatch<F> {
     /// (WI 0113 F-04): the runtime-tier guard, and squad gateway resolution.
     /// Running is then one call through the [`Command`] trait.
     pub async fn run_command(mut self, path: &[&str]) -> Result<CommandOutcome, CommandError> {
+        // Sessions outlive commands in the TUI and API. Read every config
+        // file again before admission or construction so this invocation uses
+        // edits made since the session was opened or its previous command.
+        {
+            let mut session = self.session.write().await;
+            if let Err(error) = session.reload_config() {
+                session.state_mut().fail_command(error.to_string());
+                return Err(error.into());
+            }
+        }
         self.admit(path).await?;
         let session = Arc::clone(&self.session);
-        let built = self.build_command(path)?;
+        let built = if let Some((source, run)) = self.picked_lease.take() {
+            BuiltCommand::QueuePick(
+                crate::command::worker::pick::QueuePickCommand::new(
+                    session.read().await.clone(),
+                    self.engines.clone(),
+                    None,
+                    None,
+                    false,
+                )
+                .prepared(source, run, self.cancel.clone()),
+            )
+        } else {
+            self.build_command(path)?
+        };
 
         // Decision Q3: `SessionState` is the ruling record of what a session
         // is doing, and Layer 2 is what writes it. Every frontend that runs a
@@ -551,6 +736,447 @@ impl<F: DispatchFrontend> Dispatch<F> {
         outcome_guard.disarm();
 
         result
+    }
+}
+
+impl<F: DispatchFrontend + CliRelayFrontend> Dispatch<F> {
+    /// Execute a CLI invocation using the backend chosen by the hand-off.
+    /// `argv` is the invoking argv, including argv[0]. Only catalogue entries
+    /// explicitly admitting a CLI relay can discover or start a daemon.
+    pub async fn run_relayed(
+        mut self,
+        path: &[&str],
+        argv: Vec<String>,
+    ) -> Result<CliCompletion, crate::command::engine_handoff::HandoffError> {
+        use crate::command::engine_handoff::{BackendSelection, EngineHandoff};
+        use crate::command::integrations::IntegrationRegistry;
+
+        if !self.catalogue.is_relay_allowed(path) {
+            return Ok(CliCompletion::local(self.run_command(path).await));
+        }
+        {
+            let mut session = self.session.write().await;
+            if let Err(error) = session.reload_config() {
+                session.state_mut().fail_command(error.to_string());
+                return Ok(CliCompletion::local(Err(error.into())));
+            }
+        }
+        let (env, config) = {
+            let session = self.session.read().await;
+            (session.env().clone(), session.effective_config())
+        };
+        let handoff = EngineHandoff::new(
+            env.clone(),
+            config.clone(),
+            IntegrationRegistry::compiled_in(),
+            Arc::new(CliHandoffPrompter),
+        )
+        .resolve()
+        .await;
+        let handoff = match handoff {
+            Ok(handoff) => handoff,
+            Err(error) if config.tui_backend() == crate::data::config::tui::TuiBackend::Auto => {
+                self.frontend
+                    .relay_notice(&error.message.replace(['\r', '\n'], " "));
+                return Ok(CliCompletion::local(self.run_command(path).await));
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(notice) = &handoff.notice {
+            self.frontend
+                .relay_notice(&notice.replace(['\r', '\n'], " "));
+        }
+        let BackendSelection::Daemon { endpoint, .. } = handoff.selection else {
+            return Ok(CliCompletion::local(self.run_command(path).await));
+        };
+        let facts = self.frontend.relay_facts();
+        let hello = crate::data::frontend_protocol::Hello {
+            protocol: crate::data::frontend_protocol::FRONTEND_SUBPROTOCOL.into(),
+            build: env!("CARGO_PKG_VERSION").into(),
+            kind: crate::data::frontend_protocol::FrontendKindWire::Cli,
+            role: crate::data::frontend_protocol::FrontendRole::Primary,
+            annotations: handoff.annotations,
+            cwd: env.cwd().to_path_buf(),
+            argv: argv.clone(),
+            env: env.to_hello_env(),
+            term_size: facts.term_size,
+            stdin_is_tty: facts.stdin_is_tty,
+            stdout_is_tty: facts.stdout_is_tty,
+            view: None,
+            resume: None,
+            launch_context: None,
+        };
+        // No command has been submitted yet. A failure here can safely take
+        // auto's builtin branch. After Submit, a failure must be reported.
+        let connected = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            CliRelayConnection::open(&endpoint.address, hello),
+        )
+        .await
+        .map_err(|_| CliConnectError::from("the engine did not answer the CLI handshake"))
+        .and_then(|result| result);
+        let connection = match connected {
+            Ok(connection) => connection,
+            Err(error) => {
+                let notice = crate::command::engine_handoff::fallback_notice(&error.message);
+                if config.tui_backend() == crate::data::config::tui::TuiBackend::Auto {
+                    self.frontend
+                        .relay_notice(&notice.replace(['\r', '\n'], " "));
+                    return Ok(CliCompletion::local(self.run_command(path).await));
+                }
+                return Err(crate::command::engine_handoff::HandoffError {
+                    message: notice,
+                    exit_code: error.exit_code,
+                });
+            }
+        };
+        // Reconstruct the canonical argv from the frontend's already parsed
+        // invocation. Global flags before the subcommand, aliases and values
+        // containing spaces are handled by the catalogue, never by Layer 3.
+        let args = self
+            .relay_argv(path)
+            .map_err(|error| cli_relay_failure(error.to_string()))?;
+        connection
+            .run(self.frontend, args, facts.term_size)
+            .await
+            .map(CliCompletion::Relayed)
+            .map_err(cli_relay_failure)
+    }
+}
+
+impl<F: CommandFrontend> Dispatch<F> {
+    fn relay_argv(&self, path: &[&str]) -> Result<Vec<String>, CommandError> {
+        use crate::command::dispatch::projections::raw_args::ParsedFlag;
+        let canonical = self.catalogue.canonical_path(path);
+        let refs: Vec<&str> = canonical.to_vec();
+        let spec = self
+            .catalogue
+            .lookup(&refs)
+            .ok_or_else(|| CommandError::unknown_command(path))?;
+        let mut argv: Vec<String> = canonical.iter().map(|s| (*s).to_string()).collect();
+        let resolved = self.resolve_flags(path)?;
+        // Use the same typed extraction as command construction, preserving
+        // repeated values and not forwarding frontend default values.
+        let mut values = Vec::new();
+        for flag in spec.flags.iter().chain(self.catalogue.global_flags()) {
+            use catalogue::FlagKind;
+            let value = match flag.kind {
+                FlagKind::Bool if flag.long == "headless" => {
+                    resolved.bool(flag.long).then_some(ParsedFlag::Bool(true))
+                }
+                FlagKind::Bool => self
+                    .frontend
+                    .flag_bool(&refs, flag.long)?
+                    .filter(|v| *v)
+                    .map(ParsedFlag::Bool),
+                FlagKind::String | FlagKind::OptionalString | FlagKind::Enum(_) => self
+                    .frontend
+                    .flag_string(&refs, flag.long)?
+                    .map(ParsedFlag::Str),
+                FlagKind::VecString => {
+                    let list = self.frontend.flag_strings(&refs, flag.long)?;
+                    (!list.is_empty()).then_some(ParsedFlag::Strings(list))
+                }
+                FlagKind::Path | FlagKind::OptionalPath => self
+                    .frontend
+                    .flag_path(&refs, flag.long)?
+                    .map(ParsedFlag::Path),
+                FlagKind::U16 => self
+                    .frontend
+                    .flag_u16(&refs, flag.long)?
+                    .map(ParsedFlag::U16),
+                FlagKind::UsizeAtLeastOne => self
+                    .frontend
+                    .flag_usize(&refs, flag.long)?
+                    .map(ParsedFlag::Usize),
+            };
+            if let Some(value) = value {
+                let items = match value {
+                    ParsedFlag::Bool(_) => vec![],
+                    ParsedFlag::Strings(items) => items,
+                    ParsedFlag::Str(value) => vec![value],
+                    ParsedFlag::Path(value) => vec![value.to_string_lossy().into_owned()],
+                    ParsedFlag::U16(value) => vec![value.to_string()],
+                    ParsedFlag::Usize(value) => vec![value.to_string()],
+                };
+                if items.is_empty() {
+                    values.push(format!("--{}", flag.long));
+                } else {
+                    for value in items {
+                        values.push(format!("--{}={value}", flag.long));
+                    }
+                }
+            }
+        }
+        argv.extend(values);
+        // `--` preserves positional values that begin with a dash.
+        argv.push("--".into());
+        for argument in spec.arguments {
+            argv.extend(self.frontend.arguments(&refs, argument.name)?);
+        }
+        Ok(argv)
+    }
+}
+
+struct CliHandoffPrompter;
+
+#[async_trait::async_trait]
+impl crate::command::engine_handoff::HandoffPrompter for CliHandoffPrompter {
+    async fn confirm_daemon_restart(&self, _running_jobs: usize) -> bool {
+        // The hand-off's typed failure carries the restart advice and code 2.
+        false
+    }
+}
+
+fn cli_relay_failure(message: String) -> crate::command::engine_handoff::HandoffError {
+    crate::command::engine_handoff::HandoffError {
+        message,
+        exit_code: 1,
+    }
+}
+
+struct CliRelayConnection {
+    sender: crate::engine::remote::frontend_client::FrontendSender,
+    receiver: crate::engine::remote::frontend_client::FrontendReceiver,
+    tab_id: crate::data::ids::TabId,
+}
+
+struct CliConnectError {
+    message: String,
+    exit_code: u8,
+}
+
+impl From<String> for CliConnectError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            exit_code: 1,
+        }
+    }
+}
+
+impl From<&str> for CliConnectError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+enum CliRenderEvent {
+    Bytes(crate::data::frontend_protocol::OutputStream, Vec<u8>),
+    Output(
+        crate::data::frontend_protocol::OutputStream,
+        crate::data::message::UserMessage,
+    ),
+    Notice(String),
+    Dialog {
+        id: crate::data::ids::DialogId,
+        request: Box<crate::data::dialog::DialogRequest>,
+        interrupted: tokio_util::sync::CancellationToken,
+    },
+    Finish(tokio::sync::oneshot::Sender<()>),
+}
+
+fn cli_interrupt_repeat(last: &mut Option<std::time::Instant>) -> bool {
+    let now = std::time::Instant::now();
+    let repeat =
+        last.is_some_and(|last| now.duration_since(last) < std::time::Duration::from_secs(2));
+    *last = Some(now);
+    repeat
+}
+
+impl CliRelayConnection {
+    async fn open(
+        address: &std::path::Path,
+        hello: crate::data::frontend_protocol::Hello,
+    ) -> Result<Self, CliConnectError> {
+        use crate::data::frontend_protocol::{EngineFrame, FrontendFrame, SnapshotAssembler};
+        use crate::engine::remote::{frontend_client::FrontendStream, local::LocalClient};
+        let client = LocalClient::new(address.to_path_buf());
+        let response = client
+            .send(
+                "POST",
+                "/v1/engine/instances",
+                Some(&serde_json::json!({
+                    "kind": "cli", "annotations": hello.annotations,
+                })),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if response.status >= 400 {
+            return Err(response
+                .body
+                .get("error")
+                .and_then(|s| s.as_str())
+                .unwrap_or("the engine refused a CLI instance")
+                .to_string()
+                .into());
+        }
+        let id = response
+            .body
+            .get("id")
+            .and_then(|s| s.as_str())
+            .ok_or("the engine answered without an instance id")?
+            .parse::<crate::data::ids::InstanceId>()
+            .map_err(|e| e.to_string())?;
+        let (mut sender, mut receiver) = FrontendStream::connect_local(address, &id)
+            .await
+            .map_err(|e| e.to_string())?
+            .split();
+        sender
+            .send(&FrontendFrame::Hello(hello))
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut welcomed = false;
+        let mut assembler = SnapshotAssembler::default();
+        loop {
+            let (_, frame) = receiver
+                .next()
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("the engine closed the CLI handshake")?;
+            let snapshot = match frame {
+                EngineFrame::Welcome {
+                    protocol, build, ..
+                } => {
+                    if protocol != crate::data::frontend_protocol::FRONTEND_SUBPROTOCOL
+                        || build != env!("CARGO_PKG_VERSION")
+                    {
+                        return Err(CliConnectError {
+                            message: "the daemon version changed; restart it with `awman daemon stop`, or use `--set tui.backend=builtin`".into(),
+                            exit_code: crate::command::engine_handoff::EXIT_STALE_DAEMON,
+                        });
+                    }
+                    welcomed = true;
+                    None
+                }
+                EngineFrame::Snapshot(snapshot) if welcomed => Some(snapshot),
+                EngineFrame::SnapshotChunk { chunk, of, bytes } if welcomed => assembler
+                    .push(chunk, of, &bytes)
+                    .map_err(|e| e.to_string())?,
+                _ => return Err("the engine did not send a CLI welcome and snapshot".into()),
+            };
+            if let Some(snapshot) = snapshot {
+                let tab_id = snapshot
+                    .tabs
+                    .first()
+                    .ok_or("the engine opened no CLI tab")?
+                    .tab_id
+                    .clone();
+                return Ok(Self {
+                    sender,
+                    receiver,
+                    tab_id,
+                });
+            }
+        }
+    }
+
+    async fn run<F: CliRelayFrontend>(
+        mut self,
+        mut frontend: F,
+        args: Vec<String>,
+        pty_size: crate::data::frontend_protocol::TermSize,
+    ) -> Result<crate::data::frontend_protocol::CommandResultWire, String> {
+        use crate::data::frontend_protocol::{EngineFrame, FrontendFrame, SubmitInput};
+        use crate::data::message::UserMessage;
+        use tokio_util::sync::CancellationToken;
+        // Engine traits have synchronous input methods. Keep rendering on a
+        // separate thread so a prompt never prevents Cancel or DialogClosed
+        // from reaching the socket. Each prompt has its own interruption token.
+        let (render_tx, render_rx) = std::sync::mpsc::channel();
+        let (answer_tx, mut answer_rx) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::Builder::new()
+            .name("cli-relay-render".into())
+            .spawn(move || {
+                while let Ok(event) = render_rx.recv() {
+                    match event {
+                        CliRenderEvent::Bytes(stream, bytes) => {
+                            frontend.relay_bytes(stream, &bytes)
+                        }
+                        CliRenderEvent::Output(stream, message) => {
+                            frontend.relay_output(stream, message)
+                        }
+                        CliRenderEvent::Notice(text) => frontend.relay_notice(&text),
+                        CliRenderEvent::Dialog {
+                            id,
+                            request,
+                            interrupted,
+                        } => {
+                            let response = frontend.relay_dialog(*request, &interrupted);
+                            let _ = answer_tx.send((id, response));
+                        }
+                        CliRenderEvent::Finish(done) => {
+                            frontend.replay_queued();
+                            let _ = done.send(());
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        let lifetime = CancellationToken::new();
+        let _interrupt_on_drop = lifetime.clone().drop_guard();
+        let mut dialogs =
+            std::collections::HashMap::<crate::data::ids::DialogId, CancellationToken>::new();
+        self.sender
+            .send(&FrontendFrame::Submit {
+                tab_id: self.tab_id.clone(),
+                input: SubmitInput::Argv { args },
+                pty_size,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut last_interrupt = None;
+        loop {
+            tokio::select! {
+                signal = tokio::signal::ctrl_c() => {
+                    signal.map_err(|e| e.to_string())?;
+                    let repeat = cli_interrupt_repeat(&mut last_interrupt);
+                    self.sender.send(&FrontendFrame::Cancel {tab_id: self.tab_id.clone(), repeat}).await.map_err(|e| e.to_string())?;
+                    for (dialog_id, token) in dialogs.drain() {
+                        token.cancel();
+                        self.sender.send(&FrontendFrame::DialogResponse {dialog_id, response: crate::data::dialog::DialogResponse::Interrupted}).await.map_err(|e| e.to_string())?;
+                    }
+                }
+                answer = answer_rx.recv() => {
+                    let (dialog_id, response) = answer.ok_or("the CLI renderer stopped")?;
+                    if dialogs.remove(&dialog_id).is_some() {
+                        if response == crate::data::dialog::DialogResponse::Interrupted {
+                            let repeat = cli_interrupt_repeat(&mut last_interrupt);
+                            self.sender.send(&FrontendFrame::Cancel {tab_id: self.tab_id.clone(), repeat}).await.map_err(|e| e.to_string())?;
+                        }
+                        self.sender.send(&FrontendFrame::DialogResponse {dialog_id, response}).await.map_err(|e| e.to_string())?;
+                    }
+                }
+                frame = self.receiver.next() => {
+                    let (_, frame) = frame.map_err(|e| e.to_string())?.ok_or("the daemon disconnected before the command finished")?;
+                    match frame {
+                        EngineFrame::CommandOutput {tab_id, stream, level, text} if tab_id == self.tab_id => {let _ = render_tx.send(CliRenderEvent::Output(stream, UserMessage {level, text}));}
+                        EngineFrame::CommandBytes {tab_id, stream, bytes} if tab_id == self.tab_id => {let _ = render_tx.send(CliRenderEvent::Bytes(stream, bytes));}
+                        EngineFrame::Notice {text, ..} => {let _ = render_tx.send(CliRenderEvent::Notice(text));}
+                        EngineFrame::DialogRequest {dialog_id, tab_id, request} if tab_id == self.tab_id => {
+                            let interrupted = lifetime.child_token();
+                            if request.awaits_answer() {dialogs.insert(dialog_id.clone(), interrupted.clone());}
+                            let _ = render_tx.send(CliRenderEvent::Dialog {id: dialog_id, request: Box::new(request), interrupted});
+                        }
+                        EngineFrame::DialogClosed {dialog_id, ..} => {
+                            if let Some(token) = dialogs.remove(&dialog_id) {token.cancel();}
+                        }
+                        EngineFrame::CommandFinished {tab_id, result} if tab_id == self.tab_id => {
+                            lifetime.cancel();
+                            let (done, flushed) = tokio::sync::oneshot::channel();
+                            render_tx.send(CliRenderEvent::Finish(done)).map_err(|_| "the CLI renderer stopped")?;
+                            flushed.await.map_err(|_| "the CLI renderer stopped")?;
+                            let _ = self.sender.send(&FrontendFrame::Quit).await;
+                            self.sender.close().await;
+                            return Ok(result);
+                        }
+                        EngineFrame::Detach(reason) => return Err(format!("the engine detached the CLI: {}", reason.as_str())),
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -591,9 +1217,9 @@ impl UnfinishedCommandGuard {
     /// Byte-identical to the text the TUI used to compose for this case,
     /// including the pointer at the panic log — `PanicLog` is Layer 0, so
     /// naming it here crosses nothing.
-    fn unexpected_end_message() -> String {
-        let log =
-            crate::data::fs::PanicLog::from_env(&crate::data::config::env::Env::from_process());
+    /// The panic log is located from the session's own environment.
+    fn unexpected_end_message(env: &crate::data::config::env::EnvSnapshot) -> String {
+        let log = crate::data::fs::PanicLog::from_env(env);
         match log {
             Some(log) => format!(
                 "command task ended unexpectedly (likely a panic — see {})",
@@ -610,8 +1236,9 @@ impl Drop for UnfinishedCommandGuard {
             return;
         }
         if let Ok(mut guard) = self.session.try_write() {
+            let message = Self::unexpected_end_message(guard.env());
             let state = guard.state_mut();
-            state.fail_command(Self::unexpected_end_message());
+            state.fail_command(message);
             state.set_current_workflow(None);
         }
     }
@@ -626,6 +1253,10 @@ impl Drop for UnfinishedCommandGuard {
 macro_rules! run_built_command {
     ($built:expr, $frontend:expr, { $($variant:ident => $frontend_trait:path),* $(,)? }) => {
         match $built {
+            BuiltCommand::Queue(command) => command.list().await.map(CommandOutcome::Queue),
+            BuiltCommand::QueuePick(command) => Box::pin(command.run_with_frontend(
+                crate::command::worker::pick::DispatchQueueFrontend::new($frontend)
+            )).await.map(CommandOutcome::QueuePick),
             BuiltCommand::ExecWorkflow(command) => command
                 .run_with_frontend($frontend.into_exec_workflow_frontend())
                 .await
@@ -658,11 +1289,15 @@ impl BuiltCommand {
             Init => InitCommandFrontend,
             Ready => ReadyCommandFrontend,
             Chat => ChatCommandFrontend,
+            Attach => AttachCommandFrontend,
             Specs => SpecsCommandFrontend,
             Agents => AgentsCommandFrontend,
             Config => ConfigCommandFrontend,
+            WorkerLink => CommandFrontend,
             ExecPrompt => ExecPromptCommandFrontend,
-            ApiServer => ApiServerCommandFrontend,
+            Daemon => DaemonCommandFrontend,
+            DaemonApi => DaemonApiCommandFrontend,
+            Link => LinkFrontend,
             Squad => SquadCommandFrontend,
             SquadAttach => SquadAttachFrontend,
             Remote => RemoteCommandFrontend,
@@ -710,31 +1345,12 @@ pub(crate) fn parse_squad_agent_models(
     })
 }
 
-/// Convert the catalogue-validated launch-mode enum into the Layer 0 type.
-/// Keeping this conversion at the dispatch boundary means command wiring only
-/// ever sees a typed `LaunchMode`.
-pub(crate) fn parse_launch_mode(
-    raw: Option<String>,
-    command: &[&str],
-) -> Result<Option<crate::data::config::repo::LaunchMode>, CommandError> {
-    match raw.as_deref() {
-        None => Ok(None),
-        Some("stdio") => Ok(Some(crate::data::config::repo::LaunchMode::Stdio)),
-        Some("acp") => Ok(Some(crate::data::config::repo::LaunchMode::Acp)),
-        Some(value) => Err(CommandError::InvalidFlagValue {
-            command: command.iter().map(|part| (*part).to_string()).collect(),
-            flag: "launch-mode".into(),
-            reason: format!("unknown enum value {value:?}"),
-        }),
-    }
-}
-
 /// Typed `--on-dirty-merge-target`: `None` when not passed, so config and the
 /// host's headless default apply.
 pub(crate) fn parse_on_dirty_merge_target(
     raw: Option<String>,
     command: &[&str],
-) -> Result<Option<crate::data::config::repo::OnDirtyMergeTarget>, CommandError> {
+) -> Result<Option<crate::data::config::worktree::OnDirtyMergeTarget>, CommandError> {
     raw.map(|value| {
         value
             .parse()
@@ -751,7 +1367,7 @@ pub(crate) fn parse_on_dirty_merge_target(
 pub(crate) fn parse_on_merge_failure(
     raw: Option<String>,
     command: &[&str],
-) -> Result<Option<crate::data::config::repo::OnMergeFailure>, CommandError> {
+) -> Result<Option<crate::data::config::worktree::OnMergeFailure>, CommandError> {
     raw.map(|value| {
         value
             .parse()
@@ -800,7 +1416,7 @@ pub(crate) fn parse_agent_flags(
     if raw.is_empty() {
         return Ok(None);
     }
-    crate::data::config::repo::validate_agent_flag_values("--agent-flag", raw).map_err(|e| {
+    crate::data::config::agents::validate_agent_flag_values("--agent-flag", raw).map_err(|e| {
         CommandError::InvalidFlagValue {
             command: command.iter().map(|part| (*part).to_string()).collect(),
             flag: "agent-flag".into(),
@@ -808,1099 +1424,4 @@ pub(crate) fn parse_agent_flags(
         }
     })?;
     Ok(Some(raw.to_vec()))
-}
-
-#[cfg(all(test, unix))]
-mod builtin_launch_tests;
-
-#[cfg(all(test, unix))]
-mod session_worktree_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn on_existing_worktree_parses_all_choices_and_ask_as_unset() {
-        use crate::command::commands::worktree_lifecycle::ExistingWorktreeDecision as D;
-        let command = &["exec", "workflow"];
-        assert_eq!(parse_on_existing_worktree(None, command).unwrap(), None);
-        assert_eq!(
-            parse_on_existing_worktree(Some("ask".into()), command).unwrap(),
-            None
-        );
-        assert_eq!(
-            parse_on_existing_worktree(Some(" RESUME ".into()), command).unwrap(),
-            Some(D::Resume)
-        );
-        assert_eq!(
-            parse_on_existing_worktree(Some("Recreate".into()), command).unwrap(),
-            Some(D::Recreate)
-        );
-        assert_eq!(
-            parse_on_existing_worktree(Some("fail".into()), command).unwrap(),
-            Some(D::Fail)
-        );
-    }
-
-    /// Recording frontend used by Dispatch unit tests.
-    pub(super) struct FakeCommandFrontend {
-        pub bools: std::collections::HashMap<String, bool>,
-        pub strings: std::collections::HashMap<String, String>,
-        pub strings_vec: std::collections::HashMap<String, Vec<String>>,
-        pub paths: std::collections::HashMap<String, PathBuf>,
-        pub enums: std::collections::HashMap<String, String>,
-        pub u16s: std::collections::HashMap<String, u16>,
-        pub usizes: std::collections::HashMap<String, usize>,
-        pub args: std::collections::HashMap<String, String>,
-        pub args_vec: std::collections::HashMap<String, Vec<String>>,
-        /// What this fake reports for
-        /// [`CommandFrontend::input_available`]. `true` unless a test sets it.
-        pub input_available: bool,
-    }
-
-    impl FakeCommandFrontend {
-        pub fn new() -> Self {
-            Self {
-                bools: Default::default(),
-                strings: Default::default(),
-                strings_vec: Default::default(),
-                paths: Default::default(),
-                enums: Default::default(),
-                u16s: Default::default(),
-                usizes: Default::default(),
-                args: Default::default(),
-                args_vec: Default::default(),
-                input_available: true,
-            }
-        }
-
-        /// A caller with nowhere to read an answer from — a pipe, a CI job.
-        pub fn without_input(mut self) -> Self {
-            self.input_available = false;
-            self
-        }
-    }
-
-    impl crate::data::message::UserMessageSink for FakeCommandFrontend {
-        fn write_message(&mut self, _msg: crate::data::message::UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-
-    impl CommandFrontend for FakeCommandFrontend {
-        fn kind(&self) -> FrontendKind {
-            FrontendKind::Cli
-        }
-        fn input_available(&self) -> bool {
-            self.input_available
-        }
-        fn flag_bool(&self, _p: &[&str], flag: &str) -> Result<Option<bool>, CommandError> {
-            Ok(self.bools.get(flag).copied())
-        }
-        fn flag_string(&self, _p: &[&str], flag: &str) -> Result<Option<String>, CommandError> {
-            Ok(self.strings.get(flag).cloned())
-        }
-        fn flag_strings(&self, _p: &[&str], flag: &str) -> Result<Vec<String>, CommandError> {
-            Ok(self.strings_vec.get(flag).cloned().unwrap_or_default())
-        }
-        fn flag_path(&self, _p: &[&str], flag: &str) -> Result<Option<PathBuf>, CommandError> {
-            Ok(self.paths.get(flag).cloned())
-        }
-        fn flag_enum(&self, _p: &[&str], flag: &str) -> Result<Option<String>, CommandError> {
-            Ok(self.enums.get(flag).cloned())
-        }
-        fn flag_u16(&self, _p: &[&str], flag: &str) -> Result<Option<u16>, CommandError> {
-            Ok(self.u16s.get(flag).copied())
-        }
-        fn flag_usize(&self, _p: &[&str], flag: &str) -> Result<Option<usize>, CommandError> {
-            Ok(self.usizes.get(flag).copied())
-        }
-        fn argument(&self, _p: &[&str], name: &str) -> Result<Option<String>, CommandError> {
-            Ok(self.args.get(name).cloned())
-        }
-        fn arguments(&self, _p: &[&str], name: &str) -> Result<Vec<String>, CommandError> {
-            Ok(self.args_vec.get(name).cloned().unwrap_or_default())
-        }
-    }
-
-    /// `Dispatch` takes a shared session, so this wraps the shared fixture
-    /// rather than re-spelling `Session::open`.
-    fn make_session() -> Arc<RwLock<Session>> {
-        let tmp = tempfile::tempdir().unwrap();
-        Arc::new(RwLock::new(Session::for_tests(tmp.path())))
-    }
-
-    /// Who the caller is comes from the frontend's declared kind, once, at
-    /// construction — not from a per-frontend `is_local_user_session`
-    /// override (F-49).
-    #[test]
-    fn the_caller_context_records_the_frontend_and_whether_a_user_is_there() {
-        use crate::command::dispatch::catalogue::FrontendKind;
-        use crate::command::dispatch::resolved::CallerContext;
-
-        for (kind, local) in [
-            (FrontendKind::Cli, true),
-            (FrontendKind::Tui, true),
-            (FrontendKind::Api, false),
-        ] {
-            let caller = CallerContext::new(&["squad", "add"], kind);
-            assert_eq!(caller.frontend(), kind);
-            assert_eq!(caller.local_user(), local, "local_user for {kind:?}");
-            assert_eq!(caller.leaf(), "add");
-        }
-    }
-
-    /// A command that unwinds still leaves the session with a recorded
-    /// outcome, so no frontend has to write one (decision Q3, F-22).
-    ///
-    /// Driven through the guard directly rather than by panicking a real
-    /// command: what is under test is that dropping an armed guard records
-    /// the failure, which is exactly what the unwind does to it.
-    #[test]
-    fn an_unfinished_command_is_recorded_as_failed_on_the_session() {
-        use crate::data::session::InvocationStatus;
-
-        let session = make_session();
-        {
-            let mut guard = session.try_write().unwrap();
-            guard
-                .state_mut()
-                .begin_command("exec workflow".to_string(), Vec::new());
-        }
-
-        drop(UnfinishedCommandGuard::arm(Arc::clone(&session)));
-
-        let guard = session.try_read().unwrap();
-        let command = guard
-            .state()
-            .current_command
-            .as_ref()
-            .expect("the command is still recorded");
-        match &command.status {
-            InvocationStatus::Error(message) => assert!(
-                message.contains("ended unexpectedly"),
-                "unexpected message: {message}"
-            ),
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    /// A command that records its own outcome disarms the guard, so the guard
-    /// never overwrites it.
-    #[test]
-    fn a_disarmed_guard_leaves_the_recorded_outcome_alone() {
-        use crate::data::session::InvocationStatus;
-
-        let session = make_session();
-        {
-            let mut guard = session.try_write().unwrap();
-            let state = guard.state_mut();
-            state.begin_command("agents".to_string(), Vec::new());
-            state.finish_command(0);
-        }
-
-        let mut armed = UnfinishedCommandGuard::arm(Arc::clone(&session));
-        armed.disarm();
-        drop(armed);
-
-        let guard = session.try_read().unwrap();
-        let command = guard.state().current_command.as_ref().unwrap();
-        assert!(matches!(command.status, InvocationStatus::Done));
-        assert_eq!(command.exit_code, Some(0));
-    }
-
-    #[test]
-    fn build_agents_status_command_with_no_flags() {
-        let dispatch = Dispatch::new(
-            FakeCommandFrontend::new(),
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let built = dispatch.build_command(&["agents", "status"]).unwrap();
-        match built {
-            BuiltCommand::Agents(AgentsCommand::Status(_)) => {}
-            _ => panic!("expected agents status"),
-        }
-    }
-
-    #[test]
-    fn build_bare_squad_uses_the_status_subcommand() {
-        let dispatch = Dispatch::new(
-            FakeCommandFrontend::new(),
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let built = dispatch.build_command(&["squad"]).unwrap();
-        match built {
-            BuiltCommand::Squad(command) => assert!(matches!(
-                command.subcommand(),
-                crate::command::commands::squad::commands::SquadSubcommand::Status(_)
-            )),
-            _ => panic!("expected Squad"),
-        }
-    }
-
-    #[test]
-    fn build_unknown_command_returns_unknown_command_error() {
-        let dispatch = Dispatch::new(
-            FakeCommandFrontend::new(),
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let result = dispatch.build_command(&["bogus"]);
-        match result {
-            Err(CommandError::UnknownCommand { .. }) => {}
-            Err(other) => panic!("expected UnknownCommand, got {other:?}"),
-            Ok(_) => panic!("expected error"),
-        }
-    }
-
-    #[test]
-    fn build_specs_amend_missing_argument_errors() {
-        let dispatch = Dispatch::new(
-            FakeCommandFrontend::new(),
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let result = dispatch.build_command(&["specs", "amend"]);
-        match result {
-            Err(CommandError::MissingRequiredArgument { .. }) => {}
-            Err(other) => panic!("expected MissingRequiredArgument, got {other:?}"),
-            Ok(_) => panic!("expected error"),
-        }
-    }
-
-    #[test]
-    fn build_chat_with_yolo_and_plan_returns_mutually_exclusive() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.bools.insert("yolo".into(), true);
-        frontend.bools.insert("plan".into(), true);
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let result = dispatch.build_command(&["chat"]);
-        match result {
-            Err(CommandError::MutuallyExclusive { .. }) => {}
-            Err(other) => panic!("expected MutuallyExclusive, got {other:?}"),
-            Ok(_) => panic!("expected error"),
-        }
-    }
-
-    #[test]
-    fn ready_json_implies_non_interactive_in_built_command() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.bools.insert("json".into(), true);
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let built = dispatch.build_command(&["ready"]).unwrap();
-        match built {
-            BuiltCommand::Ready(cmd) => {
-                assert!(
-                    cmd.flags().non_interactive,
-                    "json should imply non_interactive"
-                );
-            }
-            _ => panic!("expected Ready"),
-        }
-    }
-
-    #[test]
-    fn exec_workflow_yolo_implies_worktree_in_built_command() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.bools.insert("yolo".into(), true);
-        frontend
-            .args
-            .insert("workflow".into(), "/tmp/wf.toml".into());
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let built = dispatch.build_command(&["exec", "workflow"]).unwrap();
-        match built {
-            BuiltCommand::ExecWorkflow(cmd) => {
-                assert!(
-                    cmd.flags().worktree,
-                    "yolo should imply worktree on exec workflow"
-                );
-            }
-            _ => panic!("expected ExecWorkflow"),
-        }
-    }
-
-    #[test]
-    fn exec_workflow_auto_implies_worktree_in_built_command() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.bools.insert("auto".into(), true);
-        frontend
-            .args
-            .insert("workflow".into(), "/tmp/wf.toml".into());
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let built = dispatch.build_command(&["exec", "workflow"]).unwrap();
-        match built {
-            BuiltCommand::ExecWorkflow(cmd) => {
-                assert!(
-                    cmd.flags().worktree,
-                    "auto should imply worktree on exec workflow"
-                );
-                assert!(cmd.flags().auto);
-            }
-            _ => panic!("expected ExecWorkflow"),
-        }
-    }
-
-    #[test]
-    fn build_config_show_succeeds_with_no_args() {
-        let dispatch = Dispatch::new(
-            FakeCommandFrontend::new(),
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let built = dispatch.build_command(&["config", "show"]).unwrap();
-        assert!(matches!(built, BuiltCommand::Config(_)));
-    }
-
-    /// A built config command keeps the once-per-repo state of the host's
-    /// bundle, so a notice is not repeated for each command the host runs.
-    #[test]
-    fn build_config_shares_the_bundles_notices_handle() {
-        let engines = Engines::for_tests(std::path::Path::new("/tmp"));
-        let notices = engines.config_notices.clone();
-        let dispatch = Dispatch::new(FakeCommandFrontend::new(), make_session(), engines);
-        let BuiltCommand::Config(command) = dispatch.build_command(&["config", "show"]).unwrap()
-        else {
-            panic!("expected Config");
-        };
-        assert!(Arc::ptr_eq(command.notices(), &notices));
-    }
-
-    #[test]
-    fn build_config_get_with_field_argument() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend
-            .args
-            .insert("field".into(), "terminal_scrollback_lines".into());
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let built = dispatch.build_command(&["config", "get"]).unwrap();
-        assert!(matches!(built, BuiltCommand::Config(_)));
-    }
-
-    #[test]
-    fn build_config_get_missing_field_returns_missing_required_argument() {
-        let dispatch = Dispatch::new(
-            FakeCommandFrontend::new(),
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let result = dispatch.build_command(&["config", "get"]);
-        assert!(
-            matches!(result, Err(CommandError::MissingRequiredArgument { .. })),
-            "missing field must return MissingRequiredArgument"
-        );
-    }
-
-    #[test]
-    fn build_new_workflow_with_format_flag() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.enums.insert("format".into(), "yaml".into());
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let built = dispatch.build_command(&["new", "workflow"]).unwrap();
-        assert!(matches!(built, BuiltCommand::New(_)));
-    }
-
-    #[test]
-    fn build_api_start_with_port() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.u16s.insert("port".into(), 1234);
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let built = dispatch.build_command(&["api", "start"]).unwrap();
-        assert!(matches!(built, BuiltCommand::ApiServer(_)));
-    }
-
-    #[test]
-    fn build_chat_default_flags_all_false() {
-        let dispatch = Dispatch::new(
-            FakeCommandFrontend::new(),
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let built = dispatch.build_command(&["chat"]).unwrap();
-        match built {
-            BuiltCommand::Chat(cmd) => {
-                let f = cmd.flags();
-                assert!(!f.yolo && !f.plan && !f.non_interactive && !f.allow_docker);
-            }
-            _ => panic!("expected Chat"),
-        }
-    }
-
-    #[test]
-    fn build_remote_exec_workflow_with_workflow_argument() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend
-            .args
-            .insert("workflow".into(), "/tmp/wf.toml".into());
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let built = dispatch
-            .build_command(&["remote", "exec", "workflow"])
-            .unwrap();
-        assert!(matches!(built, BuiltCommand::Remote(_)));
-    }
-
-    fn build_remote(
-        path: &[&str],
-        frontend: FakeCommandFrontend,
-    ) -> Result<crate::command::commands::remote::RemoteSubcommand, CommandError> {
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        match dispatch.build_command(path)? {
-            BuiltCommand::Remote(cmd) => Ok(cmd.subcommand().clone()),
-            _ => panic!("expected a remote command"),
-        }
-    }
-
-    /// Every `exec workflow` flag the user gives `remote exec workflow`
-    /// reaches the server, in a request body the server's own parser reads
-    /// back to the same values; transport flags stay on the client.
-    #[test]
-    fn remote_exec_workflow_forwards_every_exec_flag_to_the_server() {
-        use crate::command::commands::remote::RemoteSubcommand;
-        use crate::command::commands::remote_client::ExecArg;
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.args.insert("workflow".into(), "wf.toml".into());
-        frontend.bools.insert("auto".into(), true);
-        frontend.bools.insert("follow".into(), true);
-        frontend.strings.insert("session".into(), "abc".into());
-        frontend.strings.insert("model".into(), "opus".into());
-        frontend.strings.insert("issue".into(), "42".into());
-        frontend.strings.insert("agent".into(), "codex".into());
-        frontend
-            .strings_vec
-            .insert("agent-flag".into(), vec!["--search".into()]);
-        frontend
-            .enums
-            .insert("on-existing-worktree".into(), "resume".into());
-        let RemoteSubcommand::ExecWorkflow(flags) =
-            build_remote(&["remote", "exec", "workflow"], frontend).unwrap()
-        else {
-            panic!("expected exec workflow");
-        };
-        assert!(flags.follow);
-        assert_eq!(flags.session.as_deref(), Some("abc"));
-        assert!(
-            !flags
-                .forwarded
-                .iter()
-                .any(|a| a.contains("session") || a.contains("follow")),
-            "transport flags are not forwarded: {:?}",
-            flags.forwarded
-        );
-
-        let request = ExecArg::Workflow(Some("wf.toml".into())).into_request(&flags.forwarded);
-        assert_eq!(request.subcommand, "exec workflow");
-        let parsed = crate::command::dispatch::catalogue::CommandCatalogue::get()
-            .parse_raw_args(&["exec", "workflow"], &request.args)
-            .expect("the server parses what the client sends");
-        assert_eq!(parsed.argument("workflow").as_deref(), Some("wf.toml"));
-        assert_eq!(parsed.flag_bool("auto"), Some(true));
-        assert_eq!(parsed.flag_string("model").as_deref(), Some("opus"));
-        assert_eq!(parsed.flag_string("issue").as_deref(), Some("42"));
-        assert_eq!(parsed.flag_string("agent").as_deref(), Some("codex"));
-        assert_eq!(parsed.flag_strings("agent-flag"), vec!["--search"]);
-        assert_eq!(
-            parsed.flag_string("on-existing-worktree").as_deref(),
-            Some("resume")
-        );
-    }
-
-    /// The prompt is a greedy trailing argument on the server, so flags must
-    /// precede it; they used to follow it and became part of the prompt.
-    #[test]
-    fn remote_exec_prompt_flags_reach_the_server_as_flags_not_prompt_text() {
-        use crate::command::commands::remote::RemoteSubcommand;
-        use crate::command::commands::remote_client::ExecArg;
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.args.insert("prompt".into(), "fix it".into());
-        frontend.bools.insert("yolo".into(), true);
-        frontend.strings.insert("agent".into(), "codex".into());
-        let RemoteSubcommand::ExecPrompt(flags) =
-            build_remote(&["remote", "exec", "prompt"], frontend).unwrap()
-        else {
-            panic!("expected exec prompt");
-        };
-        let request = ExecArg::Prompt(flags.prompt.clone()).into_request(&flags.forwarded);
-        let parsed = crate::command::dispatch::catalogue::CommandCatalogue::get()
-            .parse_raw_args(&["exec", "prompt"], &request.args)
-            .unwrap();
-        assert_eq!(parsed.arguments("prompt"), vec![flags.prompt.clone()]);
-        assert!(!flags.prompt.contains("--"), "{}", flags.prompt);
-        assert_eq!(parsed.flag_bool("yolo"), Some(true));
-        assert_eq!(parsed.flag_string("agent").as_deref(), Some("codex"));
-    }
-
-    #[test]
-    fn remote_exec_workflow_allows_dynamic_without_a_path_and_requires_one_otherwise() {
-        use crate::command::commands::remote::RemoteSubcommand;
-        use crate::command::commands::remote_client::ExecArg;
-        let err =
-            build_remote(&["remote", "exec", "workflow"], FakeCommandFrontend::new()).unwrap_err();
-        assert!(
-            matches!(err, CommandError::MissingRequiredArgument { ref argument, .. } if argument == "workflow"),
-            "{err:?}"
-        );
-
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.bools.insert("dynamic".into(), true);
-        let RemoteSubcommand::ExecWorkflow(flags) =
-            build_remote(&["remote", "exec", "workflow"], frontend).unwrap()
-        else {
-            panic!("expected exec workflow");
-        };
-        assert!(flags.workflow.is_none());
-        let request = ExecArg::Workflow(None).into_request(&flags.forwarded);
-        let parsed = crate::command::dispatch::catalogue::CommandCatalogue::get()
-            .parse_raw_args(&["exec", "workflow"], &request.args)
-            .unwrap();
-        assert_eq!(parsed.flag_bool("dynamic"), Some(true));
-        assert_eq!(parsed.argument("workflow"), None);
-    }
-
-    /// A flag the server cannot honour is not declared on `remote exec`, so
-    /// it is refused as an unknown flag instead of being accepted and dropped.
-    #[test]
-    fn remote_exec_refuses_json_instead_of_dropping_it() {
-        let catalogue = crate::command::dispatch::catalogue::CommandCatalogue::get();
-        let spec = catalogue.lookup(&["remote", "exec", "workflow"]).unwrap();
-        assert!(spec.find_flag("json").is_none());
-        let err = catalogue
-            .parse_raw_args(
-                &["remote", "exec", "workflow"],
-                &["--json".to_string(), "wf.toml".to_string()],
-            )
-            .unwrap_err();
-        assert!(
-            matches!(err, CommandError::UnknownFlag { ref flag, .. } if flag == "json"),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn build_remote_exec_prompt_with_prompt_argument() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.args.insert("prompt".into(), "hello".into());
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let built = dispatch
-            .build_command(&["remote", "exec", "prompt"])
-            .unwrap();
-        assert!(matches!(built, BuiltCommand::Remote(_)));
-    }
-
-    #[test]
-    fn build_exec_prompt_with_prompt_argument() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.args.insert("prompt".into(), "do something".into());
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let built = dispatch.build_command(&["exec", "prompt"]).unwrap();
-        assert!(matches!(built, BuiltCommand::ExecPrompt(_)));
-    }
-
-    #[test]
-    fn build_exec_prompt_with_empty_prompt_builds_ok_when_issue_may_provide_input() {
-        // A whitespace-only prompt is normalised to None at dispatch time;
-        // final validation (prompt-or-issue required) happens at run time.
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.args.insert("prompt".into(), "   ".into());
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let result = dispatch.build_command(&["exec", "prompt"]);
-        assert!(
-            result.is_ok(),
-            "whitespace prompt should build OK (validation deferred to runtime)"
-        );
-    }
-
-    #[test]
-    fn build_exec_workflow_missing_workflow_argument_returns_missing_required_argument() {
-        // workflow is required and neither flag nor positional arg is set
-        let dispatch = Dispatch::new(
-            FakeCommandFrontend::new(),
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let result = dispatch.build_command(&["exec", "workflow"]);
-        assert!(
-            matches!(result, Err(CommandError::MissingRequiredArgument { .. })),
-            "missing workflow must return MissingRequiredArgument"
-        );
-    }
-
-    #[test]
-    fn alias_wf_resolves_to_exec_workflow() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend
-            .args
-            .insert("workflow".into(), "/tmp/wf.toml".into());
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        // "wf" is a string alias under "exec"; dispatch should resolve it.
-        let built = dispatch.build_command(&["exec", "wf"]).unwrap();
-        assert!(
-            matches!(built, BuiltCommand::ExecWorkflow(_)),
-            "exec wf must dispatch to ExecWorkflow"
-        );
-    }
-
-    // ─── parse_command_box_input ──────────────────────────────────────────────
-
-    #[test]
-    fn parse_command_box_input_exec_workflow_with_yolo() {
-        let parsed = Dispatch::<FakeCommandFrontend>::parse_command_box_input(
-            "exec workflow my-workflow.toml --yolo",
-        )
-        .unwrap();
-        assert_eq!(parsed.path, vec!["exec", "workflow"]);
-        assert_eq!(parsed.args.flag_bool("yolo"), Some(true));
-        assert_eq!(
-            parsed.args.argument("workflow").as_deref(),
-            Some("my-workflow.toml")
-        );
-    }
-
-    #[test]
-    fn parse_command_box_input_rejects_unknown_top_level_command() {
-        let result = Dispatch::<FakeCommandFrontend>::parse_command_box_input("not-a-command");
-        assert!(
-            matches!(result, Err(CommandError::UnknownCommand { .. })),
-            "unknown command must return UnknownCommand, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn parse_command_box_input_rejects_unknown_flag() {
-        let result =
-            Dispatch::<FakeCommandFrontend>::parse_command_box_input("agents status --bogus");
-        assert!(
-            matches!(result, Err(CommandError::UnknownFlag { .. })),
-            "unknown flag must return UnknownFlag, got: {result:?}"
-        );
-    }
-
-    #[test]
-    fn parse_command_box_input_remote_exec_workflow() {
-        let parsed = Dispatch::<FakeCommandFrontend>::parse_command_box_input(
-            "remote exec workflow my-workflow.toml --follow",
-        )
-        .unwrap();
-        assert_eq!(parsed.path, vec!["remote", "exec", "workflow"]);
-        assert_eq!(
-            parsed.args.argument("workflow").as_deref(),
-            Some("my-workflow.toml")
-        );
-        assert_eq!(parsed.args.flag_bool("follow"), Some(true));
-    }
-
-    #[test]
-    fn parse_command_box_input_short_flag_non_interactive() {
-        let parsed = Dispatch::<FakeCommandFrontend>::parse_command_box_input("ready -n").unwrap();
-        assert_eq!(parsed.path, vec!["ready"]);
-        assert_eq!(parsed.args.flag_bool("non-interactive"), Some(true));
-    }
-
-    #[test]
-    fn exec_workflow_no_yolo_no_auto_worktree_false() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend
-            .args
-            .insert("workflow".into(), "/tmp/wf.toml".into());
-        // Neither yolo nor auto is set; worktree must not be implied.
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let built = dispatch.build_command(&["exec", "workflow"]).unwrap();
-        match built {
-            BuiltCommand::ExecWorkflow(cmd) => {
-                assert!(
-                    !cmd.flags().worktree,
-                    "worktree must be false when neither yolo nor auto is set"
-                );
-                assert!(!cmd.flags().yolo);
-                assert!(!cmd.flags().auto);
-            }
-            _ => panic!("expected ExecWorkflow"),
-        }
-    }
-
-    #[test]
-    fn exec_workflow_yolo_plus_explicit_worktree_true_stays_true() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.bools.insert("yolo".into(), true);
-        frontend.bools.insert("worktree".into(), true);
-        frontend
-            .args
-            .insert("workflow".into(), "/tmp/wf.toml".into());
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let built = dispatch.build_command(&["exec", "workflow"]).unwrap();
-        match built {
-            BuiltCommand::ExecWorkflow(cmd) => {
-                assert!(cmd.flags().yolo);
-                assert!(
-                    cmd.flags().worktree,
-                    "worktree must be true when both yolo and --worktree are set"
-                );
-            }
-            _ => panic!("expected ExecWorkflow"),
-        }
-    }
-
-    // ── Issue flag dispatch tests ─────────────────────────────────────────────
-
-    #[test]
-    fn build_exec_workflow_issue_flag_populates_issue_source() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend
-            .strings
-            .insert("issue".into(), "owner/repo#84".into());
-        frontend
-            .args
-            .insert("workflow".into(), "/tmp/wf.toml".into());
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let built = dispatch.build_command(&["exec", "workflow"]).unwrap();
-        match built {
-            BuiltCommand::ExecWorkflow(cmd) => {
-                assert_eq!(
-                    cmd.flags().issue_source.issue.as_deref(),
-                    Some("owner/repo#84"),
-                    "issue_source.issue must be populated from --issue flag"
-                );
-            }
-            _ => panic!("expected ExecWorkflow"),
-        }
-    }
-
-    #[test]
-    fn build_exec_workflow_issue_and_work_item_are_mutually_exclusive() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend
-            .strings
-            .insert("issue".into(), "owner/repo#84".into());
-        frontend
-            .strings
-            .insert("work-item".into(), "0084-my-item.md".into());
-        frontend
-            .args
-            .insert("workflow".into(), "/tmp/wf.toml".into());
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let result = dispatch.build_command(&["exec", "workflow"]);
-        match result {
-            Err(CommandError::MutuallyExclusive { .. }) => {}
-            Err(other) => panic!("expected MutuallyExclusive, got {other:?}"),
-            Ok(_) => panic!("expected error for mutually exclusive flags"),
-        }
-    }
-
-    #[test]
-    fn build_exec_prompt_issue_flag_populates_issue_source() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.strings.insert("issue".into(), "42".into());
-        // No positional prompt — that's ok at dispatch time (validated at runtime).
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let built = dispatch.build_command(&["exec", "prompt"]).unwrap();
-        match built {
-            BuiltCommand::ExecPrompt(cmd) => {
-                assert_eq!(
-                    cmd.flags().issue_source.issue.as_deref(),
-                    Some("42"),
-                    "issue_source.issue must be populated from --issue flag"
-                );
-            }
-            _ => panic!("expected ExecPrompt"),
-        }
-    }
-
-    #[test]
-    fn build_exec_prompt_issue_and_prompt_are_both_optional() {
-        // When only --issue is set (no positional prompt), build_command must succeed.
-        // The runtime check (at least one of prompt/issue) happens in run_with_frontend.
-        let mut frontend = FakeCommandFrontend::new();
-        frontend
-            .strings
-            .insert("issue".into(), "owner/repo#1".into());
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let result = dispatch.build_command(&["exec", "prompt"]);
-        assert!(
-            result.is_ok(),
-            "build_command must succeed when only --issue is set: {}",
-            result
-                .as_ref()
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_default()
-        );
-        match result.unwrap() {
-            BuiltCommand::ExecPrompt(cmd) => {
-                assert!(
-                    cmd.flags().prompt.is_none(),
-                    "prompt must be None when no positional argument is provided"
-                );
-                assert_eq!(
-                    cmd.flags().issue_source.issue.as_deref(),
-                    Some("owner/repo#1")
-                );
-            }
-            _ => panic!("expected ExecPrompt"),
-        }
-    }
-
-    // ─── WI-0092: Dynamic Workflows — dispatch layer tests ───────────────────
-
-    #[test]
-    fn exec_workflow_dynamic_without_path_builds_successfully() {
-        // --dynamic omits the positional workflow path; dispatch must not error.
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.bools.insert("dynamic".into(), true);
-        frontend.strings.insert("work-item".into(), "0042".into());
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let result = dispatch.build_command(&["exec", "workflow"]);
-        assert!(
-            result.is_ok(),
-            "--dynamic without workflow path must succeed at dispatch: {}",
-            result
-                .as_ref()
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_default()
-        );
-        match result.unwrap() {
-            BuiltCommand::ExecWorkflow(cmd) => {
-                assert!(cmd.flags().dynamic, "dynamic flag must be true");
-                assert!(
-                    cmd.flags().workflow.is_none(),
-                    "workflow path must be None for --dynamic"
-                );
-            }
-            _ => panic!("expected ExecWorkflow"),
-        }
-    }
-
-    #[test]
-    fn exec_workflow_dynamic_without_work_item_returns_error() {
-        // --dynamic requires --work-item; missing it must error at dispatch.
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.bools.insert("dynamic".into(), true);
-        // No work-item set.
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let result = dispatch.build_command(&["exec", "workflow"]);
-        match result {
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("--dynamic requires --work-item"),
-                    "error must name the missing flag, got: {msg}"
-                );
-            }
-            Ok(_) => panic!("--dynamic without --work-item must return an error"),
-        }
-    }
-
-    #[test]
-    fn exec_workflow_leader_without_dynamic_returns_error() {
-        // --leader is only valid with --dynamic.
-        let mut frontend = FakeCommandFrontend::new();
-        frontend
-            .strings
-            .insert("leader".into(), "claude::claude-opus-4-8".into());
-        frontend
-            .args
-            .insert("workflow".into(), "/tmp/wf.toml".into());
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let result = dispatch.build_command(&["exec", "workflow"]);
-        match result {
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("--leader is only valid with --dynamic"),
-                    "error must state the constraint, got: {msg}"
-                );
-            }
-            Ok(_) => panic!("--leader without --dynamic must return an error"),
-        }
-    }
-
-    #[test]
-    fn exec_workflow_dynamic_parses_leader_flag() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.bools.insert("dynamic".into(), true);
-        frontend.strings.insert("work-item".into(), "0042".into());
-        frontend
-            .strings
-            .insert("leader".into(), "claude::claude-opus-4-8".into());
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let result = dispatch.build_command(&["exec", "workflow"]);
-        assert!(
-            result.is_ok(),
-            "build must succeed: {}",
-            result
-                .as_ref()
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_default()
-        );
-        match result.unwrap() {
-            BuiltCommand::ExecWorkflow(cmd) => {
-                assert_eq!(
-                    cmd.flags().leader.as_deref(),
-                    Some("claude::claude-opus-4-8"),
-                    "leader flag must be preserved in ExecWorkflowCommandFlags"
-                );
-            }
-            _ => panic!("expected ExecWorkflow"),
-        }
-    }
-
-    #[test]
-    fn exec_workflow_dynamic_with_plan_returns_error() {
-        // --dynamic enforces yolo so --plan is incompatible.
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.bools.insert("dynamic".into(), true);
-        frontend.bools.insert("plan".into(), true);
-        frontend.strings.insert("work-item".into(), "0042".into());
-        let dispatch = Dispatch::new(
-            frontend,
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let result = dispatch.build_command(&["exec", "workflow"]);
-        match result {
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("--dynamic cannot be used with --plan"),
-                    "error must explain the conflict, got: {msg}"
-                );
-            }
-            Ok(_) => panic!("--dynamic --plan must return an error"),
-        }
-    }
-
-    #[test]
-    fn exec_workflow_static_without_path_returns_missing_required_argument() {
-        // Non-dynamic invocation still requires the positional workflow path.
-        let dispatch = Dispatch::new(
-            FakeCommandFrontend::new(),
-            make_session(),
-            Engines::for_tests(std::path::Path::new("/tmp")),
-        );
-        let result = dispatch.build_command(&["exec", "workflow"]);
-        assert!(
-            matches!(result, Err(CommandError::MissingRequiredArgument { .. })),
-            "static exec workflow without path must return MissingRequiredArgument"
-        );
-    }
-
-    #[test]
-    fn parse_agent_flags_absent_is_none_so_config_applies() {
-        assert_eq!(parse_agent_flags(&[], &["chat"]).unwrap(), None);
-    }
-
-    #[test]
-    fn parse_agent_flags_keeps_values_in_order() {
-        let raw = vec![
-            "--no-daemon".to_string(),
-            "--config".to_string(),
-            "a=b".to_string(),
-        ];
-        assert_eq!(parse_agent_flags(&raw, &["chat"]).unwrap(), Some(raw));
-    }
-
-    #[test]
-    fn parse_agent_flags_rejects_an_empty_entry() {
-        let raw = vec!["--no-daemon".to_string(), String::new()];
-        match parse_agent_flags(&raw, &["exec", "prompt"]).unwrap_err() {
-            CommandError::InvalidFlagValue { command, flag, .. } => {
-                assert_eq!(command, vec!["exec", "prompt"]);
-                assert_eq!(flag, "agent-flag");
-            }
-            other => panic!("expected InvalidFlagValue, got {other:?}"),
-        }
-    }
 }

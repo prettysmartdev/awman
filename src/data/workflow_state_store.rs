@@ -49,6 +49,40 @@ impl WorkflowStateStore {
         self.dir().join(filename)
     }
 
+    pub fn state_path_for_key(
+        &self,
+        key: Option<&str>,
+        workflow_name: &str,
+    ) -> Result<PathBuf, DataError> {
+        if let Some(key) = key {
+            crate::data::fs::workflow_dirs::validate_work_item_key(key)?;
+        }
+        let repo_hash = &sha256_hex(self.git_root.to_string_lossy().as_bytes())[..8];
+        let name = sanitize_name_for_filename(workflow_name);
+        let filename = match key {
+            Some(key) => format!("{repo_hash}-{key}-{name}.json"),
+            None => format!("{repo_hash}-{name}.json"),
+        };
+        Ok(self.dir().join(filename))
+    }
+
+    pub fn load_for_key(
+        &self,
+        key: Option<&str>,
+        workflow_name: &str,
+    ) -> Result<Option<WorkflowState>, DataError> {
+        Self::read_state_path(&self.state_path_for_key(key, workflow_name)?)
+    }
+
+    pub fn delete_for_key(&self, key: Option<&str>, workflow_name: &str) -> Result<(), DataError> {
+        let path = self.state_path_for_key(key, workflow_name)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(DataError::io(&path, e)),
+        }
+    }
+
     /// Load a workflow's state by name. Returns `Ok(None)` when no state file
     /// exists.
     pub fn load(
@@ -84,7 +118,11 @@ impl WorkflowStateStore {
     pub fn save(&self, state: &WorkflowState) -> Result<PathBuf, DataError> {
         let dir = self.dir();
         std::fs::create_dir_all(&dir).map_err(|e| DataError::io(&dir, e))?;
-        let path = self.state_path(state.work_item, &state.workflow_name);
+        let legacy_key = state.work_item.map(|n| format!("{n:04}"));
+        let path = self.state_path_for_key(
+            state.work_item_key.as_deref().or(legacy_key.as_deref()),
+            &state.workflow_name,
+        )?;
         let json = serde_json::to_string_pretty(state)
             .map_err(|e| DataError::ConfigSerialize { source: e })?;
         write_config_file_atomically(&path, &json)?;
@@ -100,249 +138,5 @@ impl WorkflowStateStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(DataError::io(&path, e)),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fresh_state(name: &str) -> WorkflowState {
-        WorkflowState::new(name.to_string(), &[], "hash".into(), None)
-    }
-
-    #[test]
-    fn save_load_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = WorkflowStateStore::at_git_root(tmp.path());
-        let s = fresh_state("wf");
-        store.save(&s).unwrap();
-        let loaded = store.load(None, "wf").unwrap().unwrap();
-        assert_eq!(loaded.workflow_name, "wf");
-    }
-
-    #[test]
-    fn load_missing_returns_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = WorkflowStateStore::at_git_root(tmp.path());
-        assert!(store.load(None, "nothing").unwrap().is_none());
-    }
-
-    #[test]
-    fn delete_missing_is_ok() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = WorkflowStateStore::at_git_root(tmp.path());
-        store.delete(None, "nothing").unwrap();
-    }
-
-    #[test]
-    fn state_path_without_work_item() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = WorkflowStateStore::at_git_root(tmp.path());
-        let path = store.state_path(None, "my-workflow");
-        let filename = path.file_name().unwrap().to_str().unwrap();
-        assert!(
-            filename.ends_with("-my-workflow.json"),
-            "filename={filename}"
-        );
-        assert!(
-            !filename.contains("-0"),
-            "should not have work_item segment: {filename}"
-        );
-    }
-
-    #[test]
-    fn state_path_with_work_item() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = WorkflowStateStore::at_git_root(tmp.path());
-        let path = store.state_path(Some(42), "implement");
-        let filename = path.file_name().unwrap().to_str().unwrap();
-        assert!(filename.contains("-0042-"), "filename={filename}");
-        assert!(filename.ends_with("-implement.json"), "filename={filename}");
-    }
-
-    #[test]
-    fn state_stored_in_workflows_dir_not_engine_state() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = WorkflowStateStore::at_git_root(tmp.path());
-        let s = fresh_state("wf");
-        let path = store.save(&s).unwrap();
-        let parent = path.parent().unwrap();
-        assert_eq!(
-            parent,
-            tmp.path().join(".awman").join("workflows"),
-            "state must be stored in .awman/workflows/, not a subdirectory"
-        );
-    }
-
-    #[test]
-    fn different_git_roots_produce_different_filenames() {
-        let tmp1 = tempfile::tempdir().unwrap();
-        let tmp2 = tempfile::tempdir().unwrap();
-        let store1 = WorkflowStateStore::at_git_root(tmp1.path());
-        let store2 = WorkflowStateStore::at_git_root(tmp2.path());
-        let name1 = store1.state_path(None, "wf");
-        let name2 = store2.state_path(None, "wf");
-        assert_ne!(
-            name1.file_name(),
-            name2.file_name(),
-            "different git roots should yield different filenames"
-        );
-    }
-
-    #[test]
-    fn save_load_with_work_item_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = WorkflowStateStore::at_git_root(tmp.path());
-        let mut s = fresh_state("implement");
-        s.work_item = Some(42);
-        store.save(&s).unwrap();
-        let loaded = store.load(Some(42), "implement").unwrap().unwrap();
-        assert_eq!(loaded.work_item, Some(42));
-        assert_eq!(loaded.workflow_name, "implement");
-    }
-
-    #[test]
-    fn save_with_path_unsafe_workflow_name_stays_flat_and_round_trips() {
-        // A dynamic leader can emit a title with slashes/spaces. The state
-        // file must land directly in .awman/workflows/ (not a nested dir)
-        // and load must resolve the same sanitized path.
-        let tmp = tempfile::tempdir().unwrap();
-        let store = WorkflowStateStore::at_git_root(tmp.path());
-        let name = "0008/issue-triage across Rust/TS/Python";
-        let mut s = fresh_state(name);
-        s.work_item = Some(8);
-
-        let path = store.save(&s).unwrap();
-        assert!(path.exists(), "state file should have been written");
-        assert_eq!(
-            path.parent().unwrap(),
-            tmp.path().join(".awman").join("workflows"),
-            "path-unsafe name must not create nested directories"
-        );
-        let filename = path.file_name().unwrap().to_str().unwrap();
-        assert!(!filename.contains('/'), "filename={filename}");
-
-        let loaded = store.load(Some(8), name).unwrap().unwrap();
-        assert_eq!(loaded.work_item, Some(8));
-        assert_eq!(
-            loaded.workflow_name, name,
-            "the raw name is preserved in state"
-        );
-    }
-
-    fn entries(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
-    }
-
-    #[test]
-    fn save_replaces_the_record_and_leaves_no_temp_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = WorkflowStateStore::at_git_root(tmp.path());
-        let mut s = fresh_state("wf");
-        let path = store.save(&s).unwrap();
-        s.workflow_hash = "new-hash".into();
-        assert_eq!(store.save(&s).unwrap(), path);
-        assert_eq!(
-            store.load(None, "wf").unwrap().unwrap().workflow_hash,
-            "new-hash"
-        );
-        assert_eq!(
-            entries(&store.dir()).len(),
-            1,
-            "{:?}",
-            entries(&store.dir())
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn failed_save_leaves_the_previous_checkpoint_readable() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let store = WorkflowStateStore::at_git_root(tmp.path());
-        let mut s = fresh_state("wf");
-        let path = store.save(&s).unwrap();
-        let before = std::fs::read_to_string(&path).unwrap();
-
-        let dir = store.dir();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-        s.workflow_hash = "other".into();
-        let result = store.save(&s);
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        assert!(result.is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
-        assert!(
-            store.load(None, "wf").unwrap().is_some(),
-            "resume still works"
-        );
-        assert_eq!(entries(&dir).len(), 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn save_keeps_the_mode_of_an_existing_record() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let store = WorkflowStateStore::at_git_root(tmp.path());
-        let s = fresh_state("wf");
-        let path = store.save(&s).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        store.save(&s).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o640);
-    }
-
-    /// A reader polling the checkpoint while another thread keeps replacing
-    /// it always parses a complete record — the old one or the new one, never
-    /// a truncated or half-written file. The two records differ in size so a
-    /// truncate-then-write save would be caught mid-write.
-    #[test]
-    fn a_concurrent_reader_always_sees_a_complete_old_or_new_record() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let store = WorkflowStateStore::at_git_root(tmp.path());
-        let small = fresh_state("wf");
-        let mut large = fresh_state("wf");
-        large.workflow_hash = "h".repeat(256 * 1024);
-        store.save(&small).unwrap();
-
-        let done = Arc::new(AtomicBool::new(false));
-        let reader = {
-            let done = Arc::clone(&done);
-            let store = WorkflowStateStore::at_git_root(tmp.path());
-            let (small_hash, large_hash) =
-                (small.workflow_hash.clone(), large.workflow_hash.clone());
-            std::thread::spawn(move || {
-                let mut reads = 0usize;
-                while !done.load(Ordering::Acquire) || reads == 0 {
-                    let state = store
-                        .load(None, "wf")
-                        .expect("every read parses a complete record")
-                        .expect("the record never disappears during replacement");
-                    assert!(
-                        state.workflow_hash == small_hash || state.workflow_hash == large_hash,
-                        "read a mixed record"
-                    );
-                    reads += 1;
-                }
-                reads
-            })
-        };
-        for i in 0..100 {
-            store
-                .save(if i % 2 == 0 { &large } else { &small })
-                .unwrap();
-        }
-        done.store(true, Ordering::Release);
-        assert!(reader.join().unwrap() > 0);
     }
 }

@@ -7,7 +7,7 @@
 //! interactive decisions that the catalogue requires.
 //!
 //! The full per-command rendering (dialog widgets, progress UIs, etc.) is
-//! handled by the TUI; the CLI uses safe non-interactive defaults for any
+//! handled by the TUI; the CLI uses safe headless defaults for any
 //! interactive Q&A when stdin is not a TTY.
 
 use std::path::{Path, PathBuf};
@@ -35,15 +35,17 @@ use crate::command::headless::HeadlessDefaults;
 /// Single CLI frontend struct. Implements every per-command frontend trait
 /// in `src/frontend/cli/per_command/`.
 pub struct CliFrontend {
+    pub(crate) worker_json: bool,
+    pub(crate) worker_events: Option<crate::command::worker::events::ForegroundRecorder>,
     pub(crate) matches: ArgMatches,
     /// Cached canonical command path (resolved via `command_path_from_matches`).
     pub(crate) command_path: Vec<String>,
     pub(crate) messages: CliUserMessageQueue,
-    /// Effective non-interactive mode: true when explicitly requested via
-    /// `--non-interactive` OR when stdin is not a TTY.
+    /// Effective headless mode: true when explicitly requested via
+    /// `--headless` OR when stdin is not a TTY.
     pub(crate) non_interactive: bool,
     /// Every answer the CLI gives when it reaches a question it cannot ask —
-    /// stdin is not a TTY, or `--non-interactive` was passed. See
+    /// stdin is not a TTY, or `--headless` was passed. See
     /// `src/command/headless.rs` for the table and why the CLI's row differs
     /// from the API's and squad's.
     pub(crate) headless: HeadlessDefaults,
@@ -55,6 +57,11 @@ pub struct CliFrontend {
     pub(crate) yolo_stdin_rx: Option<std::sync::Mutex<std::sync::mpsc::Receiver<String>>>,
     /// Throttle: last time a yolo countdown message was emitted to stderr.
     pub(crate) last_sink_message_time: Option<std::time::Instant>,
+    /// One agent-status line per state change (OSC 7501), whichever path
+    /// (workflow engine report or `chat`/`exec prompt` stuck channel) sees it.
+    pub(crate) status_gate: crate::frontend::program_status_text::StatusLineGate,
+    /// Why the running countdown exists, for its wording.
+    pub(crate) countdown_kind: crate::engine::workflow::actions::CountdownKind,
     /// RAII guard that restores cooked mode when dropped. Present while a
     /// full-screen interactive container owns the terminal.
     pub(crate) raw_mode_guard: Option<RawModeGuard>,
@@ -78,38 +85,15 @@ pub struct CliFrontend {
     pub(crate) squad_attach_exit_code: Arc<AtomicI32>,
     pub(crate) agents_attach_cancel: tokio_util::sync::CancellationToken,
     pub(crate) agents_watch: Option<super::per_command::agents::WatchScreen>,
+    pub(crate) attach_cancel: Option<tokio_util::sync::CancellationToken>,
+    pub(crate) attach_hangup: tokio_util::sync::CancellationToken,
+    pub(crate) host_output_policy: crate::data::terminal::HostOutputPolicy,
+    pub(crate) acp_output_filter: Option<crate::frontend::terminal_output_filter::HostOutputFilter>,
+    pub(crate) attach_exit_code: Arc<AtomicI32>,
 }
 
 #[async_trait::async_trait]
 impl crate::command::commands::squad::commands::SquadCommandFrontend for CliFrontend {
-    /// The daemon host: the unattended frontends its evaluator drives agents
-    /// and workflows with. Answers, not decisions — the policy behind them is
-    /// Layer 2's.
-    fn squad_run_frontends(
-        &self,
-    ) -> Option<std::sync::Arc<dyn crate::command::commands::squad::evaluation::SquadRunFrontends>>
-    {
-        Some(crate::frontend::squad::unattended::UnattendedFrontends::shared())
-    }
-
-    async fn serve_squad_daemon(
-        &mut self,
-        handles: crate::command::commands::squad::daemon_runtime::SquadDaemonHandles,
-    ) -> Result<(), CommandError> {
-        crate::frontend::squad::serve(handles).await
-    }
-
-    /// stdout belongs to `--json` consumers, so the key banner goes to stderr
-    /// — the same place it has always been printed. The drawing is this
-    /// frontend's (WI 0114 F-56); Layer 2 supplies only the key, the shell
-    /// and the export line.
-    fn show_key_setup(
-        &mut self,
-        setup: &crate::command::commands::squad::supervisor::SquadKeySetup,
-    ) {
-        eprintln!("{}", super::per_command::squad::render_key_setup(setup));
-    }
-
     fn ask_task_name(&mut self) -> Result<String, CommandError> {
         require_named_input("task name (slug)?")
     }
@@ -184,12 +168,12 @@ impl crate::command::commands::squad::commands::SquadCommandFrontend for CliFron
         }
     }
 
-    fn ask_task_repo(&mut self) -> Result<PathBuf, CommandError> {
+    fn ask_task_repo(&mut self, current_dir: Option<&Path>) -> Result<PathBuf, CommandError> {
         match super::per_command::helpers::read_line("repository directory [current dir]?") {
             Some(s) if !s.trim().is_empty() => Ok(PathBuf::from(s.trim())),
-            Some(_) => std::env::current_dir().map_err(|error| {
-                CommandError::Other(format!("cannot resolve current dir: {error}"))
-            }),
+            Some(_) => current_dir
+                .map(Path::to_path_buf)
+                .ok_or_else(|| CommandError::Other("cannot resolve current dir".into())),
             None => Err(CommandError::InteractiveInputUnavailable {
                 prompt: "repository directory".into(),
             }),
@@ -361,9 +345,18 @@ impl Drop for RawModeGuard {
 }
 
 impl CliFrontend {
+    /// Render a completion returned by `Dispatch::run_relayed` using the
+    /// builtin CLI outcome renderers and the engine's process exit code.
+    pub fn render_relay_result(
+        result: crate::data::frontend_protocol::CommandResultWire,
+        json: bool,
+    ) -> std::process::ExitCode {
+        super::per_command::relay::render_result(result, json)
+    }
+
     /// Whether this invocation is `agents attach`, as the catalogue names it.
     pub(crate) fn is_agent_attach(&self) -> bool {
-        CommandCatalogue::get().is_agent_attach(&command_path_from_matches(&self.matches))
+        self.command_path.as_slice() == ["attach"]
     }
 
     /// A yes/no interview step that no profile answers.
@@ -448,15 +441,19 @@ impl CliFrontend {
         // the same Layer 2 function — not a second formula (F-50). Caching it
         // here is what lets the `ask_*` bodies below be one-liners.
         let non_interactive =
-            ResolvedFlags::is_non_interactive(explicit_flag, super::output::stdin_is_tty());
+            ResolvedFlags::is_headless(explicit_flag, super::output::stdin_is_tty());
         Self {
             matches,
             command_path,
+            worker_events: None,
+            worker_json: false,
             messages: CliUserMessageQueue::new(),
             non_interactive,
             headless: HeadlessDefaults::cli(),
             yolo_stdin_rx: None,
             last_sink_message_time: None,
+            status_gate: Default::default(),
+            countdown_kind: Default::default(),
             raw_mode_guard: None,
             stdin_reader_shutdown: None,
             stdin_reader_handle: None,
@@ -465,18 +462,23 @@ impl CliFrontend {
             squad_attach_exit_code: Arc::new(AtomicI32::new(0)),
             agents_watch: None,
             agents_attach_cancel: tokio_util::sync::CancellationToken::new(),
+            attach_cancel: None,
+            attach_hangup: tokio_util::sync::CancellationToken::new(),
+            host_output_policy: crate::data::terminal::HostOutputPolicy::default(),
+            acp_output_filter: None,
+            attach_exit_code: Arc::new(AtomicI32::new(0)),
         }
     }
 
     /// The raw, TTY-independent half of the cached `non_interactive` mode:
-    /// `true` if either `--non-interactive` was passed explicitly, or
-    /// `--json` was — `--json` implies `--non-interactive` (one of the
+    /// `true` if either `--headless` was passed explicitly, or
+    /// `--json` was — `--json` implies `--headless` (one of the
     /// catalogue's documented `implies` edges, see `ResolvedFlags`/F-10).
     /// The built command's own flags always see this implication via
     /// catalogue resolution; this cache must agree, or a `--json` caller on
     /// a TTY gets a frontend that still thinks it is interactive while the
-    /// command it built believes it is non-interactive JSON. Callers pass
-    /// this into [`ResolvedFlags::is_non_interactive`] to fold in the
+    /// command it built believes it is headless JSON. Callers pass
+    /// this into [`ResolvedFlags::is_headless`] to fold in the
     /// no-input fallback.
     pub(crate) fn explicit_non_interactive(matches: &ArgMatches, command_path: &[String]) -> bool {
         let mut m = matches;
@@ -493,13 +495,16 @@ impl CliFrontend {
                 .copied()
                 .unwrap_or(false)
         };
-        flag("non-interactive") || flag("json")
+        flag("headless") || flag("json")
     }
 
     /// Returns `true` when the `--json` flag is active for the current
     /// command. Used by per-command frontends to suppress human-readable
     /// output (e.g. the ready summary box) when structured JSON is requested.
     pub(crate) fn is_json_mode(&self) -> bool {
+        if self.worker_json {
+            return true;
+        }
         let path_strs: Vec<&str> = self.command_path.iter().map(|s| s.as_str()).collect();
         self.matches_for(&path_strs)
             .and_then(|m| m.try_get_one::<bool>("json").ok().flatten().copied())
@@ -513,6 +518,66 @@ impl CliFrontend {
             current = current.subcommand_matches(seg)?;
         }
         Some(current)
+    }
+}
+
+impl crate::command::dispatch::CliRelayFrontend for CliFrontend {
+    fn relay_bytes(&mut self, stream: crate::data::frontend_protocol::OutputStream, bytes: &[u8]) {
+        use std::io::Write;
+        match stream {
+            crate::data::frontend_protocol::OutputStream::Stdout => {
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(bytes);
+                let _ = out.flush();
+            }
+            crate::data::frontend_protocol::OutputStream::Stderr => {
+                let mut out = std::io::stderr().lock();
+                let _ = out.write_all(bytes);
+                let _ = out.flush();
+            }
+        }
+    }
+    fn relay_facts(&self) -> crate::command::dispatch::CliRelayFacts {
+        use std::io::IsTerminal;
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        crate::command::dispatch::CliRelayFacts {
+            stdin_is_tty: std::io::stdin().is_terminal(),
+            stdout_is_tty: std::io::stdout().is_terminal(),
+            term_size: crate::data::frontend_protocol::TermSize { cols, rows },
+        }
+    }
+
+    fn relay_notice(&mut self, text: &str) {
+        eprintln!("{text}");
+    }
+
+    fn relay_output(
+        &mut self,
+        stream: crate::data::frontend_protocol::OutputStream,
+        message: UserMessage,
+    ) {
+        use crate::data::frontend_protocol::OutputStream;
+        use std::io::Write;
+        match stream {
+            OutputStream::Stdout => {
+                let _ = writeln!(std::io::stdout().lock(), "{}", message.text);
+            }
+            OutputStream::Stderr => self.write_message(message),
+        }
+    }
+
+    fn relay_dialog(
+        &mut self,
+        request: crate::data::dialog::DialogRequest,
+        interrupted: &tokio_util::sync::CancellationToken,
+    ) -> crate::data::dialog::DialogResponse {
+        let _input = super::per_command::helpers::RelayInputGuard::new(interrupted);
+        let response = super::per_command::relay::render_dialog(self, request, interrupted);
+        if interrupted.is_cancelled() {
+            crate::data::dialog::DialogResponse::Interrupted
+        } else {
+            response
+        }
     }
 }
 
@@ -564,12 +629,90 @@ impl UserMessageSink for CliFrontend {
 // ─── CommandFrontend ───────────────────────────────────────────────────────
 
 impl CommandFrontend for CliFrontend {
+    fn pick_queue_item(
+        &mut self,
+        items: &[crate::command::daemon_api::worker_pull::QueueRow],
+    ) -> Result<Option<String>, CommandError> {
+        super::per_command::queue::picker(items)
+            .map(|row| Some(row.id))
+            .map_err(CommandError::Other)
+    }
+    fn confirm_queue_checkout(
+        &mut self,
+        prompt: &crate::data::prompt::Prompt<crate::command::worker::queue_source::CheckoutChoice>,
+    ) -> crate::command::worker::queue_source::CheckoutChoice {
+        use crate::command::worker::queue_source::CheckoutChoice;
+        if self.non_interactive {
+            return CheckoutChoice::FreshClone;
+        }
+        eprintln!("{}\n{}", prompt.title, prompt.body);
+        for choice in &prompt.choices {
+            eprintln!("[{}] {}", choice.key, choice.label);
+        }
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err() {
+            return CheckoutChoice::FreshClone;
+        }
+        answer
+            .trim()
+            .chars()
+            .next()
+            .and_then(|key| prompt.answer_for_key(key))
+            .unwrap_or(CheckoutChoice::FreshClone)
+    }
+    fn bind_worker_run(
+        &mut self,
+        input: crate::command::dispatch::ParsedCommandBoxInput,
+        events: crate::command::commands::api_server::event_bus::EventBusSender,
+        writer: crate::data::fs::api_command_log::CommandStateWriter,
+    ) -> Result<(), CommandError> {
+        self.worker_json = self.is_json_mode();
+        if self.worker_json {
+            self.non_interactive = true;
+        }
+        let catalogue = crate::command::dispatch::catalogue::CommandCatalogue::get();
+        let path: Vec<_> = input.path.iter().map(String::as_str).collect();
+        let spec = catalogue
+            .lookup(&path)
+            .ok_or_else(|| CommandError::unknown_command(&path))?;
+        let args = std::iter::once("awman".to_string())
+            .chain(input.path.clone())
+            .chain(input.args.to_argv(spec));
+        self.matches = catalogue
+            .build_clap_command()
+            .try_get_matches_from(args)
+            .map_err(|e| CommandError::Other(e.to_string()))?;
+        self.command_path = input.path;
+        self.worker_events = Some(crate::command::worker::events::ForegroundRecorder::new(
+            events,
+            writer,
+            self.command_path == ["exec", "prompt"],
+        ));
+        Ok(())
+    }
+    fn read_stdin_secret(&mut self) -> Result<String, CommandError> {
+        let mut token = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut token).map_err(|error| {
+            CommandError::Other(format!("cannot read token from stdin: {error}"))
+        })?;
+        Ok(token.trim_end_matches(['\r', '\n']).to_string())
+    }
     fn kind(&self) -> crate::command::dispatch::catalogue::FrontendKind {
         crate::command::dispatch::catalogue::FrontendKind::Cli
     }
 
+    fn set_host_output_policy(&mut self, policy: crate::data::terminal::HostOutputPolicy) {
+        self.host_output_policy = policy;
+    }
+
     /// The CLI is the one frontend whose answer is not a property of its kind:
     /// it can ask a human only when stdin is a terminal.
+    fn confirm_browser_link(&mut self) -> Result<bool, CommandError> {
+        super::per_command::link::confirm()
+    }
+    fn read_link_token(&mut self) -> Result<String, CommandError> {
+        super::per_command::link::read_token()
+    }
     fn input_available(&self) -> bool {
         super::output::stdin_is_tty()
     }
@@ -647,7 +790,10 @@ impl CommandFrontend for CliFrontend {
         // clap stores the single value as a String.
         if let Some(spec) = CommandCatalogue::get().lookup(command_path) {
             if let Some(arg) = spec.arguments.iter().find(|a| a.name == name) {
-                if matches!(arg.kind, ArgumentKind::TrailingVarArgs) {
+                if matches!(
+                    arg.kind,
+                    ArgumentKind::TrailingVarArgs | ArgumentKind::VarArgs
+                ) {
                     let collected: Vec<String> = m
                         .get_many::<String>(name)
                         .map(|v| v.cloned().collect())
@@ -685,18 +831,6 @@ impl CommandFrontend for CliFrontend {
 // modules under `src/frontend/cli/per_command/`.
 
 impl ConfigCommandFrontend for CliFrontend {
-    fn confirm_config_migration(
-        &mut self,
-        prompt: &Prompt<crate::command::commands::config::MigrateChoice>,
-    ) -> Result<crate::command::commands::config::MigrateChoice, CommandError> {
-        if self.non_interactive {
-            return Err(CommandError::InteractiveInputUnavailable {
-                prompt: "yes".into(),
-            });
-        }
-        self.pick_from_prompt(prompt)
-    }
-
     fn present_config_table(
         &mut self,
         _rows: &[crate::command::commands::config::ConfigFieldRow],
@@ -864,519 +998,3 @@ fn edited_optional(
 // Check that flag_bool returns sensible values for SetTrue actions:
 // when not present, clap fills `false`; we surface that as `Some(false)`
 // so the catalogue's default field carries through.
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ─── command_path_from_matches ─────────────────────────────────────────────
-
-    #[test]
-    fn command_path_from_matches_extracts_nested_subcommand() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "exec", "workflow", "wf.toml"])
-            .unwrap();
-        let path = command_path_from_matches(&m);
-        assert_eq!(path, vec!["exec", "workflow"]);
-    }
-
-    #[test]
-    fn command_path_from_matches_top_level_subcommand() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "agents", "status"])
-            .unwrap();
-        let path = command_path_from_matches(&m);
-        assert_eq!(path, vec!["agents", "status"]);
-    }
-
-    #[test]
-    fn command_path_from_matches_bare_invocation_is_empty() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman"]).unwrap();
-        let path = command_path_from_matches(&m);
-        assert!(path.is_empty());
-    }
-
-    #[test]
-    fn command_path_from_matches_three_level_deep() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "remote", "session", "start"])
-            .unwrap();
-        let path = command_path_from_matches(&m);
-        assert_eq!(path, vec!["remote", "session", "start"]);
-    }
-
-    // ─── explicit_non_interactive (--json implies --non-interactive) ──────────
-
-    /// Regression: `--json` alone (no explicit `--non-interactive`) must
-    /// still resolve `explicit_non_interactive` to `true`, matching
-    /// `ResolvedFlags`' `json -> non-interactive` catalogue implication —
-    /// otherwise a `--json` caller on a TTY gets a frontend that still
-    /// thinks it is interactive while the command it built (which reads its
-    /// flags through `ResolvedFlags`) believes it is non-interactive JSON.
-    #[test]
-    fn json_alone_implies_explicit_non_interactive() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "ready", "--json"])
-            .unwrap();
-        let path = command_path_from_matches(&m);
-        assert!(CliFrontend::explicit_non_interactive(&m, &path));
-    }
-
-    #[test]
-    fn explicit_non_interactive_flag_alone_is_still_honoured() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "ready", "--non-interactive"])
-            .unwrap();
-        let path = command_path_from_matches(&m);
-        assert!(CliFrontend::explicit_non_interactive(&m, &path));
-    }
-
-    #[test]
-    fn neither_json_nor_non_interactive_is_not_explicit() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman", "ready"]).unwrap();
-        let path = command_path_from_matches(&m);
-        assert!(!CliFrontend::explicit_non_interactive(&m, &path));
-    }
-
-    // ─── flag_bool ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn flag_bool_reads_set_true_flag_from_arg_matches() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "exec", "workflow", "wf.toml", "--yolo"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.flag_bool(&["exec", "workflow"], "yolo").unwrap();
-        assert_eq!(v, Some(true));
-    }
-
-    #[test]
-    fn flag_bool_absent_returns_some_false_for_known_bool_flag() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "exec", "workflow", "wf.toml"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        // ArgAction::SetTrue stores false when the flag is absent.
-        let v = frontend.flag_bool(&["exec", "workflow"], "yolo").unwrap();
-        assert_eq!(v, Some(false));
-    }
-
-    #[test]
-    fn flag_bool_wrong_path_returns_none() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "agents", "status"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        // Querying a flag on a different subcommand path returns None.
-        let v = frontend.flag_bool(&["init"], "aspec").unwrap();
-        assert_eq!(v, None);
-    }
-
-    /// Data-table: (argv, command_path, flag, expected_value)
-    #[test]
-    fn flag_bool_data_table() {
-        struct Case {
-            argv: &'static [&'static str],
-            path: &'static [&'static str],
-            flag: &'static str,
-            expected: Option<bool>,
-        }
-        let cases = [
-            Case {
-                argv: &["awman", "init", "--aspec"],
-                path: &["init"],
-                flag: "aspec",
-                expected: Some(true),
-            },
-            Case {
-                argv: &["awman", "init"],
-                path: &["init"],
-                flag: "aspec",
-                expected: Some(false),
-            },
-            Case {
-                argv: &["awman", "ready", "--build"],
-                path: &["ready"],
-                flag: "build",
-                expected: Some(true),
-            },
-            Case {
-                argv: &["awman", "ready", "--no-cache"],
-                path: &["ready"],
-                flag: "no-cache",
-                expected: Some(true),
-            },
-            Case {
-                argv: &["awman", "ready"],
-                path: &["ready"],
-                flag: "no-cache",
-                expected: Some(false),
-            },
-            Case {
-                argv: &["awman", "chat", "--yolo"],
-                path: &["chat"],
-                flag: "yolo",
-                expected: Some(true),
-            },
-            Case {
-                argv: &["awman", "chat"],
-                path: &["chat"],
-                flag: "yolo",
-                expected: Some(false),
-            },
-            Case {
-                argv: &["awman", "agents", "status", "--watch"],
-                path: &["agents", "status"],
-                flag: "watch",
-                expected: Some(true),
-            },
-            Case {
-                argv: &["awman", "config", "set", "agent", "claude"],
-                path: &["config", "set"],
-                flag: "global",
-                expected: Some(false),
-            },
-            Case {
-                argv: &["awman", "config", "set", "agent", "claude", "--global"],
-                path: &["config", "set"],
-                flag: "global",
-                expected: Some(true),
-            },
-        ];
-        let cat = CommandCatalogue::get();
-        let clap_cmd = cat.build_clap_command();
-        for (i, case) in cases.iter().enumerate() {
-            let m = clap_cmd
-                .clone()
-                .try_get_matches_from(case.argv)
-                .unwrap_or_else(|e| panic!("case {i}: failed to parse {:?}: {e}", case.argv));
-            let frontend = CliFrontend::new(m);
-            let got = frontend
-                .flag_bool(case.path, case.flag)
-                .unwrap_or_else(|e| panic!("case {i}: flag_bool error: {e}"));
-            assert_eq!(got, case.expected, "case {i}: argv={:?}", case.argv);
-        }
-    }
-
-    // ─── flag_string / flag_enum ───────────────────────────────────────────────
-
-    #[test]
-    fn flag_enum_reads_agent_on_init() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "init", "--agent", "codex"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.flag_enum(&["init"], "agent").unwrap();
-        assert_eq!(v, Some("codex".to_string()));
-    }
-
-    /// Absent `--agent`, the frontend surfaces *the catalogue's* default.
-    ///
-    /// The expected value is read out of the catalogue rather than written
-    /// here as `"claude"` (WI 0114 tests-audit): which agent is the default is
-    /// Layer 2's decision, and a frontend test that pins it would fail on a
-    /// change it has no opinion about, while still not noticing a frontend
-    /// that substituted a default of its own.
-    #[test]
-    fn flag_enum_default_returns_catalogue_default() {
-        let catalogue = CommandCatalogue::get();
-        let expected = match catalogue
-            .lookup(&["init"])
-            .expect("`init` is a command")
-            .find_flag("agent")
-            .expect("`init --agent` exists")
-            .default
-        {
-            crate::command::dispatch::catalogue::FlagDefault::Str(s) => s,
-            other => panic!("`init --agent` must have a string default, got {other:?}"),
-        };
-
-        let m = catalogue
-            .build_clap_command()
-            .try_get_matches_from(["awman", "init"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.flag_enum(&["init"], "agent").unwrap();
-        assert_eq!(v, Some(expected.to_string()));
-    }
-
-    #[test]
-    fn flag_string_optional_agent_absent_returns_none() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman", "chat"]).unwrap();
-        let frontend = CliFrontend::new(m);
-        // `--agent` on chat is OptionalString with no default.
-        let v = frontend.flag_string(&["chat"], "agent").unwrap();
-        assert_eq!(v, None);
-    }
-
-    #[test]
-    fn flag_string_optional_agent_present() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "chat", "--agent", "gemini"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.flag_string(&["chat"], "agent").unwrap();
-        assert_eq!(v, Some("gemini".to_string()));
-    }
-
-    #[test]
-    fn flag_string_wrong_path_returns_none() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "agents", "status"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.flag_string(&["init"], "agent").unwrap();
-        assert_eq!(v, None);
-    }
-
-    // ─── flag_strings (VecString) ─────────────────────────────────────────────
-
-    #[test]
-    fn flag_strings_reads_single_overlay() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "chat", "--overlay", "/src"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.flag_strings(&["chat"], "overlay").unwrap();
-        assert_eq!(v, vec!["/src".to_string()]);
-    }
-
-    #[test]
-    fn flag_strings_reads_repeated_overlay_flags() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "chat", "--overlay", "/a", "--overlay", "/b"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.flag_strings(&["chat"], "overlay").unwrap();
-        assert_eq!(v, vec!["/a".to_string(), "/b".to_string()]);
-    }
-
-    /// `--agent-flag` values start with `-`, so they are passed in the
-    /// `--agent-flag=<value>` form; every agent-run command accepts it.
-    #[test]
-    fn flag_strings_reads_hyphen_leading_agent_flag_values() {
-        for (path, extra) in [
-            (vec!["chat"], vec![]),
-            (vec!["exec", "prompt"], vec!["hi"]),
-            (vec!["exec", "workflow"], vec!["wf.toml"]),
-        ] {
-            // Flags before the positional: `exec prompt`'s trailing prompt
-            // absorbs everything after it.
-            let mut argv = vec!["awman"];
-            argv.extend(path.iter().copied());
-            argv.extend(["--agent-flag=--no-daemon", "--agent-flag=--config=a=b"]);
-            argv.extend(extra);
-            let m = CommandCatalogue::get()
-                .build_clap_command()
-                .try_get_matches_from(&argv)
-                .unwrap_or_else(|e| panic!("{path:?}: {e}"));
-            let frontend = CliFrontend::new(m);
-            let v = frontend.flag_strings(&path, "agent-flag").unwrap();
-            assert_eq!(v, vec!["--no-daemon", "--config=a=b"], "{path:?}");
-        }
-    }
-
-    #[test]
-    fn flag_strings_returns_empty_when_flag_absent() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman", "chat"]).unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.flag_strings(&["chat"], "overlay").unwrap();
-        assert!(v.is_empty());
-    }
-
-    #[test]
-    fn flag_strings_wrong_path_returns_empty() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "agents", "status"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.flag_strings(&["chat"], "overlay").unwrap();
-        assert!(v.is_empty());
-    }
-
-    // ─── flag_path (Path / OptionalPath) ─────────────────────────────────────
-
-    #[test]
-    fn flag_path_reads_path_argument_for_exec_workflow() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "exec", "workflow", "/path/to/wf.toml"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend
-            .argument(&["exec", "workflow"], "workflow")
-            .unwrap();
-        assert_eq!(v, Some("/path/to/wf.toml".to_string()));
-    }
-
-    #[test]
-    fn flag_path_reads_first_positional_argument_for_path_args() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "exec", "workflow", "wf.toml"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend
-            .argument(&["exec", "workflow"], "workflow")
-            .unwrap();
-        assert_eq!(v, Some("wf.toml".to_string()));
-    }
-
-    // ─── flag_u16 ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn flag_u16_reads_port_flag() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "api", "start", "--port", "1234"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.flag_u16(&["api", "start"], "port").unwrap();
-        assert_eq!(v, Some(1234u16));
-    }
-
-    #[test]
-    fn flag_u16_default_value_when_absent() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman", "api", "start"]).unwrap();
-        let frontend = CliFrontend::new(m);
-        // Default for `--port` on `api start` is 9876.
-        let v = frontend.flag_u16(&["api", "start"], "port").unwrap();
-        assert_eq!(v, Some(9876u16));
-    }
-
-    #[test]
-    fn flag_u16_wrong_path_returns_none() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "agents", "status"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.flag_u16(&["api", "start"], "port").unwrap();
-        assert_eq!(v, None);
-    }
-
-    // ─── argument ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn argument_reads_work_item_positional() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "specs", "amend", "0069"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.argument(&["specs", "amend"], "work_item").unwrap();
-        assert_eq!(v, Some("0069".to_string()));
-    }
-
-    #[test]
-    fn argument_remote_exec_prompt_reads_prompt() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "remote", "exec", "prompt", "hello world"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend
-            .argument(&["remote", "exec", "prompt"], "prompt")
-            .unwrap();
-        assert_eq!(v, Some("hello world".to_string()));
-    }
-
-    #[test]
-    fn argument_remote_exec_workflow_reads_workflow() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "remote", "exec", "workflow", "my-wf.toml"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend
-            .argument(&["remote", "exec", "workflow"], "workflow")
-            .unwrap();
-        assert_eq!(v, Some("my-wf.toml".to_string()));
-    }
-
-    #[test]
-    fn argument_wrong_path_returns_none() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "agents", "status"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.argument(&["specs", "amend"], "work_item").unwrap();
-        assert_eq!(v, None);
-    }
-
-    // ─── arguments (plural) ───────────────────────────────────────────────────
-
-    #[test]
-    fn arguments_wrong_path_returns_empty_vec() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "agents", "status"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.arguments(&["remote", "run"], "command").unwrap();
-        assert!(v.is_empty());
-    }
-
-    // ─── Cross-flag interaction tests ─────────────────────────────────────────
-
-    #[test]
-    fn multiple_flags_extracted_independently_from_same_invocation() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from([
-                "awman",
-                "chat",
-                "--yolo",
-                "--agent",
-                "gemini",
-                "--overlay",
-                "/src",
-                "--overlay",
-                "/etc",
-            ])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        assert_eq!(frontend.flag_bool(&["chat"], "yolo").unwrap(), Some(true));
-        assert_eq!(
-            frontend.flag_string(&["chat"], "agent").unwrap(),
-            Some("gemini".to_string())
-        );
-        assert_eq!(
-            frontend.flag_strings(&["chat"], "overlay").unwrap(),
-            vec!["/src".to_string(), "/etc".to_string()]
-        );
-    }
-
-    #[test]
-    fn querying_flags_on_parent_path_when_child_was_invoked_returns_none() {
-        // Invoked `exec workflow`, querying on `exec` (parent) returns None
-        // because `exec` itself has no ArgMatches with those flags.
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "exec", "workflow", "wf.toml", "--yolo"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        // Querying the `exec` path (not the `exec workflow` path).
-        let v = frontend.flag_bool(&["exec"], "yolo").unwrap();
-        assert_eq!(v, None);
-    }
-}

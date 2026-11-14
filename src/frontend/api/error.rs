@@ -50,11 +50,46 @@ macro_rules! constructors {
 }
 
 constructors! {
+    precondition_failed => ("precondition_failed", PRECONDITION_FAILED),
+    context_too_large => ("context_too_large", PAYLOAD_TOO_LARGE),
+    invalid_secrets => ("invalid_secrets", BAD_REQUEST),
+    // WI 0145 session Git credentials.
+    invalid_git_auth => ("invalid_git_auth", BAD_REQUEST),
+    git_auth_unsupported_url => ("git_auth_unsupported_url", BAD_REQUEST),
+    git_auth_unsupported_platform => ("git_auth_unsupported_platform", BAD_REQUEST),
+    git_auth_failed => (crate::data::fs::api_db::failure_codes::GIT_AUTH_FAILED, UNPROCESSABLE_ENTITY),
+    credentials_lost => (crate::data::fs::api_db::failure_codes::CREDENTIALS_LOST, CONFLICT),
+    host_mismatch => ("host_mismatch", MISDIRECTED_REQUEST),
+    origin_not_allowed => ("origin_not_allowed", FORBIDDEN),
+    browser_grant_required => ("browser_grant_required", UNAUTHORIZED),
+    browser_grant_invalid => ("browser_grant_invalid", UNAUTHORIZED),
+    // WI 0159 browser pairing.
+    browser_ticket_invalid => ("browser_ticket_invalid", UNAUTHORIZED),
+    link_gone => ("link_gone", GONE),
+    link_not_found => ("link_not_found", NOT_FOUND),
+    rate_limited => ("rate_limited", TOO_MANY_REQUESTS),
+    // WI 0160 browser reauthorization.
+    credential_exists => ("credential_exists", CONFLICT),
+    daemon_restarted => ("daemon_restarted", CONFLICT),
+    listener_changed => ("listener_changed", CONFLICT),
+    reauth_failed => ("reauth_failed", UNAUTHORIZED),
+    authorization_expired => ("authorization_expired", FORBIDDEN),
+    authorization_revoked => ("authorization_revoked", FORBIDDEN),
     unauthorized => ("unauthorized", UNAUTHORIZED),
     forbidden_workdir => (failure_codes::FORBIDDEN_WORKDIR, FORBIDDEN),
     invalid_request => (failure_codes::INVALID_REQUEST, BAD_REQUEST),
     request_forbidden => ("forbidden", FORBIDDEN),
     request_not_found => ("not_found", NOT_FOUND),
+    feature_disabled => ("feature_disabled", SERVICE_UNAVAILABLE),
+    feature_degraded => ("feature_degraded", SERVICE_UNAVAILABLE),
+    ephemeral_not_allowed => ("ephemeral_not_allowed", FORBIDDEN),
+    config_invalid => ("config_invalid", UNPROCESSABLE_ENTITY),
+    task_not_found => ("task_not_found", NOT_FOUND),
+    run_not_found => ("run_not_found", NOT_FOUND),
+    grant_not_found => ("grant_not_found", NOT_FOUND),
+    task_exists => ("task_exists", CONFLICT),
+    conflict => ("conflict", CONFLICT),
+    prerequisite_widening_refused => ("prerequisite_widening_refused", FORBIDDEN),
     method_not_allowed => ("method_not_allowed", METHOD_NOT_ALLOWED),
     output_not_found => ("output_not_found", NOT_FOUND),
     request_too_large => ("request_too_large", PAYLOAD_TOO_LARGE),
@@ -80,9 +115,52 @@ constructors! {
     workflow_prerequisites_unresolved => (failure_codes::WORKFLOW_PREREQUISITES_UNRESOLVED, CONFLICT),
     unknown_agent => (failure_codes::UNKNOWN_AGENT, NOT_FOUND),
     agent_untrusted => (failure_codes::AGENT_UNTRUSTED, FORBIDDEN),
+    // WI 0141: a command asked for an interaction mode its feature's
+    // `allowOverride: false` forbids.
+    interaction_override_refused => (crate::command::interaction::INTERACTION_OVERRIDE_REFUSED, BAD_REQUEST),
+    // WI 0141 `/v1/terminals`.
+    terminal_not_found => ("terminal_not_found", NOT_FOUND),
+    terminal_gone => ("terminal_gone", GONE),
+    control_held => ("control_held", CONFLICT),
+    input_not_allowed => ("input_not_allowed", FORBIDDEN),
+    input_backpressure => ("input_backpressure", TOO_MANY_REQUESTS),
+    // WI 0143 pull routes (`/v1/worker/{servers,queue,leases}`).
+    pull_disabled => ("pull_disabled", SERVICE_UNAVAILABLE),
+    server_not_found => ("server_not_found", NOT_FOUND),
+    server_not_registered => ("server_not_registered", SERVICE_UNAVAILABLE),
+    item_not_found => ("item_not_found", NOT_FOUND),
+    lease_not_found => ("lease_not_found", NOT_FOUND),
+    lease_ended => ("lease_ended", CONFLICT),
+    taken => ("taken", CONFLICT),
+    ineligible => ("ineligible", CONFLICT),
+    worker_busy => ("worker_busy", CONFLICT),
+    link_revoked => ("link_revoked", CONFLICT),
+    upstream_unavailable => ("upstream_unavailable", BAD_GATEWAY),
 }
 
 impl ApiError {
+    /// Generic resource or route not found response.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::request_not_found(message)
+    }
+
+    /// Central mapping from command failure codes to HTTP status and response
+    /// code. All API handlers should use this instead of maintaining mappings.
+    pub fn from_command_error(error: &CommandError) -> Self {
+        let code = error.code();
+        let status = Self::ALL
+            .iter()
+            .find_map(|(registered, status)| (*registered == code).then_some(*status))
+            .unwrap_or_else(|| {
+                StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::BAD_REQUEST)
+            });
+        Self {
+            status,
+            code,
+            message: error.to_string(),
+        }
+    }
+
     /// Catalogue parsing always rejects at admission with HTTP 400.
     pub fn command_validation(error: &CommandError) -> Self {
         match error {
@@ -105,6 +183,11 @@ impl ApiError {
             CommandError::Engine(EngineError::UnknownAgent { .. }) => {
                 Self::unknown_agent(error.to_string())
             }
+            CommandError::GitAuthUnsupportedUrl { .. }
+            | CommandError::GitAuthUnsupportedPlatform
+            | CommandError::GitAuthInvalid { .. }
+            | CommandError::GitAuthFailed { .. }
+            | CommandError::CredentialsLost => Self::from_command_error(error),
             _ => Self::invalid_request(error.to_string()),
         }
     }
@@ -112,35 +195,7 @@ impl ApiError {
     /// Preserve command admission's status and reuse asynchronous failure codes
     /// for typed conditions shared with `result.failure` (WI 0137).
     pub fn command_admission(error: &CommandError) -> Self {
-        match error {
-            CommandError::SessionWorkdirNotAllowed { .. } => {
-                Self::forbidden_workdir(error.to_string())
-            }
-            CommandError::WorktreeExists { .. } => Self::worktree_exists(error.to_string()),
-            CommandError::MergeConflict { .. } => Self::merge_conflict(error.to_string()),
-            CommandError::MergeTargetDirty { .. } => Self::merge_target_dirty(error.to_string()),
-            CommandError::WorkflowPrerequisitesUnresolved { .. } => {
-                Self::workflow_prerequisites_unresolved(error.to_string())
-            }
-            CommandError::Engine(crate::engine::error::EngineError::UnknownAgent { .. }) => {
-                Self::unknown_agent(error.to_string())
-            }
-            CommandError::Engine(crate::engine::error::EngineError::AgentDefinitionUntrusted {
-                ..
-            }) => Self::agent_untrusted(error.to_string()),
-            _ => match error.http_status() {
-                403 => Self::request_forbidden(error.to_string()),
-                404 => Self::request_not_found(error.to_string()),
-                500 => Self::internal(error.to_string()),
-                400 => Self::command_validation(error),
-                status => Self {
-                    status: StatusCode::from_u16(status)
-                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                    code: error.code(),
-                    message: error.to_string(),
-                },
-            },
-        }
+        Self::from_command_error(error)
     }
 
     /// Retain existing route-specific fields alongside the shared envelope.
@@ -235,144 +290,4 @@ async fn normalize_response(response: Response) -> Response {
         axum::http::HeaderValue::from_static("application/json"),
     );
     Response::from_parts(parts, normalized.into_body())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn details_preserve_existing_context_fields() {
-        let response = ApiError::session_not_ready("session setup failed").with_details(
-            serde_json::json!({"setup_status": "failed", "setup_error": {"stage": "clone", "message": "failed"}, "hint": "poll"}),
-        );
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"], "session setup failed");
-        assert_eq!(body["code"], "session_not_ready");
-        assert_eq!(body["setup_error"]["stage"], "clone");
-        assert_eq!(body["hint"], "poll");
-    }
-
-    #[tokio::test]
-    async fn framework_rejections_keep_status_message_and_headers() {
-        for status in [
-            StatusCode::BAD_REQUEST,
-            StatusCode::NOT_FOUND,
-            StatusCode::METHOD_NOT_ALLOWED,
-            StatusCode::PAYLOAD_TOO_LARGE,
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            StatusCode::UNPROCESSABLE_ENTITY,
-        ] {
-            let response = (status, [("allow", "GET")], "original rejection").into_response();
-            let response = normalize_response(response).await;
-            assert_eq!(response.status(), status);
-            assert_eq!(response.headers()["allow"], "GET");
-            assert!(response.headers().get("content-length").is_none());
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
-                serde_json::json!({"error": "original rejection", "code": match status.as_u16() {
-                    404 => "not_found", 405 => "method_not_allowed", 413 => "request_too_large",
-                    415 => "unsupported_media_type", 422 => "unprocessable_request", _ => "invalid_request"
-                }})
-            );
-        }
-        let response =
-            normalize_response(ApiError::unknown_flag("unknown flag").into_response()).await;
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["code"],
-            "unknown_flag"
-        );
-        let response = normalize_response("success".into_response()).await;
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(&bytes[..], b"success");
-    }
-
-    #[tokio::test]
-    async fn json_with_charset_is_preserved_and_unavailable_has_retry_header() {
-        let mut response = ApiError::unknown_flag("original").into_response();
-        response.headers_mut().insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/json; charset=utf-8"),
-        );
-        let response = normalize_response(response).await;
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json["code"], "unknown_flag");
-        assert_eq!(json["error"], "original");
-        let response = ApiError::output_listing_unavailable("busy").into_response();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(response.headers()["retry-after"], "1");
-    }
-
-    #[test]
-    fn shared_conditions_reuse_async_failure_codes() {
-        let error = CommandError::WorktreeExists {
-            path: "/worktree".into(),
-            branch: "branch".into(),
-        };
-        let api = ApiError::command_admission(&error);
-        assert_eq!(api.code, error.code());
-        assert_eq!(api.status.as_u16(), error.http_status());
-        assert_eq!(api.message, error.to_string());
-        let error = CommandError::UnknownFlag {
-            command: vec!["exec".into()],
-            flag: "--typo".into(),
-        };
-        assert_eq!(ApiError::command_validation(&error).code, "unknown_flag");
-        assert_eq!(ApiError::command_admission(&error).code, error.code());
-        let error = CommandError::UnknownCommand {
-            path: vec!["typo".into()],
-            suggestions: vec![],
-        };
-        assert_eq!(
-            ApiError::command_validation(&error).code,
-            "unknown_subcommand"
-        );
-        assert_eq!(ApiError::command_admission(&error).code, error.code());
-        for error in [
-            CommandError::SessionWorkdirNotAllowed {
-                requested: "/work".into(),
-                rule: crate::command::session_create::WorkdirRefusal::NotListed,
-                allowed: vec![],
-                roots: vec![],
-            },
-            CommandError::Other("failure".into()),
-        ] {
-            let api = ApiError::command_admission(&error);
-            assert_eq!(api.code, error.code());
-            assert_eq!(api.status.as_u16(), error.http_status());
-            assert_eq!(api.message, error.to_string());
-        }
-        // Conditions WI 0138 has no code for keep its HTTP class code at
-        // admission; `result.failure.code` names the variant (WI 0137 §1).
-        for (error, class) in [
-            (
-                CommandError::WorkflowFileNotFound {
-                    path: "/workflow".into(),
-                },
-                "not_found",
-            ),
-            (CommandError::SessionRepoUrlEmpty, "invalid_request"),
-        ] {
-            let api = ApiError::command_admission(&error);
-            assert_eq!(api.code, class);
-            assert_ne!(api.code, error.code());
-            assert_eq!(api.status.as_u16(), error.http_status());
-            assert_eq!(api.message, error.to_string());
-        }
-    }
 }

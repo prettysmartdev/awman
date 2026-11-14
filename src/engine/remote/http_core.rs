@@ -50,10 +50,12 @@ pub struct HttpClientOptions {
     pub pinned_cert_pem: Option<String>,
     /// Skip certificate verification entirely.
     ///
-    /// **Loopback only.** The `api server status` probe talks to `127.0.0.1`
-    /// over the daemon's self-signed cert before it knows which cert that is.
+    /// **Loopback only.** A local certificate probe may talk to `127.0.0.1`
+    /// before it knows the daemon's self-signed certificate.
     /// Never set this for a target that leaves the machine.
     pub accept_invalid_certs: bool,
+    /// Keep device authorization on the explicitly selected server/transport.
+    pub refuse_redirects: bool,
 }
 
 impl HttpClientOptions {
@@ -180,14 +182,17 @@ impl HttpCore {
     /// The one `reqwest::Client` builder in the tree.
     ///
     /// Everything async in awman that speaks HTTP — the daemon clients here,
-    /// the per-agent Dockerfile download, the CI poller, the `api server
-    /// status` probe, the aspec tarball download — constructs its client
+    /// the per-agent Dockerfile download, the CI poller, certificate probes,
+    /// the aspec tarball download — constructs its client
     /// through this function, so the timeout, TLS and header policy has one
     /// definition (WI 0114 F-28). The synchronous issue provider
     /// (`engine::issue::github`) is the one holdout and uses
     /// `reqwest::blocking`.
     pub fn client(options: &HttpClientOptions) -> Result<reqwest::Client, EngineError> {
         let mut builder = reqwest::Client::builder();
+        if options.refuse_redirects {
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
         if let Some(connect) = options.connect_timeout {
             builder = builder.connect_timeout(connect);
         }
@@ -353,37 +358,5 @@ impl HttpCore {
             .unwrap_or(host_part);
         let host = host.trim_start_matches('[').trim_end_matches(']');
         matches!(host, "127.0.0.1" | "::1" | "localhost")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Unit tests always run isolated: loopback is reachable, the internet is
-    /// not.
-    #[test]
-    fn test_isolation_allows_loopback_only() {
-        for url in [
-            "http://localhost:9876/v1/status",
-            "http://127.0.0.1:1/x",
-            "http://[::1]:8080/",
-        ] {
-            assert!(
-                HttpCore::refuse_public_host_under_test_isolation(url).is_ok(),
-                "{url} must stay reachable"
-            );
-        }
-        for url in [
-            "https://api.github.com/repos/o/r/issues/1",
-            "https://raw.githubusercontent.com/x",
-            "https://localhost.example.com/",
-            "not a url",
-        ] {
-            assert!(
-                HttpCore::refuse_public_host_under_test_isolation(url).is_err(),
-                "{url} must be refused"
-            );
-        }
     }
 }

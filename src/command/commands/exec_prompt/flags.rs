@@ -14,18 +14,19 @@ pub struct ExecPromptCommandFlags {
     pub auto: bool,
     pub agent: Option<String>,
     pub model: Option<String>,
-    pub launch_mode: Option<crate::data::config::repo::LaunchMode>,
+    pub launch_mode: Option<crate::data::config::agents::LaunchMode>,
     pub overlay: Vec<String>,
     /// `--agent-flag` values; `None` lets config `agentFlags` apply.
     pub agent_flags: Option<Vec<String>>,
-    pub issue_source: crate::engine::issue::IssueSourceFlags,
+    /// Raw `--work-item` reference, resolved at run time (WI 0147).
+    pub work_item: Option<String>,
     pub session_worktree: Option<SessionWorktreeTarget>,
 }
 
 impl super::ExecPromptCommand {
     /// Construct from the catalogue-resolved input (WI 0113 F-10). A
     /// whitespace-only positional prompt is normalised to `None`; the
-    /// prompt-or-issue requirement is checked at run time.
+    /// prompt-or-work-item requirement is checked at run time.
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
         refuse_selector_in_prompt(ctx.args.trailing("prompt"), &ctx.path())?;
         let prompt = match ctx.args.get("prompt") {
@@ -35,25 +36,20 @@ impl super::ExecPromptCommand {
         Ok(Self::new(
             ExecPromptCommandFlags {
                 prompt,
-                non_interactive: ctx.flags.bool("non-interactive"),
+                non_interactive: ctx.flags.bool("headless"),
                 plan: ctx.flags.bool("plan"),
                 allow_docker: ctx.flags.bool("allow-docker"),
                 yolo: ctx.flags.bool("yolo"),
                 auto: ctx.flags.bool("auto"),
                 agent: ctx.flags.string("agent"),
                 model: ctx.flags.string("model"),
-                launch_mode: crate::command::dispatch::parse_launch_mode(
-                    ctx.flags.string("launch-mode"),
-                    &ctx.path(),
-                )?,
+                launch_mode: None, // `--set agents.launchMode=…` (WI 0139)
                 overlay: ctx.flags.strs("overlay").to_vec(),
                 agent_flags: crate::command::dispatch::parse_agent_flags(
                     ctx.flags.strs("agent-flag"),
                     &ctx.path(),
                 )?,
-                issue_source: crate::engine::issue::IssueSourceFlags {
-                    issue: ctx.flags.string("issue"),
-                },
+                work_item: ctx.flags.string("work-item"),
                 session_worktree: parse_session_worktree(
                     ctx.flags.string("branch"),
                     ctx.flags.string("pr"),

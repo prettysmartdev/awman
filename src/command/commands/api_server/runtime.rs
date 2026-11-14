@@ -11,8 +11,8 @@ use std::time::Instant;
 use super::cancel::{CommandCanceller, TokenRegistry};
 use super::event_bus::EventBus;
 use super::owned_runtime::stop_command_containers;
-use super::queue_worker::{ApiCommandFrontendFactory, QueueWorker, QueueWorkerDeps};
-use super::ApiServeConfig;
+
+use super::WorkerConfig;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::api_lifecycle_store::CommandLifecycleStore;
@@ -24,7 +24,6 @@ use crate::data::session::{Session, SessionOpenOptions, SessionType, StaticGitRo
 use crate::data::session_manager::SessionManager;
 use crate::data::session_setup_event::{SessionSetupError, SessionSetupStatus};
 use crate::data::session_status::SessionStatus;
-use crate::engine::auth::AuthMode;
 
 /// Outcome of the one API session drain-and-close state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,12 +155,14 @@ impl SetupReadiness {
 
 /// The API daemon's Layer 2 state. The HTTP frontend receives this fully
 /// bootstrapped runtime and only builds a router, listener, and shutdown loop.
-pub struct ApiServerRuntime {
+// unified-router/cli-surface remove their callers. DaemonRuntime::bootstrap uses
+// from_core, which reuses Core's store rather than opening another database.
+pub struct WorkerServices {
+    pub config: crate::data::config::EffectiveConfig,
     pub store: Arc<SqliteSessionStore>,
     pub sessions: Arc<SessionManager>,
     pub event_buses: Arc<tokio::sync::Mutex<HashMap<String, Arc<EventBus>>>>,
     pub paths: ApiPaths,
-    pub auth_mode: AuthMode,
     pub workdirs: Vec<std::path::PathBuf>,
     pub workdir_roots: Vec<std::path::PathBuf>,
     pub started_at: Instant,
@@ -170,8 +171,7 @@ pub struct ApiServerRuntime {
     pub worker_count: usize,
     pub bind_ip: std::net::IpAddr,
     pub port: u16,
-    pub tls_material: Option<crate::engine::auth::TlsMaterial>,
-    /// Cancel markers and `/v1/runs` linkage (WI 0135).
+    /// Cancel markers and `/v1/worker/runs` linkage (WI 0135).
     pub lifecycle_store: CommandLifecycleStore,
     /// Tokens of running commands, keyed by command id; registered by the
     /// worker that claimed each one.
@@ -181,9 +181,19 @@ pub struct ApiServerRuntime {
     pub setup_cancels: Arc<TokenRegistry>,
 }
 
-impl ApiServerRuntime {
-    /// Construct all daemon state before Layer 3 starts listening.
-    pub fn bootstrap(config: ApiServeConfig, engines: Engines) -> Result<Self, CommandError> {
+impl WorkerServices {
+    pub fn from_core(
+        config: WorkerConfig,
+        engines: Engines,
+        core: &crate::engine::daemon::core::Core,
+    ) -> Result<Self, CommandError> {
+        Self::bootstrap_inner(config, engines, Some(core))
+    }
+    fn bootstrap_inner(
+        config: WorkerConfig,
+        engines: Engines,
+        core: Option<&crate::engine::daemon::core::Core>,
+    ) -> Result<Self, CommandError> {
         // Reuse the `ApiPaths` the caller's `Engines` was built with, rather
         // than re-deriving one from the process environment: the two must
         // agree, or auth-mode resolution below checks a key hash at a
@@ -197,18 +207,28 @@ impl ApiServerRuntime {
         // two daemons would open different files and API-mode data would appear to
         // vanish after squad migrated it.
         let data_paths = paths.data_paths();
-        let migration = data_paths
-            .migrate_legacy_db(paths.root())
-            .map_err(CommandError::Data)?;
+        let migration = if core.is_none() {
+            Some(
+                data_paths
+                    .migrate_legacy_db(paths.root())
+                    .map_err(CommandError::Data)?,
+            )
+        } else {
+            None
+        };
         tracing::info!(migration = ?migration, "api database migration outcome");
 
         let db_path = paths.db_path();
         tracing::info!(db = %db_path.display(), "Opening session store");
-        let store = Arc::new(SqliteSessionStore::open_at(&db_path).map_err(CommandError::Data)?);
-        // The WI 0135 lifecycle tables (cancel markers, `/v1/runs` linkage)
+        let store = match core {
+            Some(core) => core.session_store().clone(),
+            None => Arc::new(SqliteSessionStore::open_at(&db_path).map_err(CommandError::Data)?),
+        };
+        // The WI 0135 lifecycle tables (cancel markers, `/v1/worker/runs` linkage)
         // must exist before any recovery below reads them.
         let lifecycle_store =
             CommandLifecycleStore::open(Arc::clone(&store)).map_err(CommandError::Data)?;
+        crate::data::fs::id_migration::rename_session_dirs(&paths).map_err(CommandError::Data)?;
 
         // Startup cleanup: remove closed sessions older than 24 hours.
         if let Ok(deleted) = store.delete_closed_sessions_older_than(24) {
@@ -216,15 +236,18 @@ impl ApiServerRuntime {
                 tracing::info!(session_id = %sid, commands = cmd_count, "Purging stale closed session");
             }
         }
+        if let Ok(resolver) =
+            crate::data::fs::context_dirs::ContextDirResolver::from_env(&config.env)
+        {
+            crate::command::context::retention::ScratchRetention::new(paths.clone(), resolver)
+                .sweep_at_startup(&store);
+        }
         match lifecycle_store.prune_orphans() {
             Ok(0) => {}
             Ok(pruned) => tracing::info!(pruned, "Pruned lifecycle rows of purged sessions"),
             Err(error) => tracing::warn!(%error, "Failed to prune lifecycle rows"),
         }
 
-        let auth_mode = engines
-            .auth_engine
-            .request_auth_mode(config.dangerously_skip_auth)?;
         // The config the daemon's engine bundle was assembled from, not a
         // fresh read: the two could otherwise see different files (F-31).
         let global_config = (*engines.global_config).clone();
@@ -262,6 +285,10 @@ impl ApiServerRuntime {
                     },
                 ) {
                     Ok(mut session) => {
+                        crate::command::context::session_binding::apply(
+                            &mut session,
+                            rec.context_key.as_deref(),
+                        );
                         if rec.session_type == "remote" {
                             if let Some(cloned) = rec.cloned_path.as_deref() {
                                 // Rows written before WI 0133 have no repo_url/branch
@@ -299,16 +326,27 @@ impl ApiServerRuntime {
                 setup_state.status = SessionSetupStatus::Failed;
                 setup_state.current_stage =
                     Some("Server restarted during session setup".to_string());
-                setup_state.error = Some(SessionSetupError {
-                    stage: "server_restart".to_string(),
-                    message: "Server restarted during session setup".to_string(),
+                // WI 0145: a `git_auth` session's credential did not survive
+                // the restart either; say so with the stable code.
+                setup_state.error = Some(if rec.git_auth_kind.is_some() {
+                    SessionSetupError::with_code(
+                        crate::data::fs::api_db::failure_stages::GIT_AUTH,
+                        crate::data::fs::api_db::failure_codes::CREDENTIALS_LOST,
+                        "the daemon restarted during session setup and this session's Git credentials were lost; open a new session",
+                    )
+                } else {
+                    SessionSetupError {
+                        stage: "server_restart".to_string(),
+                        message: "Server restarted during session setup".to_string(),
+                        code: None,
+                    }
                 });
                 if let Err(error) = paths.save_setup_state(&rec.id, &setup_state) {
                     tracing::warn!(session_id = %rec.id, %error, "Failed to save interrupted setup state");
                 }
-                // A `/v1/runs` command queued behind this setup can never run.
+                // A `/v1/worker/runs` command queued behind this setup can never run.
                 if let Ok(Some(run)) =
-                    lifecycle_store.run_for_session(&rec.id).inspect_err(|error| {
+                    lifecycle_store.run_for_session(&crate::data::ids::WorkerSessionId::parse(&rec.id).expect("validated persisted resource id")).inspect_err(|error| {
                         tracing::error!(session_id = %rec.id, %error, "Failed to read run of interrupted setup")
                     })
                 {
@@ -319,14 +357,14 @@ impl ApiServerRuntime {
                             .as_ref(),
                     );
                     if let Err(error) =
-                        lifecycle_store.fail_if_queued(&run.command_id, &now, &result)
+                        lifecycle_store.fail_if_queued(run.command_id.as_str(), &now, &result)
                     {
                         tracing::error!(session_id = %rec.id, command_id = %run.command_id, %error, "Failed to fail run command of interrupted setup");
                     }
                     if let Err(error) = super::queue_worker::finalize_unowned_command(
                         &store,
                         &paths,
-                        &run.command_id,
+                        run.command_id.as_str(),
                     ) {
                         tracing::error!(session_id = %rec.id, command_id = %run.command_id, %error, "Failed to finalize run command of interrupted setup");
                     }
@@ -363,7 +401,7 @@ impl ApiServerRuntime {
             Ok(cancelled) => {
                 for id in &cancelled {
                     if let Err(error) =
-                        super::queue_worker::finalize_unowned_command(&store, &paths, id)
+                        super::queue_worker::finalize_unowned_command(&store, &paths, id.as_str())
                     {
                         tracing::warn!(%error, %id, "Failed to publish recovered cancellation");
                     }
@@ -408,7 +446,11 @@ impl ApiServerRuntime {
         let cancelled = lifecycle_store
             .cancelled_command_ids()
             .map_err(CommandError::Data)?;
-        for command_id in cancelled.iter().chain(&recovered) {
+        for command_id in cancelled
+            .iter()
+            .map(|id| id.as_str())
+            .chain(recovered.iter().map(String::as_str))
+        {
             match stop_command_containers(engines.runtime.as_ref(), command_id) {
                 Ok(0) => {}
                 Ok(count) => {
@@ -428,20 +470,29 @@ impl ApiServerRuntime {
         finish_drained_closes(&store, &paths, &engines, &sessions);
 
         Ok(Self {
+            config: crate::data::config::EffectiveConfig::resolve(
+                crate::data::config::ConfigLayers {
+                    global: (*engines.global_config).clone(),
+                    ..Default::default()
+                },
+                Default::default(),
+                config.env.clone(),
+            )?,
             store,
             sessions,
             event_buses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             paths,
-            auth_mode,
             workdirs: config.workdirs,
             workdir_roots: config.workdir_roots,
             started_at: Instant::now(),
             task_handles: tokio::sync::Mutex::new(Vec::new()),
             engines,
-            worker_count: global_config.workers() as usize,
+            worker_count: crate::data::config::DaemonSettings::from_merged(
+                &global_config.daemon.clone().unwrap_or_default(),
+            )
+            .max_concurrent_jobs,
             bind_ip: config.bind_ip,
             port: config.port,
-            tls_material: config.tls_material,
             lifecycle_store,
             command_cancels: Arc::new(TokenRegistry::new()),
             setup_cancels: Arc::new(TokenRegistry::new()),
@@ -467,10 +518,6 @@ impl ApiServerRuntime {
         std::net::SocketAddr::from((self.bind_ip, self.port))
     }
 
-    pub fn tls_material(&self) -> Option<crate::engine::auth::TlsMaterial> {
-        self.tls_material.clone()
-    }
-
     pub fn lifecycle(&self) -> ApiSessionLifecycle {
         ApiSessionLifecycle::new(
             Arc::clone(&self.store),
@@ -491,49 +538,6 @@ impl ApiServerRuntime {
             self.workdirs.clone(),
             self.workdir_roots.clone(),
         )
-    }
-
-    /// Start exactly the configured worker pool after Layer 3 provides its
-    /// frontend factory. The command layer never names an API frontend type.
-    pub fn spawn_workers<F>(&self, frontend_factory: F)
-    where
-        F: ApiCommandFrontendFactory + 'static,
-    {
-        if self.worker_count == 0 {
-            tracing::warn!("workers config is 0 — no queue workers will run; commands will be enqueued but never processed");
-        }
-        let frontend_factory = Arc::new(frontend_factory);
-        let mut workers = Vec::new();
-        for worker_index in 0..self.worker_count {
-            let worker = QueueWorker::new(
-                format!("worker-{worker_index}-{}", uuid::Uuid::new_v4()),
-                QueueWorkerDeps {
-                    store: Arc::clone(&self.store),
-                    engines: self.engines.clone(),
-                    sessions: Arc::clone(&self.sessions),
-                    event_buses: Arc::clone(&self.event_buses),
-                    paths: self.paths.clone(),
-                    frontend_factory: Arc::clone(&frontend_factory),
-                    lifecycle: self.lifecycle(),
-                    lifecycle_store: self.lifecycle_store.clone(),
-                    cancels: Arc::clone(&self.command_cancels),
-                },
-            );
-            workers.push(worker);
-            tracing::debug!(worker_index, "Spawned queue worker");
-        }
-        tracing::info!(count = self.worker_count, "Queue workers started");
-        tokio::spawn(async move {
-            if let Some(worker) = workers.first() {
-                if let Err(error) = worker.recover_cancelled_cleanup().await {
-                    tracing::error!(%error, "Cancelled cleanup recovery failed; queue workers were not started");
-                    return;
-                }
-            }
-            for worker in workers {
-                tokio::spawn(worker.run());
-            }
-        });
     }
 }
 
@@ -571,19 +575,6 @@ impl ApiSessionLifecycle {
         } else {
             Ok(None)
         }
-    }
-
-    pub fn setup_error(
-        &self,
-        session: &crate::data::fs::api_db::SessionRecord,
-    ) -> Option<SessionSetupError> {
-        (session.setup_status == SessionSetupStatus::Failed)
-            .then(|| {
-                self.paths
-                    .read_setup_state(&session.id)
-                    .and_then(|state| state.error)
-            })
-            .flatten()
     }
 
     /// An in-memory snapshot wins over disk, which wins over the legacy row.
@@ -624,11 +615,14 @@ impl ApiSessionLifecycle {
         {
             if !setup_cancels.is_registered(&row.session_id) {
                 if let Some(run) = lifecycle
-                    .run_for_command(command_id)
+                    .run_for_command(
+                        &crate::data::ids::CommandId::parse(command_id)
+                            .expect("validated persisted resource id"),
+                    )
                     .map_err(CancelSessionError::Run)?
                 {
                     if run.close_on_finish {
-                        self.close(&run.session_id)
+                        self.close(run.session_id.as_str())
                             .await
                             .map_err(CancelSessionError::Close)?;
                     }
@@ -645,7 +639,7 @@ impl ApiSessionLifecycle {
         run: &crate::data::api_lifecycle_store::RunRecord,
         token: &tokio_util::sync::CancellationToken,
     ) -> Result<(), crate::data::error::DataError> {
-        match self.store.get_command(&run.command_id) {
+        match self.store.get_command(run.command_id.as_str()) {
             Ok(command) => {
                 if command.is_some_and(|c| c.status == CommandStatus::Cancelled) {
                     token.cancel();
@@ -776,15 +770,17 @@ impl ApiSessionLifecycle {
         lifecycle: &CommandLifecycleStore,
         run: &crate::data::api_lifecycle_store::RunRecord,
     ) -> Result<(), CommandError> {
-        let readiness = self.setup_readiness(&run.session_id).await;
+        let readiness = self.setup_readiness(run.session_id.as_str()).await;
         if !readiness.is_ready() {
             lifecycle.fail_if_queued(
-                &run.command_id,
+                run.command_id.as_str(),
                 &chrono::Utc::now().to_rfc3339(),
                 &run_setup_error_result(readiness.error()),
             )?;
+            // The run can never execute: release its command secrets now.
+            self.engines.ephemeral_secrets.remove(&run.command_id);
         }
-        let command = self.store.get_command(&run.command_id)?;
+        let command = self.store.get_command(run.command_id.as_str())?;
         if command.as_ref().is_some_and(|c| {
             c.started_at.is_none()
                 && matches!(c.status, CommandStatus::Error | CommandStatus::Cancelled)
@@ -792,7 +788,7 @@ impl ApiSessionLifecycle {
             super::queue_worker::finalize_unowned_command(
                 &self.store,
                 &self.paths,
-                &run.command_id,
+                run.command_id.as_str(),
             )?;
         }
         let terminal = command.as_ref().is_some_and(|c| c.status.is_terminal());
@@ -801,7 +797,7 @@ impl ApiSessionLifecycle {
             .as_ref()
             .is_some_and(|c| c.status == CommandStatus::Cancelled && c.started_at.is_none());
         if cancelled_during_setup || (run.close_on_finish && terminal) {
-            self.close(&run.session_id).await?;
+            self.close(run.session_id.as_str()).await?;
         }
         Ok(())
     }
@@ -833,6 +829,12 @@ impl ApiSessionLifecycle {
             .update_session_status(session_id, SessionStatus::Closing)?;
         // Step 2: cancel any queued jobs that entered before the gate closed.
         let cancelled = self.store.cancel_queued_for_session(session_id)?;
+        // Cancelled before a worker owned them: their secrets go now.
+        for id in &cancelled {
+            if let Ok(id) = crate::data::ids::CommandId::parse(id) {
+                self.engines.ephemeral_secrets.remove(&id);
+            }
+        }
         // Step 3: a running command owns the drain; worker post-check reenters
         // this same method once it finishes.
         if let Some(running) = self.store.running_command_for_session(session_id)? {
@@ -893,6 +895,10 @@ impl ApiSessionLifecycle {
         }
         self.store
             .close_session_force(session_id, &chrono::Utc::now().to_rfc3339())?;
+        // WI 0145: the session's in-memory Git credential ends with it.
+        self.engines
+            .ephemeral_secrets
+            .remove_session_git_auth(session_id);
         if let Some(session) = self.sessions.get_by_key(session_id) {
             let id = session.read().await.id();
             self.sessions.remove_by_key(session_id, id)?;
@@ -939,7 +945,20 @@ fn decode_queue_command(
 /// must not hide the rest of a session's queue from an operator.
 pub fn stored_args_view(record: &CommandRecord) -> serde_json::Value {
     match record.decode_args() {
-        Ok(args) => serde_json::json!(args),
+        Ok(mut args) => {
+            // Admission records the resolved interaction (WI 0141) as one
+            // leading token when the client did not spell it; it is the
+            // server's decision, not the client's argv, so the read
+            // projection leaves it out. Anything later in argv is the
+            // client's own and is shown as sent.
+            if args
+                .first()
+                .is_some_and(|first| is_injected_interaction_token(first))
+            {
+                args.remove(0);
+            }
+            serde_json::json!(args)
+        }
         Err(error) => {
             tracing::warn!(command_id = %record.id, %error, "Invalid stored command args in read projection");
             serde_json::from_str(&record.args).unwrap_or_else(|_| serde_json::json!([]))
@@ -947,7 +966,13 @@ pub fn stored_args_view(record: &CommandRecord) -> serde_json::Value {
     }
 }
 
-/// The `result` JSON of a `/v1/runs` command whose session setup failed:
+/// The spellings admission writes for a resolved interaction, plus the
+/// `--headless=false` older rows carry.
+fn is_injected_interaction_token(arg: &str) -> bool {
+    matches!(arg, "--headless" | "--interactive") || arg.starts_with("--headless=")
+}
+
+/// The `result` JSON of a `/v1/worker/runs` command whose session setup failed:
 /// `error` is the literal `"setup_error"`; the setup's own `{stage, message}`
 /// (or `null`) rides in `setup_error`. Written with exit code 1.
 pub fn run_setup_error_result(setup_error: Option<&serde_json::Value>) -> String {
@@ -956,12 +981,23 @@ pub fn run_setup_error_result(setup_error: Option<&serde_json::Value>) -> String
         .and_then(|e| e.get("message"))
         .and_then(|m| m.as_str())
         .unwrap_or("Session setup failed");
+    let code = setup_error
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str());
+    // `git_auth_failed` and `credentials_lost` keep their own code.
+    let auth_code = [
+        failure_codes::GIT_AUTH_FAILED,
+        failure_codes::CREDENTIALS_LOST,
+    ]
+    .into_iter()
+    .find(|known| code == Some(*known));
+    let auth = auth_code.is_some();
     serde_json::to_string(&CommandResult {
         exit_code: Some(1),
         outcome: Some(crate::data::execution_event::CommandStatusKind::Error),
         failure: Some(CommandFailure {
-            stage: "setup".into(),
-            code: failure_codes::SETUP_FAILED.into(),
+            stage: if auth { "git_auth" } else { "setup" }.into(),
+            code: auth_code.unwrap_or(failure_codes::SETUP_FAILED).into(),
             message: message.into(),
             step: None,
         }),
@@ -974,7 +1010,7 @@ pub fn run_setup_error_result(setup_error: Option<&serde_json::Value>) -> String
     .expect("command result is serializable")
 }
 
-/// Bootstrap: finish every `/v1/runs` lifecycle hook a crash interrupted,
+/// Bootstrap: finish every `/v1/worker/runs` lifecycle hook a crash interrupted,
 /// whatever state its setup reached. A run whose setup failed cannot start,
 /// so a still-queued command becomes `error` (a cancelled one stays
 /// cancelled); a run asking to `close_on_finish` whose command is terminal is
@@ -995,7 +1031,7 @@ fn reconcile_runs(
         }
     };
     for run in runs {
-        let session = match store.get_session(&run.session_id) {
+        let session = match store.get_session(run.session_id.as_str()) {
             Ok(Some(session)) => session,
             Ok(None) => continue,
             Err(error) => {
@@ -1009,29 +1045,31 @@ fn reconcile_runs(
         let now = chrono::Utc::now().to_rfc3339();
         if session.setup_status == SessionSetupStatus::Failed {
             let error = paths
-                .read_setup_state(&run.session_id)
+                .read_setup_state(run.session_id.as_str())
                 .and_then(|state| state.error)
                 .and_then(|error| serde_json::to_value(error).ok());
             let result = run_setup_error_result(error.as_ref());
-            if let Err(error) = lifecycle_store.fail_if_queued(&run.command_id, &now, &result) {
+            if let Err(error) =
+                lifecycle_store.fail_if_queued(run.command_id.as_str(), &now, &result)
+            {
                 tracing::warn!(command_id = %run.command_id, %error, "Failed to fail a run whose setup failed");
             }
         }
         if let Err(error) =
-            super::queue_worker::finalize_unowned_command(store, paths, &run.command_id)
+            super::queue_worker::finalize_unowned_command(store, paths, run.command_id.as_str())
         {
             tracing::warn!(%error, command_id = %run.command_id, "Failed to publish terminal run result");
         }
         let terminal = store
-            .get_command(&run.command_id)
+            .get_command(run.command_id.as_str())
             .ok()
             .flatten()
             .is_some_and(|c| c.status.is_terminal());
         // The worker finishes durable cancelled cleanup before closing a
         // one-shot session and deleting the workspace it still needs.
-        if matches!(store.get_command(&run.command_id), Ok(Some(c)) if c.status == CommandStatus::Cancelled)
+        if matches!(store.get_command(run.command_id.as_str()), Ok(Some(c)) if c.status == CommandStatus::Cancelled)
             && !matches!(
-                paths.read_command_cleanup(&run.session_id, &run.command_id),
+                paths.read_command_cleanup(run.session_id.as_str(), run.command_id.as_str()),
                 Ok(None)
             )
         {
@@ -1164,334 +1202,21 @@ fn readiness_from_state(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn lifecycle(tmp: &std::path::Path) -> (ApiSessionLifecycle, Arc<SqliteSessionStore>) {
-        let store = Arc::new(SqliteSessionStore::open(tmp).unwrap());
-        let lifecycle = ApiSessionLifecycle::new(
-            Arc::clone(&store),
-            Engines::for_tests(tmp),
-            Arc::new(SessionManager::in_memory(
-                crate::data::config::env::EnvSnapshot::empty(),
-            )),
-            ApiPaths::at_root(tmp),
-        );
-        (lifecycle, store)
-    }
-
-    fn insert_active(store: &SqliteSessionStore, id: &str) {
-        store
-            .insert_session(id, "/tmp", &chrono::Utc::now().to_rfc3339())
-            .unwrap();
-    }
+mod setup_error_result_tests {
+    use super::run_setup_error_result;
 
     #[test]
-    fn queue_view_assigns_oldest_first_positions_and_preserves_legacy_args_projection() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (lifecycle, store) = lifecycle(tmp.path());
-        insert_active(&store, "queue");
-        store
-            .enqueue_command("first", "queue", "agents status", "[\"a\"]", "log")
-            .unwrap();
-        store
-            .enqueue_command("second", "queue", "agents status", "[]", "log")
-            .unwrap();
-
-        let view = lifecycle.queue_view("queue").unwrap().unwrap();
-        assert_eq!(view.queue_depth, 2);
-        assert_eq!(
-            view.queued
-                .iter()
-                .map(|command| (command.command_id.as_str(), command.position))
-                .collect::<Vec<_>>(),
-            vec![("first", Some(0)), ("second", Some(1))]
-        );
-        assert_eq!(view.queued[0].args, serde_json::json!(["a"]));
-
-        for (id, args, expected) in [
-            ("bad", "{", serde_json::json!([])),
-            ("object", "{}", serde_json::json!({})),
-            ("numbers", "[1]", serde_json::json!([1])),
+    fn credential_codes_of_a_failed_setup_reach_the_run_result() {
+        for (code, stage, expected) in [
+            (Some("git_auth_failed"), "git_auth", "git_auth_failed"),
+            (Some("credentials_lost"), "git_auth", "credentials_lost"),
+            (None, "setup", "setup_failed"),
         ] {
-            store
-                .enqueue_command(id, "queue", "agents status", args, "log")
-                .unwrap();
-            let view = lifecycle.queue_view("queue").unwrap().unwrap();
-            assert_eq!(
-                view.queued
-                    .iter()
-                    .find(|c| c.command_id == id)
-                    .unwrap()
-                    .args,
-                expected
-            );
-            assert_eq!(view.queued[0].command_id, "first");
-            assert_eq!(view.queued[1].command_id, "second");
-            assert!(store
-                .get_command(id)
-                .unwrap()
-                .unwrap()
-                .decode_args()
-                .is_err());
+            let setup_error = serde_json::json!({"stage": "x", "message": "m", "code": code});
+            let result: serde_json::Value =
+                serde_json::from_str(&run_setup_error_result(Some(&setup_error))).unwrap();
+            assert_eq!(result["failure"]["stage"], stage);
+            assert_eq!(result["failure"]["code"], expected);
         }
-    }
-
-    #[test]
-    fn status_fallback_keeps_ready_for_legacy_missing_session() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (lifecycle, _) = lifecycle(tmp.path());
-        let fallback = lifecycle.status_fallback("legacy").unwrap();
-        assert_eq!(fallback.setup_status, SessionSetupStatus::Ready);
-        assert!(fallback.labels.is_empty());
-    }
-
-    #[test]
-    fn session_status_view_prefers_memory_then_disk_then_row() {
-        use crate::data::session_setup_event::SessionSetupState;
-        let tmp = tempfile::tempdir().unwrap();
-        let (lifecycle, store) = lifecycle(tmp.path());
-        insert_active(&store, "s");
-        store
-            .update_setup_status("s", SessionSetupStatus::Ready)
-            .unwrap();
-        let mut disk = SessionSetupState::new();
-        disk.mark_failed("clone", "disk failure");
-        lifecycle.paths.save_setup_state("s", &disk).unwrap();
-        let mut memory = SessionSetupState::new();
-        memory.current_stage = Some("from memory".into());
-        match lifecycle.session_status_view("s", Some(memory)).unwrap() {
-            SessionStatusView::Snapshot { state, .. } => {
-                assert_eq!(state.current_stage.as_deref(), Some("from memory"))
-            }
-            _ => panic!("memory snapshot lost"),
-        }
-        match lifecycle.session_status_view("s", None).unwrap() {
-            SessionStatusView::Snapshot { state, .. } => {
-                assert_eq!(state.status, SessionSetupStatus::Failed)
-            }
-            _ => panic!("disk snapshot lost"),
-        }
-        std::fs::write(
-            lifecycle.paths.session_dir("s").join("setup_state.json"),
-            "{",
-        )
-        .unwrap();
-        match lifecycle.session_status_view("s", None).unwrap() {
-            SessionStatusView::Fallback(fallback) => {
-                assert_eq!(fallback.setup_status, SessionSetupStatus::Ready)
-            }
-            _ => panic!("malformed disk state hid row fallback"),
-        }
-    }
-
-    #[test]
-    fn early_setup_cancel_carries_cancelled_row_and_fails_closed_on_read_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (lifecycle, store) = lifecycle(tmp.path());
-        insert_active(&store, "s");
-        store
-            .enqueue_command("c", "s", "exec prompt", "[]", "log")
-            .unwrap();
-        let run = crate::data::api_lifecycle_store::RunRecord {
-            session_id: "s".into(),
-            command_id: "c".into(),
-            close_on_finish: true,
-            created_at: "now".into(),
-        };
-        let token = tokio_util::sync::CancellationToken::new();
-        lifecycle.reconcile_setup_cancel(&run, &token).unwrap();
-        assert!(!token.is_cancelled());
-        store.cancel_queued_for_session("s").unwrap();
-        lifecycle.reconcile_setup_cancel(&run, &token).unwrap();
-        assert!(token.is_cancelled());
-        store
-            .with_conn(|conn| {
-                conn.execute_batch("ALTER TABLE commands RENAME TO unavailable_commands")?;
-                Ok(())
-            })
-            .unwrap();
-        let token = tokio_util::sync::CancellationToken::new();
-        assert!(lifecycle.reconcile_setup_cancel(&run, &token).is_err());
-        assert!(token.is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn cancel_run_defers_close_to_setup_owner_and_reports_close_failure() {
-        for setup_owns in [false, true] {
-            let tmp = tempfile::tempdir().unwrap();
-            let (lifecycle, store) = lifecycle(tmp.path());
-            insert_active(&store, "s");
-            let runs = CommandLifecycleStore::open(Arc::clone(&store)).unwrap();
-            runs.record_run(&crate::data::api_lifecycle_store::RunRecord {
-                session_id: "s".into(),
-                command_id: "c".into(),
-                close_on_finish: true,
-                created_at: "now".into(),
-            })
-            .unwrap();
-            store
-                .enqueue_command("c", "s", "exec prompt", "[]", "log")
-                .unwrap();
-            let setups = Arc::new(TokenRegistry::new());
-            let token = setup_owns.then(|| setups.register("s"));
-            let canceller = CommandCanceller::new(
-                Arc::clone(&store),
-                runs.clone(),
-                Arc::new(TokenRegistry::new()),
-                Arc::clone(&setups),
-            );
-            if !setup_owns {
-                store.with_conn(|conn| { conn.execute_batch("CREATE TRIGGER fail_close BEFORE UPDATE OF status ON sessions BEGIN SELECT RAISE(ABORT, 'close failed'); END;")?; Ok(()) }).unwrap();
-                assert!(matches!(
-                    lifecycle
-                        .cancel_command("c", &canceller, &setups, &runs)
-                        .await,
-                    Err(CancelSessionError::Close(_))
-                ));
-                store
-                    .with_conn(|conn| {
-                        conn.execute_batch("DROP TRIGGER fail_close;")?;
-                        Ok(())
-                    })
-                    .unwrap();
-            }
-            lifecycle
-                .cancel_command("c", &canceller, &setups, &runs)
-                .await
-                .unwrap();
-            assert_eq!(
-                store.get_session("s").unwrap().unwrap().status,
-                if setup_owns {
-                    SessionStatus::Active
-                } else {
-                    SessionStatus::Closed
-                }
-            );
-            if let Some(token) = token {
-                assert!(token.is_cancelled());
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn close_outcome_closes_session_without_a_queue() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (lifecycle, store) = lifecycle(tmp.path());
-        insert_active(&store, "empty");
-        assert_eq!(
-            lifecycle.close("empty").await.unwrap(),
-            CloseOutcome::Closed
-        );
-        assert_eq!(
-            store.get_session("empty").unwrap().unwrap().status.as_str(),
-            "closed"
-        );
-    }
-
-    #[tokio::test]
-    async fn close_outcome_drains_a_running_command_then_reports_already_closing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (lifecycle, store) = lifecycle(tmp.path());
-        insert_active(&store, "busy");
-        store
-            .enqueue_command("running", "busy", "agents status", "[]", "log")
-            .unwrap();
-        store.claim_next_command("worker").unwrap();
-        assert_eq!(
-            lifecycle.close("busy").await.unwrap(),
-            CloseOutcome::Draining {
-                running_command_id: "running".into(),
-                cancelled: Vec::new()
-            }
-        );
-        assert_eq!(
-            lifecycle.close("busy").await.unwrap(),
-            CloseOutcome::AlreadyClosing
-        );
-    }
-
-    #[tokio::test]
-    async fn close_outcome_reports_unknown_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (lifecycle, _) = lifecycle(tmp.path());
-        assert_eq!(
-            lifecycle.close("missing").await.unwrap(),
-            CloseOutcome::NotFound
-        );
-    }
-
-    #[tokio::test]
-    async fn close_waits_for_cancelled_cleanup_before_retiring_the_session() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (lifecycle, store) = lifecycle(tmp.path());
-        insert_active(&store, "cleanup");
-        store
-            .enqueue_command("command", "cleanup", "exec workflow", "[]", "log")
-            .unwrap();
-        store
-            .complete_command("command", CommandStatus::Cancelled, Some(130), None)
-            .unwrap();
-        lifecycle
-            .paths
-            .prepare_command_dir("cleanup", "command")
-            .unwrap();
-        let cleanup = crate::data::workflow_cleanup::WorkflowCleanup {
-            workflow: crate::data::workflow_definition::Workflow {
-                title: None,
-                steps: vec![],
-                agent: None,
-                model: None,
-                overlays: None,
-                setup: vec![],
-                teardown: vec![],
-                teardown_on_failure: false,
-            },
-            work_item: None,
-            workdir: tmp.path().to_path_buf(),
-            mount_path: tmp.path().to_path_buf(),
-            state_root: None,
-            image: "test".into(),
-            cli_overlays: vec![],
-            worktree_git_mount: None,
-        };
-        lifecycle
-            .paths
-            .write_command_cleanup("cleanup", "command", &cleanup)
-            .unwrap();
-        assert!(matches!(
-            lifecycle.close("cleanup").await.unwrap(),
-            CloseOutcome::Draining { .. }
-        ));
-        assert_eq!(
-            store
-                .get_session("cleanup")
-                .unwrap()
-                .unwrap()
-                .status
-                .as_str(),
-            "closing"
-        );
-        assert_eq!(
-            lifecycle.close("cleanup").await.unwrap(),
-            CloseOutcome::AlreadyClosing
-        );
-        lifecycle
-            .paths
-            .remove_command_cleanup("cleanup", "command")
-            .unwrap();
-        assert_eq!(
-            lifecycle.close("cleanup").await.unwrap(),
-            CloseOutcome::Closed
-        );
-        assert_eq!(
-            store
-                .get_session("cleanup")
-                .unwrap()
-                .unwrap()
-                .status
-                .as_str(),
-            "closed"
-        );
     }
 }

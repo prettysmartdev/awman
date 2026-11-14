@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Serialize;
 
-pub(crate) use prepare::finish_cancelled_cleanup;
+pub(crate) use prepare::{finish_cancelled_cleanup, workflow_effective_config};
 
 use crate::command::commands::launch_policy::LaunchPolicy;
 use crate::command::commands::mount_scope::MountScope;
@@ -47,6 +47,7 @@ pub struct ExecWorkflowCommandFlags {
     /// invocations with `None` produce the existing missing-required-argument
     /// error.
     pub workflow: Option<PathBuf>,
+    /// Raw `--work-item` reference, as the user wrote it (WI 0147).
     pub work_item: Option<String>,
     pub non_interactive: bool,
     pub plan: bool,
@@ -56,13 +57,12 @@ pub struct ExecWorkflowCommandFlags {
     pub auto: bool,
     pub agent: Option<String>,
     pub model: Option<String>,
-    pub launch_mode: Option<crate::data::config::repo::LaunchMode>,
+    pub launch_mode: Option<crate::data::config::agents::LaunchMode>,
     pub overlay: Vec<String>,
     /// `--agent-flag` values for the workflow's default agent; `None` lets
     /// config `agentFlags` apply.
     pub agent_flags: Option<Vec<String>>,
     pub max_concurrent: Option<usize>,
-    pub issue_source: crate::engine::issue::IssueSourceFlags,
     /// When true, a leader agent designs and runs a workflow for the work item.
     /// Implies `--yolo`, `--worktree`, and `context(workflow)`.
     pub dynamic: bool,
@@ -70,9 +70,9 @@ pub struct ExecWorkflowCommandFlags {
     /// `--dynamic`.
     pub leader: Option<String>,
     /// `--on-dirty-merge-target`; `None` lets config and the host default apply.
-    pub on_dirty_merge_target: Option<crate::data::config::repo::OnDirtyMergeTarget>,
+    pub on_dirty_merge_target: Option<crate::data::config::worktree::OnDirtyMergeTarget>,
     /// `--on-merge-failure`; `None` lets config and the host default apply.
-    pub on_merge_failure: Option<crate::data::config::repo::OnMergeFailure>,
+    pub on_merge_failure: Option<crate::data::config::worktree::OnMergeFailure>,
     /// `--on-existing-worktree`; `None` (absent or `ask`) lets the host ask or
     /// answer from its headless profile.
     pub on_existing_worktree:
@@ -189,7 +189,7 @@ pub trait ExecWorkflowCommandFrontend:
     /// workflow starts; the rest return immediately.
     fn notify_dynamic_workflow_resume_unavailable(
         &mut self,
-        work_item: u32,
+        work_item: &str,
         reason: &str,
     ) -> Result<(), CommandError>;
 }
@@ -217,6 +217,7 @@ pub struct WorkflowResumePrompt {
     /// The work item this run is bound to, when there is one.
     pub work_item: Option<u32>,
     /// The worktree the previous run left behind, when the run used one.
+    pub work_item_key: Option<String>,
     pub worktree_path: Option<PathBuf>,
     /// True when this is a `--dynamic` resume, meaning accepting it also skips
     /// a leader-design pass.
@@ -279,12 +280,23 @@ impl WorkflowResumePrompt {
             fresh_label,
             workflow_name,
             work_item,
+            work_item_key: None,
             worktree_path,
             dynamic,
             completed_steps,
             total_steps,
             start_points,
         }
+    }
+
+    pub fn with_work_item_key(mut self, key: Option<String>) -> Self {
+        if let Some(key) = &key {
+            if self.work_item.is_none() {
+                self.body.insert_str(0, &format!("Work item: {key}\n\n"));
+            }
+        }
+        self.work_item_key = key;
+        self
     }
 
     /// The unattended answer: pick up at the step the previous run stopped on,
@@ -357,7 +369,7 @@ pub struct ExecWorkflowCommand {
     /// daemon's and has no viewer, and for tests built with
     /// [`ExecWorkflowCommand::new`].
     managed_session: Option<Arc<tokio::sync::RwLock<Session>>>,
-    /// Fired by an external cancel (the API's `POST /v1/commands/{id}/cancel`).
+    /// Fired by an external cancel (the API's `POST /v1/worker/commands/{id}/cancel`).
     /// Never fired for the CLI, the TUI or squad, which never install one.
     cancel: tokio_util::sync::CancellationToken,
     /// Which frontend runs this command: picks the headless profile the
@@ -423,7 +435,7 @@ impl ExecWorkflowCommand {
             squad_task_prerequisites: None,
             workflow: ctx.args.get("workflow").map(PathBuf::from),
             work_item: ctx.flags.string("work-item"),
-            non_interactive: ctx.flags.bool("non-interactive"),
+            non_interactive: ctx.flags.bool("headless"),
             plan: ctx.flags.bool("plan"),
             allow_docker: ctx.flags.bool("allow-docker"),
             worktree: ctx.flags.bool("worktree"),
@@ -431,19 +443,13 @@ impl ExecWorkflowCommand {
             auto: ctx.flags.bool("auto"),
             agent: ctx.flags.string("agent"),
             model: ctx.flags.string("model"),
-            launch_mode: crate::command::dispatch::parse_launch_mode(
-                ctx.flags.string("launch-mode"),
-                &ctx.path(),
-            )?,
+            launch_mode: None, // `--set agents.launchMode=…` (WI 0139)
             overlay: ctx.flags.strs("overlay").to_vec(),
             agent_flags: crate::command::dispatch::parse_agent_flags(
                 ctx.flags.strs("agent-flag"),
                 &ctx.path(),
             )?,
-            max_concurrent: ctx.flags.usize("max-concurrent"),
-            issue_source: crate::engine::issue::IssueSourceFlags {
-                issue: ctx.flags.string("issue"),
-            },
+            max_concurrent: None, // `--set workflows.maxConcurrentSteps=…` (WI 0139)
             dynamic: ctx.flags.bool("dynamic"),
             leader: ctx.flags.string("leader"),
             on_dirty_merge_target: crate::command::dispatch::parse_on_dirty_merge_target(
@@ -459,7 +465,7 @@ impl ExecWorkflowCommand {
                 &ctx.path(),
             )?,
         };
-        validate_dynamic_flags(&flags)?;
+        validate_dynamic_flags(&flags, ctx.session.inline_work_item().is_some())?;
         if !flags.dynamic && flags.workflow.is_none() {
             return Err(CommandError::missing_required_argument(
                 &ctx.path(),
@@ -538,9 +544,7 @@ impl ExecWorkflowCommand {
 mod dynamic;
 mod execute;
 mod factory;
-#[cfg(test)]
-pub(crate) use factory::AgentFrontendProxy;
-mod issue;
+
 mod merge_fix_prompt;
 mod phase_container;
 mod prepare;
@@ -549,13 +553,12 @@ mod shared_frontend;
 pub(crate) use shared_frontend::SharedWorkflowFrontend;
 
 #[cfg(test)]
-pub(crate) mod tests;
+mod contract_tests;
 
 // The child modules' items are `pub(super)`; re-exporting them here is what
 // lets each one say `use super::*;` and see the others, exactly as they all
 // saw each other when this was one file.
 pub(super) use factory::*;
-pub(super) use issue::*;
 pub(super) use prepare::*;
 pub(super) use prerequisites::*;
 

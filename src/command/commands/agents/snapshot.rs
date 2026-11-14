@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::command::error::CommandError;
+use crate::data::program_status::{EffectiveStatus, ProgramState};
 use crate::data::session::AgentHandle;
 use crate::engine::agent_runtime::AgentRuntimeEngine;
 
@@ -27,8 +28,16 @@ const SHORT_ID_LEN: usize = 12;
 #[serde(rename_all = "lowercase")]
 pub enum AgentState {
     Running,
-    /// Running, but the owning TUI tab reports it silent for too long.
+    /// Running, but the owning TUI tab reports it silent for too long. Only
+    /// ever applied to agents that do not report their own status (OSC 7501).
     Stuck,
+    /// The agent reported `blocked` (permission, question or auth): it needs
+    /// the user.
+    Waiting,
+    /// The agent reported `error`.
+    Errored,
+    /// The agent reported `done` (or `idle`: its turn has ended).
+    Done,
     /// Stopped but still present in the runtime (`agents ls --all`).
     Stopped,
 }
@@ -39,6 +48,9 @@ impl AgentState {
         match self {
             Self::Running => "●",
             Self::Stuck => "▲",
+            Self::Waiting => "◆",
+            Self::Errored => "✗",
+            Self::Done => "✓",
             Self::Stopped => "○",
         }
     }
@@ -47,16 +59,22 @@ impl AgentState {
         match self {
             AgentState::Running => "running",
             AgentState::Stuck => "stuck",
+            AgentState::Waiting => "waiting",
+            AgentState::Errored => "errored",
+            AgentState::Done => "done",
             AgentState::Stopped => "stopped",
         }
     }
 
-    /// Display order: stuck agents need attention first.
+    /// Display order: agents that need attention first (waiting and errored
+    /// agents, then stuck ones), then the rest.
     fn sort_rank(&self) -> u8 {
         match self {
-            AgentState::Stuck => 0,
-            AgentState::Running => 1,
-            AgentState::Stopped => 2,
+            AgentState::Waiting | AgentState::Errored => 0,
+            AgentState::Stuck => 1,
+            AgentState::Running => 2,
+            AgentState::Done => 3,
+            AgentState::Stopped => 4,
         }
     }
 }
@@ -113,6 +131,13 @@ pub struct AgentSnapshot {
     /// `None` when the runtime does not measure stats or the lookup failed.
     pub cpu_percent: Option<f64>,
     pub memory_mb: Option<f64>,
+    /// The `blocked` kind (`permission`, `question`, `auth`) the agent
+    /// reported, when it is waiting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The agent's own one-line message (already sanitised; untrusted text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg: Option<String>,
 }
 
 impl AgentSnapshot {
@@ -131,6 +156,8 @@ impl AgentSnapshot {
             command_label: None,
             cpu_percent: None,
             memory_mb: None,
+            kind: None,
+            msg: None,
         }
     }
 
@@ -142,8 +169,38 @@ impl AgentSnapshot {
         };
         self.tab_number = Some(tab.tab_number);
         self.command_label = Some(tab.command_label.clone());
-        if tab.is_stuck && self.state == AgentState::Running {
-            self.state = AgentState::Stuck;
+        if self.state != AgentState::Running {
+            return;
+        }
+        match &tab.program_status {
+            // A reporting agent is judged on its report, never on silence.
+            Some(status) => self.apply_program_status(status),
+            None if tab.is_stuck => self.state = AgentState::Stuck,
+            None => {}
+        }
+    }
+
+    /// Present an agent's reported status: the state, plus the blocked kind
+    /// and the agent's message for the JSON output and the STATUS column.
+    fn apply_program_status(&mut self, status: &EffectiveStatus) {
+        self.state = match status.state {
+            ProgramState::Blocked => AgentState::Waiting,
+            ProgramState::Error => AgentState::Errored,
+            ProgramState::Done | ProgramState::Idle => AgentState::Done,
+            ProgramState::Working => AgentState::Running,
+        };
+        self.kind = match status.state {
+            ProgramState::Blocked => status.kind.map(|k| k.as_str().to_string()),
+            _ => None,
+        };
+        self.msg = status.msg.clone();
+    }
+
+    /// The STATUS column text: `running`, or e.g. `waiting (permission)`.
+    pub fn status_cell(&self) -> String {
+        match &self.kind {
+            Some(kind) => format!("{} ({kind})", self.state.label()),
+            None => self.state.label().to_string(),
         }
     }
 
@@ -195,7 +252,7 @@ impl AgentSnapshot {
             },
             self.name.clone(),
             self.image.clone(),
-            self.state.label().to_string(),
+            self.status_cell(),
             self.uptime_cell(),
             self.source_cell(),
         ]
@@ -207,6 +264,15 @@ impl AgentSnapshot {
 pub struct AgentTotals {
     pub running: usize,
     pub stuck: usize,
+    /// Agents that reported `blocked`.
+    #[serde(default)]
+    pub waiting: usize,
+    /// Agents that reported `error`.
+    #[serde(default)]
+    pub errored: usize,
+    /// Agents that reported `done`.
+    #[serde(default)]
+    pub done: usize,
     pub stopped: usize,
     /// `None` when no row reported a value.
     pub cpu_percent: Option<f64>,
@@ -220,6 +286,9 @@ impl AgentTotals {
             match agent.state {
                 AgentState::Running => totals.running += 1,
                 AgentState::Stuck => totals.stuck += 1,
+                AgentState::Waiting => totals.waiting += 1,
+                AgentState::Errored => totals.errored += 1,
+                AgentState::Done => totals.done += 1,
                 AgentState::Stopped => totals.stopped += 1,
             }
             if let Some(cpu) = agent.cpu_percent {
@@ -269,6 +338,12 @@ impl AgentsOverview {
             "available".to_string(),
             format!("{} running", self.totals.running),
         ];
+        if self.totals.waiting > 0 {
+            parts.push(format!("{} waiting", self.totals.waiting));
+        }
+        if self.totals.errored > 0 {
+            parts.push(format!("{} errored", self.totals.errored));
+        }
         if self.totals.stuck > 0 {
             parts.push(format!("{} stuck", self.totals.stuck));
         }
@@ -325,6 +400,9 @@ pub struct TuiTabSnapshot {
     pub tab_number: u32,
     pub container_name: Option<String>,
     pub is_stuck: bool,
+    /// The tab's agent-reported status (OSC 7501), when it reports one. A
+    /// reporting agent is never `Stuck`.
+    pub program_status: Option<EffectiveStatus>,
     pub command_label: String,
 }
 
@@ -457,240 +535,4 @@ pub(super) fn short_id(id: &str) -> String {
 
 fn format_mb(mb: f64) -> String {
     format!("{mb:.0} MB")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tui_context_new_stores_tabs() {
-        let ctx = AgentsTuiContext::new(vec![TuiTabSnapshot {
-            tab_number: 1,
-            container_name: Some("awman-abc".into()),
-            is_stuck: false,
-            command_label: "chat".into(),
-        }]);
-        assert_eq!(ctx.tabs.len(), 1);
-        assert_eq!(ctx.tabs[0].tab_number, 1);
-    }
-
-    #[test]
-    fn classify_source_marks_squad_agents() {
-        assert_eq!(AgentSource::classify("awman-abc"), AgentSource::Session);
-        assert_eq!(
-            AgentSource::classify("awman-squad-issue-triage-12ab34cd"),
-            AgentSource::Squad("issue-triage".to_string())
-        );
-        assert_eq!(
-            AgentSource::Squad("issue-triage".into()).label(),
-            "squad:issue-triage"
-        );
-    }
-
-    use crate::command::commands::agents::test_support::{handle, FakeRuntime};
-
-    const OPTS: CollectOptions = CollectOptions {
-        include_stopped: false,
-        with_stats: true,
-    };
-
-    fn tab(n: u32, container: &str, stuck: bool, label: &str) -> TuiTabSnapshot {
-        TuiTabSnapshot {
-            tab_number: n,
-            container_name: Some(container.to_string()),
-            is_stuck: stuck,
-            command_label: label.to_string(),
-        }
-    }
-
-    #[test]
-    fn collect_overview_counts_totals_and_states() {
-        let runtime = FakeRuntime::new()
-            .with_running(vec![
-                handle("aaa", "awman-a", 100),
-                handle("bbb", "awman-b", 50),
-                handle("ccc", "awman-c", 10),
-            ])
-            .with_stopped(vec![handle("ddd", "awman-d", 500)]);
-        let tui = AgentsTuiContext::new(vec![tab(2, "awman-c", true, "chat")]);
-        let opts = CollectOptions {
-            include_stopped: true,
-            ..OPTS
-        };
-        let o = collect_overview(&runtime, Some(&tui), opts, "tip").unwrap();
-        assert!(o.available);
-        assert_eq!(o.runtime, "fake");
-        assert_eq!(o.runtime_display, "Fake Runtime");
-        assert_eq!(o.tip, "tip");
-        assert_eq!(o.totals.running, 2);
-        assert_eq!(o.totals.stuck, 1);
-        assert_eq!(o.totals.stopped, 1);
-        // Three running agents report 10% CPU / 100 MB each; stopped rows none.
-        assert_eq!(o.totals.cpu_percent, Some(30.0));
-        assert_eq!(o.totals.memory_mb, Some(300.0));
-        assert_eq!(o.agents.len(), 4);
-    }
-
-    #[test]
-    fn collect_overview_sorts_stuck_first_then_uptime_descending() {
-        let runtime = FakeRuntime::new()
-            .with_running(vec![
-                handle("a1", "awman-short", 10),
-                handle("b2", "awman-long", 900),
-                handle("c3", "awman-stuck", 5),
-            ])
-            .with_stopped(vec![handle("d4", "awman-old", 9999)]);
-        let tui = AgentsTuiContext::new(vec![tab(1, "awman-stuck", true, "chat")]);
-        let opts = CollectOptions {
-            include_stopped: true,
-            ..OPTS
-        };
-        let o = collect_overview(&runtime, Some(&tui), opts, "").unwrap();
-        let names: Vec<&str> = o.agents.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(
-            names,
-            ["awman-stuck", "awman-long", "awman-short", "awman-old"]
-        );
-    }
-
-    #[test]
-    fn collect_overview_stats_error_leaves_values_none() {
-        let runtime = FakeRuntime::new().with_running(vec![
-            handle("a1", "awman-ok", 10),
-            handle("b2", "awman-bad", 5),
-        ]);
-        runtime.stats_fail.lock().unwrap().push("awman-bad".into());
-        let o = collect_overview(&runtime, None, OPTS, "").unwrap();
-        let bad = o.agents.iter().find(|a| a.name == "awman-bad").unwrap();
-        let ok = o.agents.iter().find(|a| a.name == "awman-ok").unwrap();
-        assert_eq!((bad.cpu_percent, bad.memory_mb), (None, None));
-        assert_eq!(bad.cpu_cell(), "-");
-        assert_eq!(bad.mem_cell(), "-");
-        assert_eq!(ok.cpu_percent, Some(10.0));
-        // Totals only add what rows reported.
-        assert_eq!(o.totals.cpu_percent, Some(10.0));
-    }
-
-    #[test]
-    fn collect_overview_runtime_without_stats_renders_not_reported() {
-        // SBX-style runtimes report zeros; capabilities say not to ask.
-        let mut runtime = FakeRuntime::new().with_running(vec![handle("a1", "awman-a", 10)]);
-        runtime.caps.reports_resource_stats = false;
-        let o = collect_overview(&runtime, None, OPTS, "").unwrap();
-        assert!(!runtime.called("stats"), "stats must not be queried");
-        assert_eq!(o.agents[0].cpu_cell(), "-");
-        assert_eq!(o.agents[0].mem_cell(), "-");
-        assert_eq!(o.totals.cpu_percent, None);
-        assert_eq!(o.totals.memory_mb, None);
-        assert!(!o.header_line().contains("CPU"));
-    }
-
-    #[test]
-    fn collect_overview_without_stats_option_skips_stats() {
-        let runtime = FakeRuntime::new().with_running(vec![handle("a1", "awman-a", 10)]);
-        let opts = CollectOptions {
-            with_stats: false,
-            ..OPTS
-        };
-        let o = collect_overview(&runtime, None, opts, "").unwrap();
-        assert!(!runtime.called("stats"));
-        assert_eq!(o.agents[0].cpu_percent, None);
-    }
-
-    #[test]
-    fn collect_overview_unavailable_runtime_is_not_an_error() {
-        let runtime = FakeRuntime::new();
-        *runtime.available.lock().unwrap() = Err("daemon down".into());
-        let o = collect_overview(&runtime, None, OPTS, "t").unwrap();
-        assert!(!o.available);
-        assert!(o.agents.is_empty());
-        assert!(o
-            .unavailable_reason
-            .as_deref()
-            .unwrap()
-            .contains("daemon down"));
-        assert!(o.header_line().starts_with("Fake Runtime · unavailable: "));
-        assert!(!runtime.called("list_running_all"));
-    }
-
-    #[test]
-    fn collect_overview_tui_context_enriches_row_with_matching_tab() {
-        let runtime = FakeRuntime::new().with_running(vec![
-            handle("a1", "awman-tab", 10),
-            handle("b2", "awman-other", 5),
-        ]);
-        let tui = AgentsTuiContext::new(vec![tab(3, "awman-tab", false, "chat claude")]);
-        let o = collect_overview(&runtime, Some(&tui), OPTS, "").unwrap();
-        let row = o.agents.iter().find(|a| a.name == "awman-tab").unwrap();
-        assert_eq!(row.tab_number, Some(3));
-        assert_eq!(row.command_label.as_deref(), Some("chat claude"));
-        assert_eq!(row.state, AgentState::Running);
-        assert_eq!(row.source_cell(), "tab 3");
-        let other = o.agents.iter().find(|a| a.name == "awman-other").unwrap();
-        assert_eq!(other.tab_number, None);
-        assert_eq!(other.command_label, None);
-        assert_eq!(other.source_cell(), "session");
-    }
-
-    #[test]
-    fn collect_overview_tui_context_marks_stuck_tab_stuck() {
-        let runtime = FakeRuntime::new().with_running(vec![handle("a1", "awman-tab", 10)]);
-        let tui = AgentsTuiContext::new(vec![tab(1, "awman-tab", true, "chat")]);
-        let o = collect_overview(&runtime, Some(&tui), OPTS, "").unwrap();
-        assert_eq!(o.agents[0].state, AgentState::Stuck);
-        assert_eq!(o.totals.stuck, 1);
-        assert_eq!(o.totals.running, 0);
-        assert!(o.header_line().contains("1 stuck"));
-    }
-
-    #[test]
-    fn collect_overview_without_tui_context_leaves_rows_plain() {
-        let runtime = FakeRuntime::new().with_running(vec![handle("a1", "awman-tab", 10)]);
-        let o = collect_overview(&runtime, None, OPTS, "").unwrap();
-        assert_eq!(o.agents[0].tab_number, None);
-        assert_eq!(o.agents[0].state, AgentState::Running);
-    }
-
-    #[test]
-    fn collect_overview_classifies_session_vs_squad_source() {
-        let runtime = FakeRuntime::new().with_running(vec![
-            handle("a1", "awman-abc", 20),
-            handle("b2", "awman-squad-issue-triage-12ab34cd", 10),
-        ]);
-        let o = collect_overview(&runtime, None, OPTS, "").unwrap();
-        let squad = o.agents.iter().find(|a| a.id == "b2").unwrap();
-        let session = o.agents.iter().find(|a| a.id == "a1").unwrap();
-        assert_eq!(squad.source, AgentSource::Squad("issue-triage".into()));
-        assert_eq!(squad.source_cell(), "squad:issue-triage");
-        assert_eq!(session.source, AgentSource::Session);
-        assert_eq!(session.source_cell(), "session");
-    }
-
-    #[test]
-    fn snapshot_short_id_is_twelve_chars_and_cells_follow_columns() {
-        let h = handle("0123456789abcdef", "awman-x", 65);
-        let s = AgentSnapshot::from_handle(&h, AgentState::Running, Utc::now());
-        assert_eq!(s.short_id, "0123456789ab");
-        assert_eq!(s.status_cells().len(), STATUS_COLUMNS.len());
-        assert_eq!(s.list_cells(false).len(), LIST_COLUMNS.len());
-        assert_eq!(s.list_cells(false)[0], "0123456789ab");
-        assert_eq!(s.list_cells(true)[0], "0123456789abcdef");
-    }
-
-    #[test]
-    fn empty_state_names_the_runtime() {
-        let runtime = FakeRuntime::new();
-        let o = collect_overview(&runtime, None, OPTS, "").unwrap();
-        assert!(o.empty_state_lines()[0].contains("Fake Runtime"));
-        assert_eq!(o.header_line(), "Fake Runtime · available · 0 running");
-    }
-
-    #[test]
-    fn humanize_uptime_picks_two_units() {
-        assert_eq!(humanize_uptime(42), "42s");
-        assert_eq!(humanize_uptime(252), "4m12s");
-        assert_eq!(humanize_uptime(2 * 3600 + 3 * 60 + 9), "2h03m");
-        assert_eq!(humanize_uptime(3 * 86400 + 3600), "3d01h");
-    }
 }

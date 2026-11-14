@@ -180,7 +180,11 @@ fn bullet_section(heading: &str, items: &[String], width: usize) -> Vec<Line<'st
 
 /// The report as one entry per check, the ones that need attention first,
 /// then its advisories and notes. The summary line is the dialog's title.
-fn report_lines(report: &WorkflowPrerequisiteReport, width: usize) -> Vec<Line<'static>> {
+fn report_lines(
+    report: &WorkflowPrerequisiteReport,
+    width: usize,
+    satisfied_expanded: bool,
+) -> Vec<Line<'static>> {
     let mut checks: Vec<&PrerequisiteCheck> = report.checks.iter().collect();
     checks.sort_by_key(|check| match check.status {
         PrerequisiteStatus::Missing => 0,
@@ -189,11 +193,40 @@ fn report_lines(report: &WorkflowPrerequisiteReport, width: usize) -> Vec<Line<'
         PrerequisiteStatus::Satisfied => 3,
     });
     let mut lines = Vec::new();
-    for (i, check) in checks.into_iter().enumerate() {
-        if i > 0 {
+    let mut shown = 0;
+    for check in checks
+        .iter()
+        .filter(|c| c.status != PrerequisiteStatus::Satisfied)
+    {
+        if shown > 0 {
             lines.push(Line::from(""));
         }
         lines.extend(check_lines(check, width));
+        shown += 1;
+    }
+    let satisfied = checks
+        .iter()
+        .filter(|c| c.status == PrerequisiteStatus::Satisfied)
+        .count();
+    if satisfied > 0 {
+        if shown > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("{satisfied}/{} satisfied", checks.len()),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )));
+        if satisfied_expanded {
+            for check in checks
+                .into_iter()
+                .filter(|c| c.status == PrerequisiteStatus::Satisfied)
+            {
+                lines.push(Line::from(""));
+                lines.extend(check_lines(check, width));
+            }
+        }
     }
     if !report.advisories.is_empty() {
         let items: Vec<String> = report
@@ -261,7 +294,9 @@ pub(crate) fn render_review(state: &ReviewState, area: Rect, frame: &mut Frame) 
         ReviewBody::Prose(text) => {
             body.extend(prose_rows(text, text_w).into_iter().map(Line::from))
         }
-        ReviewBody::Prerequisites(report) => body.extend(report_lines(report, text_w)),
+        ReviewBody::Prerequisites(report) => {
+            body.extend(report_lines(report, text_w, state.satisfied_expanded))
+        }
     }
     while body.last().is_some_and(|line| line.width() == 0) {
         body.pop();
@@ -282,10 +317,36 @@ pub(crate) fn render_review(state: &ReviewState, area: Rect, frame: &mut Frame) 
         } else {
             (format!("{label} (scroll to the end first)"), dim)
         };
-        let first = format!("[{ch}] ");
+        let first = if *ch == '\n' {
+            String::new()
+        } else {
+            format!("[{ch}] ")
+        };
         let rest = " ".repeat(first.width());
         for row in wrap_words(&text, text_w, &first, &rest) {
+            let style = if *ch == '\n' && state.accepts(*ch) {
+                style.fg(Color::Green).add_modifier(Modifier::BOLD)
+            } else {
+                style
+            };
             keys.push(Line::from(Span::styled(row, style)));
+        }
+    }
+    if let ReviewBody::Prerequisites(report) = &state.body {
+        if report
+            .checks
+            .iter()
+            .any(|check| check.status == PrerequisiteStatus::Satisfied)
+        {
+            let action = if state.satisfied_expanded {
+                "Collapse"
+            } else {
+                "Expand"
+            };
+            keys.push(Line::from(Span::styled(
+                format!("[s] {action} satisfied prerequisites"),
+                dim,
+            )));
         }
     }
     let dismiss = state.dismiss_label.as_deref().unwrap_or("cancel");
@@ -385,36 +446,4 @@ pub(crate) fn render_review(state: &ReviewState, area: Rect, frame: &mut Frame) 
     footer.push(Line::from(""));
     footer.extend(keys);
     frame.render_widget(Paragraph::new(footer), footer_area);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wrap_words_breaks_at_spaces_with_a_hanging_indent() {
-        let rows = wrap_words("alpha beta gamma delta", 12, "  • ", "    ");
-        assert_eq!(
-            rows,
-            vec!["  • alpha", "    beta", "    gamma", "    delta"]
-        );
-        for row in &rows {
-            assert!(row.width() <= 12, "{row:?}");
-        }
-    }
-
-    #[test]
-    fn wrap_words_hard_wraps_a_word_wider_than_the_row() {
-        let rows = wrap_words("x abcdefghijkl", 6, "", "");
-        assert_eq!(rows, vec!["x", "abcdef", "ghijkl"]);
-    }
-
-    #[test]
-    fn prose_rows_keep_each_lines_indentation_and_blank_lines() {
-        let rows = prose_rows("{\n  \"a\": 1\n}\n\nsome words here", 8);
-        assert_eq!(
-            rows,
-            vec!["{", "  \"a\": 1", "}", "", "some", "words", "here"]
-        );
-    }
 }

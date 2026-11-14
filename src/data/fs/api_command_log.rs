@@ -19,7 +19,6 @@ use crate::data::error::DataError;
 use crate::data::execution_event::ExecutionEvent;
 use crate::data::fs::api_db::{FailedStep, PullRequestRef};
 use crate::data::fs::api_paths::ApiPaths;
-use crate::data::workflow_state::WorkflowState;
 
 /// Owns the filesystem side of a command's live workflow state so the API
 /// frontend never touches the filesystem itself. Synchronous because the
@@ -33,6 +32,7 @@ use crate::data::workflow_state::WorkflowState;
 pub struct CommandStateWriter {
     worktree: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     contributions: std::sync::Arc<std::sync::Mutex<ResultContributions>>,
+    mount_receipts: std::sync::Arc<std::sync::Mutex<Vec<tempfile::NamedTempFile>>>,
     paths: ApiPaths,
     session_id: String,
     command_id: String,
@@ -58,9 +58,41 @@ pub struct ResultContributions {
     /// Failed main, setup and teardown steps, each listed once (the last
     /// record for a phase/index wins, so a retried step keeps its last attempt).
     pub failed_steps: Vec<FailedStep>,
+    /// Whether `/awman/output` was actually mounted for this command
+    /// (`None` until the command reaches its launch decision). An empty
+    /// output directory and a missing mount are therefore distinguishable.
+    pub outputs_mounted: Option<bool>,
 }
 
 impl CommandStateWriter {
+    /// Record whether `/awman/output` was mounted (see
+    /// `Capabilities::mounts_outputs`). A later call replaces an earlier one.
+    pub fn record_outputs_mounted(&self, mounted: bool) {
+        self.contributions().outputs_mounted = Some(mounted);
+    }
+
+    /// Allocate an empty receipt in the actual output directory. Only a
+    /// guest that sees that bind can acknowledge it; holding the open inode
+    /// lets the guest unlink the name before starting the agent.
+    pub fn output_mount_receipt(&self) -> Result<std::path::PathBuf, DataError> {
+        let receipt = tempfile::Builder::new()
+            .prefix(".awman-mount-")
+            .tempfile_in(self.output_dir())
+            .map_err(|e| DataError::Other(format!("output mount receipt: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            receipt
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o666))
+                .map_err(|e| DataError::Other(e.to_string()))?;
+        }
+        let guest = std::path::Path::new(crate::data::fs::command_outputs::OUTPUT_MOUNT_PATH)
+            .join(receipt.path().file_name().expect("temporary file name"));
+        self.mount_receipts.lock().unwrap().push(receipt);
+        Ok(guest)
+    }
+
     pub fn record_container_started(&self) {
         self.contributions().container_started = true;
     }
@@ -90,10 +122,15 @@ impl CommandStateWriter {
         Self {
             worktree: Default::default(),
             contributions: Default::default(),
+            mount_receipts: Default::default(),
             paths,
             session_id: session_id.into(),
             command_id: command_id.into(),
         }
+    }
+
+    pub fn command_id(&self) -> &str {
+        &self.command_id
     }
 
     /// The command's `/awman/output` host directory (WI 0137 §3).
@@ -148,7 +185,17 @@ impl CommandStateWriter {
 
     /// A snapshot of everything recorded so far.
     pub fn result_contributions(&self) -> ResultContributions {
-        self.contributions().clone()
+        let mut result = self.contributions().clone();
+        if self
+            .mount_receipts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|receipt| receipt.as_file().metadata().is_ok_and(|m| m.len() > 0))
+        {
+            result.outputs_mounted = Some(true);
+        }
+        result
     }
 
     fn contributions(&self) -> std::sync::MutexGuard<'_, ResultContributions> {
@@ -175,7 +222,7 @@ impl CommandStateWriter {
             .filter(|path| path.is_dir())
     }
 
-    pub fn write(&self, state: &WorkflowState) -> Result<(), DataError> {
+    pub fn write(&self, state: &impl serde::Serialize) -> Result<(), DataError> {
         self.paths
             .write_command_workflow_state(&self.session_id, &self.command_id, state)
     }
@@ -345,100 +392,11 @@ async fn open_append_on_line_boundary(path: &Path) -> Result<File, DataError> {
     Ok(file)
 }
 
-#[cfg(test)]
-mod append_tests {
-    use super::*;
-    use crate::data::execution_event::EventPayload;
-
-    fn event(attempt: u32, sequence: u64, text: &str) -> ExecutionEvent {
-        ExecutionEvent {
-            source: None,
-            timestamp: chrono::Utc::now(),
-            attempt,
-            sequence,
-            payload: EventPayload::StdoutLine(text.into()),
-        }
+impl CommandStateWriter {
+    pub fn paths(&self) -> &ApiPaths {
+        &self.paths
     }
-
-    async fn write_attempt(paths: &ApiPaths, attempt: u32, texts: &[&str]) {
-        let mut writer = CommandLogWriter::open_append(paths, "s", "c")
-            .await
-            .unwrap();
-        for (sequence, text) in texts.iter().enumerate() {
-            writer
-                .write_event(&event(attempt, sequence as u64, text))
-                .await;
-        }
-        writer.flush().await;
-    }
-
-    fn setup() -> (tempfile::TempDir, ApiPaths) {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = ApiPaths::at_root(tmp.path());
-        paths.prepare_command_dir("s", "c").unwrap();
-        (tmp, paths)
-    }
-
-    #[tokio::test]
-    async fn requeue_appends_the_next_attempt_after_the_previous_one() {
-        let (_tmp, paths) = setup();
-        write_attempt(&paths, 1, &["a", "b"]).await;
-        write_attempt(&paths, 2, &["c"]).await;
-
-        let events = paths.read_command_events("s", "c");
-        let cursors: Vec<_> = events.iter().map(|e| e.cursor().to_string()).collect();
-        assert_eq!(cursors, ["1:0", "1:1", "2:0"]);
-
-        let output = std::fs::read_to_string(paths.command_log_path("s", "c")).unwrap();
-        assert_eq!(output, "a\nb\nc\n", "output.log is appended too");
-    }
-
-    #[tokio::test]
-    async fn a_torn_final_line_is_not_glued_to_the_next_attempt() {
-        let (_tmp, paths) = setup();
-        write_attempt(&paths, 1, &["a"]).await;
-        // Simulate a crash mid-write: half a JSON record, no newline.
-        let events_path = paths.command_events_log_path("s", "c");
-        let mut raw = std::fs::read(&events_path).unwrap();
-        raw.extend_from_slice(br#"{"timestamp":"2026-01-01T00:00:00Z","attempt":1,"seq"#);
-        std::fs::write(&events_path, raw).unwrap();
-
-        write_attempt(&paths, 2, &["b"]).await;
-
-        let cursors: Vec<_> = paths
-            .read_command_events("s", "c")
-            .iter()
-            .map(|e| e.cursor().to_string())
-            .collect();
-        assert_eq!(
-            cursors,
-            ["1:0", "2:0"],
-            "intact lines on both sides survive"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_torn_utf8_record_does_not_hide_later_attempts() {
-        let (_tmp, paths) = setup();
-        write_attempt(&paths, 1, &["a"]).await;
-        let events_path = paths.command_events_log_path("s", "c");
-        let mut raw = std::fs::read(&events_path).unwrap();
-        raw.extend_from_slice(&[b'{', b'"', 0xE2, 0x82]); // truncated multi-byte char
-        std::fs::write(&events_path, raw).unwrap();
-
-        write_attempt(&paths, 2, &["b"]).await;
-
-        let cursors: Vec<_> = paths
-            .read_command_events("s", "c")
-            .iter()
-            .map(|e| e.cursor().to_string())
-            .collect();
-        assert_eq!(cursors, ["1:0", "2:0"]);
-    }
-
-    #[tokio::test]
-    async fn a_missing_log_reads_as_empty() {
-        let (_tmp, paths) = setup();
-        assert!(paths.read_command_events("s", "c").is_empty());
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 }

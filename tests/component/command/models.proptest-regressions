@@ -1,0 +1,3 @@
+# Committed deterministic corpus. Hand-minimized traces are executable tests
+# in models.rs; these seeds are replayed before the fixed-seed generated cases.
+cc 73d48e5cab81383a6c257ef839f934452928166c5a9191aa8fe358a5aa7ab744

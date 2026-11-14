@@ -2,17 +2,105 @@
 //! type, plus the unified handle/exit/stats shapes shared by both runtime
 //! tiers (container-class and sandbox-class).
 
+use crate::data::terminal::TerminalOwnerInfo;
+use crate::engine::terminal_hub::{
+    TerminalHandle, TerminalHub, TerminalInput, TerminalRegistration,
+};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
+use crate::data::program_status::EffectiveStatus;
 use crate::engine::agent_runtime::frontend::AgentFrontend;
 use crate::engine::agent_runtime::output_tail::OutputTail;
+use crate::engine::agent_runtime::program_status::SharedProgramStatusTracker;
 use crate::engine::error::EngineError;
 
 pub use crate::data::session::AgentHandle;
+
+/// Registration metadata carried to the actual PTY bridge by a launch wrapper.
+#[derive(Clone)]
+pub struct TerminalLaunch {
+    pub hub: Arc<TerminalHub>,
+    pub owner: TerminalOwnerInfo,
+    pub agent: String,
+    pub model: Option<String>,
+    pub(crate) handle: Arc<Mutex<Option<TerminalHandle>>>,
+    pub(crate) drain: Arc<crate::engine::agent_runtime::output_tail::OutputTail>,
+}
+
+impl std::fmt::Debug for TerminalLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalLaunch")
+            .field("owner", &self.owner)
+            .field("agent", &self.agent)
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TerminalLaunch {
+    pub(crate) fn register_pty(
+        &self,
+        cols: u16,
+        rows: u16,
+        master: &Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    ) -> (TerminalHandle, tokio::sync::mpsc::Receiver<Vec<u8>>) {
+        let (stdin, receiver) = crate::engine::terminal_hub::input_channel();
+        let master = Arc::downgrade(master);
+        let resize = Arc::new(move |cols, rows| {
+            if let Some(master) = master.upgrade() {
+                if let Ok(master) = master.lock() {
+                    let _ = master.resize(portable_pty::PtySize {
+                        cols,
+                        rows,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                }
+            }
+        });
+        (
+            self.register(
+                cols,
+                rows,
+                TerminalInput {
+                    stdin,
+                    resize: Some(resize),
+                },
+            ),
+            receiver,
+        )
+    }
+    pub fn register(&self, cols: u16, rows: u16, input: TerminalInput) -> TerminalHandle {
+        let handle = self.hub.register(
+            TerminalRegistration {
+                owner: self.owner.clone(),
+                agent: self.agent.clone(),
+                model: self.model.clone(),
+                cols,
+                rows,
+            },
+            input,
+        );
+        *self.handle.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle.clone());
+        handle
+    }
+}
+
+/// Receive remote input directly in a runtime writer, retaining its byte bound.
+pub(crate) async fn next_terminal_input(
+    receiver: &mut Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+) -> Vec<u8> {
+    if let Some(rx) = receiver {
+        if let Some(bytes) = rx.recv().await {
+            return bytes;
+        }
+    }
+    std::future::pending().await
+}
 
 /// Stats returned by the runtime for a single running agent.
 #[derive(Debug, Clone, PartialEq)]
@@ -94,7 +182,7 @@ pub struct AgentHandlePreview {
     pub image: String,
 }
 
-/// Stuck/unstuck transition published by the engine's stuck detector task.
+/// Attention event published by the engine's detector task.
 ///
 /// Lifecycle: the detector first runs in *grace* mode — it watches for the
 /// agent's first byte of output. If grace expires before that byte
@@ -102,6 +190,10 @@ pub struct AgentHandlePreview {
 /// kills the agent via its cancel callback, exiting. After the first
 /// byte arrives, grace is discarded and the detector switches to the
 /// regular `Stuck`/`Unstuck` loop driven by `stuck_timeout`.
+/// Accepted OSC 7501 reports supersede silence while records remain. Clearing
+/// all records resumes silence detection from the clear; RIS keeps the reporting
+/// latch. The latch lasts until execution end or a new step/container. Sandbox
+/// emits only reports, without silence/grace events.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StuckEvent {
     Stuck,
@@ -110,6 +202,10 @@ pub enum StuckEvent {
     /// elapsed. The detector has invoked the cancel callback; subscribers
     /// should treat the step / prompt as failed.
     StartupGraceExpired,
+    /// Effective OSC 7501 status changed. State/kind transitions are deduplicated
+    /// and limited to one per 250 ms; display updates to one per second.
+    /// `None` means all records were cleared.
+    Reported(Option<EffectiveStatus>),
 }
 
 /// Fully-built but not-yet-running agent handle. Trait so `Box<dyn>` keeps
@@ -150,6 +246,108 @@ struct OutputFormatInstance {
     format: crate::data::agent_output_format::AgentOutputFormat,
 }
 
+/// Carry resolved bridge configuration through an existing runtime launch plan.
+pub(crate) fn with_program_status_config(
+    instance: Box<dyn AgentInstance>,
+    config: crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig,
+) -> Box<dyn AgentInstance> {
+    Box::new(ProgramStatusInstance { instance, config })
+}
+
+struct ProgramStatusInstance {
+    instance: Box<dyn AgentInstance>,
+    config: crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig,
+}
+
+impl AgentInstance for ProgramStatusInstance {
+    fn handle_preview(&self) -> AgentHandlePreview {
+        self.instance.handle_preview()
+    }
+    fn run_with_frontend(
+        self: Box<Self>,
+        frontend: Box<dyn AgentFrontend>,
+    ) -> Result<AgentExecution, EngineError> {
+        self.instance
+            .run_with_frontend(with_program_status_frontend(frontend, self.config))
+    }
+}
+
+pub(crate) fn with_program_status_frontend(
+    frontend: Box<dyn AgentFrontend>,
+    config: crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig,
+) -> Box<dyn AgentFrontend> {
+    Box::new(ProgramStatusFrontend {
+        frontend,
+        config,
+        terminal: None,
+    })
+}
+
+struct ProgramStatusFrontend {
+    frontend: Box<dyn AgentFrontend>,
+    config: crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig,
+    terminal: Option<crate::engine::agent_runtime::execution::TerminalLaunch>,
+}
+
+impl crate::data::message::UserMessageSink for ProgramStatusFrontend {
+    fn write_message(&mut self, message: crate::data::message::UserMessage) {
+        self.frontend.write_message(message);
+    }
+    fn replay_queued(&mut self) {
+        self.frontend.replay_queued();
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentFrontend for ProgramStatusFrontend {
+    fn terminal_launch(&self) -> Option<crate::engine::agent_runtime::execution::TerminalLaunch> {
+        let mut launch = self
+            .terminal
+            .clone()
+            .or_else(|| self.frontend.terminal_launch())?;
+        if let Some(mut source) = self.frontend.terminal_source() {
+            if source.container.is_none() {
+                source.container = launch
+                    .owner
+                    .source
+                    .as_ref()
+                    .and_then(|s| s.container.clone());
+            }
+            launch.owner.source = Some(source);
+        }
+        Some(launch)
+    }
+    fn terminal_source(&self) -> Option<crate::data::execution_event::EventSource> {
+        self.frontend.terminal_source()
+    }
+    fn program_status_config(
+        &self,
+    ) -> crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig {
+        self.config
+    }
+    fn report_status(&mut self, status: crate::engine::agent_runtime::frontend::AgentStatus) {
+        self.frontend.report_status(status);
+    }
+    fn report_progress(&mut self, progress: crate::engine::agent_runtime::frontend::AgentProgress) {
+        self.frontend.report_progress(progress);
+    }
+    fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
+        self.frontend.take_io()
+    }
+    fn set_agent_output_format(
+        &mut self,
+        format: crate::data::agent_output_format::AgentOutputFormat,
+    ) {
+        self.frontend.set_agent_output_format(format);
+    }
+    fn grace_timeout(&self) -> std::time::Duration {
+        self.frontend.grace_timeout()
+    }
+    fn stuck_timeout(&self) -> std::time::Duration {
+        self.frontend.stuck_timeout()
+    }
+}
+
 impl AgentInstance for OutputFormatInstance {
     fn handle_preview(&self) -> AgentHandlePreview {
         self.instance.handle_preview()
@@ -167,6 +365,7 @@ impl AgentInstance for OutputFormatInstance {
 /// "Fully prepared, ready-to-run agent handle" — the type passed by
 /// Layer 2 to `WorkflowEngine` without leaking backend or frontend details.
 pub struct AgentExecution {
+    terminal: Option<crate::engine::agent_runtime::execution::TerminalLaunch>,
     handle: AgentHandle,
     inner: ExecutionState,
     stuck_tx: Arc<tokio::sync::broadcast::Sender<StuckEvent>>,
@@ -176,6 +375,7 @@ pub struct AgentExecution {
     /// engine reads this after `wait()` to persist a failure log when a
     /// container exits unexpectedly.
     output_tail: Option<Arc<OutputTail>>,
+    program_status: Option<SharedProgramStatusTracker>,
 }
 
 enum ExecutionState {
@@ -284,18 +484,8 @@ impl AgentExecution {
             inner: ExecutionState::Running(backend),
             stuck_tx,
             output_tail,
-        }
-    }
-
-    /// Construct a pre-finished execution. Test-only.
-    #[cfg(test)]
-    pub(crate) fn finished(handle: AgentHandle, info: AgentExitInfo) -> Self {
-        let (tx, _) = tokio::sync::broadcast::channel(4);
-        Self {
-            handle,
-            inner: ExecutionState::Finished(info),
-            stuck_tx: Arc::new(tx),
-            output_tail: None,
+            program_status: None,
+            terminal: None,
         }
     }
 
@@ -305,22 +495,42 @@ impl AgentExecution {
         self.output_tail.clone()
     }
 
-    /// Construct a pre-finished execution carrying an output tail. Test-only:
-    /// lets engine tests exercise the container failure-log path without a live
-    /// runtime.
-    #[cfg(test)]
-    pub(crate) fn finished_with_tail(
-        handle: AgentHandle,
-        info: AgentExitInfo,
-        output_tail: Option<Arc<OutputTail>>,
-    ) -> Self {
-        let mut execution = Self::finished(handle, info);
-        execution.output_tail = output_tail;
-        execution
-    }
-
     pub fn handle(&self) -> &AgentHandle {
         &self.handle
+    }
+
+    /// Bind the per-execution tracker supplied by a byte-stream bridge.
+    pub(crate) fn with_program_status(mut self, tracker: SharedProgramStatusTracker) -> Self {
+        self.program_status = Some(tracker);
+        self
+    }
+
+    /// Snapshot of the agent's effective OSC 7501 report.
+    pub fn program_status(&self) -> Option<EffectiveStatus> {
+        self.program_status.as_ref()?.lock().ok()?.effective()
+    }
+
+    /// The execution's shared tracker, so a consumer that moves the
+    /// execution into a wait task can still read its final status.
+    pub(crate) fn program_status_tracker(&self) -> Option<SharedProgramStatusTracker> {
+        self.program_status.clone()
+    }
+
+    /// Whether an accepted report (including clear) arrived this execution.
+    pub fn reports_program_status(&self) -> bool {
+        self.program_status
+            .as_ref()
+            .and_then(|t| t.lock().ok())
+            .is_some_and(|t| t.reporting())
+    }
+
+    /// Relearn protocol support when reusing this container for a new step.
+    pub fn reset_program_status(&self) {
+        if let Some(tracker) = &self.program_status {
+            if let Ok(mut tracker) = tracker.lock() {
+                tracker.reset();
+            }
+        }
     }
 
     /// Subscribe to stuck/unstuck transitions for this agent's output.
@@ -344,15 +554,35 @@ impl AgentExecution {
     /// its reattach-after-owner-exit behavior when no wait is active. Call
     /// [`Self::detach`] before handing off work that may outlive this owner.
     pub async fn wait(&mut self) -> Result<AgentExitInfo, EngineError> {
+        let _status_guard = ProgramStatusEndGuard(self.program_status.clone());
         // Temporarily replace with Detached while we run the future so that the
         // execution is in a safe state if the task is dropped mid-await.
         match std::mem::replace(&mut self.inner, ExecutionState::Detached) {
             ExecutionState::Running(mut backend) => {
                 let _frontend_guard = backend.frontend_for_wait();
                 let mut cancellation = WaitCancellation(Some(backend.cancel_handle()));
-                let info = tokio::task::spawn_blocking(move || backend.wait_blocking())
-                    .await
-                    .map_err(|e| EngineError::Other(format!("execution join error: {e}")))?;
+                let terminal = self.terminal.clone();
+                let info = tokio::task::spawn_blocking(move || {
+                    let info = backend.wait_blocking();
+                    if let Some(launch) = terminal {
+                        // The child can exit before its last PTY read. Preserve
+                        // final output/status before closing the mirror.
+                        launch
+                            .drain
+                            .wait_for_writers(std::time::Duration::from_secs(2));
+                        if let Some(terminal) = launch
+                            .handle
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .as_ref()
+                        {
+                            terminal.exit(info.as_ref().map_or(-1, |info| info.exit_code));
+                        }
+                    }
+                    info
+                })
+                .await
+                .map_err(|e| EngineError::Other(format!("execution join error: {e}")))?;
                 cancellation.0 = None;
                 let info = info?;
                 self.inner = ExecutionState::Finished(info.clone());
@@ -394,9 +624,15 @@ impl AgentExecution {
     /// `Ok(false)` when the backend can't inject (no PTY bridge, already
     /// finished/detached) — the engine will then fall back to launching a
     /// fresh agent.
+    /// Injection starts a new workflow step: discard its predecessor's reports
+    /// and relearn support before delivering the next prompt. Ordinary input
+    /// (including ACP traffic and query replies) uses the bridge's stdin sender.
     pub fn try_inject_stdin(&self, bytes: &[u8]) -> Result<bool, EngineError> {
         match &self.inner {
-            ExecutionState::Running(b) => b.try_inject_stdin(bytes),
+            ExecutionState::Running(b) => {
+                self.reset_program_status();
+                b.try_inject_stdin(bytes)
+            }
             _ => Ok(false),
         }
     }
@@ -412,7 +648,67 @@ impl AgentExecution {
     }
 }
 
+/// Report publisher for runtimes without silence/grace detection. This adds
+/// no silence policy; the supersede rule stays exclusively in StuckDetector.
+pub fn spawn_reported_publisher(
+    tracker: SharedProgramStatusTracker,
+) -> Arc<tokio::sync::broadcast::Sender<crate::engine::agent_runtime::execution::StuckEvent>> {
+    let (tx, _) = tokio::sync::broadcast::channel(16);
+    let tx = Arc::new(tx);
+    let weak = Arc::downgrade(&tx);
+    tokio::spawn(async move {
+        let mut gate = crate::engine::agent_runtime::program_status::ReportedGate::new();
+        let mut generation = 0;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let Some(tx) = weak.upgrade() else {
+                break;
+            };
+            let (reporting, effective, ended, tracker_generation) = tracker
+                .lock()
+                .ok()
+                .map(|tracker| {
+                    (
+                        tracker.reporting(),
+                        tracker.effective(),
+                        tracker.is_ended(),
+                        tracker.generation(),
+                    )
+                })
+                .unwrap_or((false, None, false, 0));
+            if ended {
+                break;
+            }
+            if generation != tracker_generation {
+                generation = tracker_generation;
+                gate = crate::engine::agent_runtime::program_status::ReportedGate::new();
+            }
+            if !reporting {
+                gate = crate::engine::agent_runtime::program_status::ReportedGate::new();
+                continue;
+            }
+            if let Some(status) = gate.next(std::time::Instant::now(), effective.as_ref()) {
+                let _ =
+                    tx.send(crate::engine::agent_runtime::execution::StuckEvent::Reported(status));
+            }
+        }
+    });
+    tx
+}
+
 struct WaitCancellation(Option<CancelHandle>);
+
+struct ProgramStatusEndGuard(Option<SharedProgramStatusTracker>);
+
+impl Drop for ProgramStatusEndGuard {
+    fn drop(&mut self) {
+        if let Some(tracker) = &self.0 {
+            if let Ok(mut tracker) = tracker.lock() {
+                tracker.end_execution();
+            }
+        }
+    }
+}
 
 impl Drop for WaitCancellation {
     fn drop(&mut self) {
@@ -428,6 +724,7 @@ impl Drop for WaitCancellation {
 
 impl Drop for AgentExecution {
     fn drop(&mut self) {
+        drop(ProgramStatusEndGuard(self.program_status.clone()));
         if let ExecutionState::Running(backend) = &self.inner {
             if backend.cancel_on_execution_drop() {
                 let cancel = backend.cancel_handle();
@@ -439,293 +736,56 @@ impl Drop for AgentExecution {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::engine::container::instance::{handle_now, ContainerId};
-    use crate::engine::container::options::{ContainerName, ImageRef};
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    struct ReleaseProbe(Arc<AtomicBool>);
-
-    impl Drop for ReleaseProbe {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
-    struct WaitingBackend {
-        done: std::sync::mpsc::Receiver<AgentExitInfo>,
-        cancel: std::sync::mpsc::Sender<AgentExitInfo>,
-        wait_started: std::sync::mpsc::Sender<()>,
-        _frontend: ReleaseProbe,
-    }
-
-    impl ExecutionBackend for WaitingBackend {
-        fn wait_blocking(self: Box<Self>) -> Result<AgentExitInfo, EngineError> {
-            let _ = self.wait_started.send(());
-            self.done
-                .recv()
-                .map_err(|error| EngineError::Other(error.to_string()))
-        }
-
-        fn cancel(&self) -> Result<(), EngineError> {
-            let _ = self.cancel.send(make_exit_info(KILLED_EXIT_CODE));
-            Ok(())
-        }
-
-        fn cancel_handle(&self) -> CancelHandle {
-            let cancel = self.cancel.clone();
-            CancelHandle::new(move || {
-                let _ = cancel.send(make_exit_info(KILLED_EXIT_CODE));
-                Ok(())
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn wait_releases_fake_backend_after_normal_and_dropped_wait() {
-        for drop_wait in [false, true] {
-            let released = Arc::new(AtomicBool::new(false));
-            let (done, received) = std::sync::mpsc::channel();
-            let (started, wait_started) = std::sync::mpsc::channel();
-            let (stuck_tx, _) = tokio::sync::broadcast::channel(4);
-            let mut execution = AgentExecution::new(
-                make_handle(),
-                Box::new(WaitingBackend {
-                    done: received,
-                    cancel: done.clone(),
-                    wait_started: started,
-                    _frontend: ReleaseProbe(released.clone()),
-                }),
-                Arc::new(stuck_tx),
-                None,
-            );
-            if drop_wait {
-                let task = tokio::spawn(async move { execution.wait().await });
-                tokio::task::spawn_blocking(move || {
-                    wait_started
-                        .recv_timeout(std::time::Duration::from_secs(2))
-                        .expect("wait_blocking must start before cancellation");
-                })
-                .await
-                .unwrap();
-                task.abort();
-                let _ = task.await;
-            } else {
-                done.send(make_exit_info(0)).unwrap();
-                execution.wait().await.unwrap();
-            }
-            tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                while !released.load(Ordering::SeqCst) {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("blocking backend retained frontend after wait");
-        }
-    }
-
-    #[test]
-    fn dropped_wait_cancellation_runs_outside_the_dropping_thread() {
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let release_rx = std::sync::Mutex::new(release_rx);
-        let cancellation = WaitCancellation(Some(CancelHandle::new(move || {
-            let _ = entered_tx.send(());
-            let _ = release_rx.lock().unwrap().recv();
-            Ok(())
-        })));
-        drop(cancellation);
-        entered_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .expect("cancellation closure did not start");
-        release_tx.send(()).unwrap();
-    }
-
-    #[test]
-    fn dropping_unwaited_execution_releases_frontend() {
-        let released = Arc::new(AtomicBool::new(false));
-        let (done, received) = std::sync::mpsc::channel();
-        let (started, _wait_started) = std::sync::mpsc::channel();
-        let (stuck_tx, _) = tokio::sync::broadcast::channel(4);
-        let execution = AgentExecution::new(
-            make_handle(),
-            Box::new(WaitingBackend {
-                done: received,
-                cancel: done,
-                wait_started: started,
-                _frontend: ReleaseProbe(released.clone()),
-            }),
-            Arc::new(stuck_tx),
-            None,
-        );
-        drop(execution);
-        assert!(released.load(Ordering::SeqCst));
-    }
-
-    fn make_handle() -> AgentHandle {
-        let id = ContainerId::new("test-container-id");
-        let name = ContainerName::new("test-name");
-        let image = ImageRef::new("test-image:latest");
-        handle_now(&id, &name, &image)
-    }
-
-    fn make_exit_info(exit_code: i32) -> AgentExitInfo {
-        let now = Utc::now();
-        AgentExitInfo {
-            exit_code,
-            signal: None,
-            started_at: now,
-            ended_at: now,
-        }
-    }
-
-    #[tokio::test]
-    async fn wait_on_finished_returns_exit_info() {
-        let handle = make_handle();
-        let info = make_exit_info(42);
-        let mut execution = AgentExecution::finished(handle, info);
-        let result = execution.wait().await.expect("wait should succeed");
-        assert_eq!(result.exit_code, 42);
-    }
-
-    #[tokio::test]
-    async fn wait_is_idempotent_on_finished_execution() {
-        let handle = make_handle();
-        let info = make_exit_info(7);
-        let mut execution = AgentExecution::finished(handle, info);
-        let r1 = execution.wait().await.unwrap();
-        let r2 = execution.wait().await.unwrap();
-        assert_eq!(r1.exit_code, 7);
-        assert_eq!(r2.exit_code, 7);
-    }
-
-    #[tokio::test]
-    async fn cancel_on_finished_is_noop() {
-        let handle = make_handle();
-        let info = make_exit_info(0);
-        let execution = AgentExecution::finished(handle, info);
-        assert!(execution.cancel().is_ok());
-    }
-
-    #[tokio::test]
-    async fn detach_returns_handle() {
-        let handle = make_handle();
-        let original_id = handle.id.clone();
-        let info = make_exit_info(0);
-        let execution = AgentExecution::finished(handle, info);
-        let returned_handle = execution.detach();
-        assert_eq!(returned_handle.id, original_id);
-    }
-
-    #[tokio::test]
-    async fn subscribe_stuck_receives_events() {
-        let handle = make_handle();
-        let info = make_exit_info(0);
-        let execution = AgentExecution::finished(handle, info);
-        let mut rx = execution.subscribe_stuck();
-        let _ = execution.stuck_tx.send(StuckEvent::Stuck);
-        let event = rx.recv().await.unwrap();
-        assert_eq!(event, StuckEvent::Stuck);
-    }
-
-    /// Two independent receivers from the same `AgentExecution` both
-    /// receive every Stuck/Unstuck event (broadcast semantics).
-    #[tokio::test]
-    async fn subscribe_stuck_two_receivers_both_get_same_events() {
-        let handle = make_handle();
-        let info = make_exit_info(0);
-        let execution = AgentExecution::finished(handle, info);
-
-        let mut rx1 = execution.subscribe_stuck();
-        let mut rx2 = execution.subscribe_stuck();
-
-        // Publish two events via the stored sender.
-        let _ = execution.stuck_tx.send(StuckEvent::Stuck);
-        let _ = execution.stuck_tx.send(StuckEvent::Unstuck);
-
-        // Both receivers must see both events in order.
-        let (a1, a2) = (rx1.recv().await.unwrap(), rx1.recv().await.unwrap());
-        let (b1, b2) = (rx2.recv().await.unwrap(), rx2.recv().await.unwrap());
-
-        assert_eq!(a1, StuckEvent::Stuck, "rx1 first event must be Stuck");
-        assert_eq!(a2, StuckEvent::Unstuck, "rx1 second event must be Unstuck");
-        assert_eq!(b1, StuckEvent::Stuck, "rx2 first event must be Stuck");
-        assert_eq!(b2, StuckEvent::Unstuck, "rx2 second event must be Unstuck");
-    }
-
-    /// `stuck_sender()` returns the same underlying channel so its subscribers
-    /// also receive events sent through the stored `stuck_tx`.
-    #[tokio::test]
-    async fn stuck_sender_shares_channel_with_subscribe_stuck() {
-        let handle = make_handle();
-        let info = make_exit_info(0);
-        let execution = AgentExecution::finished(handle, info);
-
-        let sender = execution.stuck_sender();
-        let mut rx_a = execution.subscribe_stuck();
-        let mut rx_b = sender.subscribe();
-
-        let _ = sender.send(StuckEvent::Stuck);
-
-        assert_eq!(rx_a.recv().await.unwrap(), StuckEvent::Stuck);
-        assert_eq!(rx_b.recv().await.unwrap(), StuckEvent::Stuck);
-    }
+/// Carry daemon ownership through a runtime's existing launch plan.
+pub(crate) fn with_terminal_launch(
+    instance: Box<dyn AgentInstance>,
+    launch: crate::engine::agent_runtime::execution::TerminalLaunch,
+) -> Box<dyn AgentInstance> {
+    Box::new(TerminalInstance { instance, launch })
 }
-
-#[cfg(test)]
-mod detail_tests {
-    use super::*;
-
-    fn handle() -> AgentHandle {
-        AgentHandle {
-            id: "abc".into(),
-            name: "awman-x".into(),
-            image_tag: "img:latest".into(),
-            started_at: chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+struct TerminalInstance {
+    instance: Box<dyn AgentInstance>,
+    launch: crate::engine::agent_runtime::execution::TerminalLaunch,
+}
+impl AgentInstance for TerminalInstance {
+    fn handle_preview(&self) -> AgentHandlePreview {
+        self.instance.handle_preview()
+    }
+    fn run_with_frontend(
+        self: Box<Self>,
+        frontend: Box<dyn AgentFrontend>,
+    ) -> Result<AgentExecution, EngineError> {
+        // Nested command runtimes must share one launch handle. Otherwise the
+        // outer wait closes a handle that was never registered, losing exit
+        // frames and the outer lease's input grant.
+        if frontend
+            .terminal_launch()
+            .is_some_and(|launch| launch.owner.owner == self.launch.owner.owner)
+        {
+            return self.instance.run_with_frontend(frontend);
         }
-    }
-
-    fn stats() -> AgentStats {
-        AgentStats {
-            name: "awman-x".into(),
-            cpu_percent: 12.5,
-            memory_mb: 256.0,
-        }
-    }
-
-    #[test]
-    fn default_detail_copies_identity_and_stats() {
-        let h = handle();
-        let d = default_detail(true, &h, Ok(stats()));
-        assert_eq!(
-            (d.id.as_str(), d.name.as_str(), d.image.as_str()),
-            ("abc", "awman-x", "img:latest")
-        );
-        assert_eq!(d.started_at, h.started_at);
-        assert!(d.running);
-        assert_eq!((d.cpu_percent, d.memory_mb), (Some(12.5), Some(256.0)));
-        assert!(d.owner.is_none());
-        assert!(d.runtime_extras.is_empty());
-    }
-
-    #[test]
-    fn default_detail_drops_stats_the_runtime_does_not_measure() {
-        // SBX-style: the stats call "succeeds" with zeros nobody measured.
-        let zeros = AgentStats {
-            cpu_percent: 0.0,
-            memory_mb: 0.0,
-            ..stats()
-        };
-        let d = default_detail(false, &handle(), Ok(zeros));
-        assert_eq!((d.cpu_percent, d.memory_mb), (None, None));
-    }
-
-    #[test]
-    fn default_detail_turns_a_stats_error_into_none() {
-        let d = default_detail(true, &handle(), Err(EngineError::Other("boom".into())));
-        assert_eq!((d.cpu_percent, d.memory_mb), (None, None));
-        assert!(d.running, "a stats failure does not change liveness");
+        let config = frontend.program_status_config();
+        let mut launch = self.launch;
+        let mut source = frontend
+            .terminal_source()
+            .or_else(|| launch.owner.source.clone())
+            .unwrap_or_else(|| {
+                crate::data::execution_event::EventSource::phase(
+                    crate::data::execution_event::EventSourcePhase::Main,
+                )
+                .with_step_attempt(1)
+            });
+        source.container = Some(self.instance.handle_preview().name);
+        launch.owner.source = Some(source);
+        let retained_launch = launch.clone();
+        let mut execution = self
+            .instance
+            .run_with_frontend(Box::new(ProgramStatusFrontend {
+                frontend,
+                config,
+                terminal: Some(launch),
+            }))?;
+        execution.terminal = Some(retained_launch);
+        Ok(execution)
     }
 }

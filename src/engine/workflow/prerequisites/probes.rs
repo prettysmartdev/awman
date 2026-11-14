@@ -68,6 +68,18 @@ impl PrerequisitePreflight {
             PushAuth { remote } => match self.remote(remote) {
                 Ok(Some(url)) => {
                     let mut classified = need.clone();
+                    if let Some(scope) = self
+                        .options
+                        .session_git_scope
+                        .as_ref()
+                        .filter(|scope| scope.matches_url(&url.redacted))
+                    {
+                        classified.prerequisite = PushAuthHttps {
+                            remote: remote.clone(),
+                            host: scope.host().into(),
+                        };
+                        return vec![self.https(&classified, scope.host(), secrets)];
+                    }
                     match url.kind {
                         GitRemoteKind::Ssh { host } => {
                             classified.prerequisite = PushAuthSsh {
@@ -449,6 +461,24 @@ impl PrerequisitePreflight {
         host: &str,
         secrets: &RedactionSet,
     ) -> PrerequisiteCheck {
+        if self.destination(need).is_some_and(|remote| {
+            self.options
+                .session_git_scope
+                .as_ref()
+                .is_some_and(|scope| scope.matches_url(&remote.redacted))
+        }) && need.needed_by.iter().all(|step| {
+            matches!(
+                step.kind,
+                PrerequisiteStepKind::PushBranch | PrerequisiteStepKind::PullBranch
+            )
+        }) {
+            return Self::check(
+                need,
+                PrerequisiteStatus::Satisfied,
+                "session Git credential available through the private helper",
+                vec![],
+            );
+        }
         if !github_host(host) {
             Self::unsupported(need, "HTTPS authentication for non-GitHub remotes is unsupported; configure a credential overlay")
         } else {

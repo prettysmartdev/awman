@@ -1,0 +1,101 @@
+//! `server.json` — owner-private endpoint metadata for the running daemon.
+//!
+//! Layer 0. The daemon writes this after binding its local listener so local
+//! clients can learn *which* transport it bound and *which* build/protocol it
+//! speaks. It never holds a secret: access to the daemon is decided by the
+//! local transport itself (socket mode and peer UID on Unix, owner-only pipe
+//! ACL and caller identity on Windows). A missing, stale or tampered sidecar
+//! therefore cannot grant access; at worst it makes a client refuse to talk.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use crate::data::error::DataError;
+use crate::data::fs::private_files::{
+    create_private_dir, read_private_json, remove_private_file, write_private_json_atomic,
+};
+
+/// Protocol family name for the HTTP resource API.
+pub const PROTOCOL_API: &str = "api";
+/// The API protocol version this build speaks.
+pub const PROTOCOL_API_VERSION: u32 = 1;
+
+/// The kind of local transport the daemon bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidecarTransportKind {
+    UnixSocket,
+    NamedPipe,
+}
+
+impl SidecarTransportKind {
+    /// The only kind this platform can serve or connect to.
+    pub fn native() -> Self {
+        if cfg!(windows) {
+            SidecarTransportKind::NamedPipe
+        } else {
+            SidecarTransportKind::UnixSocket
+        }
+    }
+}
+
+/// Where the local listener is: a socket path or a pipe name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidecarTransport {
+    pub kind: SidecarTransportKind,
+    pub address: String,
+}
+
+/// Endpoint metadata only, never a secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerSidecar {
+    /// `CARGO_PKG_VERSION` of the daemon that wrote it.
+    pub version: String,
+    /// Protocol versions spoken, e.g. `{"api": 1}`.
+    pub protocol: BTreeMap<String, u32>,
+    pub pid: u32,
+    pub transport: SidecarTransport,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl ServerSidecar {
+    /// The sidecar this build writes for `pid` serving on `transport`.
+    pub fn current(pid: u32, transport: SidecarTransport) -> Self {
+        Self {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol: BTreeMap::from([
+                (PROTOCOL_API.to_string(), PROTOCOL_API_VERSION),
+                ("frontend".into(), 1),
+            ]),
+            pid,
+            transport,
+            started_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The API protocol version recorded, if any.
+    pub fn api_protocol(&self) -> Option<u32> {
+        self.protocol.get(PROTOCOL_API).copied()
+    }
+
+    /// Atomically replace `path` with this record (0600, private parent dir).
+    pub fn write(&self, path: &Path) -> Result<(), DataError> {
+        if let Some(parent) = path.parent() {
+            create_private_dir(parent)?;
+        }
+        write_private_json_atomic(path, self, || Ok(()))
+    }
+
+    /// `Ok(None)` when absent. A file that is malformed, a symlink, not owned
+    /// by this user or open to others is an error, never adopted.
+    pub fn read(path: &Path) -> Result<Option<ServerSidecar>, DataError> {
+        read_private_json(path)
+    }
+
+    /// Remove the record. Absent is success.
+    pub fn remove(path: &Path) -> Result<(), DataError> {
+        remove_private_file(path)
+    }
+}

@@ -1,0 +1,52 @@
+/* Entry, linking, saved authorization recovery and workspace selection. */
+.connect { min-height: 100dvh; align-content: start; padding: clamp(24px, 7vh, 72px) 16px; font-size: var(--text-md); }
+.connect-card { max-width: 560px; padding: var(--space-5); border-radius: var(--radius-lg); box-shadow: var(--shadow); }
+.entry-brand { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); margin: calc(-1 * var(--space-5)) calc(-1 * var(--space-5)) var(--space-5); padding: var(--space-3) var(--space-5); border-bottom: 1px solid var(--border); border-radius: var(--radius-lg) var(--radius-lg) 0 0; background: var(--glass); font-weight: 700; }
+.entry-brand span { color: var(--muted); font-size: var(--text-sm); font-weight: 400; }
+.connect-card h1 { font-size: var(--text-xl); line-height: 1.25; margin-bottom: var(--space-4); }
+.connect[aria-busy='true'] .connect-card h1::after { content: none; }
+.connect-card h2 { font-size: var(--text-lg); margin: 0 0 var(--space-2); }
+.connect-card p { margin: 0 0 var(--space-4); }
+.connect-card code, .connect-card strong { overflow-wrap: anywhere; }
+.connect-card button, .connect-card select, .connect-card summary { min-height: 44px; min-width: 44px; }
+.connect-card button { white-space: normal; }
+.connect-card .actions { gap: var(--space-3); margin-top: var(--space-5); }
+.connect-card .hint { font-size: var(--text-sm); }
+.connect-card .about { margin-top: var(--space-5); border-top: 1px solid var(--border); padding-top: var(--space-2); }
+.connect-card .about summary { display: list-item; align-content: center; color: var(--text); padding: var(--space-2) 0; }
+.connect-card .about p { margin-top: var(--space-3); }
+.connect-card .command-block { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-2); margin-bottom: var(--space-4); }
+.connect-card .command-block pre { width: 100%; padding: var(--space-3); border-radius: var(--radius-sm); overscroll-behavior-x: contain; }
+.connect-card .command-block code { white-space: pre-wrap; overflow-wrap: anywhere; }
+.connect-card .command-block code + code { margin-top: var(--space-2); }
+.connect-card .command-block button { align-self: start; }
+.connect-card .copy-result { grid-column: 1 / -1; }
+.connect-card .copy-result:empty { display: none; }
+.connect-card .link-code .code { font-size: var(--text-xl); letter-spacing: .04em; }
+.entry-choices { border: 0; margin: var(--space-4) 0; padding: 0; min-width: 0; }
+.entry-choices legend { padding: 0; font-weight: 600; margin-bottom: var(--space-2); }
+.entry-choice { display: flex; gap: var(--space-3); align-items: center; min-height: 64px; padding: var(--space-3); margin-bottom: var(--space-2); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; }
+.entry-choice:has(:checked) { background: var(--accent-soft); border-color: var(--accent); }
+.entry-choice input { accent-color: var(--accent); flex-shrink: 0; width: 20px; height: 20px; margin: 0; }
+.entry-choice span { min-width: 0; overflow-wrap: anywhere; }
+.entry-choice .hint { display: block; }
+.workspace-label { display: block; font-weight: 600; margin-bottom: var(--space-2); }
+.connect-card select { width: 100%; max-width: 100%; padding: var(--space-2); font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); }
+.workspace-detail { margin-top: var(--space-3); padding: var(--space-3); background: var(--surface-2); border-radius: var(--radius-sm); }
+.workspace-detail code { display: block; white-space: pre-wrap; overflow-wrap: anywhere; }
+.connect-card .workspace-detail p { margin: var(--space-2) 0 0; }
+.entry-error { padding: var(--space-3); border: 1px solid var(--danger); border-radius: var(--radius-sm); background: var(--danger-soft); }
+.entry-instances { border-top: 1px solid var(--border); margin-top: var(--space-5); padding-top: var(--space-5); }
+.entry-instances ul { list-style: none; margin: 0; padding: 0; }
+.entry-instances li { display: grid; gap: var(--space-2); padding: var(--space-3) 0; border-top: 1px solid var(--border); min-width: 0; }
+.entry-instances li button { justify-self: start; }
+.connect-card .entry-instances li p { margin: var(--space-1) 0 0; }
+@media (max-width: 480px) {
+  .connect-card { padding: var(--space-4); }
+  .entry-brand { margin: calc(-1 * var(--space-4)) calc(-1 * var(--space-4)) var(--space-4); padding: var(--space-3) var(--space-4); }
+  .connect-card .actions { flex-direction: column; align-items: stretch; }
+  .connect-card .command-block { grid-template-columns: minmax(0, 1fr); }
+  .connect-card .command-block button { justify-self: stretch; }
+}
+@media (prefers-reduced-transparency: reduce) { .entry-brand { background: var(--glass-opaque); } }
+@media (prefers-reduced-motion: reduce) { .connect *, .connect *::before, .connect *::after { animation: none; transition: none; scroll-behavior: auto; } }

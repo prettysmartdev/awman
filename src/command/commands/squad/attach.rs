@@ -17,12 +17,12 @@ use crate::command::commands::remote_client::{
     RemoteWorkflowPoller, SquadTaskWorkflowSource, WorkflowStateSource,
 };
 use crate::command::commands::squad::gateway::TaskGateway;
-use crate::command::commands::squad::supervisor::SquadGatewayResolver;
+use crate::command::commands::squad::supervisor::DaemonResolver;
 use crate::command::commands::Command;
 use crate::command::dispatch::catalogue::GatewayNeed;
 use crate::command::dispatch::BuildContext;
 use crate::command::error::CommandError;
-use crate::data::config::env::Env;
+use crate::data::config::env::EnvSnapshot;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::AgentHandle;
 use crate::data::workflow_state::{StepState, WorkflowState};
@@ -189,6 +189,9 @@ pub struct SquadAttachCommand {
     requested_container: Option<String>,
     runtime: Arc<dyn AgentRuntimeEngine>,
     gateway: Option<Arc<dyn TaskGateway>>,
+    /// The invoking session's environment, which locates the daemon when
+    /// dispatch resolved no gateway.
+    env: EnvSnapshot,
 }
 
 impl SquadAttachCommand {
@@ -198,6 +201,7 @@ impl SquadAttachCommand {
             requested_container: ctx.flags.string("container"),
             runtime: ctx.engines.runtime.clone(),
             gateway: ctx.gateway.clone(),
+            env: ctx.session.env().clone(),
         })
     }
 
@@ -207,10 +211,10 @@ impl SquadAttachCommand {
     ) -> Result<SquadAttachOutcome, CommandError> {
         let gateway = match self.gateway {
             Some(gateway) => gateway,
-            None => SquadGatewayResolver::from_env(&Env::from_process())?
+            None => DaemonResolver::from_env(&self.env)?
                 .gateway_for(GatewayNeed::Running)
                 .await?
-                .ok_or_else(|| CommandError::Other("squad daemon not reachable".into()))?,
+                .ok_or_else(|| CommandError::Other("the awman daemon is not reachable".into()))?,
         };
         let source: Arc<dyn WorkflowStateSource> = Arc::new(SquadTaskWorkflowSource::new(
             gateway.clone(),
@@ -587,255 +591,4 @@ fn container_id_matches_handle(handle: &AgentHandle, container_id: &str) -> bool
     handle.id.starts_with(container_id)
         || container_id.starts_with(&handle.id)
         || handle.name == container_id
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::command::commands::agents::test_support::FakeRuntime;
-    use crate::data::workflow_definition::WorkflowStep;
-
-    #[test]
-    fn task_discovery_propagates_unavailable_runtime() {
-        let runtime = FakeRuntime::new();
-        *runtime.available.lock().unwrap() = Err("daemon down".into());
-        let error = list_task_containers(&runtime, "task").unwrap_err();
-        assert!(matches!(error, CommandError::Engine(_)));
-        assert_eq!(runtime.availability_checks.load(Ordering::SeqCst), 1);
-    }
-
-    fn candidate(id: &str, name: &str) -> SquadContainer {
-        SquadContainer {
-            short_id: id.chars().take(12).collect(),
-            label: name.to_string(),
-            handle: AgentHandle {
-                id: id.to_string(),
-                image_tag: "img".to_string(),
-                name: name.to_string(),
-                started_at: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap(),
-            },
-        }
-    }
-
-    fn workflow_state(steps: &[(&str, StepState, Option<&str>, Option<&str>)]) -> WorkflowState {
-        let definition: Vec<WorkflowStep> = steps
-            .iter()
-            .map(|(name, _, agent, model)| WorkflowStep {
-                name: (*name).to_string(),
-                depends_on: Vec::new(),
-                prompt_template: String::new(),
-                agent: agent.map(str::to_string),
-                model: model.map(str::to_string),
-                overlays: None,
-                abort_on_failure: false,
-            })
-            .collect();
-        let mut state = WorkflowState::new("attach-test".into(), &definition, "hash".into(), None);
-        for (name, status, _, _) in steps {
-            state.set_status(name, status.clone());
-        }
-        state
-    }
-
-    #[test]
-    fn slot_driver_reconciles_running_transitions_without_duplicates() {
-        let mut driver = SquadSlotDriver::new();
-        let no_id = workflow_state(&[(
-            "build",
-            StepState::Running { container_id: None },
-            Some("claude"),
-            Some("sonnet"),
-        )]);
-        assert!(driver.reconcile(&no_id).is_empty());
-
-        let running = workflow_state(&[(
-            "build",
-            StepState::Running {
-                container_id: Some("abc123".into()),
-            },
-            Some("claude"),
-            Some("sonnet"),
-        )]);
-        assert_eq!(
-            driver.reconcile(&running),
-            vec![SlotAction::Attach {
-                step_name: "build".into(),
-                container_id: "abc123".into(),
-                agent: "claude".into(),
-                model: Some("sonnet".into()),
-            }]
-        );
-        assert!(driver.reconcile(&running).is_empty());
-
-        let restarted = workflow_state(&[(
-            "build",
-            StepState::Running {
-                container_id: Some("def456".into()),
-            },
-            Some("claude"),
-            Some("sonnet"),
-        )]);
-        assert_eq!(
-            driver.reconcile(&restarted),
-            vec![
-                SlotAction::Exit {
-                    step_name: "build".into()
-                },
-                SlotAction::Attach {
-                    step_name: "build".into(),
-                    container_id: "def456".into(),
-                    agent: "claude".into(),
-                    model: Some("sonnet".into()),
-                }
-            ]
-        );
-
-        let finished = workflow_state(&[("build", StepState::Succeeded, None, None)]);
-        assert_eq!(
-            driver.reconcile(&finished),
-            vec![SlotAction::Exit {
-                step_name: "build".into()
-            }]
-        );
-    }
-
-    #[test]
-    fn step_labels_resolve_from_a_published_container_name() {
-        let mut candidates = vec![candidate("aaaa1111bbbb", "awman-squad-t-00000001")];
-        let state = workflow_state(&[(
-            "build",
-            StepState::Running {
-                container_id: Some("awman-squad-t-00000001".to_string()),
-            },
-            None,
-            None,
-        )]);
-        label_with_step_names(&mut candidates, &state);
-        assert_eq!(candidates[0].label, "build");
-    }
-
-    #[test]
-    fn explicit_container_matches_by_exact_id_name_or_unique_prefix() {
-        let candidates = vec![
-            candidate("aaaa1111bbbb2222", "awman-squad-t-one"),
-            candidate("aaaa9999cccc3333", "awman-squad-t-two"),
-        ];
-        let picked =
-            |requested: &str| match resolve_attach_target(candidates.clone(), "t", Some(requested))
-            {
-                Ok(AttachResolution::One(c)) => c.handle.name,
-                other => panic!("{requested}: expected One, got {other:?}"),
-            };
-        assert_eq!(picked("aaaa9999cccc3333"), "awman-squad-t-two");
-        assert_eq!(picked("awman-squad-t-one"), "awman-squad-t-one");
-        assert_eq!(picked("aaaa1"), "awman-squad-t-one");
-        assert_eq!(picked("aaaa9"), "awman-squad-t-two");
-    }
-
-    #[test]
-    fn explicit_container_exact_match_beats_a_prefix_and_ambiguity_is_a_miss() {
-        let candidates = vec![candidate("abc", "awman-x"), candidate("abcdef", "awman-y")];
-        match resolve_attach_target(candidates.clone(), "t", Some("abc")).unwrap() {
-            AttachResolution::One(c) => assert_eq!(c.handle.name, "awman-x"),
-            other => panic!("expected One, got {other:?}"),
-        }
-        // "ab" prefixes both: reported like any container outside the task.
-        let err = resolve_attach_target(candidates, "t", Some("ab")).unwrap_err();
-        assert!(
-            err.to_string().contains("is not a running container"),
-            "{err}"
-        );
-    }
-    #[test]
-    fn target_resolution_preserves_idle_ambiguous_and_not_in_task_errors() {
-        assert!(resolve_attach_target(Vec::new(), "issue-triage", None)
-            .unwrap_err()
-            .to_string()
-            .contains("no run currently in progress"));
-        assert_eq!(
-            resolve_attach_target(Vec::new(), "issue-triage", Some("cccc3333"))
-                .unwrap_err()
-                .to_string(),
-            "container \"cccc3333\" is not a running container for task \"issue-triage\"; legal containers: (none)"
-        );
-        let candidates = vec![candidate("aaaa1111", "a"), candidate("bbbb2222", "b")];
-        assert!(matches!(
-            resolve_attach_target(candidates.clone(), "task", None).unwrap(),
-            AttachResolution::Ambiguous(_)
-        ));
-        assert_eq!(
-            resolve_attach_target(candidates, "issue-triage", Some("cccc3333"))
-                .unwrap_err()
-                .to_string(),
-            "container \"cccc3333\" is not a running container for task \"issue-triage\"; legal containers: aaaa1111, bbbb2222"
-        );
-
-        let candidates = vec![candidate("aaaa1111bbbb2222", "a")];
-        assert_eq!(
-            resolve_attach_target(
-                candidates,
-                "issue-triage",
-                Some("aaaa1111bbbb9999")
-            )
-            .unwrap_err()
-            .to_string(),
-            "container \"aaaa1111bbbb9999\" is not a running container for task \"issue-triage\"; legal containers: aaaa1111bbbb"
-        );
-    }
-}
-
-#[cfg(test)]
-mod listing_failure_review_tests {
-    use super::*;
-    use crate::command::commands::agents::resolve::listing_failure_tests::ListingFailureRuntime;
-
-    struct Recording(Arc<Mutex<Vec<String>>>);
-    impl UserMessageSink for Recording {
-        fn write_message(&mut self, message: UserMessage) {
-            self.0.lock().unwrap().push(message.text);
-        }
-        fn replay_queued(&mut self) {}
-    }
-    #[async_trait]
-    impl SquadAttachFrontend for Recording {
-        fn ask_pick_candidate(
-            &mut self,
-            _: &[SquadContainer],
-        ) -> Result<Option<usize>, CommandError> {
-            unreachable!()
-        }
-        fn on_slot_attached(
-            &mut self,
-            _: &str,
-            _: Box<dyn AgentInstance>,
-        ) -> Result<(), CommandError> {
-            panic!("failed listing cannot attach")
-        }
-        fn on_slot_exited(&mut self, _: &str) {}
-    }
-    #[test]
-    fn reconcile_reports_listing_failure_and_retries_the_slot_on_the_next_snapshot() {
-        let runtime = ListingFailureRuntime::new(true);
-        let messages = Arc::new(Mutex::new(Vec::new()));
-        let frontend: Arc<Mutex<Box<dyn SquadAttachFrontend>>> =
-            Arc::new(Mutex::new(Box::new(Recording(messages.clone()))));
-        let driver = Arc::new(Mutex::new(SquadSlotDriver::new()));
-        let mut state = WorkflowState::new("listing-failure".into(), &[], "hash".into(), None);
-        state.set_status(
-            "build",
-            StepState::Running {
-                container_id: Some("id".into()),
-            },
-        );
-        let evaluation = Arc::new(AtomicBool::new(false));
-        for _ in 0..2 {
-            apply_workflow_state(&state, &runtime, &driver, &frontend, &evaluation);
-        }
-        let messages = messages.lock().unwrap();
-        assert_eq!(messages.len(), 2);
-        assert!(messages
-            .iter()
-            .all(|text| text.contains("running listing failed") && text.contains("build")));
-        assert!(driver.lock().unwrap().slotted.is_empty());
-    }
 }

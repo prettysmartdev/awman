@@ -3,38 +3,28 @@ INSTALL_PATH ?= /usr/local/bin
 # Honour CARGO_TARGET_DIR if set in the environment. Falls back to the cargo
 # default of `target`.
 TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
-# Keep test fixtures out of the shared host /tmp. Long-running or concurrent
-# test jobs can exhaust /tmp's directory-link limit before any test body runs.
-# Do not use the workspace/target directory here: local Git remotes in the
-# smoke tests need the native filesystem's atomic object writes.
-AWMAN_TEST_TMPROOT ?= /var/tmp/test-fixtures
-# libtest threads per test binary. Most tests wait on subprocesses, sockets
-# and timers rather than the CPU, so twice the CPU count finishes sooner than
-# libtest's one-per-CPU default without overloading the runner. Override with
-# `make test TEST_THREADS=N` (or set RUST_TEST_THREADS yourself).
-TEST_THREADS ?= $(shell n=$$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2); echo $$((n * 2)))
-export RUST_TEST_THREADS ?= $(TEST_THREADS)
 
-.PHONY: all build sign-macos install test test-fast test-full test-builtin test-builtin-hw payloads payloads-verify clean release apple-silicon-prerelease architecture-lint pre-push docs-reference reproducible-build-audit native-builtin-ci
+.PHONY: all build sign-macos install payloads payloads-verify clean release apple-silicon-prerelease architecture-lint docs-reference
 
 all: build
 
 # The workspace has one distribution executable (awman-cli's awman target).
 # awman and awman-host-shims are libraries, including the private re-exec worker.
 
-# On Apple Silicon the experimental builtin runtime is included when its
-# payload verifies, and the binary is then ad-hoc signed with the hypervisor
+# On Apple Silicon the experimental builtin runtime requires a verified
+# payload, and the binary is then ad-hoc signed with the hypervisor
 # entitlement (tools/macos-sign.sh): macOS refuses to start a VM otherwise.
 # Other hosts build the existing backends only; the builtin runtime is released
 # for macOS on Apple Silicon only (WI 0124 tracks Linux).
 build:
 	@host="$$(rustc -vV | sed -n 's/^host: //p')"; \
-	if [ "$$host" = aarch64-apple-darwin ] && bash tools/msb-payloads/verify.sh "$$host" >/dev/null 2>&1; then \
-		cargo build --workspace --bins --release --features builtin-runtime && \
-		bash tools/macos-sign.sh $(TARGET_DIR)/release/$(BINARY); \
+	if [ "$$host" = aarch64-apple-darwin ]; then \
+		bash tools/msb-payloads/verify.sh "$$host" || { echo 'Apple Silicon builtin payload is unavailable; run make payloads before installing' >&2; exit 1; }; \
+		cargo build -p awman-cli --bin $(BINARY) --release --features builtin-runtime && \
+		bash tools/macos-sign.sh "$(TARGET_DIR)/release/$(BINARY)"; \
 	else \
 		echo 'Builtin runtime not included for this host; building existing backends'; \
-		cargo build --workspace --bins --release; \
+		cargo build -p awman-cli --bin $(BINARY) --release; \
 	fi
 
 # Re-sign an existing build, e.g. after stripping or copying it elsewhere:
@@ -46,120 +36,140 @@ payloads:
 	bash tools/msb-payloads/fetch.sh "$$(rustc -vV | sed -n 's/^host: //p')"
 
 # Native, one-time promotion of a new payload pin: fetches the payload, writes
-# a candidate verified record, runs the hardware/clean-checkout/release-artifact
-# gates, and keeps the record only if all pass. Needs a clean checkout, HVF or
-# KVM, and a running Docker or Apple Containers engine for the guest fixtures.
+# a candidate verified record, runs the guest and artifact tiers, and keeps the
+# record only if all pass. Needs a clean checkout, HVF or KVM, and a running
+# Docker or Apple Containers engine for the guest fixtures.
 payloads-verify:
 	bash tools/msb-payloads/payloads-verify.sh "$$(rustc -vV | sed -n 's/^host: //p')"
 
-# Explicit verification entrypoints; native hardware targets fail closed when
-# KVM/HVF or the fixture is absent. `TARGET` is a Rust target triple.
-reproducible-build-audit:
-	bash tools/reproducible-build-audit.sh "$(or $(OUTPUT),reproducible-build-audit)"
-
-native-builtin-ci:
-	bash tools/native-builtin-ci.sh "$(TARGET)"
-
+# Build and sign as the current user. Only the final copy may need sudo.
 install: build
-	install -m 755 $(TARGET_DIR)/release/$(BINARY) $(INSTALL_PATH)/$(BINARY)
+	@bash tools/install.sh "$(TARGET_DIR)" "$(INSTALL_PATH)"
 
-# Every test target runs through tools/isolated-test.sh, which keeps the suite
-# off the developer's own machine: a throwaway HOME, no global git config, no
-# inherited awman variables, stdin from /dev/null, a per-run TMPDIR under
-# AWMAN_TEST_TMPROOT, and AWMAN_TEST_ISOLATION=1 so awman itself uses an
-# in-memory keychain and clipboard, never launchd or systemd, and no network
-# beyond loopback. See the script for why each one matters.
+# ── Tests ────────────────────────────────────────────────────────────────────
+# Every target below is a thin call into `cargo xtask`, which reads the suites,
+# tiers and per-test timeouts from ci/gates.toml and runs them with the pinned
+# cargo-nextest and the same profile CI uses (.config/nextest.toml). Test
+# isolation (private HOME, XDG and AWMAN_HOME, supervised children, owned
+# ports, no real engine or keychain) lives in crates/awman-test-support, so a
+# direct `cargo test` still includes retained inline tests; prefer the runner below.
 #
-# The real container and sandbox CLIs are off too, unless opted into with
-# AWMAN_TEST_DOCKER=1, AWMAN_TEST_APPLE_CONTAINER=1 or AWMAN_TEST_SBX=1: their
-# tests build, run and remove images and containers in your own daemon.
-# `test-full` (the CI Docker job) opts into Docker; `test` and `test-fast`
-# never touch it.
-# Keep Cargo's build progress visible; only libtest's per-test output is quiet.
+# cargo-nextest is required: `cargo xtask test install-runner` installs the
+# pinned, SHA-256-verified release into target/xtask-tools/.
+.PHONY: check test pre-push test-unit test-component test-boundary test-guest test-artifact gates
+
+# Fast inner loop: every lint, then the unit tier of the crates you changed.
+check:
+	cargo xtask lint all
+	cargo xtask test run --tier unit --changed
+
+# unit + component for this host; parity suites exercise builtin and daemon. Never
+# touches a real container engine, guest or the network.
 test:
-	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet
+	cargo xtask test run --gate local
 
-test-fast:
-	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet --skip real_git --skip real_network --skip builtin_hw
+# The same selection as the pr gate's host cells.
+pre-push:
+	$(MAKE) check test
 
-# Only the targets that exercise the builtin runtime: every test executable links the
-# whole embedded VM stack (hundreds of MB each in debug), so building all of them
-# with the feature is needlessly slow and can exhaust memory or disk on CI runners.
-# `--examples` builds the real-guest driver used by the builtin_hw_* tests.
-# On macOS the awman binary and guest drivers are signed with the hypervisor
-# entitlement between building and running (tools/macos-sign-test-artifacts.sh).
-BUILTIN_TEST_ARGS := --workspace --features builtin-runtime --lib --bins --examples --test builtin_runtime --test oci_import --test data_layer
-test-builtin:
-	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh $(BUILTIN_TEST_ARGS) --no-run --quiet
-	@# `cargo test --examples` builds the examples as test targets; the guest
-	@# drivers the hardware tests launch from target/debug/examples/ need a build.
-	@cargo build --quiet --features builtin-runtime --example builtin_hw_driver --example builtin_net_driver
-	@bash tools/macos-sign-test-artifacts.sh $(TARGET_DIR)/debug
-	@# The old-to-new upgrade test also boots the awman that last shipped the
-	@# protocol this build upgrades from. Build it from git history (cached under
-	@# target/previous-builtin/) on hosts that can boot a guest, unless
-	@# AWMAN_TEST_BUILTIN_PREVIOUS already names one.
-	@previous="$${AWMAN_TEST_BUILTIN_PREVIOUS:-}"; \
-	if [ -z "$$previous" ]; then previous=$$(bash tools/build-previous-builtin-awman.sh --if-hypervisor) || exit 1; fi; \
-	if [ -n "$$previous" ]; then export AWMAN_TEST_BUILTIN_PREVIOUS="$$previous"; fi; \
-	AWMAN_TEST_BUILTIN=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh $(BUILTIN_TEST_ARGS) --quiet
-	@AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/test-builtin-network.sh
+test-unit:
+	cargo xtask test run --tier unit
 
-# Everything above with real guests required, on a Mac (Apple Silicon) or a
-# Linux KVM host, with no setup: fetches the payload, makes the guest fixtures
-# with skopeo under Docker or Apple Containers, loads the fixture into Apple
-# Containers on macOS, turns on the network, pressure and measurement suites,
-# then runs the catalog compatibility check. See tools/test-builtin-hw.sh.
-test-builtin-hw:
-	@bash tools/test-builtin-hw.sh
+test-component:
+	cargo xtask test run --tier component
 
-test-full:
-	@AWMAN_TEST_DOCKER=1 AWMAN_TEST_TMPROOT="$(AWMAN_TEST_TMPROOT)" bash tools/isolated-test.sh -- --quiet
+# Real engines and services, only the ones you name, e.g.
+# `make test-boundary AWMAN_TEST_HOST_RESOURCES=docker=unix:///var/run/docker.sock,git-transports`.
+# A test whose capability is not named reports BLOCKED; it never passes.
+test-boundary:
+	@echo "Host runtime grants: $(AWMAN_TEST_HOST_RESOURCES)"
+	AWMAN_TEST_HOST_RESOURCES="$(AWMAN_TEST_HOST_RESOURCES)" cargo xtask test run --tier boundary
 
-architecture-lint:
+# Real guests (HVF/KVM, verified payload, pinned fixtures). Fails BLOCKED
+# without a hypervisor or with an unpinned fixture.
+test-guest:
+	cargo xtask fixtures fetch --tier guest
+	cargo xtask test run --tier guest
+
+# A release executable: `make test-artifact ARTIFACT=/abs/path/awman`.
+test-artifact:
+	AWMAN_TEST_ARTIFACT="$(ARTIFACT)" cargo xtask test run --tier artifact
+
+# Native Apple Silicon acceptance, including preparation and a portable evidence
+# packet. See aspec/devops/testing.md for prerequisites and packet review.
+.PHONY: validate-native
+validate-native:
+	CARGO_TARGET_DIR=target/native-validation-tools cargo xtask native-validation run
+
+gates:
+	cargo xtask gates check
+
+# Tests are selected exclusively through the manifest tiers above.
+
+# CI runs the structural rules and the hygiene suite once each.
+.PHONY: architecture-rules
+architecture-rules:
 	@bash tools/architecture-lint.sh
-	@bash tools/test-architecture-lint.sh
+
+architecture-lint: architecture-rules
+	@cargo xtask lint hygiene
 
 # Rewrite docs/14-command-reference.md from CommandCatalogue. The doc is
-# generated, never hand-edited; `markdown_reference_matches_committed_docs`
-# fails whenever a catalogue change leaves it stale, and this is the fix.
+# generated, never hand-edited; the component golden test
+# `command::catalogue` fails whenever a catalogue change leaves it stale.
 docs-reference:
-	cargo test --lib \
-		command::dispatch::projections::markdown::tests::regenerate_command_reference \
-		-- --ignored
+	cargo run --locked -p awman-cli --bin awman-command-reference -- docs/14-command-reference.md
 
-# The test step goes through the `test` target rather than calling `cargo
-# test` directly, so the pre-push gate gets the same per-run fixture root.
-# Running the suite against a shared /tmp is what the `test` target was
-# hardened against, and pre-push is the one that runs in a container where
-# a work item has already left tens of thousands of fixture directories
-# behind: every test body after the handful that need no temp directory
-# then dies on, or crawls against, a /tmp that cannot take another one.
-pre-push: architecture-lint
-	bash -n scripts/release.sh tools/release-runner.sh tools/test-release-runner.sh tools/apple-silicon-prerelease.sh tools/prerelease-ci-gate.sh tools/test-prerelease-ci-gate.sh
-	bash tools/test-release-runner.sh
-	bash tools/test-prerelease-ci-gate.sh
-	cargo fmt --all --check
-	cargo clippy --workspace --all-targets -- -D warnings
-	$(MAKE) --no-print-directory test
+# Separate from the binary gates. Missing web/edge artifacts are a hard error,
+# not an implicit skip or a transport-only acceptance pass.
+.PHONY: web/dev web/reinstall web/test-setup test-web test-web-check
+web/dev:
+	node tools/web-dev.mjs
+
+web/reinstall:
+	node tools/web-reinstall.mjs
+
+web/test-setup:
+	@bash tools/web-test-env.sh bash tools/web-test-setup.sh $(WEB_TEST_SETUP_ARGS)
+
+test-web:
+	@bash tools/web-test-env.sh $(MAKE) --no-print-directory test-web-check
+
+# Keep every gate in one place. The wrapper only prepares executable/library
+# lookup; it never substitutes for a check or treats missing tooling as a pass.
+test-web-check:
+	@test -f web/package.json && test -f web/edge/package.json || { echo 'WI 0159: web/edge implementation is missing' >&2; exit 1; }
+	npm --prefix web run check
+	npm --prefix web/edge run check
+	cargo build -p awman-cli --bin $(BINARY)
+	npm --prefix web/e2e ci --ignore-scripts
+	npm --prefix web/e2e run check
+	npm --prefix web/e2e test
 
 clean:
 	cargo clean
 
-# Run every local/native Apple Silicon gate against the final clean main commit,
-# including the exact signed release artifact, without creating a tag.
+# ── Release ──────────────────────────────────────────────────────────────────
+# Dispatch and watch the authenticated candidate rehearsal for current main.
+# For a local Apple Silicon acceptance packet, use validate-native instead.
 apple-silicon-prerelease:
-	@bash tools/apple-silicon-prerelease.sh
+	@cargo xtask release validate
 
-# Release VERSION. On an Apple Silicon Mac with Hypervisor.framework, the
-# release job's /opt/awman scripts are installed or refreshed and the Mac is
-# registered as a temporary GitHub Actions runner for the Apple Silicon
-# release job, then removed when the Release workflow finishes.
-# RELEASE_RUNNER=auto|local|none (see scripts/release.sh).
+# Release VERSION. A managed Apple Silicon runner verifies the manifest fixtures
+# in its private runner directory, registers for the candidate job, and
+# deregisters after the pipeline finishes.
+# RELEASE_RUNNER=auto|local|none (see aspec/devops/release.md).
 RELEASE_RUNNER ?= auto
 release:
 	@if [ -z "$(VERSION)" ]; then \
 		echo "Usage: make release VERSION=vx.y.z [RELEASE_RUNNER=auto|local|none]"; \
 		exit 1; \
 	fi
-	@RELEASE_RUNNER="$(RELEASE_RUNNER)" bash scripts/release.sh "$(VERSION)"
+	@RELEASE_RUNNER="$(RELEASE_RUNNER)" cargo xtask release run "$(VERSION)"
+
+.PHONY: release-status release-abandon
+release-status:
+	@cargo xtask release status "$(VERSION)"
+
+release-abandon:
+	@cargo xtask release abandon "$(VERSION)"

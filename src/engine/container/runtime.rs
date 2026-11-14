@@ -91,26 +91,72 @@ impl BuiltinRuntimeSettings {
 pub const BUILTIN_RUNTIME_NAME: &str = "builtin";
 
 pub struct ContainerRuntime {
+    env: crate::data::config::env::EnvSnapshot,
     backend: Arc<dyn ContainerBackend>,
     phase_tools_cache: std::sync::Mutex<crate::data::fs::phase_tools_cache::PhaseToolsCache>,
 }
 
-fn new_phase_tools_cache() -> std::sync::Mutex<crate::data::fs::phase_tools_cache::PhaseToolsCache>
-{
-    let cache = crate::data::config::global::GlobalConfig::data_home_with(
-        &crate::data::config::env::Env::from_process(),
-    )
-    .map(|root| crate::data::fs::phase_tools_cache::PhaseToolsCache::load(&root))
-    .unwrap_or_else(|_| crate::data::fs::phase_tools_cache::PhaseToolsCache::in_memory());
+// Endpoint buckets prevent a daemon's first Docker from becoming every
+// instance's Docker. Weak entries retain no instance environment after its
+// last handle is dropped. Even within one endpoint, different PATH, cwd or
+// credentials require distinct handles.
+type CliEndpointKey = (&'static str, Option<String>, Option<String>);
+type CliRuntimeHandles =
+    std::collections::BTreeMap<CliEndpointKey, Vec<std::sync::Weak<ContainerRuntime>>>;
+static CLI_HANDLES: std::sync::OnceLock<std::sync::Mutex<CliRuntimeHandles>> =
+    std::sync::OnceLock::new();
+
+fn new_phase_tools_cache(
+    env: &crate::data::config::env::EnvSnapshot,
+) -> std::sync::Mutex<crate::data::fs::phase_tools_cache::PhaseToolsCache> {
+    let cache = crate::data::fs::data_paths::data_home(env)
+        .map(|root| crate::data::fs::phase_tools_cache::PhaseToolsCache::load(&root))
+        .unwrap_or_else(|_| crate::data::fs::phase_tools_cache::PhaseToolsCache::in_memory());
     std::sync::Mutex::new(cache)
 }
 
 impl ContainerRuntime {
+    fn cli_handle(kind: &'static str, env: crate::data::config::env::EnvSnapshot) -> Arc<Self> {
+        let (context, host) = env.runtime_endpoint();
+        let registry = CLI_HANDLES.get_or_init(Default::default);
+        let mut handles = registry.lock().unwrap_or_else(|p| p.into_inner());
+        handles.retain(|_, entries| {
+            entries.retain(|entry| entry.strong_count() != 0);
+            !entries.is_empty()
+        });
+        let entries = handles.entry((kind, context, host)).or_default();
+        if let Some(runtime) = entries
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .find(|rt| rt.env == env)
+        {
+            return runtime;
+        }
+        let runtime = Arc::new(match kind {
+            "docker" => Self::docker_in(env),
+            _ => Self::apple_in(env),
+        });
+        entries.push(Arc::downgrade(&runtime));
+        runtime
+    }
+
+    pub fn docker_handle(env: crate::data::config::env::EnvSnapshot) -> Arc<Self> {
+        Self::cli_handle("docker", env)
+    }
+    pub fn apple_handle(env: crate::data::config::env::EnvSnapshot) -> Arc<Self> {
+        Self::cli_handle("container", env)
+    }
+
     /// Construct with the Docker backend.
     pub fn docker() -> Self {
+        Self::docker_in(crate::engine::host_cli::process_env())
+    }
+
+    pub fn docker_in(env: crate::data::config::env::EnvSnapshot) -> Self {
         Self {
-            backend: Arc::new(DockerBackend),
-            phase_tools_cache: new_phase_tools_cache(),
+            backend: Arc::new(DockerBackend::new(env.clone())),
+            phase_tools_cache: new_phase_tools_cache(&env),
+            env,
         }
     }
 
@@ -118,9 +164,14 @@ impl ContainerRuntime {
     /// lives in `agent_runtime::detect`; constructing this directly on a
     /// non-mac host yields a runtime whose probes simply fail.
     pub fn apple() -> Self {
+        Self::apple_in(crate::engine::host_cli::process_env())
+    }
+
+    pub fn apple_in(env: crate::data::config::env::EnvSnapshot) -> Self {
         Self {
-            backend: Arc::new(AppleBackend),
-            phase_tools_cache: new_phase_tools_cache(),
+            backend: Arc::new(AppleBackend::new(env.clone())),
+            phase_tools_cache: new_phase_tools_cache(&env),
+            env,
         }
     }
 
@@ -143,20 +194,21 @@ impl ContainerRuntime {
             }
             Err(e) => return Err(e),
         };
+        let env = crate::engine::host_cli::process_env();
         Ok(Self {
             backend,
-            phase_tools_cache: new_phase_tools_cache(),
+            phase_tools_cache: new_phase_tools_cache(&env),
+            env,
         })
     }
 
-    /// Wrap an already-constructed backend. Test-only: lets hermetic tests run
-    /// a real backend over a fake driver.
-    #[cfg(test)]
-    pub(super) fn with_backend(backend: Arc<dyn ContainerBackend>) -> Self {
-        Self {
-            backend,
-            phase_tools_cache: new_phase_tools_cache(),
-        }
+    pub fn env(&self) -> &crate::data::config::env::EnvSnapshot {
+        &self.env
+    }
+
+    /// Runtime observations and handles may only be reused for this endpoint.
+    pub fn endpoint_key(&self) -> (Option<String>, Option<String>) {
+        self.env.runtime_endpoint()
     }
 
     /// Static name of the chosen backend (e.g. `"docker"`).
@@ -478,6 +530,17 @@ impl AgentRuntimeEngine for ContainerRuntime {
         self.backend.import_image_cancellable(request, sink, cancel)
     }
 
+    fn import_image_in(
+        &self,
+        request: &ImageImportRequest,
+        env: &crate::data::config::env::EnvSnapshot,
+        sink: &mut dyn crate::data::message::UserMessageSink,
+        cancel: &crate::engine::oci::CancelToken,
+    ) -> Result<ImportedImage, EngineError> {
+        self.backend
+            .import_image_cancellable_in(request, env, sink, cancel)
+    }
+
     fn image_identity(&self, tag: &str) -> Result<Option<ImageIdentity>, EngineError> {
         self.backend.image_identity(tag)
     }
@@ -508,181 +571,5 @@ pub(crate) fn wait_with_timeout(
             }
             Err(_) => return None,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::config::effective::EffectiveConfig;
-    use crate::engine::agent_runtime::ResolvedAgentOptions;
-
-    #[test]
-    fn build_requires_image_option() {
-        let rt = ContainerRuntime::docker();
-        let resolved = ResolvedContainerOptions::resolve([]).unwrap();
-        match rt.build(resolved) {
-            Err(EngineError::MissingRequiredOption(opt)) => {
-                assert_eq!(opt, "Image");
-            }
-            Err(e) => panic!("expected MissingRequiredOption, got: {e:?}"),
-            Ok(_) => panic!("expected error from missing Image option"),
-        }
-    }
-
-    /// The `AgentRuntimeEngine` trait impl must reject sandbox-paradigm options
-    /// with a clear `OptionVariantMismatch` error — never silently fall back
-    /// or panic.
-    #[test]
-    fn container_runtime_via_trait_rejects_sandbox_options() {
-        use crate::engine::agent_runtime::AgentRuntimeEngine;
-
-        let rt = ContainerRuntime::docker();
-        let opts = ResolvedAgentOptions::Sandbox(Box::default());
-        match <ContainerRuntime as AgentRuntimeEngine>::build(&rt, opts) {
-            Err(EngineError::OptionVariantMismatch { runtime, got }) => {
-                assert_eq!(runtime, "docker");
-                assert_eq!(got, "sandbox");
-            }
-            Err(e) => panic!("expected OptionVariantMismatch, got: {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
-    }
-
-    #[test]
-    fn apple_runtime_via_trait_rejects_sandbox_options() {
-        use crate::engine::agent_runtime::AgentRuntimeEngine;
-
-        let rt = ContainerRuntime::apple();
-        let opts = ResolvedAgentOptions::Sandbox(Box::default());
-        match <ContainerRuntime as AgentRuntimeEngine>::build(&rt, opts) {
-            Err(EngineError::OptionVariantMismatch { runtime, got }) => {
-                assert_eq!(runtime, "apple-containers");
-                assert_eq!(got, "sandbox");
-            }
-            Err(e) => panic!("expected OptionVariantMismatch, got: {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
-    }
-
-    #[test]
-    fn cli_backends_state_their_reattach_model() {
-        let docker = ContainerRuntime::docker();
-        let apple = ContainerRuntime::apple();
-        assert!(<ContainerRuntime as AgentRuntimeEngine>::reattach_after_owner_exit(&docker));
-        assert!(!<ContainerRuntime as AgentRuntimeEngine>::reattach_after_owner_exit(&apple));
-    }
-
-    #[test]
-    fn builtin_process_settings_hold_only_process_wide_values() {
-        use crate::data::config::builtin_runtime::BuiltinRuntimeConfig;
-        use crate::data::config::env::{EnvSnapshot, AWMAN_BUILTIN_STATE_DIR, MSB_PATH};
-        use crate::data::config::{FlagConfig, GlobalConfig, RepoConfig};
-
-        let env = EnvSnapshot::with_overrides([
-            (AWMAN_BUILTIN_STATE_DIR, "/s"),
-            (MSB_PATH, "/elsewhere/msb"),
-        ]);
-        let layered = |global: &str, repo: &str| {
-            EffectiveConfig::new(
-                FlagConfig::default(),
-                env.clone(),
-                RepoConfig {
-                    builtin: Some(serde_json::from_str(repo).unwrap()),
-                    ..Default::default()
-                },
-                GlobalConfig {
-                    builtin: Some(serde_json::from_str(global).unwrap()),
-                    ..Default::default()
-                },
-            )
-        };
-        let resolved = layered("{}", "{}").builtin_process_settings().unwrap();
-        let settings = BuiltinRuntimeSettings::resolve(&resolved);
-        assert_eq!(
-            settings,
-            BuiltinRuntimeSettings {
-                state_dir: PathBuf::from("/s"),
-                ambient_overrides: vec![MSB_PATH],
-                test_isolation: true,
-            },
-            "unit tests are always isolated"
-        );
-
-        // Layer 0's complete resolved value validates resources and policy.
-        for (global, repo) in [
-            (
-                r#"{"network":{"mode":"none"}}"#,
-                r#"{"network":{"mode":"public"}}"#,
-            ),
-            (r#"{}"#, r#"{"network":{"hostPorts":[8765]}}"#),
-            (r#"{}"#, r#"{"vcpus":0}"#),
-            (r#"{}"#, r#"{"memoryMib":64}"#),
-        ] {
-            assert!(
-                layered(global, repo).builtin_settings().is_err(),
-                "{repo} must fail during Layer 0 resolution"
-            );
-        }
-
-        // A meaningless image source is still refused up front.
-        let bad_source = EffectiveConfig::new(
-            FlagConfig::default(),
-            env.clone(),
-            RepoConfig::default(),
-            GlobalConfig {
-                builtin: Some(BuiltinRuntimeConfig {
-                    image_source: Some(
-                        crate::data::config::image_source::ImageSourceSpec::Archive {
-                            path: "".into(),
-                        },
-                    ),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        );
-        assert!(matches!(
-            bad_source.builtin_settings(),
-            Err(crate::data::error::DataError::BuiltinConfig(_))
-        ));
-
-        // The ambient override is refused before anything else.
-        match ContainerRuntime::builtin(settings) {
-            Err(EngineError::AmbientRuntimeOverride { variable }) => assert_eq!(variable, MSB_PATH),
-            Err(e) => panic!("expected AmbientRuntimeOverride, got {e:?}"),
-            Ok(_) => panic!("expected an error"),
-        }
-    }
-}
-
-#[cfg(test)]
-mod inspect_default_tests {
-    use super::*;
-    use crate::engine::agent_runtime::AgentRuntimeEngine;
-    use crate::engine::container::test_support::holding_runtime;
-
-    fn handle() -> AgentHandle {
-        AgentHandle {
-            id: "id1".into(),
-            name: "awman-x".into(),
-            image_tag: "img".into(),
-            started_at: chrono::Utc::now(),
-        }
-    }
-
-    #[test]
-    fn container_runtime_inspect_detects_missing_agent() {
-        let rt = holding_runtime(Default::default());
-        let err = AgentRuntimeEngine::inspect(rt.as_ref(), &handle()).unwrap_err();
-        assert!(err.to_string().contains("no longer exists"));
-    }
-
-    #[test]
-    fn container_runtime_list_stopped_forwards_to_the_backend() {
-        let rt = holding_runtime(Default::default());
-        assert!(AgentRuntimeEngine::list_stopped(rt.as_ref())
-            .unwrap()
-            .is_empty());
     }
 }
