@@ -123,7 +123,7 @@ slow-timeout = { period = "1s", terminate-after = 120 }
 
 # component-core-internals
 [[profile.default.overrides]]
-filter = "package(=awman) & kind(lib) & (not (test(/^command::commands::exec_workflow::contract_tests::/)))"
+filter = "package(=awman) & kind(lib) & (not (test(/^command::commands::exec_workflow::contract_tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/)))"
 slow-timeout = { period = "1s", terminate-after = 20 }
 
 # component-daemon
@@ -260,7 +260,7 @@ threads-required = "num-test-threads"
 
 # unit-awman
 [[profile.default.overrides]]
-filter = "package(=awman) & kind(lib) & (test(/^command::commands::exec_workflow::contract_tests::/))"
+filter = "package(=awman) & kind(lib) & (test(/^command::commands::exec_workflow::contract_tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/))"
 slow-timeout = { period = "1s", terminate-after = 1 }
 
 # unit-awman-builtin

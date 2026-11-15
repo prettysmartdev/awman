@@ -211,6 +211,11 @@ struct CreateCommandRequest {
     args: Vec<String>,
     #[serde(default)]
     labels: Labels,
+    /// An inline work item for `exec prompt` / `exec workflow`: staged
+    /// privately and treated as a remote work item, whatever
+    /// `workItems.source` says. Exclusive with `--work-item`.
+    #[serde(default)]
+    work_item: Option<crate::data::work_item::InlineWorkItemInput>,
     /// `POST /v1/worker/commands` only: the session, as an alternative to the
     /// `x-awman-session` header. A run's command must not name one.
     #[serde(default)]
@@ -290,6 +295,7 @@ impl From<CreateCommandRequest> for CommandSubmission {
             args: body.args,
             labels: body.labels,
             interaction: body.interaction,
+            work_item: body.work_item,
         }
     }
 }

@@ -40,6 +40,8 @@ pub mod squad_paths;
 pub mod squad_run_paths;
 pub mod squad_verdict;
 pub mod task_store;
+pub mod work_item_draft;
+pub mod work_item_files;
 pub mod workflow_dirs;
 
 pub use agent_dirs::{AgentDirs, DefinitionScope};

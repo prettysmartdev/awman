@@ -137,6 +137,12 @@ impl<F: ApiCommandFrontendFactory + 'static> DaemonFeature for WorkerFeature<F> 
             let pull_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
                 pull.run_until(stop.clone()),
             ));
+            // If the pool is aborted, AbortOnDrop only requests cancellation.
+            // Track the pull loop too so stop_now waits for its state to drop.
+            aborts
+                .lock()
+                .unwrap()
+                .push(pull_task.as_ref().abort_handle());
             crate::command::commands::api_server::queue_worker::finalize_completed_from_sidecars(
                 &shared.store,
                 &shared.paths,
@@ -286,8 +292,8 @@ impl<F: ApiCommandFrontendFactory + 'static> DaemonFeature for WorkerFeature<F> 
         }
         self.drain().await;
         // The pool owns the worker JoinHandles. Once it has stopped, wait
-        // for its aborted workers to actually drop their state too. Collect
-        // after stopping the pool so no worker can be added behind this list.
+        // for its aborted push workers and pull loop to drop their state too.
+        // Collect after stopping the pool so no child can be added behind this list.
         let workers = std::mem::take(&mut *self.aborts.lock().unwrap());
         for task in &workers {
             task.abort();

@@ -90,6 +90,15 @@ impl ConfigFile {
     /// written when validation fails. Repo files are written without
     /// following symlinks below the git root.
     pub fn save(&self, path: &Path, kind: FileKind) -> Result<(), DataError> {
+        if let Some(crate::data::config::work_items::WorkItemSource::Invalid(value)) = self
+            .work_items
+            .as_ref()
+            .and_then(|work_items| work_items.source.as_ref())
+        {
+            return Err(DataError::Other(format!(
+                "invalid workItems.source `{value}`; expected `local`, `github`, or `http:<name>`"
+            )));
+        }
         Self::from_value_at(self.to_value(), kind, path)?;
         let content = serde_json::to_string_pretty(self)
             .map_err(|e| DataError::ConfigSerialize { source: e })?;
@@ -135,6 +144,11 @@ impl ConfigFile {
     /// entries, leader syntax, guidance entries, prerequisite values, builtin
     /// resources and image sources, required URLs of map entries.
     pub fn validate_semantics(&self) -> Result<(), DataError> {
+        if let Some(work_items) = &self.work_items {
+            work_items
+                .validate_providers()
+                .map_err(|e| DataError::Other(format!("workItems: {e}")))?;
+        }
         if let Some(agents) = &self.agents {
             agents.validate()?;
         }

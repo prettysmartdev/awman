@@ -83,13 +83,13 @@ impl ExecWorkflowCommandFrontend for InstanceCommandFrontend {
 
     fn notify_dynamic_workflow_resume_unavailable(
         &mut self,
-        work_item: u32,
+        work_item: &str,
         reason: &str,
     ) -> Result<(), CommandError> {
         self.ask_dialog(DialogRequest::Custom {
             title: "Cannot resume previous workflow".into(),
             body: format!(
-                "The worktree for work item {work_item:04} is still on disk, but the previous \
+                "The worktree for work item {work_item} is still on disk, but the previous \
                  dynamic workflow cannot be resumed:\n\n{reason}\n\n\
                  A fresh dynamic workflow will be designed instead.",
             ),

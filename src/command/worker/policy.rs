@@ -165,7 +165,9 @@ pub fn plan(
                 if !item.exec.dynamic {
                     return Err("workflow lease requires dynamic or workflow_toml".into());
                 }
-                args.extend(["--dynamic".into(), "--work-item".into(), "1".into()]);
+                // No `--work-item`: the lease body is attached as the session's inline
+                // work item, which stands in for the flag (validate_dynamic_flags).
+                args.push("--dynamic".into());
                 if let Some(leader) = &item.exec.leader {
                     args.extend(["--leader".into(), leader.clone()]);
                 }
@@ -182,4 +184,59 @@ pub fn plan(
         command,
         args,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings() -> WorkerSettings {
+        WorkerSettings {
+            enabled: true,
+            max_concurrent_jobs: 1,
+            push_enabled: false,
+            push_interaction: Interaction::Headless,
+            push_allow_override: false,
+            push_work_dirs: vec![],
+            push_work_dir_roots: vec![],
+            pull_enabled: true,
+            pull_interaction: Interaction::Headless,
+            pull_allow_override: false,
+            pull_work_root: None,
+            work_servers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn dynamic_workflow_leases_carry_no_placeholder_work_item() {
+        let mut item = awman_wsp::conformance::work_item("dyn");
+        item.kind = WorkKind::Workflow;
+        item.exec.dynamic = true;
+        let server = ResolvedWorkServer {
+            url: Some("https://example.invalid".into()),
+            enabled: true,
+            claim: Default::default(),
+            max_concurrent_jobs: 1,
+            interaction: None,
+            labels: BTreeMap::new(),
+        };
+        let support = LeaseRuntimeSupport {
+            read_only_workspace: false,
+            outputs_mount: false,
+        };
+        let plan = plan(
+            &item,
+            &BTreeMap::new(),
+            &server,
+            &settings(),
+            &support,
+            "docker",
+        )
+        .expect("dynamic lease plans");
+        assert_eq!(plan.command, ["exec", "workflow"]);
+        assert!(plan.args.iter().any(|arg| arg == "--dynamic"));
+        // The lease body is the work item (Session::inline_work_item); a
+        // placeholder reference would surface in resume hints and state keys.
+        assert!(!plan.args.iter().any(|arg| arg == "--work-item"));
+    }
 }

@@ -78,6 +78,7 @@ impl InitFrontend for CliFrontend {
         Ok(Some(WorkItemsConfig {
             dir: Some(dir.to_string()),
             template,
+            ..WorkItemsConfig::default()
         }))
     }
 

@@ -69,7 +69,7 @@ That's it — you have an isolated agent working in your repo.
 - [Workflows](05-workflows.md) — multi-step agent runs with setup and teardown
 - [Dynamic Workflows](06-dynamic-workflows.md) — let a leader agent design and run a workflow for you, no file to write
 - [Permission modes](03-agent-sessions.md#permission-modes) — `--plan`, `--auto`, and fully autonomous `--yolo`
-- [GitHub Integration](10-github-integration.md) — drive `new spec`, `exec workflow`, and `exec prompt` from GitHub issues with `--issue`
+- [GitHub Integration](10-github-integration.md) — drive `new spec`, `exec workflow`, and `exec prompt` from GitHub issues with `--work-item`
 - [squad](12-squad.md) — hand recurring work to a group of agents that watches for it and runs a workflow unattended
 - [Runtimes](11-runtimes.md) — Docker, Apple Containers, Docker Sandboxes, and the builtin embedded microVM runtime
 

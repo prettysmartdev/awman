@@ -126,7 +126,8 @@ pub struct StartSessionResponse {
 #[derive(Debug, Clone)]
 pub enum ExecArg {
     Workflow(Option<String>),
-    Prompt(String),
+    /// `None` when the prompt comes from a forwarded `--work-item` alone.
+    Prompt(Option<String>),
 }
 
 impl ExecArg {
@@ -138,7 +139,7 @@ impl ExecArg {
     pub fn into_request(self, flags: &[String]) -> StartCommandRequest {
         let (subcommand, positional) = match self {
             ExecArg::Workflow(path) => ("exec workflow", path),
-            ExecArg::Prompt(text) => ("exec prompt", Some(text)),
+            ExecArg::Prompt(text) => ("exec prompt", text),
         };
         let interaction = flags
             .iter()

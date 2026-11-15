@@ -313,6 +313,8 @@ fn decode_outcome(
                 Some("Spec") => NewOutcome::Spec(NewSpecOutcome {
                     interview: field(body, "interview")?,
                     path: field(body, "path")?,
+                    url: field(body, "url")?,
+                    number: field(body, "number")?,
                 }),
                 Some("Workflow") => NewOutcome::Workflow(NewWorkflowOutcome {
                     interview: field(body, "interview")?,

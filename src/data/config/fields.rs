@@ -472,6 +472,30 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         false,
         "Work item template (default <dir>/0000-template.md).",
     ),
+    row(
+        "workItems.source",
+        ValueKind::String,
+        "null",
+        Repo,
+        false,
+        "Default work item source: local, github, or a trusted http provider.",
+    ),
+    row(
+        "workItems.providers.*.baseUrl",
+        ValueKind::String,
+        "null",
+        Global,
+        false,
+        "Base URL for a trusted HTTP work item provider.",
+    ),
+    row(
+        "workItems.providers.*.tokenEnv",
+        ValueKind::String,
+        "null",
+        Global,
+        false,
+        "Environment variable containing the HTTP provider token.",
+    ),
     // workflows
     row(
         "workflows.maxConcurrentSteps",
@@ -1626,6 +1650,13 @@ pub fn parse_input(key: &ConfigKey, raw: &str) -> Result<Value, KeyError> {
         }
     };
     validate_value(key, &value)?;
+    if key.path == "workItems.source" {
+        let source = value.as_str().unwrap_or_default();
+        super::work_items::WorkItemSource::parse(source).map_err(|error| KeyError::Value {
+            path: key.path.to_string(),
+            reason: error.to_string(),
+        })?;
+    }
     Ok(value)
 }
 
@@ -1962,7 +1993,9 @@ pub fn render_docs_table() -> String {
         } else {
             ""
         };
-        let env = if key.has_env() {
+        // Provider definitions are refused from the environment (global config
+        // file only), so no variable is advertised for them.
+        let env = if key.has_env() && !key.path.starts_with("workItems.providers.") {
             format!("`{}`", key.env_pattern().replace('*', "<NAME>"))
         } else {
             "—".into()

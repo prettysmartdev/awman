@@ -78,10 +78,11 @@ pub(super) const REMOTE_EXEC_PROMPT: CommandSpec = CommandSpec {
     arguments: &[ArgumentSpec {
         name: "prompt",
         // Greedy trailing positional (see EXEC_PROMPT): joins remaining tokens
-        // into one prompt string, spec-driven for every frontend.
+        // into one prompt string, spec-driven for every frontend. Optional,
+        // as on `exec prompt`: `--work-item` alone is a valid prompt.
         help: "The prompt text to send to the agent.",
         kind: ArgumentKind::TrailingVarArgs,
-        optional: false,
+        optional: true,
     }],
     flags: &REMOTE_EXEC_PROMPT_FLAGS,
     api_allowed: false,

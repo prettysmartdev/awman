@@ -49,6 +49,8 @@ pub mod templates;
 pub mod terminal;
 pub mod text;
 pub mod wire;
+pub mod work_item;
+pub mod work_item_ref;
 pub mod worker;
 pub mod workflow_cleanup;
 pub mod workflow_dag;

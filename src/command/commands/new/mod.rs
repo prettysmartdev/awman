@@ -23,7 +23,8 @@ use crate::engine::container::options::ContainerOption;
 pub struct NewSpecFlags {
     pub interview: bool,
     pub non_interactive: bool,
-    pub issue_source: crate::engine::issue::IssueSourceFlags,
+    /// Raw `--work-item` reference that seeds the new spec (WI 0147).
+    pub work_item: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +67,12 @@ pub enum NewSubcommand {
 pub struct NewSpecOutcome {
     pub interview: bool,
     pub path: Option<String>,
+    /// The created remote work item (WI 0147); `None` for local files.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// The work item number: the local file number, or the provider's.
+    #[serde(default)]
+    pub number: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -249,6 +256,7 @@ pub struct NewCommand {
     sub: NewSubcommand,
     engines: Engines,
     session: Session,
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl NewCommand {
@@ -257,7 +265,15 @@ impl NewCommand {
             sub,
             engines,
             session,
+            cancel: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// Let an external cancel stop an interview agent. A remote work item's
+    /// draft is still uploaded once after the agent exits.
+    pub fn with_cancellation(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = token;
+        self
     }
 
     /// Construct from the catalogue-resolved input (WI 0113 F-10). The three
@@ -268,9 +284,7 @@ impl NewCommand {
             "spec" => NewSubcommand::Spec(NewSpecFlags {
                 interview: ctx.flags.bool("interview"),
                 non_interactive: ctx.flags.bool("headless"),
-                issue_source: crate::engine::issue::IssueSourceFlags {
-                    issue: ctx.flags.string("issue"),
-                },
+                work_item: ctx.flags.string("work-item"),
             }),
             "workflow" => NewSubcommand::Workflow(NewWorkflowFlags {
                 interview: ctx.flags.bool("interview"),
@@ -309,7 +323,8 @@ impl NewCommand {
             }),
             _ => return Err(CommandError::unknown_command(&ctx.path())),
         };
-        Ok(Self::new(sub, ctx.engines.clone(), ctx.session.clone()))
+        Ok(Self::new(sub, ctx.engines.clone(), ctx.session.clone())
+            .with_cancellation(ctx.cancel.clone()))
     }
 
     pub fn subcommand(&self) -> &NewSubcommand {

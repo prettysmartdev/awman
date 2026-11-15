@@ -311,17 +311,23 @@ fn render_remote_session_kill(o: &RemoteSessionKillOutcome) -> String {
 
 fn render_new(o: &NewOutcome) -> Option<String> {
     match o {
-        NewOutcome::Spec(s) => Some(render_new_spec(s)),
+        NewOutcome::Spec(s) => render_new_spec(s),
         NewOutcome::Workflow(w) => Some(render_new_workflow(w)),
         NewOutcome::Skill(s) => render_new_skill(s),
         NewOutcome::Agent(a) => Some(a.render()),
     }
 }
 
-fn render_new_spec(o: &NewSpecOutcome) -> String {
-    match &o.path {
-        Some(p) => format!("Created work item: {p}"),
-        None => "Work item created.".to_string(),
+fn render_new_spec(o: &NewSpecOutcome) -> Option<String> {
+    match (&o.path, &o.url) {
+        (Some(p), _) => Some(format!("Created work item: {p}")),
+        // The command already announced the URL the moment the provider
+        // confirmed it (possibly while the agent was still running); the JSON
+        // outcome keeps it, the human summary does not print it twice.
+        (None, Some(_)) => None,
+        // A remote interview whose draft was never edited creates nothing.
+        (None, None) if o.interview => Some("No work item was created.".to_string()),
+        (None, None) => Some("Work item created.".to_string()),
     }
 }
 
@@ -361,3 +367,31 @@ fn render_specs_amend(o: &SpecsAmendOutcome) -> String {
 }
 
 // ─── tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_new_spec_url_is_not_rendered_a_second_time() {
+        let spec = |path: Option<&str>, url: Option<&str>, interview| NewSpecOutcome {
+            interview,
+            path: path.map(Into::into),
+            url: url.map(Into::into),
+            number: Some(73),
+        };
+        // The command announced the URL when the provider confirmed it.
+        assert_eq!(
+            render_new_spec(&spec(None, Some("https://x/issues/73"), false)),
+            None
+        );
+        assert_eq!(
+            render_new_spec(&spec(Some("aspec/0007-x.md"), None, false)).as_deref(),
+            Some("Created work item: aspec/0007-x.md")
+        );
+        assert_eq!(
+            render_new_spec(&spec(None, None, true)).as_deref(),
+            Some("No work item was created.")
+        );
+    }
+}

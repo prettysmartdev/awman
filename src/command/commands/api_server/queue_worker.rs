@@ -1238,40 +1238,10 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         let state_writer = CommandStateWriter::new(self.paths.clone(), &session_id, &command_id);
         let interaction = self.interaction_for(&cmd);
         let job_interaction = interaction.interaction;
-        // Lease prompt bodies are private session input. Materialize them only
-        // for catalogue construction, never in the durable row or metadata.
-        let mut dispatch_cmd = cmd.clone();
-        if cmd.subcommand == "exec prompt" && self.lease_event_bus.is_some() {
-            if let Some(session) = self.sessions.get_by_key(&session_id) {
-                let session = session.read().await;
-                if let Some(path) = session.inline_work_item() {
-                    let body = crate::data::fs::private_files::open_private_file(path).and_then(
-                        |mut file| {
-                            use std::io::Read;
-                            let mut body = String::new();
-                            file.read_to_string(&mut body).map_err(|e| {
-                                crate::data::error::DataError::Io {
-                                    path: path.to_path_buf(),
-                                    source: e,
-                                }
-                            })?;
-                            Ok(body)
-                        },
-                    );
-                    match body {
-                        Ok(body) => {
-                            let mut input = args.clone();
-                            input.extend(["--".into(), body]);
-                            dispatch_cmd.args =
-                                serde_json::to_string(&input).expect("string arguments");
-                        }
-                        Err(error) => {
-                            tracing::error!(%error, "could not read private lease prompt")
-                        }
-                    }
-                }
-            }
-        }
+        // A lease prompt body stays private session input: `exec prompt`
+        // resolves it from the session as its work item, so it is never added
+        // to the arguments (which would deliver it to the agent twice).
+        let dispatch_cmd = cmd.clone();
         let frontend = self.frontend_factory.frontend_for(
             &dispatch_cmd,
             event_bus.sender(),
@@ -1399,6 +1369,46 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 allow_remote_input: cmd.allow_remote_input,
             }),
         );
+        // A pushed inline work item (WI 0147) rides on a per-command copy of
+        // the session, so it never leaks into the session's next command. A
+        // staging directory that cannot be read back is a hard error: the
+        // command must not run without the work item it was admitted with.
+        let inline_store = super::inline_work_item::InlineWorkItemStore::new(self.paths.clone());
+        let session = match inline_store.load(&session_id, &command_id) {
+            Ok(None) => session,
+            Ok(Some(staged)) => {
+                let mut copy = session.read().await.clone();
+                copy.set_staged_work_item(staged);
+                Arc::new(tokio::sync::RwLock::new(copy))
+            }
+            Err(error) => {
+                let completion = QueuedCommandResult::new(
+                    &Err(crate::command::error::CommandError::Other(format!(
+                        "the staged inline work item cannot be read: {error}"
+                    ))),
+                    &Ok(PushBackOutcome::NotConfigured),
+                )
+                .map_result(|r| {
+                    if let Some(failure) = &mut r.failure {
+                        failure.stage = "preflight".into();
+                    }
+                });
+                completion
+                    .publish(&self.store, &self.paths, &cmd, &event_bus.sender())
+                    .await;
+                let _ = log_writer.await;
+                self.cleanup_event_bus(&command_id).await;
+                self.post_execution_check(&session_id, &command_id).await;
+                return;
+            }
+        };
+        // Bare push-back commit messages follow the repository's source.
+        let work_item_source = session
+            .read()
+            .await
+            .effective_config()
+            .work_item_source()
+            .unwrap_or_default();
         // The command's `/awman/output` directory (WI 0137 §3): the command
         // that mounts it creates (or, for `exec prompt`, clears) it.
         let dispatch = Dispatch::new(frontend, session, engines)
@@ -1472,6 +1482,8 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         // buffered lines. The timeout keeps cancellation from waiting forever
         // if a backend leaves an output sender open.
         wait_for_output_drains(&event_bus, &command_id).await;
+        // The command has run to a terminal result: drop the staged body.
+        inline_store.remove(&session_id, &command_id);
 
         // A cancel accepted before push-back begins wins over a clean exit:
         // the cancelled work is not published and the command is `cancelled`.
@@ -1493,7 +1505,8 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             match self.store.get_session(&session_id) {
                 Ok(Some(record)) => match (baseline, self.push_context(&record, &push_cancel)) {
                     (Err(error), _) | (Ok(_), Err(error)) => Err(error),
-                    (Ok(baseline), Ok(ctx)) => {
+                    (Ok(baseline), Ok(mut ctx)) => {
+                        ctx.work_item_source = work_item_source.clone();
                         publish_after_success(
                             (*self.engines.git_engine).clone(),
                             record,
@@ -1674,6 +1687,7 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 &record.id,
                 record.git_auth_kind.as_deref(),
             )?,
+            work_item_source: Default::default(),
         })
     }
 

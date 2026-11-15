@@ -44,6 +44,17 @@ and need review independently when their contents differ from the approved recip
 
 ## Guidance:
 
+- **Trusted work item providers** — `workItems.source` may be repository
+  scoped, but `workItems.providers.<name>` definitions are global-only. A
+  repository checkout is untrusted input and cannot choose the destination
+  that receives a user's provider token or replace trusted provider settings.
+  HTTP providers must use HTTPS, except for literal loopback HTTP used by a
+  local service. Provider URLs must stay under the configured base URL;
+  URL validation happens before credentials are attached, redirects are not
+  followed, and provider requests have a 5-second connection timeout and a
+  15-second total timeout. Responses are limited to 2 MiB and work item
+  bodies to 1 MiB. Do not include credentials in provider URLs.
+
 - Never directly execute any code assistant on the developer host machine. Every single code agent action should be executed by running a Docker image that has the agent tool installed and passing an entrypoing command to direct the agentic tool.
   - **Sole exception — the `ready` local-agent check** (`HostAgentPinger::ping`
     in `src/engine/ready/host_agent.rs`, originally the

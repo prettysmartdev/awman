@@ -394,7 +394,7 @@ impl CommandCatalogue {
     }
 }
 
-fn parse_against_spec(
+pub(crate) fn parse_against_spec(
     spec: &CommandSpec,
     path: &[&str],
     args: &[String],
@@ -445,10 +445,17 @@ fn parse_against_spec(
                 Some((n, v)) => (n, Some(v.to_string())),
                 None => (rest, None),
             };
-            let flag_spec = spec
+            let Some(flag_spec) = spec
                 .find_flag(name)
                 .or_else(|| CommandCatalogue::get().find_global_flag(name))
-                .ok_or_else(|| CommandError::unknown_flag(path, name))?;
+            else {
+                return Err(replaced_or_unknown_flag(
+                    path,
+                    name,
+                    inline,
+                    cursor.next_token(),
+                ));
+            };
             cursor.apply_flag(flag_spec, inline, &mut flags)?;
         } else if let Some(short) = arg.strip_prefix('-') {
             // Only single-character short flags are supported (clap parity).
@@ -557,6 +564,11 @@ impl<'a> RawArgCursor<'a> {
 
     fn peek(&self) -> Option<&'a String> {
         self.args.get(self.i)
+    }
+
+    /// The token after the current one.
+    fn next_token(&self) -> Option<&'a String> {
+        self.args.get(self.i + 1)
     }
 
     fn advance(&mut self) {
@@ -669,5 +681,27 @@ impl<'a> RawArgCursor<'a> {
                 reason: "flag requires a value".to_string(),
             }),
         }
+    }
+}
+
+/// The error for an undeclared long flag: a [replaced flag]'s migration
+/// message when it is one, otherwise [`CommandError::UnknownFlag`]. The value
+/// is the inline `--flag=value`, or the next token unless it is a flag.
+///
+/// [replaced flag]: crate::command::dispatch::catalogue::ReplacedFlagSpec
+fn replaced_or_unknown_flag(
+    path: &[&str],
+    name: &str,
+    inline: Option<String>,
+    next: Option<&String>,
+) -> CommandError {
+    let Some(replaced) = CommandCatalogue::get().replaced_flag(name) else {
+        return CommandError::unknown_flag(path, name);
+    };
+    let value = inline.or_else(|| next.filter(|token| !token.starts_with('-')).cloned());
+    CommandError::InvalidFlagValue {
+        command: path.iter().map(|segment| (*segment).to_string()).collect(),
+        flag: replaced.name.to_string(),
+        reason: (replaced.message)(value.as_deref()),
     }
 }

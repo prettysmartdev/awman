@@ -21,11 +21,13 @@ use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
 
 use super::event_bus::EventBusSender;
-use crate::command::commands::exec_workflow::parse_work_item_number;
 use crate::command::dispatch::catalogue::CommandCatalogue;
+use crate::command::work_item::{is_local_reference, parse_work_item_number};
+use crate::data::config::work_items::WorkItemSource;
 use crate::data::execution_event::{EventPayload, EventSource, EventSourcePhase};
 use crate::data::fs::api_db::{failure_codes, failure_stages, PushedRef, SessionRecord};
 use crate::data::message::{UserMessage, UserMessageSink};
+use crate::data::work_item_ref::WorkItemRef;
 use crate::engine::error::EngineError;
 use crate::engine::git::push_publish::{
     NoGate, PushFailure, PushObserver, PushOutcome, PushPublisher, PushRetry,
@@ -65,6 +67,7 @@ pub(crate) async fn capture_baseline(
         cancel,
         deadline,
         transport,
+        ..
     } = ctx;
     let mut local_guard = crate::engine::git::transport::TransportGuard::new(cancel.clone());
     local_guard.deadline = deadline;
@@ -155,6 +158,9 @@ pub(crate) struct PushBackContext {
     pub cancel: CancellationToken,
     pub deadline: Option<DateTime<Utc>>,
     pub transport: HostGitTransport,
+    /// `workItems.source` of the session's repository: decides whether a bare
+    /// `--work-item` value is a local number for the commit message.
+    pub work_item_source: WorkItemSource,
 }
 
 /// Local preparation of a push-back: leftovers committed, nothing networked.
@@ -213,12 +219,13 @@ pub(crate) async fn publish_after_success(
         cancel,
         deadline,
         transport,
+        work_item_source,
     } = ctx;
     let mut local_sink = PushEventSink(sink.0.clone());
     let mut local_guard = crate::engine::git::transport::TransportGuard::new(cancel.clone());
     local_guard.deadline = deadline;
     local_guard.timeout = crate::engine::git::push_retry::PUSH_FIRST_ATTEMPT_TIMEOUT;
-    let message = leftover_commit_message(&session.id, &subcommand, &args);
+    let message = leftover_commit_message(&session.id, &subcommand, &args, &work_item_source);
     let prepared = tokio::task::spawn_blocking(move || {
         prepare(
             &git,
@@ -278,6 +285,7 @@ pub(crate) fn leftover_commit_message(
     session_id: &str,
     subcommand: &str,
     args: &[String],
+    source: &WorkItemSource,
 ) -> String {
     // Use the command parser so positional prompt text and values of other
     // flags cannot accidentally be interpreted as a work-item flag.
@@ -286,10 +294,25 @@ pub(crate) fn leftover_commit_message(
         .parse_raw_args(&path, args)
         .ok()
         .and_then(|parsed| parsed.flag_string("work-item"))
-        .and_then(|value| parse_work_item_number(&value));
+        .and_then(|value| local_work_item_number(&value, source));
     match work_item {
         Some(number) => format!("Implement work item {number:04}"),
         None => format!("awman: {subcommand} in session {session_id}"),
+    }
+}
+
+/// The local number a `--work-item` value names, if it names a local file at
+/// all. A URL, `github:7` or `http:<name>:<id>` can contain digits that are
+/// not a local number, so they never produce one.
+fn local_work_item_number(value: &str, source: &WorkItemSource) -> Option<u32> {
+    let reference = WorkItemRef::parse(value).ok()?;
+    if !is_local_reference(&reference, source) {
+        return None;
+    }
+    match reference {
+        WorkItemRef::LocalNumber(number) => Some(number),
+        WorkItemRef::Bare(value) => parse_work_item_number(&value),
+        _ => None,
     }
 }
 
@@ -332,6 +355,47 @@ impl PushObserver for PushEventSink {
 mod tests {
     use super::*;
     use crate::engine::git::push_publish::PushFailureKind;
+
+    fn message(args: &[&str], source: &WorkItemSource) -> String {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        leftover_commit_message("ses", "exec prompt", &args, source)
+    }
+
+    #[test]
+    fn commit_message_numbers_only_local_work_items() {
+        let local = WorkItemSource::Local;
+        assert_eq!(
+            message(&["--work-item", "WI-42", "go"], &local),
+            "Implement work item 0042"
+        );
+        assert_eq!(
+            message(&["--work-item", "local:7", "go"], &WorkItemSource::Github),
+            "Implement work item 0007"
+        );
+        let default = "awman: exec prompt in session ses";
+        // A URL, a GitHub or provider reference never yields a local number,
+        // whatever digits it contains.
+        for value in [
+            "https://github.com/acme/app/issues/1234",
+            "https://tracker.example/items/99",
+            "github:42",
+            "#42",
+            "acme/app#42",
+            "http:corp:42",
+        ] {
+            assert_eq!(
+                message(&["--work-item", value, "go"], &local),
+                default,
+                "{value}"
+            );
+        }
+        // A bare value follows the configured source.
+        assert_eq!(
+            message(&["--work-item", "42", "go"], &WorkItemSource::Github),
+            default
+        );
+        assert_eq!(message(&["go"], &local), default);
+    }
 
     #[test]
     fn push_failures_keep_their_stage_and_code_in_the_command_result() {
@@ -457,6 +521,7 @@ mod transport_contract_tests {
             transport: HostGitTransport::user(
                 crate::engine::git::transport::CredentialSource::Ambient,
             ),
+            work_item_source: WorkItemSource::Local,
         };
         let bus = EventBus::new(64);
         bus.redaction()

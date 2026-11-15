@@ -50,14 +50,18 @@ async fn ensure_exec_prompt_agent_setup(
 }
 
 /// Build the final prompt string by combining an optional user-provided text
-/// and an optional issue markdown block. Exposed for unit testing.
+/// and optional resolved work item content. Content is prompt data only.
 pub(crate) fn build_prompt_string(
     user_prompt: Option<&str>,
-    issue_markdown: Option<&str>,
+    work_item_content: Option<&str>,
 ) -> Option<String> {
-    match (user_prompt, issue_markdown) {
+    match (user_prompt, work_item_content) {
         (Some(user), Some(issue)) => Some(format!("{user}\n\n{issue}")),
         (Some(user), None) => Some(user.to_string()),
+        // The prompt is the agent CLI's last positional argument. Work item
+        // text comes from the repository, so it must never be parsed as an
+        // option (`--dangerously-skip-permissions`, `--flag=value`).
+        (None, Some(issue)) if issue.starts_with('-') => Some(format!("Work item:\n\n{issue}")),
         (None, Some(issue)) => Some(issue.to_string()),
         (None, None) => None,
     }
@@ -130,45 +134,35 @@ impl Command for ExecPromptCommand {
             }
         }
 
-        // Validate that at least one of prompt and --issue is provided.
-        if self.flags.prompt.is_none() && self.flags.issue_source.issue.is_none() {
-            return Err(CommandError::Other(
-                "exec prompt: either a prompt argument or --issue must be provided".to_string(),
-            ));
-        }
-
-        // Resolve issue if --issue was provided.
-        let issue_markdown = if let Some(ref issue_ref) = self.flags.issue_source.issue {
-            let router = crate::engine::issue::router::IssueSourceRouter::new(
-                std::sync::Arc::clone(&self.engines.git_engine),
-                session.env(),
-            );
-            match router.fetch_issue_with_progress(issue_ref, session.git_root(), &mut *frontend) {
-                Ok((issue, source)) => {
-                    let md = source.format_as_markdown(&issue);
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Info,
-                        text: format!("exec prompt: fetched issue '{}'", issue.title),
-                    });
-                    Some(md)
-                }
-                Err(e) => {
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Error,
-                        text: format!("exec prompt: failed to fetch issue: {e}"),
-                    });
-                    return Err(CommandError::Other(e.to_string()));
-                }
+        // Resolve --work-item through the shared resolver (WI 0147). Any
+        // resolution failure is a hard error before a container starts; the
+        // resolver reports the source and title itself.
+        let work_item_content = match crate::command::work_item::WorkItemResolver::new(
+            session.clone(),
+            std::sync::Arc::clone(&self.engines.git_engine),
+        )
+        .resolve(self.flags.work_item.as_deref(), &mut *frontend)
+        .await
+        {
+            Ok(item) => item.map(|item| item.content),
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec prompt: failed to resolve work item: {e}"),
+                });
+                return Err(e.into());
             }
-        } else {
-            None
         };
 
-        // Construct the final prompt string. The earlier validation above
-        // guarantees at least one input is present, so this cannot be None.
+        // Resolve first so staged inline input can supply the prompt too.
         let final_prompt =
-            build_prompt_string(self.flags.prompt.as_deref(), issue_markdown.as_deref())
-                .expect("validated above: at least one of prompt or --issue must be present");
+            build_prompt_string(self.flags.prompt.as_deref(), work_item_content.as_deref())
+                .ok_or_else(|| {
+                    CommandError::Other(
+                        "exec prompt: either a prompt argument or --work-item must be provided"
+                            .into(),
+                    )
+                })?;
 
         let agent = match LaunchPolicy::for_session(&session).resolve_agent(&self.flags.agent) {
             Ok(a) => a,
@@ -578,5 +572,27 @@ impl Command for ExecPromptCommand {
             report_kept_session_worktree(worktree, frontend.as_mut());
         }
         outcome
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_prompt_string;
+
+    #[test]
+    fn work_item_text_alone_never_starts_with_an_option_dash() {
+        for content in ["--dangerously-skip-permissions", "-p=x\nrest"] {
+            let prompt = build_prompt_string(None, Some(content)).unwrap();
+            assert!(!prompt.starts_with('-'), "{prompt:?}");
+            assert!(prompt.ends_with(content));
+        }
+        assert_eq!(
+            build_prompt_string(None, Some("# Title\n\nbody")).as_deref(),
+            Some("# Title\n\nbody")
+        );
+        assert_eq!(
+            build_prompt_string(Some("do it"), Some("-x")).as_deref(),
+            Some("do it\n\n-x")
+        );
     }
 }

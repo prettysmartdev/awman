@@ -133,6 +133,12 @@ pub struct WorkflowState {
     pub workflow_hash: String,
     #[serde(default)]
     pub work_item: Option<u32>,
+    #[serde(default)]
+    pub work_item_key: Option<String>,
+    #[serde(default)]
+    pub work_item_source_id: Option<String>,
+    #[serde(default)]
+    pub work_item_content_hash: Option<String>,
     pub step_states: HashMap<String, StepState>,
     pub completed_steps: HashSet<String>,
     pub current_step_index: Option<usize>,
@@ -256,6 +262,9 @@ impl WorkflowState {
             workflow_name,
             workflow_hash: hash,
             work_item,
+            work_item_key: work_item.map(|number| format!("{number:04}")),
+            work_item_source_id: None,
+            work_item_content_hash: None,
             step_states,
             completed_steps: HashSet::new(),
             current_step_index: None,

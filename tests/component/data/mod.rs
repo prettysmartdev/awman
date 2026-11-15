@@ -7,3 +7,5 @@ mod config_properties;
 mod persistence;
 
 mod context_store;
+mod work_item_drafts;
+mod work_item_files;

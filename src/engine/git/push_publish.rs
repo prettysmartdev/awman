@@ -413,6 +413,19 @@ impl PushPublisher {
             };
             let now = Utc::now();
             let class = GitFailureClass::of(&error);
+            // After a transport failure, verification and the next push share
+            // one retry budget. Exhausting it in a local probe still exhausts
+            // the retry, but a local timeout never authorizes a new attempt.
+            if first_failure.is_some()
+                && matches!(error, EngineError::GitLocalTimeout)
+                && guard.remaining_timeout().is_zero()
+            {
+                return Err(fail(
+                    PushFailureKind::Unreachable,
+                    format!("git push to {remote}: the retry process budget expired"),
+                    attempt,
+                ));
+            }
             // The attempt budget ends at the push deadline. A lease's guard
             // follows expiry rather than that deadline, so a local Git call
             // the budget killed surfaces as a plain error: the push window

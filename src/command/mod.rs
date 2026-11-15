@@ -22,6 +22,7 @@ pub mod session_setup;
 pub mod startup;
 pub mod stats_sampler;
 pub mod terminals;
+pub mod work_item;
 
 pub use dispatch::catalogue::{CommandCatalogue, CommandSpec, FlagSpec, FrontendVisibility};
 pub use dispatch::{

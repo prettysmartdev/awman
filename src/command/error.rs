@@ -237,6 +237,14 @@ pub enum CommandError {
     RemoteSessionKillFailed { session_id: String, reason: String },
 
     // ── Work item / spec ──────────────────────────────────────────────────────
+    /// Resolving, staging or creating a work item (WI 0147).
+    #[error(transparent)]
+    WorkItem(crate::command::work_item::WorkItemError),
+
+    /// Live draft sync or its final upload failed; the draft is kept.
+    #[error(transparent)]
+    DraftSync(crate::command::work_item::draft_sync::DraftSyncError),
+
     #[error("work item {number} not found in aspec/work-items/")]
     WorkItemNotFound { number: u32 },
 
@@ -438,6 +446,8 @@ impl CommandError {
     pub fn exit_code(&self) -> u8 {
         match self {
         CommandError::Aborted => 130,
+        CommandError::WorkItem(e) => e.exit_code(),
+        CommandError::DraftSync(_) => 1,
         CommandError::DaemonHttpStatus { status: 404, .. } => 4,
 
         // Exit 2 — invalid usage / parse / flag conflict
@@ -599,6 +609,8 @@ impl CommandError {
                 crate::data::fs::api_db::failure_stages::GIT_AUTH
             }
             CommandError::CommandSecretsLost => PREFLIGHT,
+            CommandError::WorkItem(_) => PREFLIGHT,
+            CommandError::DraftSync(_) => STEP,
 
             CommandError::MergeConflict { .. } | CommandError::MergeTargetDirty { .. } => MERGE,
 
@@ -746,6 +758,8 @@ impl CommandError {
             CommandError::RemoteSessionMissing => "remote_session_missing",
             CommandError::RemoteSessionKillFailed { .. } => "remote_session_kill_failed",
 
+            CommandError::WorkItem(e) => e.code(),
+            CommandError::DraftSync(_) => "work_item_sync_failed",
             CommandError::WorkItemNotFound { .. } => "work_item_not_found",
             CommandError::SpecTemplateMissing { .. } => "spec_template_missing",
             CommandError::InvalidOverlaySpec { .. } => "invalid_overlay_spec",
@@ -769,5 +783,17 @@ impl CommandError {
 
             CommandError::NotImplemented(_) => "not_implemented",
         }
+    }
+}
+
+impl From<crate::command::work_item::WorkItemError> for CommandError {
+    fn from(err: crate::command::work_item::WorkItemError) -> Self {
+        CommandError::WorkItem(err)
+    }
+}
+
+impl From<crate::command::work_item::draft_sync::DraftSyncError> for CommandError {
+    fn from(err: crate::command::work_item::draft_sync::DraftSyncError) -> Self {
+        CommandError::DraftSync(err)
     }
 }

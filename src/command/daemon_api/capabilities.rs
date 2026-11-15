@@ -81,6 +81,12 @@ pub const CAPABILITIES: &[&str] = &[
     // WI 0145: `secrets` on command submission, injected for `env(NAME)`
     // overlays, redacted from events/results, `secrets_lost` after restart.
     "command_secrets",
+    // WI 0147: `work_item: { title, body, id? }` on `POST /v1/worker/commands`
+    // (and `/v1/worker/runs`), staged privately as a remote work item.
+    "inline_work_item",
+    // WI 0147: `--work-item` accepts github / http providers / local files by
+    // `workItems.source`; `--issue` was replaced.
+    "work_item_sources",
 ];
 
 /// WI 0143: capabilities of the pull worker, in their fixed order. Each is
@@ -154,6 +160,30 @@ mod tests {
                 .map(|c| c.to_string()),
         );
         assert_eq!(with_pull, expected);
+    }
+
+    #[test]
+    fn work_item_capabilities_are_static_and_leave_the_lease_one_alone() {
+        let base = advertised(false, &[]);
+        for flag in ["inline_work_item", "work_item_sources"] {
+            assert_eq!(
+                base.iter().filter(|c| c.as_str() == flag).count(),
+                1,
+                "{flag}"
+            );
+        }
+        // The push capability is not the WSP lease capability.
+        assert!(!base.iter().any(|c| c == "lease_inline_work_item"));
+        assert!(advertised(true, PULL_CAPABILITIES)
+            .iter()
+            .any(|c| c == "lease_inline_work_item"));
+        assert_eq!(
+            PULL_CAPABILITIES
+                .iter()
+                .filter(|c| **c == "lease_inline_work_item")
+                .count(),
+            1
+        );
     }
 
     #[test]

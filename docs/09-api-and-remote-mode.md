@@ -321,16 +321,16 @@ awman exec prompt "Summarise recent changes" --headless
 awman exec prompt "Refactor the auth module" --agent codex --model gpt-4o
 
 # Send a GitHub issue as the prompt
-awman exec prompt --issue 84
+awman exec prompt --work-item github:84
 
 # Prepend your own context to the issue
-awman exec prompt "Security review for: " --issue 84
+awman exec prompt "Security review for: " --work-item github:84
 
 # Full autonomous run
 awman exec prompt "Implement caching for the API layer" --yolo --headless
 ```
 
-A prompt, `--issue`, or both is required. With both, your text comes first, followed by the issue content ([GitHub Integration](10-github-integration.md)).
+A prompt, `--work-item`, or both is required. With both, your text comes first, followed by the resolved work item content ([GitHub Integration](10-github-integration.md)). A reference that cannot be resolved is a hard error.
 
 `exec prompt` accepts the same agent flags as `chat` (`--headless`/`-n`, `--plan`, `--auto`, `--yolo`, `--agent`, `--model`, `--overlay`, `--agent-flag`, `--allow-docker`); see [Agent Sessions](03-agent-sessions.md#flags-common-to-chat-and-other-agent-launching-commands) and the [Command Reference](14-command-reference.md#awman-exec-prompt).
 
@@ -351,7 +351,7 @@ awman exec wf ./aspec/workflows/implement-feature.toml
 awman exec workflow ./aspec/workflows/implement-feature.toml --work-item 0053
 
 # Or fetch a GitHub issue instead
-awman exec workflow ./aspec/workflows/implement-feature.toml --issue 84
+awman exec workflow ./aspec/workflows/implement-feature.toml --work-item github:84
 
 # Non-interactive workflow run
 awman exec workflow ./aspec/workflows/review.toml --headless
@@ -359,13 +359,50 @@ awman exec workflow ./aspec/workflows/review.toml --headless
 
 `exec workflow` and `exec wf` are identical — `wf` is a short alias.
 
-**Work item template variables:** When no `--work-item` or `--issue` is given, prompt templates that use `{{work_item_number}}`, `{{work_item_content}}`, or `{{work_item_section:[Name]}}` are left unexpanded with a warning:
+**Work item template variables:** When no `--work-item` is given, prompt templates that use `{{work_item_number}}`, `{{work_item_content}}`, or `{{work_item_section:[Name]}}` are left unexpanded with a warning:
 
 ```
-warning: workflow uses {{work_item_content}} but no --work-item was provided; placeholder left unexpanded
+warning: workflow prompt references {{work_item_*}} but no --work-item was supplied; placeholders rendered as empty strings
 ```
 
-With `--work-item <N>`, awman resolves the work item file from the configured work items directory and substitutes all template variables; `--issue <ref>` fetches the GitHub issue and substitutes the same variables.
+With `--work-item <ref>`, awman resolves one work item and substitutes its content and available number. Bare values follow the effective `workItems.source` for that run; explicit local paths/numbers, GitHub references, HTTP provider IDs and provider URLs select their source directly. A missing, ambiguous, inaccessible, or unfetchable referenced item stops the command before agent launch; there is no local fallback. Dynamic workflows require a work item even when the request otherwise has no template variables. For remote CLI runs, the server session's effective configuration controls resolution.
+
+### Inline work items
+
+API clients can send an inline work item instead of a `--work-item` argument
+in `POST /v1/worker/commands` or `POST /v1/worker/runs`, for an `exec prompt`
+or `exec workflow` command. The request uses the `work_item` object:
+
+```json
+{
+  "subcommand": "exec prompt",
+  "args": ["Review the supplied request"],
+  "work_item": {
+    "title": "Improve import validation",
+    "body": "Validate each uploaded record before saving.",
+    "id": "request-123"
+  }
+}
+```
+
+`title` and `body` are required nonblank strings; `id` is optional. The body
+has a 1 MiB size limit, the title 1024 bytes and the `id` 256 bytes; longer
+values are rejected with HTTP 400. The same `id` in a later command keeps the
+same work item identity, so a dynamic workflow can resume it. A queued command
+whose staged work item has gone missing fails before any container starts; it
+never runs without it. Remote `--work-item` references are read with the
+server's own `gh` login and provider tokens, so any authenticated API caller can
+read issues that identity can see. Inline input is read-only for the run and is available
+only to `exec prompt` and `exec workflow`. Sending both `work_item` and a
+parsed `--work-item` flag is rejected with HTTP 400. To avoid rejecting prompt
+text that happens to contain flag-like words, awman checks parsed command
+arguments rather than searching the text.
+
+Remote CLI commands pass the supplied `--work-item` reference through to the
+server without resolving it locally. The server uses the remote session's
+repository and effective configuration, so bare values use the server's
+`workItems.source`, `workItems.dir`, `origin`, and globally trusted provider
+settings. The client machine's config and repository do not affect resolution.
 
 Workflow state is saved under `$GITROOT/.awman/workflows/` as `<repo-hash8>-<work-item>-<workflow-name>.json`, or `<repo-hash8>-<workflow-name>.json` without a work item.
 
@@ -2402,7 +2439,7 @@ Cases not covered in the sections above:
 | A `workDirs.allow` path does not exist at startup | Startup refused; create the directory first |
 | A `workDirs.roots` path does not exist at startup | Warning logged; the root is checked again on each request |
 | A `workDirs.roots` entry is itself inside a Git repository | Startup refused (exit 2); use `workDirs.allow` for a single repository |
-| `exec workflow` with `{{work_item_content}}` and no `--work-item` | Warning; placeholder left unexpanded; the workflow continues |
+| `exec workflow` with `{{work_item_content}}` and no `--work-item` | Warning; placeholder is rendered as an empty string; the workflow continues |
 | Bare `"subcommand": "exec"` (action in `args`) | HTTP 400 `invalid_request`; use `exec prompt` or `exec workflow` as the `subcommand` |
 | Session closed between listing it and submitting a command | HTTP 404 `session_not_found` |
 | `GET /v1/worker/sessions?status=active` with no active sessions | HTTP 200 `{"items":[],"next_cursor":null}` |
@@ -2525,11 +2562,11 @@ awman remote exec workflow aspec/workflows/implement-feature.toml --work-item 00
 | `--session <ID>` | | Session ID on the remote host. Falls back to `AWMAN_REMOTE_SESSION` |
 | `--follow` | `-f` | Stream output until the command completes |
 | `--remote <target>` | | Global flag: the remote target (default `remote.default`) |
-Every other flag is an [`exec workflow`](#awman-exec-workflow-path--awman-exec-wf-path) flag, and every one you pass is sent to the server, which runs `exec workflow` with it: `--work-item`, `--issue`, `--agent`, `--model`, `--yolo`, `--auto`, `--plan`, `--overlay`, `--agent-flag`, `--dynamic` and `--leader`, the `--on-…` choices, the `--prerequisite-…` grants and `--check-prerequisites`. Paths in them (`--overlay`, the workflow file) are paths on the remote host,, and `--agent-flag` replaces the remote host's `agents.flags` entry for the run. To change a setting for one run, add `--set key=value` (for example `--set workflows.maxConcurrentSteps=4`); it is forwarded to the server. The server then applies its API defaults (headless, and `--yolo` unless you passed `--plan` or `--auto`); see [Submit a command](#submit-a-command).
+Every other flag is an [`exec workflow`](#awman-exec-workflow-path--awman-exec-wf-path) flag, and every one you pass is sent to the server, which runs `exec workflow` with it: `--work-item`, `--agent`, `--model`, `--yolo`, `--auto`, `--plan`, `--overlay`, `--agent-flag`, `--dynamic` and `--leader`, the `--on-…` choices, the `--prerequisite-…` grants and `--check-prerequisites`. Paths in them (`--overlay`, the workflow file) are paths on the remote host, and `--agent-flag` replaces the remote host's `agents.flags` entry for the run. To change a setting for one run, add `--set key=value` (for example `--set workflows.maxConcurrentSteps=4`); it is forwarded to the server. The server then applies its API defaults (headless, and `--yolo` unless you passed `--plan` or `--auto`); see [Submit a command](#submit-a-command).
 
 Two `exec workflow` flags are not available, because they describe the local run: `--worktree` (the server decides; its API default `--yolo` implies one) and `--json` (the server reports the result; read it with `GET /v1/worker/commands/<id>`). Passing either is an unknown-flag error.
 
-With `--dynamic`, omit the workflow path; the server's leader agent designs the workflow for `--work-item` or `--issue`:
+With `--dynamic`, omit the workflow path; the server's leader agent designs the workflow for the required `--work-item`:
 
 ```sh
 awman remote exec workflow --dynamic --work-item 0042 --session abc123 -f
@@ -2554,7 +2591,7 @@ Command cmd_e5f6a7b8…: workflow (session abc123) via https://127.0.0.1:9876 [d
 
 ## `awman remote exec prompt`
 
-Sends a one-shot prompt to a ready session. Session resolution, `--follow` and its exit code work as for `remote exec workflow`. Every [`exec prompt`](#awman-exec-prompt-prompt) flag you pass (`--agent`, `--model`, `--issue`, `--yolo`, `--plan`, `--overlay`, `--agent-flag` and the rest) is sent to the server. Put flags before the prompt: everything after the prompt's first word is part of the prompt.
+Sends a one-shot prompt to a ready session. Session resolution, `--follow` and its exit code work as for `remote exec workflow`. Every [`exec prompt`](#awman-exec-prompt-prompt) flag you pass (`--agent`, `--model`, `--work-item`, `--yolo`, `--plan`, `--overlay`, `--agent-flag` and the rest) is sent to the server. Put flags before the prompt: everything after the prompt's first word is part of the prompt. The server resolves `--work-item` against its own session repository and configuration.
 
 ```sh
 awman remote exec prompt "Fix the failing tests" --session abc123 --follow

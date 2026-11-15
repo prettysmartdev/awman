@@ -92,6 +92,21 @@ pub struct RemovedFlagSpec {
     pub hint: &'static str,
 }
 
+/// Spec for a flag replaced by another flag whose values mean something
+/// different, so the old spelling is not kept as an alias (WI 0147: a bare
+/// `--issue 42` was a GitHub issue, a bare `--work-item 42` follows
+/// `workItems.source`). Unlike a [`RemovedFlagSpec`], it is recognized by the
+/// shared argument parser, so only a real flag token — not prompt text after
+/// `--` or inside a greedy prompt — triggers it, and the CLI, the TUI command
+/// box and API `args` all return the same message.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplacedFlagSpec {
+    /// The retired long flag name, without dashes (e.g. `issue`).
+    pub name: &'static str,
+    /// The error message, given the value the user wrote with the flag.
+    pub message: fn(Option<&str>) -> String,
+}
+
 /// The kind of an argument (positional value).
 #[derive(Debug, Clone, Copy)]
 pub enum ArgumentKind {
@@ -553,26 +568,80 @@ impl CommandCatalogue {
             .unwrap_or(true)
     }
 
-    /// Scan a raw argv for any [removed flag](RemovedFlagSpec). Returns the
-    /// composed migration message ("`<flag>` has been removed. <hint>") for the
-    /// first removed flag found, or `None` when argv contains none. Frontends
-    /// call this before clap parsing so a retired flag surfaces the hint
-    /// instead of clap's generic "unexpected argument" error. Both the bare
-    /// `--flag` and the `--flag=value` forms are matched.
+    /// Scan a raw argv for any [removed flag](RemovedFlagSpec) or
+    /// [replaced flag](ReplacedFlagSpec). Returns the message to print for the
+    /// first one found, or `None` when argv contains none. Frontends call this
+    /// before clap parsing so a retired flag surfaces the hint instead of
+    /// clap's generic "unexpected argument" error. Both the bare `--flag` and
+    /// the `--flag=value` forms are matched.
+    ///
+    /// `args` is the full argv, program name first. A replaced flag is found
+    /// with the shared parser, so a token after `--` or inside a greedy prompt
+    /// is prompt text, not a flag.
     pub fn removed_flag_hint<I, S>(&self, args: I) -> Option<String>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        for arg in args {
-            let arg = arg.as_ref();
+        let args: Vec<String> = args.into_iter().map(|a| a.as_ref().to_string()).collect();
+        for arg in &args {
             for spec in REMOVED_FLAGS {
                 if arg == spec.name || arg.starts_with(&format!("{}=", spec.name)) {
                     return Some(format!("{} has been removed. {}", spec.name, spec.hint));
                 }
             }
         }
-        None
+        self.replaced_flag_in_argv(args.get(1..).unwrap_or_default())
+    }
+
+    /// The [replaced flag](ReplacedFlagSpec) named `name` (without dashes).
+    pub fn replaced_flag(&self, name: &str) -> Option<&'static ReplacedFlagSpec> {
+        REPLACED_FLAGS.iter().find(|spec| spec.name == name)
+    }
+
+    /// Resolve the command path at the front of a CLI argv (global flags may
+    /// precede it) and parse the rest with the shared parser, reporting only
+    /// a replaced flag. Every other error is left for clap to render.
+    fn replaced_flag_in_argv(&self, args: &[String]) -> Option<String> {
+        let mut current = self.root;
+        let mut path: Vec<&str> = Vec::new();
+        let mut idx = 0;
+        while let Some(token) = args.get(idx) {
+            if let Some(rest) = token.strip_prefix("--").filter(|rest| !rest.is_empty()) {
+                let (name, inline) = match rest.split_once('=') {
+                    Some((name, _)) => (name, true),
+                    None => (rest, false),
+                };
+                let Some(global) = self.find_global_flag(name) else {
+                    break;
+                };
+                idx += 1;
+                if !inline && !matches!(global.kind, FlagKind::Bool) {
+                    idx += 1;
+                }
+                continue;
+            }
+            match current.find_subcommand(token) {
+                Some(sub) => {
+                    path.push(sub.name);
+                    current = sub;
+                    idx += 1;
+                }
+                None => break,
+            }
+        }
+        match crate::command::dispatch::projections::raw_args::parse_against_spec(
+            current,
+            &path,
+            args.get(idx..).unwrap_or_default(),
+        ) {
+            Err(crate::command::error::CommandError::InvalidFlagValue { flag, reason, .. })
+                if self.replaced_flag(&flag).is_some() =>
+            {
+                Some(reason)
+            }
+            _ => None,
+        }
     }
 
     /// Validate that a command path is reachable by the given frontend,
@@ -766,6 +835,46 @@ const REMOVED_FLAGS: &[RemovedFlagSpec] = &[
                in a per-step workflow entry). See `docs/08-overlays.md`.",
     },
 ];
+
+/// Flags replaced by a flag with different value semantics. The shared
+/// parser ([`CommandCatalogue::parse_raw_args`]) reports these instead of an
+/// unknown flag; [`CommandCatalogue::removed_flag_hint`] reports them for the
+/// CLI before clap parses.
+const REPLACED_FLAGS: &[ReplacedFlagSpec] = &[
+    // WI 0147: `--issue` became `--work-item`, whose bare value follows
+    // `workItems.source` rather than always meaning a GitHub issue.
+    ReplacedFlagSpec {
+        name: "issue",
+        message: issue_replacement_message,
+    },
+];
+
+/// `--issue was replaced by --work-item; use --work-item github:42`.
+///
+/// A bare number (or `#N`) was a GitHub issue on `origin`, which is
+/// `github:N` now. A URL or `owner/repo#N` is already an explicit form and is
+/// suggested unchanged. A value that is not a plain printable token (it may
+/// arrive from an API client) is not echoed back.
+fn issue_replacement_message(value: Option<&str>) -> String {
+    let value = value.map(str::trim).filter(|value| {
+        !value.is_empty()
+            && value.len() <= 200
+            && value.bytes().all(|b| b.is_ascii_graphic())
+            && !value.starts_with('-')
+    });
+    let suggestion = match value {
+        Some(value) => {
+            let digits = value.strip_prefix('#').unwrap_or(value);
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                format!("github:{digits}")
+            } else {
+                value.to_string()
+            }
+        }
+        None => "github:42".to_string(),
+    };
+    format!("--issue was replaced by --work-item; use --work-item {suggestion}")
+}
 
 // ─── Module layout (WI 0114 F-51) ────────────────────────────────────────────
 //

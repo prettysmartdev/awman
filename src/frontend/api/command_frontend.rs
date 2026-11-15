@@ -1893,13 +1893,13 @@ impl ExecWorkflowCommandFrontend for ApiDispatchFrontend {
 
     fn notify_dynamic_workflow_resume_unavailable(
         &mut self,
-        work_item: u32,
+        work_item: &str,
         reason: &str,
     ) -> Result<(), CommandError> {
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: "workflow".to_string(),
             message: format!(
-                "cannot resume the previous dynamic workflow for work item {work_item:04}: \
+                "cannot resume the previous dynamic workflow for work item {work_item}: \
                  {reason}"
             ),
         });

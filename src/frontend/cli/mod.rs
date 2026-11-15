@@ -193,6 +193,13 @@ pub(crate) fn format_error(err: &CommandError) -> String {
                 command.join(" ")
             )
         }
+        // A replaced flag's reason is already the whole message
+        // (`--issue was replaced by --work-item; use …`).
+        CommandError::InvalidFlagValue { flag, reason, .. }
+            if CommandCatalogue::get().replaced_flag(flag).is_some() =>
+        {
+            reason.clone()
+        }
         CommandError::InvalidFlagValue { command, flag, reason } => {
             format!(
                 "invalid value for --{flag} on `{}`: {reason}",
@@ -256,6 +263,9 @@ pub(crate) fn format_error(err: &CommandError) -> String {
             format!("failed to kill remote session '{session_id}': {reason}")
         }
         CommandError::NotImplemented(msg) => format!("not yet implemented: {msg}"),
+        // WI 0147: work item errors carry their own actionable text.
+        CommandError::WorkItem(e) => e.to_string(),
+        CommandError::DraftSync(e) => e.to_string(),
         CommandError::Other(msg) => msg.to_string(),
         CommandError::WorkItemNotFound { number } => {
             format!("work item {number} not found in aspec/work-items/")

@@ -355,20 +355,12 @@ impl QueuePickCommand {
             }
         });
         let catalogue = crate::command::dispatch::catalogue::CommandCatalogue::get();
-        let mut tokens = shell_words::split(&run.command_line)
+        let tokens = shell_words::split(&run.command_line)
             .map_err(|e| CommandError::Other(e.to_string()))?;
-        // Prompt input stays private in the session and in memory. It is not
-        // part of PickRun.command_line, JobSpec, the row, or process argv.
-        if tokens.starts_with(&["exec".into(), "prompt".into()]) {
-            if let Some(path) = session.inline_work_item() {
-                use std::io::Read;
-                let mut body = String::new();
-                crate::data::fs::private_files::open_private_file(path)?
-                    .read_to_string(&mut body)
-                    .map_err(|e| CommandError::Other(format!("private prompt input: {e}")))?;
-                tokens.extend(["--".into(), body]);
-            }
-        }
+        // Prompt input stays private in the session. `exec prompt` resolves it
+        // from there as its work item, so it is never part of
+        // PickRun.command_line, JobSpec, the row, process argv, or the parsed
+        // arguments (which would deliver it to the agent twice).
         let line = shell_words::join(tokens.iter().map(String::as_str));
         let input = crate::command::dispatch::parsed_input::parse(&line, catalogue)?;
         let path = input.path.clone();

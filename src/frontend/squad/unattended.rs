@@ -775,7 +775,7 @@ impl ExecWorkflowCommandFrontend for UnattendedFrontend {
 
     fn notify_dynamic_workflow_resume_unavailable(
         &mut self,
-        work_item: u32,
+        work_item: &str,
         reason: &str,
     ) -> Result<(), CommandError> {
         tracing::info!(

@@ -69,11 +69,11 @@ impl ExecWorkflowCommandFrontend for CliFrontend {
 
     fn notify_dynamic_workflow_resume_unavailable(
         &mut self,
-        work_item: u32,
+        work_item: &str,
         reason: &str,
     ) -> Result<(), CommandError> {
         eprintln!(
-            "awman: the worktree for work item {work_item:04} is still on disk, but the previous \
+            "awman: the worktree for work item {work_item} is still on disk, but the previous \
              dynamic workflow cannot be resumed: {reason}"
         );
         if self.non_interactive {

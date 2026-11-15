@@ -244,7 +244,9 @@ pub(super) const SPECS_AMEND: CommandSpec = CommandSpec {
     long_help: None,
     arguments: &[ArgumentSpec {
         name: "work_item",
-        help: "Work item number (e.g. 0025).",
+        help: "Work item to amend: a number in the configured workItems.source, or any \
+               explicit --work-item form (local:<N>, a path, github:<N>, owner/repo#<N>, \
+               a URL, http:<provider>:<id>).",
         kind: ArgumentKind::String,
         optional: false,
     }],

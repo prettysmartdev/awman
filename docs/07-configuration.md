@@ -36,7 +36,8 @@ A repository file:
   "tui": { "scrollbackLines": 10000 },
   "workItems": {
     "dir": "docs/work-items",
-    "template": "docs/work-items/0000-template.md"
+    "template": "docs/work-items/0000-template.md",
+    "source": "github"
   },
   "workflows": {
     "maxConcurrentSteps": 3,
@@ -60,6 +61,14 @@ A global file:
   "agents": { "default": "claude", "acpFallback": "error" },
   "runtime": { "kind": "docker" },
   "overlays": ["skill(*)", "env(ANTHROPIC_API_KEY)"],
+  "workItems": {
+    "providers": {
+      "team": {
+        "baseUrl": "https://tracker.example.com/api/work-items",
+        "tokenEnv": "TEAM_TRACKER_TOKEN"
+      }
+    }
+  },
   "daemon": {
     "maxConcurrentJobs": 2,
     "features": {
@@ -123,6 +132,57 @@ one lets current jobs finish and holds new admissions until usage falls below
 the new limit. `workServers.<name>.maxConcurrentJobs` also reloads live and limits
 new leases from that server. Environment and startup `--set` overrides still
 take precedence over file edits.
+
+---
+
+## Work item sources
+
+`workItems.source` selects what a bare `--work-item` value means and where
+`awman new spec` creates a work item. It is a repository setting, so teams can
+choose a default in `.awman/config.json`; the built-in default is `local`.
+
+| Value | Bare reference and creation target |
+|---|---|
+| `local` | A number selects a file in `workItems.dir`; `new spec` creates a local file. |
+| `github` | A number selects an issue in the repository's GitHub `origin`; `new spec` creates a GitHub issue. |
+| `http:<name>` | A value selects an item from the named HTTP provider; `new spec` creates an item there. |
+
+Explicit references such as `local:42`, a local Markdown path,
+`github:42`, `owner/repo#42`, a GitHub issue URL, `http:team:ABC-42`, or a
+URL under a configured HTTP provider can name their source directly. A bare
+number follows the configured source. awman reports an invalid source or
+missing item as an error; it does not silently switch sources.
+
+HTTP provider definitions are trusted machine configuration and belong only
+in the global file (`$AWMAN_HOME/config.json`):
+
+```json
+{
+  "workItems": {
+    "providers": {
+      "team": {
+        "baseUrl": "https://tracker.example.com/api/work-items",
+        "tokenEnv": "TEAM_TRACKER_TOKEN"
+      }
+    }
+  }
+}
+```
+
+`baseUrl` must use HTTPS. Plain HTTP is accepted only for a literal loopback
+address or `localhost`, such as a local development service. `tokenEnv` names
+an environment variable that contains the provider token. Keep the token out
+of configuration files. Provider definitions are global-only because a
+repository config is part of the checkout and may be untrusted: it must not
+be able to choose a host to receive a user's token. Repository config may set
+`workItems.source` to select a provider that the user has trusted globally,
+but it cannot define or override that provider. Provider settings also cannot
+be changed through environment variables or `--set`.
+
+For GitHub, `workItems.source = "github"` uses `origin` for bare numbers;
+explicit `github:<N>`, `owner/repo#N`, and issue URLs can point elsewhere.
+Authenticate with `gh auth login` or `GITHUB_TOKEN`. For usage and publishing
+behavior, see [GitHub Integration](10-github-integration.md).
 
 ---
 
@@ -442,7 +502,7 @@ awman config set workItems.dir docs/work-items
 awman config set workItems.template docs/work-items/0000-template.md
 ```
 
-Paths may be relative to the repo root (recommended) or absolute.
+Paths are relative to the repo root. The template must resolve to a regular file inside the repository checkout: an absolute path, a `..` path or a symlink that leads outside the checkout is refused, because `new spec` can publish the template text to a remote tracker.
 
 ### Cap concurrent agents in a workflow
 
@@ -688,6 +748,9 @@ have the effective defaults above.
 | `overlays` (additive) | list<string> | `[]` | task | no | no | `AWMAN_OVERLAYS` | Overlays applied to every agent container; layers add to each other. |
 | `workItems.dir` | string | `"aspec/work-items"` | repo | no | yes | `AWMAN_WORK_ITEMS_DIR` | Work items directory, relative to the repo root. |
 | `workItems.template` | string | `null` | repo | no | no | `AWMAN_WORK_ITEMS_TEMPLATE` | Work item template (default <dir>/0000-template.md). |
+| `workItems.source` | string | `null` | repo | no | no | `AWMAN_WORK_ITEMS_SOURCE` | Default work item source: local, github, or a trusted http provider. |
+| `workItems.providers.*.baseUrl` | string | `null` | global | no | no | — | Base URL for a trusted HTTP work item provider. |
+| `workItems.providers.*.tokenEnv` | string | `null` | global | no | no | — | Environment variable containing the HTTP provider token. |
 | `workflows.maxConcurrentSteps` | int ≥ 1 | `null` | task | no | no | `AWMAN_WORKFLOWS_MAX_CONCURRENT_STEPS` | Cap on concurrently running workflow steps (null = unlimited). |
 | `workflows.prerequisites.preflight` | enum `warn\|off` | `"warn"` | task | no | no | `AWMAN_WORKFLOWS_PREREQUISITES_PREFLIGHT` | Whether workflow prerequisites are checked before a run. |
 | `workflows.prerequisites.unresolved` | enum `warn\|fail` | `null` | task | no | no | `AWMAN_WORKFLOWS_PREREQUISITES_UNRESOLVED` | What an unresolved prerequisite does (null = frontend default). |
