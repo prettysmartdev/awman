@@ -112,11 +112,16 @@ pub(super) fn cli_build_image(
     let cli_bin = cli.bin;
     let mut command = cli.command();
     command.args(build_image_argv(tag, dockerfile, context, no_cache));
+    let output = crate::engine::agent_runtime::OutputTail::new(20);
     let status = ProcessHostCommandRunner
         .run(
             command,
             &BuildControl::unbounded(CancelToken::new()),
-            on_line,
+            &mut |line| {
+                output.push_bytes(line.as_bytes());
+                output.push_bytes(b"\n");
+                on_line(line);
+            },
         )
         .map_err(|e| match e {
             EngineError::ContainerRuntimeUnavailable { .. } => {
@@ -130,6 +135,7 @@ pub(super) fn cli_build_image(
         return Err(EngineError::ImageBuildExitNonzero {
             tag: tag.to_string(),
             exit_code: status.code().unwrap_or(-1),
+            output: output.snapshot_text(),
         });
     }
     Ok(())

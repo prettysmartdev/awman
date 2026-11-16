@@ -820,6 +820,21 @@ fn render_argv(argv: &[String]) -> String {
     shell_words::join(argv)
 }
 
+/// Prepare a missing image using the plan shown in the prerequisite report.
+pub fn prerequisite_image(
+    check: &crate::data::workflow_prerequisites::PrerequisiteCheck,
+) -> Prompt<bool> {
+    Prompt::new(
+        check.prerequisite.label(),
+        check.explanation.clone(),
+        vec![
+            Choice::new('\n', "Prepare image", true),
+            Choice::new('q', "Abort", false),
+        ],
+        Some(false),
+    )
+}
+
 /// The prerequisite summary's choices, and what each leads to.
 ///
 /// The body is not the table (each frontend draws the report its own way)

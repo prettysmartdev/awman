@@ -116,10 +116,30 @@ impl Command for ExecWorkflowCommand {
         // image or any container exists. `--check-prerequisites` ends here.
         let prerequisite_needs =
             crate::data::workflow_prerequisites::WorkflowPrerequisites::from_workflow(&workflow);
+        let image_default = workflow_effective_config(&self.session, &self.flags)?
+            .agent()
+            .unwrap_or_else(|| self.session.configured_agent().as_str().to_string());
+        let mut image_agents: Vec<String> = workflow
+            .steps
+            .iter()
+            .map(|step| {
+                step.agent
+                    .as_ref()
+                    .or(workflow.agent.as_ref())
+                    .unwrap_or(&image_default)
+                    .clone()
+            })
+            .collect();
+        if (!workflow.setup.is_empty() || !workflow.teardown.is_empty())
+            && self.session.effective_config().base_image().is_none()
+        {
+            image_agents.push(self.session.configured_agent().as_str().to_string());
+        }
         let prerequisites = match self
             .start_prerequisites(
                 &prerequisite_needs,
                 crate::engine::workflow::workflow_name_for(&workflow),
+                &image_agents,
                 &frontend,
             )
             .await?
@@ -368,6 +388,7 @@ impl Command for ExecWorkflowCommand {
         }
 
         let prepared = PreparedRun {
+            invocation_id: None,
             workflow,
             workflow_path,
             work_item_context,

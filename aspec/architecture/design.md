@@ -153,10 +153,12 @@ may build through the local Docker Engine (Unix socket) or Apple Containers
 store selected by that image's resolved source, then import from that same
 source. `ready` (`Ready`), API session setup, and the agent availability check behind
 `chat`/`exec prompt` for an image that is not installed (`SessionSetup`, only
-when the compatible source store lacks the image) may build; workflow
-preflight, dynamic workflow and squad evaluation (`ImportOnly`) and the
-availability check for an installed image or with the builder disabled
-(`CheckOnly`) never do. Other sources retain their normal import behavior and
+when the compatible source store lacks the image) may build. Workflow
+prerequisite solves (static, dynamic and worker leases) and squad evaluation
+use that same missing-image decision: `SessionSetup` for a missing image with
+an enabled builder and a usable source, otherwise `ImportOnly`. Installed
+images are never rebuilt by preflight; `ready --build` refreshes them. Launches
+keep `CheckOnly` for installed images or disabled builders. Other sources retain their normal import behavior and
 never select a substitute builder. Build and import remain separate stages;
 successful build alone is not readiness. Source acquisition is not required
 after an image is cached.

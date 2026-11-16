@@ -117,6 +117,11 @@ fn unavailable(prompt: &str) -> CommandError {
 /// choices are, or what runs: the command layer builds the prompts and hands
 /// [`with_terminal_released`](Self::with_terminal_released) the closure to run.
 pub trait WorkflowPrerequisiteFrontend: UserMessageSink {
+    /// Prepare a missing image, or abort. Headless callers prepare without
+    /// calling this method; enabling the builder is the build opt-in.
+    fn ask_prerequisite_image(&mut self, prompt: &Prompt<bool>) -> Result<bool, CommandError> {
+        Err(unavailable(&prompt.title))
+    }
     /// Start collecting the initial report. Event frontends may defer progress
     /// until the structured report is published; native presenters stay live.
     fn begin_workflow_prerequisites(&mut self) {}

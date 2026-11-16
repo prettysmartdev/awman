@@ -11,6 +11,8 @@
 mod flags;
 mod flow;
 mod frontend;
+mod images;
+pub(crate) use images::prepare_images;
 mod task_policy;
 mod widening;
 

@@ -191,12 +191,12 @@ impl WorkflowEngine {
             .clone()
             .unwrap_or_else(|| "Untitled Workflow".to_string());
         let total = self.workflow.steps.len();
-        let mut current_index = 0;
+        let mut current_index = None;
         let mut steps = Vec::with_capacity(total);
 
         for (i, step) in self.workflow.steps.iter().enumerate() {
             let state = if step.name == current_step_name {
-                current_index = i;
+                current_index = Some(i);
                 WorkflowStepState::InProgress
             } else {
                 match self.state.status_of(&step.name) {

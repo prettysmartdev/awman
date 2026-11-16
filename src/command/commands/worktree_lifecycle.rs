@@ -380,10 +380,23 @@ impl WorktreeLifecycle {
                     None => WorktreeName::Workflow(item.key.clone()),
                 };
             }
-            // Include identity so unrelated items with equal titles cannot
-            // share a branch, worktree, or resume state.
             let slug = item.slug.as_deref().unwrap_or("work-item");
-            return WorktreeName::Workflow(format!("{slug}-{}", item.key));
+            let legacy_name = format!("{slug}-{}", item.key);
+            if let crate::command::work_item::WorkItemOrigin::Remote { provider, .. } = &item.origin
+            {
+                if provider == "github" {
+                    if let Some(number) = item.number {
+                        let title = crate::data::issue::slugify(&item.title, 40);
+                        let name = if title.is_empty() {
+                            number.to_string()
+                        } else {
+                            format!("{number}-{title}")
+                        };
+                        return WorktreeName::GithubIssue { name, legacy_name };
+                    }
+                }
+            }
+            return WorktreeName::Workflow(legacy_name);
         }
         WorktreeName::Workflow(
             workflow_path
@@ -403,6 +416,33 @@ impl WorktreeLifecycle {
         match name {
             WorktreeName::Workflow(name) => Self::for_workflow(git_engine, git_root, name),
             WorktreeName::WorkItem(number) => Self::for_work_item(git_engine, git_root, *number),
+            WorktreeName::GithubIssue { name, legacy_name } => {
+                let legacy = Self::for_workflow(git_engine.clone(), git_root.clone(), legacy_name)?;
+                let path = crate::data::worktree_paths::WorktreePaths::from_env(git_engine.env())?
+                    .named(
+                        &git_root
+                            .canonicalize()
+                            .map_err(|e| CommandError::Other(e.to_string()))?,
+                        name,
+                    );
+                // Keep interrupted runs on their original branch. Only reuse
+                // a legacy directory if Git verifies that this repo owns it.
+                if git_engine.pick_worktree_path(
+                    &git_root,
+                    path.clone(),
+                    legacy.worktree_path.clone(),
+                ) != path
+                {
+                    return Ok(legacy);
+                }
+                Ok(Self {
+                    git_engine,
+                    git_root,
+                    worktree_path: path.clone(),
+                    creation_path: path,
+                    branch: format!("awman/{name}"),
+                })
+            }
         }
     }
 
@@ -1067,4 +1107,6 @@ pub enum WorktreeName {
     Workflow(String),
     /// A work item number.
     WorkItem(u32),
+    /// Issue number and sanitized title; legacy naming is only for resume.
+    GithubIssue { name: String, legacy_name: String },
 }

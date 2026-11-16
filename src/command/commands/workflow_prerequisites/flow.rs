@@ -762,6 +762,7 @@ impl WorkflowPrerequisiteFlow {
                 _ => "origin".into(),
             };
             let resolution = match &check.prerequisite {
+                WorkflowPrerequisite::AgentImage { .. } => Resolution::Unchanged,
                 WorkflowPrerequisite::GitIdentity => {
                     self.resolve_identity(&check, &mut grants, frontend, can_ask)?
                 }

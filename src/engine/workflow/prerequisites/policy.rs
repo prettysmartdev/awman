@@ -66,6 +66,7 @@ impl PrerequisiteStepKind {
 impl WorkflowPrerequisite {
     pub fn label(&self) -> String {
         match self {
+            Self::AgentImage { agent, .. } => format!("Agent image: {agent}"),
             Self::GitIdentity => "Git identity".into(),
             Self::GitRemote { remote } => format!("Git remote {remote}"),
             Self::PushAuth { remote } => format!("Push authentication ({remote})"),
@@ -344,6 +345,7 @@ impl WorkflowPrerequisiteReport {
                 // AssumedAll has no step references yet. Describe capabilities
                 // using the same structured-step prerequisite categories.
                 match &check.prerequisite {
+                    WorkflowPrerequisite::AgentImage { .. } => false,
                     WorkflowPrerequisite::GitIdentity => kind == Kind::CommitChanges,
                     WorkflowPrerequisite::GitRemote { .. } => matches!(kind, Kind::PushBranch | Kind::CreatePullRequest | Kind::PullBranch),
                     WorkflowPrerequisite::PushAuth { .. } | WorkflowPrerequisite::PushAuthSsh { .. } | WorkflowPrerequisite::PushAuthHttps { .. } => matches!(kind, Kind::PushBranch | Kind::PullBranch | Kind::CloneRepo),

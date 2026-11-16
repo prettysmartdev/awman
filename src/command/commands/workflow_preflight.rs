@@ -23,6 +23,9 @@ use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::Session;
 use crate::data::workflow_definition::Workflow;
 use crate::engine::error::EngineError;
+#[cfg(test)]
+#[path = "workflow_preflight_contracts.rs"]
+mod image_contracts;
 
 /// Review and approve, once per distinct agent, every custom definition the
 /// workflow's steps will launch — before any of them is resolved, so a
@@ -519,7 +522,7 @@ pub(crate) fn resolve_and_validate_workflow_agents(
     Ok(resolved)
 }
 
-pub(crate) trait BuildOutputTarget: Send {
+pub(crate) trait BuildOutputTarget: Send + Sync {
     /// A build for `image` is actually starting (never called when the image
     /// already exists).
     fn begin(&mut self, image: &str);
@@ -527,6 +530,65 @@ pub(crate) trait BuildOutputTarget: Send {
     fn line(&mut self, line: &str);
     /// The build ended; `error` is `Some` on failure.
     fn finish(&mut self, image: &str, error: Option<&str>);
+}
+
+struct StepImageSink<'a, 'b> {
+    sink: &'a mut dyn UserMessageSink,
+    build_output: Option<&'b mut dyn BuildOutputTarget>,
+}
+impl UserMessageSink for StepImageSink<'_, '_> {
+    fn write_message(&mut self, message: UserMessage) {
+        self.sink.write_message(message);
+    }
+    fn replay_queued(&mut self) {
+        self.sink.replay_queued();
+    }
+}
+impl crate::engine::image_prep::ImagePreparationSink for StepImageSink<'_, '_> {
+    fn report_step(
+        &mut self,
+        step: &crate::data::setup_step::SetupStep,
+        status: crate::data::step_status::StepStatus,
+    ) {
+        self.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("{step}: {}", status.label()),
+        });
+    }
+    fn build_started(&mut self, tag: &str) {
+        self.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("Building image {tag}…"),
+        });
+        if let Some(target) = self.build_output.as_mut() {
+            target.begin(tag);
+        }
+    }
+    fn build_output(&mut self, line: &str) {
+        match self.build_output.as_mut() {
+            Some(target) => target.line(line),
+            None => self.sink.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: line.into(),
+            }),
+        }
+    }
+    fn build_finished(&mut self, tag: &str, error: Option<&str>) {
+        if let Some(target) = self.build_output.as_mut() {
+            target.finish(tag, error);
+        }
+        self.write_message(UserMessage {
+            level: if error.is_some() {
+                MessageLevel::Error
+            } else {
+                MessageLevel::Info
+            },
+            text: match error {
+                Some(error) => format!("Failed to build image {tag}: {error}"),
+                None => format!("Built image {tag}."),
+            },
+        });
+    }
 }
 
 /// Ensure a Dockerfile-backed agent image is available for a container runtime,
@@ -663,6 +725,7 @@ async fn import_agent_image_for_step(
     session: &crate::data::session::Session,
     definition: crate::engine::agent::ResolvedAgent,
     sink: &mut dyn UserMessageSink,
+    build_output: Option<&mut dyn BuildOutputTarget>,
 ) -> Result<(), CommandError> {
     use crate::engine::image_prep::{AgentImagePreparer, ImageBuildContext};
     let preparer = AgentImagePreparer::new(
@@ -681,7 +744,7 @@ async fn import_agent_image_for_step(
     .with_definition_env(session.env().clone())
     .with_definition(definition);
     let tag = crate::data::image_tags::agent_image_tag(git_root, agent);
-    prepare_importing_step_with_recovery(preparer, &tag, agent, sink).await
+    prepare_importing_step_with_recovery(preparer, &tag, agent, sink, build_output).await
 }
 
 async fn prepare_importing_step_with_recovery(
@@ -689,18 +752,19 @@ async fn prepare_importing_step_with_recovery(
     tag: &str,
     agent: &str,
     sink: &mut dyn UserMessageSink,
+    build_output: Option<&mut dyn BuildOutputTarget>,
 ) -> Result<(), CommandError> {
-    use crate::engine::image_prep::{AgentImageRequest, BuildPolicy, MessageSink};
+    use crate::engine::image_prep::{AgentImageRequest, BuildPolicy};
+    let policy = preparer.missing_image_policy(tag, agent, BuildPolicy::ImportOnly)?;
+    let mut sink = StepImageSink { sink, build_output };
     let result = preparer
-        .prepare(
-            &AgentImageRequest {
-                tag,
-                agent,
-                policy: BuildPolicy::ImportOnly,
-            },
-            &mut MessageSink(sink),
-        )
+        .prepare(&AgentImageRequest { tag, agent, policy }, &mut sink)
         .await?;
+    if let crate::data::step_status::StepStatus::Failed(error) = &result.build {
+        return Err(CommandError::Other(format!(
+            "failed to build image for agent '{agent}': {error}"
+        )));
+    }
     if result.import_failure
         == Some(crate::data::ready_image::ReadyImageImportFailure::AppleContentMissing)
         && preparer.missing_image_plan(tag, agent)
@@ -723,7 +787,7 @@ async fn prepare_importing_step_with_recovery(
                         refresh: false,
                     },
                 },
-                &mut MessageSink(sink),
+                &mut sink,
             )
             .await?;
         if let crate::data::step_status::StepStatus::Failed(error) = repaired.build {
@@ -770,17 +834,24 @@ pub(crate) async fn ensure_agent_image_with_build_output(
 ) -> Result<(), CommandError> {
     let name = crate::data::session::AgentName::new(agent).map_err(EngineError::Data)?;
     let definition = engines.agent_engine.resolve_definition(session, &name)?;
+    if engines.runtime.capabilities().image_acquisition
+        == crate::engine::agent_runtime::ImageAcquisition::Import
+    {
+        let runtime = engines.runtime.clone();
+        return import_agent_image_for_step(
+            runtime,
+            git_root,
+            agent,
+            session,
+            definition,
+            sink,
+            build_output,
+        )
+        .await;
+    }
     let runtime = engines
         .require_container_runtime()
         .map_err(CommandError::from)?;
-    if runtime.capabilities().image_acquisition
-        == crate::engine::agent_runtime::ImageAcquisition::Import
-    {
-        let runtime: std::sync::Arc<dyn crate::engine::agent_runtime::AgentRuntimeEngine> =
-            runtime.clone();
-        return import_agent_image_for_step(runtime, git_root, agent, session, definition, sink)
-            .await;
-    }
     let dockerfile = paths.agent_dockerfile(agent);
     let sync = crate::engine::agent::provision_agent_dockerfile(
         &definition,

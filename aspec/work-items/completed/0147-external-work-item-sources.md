@@ -114,6 +114,13 @@ The explicit forms always win over `workItems.source`, so a repo set to GitHub c
 
 ### Reading on each command
 - **`exec workflow` (`execute.rs`):** replace the `--issue` and `--work-item` branches with one resolver call. Remote work items keep the temp-file overlay and slug-based worktree naming. Local files keep using the checkout's file.
+  GitHub issue workflows name new branches `awman/<number>-<title-slug>` and
+  worktree directories `<number>-<title-slug>`. Titles use the existing safe
+  ASCII slug conversion, capped at 40 characters; an empty slug leaves just
+  the number. No workflow prefix, repository identity or identity hash is
+  included. The source key still identifies persisted workflow state. Existing
+  worktrees with the earlier slug-plus-key name remain discoverable for resume,
+  after Git ownership validation, and retain their branch names.
 - **`exec workflow --dynamic` (`dynamic.rs`):** build `WorkItemContext` from `ResolvedWorkItem`. Key the dynamic-workflow and resume state by `key`. `--dynamic` still requires `--work-item`.
 - **`exec prompt`:** use the resolver, so a local file can now also be the prompt.
 - **`api_server/push_back.rs`:** this runs `parse_work_item_number` on the raw flag value, which would read digits out of any URL. Treat the value as a number only if it is a local `WorkItemRef`; otherwise use the default commit message or the resolved title.

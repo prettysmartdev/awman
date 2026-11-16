@@ -5,6 +5,7 @@ use crate::data::{
     config::env::EnvSnapshot,
     message::{UserMessage, UserMessageSink},
     session::SessionOpenOptions,
+    workflow_state::WorkflowPhase,
 };
 use crate::engine::agent_runtime::execution::ExecutionBackend;
 use awman_test_support::{TestCase, TestSandbox};
@@ -49,6 +50,7 @@ impl ExecutionBackend for Running {
 #[derive(Default)]
 struct Trace {
     launched: Vec<String>,
+    contexts: Vec<WorkflowRuntimeContext>,
     stopped: Vec<String>,
     exits: VecDeque<i32>,
     held: Vec<mpsc::Sender<i32>>,
@@ -65,11 +67,12 @@ impl AgentExecutionFactory for Runtime {
         &self,
         step: &WorkflowStep,
         _: &Session,
-        _: &WorkflowRuntimeContext,
+        runtime: &WorkflowRuntimeContext,
     ) -> Result<AgentExecution, EngineError> {
         let (tx, rx) = mpsc::channel();
         let mut t = self.trace.lock().unwrap();
         t.launched.push(step.name.clone());
+        t.contexts.push(runtime.clone());
         if self.hold {
             t.held.push(tx.clone());
         } else {
@@ -252,6 +255,225 @@ async fn persisted_execution_resumes_without_repeating_completed_steps() {
     }
     s.finish();
 }
+#[tokio::test]
+async fn resume_rewind_preserves_completed_parallel_branches() {
+    let s = TestSandbox::for_test(TestCase::component(
+        "engine::workflow::contracts::resume_rewind_preserves_completed_parallel_branches",
+    ));
+    let session = Session::open_at_directory_root(
+        s.work(),
+        SessionOpenOptions {
+            env: Some(environment(&s)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut workflow = definition(false);
+    workflow.steps = [
+        ("plan-a", vec![]),
+        ("implement-a", vec!["plan-a"]),
+        ("review-a", vec!["implement-a"]),
+        ("plan-b", vec![]),
+        ("implement-b", vec!["plan-b"]),
+        ("join", vec!["review-a", "implement-b"]),
+    ]
+    .into_iter()
+    .map(|(name, deps)| WorkflowStep {
+        name: name.into(),
+        depends_on: deps.into_iter().map(str::to_string).collect(),
+        ..workflow.steps[0].clone()
+    })
+    .collect();
+    let dag = WorkflowDag::build(&workflow.steps).unwrap();
+    let store = WorkflowStateStore::at_git_root(s.work());
+    let mut saved = WorkflowState::new(
+        "execution-contract".into(),
+        &workflow.steps,
+        compute_workflow_hash(&workflow),
+        None,
+    );
+    // Both branches reached review; one was interrupted while the other's
+    // implementation was deliberately skipped. Its lower stages occur AFTER
+    // review-a in the DFS listing used by both resume prompts.
+    for name in ["plan-a", "implement-a", "plan-b"] {
+        saved.set_status(name, StepState::Succeeded);
+    }
+    saved.set_status("implement-b", StepState::Skipped);
+    saved.set_status("review-a", StepState::Running { container_id: None });
+    saved.set_status("join", StepState::Cancelled);
+    store.save(&saved).unwrap();
+
+    // The command paths (plain and dynamic) rewind and persist before loading
+    // the engine. A direct engine resume alone missed this regression.
+    let mut saved = store.load(None, "execution-contract").unwrap().unwrap();
+    saved.rewind_to(&dag, "review-a");
+    store.save(&saved).unwrap();
+    let trace = Arc::new(Mutex::new(Trace::default()));
+    let deps = || {
+        let (started, _) = tokio::sync::mpsc::unbounded_channel();
+        WorkflowEngineDeps {
+            frontend: Box::new(Frontend { retries: 0 }),
+            agent_factory: Box::new(Runtime {
+                trace: trace.clone(),
+                hold: false,
+                started,
+            }),
+        }
+    };
+    let mut resumed = WorkflowEngine::resume(&session, WorkflowSpec::new(workflow.clone()), deps())
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed.state().status_of("plan-b"),
+        Some(&StepState::Succeeded)
+    );
+    assert_eq!(
+        resumed.state().status_of("implement-b"),
+        Some(&StepState::Skipped)
+    );
+    assert_eq!(resumed.step_once().await.unwrap().step_name, "review-a");
+    drop(resumed);
+
+    // Interrupt and resume again at the join: progress must survive repeated
+    // save/load/rewind cycles, and the scheduler must launch only remaining work.
+    let mut saved = store.load(None, "execution-contract").unwrap().unwrap();
+    saved.rewind_to(&dag, "join");
+    store.save(&saved).unwrap();
+    let mut resumed = WorkflowEngine::resume(&session, WorkflowSpec::new(workflow), deps())
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed.run_to_completion().await.unwrap(),
+        WorkflowOutcome::Completed
+    );
+    assert_eq!(trace.lock().unwrap().launched, ["review-a", "join"]);
+    assert_eq!(resumed.state().completed_steps.len(), 6);
+    s.finish();
+}
+
+#[tokio::test]
+async fn remediation_inherits_workflow_progress_and_invocation() {
+    use crate::engine::context_prompt::{ContextPromptBuilder, WorkflowStepState};
+    let s = TestSandbox::for_test(TestCase::component(
+        "engine::workflow::contracts::remediation_inherits_workflow_progress_and_invocation",
+    ));
+    let trace = Arc::new(Mutex::new(Trace::default()));
+    let (mut workflow, _) = engine(&s, trace.clone(), false, 0, false, false).await;
+    let invocation = workflow.state().invocation_id;
+    workflow.work_item_context = Some(
+        crate::data::workflow_prompt_template::WorkItemContext::from_legacy(
+            7,
+            "# Shared context".into(),
+        ),
+    );
+    let session = workflow.session.clone();
+    for (phase, label) in [
+        (WorkflowPhase::Setup, "Setup"),
+        (WorkflowPhase::Teardown, "Teardown"),
+        (WorkflowPhase::Done, "Merge"),
+    ] {
+        workflow.state.current_phase = phase;
+        if phase != WorkflowPhase::Setup {
+            workflow.state.set_status("build", StepState::Succeeded);
+        }
+        workflow
+            .run_remediation_agent(
+                &session,
+                RemediationAgentSpec {
+                    label: "on_failure: check".into(),
+                    prompt: "Fix the failure".into(),
+                    agent: AgentName::new("claude").unwrap(),
+                    model: None,
+                    extra_overlays: None,
+                },
+            )
+            .await
+            .unwrap();
+        let trace = trace.lock().unwrap();
+        let runtime = trace.contexts.last().unwrap();
+        assert_eq!(runtime.workflow_invocation_id, invocation);
+        let info = runtime
+            .workflow_step_info
+            .as_ref()
+            .expect("remediation workflow metadata");
+        assert_eq!(info.workflow_title, "execution-contract");
+        assert_eq!(
+            info.current_step_name,
+            format!("{label} remediation: on_failure: check")
+        );
+        assert_eq!(info.current_step_index, None);
+        assert_eq!(info.work_item_number, Some(7));
+        assert_eq!(
+            info.steps[0].1,
+            if phase == WorkflowPhase::Setup {
+                WorkflowStepState::Pending
+            } else {
+                WorkflowStepState::Completed
+            }
+        );
+        let prompt = ContextPromptBuilder::new()
+            .with_workflow(info)
+            .build()
+            .unwrap();
+        assert!(prompt.contains("read any files left by previous steps"));
+        assert!(prompt.contains("Write your outputs, notes"));
+        assert!(!prompt.contains("one-shot"));
+        assert!(!prompt.contains("step 1 of"));
+    }
+    s.finish();
+}
+
+#[tokio::test]
+async fn preallocated_invocation_is_persisted_and_resume_keeps_it() {
+    let s = TestSandbox::for_test(TestCase::component(
+        "engine::workflow::contracts::preallocated_invocation_is_persisted_and_resume_keeps_it",
+    ));
+    let session = Session::open_at_directory_root(
+        s.work(),
+        SessionOpenOptions {
+            env: Some(environment(&s)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let trace = Arc::new(Mutex::new(Trace::default()));
+    let deps = || {
+        let (started, _) = tokio::sync::mpsc::unbounded_channel();
+        WorkflowEngineDeps {
+            frontend: Box::new(Frontend { retries: 0 }),
+            agent_factory: Box::new(Runtime {
+                trace: trace.clone(),
+                hold: false,
+                started,
+            }),
+        }
+    };
+    let invocation = uuid::Uuid::new_v4();
+    let mut first = WorkflowEngine::resume(
+        &session,
+        WorkflowSpec::new(definition(false)).with_invocation_id(Some(invocation)),
+        deps(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.state().invocation_id, invocation);
+    first.step_once().await.unwrap();
+    drop(first);
+    let mut resumed = WorkflowEngine::resume(
+        &session,
+        WorkflowSpec::new(definition(false)).with_invocation_id(Some(uuid::Uuid::new_v4())),
+        deps(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed.state().invocation_id, invocation);
+    resumed.step_once().await.unwrap();
+    for runtime in &trace.lock().unwrap().contexts {
+        assert_eq!(runtime.workflow_invocation_id, invocation);
+    }
+    s.finish();
+}
+
 #[tokio::test]
 async fn failure_can_be_retried_before_dependents_run() {
     let s = TestSandbox::for_test(TestCase::component(

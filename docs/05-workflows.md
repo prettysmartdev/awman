@@ -904,7 +904,11 @@ awman ready --agent codex
 
 This check applies to the Docker and Apple Containers runtimes, which build images; when the runtime itself is unreachable, the run reports that instead. A [dynamic workflow](06-dynamic-workflows.md) checks the generated workflow's agents after the leader finishes and builds any missing image from `.awman/Dockerfile.<agent>` before the first step; a failed build stops the run.
 
-**Builtin runtime.** Image preparation for workflows (and squad) is import-only: it never starts a host build, even when `runtime.builtin.builder.enabled` is true, but it re-acquires an image that was installed from a different source than the one now configured (an installed image with no configured source is kept). A step that runs an agent other than the repo's default one stops when `runtime.builtin.imageSource` names a single image (an archive, or a fixed `reference`): give that agent its own `runtime.builtin.images` entry. In a worktree, the repo's `runtime.builtin` settings, default `agents.default` and `workItems` settings come from the checkout you launched from, not the worktree's commit. If a required agent image is not imported, the run stops and tells you to prepare it with `awman ready` (or to configure an image source). Setup and teardown steps run in the imported agent image of the repo's configured agent (or in the `runtime.baseImage` you set, which must also be imported). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
+**Builtin runtime.** Missing agent images appear in the workflow prerequisite solve flow. Choose **Prepare image** to prepare them before an agent starts, or abort. With `runtime.builtin.builder.enabled: true` and a compatible local Docker or Apple Containers source, awman builds the base and agent images only if the source store lacks them, then imports. Headless CLI, API, worker leases and squad do this automatically without an interactive choice. `--check-prerequisites` only reports missing images; it never builds or imports. Dynamic runs solve the leader's image before starting it, then the generated steps' images once their agents are known.
+
+Installed images are not rebuilt by preflight; use `awman ready --build` to refresh them. Preflight can re-acquire an installed image when its configured source changes, and retains Apple missing-content repair. With the builder disabled or an incompatible source, normal import behavior and configuration hints still apply. Build progress is reported during the solve; failures include the last build-output lines and stop the workflow.
+
+A step that runs an agent other than the repo's default one stops when `runtime.builtin.imageSource` names a single image (an archive, or a fixed `reference`): give that agent its own `runtime.builtin.images` entry. In a worktree, the repo's `runtime.builtin` settings, default `agents.default` and `workItems` settings come from the checkout you launched from, not the worktree's commit. Setup and teardown steps use the imported agent image of the configured agent, or an explicit `runtime.baseImage`, which must already be imported. See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
 
 ### Unknown agents
 
@@ -1053,7 +1057,10 @@ The main `exec workflow` flags (see the [Command Reference](14-command-reference
 `--worktree` runs the workflow on its own branch in a worktree under
 `~/.awman/worktrees/<repo-name>-<hash>/`, where `<hash>` is 8 hex characters
 derived from the repository's full path. A work item uses `<NNNN>/` inside that
-folder and a named workflow uses `wf-<name>/`. The hash keeps two checkouts that
+folder and a named workflow uses `wf-<name>/`. GitHub issue workflows use
+`<number>-<title-slug>/` and branch `awman/<number>-<title-slug>`, for example
+`84-fix-login-timeout`, with no workflow prefix or trailing issue hash.
+The hash in the parent directory keeps two checkouts that
 share a folder name (for example two clones both called `app`) apart. A worktree
 created by an earlier awman under the plain `<repo-name>/` folder is still found
 and reused only when Git lists it for the same repository and its checkout pointer and administrative registration agree. Recreating a legacy worktree moves the fresh checkout to the hashed path.
@@ -1522,7 +1529,7 @@ If a saved state file exists when you run `exec workflow`, awman offers to resum
 ╰────────────────────────────────────────────────────────────╯
 ```
 
-This is the same prompt, with the same three start points, that [`--dynamic`](06-dynamic-workflows.md#resuming-a-failed-dynamic-run) shows — the two modes resume identically. Picking a step rewinds the saved state: everything from that step onwards runs again, and earlier steps that never succeeded are marked skipped so they don't block their dependents.
+This is the same prompt, with the same three start points, that [`--dynamic`](06-dynamic-workflows.md#resuming-a-failed-dynamic-run) shows — the two modes resume identically. Picking a step reruns that step and every step that depends on it, directly or indirectly. Completed or skipped steps on other branches keep their status in the overview and do not run again. Unfinished prerequisites of the selected step are marked skipped so you can resume past them; unfinished work on other branches remains eligible to run.
 
 The first start point is named after what actually stopped the run: *the step that failed*, *the step that was cancelled*, or *the step the run stopped on* when the run was interrupted rather than failed.
 

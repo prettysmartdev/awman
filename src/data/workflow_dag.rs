@@ -63,6 +63,11 @@ impl WorkflowDag {
     pub fn step_names(&self) -> &[String] {
         &self.order
     }
+
+    /// Direct prerequisites of a step, or an empty slice for an unknown name.
+    pub fn dependencies_of(&self, name: &str) -> &[String] {
+        self.edges.get(name).map(Vec::as_slice).unwrap_or(&[])
+    }
 }
 
 /// Referential integrity check — every `depends_on` must name a real step.

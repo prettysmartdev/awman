@@ -115,6 +115,95 @@ fn workflow_recovery_and_resume_planning_follow_the_state_model() {
 }
 
 #[test]
+fn resume_rewind_follows_dependencies_in_any_definition_order() {
+    let steps: Vec<_> = [
+        ("plan-a", vec![]),
+        ("work-a", vec!["plan-a"]),
+        ("plan-b", vec![]),
+        ("work-b", vec!["plan-b"]),
+        ("join", vec!["work-a", "work-b"]),
+        ("finish", vec!["join"]),
+        ("independent", vec![]),
+    ]
+    .into_iter()
+    .map(|(name, deps)| WorkflowStep {
+        name: name.into(),
+        depends_on: deps.into_iter().map(str::to_string).collect(),
+        prompt_template: "literal".into(),
+        agent: None,
+        model: None,
+        overlays: None,
+        abort_on_failure: false,
+    })
+    .collect();
+    for reverse in [false, true] {
+        for rotation in 0..steps.len() {
+            let mut steps = steps.clone();
+            if reverse {
+                steps.reverse();
+            }
+            steps.rotate_left(rotation);
+            let dag = WorkflowDag::build(&steps).unwrap();
+            let mut saved = WorkflowState::new("branches".into(), &steps, "stable".into(), None);
+            for step in &steps {
+                saved.set_status(&step.name, StepState::Succeeded);
+            }
+            saved.set_status(
+                "work-a",
+                StepState::Failed {
+                    exit_code: 1,
+                    error_message: None,
+                },
+            );
+            saved.set_status("work-b", StepState::Skipped);
+            saved.set_status("independent", StepState::Pending);
+
+            for start in ["plan-a", "work-a", "join"] {
+                let mut resumed = saved.clone();
+                resumed.rewind_to(&dag, start);
+                let expected_a = match start {
+                    "join" => StepState::Skipped,
+                    _ => StepState::Pending,
+                };
+                assert_eq!(resumed.status_of("work-a"), Some(&expected_a));
+                assert_eq!(
+                    resumed.status_of("plan-a"),
+                    Some(&if start == "plan-a" {
+                        StepState::Pending
+                    } else {
+                        StepState::Succeeded
+                    })
+                );
+                // A join downstream of the chosen step must be invalidated,
+                // even if it had completed; its other branch must be preserved.
+                assert_eq!(resumed.status_of("join"), Some(&StepState::Pending));
+                assert_eq!(resumed.status_of("finish"), Some(&StepState::Pending));
+                assert_eq!(resumed.status_of("plan-b"), Some(&StepState::Succeeded));
+                assert_eq!(resumed.status_of("work-b"), Some(&StepState::Skipped));
+                assert_eq!(resumed.status_of("independent"), Some(&StepState::Pending));
+                let ready: std::collections::HashSet<_> =
+                    resumed.next_ready(&dag).into_iter().collect();
+                assert_eq!(
+                    ready,
+                    [start.to_string(), "independent".into()]
+                        .into_iter()
+                        .collect()
+                );
+                for (name, status) in &resumed.step_states {
+                    assert_eq!(
+                        resumed.completed_steps.contains(name),
+                        matches!(status, StepState::Succeeded | StepState::Skipped)
+                    );
+                }
+            }
+            let original = saved.clone();
+            saved.rewind_to(&dag, "unknown");
+            assert_eq!(saved, original);
+        }
+    }
+}
+
+#[test]
 fn minimal_recovery_traces_prioritize_failure_over_unfinished_work() {
     // Minimal independent corpus: failure after pending; failed/cancelled
     // terminal run; complete run; crash with a running step.

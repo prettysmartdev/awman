@@ -6,7 +6,8 @@
 pub struct WorkflowStepInfo {
     pub workflow_title: String,
     pub current_step_name: String,
-    pub current_step_index: usize,
+    /// Main-step index, or `None` for planning and remediation phases.
+    pub current_step_index: Option<usize>,
     pub total_steps: usize,
     pub steps: Vec<(String, WorkflowStepState)>,
     pub work_item_number: Option<u32>,
@@ -172,13 +173,17 @@ fn render_workflow_prompt(info: &WorkflowStepInfo) -> String {
     out.push_str(&format!(
         "## Workflow Context\n\n\
          You are running as part of the multi-agent \"{}\" workflow, managed by awman.\n\n\
-         Your current step: {} (step {} of {})\n\n\
-         Workflow progress:\n",
-        info.workflow_title,
-        info.current_step_name,
-        info.current_step_index + 1,
-        info.total_steps,
+         Your current step: {}",
+        info.workflow_title, info.current_step_name,
     ));
+    if let Some(index) = info.current_step_index {
+        out.push_str(&format!(" (step {} of {})", index + 1, info.total_steps));
+    }
+    if info.steps.is_empty() {
+        out.push_str("\n\nWorkflow steps are being planned.\n");
+    } else {
+        out.push_str("\n\nWorkflow progress:\n");
+    }
 
     for (name, state) in &info.steps {
         let marker = match state {
@@ -188,7 +193,10 @@ fn render_workflow_prompt(info: &WorkflowStepInfo) -> String {
         };
         let label = match state {
             WorkflowStepState::Completed => "completed",
-            WorkflowStepState::InProgress => "in progress (this is you)",
+            WorkflowStepState::InProgress if name == &info.current_step_name => {
+                "in progress (this is you)"
+            }
+            WorkflowStepState::InProgress => "in progress",
             WorkflowStepState::Pending => "pending",
         };
         out.push_str(&format!("  {marker} {name} — {label}\n"));

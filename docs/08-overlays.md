@@ -593,6 +593,13 @@ Resuming a workflow reuses its invocation's scratch files, including notes from 
 
 **Workflow context** (`context(workflow)`) — multi-step coordination where each step needs to see which steps completed, notes left by earlier steps, and a shared workspace. Example: a `plan` step writes `/awman/context/workflow/plan.md`, the `implement` step reads it and builds accordingly, the `document` step reads both. No step re-discovers what earlier steps decided.
 
+The dynamic workflow leader and its repair attempts share this directory with
+the generated steps. Setup and teardown `on_failure` agents also receive the
+workflow's context and instructions to read and contribute notes when this
+overlay is active. Their prompts identify the planning or remediation phase;
+remediation prompts include the current workflow progress. Explicit `:ro`
+permissions still apply.
+
 ### System prompt injection
 
 When you use `context()`, awman automatically injects a section into the agent's system prompt explaining the context directory and what to do with it. The exact wording may vary slightly; the shapes are:

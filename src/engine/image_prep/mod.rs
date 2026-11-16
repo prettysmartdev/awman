@@ -25,6 +25,8 @@ use std::sync::Arc;
 mod bridge;
 mod build;
 pub mod builder;
+#[cfg(test)]
+pub(crate) mod contracts;
 pub(crate) mod helpers;
 pub use bridge::ImageImporter;
 
@@ -115,6 +117,11 @@ impl ImageBuildContext {
 
 pub trait ImagePreparationSink: crate::data::message::UserMessageSink {
     fn report_step(&mut self, step: &SetupStep, status: StepStatus);
+    fn build_started(&mut self, _tag: &str) {}
+    fn build_output(&mut self, line: &str) {
+        self.report_step(&SetupStep::output(line), StepStatus::Running);
+    }
+    fn build_finished(&mut self, _tag: &str, _error: Option<&str>) {}
 }
 impl<T: crate::engine::agent::AgentImageFrontend + ?Sized> ImagePreparationSink for T {
     fn report_step(&mut self, step: &SetupStep, status: StepStatus) {
@@ -166,6 +173,28 @@ pub struct AgentImagePreparer {
     cancel: crate::engine::oci::CancelToken,
 }
 impl AgentImagePreparer {
+    /// On-demand preparation shared by launches and workflow prerequisites.
+    /// Installed images and disabled/unusable builders retain the caller's
+    /// existing check/import policy. Only ready's explicit flags refresh builds.
+    pub fn missing_image_policy(
+        &mut self,
+        tag: &str,
+        agent: &str,
+        fallback: BuildPolicy,
+    ) -> Result<BuildPolicy, EngineError> {
+        if self.builder_enabled
+            && !self.runtime.image_exists(tag)?
+            && matches!(
+                self.missing_image_plan(tag, agent),
+                ReadyImagePlan::BuildAndImport | ReadyImagePlan::Import
+            )
+        {
+            Ok(BuildPolicy::SessionSetup)
+        } else {
+            Ok(fallback)
+        }
+    }
+
     pub fn new(
         resolved: ResolvedBuiltinConfig,
         runtime: Arc<dyn AgentRuntimeEngine>,

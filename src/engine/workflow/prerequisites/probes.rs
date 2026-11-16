@@ -44,6 +44,12 @@ impl PrerequisitePreflight {
     ) -> Vec<PrerequisiteCheck> {
         use WorkflowPrerequisite::*;
         let check = match &need.prerequisite {
+            AgentImage { .. } => Self::check(
+                need,
+                PrerequisiteStatus::Unknown,
+                "checked by workflow image preparation before agent launch",
+                vec![],
+            ),
             GitIdentity => self.identity(need),
             GitRemote { remote } => match self.remote(remote) {
                 Ok(Some(url)) => Self::check(

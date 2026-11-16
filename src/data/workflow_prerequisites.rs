@@ -120,6 +120,10 @@ impl GitRemoteUrl {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkflowPrerequisite {
+    AgentImage {
+        agent: String,
+        tag: String,
+    },
     GitIdentity,
     GitRemote {
         remote: String,
@@ -191,6 +195,7 @@ pub enum AcquireScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Remediation {
+    PrepareImage,
     ReplaceRejectedToken,
     UseHostIdentity {
         name: String,
@@ -276,6 +281,21 @@ pub struct WorkflowPrerequisiteReport {
 }
 
 impl WorkflowPrerequisiteReport {
+    /// Include image preparation diagnostics in returned failures as well as
+    /// the report, so unattended callers receive the builder's output tail.
+    pub fn failure_summary(&self) -> String {
+        let mut text = self.summary_line();
+        for check in &self.checks {
+            if matches!(check.prerequisite, WorkflowPrerequisite::AgentImage { .. })
+                && check.status == PrerequisiteStatus::Missing
+            {
+                text.push('\n');
+                text.push_str(&check.explanation);
+            }
+        }
+        text
+    }
+
     /// A compact, stable summary for persisted execution events.
     pub fn summary_line(&self) -> String {
         let count = self

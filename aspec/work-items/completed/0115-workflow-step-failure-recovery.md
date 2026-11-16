@@ -132,9 +132,15 @@ command layer nor the engine reimplements them:
 
 - `resume_stop_point(&dag)` — index of the first `Failed`/`Cancelled` step in
   topological order, falling back to the first step that never succeeded.
-- `rewind_to(&dag, start)` — steps at or after `start` back to `Pending`;
-  earlier non-succeeded steps to `Skipped` so they count as satisfied
-  dependencies without re-running.
+- `rewind_to(&dag, start)` — reset `start` and its transitive dependents to
+  `Pending`. Mark unfinished prerequisites of `start` as `Skipped` so an
+  explicit resume after an unfinished step can advance. Preserve all other
+  branches, including their succeeded/skipped states and unfinished work.
+  A topological-order suffix is not a valid reset boundary: a depth-first
+  traversal can place completed earlier-stage steps after `start`. Both
+  plain and dynamic resume must use dependency reachability, independent of
+  definition order. Replaying an earlier step deliberately invalidates its
+  dependents, including completed joins, but not the joins' other branches.
 - `unrecovered_steps()` — the `Failed`/`Cancelled` steps a saved run left behind.
 - `retain_steps_in(&dag)` — drop steps the workflow no longer defines. A saved
   state outlives edits to its workflow file; such a step can never run (the DAG

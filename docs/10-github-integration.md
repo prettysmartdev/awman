@@ -54,6 +54,11 @@ use `{{work_item_content}}`, `{{work_item_title}}`, and the other documented
 [work item inputs](06-dynamic-workflows.md#work-item-inputs). Dynamic workflows
 require a work item; if none is supplied, the command fails before launch.
 
+When a workflow uses an isolated worktree, its branch is named after the issue
+number and title, for example `awman/84-fix-login-timeout`, and its worktree
+directory is `84-fix-login-timeout`. The title becomes a lowercase slug of up
+to 40 characters. Existing worktrees with older names can still be resumed.
+
 ## Create an issue with `new spec`
 
 With `workItems.source = "github"`, `new spec` creates an issue instead of a

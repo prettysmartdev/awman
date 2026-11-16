@@ -50,6 +50,7 @@
 //! | [`prerequisite_unresolved`](HeadlessDefaults::prerequisite_unresolved) | `static ? Fail : Warn` | `static ? Fail : Warn` | `static ? Fail : Warn` |
 //! | [`prerequisite_tool`](HeadlessDefaults::prerequisite_tool) | `Continue` | `Continue` | `Continue` |
 //! | [`prerequisite_gap`](HeadlessDefaults::prerequisite_gap) | `Continue` | `Continue` | `Continue` |
+//! | [`prerequisite_image`](HeadlessDefaults::prerequisite_image) | `Prepare` | `Prepare` | `Prepare` |
 //!
 //! Approving a custom agent definition (`agent_trust::ensure_agent_trusted`)
 //! deliberately has **no row**: no profile, and no `--yes`, ever answers it.
@@ -451,6 +452,12 @@ impl HeadlessDefaults {
     /// image). Uniform: continue, and let `unresolved` decide.
     pub fn prerequisite_tool(&self) -> ToolChoice {
         ToolChoice::Continue
+    }
+
+    /// Prepare missing workflow images. Building still requires the session's
+    /// explicit builtin builder opt-in and a compatible local source.
+    pub fn prerequisite_image(&self) -> bool {
+        true
     }
 
     /// Answer for `ask_prerequisite_gap` (missing remote, detached HEAD, a

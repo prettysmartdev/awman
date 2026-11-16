@@ -163,6 +163,7 @@ pub(crate) struct DynamicResumePlan {
 /// Everything [`ExecWorkflowCommand::execute_generated_workflow`] needs. Both
 /// dynamic paths — leader-designed and resumed — fill one in.
 pub(crate) struct DynamicExecution {
+    invocation_id: Option<uuid::Uuid>,
     effective_flags: ExecWorkflowCommandFlags,
     workflow: Workflow,
     workflow_path: PathBuf,
@@ -318,6 +319,7 @@ impl ExecWorkflowCommand {
             .start_prerequisites(
                 &crate::data::workflow_prerequisites::WorkflowPrerequisites::assume_all(),
                 format!("dynamic-{wi_key}"),
+                &[],
                 &frontend,
             )
             .await?
@@ -461,6 +463,7 @@ impl ExecWorkflowCommand {
             let workflow_name = crate::engine::workflow::workflow_name_for(&workflow);
             let outcome = self
                 .execute_generated_workflow(DynamicExecution {
+                    invocation_id: None,
                     effective_flags,
                     workflow,
                     workflow_path,
@@ -516,6 +519,21 @@ impl ExecWorkflowCommand {
         let leader_work_item_path = &prepared_input.container_path;
 
         // ── Resolve the context(workflow) overlay for the leader. ───────────
+        // Allocate the run identity before planning so the leader, repairs,
+        // generated steps and later resumes all share the same scratch.
+        let invocation_id = uuid::Uuid::new_v4();
+        let _context_lease =
+            crate::data::fs::context_dirs::ContextDirResolver::from_env(leader_session.env())?
+                .workflow_lease(invocation_id)?;
+        let leader_step_info = crate::engine::context_prompt::WorkflowStepInfo {
+            workflow_title: format!("Dynamic workflow for {}", work_item_context.title),
+            current_step_name: "Dynamic workflow planning (leader / repair)".into(),
+            current_step_index: None,
+            total_steps: 0,
+            steps: Vec::new(),
+            work_item_number: work_item_context.number,
+            work_item_title: Some(work_item_context.title.clone()),
+        };
         let (leader_context_overlays, leader_system_prompt) =
             LaunchPolicy::for_session(&leader_session)
                 .with_git(&self.engines.git_engine)
@@ -526,8 +544,8 @@ impl ExecWorkflowCommand {
                         permission: crate::data::config::overlays::OverlayPermission::ReadWrite,
                     }],
                     &leader_agent,
-                    None,
-                    None,
+                    Some(invocation_id),
+                    Some(&leader_step_info),
                     frontend.lock().unwrap().as_mut(),
                 )?;
         let context_dir = leader_context_overlays
@@ -575,17 +593,32 @@ impl ExecWorkflowCommand {
             });
         }
 
-        // ── Ensure the leader image is built. ───────────────────────────────
-        ensure_agent_image(
-            &self.engines,
-            &git_root_for_scope,
-            &paths,
-            leader_agent.as_str(),
-            &self.session,
-            &mut frontend.clone(),
-        )
-        .await
-        .map_err(|e| attribute_leader_error(&dynamic, e))?;
+        // Solve the leader's image prerequisite only after resume was ruled
+        // out and the selected leader was trusted and validated.
+        let images = self
+            .prepare_workflow_image_prerequisites(
+                &[leader_agent.as_str().to_string()],
+                crate::data::workflow_prerequisites::PrerequisiteOrigin::AssumedAll,
+                &frontend,
+            )
+            .await
+            .map_err(|e| attribute_leader_error(&dynamic, e))?;
+        prerequisites.report.checks.extend(images.checks);
+        self.record_prerequisite_report(&prerequisites.report).await;
+        if self.engines.runtime.capabilities().image_acquisition
+            != crate::engine::agent_runtime::ImageAcquisition::Import
+        {
+            ensure_agent_image(
+                &self.engines,
+                &git_root_for_scope,
+                &paths,
+                leader_agent.as_str(),
+                &self.session,
+                &mut frontend.clone(),
+            )
+            .await
+            .map_err(|e| attribute_leader_error(&dynamic, e))?;
+        }
 
         let session_max_concurrent_steps =
             crate::command::commands::exec_workflow::workflow_effective_config(
@@ -757,6 +790,7 @@ impl ExecWorkflowCommand {
 
         let outcome = self
             .execute_generated_workflow(DynamicExecution {
+                invocation_id: Some(invocation_id),
                 effective_flags: effective_flags.clone(),
                 workflow: validated_workflow,
                 workflow_path: generated_path,
@@ -771,7 +805,8 @@ impl ExecWorkflowCommand {
                 worktree_path,
                 lifecycle,
                 worktree_git_mount,
-                skip_state_resume_prompt: false,
+                // Fresh versus resume was settled before launching the leader.
+                skip_state_resume_prompt: true,
                 prerequisites,
                 frontend: shared,
             })
@@ -911,6 +946,7 @@ impl ExecWorkflowCommand {
         exec: DynamicExecution,
     ) -> Result<ExecWorkflowOutcome, CommandError> {
         let DynamicExecution {
+            invocation_id,
             effective_flags,
             workflow,
             workflow_path,
@@ -970,10 +1006,32 @@ impl ExecWorkflowCommand {
         self.record_prerequisite_report(&prerequisites.report).await;
 
         // ── Build any missing agent images before execution (WI-0092 §9b). ──
-        let resolved_agents =
+        let mut resolved_agents =
             resolve_and_validate_workflow_agents(&workflow, &worktree_session, &paths)
                 .map_err(CommandError::Other)?;
-        for agent in &resolved_agents {
+        if (!workflow.setup.is_empty() || !workflow.teardown.is_empty())
+            && self.engines.runtime.capabilities().image_acquisition
+                == crate::engine::agent_runtime::ImageAcquisition::Import
+            && self.session.effective_config().base_image().is_none()
+        {
+            let phase_agent = self.session.configured_agent().as_str().to_string();
+            if !resolved_agents.contains(&phase_agent) {
+                resolved_agents.push(phase_agent);
+            }
+        }
+        let images = self
+            .prepare_workflow_image_prerequisites(
+                &resolved_agents,
+                crate::data::workflow_prerequisites::PrerequisiteOrigin::Static,
+                &frontend,
+            )
+            .await?;
+        prerequisites.report.checks.extend(images.checks);
+        self.record_prerequisite_report(&prerequisites.report).await;
+        for agent in resolved_agents.iter().filter(|_| {
+            self.engines.runtime.capabilities().image_acquisition
+                != crate::engine::agent_runtime::ImageAcquisition::Import
+        }) {
             ensure_agent_image(
                 &self.engines,
                 &git_root_for_scope,
@@ -1014,6 +1072,7 @@ impl ExecWorkflowCommand {
         }
 
         let prepared = PreparedRun {
+            invocation_id,
             workflow,
             workflow_path,
             work_item_context: Some(work_item_context),
