@@ -29,6 +29,19 @@ pub const READ_ONLY_WORKSPACE_FLAG: &str = "read-only-workspace";
 /// read-only workspace. `lease_read_only` remains the WSP registration flag.
 pub const READ_ONLY_WORKSPACE_CAPABILITY: &str = "read_only_workspace";
 
+/// Container paths use Linux roots even when the host is Windows. Native
+/// `Path::is_absolute` would require a Windows drive for `/tmp` on that host.
+pub fn is_normalized_guest_path(path: &Path) -> bool {
+    path.to_str().is_some_and(|value| {
+        value.starts_with('/')
+            && !value.starts_with("//")
+            && !value.contains([':', ',', '\0'])
+            && !value
+                .split(['/', '\\'])
+                .any(|part| part == "." || part == "..")
+    })
+}
+
 /// Whether the agent may write to the session workspace.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -152,6 +165,28 @@ pub fn with_read_only_workspace_section(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_paths_use_linux_roots_on_every_host() {
+        for valid in ["/", "/tmp", "/home/agent/.cache"] {
+            assert!(is_normalized_guest_path(Path::new(valid)), "{valid}");
+        }
+        for invalid in [
+            "",
+            "tmp",
+            "C:/tmp",
+            "//server/share",
+            "\\tmp",
+            "/tmp/../workspace",
+            "/tmp/./cache",
+            "/tmp/..\\workspace",
+            "/tmp:rw",
+            "/tmp,size=1",
+            "/tmp\0",
+        ] {
+            assert!(!is_normalized_guest_path(Path::new(invalid)), "{invalid:?}");
+        }
+    }
 
     #[test]
     fn access_defaults_to_read_write_and_serializes_snake_case() {

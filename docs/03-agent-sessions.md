@@ -336,7 +336,9 @@ runtime supports it by looking for `read_only_workspace` in the `capabilities`
 array returned by `GET /v1/status`; the capability is absent when the runtime
 cannot enforce a read-only workspace.
 It conflicts with `--allow-docker`, since access to the host Docker daemon
-could bypass the workspace mount. See [API & Remote Mode](09-api-and-remote-mode.md#get-v1status)
+could bypass the workspace mount. Overlays exposing a runtime control socket
+or its protected parent directories are also refused, including paths reached
+through symlinks. See [API & Remote Mode](09-api-and-remote-mode.md#get-v1status)
 for the status response details.
 
 For workflows, set `read_only_workspace = true` on individual review or

@@ -610,9 +610,22 @@ fn reject_runtime_control_mounts(
         .into_iter()
         .map(PathBuf::from)
         .collect();
+    reject_runtime_control_mounts_at(overlays, &sockets)
+}
+
+fn reject_runtime_control_mounts_at(
+    overlays: &[OverlaySpec],
+    sockets: &[PathBuf],
+) -> Result<(), crate::engine::error::EngineError> {
     let sockets: Vec<PathBuf> = sockets
-        .into_iter()
-        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .iter()
+        .cloned()
+        // Keep the lexical location as well as its target: resolving
+        // /var/run/docker.sock to /run/docker.sock must not unprotect /var.
+        .flat_map(|path| {
+            let resolved = std::fs::canonicalize(&path).ok();
+            std::iter::once(path).chain(resolved)
+        })
         .collect();
     for overlay in overlays {
         let source =
@@ -620,7 +633,11 @@ fn reject_runtime_control_mounts(
         let special = std::fs::metadata(&source)
             .map(|m| !m.is_dir() && !m.is_file())
             .unwrap_or(false);
-        if special || sockets.iter().any(|s| s.starts_with(&source)) {
+        if special
+            || sockets
+                .iter()
+                .any(|s| s.starts_with(&source) || s.starts_with(&overlay.host_path))
+        {
             return Err(crate::engine::error::EngineError::Config(format!(
                 "read-only workspace cannot mount '{}': it exposes a container \
                  runtime control socket or special file",
@@ -640,15 +657,7 @@ impl ResolvedContainerOptions {
         use crate::data::workspace::{SCRATCH_TMPFS_PATH, WORKSPACE_GUEST_PATH};
         use crate::engine::error::EngineError;
         for path in &self.tmpfs {
-            if !path.is_absolute()
-                || !path.components().all(|c| {
-                    matches!(
-                        c,
-                        std::path::Component::RootDir | std::path::Component::Normal(_)
-                    )
-                })
-                || path.to_str().is_none_or(|s| s.contains([':', ',', '\0']))
-            {
+            if !crate::data::workspace::is_normalized_guest_path(path) {
                 return Err(EngineError::Config(
                     "tmpfs guest path must be absolute and normalized".into(),
                 ));
@@ -1044,7 +1053,8 @@ pub(crate) mod workspace_access_tests {
                 );
             }
         }
-        // A special file is refused regardless of path.
+        // Unix device files are refused regardless of path.
+        #[cfg(unix)]
         assert!(super::reject_runtime_control_mounts(&[overlay(
             "/dev/null",
             OverlayPermission::ReadOnly
@@ -1057,5 +1067,33 @@ pub(crate) mod workspace_access_tests {
             OverlayPermission::ReadWrite
         )])
         .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_check_keeps_symlinked_socket_parents_protected() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::options::workspace_access_tests::final_check_keeps_symlinked_socket_parents_protected"));
+        let var = sandbox.root().join("var");
+        let run = sandbox.root().join("run");
+        std::fs::create_dir_all(&var).unwrap();
+        std::fs::create_dir_all(&run).unwrap();
+        std::os::unix::fs::symlink(&run, var.join("run")).unwrap();
+        // A known endpoint must protect its parents even without a live daemon.
+        std::fs::write(run.join("docker.sock"), b"").unwrap();
+        let sockets = [var.join("run/docker.sock")];
+        for source in [&var, &run, &var.join("run")] {
+            for permission in [OverlayPermission::ReadOnly, OverlayPermission::ReadWrite] {
+                let overlay = OverlaySpec {
+                    host_path: source.clone(),
+                    container_path: "/run/engine".into(),
+                    permission,
+                };
+                assert!(
+                    super::reject_runtime_control_mounts_at(&[overlay], &sockets).is_err(),
+                    "{}",
+                    source.display()
+                );
+            }
+        }
     }
 }

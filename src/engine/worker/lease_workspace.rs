@@ -459,14 +459,7 @@ pub(crate) fn validate_workspace_mounts(
             }
         }
         let guest = &spec.container_path;
-        if !guest.is_absolute()
-            || guest.components().any(|part| {
-                matches!(
-                    part,
-                    std::path::Component::ParentDir | std::path::Component::CurDir
-                )
-            })
-        {
+        if !crate::data::workspace::is_normalized_guest_path(guest) {
             return Err(EngineError::Config(
                 "overlay guest path must be normalized".into(),
             ));

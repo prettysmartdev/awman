@@ -305,7 +305,7 @@ fn emit_read_only_workspace_env(
     if !read_only {
         return Ok(());
     }
-    if !Path::new(container_home).is_absolute()
+    if !crate::data::workspace::is_normalized_guest_path(Path::new(container_home))
         || Path::new(container_home).starts_with(crate::data::workspace::WORKSPACE_GUEST_PATH)
     {
         return Err(EngineError::Config(
@@ -316,11 +316,11 @@ fn emit_read_only_workspace_env(
     let mut redirects = vec![
         (
             "XDG_CACHE_HOME".to_owned(),
-            Path::new(container_home).join(".cache"),
+            format!("{}/.cache", container_home.trim_end_matches('/')),
         ),
         (
             "XDG_STATE_HOME".to_owned(),
-            Path::new(container_home).join(".local/state"),
+            format!("{}/.local/state", container_home.trim_end_matches('/')),
         ),
         (
             "TMPDIR".to_owned(),
@@ -328,11 +328,12 @@ fn emit_read_only_workspace_env(
         ),
     ];
     for redirect in &def.read_only_workspace_redirects {
-        let path = Path::new(&redirect.home_relative_path);
         if redirect.home_relative_path.is_empty()
-            || !path
-                .components()
-                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            || redirect.home_relative_path.contains(['\\', ':', ',', '\0'])
+            || redirect
+                .home_relative_path
+                .split('/')
+                .any(|part| matches!(part, "" | "." | ".."))
         {
             return Err(EngineError::Config(format!(
                 "invalid read-only workspace redirect path: {}",
@@ -341,7 +342,11 @@ fn emit_read_only_workspace_env(
         }
         redirects.push((
             redirect.env_var.clone(),
-            Path::new(container_home).join(path),
+            format!(
+                "{}/{}",
+                container_home.trim_end_matches('/'),
+                redirect.home_relative_path
+            ),
         ));
     }
     for (key, path) in redirects {
@@ -352,10 +357,7 @@ fn emit_read_only_workspace_env(
             ContainerOption::EnvOverride { key: name, .. } => name == &key,
             _ => false,
         }) {
-            options.push(ContainerOption::EnvLiteral(EnvLiteral {
-                key,
-                value: path.to_string_lossy().into_owned(),
-            }));
+            options.push(ContainerOption::EnvLiteral(EnvLiteral { key, value: path }));
         }
     }
     Ok(())
