@@ -300,7 +300,19 @@ fn aggregate_valid_authenticated_exact_sets_pass() {
     let (m, p, c, r) = context();
     let g = aggregate::aggregate(&m, &p, &r, &c).unwrap();
     assert_eq!(g.verdict, Outcome::Passed, "{:?}", g.errors);
-    assert_eq!(g.execution_ms, 1000);
+    assert_eq!(g.execution_ms, Some(1000));
+}
+#[test]
+fn unavailable_gate_timings_preserve_the_verdict_and_serialize_as_unknown() {
+    let (m, p, c, r) = context();
+    let mut gate = aggregate::aggregate(&m, &p, &r, &c).unwrap();
+    (gate.queue_ms, gate.execution_ms) = history::raw::job_times(&[]);
+    let json = serde_json::to_value(&gate).unwrap();
+    assert!(json["queue_ms"].is_null());
+    assert!(json["execution_ms"].is_null());
+    let restored: GateEvidence = serde_json::from_value(json).unwrap();
+    assert_eq!(restored.verdict, Outcome::Passed);
+    assert!(summary::render(&restored, &r).contains("Queue: unavailable; execution: unavailable"));
 }
 #[test]
 fn missing_suite_fails_closed() {
@@ -423,7 +435,7 @@ fn history_percentiles_and_three_run_budget() {
         commit: "a".repeat(40),
         tests: BTreeMap::new(),
         queue_ms: Some(0),
-        execution_ms: 100,
+        execution_ms: Some(100),
         outcome: Outcome::Passed,
         cache_hit: None,
         rebuilds: Some(1),
@@ -438,6 +450,11 @@ fn history_percentiles_and_three_run_budget() {
     }
     assert!(history::budget_regression(&rows, 50));
     assert!(history::report(&rows).contains("100"));
+    let mut unknown = rows[2].clone();
+    unknown.attempt += 1;
+    unknown.execution_ms = None;
+    rows.push(unknown);
+    assert!(!history::budget_regression(&rows, 50));
 }
 /// Guards: 824aeda9, d0a29ec2, 4a2853d7.
 #[test]

@@ -135,6 +135,12 @@ than adding parallel suite durations. The span runs from the first completed
 predecessor's start to the last predecessor's finish; it excludes aggregation.
 Queue time is the longest predecessor queue. Unmeasured invocation queue and
 cache values remain unknown, rather than being reported as zero or cache misses.
+Actions job timestamps are diagnostic only: missing, malformed or inverted
+timestamps leave gate queue and execution measurements unavailable (`null`) and
+do not affect the verdict. Required job success, provenance, artifacts and exact
+test coverage still determine admission. Timing history retains the verdict
+without inventing a duration; unavailable measurements do not enter percentiles
+and break a sequence of measured main-gate budget overruns.
 
 ## Pinned inputs
 

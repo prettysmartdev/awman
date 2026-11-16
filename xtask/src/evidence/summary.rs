@@ -1,6 +1,8 @@
 use super::schema::*;
 pub fn render(g: &GateEvidence, records: &[Evidence]) -> String {
-    let mut s=format!("Gate {}: {:?}\n\nQueue: {} ms; execution: {} ms. Budget: {:?} minutes.\n\n| Cell | Outcome | Expected | Ran | Failed | Skipped | Blocked |\n| --- | --- | --- | --- | --- | --- | --- |\n",g.gate,g.verdict,g.queue_ms,g.execution_ms,g.p95_budget_minutes);
+    let duration =
+        |ms: Option<u64>| ms.map_or_else(|| "unavailable".into(), |ms| format!("{ms} ms"));
+    let mut s=format!("Gate {}: {:?}\n\nQueue: {}; execution: {}. Budget: {:?} minutes.\n\n| Cell | Outcome | Expected | Ran | Failed | Skipped | Blocked |\n| --- | --- | --- | --- | --- | --- | --- |\n",g.gate,g.verdict,duration(g.queue_ms),duration(g.execution_ms),g.p95_budget_minutes);
     for c in &g.cells {
         s.push_str(&format!(
             "| {} | {:?} | {} | {} | {} | {} | {} |\n",

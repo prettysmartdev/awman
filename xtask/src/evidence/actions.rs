@@ -364,7 +364,7 @@ pub fn aggregate(root: &Path, m: &Manifest, p: &Plan) -> Result<GateEvidence> {
     )?;
     let uploaded: Plan = serde_json::from_slice(&fs::read(scratch.path().join("plan/plan.json"))?)?;
     ensure!(uploaded == *p, "plan artifact differs");
-    let (queue_ms, execution_ms) = super::history::raw::job_times(&jobs)?;
+    let (queue_ms, execution_ms) = super::history::raw::job_times(&jobs);
     let mut report = GateEvidence {
         schema: 1,
         kind: "gate".into(),
@@ -601,5 +601,20 @@ mod tests {
         let mut skipped = good;
         skipped["conclusion"] = json!("skipped");
         assert!(job_passed(&[skipped], "Test unit on linux-x64", 1).is_err());
+    }
+
+    #[test]
+    fn job_success_is_required_even_when_timestamps_are_unavailable() {
+        let mut jobs = vec![
+            json!({"name":"Plan", "status":"completed", "conclusion":"success",
+            "created_at":"2026-11-16T19:47:19Z", "started_at":"2026-11-16T18:37:09Z",
+            "completed_at":"2026-11-16T18:38:04Z"}),
+        ];
+        assert_eq!(super::super::history::raw::job_times(&jobs), (None, None));
+        assert!(job_passed(&jobs, "Plan", 1).is_ok());
+        for conclusion in ["failure", "cancelled", "skipped", "timed_out"] {
+            jobs[0]["conclusion"] = json!(conclusion);
+            assert!(job_passed(&jobs, "Plan", 1).is_err(), "{conclusion}");
+        }
     }
 }
