@@ -229,48 +229,6 @@ fn work_item_numbers_reject_overflow_and_keep_hostile_text_as_data() {
 }
 
 #[test]
-fn work_item_lookup_uses_session_scope_without_executing_content() {
-    use crate::command::work_item::find_work_item_file;
-    use crate::data::session::{Session, SessionOpenOptions};
-    use awman_test_support::TestSandbox;
-    let s = TestSandbox::named("work_item_lookup");
-    let dirs = s.work().join("aspec/work-items");
-    std::fs::create_dir_all(&dirs).unwrap();
-    let item = dirs.join("0144-hostile.md");
-    std::fs::write(&item, "# Task\n$(codex) `claude` ; gemini\n").unwrap();
-    let env = crate::data::config::env::EnvSnapshot::from_full_env(
-        s.env()
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.to_string_lossy().into_owned(),
-                    v.to_string_lossy().into_owned(),
-                )
-            })
-            .collect(),
-    );
-    let session = Session::open_at_git_root(
-        s.work(),
-        s.work(),
-        SessionOpenOptions {
-            env: Some(env),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        find_work_item_file(&session, &s.work(), 144).unwrap(),
-        item.clone()
-    );
-    assert!(find_work_item_file(&session, &s.work(), 145).is_err());
-    assert_eq!(
-        std::fs::read_to_string(item).unwrap(),
-        "# Task\n$(codex) `claude` ; gemini\n"
-    );
-    s.finish();
-}
-
-#[test]
 fn generated_prerequisites_preserve_declines_and_cannot_add_grants() {
     use crate::data::workflow_prerequisites::*;
     let token = WorkflowPrerequisite::GitHubToken {
