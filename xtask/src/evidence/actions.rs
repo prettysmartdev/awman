@@ -210,7 +210,19 @@ fn check_run(
         &raw["source"] == source && source["clean"] == true,
         "stale or dirty source evidence"
     );
-    ensure!(&raw["producer"] == producer, "wrong producer/run attempt");
+    // A partial Actions rerun carries forward successful jobs and their
+    // artifacts. The service-authenticated artifact belongs to this run and
+    // job_passed still requires success in the current attempt. Its recorded
+    // producer attempt may therefore precede the aggregator's attempt.
+    let produced_attempt = text(&raw["producer"], "attempt")?.parse::<u64>()?;
+    let current_attempt = text(producer, "attempt")?.parse::<u64>()?;
+    ensure!(
+        produced_attempt > 0 && produced_attempt <= current_attempt,
+        "invalid producer attempt"
+    );
+    let mut recorded_producer = raw["producer"].clone();
+    recorded_producer["attempt"] = producer["attempt"].clone();
+    ensure!(&recorded_producer == producer, "wrong producer/run/job");
     ensure!(
         raw["runner"] == "nextest" && raw["build"] == build && raw["shard"] == json!(shard),
         "wrong build/runner/shard"
@@ -575,7 +587,7 @@ mod tests {
             ("source", json!({"commit":"other", "clean":true})),
             (
                 "producer",
-                json!({"run_id":"42", "attempt":"1", "job":"test-unit-linux-x64"}),
+                json!({"run_id":"42", "attempt":"3", "job":"test-unit-linux-x64"}),
             ),
             ("shard", json!("2/2")),
             ("failed_suites", json!(["unit-test-support"])),
@@ -591,6 +603,42 @@ mod tests {
         setup(dir.path());
         fs::remove_file(dir.path().join("expected.json")).unwrap();
         assert!(check().is_err());
+    }
+
+    #[test]
+    fn partial_reruns_accept_prior_attempts_only_from_the_same_run_and_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, producer, m, suites) = setup(dir.path());
+        let file = dir.path().join("run.json");
+        let mut raw: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        let check = |raw: &Value| {
+            fs::write(&file, serde_json::to_vec(raw).unwrap()).unwrap();
+            check_run(
+                dir.path(),
+                &suites,
+                "linux-x64-default",
+                Some("1/1"),
+                &source,
+                &producer,
+                &m,
+            )
+        };
+        raw["producer"]["attempt"] = json!("1");
+        assert_eq!(check(&raw).unwrap()["unit-test-support"].passed, 1);
+        for (key, value) in [
+            ("run_id", json!("41")),
+            ("job", json!("test-unit-windows-x64")),
+            ("attempt", json!("0")),
+            ("attempt", json!("3")),
+            ("attempt", json!("invalid")),
+            ("attempt", Value::Null),
+        ] {
+            let mut bad = raw.clone();
+            bad["producer"][key] = value;
+            assert!(check(&bad).is_err(), "accepted changed producer {key}");
+        }
+        raw["source"]["commit"] = json!("other");
+        assert!(check(&raw).is_err(), "accepted an older source");
     }
     #[test]
     fn job_authentication_rejects_skips_renames_and_missing_matrix_members() {

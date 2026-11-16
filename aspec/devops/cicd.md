@@ -104,6 +104,11 @@ reported as passed because it was skipped.
   summary: tier × platform matrix of passed/failed/blocked/skipped/not-selected,
   slowest tests, quarantine and override state, cache statistics and the
   `reproduce` line of every failure.
+  Partial reruns may reuse successful jobs' artifacts from an earlier attempt
+  of the same authenticated run. The current attempt must still report each
+  required job successful, and source, job, shard and complete passing test
+  inventory must match. Zero, future or malformed producer attempts and
+  artifacts from another run or source are rejected.
 
 ### `nightly.yml`
 
