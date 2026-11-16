@@ -174,7 +174,7 @@ fn check_build(
             format!("{BUILT_IMAGE} absent after a successful build")
         }),
         (false, Err(e)) => Err(format!("build failed: {e}")),
-        (true, Err(EngineError::ImageBuildExitNonzero { tag, exit_code })) => {
+        (true, Err(EngineError::ImageBuildExitNonzero { tag, exit_code, .. })) => {
             ensure(tag == BUILT_IMAGE && exit_code != 0, || {
                 format!("failure names tag {tag:?} exit {exit_code}")
             })?;

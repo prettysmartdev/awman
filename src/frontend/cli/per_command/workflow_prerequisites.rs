@@ -29,6 +29,9 @@ pub(crate) fn print_report(report: &WorkflowPrerequisiteReport) {
 }
 
 impl WorkflowPrerequisiteFrontend for CliFrontend {
+    fn ask_prerequisite_image(&mut self, prompt: &Prompt<bool>) -> Result<bool, CommandError> {
+        self.pick_from_prompt(prompt)
+    }
     /// `--json` prints nothing here: the outcome carries the report. Only a
     /// report that questions follow asks Continue/Abort, after saying what
     /// continuing leads to; a check-only or headless report is just printed.

@@ -44,7 +44,7 @@ impl PrerequisitePreflight {
     ) -> Vec<PrerequisiteCheck> {
         use WorkflowPrerequisite::*;
         let check = match &need.prerequisite {
-            AgentImage { agent } => {
+            AgentImage { tag, .. } => {
                 if self.options.runtime.capabilities().image_acquisition
                     == crate::engine::agent_runtime::ImageAcquisition::Kit
                 {
@@ -55,8 +55,7 @@ impl PrerequisitePreflight {
                         vec![],
                     )];
                 }
-                let tag = crate::data::image_tags::agent_image_tag(&self.options.git_root, agent);
-                let (status, explanation) = match self.options.runtime.image_exists(&tag) {
+                let (status, explanation) = match self.options.runtime.image_exists(tag) {
                     Ok(true) => (
                         PrerequisiteStatus::Satisfied,
                         format!("image {tag} is available"),
@@ -73,9 +72,7 @@ impl PrerequisitePreflight {
                 let remediations = if status == PrerequisiteStatus::Satisfied {
                     vec![]
                 } else {
-                    vec![Remediation::PrepareAgentImage {
-                        agent: agent.clone(),
-                    }]
+                    vec![Remediation::PrepareImage]
                 };
                 Self::check(need, status, explanation, remediations)
             }

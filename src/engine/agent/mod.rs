@@ -526,13 +526,11 @@ impl AgentEngine {
         if self.runtime.capabilities().image_acquisition
             == crate::engine::agent_runtime::ImageAcquisition::Import
         {
-            use crate::data::ready_image::ReadyImagePlan;
             use crate::engine::image_prep::{
                 AgentImagePreparer, AgentImageRequest, BuildPolicy, ImageBuildContext,
             };
             let tag = agent_image_tag(session.git_root(), agent.as_str());
             let resolved = config.builtin_settings()?;
-            let builder_enabled = resolved.builder_enabled;
             let mut preparer = AgentImagePreparer::new(
                 resolved,
                 self.runtime.clone(),
@@ -551,13 +549,8 @@ impl AgentEngine {
             // check, and without a usable source `CheckOnly` reports the
             // typed configuration error.
 
-            let missing = builder_enabled && !self.runtime.image_exists(&tag)?;
-            let policy = match missing.then(|| preparer.missing_image_plan(&tag, agent.as_str())) {
-                Some(ReadyImagePlan::BuildAndImport | ReadyImagePlan::Import) => {
-                    BuildPolicy::SessionSetup
-                }
-                _ => BuildPolicy::CheckOnly,
-            };
+            let policy =
+                preparer.missing_image_policy(&tag, agent.as_str(), BuildPolicy::CheckOnly)?;
             let result = preparer
                 .prepare(
                     &AgentImageRequest {
@@ -615,10 +608,13 @@ impl AgentEngine {
                         StepStatus::Done,
                     );
                 }
-                Err(EngineError::ImageBuildExitNonzero { exit_code, .. }) => {
+                Err(EngineError::ImageBuildExitNonzero {
+                    exit_code, output, ..
+                }) => {
                     let error = EngineError::AgentImageBuildFailed {
                         agent: agent.as_str().to_string(),
                         exit_code,
+                        output,
                     };
                     let message = custom_build_failure(&def, &error);
                     frontend.report_step_status(

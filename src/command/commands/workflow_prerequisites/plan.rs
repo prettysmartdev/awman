@@ -70,25 +70,40 @@ impl WorkflowPreflightPlan {
                     .to_owned(),
             );
         }
+        if (!workflow.setup.is_empty() || !workflow.teardown.is_empty())
+            && session.effective_config().base_image().is_none()
+            && session.effective_config().runtime_selection()
+                == Ok(crate::data::config::RuntimeSelection::BuiltinExperimental)
+        {
+            agents.push(session.configured_agent().as_str().to_owned());
+        }
         Ok(Self::new(
             WorkflowPrerequisites::from_workflow(workflow),
             agents,
             default.unwrap_or_else(|| session.configured_agent().as_str().to_owned()),
+            session.git_root(),
         ))
     }
 
     pub fn dynamic(
-        agents: Vec<String>,
+        mut agents: Vec<String>,
         session: &Session,
         flags: &ExecWorkflowCommandFlags,
     ) -> Result<Self, CommandError> {
         let default_agent = workflow_effective_config(session, flags)?
             .agent()
             .unwrap_or_else(|| session.configured_agent().as_str().to_owned());
+        if session.effective_config().base_image().is_none()
+            && session.effective_config().runtime_selection()
+                == Ok(crate::data::config::RuntimeSelection::BuiltinExperimental)
+        {
+            agents.push(session.configured_agent().as_str().to_owned());
+        }
         Ok(Self::new(
             WorkflowPrerequisites::assume_all(),
             agents,
             default_agent,
+            session.git_root(),
         ))
     }
 
@@ -96,12 +111,16 @@ impl WorkflowPreflightPlan {
         mut needs: WorkflowPrerequisites,
         mut agents: Vec<String>,
         default_agent: String,
+        git_root: &std::path::Path,
     ) -> Self {
         agents.sort();
         agents.dedup();
         for agent in agents {
             needs.merge_needs(PrerequisiteNeed {
-                prerequisite: WorkflowPrerequisite::AgentImage { agent },
+                prerequisite: WorkflowPrerequisite::AgentImage {
+                    tag: crate::data::image_tags::agent_image_tag(git_root, &agent),
+                    agent,
+                },
                 needed_by: vec![],
             });
         }
@@ -126,7 +145,7 @@ impl WorkflowPreflightPlan {
         use crate::data::image_tags::{agent_image_tag, project_image_tag};
         let paths = crate::data::RepoDockerfilePaths::new(session.git_root());
         for check in &mut report.checks {
-            let WorkflowPrerequisite::AgentImage { agent } = &check.prerequisite else {
+            let WorkflowPrerequisite::AgentImage { agent, .. } = &check.prerequisite else {
                 continue;
             };
             let runtime = &engines.runtime;
@@ -141,7 +160,9 @@ impl WorkflowPreflightPlan {
                     "workflow prerequisite: agent runtime is unavailable".into(),
                 ));
             }
-            if let Some(defaults) = headless.as_ref().filter(|_| !present) {
+            if let Some(defaults) = headless.as_ref().filter(|_| {
+                !present && runtime.capabilities().image_acquisition == ImageAcquisition::Build
+            }) {
                 let default_available = runtime
                     .image_exists(&agent_image_tag(session.git_root(), &self.default_agent))
                     .unwrap_or(false);
@@ -160,15 +181,23 @@ impl WorkflowPreflightPlan {
                 }
             }
             if runtime.capabilities().image_acquisition != ImageAcquisition::Kit {
-                crate::command::commands::workflow_preflight::ensure_agent_image(
-                    engines,
-                    session.git_root(),
-                    &paths,
-                    agent,
-                    session,
-                    sink,
-                )
-                .await?;
+                if let Err(error) =
+                    crate::command::commands::workflow_preflight::ensure_agent_image(
+                        engines,
+                        session.git_root(),
+                        &paths,
+                        agent,
+                        session,
+                        sink,
+                    )
+                    .await
+                {
+                    check.status = PrerequisiteStatus::Missing;
+                    check.explanation = error.to_string();
+                    return Err(CommandError::WorkflowPrerequisitesUnresolved {
+                        report: Box::new(report.clone()),
+                    });
+                }
             }
             check.status = PrerequisiteStatus::Satisfied;
             check.explanation = "image prepared for this workflow".into();
@@ -191,7 +220,7 @@ impl super::PreparedPrerequisites {
         let concrete = WorkflowPreflightPlan::for_workflow(workflow, session, flags)?;
         let mut images = Vec::new();
         for need in &concrete.needs.needs {
-            if let WorkflowPrerequisite::AgentImage { agent } = &need.prerequisite {
+            if let WorkflowPrerequisite::AgentImage { agent, .. } = &need.prerequisite {
                 let check = self.report.find(&need.prerequisite)
                     .filter(|check| check.status == PrerequisiteStatus::Satisfied)
                     .ok_or_else(|| CommandError::Other(format!(

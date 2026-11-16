@@ -848,13 +848,20 @@ impl WorkflowEngine {
             read_only_workspace: false,
         };
 
+        let phase = match self.state.current_phase {
+            crate::data::workflow_state::WorkflowPhase::Setup => "Setup",
+            crate::data::workflow_state::WorkflowPhase::Main => "Main",
+            crate::data::workflow_state::WorkflowPhase::Teardown => "Teardown",
+            crate::data::workflow_state::WorkflowPhase::Done => "Merge",
+        };
         let runtime = WorkflowRuntimeContext {
             step_agent: spec.agent.clone(),
             step_model: spec.model.clone(),
             git_root: session.git_root().to_path_buf(),
             session_id: session.id(),
             workflow_invocation_id: self.state.invocation_id,
-            workflow_step_info: None,
+            workflow_step_info: self
+                .build_workflow_step_info(&format!("{phase} remediation: {}", spec.label)),
             // An `on_failure` remediation runs while its phase is current; the
             // merge-fix agent runs after the workflow is done, at merge-back.
             source: EventSource::phase(match self.state.current_phase {

@@ -266,6 +266,9 @@ struct ActiveParallelStep {
 /// six-parameter `new` / `resume` / `resume_with_state_root` constructors
 /// (F-34).
 pub struct WorkflowSpec {
+    /// Invocation already allocated by a dynamic leader. Used only for a
+    /// fresh run; a resumed run keeps its persisted invocation and scratch.
+    pub invocation_id: Option<uuid::Uuid>,
     /// Explicitly granted credential for host CI polling. Never persisted.
     pub ci_token: Option<SecretString>,
     pub workflow: Workflow,
@@ -284,6 +287,7 @@ impl WorkflowSpec {
     /// A spec for a session-rooted run of `workflow`.
     pub fn new(workflow: Workflow) -> Self {
         Self {
+            invocation_id: None,
             workflow,
             work_item_context: None,
             state_root: None,
@@ -301,6 +305,11 @@ impl WorkflowSpec {
 
     pub fn with_state_root(mut self, root: Option<std::path::PathBuf>) -> Self {
         self.state_root = root;
+        self
+    }
+
+    pub fn with_invocation_id(mut self, invocation_id: Option<uuid::Uuid>) -> Self {
+        self.invocation_id = invocation_id;
         self
     }
 
@@ -494,6 +503,7 @@ impl WorkflowEngine {
         deps: WorkflowEngineDeps,
     ) -> Result<Self, EngineError> {
         let WorkflowSpec {
+            invocation_id,
             workflow,
             work_item_context,
             state_root,
@@ -508,6 +518,9 @@ impl WorkflowEngine {
             workflow_hash,
             work_item_number,
         );
+        if let Some(invocation_id) = invocation_id {
+            state.invocation_id = invocation_id;
+        }
         if let Some(context) = &work_item_context {
             state.work_item_key = Some(context.key.clone());
             state.work_item_source_id = Some(context.source_id.clone());
@@ -642,6 +655,7 @@ impl WorkflowEngine {
         deps: WorkflowEngineDeps,
     ) -> Result<Self, EngineError> {
         let WorkflowSpec {
+            invocation_id,
             workflow,
             work_item_context,
             state_root,
@@ -703,6 +717,11 @@ impl WorkflowEngine {
             ),
         };
 
+        if fresh_work_item_design {
+            if let Some(invocation_id) = invocation_id {
+                state.invocation_id = invocation_id;
+            }
+        }
         if let Some(context) = &work_item_context {
             state.work_item_key = Some(context.key.clone());
             state.work_item_source_id = Some(context.source_id.clone());

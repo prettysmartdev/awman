@@ -163,6 +163,7 @@ pub(crate) struct DynamicResumePlan {
 /// Everything [`ExecWorkflowCommand::execute_generated_workflow`] needs. Both
 /// dynamic paths — leader-designed and resumed — fill one in.
 pub(crate) struct DynamicExecution {
+    invocation_id: Option<uuid::Uuid>,
     effective_flags: ExecWorkflowCommandFlags,
     workflow: Workflow,
     workflow_path: PathBuf,
@@ -412,9 +413,23 @@ impl ExecWorkflowCommand {
                 });
             }
             agents.push(leader_agent.as_str().to_owned());
-            let names = agents
+            let preflight =
+                crate::command::commands::workflow_prerequisites::WorkflowPreflightPlan::dynamic(
+                    agents,
+                    &base_session,
+                    &effective_flags,
+                )?;
+            let names = preflight
+                .needs
+                .needs
                 .iter()
-                .map(crate::data::session::AgentName::new)
+                .filter_map(|need| match &need.prerequisite {
+                    crate::data::workflow_prerequisites::WorkflowPrerequisite::AgentImage {
+                        agent,
+                        ..
+                    } => Some(crate::data::session::AgentName::new(agent)),
+                    _ => None,
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             frontend.with(|f| {
                 crate::command::commands::agent_trust::ensure_workflow_agents_trusted(
@@ -424,11 +439,7 @@ impl ExecWorkflowCommand {
                 )
             })?;
             (
-                crate::command::commands::workflow_prerequisites::WorkflowPreflightPlan::dynamic(
-                    agents,
-                    &base_session,
-                    &effective_flags,
-                )?,
+                preflight,
                 Some((dynamic, leader_agent, leader_model, agents_section)),
             )
         };
@@ -512,6 +523,7 @@ impl ExecWorkflowCommand {
             let workflow_name = crate::engine::workflow::workflow_name_for(&workflow);
             let outcome = self
                 .execute_generated_workflow(DynamicExecution {
+                    invocation_id: None,
                     effective_flags,
                     workflow,
                     workflow_path,
@@ -548,6 +560,21 @@ impl ExecWorkflowCommand {
         let leader_work_item_path = &prepared_input.container_path;
 
         // ── Resolve the context(workflow) overlay for the leader. ───────────
+        // Allocate the run identity before planning so the leader, repairs,
+        // generated steps and later resumes all share the same scratch.
+        let invocation_id = uuid::Uuid::new_v4();
+        let _context_lease =
+            crate::data::fs::context_dirs::ContextDirResolver::from_env(leader_session.env())?
+                .workflow_lease(invocation_id)?;
+        let leader_step_info = crate::engine::context_prompt::WorkflowStepInfo {
+            workflow_title: format!("Dynamic workflow for {}", work_item_context.title),
+            current_step_name: "Dynamic workflow planning (leader / repair)".into(),
+            current_step_index: None,
+            total_steps: 0,
+            steps: Vec::new(),
+            work_item_number: work_item_context.number,
+            work_item_title: Some(work_item_context.title.clone()),
+        };
         let (leader_context_overlays, leader_system_prompt) =
             LaunchPolicy::for_session(&leader_session)
                 .with_git(&self.engines.git_engine)
@@ -558,8 +585,8 @@ impl ExecWorkflowCommand {
                         permission: crate::data::config::overlays::OverlayPermission::ReadWrite,
                     }],
                     &leader_agent,
-                    None,
-                    None,
+                    Some(invocation_id),
+                    Some(&leader_step_info),
                     frontend.lock().unwrap().as_mut(),
                 )?;
         let context_dir = leader_context_overlays
@@ -751,6 +778,7 @@ impl ExecWorkflowCommand {
 
         let outcome = self
             .execute_generated_workflow(DynamicExecution {
+                invocation_id: Some(invocation_id),
                 effective_flags: effective_flags.clone(),
                 workflow: validated_workflow,
                 workflow_path: generated_path,
@@ -763,7 +791,8 @@ impl ExecWorkflowCommand {
                 worktree_path,
                 lifecycle,
                 worktree_git_mount,
-                skip_state_resume_prompt: false,
+                // Fresh versus resume was settled before launching the leader.
+                skip_state_resume_prompt: true,
                 prerequisites,
                 frontend: shared,
             })
@@ -903,6 +932,7 @@ impl ExecWorkflowCommand {
         exec: DynamicExecution,
     ) -> Result<ExecWorkflowOutcome, CommandError> {
         let DynamicExecution {
+            invocation_id,
             effective_flags,
             workflow,
             workflow_path,
@@ -957,6 +987,7 @@ impl ExecWorkflowCommand {
         }
 
         let prepared = PreparedRun {
+            invocation_id,
             workflow,
             workflow_path,
             work_item_context: Some(work_item_context),

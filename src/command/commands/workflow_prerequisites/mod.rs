@@ -14,6 +14,8 @@ pub(crate) use plan::WorkflowPreflightPlan;
 mod flags;
 mod flow;
 mod frontend;
+#[cfg(test)]
+mod images;
 mod task_policy;
 mod widening;
 

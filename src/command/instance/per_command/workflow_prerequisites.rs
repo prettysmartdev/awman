@@ -20,6 +20,7 @@ use crate::command::commands::workflow_prerequisites::{
 use crate::command::error::CommandError;
 use crate::command::instance::frontend::InstanceCommandFrontend;
 use crate::data::dialog::{DialogRequest, DialogResponse, ReviewBody, ReviewRequest};
+use crate::data::message::UserMessageSink;
 use crate::data::prompt::{Prompt, TextPrompt};
 use crate::data::workflow_prerequisites::WorkflowPrerequisiteReport;
 use crate::engine::auth::credential::SecretString;
@@ -46,6 +47,9 @@ impl InstanceCommandFrontend {
 }
 
 impl WorkflowPrerequisiteFrontend for InstanceCommandFrontend {
+    fn ask_prerequisite_image(&mut self, prompt: &Prompt<bool>) -> Result<bool, CommandError> {
+        self.ask_prerequisite_prompt(prompt)
+    }
     /// One entry per check, with what continuing leads to pinned above the
     /// choices. A check-only report offers only Close.
     fn show_workflow_prerequisites(
@@ -53,6 +57,15 @@ impl WorkflowPrerequisiteFrontend for InstanceCommandFrontend {
         report: &WorkflowPrerequisiteReport,
         next: PrerequisiteReportNext,
     ) -> Result<(), CommandError> {
+        if self.is_headless_cli() {
+            for text in report.render_lines() {
+                self.write_message(crate::data::message::UserMessage {
+                    level: crate::data::message::MessageLevel::Info,
+                    text,
+                });
+            }
+            return Ok(());
+        }
         let prompt = crate::command::prompts::prerequisite_report(report, next);
         let mut state = ReviewRequest::question(&prompt, ReviewBody::Prerequisites(report.clone()))
             .with_note(prompt.body.clone());

@@ -417,10 +417,10 @@ impl WorkflowState {
 
     /// Rewind this state so a resumed run restarts at `start`.
     ///
-    /// Steps at or after `start` in topological order go back to `Pending`;
-    /// earlier steps that never succeeded are marked `Skipped` so they count as
-    /// satisfied dependencies without being re-run. Unknown `start` names are
-    /// a no-op.
+    /// Reset `start` and its transitive dependents to `Pending`. Unfinished
+    /// prerequisites of `start` are marked `Skipped` so an explicit resume
+    /// past them can advance. Other branches retain their progress, regardless
+    /// of their position in a topological listing. Unknown names are a no-op.
     ///
     /// This is what makes a failed or aborted run resumable at all: such a run
     /// leaves *every* step in a terminal status, which [`Self::is_complete`]
@@ -428,16 +428,38 @@ impl WorkflowState {
     /// instant success and run nothing.
     pub fn rewind_to(&mut self, dag: &WorkflowDag, start: &str) {
         let order = dag.topological_order();
-        let Some(start_idx) = order.iter().position(|n| n == start) else {
+        if !order.iter().any(|name| name == start) {
             return;
-        };
-        for (i, name) in order.iter().enumerate() {
-            if i >= start_idx {
+        }
+
+        // Reverse topological order visits each prerequisite after the step
+        // that needs it, collecting the complete ancestor set in one pass.
+        let mut prerequisites = HashSet::from([start.to_string()]);
+        for name in order.iter().rev() {
+            if prerequisites.contains(name) {
+                prerequisites.extend(dag.dependencies_of(name).iter().cloned());
+            }
+        }
+
+        // A DFS topological suffix can contain unrelated, already completed
+        // steps from earlier stages. Only dependency reachability invalidates
+        // their results, including joins downstream of the selected step.
+        let mut rerun = HashSet::from([start.to_string()]);
+        for name in &order {
+            if rerun.contains(name)
+                || dag
+                    .dependencies_of(name)
+                    .iter()
+                    .any(|dep| rerun.contains(dep))
+            {
+                rerun.insert(name.clone());
                 self.set_status(name, StepState::Pending);
-            } else if !matches!(
-                self.status_of(name),
-                Some(StepState::Succeeded) | Some(StepState::Skipped)
-            ) {
+            } else if prerequisites.contains(name)
+                && !matches!(
+                    self.status_of(name),
+                    Some(StepState::Succeeded) | Some(StepState::Skipped)
+                )
+            {
                 self.set_status(name, StepState::Skipped);
             }
         }

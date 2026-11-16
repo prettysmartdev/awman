@@ -311,7 +311,23 @@ Remove the host-global warning at `prepare.rs:469-495` and replace it with the `
 - **Repo `.awman/config.json` sets `"overlays": ["ssh()"]`** (possible today, silent): this item doesn't change overlay semantics. The prerequisite summary lists credential-bearing overlays that came from repo config ("repo config mounts ~/.ssh into every step"), so the user can see them. Recommend a follow-up work item to put repo-sourced `ssh()` and secret `env()` overlays behind consent.
 - **Worktree runs**: the identity probe must read the worktree's common git dir (`worktree_git_overlay`), not only the checkout. Running `git config --local` from the worktree writes the shared config, and the prompt says so.
 - **Remote API sessions** (server-side clone): the remote URL comes from the session's `repo_url`. Host SSH keys belong to the server operator, so `ssh.use` defaults to `deny` for remote sessions unless global config allows it.
-- **Image probe on builtin runtime (import-only)**: the probe must not trigger a build (`BuildPolicy::ImportOnly`). If the image isn't imported yet, the result is `Unknown`.
+- **Image prerequisites on builtin runtime**: image availability is an explicit
+  prerequisite solve before launching a static step, a dynamic leader, or its
+  generated steps. Interactive CLI/TUI users see each missing agent image and
+  can prepare or abort; headless CLI, API, worker leases and squad prepare
+  automatically under the configured builder opt-in. `--check-prerequisites`
+  only reports missing images and never builds/imports; dynamic checks include
+  the configured leader and discovered agents without launching the leader.
+  Missing images use the shared launch/preflight `AgentImagePreparer` policy:
+  enabled builder plus `BuildAndImport`/`Import` plan selects `SessionSetup`,
+  otherwise retain `ImportOnly`. Build base and agent images only if absent
+  from the compatible local source store; installed images are not rebuilt.
+  Keep Apple missing-content repair. Per-store/reference build leases span
+  inspection, build and import. Raw build output honors the caller's output
+  target; lifecycle messages stay on the message sink. Failed builds retain
+  a bounded output tail and stop the solve before any agent launches.
+  Container-tool probes themselves remain read-only; an unavailable phase
+  image reports `Unknown` until image preparation completes.
 - **`--check-prerequisites` with `--dynamic`**: the leader isn't run. The report is for `WorkflowPrerequisites::assume_all()`.
 - **Concurrent runs writing `prerequisite-grants.json`**: atomic rename plus last-writer-wins per key. Reads are bounded in size, as for `TrustStore`.
 - **Squad task created before this item**: no `prerequisites` policy means `ask`, which headless resolves to deny. On the first run after upgrade, the daemon log and `squad show` say "workflow prerequisite policy not set; run `awman squad edit <task>` to configure". Today's behaviour, where explicit step overlays still work, is preserved.

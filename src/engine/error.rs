@@ -184,11 +184,19 @@ pub enum EngineError {
     #[error("failed to download Dockerfile for agent '{agent}': {message}")]
     AgentDockerfileDownloadFailed { agent: String, message: String },
 
-    #[error("agent image build failed for agent '{agent}' (exit code {exit_code})")]
-    AgentImageBuildFailed { agent: String, exit_code: i32 },
+    #[error("agent image build failed for agent '{agent}' (exit code {exit_code})\n{output}")]
+    AgentImageBuildFailed {
+        agent: String,
+        exit_code: i32,
+        output: String,
+    },
 
-    #[error("image build for tag '{tag}' exited with code {exit_code}")]
-    ImageBuildExitNonzero { tag: String, exit_code: i32 },
+    #[error("image build for tag '{tag}' exited with code {exit_code}\n{output}")]
+    ImageBuildExitNonzero {
+        tag: String,
+        exit_code: i32,
+        output: String,
+    },
 
     // ── squad daemon lifecycle (WI 0113 F-02) ─────────────────────────────
     //

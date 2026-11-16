@@ -245,6 +245,9 @@ pub(crate) fn offer_state_resume(
 /// (WI-0092 §10) — neither path recursively re-enters
 /// `ExecWorkflowCommand::run_with_frontend`.
 pub(crate) struct PreparedRun {
+    /// A fresh dynamic run's identity, allocated before its leader launched.
+    /// `None` lets the engine create or resume the ordinary persisted run.
+    pub(crate) invocation_id: Option<uuid::Uuid>,
     pub(crate) workflow: Workflow,
     pub(crate) workflow_path: PathBuf,
     pub(crate) work_item_context: Option<WorkItemContext>,
@@ -320,6 +323,7 @@ pub(crate) async fn execute_prepared_with_outputs(
         })?;
     }
     let PreparedRun {
+        invocation_id,
         mut workflow,
         workflow_path,
         work_item_context,
@@ -521,25 +525,29 @@ pub(crate) async fn execute_prepared_with_outputs(
         };
         let cleanup_workflow = workflow.clone();
         let cleanup_work_item_context = engine_work_item_context.clone();
-        let mut engine = match WorkflowEngine::resume(
-            &session,
-            crate::engine::workflow::WorkflowSpec::new(workflow)
-                .with_work_item_context(engine_work_item_context)
-                .with_state_root(workflow_state_root.map(Path::to_path_buf))
-                // poll_ci runs on the host with the granted token, never the
-                // ambient GITHUB_TOKEN.
-                .with_ci_token(
-                    prerequisites
-                        .remote("origin")
-                        .and_then(|remote| prerequisites.grants.token_for_remote(&remote)),
-                ),
-            crate::engine::workflow::WorkflowEngineDeps {
-                frontend: proxy.into_workflow_frontend(),
-                agent_factory: Box::new(factory),
-            },
-        )
-        .await
-        {
+        let spec = crate::engine::workflow::WorkflowSpec::new(workflow)
+            .with_invocation_id(invocation_id)
+            .with_work_item_context(engine_work_item_context)
+            .with_state_root(workflow_state_root.map(Path::to_path_buf))
+            // poll_ci runs on the host with the granted token, never the
+            // ambient GITHUB_TOKEN.
+            .with_ci_token(
+                prerequisites
+                    .remote("origin")
+                    .and_then(|remote| prerequisites.grants.token_for_remote(&remote)),
+            );
+        let deps = crate::engine::workflow::WorkflowEngineDeps {
+            frontend: proxy.into_workflow_frontend(),
+            agent_factory: Box::new(factory),
+        };
+        // A new leader has already committed this command to a fresh run.
+        // Never adopt stale state (and its scratch) after planning completes.
+        let initialized = if invocation_id.is_some() {
+            WorkflowEngine::new(&session, spec, deps)
+        } else {
+            WorkflowEngine::resume(&session, spec, deps).await
+        };
+        let mut engine = match initialized {
             Ok(eng) => eng,
             Err(e) => {
                 let err = CommandError::from(e);

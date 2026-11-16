@@ -683,7 +683,7 @@ To build with Apple Containers instead of Docker, use an `apple-local` source:
 | `runtime.builtin.rootDisk` | `30GiB` | Writable root disk (everything outside the mounts), 256MiB or more; sparse, so it only uses host space as the agent writes |
 | `runtime.builtin.mountQuota` | `30GiB` | How much the agent may add to each host mount, the workspace included, beyond what it already held (1MiB or more) |
 | `runtime.builtin.imageSource` | unset | Default image source: an object whose `type` is `registry`, `docker-local`, `archive`, or `apple-local` (macOS) |
-| `runtime.builtin.builder.enabled` | `false` | Opt in to local source-matched Docker or Apple Containers builds during `awman ready`, and when a `chat` or `exec prompt` launch finds its agent image missing; see [Building from a local image source](11-runtimes.md#building-from-a-local-image-source). Repository value overrides global |
+| `runtime.builtin.builder.enabled` | `false` | Opt in to local source-matched Docker or Apple Containers builds during `awman ready`, launches and workflow prerequisites (including worker leases and squad) when an agent image is missing; see [Building from a local image source](11-runtimes.md#building-from-a-local-image-source). Repository value overrides global |
 | `runtime.builtin.images.<tag>` | `{}` | Per-image source; wins over `imageSource` for that tag |
 | `runtime.builtin.registries.<host>` | `{}` | Per-registry `insecure`, `caCert`, and `auth` |
 | `runtime.builtin.network.*` | `mode: public` | Guest network policy: `mode` (`public`/`allowlist`/`none`), `allow` (allowlist names), `hostPorts` (host loopback ports the guest may reach), `nameservers` and `trustHostCas` (global config only) — see [Runtimes: Network](11-runtimes.md#network) |

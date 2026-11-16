@@ -14,6 +14,16 @@ impl AgentImagePreparer {
         let tag = request.tag.to_string();
         let agent = request.agent;
         let mut policy = request.policy;
+        // On-demand preparation of an incompatible source is still an import,
+        // without builder probes, provisioning, or a new build warning.
+        if policy == BuildPolicy::SessionSetup
+            && matches!(
+                self.plan(&tag, agent).selection,
+                BuilderSelection::Incompatible(_)
+            )
+        {
+            policy = BuildPolicy::ImportOnly;
+        }
         let git_root_buf = self.context.git_root.clone();
         let git_root = git_root_buf.as_path();
         let hint = self.context.hint(agent);

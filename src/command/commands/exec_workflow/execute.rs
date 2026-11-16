@@ -393,6 +393,7 @@ impl Command for ExecWorkflowCommand {
         };
 
         let prepared = PreparedRun {
+            invocation_id: None,
             workflow,
             workflow_path,
             work_item_context,

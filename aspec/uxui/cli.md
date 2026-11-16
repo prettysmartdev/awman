@@ -354,9 +354,10 @@ API session setup may also build, when the compatible source store lacks the
 image; it never forces a rebuild. `chat` and `exec prompt` prepare an agent image
 that is not installed the same way, as the Docker and Apple runtimes build a
 missing image at launch; an installed image is only checked against its
-recorded source, and with the builder disabled a launch never acquires. Workflow preflight (static and dynamic) and
-squad image checks remain import-only: they never build or probe a builder, and
-they re-acquire an image that is present but was imported from a different
+recorded source, and with the builder disabled a launch never acquires. Workflow
+preflight (static and dynamic) and squad image checks may build missing images
+through the same explicitly enabled compatible local builder, then import them.
+These checks re-acquire an image that is present but was imported from a different
 source than the one now resolved, so an image they accept is the one `ready`
 would have accepted. Like `ready`, they refuse to import a default source that
 names a single image (an archive or a fixed reference) for any agent other than

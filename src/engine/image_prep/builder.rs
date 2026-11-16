@@ -64,6 +64,29 @@ impl HostLocalImageBuilder {
 }
 
 impl HostLocalImageBuilder {
+    fn run_build(
+        &self,
+        request: &BuildRequest,
+        command: Command,
+        control: &BuildControl,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), EngineError> {
+        let output = crate::engine::agent_runtime::OutputTail::new(20);
+        let status = self.run_host(&request.target, command, control, &mut |line| {
+            output.push_bytes(line.as_bytes());
+            output.push_bytes(b"\n");
+            on_line(line);
+        })?;
+        if !status.success() {
+            return Err(EngineError::ImageBuildExitNonzero {
+                tag: request.reference.clone(),
+                exit_code: status.code().unwrap_or(-1),
+                output: output.snapshot_text(),
+            });
+        }
+        Ok(())
+    }
+
     fn bound_command(&self, target: &BuildTarget) -> Command {
         match target {
             BuildTarget::Runtime => crate::engine::host_cli::command(&self.env, "docker"),
@@ -412,7 +435,7 @@ impl LocalImageBuilder for HostLocalImageBuilder {
                 };
                 command.args(argv.to_args());
                 let mut produced_manifest = None;
-                let status = self.run_host(&request.target, command, control, &mut |line| {
+                self.run_build(request, command, control, &mut |line| {
                     if let Some(marker) = line.find("exporting manifest sha256:") {
                         let digest = line[marker + "exporting manifest ".len()..]
                             .split_whitespace()
@@ -422,12 +445,6 @@ impl LocalImageBuilder for HostLocalImageBuilder {
                     }
                     on_line(line);
                 })?;
-                if !status.success() {
-                    return Err(EngineError::ImageBuildExitNonzero {
-                        tag: request.reference.clone(),
-                        exit_code: status.code().unwrap_or(-1),
-                    });
-                }
                 let produced_manifest = produced_manifest.ok_or_else(|| {
                     EngineError::ImageBuilder(BuilderFailure::AppleManifestUnreported)
                 })?;
@@ -508,13 +525,7 @@ impl HostLocalImageBuilder {
         };
         let mut command = self.docker_command(endpoint);
         command.args(argv.to_args());
-        let status = self.run_host(&request.target, command, control, on_line)?;
-        if !status.success() {
-            return Err(EngineError::ImageBuildExitNonzero {
-                tag: request.reference.clone(),
-                exit_code: status.code().unwrap_or(-1),
-            });
-        }
+        self.run_build(request, command, control, on_line)?;
         let raw = std::fs::read_to_string(iid.path()).map_err(|e| {
             EngineError::ImageBuilder(BuilderFailure::ImageIdFileRead {
                 detail: e.to_string(),
@@ -595,3 +606,67 @@ const DOCKER_AMBIENT_ENV: &[&str] = &[
     "DOCKER_CERT_PATH",
     "BUILDX_BUILDER",
 ];
+
+#[cfg(all(test, unix))]
+mod contracts {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    struct Failing;
+    impl HostCommandRunner for Failing {
+        fn run(
+            &self,
+            _: Command,
+            _: &BuildControl,
+            on_line: &mut dyn FnMut(&str),
+        ) -> Result<std::process::ExitStatus, EngineError> {
+            for i in 0..40 {
+                on_line(&format!("build progress {i}"));
+            }
+            on_line("stderr: invalid build option");
+            Ok(std::process::ExitStatus::from_raw(64 << 8))
+        }
+    }
+    #[test]
+    fn apple_and_docker_build_failures_retain_bounded_output_without_hiding_streamed_lines() {
+        let builder = HostLocalImageBuilder {
+            env: crate::data::config::env::EnvSnapshot::from_full_env(Default::default()),
+            runner: Arc::new(Failing),
+        };
+        for target in [
+            BuildTarget::Apple,
+            BuildTarget::Docker {
+                endpoint: "unix:///test.sock".into(),
+            },
+        ] {
+            let request = BuildRequest {
+                target,
+                reference: "test:latest".into(),
+                dockerfile: "Dockerfile".into(),
+                context: ".".into(),
+                platform: OciPlatform::host_linux(),
+                build_args: vec![],
+                no_cache: false,
+            };
+            let mut lines = vec![];
+            let error = builder
+                .run_build(
+                    &request,
+                    builder.bound_command(&request.target),
+                    &BuildControl::source_build(crate::engine::oci::CancelToken::new()),
+                    &mut |line| lines.push(line.to_string()),
+                )
+                .unwrap_err();
+            assert_eq!(lines.len(), 41);
+            let EngineError::ImageBuildExitNonzero {
+                output, exit_code, ..
+            } = &error
+            else {
+                panic!("wrong error")
+            };
+            assert_eq!(*exit_code, 64);
+            assert_eq!(output.lines().count(), 20);
+            assert!(error.to_string().contains("stderr: invalid build option"));
+            assert!(!output.contains("build progress 0\n"));
+        }
+    }
+}

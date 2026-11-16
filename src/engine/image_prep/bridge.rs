@@ -4,8 +4,6 @@
 use std::sync::Arc;
 
 use crate::data::oci_identity::OciPlatform;
-use crate::data::setup_step::SetupStep;
-use crate::data::step_status::StepStatus;
 use crate::engine::error::EngineError;
 use crate::engine::oci::CancelToken;
 
@@ -148,7 +146,9 @@ impl AgentImagePreparer {
     ) -> Result<BuiltImageIdentity, EngineError> {
         let builder = self.builder();
         let cancel = self.cancel.clone();
-        stream(
+        let tag = request.reference.clone();
+        sink.build_started(&tag);
+        let result = stream(
             cancel.clone(),
             move |tx| {
                 builder.build(
@@ -159,9 +159,14 @@ impl AgentImagePreparer {
                     },
                 )
             },
-            |line| sink.report_step(&SetupStep::output(line), StepStatus::Running),
+            |line| sink.build_output(&line),
         )
-        .await
+        .await;
+        sink.build_finished(
+            &tag,
+            result.as_ref().err().map(ToString::to_string).as_deref(),
+        );
+        result
     }
     pub(super) async fn import_source(
         &self,

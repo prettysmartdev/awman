@@ -618,7 +618,7 @@ message = "Done"
                 .checks
                 .iter()
                 .filter_map(|check| {
-                    if let WorkflowPrerequisite::AgentImage { agent } = &check.prerequisite {
+                    if let WorkflowPrerequisite::AgentImage { agent, .. } = &check.prerequisite {
                         if agent == "codex" {
                             assert_eq!(check.status, PrerequisiteStatus::Missing);
                         }
@@ -709,6 +709,7 @@ message = "Done"
                 token.clone(),
                 WorkflowPrerequisite::AgentImage {
                     agent: "claude".into(),
+                    tag: awman::data::image_tags::agent_image_tag(session.git_root(), "claude"),
                 },
             ]
             .into_iter()

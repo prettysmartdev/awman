@@ -66,7 +66,7 @@ impl PrerequisiteStepKind {
 impl WorkflowPrerequisite {
     pub fn label(&self) -> String {
         match self {
-            Self::AgentImage { agent } => format!("Agent image: {agent}"),
+            Self::AgentImage { agent, .. } => format!("Agent image: {agent}"),
             Self::GitIdentity => "Git identity".into(),
             Self::GitRemote { remote } => format!("Git remote {remote}"),
             Self::PushAuth { remote } => format!("Push authentication ({remote})"),

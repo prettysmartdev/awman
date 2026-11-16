@@ -861,6 +861,7 @@ export interface StepRef {
 
 // Rust: data::workflow_prerequisites::WorkflowPrerequisite (tag = "type"); GitHubToken → "git_hub_token"
 export type WorkflowPrerequisite =
+  | { type: 'agent_image'; agent: string; tag: string }
   | { type: 'git_identity' }
   | { type: 'git_remote'; remote: string }
   | { type: 'push_auth'; remote: string }
@@ -882,6 +883,7 @@ export type PrerequisitePhase = 'start' | 'before_teardown';
 
 // Rust: data::workflow_prerequisites::Remediation (tag = "type")
 export type Remediation =
+  | { type: 'prepare_image' }
   | { type: 'replace_rejected_token' }
   | { type: 'use_host_identity'; name: string; email: string }
   | { type: 'use_repo_config_identity'; name: string; email: string }

@@ -266,7 +266,7 @@ pub enum CommandError {
     // ── Workflow prerequisites (WI 0149) ──────────────────────────────────
     /// A prerequisite is still unsatisfied after prompts and policy, and the
     /// `unresolved` policy is `fail`. Raised before any container starts.
-    #[error("workflow prerequisites unresolved: {}", report.summary_line())]
+    #[error("workflow prerequisites unresolved: {}", report.failure_summary())]
     WorkflowPrerequisitesUnresolved {
         report: Box<crate::data::workflow_prerequisites::WorkflowPrerequisiteReport>,
     },
