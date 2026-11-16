@@ -554,6 +554,8 @@ pub(crate) use shared_frontend::SharedWorkflowFrontend;
 
 #[cfg(test)]
 mod contract_tests;
+#[cfg(test)]
+mod dockerfile_preflight_contracts;
 
 // The child modules' items are `pub(super)`; re-exporting them here is what
 // lets each one say `use super::*;` and see the others, exactly as they all

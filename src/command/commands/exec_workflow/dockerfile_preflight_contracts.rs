@@ -1,12 +1,11 @@
-use super::super::*;
-use awman_test_support::{fixtures::ConfigTree, TestCase, TestSandbox, Tier};
+// These contracts combine session loading, configuration and workflow preflight.
+// Keep them in the component suite for both default and builtin feature builds.
+use super::*;
+use awman_test_support::{fixtures::ConfigTree, TestCase, TestSandbox};
 use serde_json::json;
 
 fn sandbox(id: &'static str) -> TestSandbox {
-    TestSandbox::for_test(TestCase {
-        id,
-        tier: Tier::Unit,
-    })
+    TestSandbox::for_test(TestCase::component(id))
 }
 
 fn session(s: &TestSandbox) -> Session {
@@ -58,7 +57,7 @@ fn flags() -> ExecWorkflowCommandFlags {
 
 #[test]
 fn missing_project_dockerfiles_list_every_agent_and_init_action_without_writes() {
-    let s = sandbox("command::commands::exec_workflow::contract_tests::dockerfile_preflight::missing_project_dockerfiles_list_every_agent_and_init_action_without_writes");
+    let s = sandbox("command::commands::exec_workflow::dockerfile_preflight_contracts::missing_project_dockerfiles_list_every_agent_and_init_action_without_writes");
     ConfigTree::new()
         .repo(json!({"workflows":{"dynamic":{"agentsToModels":{
             "codex":["model"], "claude":["model"]
@@ -98,7 +97,7 @@ fn missing_project_dockerfiles_list_every_agent_and_init_action_without_writes()
 
 #[test]
 fn prepared_agents_pass_and_global_model_maps_still_skip_missing_agents() {
-    let s = sandbox("command::commands::exec_workflow::contract_tests::dockerfile_preflight::prepared_agents_pass_and_global_model_maps_still_skip_missing_agents");
+    let s = sandbox("command::commands::exec_workflow::dockerfile_preflight_contracts::prepared_agents_pass_and_global_model_maps_still_skip_missing_agents");
     ConfigTree::new()
         .global(json!({"workflows":{"dynamic":{"agentsToModels":{
             "codex":["model"]
@@ -126,7 +125,7 @@ fn prepared_agents_pass_and_global_model_maps_still_skip_missing_agents() {
 
 #[test]
 fn generated_workflow_missing_dockerfiles_do_not_consume_leader_repairs() {
-    let s = sandbox("command::commands::exec_workflow::contract_tests::dockerfile_preflight::generated_workflow_missing_dockerfiles_do_not_consume_leader_repairs");
+    let s = sandbox("command::commands::exec_workflow::dockerfile_preflight_contracts::generated_workflow_missing_dockerfiles_do_not_consume_leader_repairs");
     let session = session(&s);
     let path = s.work().join("workflow.toml");
     let content = "[[step]]\nname = 'work'\nagent = 'claude'\nprompt = 'work'\n";
