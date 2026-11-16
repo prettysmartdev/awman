@@ -10,6 +10,7 @@ mod differential;
 mod draft_sync;
 mod failures;
 mod models;
+mod read_only_workspace;
 mod relay;
 mod scaffolding;
 mod scenarios;

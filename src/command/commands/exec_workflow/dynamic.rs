@@ -1041,6 +1041,7 @@ impl ExecWorkflowCommand {
             self.managed_session.as_ref(),
             &self.cancel,
             self.output_dir.as_deref(),
+            self.workspace_access,
         )
         .await
     }

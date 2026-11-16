@@ -60,7 +60,11 @@ impl super::ExecPromptCommand {
             ctx.session.clone(),
         )
         .with_cancellation(ctx.cancel.clone())
-        .with_output_dir(ctx.output_dir.clone()))
+        .with_output_dir(ctx.output_dir.clone())
+        .with_workspace_access(crate::data::workspace::WorkspaceAccess::from_read_only(
+            ctx.flags
+                .bool(crate::data::workspace::READ_ONLY_WORKSPACE_FLAG),
+        )))
     }
 }
 

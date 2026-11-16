@@ -274,6 +274,7 @@ impl BuiltinBackend {
         Ok(summary)
     }
     fn plan(&self, options: ResolvedContainerOptions) -> Result<LaunchPlan, EngineError> {
+        options.validate_read_only_workspace()?;
         if options.allow_docker {
             return Err(unsupported("Docker socket bridge"));
         }
@@ -340,6 +341,11 @@ impl BuiltinBackend {
                 &options.labels,
             )?,
             mounts: mounts(&overlays)?,
+            tmpfs: options
+                .tmpfs
+                .iter()
+                .map(|p| guest_path(p))
+                .collect::<Result<_, _>>()?,
             mount_owner: image_owner(user.as_deref(), &config.accounts)?,
             vcpus,
             memory_mib,
@@ -649,6 +655,7 @@ impl ContainerBackend for BuiltinBackend {
                 &[],
             )?,
             mounts: Vec::new(),
+            tmpfs: Vec::new(),
             mount_owner: None,
             vcpus: 1,
             memory_mib: launch.memory_mib,
@@ -859,6 +866,7 @@ impl ContainerBackend for BuiltinBackend {
                 &[],
             )?,
             mounts: mounted,
+            tmpfs: Vec::new(),
             mount_owner: image_owner(config.user.as_deref(), &config.accounts)?,
             vcpus: launch.vcpus,
             memory_mib: launch.memory_mib,
@@ -1027,5 +1035,102 @@ fn acquire_request(request: &ImageImportRequest) -> AcquireRequest {
             AcquirePolicy::IfMissing
         },
         registries: request.registries.clone(),
+    }
+}
+
+#[cfg(test)]
+mod workspace_access_tests {
+    use super::*;
+    use awman_test_support::{TestCase, TestSandbox};
+    use std::path::PathBuf;
+
+    // Planning must not create or execute a VM. Only image metadata is used.
+    struct ImageOnlyDriver;
+    impl SandboxDriver for ImageOnlyDriver {
+        fn create(&self, _: SandboxSpec) -> Result<(), EngineError> {
+            panic!("unexpected VM creation")
+        }
+        fn get(&self, _: &str) -> Result<SandboxSummary, EngineError> {
+            panic!("unexpected guest access")
+        }
+        fn list(&self) -> Result<Vec<SandboxSummary>, EngineError> {
+            panic!("unexpected guest access")
+        }
+        fn exec(&self, _: &str, _: ExecRequest) -> Result<ExecSession, EngineError> {
+            panic!("unexpected guest execution")
+        }
+        fn finish_owned(&self, _: &str, _: &str, _: Duration, _: bool) -> Result<(), EngineError> {
+            panic!("unexpected guest cleanup")
+        }
+        fn remove_stopped(&self, _: &str) -> Result<(), EngineError> {
+            panic!("unexpected guest cleanup")
+        }
+        fn stats(&self, _: &str) -> Result<crate::engine::agent_runtime::AgentStats, EngineError> {
+            panic!("unexpected guest stats")
+        }
+        fn image_config(&self, _: &str) -> Result<Option<SandboxImageConfig>, EngineError> {
+            Ok(Some(SandboxImageConfig::default()))
+        }
+        fn import_archive(&self, _: PathBuf, _: String) -> Result<(), EngineError> {
+            panic!("unexpected image import")
+        }
+        fn remove_image(&self, _: &str) -> Result<(), EngineError> {
+            panic!("unexpected image removal")
+        }
+    }
+
+    #[test]
+    fn read_only_builtin_plan_carries_tmpfs_and_writable_output_context() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::builtin::backend::workspace_access_tests::read_only_builtin_plan_carries_tmpfs_and_writable_output_context"));
+        let root = sandbox.root().join("builtin");
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = BuiltinBackend {
+            driver: Arc::new(ImageOnlyDriver),
+            paths: BuiltinPaths { home: root.clone() },
+            settings: BuiltinRuntimeSettings {
+                state_dir: root,
+                ambient_overrides: Vec::new(),
+                test_isolation: true,
+            },
+            owner: "test-owner".into(),
+            background_env: Mutex::new(Default::default()),
+            notices: Mutex::new(Vec::new()),
+            cancel_grace: Duration::from_secs(1),
+        };
+        assert!(backend.capabilities().read_only_workspace());
+        let mut options =
+            crate::engine::container::options::workspace_access_tests::options(&sandbox);
+        options.builtin_launch = Some(Box::default());
+        let prompt = sandbox.root().join("prompt");
+        std::fs::write(&prompt, "Review only").unwrap();
+        options.system_prompt_env_file = Some((
+            "SYSTEM_PROMPT".into(),
+            prompt,
+            "/tmp/awman-ctx-prompt-test".into(),
+        ));
+        let plan = backend.plan(options.clone()).unwrap();
+        assert_eq!(plan.spec.tmpfs, ["/tmp"]);
+        assert!(plan
+            .spec
+            .mounts
+            .iter()
+            .any(|m| m.guest == "/workspace" && m.read_only));
+        assert!(plan
+            .spec
+            .mounts
+            .iter()
+            .any(|m| m.guest == "/awman/output" && !m.read_only));
+        assert!(plan
+            .spec
+            .mounts
+            .iter()
+            .any(|m| m.guest == "/awman/context/repo" && !m.read_only));
+        assert!(plan
+            .spec
+            .mounts
+            .iter()
+            .any(|m| m.guest == "/tmp/awman-ctx-prompt-test" && m.read_only));
+        options.overlays[0].permission = OverlayPermission::ReadWrite;
+        assert!(backend.plan(options).is_err());
     }
 }

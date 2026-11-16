@@ -294,6 +294,7 @@ Available via: CLI, TUI, API
 | `--branch` | string (optional) | — | — | `--pr`, `--worktree` | CLI, TUI | Run in a worktree for this branch. |
 | `--pr` | string (optional) | — | — | `--branch`, `--worktree` | CLI, TUI | Run in a worktree for this GitHub pull request. |
 | `--worktree` | string (optional) | — | — | `--branch`, `--pr` | CLI, TUI | Reuse an existing named or path-based Git worktree. |
+| `--read-only-workspace` | bool | false | — | `--allow-docker` | CLI, TUI, API | Mount the workspace read-only; the agent can write only to /awman/output, mounted contexts and /tmp. |
 
 ### `awman exec workflow`
 
@@ -332,6 +333,7 @@ Available via: CLI, TUI, API
 | `--prerequisite-unresolved` | enum: warn, fail | — | — | — | CLI, TUI, API | What an unsatisfied workflow prerequisite does: warn and continue, or fail before any container starts. |
 | `--check-prerequisites` | bool | false | — | — | CLI, TUI, API | Run only the workflow prerequisite checks, print the report and exit 0 when all checks are satisfied or 1 when any check is missing, needs consent or is unknown. |
 | `--json` | bool | false | `--headless` | — | CLI, TUI, API | Print the workflow outcome and prerequisite report as JSON. |
+| `--read-only-workspace` | bool | false | — | `--allow-docker` | CLI, TUI, API | Mount the workspace read-only; the agent can write only to /awman/output, mounted contexts and /tmp. |
 
 ---
 
@@ -692,6 +694,7 @@ Runs without a working agent runtime — reachable even when the configured runt
 | `--prerequisite-token` | string (optional) | — | — | — | CLI, TUI, API | GitHub token for create_pull_request, an HTTPS push_branch and poll_ci: env:NAME, acquire (the configured token command), or deny. Never granted by --yes. |
 | `--prerequisite-unresolved` | enum: warn, fail | — | — | — | CLI, TUI, API | What an unsatisfied workflow prerequisite does: warn and continue, or fail before any container starts. |
 | `--check-prerequisites` | bool | false | — | — | CLI, TUI, API | Run only the workflow prerequisite checks, print the report and exit 0 when all checks are satisfied or 1 when any check is missing, needs consent or is unknown. |
+| `--read-only-workspace` | bool | false | — | `--allow-docker` | CLI, TUI, API | Mount the workspace read-only; the agent can write only to /awman/output, mounted contexts and /tmp. |
 
 #### `awman remote exec prompt`
 
@@ -720,6 +723,7 @@ Runs without a working agent runtime — reachable even when the configured runt
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
 | `--work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
 | `--interactive` | bool | false | — | `--headless` | CLI, TUI, API | Run the agent interactively in a terminal (PTY). Overrides a daemon worker's headless default where the worker allows it. |
+| `--read-only-workspace` | bool | false | — | `--allow-docker` | CLI, TUI, API | Mount the workspace read-only; the agent can write only to /awman/output, mounted contexts and /tmp. |
 
 ---
 

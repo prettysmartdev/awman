@@ -139,3 +139,88 @@ pub async fn workflow_preflight_is_read_only_and_missing_work_is_typed(
     assert_eq!(missing.exit, Exit::Code(4), "{}", missing.stderr_text());
     json!({"preflight_exit":0,"missing_exit":4,"workflow_unchanged":true})
 }
+
+/// WI 0152: the CLI refuses the read-only option in the same typed way on
+/// every backend, before any container is launched, and the help text names
+/// it. The trace is compared across backends by the differential test.
+pub async fn read_only_workspace_refusals_are_typed_and_precede_launch(
+    backend: &Backend,
+    s: &TestSandbox,
+) -> Value {
+    let repo = RepoBuilder::new(s, "read-only")
+        .file("README.md", "fixture\n")
+        .file(
+            "setup.toml",
+            "title = 's'\n\n[[setup]]\ntype = 'run_shell'\ncommand = 'true'\n\n[[step]]\nname = 'run'\nprompt = 'look'\n",
+        )
+        .file(
+            "plain.toml",
+            "title = 'p'\n\n[[step]]\nname = 'run'\nprompt = 'look'\n",
+        )
+        .init();
+    let run = |args: &[&str]| {
+        let out = crate::support::awman(s)
+            .envs(&backend.env())
+            .args(args)
+            .current_dir(repo.path())
+            .run();
+        let text = format!("{}{}", out.stdout_text(), out.stderr_text());
+        (out.exit, text)
+    };
+    let help = run(&["exec", "prompt", "--help"]);
+    assert_eq!(help.0, Exit::Code(0), "{}", help.1);
+    assert!(help.1.contains("--read-only-workspace"), "{}", help.1);
+
+    let docker = run(&[
+        "exec",
+        "prompt",
+        "--read-only-workspace",
+        "--allow-docker",
+        "look",
+    ]);
+    assert_ne!(docker.0, Exit::Code(0), "{}", docker.1);
+    assert!(
+        docker.1.contains("read-only-workspace") && docker.1.contains("allow-docker"),
+        "{}",
+        docker.1
+    );
+
+    let dynamic = run(&[
+        "exec",
+        "workflow",
+        "--dynamic",
+        "--read-only-workspace",
+        "--headless",
+    ]);
+    assert_ne!(dynamic.0, Exit::Code(0), "{}", dynamic.1);
+    assert!(dynamic.1.contains("--dynamic"), "{}", dynamic.1);
+
+    let setup = run(&[
+        "exec",
+        "workflow",
+        "setup.toml",
+        "--read-only-workspace",
+        "--headless",
+    ]);
+    assert_ne!(setup.0, Exit::Code(0), "{}", setup.1);
+    assert!(setup.1.contains("setup or teardown"), "{}", setup.1);
+
+    // The option is accepted by the preflight-only path of a plain workflow.
+    let ok = run(&[
+        "exec",
+        "workflow",
+        "plain.toml",
+        "--read-only-workspace",
+        "--check-prerequisites",
+        "--headless",
+        "--json",
+    ]);
+    assert_eq!(ok.0, Exit::Code(0), "{}", ok.1);
+    json!({
+        "help_names_flag": true,
+        "allow_docker_refused": true,
+        "dynamic_refused": true,
+        "setup_refused": true,
+        "check_exit": 0,
+    })
+}

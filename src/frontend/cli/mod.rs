@@ -201,10 +201,14 @@ pub(crate) fn format_error(err: &CommandError) -> String {
             reason.clone()
         }
         CommandError::InvalidFlagValue { command, flag, reason } => {
-            format!(
-                "invalid value for --{flag} on `{}`: {reason}",
-                command.join(" ")
-            )
+            if command.is_empty() {
+                format!("invalid value for --{flag}: {reason}")
+            } else {
+                format!(
+                    "invalid value for --{flag} on `{}`: {reason}",
+                    command.join(" ")
+                )
+            }
         }
         CommandError::InvalidArgumentValue {
             command,
@@ -255,7 +259,8 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         CommandError::DaemonNotRunning
         | CommandError::DaemonAlreadyRunning { .. }
         | CommandError::DaemonNoFeatures
-        | CommandError::DaemonHttpStatus { .. } => err.to_string(),
+        | CommandError::DaemonHttpStatus { .. }
+        | CommandError::ReadOnlyWorkspaceUnsupported { .. } => err.to_string(),
         CommandError::RemoteSessionMissing => {
             "no remote session id; pass --session <id> or run `awman remote session start` first".into()
         }

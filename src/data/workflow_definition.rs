@@ -63,6 +63,24 @@ pub struct WorkflowStep {
     pub overlays: Option<Vec<String>>,
     #[serde(default)]
     pub abort_on_failure: bool,
+    /// Mount the workspace read-only for this agent step (`read_only_workspace
+    /// = true`). Absent means `false`, so existing workflow files are
+    /// unchanged. The command-level `--read-only-workspace` can only add to
+    /// this, never clear it (see [`WorkflowStep::workspace_access`]).
+    #[serde(default)]
+    pub read_only_workspace: bool,
+}
+
+impl WorkflowStep {
+    /// The workspace access this step runs with, given the command-level
+    /// request. Read-only from either source wins.
+    pub fn workspace_access(
+        &self,
+        command: crate::data::workspace::WorkspaceAccess,
+    ) -> crate::data::workspace::WorkspaceAccess {
+        crate::data::workspace::WorkspaceAccess::from_read_only(self.read_only_workspace)
+            .strictest(command)
+    }
 }
 
 /// How a `clone_repo` setup step handles a target directory that already
@@ -327,6 +345,8 @@ struct RawStep {
     overlays: Option<Vec<String>>,
     #[serde(default)]
     abort_on_failure: bool,
+    #[serde(default)]
+    read_only_workspace: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -395,6 +415,7 @@ fn raw_to_steps(raw: Vec<RawStep>) -> Result<Vec<WorkflowStep>, DataError> {
             model: r.model,
             overlays: r.overlays,
             abort_on_failure: r.abort_on_failure,
+            read_only_workspace: r.read_only_workspace,
         });
     }
     if steps.is_empty() {
@@ -437,4 +458,80 @@ fn parse_yaml(content: &str) -> Result<Workflow, DataError> {
         teardown: parsed.teardown,
         teardown_on_failure: parsed.teardown_on_failure,
     })
+}
+
+#[cfg(test)]
+mod read_only_workspace_tests {
+    use super::*;
+    use crate::data::workspace::WorkspaceAccess;
+
+    const TOML: &str = r#"
+title = "review"
+
+[[step]]
+name = "plan"
+prompt = "Plan it"
+read_only_workspace = true
+
+[[step]]
+name = "build"
+prompt = "Build it"
+depends_on = ["plan"]
+"#;
+
+    const YAML: &str = r#"
+title: review
+steps:
+  - name: plan
+    prompt: Plan it
+    read_only_workspace: true
+  - name: build
+    prompt: Build it
+    depends_on: [plan]
+"#;
+
+    #[test]
+    fn step_field_parses_in_toml_and_yaml_and_defaults_to_false() {
+        for (content, format) in [(TOML, WorkflowFormat::Toml), (YAML, WorkflowFormat::Yaml)] {
+            let workflow = Workflow::parse(content, format).unwrap();
+            assert!(workflow.steps[0].read_only_workspace);
+            assert!(!workflow.steps[1].read_only_workspace);
+        }
+    }
+
+    #[test]
+    fn a_non_boolean_value_is_refused_rather_than_treated_as_writable() {
+        let content = TOML.replace(
+            "read_only_workspace = true",
+            "read_only_workspace = \"yes\"",
+        );
+        assert!(Workflow::parse(&content, WorkflowFormat::Toml).is_err());
+    }
+
+    #[test]
+    fn serialized_steps_without_the_field_still_deserialize() {
+        let step: WorkflowStep =
+            serde_json::from_str(r#"{"name":"a","prompt_template":"p"}"#).unwrap();
+        assert!(!step.read_only_workspace);
+        let json = serde_json::to_value(&step).unwrap();
+        assert_eq!(json["read_only_workspace"], false);
+    }
+
+    #[test]
+    fn step_access_is_read_only_when_either_source_asks() {
+        let workflow = Workflow::parse(TOML, WorkflowFormat::Toml).unwrap();
+        let (plan, build) = (&workflow.steps[0], &workflow.steps[1]);
+        assert!(plan
+            .workspace_access(WorkspaceAccess::ReadWrite)
+            .is_read_only());
+        assert!(plan
+            .workspace_access(WorkspaceAccess::ReadOnly)
+            .is_read_only());
+        assert!(!build
+            .workspace_access(WorkspaceAccess::ReadWrite)
+            .is_read_only());
+        assert!(build
+            .workspace_access(WorkspaceAccess::ReadOnly)
+            .is_read_only());
+    }
 }

@@ -17,6 +17,7 @@ use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
 use crate::data::session::{AgentName, Session};
 use crate::data::setup_step::{AgentSetupStep, SetupStep};
 use crate::data::step_status::StepStatus;
+use crate::data::workspace::{WorkspaceAccess, WorkspaceMountSpec};
 use crate::engine::agent_runtime::{AgentRuntimeEngine, ResolvedAgentOptions};
 use crate::engine::auth::{AgentCredentials, CredentialDelivery, RefreshableCredentialDelivery};
 use crate::engine::container::options::{
@@ -25,6 +26,7 @@ use crate::engine::container::options::{
 use crate::engine::error::EngineError;
 use crate::engine::overlay::{ContextOverlay, DirectorySpec, OverlayEngine, OverlayRequest};
 use crate::engine::sandbox::options::SandboxOption;
+use crate::engine::worker::lease_workspace::{read_only_unsupported, validate_workspace_mounts};
 
 pub mod custom;
 pub mod definition;
@@ -294,86 +296,67 @@ pub const READ_ONLY_SCRATCH_PATH: &str = "/awman/scratch";
 /// Environment variable naming [`READ_ONLY_SCRATCH_PATH`] inside the container.
 pub const READ_ONLY_SCRATCH_ENV: &str = "AWMAN_SCRATCH";
 
-fn read_only_unsupported(runtime: &str) -> EngineError {
-    EngineError::Config(format!(
-        "the {runtime} runtime cannot mount the workspace read-only; this run requires a read-only workspace"
-    ))
-}
-
-/// Runs after all overlays are assembled and before any runtime sees them.
-fn validate_workspace_mounts(
-    options: &mut [ContainerOption],
-    workspace: &Path,
+fn emit_read_only_workspace_env(
+    def: &AgentDefinition,
+    container_home: &str,
     read_only: bool,
-    lease_scope: Option<&Path>,
-    inline_file: Option<&Path>,
-    command_mounts: &[crate::engine::container::options::OverlaySpec],
+    options: &mut Vec<ContainerOption>,
 ) -> Result<(), EngineError> {
-    use crate::engine::container::options::OverlayPermission;
-    let workspace = workspace
-        .canonicalize()
-        .map_err(|e| EngineError::io(workspace, e))?;
-    let inline_file = inline_file.and_then(|path| path.canonicalize().ok());
-    let lease_root = lease_scope
-        .map(|scope| scope.canonicalize())
-        .transpose()
-        .map_err(|e| EngineError::Config(format!("lease workspace: {e}")))?;
-    for option in options {
-        let ContainerOption::Overlay(spec) = option else {
-            continue;
-        };
-        let host = spec
-            .host_path
-            .canonicalize()
-            .map_err(|e| EngineError::io(&spec.host_path, e))?;
-        if let Some(clone) = &lease_root {
-            if !host.starts_with(clone)
-                && inline_file.as_deref() != Some(host.as_path())
-                && !command_mounts.iter().any(|allowed| {
-                    // Compare resolved paths: on macOS a temporary directory is
-                    // reached through a symlink (/var -> /private/var).
-                    allowed
-                        .host_path
-                        .canonicalize()
-                        .unwrap_or_else(|_| allowed.host_path.clone())
-                        == host
-                        && allowed.container_path == spec.container_path
-                        && allowed.permission == spec.permission
-                })
-            {
-                return Err(EngineError::Config(
-                    "overlay exposes a path outside the lease workspace".into(),
-                ));
-            }
-        }
-        let guest = &spec.container_path;
-        if guest.components().any(|part| {
-            matches!(
-                part,
-                std::path::Component::ParentDir | std::path::Component::CurDir
-            )
-        }) {
-            return Err(EngineError::Config(
-                "overlay guest path must be normalized".into(),
-            ));
-        }
-        let guest_workspace = Path::new("/workspace");
-        if guest_workspace.starts_with(guest) && (guest != guest_workspace || host != workspace) {
-            return Err(EngineError::Config(
-                "overlay overlaps the workspace mount".into(),
-            ));
-        }
-        if read_only
-            && (host.starts_with(&workspace)
-                || workspace.starts_with(&host)
-                || guest.starts_with(guest_workspace))
+    if !read_only {
+        return Ok(());
+    }
+    if !Path::new(container_home).is_absolute()
+        || Path::new(container_home).starts_with(crate::data::workspace::WORKSPACE_GUEST_PATH)
+    {
+        return Err(EngineError::Config(
+            "read-only workspace requires an absolute writable agent home outside /workspace"
+                .into(),
+        ));
+    }
+    let mut redirects = vec![
+        (
+            "XDG_CACHE_HOME".to_owned(),
+            Path::new(container_home).join(".cache"),
+        ),
+        (
+            "XDG_STATE_HOME".to_owned(),
+            Path::new(container_home).join(".local/state"),
+        ),
+        (
+            "TMPDIR".to_owned(),
+            crate::data::workspace::SCRATCH_TMPFS_PATH.into(),
+        ),
+    ];
+    for redirect in &def.read_only_workspace_redirects {
+        let path = Path::new(&redirect.home_relative_path);
+        if redirect.home_relative_path.is_empty()
+            || !path
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
         {
-            spec.permission = OverlayPermission::ReadOnly;
+            return Err(EngineError::Config(format!(
+                "invalid read-only workspace redirect path: {}",
+                redirect.home_relative_path
+            )));
         }
-        if inline_file.as_deref() == Some(host.as_path()) {
-            spec.permission = OverlayPermission::ReadOnly;
+        redirects.push((
+            redirect.env_var.clone(),
+            Path::new(container_home).join(path),
+        ));
+    }
+    for (key, path) in redirects {
+        // Explicit env() overlays and per-launch secrets take precedence.
+        if !options.iter().any(|option| match option {
+            ContainerOption::EnvPassthrough(var) => var.0 == key,
+            ContainerOption::EnvLiteral(var) => var.key == key,
+            ContainerOption::EnvOverride { key: name, .. } => name == &key,
+            _ => false,
+        }) {
+            options.push(ContainerOption::EnvLiteral(EnvLiteral {
+                key,
+                value: path.to_string_lossy().into_owned(),
+            }));
         }
-        spec.host_path = host;
     }
     Ok(())
 }
@@ -431,7 +414,11 @@ impl AgentEngine {
     /// workspace is read-only.
     fn workspace_mounts(&self, session: &Session) -> Result<Vec<ContainerOption>, EngineError> {
         use crate::engine::container::options::{MountGuard, OverlayPermission, OverlaySpec};
-        let permission = if self.read_only_workspace {
+        let spec = WorkspaceMountSpec::new(
+            session.git_root(),
+            WorkspaceAccess::from_read_only(self.read_only_workspace),
+        );
+        let permission = if spec.access.is_read_only() {
             if !self.runtime.capabilities().read_only_workspace() {
                 return Err(read_only_unsupported(self.runtime.display_name()));
             }
@@ -439,15 +426,19 @@ impl AgentEngine {
         } else {
             OverlayPermission::ReadWrite
         };
-        let mut mounts = vec![ContainerOption::Overlay(OverlaySpec {
-            host_path: session.git_root().to_path_buf(),
-            container_path: std::path::PathBuf::from("/workspace"),
-            permission,
-        })];
+        let mut mounts = vec![
+            ContainerOption::ReadOnlyWorkspace(spec.access.is_read_only()),
+            ContainerOption::Overlay(OverlaySpec {
+                host_path: spec.host_path,
+                container_path: spec.guest_path,
+                permission,
+            }),
+        ];
+        mounts.extend(spec.tmpfs.into_iter().map(ContainerOption::Tmpfs));
         if self.read_only_workspace {
             let scratch = tempfile::Builder::new()
                 .prefix("awman-scratch-")
-                .tempdir()
+                .tempdir_in(session.env().temp_dir())
                 .map_err(|e| EngineError::Other(format!("create scratch directory: {e}")))?;
             mounts.push(ContainerOption::TemporaryDirectoryMount {
                 container_path: std::path::PathBuf::from(READ_ONLY_SCRATCH_PATH),
@@ -745,6 +736,16 @@ impl AgentEngine {
         run: &AgentRunOptions,
         credentials: &AgentCredentials,
     ) -> Result<Vec<ContainerOption>, EngineError> {
+        if self.read_only_workspace {
+            if !self.runtime.capabilities().read_only_workspace() {
+                return Err(read_only_unsupported(self.runtime.display_name()));
+            }
+            if run.allow_docker {
+                return Err(EngineError::Config(
+                    "--allow-docker gives the agent the host Docker daemon, which can write to the workspace".into(),
+                ));
+            }
+        }
         let def = self.resolve_definition(session, agent)?;
         // A `--yolo` launch carries the configured `yoloDisallowedTools`.
         let yolo_run = with_yolo_disallowed_tools(session, &def, run, RunParadigm::Container)?;
@@ -944,6 +945,12 @@ impl AgentEngine {
                 session.definition_root(),
             )
         });
+        emit_read_only_workspace_env(
+            &def,
+            container_home.as_deref().unwrap_or("/root"),
+            self.read_only_workspace,
+            &mut options,
+        )?;
         // Private writable mounts are definition facts. The generic mount
         // option owns each tempdir through the execution's guest-exit guard;
         // an OverlayEngine-wide TempDir would be shared across launches.
@@ -963,7 +970,7 @@ impl AgentEngine {
                 std::path::Path::new(container_home.as_deref().unwrap_or("/root")).join(relative);
             let dir = tempfile::Builder::new()
                 .prefix("awman-session-storage-")
-                .tempdir()
+                .tempdir_in(session.env().temp_dir())
                 .map_err(|e| EngineError::Other(format!("create session storage: {e}")))?;
             options.push(ContainerOption::TemporaryDirectoryMount {
                 container_path: guest_path.clone(),
@@ -1025,6 +1032,29 @@ impl AgentEngine {
         }
 
         // System prompt delivery (context overlays).
+        if self.read_only_workspace {
+            // The read-only notice is mandatory. Refuse any launch whose
+            // delivery channel cannot reach the agent rather than running it
+            // with an uninformed agent.
+            let acp = matches!(run.launch_mode, LaunchMode::Acp);
+            let needs_context = matches!(
+                def.system_prompt_delivery,
+                SystemPromptMode::AgentsMd | SystemPromptMode::AddDir { .. }
+            );
+            if run.system_prompt.is_none()
+                || matches!(def.system_prompt_delivery, SystemPromptMode::Unsupported)
+                || acp
+                || (needs_context && run.context_overlays.is_empty())
+            {
+                return Err(EngineError::Config(format!(
+                    "agent '{}' cannot receive the read-only workspace instructions in \
+                     this launch mode (ACP, no system-prompt channel, or no context \
+                     directory to carry them); use another agent, add a context \
+                     overlay, or launch without --read-only-workspace",
+                    def.name
+                )));
+            }
+        }
         if let Some(ref prompt_text) = run.system_prompt {
             self.emit_system_prompt_options(
                 &def,
@@ -1551,18 +1581,172 @@ fn emit_sandbox_system_prompt_options(
 /// content already matches. Logs (and silently moves on) when the write fails
 /// e.g. because the host directory is read-only.
 fn plant_agents_md(host_dir: &std::path::Path, prompt_text: &str) {
+    use std::io::Write;
     let agents_md = host_dir.join("AGENTS.md");
-    if let Ok(existing) = std::fs::read_to_string(&agents_md) {
-        if existing == prompt_text {
+    // The context directory is agent-writable, so an existing `AGENTS.md` may be
+    // a symlink or hardlink into the checkout. Never read-through or truncate it:
+    // keep a plain single-link file only when its content already matches,
+    // otherwise drop the directory entry (which leaves any link target
+    // untouched) and create a fresh inode with `create_new` (O_EXCL, which does
+    // not follow a symlink raced into place).
+    if let Ok(meta) = std::fs::symlink_metadata(&agents_md) {
+        if meta.file_type().is_file() && !has_extra_links(&meta) {
+            if let Ok(existing) = std::fs::read_to_string(&agents_md) {
+                if existing == prompt_text {
+                    return;
+                }
+            }
+        }
+        if let Err(e) = std::fs::remove_file(&agents_md) {
+            tracing::warn!(path = %agents_md.display(), error = %e,
+                "context overlay: failed to replace AGENTS.md; skipping");
             return;
         }
     }
-    if let Err(e) = std::fs::write(&agents_md, prompt_text) {
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&agents_md)
+        .and_then(|mut f| f.write_all(prompt_text.as_bytes()));
+    if let Err(e) = result {
         tracing::warn!(
             path = %agents_md.display(),
             error = %e,
             "context overlay: failed to plant AGENTS.md (host dir read-only?); \
              agent will not be automatically notified about the context directory"
         );
+    }
+}
+
+#[cfg(unix)]
+fn has_extra_links(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.nlink() > 1
+}
+
+#[cfg(not(unix))]
+fn has_extra_links(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(test)]
+mod workspace_access_tests {
+    use super::*;
+    use awman_test_support::{TestCase, TestSandbox};
+
+    fn session(sandbox: &TestSandbox) -> Session {
+        Session::open_at_directory_root(
+            sandbox.work(),
+            crate::data::session::SessionOpenOptions {
+                env: Some(crate::data::config::env::EnvSnapshot::from_full_env(
+                    sandbox
+                        .env()
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                k.to_string_lossy().into_owned(),
+                                v.to_string_lossy().into_owned(),
+                            )
+                        })
+                        .collect(),
+                )),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn read_only_workspace_spec_adds_tmpfs_and_preserves_lease_scratch() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::agent::workspace_access_tests::read_only_workspace_spec_adds_tmpfs_and_preserves_lease_scratch"));
+        let session = session(&sandbox);
+        let engine = AgentEngine::new(
+            Arc::new(OverlayEngine::new(&session).unwrap()),
+            Arc::new(crate::engine::container::ContainerRuntime::docker_in(
+                session.env().clone(),
+            )),
+        );
+        let writable = engine.workspace_mounts(&session).unwrap();
+        assert!(!writable
+            .iter()
+            .any(|o| matches!(o, ContainerOption::Tmpfs(_))));
+        let engine = engine.with_read_only_workspace(true);
+        let options = engine.workspace_mounts(&session).unwrap();
+        assert!(options
+            .iter()
+            .any(|o| matches!(o, ContainerOption::Tmpfs(p) if p == Path::new("/tmp"))));
+        assert!(options.iter().any(|o| matches!(o, ContainerOption::TemporaryDirectoryMount { container_path, env_var, .. } if container_path == Path::new(READ_ONLY_SCRATCH_PATH) && env_var.as_deref() == Some(READ_ONLY_SCRATCH_ENV))));
+        let resolved =
+            crate::engine::container::options::ResolvedContainerOptions::resolve(options).unwrap();
+        assert!(resolved.read_only_workspace);
+        resolved.validate_read_only_workspace().unwrap();
+        let run = AgentRunOptions {
+            allow_docker: true,
+            ..Default::default()
+        };
+        assert!(engine
+            .build_options(&session, &AgentName::new("claude").unwrap(), &run)
+            .unwrap_err()
+            .to_string()
+            .contains("host Docker daemon"));
+    }
+
+    #[test]
+    fn cache_redirects_use_effective_home_and_respect_explicit_env() {
+        let mut def = first_party::first_party("claude").unwrap();
+        def.read_only_workspace_redirects
+            .push(ReadOnlyWorkspaceRedirect {
+                env_var: "AGENT_STATE_DIR".into(),
+                home_relative_path: ".agent/state".into(),
+            });
+        let mut options = vec![ContainerOption::EnvPassthrough(EnvVar(
+            "XDG_CACHE_HOME".into(),
+        ))];
+        let before = options.clone();
+        emit_read_only_workspace_env(&def, "/home/agent", false, &mut options).unwrap();
+        assert_eq!(options, before);
+        emit_read_only_workspace_env(&def, "/home/agent", true, &mut options).unwrap();
+        assert!(!options
+            .iter()
+            .any(|o| matches!(o, ContainerOption::EnvLiteral(v) if v.key == "XDG_CACHE_HOME")));
+        assert!(options.contains(&ContainerOption::EnvLiteral(EnvLiteral {
+            key: "XDG_STATE_HOME".into(),
+            value: "/home/agent/.local/state".into()
+        })));
+        assert!(options.contains(&ContainerOption::EnvLiteral(EnvLiteral {
+            key: "TMPDIR".into(),
+            value: "/tmp".into()
+        })));
+        assert!(options.contains(&ContainerOption::EnvLiteral(EnvLiteral {
+            key: "AGENT_STATE_DIR".into(),
+            value: "/home/agent/.agent/state".into()
+        })));
+        def.read_only_workspace_redirects[0].home_relative_path = "../workspace".into();
+        assert!(emit_read_only_workspace_env(&def, "/home/agent", true, &mut Vec::new()).is_err());
+        assert!(emit_read_only_workspace_env(&def, "/workspace", true, &mut Vec::new()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plant_agents_md_never_writes_through_links() {
+        let sandbox = TestSandbox::for_test(TestCase::component(
+            "engine::agent::workspace_access_tests::plant_agents_md_never_writes_through_links",
+        ));
+        let ctx = sandbox.tmp().join("ctx");
+        std::fs::create_dir_all(&ctx).unwrap();
+        let sentinel = sandbox.work().join("tracked.txt");
+        std::fs::write(&sentinel, "keep").unwrap();
+        let agents = ctx.join("AGENTS.md");
+
+        std::os::unix::fs::symlink(&sentinel, &agents).unwrap();
+        super::plant_agents_md(&ctx, "instructions");
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
+        assert_eq!(std::fs::read_to_string(&agents).unwrap(), "instructions");
+
+        std::fs::remove_file(&agents).unwrap();
+        std::fs::hard_link(&sentinel, &agents).unwrap();
+        super::plant_agents_md(&ctx, "instructions");
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
+        assert_eq!(std::fs::read_to_string(&agents).unwrap(), "instructions");
     }
 }

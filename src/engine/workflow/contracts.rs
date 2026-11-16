@@ -190,6 +190,7 @@ fn definition(parallel: bool) -> Workflow {
             model: None,
             overlays: None,
             abort_on_failure: false,
+            read_only_workspace: false,
         })
         .collect(),
     }
@@ -585,4 +586,54 @@ async fn scratch_lease_spans_setup_single_steps_main_and_teardown_lifetime() {
     drop(workflow);
     resolver.remove_workflow_dir(invocation).unwrap();
     assert!(!dir.exists());
+}
+
+/// A live container keeps the workspace access it launched with, so a prompt
+/// must never be injected across a read-only/writable boundary.
+#[tokio::test]
+async fn continue_in_current_container_refuses_a_workspace_access_change() {
+    let s = TestSandbox::for_test(TestCase::component("engine::workflow::contracts::continue_in_current_container_refuses_a_workspace_access_change"));
+    let session = Session::open_at_directory_root(
+        s.work(),
+        SessionOpenOptions {
+            env: Some(environment(&s)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for (next_read_only, expect_offered) in [(true, false), (false, true)] {
+        let mut workflow = definition(false);
+        workflow.steps.truncate(2);
+        workflow.steps[1].read_only_workspace = next_read_only;
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let (started, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut engine = WorkflowEngine::new(
+            &session,
+            WorkflowSpec::new(workflow).with_work_item_context(None),
+            WorkflowEngineDeps {
+                frontend: Box::new(Frontend { retries: 0 }),
+                agent_factory: Box::new(Runtime {
+                    trace: trace.clone(),
+                    hold: true,
+                    started,
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(engine.launch_step().await.unwrap(), "build");
+        engine.state.set_status("build", StepState::Succeeded);
+        let actions = engine.compute_available_actions().unwrap();
+        assert_eq!(actions.can_continue_in_current_container, expect_offered);
+        let err = engine
+            .handle_continue_in_current_container("next")
+            .unwrap_err()
+            .to_string();
+        // Same access reaches the (test) backend, which declines injection;
+        // a changed access is refused before any injection is attempted.
+        assert_eq!(err.contains("workspace access"), !expect_offered, "{err}");
+        for tx in trace.lock().unwrap().held.drain(..) {
+            let _ = tx.send(0);
+        }
+    }
+    s.finish();
 }

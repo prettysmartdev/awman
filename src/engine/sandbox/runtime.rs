@@ -548,3 +548,53 @@ impl ExecutionBackend for SandboxAttachExecution {
         })
     }
 }
+
+#[cfg(test)]
+mod workspace_access_tests {
+    use super::*;
+    use awman_test_support::{TestCase, TestSandbox};
+
+    #[test]
+    fn sandbox_cannot_advertise_or_prepare_read_only_workspaces() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::sandbox::runtime::workspace_access_tests::sandbox_cannot_advertise_or_prepare_read_only_workspaces"));
+        let env = crate::data::config::env::EnvSnapshot::from_full_env(
+            sandbox
+                .env()
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect(),
+        );
+        let runtime = SandboxRuntime {
+            backend: Arc::new(DSbxBackend::with_env(env.clone())),
+            env: env.clone(),
+        };
+        assert!(!runtime.capabilities().read_only_workspace());
+        let session = Session::open_at_directory_root(
+            sandbox.work(),
+            crate::data::session::SessionOpenOptions {
+                env: Some(env),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let engine = crate::engine::agent::AgentEngine::new(
+            Arc::new(crate::engine::overlay::OverlayEngine::new(&session).unwrap()),
+            Arc::new(runtime),
+        )
+        .with_read_only_workspace(true);
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let run = crate::engine::agent::AgentRunOptions::default();
+        let error = engine
+            .build_sandbox_options(&session, &agent, &run)
+            .unwrap_err();
+        assert!(error.to_string().contains(
+            "cannot mount the workspace read-only; this run requires a read-only workspace"
+        ));
+        assert!(engine.build_options(&session, &agent, &run).is_err());
+    }
+}

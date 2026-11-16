@@ -280,6 +280,13 @@ pub enum CommandError {
     #[error("flag '{flag}' is unsupported until per-command secrets are available")]
     PrerequisiteFlagUnsupported { flag: String },
 
+    // ── Read-only workspace (WI 0152) ─────────────────────────────────────
+    /// `--read-only-workspace` (or a workflow step's `read_only_workspace`)
+    /// on a runtime that cannot mount the workspace read-only. Raised before
+    /// any side effect; the run is never downgraded to a writable workspace.
+    #[error("the {runtime} runtime cannot mount the workspace read-only; --read-only-workspace is refused rather than run with a writable workspace")]
+    ReadOnlyWorkspaceUnsupported { runtime: String },
+
     // ── Agents (`awman agents …`) ─────────────────────────────────────────
     #[error("no agent matches {reference:?}; run `awman agents ls` to see running agents")]
     AgentNotFound { reference: String },
@@ -466,6 +473,7 @@ impl CommandError {
         | CommandError::WorkflowPrerequisitesUnresolved { .. }
         | CommandError::PrerequisiteWideningRefused { .. }
         | CommandError::PrerequisiteFlagUnsupported { .. }
+        | CommandError::ReadOnlyWorkspaceUnsupported { .. }
         // Session-creation validation failures are invalid-usage class.
         | CommandError::SessionInvalidType { .. }
         | CommandError::SessionWorkdirRequired
@@ -657,6 +665,7 @@ impl CommandError {
             | CommandError::WorkflowFileNotFound { .. }
             | CommandError::PrerequisiteWideningRefused { .. }
             | CommandError::PrerequisiteFlagUnsupported { .. }
+            | CommandError::ReadOnlyWorkspaceUnsupported { .. }
             | CommandError::AgentNotFound { .. }
             | CommandError::AgentNoLongerRunning { .. }
             | CommandError::AgentNotRunning { .. }
@@ -772,6 +781,7 @@ impl CommandError {
             }
             CommandError::PrerequisiteWideningRefused { .. } => "prerequisite_widening_refused",
             CommandError::PrerequisiteFlagUnsupported { .. } => "prerequisite_flag_unsupported",
+            CommandError::ReadOnlyWorkspaceUnsupported { .. } => "read_only_workspace_unsupported",
 
             CommandError::AgentNotFound { .. } => "agent_not_found",
             CommandError::AgentNoLongerRunning { .. } => "agent_no_longer_running",

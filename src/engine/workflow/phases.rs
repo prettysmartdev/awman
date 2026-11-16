@@ -845,6 +845,7 @@ impl WorkflowEngine {
             model: spec.model.clone(),
             overlays: spec.extra_overlays,
             abort_on_failure: false,
+            read_only_workspace: false,
         };
 
         let runtime = WorkflowRuntimeContext {

@@ -31,6 +31,33 @@ impl Command for ExecWorkflowCommand {
             });
             return Err(e);
         }
+        // Read-only workspace (WI 0152), command level: refused with
+        // --dynamic or on a runtime that cannot enforce it, before any IO.
+        // The per-step field is checked once the workflow file is loaded.
+        let command_access = crate::command::commands::workspace_access::effective_access(
+            self.workspace_access,
+            &self.engines.agent_engine,
+        );
+        if let Err(e) = crate::command::commands::workspace_access::check_workflow_flags(
+            self.workspace_access,
+            self.flags.dynamic,
+        )
+        .and_then(|()| {
+            crate::command::commands::workspace_access::preflight_workspace_access(
+                command_access,
+                self.flags.allow_docker,
+                self.engines.runtime.as_ref(),
+            )
+        }) {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: {e}"),
+            });
+            return Err(e);
+        }
+        if self.workspace_access.is_read_only() {
+            frontend.report_workspace_access(self.workspace_access, None);
+        }
 
         // Resolve against the invoking checkout before prerequisites, worktree
         // preparation, setup, or any agent launch. Fail closed on every error.
@@ -98,6 +125,22 @@ impl Command for ExecWorkflowCommand {
                 return Err(err);
             }
         };
+
+        // Read-only workspace (WI 0152), workflow level: one read-only step
+        // on a runtime that cannot honour it fails here, before prerequisites,
+        // the worktree or setup — not midway through the run.
+        if let Err(e) = crate::command::commands::workspace_access::preflight_workflow_access(
+            &workflow,
+            command_access,
+            self.flags.allow_docker,
+            self.engines.runtime.as_ref(),
+        ) {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: {e}"),
+            });
+            return Err(e);
+        }
 
         // Custom agent definitions are reviewed once per distinct agent
         // before anything resolves them (the preflight below included).
@@ -395,6 +438,7 @@ impl Command for ExecWorkflowCommand {
             self.managed_session.as_ref(),
             &self.cancel,
             self.output_dir.as_deref(),
+            self.workspace_access,
         )
         .await
     }

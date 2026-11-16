@@ -22,6 +22,7 @@ fn recover(codes: &[u8]) {
             model: None,
             overlays: None,
             abort_on_failure: false,
+            read_only_workspace: false,
         })
         .collect();
     let dag = WorkflowDag::build(&steps).unwrap();
