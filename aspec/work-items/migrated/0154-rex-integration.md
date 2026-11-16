@@ -321,7 +321,7 @@ After implementation is complete, update user-facing documentation in `docs/` to
 - **Keep all technical/implementation details in work item specs or code comments**, not in `docs/`
 - **Docs are for end users**, not for developers trying to understand implementation
 
-See `CLAUDE.md` for more guidance on documentation standards.
+See `AGENTS.md` for more guidance on documentation standards.
 
 Specifically for this item:
 - New `docs/18-rex-integration.md` (0140 claims `16-daemon.md`, 0143 claims `17-workers-and-work-servers.md`, and 0142 claims `19-engine-and-frontends.md`). It covers:

@@ -2,11 +2,12 @@
   "agents": {
     "default": "codex"
   },
-  "tui": {
-    "scrollbackLines": 10000
+  "workItems": {
+    "source": "github"
   },
   "workflows": {
     "dynamic": {
+      "defaultLeader": "claude::claude-opus-5-5",
       "agentsToModels": {
         "claude": [
           "claude-sonnet-5-5",
@@ -19,7 +20,6 @@
           "gpt-6-astra"
         ]
       },
-      "defaultLeader": "claude::claude-opus-5-5",
       "guidance": [
         "Spread work evenly amongst the available agents. Don't use one agent type (i.e. only claude or only codex). Determine the best model level (as described below) for each part of the workflow, and then alternate agent types as available to spread out the work. Always use different agents to implement vs review to avoid bias",
         "Use Sonnet 5.1 and Luna 6 evenly for simpler, well-scoped tasks like writing pre-designed functions and modules",
@@ -28,5 +28,8 @@
         "Emulate the BMAD method's 'adverserial review' strategy when configuring the workflow for complex implementations (docs.bmad-method.org/explanation/adversarial-review/)"
       ]
     }
+  },
+  "tui": {
+    "scrollbackLines": 10000
   }
 }

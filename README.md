@@ -73,3 +73,8 @@ awman exec workflow --dynamic --work-item ./path/to/spec.md
 ## Documentation
 
 [Getting started](docs/00-getting-started.md) · [Security and isolation](docs/04-security-and-isolation.md) · [Web app](docs/20-webapp.md) · [Command reference](docs/14-command-reference.md) · [License](LICENSE)
+
+## Contributing
+
+See [AGENTS.md](AGENTS.md) for repository instructions, build and test commands,
+and the developer skills in [.agents/skills/](.agents/skills/).

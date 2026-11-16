@@ -1,5 +1,7 @@
 # awman work items
 
+Open work items have been migrated to GitHub issues. See the [migration index](migrated/README.md) for issue links in their original relative order and unchanged archival copies. The tables below retain the historical implementation plan.
+
 The tables below give implementation order. Active items after 0143 are numbered in that order; completed [0149](completed/0149-workflow-teardown-hardening.md), [0150](completed/0150-workflows-dynamic-config-migration.md), and [0151](completed/0151-branch-pr-worktree-for-chat.md) keep their shipped historical identifiers. The gap between 0148 and 0152 is intentional.
 
 Every active item from 0139 onward uses [the grand architecture](../architecture/2026-grand-architecture.md) as an acceptance gate. Exchangeable types, configuration resolution and filesystem/database access belong to Layer 0; reusable runtime and transport mechanics to Layer 1; Session-based command behavior, catalogue definitions and policy to Layer 2; input and presentation adapters to Layer 3. Lower layers never import higher layers, and frontends never call engine behavior directly. New command paths must preserve builtin/daemon and CLI/TUI/API parity where the command is available. `make architecture-lint` and the relevant parity tests must pass before an item closes; its own layer contract in Codebase Integration specifies the concrete boundary.
@@ -30,16 +32,16 @@ Every item below depends on the completed 0139–0143 daemon gate. Additional de
 | 7 | [0145 — Git transport, retry, credentials and secrets](0145-git-transport-retry-credentials-and-secrets.md) | Fix push-side Git transport and auth classification, add bounded push retry, then per-session credentials and per-command secrets. |
 | 8 | [0146 — Context API and workflow artifacts](0146-context-api-and-workflow-artifacts.md) | Keyed durable repo context and per-run workflow notes over the push API and WSP. |
 | 9 | [0147 — External work item sources](0147-external-work-item-sources.md) | HTTP and inline work items. |
-| 10 | [0148 — Init over the API](0148-init-over-the-api.md) | API-driven project setup. |
-| 11 | [0152 — Read-only planning sessions](0152-read-only-planning-sessions.md) | Read-only workspaces for planning. |
-| 12 | [0153 — GitHub issues work server](0153-github-issues-work-server.md) | Later standalone Work Server Protocol reference source, built separately from a repository clone. |
-| 13 | [0154 — Rex integration](integrations/0154-rex-integration.md) | Present the finished daemon engine in Rex. |
-| 14 | [0155 — Daemon work in Rex](integrations/0155-daemon-work-in-rex.md) | Present squad and worker work in Rex. |
-| 15 | [0156 — Rex action pack](integrations/0156-rex-action-pack.md) | Palette actions over the finalized daemon API. |
-| 16 | [0157 — OpenCode and Cursor builtins](0157-opencode-v2-support.md) | OpenCode 1.x/2.x and Cursor; retire builtin Gemini. |
-| 17 | [0158 — Builtin runtime setup and errors](0158-builtin-ready-setup-and-errors.md) | Image-source setup and clear `ready`/Docker errors. |
+| 10 | [0148 — Init over the API](migrated/0148-init-over-the-api.md) | API-driven project setup. |
+| 11 | [0152 — Read-only planning sessions](migrated/0152-read-only-planning-sessions.md) | Read-only workspaces for planning. |
+| 12 | [0153 — GitHub issues work server](migrated/0153-github-issues-work-server.md) | Later standalone Work Server Protocol reference source, built separately from a repository clone. |
+| 13 | [0154 — Rex integration](migrated/0154-rex-integration.md) | Present the finished daemon engine in Rex. |
+| 14 | [0155 — Daemon work in Rex](migrated/0155-daemon-work-in-rex.md) | Present squad and worker work in Rex. |
+| 15 | [0156 — Rex action pack](migrated/0156-rex-action-pack.md) | Palette actions over the finalized daemon API. |
+| 16 | [0157 — OpenCode and Cursor builtins](migrated/0157-opencode-v2-support.md) | OpenCode 1.x/2.x and Cursor; retire builtin Gemini. |
+| 17 | [0158 — Builtin runtime setup and errors](migrated/0158-builtin-ready-setup-and-errors.md) | Image-source setup and clear `ready`/Docker errors. |
 | 18 | [0159 — Webapp v0](0159-webapp-v0.md) | Same-machine browser frontend; named daemon listeners keep engine on loopback and worker access separate. |
 | 19 | [0160 — Webapp UX and liquid glass](0160-webapp-ux-and-liquid-glass.md) | Cohesive responsive navigation and ethereal glass design, TUI feature parity, agent PTY resizing, and refresh without repeated browser linking. |
-| 20 | [0161 — Webapp v0 acceptance follow-ups](0161-webapp-v0-acceptance-followups.md) | Engine-trace parity harness, deployed-origin browser checks, live PTY, offline/update e2e, web baselines and the items 0159's final audit deferred. |
+| 20 | [0161 — Webapp v0 acceptance follow-ups](migrated/0161-webapp-v0-acceptance-followups.md) | Engine-trace parity harness, deployed-origin browser checks, live PTY, offline/update e2e, web baselines and the items 0159's final audit deferred. |
 
-Other open work items [0120](0120-upstream-embedded-kernel-support.md), [0124](0124-builtin-linux-and-docker-gates.md) and [0129](0129-codebase-simplicity-and-rust-quality-review.md) retain their numbers and link to the new daemon items where relevant.
+Other open work items [0120](migrated/0120-upstream-embedded-kernel-support.md), [0124](migrated/0124-builtin-linux-and-docker-gates.md) and [0129](0129-codebase-simplicity-and-rust-quality-review.md) retain their numbers and link to the new daemon items where relevant.

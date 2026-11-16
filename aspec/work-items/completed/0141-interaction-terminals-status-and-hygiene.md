@@ -443,7 +443,7 @@ Specific docs to update for this item:
 - `docs/09-api-and-remote-mode.md`: the `program_status` event.
 - `docs/14-command-reference.md`: `agents status` states (`waiting`, `errored`, `done`).
 
-See `CLAUDE.md` for more guidance on documentation standards.
+See `AGENTS.md` for more guidance on documentation standards.
 
 ## Part: Host-terminal hygiene
 
@@ -593,7 +593,7 @@ After implementation is complete, update user-facing documentation in `docs/` to
 - **Keep all technical/implementation details in work item specs or code comments**, not in `docs/`
 - **Docs are for end users**, not for developers trying to understand implementation
 
-See `CLAUDE.md` for more guidance on documentation standards.
+See `AGENTS.md` for more guidance on documentation standards.
 
 Specifically for this item:
 - `docs/04-security-and-isolation.md`: which control sequences from agents are filtered, and which host-terminal variables never reach containers.

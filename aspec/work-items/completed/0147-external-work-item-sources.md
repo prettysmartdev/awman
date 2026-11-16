@@ -241,7 +241,7 @@ After implementation is complete, update user-facing documentation in `docs/` to
 - **Keep all technical/implementation details in work item specs or code comments**, not in `docs/`
 - **Docs are for end users**, not for developers trying to understand implementation
 
-See `CLAUDE.md` for more guidance on documentation standards.
+See `AGENTS.md` for more guidance on documentation standards.
 
 For this item, update:
 - `docs/07-configuration.md`: `workItems.source` and global `workItems.providers.<name>`.

@@ -1,5 +1,11 @@
 # awman
 
+## Project Overview
+
+awman runs coding agents in isolated containers and microVMs, with CLI, TUI,
+API, web, and worker interfaces. These instructions apply throughout this
+repository; a nested `AGENTS.md` takes precedence within its directory.
+
 ## Source of Truth
 
 All decisions — architecture, behavior, security, UX, and implementation — are governed by the spec files in `aspec/`. Before writing or modifying code, consult the relevant spec document(s).
@@ -11,6 +17,7 @@ All decisions — architecture, behavior, security, UX, and implementation — a
 | Security constraints | `aspec/architecture/security.md` |
 | CLI commands, flags, config | `aspec/uxui/cli.md` |
 | Local dev, build, test workflows | `aspec/devops/localdev.md` |
+| Test tiers and coverage | `aspec/devops/testing.md` |
 | CI/CD | `aspec/devops/cicd.md` |
 | Operations | `aspec/devops/operations.md` |
 | Subagents | `aspec/devops/subagents.md` |
@@ -25,7 +32,7 @@ All decisions — architecture, behavior, security, UX, and implementation — a
 
 ## Build & Test Commands
 
-```
+```sh
 make all      # build the awman binary
 make install  # build + install to /usr/local/bin/
 make test     # run the manifest local gate
@@ -73,3 +80,24 @@ After implementing a work item:
    - If a new feature warrants a new doc file, create it as a user guide (e.g., `docs/10-new-feature.md`), not as implementation/architecture notes
    - Implementation details, decisions, and technical notes belong in the work item spec or code comments, never in published docs
 2. Follow the patterns, conventions, and architecture established in the `aspec/` spec
+
+## Developer Skills
+
+Repository development skills live in `.agents/skills/<name>/SKILL.md`. Read
+the relevant skill when its workflow applies:
+
+| Skill | When to use it |
+|---|---|
+| [blog-post](.agents/skills/blog-post/SKILL.md) | Write an awman blog post in the established style. |
+| [release-prep](.agents/skills/release-prep/SKILL.md) | Prepare a release, including versions, docs, release notes, and a blog post. |
+| [security-review](.agents/skills/security-review/SKILL.md) | Conduct a requested security review of awman and its repository. |
+
+Customer-facing skills remain in `skills/` and are distributed by awman's
+builtin skill library. Both collections use the [Agent Skills format](https://agentskills.io/specification):
+a directory named after the skill, with a `SKILL.md` containing YAML `name` and
+`description` fields followed by Markdown instructions. Supporting files use
+paths relative to the skill directory.
+
+`AGENTS.md` is the canonical repository instruction file, following the
+[AGENTS.md standard](https://agents.md/) stewarded by the Linux Foundation's
+Agentic AI Foundation.
