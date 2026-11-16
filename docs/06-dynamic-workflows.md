@@ -63,6 +63,27 @@ Dynamic workflows check all prerequisites in one pass before starting the leader
 
 The leader receives a summary of the available workflow credentials and tools, so it can plan around them. After awman validates the generated workflow, it narrows the grants to the needs that workflow actually uses: unused grants are dropped, and any newly introduced requirement remains unavailable. No further prerequisite or image-setup dialog opens after the leader, and generation cannot authorize new credentials or image builds. When unresolved requirements use `--prerequisite-unresolved fail`, awman stops before executing the generated workflow. See [Workflow prerequisite checks](05-workflows.md#workflow-prerequisite-checks) for the available choices and credential behavior.
 
+Before launching the leader, awman checks that the project has a Dockerfile
+for the selected leader and every agent configured for the dynamic workflow.
+If one is missing, the command fails with an error naming each agent and its
+expected `.awman/Dockerfile.<agent>` path, followed by an `init` action for
+each one. For example:
+
+```text
+dynamic workflow references agents with no Dockerfile in the project:
+  - "claude" (expected .awman/Dockerfile.claude)
+Run init for each missing agent before retrying:
+  POST /v1/worker/commands {"subcommand":"init","args":["--agent","claude"]} / awman init --agent claude
+```
+
+This check is read-only and runs before the leader starts, so it does not use
+a leader repair attempt or create project files. In an API worker session,
+run [`init` through the API](09-api-and-remote-mode.md#initialize-a-project)
+for every missing agent, commit every reported file marked
+`"uncommitted": true`, then retry the dynamic workflow. Pull leases prepare
+missing built-in agent Dockerfiles in their session clone before dispatch;
+this preflight catches any Dockerfiles still missing afterwards.
+
 ---
 
 ## How it works

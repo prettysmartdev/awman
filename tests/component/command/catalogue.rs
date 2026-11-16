@@ -77,6 +77,7 @@ pub const CONTRACT_PATHS: &[&str] = &[
 /// config, credentials, remote delegation and foreground terminals stay local.
 /// An independent permission oracle: flipping api_allowed must turn this red.
 const WORKER_COMMANDS: &[&str] = &[
+    "init",
     "agents status",
     "agents list",
     "agents detail",
@@ -107,6 +108,19 @@ fn every_catalogue_leaf_has_a_reviewed_command_contract() {
         actual, expected,
         "add a contract scenario when adding a command"
     );
+}
+
+#[test]
+fn api_init_accepts_agent_and_aspec_fields() {
+    let catalogue = CommandCatalogue::get();
+    let frontend = FrontendKind::WORKER_LOCAL;
+    let path = ["init"];
+    assert!(catalogue.validate_for_frontend(frontend, &path).is_ok());
+    let parsed = catalogue
+        .parse_raw_args_with_profile(&path, &args(&["--agent", "claude", "--aspec"]), frontend)
+        .unwrap();
+    assert_eq!(parsed.flag_string("agent").as_deref(), Some("claude"));
+    assert_eq!(parsed.flag_bool("aspec"), Some(true));
 }
 
 #[test]

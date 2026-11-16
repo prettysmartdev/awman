@@ -4,6 +4,7 @@ mod api;
 mod browser;
 mod browser_reauth;
 mod git_results;
+mod init_api;
 mod read_only_status;
 mod reload;
 mod session_git_auth;

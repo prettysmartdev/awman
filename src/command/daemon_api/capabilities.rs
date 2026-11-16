@@ -87,6 +87,9 @@ pub const CAPABILITIES: &[&str] = &[
     // WI 0147: `--work-item` accepts github / http providers / local files by
     // `workItems.source`; `--issue` was replaced.
     "work_item_sources",
+    // WI 0148: `init` is available to API clients and returns its project
+    // file list in the typed command result.
+    "api_init",
     // WI 0152: `--read-only-workspace` on `exec prompt` / `exec workflow` and
     // per-step `read_only_workspace`. Advertised only by
     // [`advertised_for_runtime`] on a runtime that enforces it, never by

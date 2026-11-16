@@ -5,6 +5,31 @@ use crate::support::{
 };
 
 #[tokio::test(flavor = "multi_thread")]
+async fn status_advertises_api_init() {
+    let s = support::sandbox("command::daemon::status_advertises_api_init");
+    let _host_agents = scenarios::prepare(&s);
+    let backend = Backend::start(BackendKind::Daemon, &s).await;
+    let status = backend
+        .client()
+        .call(&awman::command::commands::daemon::actions::Request::get(
+            "/v1/status",
+        ))
+        .await
+        .unwrap();
+    let capabilities = status["capabilities"].as_array().unwrap();
+    assert_eq!(
+        capabilities
+            .iter()
+            .filter(|value| **value == "api_init")
+            .count(),
+        1,
+        "{status}"
+    );
+    backend.shutdown().await;
+    s.finish();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn catalogue_explains_each_command_before_execution() {
     let s = support::sandbox("command::daemon::catalogue_explains_each_command_before_execution");
     let host_agents = scenarios::prepare(&s);

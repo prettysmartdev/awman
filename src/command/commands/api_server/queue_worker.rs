@@ -1805,6 +1805,7 @@ fn command_succeeded_for_push(
 /// exact status/list/detail/kill value in the frontend instead.
 fn catalogue_json(outcome: &CommandOutcome) -> Option<serde_json::Value> {
     match outcome {
+        CommandOutcome::Init(outcome) => serde_json::to_value(outcome).ok(),
         CommandOutcome::Ready(outcome) if outcome.json_requested => Some(outcome.to_legacy_json()),
         CommandOutcome::Squad(outcome) => serde_json::to_value(outcome).ok(),
         _ => None,

@@ -4,6 +4,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::data::config::file::{repo_config_path, ConfigFile, FileKind};
+use crate::data::fs::repo_tree::{RepoRelPath, RepoTree};
+use crate::data::init_files::{
+    create_project_dockerfile, inspect_project_dockerfile, ExistingDockerfile, FileSnapshot,
+    InitFile, InitFileKind, InitFileStatus, ProjectDockerfileTarget,
+};
 use crate::data::prompt::Prompt;
 use crate::data::session::{AgentName, Session};
 use crate::data::setup_step::{InitStep, SetupStep};
@@ -15,6 +20,8 @@ use crate::engine::git::GitEngine;
 use crate::engine::init::frontend::DockerfileSetupChoice;
 use crate::engine::overlay::OverlayEngine;
 
+#[cfg(test)]
+mod contracts;
 pub mod frontend;
 pub mod phase;
 pub mod summary;
@@ -65,6 +72,16 @@ pub struct InitEngine {
     /// engine's view can no longer diverge.
     repo_config: ConfigFile,
     definition: Option<crate::engine::agent::ResolvedAgent>,
+    /// `.awman/config.json` and `.awman/Dockerfile.<agent>` as they were when
+    /// init started (`None` = absent), captured in `Preflight`. Compared with
+    /// the files on completion to report each as created, updated or kept —
+    /// whichever phase wrote it, and however many times.
+    snapshots: Vec<FileSnapshot>,
+    /// The git root every project file is written through (no linked
+    /// ancestors), opened in `Preflight`.
+    tree: Option<RepoTree>,
+    /// Where `--aspec` gets the template archive.
+    aspec_downloader: crate::engine::aspec::AspecDownloader,
 }
 
 impl InitEngine {
@@ -89,7 +106,100 @@ impl InitEngine {
             config_existed_at_start: false,
             repo_config: ConfigFile::default(),
             definition: None,
+            snapshots: Vec::new(),
+            tree: None,
+            aspec_downloader: crate::engine::aspec::AspecDownloader::canonical(),
         }
+    }
+
+    /// Serve `--aspec` from `downloader` instead of the canonical template.
+    pub fn with_aspec_downloader(
+        mut self,
+        downloader: crate::engine::aspec::AspecDownloader,
+    ) -> Self {
+        self.aspec_downloader = downloader;
+        self
+    }
+
+    fn tree(&self) -> RepoTree {
+        self.tree
+            .clone()
+            .expect("init preflight opened the repository tree")
+    }
+
+    /// Report `.awman/config.json` and the agent Dockerfile by comparing them
+    /// with their `Preflight` snapshots. A file absent at both ends (an agent
+    /// Dockerfile whose download failed) is not reported. Then mark which
+    /// reported files a client still has to commit.
+    fn record_snapshotted_files(&mut self) -> Result<(), EngineError> {
+        if let Some(tree) = self.tree.clone() {
+            for snapshot in std::mem::take(&mut self.snapshots) {
+                if let Some(file) = snapshot
+                    .finish(&tree)
+                    .map_err(|e| EngineError::Other(e.to_string()))?
+                {
+                    self.summary.record_file(file);
+                }
+            }
+        }
+        self.mark_uncommitted();
+        Ok(())
+    }
+
+    /// Set [`InitFile::uncommitted`] from `git status`: a file is uncommitted
+    /// when it is new or differs from HEAD — whoever wrote it. Session setup
+    /// provisions a missing project and agent Dockerfile before init can run,
+    /// so init then reports them `kept` yet a client must still commit them.
+    /// Outside git (or if git fails) each file keeps the default: uncommitted
+    /// exactly when init wrote it.
+    fn mark_uncommitted(&mut self) {
+        let candidates: Vec<String> = self
+            .summary
+            .files
+            .iter()
+            .filter(|f| {
+                !matches!(f.status, InitFileStatus::Skipped { .. })
+                    && !std::path::Path::new(&f.path).is_absolute()
+            })
+            .map(|f| f.path.clone())
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        match self
+            .git_engine
+            .uncommitted_paths(&self.options.git_root, &candidates)
+        {
+            Ok(uncommitted) => {
+                for file in &mut self.summary.files {
+                    if candidates.contains(&file.path) {
+                        file.uncommitted = uncommitted.contains(&file.path);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "init: git status unavailable; reporting written files as uncommitted")
+            }
+        }
+    }
+
+    /// Report the project Dockerfile at `path`.
+    fn record_project_dockerfile(&mut self, path: &std::path::Path, status: InitFileStatus) {
+        self.summary.record_file(InitFile::at(
+            &self.options.git_root,
+            path,
+            InitFileKind::ProjectDockerfile,
+            status,
+        ));
+    }
+
+    /// Report the project Dockerfile at `rel` below the git root.
+    fn record_project_dockerfile_rel(&mut self, rel: &RepoRelPath, status: InitFileStatus) {
+        self.summary.record_file(InitFile::new(
+            rel.display(),
+            InitFileKind::ProjectDockerfile,
+            status,
+        ));
     }
 
     pub fn phase(&self) -> &InitPhase {
@@ -128,8 +238,11 @@ impl InitEngine {
                     self.agent_engine
                         .resolve_definition(&self.session, &self.options.agent)?,
                 );
-                let _ = self.git_engine;
                 let _ = self.overlay_engine;
+                // Every project file below is written through this tree: no
+                // linked ancestor (a symlinked `.awman/`, say) is followed.
+                let tree =
+                    RepoTree::open(&git_root).map_err(|e| EngineError::Other(e.to_string()))?;
                 // Snapshot before creating .awman/ so we can tell whether
                 // config.json already existed when init began.
                 self.config_existed_at_start = repo_config_path(&git_root).exists();
@@ -141,10 +254,29 @@ impl InitEngine {
                 } else {
                     ConfigFile::default()
                 };
-                let awman_dir = git_root.join(".awman");
-                if let Err(e) = std::fs::create_dir_all(&awman_dir) {
-                    tracing::warn!("failed to create .awman directory: {e}");
+                let agent_dockerfile = RepoDockerfilePaths::new(&git_root)
+                    .agent_dockerfile(self.options.agent.as_str());
+                let mut snapshots = Vec::new();
+                for (path, kind) in [
+                    (repo_config_path(&git_root), InitFileKind::RepoConfig),
+                    (agent_dockerfile, InitFileKind::AgentDockerfile),
+                ] {
+                    let rel = tree.relative(&path).ok_or_else(|| {
+                        EngineError::Other(format!("{} is not below the git root", path.display()))
+                    })?;
+                    snapshots.push(
+                        FileSnapshot::take(&tree, rel, kind)
+                            .map_err(|e| EngineError::Other(e.to_string()))?,
+                    );
                 }
+                self.snapshots = snapshots;
+                // `.awman/` must be a real directory: the config and agent
+                // Dockerfile are written into it.
+                tree.create_dir_all(
+                    &RepoRelPath::new(std::path::Path::new(".awman")).expect("plain name"),
+                )
+                .map_err(|e| EngineError::Other(e.to_string()))?;
+                self.tree = Some(tree);
                 InitPhase::AwaitingAspecDecision
             }
             InitPhase::AwaitingAspecDecision => {
@@ -167,52 +299,64 @@ impl InitEngine {
                 }
             }
             InitPhase::CreatingAspecFolder => {
-                let aspec_dir = git_root.join("aspec");
                 // Always try to download the aspec template — this phase is only
                 // reached when --aspec is passed or the user confirmed replacement.
+                let tree = self.tree();
                 let mut downloaded = false;
-                let downloader = crate::engine::aspec::AspecDownloader::canonical();
-                match downloader.download().await {
+                let mut written = Vec::new();
+                let result = match self.aspec_downloader.download().await {
                     Ok(bytes) => {
-                        match crate::engine::aspec::AspecDownloader::extract(&bytes, &aspec_dir) {
-                            Ok(()) => downloaded = true,
-                            Err(e) => {
-                                frontend.write_message(crate::data::message::UserMessage {
-                                    level: crate::data::message::MessageLevel::Warning,
-                                    text: format!(
-                                        "aspec download failed: {e}; using empty aspec directory"
-                                    ),
-                                });
-                            }
-                        }
+                        crate::engine::aspec::AspecDownloader::extract(&bytes, &tree, &mut written)
                     }
-                    Err(e) => {
-                        frontend.write_message(crate::data::message::UserMessage {
-                            level: crate::data::message::MessageLevel::Warning,
-                            text: format!(
-                                "aspec download failed: {e}; using empty aspec directory"
-                            ),
-                        });
-                    }
+                    Err(e) => Err(e),
+                };
+                // Every template file is reported — also those written
+                // before a failure part-way through.
+                for file in written {
+                    self.summary.record_file(file);
+                }
+                match result {
+                    Ok(()) => downloaded = true,
+                    Err(e) => frontend.write_message(crate::data::message::UserMessage {
+                        level: crate::data::message::MessageLevel::Warning,
+                        text: format!("aspec download failed: {e}; using empty aspec directory"),
+                    }),
                 }
                 if !downloaded {
                     // Fall back to creating an empty aspec dir so subsequent
                     // engines can write into it.
-                    if !aspec_dir.exists() {
-                        std::fs::create_dir_all(&aspec_dir)
-                            .map_err(|e| EngineError::io(aspec_dir.clone(), e))?;
-                    }
+                    tree.create_dir_all(
+                        &RepoRelPath::new(std::path::Path::new("aspec")).expect("plain name"),
+                    )
+                    .map_err(|e| EngineError::Other(e.to_string()))?;
                 }
                 self.summary.aspec_folder = StepStatus::Done;
                 InitPhase::SettingUpDockerfile
             }
             InitPhase::SettingUpDockerfile => {
                 let dockerfile_path = dockerfile_path_or_default(&self.repo_config, &git_root);
-                if dockerfile_path.exists() {
-                    self.summary.dockerfile = StepStatus::Done;
-                    InitPhase::SettingUpAgentDockerfile
-                } else {
-                    InitPhase::AwaitingDockerfileDecision
+                match inspect_project_dockerfile(&dockerfile_path) {
+                    ExistingDockerfile::Usable => {
+                        self.summary.dockerfile = StepStatus::Done;
+                        self.record_project_dockerfile(&dockerfile_path, InitFileStatus::Kept);
+                        InitPhase::SettingUpAgentDockerfile
+                    }
+                    ExistingDockerfile::Missing => InitPhase::AwaitingDockerfileDecision,
+                    // A dangling link, directory or special file: not a
+                    // Dockerfile a build can use, and not something to
+                    // replace. Say so instead of reporting it kept.
+                    ExistingDockerfile::Unusable(reason) => {
+                        frontend.write_message(crate::data::message::UserMessage {
+                            level: crate::data::message::MessageLevel::Warning,
+                            text: reason.clone(),
+                        });
+                        self.record_project_dockerfile(
+                            &dockerfile_path,
+                            InitFileStatus::Skipped { reason },
+                        );
+                        self.summary.dockerfile = StepStatus::Skipped;
+                        InitPhase::SettingUpAgentDockerfile
+                    }
                 }
             }
             InitPhase::AwaitingDockerfileDecision => {
@@ -229,14 +373,66 @@ impl InitEngine {
                     &dockerfile_display,
                 )? {
                     DockerfileSetupDecision::CreateNew => {
-                        let paths = RepoDockerfilePaths::new(&git_root);
-                        let dockerfile_path = paths.project_dockerfile();
-                        std::fs::write(&dockerfile_path, templates::project_dockerfile_dev())
-                            .map_err(|e| EngineError::io(dockerfile_path.clone(), e))?;
-                        self.summary.dockerfile = StepStatus::Done;
+                        // The path `SettingUpDockerfile` looked at and every
+                        // build reads — the configured `runtime.dockerfile`,
+                        // else `Dockerfile.dev` — never a fixed name the
+                        // build would then ignore.
+                        let dockerfile_path =
+                            dockerfile_path_or_default(&self.repo_config, &git_root);
+                        let tree = self.tree();
+                        match ProjectDockerfileTarget::classify(&tree, &dockerfile_path) {
+                            ProjectDockerfileTarget::InRepo(rel) => {
+                                let status = create_project_dockerfile(
+                                    &tree,
+                                    &rel,
+                                    templates::project_dockerfile_dev().as_bytes(),
+                                )
+                                .map_err(|e| EngineError::Other(e.to_string()))?;
+                                if let InitFileStatus::Skipped { reason } = &status {
+                                    frontend.write_message(crate::data::message::UserMessage {
+                                        level: crate::data::message::MessageLevel::Warning,
+                                        text: reason.clone(),
+                                    });
+                                    self.summary.dockerfile = StepStatus::Skipped;
+                                } else {
+                                    self.summary.dockerfile = StepStatus::Done;
+                                }
+                                self.record_project_dockerfile_rel(&rel, status);
+                            }
+                            ProjectDockerfileTarget::OutsideRepo(path) => {
+                                let reason = ProjectDockerfileTarget::outside_reason(&path);
+                                frontend.write_message(crate::data::message::UserMessage {
+                                    level: crate::data::message::MessageLevel::Warning,
+                                    text: reason.clone(),
+                                });
+                                self.record_project_dockerfile(
+                                    &path,
+                                    InitFileStatus::Skipped { reason },
+                                );
+                                self.summary.dockerfile = StepStatus::Skipped;
+                            }
+                        }
                         InitPhase::SettingUpAgentDockerfile
                     }
                     DockerfileSetupDecision::UseExisting(path) => {
+                        let resolved = {
+                            let p = std::path::Path::new(&path);
+                            if p.is_absolute() {
+                                p.to_path_buf()
+                            } else {
+                                git_root.join(p)
+                            }
+                        };
+                        let status = match inspect_project_dockerfile(&resolved) {
+                            ExistingDockerfile::Usable => InitFileStatus::Kept,
+                            ExistingDockerfile::Missing => InitFileStatus::Skipped {
+                                reason: format!("{path} does not exist"),
+                            },
+                            ExistingDockerfile::Unusable(reason) => {
+                                InitFileStatus::Skipped { reason }
+                            }
+                        };
+                        self.record_project_dockerfile(&resolved, status);
                         self.pending_dockerfile_path = Some(path);
                         // If config already existed at init start, merge into
                         // it via SavingDockerfileConfig. Otherwise, let
@@ -250,6 +446,14 @@ impl InitEngine {
                         }
                     }
                     DockerfileSetupDecision::Skip => {
+                        let dockerfile_path =
+                            dockerfile_path_or_default(&self.repo_config, &git_root);
+                        self.record_project_dockerfile(
+                            &dockerfile_path,
+                            InitFileStatus::Skipped {
+                                reason: "Dockerfile setup was declined".to_string(),
+                            },
+                        );
                         self.summary.dockerfile = StepStatus::Skipped;
                         InitPhase::SettingUpAgentDockerfile
                     }
@@ -638,6 +842,7 @@ impl InitEngine {
         };
         self.phase = next.clone();
         if matches!(self.phase, InitPhase::Complete | InitPhase::Failed(_)) {
+            self.record_snapshotted_files()?;
             frontend.report_summary(&self.summary);
         }
         Ok(next)

@@ -376,6 +376,8 @@ impl ExecWorkflowCommand {
         // a fresh dynamic run includes the leader and every agent offered to it.
         let paths = crate::data::RepoDockerfilePaths::new(&git_root_for_scope);
         let (preflight, leader_plan) = if let Some(plan) = &resume_plan {
+            validate_workflow_agent_dockerfiles(&plan.workflow, &base_session, &paths)
+                .map_err(CommandError::Other)?;
             frontend.with(|f| {
                 ensure_workflow_agents_approved(&plan.workflow, &base_session, &effective_flags, f)
             })?;
@@ -383,6 +385,11 @@ impl ExecWorkflowCommand {
                 &plan.workflow, &base_session, &effective_flags)?, None)
         } else {
             let dynamic = resolve_dynamic_workflows(&base_session, &effective_flags)?;
+            // Check project setup before the unified review can prepare images
+            // or acquire credentials. Diagnostic mode only reports prerequisites.
+            if !effective_flags.prerequisites.check_only {
+                validate_dynamic_agent_dockerfiles(&base_session, &effective_flags, &dynamic)?;
+            }
             let (leader_agent, leader_model) =
                 resolve_leader_model(&effective_flags, &base_session, &dynamic)?;
             frontend
@@ -768,6 +775,12 @@ impl ExecWorkflowCommand {
             }
         };
 
+        // Project setup failures are terminal, outside the leader's repair
+        // budget. An unprepared agent cannot create its project Dockerfile under
+        // the mutation guard or expand the reviewed prerequisite scope.
+        resolve_and_validate_workflow_agents(&validated_workflow, &leader_session, &paths)
+            .map_err(CommandError::Other)?;
+
         // Stash the generated workflow inside the checkout so a failed run can
         // be resumed without a second leader-design pass (WI-0115 §2).
         save_dynamic_workflow_copy(&state_git_root, &work_item_context, &generated_path);
@@ -886,6 +899,10 @@ impl ExecWorkflowCommand {
                 })))
             }
             WorkflowResumeDecision::Fresh => {
+                // Do not discard saved project files until a fresh leader's
+                // Dockerfile prerequisites have passed their read-only check.
+                let dynamic = resolve_dynamic_workflows(&self.session, &self.flags)?;
+                validate_dynamic_agent_dockerfiles(&self.session, &self.flags, &dynamic)?;
                 // Clear both halves so neither this run's state check nor the
                 // next invocation trips over the abandoned run.
                 let store = crate::data::workflow_state_store::WorkflowStateStore::at_git_root(
