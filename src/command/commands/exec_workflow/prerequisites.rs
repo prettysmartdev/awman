@@ -9,11 +9,12 @@
 use super::*;
 pub(crate) use crate::command::commands::workflow_prerequisites::PreparedPrerequisites;
 use crate::command::commands::workflow_prerequisites::{
-    PrerequisiteReportNext, WorkflowPrerequisiteFlow, WorkflowPrerequisiteFlowOptions,
+    PrerequisiteReportNext, WorkflowPreflightPlan, WorkflowPrerequisiteFlow,
+    WorkflowPrerequisiteFlowOptions,
 };
 use crate::data::workflow_definition::{SetupStep, TeardownStep};
 use crate::data::workflow_prerequisites::{
-    PrerequisiteOrigin, PrerequisiteStepKind, WorkflowPrerequisiteReport, WorkflowPrerequisites,
+    PrerequisiteOrigin, PrerequisiteStepKind, WorkflowPrerequisiteReport,
 };
 use crate::engine::overlay::prerequisite_grants::{GrantOverlays, GrantTarget};
 use crate::engine::workflow::step_commands::StepCommandOptions;
@@ -42,7 +43,7 @@ impl ExecWorkflowCommand {
             origin,
             Some(phase_image),
         );
-        options.worktree_planned = self.flags.worktree;
+        options.worktree_planned = self.flags.worktree || self.flags.dynamic;
         WorkflowPrerequisiteFlow::new(&self.engines, &self.session, options)
     }
 
@@ -51,13 +52,15 @@ impl ExecWorkflowCommand {
     /// still at the keyboard. `--check-prerequisites` stops here.
     pub(super) async fn start_prerequisites(
         &self,
-        needs: &WorkflowPrerequisites,
+        plan: &WorkflowPreflightPlan,
         workflow_name: String,
         frontend: &SharedWorkflowFrontend,
     ) -> Result<PrerequisiteStart, CommandError> {
-        let flow = self.prerequisite_flow(needs.origin);
+        let flow = self.prerequisite_flow(plan.needs.origin);
+        let can_ask =
+            !self.flags.prerequisites.check_only && frontend.with(|f| f.can_ask_prerequisites());
+        let report = frontend.with(|f| flow.preflight_with_messages(&plan.needs, can_ask, f));
         if self.flags.prerequisites.check_only {
-            let report = frontend.with(|f| flow.preflight_with_messages(needs, false, f));
             frontend.with(|f| {
                 f.show_workflow_prerequisites(&report, PrerequisiteReportNext::CheckOnly)
             })?;
@@ -69,8 +72,21 @@ impl ExecWorkflowCommand {
                 worktree_used: false,
             }));
         }
-        let prepared = frontend.with(|f| flow.prepare(needs, f));
-        let prepared = match prepared {
+        if can_ask {
+            frontend.with(|f| {
+                f.show_workflow_prerequisites(
+                    &report,
+                    PrerequisiteReportNext::Questions {
+                        unresolved: flow
+                            .options()
+                            .policy
+                            .unresolved_or(crate::data::config::workflows::UnresolvedMode::Warn),
+                    },
+                )
+            })?;
+        }
+        let prepared = frontend.with(|f| flow.prepare_report(report, f, false));
+        let mut prepared = match prepared {
             Ok(prepared) => prepared,
             Err(e) => {
                 if let CommandError::WorkflowPrerequisitesUnresolved { report } = &e {
@@ -85,7 +101,22 @@ impl ExecWorkflowCommand {
                 return Err(e);
             }
         };
+        let image_result = plan
+            .prepare_images(
+                &mut prepared.report,
+                &self.engines,
+                &self.session,
+                (!can_ask).then_some(prepared.flow.options().headless.clone()),
+                &mut frontend.clone(),
+            )
+            .await;
+        if !can_ask {
+            frontend.with(|f| {
+                f.show_workflow_prerequisites(&prepared.report, PrerequisiteReportNext::Decided)
+            })?;
+        }
         self.record_prerequisite_report(&prepared.report).await;
+        image_result?;
         Ok(PrerequisiteStart::Run(Box::new(prepared)))
     }
 

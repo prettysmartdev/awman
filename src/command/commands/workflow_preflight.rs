@@ -37,20 +37,21 @@ pub(crate) fn ensure_workflow_agents_approved(
     flags: &ExecWorkflowCommandFlags,
     frontend: &mut dyn crate::command::commands::agent_trust::AgentTrustFrontend,
 ) -> Result<(), CommandError> {
-    let config = crate::command::commands::exec_workflow::workflow_effective_config(session, flags)
-        .map_err(EngineError::Data)?;
-    let default_agent = config.agent();
-    let mut agents = Vec::new();
-    for step in &workflow.steps {
-        let name = step
-            .agent
-            .as_deref()
-            .or(workflow.agent.as_deref())
-            .or(default_agent.as_deref());
-        if let Some(name) = name {
-            agents.push(crate::data::session::AgentName::new(name)?);
-        }
-    }
+    let plan =
+        crate::command::commands::workflow_prerequisites::WorkflowPreflightPlan::for_workflow(
+            workflow, session, flags,
+        )?;
+    let agents = plan
+        .needs
+        .needs
+        .iter()
+        .filter_map(|need| match &need.prerequisite {
+            crate::data::workflow_prerequisites::WorkflowPrerequisite::AgentImage { agent } => {
+                Some(crate::data::session::AgentName::new(agent))
+            }
+            _ => None,
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     crate::command::commands::agent_trust::ensure_workflow_agents_trusted(
         session, &agents, frontend,
     )
@@ -418,10 +419,17 @@ pub(crate) fn build_effective_agents_to_models(
 pub(crate) fn agents_section_for_leader(
     resolved: &ResolvedDynamicWorkflows,
     available_agents: &[(String, std::path::PathBuf)],
-) -> Result<(String, Vec<String>), CommandError> {
+) -> Result<(String, Vec<String>, Vec<String>), CommandError> {
     let mut warnings = Vec::new();
     let Some(map) = &resolved.agents_to_models else {
-        return Ok((format_available_agents(available_agents), warnings));
+        return Ok((
+            format_available_agents(available_agents),
+            available_agents
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
+            warnings,
+        ));
     };
     let key_label = "workflows.dynamic.agentsToModels".to_string();
     let policy = match map.source {
@@ -440,9 +448,18 @@ pub(crate) fn agents_section_for_leader(
             "global {key_label}: no listed agent has a Dockerfile in this repo; falling back to \
              Dockerfile discovery"
         ));
-        return Ok((format_available_agents(available_agents), warnings));
+        return Ok((
+            format_available_agents(available_agents),
+            available_agents
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
+            warnings,
+        ));
     }
-    Ok((format_agents_with_models(&effective), warnings))
+    let mut agents: Vec<_> = effective.keys().cloned().collect();
+    agents.sort();
+    Ok((format_agents_with_models(&effective), agents, warnings))
 }
 
 /// Resolve the unique set of agent names a workflow will launch, using the same
@@ -542,115 +559,6 @@ pub(crate) async fn ensure_agent_image(
     sink: &mut dyn UserMessageSink,
 ) -> Result<(), CommandError> {
     ensure_agent_image_with_build_output(engines, git_root, paths, agent, session, sink, None).await
-}
-
-/// Static `exec workflow` preflight on a runtime that builds its images
-/// (Docker, Apple Containers). Every agent the steps launch needs its image
-/// before the first step's container starts; for each one that is missing
-/// the frontend is asked, once per agent:
-///
-/// - **set up** — write the agent's Dockerfile from its definition when the
-///   repo has none, then build its image;
-/// - **fall back** — run those steps with the default agent instead (offered
-///   only when the default agent's image exists);
-/// - **abort** — stop before anything is created.
-///
-/// Importing runtimes (builtin) and sandbox runtimes prepare images their own
-/// way and are left alone, as is a runtime that is not reachable (the launch
-/// then reports the runtime error).
-pub(crate) async fn ensure_static_workflow_agent_images(
-    workflow: &mut Workflow,
-    engines: &Engines,
-    session: &Session,
-    flags: &ExecWorkflowCommandFlags,
-    frontend: &mut dyn crate::command::commands::agent_setup::AgentSetupFrontend,
-) -> Result<(), CommandError> {
-    let config = crate::command::commands::exec_workflow::workflow_effective_config(session, flags)
-        .map_err(EngineError::Data)?;
-    let default_agent = match config.agent() {
-        Some(name) => crate::data::session::AgentName::new(name).map_err(EngineError::Data)?,
-        None => session.configured_agent(),
-    };
-    ensure_workflow_agent_images_with_default(workflow, engines, session, &default_agent, frontend)
-        .await
-}
-
-/// [`ensure_static_workflow_agent_images`] once the run's default agent (the
-/// one a step runs when neither it nor the workflow names one) is resolved.
-async fn ensure_workflow_agent_images_with_default(
-    workflow: &mut Workflow,
-    engines: &Engines,
-    session: &Session,
-    default_agent: &crate::data::session::AgentName,
-    frontend: &mut dyn crate::command::commands::agent_setup::AgentSetupFrontend,
-) -> Result<(), CommandError> {
-    use crate::command::commands::agent_setup::AgentSetupDecision;
-    use crate::data::image_tags::{agent_image_tag, project_image_tag};
-    use crate::data::session::AgentName;
-    use crate::engine::agent_runtime::ImageAcquisition;
-
-    let runtime = &engines.runtime;
-    // An unreachable runtime has no images to ask about; the launch reports
-    // it with its own error (and exit code).
-    if runtime.capabilities().image_acquisition != ImageAcquisition::Build
-        || !runtime.is_available()
-    {
-        return Ok(());
-    }
-    let git_root = session.git_root();
-    let paths = crate::data::RepoDockerfilePaths::new(git_root);
-    let image_present = |agent: &str| runtime.image_exists(&agent_image_tag(git_root, agent));
-
-    // Step → workflow → default, the order `validate_workflow_acp_preflight`
-    // and the engine resolve a step's agent in.
-    let workflow_agent = workflow.agent.clone();
-    let resolve = |step_agent: &Option<String>| -> String {
-        step_agent
-            .clone()
-            .or_else(|| workflow_agent.clone())
-            .unwrap_or_else(|| default_agent.as_str().to_string())
-    };
-    let mut agents: Vec<String> = Vec::new();
-    for step in &workflow.steps {
-        let agent = resolve(&step.agent);
-        if !agents.contains(&agent) {
-            agents.push(agent);
-        }
-    }
-
-    for agent in agents {
-        if !matches!(image_present(&agent), Ok(false)) {
-            continue;
-        }
-        let requested = AgentName::new(&agent).map_err(EngineError::Data)?;
-        let image_only = paths.agent_dockerfile(&agent).exists();
-        let default_available = agent != default_agent.as_str()
-            && image_present(default_agent.as_str()).unwrap_or(false);
-        match frontend.ask_agent_setup(&requested, default_agent, default_available, image_only)? {
-            AgentSetupDecision::Setup => {
-                let project_tag = project_image_tag(git_root);
-                if !runtime.image_exists(&project_tag).unwrap_or(false) {
-                    return Err(EngineError::AgentRequiresProjectImage { tag: project_tag }.into());
-                }
-                ensure_agent_image(engines, git_root, &paths, &agent, session, frontend).await?;
-            }
-            AgentSetupDecision::FallbackToDefault if default_available => {
-                for step in &mut workflow.steps {
-                    if resolve(&step.agent) == agent {
-                        step.agent = Some(default_agent.as_str().to_string());
-                    }
-                }
-                frontend.record_fallback(&requested, default_agent);
-            }
-            _ => {
-                return Err(CommandError::Other(format!(
-                    "workflow step agent '{agent}' has no image; set it up with \
-                     `awman ready --agent {agent}` and run the workflow again"
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Import the image a workflow or squad step needs. If Apple Containers has

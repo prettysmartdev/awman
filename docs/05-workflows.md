@@ -272,12 +272,13 @@ All setup and teardown steps execute inside the project's **base container image
 
 ### Workflow prerequisite checks
 
-Before starting a workflow, awman checks the resources needed by its setup and teardown steps. The check happens before the first agent or step container starts. In an interactive run, awman shows a report and asks before using host credentials. In headless runs, it uses only credentials already available through the selected policy or explicit flags; `--yes` does not grant credentials. If requirements remain unresolved, a headless static workflow fails before launch by default; interactive, dynamic and squad runs warn by default. Set `--prerequisite-unresolved warn` to continue with a warning, or `fail` to stop when a requirement remains missing or needs consent.
+Before starting a workflow, awman checks its agent images, credentials, Git requirements and container tools together. Static workflows check their specific steps; dynamic workflows check all possible workflow requirements and all agents available to the leader. This single pass finishes before the leader or any workflow step starts. In an interactive run, awman shows a report and asks before using host credentials. In headless runs, it uses only credentials already available through the selected policy or explicit flags; `--yes` does not grant credentials. If requirements remain unresolved, a headless static workflow fails before launch by default; interactive, dynamic and squad runs warn by default. Set `--prerequisite-unresolved warn` to continue with a warning, or `fail` to stop when a requirement remains missing or needs consent.
 
 The requirements depend on the steps and the repository's remote:
 
 | Workflow need | When it is needed | What awman checks or supplies |
 |---|---|---|
+| Agent images | Every selected agent, including the dynamic leader | Images are included in the same prerequisite report and prepared before any agent starts. |
 | Git identity | `commit_changes` | A complete `user.name` and `user.email` in the repository/worktree config is used directly. If missing, you can provide an identity for this run or explicitly allow use of your host Git identity. awman does not change your global Git configuration. |
 | SSH access | `push_branch` when the remote uses SSH | awman checks for a usable key and the `ssh` tool in the base image. With consent, it mounts a selected key read-only, or the whole `~/.ssh` directory if you choose that broader access. |
 | GitHub token | GitHub HTTPS `clone_repo` / `pull_branch`, `create_pull_request`, HTTPS `push_branch`, and token-authenticated `poll_ci` | awman can use a token from an approved host variable, `gh auth token`, a token you paste, or a configured `acquire` command. Credentials are supplied only to the steps that need them. For `poll_ci`, an already-authenticated host `gh` may be used without a token grant. |
@@ -290,7 +291,7 @@ In an interactive run (the TUI, or the CLI on a terminal), awman first reports w
 
 Under the checks, the report says what happens if you continue:
 
-- **Enter to configure missing prerequisites**: awman asks about each item that needs attention, one at a time, and offers the fixes it can apply (mount a key, use or paste a token, enter an identity). Nothing is mounted, passed to a container or written until you pick a fix.
+- **Enter to configure missing prerequisites**: awman asks about each item that needs attention, one at a time, and offers the fixes it can apply (mount a key, use or paste a token, enter an identity). Continuing also approves preparation of the listed missing agent images; credential use still requires an explicit choice or an existing grant.
 - **Esc** (or **Ctrl-C**): cancel before anything starts.
 
 If you leave items unresolved after the questions, by declining or picking "continue without", the run still starts by default. You get a warning for each item, and the steps that need it fail when they run. With `--prerequisite-unresolved fail` (or `workflows.prerequisites.unresolved: "fail"`), the run stops before any agent starts. The report says which of these applies. When every check is satisfied, **Enter** starts the workflow. With `--check-prerequisites`, the report is the whole result and the only choice is **Close**.
@@ -886,23 +887,11 @@ A step without an `agent` field uses, in order: the workflow's top-level `agent`
 
 ### Agent images
 
-Every agent a workflow uses needs its image. Before a static workflow runs its first setup step or agent container (after any worktree is prepared), awman collects the agent each step will run and checks that its image exists. For each agent whose image is missing it asks once:
+Every agent a workflow uses needs its image. Agent images are checked together with the workflow's credentials, Git requirements and container tools in one prerequisite review before any agent starts. Static workflows check only their resolved step agents. Dynamic workflows check the leader and all agents available to it before the leader starts.
 
-```
-awman: Set up agent codex? [y]es / [n]o / [f]allback to claude
-```
+Continuing the prerequisite review prepares the listed missing images. For Docker and Apple Containers, awman writes a missing agent Dockerfile from its definition and builds the image. The project image must already be available; otherwise run `awman ready --build` first. Headless runs apply their mode's agent-setup defaults. Image preparation must succeed before the workflow runs.
 
-- **Yes** — awman writes `.awman/Dockerfile.codex` from the agent's definition if the repo doesn't have one, then builds the image. When the Dockerfile already exists the question is `Build image for codex?`. The agent image is built on top of the project image, so if that is missing too the run stops and tells you to run `awman ready --build` first.
-- **Fallback** — the steps that would have run `codex` run with the default agent instead (the `--agent` flag, else the configured `agent`, else `claude`). It is offered only when the default agent's image exists.
-- **No** (or Esc in the TUI) — the run stops before any container starts and tells you to prepare the agent with `awman ready --agent codex`.
-
-The TUI asks the same question in a dialog. A run with no terminal to ask (piped CLI, `--headless`, squad) sets the agent up; the HTTP API sets it up when the default agent's image exists and otherwise refuses the command. You can always prepare images ahead of time:
-
-```sh
-awman ready --agent codex
-```
-
-This check applies to the Docker and Apple Containers runtimes, which build images; when the runtime itself is unreachable, the run reports that instead. A [dynamic workflow](06-dynamic-workflows.md) checks the generated workflow's agents after the leader finishes and builds any missing image from `.awman/Dockerfile.<agent>` before the first step; a failed build stops the run.
+There is no separate agent-image setup dialog or image-build pass after the leader. To change an agent, update the workflow's agent selection before starting. `--check-prerequisites` includes image readiness in the report without building or importing anything.
 
 **Builtin runtime.** Image preparation for workflows (and squad) is import-only: it never starts a host build, even when `runtime.builtin.builder.enabled` is true, but it re-acquires an image that was installed from a different source than the one now configured (an installed image with no configured source is kept). A step that runs an agent other than the repo's default one stops when `runtime.builtin.imageSource` names a single image (an archive, or a fixed `reference`): give that agent its own `runtime.builtin.images` entry. In a worktree, the repo's `runtime.builtin` settings, default `agents.default` and `workItems` settings come from the checkout you launched from, not the worktree's commit. If a required agent image is not imported, the run stops and tells you to prepare it with `awman ready` (or to configure an image source). Setup and teardown steps run in the imported agent image of the repo's configured agent (or in the `runtime.baseImage` you set, which must also be imported). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
 

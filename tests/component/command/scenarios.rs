@@ -14,6 +14,12 @@ pub fn prepare(s: &TestSandbox) -> Vec<awman_test_support::fakes::FakeCli> {
         .write(s, None);
     let docker = s.install_fake(crate::support::fake_cli_exe(), "docker");
     awman_test_support::fakes::docker_cli_baseline(&docker);
+    // Successful check-only scenarios now include the selected agent image.
+    // Other images retain the baseline's missing-image response.
+    for repo in ["workflow", "read-only"] {
+        let tag = awman::data::image_tags::agent_image_tag(&s.work().join(repo), "claude");
+        docker.on(&["image", "inspect", &tag]).exit(0);
+    }
     [
         "claude", "codex", "gemini", "opencode", "pi", "crush", "maki",
     ]
@@ -30,6 +36,16 @@ pub fn assert_no_host_agents(agents: &[awman_test_support::fakes::FakeCli]) {
             agent.calls()
         );
     }
+}
+
+fn container_env(backend: &Backend, s: &TestSandbox) -> awman_test_support::EnvMap {
+    let mut env = backend.env();
+    // The fake binaries and scratch directory are siblings. Admit only the
+    // sandbox's fakes through host CLI isolation, as in the container suites.
+    for key in ["TMPDIR", "TMP", "TEMP"] {
+        env.set(key, s.root());
+    }
+    env
 }
 
 pub async fn catalogue_explains_each_command_before_execution(
@@ -105,12 +121,17 @@ pub async fn workflow_preflight_is_read_only_and_missing_work_is_typed(
         .file("README.md", "fixture\n")
         .init();
     let workflow = WorkflowBuilder::new("preflight")
-        .step("first", "literal $(codex)", &[])
+        .step_with(awman_test_support::fixtures::WorkflowStep {
+            name: "first".into(),
+            agent: Some("claude".into()),
+            prompt: "literal $(codex)".into(),
+            ..Default::default()
+        })
         .write(repo.path(), "workflow");
     let path = workflow.to_str().unwrap();
     let before = std::fs::read(&workflow).unwrap();
     let checked = crate::support::awman(s)
-        .envs(&backend.env())
+        .envs(&container_env(backend, s))
         .args([
             "exec",
             "workflow",
@@ -130,9 +151,18 @@ pub async fn workflow_preflight_is_read_only_and_missing_work_is_typed(
     );
     let report: Value = serde_json::from_str(&checked.stdout_text()).unwrap();
     assert!(report.is_object());
+    assert!(report["prerequisites"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|check| {
+            check["prerequisite"]["type"] == "agent_image"
+                && check["prerequisite"]["agent"] == "claude"
+                && check["status"] == "satisfied"
+        }));
     assert_eq!(std::fs::read(&workflow).unwrap(), before);
     let missing = crate::support::awman(s)
-        .envs(&backend.env())
+        .envs(&container_env(backend, s))
         .args(["exec", "workflow", "missing.toml", "--headless"])
         .current_dir(repo.path())
         .run();
@@ -151,16 +181,16 @@ pub async fn read_only_workspace_refusals_are_typed_and_precede_launch(
         .file("README.md", "fixture\n")
         .file(
             "setup.toml",
-            "title = 's'\n\n[[setup]]\ntype = 'run_shell'\ncommand = 'true'\n\n[[step]]\nname = 'run'\nprompt = 'look'\n",
+            "title = 's'\nagent = 'claude'\n\n[[setup]]\ntype = 'run_shell'\ncommand = 'true'\n\n[[step]]\nname = 'run'\nprompt = 'look'\n",
         )
         .file(
             "plain.toml",
-            "title = 'p'\n\n[[step]]\nname = 'run'\nprompt = 'look'\n",
+            "title = 'p'\nagent = 'claude'\n\n[[step]]\nname = 'run'\nprompt = 'look'\n",
         )
         .init();
     let run = |args: &[&str]| {
         let out = crate::support::awman(s)
-            .envs(&backend.env())
+            .envs(&container_env(backend, s))
             .args(args)
             .current_dir(repo.path())
             .run();

@@ -120,6 +120,9 @@ impl GitRemoteUrl {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkflowPrerequisite {
+    AgentImage {
+        agent: String,
+    },
     GitIdentity,
     GitRemote {
         remote: String,
@@ -191,6 +194,9 @@ pub enum AcquireScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Remediation {
+    PrepareAgentImage {
+        agent: String,
+    },
     ReplaceRejectedToken,
     UseHostIdentity {
         name: String,
@@ -252,7 +258,7 @@ pub struct PrerequisiteCheck {
     pub prerequisite: WorkflowPrerequisite,
     pub status: PrerequisiteStatus,
     pub explanation: String,
-    /// Empty means "any teardown step" (AssumedAll).
+    /// Empty means "workflow-wide" (AssumedAll).
     pub needed_by: Vec<StepRef>,
     pub remediations: Vec<Remediation>,
 }

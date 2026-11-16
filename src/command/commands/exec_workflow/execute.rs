@@ -114,7 +114,7 @@ impl Command for ExecWorkflowCommand {
             });
             return Err(err);
         }
-        let mut workflow = match Workflow::load(&workflow_path) {
+        let workflow = match Workflow::load(&workflow_path) {
             Ok(w) => w,
             Err(e) => {
                 let err = CommandError::Other(format!("loading workflow: {e}"));
@@ -154,14 +154,26 @@ impl Command for ExecWorkflowCommand {
             return Err(e);
         }
 
-        // Workflow prerequisites (WI 0149): what the teardown steps need is
-        // checked, asked about and granted now, before the worktree, the
-        // image or any container exists. `--check-prerequisites` ends here.
-        let prerequisite_needs =
-            crate::data::workflow_prerequisites::WorkflowPrerequisites::from_workflow(&workflow);
+        // ACP compatibility is a workflow-wide pre-flight check.  Do it
+        // before mount scope, worktree preparation, image setup, overlays, or
+        // the workflow engine so `fallback: error` cannot leave partial work.
+        let launch_modes = match frontend.with(|frontend| {
+            validate_workflow_acp_preflight(&workflow, &self.session, &self.flags, frontend)
+        }) {
+            Ok(modes) => modes,
+            Err(e) => return Err(CommandError::from(e)),
+        };
+
+        // Collect the complete workflow scope before any worktree or agent starts.
+        let preflight =
+            crate::command::commands::workflow_prerequisites::WorkflowPreflightPlan::for_workflow(
+                &workflow,
+                &self.session,
+                &self.flags,
+            )?;
         let prerequisites = match self
             .start_prerequisites(
-                &prerequisite_needs,
+                &preflight,
                 crate::engine::workflow::workflow_name_for(&workflow),
                 &frontend,
             )
@@ -208,16 +220,6 @@ impl Command for ExecWorkflowCommand {
         // be empty.
         frontend.with(|frontend| warn_context_workflow_in_phase(&workflow, frontend));
         let _ = deprecation_warned;
-
-        // ACP compatibility is a workflow-wide pre-flight check.  Do it
-        // before mount scope, worktree preparation, image setup, overlays, or
-        // the workflow engine so `fallback: error` cannot leave partial work.
-        let launch_modes = match frontend.with(|frontend| {
-            validate_workflow_acp_preflight(&workflow, &self.session, &self.flags, frontend)
-        }) {
-            Ok(modes) => modes,
-            Err(e) => return Err(CommandError::from(e)),
-        };
 
         // 2. Resolve mount scope — confirm with the user when cwd differs from git root.
         let cwd = self.session.working_dir().to_path_buf();
@@ -389,26 +391,6 @@ impl Command for ExecWorkflowCommand {
             }
             all
         };
-
-        // 6. Every agent the steps launch needs its image. Ask about each
-        //    one that is missing (set up / fall back to the default agent /
-        //    abort) now, before any setup step or agent container starts.
-        //    Images are tagged by the invoking repo, not the worktree.
-        if let Err(e) = ensure_static_workflow_agent_images(
-            &mut workflow,
-            &self.engines,
-            &self.session,
-            &self.flags,
-            &mut frontend,
-        )
-        .await
-        {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Error,
-                text: format!("exec workflow: {e}"),
-            });
-            return Err(e);
-        }
 
         let prepared = PreparedRun {
             workflow,

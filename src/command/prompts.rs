@@ -378,7 +378,7 @@ fn cancel_parallel_group(group: &[String], exit: &GroupExit) -> Prompt<ParallelG
 // tool and gap questions dismiss to `Abort`: walking away from "this step
 // will fail" should not start a long run.
 
-/// "push_branch", "push_branch, create_pull_request" or "any teardown step"
+/// "push_branch", "push_branch, create_pull_request" or "any workflow step"
 /// (a dynamic run, whose steps do not exist yet).
 fn prerequisite_steps(check: &PrerequisiteCheck) -> String {
     check.needed_by_label()
@@ -634,7 +634,7 @@ fn tilde_path(path: &str, home: Option<&Path>) -> String {
 pub fn prerequisite_token_consent(check: &PrerequisiteCheck, var: &str) -> Prompt<TokenConsent> {
     let steps = prerequisite_steps(check);
     prerequisite_prompt(
-        format!("{steps} need a GitHub token. Use the token in {var} for teardown steps?"),
+        format!("{steps} need a GitHub token. Use the token in {var} for the workflow steps that need it?"),
         format!(
             "The token is passed by name only to the containers that need it \
              (create_pull_request as GH_TOKEN, an HTTPS push_branch as AWMAN_GIT_TOKEN) and \
@@ -834,14 +834,29 @@ pub fn prerequisite_report(
     use crate::data::workflow_prerequisites::{PrerequisiteOrigin, PrerequisiteStatus};
 
     let attention = report.needs_attention();
+    let has_images = report.checks.iter().any(|check| {
+        matches!(
+            check.prerequisite,
+            crate::data::workflow_prerequisites::WorkflowPrerequisite::AgentImage { .. }
+        ) && check.status != PrerequisiteStatus::Satisfied
+    });
     let dynamic = report.origin == PrerequisiteOrigin::AssumedAll;
     let mut body: Vec<String> = Vec::new();
-    if dynamic && next != PrerequisiteReportNext::CheckOnly {
+    if dynamic {
         body.push(
-            "This is a dynamic workflow: its teardown steps are not known until the leader \
-             writes them, so every kind of teardown step is checked."
+            "This is a dynamic workflow: its steps are not known until the leader writes them, \
+             so all workflow prerequisites, including available agent images, are checked together."
                 .into(),
         );
+    }
+    if !dynamic {
+        body.push(
+            "Prerequisites are calculated for this workflow and checked together before it starts."
+                .into(),
+        );
+    }
+    if has_images && matches!(next, PrerequisiteReportNext::Questions { .. }) {
+        body.push("Continue prepares the listed missing agent images before any agent starts. Image preparation must succeed to run the workflow.".into());
     }
     let choices = match next {
         PrerequisiteReportNext::CheckOnly => {
@@ -857,16 +872,26 @@ pub fn prerequisite_report(
             vec![Choice::new('\n', "Start the workflow", true)]
         }
         PrerequisiteReportNext::Questions { unresolved } => {
-            let count = attention.len();
-            body.push(format!(
-                "Next: awman asks about {} one at a time and offers a fix where it can. \
+            let count = attention
+                .iter()
+                .filter(|check| {
+                    !matches!(
+                        check.prerequisite,
+                        crate::data::workflow_prerequisites::WorkflowPrerequisite::AgentImage { .. }
+                    )
+                })
+                .count();
+            if count > 0 {
+                body.push(format!(
+                    "Next: awman asks about {} one at a time and offers a fix where it can. \
                  Nothing is mounted, passed to a container or written until you choose it.",
-                if count == 1 {
-                    "the item that needs attention".to_string()
-                } else {
-                    format!("each of the {count} items that need attention")
-                }
-            ));
+                    if count == 1 {
+                        "the item that needs attention".to_string()
+                    } else {
+                        format!("each of the {count} items that need attention")
+                    }
+                ));
+            }
             let mut steps: Vec<&str> = Vec::new();
             let mut any_step = false;
             for check in &attention {
@@ -884,12 +909,12 @@ pub fn prerequisite_report(
             };
             body.push(match unresolved {
                 UnresolvedMode::Warn if dynamic => format!(
-                    "Anything you leave unresolved does not stop the run: the workflow starts, \
+                    "Unresolved credential or tool requirements do not stop the run: the workflow starts, \
                      you get a warning for each item, the leader is told what is unavailable, \
                      and {steps} will fail if they run."
                 ),
                 UnresolvedMode::Warn => format!(
-                    "Anything you leave unresolved does not stop the run: the workflow starts, \
+                    "Unresolved credential or tool requirements do not stop the run: the workflow starts, \
                      you get a warning for each item, and {steps} will fail when they run."
                 ),
                 UnresolvedMode::Fail => "Anything you leave unresolved stops the run before any \
