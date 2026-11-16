@@ -317,3 +317,80 @@ install = ["echo install"]
         ]
     );
 }
+
+/// Session setup's `CreatingDockerfile` with `runtime.dockerfile` set to
+/// `configured`: what one step does to the repository.
+async fn create_project_dockerfile(
+    sandbox: &TestSandbox,
+    configured: &serde_json::Value,
+) -> Result<ReadyPhase, EngineError> {
+    let dir = sandbox.work().join(".awman");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::json!({"runtime": {"dockerfile": configured}}).to_string(),
+    )
+    .unwrap();
+    let mut engine = engine(sandbox, "claude", Arc::new(Pinger::default()));
+    engine.phase = ReadyPhase::CreatingDockerfile;
+    engine.step(&mut Frontend::default()).await
+}
+
+#[tokio::test]
+async fn setup_creates_a_configured_dockerfile_with_missing_parents_and_never_overwrites() {
+    let sandbox = TestSandbox::for_test(TestCase::component(
+        "engine::ready::contracts::setup_creates_a_configured_dockerfile_with_missing_parents_and_never_overwrites",
+    ));
+    let target = sandbox.work().join("missing/Project.Dockerfile");
+    create_project_dockerfile(&sandbox, &"missing/Project.Dockerfile".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        crate::data::templates::project_dockerfile_dev()
+    );
+    // A file that appeared after Preflight's existence check is kept.
+    std::fs::write(&target, "FROM mine\n").unwrap();
+    create_project_dockerfile(&sandbox, &"missing/Project.Dockerfile".into())
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "FROM mine\n");
+}
+
+#[tokio::test]
+async fn setup_never_creates_a_dockerfile_outside_the_git_root() {
+    let sandbox = TestSandbox::for_test(TestCase::component(
+        "engine::ready::contracts::setup_never_creates_a_dockerfile_outside_the_git_root",
+    ));
+    let outside_dir = sandbox.root().join("outside");
+    std::fs::create_dir_all(&outside_dir).unwrap();
+    let outside = outside_dir.join("Dockerfile");
+    let err = create_project_dockerfile(&sandbox, &outside.display().to_string().into())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("outside the git root"), "{err}");
+    assert!(!outside.exists());
+
+    #[cfg(unix)]
+    {
+        // Through a committed directory link, and to a dangling final link.
+        std::os::unix::fs::symlink(&outside_dir, sandbox.work().join("docker")).unwrap();
+        std::os::unix::fs::symlink(outside_dir.join("gone"), sandbox.work().join("dangling"))
+            .unwrap();
+        for (configured, why) in [
+            (
+                "docker/Project.Dockerfile",
+                "symbolic link or not a directory",
+            ),
+            ("dangling", "is a symbolic link"),
+        ] {
+            let err = create_project_dockerfile(&sandbox, &configured.into())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(why), "{configured}: {err}");
+        }
+        assert_eq!(std::fs::read_dir(&outside_dir).unwrap().count(), 0);
+    }
+}

@@ -254,9 +254,10 @@ pub(crate) fn attribute_leader_error(
 }
 
 /// Validate the `workflow.toml` produced by the leader agent: checks file
-/// presence, TOML parse, and resolved-agent Dockerfile validation. Returns the
+/// presence, TOML parse, and agent-definition resolution. Returns the
 /// parsed [`Workflow`] on success or a human-readable error string that is
-/// passed to the repair loop (WI-0092 §9).
+/// passed to the repair loop (WI-0092 §9). Missing project Dockerfiles are
+/// setup failures, checked outside the repair loop: a leader cannot fix them.
 pub(crate) fn validate_generated_workflow(
     generated_path: &std::path::Path,
     session: &Session,
@@ -270,10 +271,11 @@ pub(crate) fn validate_generated_workflow(
     }
     match Workflow::load(generated_path) {
         Err(e) => Err(e.to_string()),
-        Ok(wf) => match resolve_and_validate_workflow_agents(&wf, session, paths) {
-            Err(e) => Err(e),
-            Ok(_) => Ok(wf),
-        },
+        Ok(wf) => {
+            let agents = resolve_workflow_agents(&wf, session, paths)?;
+            validate_workflow_agent_definitions(&agents, session)?;
+            Ok(wf)
+        }
     }
 }
 
@@ -403,10 +405,11 @@ pub(crate) fn build_effective_agents_to_models(
             available_names.sort();
             Err(CommandError::Other(format!(
                 "{key_label} references agents that have no Dockerfile in this repo: [{}].\n\
-                 Available agents: [{}].\nAdd a .awman/Dockerfile.<agent> for each missing \
-                 agent, or remove it from agentsToModels.",
+                 Available agents: [{}].\nRun init for each missing agent before retrying:\n{}\n\
+                 Or remove it from agentsToModels.",
                 missing.join(", "),
-                available_names.join(", ")
+                available_names.join(", "),
+                missing_agent_init_actions(&missing)
             )))
         }
     }
@@ -452,8 +455,97 @@ pub(crate) fn agents_section_for_leader(
 /// precedence as `WorkflowEngine::resolve_agent` (step → workflow → session
 /// default), and validate that each has a project Dockerfile. On success
 /// returns the set of resolved agents; on failure returns a human-readable
-/// error string suitable for the leader repair prompt (WI-0092 §9a).
+/// setup error with the init remedy. Call outside the leader repair loop:
+/// the leader is not allowed to create project Dockerfiles (WI 0148).
 pub(crate) fn resolve_and_validate_workflow_agents(
+    workflow: &Workflow,
+    session: &Session,
+    paths: &crate::data::RepoDockerfilePaths,
+) -> Result<Vec<String>, String> {
+    let resolved = validate_workflow_agent_dockerfiles(workflow, session, paths)?;
+    validate_workflow_agent_definitions(&resolved, session)?;
+    Ok(resolved)
+}
+
+/// Read-only project-file check, independent of custom-agent trust prompts.
+pub(crate) fn validate_workflow_agent_dockerfiles(
+    workflow: &Workflow,
+    session: &Session,
+    paths: &crate::data::RepoDockerfilePaths,
+) -> Result<Vec<String>, String> {
+    let resolved = resolve_workflow_agents(workflow, session, paths)?;
+    validate_agent_dockerfiles(&resolved, paths, "workflow.toml")?;
+    Ok(resolved)
+}
+
+/// Check only the agents known before generation. A global model map spans
+/// repositories and keeps its skip-with-warning policy (WI 0150); a repo map
+/// explicitly selects agents for this project and must be fully prepared.
+pub(crate) fn validate_dynamic_agent_dockerfiles(
+    session: &Session,
+    flags: &ExecWorkflowCommandFlags,
+    dynamic: &ResolvedDynamicWorkflows,
+) -> Result<(), CommandError> {
+    let (leader, _) = resolve_leader_model(flags, session, dynamic)?;
+    let mut agents = vec![leader.as_str().to_string()];
+    if let Some(map) = &dynamic.agents_to_models {
+        if map.source != DynamicWorkflowsSource::Global {
+            agents.extend(map.value.keys().map(|name| name.to_ascii_lowercase()));
+        }
+    }
+    let paths = crate::data::RepoDockerfilePaths::new(session.git_root());
+    validate_agent_dockerfiles(&agents, &paths, "dynamic workflow").map_err(|error| {
+        let error = CommandError::Other(error);
+        if !paths.agent_dockerfile(leader.as_str()).is_file() {
+            attribute_leader_error(dynamic, error)
+        } else {
+            error
+        }
+    })
+}
+
+fn missing_agent_init_actions(missing: &[String]) -> String {
+    missing
+        .iter()
+        .map(|agent| {
+            format!(
+                "  POST /v1/worker/commands {{\"subcommand\":\"init\",\"args\":[\"--agent\",\"{agent}\"]}} / awman init --agent {agent}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn validate_agent_dockerfiles(
+    agents: &[String],
+    paths: &crate::data::RepoDockerfilePaths,
+    context: &str,
+) -> Result<(), String> {
+    for agent in agents {
+        crate::data::session::AgentName::new(agent).map_err(|e| e.to_string())?;
+    }
+    let mut missing: Vec<String> = agents
+        .iter()
+        .filter(|agent| !paths.agent_dockerfile(agent).is_file())
+        .cloned()
+        .collect();
+    missing.sort();
+    missing.dedup();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut message = format!("{context} references agents with no Dockerfile in the project:\n");
+    for agent in &missing {
+        message.push_str(&format!(
+            "  - \"{agent}\" (expected .awman/Dockerfile.{agent})\n"
+        ));
+    }
+    message.push_str("Run init for each missing agent before retrying:\n");
+    message.push_str(&missing_agent_init_actions(&missing));
+    Err(message)
+}
+
+fn resolve_workflow_agents(
     workflow: &Workflow,
     session: &Session,
     paths: &crate::data::RepoDockerfilePaths,
@@ -492,34 +584,16 @@ pub(crate) fn resolve_and_validate_workflow_agents(
         }
     }
 
-    let available = paths.discover_agent_dockerfiles();
-    let available_names: Vec<String> = available.iter().map(|(n, _)| n.clone()).collect();
-    for name in &resolved {
+    Ok(resolved)
+}
+
+fn validate_workflow_agent_definitions(agents: &[String], session: &Session) -> Result<(), String> {
+    for name in agents {
         let agent = crate::data::session::AgentName::new(name).map_err(|e| e.to_string())?;
         crate::engine::agent::AgentRegistry::resolve_for_session(session, &agent)
             .map_err(|e| e.to_string())?;
     }
-    let unknown: Vec<&String> = resolved
-        .iter()
-        .filter(|a| !paths.agent_dockerfile(a).exists())
-        .collect();
-    if !unknown.is_empty() {
-        let mut msg =
-            String::from("workflow.toml references agents with no Dockerfile in the project:\n");
-        for a in &unknown {
-            msg.push_str(&format!("  - \"{a}\" (expected .awman/Dockerfile.{a})\n"));
-        }
-        msg.push_str(&format!(
-            "Available agents: {}",
-            if available_names.is_empty() {
-                "(none)".to_string()
-            } else {
-                available_names.join(", ")
-            },
-        ));
-        return Err(msg);
-    }
-    Ok(resolved)
+    Ok(())
 }
 
 pub(crate) trait BuildOutputTarget: Send + Sync {

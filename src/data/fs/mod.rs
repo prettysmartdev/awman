@@ -32,6 +32,7 @@ pub mod path_guard;
 pub mod private_files;
 pub mod remote_slug;
 pub mod repo_file;
+pub mod repo_tree;
 pub mod safe_tree;
 pub mod schema_version;
 pub mod skill_dirs;

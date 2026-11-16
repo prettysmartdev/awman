@@ -542,6 +542,38 @@ impl GitEngine {
             .collect())
     }
 
+    /// Which of `paths` (`/`-separated, relative to the repository root
+    /// `root`) are untracked or differ from HEAD — what a commit would
+    /// pick up. Ignored files are not reported.
+    pub fn uncommitted_paths(
+        &self,
+        root: &Path,
+        paths: &[String],
+    ) -> Result<std::collections::HashSet<String>, EngineError> {
+        let mut args = vec![
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+        ];
+        args.extend(paths.iter().map(String::as_str));
+        let stdout = run_git_summary(&self.env, &args, root)?;
+        let mut out = std::collections::HashSet::new();
+        let mut records = stdout.split('\0');
+        while let Some(record) = records.next() {
+            if record.len() < 4 {
+                continue;
+            }
+            // `XY PATH`; a rename or copy is followed by its source record.
+            if matches!(record.as_bytes()[0], b'R' | b'C') {
+                records.next();
+            }
+            out.insert(record[3..].to_string());
+        }
+        Ok(out)
+    }
+
     /// Return the branch, changed files, and line counts for `root`.
     ///
     /// Porcelain status remains the source of truth for the file set, while

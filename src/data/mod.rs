@@ -26,6 +26,7 @@ pub mod ids;
 pub mod image_build_lock;
 pub mod image_build_state;
 pub mod image_tags;
+pub mod init_files;
 pub mod issue;
 pub mod merge_fix_prompt;
 pub mod message;

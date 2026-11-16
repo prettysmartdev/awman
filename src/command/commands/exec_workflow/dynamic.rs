@@ -312,21 +312,20 @@ impl ExecWorkflowCommand {
         let work_item_context = prepared_input.context.clone();
         let wi_key = item.key.clone();
 
-        // ── Workflow prerequisites BEFORE the leader (WI 0149). The workflow
-        //    does not exist yet, so assume it may use every teardown kind; the
-        //    grants are narrowed once the generated workflow validates.
-        let mut prerequisites = match self
-            .start_prerequisites(
-                &crate::data::workflow_prerequisites::WorkflowPrerequisites::assume_all(),
-                format!("dynamic-{wi_key}"),
-                &[],
-                &frontend,
-            )
-            .await?
-        {
-            PrerequisiteStart::Run(prepared) => prepared,
-            PrerequisiteStart::CheckOnly(outcome) => return Ok(outcome),
-        };
+        // Diagnostic mode only probes; do not offer a resume or require setup.
+        if self.flags.prerequisites.check_only {
+            if let PrerequisiteStart::CheckOnly(outcome) = self
+                .start_prerequisites(
+                    &crate::data::workflow_prerequisites::WorkflowPrerequisites::assume_all(),
+                    format!("dynamic-{wi_key}"),
+                    &[],
+                    &frontend,
+                )
+                .await?
+            {
+                return Ok(outcome);
+            }
+        }
 
         frontend.with(|frontend| LaunchPolicy::for_session(&self.session).warn_config(frontend));
 
@@ -389,6 +388,36 @@ impl ExecWorkflowCommand {
             }
         };
 
+        // Read-only project setup validation precedes credential acquisition,
+        // worktree creation, image preparation and the leader/repair budget.
+        // Pull leases have already prepared their disposable clone. A resume
+        // validates its saved workflow instead of today's unused leader.
+        let paths = crate::data::RepoDockerfilePaths::new(&git_root_for_scope);
+        let dynamic = if let Some(plan) = &resume_plan {
+            validate_workflow_agent_dockerfiles(&plan.workflow, &base_session, &paths)
+                .map_err(CommandError::Other)?;
+            None
+        } else {
+            let dynamic = resolve_dynamic_workflows(&base_session, &self.flags)?;
+            validate_dynamic_agent_dockerfiles(&base_session, &self.flags, &dynamic)?;
+            Some(dynamic)
+        };
+
+        // The workflow does not exist yet: assume every teardown kind, then
+        // narrow the grants once the generated workflow validates (WI 0149).
+        let mut prerequisites = match self
+            .start_prerequisites(
+                &crate::data::workflow_prerequisites::WorkflowPrerequisites::assume_all(),
+                format!("dynamic-{wi_key}"),
+                &[],
+                &frontend,
+            )
+            .await?
+        {
+            PrerequisiteStart::Run(prepared) => prepared,
+            PrerequisiteStart::CheckOnly(outcome) => return Ok(outcome),
+        };
+
         let (lifecycle, run_root, worktree_path, worktree_git_mount) = match lifecycle {
             Some(lifecycle) => {
                 // A confirmed resume answers the existing-worktree question
@@ -431,8 +460,6 @@ impl ExecWorkflowCommand {
             Session::open_worktree_for(run_root.clone(), leader_git_root, &self.session)
                 .map_err(|e| CommandError::Other(format!("opening worktree session: {e}")))?
         };
-
-        let paths = crate::data::RepoDockerfilePaths::new(&git_root_for_scope);
 
         // ── Resume path: no leader, no context seeding, no image build for a
         //    leader that is never launched. Rewrite the saved state so the
@@ -502,7 +529,7 @@ impl ExecWorkflowCommand {
         //    The dynamic settings (WI 0150) layer the invoking checkout's repo
         //    config over global config, with `--leader` on top; a worktree's
         //    copy of the repo config is never consulted.
-        let dynamic = resolve_dynamic_workflows(&base_session, &self.flags)?;
+        let dynamic = dynamic.expect("a fresh dynamic run validated its settings before setup");
         let (leader_agent, leader_model) =
             resolve_leader_model(&self.flags, &self.session, &dynamic)?;
         // A custom leader definition is reviewed before the leader resolves.
@@ -780,6 +807,12 @@ impl ExecWorkflowCommand {
             }
         };
 
+        // Project setup failures are terminal, outside the leader's repair
+        // budget. The leader can choose an agent that was unknown at preflight,
+        // but cannot create its project Dockerfile under the mutation guard.
+        resolve_and_validate_workflow_agents(&validated_workflow, &leader_session, &paths)
+            .map_err(CommandError::Other)?;
+
         // Stash the generated workflow inside the checkout so a failed run can
         // be resumed without a second leader-design pass (WI-0115 §2).
         save_dynamic_workflow_copy(&state_git_root, &work_item_context, &generated_path);
@@ -900,6 +933,10 @@ impl ExecWorkflowCommand {
                 })))
             }
             WorkflowResumeDecision::Fresh => {
+                // Do not discard saved project files until a fresh leader's
+                // Dockerfile prerequisites have passed their read-only check.
+                let dynamic = resolve_dynamic_workflows(&self.session, &self.flags)?;
+                validate_dynamic_agent_dockerfiles(&self.session, &self.flags, &dynamic)?;
                 // Clear both halves so neither this run's state check nor the
                 // next invocation trips over the abandoned run.
                 let store = crate::data::workflow_state_store::WorkflowStateStore::at_git_root(

@@ -467,3 +467,172 @@ impl HeadlessDefaults {
         GapChoice::Continue
     }
 }
+
+/// The answer table above, cell by cell, for every row that takes no
+/// run-specific prompt. Changing a policy means changing a row here, which
+/// makes the change deliberate and reviewable.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `(question, [api, squad, cli])`, each answer in its `Debug` form.
+    fn table() -> Vec<(&'static str, [String; 3])> {
+        let profiles = [
+            HeadlessDefaults::api(),
+            HeadlessDefaults::squad(MountScopeDecision::MountCurrentDirOnly),
+            HeadlessDefaults::cli(),
+        ];
+        let row = |name: &'static str, f: &dyn Fn(&HeadlessDefaults) -> String| {
+            (name, [f(&profiles[0]), f(&profiles[1]), f(&profiles[2])])
+        };
+        vec![
+            row("mount_scope", &|p| format!("{:?}", p.mount_scope())),
+            row("agent_setup(available)", &|p| {
+                format!("{:?}", p.agent_setup(true))
+            }),
+            row("agent_setup(unavailable)", &|p| {
+                format!("{:?}", p.agent_setup(false))
+            }),
+            row("agent_auth_consent", &|p| {
+                format!("{:?}", p.agent_auth_consent())
+            }),
+            row("confirm_resume", &|p| format!("{:?}", p.confirm_resume())),
+            row("yolo_tick", &|p| format!("{:?}", p.yolo_tick())),
+            row("pre_worktree_uncommitted_files", &|p| {
+                format!("{:?}", p.pre_worktree_uncommitted_files("m"))
+            }),
+            row("existing_worktree", &|p| {
+                format!("{:?}", p.existing_worktree())
+            }),
+            row("worktree_commit_before_merge", &|p| {
+                format!("{:?}", p.worktree_commit_before_merge("m"))
+            }),
+            row("merge_mode", &|p| format!("{:?}", p.merge_mode())),
+            row("confirm_worktree_cleanup", &|p| {
+                format!("{:?}", p.confirm_worktree_cleanup())
+            }),
+            row("dirty_merge_target", &|p| {
+                format!("{:?}", p.dirty_merge_target())
+            }),
+            row("launch_merge_fix_agent", &|p| {
+                format!("{:?}", p.launch_merge_fix_agent())
+            }),
+            row("replace_aspec", &|p| format!("{:?}", p.replace_aspec())),
+            row("run_audit", &|p| format!("{:?}", p.run_audit())),
+            row("work_items_setup", &|p| {
+                format!("{:?}", p.work_items_setup())
+            }),
+            row("dockerfile_setup", &|p| {
+                format!("{:?}", p.dockerfile_setup())
+            }),
+            row("create_dockerfile", &|p| {
+                format!("{:?}", p.create_dockerfile())
+            }),
+            row("run_audit_on_template", &|p| {
+                format!("{:?}", p.run_audit_on_template())
+            }),
+            row("confirm_deletion", &|p| {
+                format!("{:?}", p.confirm_deletion())
+            }),
+            row("delete_task_dir", &|p| format!("{:?}", p.delete_task_dir())),
+            row("spec_kind", &|p| format!("{:?}", p.spec_kind())),
+            row("prerequisite_credential_use", &|p| {
+                format!("{:?}", p.prerequisite_credential_use())
+            }),
+            row("prerequisite_unresolved(static)", &|p| {
+                format!(
+                    "{:?}",
+                    p.prerequisite_unresolved(PrerequisiteOrigin::Static)
+                )
+            }),
+            row("prerequisite_unresolved(assumed)", &|p| {
+                format!(
+                    "{:?}",
+                    p.prerequisite_unresolved(PrerequisiteOrigin::AssumedAll)
+                )
+            }),
+            row("prerequisite_tool", &|p| {
+                format!("{:?}", p.prerequisite_tool())
+            }),
+            row("prerequisite_gap", &|p| {
+                format!("{:?}", p.prerequisite_gap())
+            }),
+            row("prerequisite_image", &|p| {
+                format!("{:?}", p.prerequisite_image())
+            }),
+        ]
+    }
+
+    #[test]
+    fn headless_answer_table() {
+        let expected: &[(&str, [&str; 3])] = &[
+            (
+                "mount_scope",
+                ["MountGitRoot", "MountCurrentDirOnly", "MountGitRoot"],
+            ),
+            ("agent_setup(available)", ["Setup", "Setup", "Setup"]),
+            ("agent_setup(unavailable)", ["Abort", "Setup", "Setup"]),
+            ("agent_auth_consent", ["Accept", "Accept", "DeclineOnce"]),
+            ("confirm_resume", ["true", "false", "false"]),
+            ("yolo_tick", ["Continue", "Continue", "Continue"]),
+            (
+                "pre_worktree_uncommitted_files",
+                [
+                    "Commit { message: \"m\" }",
+                    "UseLastCommit",
+                    "UseLastCommit",
+                ],
+            ),
+            ("existing_worktree", ["Fail", "Resume", "Resume"]),
+            (
+                "worktree_commit_before_merge",
+                ["Some(\"m\")", "None", "None"],
+            ),
+            ("merge_mode", ["Squash", "LeaveBranch", "LeaveBranch"]),
+            ("confirm_worktree_cleanup", ["true", "false", "false"]),
+            ("dirty_merge_target", ["Abort", "Abort", "Abort"]),
+            ("launch_merge_fix_agent", ["false", "false", "false"]),
+            // Init (WI 0148): a headless host keeps an existing aspec/ and
+            // project Dockerfile, never runs the audit, sets up no work items,
+            // and creates the project Dockerfile from the default template
+            // when it is missing. API `init` depends on `CreateNew` here: a
+            // `Skip` would leave an API-initialised repository with no
+            // Dockerfile.dev for later nodes to add tools to.
+            ("replace_aspec", ["false", "false", "false"]),
+            ("run_audit", ["false", "false", "false"]),
+            ("work_items_setup", ["None", "None", "None"]),
+            ("dockerfile_setup", ["CreateNew", "CreateNew", "CreateNew"]),
+            ("create_dockerfile", ["true", "true", "true"]),
+            ("run_audit_on_template", ["false", "false", "false"]),
+            ("confirm_deletion", ["false", "false", "false"]),
+            ("delete_task_dir", ["false", "false", "false"]),
+            ("spec_kind", ["Task", "Task", "Task"]),
+            ("prerequisite_credential_use", ["Deny", "Deny", "Deny"]),
+            ("prerequisite_unresolved(static)", ["Fail", "Fail", "Fail"]),
+            ("prerequisite_unresolved(assumed)", ["Warn", "Warn", "Warn"]),
+            ("prerequisite_tool", ["Continue", "Continue", "Continue"]),
+            ("prerequisite_gap", ["Continue", "Continue", "Continue"]),
+            ("prerequisite_image", ["true", "true", "true"]),
+        ];
+        let actual = table();
+        assert_eq!(actual.len(), expected.len(), "every row is pinned");
+        for ((name, got), (want_name, want)) in actual.iter().zip(expected) {
+            assert_eq!(name, want_name);
+            assert_eq!(
+                got.iter().map(String::as_str).collect::<Vec<_>>(),
+                want.to_vec(),
+                "row `{name}` as [api, squad, cli]"
+            );
+        }
+    }
+
+    /// The row API `init` stands on, pinned by value as well as by table.
+    #[test]
+    fn api_init_creates_the_default_project_dockerfile() {
+        let api = HeadlessDefaults::api();
+        assert_eq!(api.dockerfile_setup(), DockerfileSetupDecision::CreateNew);
+        assert!(!api.replace_aspec());
+        assert!(!api.run_audit());
+        assert!(api.work_items_setup().is_none());
+    }
+}

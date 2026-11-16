@@ -353,9 +353,38 @@ impl ReadyEngine {
                 }
             }
             ReadyPhase::CreatingDockerfile => {
+                use crate::data::fs::repo_tree::RepoTree;
+                use crate::data::init_files::{
+                    create_project_dockerfile, InitFileStatus, ProjectDockerfileTarget,
+                };
                 let dockerfile_path = self.preparer.project_dockerfile().to_path_buf();
-                std::fs::write(&dockerfile_path, templates::project_dockerfile_dev())
-                    .map_err(|e| EngineError::io(dockerfile_path.clone(), e))?;
+                // The same Layer 0 write `init` uses: never outside the git
+                // root, never through a linked ancestor, never over a file
+                // that appeared since `Preflight` looked.
+                let tree =
+                    RepoTree::open(&git_root).map_err(|e| EngineError::Other(e.to_string()))?;
+                let refused = match ProjectDockerfileTarget::classify(&tree, &dockerfile_path) {
+                    ProjectDockerfileTarget::OutsideRepo(path) => {
+                        Some(ProjectDockerfileTarget::outside_reason(&path))
+                    }
+                    ProjectDockerfileTarget::InRepo(rel) => match create_project_dockerfile(
+                        &tree,
+                        &rel,
+                        templates::project_dockerfile_dev().as_bytes(),
+                    )
+                    .map_err(|e| EngineError::Other(e.to_string()))?
+                    {
+                        InitFileStatus::Skipped { reason } => Some(reason),
+                        _ => None,
+                    },
+                };
+                if let Some(reason) = refused {
+                    return Err(EngineError::Other(format!(
+                        "{reason}. Create {} yourself, or point runtime.dockerfile at a path \
+                         inside the repository",
+                        dockerfile_path.display()
+                    )));
+                }
                 self.summary.dockerfile = StepStatus::Done;
                 frontend.report_step_status(
                     &ReadyStep::CreateDockerfile(dockerfile_path.clone()).into(),

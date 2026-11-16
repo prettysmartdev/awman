@@ -6,6 +6,8 @@ use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::{StepState, WorkflowState};
 use proptest::test_runner::{Config, FileFailurePersistence, RngSeed, TestRunner};
 
+mod dockerfile_preflight;
+
 fn recover(codes: &[u8]) {
     let steps: Vec<_> = codes
         .iter()

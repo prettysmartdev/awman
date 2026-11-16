@@ -112,7 +112,7 @@ Sessions and commands accept [labels](#labels). A label key is `<namespace>/<nam
   "status": "ok",
   "version": "0.13.0",
   "protocol": { "api": 1 },
-  "capabilities": ["daemon_features", "network_listener", "api_keys", "health", "trace_propagation", "…"],
+  "capabilities": ["daemon_features", "network_listener", "api_keys", "health", "trace_propagation", "api_init", "…"],
   "features": {
     "worker": {
       "name": "worker", "state": "on", "enabled_by": "config",
@@ -140,6 +140,10 @@ Sessions and commands accept [labels](#labels). A label key is `<namespace>/<nam
 ```
 
 `capabilities` (a list of strings) is what the older `features` list used to be; `features` is now an object keyed by feature name holding each feature's state. See [Server health](#server-health).
+
+The `api_init` capability means `init` is available through the worker command
+route and its structured result includes the files it created, updated, kept
+or skipped.
 
 The `listeners.network` object is keyed by listener name. Browser linking is
 available through the built-in loopback listener when it serves the engine and
@@ -1221,7 +1225,104 @@ curl -sk -X POST https://localhost:9876/v1/worker/commands \
 
 Dispatches a subcommand to the session named by the `session_id` field in the JSON body. The `x-awman-session` header is still supported as an alternative; if both are sent they must name the same session, otherwise the request is rejected with HTTP 400 `invalid_request`. Idempotency comparison covers whichever form was sent.
 
-The API accepts these commands: `exec prompt`, `exec workflow`, `agents status|list|detail|kill` (see [Agent commands](#agent-commands)), and the `squad` task and daemon commands except `squad attach` (which needs an interactive PTY) and `squad env`. Anything else — `chat`, `ready`, `init`, `config`, `new`, `clean`, `remote` — is refused with HTTP 400 `invalid_request` ("command not available via API"), and the response lists the available commands. The [Command Reference](14-command-reference.md) marks each command's frontends.
+The API accepts `init`, `exec prompt`, `exec workflow`, `agents status|list|detail|kill` (see [Agent commands](#agent-commands)), and the `squad` task and daemon commands except `squad attach` (which needs an interactive PTY) and `squad env`. Other commands — including `chat`, `ready`, `config`, `new`, `clean` and `remote` — are refused with HTTP 400 `invalid_request` ("command not available via API"), and the response lists the available commands. The [Command Reference](14-command-reference.md) marks each command's frontends.
+
+#### Initialize a project
+
+Use `init` as a setup command before running a dynamic workflow in a repository
+that has not yet been initialized for its agent:
+
+```sh
+curl -sk -X POST https://localhost:9876/v1/worker/commands \
+  -H 'Authorization: Bearer <api-key>' \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id":"<session-id>","subcommand":"init","args":["--agent","claude"]}'
+```
+
+The `--agent <name>` argument selects the agent whose project Dockerfile to
+prepare; it defaults to `claude`. `--aspec` is also accepted. API init runs
+headlessly with setup defaults: it keeps an existing project Dockerfile and
+`aspec/`, skips the agent audit and work-items setup, and creates the default
+`Dockerfile.dev` from awman's project template when no project Dockerfile
+exists. It never overwrites an existing Dockerfile, including an empty one.
+When `runtime.dockerfile` points to a missing path inside the repository, init
+creates the template at that configured path, creating missing directories.
+If the configured path is outside the repository, init skips it and reports
+why.
+
+Poll `GET /v1/worker/commands/{id}` until the command finishes. For a
+successful init, `result.data` contains the typed init result and its `files`
+array. Paths are relative to the session repository when possible. Each entry
+has a `kind`, a `status` and an `uncommitted` flag:
+
+| Field | Values |
+|---|---|
+| `kind` | `project_dockerfile`, `repo_config` (`.awman/config.json`), `agent_dockerfile` (`.awman/Dockerfile.<agent>`), or `aspec_file` (one entry per template file written by `--aspec`) |
+| `status` | `created` or `updated` — init wrote the file; `kept` — init left it byte-for-byte unchanged; `skipped` — init did not create it, with a `reason` |
+| `uncommitted` | `true` when the file is new or differs from the repository's last commit, so there is something to commit. Files matched by `.gitignore` are `false`. |
+
+A skipped project Dockerfile entry is included when init cannot create the
+configured path. For example, on a fresh repository:
+
+```json
+{
+  "result": {
+    "data": {
+      "agent": "claude",
+      "aspec_requested": false,
+      "summary": {
+        "aspec_folder": "Skipped",
+        "dockerfile": "Done",
+        "config": "Done",
+        "audit": "Skipped",
+        "image_build": "Skipped",
+        "work_items_setup": "Skipped"
+      },
+      "files": [
+        {"path": "Dockerfile.dev", "kind": "project_dockerfile", "status": "kept", "uncommitted": true},
+        {"path": ".awman/config.json", "kind": "repo_config", "status": "created", "uncommitted": true},
+        {"path": ".awman/Dockerfile.claude", "kind": "agent_dockerfile", "status": "kept", "uncommitted": true}
+      ]
+    }
+  }
+}
+```
+
+Session setup already prepares a missing project Dockerfile and agent
+Dockerfile before the session becomes `ready`, so on a fresh repository init
+usually reports them `kept` — they exist, but nothing has committed them yet.
+Commit every entry with `"uncommitted": true` (not only the `created` and
+`updated` ones) in the session repository, then run the dynamic workflow. For
+a local session, commit from the checkout on the server; for a remote session,
+commit or push the session clone according to your workflow. The client
+controls when these project changes are committed. Running init again after
+the commit reports every entry with `"uncommitted": false`.
+
+When a Dockerfile already exists, its entry is reported as `kept`. If the
+configured Dockerfile path is outside the repository, the `skipped` entry
+includes the path and reason, for example:
+
+```json
+{"path":"Dockerfile.dev","kind":"project_dockerfile","status":"kept","uncommitted":false}
+{"path":"/opt/shared/Dockerfile","kind":"project_dockerfile","status":"skipped","reason":"runtime.dockerfile /opt/shared/Dockerfile is outside the git root; awman does not create it","uncommitted":false}
+```
+
+awman only writes project files inside the repository, and never through a
+symbolic link. A configured Dockerfile below a symlinked directory, or at a
+path that is a dangling link, a directory or another non-file, is reported
+`skipped` with the reason instead of being created or reported `kept`. A
+symlinked `.awman/` directory makes init fail before it writes anything.
+`--aspec` writes only regular files from the template; links in the template
+archive are not created.
+
+Session setup applies the same rules when it prepares a missing project
+Dockerfile: it creates missing directories inside the repository, never
+overwrites a file, and never creates a Dockerfile outside the repository or
+through a symbolic link. If `runtime.dockerfile` names such a path and the
+file does not exist, setup fails with that reason in `setup_error`, and
+commands — including `init` — are refused with `409 session_not_ready`.
+Create the file yourself, or point `runtime.dockerfile` inside the repository,
+and open a new session.
 
 For `exec`, put the action in `subcommand` (`exec prompt` or `exec workflow`) and the action's arguments in `args`. A bare `"subcommand": "exec"` with the action as the first `args` entry is rejected at admission with HTTP 400 `invalid_request`:
 

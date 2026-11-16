@@ -487,6 +487,97 @@ mod work_item_execution {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn dynamic_missing_agent_dockerfiles_fail_before_leader_in_local_and_push_sessions() {
+        let s = support::sandbox("command::workflow::work_item_execution::dynamic_missing_agent_dockerfiles_fail_before_leader_in_local_and_push_sessions");
+        let initial = session(&s, "local", "https://tracker.example/items");
+        ConfigTree::new()
+            .global(json!({"agents":{"auth":{"refresh":{"enabled":false}}}}))
+            .repo(json!({
+                "workItems":{"source":"local"},
+                "workflows":{"dynamic":{"agentsToModels":{
+                    "claude":["model"], "codex":["model"]
+                }}}
+            }))
+            .write(&s, Some(initial.git_root()));
+        for push in [false, true] {
+            let mut session = Session::open_at_git_root(
+                initial.git_root().to_path_buf(),
+                initial.git_root().to_path_buf(),
+                SessionOpenOptions {
+                    env: Some(support::env_snapshot(&s)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            if push {
+                session.set_session_type(awman::data::session::SessionType::Remote {
+                    repo_url: "https://github.com/o/r.git".into(),
+                    branch: "main".into(),
+                    cloned_path: session.git_root().to_path_buf(),
+                });
+            }
+            let (engines, runtime) = engines(&s, &session);
+            let before = engines
+                .git_engine
+                .checkout_fingerprint(session.git_root())
+                .unwrap();
+            let mut flags = workflow_flags("7", true);
+            flags.prerequisites.check_only = false;
+            let bus = EventBus::new(1024);
+            let mut log = bus.subscribe_log();
+            let frontend = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
+            let error = ExecWorkflowCommand::new(flags, engines.clone(), session.clone())
+                .with_frontend_kind(awman::command::dispatch::catalogue::FrontendKind::Daemon {
+                    feature: awman::data::daemon_state::FeatureName::Worker,
+                    listener: if push {
+                        awman::data::daemon_state::CommandListener::Network
+                    } else {
+                        awman::data::daemon_state::CommandListener::Local
+                    },
+                })
+                .run_with_frontend(Box::new(frontend))
+                .await
+                .unwrap_err()
+                .to_string();
+            for agent in ["claude", "codex"] {
+                assert!(
+                    error.contains(&format!("expected .awman/Dockerfile.{agent}")),
+                    "{error}"
+                );
+                assert!(
+                    error.contains(&format!(
+                        "{{\"subcommand\":\"init\",\"args\":[\"--agent\",\"{agent}\"]}}"
+                    )),
+                    "{error}"
+                );
+                assert!(
+                    error.contains(&format!("awman init --agent {agent}")),
+                    "{error}"
+                );
+            }
+            assert!(
+                runtime.prompts.lock().unwrap().is_empty(),
+                "leader launched"
+            );
+            let mut output = String::new();
+            while let Ok(event) = log.try_recv() {
+                output.push_str(&serde_json::to_string(&event).unwrap());
+            }
+            assert!(!output.contains("validation failed (attempt"), "{output}");
+            assert_eq!(
+                engines
+                    .git_engine
+                    .checkout_fingerprint(session.git_root())
+                    .unwrap(),
+                before
+            );
+            assert!(!session.git_root().join(".awman/Dockerfile.claude").exists());
+            assert!(!session.git_root().join(".awman/Dockerfile.codex").exists());
+        }
+        s.finish();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn all_read_commands_resolve_local_github_and_http_before_launch() {
         let mut s=support::sandbox("command::workflow::work_item_execution::all_read_commands_resolve_local_github_and_http_before_launch");
         s.env_mut().set("TRACKER_TOKEN", "test-token");

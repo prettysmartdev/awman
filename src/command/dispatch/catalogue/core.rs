@@ -56,7 +56,7 @@ pub(super) const CLEAN: CommandSpec = CommandSpec {
 pub(super) const INIT: CommandSpec = CommandSpec {
     name: "init",
     aliases: &[],
-    help: "Initialize the current Git repo for use with awman.",
+    help: "Initialize the current Git repo for use with awman. API init creates a default Dockerfile.dev when missing and never overwrites an existing one.",
     long_help: None,
     arguments: &[],
     flags: &[
@@ -86,7 +86,7 @@ pub(super) const INIT: CommandSpec = CommandSpec {
             optional: true,
         },
     ],
-    api_allowed: false,
+    api_allowed: true,
     build: crate::command::dispatch::build::init,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,

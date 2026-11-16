@@ -36,8 +36,18 @@ impl Api {
         Self::with_config(sandbox, json!({})).await
     }
     pub async fn with_config(sandbox: &TestSandbox, extra: Value) -> Self {
+        Self::with_docker(sandbox, extra, |_| {}).await
+    }
+    /// [`Self::with_config`] plus extra rules for the fake `docker`, applied
+    /// on top of the baseline.
+    pub async fn with_docker(
+        sandbox: &TestSandbox,
+        extra: Value,
+        rules: impl FnOnce(&awman_test_support::fakes::FakeCli),
+    ) -> Self {
         let docker = sandbox.install_fake(support::fake_cli_exe(), "docker");
         awman_test_support::fakes::docker_cli_baseline(&docker);
+        rules(&docker);
         Self::boot(sandbox, extra).await
     }
     /// A new daemon process on the same private state after `shutdown`

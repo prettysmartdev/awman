@@ -126,9 +126,10 @@ pub async fn provision_agent_dockerfile(
     let preview = preview_agent_dockerfile(def, paths, project_tag)?;
     if preview.action == DockerfileSync::Written {
         if let Some(content) = &preview.rendered {
-            download::atomic_write(&path, content.as_bytes())?;
+            download::publish_in_repo(paths.git_root(), &path, content.as_bytes())?;
         } else {
-            download::download_agent_dockerfile(&def.name, &path, project_tag).await?;
+            download::download_agent_dockerfile(&def.name, paths.git_root(), &path, project_tag)
+                .await?;
         }
     }
     Ok(preview)

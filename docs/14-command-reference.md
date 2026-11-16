@@ -39,9 +39,9 @@ Runs without a working agent runtime — reachable even when the configured runt
 
 ## `awman init`
 
-Initialize the current Git repo for use with awman.
+Initialize the current Git repo for use with awman. API init creates a default Dockerfile.dev when missing and never overwrites an existing one.
 
-Available via: CLI, TUI
+Available via: CLI, TUI, API
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|

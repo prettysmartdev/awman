@@ -87,6 +87,9 @@ pub const CAPABILITIES: &[&str] = &[
     // WI 0147: `--work-item` accepts github / http providers / local files by
     // `workItems.source`; `--issue` was replaced.
     "work_item_sources",
+    // WI 0148: `init` is available to API clients and returns its project
+    // file list in the typed command result.
+    "api_init",
 ];
 
 /// WI 0143: capabilities of the pull worker, in their fixed order. Each is
