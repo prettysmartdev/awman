@@ -257,7 +257,7 @@ pub struct PrerequisiteCheck {
     pub prerequisite: WorkflowPrerequisite,
     pub status: PrerequisiteStatus,
     pub explanation: String,
-    /// Empty means "any teardown step" (AssumedAll).
+    /// Empty means "workflow-wide" (AssumedAll).
     pub needed_by: Vec<StepRef>,
     pub remediations: Vec<Remediation>,
 }

@@ -202,6 +202,10 @@ pub(crate) struct CommandLayerFactory {
     /// Mounted read-write at `/awman/output` into every step container
     /// (WI 0137 §3). `None` outside the API.
     pub(crate) output_dir: Option<PathBuf>,
+    /// The command-level `--read-only-workspace` (WI 0152). A step is
+    /// read-only when this, its own `read_only_workspace` or a read-only
+    /// lease engine says so.
+    pub(crate) workspace_access: crate::data::workspace::WorkspaceAccess,
 }
 
 /// The `agentFlags` resolver for every agent a workflow run launches.
@@ -274,6 +278,16 @@ impl CommandLayerFactory {
         runtime: &WorkflowRuntimeContext,
         substitution: crate::data::workflow_prompt_template::Substitution,
     ) -> Result<crate::engine::agent_runtime::execution::AgentExecution, EngineError> {
+        // Read-only workspace (WI 0152): the step's own field, the command
+        // flag and a read-only lease engine combine; read-only always wins.
+        let workspace_access = crate::command::commands::workspace_access::effective_access(
+            step.workspace_access(self.workspace_access),
+            &self.engines.agent_engine,
+        );
+        let launch_engine = crate::command::commands::workspace_access::agent_engine_for(
+            workspace_access,
+            &self.engines.agent_engine,
+        );
         // Compute per-step overlays by merging config/env/CLI with step-level overlays.
         let collected = session
             .effective_config()
@@ -347,11 +361,11 @@ impl CommandLayerFactory {
         if let Some(TypedOverlay::Directory(directory)) = &self.work_item_overlay {
             command_mounts.push(directory.clone());
         }
-        let system_prompt = match self
+        let outputs_dir = self
             .output_dir
             .as_ref()
-            .filter(|_| self.engines.runtime.capabilities().arbitrary_host_mounts)
-        {
+            .filter(|_| self.engines.runtime.capabilities().arbitrary_host_mounts);
+        let system_prompt = match outputs_dir {
             Some(dir) => {
                 command_mounts.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
                 Some(crate::engine::context_prompt::with_outputs_section(
@@ -361,6 +375,13 @@ impl CommandLayerFactory {
             }
             None => system_prompt,
         };
+        // The read-only section goes last, after the outputs section.
+        let system_prompt = crate::command::commands::workspace_access::system_prompt_for(
+            workspace_access,
+            system_prompt,
+            outputs_dir.is_some(),
+            &context_overlays,
+        );
         let run_opts = AgentRunOptions {
             command_secrets: self.engines.command_secrets(),
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
@@ -459,7 +480,7 @@ impl CommandLayerFactory {
             resolved_credentials
         };
 
-        let resolved = self.engines.agent_engine.resolve_agent_options(
+        let resolved = launch_engine.resolve_agent_options(
             session,
             &runtime.step_agent,
             &run_opts,
@@ -473,6 +494,13 @@ impl CommandLayerFactory {
             None => resolved,
         };
         let instance = self.engines.runtime.build(resolved)?;
+        if workspace_access.is_read_only() {
+            let mut frontend = self.shared.lock().unwrap();
+            frontend.write_message(
+                crate::command::commands::workspace_access::read_only_message(Some(&step.name)),
+            );
+            frontend.report_workspace_access(workspace_access, Some(&step.name));
+        }
         let proxy = AgentFrontendProxy::new(
             self.shared.clone(),
             run_opts.launch_mode == crate::data::config::agents::LaunchMode::Acp,

@@ -147,6 +147,7 @@ impl ContainerBackend for DockerBackend {
         &self,
         mut options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        options.validate_read_only_workspace()?;
         if options.host_env.is_none() {
             options.host_env = self.env.clone();
         }
@@ -887,6 +888,7 @@ pub(super) fn build_run_argv(
     image: &ImageRef,
     options: &ResolvedContainerOptions,
 ) -> Result<Vec<String>, EngineError> {
+    options.validate_read_only_workspace()?;
     let mut args: Vec<String> = vec!["run".into()];
     if options.remove_on_exit {
         args.push("--rm".into());
@@ -933,6 +935,17 @@ pub(super) fn build_run_argv(
     if let Some(wd) = &options.working_dir {
         args.push("-w".into());
         args.push(wd.display().to_string());
+    }
+
+    // Parent tmpfs before nested prompt file binds. Docker orders mounts by
+    // destination depth as well, so the prompt under /tmp remains visible.
+    for path in &options.tmpfs {
+        args.push("--tmpfs".into());
+        args.push(if options.tmpfs_bare_paths {
+            path.display().to_string()
+        } else {
+            format!("{}:rw,exec,nosuid,nodev,mode=1777", path.display())
+        });
     }
 
     // Overlays / volume mounts.
@@ -1263,5 +1276,53 @@ mod command_secrets_tests {
                 "test-secret-caller-provider".into()
             )]
         );
+    }
+}
+
+#[cfg(test)]
+mod workspace_access_tests {
+    use super::*;
+    use awman_test_support::{TestCase, TestSandbox};
+
+    #[test]
+    fn read_only_argv_keeps_output_context_and_nested_prompt_mounts() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::docker::workspace_access_tests::read_only_argv_keeps_output_context_and_nested_prompt_mounts"));
+        let mut options = super::super::options::workspace_access_tests::options(&sandbox);
+        let prompt = sandbox.root().join("prompt");
+        std::fs::write(&prompt, "Review the code").unwrap();
+        options.system_prompt_file = Some((
+            prompt.clone(),
+            "/tmp/awman-ctx-prompt-test".into(),
+            "--system-prompt".into(),
+        ));
+        let argv = build_run_argv(
+            &ContainerName::new("test"),
+            options.image.as_ref().unwrap(),
+            &options,
+        )
+        .unwrap();
+        assert!(argv.contains(&format!("{}:/workspace:ro", sandbox.work().display())));
+        assert!(argv
+            .windows(2)
+            .any(|p| p == ["--tmpfs", "/tmp:rw,exec,nosuid,nodev,mode=1777"]));
+        assert!(argv.contains(&format!(
+            "{}:/awman/output",
+            sandbox.root().join("output").display()
+        )));
+        assert!(argv.contains(&format!(
+            "{}:/awman/context/repo",
+            sandbox.root().join("context").display()
+        )));
+        assert!(argv.contains(&format!(
+            "{}:/tmp/awman-ctx-prompt-test:ro",
+            prompt.display()
+        )));
+        options.tmpfs.clear();
+        assert!(build_run_argv(
+            &ContainerName::new("test"),
+            options.image.as_ref().unwrap(),
+            &options
+        )
+        .is_err());
     }
 }

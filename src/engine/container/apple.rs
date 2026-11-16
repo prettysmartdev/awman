@@ -196,6 +196,10 @@ impl ContainerBackend for AppleBackend {
         &self,
         mut options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        options.validate_read_only_workspace()?;
+        // Apple's --tmpfs accepts a destination, rather than Docker's
+        // destination:options syntax. See apple/container docs/volumes.md.
+        options.tmpfs_bare_paths = true;
         if options.host_env.is_none() {
             options.host_env = self.env.clone();
         }
@@ -680,5 +684,41 @@ fn owner_is_alive(pid: u32) -> bool {
     {
         let _ = pid;
         false
+    }
+}
+
+#[cfg(test)]
+mod workspace_access_tests {
+    use super::*;
+    use awman_test_support::{TestCase, TestSandbox};
+
+    #[test]
+    fn read_only_apple_launch_uses_bare_tmpfs_destination() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::apple::workspace_access_tests::read_only_apple_launch_uses_bare_tmpfs_destination"));
+        let mut options = super::super::options::workspace_access_tests::options(&sandbox);
+        // Exercise Apple's build path too: it validates and selects the bare
+        // syntax without starting the CLI or registering credentials.
+        let backend = AppleBackend::new(options.host_env.clone().unwrap());
+        assert!(backend.capabilities().read_only_workspace());
+        backend.build(options.clone()).unwrap();
+        options.tmpfs_bare_paths = true;
+        let argv = super::super::docker::build_run_argv(
+            &ContainerName::new("test"),
+            options.image.as_ref().unwrap(),
+            &options,
+        )
+        .unwrap();
+        assert!(argv.windows(2).any(|p| p == ["--tmpfs", "/tmp"]));
+        assert!(argv.contains(&format!("{}:/workspace:ro", sandbox.work().display())));
+        assert!(argv.contains(&format!(
+            "{}:/awman/output",
+            sandbox.root().join("output").display()
+        )));
+        assert!(argv.contains(&format!(
+            "{}:/awman/context/repo",
+            sandbox.root().join("context").display()
+        )));
+        options.tmpfs.clear();
+        assert!(backend.build(options).is_err());
     }
 }

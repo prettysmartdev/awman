@@ -64,3 +64,16 @@ async fn workflow_preflight_is_read_only_and_missing_work_is_typed() {
     backend.shutdown().await;
     s.finish();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_only_workspace_refusals_are_typed_and_precede_launch() {
+    let s = support::sandbox(
+        "command::daemon::read_only_workspace_refusals_are_typed_and_precede_launch",
+    );
+    let host_agents = scenarios::prepare(&s);
+    let backend = Backend::start(BackendKind::Daemon, &s).await;
+    scenarios::read_only_workspace_refusals_are_typed_and_precede_launch(&backend, &s).await;
+    scenarios::assert_no_host_agents(&host_agents);
+    backend.shutdown().await;
+    s.finish();
+}

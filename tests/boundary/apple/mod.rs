@@ -111,3 +111,50 @@ fn native_store_export_validates_content_and_reuses_the_cache() {
     assert_eq!(cached.archive, first.archive);
     s.finish();
 }
+
+/// WI 0152: the same read-only proof against the Apple container service:
+/// workspace writes fail inside the container; `/tmp`, `/awman/output`, a
+/// mounted context directory and the agent home stay writable.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "not-applicable: Apple Containers exist only on macOS"
+)]
+fn a_read_only_workspace_rejects_writes_while_scratch_output_context_and_home_stay_writable() {
+    use awman_test_support::{capability::GuestFixtures, TestSandbox};
+    struct Image<'a>(&'a TestSandbox);
+    impl Drop for Image<'_> {
+        fn drop(&mut self) {
+            let _ = self
+                .0
+                .command("container")
+                .args(["image", "delete", "awman-test/guest:fixture"])
+                .run();
+        }
+    }
+    let mut s = support::sandbox(
+        "apple::a_read_only_workspace_rejects_writes_while_scratch_output_context_and_home_stay_writable",
+    );
+    let apple = s.require::<AppleContainers>();
+    s.grant(&apple);
+    let fixture = s.require::<GuestFixtures>();
+    let runtime = ContainerRuntime::apple_in(support::env_snapshot(&s));
+    assert!(
+        !runtime.image_exists("awman-test/guest:fixture"),
+        "BLOCKED[fixture-ownership]: remove or rename an existing awman-test/guest:fixture before this test"
+    );
+    let image = Image(&s);
+    s.command("container")
+        .args(["image", "load", "--input"])
+        .arg(&fixture.paths["guest-oci-base"])
+        .run()
+        .assert_success();
+    support::read_only::prove(&support::read_only::Proof {
+        runtime: std::sync::Arc::new(runtime),
+        image: "awman-test/guest:fixture",
+        root: &s.root().join("read-only-proof"),
+        builtin: false,
+    });
+    drop(image);
+    s.finish();
+}

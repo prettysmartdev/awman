@@ -106,9 +106,10 @@ pub async fn status(api: &DaemonApi) -> Result<StatusResponse, CommandError> {
             .features
             .insert(worker.name.clone(), with_worker_sides(api, worker));
     }
-    let mounts_outputs = api.engines.runtime.capabilities().mounts_outputs(true);
-    status.capabilities =
-        super::capabilities::advertised(mounts_outputs, &super::worker_pull::capabilities(api));
+    status.capabilities = super::capabilities::advertised_for_runtime(
+        api.engines.runtime.capabilities(),
+        &super::worker_pull::capabilities(api),
+    );
     let worker = api.runtime.config().daemon().worker;
     if worker.pull_enabled
         && worker.pull_interaction.is_headless()

@@ -322,6 +322,7 @@ fn exec_prompt_flags_are_the_base_set_plus_work_item() {
             "branch",
             "pr",
             "worktree",
+            "read-only-workspace",
         ]
     );
     // Remote derivation drops the local-only selectors and adds transport.
@@ -341,6 +342,7 @@ fn exec_prompt_flags_are_the_base_set_plus_work_item() {
             "agent-flag",
             "work-item",
             "interactive",
+            "read-only-workspace",
         ]
     );
     // It composes with 0151's session-worktree selectors.
@@ -388,6 +390,7 @@ fn exec_workflow_flags_keep_their_documented_order() {
         "prerequisite-unresolved",
         "check-prerequisites",
         "json",
+        "read-only-workspace",
     ];
     assert_eq!(flag_names(&["exec", "workflow"]), expected);
     let remote: Vec<&str> = ["session", "follow"]

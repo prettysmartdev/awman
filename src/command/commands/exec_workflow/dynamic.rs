@@ -169,9 +169,6 @@ pub(crate) struct DynamicExecution {
     workflow_path: PathBuf,
     work_item_context: WorkItemContext,
     work_item_overlay: Option<TypedOverlay>,
-    /// Session rooted at the worktree or remote clone; agent/image validation uses it.
-    worktree_session: Session,
-    paths: crate::data::RepoDockerfilePaths,
     git_root_for_scope: PathBuf,
     cwd: PathBuf,
     base_session: Session,
@@ -312,26 +309,13 @@ impl ExecWorkflowCommand {
         let work_item_context = prepared_input.context.clone();
         let wi_key = item.key.clone();
 
-        // Diagnostic mode only probes; do not offer a resume or require setup.
-        if self.flags.prerequisites.check_only {
-            if let PrerequisiteStart::CheckOnly(outcome) = self
-                .start_prerequisites(
-                    &crate::data::workflow_prerequisites::WorkflowPrerequisites::assume_all(),
-                    format!("dynamic-{wi_key}"),
-                    &[],
-                    &frontend,
-                )
-                .await?
-            {
-                return Ok(outcome);
-            }
-        }
-
         frontend.with(|frontend| LaunchPolicy::for_session(&self.session).warn_config(frontend));
 
         // ── Worktree prepare BEFORE launching the leader (WI-0092 §5). ──────
         let remote_clone = base_session.session_type().is_remote();
-        let lifecycle = if remote_clone {
+        let lifecycle = if self.flags.prerequisites.check_only {
+            None
+        } else if remote_clone {
             frontend.write_message(UserMessage {
                 level: MessageLevel::Info,
                 text: "Skipping worktree creation for remote session — repo is already isolated."
@@ -360,7 +344,7 @@ impl ExecWorkflowCommand {
             Some(lifecycle) => frontend.with(|frontend| {
                 lifecycle.should_offer_resume(frontend, self.flags.on_existing_worktree)
             })?,
-            None => true,
+            None => !self.flags.prerequisites.check_only,
         };
         let resume_plan = if !offer_resume {
             None
@@ -388,30 +372,86 @@ impl ExecWorkflowCommand {
             }
         };
 
-        // Read-only project setup validation precedes credential acquisition,
-        // worktree creation, image preparation and the leader/repair budget.
-        // Pull leases have already prepared their disposable clone. A resume
-        // validates its saved workflow instead of today's unused leader.
+        // Scope is fixed before preparation: a resume has a concrete workflow;
+        // a fresh dynamic run includes the leader and every agent offered to it.
         let paths = crate::data::RepoDockerfilePaths::new(&git_root_for_scope);
-        let dynamic = if let Some(plan) = &resume_plan {
+        let (preflight, leader_plan) = if let Some(plan) = &resume_plan {
             validate_workflow_agent_dockerfiles(&plan.workflow, &base_session, &paths)
                 .map_err(CommandError::Other)?;
-            None
+            frontend.with(|f| {
+                ensure_workflow_agents_approved(&plan.workflow, &base_session, &effective_flags, f)
+            })?;
+            (crate::command::commands::workflow_prerequisites::WorkflowPreflightPlan::for_workflow(
+                &plan.workflow, &base_session, &effective_flags)?, None)
         } else {
-            let dynamic = resolve_dynamic_workflows(&base_session, &self.flags)?;
-            validate_dynamic_agent_dockerfiles(&base_session, &self.flags, &dynamic)?;
-            Some(dynamic)
-        };
-
-        // The workflow does not exist yet: assume every teardown kind, then
-        // narrow the grants once the generated workflow validates (WI 0149).
-        let mut prerequisites = match self
-            .start_prerequisites(
-                &crate::data::workflow_prerequisites::WorkflowPrerequisites::assume_all(),
-                format!("dynamic-{wi_key}"),
-                &[],
-                &frontend,
+            let dynamic = resolve_dynamic_workflows(&base_session, &effective_flags)?;
+            // Check project setup before the unified review can prepare images
+            // or acquire credentials. Diagnostic mode only reports prerequisites.
+            if !effective_flags.prerequisites.check_only {
+                validate_dynamic_agent_dockerfiles(&base_session, &effective_flags, &dynamic)?;
+            }
+            let (leader_agent, leader_model) =
+                resolve_leader_model(&effective_flags, &base_session, &dynamic)?;
+            frontend
+                .with(|f| {
+                    crate::command::commands::agent_trust::ensure_agent_trusted(
+                        &base_session,
+                        &leader_agent,
+                        f,
+                    )
+                })
+                .map_err(|e| attribute_leader_error(&dynamic, e))?;
+            let (available, warnings) = self
+                .engines
+                .agent_engine
+                .filter_available_agents(&base_session, paths.discover_agent_dockerfiles());
+            for text in warnings {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Warning,
+                    text,
+                });
+            }
+            let (agents_section, mut agents, warnings) =
+                agents_section_for_leader(&dynamic, &available)?;
+            for text in warnings {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Warning,
+                    text,
+                });
+            }
+            agents.push(leader_agent.as_str().to_owned());
+            let preflight =
+                crate::command::commands::workflow_prerequisites::WorkflowPreflightPlan::dynamic(
+                    agents,
+                    &base_session,
+                    &effective_flags,
+                )?;
+            let names = preflight
+                .needs
+                .needs
+                .iter()
+                .filter_map(|need| match &need.prerequisite {
+                    crate::data::workflow_prerequisites::WorkflowPrerequisite::AgentImage {
+                        agent,
+                        ..
+                    } => Some(crate::data::session::AgentName::new(agent)),
+                    _ => None,
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            frontend.with(|f| {
+                crate::command::commands::agent_trust::ensure_workflow_agents_trusted(
+                    &base_session,
+                    &names,
+                    f,
+                )
+            })?;
+            (
+                preflight,
+                Some((dynamic, leader_agent, leader_model, agents_section)),
             )
+        };
+        let mut prerequisites = match self
+            .start_prerequisites(&preflight, format!("dynamic-{wi_key}"), &frontend)
             .await?
         {
             PrerequisiteStart::Run(prepared) => prepared,
@@ -496,8 +536,6 @@ impl ExecWorkflowCommand {
                     workflow_path,
                     work_item_context,
                     work_item_overlay: prepared_input.overlay.clone(),
-                    worktree_session: leader_session,
-                    paths,
                     git_root_for_scope,
                     cwd,
                     base_session,
@@ -523,25 +561,8 @@ impl ExecWorkflowCommand {
             return Ok(outcome);
         }
 
-        // ── Resolve the leader agent + model (WI-0092 §7). Deliberately after
-        //    the resume branch: a resumed run never launches a leader, and must
-        //    not be blocked by leader config that has drifted since.
-        //    The dynamic settings (WI 0150) layer the invoking checkout's repo
-        //    config over global config, with `--leader` on top; a worktree's
-        //    copy of the repo config is never consulted.
-        let dynamic = dynamic.expect("a fresh dynamic run validated its settings before setup");
-        let (leader_agent, leader_model) =
-            resolve_leader_model(&self.flags, &self.session, &dynamic)?;
-        // A custom leader definition is reviewed before the leader resolves.
-        frontend
-            .with(|frontend| {
-                crate::command::commands::agent_trust::ensure_agent_trusted(
-                    &base_session,
-                    &leader_agent,
-                    frontend,
-                )
-            })
-            .map_err(|e| attribute_leader_error(&dynamic, e))?;
+        let (dynamic, leader_agent, leader_model, agents_section) =
+            leader_plan.expect("fresh dynamic run has a prepared leader");
 
         let leader_work_item_path = &prepared_input.container_path;
 
@@ -593,59 +614,6 @@ impl ExecWorkflowCommand {
             crate::data::dynamic_workflow_assets::WORKFLOW_USAGE_MD,
         )
         .map_err(|e| CommandError::Other(format!("writing workflow-usage.md: {e}")))?;
-
-        // ── Discover available agents. ──────────────────────────────────────
-        // (`paths` was resolved above, before the resume branch.)
-        let (available_agents, warnings) = self
-            .engines
-            .agent_engine
-            .filter_available_agents(&base_session, paths.discover_agent_dockerfiles());
-        for warning in warnings {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Warning,
-                text: warning,
-            });
-        }
-
-        // ── The agent/model listing for the leader prompt (WI-0095, WI 0150
-        //    §2): a repo `agentsToModels` is validated against the discovered
-        //    Dockerfiles (a missing one is an error); a global one skips the
-        //    agents this repo lacks. Done before ensure_agent_image so a
-        //    misconfigured map fails before any image build or container work.
-        let (agents_section, warnings) = agents_section_for_leader(&dynamic, &available_agents)?;
-        for w in warnings {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Warning,
-                text: w,
-            });
-        }
-
-        // Solve the leader's image prerequisite only after resume was ruled
-        // out and the selected leader was trusted and validated.
-        let images = self
-            .prepare_workflow_image_prerequisites(
-                &[leader_agent.as_str().to_string()],
-                crate::data::workflow_prerequisites::PrerequisiteOrigin::AssumedAll,
-                &frontend,
-            )
-            .await
-            .map_err(|e| attribute_leader_error(&dynamic, e))?;
-        prerequisites.report.checks.extend(images.checks);
-        self.record_prerequisite_report(&prerequisites.report).await;
-        if self.engines.runtime.capabilities().image_acquisition
-            != crate::engine::agent_runtime::ImageAcquisition::Import
-        {
-            ensure_agent_image(
-                &self.engines,
-                &git_root_for_scope,
-                &paths,
-                leader_agent.as_str(),
-                &self.session,
-                &mut frontend.clone(),
-            )
-            .await
-            .map_err(|e| attribute_leader_error(&dynamic, e))?;
-        }
 
         let session_max_concurrent_steps =
             crate::command::commands::exec_workflow::workflow_effective_config(
@@ -808,8 +776,8 @@ impl ExecWorkflowCommand {
         };
 
         // Project setup failures are terminal, outside the leader's repair
-        // budget. The leader can choose an agent that was unknown at preflight,
-        // but cannot create its project Dockerfile under the mutation guard.
+        // budget. An unprepared agent cannot create its project Dockerfile under
+        // the mutation guard or expand the reviewed prerequisite scope.
         resolve_and_validate_workflow_agents(&validated_workflow, &leader_session, &paths)
             .map_err(CommandError::Other)?;
 
@@ -829,8 +797,6 @@ impl ExecWorkflowCommand {
                 workflow_path: generated_path,
                 work_item_context,
                 work_item_overlay: prepared_input.overlay.clone(),
-                worktree_session: leader_session,
-                paths,
                 git_root_for_scope,
                 cwd,
                 base_session,
@@ -974,7 +940,7 @@ impl ExecWorkflowCommand {
         session_root.to_path_buf()
     }
 
-    /// Shared tail of both dynamic paths: build any missing agent images, run
+    /// Shared tail of both dynamic paths: narrow the prepared scope, run
     /// the whole-workflow ACP pre-flight, then hand the run to
     /// [`execute_prepared`]. The leader path reaches it with a freshly designed
     /// workflow; the resume path with the one recovered from disk.
@@ -989,8 +955,6 @@ impl ExecWorkflowCommand {
             workflow_path,
             work_item_context,
             work_item_overlay,
-            worktree_session,
-            paths,
             git_root_for_scope,
             cwd,
             base_session,
@@ -1003,82 +967,13 @@ impl ExecWorkflowCommand {
             frontend,
         } = exec;
 
-        // ── Review custom definitions once per agent, before resolving. ─────
-        frontend.with(|frontend| {
-            ensure_workflow_agents_approved(&workflow, &base_session, &effective_flags, frontend)
-        })?;
-
-        // ── Narrow the assumed-all grants to what the generated workflow
-        //    really uses (WI 0149 §1): no SSH mount if nothing pushes. A newly
-        //    needed prerequisite is asked about again when a person is there.
+        // Generation may only narrow the reviewed startup scope.
         let mut prerequisites = prerequisites;
         prerequisites.flow.set_worktree(worktree_path.clone());
-        {
-            let PreparedPrerequisites {
-                flow,
-                grants,
-                redaction,
-                ..
-            } = &mut *prerequisites;
-            let narrowed = frontend.with(|frontend| {
-                flow.narrow_after_generation(&workflow, grants, redaction, frontend)
-            });
-            match narrowed {
-                Ok((needs, report)) => {
-                    prerequisites.needs = needs;
-                    prerequisites.report = report;
-                }
-                Err(e) => {
-                    frontend.with(|frontend| {
-                        frontend.write_message(UserMessage {
-                            level: MessageLevel::Error,
-                            text: format!("exec workflow: {e}"),
-                        })
-                    });
-                    return Err(e);
-                }
-            }
-        }
-        prerequisites.remotes = prerequisites.flow.remotes_for(&prerequisites.needs);
+        frontend.with(|frontend| {
+            prerequisites.narrow_to(&workflow, &base_session, &effective_flags, frontend)
+        })?;
         self.record_prerequisite_report(&prerequisites.report).await;
-
-        // ── Build any missing agent images before execution (WI-0092 §9b). ──
-        let mut resolved_agents =
-            resolve_and_validate_workflow_agents(&workflow, &worktree_session, &paths)
-                .map_err(CommandError::Other)?;
-        if (!workflow.setup.is_empty() || !workflow.teardown.is_empty())
-            && self.engines.runtime.capabilities().image_acquisition
-                == crate::engine::agent_runtime::ImageAcquisition::Import
-            && self.session.effective_config().base_image().is_none()
-        {
-            let phase_agent = self.session.configured_agent().as_str().to_string();
-            if !resolved_agents.contains(&phase_agent) {
-                resolved_agents.push(phase_agent);
-            }
-        }
-        let images = self
-            .prepare_workflow_image_prerequisites(
-                &resolved_agents,
-                crate::data::workflow_prerequisites::PrerequisiteOrigin::Static,
-                &frontend,
-            )
-            .await?;
-        prerequisites.report.checks.extend(images.checks);
-        self.record_prerequisite_report(&prerequisites.report).await;
-        for agent in resolved_agents.iter().filter(|_| {
-            self.engines.runtime.capabilities().image_acquisition
-                != crate::engine::agent_runtime::ImageAcquisition::Import
-        }) {
-            ensure_agent_image(
-                &self.engines,
-                &git_root_for_scope,
-                &paths,
-                agent,
-                &self.session,
-                &mut frontend.clone(),
-            )
-            .await?;
-        }
 
         // The dynamically generated workflow is not known until after the
         // leader phase, so this is its first possible whole-workflow ACP
@@ -1137,6 +1032,7 @@ impl ExecWorkflowCommand {
             self.managed_session.as_ref(),
             &self.cancel,
             self.output_dir.as_deref(),
+            self.workspace_access,
         )
         .await
     }

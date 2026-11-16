@@ -628,6 +628,17 @@ impl WorkflowEngine {
         }
     }
 
+    /// True when `next` runs with the same step-level workspace access as the
+    /// step that owns the live container. Command-level access applies to every
+    /// step equally, so comparing the step flags is sufficient; an unknown
+    /// current step is treated as a mismatch (fail closed).
+    fn access_matches_current(&self, next: &WorkflowStep) -> bool {
+        self.current_step_name
+            .as_deref()
+            .and_then(|n| self.find_step(n).ok())
+            .is_some_and(|cur| cur.read_only_workspace == next.read_only_workspace)
+    }
+
     pub(super) fn handle_continue_in_current_container(
         &mut self,
         prompt: &str,
@@ -648,6 +659,16 @@ impl WorkflowEngine {
             .map(|a| *a == next_agent)
             .unwrap_or(false);
         let model_ok = self.current_step_model == next_model;
+        // A running container keeps the workspace access it was launched with;
+        // never carry a prompt across a read-only/writable boundary.
+        if !self.access_matches_current(&next_step) {
+            return Err(EngineError::InvalidAdvanceAction(
+                "ContinueInCurrentContainer requires the same workspace access \
+                 (read-only or writable) for the current and next steps; \
+                 use LaunchNext to start a fresh container"
+                    .into(),
+            ));
+        }
         if !agent_ok || !model_ok {
             return Err(EngineError::InvalidAdvanceAction(
                 "ContinueInCurrentContainer requires the same agent and model \
@@ -694,7 +715,11 @@ impl WorkflowEngine {
             let next_agent = self.resolve_agent(&next)?;
             let next_model = self.resolve_model(&next);
             let ok = match (&self.current_step_agent, &self.current_step_model) {
-                (Some(curr_a), curr_m) => *curr_a == next_agent && *curr_m == next_model,
+                (Some(curr_a), curr_m) => {
+                    *curr_a == next_agent
+                        && *curr_m == next_model
+                        && self.access_matches_current(&next)
+                }
                 _ => false,
             };
             if ok && has_execution {
@@ -704,7 +729,7 @@ impl WorkflowEngine {
                 a.continue_unavailable_reason = Some(if self.current_step_agent.is_none() {
                     "no current container".into()
                 } else {
-                    "next step targets a different agent or model".into()
+                    "next step targets a different agent, model or workspace access".into()
                 });
             }
         }

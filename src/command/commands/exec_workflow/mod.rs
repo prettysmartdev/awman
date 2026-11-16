@@ -144,6 +144,19 @@ pub trait ExecWorkflowCommandFrontend:
 
     fn report_workflow_context_path(&mut self, _host_path: &std::path::Path) {}
 
+    /// A launch's workspace is mounted read-only (WI 0152). Called by the
+    /// command once per run with `step: None` when the command-level
+    /// `--read-only-workspace` is set. Each read-only step launch is reported
+    /// through the `Info` message `Step '<name>': workspace mounted
+    /// read-only; …` (the step factory talks to the shared frontend, which
+    /// reaches this method too, with `step: Some(name)`). Presentation only.
+    fn report_workspace_access(
+        &mut self,
+        _access: crate::data::workspace::WorkspaceAccess,
+        _step: Option<&str>,
+    ) {
+    }
+
     /// Persist teardown inputs before starting work on a durable API command.
     fn record_cancel_cleanup(
         &mut self,
@@ -378,6 +391,10 @@ pub struct ExecWorkflowCommand {
     /// container (WI 0137 §3). Set only under the API.
     output_dir: Option<PathBuf>,
     frontend_kind: crate::command::dispatch::catalogue::FrontendKind,
+    /// The command-level `--read-only-workspace` (WI 0152). Each step's own
+    /// `read_only_workspace` and a pulled lease's read-only engine can only
+    /// make a step stricter than this, never more permissive.
+    workspace_access: crate::data::workspace::WorkspaceAccess,
 }
 
 impl ExecWorkflowCommand {
@@ -393,7 +410,22 @@ impl ExecWorkflowCommand {
             cancel: tokio_util::sync::CancellationToken::new(),
             frontend_kind: crate::command::dispatch::catalogue::FrontendKind::Cli,
             output_dir: None,
+            workspace_access: Default::default(),
         }
+    }
+
+    /// Mount the workspace read-only for every agent step
+    /// (`--read-only-workspace`, WI 0152).
+    pub fn with_workspace_access(
+        mut self,
+        access: crate::data::workspace::WorkspaceAccess,
+    ) -> Self {
+        self.workspace_access = access;
+        self
+    }
+
+    pub fn workspace_access(&self) -> crate::data::workspace::WorkspaceAccess {
+        self.workspace_access
     }
 
     /// Mount `dir` at `/awman/output` into every agent container of the run
@@ -466,6 +498,14 @@ impl ExecWorkflowCommand {
             )?,
         };
         validate_dynamic_flags(&flags, ctx.session.inline_work_item().is_some())?;
+        let workspace_access = crate::data::workspace::WorkspaceAccess::from_read_only(
+            ctx.flags
+                .bool(crate::data::workspace::READ_ONLY_WORKSPACE_FLAG),
+        );
+        crate::command::commands::workspace_access::check_workflow_flags(
+            workspace_access,
+            flags.dynamic,
+        )?;
         if !flags.dynamic && flags.workflow.is_none() {
             return Err(CommandError::missing_required_argument(
                 &ctx.path(),
@@ -476,7 +516,8 @@ impl ExecWorkflowCommand {
             .with_frontend_kind(ctx.caller.frontend())
             .mirroring_into(Arc::clone(&ctx.managed_session))
             .with_cancellation(ctx.cancel.clone())
-            .with_output_dir(ctx.output_dir.clone()))
+            .with_output_dir(ctx.output_dir.clone())
+            .with_workspace_access(workspace_access))
     }
 
     /// Carry a squad container identity so every generated-workflow step

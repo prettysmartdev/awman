@@ -242,6 +242,8 @@ mod work_item_execution {
     #[derive(Default)]
     struct Runtime {
         prompts: Mutex<Vec<String>>,
+        image_checks: Mutex<Vec<String>>,
+        missing_images: Mutex<Vec<String>>,
         inputs: Mutex<Vec<(std::path::PathBuf, String)>>,
     }
     impl AgentRuntimeEngine for Runtime {
@@ -253,8 +255,14 @@ mod work_item_execution {
         ) -> Result<(), EngineError> {
             Ok(())
         }
-        fn image_exists(&self, _: &str) -> Result<bool, EngineError> {
-            Ok(true)
+        fn image_exists(&self, tag: &str) -> Result<bool, EngineError> {
+            self.image_checks.lock().unwrap().push(tag.to_owned());
+            Ok(!self
+                .missing_images
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|missing| tag == missing))
         }
         fn image_home_dir(&self, _: &str) -> Result<Option<String>, EngineError> {
             Ok(Some("/home/awman".into()))
@@ -559,6 +567,10 @@ mod work_item_execution {
                 runtime.prompts.lock().unwrap().is_empty(),
                 "leader launched"
             );
+            assert!(
+                runtime.image_checks.lock().unwrap().is_empty(),
+                "image preflight ran before project setup validation"
+            );
             let mut output = String::new();
             while let Ok(event) = log.try_recv() {
                 output.push_str(&serde_json::to_string(&event).unwrap());
@@ -650,6 +662,196 @@ mod work_item_execution {
             }
         }
         drop(server);
+        s.finish();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preflight_reports_images_and_step_requirements_once_without_preparing_them() {
+        use awman::data::image_tags::agent_image_tag;
+        use awman::data::workflow_prerequisites::{PrerequisiteStatus, WorkflowPrerequisite};
+        let s = support::sandbox("command::workflow::work_item_execution::preflight_reports_images_and_step_requirements_once_without_preparing_them");
+        let session = session(&s, "local", "https://tracker.example/items");
+        std::fs::create_dir_all(session.git_root().join(".awman")).unwrap();
+        for agent in ["claude", "codex", "gemini"] {
+            std::fs::write(
+                session
+                    .git_root()
+                    .join(format!(".awman/Dockerfile.{agent}")),
+                "FROM scratch\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            session.git_root().join("workflow.toml"),
+            r#"
+[[steps]]
+name = "first"
+agent = "codex"
+prompt = "Do the work"
+[[steps]]
+name = "second"
+agent = "codex"
+prompt = "Check it"
+[[teardown]]
+type = "commit_changes"
+message = "Done"
+"#,
+        )
+        .unwrap();
+        let (engines, runtime) = engines(&s, &session);
+        runtime
+            .missing_images
+            .lock()
+            .unwrap()
+            .push(agent_image_tag(session.git_root(), "codex"));
+        for dynamic in [false, true] {
+            runtime.image_checks.lock().unwrap().clear();
+            let (outcome, output) = run_workflow(&session, &engines, "7", dynamic).await;
+            let outcome = outcome.unwrap();
+            let report = outcome.prerequisites.unwrap();
+            let mut agents: Vec<_> = report
+                .checks
+                .iter()
+                .filter_map(|check| {
+                    if let WorkflowPrerequisite::AgentImage { agent, .. } = &check.prerequisite {
+                        if agent == "codex" {
+                            assert_eq!(check.status, PrerequisiteStatus::Missing);
+                        }
+                        Some(agent.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            agents.sort();
+            assert_eq!(
+                agents,
+                if dynamic {
+                    vec!["claude", "codex", "gemini"]
+                } else {
+                    vec!["codex"]
+                }
+            );
+            assert!(report.find(&WorkflowPrerequisite::GitIdentity).is_some());
+            assert_eq!(outcome.exit_code, Some(1));
+            assert_eq!(output.matches(r#""checks":"#).count(), 1, "{output}");
+            let mut probed = runtime.image_checks.lock().unwrap().clone();
+            probed.sort();
+            let mut expected: Vec<_> = agents
+                .iter()
+                .map(|agent| agent_image_tag(session.git_root(), agent))
+                .collect();
+            expected.sort();
+            assert_eq!(probed, expected);
+            assert!(runtime.prompts.lock().unwrap().is_empty());
+            assert!(!outcome.worktree_used);
+        }
+        s.finish();
+    }
+
+    #[test]
+    fn generation_narrows_the_report_without_reprobing_or_reopening_consent() {
+        use awman::command::commands::workflow_prerequisites::*;
+        use awman::command::dispatch::catalogue::FrontendKind;
+        use awman::data::workflow_definition::{Workflow, WorkflowFormat};
+        use awman::data::workflow_prerequisites::*;
+        struct Frontend {
+            interactive: bool,
+            reports: usize,
+        }
+        impl awman::data::message::UserMessageSink for Frontend {
+            fn write_message(&mut self, _: awman::data::message::UserMessage) {}
+            fn replay_queued(&mut self) {}
+        }
+        impl WorkflowPrerequisiteFrontend for Frontend {
+            fn can_ask_prerequisites(&self) -> bool {
+                self.interactive
+            }
+            fn show_workflow_prerequisites(
+                &mut self,
+                _: &WorkflowPrerequisiteReport,
+                _: PrerequisiteReportNext,
+            ) -> Result<(), awman::command::error::CommandError> {
+                self.reports += 1;
+                Ok(())
+            }
+            // Any credential question uses the trait's error default, so a
+            // second consent round fails this test even without a report.
+        }
+        let s = support::sandbox("command::workflow::work_item_execution::generation_narrows_the_report_without_reprobing_or_reopening_consent");
+        let session = session(&s, "local", "https://tracker.example/items");
+        let (engines, runtime) = engines(&s, &session);
+        let flags = PrerequisiteFlags {
+            token: Some(awman::data::config::flags::TokenFlag::Deny),
+            unresolved: Some(awman::data::config::workflows::UnresolvedMode::Warn),
+            ..Default::default()
+        };
+        let options = WorkflowPrerequisiteFlowOptions::for_session(
+            &session,
+            FrontendKind::Cli,
+            &flags,
+            None,
+            PrerequisiteOrigin::AssumedAll,
+            None,
+        );
+        let flow = WorkflowPrerequisiteFlow::new(&engines, &session, options);
+        let token = WorkflowPrerequisite::GitHubToken {
+            host: "github.com".into(),
+        };
+        let needs = WorkflowPrerequisites {
+            origin: PrerequisiteOrigin::AssumedAll,
+            needs: vec![
+                token.clone(),
+                WorkflowPrerequisite::AgentImage {
+                    agent: "claude".into(),
+                    tag: awman::data::image_tags::agent_image_tag(session.git_root(), "claude"),
+                },
+            ]
+            .into_iter()
+            .map(|prerequisite| PrerequisiteNeed {
+                prerequisite,
+                needed_by: vec![],
+            })
+            .collect(),
+            advisories: vec![],
+        };
+        let mut frontend = Frontend {
+            interactive: false,
+            reports: 0,
+        };
+        let mut prepared = flow.prepare(&needs, &mut frontend).unwrap();
+        let probes = runtime.image_checks.lock().unwrap().len();
+        assert_eq!(probes, 1);
+        assert_eq!(frontend.reports, 1);
+        frontend.interactive = true;
+        let workflow = Workflow::parse(
+            r#"
+[[steps]]
+name = "work"
+prompt = "work"
+[[teardown]]
+type = "poll_ci"
+"#,
+            WorkflowFormat::Toml,
+        )
+        .unwrap();
+        let (_, narrowed) = prepared
+            .flow
+            .narrow_after_generation(
+                &workflow,
+                &prepared.report,
+                &mut prepared.grants,
+                &prepared.redaction,
+                &mut frontend,
+            )
+            .unwrap();
+        assert_eq!(
+            narrowed.find(&token).unwrap().status,
+            PrerequisiteStatus::Missing
+        );
+        assert!(prepared.grants.token.is_none());
+        assert_eq!(runtime.image_checks.lock().unwrap().len(), probes);
+        assert_eq!(frontend.reports, 1);
         s.finish();
     }
 

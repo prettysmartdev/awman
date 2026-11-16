@@ -1,7 +1,7 @@
 //! Squad tasks store prerequisite **decisions** (WI 0149 §6), never values.
 //!
 //! `squad add` / `squad edit` run from an interactive client walk the same
-//! questions as `exec workflow --dynamic` (assume every teardown kind), then
+//! questions as `exec workflow --dynamic` (assume all workflow requirements), then
 //! turn the answers into the `PrerequisitePolicy` kept on the `Task`. The
 //! daemon resolves the credentials again at every run.
 

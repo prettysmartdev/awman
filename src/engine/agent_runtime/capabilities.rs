@@ -65,9 +65,9 @@ impl Capabilities {
     }
 
     /// Whether the runtime can mount the session workspace read-only while
-    /// keeping a scratch directory and the agent home writable. Every
+    /// keeping tmpfs /tmp, the scratch directory and the agent home writable. Every
     /// container-tier driver (Docker, Apple, builtin) honours a read-only
-    /// bind mount; the sandbox tier shares its workspace directory
+    /// bind mount and a writable tmpfs; the sandbox tier shares its workspace directory
     /// read-write and cannot. Read by `AgentEngine` (which refuses a
     /// read-only launch it cannot enforce) and by the worker's lease
     /// eligibility check and WSP registration (`lease_read_only`).

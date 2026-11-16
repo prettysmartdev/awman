@@ -18,6 +18,8 @@ async fn command_traces_match_between_builtin_and_daemon() {
             scenarios::config_edits_are_durable_and_invalid_values_are_atomic(&backend, &s).await,
             scenarios::workflow_preflight_is_read_only_and_missing_work_is_typed(&backend, &s)
                 .await,
+            scenarios::read_only_workspace_refusals_are_typed_and_precede_launch(&backend, &s)
+                .await,
         ];
         traces.push(trace);
         scenarios::assert_no_host_agents(&host_agents);

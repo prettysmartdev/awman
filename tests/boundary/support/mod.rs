@@ -62,3 +62,5 @@ pub fn env_snapshot(sandbox: &TestSandbox) -> EnvSnapshot {
         .collect();
     EnvSnapshot::from_full_env(env).with_invocation(sandbox.work(), vec!["awman".to_string()])
 }
+
+pub mod read_only;

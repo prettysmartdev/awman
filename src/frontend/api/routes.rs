@@ -3084,7 +3084,7 @@ async fn listener_gate(
             .feature_state(crate::data::daemon_state::FeatureName::Engine)
             .state;
         let mut protocols = serde_json::json!({"api":1,"frontend":1,"terminal":1});
-        let mut capabilities = crate::command::daemon_api::capabilities::advertised(true, &[]);
+        let mut capabilities = api.runtime.status_snapshot().capabilities;
         if browser_links {
             protocols["browser"] = serde_json::json!(1);
         }

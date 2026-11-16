@@ -95,3 +95,4 @@ pub mod secret;
 
 pub mod git_transport;
 pub mod launch_context;
+pub mod workspace;

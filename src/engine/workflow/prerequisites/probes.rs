@@ -44,12 +44,38 @@ impl PrerequisitePreflight {
     ) -> Vec<PrerequisiteCheck> {
         use WorkflowPrerequisite::*;
         let check = match &need.prerequisite {
-            AgentImage { .. } => Self::check(
-                need,
-                PrerequisiteStatus::Unknown,
-                "checked by workflow image preparation before agent launch",
-                vec![],
-            ),
+            AgentImage { tag, .. } => {
+                if self.options.runtime.capabilities().image_acquisition
+                    == crate::engine::agent_runtime::ImageAcquisition::Kit
+                {
+                    return vec![Self::check(
+                        need,
+                        PrerequisiteStatus::Satisfied,
+                        "agent image managed by the runtime kit",
+                        vec![],
+                    )];
+                }
+                let (status, explanation) = match self.options.runtime.image_exists(tag) {
+                    Ok(true) => (
+                        PrerequisiteStatus::Satisfied,
+                        format!("image {tag} is available"),
+                    ),
+                    Ok(false) => (
+                        PrerequisiteStatus::Missing,
+                        format!("image {tag} must be prepared before the workflow starts"),
+                    ),
+                    Err(error) => (
+                        PrerequisiteStatus::Unknown,
+                        format!("could not inspect image {tag}: {error}"),
+                    ),
+                };
+                let remediations = if status == PrerequisiteStatus::Satisfied {
+                    vec![]
+                } else {
+                    vec![Remediation::PrepareImage]
+                };
+                Self::check(need, status, explanation, remediations)
+            }
             GitIdentity => self.identity(need),
             GitRemote { remote } => match self.remote(remote) {
                 Ok(Some(url)) => Self::check(

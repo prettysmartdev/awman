@@ -52,6 +52,10 @@ fn base(name: &str, display_name: &str) -> AgentDefinition {
         settings_mount: SettingsMount::None,
         extra_settings_mounts: Vec::new(),
         session_storage_dirs: Vec::new(),
+        // First-party session state already lives under HOME (Claude's
+        // ~/.claude, Codex's ~/.codex and private sqlite mount, XDG for
+        // opencode). Project configuration must stay visible, read-only.
+        read_only_workspace_redirects: Vec::new(),
         skills_mount: None,
         credential_source: CredentialSource::None,
         ping_argv: None,

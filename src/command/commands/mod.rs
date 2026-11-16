@@ -24,6 +24,7 @@ pub mod squad;
 pub mod view;
 pub mod workflow_preflight;
 pub mod workflow_prerequisites;
+pub mod workspace_access;
 // `HttpCore` is Layer 1 (WI 0114 F-28) — the tree's one `reqwest::Client`
 // builder, shared with the engine's own HTTP users. Re-exported here so
 // daemon-facing Layer 2 clients and integration consumers keep the path they

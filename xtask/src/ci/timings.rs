@@ -36,7 +36,7 @@ fn whole_suite(rows: &[&Sample]) -> Option<(u64, u32)> {
     let mut tests = BTreeSet::new();
     let mut ms = 0u64;
     for row in shards.values() {
-        ms = ms.checked_add(row.execution_ms)?;
+        ms = ms.checked_add(row.execution_ms?)?;
         for (test, outcome) in &row.tests {
             if *outcome != Outcome::Passed || !tests.insert(test) {
                 return None;
@@ -75,11 +75,20 @@ pub fn timings(samples: &[Sample]) -> serde_json::Value {
         let c = counts.entry(suite).or_default();
         *c = (*c).max(count);
     }
+    // Unknown timing on the latest attempt breaks consecutive measurements;
+    // neither reuse an older attempt nor substitute zero for the missing time.
+    let mut main_durations = Vec::new();
+    for (_, ms) in main_runs(samples).values() {
+        match ms {
+            Some(ms) => main_durations.push(*ms),
+            None => main_durations.clear(),
+        }
+    }
     json!({
         "suite_durations_ms": durations.iter().filter_map(|(k, v)| Some((k.clone(), percentile(v, 50)?))).collect::<BTreeMap<_, _>>(),
         "suite_test_counts": counts,
         // run ids grow over time, so the BTreeMap order is chronological
-        "main_durations_ms": main_runs(samples).values().map(|(_, ms)| ms).collect::<Vec<_>>(),
+        "main_durations_ms": main_durations,
     })
 }
 
@@ -113,7 +122,7 @@ mod tests {
                 .map(|i| (format!("t{i}"), Outcome::Passed))
                 .collect(),
             queue_ms: None,
-            execution_ms: ms,
+            execution_ms: Some(ms),
             outcome: Outcome::Passed,
             cache_hit: None,
             rebuilds: None,
@@ -183,7 +192,7 @@ mod tests {
             assert_eq!(timings(&[a.clone(), bad])["suite_durations_ms"], json!({}));
         }
         let conflict = Sample {
-            execution_ms: 1,
+            execution_ms: Some(1),
             ..a.clone()
         };
         assert_eq!(timings(&[a, b, conflict])["suite_durations_ms"], json!({}));
@@ -195,12 +204,12 @@ mod tests {
         a.tier = "gate".into();
         let b = Sample {
             attempt: 2,
-            execution_ms: 200,
+            execution_ms: Some(200),
             ..a.clone()
         };
         let c = Sample {
             attempt: 3,
-            execution_ms: 100,
+            execution_ms: Some(100),
             ..a.clone()
         };
         let rows = [c.clone(), a.clone(), b];
@@ -216,5 +225,16 @@ mod tests {
         ];
         assert!(crate::evidence::history::budget_regression(&rows, 50));
         assert_eq!(timings(&rows)["suite_durations_ms"], json!({}));
+        let mut unknown = rows[2].clone();
+        unknown.attempt += 1;
+        unknown.execution_ms = None;
+        let mut rows = rows.to_vec();
+        rows.push(unknown);
+        assert_eq!(timings(&rows)["main_durations_ms"], json!([]));
+        rows.push(Sample {
+            run_id: 4,
+            ..rows[0].clone()
+        });
+        assert_eq!(timings(&rows)["main_durations_ms"], json!([300]));
     }
 }

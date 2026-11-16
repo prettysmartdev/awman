@@ -326,6 +326,22 @@ pub(super) const INTERACTIVE_FLAG: [FlagSpec; 1] = [FlagSpec {
     optional: true,
 }];
 
+/// `--read-only-workspace` (WI 0152) on `exec prompt` and `exec workflow`, and
+/// so on their `remote exec` forms. Visible to every frontend: the API and
+/// push commands pass it in `args`. Its conflict with `--dynamic` is checked by
+/// `exec workflow` itself, because `exec prompt` has no `--dynamic` to name.
+pub(super) const READ_ONLY_WORKSPACE_FLAG: [FlagSpec; 1] = [FlagSpec {
+    long: crate::data::workspace::READ_ONLY_WORKSPACE_FLAG,
+    short: None,
+    help: "Mount the workspace read-only; the agent can write only to /awman/output, mounted contexts and /tmp.",
+    kind: FlagKind::Bool,
+    default: FlagDefault::Bool(false),
+    frontends: FrontendVisibility::All,
+    conflicts_with: &["allow-docker"],
+    implies: &[],
+    optional: true,
+}];
+
 /// Help for `--work-item`: every reference form the resolver accepts, so the
 /// grammar is described once for `exec prompt`, `exec workflow` and `new spec`.
 pub(super) const WORK_ITEM_HELP: &str =
@@ -364,11 +380,13 @@ pub(super) const EXEC_PROMPT_FLAGS: [FlagSpec;
     AGENT_RUN_FLAGS_NO_WORKTREE.len()
         + WORK_ITEM_FLAG.len()
         + INTERACTIVE_FLAG.len()
-        + SESSION_WORKTREE_FLAGS.len()] = concat_flags(&[
+        + SESSION_WORKTREE_FLAGS.len()
+        + READ_ONLY_WORKSPACE_FLAG.len()] = concat_flags(&[
     &AGENT_RUN_FLAGS_NO_WORKTREE,
     &WORK_ITEM_FLAG,
     &INTERACTIVE_FLAG,
     &SESSION_WORKTREE_FLAGS,
+    &READ_ONLY_WORKSPACE_FLAG,
 ]);
 
 /// `--work-item`, which `exec workflow` lists before everything else.
@@ -533,7 +551,7 @@ pub(super) const CHECK_PREREQUISITES_FLAG: [FlagSpec; 1] = [FlagSpec {
 /// base run, so the base set is spliced rather than concatenated. The order is
 /// exactly what the literal had, because it is the order `--help` and the
 /// generated command reference print.
-pub(super) const EXEC_WORKFLOW_FLAGS: [FlagSpec; 23] = concat_flags(&[
+pub(super) const EXEC_WORKFLOW_FLAGS: [FlagSpec; 24] = concat_flags(&[
     &EXEC_WORKFLOW_LEADING_FLAGS,
     AGENT_RUN_BEFORE_WORKTREE,
     &INTERACTIVE_FLAG,
@@ -553,6 +571,7 @@ pub(super) const EXEC_WORKFLOW_FLAGS: [FlagSpec; 23] = concat_flags(&[
         implies: &["headless"],
         optional: true,
     }],
+    &READ_ONLY_WORKSPACE_FLAG,
 ]);
 
 /// The three base flags `exec workflow` declares differently.
@@ -657,4 +676,92 @@ pub(super) const fn override_flags<const N: usize>(
         i += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod read_only_workspace_flag_tests {
+    use super::*;
+    use crate::data::workspace::READ_ONLY_WORKSPACE_FLAG as FLAG;
+
+    const PATHS: [&[&str]; 4] = [
+        &["exec", "prompt"],
+        &["exec", "workflow"],
+        &["remote", "exec", "prompt"],
+        &["remote", "exec", "workflow"],
+    ];
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn flag_is_declared_on_both_exec_leaves_and_their_remote_forms_for_every_frontend() {
+        let catalogue = CommandCatalogue::get();
+        for path in PATHS {
+            let spec = catalogue.lookup(path).unwrap_or_else(|| panic!("{path:?}"));
+            let flag = spec.find_flag(FLAG).unwrap_or_else(|| panic!("{path:?}"));
+            assert!(matches!(flag.kind, FlagKind::Bool));
+            assert_eq!(flag.frontends, FrontendVisibility::All);
+            assert_eq!(flag.conflicts_with, &["allow-docker"]);
+        }
+        assert!(catalogue.lookup(&["exec", "prompt"]).unwrap().api_allowed);
+        assert!(catalogue.lookup(&["exec", "workflow"]).unwrap().api_allowed);
+        // Out of scope for chat.
+        assert!(catalogue
+            .lookup(&["chat"])
+            .unwrap()
+            .find_flag(FLAG)
+            .is_none());
+    }
+
+    #[test]
+    fn raw_args_parse_the_flag_and_refuse_it_with_allow_docker() {
+        let catalogue = CommandCatalogue::get();
+        for path in [&["exec", "prompt"][..], &["exec", "workflow"][..]] {
+            let parsed = catalogue
+                .parse_raw_args(path, &args(&["--read-only-workspace"]))
+                .unwrap();
+            assert_eq!(parsed.flag_bool(FLAG), Some(true), "{path:?}");
+            let absent = catalogue.parse_raw_args(path, &args(&[])).unwrap();
+            assert_ne!(absent.flag_bool(FLAG), Some(true), "{path:?}");
+            let err = catalogue
+                .parse_raw_args(path, &args(&["--read-only-workspace", "--allow-docker"]))
+                .unwrap_err();
+            // The raw-args projection reports a declared conflict as an
+            // invalid value of the declaring flag.
+            assert!(
+                matches!(
+                    &err,
+                    crate::command::error::CommandError::InvalidFlagValue { flag, .. }
+                        if flag == FLAG
+                ) || matches!(
+                    err,
+                    crate::command::error::CommandError::MutuallyExclusive { .. }
+                ),
+                "{path:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clap_parses_the_flag_and_refuses_it_with_allow_docker() {
+        let cli = CommandCatalogue::get().build_clap_command();
+        let matches = cli
+            .clone()
+            .try_get_matches_from(["awman", "exec", "prompt", "--read-only-workspace", "review"])
+            .unwrap();
+        let (_, exec) = matches.subcommand().unwrap();
+        let (_, prompt) = exec.subcommand().unwrap();
+        assert!(prompt.get_flag(FLAG));
+        assert!(cli
+            .try_get_matches_from([
+                "awman",
+                "exec",
+                "workflow",
+                "--read-only-workspace",
+                "--allow-docker",
+                "wf.toml",
+            ])
+            .is_err());
+    }
 }

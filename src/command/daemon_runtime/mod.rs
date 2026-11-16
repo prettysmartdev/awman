@@ -453,8 +453,8 @@ impl DaemonRuntime {
             .into(),
             version: env!("CARGO_PKG_VERSION").into(),
             protocol: [("api".into(), 1), ("frontend".into(), 1)].into(),
-            capabilities: crate::command::daemon_api::capabilities::advertised(
-                self.engines.runtime.capabilities().mounts_outputs(true),
+            capabilities: crate::command::daemon_api::capabilities::advertised_for_runtime(
+                self.engines.runtime.capabilities(),
                 &[],
             ),
             features: FeatureName::ALL

@@ -1,3 +1,5 @@
+#[path = "../boundary/support/read_only.rs"]
+mod read_only;
 use awman::{
     command::commands::api_server::{event_bus::EventBus, owned_runtime::CommandOwnedRuntime},
     data::fs::{api_command_log::CommandStateWriter, api_paths::ApiPaths},
@@ -84,5 +86,14 @@ pub async fn run(runtime: Arc<dyn AgentRuntimeEngine>, selected: &str, image: &s
     }
     assert!(workspace.join("control").exists(), "positive write control");
     assert!(!workspace.join("forbidden").exists());
+    // WI 0152: the full read-only contract (tmpfs /tmp, writable output, context
+    // and home), with the engine's option set.
+    read_only::prove_async(&read_only::Proof {
+        runtime: runtime.clone(),
+        image,
+        root: &temp.join("read-only-proof"),
+        builtin: selected == "builtin",
+    })
+    .await;
     println!("PASS: worker mount probe {selected}");
 }

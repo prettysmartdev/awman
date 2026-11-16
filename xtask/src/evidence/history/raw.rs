@@ -83,9 +83,11 @@ pub fn append_run(store: &Path, file: &Path, gate: &str) -> Result<()> {
                 tests,
                 // Queue and cache belong to the job, not its individual invocations.
                 queue_ms: None,
-                execution_ms: inv["execution_ms"]
-                    .as_u64()
-                    .context("missing measured invocation time")?,
+                execution_ms: Some(
+                    inv["execution_ms"]
+                        .as_u64()
+                        .context("missing measured invocation time")?,
+                ),
                 outcome,
                 cache_hit: None,
                 rebuilds: None,
@@ -111,7 +113,7 @@ pub fn append_gate(store: &Path, file: &Path) -> Result<()> {
             manifest_version: gate.manifest_version,
             commit: gate.commit,
             tests: BTreeMap::new(),
-            queue_ms: Some(gate.queue_ms),
+            queue_ms: gate.queue_ms,
             execution_ms: gate.execution_ms,
             outcome: gate.verdict,
             cache_hit: None,
@@ -123,7 +125,19 @@ pub fn append_gate(store: &Path, file: &Path) -> Result<()> {
 
 /// Longest predecessor queue and wall span from first job start to last finish.
 /// In-progress aggregation and skipped jobs have no completed duration.
-pub fn job_times(jobs: &[Value]) -> Result<(u64, u64)> {
+/// Provider timestamps are diagnostics, never evidence of job success. Reruns
+/// can recreate job records with creation times later than their execution.
+pub fn job_times(jobs: &[Value]) -> (Option<u64>, Option<u64>) {
+    match measured_job_times(jobs) {
+        Ok((queue, execution)) => (Some(queue), Some(execution)),
+        Err(error) => {
+            eprintln!("job timing diagnostics unavailable: {error:#}");
+            (None, None)
+        }
+    }
+}
+
+fn measured_job_times(jobs: &[Value]) -> Result<(u64, u64)> {
     // Reusable workflows share the provider's job list with their caller and
     // siblings. Use the already-validated Plan job's prefix to isolate this gate.
     let scope = |name: &str| {
@@ -190,7 +204,7 @@ mod tests {
         let rows = super::super::read(&store).unwrap();
         assert_eq!(rows[0].tests["p a"], Outcome::Failed);
         assert_eq!(rows[0].tests["p b"], Outcome::Blocked);
-        assert_eq!(rows[0].execution_ms, 123);
+        assert_eq!(rows[0].execution_ms, Some(123));
         assert_eq!(rows[0].queue_ms, None);
         assert_eq!(rows[0].cache_hit, None);
         assert_eq!(rows[0].shard, Some(Shard { index: 1, of: 2 }));
@@ -236,7 +250,26 @@ mod tests {
                 "2026-01-01T01:00:00Z",
             ),
         ];
-        assert_eq!(job_times(&jobs).unwrap(), (20_000, 35_000));
-        assert!(job_times(&[]).is_err());
+        assert_eq!(job_times(&jobs), (Some(20_000), Some(35_000)));
+        assert_eq!(job_times(&[]), (None, None));
+    }
+
+    #[test]
+    fn invalid_provider_timestamps_only_make_diagnostics_unavailable() {
+        let valid = json!({"name":"Plan", "status":"completed", "conclusion":"success",
+            "created_at":"2026-11-16T18:37:00Z", "started_at":"2026-11-16T18:37:09Z",
+            "completed_at":"2026-11-16T18:38:04Z"});
+        for (key, value) in [
+            ("created_at", json!("2026-11-16T19:47:19Z")),
+            ("started_at", json!("2026-11-16T19:47:19Z")),
+            ("completed_at", json!("2026-11-16T18:36:00Z")),
+            ("created_at", Value::Null),
+            ("started_at", json!("invalid")),
+            ("completed_at", Value::Null),
+        ] {
+            let mut job = valid.clone();
+            job[key] = value;
+            assert_eq!(job_times(&[job]), (None, None), "{key}");
+        }
     }
 }

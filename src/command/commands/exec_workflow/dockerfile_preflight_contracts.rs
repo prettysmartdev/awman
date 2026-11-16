@@ -111,7 +111,7 @@ fn prepared_agents_pass_and_global_model_maps_still_skip_missing_agents() {
     let dynamic = resolve_dynamic_workflows(&session, &flags).unwrap();
     validate_dynamic_agent_dockerfiles(&session, &flags, &dynamic).unwrap();
     let paths = crate::data::RepoDockerfilePaths::new(s.work());
-    let (_, warnings) =
+    let (_, _, warnings) =
         agents_section_for_leader(&dynamic, &paths.discover_agent_dockerfiles()).unwrap();
     assert!(warnings.iter().any(|w| w.contains("skipping 'codex'")));
     assert!(!paths.agent_dockerfile("codex").exists());

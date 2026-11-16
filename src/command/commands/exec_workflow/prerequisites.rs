@@ -9,11 +9,12 @@
 use super::*;
 pub(crate) use crate::command::commands::workflow_prerequisites::PreparedPrerequisites;
 use crate::command::commands::workflow_prerequisites::{
-    PrerequisiteReportNext, WorkflowPrerequisiteFlow, WorkflowPrerequisiteFlowOptions,
+    PrerequisiteReportNext, WorkflowPreflightPlan, WorkflowPrerequisiteFlow,
+    WorkflowPrerequisiteFlowOptions,
 };
 use crate::data::workflow_definition::{SetupStep, TeardownStep};
 use crate::data::workflow_prerequisites::{
-    PrerequisiteOrigin, PrerequisiteStepKind, WorkflowPrerequisiteReport, WorkflowPrerequisites,
+    PrerequisiteOrigin, PrerequisiteStepKind, WorkflowPrerequisiteReport,
 };
 use crate::engine::overlay::prerequisite_grants::{GrantOverlays, GrantTarget};
 use crate::engine::workflow::step_commands::StepCommandOptions;
@@ -42,7 +43,7 @@ impl ExecWorkflowCommand {
             origin,
             Some(phase_image),
         );
-        options.worktree_planned = self.flags.worktree;
+        options.worktree_planned = self.flags.worktree || self.flags.dynamic;
         WorkflowPrerequisiteFlow::new(&self.engines, &self.session, options)
     }
 
@@ -51,32 +52,15 @@ impl ExecWorkflowCommand {
     /// still at the keyboard. `--check-prerequisites` stops here.
     pub(super) async fn start_prerequisites(
         &self,
-        needs: &WorkflowPrerequisites,
+        plan: &WorkflowPreflightPlan,
         workflow_name: String,
-        image_agents: &[String],
         frontend: &SharedWorkflowFrontend,
     ) -> Result<PrerequisiteStart, CommandError> {
-        let flow = self.prerequisite_flow(needs.origin);
-        let image_agents = if self.flags.dynamic && self.flags.prerequisites.check_only {
-            let dynamic = resolve_dynamic_workflows(&self.session, &self.flags)?;
-            let (leader, _) = resolve_leader_model(&self.flags, &self.session, &dynamic)?;
-            let mut agents = vec![leader.as_str().to_string()];
-            agents.extend(
-                crate::data::RepoDockerfilePaths::new(self.session.git_root())
-                    .discover_agent_dockerfiles()
-                    .into_iter()
-                    .map(|(agent, _)| agent),
-            );
-            agents
-        } else {
-            image_agents.to_vec()
-        };
-        let images = self
-            .prepare_workflow_image_prerequisites(&image_agents, needs.origin, frontend)
-            .await?;
+        let flow = self.prerequisite_flow(plan.needs.origin);
+        let can_ask =
+            !self.flags.prerequisites.check_only && frontend.with(|f| f.can_ask_prerequisites());
+        let report = frontend.with(|f| flow.preflight_with_messages(&plan.needs, can_ask, f));
         if self.flags.prerequisites.check_only {
-            let mut report = frontend.with(|f| flow.preflight_with_messages(needs, false, f));
-            report.checks.extend(images.checks);
             frontend.with(|f| {
                 f.show_workflow_prerequisites(&report, PrerequisiteReportNext::CheckOnly)
             })?;
@@ -88,7 +72,20 @@ impl ExecWorkflowCommand {
                 worktree_used: false,
             }));
         }
-        let prepared = frontend.with(|f| flow.prepare(needs, f));
+        if can_ask {
+            frontend.with(|f| {
+                f.show_workflow_prerequisites(
+                    &report,
+                    PrerequisiteReportNext::Questions {
+                        unresolved: flow
+                            .options()
+                            .policy
+                            .unresolved_or(crate::data::config::workflows::UnresolvedMode::Warn),
+                    },
+                )
+            })?;
+        }
+        let prepared = frontend.with(|f| flow.prepare_report(report, f, false));
         let mut prepared = match prepared {
             Ok(prepared) => prepared,
             Err(e) => {
@@ -104,51 +101,23 @@ impl ExecWorkflowCommand {
                 return Err(e);
             }
         };
-        prepared.report.checks.extend(images.checks);
-        self.record_prerequisite_report(&prepared.report).await;
-        Ok(PrerequisiteStart::Run(Box::new(prepared)))
-    }
-
-    pub(super) async fn prepare_workflow_image_prerequisites(
-        &self,
-        agents: &[String],
-        origin: PrerequisiteOrigin,
-        frontend: &SharedWorkflowFrontend,
-    ) -> Result<WorkflowPrerequisiteReport, CommandError> {
-        if !self.flags.prerequisites.check_only {
-            for agent in agents {
-                let agent = crate::data::session::AgentName::new(agent)?;
-                frontend.with(|f| {
-                    crate::command::commands::agent_trust::ensure_agent_trusted(
-                        &self.session,
-                        &agent,
-                        f,
-                    )
-                })?;
-            }
-        }
-        let engines = self.engines.clone();
-        let session = self.session.clone();
-        let agents = agents.to_vec();
-        let frontend = frontend.clone();
-        let check_only = self.flags.prerequisites.check_only;
-        // Frontend questions are synchronous. Keep their lock and any waiting
-        // on a builder off the async executor, as worktree preparation does.
-        let result = tokio::task::spawn_blocking(move || {
+        let image_result = plan
+            .prepare_images(
+                &mut prepared.report,
+                &self.engines,
+                &self.session,
+                (!can_ask).then_some(prepared.flow.options().headless.clone()),
+                &mut frontend.clone(),
+            )
+            .await;
+        if !can_ask {
             frontend.with(|f| {
-                tokio::runtime::Handle::current().block_on(
-                    crate::command::commands::workflow_prerequisites::prepare_images(
-                        &engines, &session, &agents, origin, check_only, f,
-                    ),
-                )
-            })
-        })
-        .await
-        .map_err(|e| CommandError::Other(format!("image prerequisite task failed: {e}")))?;
-        if let Err(CommandError::WorkflowPrerequisitesUnresolved { report }) = &result {
-            self.record_prerequisite_report(report).await;
+                f.show_workflow_prerequisites(&prepared.report, PrerequisiteReportNext::Decided)
+            })?;
         }
-        result
+        self.record_prerequisite_report(&prepared.report).await;
+        image_result?;
+        Ok(PrerequisiteStart::Run(Box::new(prepared)))
     }
 
     /// Mirror the (secret-free) report into the shared session for viewers.
