@@ -354,9 +354,10 @@ API session setup may also build, when the compatible source store lacks the
 image; it never forces a rebuild. `chat` and `exec prompt` prepare an agent image
 that is not installed the same way, as the Docker and Apple runtimes build a
 missing image at launch; an installed image is only checked against its
-recorded source, and with the builder disabled a launch never acquires. Workflow preflight (static and dynamic) and
-squad image checks remain import-only: they never build or probe a builder, and
-they re-acquire an image that is present but was imported from a different
+recorded source, and with the builder disabled a launch never acquires. Workflow
+preflight (static and dynamic) and squad image checks may build missing images
+through the same explicitly enabled compatible local builder, then import them.
+These checks re-acquire an image that is present but was imported from a different
 source than the one now resolved, so an image they accept is the one `ready`
 would have accepted. Like `ready`, they refuse to import a default source that
 names a single image (an archive or a fixed reference) for any agent other than
@@ -370,15 +371,16 @@ rather than launching with the tool restriction silently dropped. The effective
 frontend, any workflow step): it is added to the launch's disallowed tools, and
 an agent that cannot deliver it is refused with an error naming the setting.
 
-Before a static workflow starts its first setup or agent container on a
-reachable runtime that builds images, every agent its steps resolve to must
-have its image. For each missing one, Layer 2 asks the frontend once
-(`AgentSetupFrontend`): set it up (provision its Dockerfile from the definition
-and build, which needs the project image), fall back to the default agent for
-those steps (offered only when the default agent's image exists), or abort
-before any container starts. Hosts with nobody to ask answer from their
-headless profile. Importing and sandbox runtimes keep their own image
-preparation.
+Before a workflow starts, agent images join credentials and tools in one
+prerequisite review. Static workflows resolve step, workflow and configured
+agent defaults; a step with no resolved agent is rejected during preflight.
+Fresh dynamic workflows include the leader and every agent offered to it;
+resume checks the saved workflow's agents. Continuing the review approves
+preparation of the listed images before any agent starts. Hosts with nobody
+to ask use their headless profile. Building runtimes provision missing agent
+Dockerfiles and require the project image; importing and sandbox runtimes keep
+their own image preparation. There is no separate image dialog or post-leader
+build pass. Generation may only narrow the prepared scope.
 Sandbox tool lists also require a supported native settings delivery path;
 currently only Claude's sandbox startup script applies them.
 

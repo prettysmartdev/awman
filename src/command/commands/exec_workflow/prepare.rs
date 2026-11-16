@@ -282,17 +282,37 @@ pub(crate) async fn execute_prepared_with_outputs(
     flags: &ExecWorkflowCommandFlags,
     engines: &Engines,
     prepared: PreparedRun,
-    frontend: SharedWorkflowFrontend,
+    mut frontend: SharedWorkflowFrontend,
     squad_identity: Option<&crate::engine::squad::launcher::SquadContainerIdentity>,
     task_workspace: Option<&Path>,
     workflow_state_root: Option<&Path>,
     managed_session: Option<&Arc<tokio::sync::RwLock<Session>>>,
     cancel: &tokio_util::sync::CancellationToken,
     output_dir: Option<&Path>,
+    workspace_access: crate::data::workspace::WorkspaceAccess,
 ) -> Result<ExecWorkflowOutcome, CommandError> {
     if engines.agent_engine.is_lease_workspace() {
         crate::command::worker::policy::validate_workflow(&prepared.workflow)
             .map_err(CommandError::Other)?;
+    }
+    // Read-only workspace (WI 0152): the last check before outputs, setup or
+    // any step. The plain path already ran it after loading the file; this is
+    // the only check a generated (dynamic) workflow's read-only steps get.
+    let workspace_access = crate::command::commands::workspace_access::effective_access(
+        workspace_access,
+        &engines.agent_engine,
+    );
+    if let Err(e) = crate::command::commands::workspace_access::preflight_workflow_access(
+        &prepared.workflow,
+        workspace_access,
+        flags.allow_docker,
+        engines.runtime.as_ref(),
+    ) {
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Error,
+            text: format!("exec workflow: {e}"),
+        });
+        return Err(e);
     }
     if let Some(dir) = output_dir {
         crate::data::fs::command_outputs::prepare_output_dir(dir, false).map_err(|e| {
@@ -501,6 +521,7 @@ pub(crate) async fn execute_prepared_with_outputs(
             launch_modes: Arc::new(launch_modes),
             agent_flags: workflow_agent_flags,
             output_dir: output_dir.map(Path::to_path_buf),
+            workspace_access,
         };
         let cleanup_workflow = workflow.clone();
         let cleanup_work_item_context = engine_work_item_context.clone();

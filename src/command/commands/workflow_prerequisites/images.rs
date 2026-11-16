@@ -1,144 +1,77 @@
-//! Image preparation is a prerequisite solve, shared by interactive and
-//! unattended workflows. Check-only reports never acquire or build images.
-use super::{PrerequisiteReportNext, WorkflowPrerequisiteFrontend};
-use crate::command::{dispatch::Engines, error::CommandError};
-use crate::data::{
-    config::workflows::UnresolvedMode,
-    image_tags::agent_image_tag,
-    session::Session,
-    workflow_prerequisites::{
-        PrerequisiteCheck, PrerequisiteOrigin, PrerequisitePhase, PrerequisiteStatus, Remediation,
-        WorkflowPrerequisite, WorkflowPrerequisiteReport,
-    },
-};
-use crate::engine::{
-    agent_runtime::ImageAcquisition,
-    image_prep::{AgentImagePreparer, BuildPolicy, ImageBuildContext},
-};
-
-pub(crate) async fn prepare_images(
-    engines: &Engines,
-    session: &Session,
-    agents: &[String],
-    origin: PrerequisiteOrigin,
-    check_only: bool,
-    frontend: &mut dyn WorkflowPrerequisiteFrontend,
-) -> Result<WorkflowPrerequisiteReport, CommandError> {
-    let mut report = WorkflowPrerequisiteReport {
-        phase: PrerequisitePhase::Start,
-        origin,
-        checks: vec![],
-        advisories: vec![],
-        notes: vec![],
-    };
-    if agents.is_empty()
-        || engines.runtime.capabilities().image_acquisition != ImageAcquisition::Import
-    {
-        return Ok(report);
-    }
-    let config = session.effective_config();
-    let mut preparer = AgentImagePreparer::new(
-        config.builtin_settings()?,
-        engines.runtime.clone(),
-        crate::data::fs::data_paths::data_home(config.env())?,
-        ImageBuildContext::for_session(session, session.configured_agent().as_str()),
-    )
-    .with_definition_env(session.env().clone());
-    for agent in agents {
-        let tag = agent_image_tag(session.git_root(), agent);
-        if report.checks.iter().any(|check| matches!(&check.prerequisite, WorkflowPrerequisite::AgentImage { tag: existing, .. } if existing == &tag)) { continue; }
-        let installed = engines.runtime.image_exists(&tag)?;
-        let policy = preparer.missing_image_policy(&tag, agent, BuildPolicy::ImportOnly)?;
-        let explanation = if installed {
-            format!("{tag} is installed; verify its configured source without rebuilding")
-        } else if policy == BuildPolicy::SessionSetup
-            && preparer.missing_image_plan(&tag, agent)
-                == crate::data::ready_image::ReadyImagePlan::BuildAndImport
-        {
-            format!("{tag} is missing; build base and agent images only if absent from the configured local source store, then import")
-        } else {
-            format!("{tag} is missing; import from the configured source (no local build)")
-        };
-        report.checks.push(PrerequisiteCheck {
-            prerequisite: WorkflowPrerequisite::AgentImage {
-                agent: agent.clone(),
-                tag,
-            },
-            status: if installed {
-                PrerequisiteStatus::Satisfied
-            } else {
-                PrerequisiteStatus::Missing
-            },
-            explanation,
-            needed_by: vec![],
-            remediations: if installed {
-                vec![]
-            } else {
-                vec![Remediation::PrepareImage, Remediation::Abort]
-            },
-        });
-    }
-    if check_only || report.checks.is_empty() {
-        return Ok(report);
-    }
-    frontend.begin_workflow_prerequisites();
-    let can_ask = frontend.can_ask_prerequisites();
-    if can_ask && !report.needs_attention().is_empty() {
-        frontend.show_workflow_prerequisites(
-            &report,
-            PrerequisiteReportNext::Questions {
-                unresolved: UnresolvedMode::Fail,
-            },
-        )?;
-    }
-    // Ask every choice before starting builds, so cancelling leaves images
-    // untouched. All headless profiles prepare without asking.
-    for check in report.needs_attention() {
-        let prompt = crate::command::prompts::prerequisite_image(check);
-        let prepare = if can_ask {
-            frontend.ask_prerequisite_image(&prompt)?
-        } else {
-            crate::command::headless::HeadlessDefaults::cli().prerequisite_image()
-        };
-        if !prepare {
-            return Err(CommandError::Aborted);
-        }
-    }
-    let paths = crate::data::RepoDockerfilePaths::new(session.git_root());
-    for index in 0..report.checks.len() {
-        let WorkflowPrerequisite::AgentImage { agent, .. } = &report.checks[index].prerequisite
-        else {
-            unreachable!()
-        };
-        let result = crate::command::commands::workflow_preflight::ensure_agent_image(
-            engines,
-            session.git_root(),
-            &paths,
-            agent,
-            session,
-            frontend,
-        )
-        .await;
-        let check = &mut report.checks[index];
-        if let Err(error) = result {
-            check.status = PrerequisiteStatus::Missing;
-            check.explanation = error.to_string();
-            frontend.show_workflow_prerequisites(&report, PrerequisiteReportNext::Decided)?;
-            return Err(CommandError::WorkflowPrerequisitesUnresolved {
-                report: Box::new(report),
-            });
-        }
-        check.status = PrerequisiteStatus::Satisfied;
-        check.explanation = "image prepared for workflow execution".into();
-        check.remediations.clear();
-    }
-    frontend.show_workflow_prerequisites(&report, PrerequisiteReportNext::Decided)?;
-    Ok(report)
-}
-
+//! Image preparation contracts through the combined workflow prerequisite flow.
 #[cfg(test)]
 mod contracts {
-    use super::*;
+    use super::super::*;
+    use crate::command::{
+        dispatch::{catalogue::FrontendKind, Engines},
+        error::CommandError,
+    };
+    use crate::data::{
+        session::Session,
+        workflow_definition::{Workflow, WorkflowFormat},
+        workflow_prerequisites::{
+            PrerequisiteOrigin, PrerequisiteStatus, WorkflowPrerequisiteReport,
+        },
+    };
+
+    async fn prepare_images(
+        engines: &Engines,
+        session: &Session,
+        agents: &[String],
+        origin: PrerequisiteOrigin,
+        check_only: bool,
+        frontend: &mut dyn WorkflowPrerequisiteFrontend,
+    ) -> Result<WorkflowPrerequisiteReport, CommandError> {
+        let mut source = String::from("title = 'images'\n");
+        for (index, agent) in agents.iter().enumerate() {
+            source.push_str(&format!(
+                "[[steps]]\nname = 'step-{index}'\nagent = '{agent}'\nprompt = 'literal'\n"
+            ));
+        }
+        let workflow = Workflow::parse(&source, WorkflowFormat::Toml)?;
+        let flags = crate::command::commands::exec_workflow::ExecWorkflowCommandFlags {
+            workflow: None,
+            work_item: None,
+            non_interactive: false,
+            plan: false,
+            allow_docker: false,
+            worktree: false,
+            yolo: false,
+            auto: false,
+            agent: None,
+            model: None,
+            launch_mode: None,
+            overlay: vec![],
+            agent_flags: None,
+            max_concurrent: None,
+            dynamic: false,
+            leader: None,
+            on_dirty_merge_target: None,
+            on_merge_failure: None,
+            on_existing_worktree: None,
+            prerequisites: Default::default(),
+            squad_task_prerequisites: None,
+        };
+        let plan = WorkflowPreflightPlan::for_workflow(&workflow, session, &flags)?;
+        let options = WorkflowPrerequisiteFlowOptions::for_session(
+            session,
+            FrontendKind::Cli,
+            &Default::default(),
+            None,
+            origin,
+            None,
+        );
+        let headless = (!frontend.can_ask_prerequisites()).then(|| options.headless.clone());
+        let flow = WorkflowPrerequisiteFlow::new(engines, session, options);
+        if check_only {
+            return Ok(flow.preflight(&plan.needs, false));
+        }
+        let mut prepared = flow.prepare(&plan.needs, frontend)?;
+        plan.prepare_images(&mut prepared.report, engines, session, headless, frontend)
+            .await?;
+        frontend.show_workflow_prerequisites(&prepared.report, PrerequisiteReportNext::Decided)?;
+        Ok(prepared.report)
+    }
     use crate::data::{
         config::env::EnvSnapshot,
         fs::{ApiPaths, AuthPathResolver},
@@ -168,16 +101,21 @@ mod contracts {
             self.interactive
         }
         fn ask_prerequisite_image(&mut self, _: &Prompt<bool>) -> Result<bool, CommandError> {
-            assert!(self.interactive, "headless must not ask");
-            self.asked += 1;
-            Ok(self.accept)
+            panic!("image preparation belongs to the combined prerequisite review")
         }
         fn show_workflow_prerequisites(
             &mut self,
             _: &WorkflowPrerequisiteReport,
-            _: PrerequisiteReportNext,
+            next: PrerequisiteReportNext,
         ) -> Result<(), CommandError> {
             self.reports += 1;
+            if matches!(next, PrerequisiteReportNext::Questions { .. }) {
+                assert!(self.interactive, "headless must not ask");
+                self.asked += 1;
+                if !self.accept {
+                    return Err(CommandError::Aborted);
+                }
+            }
             Ok(())
         }
     }

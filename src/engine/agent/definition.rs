@@ -109,6 +109,15 @@ pub struct SessionStorageDir {
     pub config_override: Option<(String, String)>,
 }
 
+/// State an agent would otherwise write under the workspace, redirected to
+/// its writable home for a read-only launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadOnlyWorkspaceRedirect {
+    pub env_var: String,
+    /// Relative to the effective container HOME; only normal components.
+    pub home_relative_path: String,
+}
+
 /// Which host credential scheme awman reads for an agent.
 ///
 /// Each variant names one concrete scheme, not a generic shape: adding an
@@ -260,6 +269,7 @@ pub struct AgentDefinition {
     pub extra_settings_mounts: Vec<String>,
     /// Private writable directories mounted for one execution.
     pub session_storage_dirs: Vec<SessionStorageDir>,
+    pub read_only_workspace_redirects: Vec<ReadOnlyWorkspaceRedirect>,
     /// Where the global skills directory is mounted inside the container,
     /// relative to the container `$HOME`. `None` means the agent has no known
     /// skills directory and the skills overlay is skipped with a warning.

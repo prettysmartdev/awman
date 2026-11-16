@@ -428,6 +428,11 @@ impl SandboxDriver for MsbDriver {
                         .tls(|tls| tls.enabled(false))
                 })
             };
+            // Tmpfs parents first; then the bind mounts already sorted by
+            // destination depth, including prompt files nested under /tmp.
+            for path in spec.tmpfs {
+                builder = builder.volume(path, |m| m.tmpfs().nosuid().nodev());
+            }
             for mount in spec.mounts {
                 let owner = spec.mount_owner;
                 let quota = spec.mount_quota_mib;

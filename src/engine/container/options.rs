@@ -203,6 +203,10 @@ pub enum ContainerOption {
     Image(ImageRef),
     Entrypoint(Entrypoint),
     Overlay(OverlaySpec),
+    /// Writable memory-backed guest directory (never a host bind).
+    Tmpfs(PathBuf),
+    /// Required workspace policy, carried to the backend's final launch check.
+    ReadOnlyWorkspace(bool),
     /// A private host directory mounted read-write for this execution. The
     /// guard follows the same confirmed-guest-exit lifecycle as prompt mounts.
     TemporaryDirectoryMount {
@@ -518,6 +522,11 @@ pub struct ResolvedContainerOptions {
     pub image: Option<ImageRef>,
     pub entrypoint: Option<Entrypoint>,
     pub overlays: Vec<OverlaySpec>,
+    pub tmpfs: Vec<PathBuf>,
+    pub read_only_workspace: bool,
+    /// Apple accepts bare tmpfs destinations; Docker accepts mount options.
+    /// Set by the Apple backend before handing options to the shared launcher.
+    pub tmpfs_bare_paths: bool,
     pub env_passthrough: Vec<EnvVar>,
     pub env_overrides: Vec<(String, crate::engine::auth::credential::SecretString)>,
     pub env_literal: Vec<EnvLiteral>,
@@ -588,7 +597,153 @@ pub struct ResolvedContainerOptions {
     pub builtin_launch: Option<Box<BuiltinLaunchSettings>>,
 }
 
+/// A container runtime control socket lets the agent start a sibling container
+/// with the checkout mounted writable, so no mount of one (or of a directory
+/// that exposes one) is allowed for a read-only workspace, whatever the
+/// overlay's own permission says: a `:ro` socket bind is still a usable API.
+fn reject_runtime_control_mounts(
+    overlays: &[OverlaySpec],
+) -> Result<(), crate::engine::error::EngineError> {
+    // Well-known default locations; any socket named directly as a source is
+    // caught by the special-file check below, wherever it lives.
+    let sockets: Vec<PathBuf> = ["/var/run/docker.sock", "/run/docker.sock", "/run/user"]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    reject_runtime_control_mounts_at(overlays, &sockets)
+}
+
+fn reject_runtime_control_mounts_at(
+    overlays: &[OverlaySpec],
+    sockets: &[PathBuf],
+) -> Result<(), crate::engine::error::EngineError> {
+    let sockets: Vec<PathBuf> = sockets
+        .iter()
+        .cloned()
+        // Keep the lexical location as well as its target: resolving
+        // /var/run/docker.sock to /run/docker.sock must not unprotect /var.
+        .flat_map(|path| {
+            let resolved = std::fs::canonicalize(&path).ok();
+            std::iter::once(path).chain(resolved)
+        })
+        .collect();
+    for overlay in overlays {
+        let source =
+            std::fs::canonicalize(&overlay.host_path).unwrap_or_else(|_| overlay.host_path.clone());
+        let special = std::fs::metadata(&source)
+            .map(|m| !m.is_dir() && !m.is_file())
+            .unwrap_or(false);
+        if special
+            || sockets
+                .iter()
+                .any(|s| s.starts_with(&source) || s.starts_with(&overlay.host_path))
+        {
+            return Err(crate::engine::error::EngineError::Config(format!(
+                "read-only workspace cannot mount '{}': it exposes a container \
+                 runtime control socket or special file",
+                overlay.host_path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl ResolvedContainerOptions {
+    /// Final backend check. Reuse the lease overlay enforcement, but refuse
+    /// any correction here: options reaching a spawn must already be safe.
+    pub(crate) fn validate_read_only_workspace(
+        &self,
+    ) -> Result<(), crate::engine::error::EngineError> {
+        use crate::data::workspace::{SCRATCH_TMPFS_PATH, WORKSPACE_GUEST_PATH};
+        use crate::engine::error::EngineError;
+        for path in &self.tmpfs {
+            if !crate::data::workspace::is_normalized_guest_path(path) {
+                return Err(EngineError::Config(
+                    "tmpfs guest path must be absolute and normalized".into(),
+                ));
+            }
+        }
+        if !self.read_only_workspace {
+            return Ok(());
+        }
+        if self.allow_docker {
+            return Err(EngineError::Config(
+                "read-only workspace cannot expose the host Docker socket".into(),
+            ));
+        }
+        let mut overlays = self.overlays.clone();
+        if let Some(settings) = &self.agent_settings {
+            overlays.extend(settings.overlays.clone());
+        }
+        if let Some((host, guest, _)) = &self.system_prompt_file {
+            overlays.push(OverlaySpec {
+                host_path: host.clone(),
+                container_path: guest.clone(),
+                permission: OverlayPermission::ReadOnly,
+            });
+        }
+        if let Some((_, host, guest)) = &self.system_prompt_env_file {
+            overlays.push(OverlaySpec {
+                host_path: host.clone(),
+                container_path: guest.clone(),
+                permission: OverlayPermission::ReadOnly,
+            });
+        }
+        reject_runtime_control_mounts(&overlays)?;
+        let workspaces: Vec<_> = overlays
+            .iter()
+            .filter(|o| o.container_path == Path::new(WORKSPACE_GUEST_PATH))
+            .collect();
+        if workspaces.len() != 1 || workspaces[0].permission != OverlayPermission::ReadOnly {
+            return Err(EngineError::Config(
+                "read-only workspace requires exactly one read-only /workspace mount".into(),
+            ));
+        }
+        if self
+            .tmpfs
+            .iter()
+            .filter(|p| *p == Path::new(SCRATCH_TMPFS_PATH))
+            .count()
+            != 1
+            || self.tmpfs.iter().any(|p| {
+                p.starts_with(WORKSPACE_GUEST_PATH)
+                    || Path::new(WORKSPACE_GUEST_PATH).starts_with(p)
+            })
+            || overlays
+                .iter()
+                .any(|o| Path::new(SCRATCH_TMPFS_PATH).starts_with(&o.container_path))
+        {
+            return Err(EngineError::Config(
+                "read-only workspace requires an unshadowed writable tmpfs at /tmp".into(),
+            ));
+        }
+        let workspace = workspaces[0].host_path.clone();
+        let mut checked: Vec<_> = overlays
+            .iter()
+            .cloned()
+            .map(ContainerOption::Overlay)
+            .collect();
+        crate::engine::worker::lease_workspace::validate_workspace_mounts(
+            &mut checked,
+            &workspace,
+            true,
+            None,
+            None,
+            &[],
+        )?;
+        for (original, checked) in overlays.iter().zip(checked) {
+            let ContainerOption::Overlay(checked) = checked else {
+                unreachable!()
+            };
+            if original.permission != checked.permission {
+                return Err(EngineError::Config(
+                    "writable overlay exposes a read-only workspace or its Git directory".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn resolve(
         options: impl IntoIterator<Item = ContainerOption>,
     ) -> Result<Self, ResolveError> {
@@ -676,6 +831,8 @@ impl ResolvedContainerOptions {
             ContainerOption::Image(v) => self.image = Some(v),
             ContainerOption::Entrypoint(v) => self.entrypoint = Some(v),
             ContainerOption::Overlay(v) => self.overlays.push(v),
+            ContainerOption::Tmpfs(v) => self.tmpfs.push(v),
+            ContainerOption::ReadOnlyWorkspace(v) => self.read_only_workspace |= v,
             ContainerOption::TemporaryDirectoryMount {
                 container_path,
                 env_var,
@@ -794,6 +951,148 @@ impl From<ResolveError> for crate::engine::error::EngineError {
             }
             ResolveError::CredentialSuppression(msg) => {
                 crate::engine::error::EngineError::ConflictingOptions(msg)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod workspace_access_tests {
+    use super::*;
+    use awman_test_support::{TestCase, TestSandbox};
+
+    pub(crate) fn options(sandbox: &TestSandbox) -> ResolvedContainerOptions {
+        let output = sandbox.root().join("output");
+        let context = sandbox.root().join("context");
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::create_dir_all(&context).unwrap();
+        ResolvedContainerOptions {
+            image: Some(ImageRef::new("read-only-test")),
+            entrypoint: Some(Entrypoint::new(["review-agent"])),
+            read_only_workspace: true,
+            tmpfs: vec!["/tmp".into()],
+            overlays: vec![
+                OverlaySpec {
+                    host_path: sandbox.work(),
+                    container_path: "/workspace".into(),
+                    permission: OverlayPermission::ReadOnly,
+                },
+                OverlaySpec {
+                    host_path: output,
+                    container_path: "/awman/output".into(),
+                    permission: OverlayPermission::ReadWrite,
+                },
+                OverlaySpec {
+                    host_path: context,
+                    container_path: "/awman/context/repo".into(),
+                    permission: OverlayPermission::ReadWrite,
+                },
+            ],
+            host_env: Some(crate::data::config::env::EnvSnapshot::from_full_env(
+                Default::default(),
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn read_only_intent_cannot_be_cleared_by_a_later_option() {
+        let options = ResolvedContainerOptions::resolve([
+            ContainerOption::ReadOnlyWorkspace(true),
+            ContainerOption::ReadOnlyWorkspace(false),
+            ContainerOption::Tmpfs("/tmp".into()),
+        ])
+        .unwrap();
+        assert!(options.read_only_workspace);
+        assert_eq!(options.tmpfs, [PathBuf::from("/tmp")]);
+    }
+
+    #[test]
+    fn final_check_refuses_writable_aliases_missing_tmpfs_and_docker_socket() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::options::workspace_access_tests::final_check_refuses_writable_aliases_missing_tmpfs_and_docker_socket"));
+        let valid = options(&sandbox);
+        valid.validate_read_only_workspace().unwrap();
+        let mut writable = valid.clone();
+        writable.overlays[0].permission = OverlayPermission::ReadWrite;
+        assert!(writable.validate_read_only_workspace().is_err());
+        let mut alias = valid.clone();
+        alias.overlays.push(OverlaySpec {
+            host_path: sandbox.work(),
+            container_path: "/elsewhere".into(),
+            permission: OverlayPermission::ReadWrite,
+        });
+        assert!(alias.validate_read_only_workspace().is_err());
+        let mut missing_tmpfs = valid.clone();
+        missing_tmpfs.tmpfs.clear();
+        assert!(missing_tmpfs.validate_read_only_workspace().is_err());
+        let mut shadowed_tmpfs = valid.clone();
+        shadowed_tmpfs.overlays.push(OverlaySpec {
+            host_path: sandbox.tmp(),
+            container_path: "/tmp".into(),
+            permission: OverlayPermission::ReadWrite,
+        });
+        assert!(shadowed_tmpfs.validate_read_only_workspace().is_err());
+        let mut socket = valid;
+        socket.allow_docker = true;
+        assert!(socket.validate_read_only_workspace().is_err());
+    }
+
+    #[test]
+    fn final_check_refuses_socket_and_parent_directory_overlays() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::options::workspace_access_tests::final_check_refuses_socket_and_parent_directory_overlays"));
+        let overlay = |p: &str, perm| OverlaySpec {
+            host_path: p.into(),
+            container_path: "/run/engine".into(),
+            permission: perm,
+        };
+        for p in ["/var/run", "/run", "/var", "/"] {
+            for perm in [OverlayPermission::ReadOnly, OverlayPermission::ReadWrite] {
+                assert!(
+                    super::reject_runtime_control_mounts(&[overlay(p, perm)]).is_err(),
+                    "{p}"
+                );
+            }
+        }
+        // Unix device files are refused regardless of path.
+        #[cfg(unix)]
+        assert!(super::reject_runtime_control_mounts(&[overlay(
+            "/dev/null",
+            OverlayPermission::ReadOnly
+        )])
+        .is_err());
+        let dir = sandbox.tmp();
+        // Ordinary directories remain accepted.
+        assert!(super::reject_runtime_control_mounts(&[overlay(
+            dir.to_str().unwrap(),
+            OverlayPermission::ReadWrite
+        )])
+        .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_check_keeps_symlinked_socket_parents_protected() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::options::workspace_access_tests::final_check_keeps_symlinked_socket_parents_protected"));
+        let var = sandbox.root().join("var");
+        let run = sandbox.root().join("run");
+        std::fs::create_dir_all(&var).unwrap();
+        std::fs::create_dir_all(&run).unwrap();
+        std::os::unix::fs::symlink(&run, var.join("run")).unwrap();
+        // A known endpoint must protect its parents even without a live daemon.
+        std::fs::write(run.join("docker.sock"), b"").unwrap();
+        let sockets = [var.join("run/docker.sock")];
+        for source in [&var, &run, &var.join("run")] {
+            for permission in [OverlayPermission::ReadOnly, OverlayPermission::ReadWrite] {
+                let overlay = OverlaySpec {
+                    host_path: source.clone(),
+                    container_path: "/run/engine".into(),
+                    permission,
+                };
+                assert!(
+                    super::reject_runtime_control_mounts_at(&[overlay], &sockets).is_err(),
+                    "{}",
+                    source.display()
+                );
             }
         }
     }

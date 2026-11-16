@@ -312,3 +312,26 @@ fn teardown_git_uses_the_private_credential_cache_only_for_the_session_host() {
     drop(listener);
     sandbox.finish();
 }
+
+/// WI 0152: with the option set `--read-only-workspace` produces, the real
+/// engine refuses every write to the workspace from inside the container,
+/// while `/tmp` (a tmpfs), `/awman/output`, a mounted context directory and
+/// the agent home stay writable. The control launch without the option
+/// writes the same workspace, so the refusal is the option's doing.
+#[test]
+fn a_read_only_workspace_rejects_writes_while_scratch_output_context_and_home_stay_writable() {
+    let mut sandbox = support::sandbox(
+        "docker::a_read_only_workspace_rejects_writes_while_scratch_output_context_and_home_stay_writable",
+    );
+    let engine = Engine::grant(&mut sandbox);
+    let image = engine.base_image();
+    let runtime: std::sync::Arc<dyn awman::engine::agent_runtime::AgentRuntimeEngine> =
+        std::sync::Arc::new(ContainerRuntime::docker_in(engine.snapshot()));
+    support::read_only::prove(&support::read_only::Proof {
+        runtime,
+        image: &image,
+        root: &engine.sandbox.root().join("read-only-proof"),
+        builtin: false,
+    });
+    sandbox.finish();
+}

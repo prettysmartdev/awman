@@ -1862,10 +1862,46 @@ impl AcpFrontend for ApiDispatchFrontend {
     }
 }
 
-impl ExecPromptCommandFrontend for ApiDispatchFrontend {}
+impl ExecPromptCommandFrontend for ApiDispatchFrontend {
+    fn report_workspace_access(
+        &mut self,
+        access: crate::data::workspace::WorkspaceAccess,
+        _step: Option<&str>,
+    ) {
+        if access.is_read_only() {
+            self.event_bus.emit(EventPayload::StatusMessage {
+                phase: "workspace_access".to_string(),
+                message:
+                    "Workspace mounted read-only; writable: /awman/output, mounted contexts, /tmp."
+                        .to_string(),
+            });
+        }
+    }
+}
 
 #[async_trait]
 impl ExecWorkflowCommandFrontend for ApiDispatchFrontend {
+    fn report_workspace_access(
+        &mut self,
+        access: crate::data::workspace::WorkspaceAccess,
+        step: Option<&str>,
+    ) {
+        if !access.is_read_only() {
+            return;
+        }
+        let message = match step {
+            Some(name) => format!(
+                "Step '{name}': workspace mounted read-only; writable: /awman/output, mounted contexts, /tmp."
+            ),
+            None => "Workspace mounted read-only; writable: /awman/output, mounted contexts, /tmp."
+                .to_string(),
+        };
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "workspace_access".to_string(),
+            message,
+        });
+    }
+
     fn record_cancel_cleanup(
         &mut self,
         cleanup: &crate::data::workflow_cleanup::WorkflowCleanup,

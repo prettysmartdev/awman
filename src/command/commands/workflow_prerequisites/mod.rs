@@ -8,11 +8,14 @@
 //! `OverlayEngine::prerequisite_grant_overlays`. Nothing here prompts
 //! directly: every question goes through [`WorkflowPrerequisiteFrontend`].
 
+mod plan;
+pub(crate) use plan::WorkflowPreflightPlan;
+
 mod flags;
 mod flow;
 mod frontend;
+#[cfg(test)]
 mod images;
-pub(crate) use images::prepare_images;
 mod task_policy;
 mod widening;
 

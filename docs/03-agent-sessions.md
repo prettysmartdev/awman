@@ -307,6 +307,63 @@ awman exec prompt --agent-flag=--config --agent-flag=key=value "fix the build"
 
 Mount the host Docker socket into the container, giving the agent the ability to build and run Docker containers. See [Security & Isolation](04-security-and-isolation.md#docker-socket-access) for details on when to use this.
 
+### `--read-only-workspace`
+
+Use `exec prompt --read-only-workspace` when you want an agent to inspect a
+checkout without changing it. This is useful for running several planning or
+review prompts concurrently against the same checkout: each agent can read the
+same files, while its workspace mount prevents it from creating, changing, or
+deleting repository files.
+
+```sh
+awman exec prompt --read-only-workspace "Review the authentication flow for security issues"
+awman exec prompt --read-only-workspace "Suggest a test plan for the current changes"
+```
+
+The workspace mount is read-only, while these locations remain writable:
+
+- `/awman/output`, when the run has a persistent output directory mounted.
+- Context directories mounted read-write for the run.
+- `/tmp`, which is a temporary filesystem discarded when the run ends.
+- The agent's home directory, used for its own settings and cache files.
+
+The agent receives a prompt section explaining the available writable
+locations. A runtime that cannot enforce a read-only workspace rejects the
+command during preflight; awman never retries it with a writable workspace.
+The `--read-only-workspace` option is allowed for both `exec prompt` and
+`exec workflow` API commands. API clients can check whether the server's
+runtime supports it by looking for `read_only_workspace` in the `capabilities`
+array returned by `GET /v1/status`; the capability is absent when the runtime
+cannot enforce a read-only workspace.
+It conflicts with `--allow-docker`, since access to the host Docker daemon
+could bypass the workspace mount. Overlays exposing a runtime control socket
+or its protected parent directories are also refused, including paths reached
+through symlinks. See [API & Remote Mode](09-api-and-remote-mode.md#get-v1status)
+for the status response details.
+
+For workflows, set `read_only_workspace = true` on individual review or
+planning steps when only those steps should be read-only. Other steps retain
+their normal workspace access:
+
+```toml
+[[step]]
+name = "implement"
+prompt = "Implement the planned changes."
+
+[[step]]
+name = "review"
+depends_on = ["implement"]
+prompt = "Review the implementation for correctness and style."
+read_only_workspace = true
+```
+
+The command-level `exec workflow --read-only-workspace` applies to every agent
+step. Individual step settings can only make a step read-only; they cannot
+make it writable when the command flag is set. Use per-step settings for a
+workflow containing setup or teardown actions, since those actions are not
+agent steps and remain writable. The command-level option cannot be combined
+with `--dynamic`.
+
 ### `--branch`, `--pr` and `--worktree`
 
 `chat` and `exec prompt` normally run in your current checkout. Three mutually exclusive flags run the session in a separate Git worktree instead, so the agent works on a branch without touching your checkout. They are available on the CLI and in the TUI, not through the HTTP API.

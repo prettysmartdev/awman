@@ -254,3 +254,27 @@ Lower layers request input/output from higher layers via traits:
 This approach decouples business logic from presentation while preserving the ability to customize behavior per frontend.
 
 A command owns its frontend for its whole lifetime. Commands that hand the same frontend to several phases or runtimes hold it behind a shared handle (`SharedWorkflowFrontend`) and pass clones; they never reclaim it. In exchange, a runtime must drop the frontend no later than when `AgentExecution::wait()` resolves, when the `wait()` future is dropped, or when the execution is dropped.
+
+### Workflow prerequisite lifecycle
+
+Workflow startup owns one preflight plan, one probe pass and one aggregate
+report. The plan includes agent images alongside setup/teardown credentials,
+Git requirements and container tools. Static workflows select their resolved
+step agents; fresh dynamic workflows select the leader and every agent offered
+in its available-agent list. Resume selects the saved workflow's concrete
+requirements without requiring a leader image.
+
+All checks use `PrerequisitePreflight` and the serializable
+`WorkflowPrerequisiteReport`. Command orchestration presents one initial
+review, resolves explicit flags, remembered decisions, policy and mode defaults,
+and prepares approved images before any leader or workflow agent starts.
+Image setup has no separate modal or post-leader build pass.
+`--check-prerequisites` uses the same plan and probes without granting
+credentials, building/importing images or creating a worktree.
+
+Generation can only narrow the prepared scope. It projects the original report,
+drops unused grants and validates image membership without rerunning startup
+probes or asking again. An unreviewed agent is rejected; an unapproved credential
+remains unavailable under the unresolved policy. The bounded, noninteractive
+credential freshness recheck immediately before teardown remains separate from
+startup consent and can never widen it.

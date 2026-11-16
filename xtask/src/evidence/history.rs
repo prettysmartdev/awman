@@ -19,7 +19,7 @@ pub struct Sample {
     pub commit: String,
     pub tests: BTreeMap<String, Outcome>,
     pub queue_ms: Option<u64>,
-    pub execution_ms: u64,
+    pub execution_ms: Option<u64>,
     pub outcome: Outcome,
     pub cache_hit: Option<bool>,
     pub rebuilds: Option<u32>,
@@ -42,7 +42,7 @@ pub fn append(store: &Path, e: &Evidence) -> Result<()> {
             .map(|r| (r.test.clone(), r.outcome))
             .collect(),
         queue_ms: Some(e.durations.queue_ms),
-        execution_ms: e.durations.run_ms,
+        execution_ms: Some(e.durations.run_ms),
         outcome: e.outcome,
         cache_hit: e.cache.as_ref().map(|c| c.hit),
         rebuilds: None,
@@ -92,7 +92,7 @@ pub fn report(samples: &[Sample]) -> String {
         "Gate / Tier | Samples | Execution p50/p95 ms | Queue p50/p95 ms | Non-green | Cache hits\n",
     );
     for ((gate, tier), rows) in groups {
-        let times: Vec<_> = rows.iter().map(|s| s.execution_ms).collect();
+        let times: Vec<_> = rows.iter().filter_map(|s| s.execution_ms).collect();
         let queue: Vec<_> = rows.iter().filter_map(|s| s.queue_ms).collect();
         out.push_str(&format!(
             "{gate} / {tier} | {} | {:?}/{:?} | {:?}/{:?} | {} | {}/{} known\n",
@@ -127,17 +127,20 @@ pub fn report(samples: &[Sample]) -> String {
 pub fn budget_regression(samples: &[Sample], budget_ms: u64) -> bool {
     let runs = main_runs(samples);
     let last: Vec<_> = runs.values().rev().take(3).collect();
-    last.len() == 3 && last.iter().all(|(_, ms)| *ms > budget_ms)
+    last.len() == 3
+        && last
+            .iter()
+            .all(|(_, ms)| ms.is_some_and(|ms| ms > budget_ms))
 }
 
 /// A retry replaces a run's measurement; three attempts are not three runs.
-pub fn main_runs(samples: &[Sample]) -> BTreeMap<u64, (u32, u64)> {
+pub fn main_runs(samples: &[Sample]) -> BTreeMap<u64, (u32, Option<u64>)> {
     let mut runs = BTreeMap::new();
     for s in samples
         .iter()
         .filter(|s| s.gate == "main" && s.tier == "gate")
     {
-        let row = runs.entry(s.run_id).or_insert((0, 0));
+        let row = runs.entry(s.run_id).or_insert((0, None));
         if s.attempt >= row.0 {
             *row = (s.attempt, s.execution_ms);
         }

@@ -221,6 +221,7 @@ impl WorkflowPrerequisites {
                 ContainerTool { name: "gh".into() },
                 ContainerTool { name: "ssh".into() },
                 NotDetachedHead,
+                PushedBranch,
             ]
             .into_iter()
             .map(|prerequisite| PrerequisiteNeed {
@@ -266,10 +267,10 @@ impl WorkflowPrerequisites {
 
 impl PrerequisiteCheck {
     /// The step kinds that need this check, each named once, in order
-    /// ("any teardown step" when the workflow is not known yet).
+    /// ("any workflow step" when the workflow is not known yet).
     pub fn needed_by_label(&self) -> String {
         if self.needed_by.is_empty() {
-            return "any teardown step".to_string();
+            return "any workflow step".to_string();
         }
         let mut kinds: Vec<&str> = Vec::new();
         for step in &self.needed_by {
@@ -282,6 +283,51 @@ impl PrerequisiteCheck {
 }
 
 impl WorkflowPrerequisiteReport {
+    /// Project the startup decisions onto a concrete generated workflow.
+    /// Pure: no probes, prompts, or acquisition can occur after the leader.
+    pub fn narrow_to(&self, needs: &WorkflowPrerequisites) -> Self {
+        let checks = needs
+            .needs
+            .iter()
+            .map(|need| {
+                let mut check =
+                    self.find(&need.prerequisite)
+                        .cloned()
+                        .unwrap_or_else(|| PrerequisiteCheck {
+                            prerequisite: need.prerequisite.clone(),
+                            status: PrerequisiteStatus::Missing,
+                            explanation:
+                                "requirement was not included in the initial workflow preflight"
+                                    .into(),
+                            needed_by: vec![],
+                            remediations: vec![],
+                        });
+                check.needed_by = need.needed_by.clone();
+                if need.prerequisite == WorkflowPrerequisite::PushedBranch
+                    && need.needed_by.iter().all(|pr| {
+                        needs.needs.iter().flat_map(|n| &n.needed_by).any(|step| {
+                            step.kind == PrerequisiteStepKind::PushBranch
+                                && step.phase == PhaseKind::Teardown
+                                && pr.phase == PhaseKind::Teardown
+                                && step.index < pr.index
+                        })
+                    })
+                {
+                    check.status = PrerequisiteStatus::Satisfied;
+                    check.explanation = "push_branch precedes create_pull_request".into();
+                }
+                check
+            })
+            .collect();
+        Self {
+            phase: self.phase,
+            origin: needs.origin,
+            checks,
+            advisories: needs.advisories.clone(),
+            notes: self.notes.clone(),
+        }
+    }
+
     pub fn all_satisfied(&self) -> bool {
         self.needs_attention().is_empty()
     }

@@ -87,6 +87,11 @@ pub const CAPABILITIES: &[&str] = &[
     // WI 0147: `--work-item` accepts github / http providers / local files by
     // `workItems.source`; `--issue` was replaced.
     "work_item_sources",
+    // WI 0152: `--read-only-workspace` on `exec prompt` / `exec workflow` and
+    // per-step `read_only_workspace`. Advertised only by
+    // [`advertised_for_runtime`] on a runtime that enforces it, never by
+    // [`advertised`]; the WSP lease flag stays `lease_read_only`.
+    crate::data::workspace::READ_ONLY_WORKSPACE_CAPABILITY,
 ];
 
 /// WI 0143: capabilities of the pull worker, in their fixed order. Each is
@@ -103,14 +108,34 @@ pub const PULL_CAPABILITIES: &[&str] = &[
     "lease_push_retry",
 ];
 
-/// The `capabilities` list of `/v1/status`: every static capability
-/// (`outputs` only when the runtime mounts `/awman/output`), then the pull
-/// worker's, in [`PULL_CAPABILITIES`] order.
+/// The `capabilities` list of `/v1/status` without the runtime-dependent
+/// `read_only_workspace`: every other static capability (`outputs` only when
+/// the runtime mounts `/awman/output`), then the pull worker's, in
+/// [`PULL_CAPABILITIES`] order. Prefer [`advertised_for_runtime`] wherever
+/// the runtime's capabilities are reachable.
 pub fn advertised(mounts_outputs: bool, pull: &[&str]) -> Vec<String> {
+    advertised_with(mounts_outputs, false, pull)
+}
+
+/// [`advertised`], plus `read_only_workspace` when the runtime enforces a
+/// read-only workspace mount (WI 0152). On a runtime that cannot (sbx) the
+/// capability is absent, which is how a client learns that
+/// `--read-only-workspace` would be refused.
+pub fn advertised_for_runtime(
+    caps: &crate::engine::agent_runtime::Capabilities,
+    pull: &[&str],
+) -> Vec<String> {
+    advertised_with(caps.mounts_outputs(true), caps.read_only_workspace(), pull)
+}
+
+fn advertised_with(mounts_outputs: bool, read_only_workspace: bool, pull: &[&str]) -> Vec<String> {
     CAPABILITIES
         .iter()
         .filter(|c| enabled(c))
         .filter(|c| mounts_outputs || **c != "outputs")
+        .filter(|c| {
+            read_only_workspace || **c != crate::data::workspace::READ_ONLY_WORKSPACE_CAPABILITY
+        })
         .filter(|c| crate::engine::git::credential_socket::supported() || **c != "session_git_auth")
         .chain(
             PULL_CAPABILITIES
@@ -151,6 +176,7 @@ mod tests {
             .iter()
             .filter(|c| enabled(c))
             .filter(|c| cfg!(any(unix, windows)) || **c != "session_git_auth")
+            .filter(|c| **c != crate::data::workspace::READ_ONLY_WORKSPACE_CAPABILITY)
             .map(|c| c.to_string())
             .collect::<Vec<_>>();
         expected.extend(
@@ -216,5 +242,40 @@ mod tests {
         }
         // WSP keeps 0143's lease credential capability name.
         assert!(PULL_CAPABILITIES.contains(&"lease_credentials"));
+    }
+}
+
+#[cfg(test)]
+mod read_only_workspace_tests {
+    use super::*;
+    use crate::data::workspace::READ_ONLY_WORKSPACE_CAPABILITY as RO;
+
+    fn count(list: &[String], flag: &str) -> usize {
+        list.iter().filter(|c| c.as_str() == flag).count()
+    }
+
+    #[test]
+    fn read_only_workspace_is_advertised_once_only_when_the_runtime_enforces_it() {
+        assert_eq!(RO, "read_only_workspace");
+        assert_eq!(count(&advertised_with(true, true, &[]), RO), 1);
+        assert_eq!(count(&advertised_with(true, false, &[]), RO), 0);
+        // The legacy entry point never advertises it.
+        assert_eq!(count(&advertised(true, PULL_CAPABILITIES), RO), 0);
+        // It is the last static capability, before any pull capability.
+        let with_pull = advertised_with(false, true, PULL_CAPABILITIES);
+        let at = |flag: &str| with_pull.iter().position(|c| c == flag).unwrap();
+        assert!(at("work_item_sources") < at(RO));
+        assert!(at(RO) < at("worker_pull"));
+    }
+
+    #[test]
+    fn lease_read_only_stays_a_pull_capability_independent_of_the_runtime() {
+        assert!(PULL_CAPABILITIES.contains(&"lease_read_only"));
+        assert!(!CAPABILITIES.contains(&"lease_read_only"));
+        let without_pull = advertised_with(true, true, &[]);
+        assert_eq!(count(&without_pull, "lease_read_only"), 0);
+        let pull_only = advertised_with(true, false, &["lease_read_only"]);
+        assert_eq!(count(&pull_only, "lease_read_only"), 1);
+        assert_eq!(count(&pull_only, RO), 0);
     }
 }

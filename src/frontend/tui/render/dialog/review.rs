@@ -146,7 +146,7 @@ fn check_lines(check: &PrerequisiteCheck, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::from(Span::styled(row, detail)));
     }
     // A dynamic run's steps are not known yet; the note says so once
-    // rather than every check saying "any teardown step".
+    // rather than every check saying "any workflow step".
     if !check.needed_by.is_empty() {
         let needed_by = format!("needed by: {}", check.needed_by_label());
         for row in wrap_words(&needed_by, width, "    ", "      ") {

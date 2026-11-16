@@ -349,3 +349,205 @@ impl CheckoutOutcome {
         format!("lease branch {branch} {from}{merged}; head {}", self.head)
     }
 }
+
+// Shared by lease and command launches: the workspace access intent is enforced
+// after all overlays have been collected, independent of its source.
+use crate::engine::container::options::ContainerOption;
+use crate::engine::error::EngineError;
+
+pub(crate) fn read_only_unsupported(runtime: &str) -> EngineError {
+    EngineError::Config(format!(
+        "the {runtime} runtime cannot mount the workspace read-only; this run requires a read-only workspace"
+    ))
+}
+
+/// Include linked-worktree administrative state, which can live outside the
+/// checkout and is often mounted as a sidecar so Git works in the guest.
+fn workspace_git_dirs(workspace: &Path) -> Result<Vec<PathBuf>, EngineError> {
+    let dot_git = workspace.join(".git");
+    let metadata = match std::fs::metadata(&dot_git) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(EngineError::io(&dot_git, e)),
+    };
+    let git_dir = if metadata.is_dir() {
+        dot_git.clone()
+    } else {
+        let content =
+            std::fs::read_to_string(&dot_git).map_err(|e| EngineError::io(&dot_git, e))?;
+        let path = content
+            .trim()
+            .strip_prefix("gitdir: ")
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| EngineError::Config("invalid workspace .git file".into()))?;
+        workspace.join(path)
+    };
+    let git_dir = git_dir
+        .canonicalize()
+        .map_err(|e| EngineError::io(&git_dir, e))?;
+    let common_file = git_dir.join("commondir");
+    let mut dirs = vec![git_dir.clone()];
+    match std::fs::read_to_string(&common_file) {
+        Ok(content) => {
+            if content.trim().is_empty() {
+                return Err(EngineError::Config(
+                    "invalid workspace Git commondir".into(),
+                ));
+            }
+            let common = git_dir.join(content.trim());
+            dirs.push(
+                common
+                    .canonicalize()
+                    .map_err(|e| EngineError::io(&common, e))?,
+            );
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(EngineError::io(&common_file, e)),
+    }
+    Ok(dirs)
+}
+
+/// Runs after all overlays are assembled and before any runtime sees them.
+pub(crate) fn validate_workspace_mounts(
+    options: &mut [ContainerOption],
+    workspace: &Path,
+    read_only: bool,
+    lease_scope: Option<&Path>,
+    inline_file: Option<&Path>,
+    command_mounts: &[crate::engine::container::options::OverlaySpec],
+) -> Result<(), EngineError> {
+    use crate::engine::container::options::OverlayPermission;
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|e| EngineError::io(workspace, e))?;
+    let git_dirs = if read_only {
+        workspace_git_dirs(&workspace)?
+    } else {
+        Vec::new()
+    };
+    let inline_file = inline_file.and_then(|path| path.canonicalize().ok());
+    let lease_root = lease_scope
+        .map(|scope| scope.canonicalize())
+        .transpose()
+        .map_err(|e| EngineError::Config(format!("lease workspace: {e}")))?;
+    for option in options {
+        let ContainerOption::Overlay(spec) = option else {
+            continue;
+        };
+        let host = spec
+            .host_path
+            .canonicalize()
+            .map_err(|e| EngineError::io(&spec.host_path, e))?;
+        if let Some(clone) = &lease_root {
+            if !host.starts_with(clone)
+                && inline_file.as_deref() != Some(host.as_path())
+                && !command_mounts.iter().any(|allowed| {
+                    // Compare resolved paths: on macOS a temporary directory is
+                    // reached through a symlink (/var -> /private/var).
+                    allowed
+                        .host_path
+                        .canonicalize()
+                        .unwrap_or_else(|_| allowed.host_path.clone())
+                        == host
+                        && allowed.container_path == spec.container_path
+                        && allowed.permission == spec.permission
+                })
+            {
+                return Err(EngineError::Config(
+                    "overlay exposes a path outside the lease workspace".into(),
+                ));
+            }
+        }
+        let guest = &spec.container_path;
+        if !crate::data::workspace::is_normalized_guest_path(guest) {
+            return Err(EngineError::Config(
+                "overlay guest path must be normalized".into(),
+            ));
+        }
+        let guest_workspace = Path::new("/workspace");
+        if guest_workspace.starts_with(guest) && (guest != guest_workspace || host != workspace) {
+            return Err(EngineError::Config(
+                "overlay overlaps the workspace mount".into(),
+            ));
+        }
+        if read_only
+            && (host.starts_with(&workspace)
+                || workspace.starts_with(&host)
+                || git_dirs
+                    .iter()
+                    .any(|dir| host.starts_with(dir) || dir.starts_with(&host))
+                || guest.starts_with(guest_workspace))
+        {
+            spec.permission = OverlayPermission::ReadOnly;
+        }
+        if inline_file.as_deref() == Some(host.as_path()) {
+            spec.permission = OverlayPermission::ReadOnly;
+        }
+        spec.host_path = host;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod workspace_access_tests {
+    use super::*;
+    use crate::engine::container::options::{OverlayPermission, OverlaySpec};
+    use awman_test_support::{TestCase, TestSandbox};
+
+    #[test]
+    fn linked_worktree_git_sidecars_are_read_only_and_external_writes_stay_writable() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::worker::lease_workspace::workspace_access_tests::linked_worktree_git_sidecars_are_read_only_and_external_writes_stay_writable"));
+        let common = sandbox.root().join("main/.git");
+        let admin = common.join("worktrees/review");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(
+            sandbox.work().join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let mut options: Vec<_> = [
+            (sandbox.work(), "/workspace"),
+            (admin, "/awman/git-admin"),
+            (common, "/awman/git-common"),
+            (sandbox.root().join("main"), "/awman/git-parent"),
+            (sandbox.home(), "/awman/output"),
+            (sandbox.tmp(), "/awman/context/repo"),
+        ]
+        .into_iter()
+        .map(|(host_path, guest)| {
+            ContainerOption::Overlay(OverlaySpec {
+                host_path,
+                container_path: guest.into(),
+                permission: OverlayPermission::ReadWrite,
+            })
+        })
+        .collect();
+        validate_workspace_mounts(&mut options, &sandbox.work(), true, None, None, &[]).unwrap();
+        let permissions: Vec<_> = options
+            .iter()
+            .map(|o| match o {
+                ContainerOption::Overlay(o) => o.permission,
+                _ => panic!("expected overlay"),
+            })
+            .collect();
+        assert_eq!(
+            permissions,
+            [
+                OverlayPermission::ReadOnly,
+                OverlayPermission::ReadOnly,
+                OverlayPermission::ReadOnly,
+                OverlayPermission::ReadOnly,
+                OverlayPermission::ReadWrite,
+                OverlayPermission::ReadWrite
+            ]
+        );
+        let mut resolved =
+            crate::engine::container::options::ResolvedContainerOptions::resolve(options).unwrap();
+        resolved.read_only_workspace = true;
+        resolved.tmpfs = vec!["/tmp".into()];
+        resolved.validate_read_only_workspace().unwrap();
+        resolved.overlays[1].permission = OverlayPermission::ReadWrite;
+        assert!(resolved.validate_read_only_workspace().is_err());
+    }
+}

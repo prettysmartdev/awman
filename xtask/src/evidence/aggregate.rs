@@ -47,8 +47,8 @@ pub fn aggregate(
             .map(|q| format!("{} expires {}", q.test, q.expires))
             .collect(),
         overrides_applied: Vec::new(),
-        queue_ms: 0,
-        execution_ms: 0,
+        queue_ms: None,
+        execution_ms: None,
         p95_budget_minutes: m.gates[&authoritative.gate].budget_minutes,
         generated_at: ctx.now,
         expires_at: None,
@@ -247,7 +247,7 @@ pub fn aggregate(
             if r.counts != super::junit::counts(r.results.len(), &r.results) {
                 cell_errors.push("reported counts disagree with exact results".into());
             }
-            gate.queue_ms = gate.queue_ms.max(r.durations.queue_ms);
+            gate.queue_ms = Some(gate.queue_ms.unwrap_or(0).max(r.durations.queue_ms));
             execution_start =
                 Some(execution_start.map_or(r.started_at, |old| old.min(r.started_at)));
             execution_end = Some(execution_end.map_or(r.finished_at, |old| old.max(r.finished_at)));
@@ -326,13 +326,11 @@ pub fn aggregate(
     }
     gate.execution_ms = execution_start
         .zip(execution_end)
-        .map_or(0, |(start, end)| {
-            (end - start).num_milliseconds().max(0) as u64
-        });
+        .map(|(start, end)| (end - start).num_milliseconds().max(0) as u64);
     gate.errors.extend(budget_findings(
         &gate.gate,
         &ctx.request.main_durations_ms,
-        gate.execution_ms,
+        gate.execution_ms.unwrap_or(0),
         m.gates["main"].budget_minutes.unwrap_or(20) * 60_000,
     ));
     if !gate.errors.is_empty() {

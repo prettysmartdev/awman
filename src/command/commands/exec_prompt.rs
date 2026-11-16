@@ -33,6 +33,17 @@ pub trait ExecPromptCommandFrontend:
     + Sync
 {
     fn report_session_worktree(&mut self, _path: &std::path::Path, _branch: Option<&str>) {}
+
+    /// The launch's workspace is mounted read-only (WI 0152). Called once,
+    /// only for a read-only launch, after the `Info` message the command
+    /// writes itself; `step` is always `None` for `exec prompt`. Presentation
+    /// only: the decision is already made.
+    fn report_workspace_access(
+        &mut self,
+        _access: crate::data::workspace::WorkspaceAccess,
+        _step: Option<&str>,
+    ) {
+    }
 }
 
 async fn ensure_exec_prompt_agent_setup(
@@ -78,6 +89,9 @@ pub struct ExecPromptCommand {
     /// §3). Set only under the API; cleared at the start of every run, since
     /// a restarted `exec prompt` reruns from scratch.
     output_dir: Option<std::path::PathBuf>,
+    /// `--read-only-workspace` (WI 0152). A pulled lease's read-only engine
+    /// makes the launch read-only whatever this says.
+    workspace_access: crate::data::workspace::WorkspaceAccess,
 }
 
 impl ExecPromptCommand {
@@ -88,7 +102,21 @@ impl ExecPromptCommand {
             session,
             cancel: tokio_util::sync::CancellationToken::new(),
             output_dir: None,
+            workspace_access: Default::default(),
         }
+    }
+
+    /// Mount the workspace read-only (`--read-only-workspace`, WI 0152).
+    pub fn with_workspace_access(
+        mut self,
+        access: crate::data::workspace::WorkspaceAccess,
+    ) -> Self {
+        self.workspace_access = access;
+        self
+    }
+
+    pub fn workspace_access(&self) -> crate::data::workspace::WorkspaceAccess {
+        self.workspace_access
     }
 
     /// Observe `token`: once it fires the agent container is stopped and the
@@ -119,6 +147,26 @@ impl Command for ExecPromptCommand {
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
         let session = self.session;
+        // Read-only workspace (WI 0152): decided and checked before anything
+        // is written — outputs, work item staging, worktree, image. A pulled
+        // lease's read-only engine makes the launch read-only too.
+        let workspace_access = super::workspace_access::effective_access(
+            self.workspace_access,
+            &self.engines.agent_engine,
+        );
+        if let Err(e) = super::workspace_access::preflight_workspace_access(
+            workspace_access,
+            self.flags.allow_docker,
+            self.engines.runtime.as_ref(),
+        ) {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec prompt: {e}"),
+            });
+            return Err(e);
+        }
+        let launch_engine =
+            super::workspace_access::agent_engine_for(workspace_access, &self.engines.agent_engine);
         if self.output_dir.is_some() && !self.engines.runtime.capabilities().arbitrary_host_mounts {
             frontend.write_message(UserMessage { level: MessageLevel::Warning, text: "Persistent command outputs are unavailable on this runtime; /awman/output is not mounted.".into() });
         }
@@ -329,11 +377,11 @@ impl Command for ExecPromptCommand {
                 )?;
             let directory_overlays = collected.directories;
             let mut command_mounts = Vec::new();
-            let system_prompt = match self
+            let outputs_dir = self
                 .output_dir
                 .as_ref()
-                .filter(|_| self.engines.runtime.capabilities().arbitrary_host_mounts)
-            {
+                .filter(|_| self.engines.runtime.capabilities().arbitrary_host_mounts);
+            let system_prompt = match outputs_dir {
                 Some(dir) => {
                     command_mounts.push(crate::data::fs::command_outputs::output_dir_overlay(dir));
                     Some(crate::engine::context_prompt::with_outputs_section(
@@ -343,6 +391,13 @@ impl Command for ExecPromptCommand {
                 }
                 None => system_prompt,
             };
+            // The read-only section goes last, after the outputs section.
+            let system_prompt = super::workspace_access::system_prompt_for(
+                workspace_access,
+                system_prompt,
+                outputs_dir.is_some(),
+                &context_overlays,
+            );
 
             let mut run_opts = AgentRunOptions {
                 command_secrets: self.engines.command_secrets(),
@@ -389,12 +444,15 @@ impl Command for ExecPromptCommand {
                     &mut run_opts.directory_overlays,
                     invoker.working_dir(),
                 )?;
-                if let Some(overlay) = worktree.git_directory_overlay(self.engines.git_engine.clone()).await? {
+                if let Some(mut overlay) = worktree.git_directory_overlay(self.engines.git_engine.clone()).await? {
+                    // The worktree's Git directory is part of the workspace:
+                    // a read-only run must not commit or rewrite refs there.
+                    super::workspace_access::restrict_to_access(&mut overlay, workspace_access);
                     run_opts.command_mounts.push(overlay);
                 }
             }
 
-            let resolved = match self.engines.agent_engine.resolve_agent_options(
+            let resolved = match launch_engine.resolve_agent_options(
                 &session,
                 &agent,
                 &run_opts,
@@ -420,6 +478,10 @@ impl Command for ExecPromptCommand {
                     return Err(CommandError::from(e));
                 }
             };
+            if workspace_access.is_read_only() {
+                frontend.write_message(super::workspace_access::read_only_message(None));
+                frontend.report_workspace_access(workspace_access, None);
+            }
             frontend.write_message(UserMessage {
                 level: MessageLevel::Info,
                 text: format!("Launching agent ({})…", self.engines.runtime.display_name()),

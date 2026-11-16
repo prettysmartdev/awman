@@ -31,6 +31,33 @@ impl Command for ExecWorkflowCommand {
             });
             return Err(e);
         }
+        // Read-only workspace (WI 0152), command level: refused with
+        // --dynamic or on a runtime that cannot enforce it, before any IO.
+        // The per-step field is checked once the workflow file is loaded.
+        let command_access = crate::command::commands::workspace_access::effective_access(
+            self.workspace_access,
+            &self.engines.agent_engine,
+        );
+        if let Err(e) = crate::command::commands::workspace_access::check_workflow_flags(
+            self.workspace_access,
+            self.flags.dynamic,
+        )
+        .and_then(|()| {
+            crate::command::commands::workspace_access::preflight_workspace_access(
+                command_access,
+                self.flags.allow_docker,
+                self.engines.runtime.as_ref(),
+            )
+        }) {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: {e}"),
+            });
+            return Err(e);
+        }
+        if self.workspace_access.is_read_only() {
+            frontend.report_workspace_access(self.workspace_access, None);
+        }
 
         // Resolve against the invoking checkout before prerequisites, worktree
         // preparation, setup, or any agent launch. Fail closed on every error.
@@ -87,7 +114,7 @@ impl Command for ExecWorkflowCommand {
             });
             return Err(err);
         }
-        let mut workflow = match Workflow::load(&workflow_path) {
+        let workflow = match Workflow::load(&workflow_path) {
             Ok(w) => w,
             Err(e) => {
                 let err = CommandError::Other(format!("loading workflow: {e}"));
@@ -98,6 +125,22 @@ impl Command for ExecWorkflowCommand {
                 return Err(err);
             }
         };
+
+        // Read-only workspace (WI 0152), workflow level: one read-only step
+        // on a runtime that cannot honour it fails here, before prerequisites,
+        // the worktree or setup — not midway through the run.
+        if let Err(e) = crate::command::commands::workspace_access::preflight_workflow_access(
+            &workflow,
+            command_access,
+            self.flags.allow_docker,
+            self.engines.runtime.as_ref(),
+        ) {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: {e}"),
+            });
+            return Err(e);
+        }
 
         // Custom agent definitions are reviewed once per distinct agent
         // before anything resolves them (the preflight below included).
@@ -111,35 +154,27 @@ impl Command for ExecWorkflowCommand {
             return Err(e);
         }
 
-        // Workflow prerequisites (WI 0149): what the teardown steps need is
-        // checked, asked about and granted now, before the worktree, the
-        // image or any container exists. `--check-prerequisites` ends here.
-        let prerequisite_needs =
-            crate::data::workflow_prerequisites::WorkflowPrerequisites::from_workflow(&workflow);
-        let image_default = workflow_effective_config(&self.session, &self.flags)?
-            .agent()
-            .unwrap_or_else(|| self.session.configured_agent().as_str().to_string());
-        let mut image_agents: Vec<String> = workflow
-            .steps
-            .iter()
-            .map(|step| {
-                step.agent
-                    .as_ref()
-                    .or(workflow.agent.as_ref())
-                    .unwrap_or(&image_default)
-                    .clone()
-            })
-            .collect();
-        if (!workflow.setup.is_empty() || !workflow.teardown.is_empty())
-            && self.session.effective_config().base_image().is_none()
-        {
-            image_agents.push(self.session.configured_agent().as_str().to_string());
-        }
+        // ACP compatibility is a workflow-wide pre-flight check.  Do it
+        // before mount scope, worktree preparation, image setup, overlays, or
+        // the workflow engine so `fallback: error` cannot leave partial work.
+        let launch_modes = match frontend.with(|frontend| {
+            validate_workflow_acp_preflight(&workflow, &self.session, &self.flags, frontend)
+        }) {
+            Ok(modes) => modes,
+            Err(e) => return Err(CommandError::from(e)),
+        };
+
+        // Collect the complete workflow scope before any worktree or agent starts.
+        let preflight =
+            crate::command::commands::workflow_prerequisites::WorkflowPreflightPlan::for_workflow(
+                &workflow,
+                &self.session,
+                &self.flags,
+            )?;
         let prerequisites = match self
             .start_prerequisites(
-                &prerequisite_needs,
+                &preflight,
                 crate::engine::workflow::workflow_name_for(&workflow),
-                &image_agents,
                 &frontend,
             )
             .await?
@@ -185,16 +220,6 @@ impl Command for ExecWorkflowCommand {
         // be empty.
         frontend.with(|frontend| warn_context_workflow_in_phase(&workflow, frontend));
         let _ = deprecation_warned;
-
-        // ACP compatibility is a workflow-wide pre-flight check.  Do it
-        // before mount scope, worktree preparation, image setup, overlays, or
-        // the workflow engine so `fallback: error` cannot leave partial work.
-        let launch_modes = match frontend.with(|frontend| {
-            validate_workflow_acp_preflight(&workflow, &self.session, &self.flags, frontend)
-        }) {
-            Ok(modes) => modes,
-            Err(e) => return Err(CommandError::from(e)),
-        };
 
         // 2. Resolve mount scope — confirm with the user when cwd differs from git root.
         let cwd = self.session.working_dir().to_path_buf();
@@ -367,26 +392,6 @@ impl Command for ExecWorkflowCommand {
             all
         };
 
-        // 6. Every agent the steps launch needs its image. Ask about each
-        //    one that is missing (set up / fall back to the default agent /
-        //    abort) now, before any setup step or agent container starts.
-        //    Images are tagged by the invoking repo, not the worktree.
-        if let Err(e) = ensure_static_workflow_agent_images(
-            &mut workflow,
-            &self.engines,
-            &self.session,
-            &self.flags,
-            &mut frontend,
-        )
-        .await
-        {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Error,
-                text: format!("exec workflow: {e}"),
-            });
-            return Err(e);
-        }
-
         let prepared = PreparedRun {
             invocation_id: None,
             workflow,
@@ -416,6 +421,7 @@ impl Command for ExecWorkflowCommand {
             self.managed_session.as_ref(),
             &self.cancel,
             self.output_dir.as_deref(),
+            self.workspace_access,
         )
         .await
     }

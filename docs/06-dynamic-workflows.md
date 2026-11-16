@@ -59,9 +59,9 @@ come from the resolved work item, whether it is local or remote.
 
 ## Workflow prerequisites
 
-Dynamic workflows check prerequisites after reading the work item and before offering resume or starting the leader. Because the final workflow does not exist yet, this first report covers the possible workflow requirements. `--check-prerequisites` displays that report and exits without starting the leader.
+Dynamic workflows check all prerequisites in one pass before starting the leader: its image, the images of every agent available to it, workflow credentials, Git requirements and container tools. A resumed run checks the saved workflow’s concrete requirements instead. The checks appear together in one prerequisite review; continuing prepares the approved requirements before any agent starts. `--check-prerequisites` displays that report and exits without starting the leader.
 
-The leader receives a summary of the available workflow credentials and tools, so it can plan around them. After awman validates the generated workflow, it narrows the grants to the needs that workflow actually uses: unused grants are dropped, and any newly introduced requirement is checked and reported. When unresolved requirements use `--prerequisite-unresolved fail`, awman stops before executing the generated workflow. See [Workflow prerequisite checks](05-workflows.md#workflow-prerequisite-checks) for the available choices and credential behavior.
+The leader receives a summary of the available workflow credentials and tools, so it can plan around them. After awman validates the generated workflow, it narrows the grants to the needs that workflow actually uses: unused grants are dropped, and any newly introduced requirement remains unavailable. No further prerequisite or image-setup dialog opens after the leader, and generation cannot authorize new credentials or image builds. When unresolved requirements use `--prerequisite-unresolved fail`, awman stops before executing the generated workflow. See [Workflow prerequisite checks](05-workflows.md#workflow-prerequisite-checks) for the available choices and credential behavior.
 
 ---
 
@@ -71,12 +71,12 @@ When you run `exec workflow --dynamic`, awman follows these steps:
 
 1. **Validate flags** — checks for conflicts before doing any work (see [Flag rules](#flag-rules))
 2. **Read the work item** — loads the work item file; fails immediately if it cannot be found or read
-3. **Set up the worktree** — creates an isolated Git worktree (the same path as `--yolo --worktree`); all subsequent agent work runs inside it
-4. **Seed the context directory** — writes `workflow-usage.md`, including several inline examples, into the `context(workflow)` directory so the leader has reference material
-5. **Launch the leader agent** — starts a container with a pre-built prompt describing the work item, available agents, and path conventions; the agent's job is to write a `workflow.toml` to the context directory
-6. **Wait for the leader to finish** — stuck detection runs normally; after 30 seconds of silence the 60-second yolo countdown starts; when it expires (or you press `[n]`), the container is killed and awman reads the file
-7. **Validate the workflow** — checks that `workflow.toml` is valid TOML, references only agents that exist in the project, and has all required fields; if validation fails, a repair agent is launched (see [Repair loop](#repair-loop))
-8. **Build missing images** — for any agent referenced in the generated workflow that has a `Dockerfile.<agent>` but no built image, awman builds the image automatically before starting the workflow
+3. **Check and prepare prerequisites** — review all workflow requirements and prepare agent images before the leader starts
+4. **Set up the worktree** — creates an isolated Git worktree (the same path as `--yolo --worktree`); all subsequent agent work runs inside it
+5. **Seed the context directory** — writes `workflow-usage.md`, including several inline examples, into the `context(workflow)` directory so the leader has reference material
+6. **Launch the leader agent** — starts a container with a pre-built prompt describing the work item, available agents, and path conventions; the agent's job is to write a `workflow.toml` to the context directory
+7. **Wait for the leader to finish** — stuck detection runs normally; after 30 seconds of silence the 60-second yolo countdown starts; when it expires (or you press `[n]`), the container is killed and awman reads the file
+8. **Validate the workflow** — checks that `workflow.toml` is valid TOML, references only agents that exist in the project, and has all required fields; if validation fails, a repair agent is launched (see [Repair loop](#repair-loop))
 9. **Execute the workflow** — runs the generated workflow exactly as if you had written it yourself and passed it to `exec workflow --yolo --work-item 42`
 
 The leader may write in the context directory and, for API runs on runtimes with host directory mounts, `/awman/output`. The checkout is mounted read-only when the runtime supports it. A guard compares HEAD and source-file contents before and after the leader runs, including already dirty and untracked files; a change aborts the dynamic run before the generated workflow executes.

@@ -747,8 +747,8 @@ pub fn candidate_gate(
             .map(|q| format!("{} expires {}", q.test, q.expires))
             .collect(),
         overrides_applied: overrides,
-        queue_ms: 0,
-        execution_ms: 0,
+        queue_ms: None,
+        execution_ms: None,
         p95_budget_minutes: m.gates.get("candidate").and_then(|g| g.budget_minutes),
         generated_at: now,
         expires_at: Some(expires),

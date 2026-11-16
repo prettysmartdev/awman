@@ -10,6 +10,9 @@ pub struct SandboxSpec {
     pub image: String,
     pub labels: BTreeMap<String, String>,
     pub mounts: Vec<MountSpec>,
+    /// Writable memory-backed mounts. These precede bind mounts so files
+    /// mounted under /tmp (system prompts) are visible inside the guest.
+    pub tmpfs: Vec<String>,
     pub mount_owner: Option<(u32, u32)>,
     pub vcpus: u8,
     pub memory_mib: u32,

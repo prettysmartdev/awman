@@ -22,6 +22,7 @@ fn recover(codes: &[u8]) {
             model: None,
             overlays: None,
             abort_on_failure: false,
+            read_only_workspace: false,
         })
         .collect();
     let dag = WorkflowDag::build(&steps).unwrap();
@@ -134,6 +135,7 @@ fn resume_rewind_follows_dependencies_in_any_definition_order() {
         model: None,
         overlays: None,
         abort_on_failure: false,
+        read_only_workspace: false,
     })
     .collect();
     for reverse in [false, true] {
@@ -266,4 +268,101 @@ fn work_item_lookup_uses_session_scope_without_executing_content() {
         "# Task\n$(codex) `claude` ; gemini\n"
     );
     s.finish();
+}
+
+#[test]
+fn generated_prerequisites_preserve_declines_and_cannot_add_grants() {
+    use crate::data::workflow_prerequisites::*;
+    let token = WorkflowPrerequisite::GitHubToken {
+        host: "github.com".into(),
+    };
+    let identity = WorkflowPrerequisite::GitIdentity;
+    let report = WorkflowPrerequisiteReport {
+        phase: PrerequisitePhase::Start,
+        origin: PrerequisiteOrigin::AssumedAll,
+        checks: vec![
+            PrerequisiteCheck {
+                prerequisite: token.clone(),
+                status: PrerequisiteStatus::Missing,
+                explanation: "declined".into(),
+                needed_by: vec![],
+                remediations: vec![],
+            },
+            PrerequisiteCheck {
+                prerequisite: identity.clone(),
+                status: PrerequisiteStatus::Satisfied,
+                explanation: "approved".into(),
+                needed_by: vec![],
+                remediations: vec![],
+            },
+        ],
+        advisories: vec![],
+        notes: vec![],
+    };
+    let unreviewed = WorkflowPrerequisite::PushAuthSsh {
+        remote: "another".into(),
+        host: "example.org".into(),
+    };
+    let needs = WorkflowPrerequisites {
+        origin: PrerequisiteOrigin::Static,
+        needs: vec![
+            PrerequisiteNeed {
+                prerequisite: token.clone(),
+                needed_by: vec![],
+            },
+            PrerequisiteNeed {
+                prerequisite: unreviewed.clone(),
+                needed_by: vec![],
+            },
+        ],
+        advisories: vec![],
+    };
+    let narrowed = report.narrow_to(&needs);
+    assert_eq!(narrowed.find(&token).unwrap().explanation, "declined");
+    assert_eq!(
+        narrowed.find(&token).unwrap().status,
+        PrerequisiteStatus::Missing
+    );
+    assert_eq!(
+        narrowed.find(&unreviewed).unwrap().status,
+        PrerequisiteStatus::Missing
+    );
+    assert!(
+        narrowed.find(&identity).is_none(),
+        "unused grant must not remain in the report"
+    );
+}
+
+#[test]
+fn prerequisite_review_describes_the_whole_workflow_and_image_preparation() {
+    use crate::command::commands::workflow_prerequisites::PrerequisiteReportNext;
+    use crate::data::workflow_prerequisites::*;
+    let mut report = WorkflowPrerequisiteReport {
+        phase: PrerequisitePhase::Start,
+        origin: PrerequisiteOrigin::AssumedAll,
+        checks: vec![PrerequisiteCheck {
+            prerequisite: WorkflowPrerequisite::AgentImage {
+                agent: "codex".into(),
+                tag: "codex:latest".into(),
+            },
+            status: PrerequisiteStatus::Missing,
+            explanation: "missing image".into(),
+            needed_by: vec![],
+            remediations: vec![],
+        }],
+        advisories: vec![],
+        notes: vec![],
+    };
+    let next = PrerequisiteReportNext::Questions {
+        unresolved: crate::data::config::workflows::UnresolvedMode::Warn,
+    };
+    let dynamic = crate::command::prompts::prerequisite_report(&report, next);
+    assert!(dynamic.body.contains("all workflow prerequisites"));
+    assert!(dynamic
+        .body
+        .contains("prepares the listed missing agent images"));
+    assert!(!dynamic.body.contains("teardown"));
+    report.origin = PrerequisiteOrigin::Static;
+    let concrete = crate::command::prompts::prerequisite_report(&report, next);
+    assert!(concrete.body.contains("calculated for this workflow"));
 }

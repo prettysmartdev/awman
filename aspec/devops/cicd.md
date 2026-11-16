@@ -104,6 +104,11 @@ reported as passed because it was skipped.
   summary: tier × platform matrix of passed/failed/blocked/skipped/not-selected,
   slowest tests, quarantine and override state, cache statistics and the
   `reproduce` line of every failure.
+  Partial reruns may reuse successful jobs' artifacts from an earlier attempt
+  of the same authenticated run. The current attempt must still report each
+  required job successful, and source, job, shard and complete passing test
+  inventory must match. Zero, future or malformed producer attempts and
+  artifacts from another run or source are rejected.
 
 ### `nightly.yml`
 
@@ -135,6 +140,12 @@ than adding parallel suite durations. The span runs from the first completed
 predecessor's start to the last predecessor's finish; it excludes aggregation.
 Queue time is the longest predecessor queue. Unmeasured invocation queue and
 cache values remain unknown, rather than being reported as zero or cache misses.
+Actions job timestamps are diagnostic only: missing, malformed or inverted
+timestamps leave gate queue and execution measurements unavailable (`null`) and
+do not affect the verdict. Required job success, provenance, artifacts and exact
+test coverage still determine admission. Timing history retains the verdict
+without inventing a duration; unavailable measurements do not enter percentiles
+and break a sequence of measured main-gate budget overruns.
 
 ## Pinned inputs
 
