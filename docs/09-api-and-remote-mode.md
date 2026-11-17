@@ -1401,6 +1401,11 @@ host environment for the matching `env(NAME)` overlay. The overlay must
 explicitly request each variable; command secrets are not added to every
 container environment.
 
+Secret overrides for runtime-control, loader, interpreter, proxy, and terminal variables
+(such as `DOCKER_HOST`, `DOCKER_CONFIG`, `PATH`, `LD_PRELOAD`, `HTTPS_PROXY`,
+and `TERM`) fail before launch. Name-only environment delivery uses the host
+runtime client's environment, so these names remain reserved for the worker.
+
 Secret values exist in daemon memory for the command lifetime and are not
 written to the command record or idempotency record. After a daemon restart,
 queued commands whose secret values were lost fail before execution with
@@ -2201,6 +2206,15 @@ The response shape is shown under [`GET /v1/status`](#get-v1status). `features` 
 The `capabilities` array lists what clients can detect without relying on the server version. `workflow_state` means the server exposes live workflow snapshots through `GET /v1/worker/commands/:id/workflow`.
 `command_cancel`, `labels`, `idempotency` and `runs` mean the server supports [command cancellation](#cancel-a-command), [labels](#labels), [idempotency keys](#idempotency-keys) and [`POST /v1/worker/runs`](#one-shot-runs).
 `error_codes` means every error body carries a `code` ([Error responses](#error-responses)). `structured_results` means command records carry the structured [`result`](#get-command-status); `outputs` means the [outputs endpoints](#list-and-retrieve-command-outputs) exist; `event_source` means events carry `source` and the event stream accepts `?step=`; `step_activity` means `step_activity` events can appear. `command_record` means `GET /v1/worker/commands/:id` is served. `session_setup_status` means sessions carry `setup_status` and `setup_error` and `GET /v1/worker/sessions` accepts `setup_status`. `command_session_body` means `POST /v1/worker/commands` accepts `session_id` in the body. `remote_dynamic` means `--dynamic` is accepted in `args`; `workdir_roots` means workdir roots are honoured; `event_ids` means SSE frames carry `id:` and `Last-Event-ID` resumes. `resource_routes`, `feature_states`, `config_routes`, `grant_routes`, `typed_ids`, `list_pages` and `headless_interaction` mean the [route tree](#route-tree), feature states, `/v1/config*`, `/v1/grants*`, prefixed IDs, list envelopes and the `interaction` request field.
+
+`workflow_prerequisites` advertises workflow prerequisite selection: supported
+workflow runs emit a `workflow_prerequisites` report event, and unresolved
+prerequisites fail with stage `workflow_prerequisites`. A grant that widens the
+worker's global prerequisite policy is refused with
+`prerequisite_widening_refused` unless global
+`workflows.prerequisites.allowApiClientGrants` permits it. Pull workers may
+also register the separate WSP feature `lease_prerequisites` for prerequisite
+choices on workflow leases.
 
 New capabilities are added to `capabilities`, never removed, so check for a capability rather than comparing versions.
 

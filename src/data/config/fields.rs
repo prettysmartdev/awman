@@ -1032,6 +1032,22 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         true,
         "One owner-configured worker label; awman/ is reserved.",
     ),
+    row(
+        "workServers.*.allowEnv",
+        StringList,
+        "[]",
+        Global,
+        true,
+        "Worker environment variables a lease from this server may request with env(NAME).",
+    ),
+    row(
+        "workServers.*.allowSkills",
+        StringList,
+        "[]",
+        Global,
+        true,
+        "Installed skills outside the default library a lease from this server may request with skill(name).",
+    ),
     // remote
     row(
         "remote.default",
@@ -1744,6 +1760,12 @@ pub fn validate_value(key: &ConfigKey, value: &Value) -> Result<(), KeyError> {
                         "daemon.network.listeners.*.features" => {
                             ["squad", "worker", "engine"].contains(&s)
                         }
+                        "workServers.*.allowEnv" => {
+                            super::work_servers::validate_allow_env_entry(s).is_ok()
+                        }
+                        "workServers.*.allowSkills" => {
+                            super::work_servers::validate_allow_skill_entry(s).is_ok()
+                        }
                         _ => true,
                     }
                 })
@@ -1756,6 +1778,12 @@ pub fn validate_value(key: &ConfigKey, value: &Value) -> Result<(), KeyError> {
                     }
                     "daemon.network.listeners.*.features" => {
                         "a list containing only squad, worker, or engine"
+                    }
+                    "workServers.*.allowEnv" => {
+                        "a list of environment variable names matching ^[A-Z_][A-Z0-9_]*$"
+                    }
+                    "workServers.*.allowSkills" => {
+                        "a list of skill names such as planner or library/planner"
                     }
                     _ => "a list of strings",
                 };

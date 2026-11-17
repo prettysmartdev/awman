@@ -203,6 +203,10 @@ pub struct LeaseRuntimeSupport {
     pub read_only_workspace: bool,
     /// `/awman/output` is mounted (`outputs`).
     pub outputs_mount: bool,
+    /// The runtime can mount installed skills.
+    pub skill_mounts: bool,
+    /// The execution path accepts per-command secret environment overrides.
+    pub secret_env: bool,
 }
 
 /// Why a lease was refused before any work started (`release(ineligible)`).
@@ -214,6 +218,8 @@ impl LeaseRuntimeSupport {
         Self {
             read_only_workspace: caps.read_only_workspace(),
             outputs_mount: caps.mounts_outputs(true),
+            skill_mounts: caps.arbitrary_host_mounts,
+            secret_env: !caps.kit_declarative,
         }
     }
 

@@ -1196,7 +1196,36 @@ mod command_secrets_tests {
     use super::*;
     use crate::data::secret::{CommandSecrets, SecretString};
     use crate::engine::agent::AgentRunOptions;
+    use crate::engine::container::ContainerOption;
     use std::sync::Arc;
+
+    #[test]
+    fn caller_secret_overrides_cannot_configure_the_runtime_client() {
+        for name in [
+            "DOCKER_HOST",
+            "DOCKER_CONTEXT",
+            "DOCKER_CONFIG",
+            "CONTAINER_HOST",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "SSH_ASKPASS",
+            "PYTHONPATH",
+            "NODE_OPTIONS",
+            "PATH",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "TERM",
+            "TMUX",
+        ] {
+            let error = ResolvedContainerOptions::resolve([ContainerOption::EnvOverride {
+                key: name.into(),
+                value: SecretString::new("private-runtime-override"),
+            }])
+            .unwrap_err();
+            assert!(error.to_string().contains(name));
+            assert!(!format!("{error:?}").contains("private-runtime-override"));
+        }
+    }
 
     #[test]
     fn requested_command_secrets_override_host_env_with_name_only_runtime_argv() {

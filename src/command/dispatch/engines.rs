@@ -59,6 +59,9 @@ fn lease_factory_for(
 /// engines accept per-invocation flag values.
 #[derive(Clone)]
 pub struct Engines {
+    /// Lease admission snapshot, reapplied before executing any workflow.
+    pub lease_workflow_review: Option<Arc<crate::command::worker::policy::LeaseWorkflowReview>>,
+
     pub ephemeral_secrets: Arc<super::ephemeral_secrets::EphemeralSecrets>,
     /// Cross-paradigm trait-object handle. Used for build(), list_running(),
     /// stats(), stop(), attach(), is_available(), capabilities() and
@@ -182,6 +185,7 @@ impl Engines {
         let workflow_root = api_paths.data_paths().root().to_path_buf();
         Ok(Self {
             ephemeral_secrets: Arc::new(Default::default()),
+            lease_workflow_review: None,
             runtime,
             container_runtime,
             sandbox_runtime,
@@ -204,6 +208,7 @@ impl Engines {
     ) -> Self {
         Self {
             ephemeral_secrets: Arc::new(Default::default()),
+            lease_workflow_review: None,
             runtime: Arc::new(
                 crate::command::commands::api_server::owned_runtime::CommandOwnedRuntime::new(
                     core.runtime().clone(),
@@ -251,6 +256,7 @@ impl Engines {
 
         Ok(Self {
             ephemeral_secrets: Arc::new(Default::default()),
+            lease_workflow_review: None,
             runtime,
             container_runtime,
             sandbox_runtime,

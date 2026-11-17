@@ -902,6 +902,7 @@ mod claude;
 mod credential_file;
 pub mod prerequisite_grants;
 mod skills;
+pub use skills::SkillStatus;
 
 pub(crate) use claude::*;
 pub(crate) use credential_file::*;

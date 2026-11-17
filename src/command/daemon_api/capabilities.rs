@@ -90,6 +90,12 @@ pub const CAPABILITIES: &[&str] = &[
     // WI 0148: `init` is available to API clients and returns its project
     // file list in the typed command result.
     "api_init",
+    // WI 0149/0162: `exec workflow` accepts the four `--prerequisite-*` flags
+    // (identity, ssh, token, unresolved; a value granting beyond the server's
+    // global policy is refused `prerequisite_widening_refused`), emits a
+    // `workflow_prerequisites` report event, and an unresolved prerequisite
+    // fails with `failure.stage` `workflow_prerequisites`.
+    "workflow_prerequisites",
     // WI 0152: `--read-only-workspace` on `exec prompt` / `exec workflow` and
     // per-step `read_only_workspace`. Advertised only by
     // [`advertised_for_runtime`] on a runtime that enforces it, never by
@@ -101,6 +107,10 @@ pub const CAPABILITIES: &[&str] = &[
 /// advertised only while the daemon runs a pull worker that reports it
 /// (`PullHandle::capabilities`), never speculatively.
 pub const PULL_CAPABILITIES: &[&str] = &[
+    "lease_secrets",
+    "lease_skills",
+    "lease_prerequisites",
+    "lease_workflows_dynamic",
     "lease_context",
     "lease_workflow_context",
     "worker_pull",

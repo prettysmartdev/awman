@@ -49,6 +49,31 @@ fn beat() -> HeartbeatRequest {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_lease_lifetime_applies_to_claims_and_heartbeats() {
+    let sandbox = support::sandbox(
+        "worker::protocol::configured_lease_lifetime_applies_to_claims_and_heartbeats",
+    );
+    let ttl = chrono::Duration::seconds(30);
+    let server = FakeWorkServer::start_with(
+        &sandbox,
+        Arc::new(awman_wsp::mock::MockWorkServer::new().with_lease_ttl(ttl)),
+    )
+    .await;
+    let session = linked(&server).await;
+    let before = awman_wsp::wire::now();
+    let lease = claim(&server, &session, "lifetime").await;
+    assert!((before + ttl..=awman_wsp::wire::now() + ttl).contains(&lease.expires_at));
+    let before = awman_wsp::wire::now();
+    let renewed = session
+        .heartbeat(&LeaseRef::of(&lease), &beat())
+        .await
+        .unwrap();
+    assert!((before + ttl..=awman_wsp::wire::now() + ttl).contains(&renewed.expires_at));
+    server.shutdown().await;
+    sandbox.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wsp_conformance_covers_auth_affinity_events_epoch_and_wire() {
     let sandbox = support::sandbox(
         "worker::protocol::wsp_conformance_covers_auth_affinity_events_epoch_and_wire",

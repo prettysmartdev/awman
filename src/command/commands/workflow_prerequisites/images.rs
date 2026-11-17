@@ -161,6 +161,7 @@ mod contracts {
             credential_monitor: None,
             global_config: Arc::new(Default::default()),
             ephemeral_secrets: Arc::new(Default::default()),
+            lease_workflow_review: None,
         };
         let agents = vec!["claude".into(), "claude".into()];
         let mut frontend = Frontend {

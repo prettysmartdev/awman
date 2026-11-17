@@ -923,7 +923,16 @@ impl ResolvedContainerOptions {
         Ok(())
     }
 
+    pub(crate) fn validate_caller_env(&self) -> Result<(), ResolveError> {
+        for (name, _) in &self.env_overrides {
+            super::host_env_denylist::validate_caller_env_name(name)
+                .map_err(ResolveError::Conflict)?;
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), ResolveError> {
+        self.validate_caller_env()?;
         // Yolo + Plan are mutually exclusive — yolo grants permissions, plan
         // forbids them.
         if matches!(self.yolo, YoloMode::Enabled) && matches!(self.plan, PlanMode::Enabled) {

@@ -249,6 +249,8 @@ impl Command for WorkerLinkCommand {
                     url: Some(self.url.clone()),
                     enabled: Some(true),
                     claim: None,
+                    allow_env: None,
+                    allow_skills: None,
                     max_concurrent_jobs: None,
                     interaction: None,
                     labels: (!self.labels.is_empty()).then_some(self.labels),

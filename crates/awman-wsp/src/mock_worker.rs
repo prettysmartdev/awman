@@ -62,6 +62,25 @@ impl MockWorker {
         let Some(lease) = self.client.claim(None, 0).await? else {
             return Ok(None);
         };
+        if !item_exec_supported(&lease.item, &self.features) {
+            self.client
+                .release(
+                    &lease.id,
+                    &ReleaseRequest::<Value> {
+                        context_changes: None,
+                        reason: ReleaseReason::Ineligible,
+                        message: Some(
+                            "worker does not support one or more lease exec fields".into(),
+                        ),
+                        result: None,
+                    },
+                )
+                .await?;
+            return Ok(Some(LeaseReport {
+                lease,
+                outcome: MockOutcome::Release(ReleaseReason::Ineligible),
+            }));
+        }
         if !matches!(outcome, MockOutcome::Vanish) {
             let heartbeat = self
                 .client
@@ -126,4 +145,8 @@ impl MockWorker {
         }
         Ok(Some(LeaseReport { lease, outcome }))
     }
+}
+
+fn item_exec_supported(item: &WorkItem, registered: &[String]) -> bool {
+    crate::lease_exec::supported(registered, item)
 }

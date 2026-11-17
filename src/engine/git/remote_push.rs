@@ -638,15 +638,20 @@ impl RemotePushGit {
     }
 
     pub fn commit_leftovers(&self, message: &str, sink: &mut dyn GitFrontend) -> Result<()> {
-        self.commit_leftovers_impl(message, sink, None)
+        self.commit_leftovers_impl(message, sink, None, None)
     }
+    /// Commit leftovers under a lease guard. `identity` is an already
+    /// validated fixed `(name, email)` (non-empty, no control characters):
+    /// when given it authors and commits, and neither the clone's nor the
+    /// host's identity is consulted or written.
     pub fn commit_leftovers_guarded(
         &self,
         message: &str,
         sink: &mut dyn GitFrontend,
         guard: &LeaseGitGuard,
+        identity: Option<(&str, &str)>,
     ) -> Result<()> {
-        self.commit_leftovers_impl(message, sink, Some(guard))
+        self.commit_leftovers_impl(message, sink, Some(guard), identity)
     }
     fn text_guarded(
         &self,
@@ -666,11 +671,17 @@ impl RemotePushGit {
         message: &str,
         sink: &mut dyn GitFrontend,
         guard: Option<&LeaseGitGuard>,
+        fixed: Option<(&str, &str)>,
     ) -> Result<()> {
         // Use host identity when local identity is absent, but never import other
         // global config (filters, signing, etc.) into work-tree operations.
         let mut fallback_used = false;
-        for key in ["user.name", "user.email"] {
+        let keys: &[&str] = if fixed.is_some() {
+            &[]
+        } else {
+            &["user.name", "user.email"]
+        };
+        for &key in keys {
             let configured = self
                 .text_guarded(&["config", "--get", key], false, sink, guard)
                 .ok();
@@ -700,15 +711,47 @@ impl RemotePushGit {
                 )?;
             }
         }
-        let identity = CommitIdentity {
-            name: self.text_guarded(&["config", "--get", "user.name"], false, sink, guard)?,
-            email: self.text_guarded(&["config", "--get", "user.email"], false, sink, guard)?,
-            fallback: fallback_used,
-            overrides: Vec::new(),
+        let (identity, text) = match fixed {
+            // `-c key=value` keeps each value a single argument even when it
+            // starts with `-`, and writes nothing into the clone's config.
+            Some((name, email)) => (
+                CommitIdentity {
+                    name: name.into(),
+                    email: email.into(),
+                    fallback: false,
+                    overrides: vec![
+                        "-c".into(),
+                        format!("user.name={name}"),
+                        "-c".into(),
+                        format!("user.email={email}"),
+                    ],
+                },
+                format!("committing as {name} <{email}> (workflow prerequisites)"),
+            ),
+            None => {
+                let identity = CommitIdentity {
+                    name: self.text_guarded(
+                        &["config", "--get", "user.name"],
+                        false,
+                        sink,
+                        guard,
+                    )?,
+                    email: self.text_guarded(
+                        &["config", "--get", "user.email"],
+                        false,
+                        sink,
+                        guard,
+                    )?,
+                    fallback: fallback_used,
+                    overrides: Vec::new(),
+                };
+                let text = identity.describe();
+                (identity, text)
+            }
         };
         sink.write_message(UserMessage {
             level: MessageLevel::Info,
-            text: identity.describe(),
+            text,
         });
         // Start at HEAD so staging reflects the worktree's current state.
         self.run_guarded(&["read-tree", "HEAD"], false, sink, guard)?;
@@ -718,7 +761,9 @@ impl RemotePushGit {
         let changed =
             self.text_guarded(&["diff", "--cached", "--name-only"], false, sink, guard)?;
         if !changed.is_empty() {
-            self.run_guarded(&["commit", "-m", message], false, sink, guard)?;
+            let mut commit: Vec<&str> = identity.overrides.iter().map(String::as_str).collect();
+            commit.extend(["commit", "-m", message]);
+            self.run_guarded(&commit, false, sink, guard)?;
             self.save_commit()?;
         }
         Ok(())

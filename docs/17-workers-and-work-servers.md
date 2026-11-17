@@ -63,6 +63,8 @@ values use these defaults:
 | `workServers.<name>.maxConcurrentJobs` | `1` | Maximum simultaneous leases from this server. |
 | `workServers.<name>.interaction` | inherited | Optional `interactive` or `headless` mode for this server's jobs. |
 | `workServers.<name>.labels` | `{}` | Owner-configured labels reported by this worker. |
+| `workServers.<name>.allowEnv` | `[]` | Worker environment variable names that leases from this server may request with `env(NAME)`. |
+| `workServers.<name>.allowSkills` | `[]` | Installed skill names outside awman's builtin library that leases from this server may request with `skill(name)`. |
 
 The per-server limit and the daemon's shared worker capacity both apply. A
 server cannot run more than `maxConcurrentJobs` (a positive integer), and
@@ -70,6 +72,24 @@ pushed jobs and pulled leases compete for the daemon worker's available slots.
 See [Configuration](07-configuration.md#work-server-links)
 for config layering and [The daemon](16-daemon.md#worker-push-and-pull) for
 worker capacity and interaction settings.
+
+`allowEnv` entries are exact environment variable names matching
+`^[A-Z_][A-Z0-9_]*$`. A lease may request `env(NAME)` when it supplies that
+name in `exec.secrets`, or when the name is in `allowEnv` and is set in the
+worker daemon's environment. A supplied secret takes precedence over a worker
+environment value with the same name. Secret values without a matching
+`env(NAME)` request are accepted but never injected.
+
+`allowSkills` entries name installed skills. Skills in awman's builtin skill
+library are allowed without this list; other installed skills must be listed.
+An allowed library name also allows its named child skills. Hand-authored
+skills take precedence over a same-named builtin library skill and do not
+inherit the builtin library's trust. Workers report eligible installed skills
+with labels of the form `awman/skill.<name>=true` (slashes in a skill name are
+written as dots in the label key), for example
+`awman/skill.awman.create-custom-agent=true`. If a skill is installed after
+the worker registered, restart or re-register the worker before relying on
+its skill label.
 
 `auto` long-polls for eligible items while capacity is available. The claim
 holds an execution slot while it waits, so a claimed item starts at once; the
@@ -253,8 +273,12 @@ currently use. WSP v1 capability names recognized by awman are `terminal`,
 `interactive`, `prompt`, `workflow_dynamic`, `workflow_file`, `outputs`,
 `outputs_mount_state`, `workflow_state_events`, `lease_credentials`,
 `lease_inline_work_item`, `lease_read_only`, `lease_git_auth_failure`,
-`lease_push_retry`, `lease_context`, and `lease_workflow_context`. The daemon API separately advertises `worker_pull` when
-pull is active.
+`lease_push_retry`, `lease_secrets`, `lease_skills`, `lease_prerequisites`,
+`lease_workflows_dynamic`, `lease_context`, and `lease_workflow_context`. The
+four `lease_*` features are registered only by daemon pull workers that can
+honor them on the current runtime; `lease_skills` also requires host skill
+mount support. A worker refuses an item that requests an unsupported feature.
+The daemon API separately advertises `worker_pull` when pull is active.
 
 Each `QueueItem` has `id`, `title`, `kind`, `labels`, integer `priority`,
 `enqueued_at`, and `assigned_to_me`, with optional `summary`, `body`, and
@@ -298,6 +322,95 @@ Credential `kind` is `bearer`, `basic`, or `none`, with optional `token`,
 `workflow_toml`, `agent`, and `model`, plus `read_only`, `overlays`, optional
 `interaction` (`interactive` or `headless`), `yolo`, and optional `timeout_ms`.
 `leader` uses `agent::model` syntax.
+
+The `exec` object may also include `secrets`, `prerequisites`, and
+`workflows_dynamic`. These additions are optional:
+
+```json
+{
+  "exec": {
+    "dynamic": true,
+    "overlays": ["env(DEPLOY_TOKEN)", "skill(awman/create-custom-agent)"],
+    "secrets": { "DEPLOY_TOKEN": "<secret value>" },
+    "prerequisites": {
+      "git_identity": { "name": "Build Bot", "email": "build@example.com" },
+      "ssh": "allow",
+      "github_token": "deny"
+    },
+    "workflows_dynamic": {
+      "default_leader": "claude::sonnet",
+      "agents_to_models": { "codex": ["gpt-5-codex"] },
+      "guidance": ["Keep the patch focused."]
+    }
+  }
+}
+```
+
+Rust servers must use the explicit secret-bearing adapter for claim responses:
+
+```rust
+let response = serde_json::json!({
+    "lease": awman_wsp::secret::server_wire::lease(&lease)
+});
+// Return `response` as the HTTP 201 JSON body.
+```
+
+Ordinary `Serialize` on `Exec`, `WorkItem`, `Lease`, or `ClaimResponse`
+intentionally omits secret values. The adapter's returned JSON contains plaintext
+secrets: send it only over the authenticated claim response and never log or
+persist it.
+
+`secrets` maps names to values and follows the command-secret limits:
+ at most
+32 entries, names matching `^[A-Z_][A-Z0-9_]*$` and at most 128 bytes, and
+non-empty values of at most 8192 bytes without NUL. Duplicate names and repeated
+`secrets` fields are refused. Runtime-control, loader, interpreter, proxy, and terminal
+variables (for example `DOCKER_HOST`, `DOCKER_CONFIG`, `PATH`, `LD_PRELOAD`,
+`HTTPS_PROXY`, and `TERM`) cannot be requested through lease environment
+overlays, even when allowlisted or supplied as per-item secrets. This keeps the
+host runtime client's configuration worker-owned. Ordinary token values use
+the shared command-secret delivery path: name-only runtime arguments, with the
+value in the runtime child process's environment. Values are held in memory;
+
+lease records retain secret names only. A worker restart cannot resume a lease
+whose secret values were lost.
+The complete claim response must fit within 8 MiB.
+
+For leases, `exec.overlays` may request only `env(NAME)` and named
+`skill(name)` overlays. Other kinds are refused. `context` is supplied through
+the WorkItem's `context` field instead. Environment overlays must meet the
+`allowEnv` or per-item secret rule above. Requested skills must be installed
+and either in the builtin library or allowed by `allowSkills`. Overlays in
+server-supplied `workflow_toml` and generated or resumed dynamic workflows are\nreviewed by the same env and skill rules before their steps launch.
+
+`prerequisites` is valid only for workflow items. It may contain
+`git_identity: {name, email}`, `ssh: "allow"|"deny"`, and
+`github_token: "allow"|"deny"`. An `allow` choice can select only credentials
+already named by the worker's prerequisite policy; widening beyond that policy
+is refused. A fixed `git_identity` applies to the worker's commit of leftover
+changes before lease publication. Main agent containers retain their own Git
+identity; commits they create themselves are not rewritten or assigned this
+identity. `workflows_dynamic` uses the snake_case fields shown above, is
+
+valid only for dynamic workflow items (`dynamic: true`), and is applied as the
+lease's workflow configuration layer.
+
+An unsupported feature or invalid lease request is released with reason
+`ineligible`. A prerequisite policy widening refusal is also released with
+reason `ineligible`; its release message starts with
+`prerequisite_widening_refused`. If the worker restarts after receiving
+`exec.secrets`, it releases that lease with reason `error` and failure code
+`credentials_lost`; it never reruns the lease without those values.
+
+Secret redaction covers posted lease events, the result's `final_message` and
+`failure.message`, and release messages. It does not redact values written to
+`/awman/output`, context or workflow-note attachments, or bytes sent through a terminal. A `remote_input` lease can
+show a secret value typed by a person or echoed by a program; those terminal
+bytes are outside the redaction guarantee. Do not use output files or
+terminals to return secret material.
+
+When access to a work server is refused, the link endpoint responds with HTTP
+403 and code `access_denied`.
 
 `HeartbeatRequest` has `state` (`preparing`, `running`, `awaiting_input`, or
 `pushing`) and optional `step` and arbitrary JSON `progress`.

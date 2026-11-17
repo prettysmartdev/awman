@@ -167,6 +167,7 @@ fn engines(s: &TestSandbox, session: &Session) -> (Engines, Arc<Runtime>) {
             credential_monitor: None,
             global_config: Arc::new(Default::default()),
             ephemeral_secrets: Arc::new(Default::default()),
+            lease_workflow_review: None,
         },
         runtime,
     )

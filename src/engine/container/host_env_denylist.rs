@@ -56,6 +56,88 @@ pub fn is_host_terminal_var(name: &str) -> bool {
     EXACT.contains(&name) || PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
+/// Name-only `-e` delivery uses the host runtime client's environment. A
+/// caller-controlled value must not configure that client or its loader.
+/// Terminal variables are also reserved by the runtime.
+pub fn validate_caller_env_name(name: &str) -> Result<(), String> {
+    let upper = name.to_ascii_uppercase();
+    const EXACT: &[&str] = &[
+        "PATH",
+        "PATHEXT",
+        "HOME",
+        "USERPROFILE",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "SHELL",
+        "ENV",
+        "BASH_ENV",
+        "IFS",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "REQUEST_METHOD",
+        "CURL_CA_BUNDLE",
+        "GODEBUG",
+        "GOMAXPROCS",
+        "GOMEMLIMIT",
+        "GOTRACEBACK",
+        "GOGC",
+        "GIT_ASKPASS",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GIT_EXEC_PATH",
+        "GIT_PROXY_COMMAND",
+        "JAVA_TOOL_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "_JAVA_OPTIONS",
+        "CLASSPATH",
+        "ZDOTDIR",
+        "KSH_ENV",
+        "CDPATH",
+        "FPATH",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PS4",
+        "PROMPT_COMMAND",
+        "TERM",
+        "COLORTERM",
+    ];
+    const PREFIXES: &[&str] = &[
+        "DOCKER_",
+        "CONTAINER_",
+        "LD_",
+        "DYLD_",
+        "XDG_",
+        "SSL_",
+        // Runtime clients can invoke SSH and credential helpers. Their
+        // loaders/interpreters must stay worker-owned as well.
+        "SSH_",
+        "GIT_CONFIG_",
+        "BASH_FUNC_",
+        "PYTHON",
+        "NODE_",
+        "RUBY",
+        "PERL",
+        "BUNDLE_",
+        "GEM_",
+    ];
+    if EXACT.contains(&upper.as_str())
+        || PREFIXES.iter().any(|prefix| upper.starts_with(prefix))
+        || is_host_terminal_var(&upper)
+    {
+        Err(format!(
+            "env({name}) refused: variable is reserved for the host runtime or terminal"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// The result of scrubbing one run spec's environment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScrubbedEnv {
