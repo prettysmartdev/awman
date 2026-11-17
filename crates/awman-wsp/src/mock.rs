@@ -25,10 +25,19 @@ pub enum MockFault {
     Wire(&'static str),
 }
 
-#[derive(Default)]
 pub struct MockWorkServer {
     inner: Mutex<State>,
     changed: Notify,
+    lease_ttl: Duration,
+}
+impl Default for MockWorkServer {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::default(),
+            changed: Notify::default(),
+            lease_ttl: Duration::seconds(3),
+        }
+    }
 }
 #[derive(Default)]
 struct State {
@@ -137,6 +146,14 @@ fn eligible<'a>(s: &'a State, worker: &str) -> Result<Vec<&'a Entry>, ApiError> 
 impl MockWorkServer {
     pub fn new() -> Self {
         Self::default()
+    }
+    /// Set the lifetime granted by HTTP claims and heartbeats. The default
+    /// is three seconds for expiry scenarios; execution fixtures can grant
+    /// a lease that covers their full test budget.
+    pub fn with_lease_ttl(mut self, ttl: Duration) -> Self {
+        assert!(ttl > Duration::zero(), "lease TTL must be positive");
+        self.lease_ttl = ttl;
+        self
     }
     /// Construct a deliberately nonconforming fake to validate conformance probes.
     pub fn with_fault(fault: MockFault) -> Self {

@@ -18,6 +18,7 @@ use awman_test_support::capability::{LocalGit, Loopback};
 use awman_test_support::fakes::{Call, FakeCli, FakeGitHttp, FakeWorkServer};
 use awman_test_support::fixtures::RepoBuilder;
 use awman_test_support::{wait_for_async, TestSandbox};
+use awman_wsp::mock::MockWorkServer;
 use awman_wsp::{secret::SecretString, ExecSecrets, WorkItem, WorkKind};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -43,6 +44,7 @@ struct Host {
 }
 
 struct Options {
+    mock: MockWorkServer,
     /// Merged into the `workServers.mock` entry.
     server: Value,
     /// Merged into the global config.
@@ -56,6 +58,7 @@ struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            mock: MockWorkServer::new(),
             server: json!({}),
             extra: json!({}),
             pull: true,
@@ -103,7 +106,7 @@ impl Host {
         drop(repo);
         let http = FakeGitHttp::builder(&s, &s.root().join("remotes")).start();
         let url = http.url("origin.git");
-        let wsp = FakeWorkServer::start(&s).await;
+        let wsp = FakeWorkServer::start_with(&s, std::sync::Arc::new(options.mock)).await;
         let link = wsp.server().link();
         wsp.server().approve_link(&link.link_id, BTreeMap::new());
         let token = awman_wsp::Client::new(wsp.base_url(), String::new())
@@ -738,7 +741,14 @@ prompt = "make the change"
 async fn the_commit_author_follows_exec_prerequisites_and_widening_is_refused() {
     let host = Host::start(
         "daemon::lease_exec::the_commit_author_follows_exec_prerequisites_and_widening_is_refused",
-        Options::default(),
+        Options {
+            // Cover the whole component test budget, including the two-
+            // heartbeat push margin. This tests commit identity, not whether
+            // several real Git processes finish in the mock's one-second
+            // push window on every runner.
+            mock: MockWorkServer::new().with_lease_ttl(chrono::Duration::seconds(30)),
+            ..Options::default()
+        },
         |_| {},
         |docker| {
             docker.on(&["run"]).hold_until_released();

@@ -316,7 +316,7 @@ async fn dispatch_inner(
                     &worker,
                     req.item_id.as_deref(),
                     Utc::now(),
-                    Duration::seconds(3),
+                    server.lease_ttl,
                 )? {
                     return Ok((
                         StatusCode::CREATED,
@@ -343,7 +343,7 @@ async fn dispatch_inner(
                     id,
                     lease.epoch,
                     now,
-                    Duration::seconds(3),
+                    server.lease_ttl,
                     &read(&bytes)?,
                 )?)
                 .into_response()),
