@@ -315,10 +315,10 @@ Expressions are comma-separated. They are added to the config-file overlays and 
 
 ## CLI flag
 
-The `--overlay` flag is available on all agent-launching commands: `chat`, `exec prompt`, and `exec workflow`. Pass it once per expression:
+The `--overlay` flag is available on all agent-launching commands: `chat`, `exec prompt`, and `exec workflow`. Every command that accepts `--overlay` also accepts its short form, `-o`. Pass either form once per expression:
 
 ```sh
-awman chat --overlay "ssh()" --overlay "env(GITHUB_TOKEN)"
+awman chat -o "ssh()" -o "env(GITHUB_TOKEN)"
 ```
 
 Or comma-separate multiple expressions in a single flag:

@@ -2315,6 +2315,11 @@ snake_case `state` (`pending`, `running`, `succeeded`, `failed`, `remediating`
 or `skipped`). The added top-level `phase` is snake_case (`setup`, `main`,
 `teardown` or `done`).
 
+Both phase-step arrays contain the full ordered plan before their phase starts,
+including pending entries. Instance workflow overviews expose the same complete
+lists in snapshots and updates, so clients can show every teardown step before
+the first one runs. Repeated descriptions remain separate entries in plan order.
+
 The legacy `current_phase`, `step_states`, and phase-entry `status` fields
 remain in their persisted representation for compatibility. `WorkflowState`
 has no top-level workflow status property; monitor command status or the final

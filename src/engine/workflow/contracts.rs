@@ -593,7 +593,7 @@ impl WorkflowFrontend for FinalReviewFrontend {
     }
     fn show_workflow_control_board(
         &mut self,
-        _: &WorkflowState,
+        state: &WorkflowState,
         actions: &AvailableActions,
     ) -> Result<NextAction, EngineError> {
         use std::sync::atomic::Ordering::SeqCst;
@@ -604,6 +604,13 @@ impl WorkflowFrontend for FinalReviewFrontend {
         assert!(actions.can_finish_workflow);
         assert!(!actions.can_launch_next);
         assert!(actions.simple_advance.is_none());
+        assert_eq!(state.current_phase, WorkflowPhase::Main);
+        assert_eq!(state.teardown_step_states.len(), 2);
+        assert!(state.teardown_step_states.iter().all(|step| matches!(
+            step.status,
+            crate::data::workflow_state::PhaseStepStatus::Pending
+        )));
+        assert!(!state.teardown_completed);
         let trace = self.trace.lock().unwrap();
         assert_eq!(
             trace.cancelled.lock().unwrap().len(),
@@ -656,7 +663,25 @@ async fn final_review_scenario(
     non_interactive: bool,
     report: Option<StuckEvent>,
 ) {
+    use crate::data::workflow_definition::TeardownStep;
+    use crate::engine::agent_runtime::background::ExecOutput;
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    struct TeardownExec;
+    impl AgentExec for TeardownExec {
+        fn exec(
+            &self,
+            _: &str,
+            _: Option<&HashMap<String, String>>,
+        ) -> Result<ExecOutput, EngineError> {
+            Ok(ExecOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+    }
+
     let trace = Arc::new(Mutex::new(Trace::default()));
     let boards = Arc::new(AtomicUsize::new(0));
     let session = Session::open_at_directory_root(
@@ -700,7 +725,37 @@ async fn final_review_scenario(
     } else {
         None
     };
-    let task = tokio::spawn(async move { engine.run_to_completion().await.unwrap() });
+    let teardown = ["verify", "publish"].map(|command| TeardownStep::RunShell {
+        command: command.into(),
+        env: None,
+    });
+    // Publishing the full plan must not grant permission to execute teardown.
+    engine.declare_phase_steps(&[], &teardown).unwrap();
+    let review = attended && !non_interactive;
+    let held_agents = report.is_some();
+    let task_boards = boards.clone();
+    let task_trace = trace.clone();
+    let task = tokio::spawn(async move {
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(result, WorkflowOutcome::Completed);
+        assert_eq!(task_boards.load(SeqCst), if review { 2 } else { 0 });
+        assert_eq!(engine.state().current_phase, WorkflowPhase::Main);
+        let mut teardown_launches = 0;
+        let outcome = engine
+            .run_phase(PhaseKind::Teardown, &teardown, &[], &[], |_| {
+                teardown_launches += 1;
+                if held_agents {
+                    let trace = task_trace.lock().unwrap();
+                    assert_eq!(trace.cancelled.lock().unwrap().len(), count);
+                }
+                Ok(Box::new(TeardownExec))
+            })
+            .unwrap();
+        assert!(!outcome.any_failed);
+        assert_eq!(teardown_launches, 2);
+        assert!(engine.state().teardown_completed);
+        result
+    });
     for _ in 0..count {
         let name = tokio::time::timeout(Duration::from_secs(5), launches.recv())
             .await
@@ -718,7 +773,6 @@ async fn final_review_scenario(
             .unwrap(),
         WorkflowOutcome::Completed
     );
-    let review = attended && !non_interactive;
     assert_eq!(boards.load(SeqCst), if review { 2 } else { 0 });
     let trace = trace.lock().unwrap();
     assert_eq!(trace.launched.len(), count);

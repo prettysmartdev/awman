@@ -497,7 +497,7 @@ const SQUAD_ADD_OWN_FLAGS: [FlagSpec; 12] = [
     },
     FlagSpec {
         long: "overlay",
-        short: None,
+        short: Some('o'),
         help: "Overlay the task's containers get: dir()/ssh()/env()/skill(). Repeatable.",
         kind: FlagKind::VecString,
         default: FlagDefault::EmptyVec,
@@ -616,7 +616,7 @@ const SQUAD_EDIT_OWN_FLAGS: [FlagSpec; 12] = [
     },
     FlagSpec {
         long: "overlay",
-        short: None,
+        short: Some('o'),
         help: "Replace the task's overlays: dir()/ssh()/env()/skill(). Repeatable.",
         kind: FlagKind::VecString,
         default: FlagDefault::EmptyVec,

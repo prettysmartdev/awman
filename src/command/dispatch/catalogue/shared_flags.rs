@@ -236,7 +236,7 @@ pub(super) const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 9] = [
     },
     FlagSpec {
         long: "overlay",
-        short: None,
+        short: Some('o'),
         help:
             "Mount a directory or context(repo@<key>[:ro|rw]) into the agent container. Repeatable.",
         kind: FlagKind::VecString,
