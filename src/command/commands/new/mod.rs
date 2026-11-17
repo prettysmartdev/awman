@@ -142,10 +142,10 @@ pub struct WorkflowStepInput {
     pub prompt: String,
 }
 
-/// `NewCommandFrontend` extends `SpecsCommandFrontend` so the `Spec`
+/// `NewCommandFrontend` extends `NewSpecFrontend` so the `Spec`
 /// subcommand can drive the same Q&A (kind / title / summary).
 pub trait NewCommandFrontend:
-    UserMessageSink + crate::command::commands::specs::SpecsCommandFrontend + Send + Sync
+    UserMessageSink + crate::command::work_item::spec_service::NewSpecFrontend + Send + Sync
 {
     /// Prompt for a workflow name. CLI implementations gate on stdin TTY.
     fn ask_workflow_name(&mut self) -> Result<String, CommandError> {

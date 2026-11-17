@@ -8,6 +8,7 @@ mod credentials;
 mod daemon;
 mod differential;
 mod draft_sync;
+mod edit_artifacts;
 mod failures;
 mod models;
 mod read_only_workspace;

@@ -4,10 +4,10 @@ use awman::command::commands::new::{
 use awman::command::commands::Command;
 use awman::command::commands::{
     agent_auth::*, agent_setup::*, agent_trust::AgentTrustFrontend, mount_scope::*,
-    specs::SpecsCommandFrontend,
 };
 use awman::command::dispatch::Engines;
 use awman::command::error::CommandError;
+use awman::command::work_item::spec_service::NewSpecFrontend;
 use awman::data::session::{Session, SessionOpenOptions};
 use awman::data::{
     message::{UserMessage, UserMessageSink},
@@ -64,7 +64,7 @@ impl AgentLaunchFrontend for Scaffolder {
         panic!("scaffolding must not acquire terminal IO")
     }
 }
-impl SpecsCommandFrontend for Scaffolder {}
+impl NewSpecFrontend for Scaffolder {}
 impl awman::command::commands::new::NewCommandFrontend for Scaffolder {
     fn ask_workflow_step_name(&mut self) -> Result<String, CommandError> {
         Ok("one".into())

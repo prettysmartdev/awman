@@ -32,7 +32,10 @@ pub const CONTRACT_PATHS: &[&str] = &[
     "init",
     "ready",
     "chat",
-    "specs amend",
+    "edit spec",
+    "edit workflow",
+    "edit skill",
+    "edit agent",
     "agents status",
     "agents list",
     "agents detail",
@@ -496,4 +499,66 @@ fn remote_exec_forwards_the_work_item_unparsed() {
     );
     let request = ExecArg::Prompt(Some("go".into())).into_request(&forwarded);
     assert_eq!(request.args, ["--work-item=PROJ-12", "--", "go"]);
+}
+
+// ── WI 0059: `edit` replaces the removed `specs` command ───────────────────
+
+fn flag(path: &[&str], long: &str) -> &'static awman::command::dispatch::catalogue::FlagSpec {
+    CommandCatalogue::get()
+        .lookup(path)
+        .unwrap_or_else(|| panic!("missing {path:?}"))
+        .flags
+        .iter()
+        .find(|f| f.long == long)
+        .unwrap_or_else(|| panic!("{path:?} has no --{long}"))
+}
+
+#[test]
+fn edit_has_four_leaves_and_every_new_kind_has_an_edit_counterpart() {
+    let catalogue = CommandCatalogue::get();
+    let edit = catalogue.lookup(&["edit"]).expect("edit group");
+    let edit_kinds: BTreeSet<_> = edit.subcommands.iter().map(|s| s.name).collect();
+    assert_eq!(
+        edit_kinds,
+        BTreeSet::from(["spec", "workflow", "skill", "agent"])
+    );
+    for leaf in edit.subcommands {
+        assert!(leaf.subcommands.is_empty(), "edit {} is a leaf", leaf.name);
+    }
+    let new = catalogue.lookup(&["new"]).expect("new group");
+    for kind in new.subcommands {
+        assert!(
+            edit_kinds.contains(kind.name),
+            "`new {}` has no `edit {}`",
+            kind.name,
+            kind.name
+        );
+    }
+}
+
+#[test]
+fn the_specs_command_is_gone_with_no_alias() {
+    let catalogue = CommandCatalogue::get();
+    assert!(catalogue.lookup(&["specs"]).is_none());
+    assert!(catalogue.lookup(&["specs", "amend"]).is_none());
+    assert!(catalogue.lookup_with_aliases(&["specs", "amend"]).is_none());
+    assert!(leaves().iter().all(|(path, _)| path[0] != "specs"));
+}
+
+#[test]
+fn edit_interview_conflicts_with_headless_and_json_and_every_leaf_needs_a_runtime() {
+    for kind in ["spec", "workflow", "skill", "agent"] {
+        let path = ["edit", kind];
+        let interview = flag(&path, "interview");
+        assert!(interview.conflicts_with.contains(&"headless"), "{kind}");
+        assert!(interview.conflicts_with.contains(&"json"), "{kind}");
+        assert!(CommandCatalogue::get().requires_runtime(&path), "{kind}");
+    }
+    assert!(flag(&["edit", "spec"], "headless")
+        .conflicts_with
+        .contains(&"interview"));
+    assert!(flag(&["edit", "spec"], "json")
+        .conflicts_with
+        .contains(&"interview"));
+    assert!(flag_names(&["edit", "spec"]).contains(&"amend"));
 }

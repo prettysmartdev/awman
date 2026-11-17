@@ -8,8 +8,8 @@
 //! `from_input` constructor, so the construction logic itself lives with the
 //! command in `src/command/commands/`, never here.
 //!
-//! A command with several subcommands (`agents`, `config`, `daemon`, `squad`, `new`,
-//! `remote`, `specs`) registers the *same* function on every leaf: its
+//! A command with several subcommands (`agents`, `config`, `daemon`, `squad`, `new`, `edit`,
+//! `remote`) registers the *same* function on every leaf: its
 //! `from_input` selects the subcommand from
 //! [`CallerContext::leaf`](crate::command::dispatch::CallerContext::leaf).
 
@@ -18,13 +18,13 @@ use crate::command::commands::attach::AttachCommand;
 use crate::command::commands::chat::ChatCommand;
 use crate::command::commands::clean::CleanCommand;
 use crate::command::commands::config::ConfigCommand;
+use crate::command::commands::edit::EditCommand;
 use crate::command::commands::exec_prompt::ExecPromptCommand;
 use crate::command::commands::exec_workflow::ExecWorkflowCommand;
 use crate::command::commands::init::InitCommand;
 use crate::command::commands::new::NewCommand;
 use crate::command::commands::ready::ReadyCommand;
 use crate::command::commands::remote::RemoteCommand;
-use crate::command::commands::specs::SpecsCommand;
 use crate::command::commands::squad::commands::SquadCommand;
 use crate::command::dispatch::{BuildContext, BuiltCommand};
 use crate::command::error::CommandError;
@@ -81,10 +81,6 @@ pub fn attach(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     Ok(BuiltCommand::Attach(AttachCommand::from_input(ctx)?))
 }
 
-pub fn specs(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
-    Ok(BuiltCommand::Specs(SpecsCommand::from_input(ctx)?))
-}
-
 pub fn agents(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     Ok(BuiltCommand::Agents(AgentsCommand::from_input(ctx)?))
 }
@@ -133,6 +129,10 @@ pub fn remote(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
 
 pub fn new(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
     Ok(BuiltCommand::New(NewCommand::from_input(ctx)?))
+}
+
+pub fn edit(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::Edit(EditCommand::from_input(ctx)?))
 }
 
 pub fn clean(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {

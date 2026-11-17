@@ -13,7 +13,6 @@
 
 use crate::command::commands::agent_trust::{AgentTrustReview, TrustDecision};
 use crate::command::commands::agents::{AgentSnapshot, AgentSource, KillChoice};
-use crate::command::commands::specs::WorkItemKind;
 use crate::command::commands::squad::commands::{SquadConfirmDecision, TaskWorkspaceChoice};
 use crate::command::commands::workflow_prerequisites::{
     GapChoice, IdentityChoice, IdentityPersist, PrerequisiteReportNext, SshChoice, TokenConsent,
@@ -21,6 +20,7 @@ use crate::command::commands::workflow_prerequisites::{
 };
 use crate::command::dispatch::catalogue::{CommandCatalogue, FlagDefault};
 use crate::command::dispatch::frontend_action::FrontendAction;
+use crate::command::work_item::spec_service::WorkItemKind;
 use crate::data::fs::task_store::MountScope;
 use crate::data::prompt::{Choice, Prompt, TextPrompt};
 use crate::data::workflow_prerequisites::{PrerequisiteCheck, Remediation};
@@ -32,7 +32,7 @@ use crate::engine::workflow::actions::{
 };
 use std::path::{Path, PathBuf};
 
-/// Which kind of work item `awman new spec` / `awman specs` is creating.
+/// Which kind of work item `awman new spec` is creating.
 ///
 /// `default_on_dismiss` is `None`: abandoning the interview must not silently
 /// file a Task. The CLI's old `_ =>` fall-through did exactly that for any

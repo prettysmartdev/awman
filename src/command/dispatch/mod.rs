@@ -19,13 +19,13 @@ use crate::command::commands::clean::{CleanCommand, CleanCommandFrontend};
 use crate::command::commands::config::{ConfigCommand, ConfigCommandFrontend};
 use crate::command::commands::daemon::api::{DaemonApiCommand, DaemonApiCommandFrontend};
 use crate::command::commands::daemon::lifecycle::{DaemonCommand, DaemonCommandFrontend};
+use crate::command::commands::edit::{EditCommand, EditCommandFrontend};
 use crate::command::commands::exec_prompt::{ExecPromptCommand, ExecPromptCommandFrontend};
 use crate::command::commands::exec_workflow::{ExecWorkflowCommand, ExecWorkflowCommandFrontend};
 use crate::command::commands::init::{InitCommand, InitCommandFrontend};
 use crate::command::commands::new::{NewCommand, NewCommandFrontend};
 use crate::command::commands::ready::{ReadyCommand, ReadyCommandFrontend};
 use crate::command::commands::remote::{RemoteCommand, RemoteCommandFrontend};
-use crate::command::commands::specs::{SpecsCommand, SpecsCommandFrontend};
 use crate::command::commands::squad::attach::{SquadAttachCommand, SquadAttachFrontend};
 use crate::command::commands::squad::commands::{SquadCommand, SquadCommandFrontend};
 use crate::command::commands::squad::gateway::TaskGateway;
@@ -215,7 +215,7 @@ pub trait DispatchFrontend:
     + SquadAttachFrontend
     + RemoteCommandFrontend
     + NewCommandFrontend
-    + SpecsCommandFrontend
+    + EditCommandFrontend
     + CleanCommandFrontend
     + 'static
 {
@@ -238,7 +238,7 @@ impl<T> DispatchFrontend for T where
         + SquadAttachFrontend
         + RemoteCommandFrontend
         + NewCommandFrontend
-        + SpecsCommandFrontend
+        + EditCommandFrontend
         + CleanCommandFrontend
         + 'static
 {
@@ -254,7 +254,6 @@ pub enum BuiltCommand {
     Init(InitCommand),
     Ready(ReadyCommand),
     Chat(ChatCommand),
-    Specs(SpecsCommand),
     Agents(AgentsCommand),
     Config(ConfigCommand),
     WorkerLink(WorkerLinkCommand),
@@ -269,6 +268,7 @@ pub enum BuiltCommand {
     SquadAttach(SquadAttachCommand),
     Remote(RemoteCommand),
     New(NewCommand),
+    Edit(EditCommand),
     Clean(CleanCommand),
 }
 
@@ -1290,7 +1290,6 @@ impl BuiltCommand {
             Ready => ReadyCommandFrontend,
             Chat => ChatCommandFrontend,
             Attach => AttachCommandFrontend,
-            Specs => SpecsCommandFrontend,
             Agents => AgentsCommandFrontend,
             Config => ConfigCommandFrontend,
             WorkerLink => CommandFrontend,
@@ -1302,6 +1301,7 @@ impl BuiltCommand {
             SquadAttach => SquadAttachFrontend,
             Remote => RemoteCommandFrontend,
             New => NewCommandFrontend,
+            Edit => EditCommandFrontend,
             Clean => CleanCommandFrontend,
         })
     }

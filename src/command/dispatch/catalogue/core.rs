@@ -1,5 +1,5 @@
 //! The commands that operate on one repository: `clean`, `init`, `ready`,
-//! `chat`, `specs`, `config`.
+//! `chat`, `config`.
 //!
 //! Split out of `dispatch/catalogue.rs` by WI 0114 F-51. The specs are data;
 //! `ROOT` in `mod.rs` is what assembles them into the tree.
@@ -214,74 +214,6 @@ pub(super) const CHAT: CommandSpec = CommandSpec {
     opens_tui_when_bare: false,
     internal: false,
     relay_allowed: true,
-    subcommands: &[],
-};
-
-// ── specs ───────────────────────────────────────────────────────────────────
-
-pub(super) const SPECS: CommandSpec = CommandSpec {
-    name: "specs",
-    aliases: &[],
-    help: "Manage work item specs (amend).",
-    long_help: None,
-    arguments: &[],
-    flags: &[],
-    api_allowed: false,
-    build: crate::command::dispatch::build::unsupported,
-    gateway_need: GatewayNeed::None,
-    requires_container_tier: false,
-    requires_runtime: true,
-    opens_tui_when_bare: false,
-    internal: false,
-    relay_allowed: false,
-    subcommands: &[&SPECS_AMEND],
-};
-
-pub(super) const SPECS_AMEND: CommandSpec = CommandSpec {
-    name: "amend",
-    aliases: &[],
-    help: "Review and amend a completed work item to match the final implementation.",
-    long_help: None,
-    arguments: &[ArgumentSpec {
-        name: "work_item",
-        help: "Work item to amend: a number in the configured workItems.source, or any \
-               explicit --work-item form (local:<N>, a path, github:<N>, owner/repo#<N>, \
-               a URL, http:<provider>:<id>).",
-        kind: ArgumentKind::String,
-        optional: false,
-    }],
-    flags: &[
-        FlagSpec {
-            long: "headless",
-            short: Some('n'),
-            help: "Run the agent headless (print mode).",
-            kind: FlagKind::Bool,
-            default: FlagDefault::Bool(false),
-            frontends: FrontendVisibility::All,
-            conflicts_with: &[],
-            implies: &[],
-            optional: true,
-        },
-        FlagSpec {
-            long: "allow-docker",
-            short: None,
-            help: "Mount the host Docker daemon socket into the agent container.",
-            kind: FlagKind::Bool,
-            default: FlagDefault::Bool(false),
-            frontends: FrontendVisibility::All,
-            conflicts_with: &[],
-            implies: &[],
-            optional: true,
-        },
-    ],
-    api_allowed: false,
-    build: crate::command::dispatch::build::specs,
-    gateway_need: GatewayNeed::None,
-    requires_container_tier: false,
-    requires_runtime: true,
-    opens_tui_when_bare: false,
-    internal: false,
-    relay_allowed: false,
     subcommands: &[],
 };
 

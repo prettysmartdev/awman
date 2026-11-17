@@ -46,7 +46,7 @@ impl HasAgentFrontend for CliFrontend {
 impl ChatCommandFrontend for CliFrontend {}
 
 /// One `AgentLaunchFrontend` for the CLI: `chat`, `exec prompt`,
-/// `exec workflow` and `specs` all gated host stdio the same way before F-35.
+/// `exec workflow` and `new spec` all gated host stdio the same way before F-35.
 impl crate::command::commands::agent_setup::AgentLaunchFrontend for CliFrontend {
     fn set_pty_active(&mut self, active: bool) {
         self.messages.set_pty_active(active);

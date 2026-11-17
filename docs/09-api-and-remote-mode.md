@@ -361,6 +361,15 @@ awman exec workflow ./aspec/workflows/implement-feature.toml --work-item github:
 awman exec workflow ./aspec/workflows/review.toml --headless
 ```
 
+`awman edit` is also headless-capable. A headless edit needs `--prompt` (or `--amend`, which can run without one); `--interview` needs a terminal and conflicts with `--headless` and `--json`:
+
+```sh
+awman edit agent custom --headless --prompt "Correct the model setting"
+awman edit spec 42 --amend --headless --json
+```
+
+See [Editing existing artifacts](03-agent-sessions.md#editing-existing-artifacts).
+
 `exec workflow` and `exec wf` are identical — `wf` is a short alias.
 
 **Work item template variables:** When no `--work-item` is given, prompt templates that use `{{work_item_number}}`, `{{work_item_content}}`, or `{{work_item_section:[Name]}}` are left unexpanded with a warning:

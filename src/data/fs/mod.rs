@@ -21,6 +21,8 @@ pub mod daemon_paths;
 pub mod daemon_process;
 pub mod daemon_sidecar;
 pub mod data_paths;
+pub mod edit_stage;
+pub mod edit_target;
 pub mod git_metadata;
 pub mod hash;
 pub mod id_migration;

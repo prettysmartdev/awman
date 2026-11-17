@@ -1,5 +1,7 @@
-//! Prompt templates for `SpecsCommand` and `NewCommand`. Keep these literal
+//! Prompt templates for `NewCommand`; edit prompts live in [`edit`]. Keep these literal
 //! strings stable because they are shown to users and passed to agents.
+
+pub mod edit;
 
 /// Interview prompt for `new spec --interview`.
 ///
@@ -29,26 +31,10 @@ pub fn render_interview_prompt(path: &str, kind: &str, title: &str, summary: &st
     )
 }
 
-/// Amend prompt for `specs amend`. `{path}` is the container path of the
-/// markdown file to edit (see [`INTERVIEW_PROMPT`]).
-pub const AMEND_PROMPT: &str = "The work item \"{title}\" is complete. Its markdown is in the \
-file at {path}. Review the work that has been done in the codebase and compare it against that \
-file. If needed, amend the work item to ensure it matches the final implementation, ensuring \
-completeness and correctness. Only edit the work item markdown file at {path}. Re-read the file \
-immediately before each change, because the user may be editing it at the same time. Be concise \
-and prefer leaving existing text as-is unless it is factually incorrect. Add new details if \
-needed. Summarize the implementation and any corrections or changes that were needed to achieve \
-the desired result in a new `Agent implementation notes` section at the bottom of the file.";
-
-/// Build the amend prompt for the completed work item stored at `path`.
-pub fn render_amend_prompt(path: &str, title: &str) -> String {
-    render(AMEND_PROMPT, &[("{path}", path), ("{title}", title)])
-}
-
 /// Substitute every placeholder against the original template in one pass,
 /// so a title or summary containing `{summary}` (work item text is untrusted)
 /// is never expanded a second time.
-fn render(template: &str, values: &[(&str, &str)]) -> String {
+pub(crate) fn render(template: &str, values: &[(&str, &str)]) -> String {
     let mut out = String::with_capacity(template.len() + 256);
     let mut rest = template;
     'outer: while !rest.is_empty() {

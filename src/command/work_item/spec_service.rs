@@ -1,49 +1,38 @@
-//! `SpecsCommand` — `specs amend` — and the `new spec` body.
-//!
-//! Both commands work on local work item files and on remote work items
-//! (WI 0147). A local work item is edited in place in the checkout. A remote
-//! one is edited through a markdown draft in the `context(repo)` overlay,
-//! which awman uploads to the tracker while the agent runs and once more
-//! after it exits (`command::work_item::draft_sync`).
+//! Shared spec creation, work-item edit resolution and remote draft sessions.
+//! Frontends only supply questions and launch I/O; source selection and saving
+//! stay in these command-layer services.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::command::commands::launch_policy::LaunchPolicy;
-use crate::command::commands::prompt_templates::{render_amend_prompt, render_interview_prompt};
-use crate::command::commands::Command;
-use crate::command::dispatch::{BuildContext, Engines};
-use crate::command::error::CommandError;
-use crate::command::work_item::draft_sync::{DraftSync, DraftSyncMode, DraftSyncRequest};
-use crate::command::work_item::edit::{prepare_draft_edit, wait_with_draft_sync};
-use crate::command::work_item::{
+use super::draft_sync::{
+    DraftSync, DraftSyncError, DraftSyncMode, DraftSyncRequest, FinalDraftSyncOutcome,
+};
+use super::edit::{prepare_draft_edit, wait_with_draft_sync};
+use super::{
     ResolvedWorkItem, WorkItemCreationTarget, WorkItemError, WorkItemOrigin, WorkItemResolver,
 };
+use crate::command::commands::agent_setup::AgentLaunchFrontend;
+use crate::command::commands::launch_policy::agent_session::{
+    build_instance, resolve_agent, resolve_credentials, run_agent_session, AgentSessionError,
+    AgentSessionRequest,
+};
+use crate::command::commands::launch_policy::LaunchPolicy;
+use crate::command::commands::prompt_templates::render_interview_prompt;
+use crate::command::dispatch::Engines;
+use crate::command::error::CommandError;
 use crate::data::issue::Issue;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::prompt::Prompt;
 use crate::data::session::{AgentName, Session};
 use crate::engine::agent::AgentRunOptions;
-use crate::engine::agent_runtime::AgentInstance;
+use crate::engine::agent_runtime::AgentExitInfo;
 use crate::engine::auth::AgentCredentials;
-use crate::engine::container::options::ContainerOption;
+use crate::engine::error::EngineError;
 use crate::engine::issue::IssueSource;
-
-#[derive(Debug, Clone)]
-pub struct SpecsAmendFlags {
-    pub work_item: String,
-    pub non_interactive: bool,
-    pub allow_docker: bool,
-}
-
-#[derive(Debug, Clone)]
-pub enum SpecsSubcommand {
-    Amend(SpecsAmendFlags),
-}
 
 /// What `create_new_spec` produced: a local file (`created_path`), a remote
 /// work item (`created_url`, plus the provider's `number` when it has one),
@@ -54,19 +43,6 @@ pub struct NewSpecOutcome {
     pub created_path: Option<String>,
     pub created_url: Option<String>,
     pub number: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SpecsAmendOutcome {
-    pub work_item: String,
-    pub non_interactive: bool,
-    pub allow_docker: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", content = "payload")]
-pub enum SpecsOutcome {
-    Amend(SpecsAmendOutcome),
 }
 
 /// Work-item kinds accepted by the spec commands.
@@ -89,9 +65,8 @@ impl WorkItemKind {
     }
 }
 
-pub trait SpecsCommandFrontend:
-    UserMessageSink + crate::command::commands::agent_setup::AgentLaunchFrontend + Send + Sync
-{
+/// Questions used only by spec creation. Editing needs `AgentLaunchFrontend`.
+pub trait NewSpecFrontend: UserMessageSink + AgentLaunchFrontend + Send + Sync {
     /// Prompt the user for the title of the new spec. Returns the title text.
     /// CLI implementations gate this on `stdin_is_tty()` and fall back to a
     /// generated default when not a TTY.
@@ -126,168 +101,84 @@ pub trait SpecsCommandFrontend:
     }
 }
 
-pub struct SpecsCommand {
-    sub: SpecsSubcommand,
-    engines: Engines,
-    session: Session,
-    cancel: CancellationToken,
+/// An existing work item, resolved before launch. Remote draft seeds must use
+/// the raw `issue.body`; the title is supplied separately to the prompt.
+pub enum SpecEditTarget {
+    Local {
+        item: ResolvedWorkItem,
+        host_path: PathBuf,
+        container_path: String,
+    },
+    Remote {
+        item: ResolvedWorkItem,
+        issue: Issue,
+        source: Arc<dyn IssueSource>,
+        url: String,
+    },
 }
 
-impl SpecsCommand {
-    pub fn new(sub: SpecsSubcommand, engines: Engines, session: Session) -> Self {
-        Self {
-            sub,
-            engines,
-            session,
-            cancel: CancellationToken::new(),
+impl SpecEditTarget {
+    pub fn item(&self) -> &ResolvedWorkItem {
+        match self {
+            Self::Local { item, .. } | Self::Remote { item, .. } => item,
         }
     }
-
-    /// Let an external cancel stop the agent. The draft of a remote work item
-    /// is still uploaded once after the agent exits.
-    pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
-        self.cancel = token;
-        self
-    }
-
-    /// Construct from the catalogue-resolved input (WI 0113 F-10). `specs`
-    /// has one leaf today; the subcommand is still selected from the caller's
-    /// canonical path so a second one needs no new entry point.
-    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
-        let sub = match ctx.caller.leaf() {
-            "amend" => SpecsSubcommand::Amend(SpecsAmendFlags {
-                work_item: ctx.args.require("work_item")?,
-                non_interactive: ctx.flags.bool("headless"),
-                allow_docker: ctx.flags.bool("allow-docker"),
-            }),
-            _ => return Err(CommandError::unknown_command(&ctx.path())),
-        };
-        Ok(Self::new(sub, ctx.engines.clone(), ctx.session.clone())
-            .with_cancellation(ctx.cancel.clone()))
-    }
-
-    pub fn subcommand(&self) -> &SpecsSubcommand {
-        &self.sub
-    }
 }
 
-#[async_trait]
-impl Command for SpecsCommand {
-    type Frontend = Box<dyn SpecsCommandFrontend>;
-    type Outcome = SpecsOutcome;
-
-    async fn run_with_frontend(
-        self,
-        mut frontend: Self::Frontend,
-    ) -> Result<Self::Outcome, CommandError> {
-        let outcome = match self.sub {
-            SpecsSubcommand::Amend(f) => SpecsOutcome::Amend(
-                amend(
-                    &self.engines,
-                    &self.session,
-                    f,
-                    &self.cancel,
-                    frontend.as_mut(),
-                )
-                .await?,
-            ),
-        };
-        frontend.replay_queued();
-        Ok(outcome)
-    }
-}
-
-/// `specs amend <work_item>`: resolve the reference with the shared resolver
-/// (so `workItems.source` and the reference grammar apply), then edit the
-/// local file in place or the remote work item through a synced draft.
-async fn amend(
+/// Use the full shared reference grammar and the resolved item's own provider.
+/// Errors are reported once and never cause probing of another source.
+pub async fn resolve_spec_edit_target(
     engines: &Engines,
     session: &Session,
-    f: SpecsAmendFlags,
-    cancel: &CancellationToken,
-    frontend: &mut dyn SpecsCommandFrontend,
-) -> Result<SpecsAmendOutcome, CommandError> {
-    const LABEL: &str = "specs amend";
+    reference: &str,
+    label: &str,
+    frontend: &mut dyn AgentLaunchFrontend,
+) -> Result<SpecEditTarget, CommandError> {
     let resolver = WorkItemResolver::new(session.clone(), Arc::clone(&engines.git_engine));
-    let item = match resolver.resolve(Some(&f.work_item), &mut *frontend).await {
-        Ok(Some(item)) => item,
-        Ok(None) => return Err(report(frontend, LABEL, WorkItemError::MissingInput)),
-        Err(e) => return Err(report(frontend, LABEL, e)),
-    };
-    // Pick the provider before launching anything: an inline item, or a
-    // provider that is no longer configured, stops here.
-    let remote = match &item.origin {
-        WorkItemOrigin::Local { .. } => None,
+    let item = resolver
+        .resolve(Some(reference), frontend)
+        .await
+        .map_err(|e| report(frontend, label, e))?
+        .ok_or_else(|| report(frontend, label, WorkItemError::MissingInput))?;
+    match &item.origin {
+        WorkItemOrigin::Local { path } => {
+            let host_path = path.clone();
+            let container_path = Path::new("/workspace")
+                .join(super::resolver::repo_relative_display(
+                    session.git_root(),
+                    path,
+                ))
+                .display()
+                .to_string();
+            Ok(SpecEditTarget::Local {
+                item,
+                host_path,
+                container_path,
+            })
+        }
         WorkItemOrigin::Remote { .. } => {
             let source = resolver
                 .source_for(&item)
-                .map_err(|e| report(frontend, LABEL, e))?;
+                .map_err(|e| report(frontend, label, e))?;
             let issue = item
                 .issue
                 .clone()
-                .ok_or(WorkItemError::InlineNotEditable)
-                .map_err(|e| report(frontend, LABEL, e))?;
-            Some((source, issue))
-        }
-    };
-
-    let agent = resolve_agent(session, LABEL, frontend)?;
-    frontend.write_message(UserMessage {
-        level: MessageLevel::Info,
-        text: format!(
-            "{LABEL}: reviewing work item \"{}\" with agent '{}'",
-            item.title,
-            agent.as_str()
-        ),
-    });
-    let run_opts = AgentRunOptions {
-        non_interactive: f.non_interactive,
-        allow_docker: f.allow_docker,
-        ..Default::default()
-    };
-    match remote {
-        None => {
-            let path = local_container_path(session.git_root(), &item);
-            let prompt = render_amend_prompt(&path, &item.title);
-            run_local_agent(
-                engines, session, &agent, run_opts, None, prompt, LABEL, frontend,
-            )
-            .await?;
-        }
-        Some((source, issue)) => {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Info,
-                text: format!(
-                    "{LABEL}: work item {}",
-                    crate::data::issue::display_url(&issue.source_id)
-                ),
-            });
-            let seed = issue.body.clone();
-            let title = item.title.clone();
-            run_remote_edit(
-                engines,
-                session,
-                RemoteEdit {
-                    agent: &agent,
-                    run_opts,
-                    credentials: None,
-                    source,
-                    mode: DraftSyncMode::Amend { issue },
-                    seed,
-                    prompt: &|path| render_amend_prompt(path, &title),
-                    label: LABEL,
-                },
-                cancel,
-                frontend,
-            )
-            .await?;
+                .ok_or_else(|| report(frontend, label, WorkItemError::InlineNotEditable))?;
+            let url = crate::data::issue::display_url(&issue.source_id);
+            Ok(SpecEditTarget::Remote {
+                item,
+                issue,
+                source,
+                url,
+            })
         }
     }
-    Ok(SpecsAmendOutcome {
-        work_item: f.work_item,
-        non_interactive: f.non_interactive,
-        allow_docker: f.allow_docker,
-    })
+}
+
+pub struct RemoteSpecEditEnd {
+    pub execution: Result<AgentExitInfo, EngineError>,
+    pub sync: Result<FinalDraftSyncOutcome, DraftSyncError>,
+    pub draft_host_path: PathBuf,
 }
 
 /// `new spec` body. Resolves the creation target and the template, runs the
@@ -302,7 +193,7 @@ pub(crate) async fn create_new_spec(
     non_interactive: bool,
     work_item: Option<String>,
     cancel: &CancellationToken,
-    frontend: &mut dyn SpecsCommandFrontend,
+    frontend: &mut dyn NewSpecFrontend,
 ) -> Result<NewSpecOutcome, CommandError> {
     const LABEL: &str = "new spec";
     let git_root = session.git_root().to_path_buf();
@@ -340,7 +231,7 @@ pub(crate) async fn create_new_spec(
 
     // Where the new work item goes, and the seed it is created from. Both
     // are decided before any side effect: a seed that already lives in the
-    // target would be duplicated, so it is refused in favour of `specs amend`.
+    // target would be duplicated, so it is refused in favour of `edit spec`.
     let resolver = WorkItemResolver::new(session.clone(), Arc::clone(&engines.git_engine));
     let target = resolver
         .creation_target()
@@ -419,7 +310,7 @@ pub(crate) async fn create_new_spec(
             .map_err(|e| report_data(frontend, LABEL, "failed to write work item", e))?;
 
             if should_interview {
-                let agent = resolve_agent(&session, LABEL, frontend)?;
+                let agent = resolve_agent(&session, &None, LABEL, frontend)?;
                 let credentials = resolve_credentials(engines, &session, &agent, LABEL, frontend)?;
                 let path = Path::new("/workspace")
                     .join(crate::command::work_item::resolver::repo_relative_display(
@@ -477,7 +368,7 @@ pub(crate) async fn create_new_spec(
                 });
             }
             let created = if should_interview {
-                let agent = resolve_agent(&session, LABEL, frontend)?;
+                let agent = resolve_agent(&session, &None, LABEL, frontend)?;
                 let credentials = resolve_credentials(engines, &session, &agent, LABEL, frontend)?;
                 let run_opts = AgentRunOptions {
                     non_interactive,
@@ -488,7 +379,7 @@ pub(crate) async fn create_new_spec(
                 let created = run_remote_edit(
                     engines,
                     &session,
-                    RemoteEdit {
+                    RemoteSpecEdit {
                         agent: &agent,
                         run_opts,
                         credentials: Some(credentials),
@@ -552,7 +443,7 @@ async fn create_remote_now(
     source: Arc<dyn IssueSource>,
     title: &str,
     body: &str,
-    frontend: &mut dyn SpecsCommandFrontend,
+    frontend: &mut dyn NewSpecFrontend,
 ) -> Result<Issue, CommandError> {
     const LABEL: &str = "new spec";
     let git_root = session.git_root().to_path_buf();
@@ -594,7 +485,7 @@ async fn create_remote_now(
     Err(error)
 }
 
-fn announce_created(issue: &Issue, label: &str, frontend: &mut dyn SpecsCommandFrontend) {
+fn announce_created(issue: &Issue, label: &str, frontend: &mut dyn NewSpecFrontend) {
     let number = issue.number.map(|n| format!(" (#{n})")).unwrap_or_default();
     frontend.write_message(UserMessage {
         level: MessageLevel::Info,
@@ -602,20 +493,21 @@ fn announce_created(issue: &Issue, label: &str, frontend: &mut dyn SpecsCommandF
     });
 }
 
-/// Everything `run_remote_edit` needs besides the engines and frontend.
-struct RemoteEdit<'a> {
-    agent: &'a AgentName,
+/// Input to a remote draft session. Existing issues always use
+/// `DraftSyncMode::Update`; `Create` is reserved for `new spec` interviews.
+pub struct RemoteSpecEdit<'a> {
+    pub agent: &'a AgentName,
     /// The run's flags; the prompt and context overlays are filled in here.
-    run_opts: AgentRunOptions,
-    credentials: Option<AgentCredentials>,
-    source: Arc<dyn IssueSource>,
-    mode: DraftSyncMode,
-    /// The draft's initial content: the raw issue body, never
-    /// `format_as_markdown` (which would prepend another `# <title>`).
-    seed: String,
+    pub run_opts: AgentRunOptions,
+    pub credentials: Option<AgentCredentials>,
+    pub source: Arc<dyn IssueSource>,
+    pub mode: DraftSyncMode,
+    /// Initial creation content. Updates always take the raw body from the
+    /// issue in `mode`, never `format_as_markdown` (which adds a title heading).
+    pub seed: String,
     /// Renders the agent prompt from the draft's container path.
-    prompt: &'a (dyn Fn(&str) -> String + Sync),
-    label: &'static str,
+    pub prompt: &'a (dyn Fn(&str) -> String + Sync),
+    pub label: &'a str,
 }
 
 /// Edit a remote work item through a draft: write the draft into the
@@ -623,17 +515,32 @@ struct RemoteEdit<'a> {
 /// read-only), print its host path, launch the agent, sync the draft while it
 /// runs, and upload it once more after the agent exits however it exits.
 ///
-/// Returns the created or updated issue (`None` when an interview made no
-/// edit). A failed or paused sync keeps the draft, prints its path and fails
-/// the command; on success the draft is deleted.
-async fn run_remote_edit(
+/// `Err` means nothing ran and the unused draft was removed (or a cleanup
+/// warning names it). Once the agent runs, returns execution and sync results
+/// separately so the caller can report both failures. Failed or paused sync
+/// retains the draft; successful sync removes it, including a no-op.
+pub async fn run_remote_spec_edit(
     engines: &Engines,
     session: &Session,
-    edit: RemoteEdit<'_>,
+    edit: RemoteSpecEdit<'_>,
     cancel: &CancellationToken,
-    frontend: &mut dyn SpecsCommandFrontend,
-) -> Result<Option<Issue>, CommandError> {
-    let RemoteEdit {
+    frontend: &mut dyn AgentLaunchFrontend,
+) -> Result<RemoteSpecEditEnd, CommandError> {
+    run_remote_spec_edit_with_overlays(engines, session, edit, Vec::new(), cancel, frontend).await
+}
+
+/// Like `run_remote_spec_edit`, including explicit command overlays in repo
+/// context selection and permission checks. Already resolved mounts alone lose
+/// the context key, so edit callers pass the parsed `--overlay` values here.
+pub async fn run_remote_spec_edit_with_overlays(
+    engines: &Engines,
+    session: &Session,
+    edit: RemoteSpecEdit<'_>,
+    overlays: Vec<crate::data::config::overlays::TypedOverlay>,
+    cancel: &CancellationToken,
+    frontend: &mut dyn AgentLaunchFrontend,
+) -> Result<RemoteSpecEditEnd, CommandError> {
+    let RemoteSpecEdit {
         agent,
         mut run_opts,
         credentials,
@@ -651,12 +558,16 @@ async fn run_remote_edit(
     let origin_url = engines.git_engine.remote_effective_url(&git_root, "origin");
     let mut collected = session
         .effective_config()
-        .collected_overlays(Vec::new(), None, None)?;
+        .collected_overlays(overlays, None, None)?;
+    let seed = match &mode {
+        DraftSyncMode::Update { issue } => &issue.body,
+        DraftSyncMode::Create { .. } => &seed,
+    };
     let prepared = prepare_draft_edit(
         session,
         origin_url.as_deref(),
         &mut collected,
-        &seed,
+        seed,
         &mut *frontend,
     )
     .map_err(|e| report(frontend, label, e))?;
@@ -667,7 +578,7 @@ async fn run_remote_edit(
     // the seed (a copy of the issue body), so a failure deletes it rather
     // than leaving private issue text in the context directory.
     let discard_draft = |draft: crate::data::fs::work_item_draft::WorkItemDraft,
-                         frontend: &mut dyn SpecsCommandFrontend,
+                         frontend: &mut dyn AgentLaunchFrontend,
                          error: CommandError| {
         if let Err(e) = draft.remove() {
             frontend.write_message(UserMessage {
@@ -698,10 +609,12 @@ async fn run_remote_edit(
                 build_instance(
                     engines,
                     session,
-                    agent,
-                    &run_opts,
-                    credentials,
-                    label,
+                    &AgentSessionRequest {
+                        label,
+                        agent,
+                        run_opts,
+                        credentials,
+                    },
                     frontend,
                 )
             }
@@ -746,7 +659,55 @@ async fn run_remote_edit(
     frontend.set_pty_active(false);
     frontend.replay_queued();
 
-    // The helper already printed a sync error with the draft's path.
+    Ok(RemoteSpecEditEnd {
+        execution: outcome.execution,
+        sync: outcome.sync,
+        draft_host_path: host_path,
+    })
+}
+/// Compatibility behavior for local creation interviews: wait errors and
+/// nonzero exits have historically been ignored, and cancellation is not wired.
+#[allow(clippy::too_many_arguments)]
+async fn run_local_agent(
+    engines: &Engines,
+    session: &Session,
+    agent: &AgentName,
+    mut run_opts: AgentRunOptions,
+    credentials: Option<AgentCredentials>,
+    prompt: String,
+    label: &str,
+    frontend: &mut dyn NewSpecFrontend,
+) -> Result<(), CommandError> {
+    run_opts.initial_prompt = Some(prompt);
+    match run_agent_session(
+        engines,
+        session,
+        AgentSessionRequest {
+            label,
+            agent,
+            run_opts,
+            credentials,
+        },
+        &CancellationToken::new(),
+        frontend,
+    )
+    .await
+    {
+        Err(AgentSessionError::Launch(error)) => Err(error),
+        Ok(_) | Err(AgentSessionError::Wait(_)) => Ok(()),
+    }
+}
+
+/// Creation retains the legacy error precedence: sync, wait, then exit status.
+async fn run_remote_edit(
+    engines: &Engines,
+    session: &Session,
+    edit: RemoteSpecEdit<'_>,
+    cancel: &CancellationToken,
+    frontend: &mut dyn NewSpecFrontend,
+) -> Result<Option<Issue>, CommandError> {
+    let label = edit.label;
+    let outcome = run_remote_spec_edit(engines, session, edit, cancel, frontend).await?;
     let synced = outcome.sync.map_err(CommandError::DraftSync)?;
     match outcome.execution {
         Err(e) => Err(CommandError::from(e)),
@@ -758,160 +719,8 @@ async fn run_remote_edit(
     }
 }
 
-/// Launch the agent on a local work item file and wait for it. Today's
-/// behaviour: the agent's exit status does not fail the command.
-#[allow(clippy::too_many_arguments)]
-async fn run_local_agent(
-    engines: &Engines,
-    session: &Session,
-    agent: &AgentName,
-    mut run_opts: AgentRunOptions,
-    credentials: Option<AgentCredentials>,
-    prompt: String,
-    label: &'static str,
-    frontend: &mut dyn SpecsCommandFrontend,
-) -> Result<(), CommandError> {
-    // Sandbox-class runtimes: agent spawn lands in WI 0090.
-    engines
-        .require_container_runtime()
-        .map_err(CommandError::from)?;
-    run_opts.initial_prompt = Some(prompt);
-    let instance = build_instance(
-        engines,
-        session,
-        agent,
-        &run_opts,
-        credentials,
-        label,
-        frontend,
-    )?;
-    frontend.write_message(UserMessage {
-        level: MessageLevel::Info,
-        text: "Launching agent container…".into(),
-    });
-    frontend.set_pty_active(true);
-    let cf = frontend.container_frontend_for_pty();
-    let mut execution = match instance.run_with_frontend(cf) {
-        Ok(e) => e,
-        Err(e) => {
-            frontend.set_pty_active(false);
-            frontend.replay_queued();
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Error,
-                text: format!("{label}: failed to run container: {e}"),
-            });
-            return Err(CommandError::from(e));
-        }
-    };
-    let _ = execution.wait().await;
-    frontend.set_pty_active(false);
-    frontend.replay_queued();
-    Ok(())
-}
-
-/// Build the agent's container instance. `credentials` are resolved by the
-/// caller (`new spec`); `specs amend` launches without them, as before.
-fn build_instance(
-    engines: &Engines,
-    session: &Session,
-    agent: &AgentName,
-    run_opts: &AgentRunOptions,
-    credentials: Option<AgentCredentials>,
-    label: &str,
-    frontend: &mut dyn SpecsCommandFrontend,
-) -> Result<Box<dyn AgentInstance>, CommandError> {
-    let built = match &credentials {
-        Some(credentials) => engines.agent_engine.build_options_with_credentials(
-            session,
-            agent,
-            run_opts,
-            credentials,
-        ),
-        None => engines.agent_engine.build_options(session, agent, run_opts),
-    };
-    let mut options = match built {
-        Ok(o) => o,
-        Err(e) => {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Error,
-                text: format!("{label}: failed to build agent options: {e}"),
-            });
-            return Err(CommandError::from(e));
-        }
-    };
-    if let Some(credentials) = credentials {
-        if !credentials.env_vars.is_empty()
-            && matches!(
-                credentials.delivery,
-                crate::engine::auth::CredentialDelivery::Env
-            )
-        {
-            options.push(ContainerOption::AgentCredentials {
-                env_vars: credentials.env_vars,
-            });
-        }
-    }
-    crate::engine::agent_runtime::ResolvedAgentOptions::container(options)
-        .and_then(|o| engines.runtime.build(o))
-        .map_err(|e| {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Error,
-                text: format!("{label}: failed to build container instance: {e}"),
-            });
-            CommandError::from(e)
-        })
-}
-
-fn resolve_agent(
-    session: &Session,
-    label: &str,
-    frontend: &mut dyn SpecsCommandFrontend,
-) -> Result<AgentName, CommandError> {
-    LaunchPolicy::for_session(session)
-        .resolve_agent(&None)
-        .inspect_err(|e| {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Error,
-                text: format!("{label}: failed to resolve agent: {e}"),
-            });
-        })
-}
-
-fn resolve_credentials(
-    engines: &Engines,
-    session: &Session,
-    agent: &AgentName,
-    label: &str,
-    frontend: &mut dyn SpecsCommandFrontend,
-) -> Result<AgentCredentials, CommandError> {
-    engines
-        .auth_engine
-        .resolve_agent_auth(session, agent)
-        .map_err(|e| {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Error,
-                text: format!("{label}: failed to resolve agent auth: {e}"),
-            });
-            CommandError::from(e)
-        })
-}
-
-/// The container path of a local work item file (the checkout is mounted at
-/// `/workspace`).
-fn local_container_path(git_root: &Path, item: &ResolvedWorkItem) -> String {
-    match &item.origin {
-        WorkItemOrigin::Local { path } => Path::new("/workspace")
-            .join(crate::command::work_item::resolver::repo_relative_display(
-                git_root, path,
-            ))
-            .display()
-            .to_string(),
-        WorkItemOrigin::Remote { .. } => String::new(),
-    }
-}
-
 fn report(
-    frontend: &mut dyn SpecsCommandFrontend,
+    frontend: &mut dyn AgentLaunchFrontend,
     label: &str,
     error: WorkItemError,
 ) -> CommandError {
@@ -923,7 +732,7 @@ fn report(
 }
 
 fn report_data(
-    frontend: &mut dyn SpecsCommandFrontend,
+    frontend: &mut dyn AgentLaunchFrontend,
     label: &str,
     what: &str,
     error: crate::data::error::DataError,

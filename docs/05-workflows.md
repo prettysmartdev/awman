@@ -96,6 +96,16 @@ Enter a one-paragraph summary of what the workflow should accomplish. A code age
 
 In the TUI, the dialog switches to a two-field layout: workflow name and summary. Press **Ctrl-Enter** to start the interview agent.
 
+### Editing a workflow
+
+```sh
+awman edit workflow release --interview             # the agent asks what you want to change, then edits
+awman edit workflow release --amend                 # reconcile the workflow with the commands and files it references
+awman edit workflow release --global --prompt "Add a lint step before tests"
+```
+
+`awman edit workflow <name-or-path>` changes an existing workflow; it never creates one. Repo workflows are edited in place and keep their format (a `.yaml` workflow stays YAML); global workflows are edited on a staged copy that awman validates and publishes back to `~/.awman/workflows/`. A workflow that no longer parses after the edit is left as written, with the problems listed, so you can run the edit again to repair it. See [Editing existing artifacts](03-agent-sessions.md#editing-existing-artifacts) for target selection, saving, and recovery.
+
 ### Global workflows
 
 ```sh

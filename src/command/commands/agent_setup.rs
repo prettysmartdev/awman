@@ -105,7 +105,7 @@ impl<F: ?Sized + HasAgentFrontend> crate::engine::agent::AgentImageFrontend
 
 /// The surface every command that launches an agent needs from its frontend.
 ///
-/// `chat`, `exec prompt`, `exec workflow` and `specs` each declared the same
+/// `chat`, `exec prompt`, `exec workflow` and `new spec` each declared the same
 /// mount-scope / agent-setup / agent-auth / container-frontend bounds plus
 /// their own copy of `set_pty_active` and `set_stuck_sender`. This trait is
 /// that shared surface, declared once (F-35).
@@ -120,7 +120,7 @@ pub trait AgentLaunchFrontend:
     /// container (`true`) or has been released (`false`).
     ///
     /// **Required, with no default.** The two frontends that previously took
-    /// the no-op default — `SpecsCommandFrontend` and
+    /// the no-op default — `NewSpecFrontend` and
     /// `ExecPromptCommandFrontend` — were the CLI and API, and both already
     /// had a real implementation through their `chat` / `exec workflow` impls;
     /// the default only ever hid the fact that the same type answered the same
@@ -154,7 +154,7 @@ pub trait AgentLaunchFrontend:
 /// An agent frontend that binds no I/O and reports nothing.
 ///
 /// For frontends that satisfy [`AgentLaunchFrontend`] only to be dispatchable
-/// and never actually launch a container — the `new`/`specs` test fakes, for
+/// and never actually launch a container — the `new`/`edit` test fakes, for
 /// instance. Anything that really runs an agent must hand back a real sink.
 pub struct NullAgentFrontend;
 

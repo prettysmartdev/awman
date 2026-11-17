@@ -3,7 +3,7 @@
 awman treats GitHub issues as work items through the shared `--work-item`
 option and the `workItems.source` setting. You can use an issue as input for
 `exec prompt` or a workflow, create a new issue with `new spec`, and edit an
-existing issue with `specs amend`. A separate `--pr` option on `chat` and
+existing issue with `edit spec`. A separate `--pr` option on `chat` and
 `exec prompt` opens a pull request in a worktree; see
 [Pull requests for `--pr`](#pull-requests-for---pr).
 
@@ -90,19 +90,27 @@ close it if you do not intend to finish it.
 You can also seed a new spec from an existing GitHub issue by passing its
 reference with `--work-item` while the configured creation target is local or
 another provider. If the seed is already in the configured target, awman
-refuses to duplicate it and suggests `awman specs amend <ref>` instead.
+refuses to duplicate it and suggests `awman edit spec <ref> --amend` instead.
 
-## Amend an existing issue
+## Edit an existing issue
 
 ```sh
-awman specs amend github:84
+awman edit spec github:84 --amend --interview
+awman edit spec github:84 --prompt "Add an acceptance criterion for retries"
 ```
 
 The issue's current title and raw body seed an editable draft. awman prints the
-issue URL and draft path before the agent starts, then publishes edits while
-the agent runs. If you abandon an amend, the issue may contain a partial
-update; use the reported URL to review it and close the issue if it should not
-remain open. A failed upload keeps the draft path available for recovery. awman retries a
+issue URL and draft path before the agent starts, then saves edits to the issue
+*while the agent runs*. Because changes are saved during execution, cancelling
+is not a rollback: whatever was already uploaded stays on the issue. If you stop
+an edit part-way, review the reported URL and restore or close the issue as
+needed. The issue always ends with the final draft: if the draft is changed back
+to the original body after an intermediate save, that restore is uploaded too.
+`--amend` asks the agent to reconcile the issue with the code that was
+written, and `--interview` has it question you first; see
+[Editing existing artifacts](03-agent-sessions.md#editing-existing-artifacts).
+A failed upload keeps the draft path available for recovery, and the error
+reports the agent result and the upload result separately. awman retries a
 failed upload after one second, then waits twice as long after each further
 failure, up to five minutes; a successful upload resets the delay. If the agent
 cannot be launched at all, the unedited draft is deleted.
