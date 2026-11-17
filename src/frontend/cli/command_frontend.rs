@@ -17,11 +17,12 @@ use std::sync::Arc;
 use clap::ArgMatches;
 
 use crate::command::commands::{
-    config::ConfigCommandFrontend,
-    new::NewCommandFrontend,
+    config::ConfigCommandFrontend, edit::EditCommandFrontend, new::NewCommandFrontend,
     remote::RemoteCommandFrontend,
-    specs::{SpecsCommandFrontend, WorkItemKind},
 };
+use crate::command::work_item::spec_service::{NewSpecFrontend, WorkItemKind};
+
+impl EditCommandFrontend for CliFrontend {}
 use crate::command::dispatch::catalogue::{ArgumentKind, CommandCatalogue, FlagKind};
 use crate::command::dispatch::resolved::ResolvedFlags;
 use crate::command::dispatch::CommandFrontend;
@@ -898,7 +899,7 @@ impl RemoteCommandFrontend for CliFrontend {
         });
     }
 }
-impl SpecsCommandFrontend for CliFrontend {
+impl NewSpecFrontend for CliFrontend {
     /// Prints `prompt`'s own choices and maps the answer back through it —
     /// the labels and hotkeys are Layer 2's (F-19). The CLI used to print its
     /// own list and accept word aliases (`feature`, `bug`) the TUI did not,

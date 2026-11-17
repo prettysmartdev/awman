@@ -116,6 +116,11 @@ slow-timeout = { period = "1s", terminate-after = 20 }
 filter = "package(=awman-cli) & binary(=component) & (test(/^command::differential::/))"
 slow-timeout = { period = "1s", terminate-after = 20 }
 
+# component-command-edit-artifacts
+[[profile.default.overrides]]
+filter = "package(=awman-cli) & binary(=component) & (test(/^command::edit_artifacts::/))"
+slow-timeout = { period = "1s", terminate-after = 20 }
+
 # component-command-models
 [[profile.default.overrides]]
 filter = "package(=awman-cli) & binary(=component) & (test(/^command::models::/))"

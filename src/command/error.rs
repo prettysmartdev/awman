@@ -14,6 +14,8 @@ use crate::engine::error::EngineError;
 #[derive(Debug, Error)]
 pub enum CommandError {
     #[error(transparent)]
+    Edit(#[from] crate::command::commands::edit::EditError),
+    #[error(transparent)]
     Engine(EngineError),
 
     #[error(transparent)]
@@ -453,6 +455,7 @@ impl CommandError {
     pub fn exit_code(&self) -> u8 {
         match self {
         CommandError::Aborted => 130,
+        CommandError::Edit(_) => 1,
         CommandError::WorkItem(e) => e.exit_code(),
         CommandError::DraftSync(_) => 1,
         CommandError::DaemonHttpStatus { status: 404, .. } => 4,
@@ -619,6 +622,7 @@ impl CommandError {
             CommandError::CommandSecretsLost => PREFLIGHT,
             CommandError::WorkItem(_) => PREFLIGHT,
             CommandError::DraftSync(_) => STEP,
+            CommandError::Edit(_) => STEP,
 
             CommandError::MergeConflict { .. } | CommandError::MergeTargetDirty { .. } => MERGE,
 
@@ -768,6 +772,7 @@ impl CommandError {
             CommandError::RemoteSessionKillFailed { .. } => "remote_session_kill_failed",
 
             CommandError::WorkItem(e) => e.code(),
+            CommandError::Edit(_) => "edit_failed",
             CommandError::DraftSync(_) => "work_item_sync_failed",
             CommandError::WorkItemNotFound { .. } => "work_item_not_found",
             CommandError::SpecTemplateMissing { .. } => "spec_template_missing",

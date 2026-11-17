@@ -4,7 +4,7 @@ Title: spec commands upgrade
 Issue: issuelink
 
 ## Summary:
-- move spec related commands under `specs` subcommand, add `interview` mode to `specs new`, add `specs amend`.
+- move spec related commands under `specs` subcommand, add `interview` mode to `specs new`, add `edit spec --amend`.
 
 ## User Stories
 
@@ -35,7 +35,7 @@ Summary:
 
 - add `Enhancement` to the list of work item types that can be chosen
 
-- add a net-new subcommand, `amux specs amend <NNNN>`, which uses a code agent to review the final implementation of a work item and ensure the work item remains up to date.
+- add a net-new subcommand, `amux edit spec <NNNN> --amend`, which uses a code agent to review the final implementation of a work item and ensure the work item remains up to date.
 	- the `amend` subcommand launches a code agent container, similar to `implement`, with the following prompt:
 
 "Work item {number} is complete. Review the work that has been done in the codebase and compare it against the work item markdown file. If needed, amend the work item to ensure it matches the final implementation, ensuring completeness and correctness. Only edit the work item markdown file. Be concise and prefer leaving existing text as-is unless it is factually incorrect. Add new details if needed. Summarize the implementation and any corrections or changes that were needed to achieve the desired result in a new `Agent implementation notes` section at the bottom of the file."
@@ -63,7 +63,7 @@ All three features were implemented as specified:
 
 2. **`specs new --interview`** — Implemented in `src/commands/specs.rs` (`run_new_with_sink`). Creates the file first via `create_file_return_number` (extracted from `new.rs`), then prompts for a summary, then launches the agent container with `INTERVIEW_PROMPT_TEMPLATE`. After the agent exits, opens the file in VS Code if applicable.
 
-3. **`specs amend <NNNN>`** — Implemented in `src/commands/specs.rs` (`run_amend` / `run_with_sink_amend`). Launches an agent container with `AMEND_PROMPT_TEMPLATE`, supporting `--non-interactive` and `--allow-docker` flags, matching `implement` behaviour.
+3. **`edit spec <NNNN> --amend`** — Implemented in `src/commands/specs.rs` (`run_amend` / `run_with_sink_amend`). Launches an agent container with `AMEND_PROMPT_TEMPLATE`, supporting `--non-interactive` and `--allow-docker` flags, matching `implement` behaviour.
 
 4. **`Enhancement` work item type** — Added to `WorkItemKind` enum in `src/commands/new.rs`, with `from_str` shortcuts `"enhancement"`, `"e"`, and `"4"`.
 

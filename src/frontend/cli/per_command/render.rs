@@ -13,6 +13,7 @@ use crate::command::commands::chat::ChatOutcome;
 use crate::command::commands::config::{
     ConfigGetOutcome, ConfigOutcome, ConfigSetOutcome, ConfigShowOutcome,
 };
+use crate::command::commands::edit::EditOutcome;
 use crate::command::commands::exec_prompt::ExecPromptOutcome;
 use crate::command::commands::exec_workflow::ExecWorkflowOutcome;
 use crate::command::commands::init::InitOutcome;
@@ -23,7 +24,6 @@ use crate::command::commands::ready::ReadyOutcome;
 use crate::command::commands::remote::{
     RemoteExecOutcome, RemoteOutcome, RemoteSessionKillOutcome, RemoteSessionStartOutcome,
 };
-use crate::command::commands::specs::{SpecsAmendOutcome, SpecsOutcome};
 use crate::command::CommandOutcome;
 use crate::frontend::render_helpers::format_table;
 
@@ -85,7 +85,7 @@ pub fn render(outcome: &CommandOutcome, json: bool) -> Option<String> {
         CommandOutcome::DaemonApi(o) => Some(super::daemon::render_api(o, json)),
         CommandOutcome::Remote(o) => render_remote(o),
         CommandOutcome::New(o) => render_new(o),
-        CommandOutcome::Specs(o) => render_specs(o),
+        CommandOutcome::Edit(o) => render_edit(o, json),
         CommandOutcome::Clean(o) => render_clean(o),
         CommandOutcome::Squad(o) => super::squad::render_squad(o, json),
         CommandOutcome::SquadAttach(_) => None,
@@ -354,16 +354,10 @@ fn render_new_skill(o: &NewSkillOutcome) -> Option<String> {
     })
 }
 
-// ─── specs / auth / download ─────────────────────────────────────────────────
+// ─── edit ───────────────────────────────────────────────────────────────────
 
-fn render_specs(o: &SpecsOutcome) -> Option<String> {
-    match o {
-        SpecsOutcome::Amend(a) => Some(render_specs_amend(a)),
-    }
-}
-
-fn render_specs_amend(o: &SpecsAmendOutcome) -> String {
-    format!("Amended work item {}.", o.work_item)
+fn render_edit(o: &EditOutcome, json: bool) -> Option<String> {
+    Some(if json { to_json(o) } else { o.render() })
 }
 
 // ─── tests ───────────────────────────────────────────────────────────────────

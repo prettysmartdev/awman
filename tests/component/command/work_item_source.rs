@@ -660,7 +660,7 @@ async fn seeding_refuses_items_already_in_the_creation_target() {
         .ensure_new_in_target(&existing, &target)
         .unwrap_err();
     assert!(matches!(err, WorkItemError::AlreadyExists { .. }), "{err}");
-    assert!(err.to_string().contains("specs amend"), "{err}");
+    assert!(err.to_string().contains("edit spec"), "{err}");
     let elsewhere = w.resolve("docs/notes.md").await.unwrap();
     resolver.ensure_new_in_target(&elsewhere, &target).unwrap();
     let issue = w.resolve("github:7").await.unwrap();

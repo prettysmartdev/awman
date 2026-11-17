@@ -104,7 +104,7 @@ impl crate::engine::agent::AgentImageFrontend for InstanceCommandFrontend {
 }
 
 /// One `AgentLaunchFrontend` for the TUI: `chat`, `exec prompt`,
-/// `exec workflow` and `specs` all shared these two methods with identical
+/// `exec workflow` and `new spec` all shared these two methods with identical
 /// bodies before F-35.
 impl crate::command::commands::agent_setup::AgentLaunchFrontend for InstanceCommandFrontend {
     fn set_pty_active(&mut self, active: bool) {

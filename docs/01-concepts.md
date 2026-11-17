@@ -45,11 +45,11 @@ Permission levels apply across modes: default (agent asks), `--plan` (read-only)
 
 `aspec/` is an optional folder of Markdown specs describing your project to agents — purpose, architecture, security constraints, conventions. With it, agents make decisions consistent with your codebase instead of guessing.
 
-A **work item** is one numbered Markdown file (`0001-add-auth.md`) describing a feature, bug, task, or enhancement in enough detail for an agent to implement, test, and document it. Create them with `awman new spec` (add `--interview` to have an agent draft the spec from a summary), point awman at a custom directory with `awman config set work_items.dir <path>`, and execute them through workflows (`awman exec workflow <file> --work-item 0001`). After implementation, `awman specs amend 0001` updates the spec to match what was actually built.
+A **work item** is one numbered Markdown file (`0001-add-auth.md`) describing a feature, bug, task, or enhancement in enough detail for an agent to implement, test, and document it. Create them with `awman new spec` (add `--interview` to have an agent draft the spec from a summary), point awman at a custom directory with `awman config set work_items.dir <path>`, and execute them through workflows (`awman exec workflow <file> --work-item 0001`). Change an existing one with `awman edit spec 0001` (add `--amend` to have the agent update it to match what was actually built, `--interview` to be questioned first).
 
 ## Workflows
 
-A workflow is a TOML (or YAML) file describing a multi-step agent run: optional setup steps (clone, branch, shell), a DAG of prompt steps with per-step agent/model overrides, and teardown steps (commit, push, open a PR, poll CI). Workflows live in `.awman/workflows/` (repo) or `~/.awman/workflows/` (personal, via `--global`), and are created by hand, interactively, or by an agent with `awman new workflow --interview`. See [Workflows](05-workflows.md).
+A workflow is a TOML (or YAML) file describing a multi-step agent run: optional setup steps (clone, branch, shell), a DAG of prompt steps with per-step agent/model overrides, and teardown steps (commit, push, open a PR, poll CI). Workflows live in `.awman/workflows/` (repo) or `~/.awman/workflows/` (personal, via `--global`), and are created by hand, interactively, or by an agent with `awman new workflow --interview`. Change one later with `awman edit workflow <name>`. See [Workflows](05-workflows.md).
 
 ## Overlays
 
@@ -83,7 +83,7 @@ Two JSON files: `<git root>/.awman/config.json` (per-repo, committed) and `~/.aw
 | `awman exec workflow` | Run a workflow file | [05](05-workflows.md) |
 | `awman new spec\|workflow\|skill` | Create artefacts | [03](03-agent-sessions.md), [05](05-workflows.md) |
 | `awman new agent` | Define a custom agent type | [15](15-custom-agents.md) |
-| `awman specs amend <N>` | Sync a spec with the implementation | [03](03-agent-sessions.md) |
+| `awman edit spec\|workflow\|skill\|agent <ref>` | Change an existing artifact; `--amend` reconciles it with reality, `--interview` asks you first | [03](03-agent-sessions.md#editing-existing-artifacts) |
 | `awman agents status` | Show running agents; add `--watch` to refresh continuously | [03](03-agent-sessions.md) |
 | `awman agents list` (`ps`, `ls`) | List agents; `--all` includes stopped agents eligible for cleanup | [03](03-agent-sessions.md) |
 | `awman agents detail` (`inspect`) | Show an agent's identity, lifecycle, resources, and runtime details | [03](03-agent-sessions.md) |

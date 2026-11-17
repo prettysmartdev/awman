@@ -95,7 +95,7 @@ Delete every file and reference related to `claws`. This is the largest change.
 
 ## Edge Case Considerations:
 
-- **`specs amend` is unaffected** — only `specs new` (alias) is removed; `specs amend` remains. The `SpecsCommand` struct, its `Amend` arm, and all amend-related types stay.
+- **Spec amendment is unaffected** — only `specs new` (alias) is removed; amendment of an existing work item remains. (Superseded: amendment is now `edit spec <ref> --amend`, and the `specs` command group and its types have since been removed entirely.)
 - **`new spec` continues to work** — the canonical `new spec` command is untouched. `create_new_spec`, `next_work_item_number`, `apply_work_item_template`, `slugify`, and the `SpecsCommandFrontend` trait all remain in `specs.rs` because `NewCommand` calls into them.
 - **`implement_prompts` shared usage** — `render_interview_prompt` and `render_amend_prompt` are called by `specs.rs`; do not delete the module. Only remove `render_default_prompt` if it was exclusively used by the `implement` command.
 - **TUI tab state** — if the TUI hard-codes a claws/nanoclaw tab index or purple tab color in its tab bar, removing it may shift the indices of other tabs. Audit `tabs.rs` and any tab-index constants to ensure the remaining tabs re-index cleanly.
@@ -108,7 +108,7 @@ Delete every file and reference related to `claws`. This is the largest change.
 
 - **Dispatch tests**: After removing the `["specs", "new"]` arm, the `["claws", ...]` arm, and the `["implement"]` arm from dispatch, run `make test` to confirm no remaining dispatch tests reference those paths.
 - **Catalogue tests**: Verify the catalogue no longer advertises `specs new`, `implement`, or `claws` subcommands. If there are catalogue snapshot tests or help-text golden files, update them.
-- **`SpecsCommand` unit tests**: The existing `specs_new_*` tests in `specs.rs` exercise `SpecsSubcommand::New` directly and must be removed. The `specs_amend_*` tests must be kept. The `create_new_spec` function is still exercised indirectly through `NewCommand` tests elsewhere.
+- **`SpecsCommand` unit tests**: The existing `specs_new_*` tests in `specs.rs` exercise `SpecsSubcommand::New` directly and must be removed. (Superseded: the remaining `specs` types and their tests have since been removed; amendment is covered through `edit spec --amend`.) The `create_new_spec` function is still exercised indirectly through `NewCommand` tests elsewhere.
 - **Compile-time check**: The primary correctness gate for a deletion work item is a clean `make all`. After each deletion step, confirm the build passes before moving to the next step.
 - **Frontend smoke tests**: If any integration or end-to-end tests invoke `implement` or `claws` commands against a real or mock dispatch, update or delete those tests.
 - **No new tests needed**: This is a pure deletion. The goal is a green build and test suite with no references to the removed commands.

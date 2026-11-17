@@ -22,7 +22,7 @@ pub const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(300);
 
 pub enum DraftSyncMode {
     Create { title: String },
-    Amend { issue: Issue },
+    Update { issue: Issue },
 }
 
 pub struct DraftSyncRequest {
@@ -147,6 +147,13 @@ pub struct DraftSyncState {
     failures: u32,
     in_flight: Option<String>,
     pause: Option<SyncPauseReason>,
+    /// Set once this session has had an upload acknowledged.
+    acknowledged: bool,
+    /// Updating an existing issue: once an upload has been acknowledged the
+    /// tracker no longer holds the seed, so restoring the seed is a real
+    /// change that must be sent. (Creation keeps its rule that the untouched
+    /// seed is never published.)
+    seed_reverts_publish: bool,
 }
 
 impl DraftSyncState {
@@ -163,12 +170,24 @@ impl DraftSyncState {
             failures: 0,
             in_flight: None,
             pause: None,
+            acknowledged: false,
+            seed_reverts_publish: false,
+        }
+    }
+
+    /// The state for an existing-issue update session; see `seed_reverts_publish`.
+    pub fn for_update(seed_hash: String, last_uploaded_hash: Option<String>) -> Self {
+        Self {
+            seed_reverts_publish: true,
+            ..Self::new(seed_hash, last_uploaded_hash)
         }
     }
 
     fn pending(&self) -> bool {
         self.latest.as_ref().is_some_and(|v| {
-            !v.empty && v.sha256 != self.seed && self.uploaded.as_ref() != Some(&v.sha256)
+            !v.empty
+                && ((self.acknowledged && self.seed_reverts_publish) || v.sha256 != self.seed)
+                && self.uploaded.as_ref() != Some(&v.sha256)
         })
     }
 
@@ -201,6 +220,7 @@ impl DraftSyncState {
                 match result {
                     UploadResult::Success => {
                         self.uploaded = Some(uploaded_hash);
+                        self.acknowledged = true;
                         self.retry_after = Duration::ZERO;
                         self.retrying = false;
                         self.failures = 0;
@@ -300,16 +320,21 @@ impl DraftSync {
             let seed_hash = sha256_hex(request.seeded_body.as_bytes());
             let (title, issue) = match request.mode {
                 DraftSyncMode::Create { title } => (title, None),
-                DraftSyncMode::Amend { issue } => (issue.title.clone(), Some(issue)),
+                DraftSyncMode::Update { issue } => (issue.title.clone(), Some(issue)),
             };
             let uploaded = issue.as_ref().map(|i| sha256_hex(i.body.as_bytes()));
+            let state = if issue.is_some() {
+                DraftSyncState::for_update(seed_hash, uploaded)
+            } else {
+                DraftSyncState::new(seed_hash, uploaded)
+            };
             let mut sync = StoppedDraftSync {
                 draft: request.draft,
                 source: request.source,
                 git_root: request.git_root,
                 title,
                 issue,
-                state: DraftSyncState::new(seed_hash, uploaded),
+                state,
                 latest: None,
                 events,
                 read_warning: None,
@@ -693,6 +718,26 @@ mod timing_tests {
                 SyncAction::Finished
             );
         }
+    }
+
+    #[test]
+    fn reverting_to_the_seed_after_an_acknowledged_upload_is_published() {
+        // Update session: the issue starts with the seed body A.
+        let mut state = DraftSyncState::for_update("A".into(), Some("A".into()));
+        observe(&mut state, 1, "B");
+        assert_eq!(tick(&mut state, 6), upload("B"));
+        complete(&mut state, 6, "B", UploadResult::Success);
+        observe(&mut state, 7, "A");
+        assert_eq!(
+            state.advance(SyncInput::Finish { at: at(8) }),
+            upload("A"),
+            "the tracker holds B, so restoring A must be sent before the draft is deleted"
+        );
+        complete(&mut state, 8, "A", UploadResult::Success);
+        assert_eq!(
+            state.advance(SyncInput::Finish { at: at(9) }),
+            SyncAction::Finished
+        );
     }
 
     #[test]

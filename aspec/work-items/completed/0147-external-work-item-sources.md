@@ -103,12 +103,12 @@ The explicit forms always win over `workItems.source`, so a repo set to GitHub c
   ```
 - `key` is `NNNN` for local files, and for remote work items a short hash of the canonical `source_id`, so GitHub #7 and file `0007` never share state. Stop using `numeric_id().unwrap_or(0)`, which makes every non-numeric id `0000`.
 - Rewrite `IssueSourceRouter` so routing comes from the parsed `WorkItemRef`, not from `can_handle` guessing. Remove the rule that gives bare integers to GitHub. Keep `fetch_issue_with_progress` for user feedback.
-- Make `find_work_item_file` collect every match and return `AmbiguousWorkItem { number, paths }` when there is more than one. Replace the separate lookup in `specs amend`, which ignores `workItems` rules and maps an unparseable value to 0.
+- Make `find_work_item_file` collect every match and return `AmbiguousWorkItem { number, paths }` when there is more than one. Replace the separate lookup in `edit spec --amend`, which ignores `workItems` rules and maps an unparseable value to 0.
 
 ### Flag changes
 - Remove `--issue` from `exec prompt`, `exec workflow`, `new spec` and, through flag derivation, `remote exec prompt` and `remote exec workflow`. Remove `IssueSourceFlags` and the `issue` and `work-item` `conflicts_with` entries.
 - Add `--work-item` to `exec prompt` and `new spec`, and keep it on `exec workflow`. Update the help text to describe all the accepted forms. `exec prompt` then requires a prompt or `--work-item`, as it does for `--issue` now.
-- `specs amend <work_item>` keeps its positional argument, and it takes the same grammar.
+- `edit spec <work_item> --amend` keeps its positional argument, and it takes the same grammar.
 - Do not keep `--issue` as an alias, since a bare value would have a different meaning under each flag. Parsing `--issue` returns an error that names the replacement, for example: `--issue was replaced by --work-item; use --work-item github:42`. Do this for the CLI, the TUI and API arguments.
 - `remote` commands forward the value as written, so the server resolves it against its own repo config. Do not parse it on the client.
 
@@ -135,9 +135,9 @@ The explicit forms always win over `workItems.source`, so a repo set to GitHub c
   - `{{number}}` renders empty, since the provider assigns the number at creation.
   - With an interview, live sync creates the issue the first time the agent changes the draft (see below), so an interview abandoned before any edit leaves nothing on the tracker. Without an interview, create it right away.
   - `NewSpecOutcome` gains the created URL next to `created_path`. Print the URL and number.
-- `new spec --work-item <ref>` replaces `new spec --issue <ref>`: it seeds a new work item from the reference, and implies an interview as now. If the reference is already in the configured source, stop with an error that says the work item already exists and suggests `specs amend`, because creating it would make a duplicate. A reference from another location is allowed, so a local file or foreign issue can be brought into the configured source.
+- `new spec --work-item <ref>` replaces `new spec --issue <ref>`: it seeds a new work item from the reference, and implies an interview as now. If the reference is already in the configured source, stop with an error that says the work item already exists and suggests `edit spec --amend`, because creating it would make a duplicate. A reference from another location is allowed, so a local file or foreign issue can be brought into the configured source.
 
-### Editing: interview and `specs amend`
+### Editing: interview and `edit spec --amend`
 - The agent cannot write to a tracker directly, so it edits a markdown draft in a scratch file in the `context(repo)` overlay, and awman uploads the result. This reuses an existing mount instead of adding a new one:
   1. Add a `context(repo)` spec with `rw` permission to the run's `collected.context_overlays`. Overlays have union semantics, so this is safe if the user already has one. If config narrows it to `context(repo:ro)`, the most restrictive permission wins and the agent cannot save, so stop with an error before launching.
   2. Write the draft on the host to `<repo context dir>/scratch/work-items/<uuid>.md`, resolving the directory with `ContextDirResolver::repo_dir`. The agent sees it at `/awman/context/repo/scratch/work-items/<uuid>.md`. Because the whole directory is mounted, agents that save by rename work normally. Add a helper in `data/fs/context_dirs.rs` for this path.
@@ -148,9 +148,9 @@ The explicit forms always win over `workItems.source`, so a repo set to GitHub c
 - Seed the draft from the raw `issue.body`, not `format_as_markdown`. That function prepends `# <title>`, so each amend would otherwise add another heading to the issue. Give the agent the title in the prompt.
 - **Every read of the draft is untrusted.** The agent controls this directory, so open the file without following symlinks, require a regular file, and enforce a size limit. Otherwise, an agent could replace the draft with a symlink and have awman upload a host file to the tracker. A read that fails these checks or is not valid UTF-8 is skipped, with a warning, and does not stop the agent.
 
-### Live sync for interview and `specs amend`
+### Live sync for interview and `edit spec --amend`
 - While the agent runs, awman watches the draft and uploads changes, so the user can read the work item on the tracker and keep iterating with the agent. Sync is one-way, from the draft to the tracker. It applies only to remote sources.
-- Add `src/command/work_item/draft_sync.rs` with a Layer 2 task that runs alongside `execution.wait().await` in `create_new_spec` and `specs amend`, and share that wiring between the two. Layer 0 supplies safe draft-file reads, Layer 1 supplies provider transport, and sync timing, conflict and retry decisions stay in Layer 2.
+- Add `src/command/work_item/draft_sync.rs` with a Layer 2 task that runs alongside `execution.wait().await` in `create_new_spec` and `edit spec --amend`, and share that wiring between the two. Layer 0 supplies safe draft-file reads, Layer 1 supplies provider transport, and sync timing, conflict and retry decisions stay in Layer 2.
 - **Detecting changes:** poll the draft once per second, comparing size and modification time, then a hash of the content. Do not use filesystem events: they do not reliably cross the VM-backed mounts used by the Apple and builtin runtimes.
 - **Debounce:** upload after the draft has been unchanged for 5 seconds. During continuous edits, upload at most once every 30 seconds, using the latest content. Allow one request at a time, and on `RateLimited`, back off and let later uploads replace the skipped ones. Define these as constants in `draft_sync.rs`; do not add config settings. Put the timing decisions in a small pure state machine so tests do not depend on real time.
 - **What is uploaded:** skip any content identical to the last upload. Never upload an empty draft during the run, since this is usually a save in progress.
@@ -218,7 +218,7 @@ The explicit forms always win over `workItems.source`, so a repo set to GitHub c
   - A failed upload does not stop the agent and is retried; an auth failure is not retried.
   - A remote edit pauses sync; a create timeout does not create a second issue.
 - **Final upload:** edits made inside the debounce window are uploaded after exit, for a normal exit, a non-zero exit and a cancelled run; nothing races an in-flight request; nothing is uploaded when already current; a failed final upload keeps the draft and returns an error.
-- **Commands:** `exec workflow`, `--dynamic`, `exec prompt` and `specs amend` each with local, GitHub and HTTP sources; a missing work item stops before any container starts; resume keying by `key`, including GitHub #7 vs file `0007`.
+- **Commands:** `exec workflow`, `--dynamic`, `exec prompt` and `edit spec --amend` each with local, GitHub and HTTP sources; a missing work item stops before any container starts; resume keying by `key`, including GitHub #7 vs file `0007`.
 - **Inline:** dynamic preflight with an inline work item; inline plus `--work-item` is a 400.
 - **Catalogue and parity:**
   - `--issue` is gone from every command, including derived `remote` flag sets, and its error names the replacement.
@@ -226,7 +226,7 @@ The explicit forms always win over `workItems.source`, so a repo set to GitHub c
   - The conflict test between `--issue` and `--work-item` is deleted.
   - The regenerated command reference passes `markdown_reference_matches_committed_docs`.
 - **`push_back.rs`:** a URL value containing digits does not produce an "Implement work item NNNN" message.
-- **Ambiguous `NNNN`:** the error lists both paths, for `--work-item` and `specs amend`.
+- **Ambiguous `NNNN`:** the error lists both paths, for `--work-item` and `edit spec --amend`.
 - **End-to-end:** `new spec` in a repo set to GitHub, with a fake `gh`, creates no file and prints the URL.
 
 ## Codebase Integration:

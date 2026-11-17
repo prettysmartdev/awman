@@ -23,7 +23,7 @@ The companion work items are:
 
 ## Summary:
 
-- Build `src/command/` with two halves: a `dispatch/` module that holds the canonical command catalogue and per-frontend projections, and a `commands/` module that holds one struct per amux command (`init`, `ready`, `chat`, `exec prompt`, `exec workflow`, `claws`, `status`, `specs amend`, `config`, `headless`, `remote`, `new`, plus subcommands).
+- Build `src/command/` with two halves: a `dispatch/` module that holds the canonical command catalogue and per-frontend projections, and a `commands/` module that holds one struct per amux command (`init`, `ready`, `chat`, `exec prompt`, `exec workflow`, `claws`, `status`, `edit spec --amend`, `config`, `headless`, `remote`, `new`, plus subcommands).
 - Define a single `CommandCatalogue` data structure that enumerates every command, subcommand, flag, argument, and value type *exactly once*. Every projection (clap commands, TUI hints, headless schema) is generated from this catalogue. Adding a new flag is one edit in one file.
 - Define a `Dispatch` type that frontends construct with a frontend-specific trait object (`CliCommandFrontend`, `TuiCommandFrontend`, `HeadlessCommandFrontend`). Dispatch uses the trait to pull flag values and then constructs and returns the appropriate `*Command` struct, instantiated with all engines, configs, and per-command frontend traits it needs.
 - Define a `Command` trait: `async fn run_with_frontend(self, frontend: Self::Frontend) -> Result<CommandOutcome, CommandError>`. Each command has its own associated `Frontend` trait describing exactly the user-input methods that command requires.
@@ -110,7 +110,7 @@ impl CommandCatalogue {
 
 The catalogue MUST enumerate every command currently defined in `oldsrc/cli.rs`:
 
-- `init`, `ready`, `chat`, `exec prompt`, `exec workflow`, `claws *`, `status`, `specs amend`, `config *`, `headless *`, `remote *`, `new *`.
+- `init`, `ready`, `chat`, `exec prompt`, `exec workflow`, `claws *`, `status`, `edit spec --amend`, `config *`, `headless *`, `remote *`, `new *`.
 
 If the catalogue and `oldsrc/cli.rs` ever disagree on an existing command's name, alias, flag, or default, the catalogue is wrong and must be fixed in this work item — there is to be zero user-visible drift.
 
@@ -584,7 +584,7 @@ For each command below, the catalogue MUST contain every listed flag with the li
 
 **`chat`**: `-n/--non-interactive`, `--plan`, `--allow-docker`, `--mount-ssh`, `--yolo`, `--auto`, `--agent <NAME>`, `--model <NAME>`, `--overlay <SPEC>` (repeatable).
 
-**`specs new`**: `--interview`. **`specs amend` (positional `<WORK_ITEM>` required)**: `-n/--non-interactive`, `--allow-docker`.
+**`specs new`**: `--interview`. **`edit spec --amend` (positional `<WORK_ITEM>` required)**: `-n/--non-interactive`, `--allow-docker`.
 
 **`claws init`**: no flags. **`claws ready`**: no flags. **`claws chat`**: no flags.
 
@@ -610,7 +610,7 @@ The legacy code has Q&A flows that span multiple commands. Each is a separate La
 
 ##### 6.3a `MountScopeFrontend`
 
-When `cwd != git_root`, every command that mounts a host directory into a container (`implement`, `chat`, `exec prompt`, `exec workflow`, `specs amend`, `claws *`, `init`, `ready` with audit) MUST prompt the user to choose between mounting the entire git root or just the current directory. The legacy implementation lives in `oldsrc/commands/implement.rs::confirm_mount_scope_stdin` and is called from `chat`, `implement`, and `exec`.
+When `cwd != git_root`, every command that mounts a host directory into a container (`implement`, `chat`, `exec prompt`, `exec workflow`, `edit spec --amend`, `claws *`, `init`, `ready` with audit) MUST prompt the user to choose between mounting the entire git root or just the current directory. The legacy implementation lives in `oldsrc/commands/implement.rs::confirm_mount_scope_stdin` and is called from `chat`, `implement`, and `exec`.
 
 ```rust
 // src/command/commands/mount_scope.rs
@@ -879,7 +879,7 @@ This sequence is the canonical order for every agent-launching command (chat, ex
 - **`--json` output mode**: today some commands accept `--json` to produce structured output. In the new architecture, the command's `*Outcome` is a typed value; JSON serialization is a frontend concern, not a command concern. Ensure every `*Outcome` derives `Serialize`.
 - **`--non-interactive` flag and `headless.alwaysNonInteractive` config**: these two concerns control whether a containerized agent runs in print-only mode (e.g. passes `--print` to Claude Code). They are distinct from the Q&A-decision non-interactive behavior handled by frontend safe-defaults. The path is: `Dispatch::build_command` reads the `--non-interactive` CLI flag and the `GlobalConfig::headless.alwaysNonInteractive` setting; if either is true, the constructed `*Command` receives `AgentRunOptions { non_interactive: true, .. }`, which `AgentEngine::build_options` translates into the agent-specific print flag inside the container. This mutation belongs in `Dispatch::build_command` after reading flags but before constructing the `*Command`. Cover with unit tests for both sources (explicit flag and headless config).
 - **`AMUX_OVERLAYS` env validation**: today's `commands/mod.rs::run` validates this env up front for every command. In the new architecture, this validation belongs to `OverlayEngine::new` (Layer 1) or `EffectiveConfig::overlays` (Layer 0) — ASK THE DEVELOPER. Whichever layer owns it, every command path MUST trigger the validation early.
-- **Agent-launching command canonical order**: every command that launches an agent (`implement`, `chat`, `exec prompt`, `exec workflow`, `specs amend`, `claws *`, `init` audit, `ready` audit) MUST follow the §6.10 canonical order: mount-scope resolve → agent resolve → ensure_available (with `AgentSetupFrontend` fallback) → keychain consent (`AgentAuthFrontend`) → worktree prepare → workflow run → worktree finalize → outcome. Cover with a per-command unit test asserting call order against a recording frontend.
+- **Agent-launching command canonical order**: every command that launches an agent (`implement`, `chat`, `exec prompt`, `exec workflow`, `edit spec --amend`, `claws *`, `init` audit, `ready` audit) MUST follow the §6.10 canonical order: mount-scope resolve → agent resolve → ensure_available (with `AgentSetupFrontend` fallback) → keychain consent (`AgentAuthFrontend`) → worktree prepare → workflow run → worktree finalize → outcome. Cover with a per-command unit test asserting call order against a recording frontend.
 - **`auto_agent_auth_accepted` persistence**: when the user accepts or declines (not "decline once") the keychain-consent prompt, the per-repo `RepoConfig::auto_agent_auth_accepted` flag MUST be updated and persisted to `<git-root>/.amux/config.json` BEFORE the agent container launches. This avoids re-prompting on subsequent commands. The persistence call is `RepoConfig::set_auto_agent_auth_accepted(repo_dir, accepted: bool)` from Layer 0. Cover the lifecycle with a per-repo config integration test.
 - **`specs new` ↔ `new spec` aliasing**: both invocations MUST construct the same `*Command` and produce identical behavior. Cover with a unit test that calls `Dispatch::run_command(["specs", "new"])` and `Dispatch::run_command(["new", "spec"])` and asserts both produce the same constructor arguments.
 - **`implement` ↔ `exec workflow` relationship**: `ImplementCommand` is a top-level command but its body MAY share helpers with `ExecWorkflowCommand`. Both MUST go through the same shared `agent_command_pattern` (§6.10). When `--workflow` is omitted on `implement`, the synthetic single-step workflow MUST use the literal legacy prompt template captured in `src/command/commands/implement_prompts.rs::DEFAULT_IMPLEMENT_PROMPT` — the exact string is preserved from `oldsrc/commands/implement.rs`.

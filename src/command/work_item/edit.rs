@@ -20,15 +20,35 @@ pub struct PreparedDraftEdit {
     pub seeded_body: String,
 }
 
-/// Call before launch/PTY ownership. The caller must use the amended collected
-/// overlays when resolving and building the actual agent run options.
-pub fn prepare_draft_edit(
+/// The host directory mounted at `/awman/context/repo` for this session.
+pub struct WritableRepoContext {
+    pub host_dir: std::path::PathBuf,
+}
+
+/// The overlay collector keeps only the first context overlay per scope, so
+/// an earlier read-write entry (configured, or an earlier flag) would hide an
+/// explicit read-only `context(repo:ro)` flag. Callers that need a writable
+/// repo context check the raw CLI overlays with this before collection.
+pub fn reject_explicit_read_only_repo_context(
+    cli_overlays: &[TypedOverlay],
+) -> Result<(), WorkItemError> {
+    if cli_overlays.iter().any(|overlay| {
+        matches!(overlay, TypedOverlay::Context(ctx)
+            if ctx.scope == ContextScope::Repo && ctx.permission == OverlayPermission::ReadOnly)
+    }) {
+        return Err(WorkItemError::ReadOnlyContext);
+    }
+    Ok(())
+}
+
+/// Validate the repo context binding and require read-write access without
+/// creating a draft. Callers must use the resulting collected overlays to
+/// resolve the mounts for the agent session.
+pub fn require_writable_repo_context(
     session: &Session,
     origin_url: Option<&str>,
     collected: &mut CollectedOverlays,
-    body: &str,
-    sink: &mut dyn UserMessageSink,
-) -> Result<PreparedDraftEdit, WorkItemError> {
+) -> Result<WritableRepoContext, WorkItemError> {
     let config = session.effective_config();
     let runtime = config
         .runtime_selection()
@@ -65,8 +85,6 @@ pub fn prepare_draft_edit(
         .iter()
         .find(|spec| spec.scope == ContextScope::Repo);
     let resolver = ContextDirResolver::from_env(session.env()).map_err(WorkItemError::Data)?;
-    let mut paths =
-        resolver.work_item_draft_paths(origin_url, session.git_root(), uuid::Uuid::new_v4());
     // Match LaunchPolicy's session/overlay context binding. Inferred contexts
     // use repo_dir; keyed and staged sessions must edit the directory mounted
     // at the same container path, rather than an unmounted inferred directory.
@@ -74,13 +92,6 @@ pub fn prepare_draft_edit(
         .resolve(existing.and_then(|spec| spec.key.as_ref()), origin_url);
     crate::data::fs::context_dirs::validate_context_path(resolver.awman_home(), &repo.host_dir)
         .map_err(WorkItemError::Data)?;
-    let name = paths
-        .host_path
-        .file_name()
-        .expect("generated draft filename")
-        .to_owned();
-    paths.host_path = repo.host_dir.join("scratch/work-items").join(name);
-    let draft = WorkItemDraft::create(paths, body).map_err(WorkItemError::Data)?;
     if existing.is_none() {
         collected.context_overlays.push(ContextOverlaySpec {
             key: None,
@@ -88,6 +99,31 @@ pub fn prepare_draft_edit(
             permission: OverlayPermission::ReadWrite,
         });
     }
+    Ok(WritableRepoContext {
+        host_dir: repo.host_dir,
+    })
+}
+
+/// Call before launch/PTY ownership. The caller must use the amended collected
+/// overlays when resolving and building the actual agent run options.
+pub fn prepare_draft_edit(
+    session: &Session,
+    origin_url: Option<&str>,
+    collected: &mut CollectedOverlays,
+    body: &str,
+    sink: &mut dyn UserMessageSink,
+) -> Result<PreparedDraftEdit, WorkItemError> {
+    let repo = require_writable_repo_context(session, origin_url, collected)?;
+    let resolver = ContextDirResolver::from_env(session.env()).map_err(WorkItemError::Data)?;
+    let mut paths =
+        resolver.work_item_draft_paths(origin_url, session.git_root(), uuid::Uuid::new_v4());
+    let name = paths
+        .host_path
+        .file_name()
+        .expect("generated draft filename")
+        .to_owned();
+    paths.host_path = repo.host_dir.join("scratch/work-items").join(name);
+    let draft = WorkItemDraft::create(paths, body).map_err(WorkItemError::Data)?;
     sink.write_message(UserMessage {
         level: MessageLevel::Info,
         text: format!("Work item draft: {}", draft.paths().host_path.display()),

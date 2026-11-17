@@ -270,6 +270,7 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         CommandError::NotImplemented(msg) => format!("not yet implemented: {msg}"),
         // WI 0147: work item errors carry their own actionable text.
         CommandError::WorkItem(e) => e.to_string(),
+        CommandError::Edit(e) => e.to_string(),
         CommandError::DraftSync(e) => e.to_string(),
         CommandError::Other(msg) => msg.to_string(),
         CommandError::WorkItemNotFound { number } => {

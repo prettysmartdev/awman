@@ -1,7 +1,7 @@
 //! Work item reference grammar (Layer 0, pure).
 //!
 //! [`WorkItemRef::parse`] classifies the text a user typed for `--work-item`
-//! (or `specs amend`). It performs no config lookup, file access, Git call or
+//! (or `edit spec`). It performs no config lookup, file access, Git call or
 //! network request. The first matching rule wins:
 //!
 //! | Input | Result |

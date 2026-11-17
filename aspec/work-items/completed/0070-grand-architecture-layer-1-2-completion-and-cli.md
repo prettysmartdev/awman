@@ -9,7 +9,7 @@ Issue: n/a — fifth-of-eight work item implementing `aspec/architecture/2026-gr
 >
 > The remaining work is partitioned across the work items:
 >
-> - `0070-…` (this work item) — Real container execution + real engine phase bodies + real per-command Layer 2 bodies for **every** command (`init`, `ready`, `chat`, `specs new`, `specs amend`, `new spec/workflow/skill`, `status`, `config show/get/set`, `claws init/ready/chat`, `implement`, `exec prompt`, `exec workflow`, `download`, the interactive half of `auth`) + real `AgentEngine::ensure_available` (download + build) + real `OverlayEngine` Claude transformations + full CLI completion (every `*Outcome` and `*Error` variant rendered, every flag honored end-to-end including `--json`, every Q&A frontend method TTY-aware).
+> - `0070-…` (this work item) — Real container execution + real engine phase bodies + real per-command Layer 2 bodies for **every** command (`init`, `ready`, `chat`, `specs new`, `edit spec --amend`, `new spec/workflow/skill`, `status`, `config show/get/set`, `claws init/ready/chat`, `implement`, `exec prompt`, `exec workflow`, `download`, the interactive half of `auth`) + real `AgentEngine::ensure_available` (download + build) + real `OverlayEngine` Claude transformations + full CLI completion (every `*Outcome` and `*Error` variant rendered, every flag honored end-to-end including `--json`, every Q&A frontend method TTY-aware).
 > - `0071-grand-architecture-tui-frontend.md` — TUI frontend on top of the now-real engines and commands (no business logic; pure presentation per the four tenets).
 > - `0072-grand-architecture-headless-frontend.md` — Headless frontend + the still-stub Layer 2 command bodies that exist only to talk to the headless server (`headless start/kill/logs/status`, `remote run/session start/session kill`) + the headless-side persistence half of `auth` + `AuthEngine::ensure_self_signed_tls` real wiring.
 > - `0073-grand-architecture-finalize.md` — Cross-frontend parity validation, `tests/` rebuild, docs/aspec refresh.
@@ -41,7 +41,7 @@ Three deliverables, in dependency order:
 
 1. **Real container execution.** Replace the no-op `DockerContainerInstance::run_with_frontend` and `AppleContainerInstance::run_with_frontend` with real subprocess wiring that spawns the container, allocates a PTY when interactive, streams stdin/stdout/stderr through the supplied `ContainerFrontend`, propagates resize, captures exit code, and supports cancel. Every higher-level engine and command underpins on this. (§1a)
 
-2. **Complete every Layer 1 / Layer 2 stub** so every CLI command works end-to-end: real engine phase bodies (`InitEngine`, `ReadyEngine`, `ClawsEngine`), real per-command bodies (`chat`, `specs new`, `specs amend`, `new spec/workflow/skill`, `status`, `config show/get/set`, `download`, the interactive half of `auth`, `chat`, `exec prompt`), real `AgentEngine::ensure_available` build/download path, real `OverlayEngine` Claude transformations, real network helper (aspec download). The plumbing for `implement` and `exec workflow` already exists in 0068; once §1a is real these commands start working. (§1b–§1q)
+2. **Complete every Layer 1 / Layer 2 stub** so every CLI command works end-to-end: real engine phase bodies (`InitEngine`, `ReadyEngine`, `ClawsEngine`), real per-command bodies (`chat`, `specs new`, `edit spec --amend`, `new spec/workflow/skill`, `status`, `config show/get/set`, `download`, the interactive half of `auth`, `chat`, `exec prompt`), real `AgentEngine::ensure_available` build/download path, real `OverlayEngine` Claude transformations, real network helper (aspec download). The plumbing for `implement` and `exec workflow` already exists in 0068; once §1a is real these commands start working. (§1b–§1q)
 
 3. **Full CLI completion.** Every `*Outcome` variant gets a final `render_outcome_for_cli` branch (no `todo!()`s); every `*Error` variant gets a `render_error_for_cli` branch with the right exit code; every command's flag set is fully threaded through (`ready --json` actually emits JSON; `status --watch` actually loops; every `Q&A` frontend method falls back to safe defaults when stdin is not a TTY). (§2)
 
@@ -86,7 +86,7 @@ Every entry below MUST be replaced with a real implementation that matches old-a
 
 Files: `src/engine/container/docker.rs`, `src/engine/container/apple.rs`, `src/engine/container/instance.rs`, `src/engine/container/backend.rs`.
 
-Today `DockerContainerInstance::run_with_frontend` returns `ContainerExecution::finished(handle, info)` with `exit_code = 0` and never spawns a subprocess. `AppleContainerInstance::run_with_frontend` does the same. `DockerBackend::list_running` returns `Vec::new()`; `stats` and `stop` return `EngineError::NotImplemented`. Every command that runs an agent (chat, exec, implement, ready audit, init audit, claws audit, claws controller, specs amend) silently no-ops as a result.
+Today `DockerContainerInstance::run_with_frontend` returns `ContainerExecution::finished(handle, info)` with `exit_code = 0` and never spawns a subprocess. `AppleContainerInstance::run_with_frontend` does the same. `DockerBackend::list_running` returns `Vec::new()`; `stats` and `stop` return `EngineError::NotImplemented`. Every command that runs an agent (chat, exec, implement, ready audit, init audit, claws audit, claws controller, edit spec --amend) silently no-ops as a result.
 
 Replace with full subprocess wiring derived from `oldsrc/runtime/docker.rs` and `oldsrc/runtime/apple.rs`:
 
@@ -324,7 +324,7 @@ For every flag in `CommandCatalogue`, audit the per-command CLI frontend impl to
 - `chat / exec prompt / exec workflow / implement` — `--non-interactive / --plan / --allow-docker / --mount-ssh / --yolo / --auto / --agent / --model / --overlay` plus per-command flags. Confirm each is read into the appropriate `*CommandFlags` field. The CLI's `--overlay` is repeatable; ensure it's collected as `Vec<String>` and parsed (`HOST:CONTAINER:MODE`) per `oldsrc/cli.rs::parse_overlay_spec` (move the parser into `src/data/overlay_spec.rs`).
 - `status --watch` — ensure the CLI's `should_continue_watching` returns true on each tick (probably needs a `Ctrl+C` handler that toggles the flag).
 - `init --agent / --aspec` — already works; add a confirmation test.
-- `specs amend / new <kind>` — every flag wired.
+- `edit spec --amend` / `new spec <kind>` — every flag wired.
 - `headless start --port / --workdirs / --background / --refresh-key / --dangerously-skip-auth` — flags read into `HeadlessCommandFlags`. The command body itself stays stubbed until 0072; only the flag-reading half lands in 0070.
 - `remote run / session start / session kill --remote-addr / --session / --follow / --api-key` — same: flags read; bodies stubbed until 0072.
 
@@ -371,7 +371,7 @@ The PR description MUST include:
   - `amux ready [--refresh] [--build] [--no-cache] [--non-interactive] [--allow-docker] [--json]` — exercise every flag combination at least once.
   - `amux implement 0001 [--workflow] [--worktree] [--yolo] [--auto] [--plan] [--agent] [--model] [--non-interactive] [--allow-docker] [--mount-ssh] [--overlay]` — exercise the implication rule (`--yolo + --workflow ⇒ --worktree`).
   - `amux chat [flags]` interactive (PTY) and `amux chat -n` non-interactive.
-  - `amux specs new [--interview]` and `amux specs amend 0042 [-n] [--allow-docker]`.
+  - `amux specs new [--interview]` and `amux edit spec 0042 --amend [-n] [--allow-docker]`.
   - `amux new spec` (alias check), `amux new workflow [--interview] [--global] [--format toml|yaml|md]`, `amux new skill [--interview] [--global]`.
   - `amux claws init / claws ready / claws chat`.
   - `amux status [--watch]`.

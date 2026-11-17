@@ -1,11 +1,11 @@
-//! `SpecsCommandFrontend` impl for the TUI.
+//! `NewSpecFrontend` impl for the TUI (`new spec` questions).
 
-use crate::command::commands::specs::{SpecsCommandFrontend, WorkItemKind};
 use crate::command::error::CommandError;
 use crate::command::instance::frontend::InstanceCommandFrontend;
+use crate::command::work_item::spec_service::{NewSpecFrontend, WorkItemKind};
 use crate::data::dialog::{DialogRequest, DialogResponse};
 
-impl SpecsCommandFrontend for InstanceCommandFrontend {
+impl NewSpecFrontend for InstanceCommandFrontend {
     fn ask_spec_title(&mut self) -> Result<String, CommandError> {
         let response = self.ask_dialog(DialogRequest::TextInput {
             title: "Spec title".into(),

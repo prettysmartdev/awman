@@ -771,8 +771,8 @@ const ROOT: CommandSpec = CommandSpec {
         },
     ],
     subcommands: &[
-        &ATTACH, &INIT, &READY, &CHAT, &SPECS, &AGENTS, &CONFIG, &EXEC, &DAEMON, &SQUAD, &REMOTE,
-        &NEW, &CLEAN, &VIEW, &LINK, &QUEUE,
+        &ATTACH, &INIT, &READY, &CHAT, &AGENTS, &CONFIG, &EXEC, &DAEMON, &SQUAD, &REMOTE, &NEW,
+        &EDIT, &CLEAN, &VIEW, &LINK, &QUEUE,
     ],
 };
 
@@ -885,6 +885,7 @@ mod agents;
 mod attach;
 mod core;
 mod daemon;
+mod edit;
 mod exec;
 mod new;
 mod remote;
@@ -900,6 +901,7 @@ use agents::*;
 use attach::*;
 use core::*;
 use daemon::*;
+use edit::*;
 use exec::*;
 use link::*;
 use new::*;

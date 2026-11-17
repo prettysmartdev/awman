@@ -7,6 +7,10 @@ The worker API and squad scheduler now share one daemon, one database and one ex
 
 Local clients use an owner-authenticated socket or named pipe. The optional network listener uses TLS and named API keys, exposes only configured features, and never exposes ephemeral features. Feature switches and network exposure changes apply live.
 
+`awman edit spec|workflow|skill|agent <ref>` changes an existing artifact with an agent. It supports `--interview` (the agent questions you first) and `--amend` (the agent reconciles the artifact with the evidence) for every kind, `--global` for workflows, skills and agents, and `--headless`/`--json` with `--prompt`. Repo artifacts are edited in place, global and library artifacts on a staged copy that is validated and published back, and remote work items through a draft that is saved while the agent runs. Cancellation is not rollback, retained drafts can be recovered, and editing an agent definition does not approve or run it. See [Editing existing artifacts](../03-agent-sessions.md#editing-existing-artifacts).
+
+**Removed: `awman specs amend`.** Use `awman edit spec <ref> --amend` instead (for example `awman edit spec 0042 --amend`, or `awman edit spec github:84 --amend`). The `specs` command group is gone and no alias is provided.
+
 `awman link <server-url>` saves a work server link using device approval or a supplied token. `workServers.*` config manages the link, and unsetting the server also removes its stored token. Linked servers supply manual queue items and automatic pull work. `awman link web-<code>` approves a browser on the daemon's engine listener.
 
 Work item input now uses the shared `--work-item <REF>` flag. The old
