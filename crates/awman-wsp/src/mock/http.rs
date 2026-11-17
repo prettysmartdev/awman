@@ -316,9 +316,15 @@ async fn dispatch_inner(
                     &worker,
                     req.item_id.as_deref(),
                     Utc::now(),
-                    Duration::seconds(3),
+                    server.lease_ttl,
                 )? {
-                    return Ok((StatusCode::CREATED, Json(ClaimResponse { lease })).into_response());
+                    return Ok((
+                        StatusCode::CREATED,
+                        Json(
+                            serde_json::json!({"lease": crate::secret::server_wire::lease(&lease)}),
+                        ),
+                    )
+                        .into_response());
                 }
                 if tokio::time::Instant::now() >= deadline {
                     return Ok(StatusCode::NO_CONTENT.into_response());
@@ -337,7 +343,7 @@ async fn dispatch_inner(
                     id,
                     lease.epoch,
                     now,
-                    Duration::seconds(3),
+                    server.lease_ttl,
                     &read(&bytes)?,
                 )?)
                 .into_response()),

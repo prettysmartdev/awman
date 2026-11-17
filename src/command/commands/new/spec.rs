@@ -2,7 +2,7 @@
 //!
 //! Split out of `commands/new.rs` by WI 0114 F-51: `run_with_frontend` was
 //! one 530-line `match` over three unrelated scaffolds. The body lives in
-//! `specs::create_new_spec`, which creates a local file or a
+//! `spec_service::create_new_spec`, which creates a local file or a
 //! remote work item depending on `workItems.source` (WI 0147).
 
 use super::*;
@@ -17,7 +17,7 @@ pub(super) async fn run(
         level: MessageLevel::Info,
         text: "new spec: starting work item creation".into(),
     });
-    let new_outcome = match crate::command::commands::specs::create_new_spec(
+    let new_outcome = match crate::command::work_item::spec_service::create_new_spec(
         &command.engines,
         command.session.clone(),
         f.interview,

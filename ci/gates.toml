@@ -263,7 +263,7 @@ contracts = ["unit-awman"]
 requires = []
 paths = []
 always = true
-filter = "test(/^command::commands::exec_workflow::contract_tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/) | test(/^data::workspace::tests::/) | test(/^data::workflow_definition::read_only_workspace_tests::/) | test(/^data::image_inputs::tests::/) | test(/^data::image_tags::lease_tag_tests::/) | test(/^data::worker::lease_images::tests::/) | test(/^data::execution_event::image_stale_tests::/) | test(/^data::config::work_servers::image_budget_tests::/) | test(/^engine::agent::image_freshness::failure_reason_tests::/)"
+filter = "test(/^command::commands::exec_workflow::contract_tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/) | test(/^data::checkout_paths::tests::/) | test(/^data::workspace::tests::/) | test(/^data::workflow_definition::read_only_workspace_tests::/) | test(/^data::image_inputs::tests::/) | test(/^data::image_tags::lease_tag_tests::/) | test(/^data::worker::lease_images::tests::/) | test(/^data::execution_event::image_stale_tests::/) | test(/^data::config::work_servers::image_budget_tests::/) | test(/^engine::agent::image_freshness::failure_reason_tests::/)"
 
 [suites.component-core-internals]
 tier = "component"
@@ -274,7 +274,7 @@ contracts = ["component-core-internals"]
 requires = []
 paths = []
 always = true
-filter = "not (test(/^command::commands::exec_workflow::contract_tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/) | test(/^data::workspace::tests::/) | test(/^data::workflow_definition::read_only_workspace_tests::/) | test(/^data::image_inputs::tests::/) | test(/^data::image_tags::lease_tag_tests::/) | test(/^data::worker::lease_images::tests::/) | test(/^data::execution_event::image_stale_tests::/) | test(/^data::config::work_servers::image_budget_tests::/) | test(/^engine::agent::image_freshness::failure_reason_tests::/))"
+filter = "not (test(/^command::commands::exec_workflow::contract_tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/) | test(/^data::checkout_paths::tests::/) | test(/^data::workspace::tests::/) | test(/^data::workflow_definition::read_only_workspace_tests::/) | test(/^data::image_inputs::tests::/) | test(/^data::image_tags::lease_tag_tests::/) | test(/^data::worker::lease_images::tests::/) | test(/^data::execution_event::image_stale_tests::/) | test(/^data::config::work_servers::image_budget_tests::/) | test(/^engine::agent::image_freshness::failure_reason_tests::/))"
 
 
 
@@ -352,7 +352,17 @@ target = "test:component"
 contracts = ["component-command"]
 requires = []
 paths = ["tests/component/command/**", "src/command/**"]
-filter = "test(/^command::/) - test(/^command::builtin::/) - test(/^command::daemon::/) - test(/^command::differential::/) - test(/^command::models::/)"
+filter = "test(/^command::/) - test(/^command::builtin::/) - test(/^command::daemon::/) - test(/^command::differential::/) - test(/^command::models::/) - test(/^command::edit_artifacts::/)"
+
+[suites.component-command-edit-artifacts]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-command"]
+requires = []
+paths = ["tests/component/command/edit_artifacts.rs", "tests/component/command/mod.rs", "src/command/commands/edit/**", "src/data/fs/edit_*.rs"]
+filter = "test(/^command::edit_artifacts::/)"
 
 [suites.component-command-builtin]
 tier = "component"
@@ -911,7 +921,7 @@ required_check = "gate"
 build_smokes = ["linux-x64-musl-static"]
 
 [[gates.pr.cells]]
-suites = ["component-core-internals", "component-command-models", "unit-awman", "unit-wsp", "unit-test-support", "unit-xtask", "component-data", "component-engine", "component-command", "component-command-builtin", "component-command-daemon", "component-command-differential", "component-frontend", "component-daemon", "component-squad", "component-worker", "component-security", "component-tools", "component-parity-builtin", "component-parity-daemon", "component-parity-differential"]
+suites = ["component-core-internals", "component-command-models", "unit-awman", "unit-wsp", "unit-test-support", "unit-xtask", "component-data", "component-engine", "component-command", "component-command-edit-artifacts", "component-command-builtin", "component-command-daemon", "component-command-differential", "component-frontend", "component-daemon", "component-squad", "component-worker", "component-security", "component-tools", "component-parity-builtin", "component-parity-daemon", "component-parity-differential"]
 builds = ["linux-x64-default", "macos-arm64-default", "windows-x64-default"]
 
 [[gates.pr.cells]]

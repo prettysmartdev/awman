@@ -359,6 +359,7 @@ fn decode_outcome(
                 }
             })
         }
+        Some("Edit") => O::Edit(field(payload, "payload")?),
         _ => {
             return Err(<serde_json::Error as serde::de::Error>::custom(
                 "unsupported relayed outcome",

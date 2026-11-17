@@ -7,10 +7,10 @@
 //! outcome. Remotes are local bare repositories reached over `file://`.
 
 use crate::support;
+use awman::data::checkout_paths::{repo_key, WorktreePaths};
 use awman::data::config::env::EnvSnapshot;
 use awman::data::message::RecordingMessageSink;
 use awman::data::session::GitRootResolver;
-use awman::data::worktree_paths::{repo_key, WorktreePaths};
 use awman::engine::error::EngineError;
 use awman::engine::git::lease_transport::{
     lease_transport_command, HelperProgram, LeaseCredentialHelper, LeaseCredentials,
@@ -253,7 +253,7 @@ fn worktree_create_squash_merge_remove_cycle_commits_implement_subject() {
         .file("README.md", "initial\n")
         .init();
     let g = engine(&sandbox);
-    let branch = g.branch_name_for_work_item(42);
+    let branch = awman::data::checkout_paths::worktree_branch_name(42);
     assert_eq!(branch, "awman/work-item-0042");
     let wt = sandbox.work().join("wt-0042");
     g.create_worktree(repo.path(), &wt, &branch).unwrap();
@@ -311,74 +311,57 @@ fn worktree_paths_are_keyed_by_home_repo_and_item() {
         g.worktree_path_named(&first_root, "same-flow").unwrap(),
         g.worktree_path_named(&second_root, "same-flow").unwrap()
     );
-    assert_eq!(g.branch_name_for_work_item(9999), "awman/work-item-9999");
-    assert_eq!(g.branch_name_for_workflow("my-wf"), "awman/workflow-my-wf");
+    assert_eq!(
+        awman::data::checkout_paths::worktree_branch_name(9999),
+        "awman/work-item-9999"
+    );
+    assert_eq!(
+        awman::data::checkout_paths::worktree_branch_name_for_workflow("my-wf"),
+        "awman/workflow-my-wf"
+    );
     sandbox.finish();
 }
 
 #[test]
-fn legacy_unhashed_worktree_owned_by_this_repository_is_reused() {
-    let sandbox =
-        sandbox("engine::git::legacy_unhashed_worktree_owned_by_this_repository_is_reused");
-    let repo = RepoBuilder::new(&sandbox, "legacy-owner")
-        .file("a", "a")
-        .init();
+fn worktree_resolution_ignores_retired_unhashed_directories() {
+    let sandbox = sandbox("engine::git::worktree_resolution_ignores_retired_unhashed_directories");
+    let repo = RepoBuilder::new(&sandbox, "app").file("a", "a").init();
     let root = repo.path().canonicalize().unwrap();
     let g = engine(&sandbox);
     let paths = WorktreePaths::with_home(sandbox.home());
-    let legacy = paths.legacy_for_work_item(&root, 8134);
-    g.create_worktree(&root, &legacy, "awman/test-legacy-owned")
-        .unwrap();
-    assert_eq!(g.worktree_path(&root, 8134).unwrap(), legacy);
-    let legacy_flow = paths.legacy_for_workflow(&root, "old-flow");
-    g.create_worktree(&root, &legacy_flow, "awman/test-legacy-workflow")
-        .unwrap();
+    let retired_root = sandbox.home().join(".awman/worktrees/app");
+    for (index, name) in ["8134", "wf-build", "br-feature", "pr-12"]
+        .iter()
+        .enumerate()
+    {
+        let retired = retired_root.join(name);
+        g.create_worktree(&root, &retired, &format!("retired-{index}"))
+            .unwrap();
+        let canonical = paths.named(&root, name);
+        assert_eq!(g.worktree_path_by_name(&root, name).unwrap(), canonical);
+        assert!(retired.join("a").is_file());
+        assert!(!canonical.exists());
+    }
     assert_eq!(
-        g.worktree_path_named(&root, "old-flow").unwrap(),
-        legacy_flow
+        g.worktree_path(&root, 8134).unwrap(),
+        paths.for_work_item(&root, 8134)
     );
-    g.remove_worktree(&root, &legacy).unwrap();
-    g.remove_worktree(&root, &legacy_flow).unwrap();
-    sandbox.finish();
+    assert_eq!(
+        g.worktree_path_named(&root, "build").unwrap(),
+        paths.for_workflow(&root, "build")
+    );
 }
 
 #[test]
-fn legacy_unhashed_worktree_owned_by_another_repository_is_ignored() {
-    let sandbox =
-        sandbox("engine::git::legacy_unhashed_worktree_owned_by_another_repository_is_ignored");
-    let current = RepoBuilder::at(&sandbox, sandbox.work().join("same-name"))
-        .file("a", "a")
-        .init();
-    let other = RepoBuilder::at(&sandbox, sandbox.work().join("other-parent/same-name"))
-        .file("a", "a")
-        .init();
-    let current_root = current.path().canonicalize().unwrap();
-    let g = engine(&sandbox);
-    let legacy = WorktreePaths::with_home(sandbox.home()).legacy_for_work_item(&current_root, 8135);
-    g.create_worktree(other.path(), &legacy, "awman/test-legacy-foreign")
-        .unwrap();
-    let hashed = g.worktree_path(&current_root, 8135).unwrap();
-    assert_ne!(hashed, legacy);
-    assert!(hashed.ends_with(format!("worktrees/{}/8135", repo_key(&current_root))));
-    g.create_worktree(&current_root, &hashed, "awman/test-legacy-new")
-        .unwrap();
-    assert!(hashed.exists());
-    g.remove_worktree(&current_root, &hashed).unwrap();
-    g.remove_worktree(other.path(), &legacy).unwrap();
-    sandbox.finish();
-}
-
-#[test]
-fn legacy_lookup_rejects_a_stale_registration_replaced_by_a_foreign_checkout() {
+fn worktree_owner_rejects_a_stale_registration_replaced_by_a_foreign_checkout() {
     let sandbox = sandbox(
-        "engine::git::legacy_lookup_rejects_a_stale_registration_replaced_by_a_foreign_checkout",
+        "engine::git::worktree_owner_rejects_a_stale_registration_replaced_by_a_foreign_checkout",
     );
     let a = RepoBuilder::new(&sandbox, "a").file("a", "a").init();
     let b = RepoBuilder::new(&sandbox, "b").file("b", "b").init();
     let g = engine(&sandbox);
     for suffix in ["0134", "wf-build"] {
         let legacy = sandbox.work().join("legacy").join(suffix);
-        let hashed = sandbox.work().join("hashed").join(suffix);
         g.create_worktree(a.path(), &legacy, &format!("old-a-{suffix}"))
             .unwrap();
         std::fs::remove_dir_all(&legacy).unwrap();
@@ -391,18 +374,14 @@ fn legacy_lookup_rejects_a_stale_registration_replaced_by_a_foreign_checkout() {
         // Some Git versions keep the registration without a prunable marker
         // once another checkout occupies the path; ownership rejects it anyway.
         assert!(g.validate_worktree_owner(a.path(), &legacy).is_err());
-        assert_eq!(
-            g.pick_worktree_path(a.path(), hashed.clone(), legacy.clone()),
-            hashed
-        );
     }
     sandbox.finish();
 }
 
 #[cfg(unix)]
 #[test]
-fn legacy_lookup_rejects_a_replacement_symlink() {
-    let sandbox = sandbox("engine::git::legacy_lookup_rejects_a_replacement_symlink");
+fn worktree_owner_rejects_a_replacement_symlink() {
+    let sandbox = sandbox("engine::git::worktree_owner_rejects_a_replacement_symlink");
     let repo = RepoBuilder::new(&sandbox, "repo").file("a", "a").init();
     let g = engine(&sandbox);
     let legacy = sandbox.work().join("legacy");
@@ -413,20 +392,16 @@ fn legacy_lookup_rejects_a_replacement_symlink() {
     std::fs::remove_dir_all(&legacy).unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(&replacement, &legacy).unwrap();
-    let hashed = sandbox.work().join("hashed");
-    assert_eq!(
-        g.pick_worktree_path(repo.path(), hashed.clone(), legacy),
-        hashed
-    );
+    assert!(g.validate_worktree_owner(repo.path(), &legacy).is_err());
     sandbox.finish();
 }
 
 // APFS refuses file names that are not valid UTF-8.
 #[cfg(all(unix, not(target_os = "macos")))]
 #[test]
-fn legacy_lookup_preserves_tabs_newlines_and_native_path_bytes() {
+fn worktree_owner_preserves_tabs_newlines_and_native_path_bytes() {
     let sandbox =
-        sandbox("engine::git::legacy_lookup_preserves_tabs_newlines_and_native_path_bytes");
+        sandbox("engine::git::worktree_owner_preserves_tabs_newlines_and_native_path_bytes");
     let repo = RepoBuilder::new(&sandbox, "repo").file("a", "a").init();
     let g = engine(&sandbox);
     #[cfg(unix)]
@@ -434,7 +409,6 @@ fn legacy_lookup_preserves_tabs_newlines_and_native_path_bytes() {
         use std::os::unix::ffi::OsStringExt;
         let ancestor = std::ffi::OsString::from_vec(b"tab\tline\nnonutf8-\xff".to_vec());
         let legacy = sandbox.work().join(ancestor).join(suffix);
-        let hashed = sandbox.work().join("hashed").join(suffix);
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         // The engine's own creation needs UTF-8 argv; git accepts native bytes.
         sandbox
@@ -444,9 +418,10 @@ fn legacy_lookup_preserves_tabs_newlines_and_native_path_bytes() {
             .current_dir(repo.path())
             .run()
             .assert_success();
+        assert!(g.list_worktrees(repo.path()).unwrap().contains(&legacy));
         assert_eq!(
-            g.pick_worktree_path(repo.path(), hashed, legacy.clone()),
-            legacy
+            g.validate_worktree_owner(repo.path(), &legacy).unwrap(),
+            repo.path().join(".git").canonicalize().unwrap()
         );
     }
     sandbox.finish();

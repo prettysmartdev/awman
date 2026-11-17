@@ -294,6 +294,14 @@ pub(crate) async fn execute_prepared_with_outputs(
     if engines.agent_engine.is_lease_workspace() {
         crate::command::worker::policy::validate_workflow(&prepared.workflow)
             .map_err(CommandError::Other)?;
+        // Freshly generated and saved/resumed definitions both enter here,
+        // before any generated step or factory can resolve its overlays.
+        let review = engines.lease_workflow_review.as_ref().ok_or_else(|| {
+            CommandError::Other("lease workflow overlay review is unavailable".into())
+        })?;
+        review
+            .review(&prepared.workflow, prepared.original_session.env())
+            .map_err(CommandError::Other)?;
     }
     // Read-only workspace (WI 0152): the last check before outputs, setup or
     // any step. The plain path already ran it after loading the file; this is

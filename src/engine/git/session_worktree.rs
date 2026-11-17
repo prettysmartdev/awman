@@ -16,7 +16,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Output, Stdio};
 
 use super::{canonical_or_given, host_command, path_from_git_bytes, GitEngine};
-use crate::data::worktree_paths::WorktreePaths;
+use crate::data::checkout_paths::WorktreePaths;
 use crate::engine::error::EngineError;
 
 /// One record of `git worktree list --porcelain -z`.
@@ -331,8 +331,7 @@ impl GitEngine {
         Ok(parse_worktree_entries(&output.stdout))
     }
 
-    /// `~/.awman/worktrees/<dirname>-<hash8>/<name>/` (or the legacy unhashed
-    /// path when it holds a worktree of this repository). `name` must be one
+    /// `~/.awman/worktrees/<dirname>-<hash8>/<name>/`. `name` must be one
     /// normal path component: empty, `.`, `..`, separators and prefixes are
     /// rejected. Creates nothing.
     pub fn worktree_path_by_name(
@@ -361,7 +360,7 @@ impl GitEngine {
         }
         let p = WorktreePaths::from_env(self.env()).map_err(EngineError::Data)?;
         let root = canonical_or_given(git_root);
-        Ok(self.pick_worktree_path(&root, p.named(&root, name), p.legacy_named(&root, name)))
+        Ok(p.named(&root, name))
     }
 
     /// Names of the configured remotes (`git remote`). A failure is an error,
@@ -445,7 +444,7 @@ impl GitEngine {
         number: u32,
     ) -> Result<String, EngineError> {
         validate_remote_name(remote)?;
-        let cache = format!("refs/awman/pull-heads/{remote}/{number}");
+        let cache = crate::data::checkout_paths::pull_request_cache_ref(remote, number);
         self.check_full_ref(repo, &cache)?;
         let refspec = format!("+refs/pull/{number}/head:{cache}");
         fetch_ok(self.env(), repo, remote, &refspec)?;

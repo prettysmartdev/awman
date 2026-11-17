@@ -65,6 +65,7 @@ awman exec workflow --dynamic --work-item ./path/to/spec.md
 | [Run a one-off prompt](docs/03-agent-sessions.md) | `awman exec prompt "Review this change for bugs"` |
 | [Work directly with an agent](docs/03-agent-sessions.md) | `awman chat` |
 | [Turn a GitHub issue into a work item](docs/10-github-integration.md) | `awman new spec --work-item github:84` |
+| [Update a spec, workflow, skill, or agent](docs/03-agent-sessions.md#editing-existing-artifacts) | `awman edit spec 42 --amend --interview` |
 | [Set up recurring squad work](docs/12-squad.md) | `awman squad add --interview` |
 | [Watch and manage live sessions](docs/02-using-the-tui.md) | `awman` |
 | [Serve work through the API](docs/09-api-and-remote-mode.md#running-the-api-server) | `awman config set daemon.features.worker.enabled true`<br>`awman config set daemon.features.worker.push.workDirs.allow "$PWD"`<br>`awman daemon start --background` |

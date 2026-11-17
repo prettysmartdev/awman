@@ -96,6 +96,16 @@ Enter a one-paragraph summary of what the workflow should accomplish. A code age
 
 In the TUI, the dialog switches to a two-field layout: workflow name and summary. Press **Ctrl-Enter** to start the interview agent.
 
+### Editing a workflow
+
+```sh
+awman edit workflow release --interview             # the agent asks what you want to change, then edits
+awman edit workflow release --amend                 # reconcile the workflow with the commands and files it references
+awman edit workflow release --global --prompt "Add a lint step before tests"
+```
+
+`awman edit workflow <name-or-path>` changes an existing workflow; it never creates one. Repo workflows are edited in place and keep their format (a `.yaml` workflow stays YAML); global workflows are edited on a staged copy that awman validates and publishes back to `~/.awman/workflows/`. A workflow that no longer parses after the edit is left as written, with the problems listed, so you can run the edit again to repair it. See [Editing existing artifacts](03-agent-sessions.md#editing-existing-artifacts) for target selection, saving, and recovery.
+
 ### Global workflows
 
 ```sh
@@ -312,6 +322,12 @@ Setup steps are defined in a `[[setup]]` (TOML) or `setup:` (YAML) array. Each s
 | `run_shell` | `command` (string, required), `env` (object, optional) | Execute a shell command. `env` is an optional object of environment variables to inject (`{"KEY": "value"}`). |
 | `run_script` | `path` (string, required), `env` (object, optional) | Execute a shell script file (relative to the workdir). `env` is an optional object of environment variables. |
 | `poll_ci` | `interval_secs` (integer, optional, default 30), `max_retries` (integer, optional, default 10) | Wait for GitHub Actions CI on the current HEAD commit to pass. See [Polling CI status](#polling-ci-status). |
+
+When `clone_repo.into` is omitted, the clone directory uses the repository's
+URL basename without `.git`, following the same naming rules as remote
+sessions. Unsafe or oversized names receive a hash suffix. An explicit `into`
+path is used as written. The conflict check and clone always use the same
+destination.
 
 Example TOML setup:
 
@@ -628,7 +644,7 @@ Teardown steps are defined in a `[[teardown]]` (TOML) or `teardown:` (YAML) arra
 | `run_script` | `path` (string, required) | Execute a shell script file (relative to the workdir). Unlike the setup form, a teardown `run_script` has no `env` field; use `run_shell` if the script needs variables. |
 | `commit_changes` | `message` (string, required), `add_all` (boolean, optional, default `true`) | Commit the agent's work. By default changes are staged with `git add -A`, following the repository's Git ignore rules. Set `add_all = false` to commit only what is already staged. If there is nothing to commit (for example, the agent already committed its own work), the step succeeds and says so, so the following push and pull request steps still run. |
 | `push_branch` | `remote` (string, optional), `branch` (string, optional) | Push the current branch to a remote and set it as the upstream (`git push -u`). `remote` defaults to `origin` and `branch` to the current branch (`HEAD`), so omitting both runs `git push -u -- origin HEAD`. The branch field accepts a branch name, not options or force refspecs. |
-| `create_pull_request` | `title` (string, optional), `body` (string, optional), `base` (string, optional) | Create a pull request with `gh pr create` in the base container image (which must contain `gh`). `base` sets the branch the PR targets. Without a `title`, a run with a work item uses `Implement awman/work-item-NNNN` (otherwise `Automated PR`); without a `body`, it uses the work item's `Summary` section. If a preceding `push_branch` fails, this step is skipped. GitHub indexes a push a moment after it arrives; if `gh` reports only "No commits between" the base and the branch, awman retries up to four times (about 30 seconds). An invalid or missing head or base ref fails immediately. |
+| `create_pull_request` | `title` (string, optional), `body` (string, optional), `base` (string, optional) | Create a pull request with `gh pr create` in the base container image (which must contain `gh`). `base` sets the branch the PR targets. Without a `title`, a run uses the work item title, or `Implement work item <key>` if the work item has no title (otherwise `Automated PR`); without a `body`, it uses the work item's `Summary` section. If a preceding `push_branch` fails, this step is skipped. GitHub indexes a push a moment after it arrives; if `gh` reports only "No commits between" the base and the branch, awman retries up to four times (about 30 seconds). An invalid or missing head or base ref fails immediately. |
 | `poll_ci` | `interval_secs` (integer, optional, default 30), `max_retries` (integer, optional, default 10) | Wait for GitHub Actions CI on the current HEAD commit to pass. See [Polling CI status](#polling-ci-status). |
 
 If any teardown step is `commit_changes`, awman checks the identity available in the repository or worktree before starting. A complete repo-local identity is used as-is. If it is incomplete, awman offers choices in an interactive run, including entering an identity for this run or allowing the host-global identity for this run. No global Git config is changed. Headless runs need a complete repo-local identity or an explicit `--prerequisite-identity` choice.
@@ -1050,9 +1066,10 @@ folder and a named workflow uses `wf-<name>/`. GitHub issue workflows use
 `<number>-<title-slug>/` and branch `awman/<number>-<title-slug>`, for example
 `84-fix-login-timeout`, with no workflow prefix or trailing issue hash.
 The hash in the parent directory keeps two checkouts that
-share a folder name (for example two clones both called `app`) apart. A worktree
-created by an earlier awman under the plain `<repo-name>/` folder is still found
-and reused only when Git lists it for the same repository and its checkout pointer and administrative registration agree. Recreating a legacy worktree moves the fresh checkout to the hashed path.
+share a folder name (for example two clones both called `app`) apart. Creation,
+resume and recreation use only these canonical names. Unhashed repository
+directories, old GitHub issue names and unencoded workflow names are no longer
+searched or migrated; see the [retirement notes](releases/unreleased.md).
 
 If the worktree for a run already exists (for example after an interrupted run),
 choose what happens with `--on-existing-worktree`:

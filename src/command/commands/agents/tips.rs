@@ -50,7 +50,7 @@ pub const TIPS: &[&str] = &[
     // ── Specs and skills ─────────────────────────────────────────────────────
     "`awman new spec` creates a work item from `aspec/work-items/0000-template.md`.",
     "`awman new spec --work-item github:42` turns a GitHub issue into a work item spec.",
-    "`awman specs amend 0042` updates a completed work item to match what was actually built.",
+    "`awman edit spec 0042 --amend` updates a completed work item to match what was actually built.",
     "`awman new skill` creates a skill; add `--global` to share it with every repo.",
     "`awman new skill --pull github.com/obra/superpowers` pulls a published skills library.",
     "`awman new skill --pull-all` refreshes every skills library you've pulled.",

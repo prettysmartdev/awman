@@ -32,7 +32,10 @@ pub const CONTRACT_PATHS: &[&str] = &[
     "init",
     "ready",
     "chat",
-    "specs amend",
+    "edit spec",
+    "edit workflow",
+    "edit skill",
+    "edit agent",
     "agents status",
     "agents list",
     "agents detail",
@@ -498,4 +501,110 @@ fn remote_exec_forwards_the_work_item_unparsed() {
     );
     let request = ExecArg::Prompt(Some("go".into())).into_request(&forwarded);
     assert_eq!(request.args, ["--work-item=PROJ-12", "--", "go"]);
+}
+
+// ── WI 0059: `edit` replaces the removed `specs` command ───────────────────
+
+fn flag(path: &[&str], long: &str) -> &'static awman::command::dispatch::catalogue::FlagSpec {
+    CommandCatalogue::get()
+        .lookup(path)
+        .unwrap_or_else(|| panic!("missing {path:?}"))
+        .flags
+        .iter()
+        .find(|f| f.long == long)
+        .unwrap_or_else(|| panic!("{path:?} has no --{long}"))
+}
+
+#[test]
+fn edit_has_four_leaves_and_every_new_kind_has_an_edit_counterpart() {
+    let catalogue = CommandCatalogue::get();
+    let edit = catalogue.lookup(&["edit"]).expect("edit group");
+    let edit_kinds: BTreeSet<_> = edit.subcommands.iter().map(|s| s.name).collect();
+    assert_eq!(
+        edit_kinds,
+        BTreeSet::from(["spec", "workflow", "skill", "agent"])
+    );
+    for leaf in edit.subcommands {
+        assert!(leaf.subcommands.is_empty(), "edit {} is a leaf", leaf.name);
+    }
+    let new = catalogue.lookup(&["new"]).expect("new group");
+    for kind in new.subcommands {
+        assert!(
+            edit_kinds.contains(kind.name),
+            "`new {}` has no `edit {}`",
+            kind.name,
+            kind.name
+        );
+    }
+}
+
+#[test]
+fn the_specs_command_is_gone_with_no_alias() {
+    let catalogue = CommandCatalogue::get();
+    assert!(catalogue.lookup(&["specs"]).is_none());
+    assert!(catalogue.lookup(&["specs", "amend"]).is_none());
+    assert!(catalogue.lookup_with_aliases(&["specs", "amend"]).is_none());
+    assert!(leaves().iter().all(|(path, _)| path[0] != "specs"));
+}
+
+#[test]
+fn edit_interview_conflicts_with_headless_and_json_and_every_leaf_needs_a_runtime() {
+    for kind in ["spec", "workflow", "skill", "agent"] {
+        let path = ["edit", kind];
+        let interview = flag(&path, "interview");
+        assert!(interview.conflicts_with.contains(&"headless"), "{kind}");
+        assert!(interview.conflicts_with.contains(&"json"), "{kind}");
+        assert!(CommandCatalogue::get().requires_runtime(&path), "{kind}");
+    }
+    assert!(flag(&["edit", "spec"], "headless")
+        .conflicts_with
+        .contains(&"interview"));
+    assert!(flag(&["edit", "spec"], "json")
+        .conflicts_with
+        .contains(&"interview"));
+    assert!(flag_names(&["edit", "spec"]).contains(&"amend"));
+}
+
+#[test]
+fn work_item_short_alias_parses_on_every_supporting_command() {
+    let catalogue = CommandCatalogue::get();
+    let mut supported = Vec::new();
+    for (path, spec) in leaves() {
+        let Some(flag) = spec.find_flag("work-item") else {
+            continue;
+        };
+        supported.push(path.join(" "));
+        assert_eq!(flag.short, Some('w'), "{path:?}");
+        assert_eq!(
+            spec.flags.iter().filter(|f| f.short == Some('w')).count(),
+            1
+        );
+        for spelling in [vec!["-w", "github:42"], vec!["--work-item", "github:42"]] {
+            let parsed = catalogue.parse_raw_args(&path, &args(&spelling)).unwrap();
+            assert_eq!(
+                parsed.flag_string("work-item").as_deref(),
+                Some("github:42"),
+                "{path:?}"
+            );
+            let mut argv = vec!["awman"];
+            argv.extend_from_slice(&path);
+            argv.extend_from_slice(&spelling);
+            let matches = catalogue
+                .build_clap_command()
+                .try_get_matches_from(argv)
+                .unwrap();
+            let mut leaf = &matches;
+            for command in &path {
+                leaf = leaf.subcommand_matches(command).unwrap();
+            }
+            assert_eq!(
+                leaf.get_one::<String>("work-item").map(String::as_str),
+                Some("github:42")
+            );
+        }
+    }
+    assert_eq!(
+        supported.into_iter().collect::<BTreeSet<_>>(),
+        WORK_ITEM_COMMANDS.iter().map(|p| p.join(" ")).collect()
+    );
 }

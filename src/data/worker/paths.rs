@@ -14,16 +14,6 @@ pub fn work_root(paths: &DataPaths, settings: &WorkerSettings) -> PathBuf {
     }
 }
 
-/// `<work_root>/leases/`.
-pub fn leases_dir(work_root: &Path) -> PathBuf {
-    work_root.join("leases")
-}
-
-/// `<work_root>/leases/<lease_id>/`.
-pub fn lease_dir(work_root: &Path, lease: &LeaseId) -> PathBuf {
-    leases_dir(work_root).join(lease.as_str())
-}
-
 /// A lease owner's cross-process liveness lock. Lock files are never unlinked:
 /// replacing their inode would let two owners hold different locks.
 pub fn try_lease_owner(

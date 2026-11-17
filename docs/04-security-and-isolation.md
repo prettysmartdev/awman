@@ -113,10 +113,16 @@ awman exec workflow path/to/workflow.toml --worktree
 
 ### How it works
 
-1. awman creates a branch from your current `HEAD`: `awman/work-item-NNNN` for a work item, `awman/workflow-<name>` for a named workflow
-2. A worktree is checked out under `~/.awman/worktrees/<repo-name>-<hash>/` (`<NNNN>/` or `wf-<name>/`; `<hash>` is 8 hex characters derived from the repository's full path, so two checkouts with the same folder name never share a worktree)
+1. awman creates a branch from your current `HEAD`: `awman/work-item-NNNN` for a local work item, `awman/<number>-<title>` for a GitHub issue, or `awman/workflow-<name>` for a named workflow
+2. A worktree is checked out under `~/.awman/worktrees/<repo-name>-<hash>/` (`<NNNN>/`, `<number>-<title>/`, or `wf-<name>/`; `<hash>` is 8 hex characters derived from the repository's full path, so two checkouts with the same folder name never share a worktree)
 3. The agent container mounts the worktree instead of your repo root
 4. When the run ends, you choose what to do with the branch
+
+Workflow names that contain unsafe characters or are too long are shortened
+or escaped with a hash suffix. The branch and directory use the same encoded
+name. Creation, resume and recreation use only the canonical path and branch.
+Older naming schemes are no longer searched or migrated. Existing files and
+branches remain on disk; see the [retirement notes](releases/unreleased.md).
 
 ### After the run
 

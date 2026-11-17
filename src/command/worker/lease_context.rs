@@ -111,6 +111,8 @@ mod tests {
         let support = crate::engine::worker::lease_workspace::LeaseRuntimeSupport {
             read_only_workspace: false,
             outputs_mount: false,
+            skill_mounts: true,
+            secret_env: true,
         };
         let settings = crate::data::config::daemon::DaemonSettings::from_merged(
             &crate::data::config::daemon::DaemonConfig::default(),

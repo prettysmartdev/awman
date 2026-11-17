@@ -58,6 +58,15 @@ Then ask the agent, for example: *"Add support for the pi coding agent to awman.
 
 ---
 
+### Editing an existing definition
+
+```sh
+awman edit agent custom --headless --prompt "Correct the model setting"
+awman edit agent custom --amend --interview
+```
+
+`awman edit agent <name>` changes an existing definition (and its companion Dockerfile) in `.awman/agents/`, or in `~/.awman/agents/` with `--global`. The built-in agents are read-only. A definition that no longer validates after the edit is left as written, with the problems listed. Editing a definition **does not approve or run it**: awman reminds you that the changed definition must be approved again, and nothing is built or executed until you review it with `awman ready --agent <name>`. See [Editing existing artifacts](03-agent-sessions.md#editing-existing-artifacts).
+
 ## Definition reference
 
 A definition is a TOML file with `schema = 1`. Unknown keys are rejected, so a typo is an error rather than silently ignored. A top-level `[sandbox]` table is reserved and rejected (custom agents do not support Docker Sandboxes yet).

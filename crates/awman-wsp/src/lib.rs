@@ -7,6 +7,7 @@ pub mod context;
 pub use context::*;
 pub mod conformance;
 pub mod labels;
+mod lease_exec;
 #[cfg(feature = "mock")]
 pub mod mock;
 pub mod mock_worker;
@@ -20,3 +21,4 @@ pub use client::{Client, Error};
 pub use types::*;
 
 pub mod repo_url;
+pub mod secret;

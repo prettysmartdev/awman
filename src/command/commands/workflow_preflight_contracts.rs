@@ -474,6 +474,7 @@ mod stale_images {
                 credential_monitor: None,
                 global_config: Arc::new(Default::default()),
                 ephemeral_secrets: Arc::new(Default::default()),
+                lease_workflow_review: None,
             }
         }
     }

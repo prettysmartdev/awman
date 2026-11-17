@@ -819,6 +819,8 @@ have the effective defaults above.
 | `workServers.*.labels.*` | string | `null` | global | no | yes | — | One owner-configured worker label; awman/ is reserved. |
 | `workServers.*.imageBudget.maxImages` | int ≥ 1 | `null` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_IMAGE_BUDGET_MAX_IMAGES` | Most lease-built images the worker keeps (20 when imageBudget is unset); oldest unused go first. |
 | `workServers.*.imageBudget.maxBytes` | size | `null` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_IMAGE_BUDGET_MAX_BYTES` | Most total bytes of lease-built images the worker keeps; unlimited when unset. |
+| `workServers.*.allowEnv` | list<string> | `[]` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_ALLOW_ENV` | Worker environment variables a lease from this server may request with env(NAME). |
+| `workServers.*.allowSkills` | list<string> | `[]` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_ALLOW_SKILLS` | Installed skills outside the default library a lease from this server may request with skill(name). |
 | `remote.default` | string | `null` | global | no | no | `AWMAN_REMOTE_DEFAULT` | Target used when --remote names none. |
 | `remote.targets.*.url` | string | `null` | global | no | no | `AWMAN_REMOTE_TARGETS_<NAME>_URL` | Target API URL (https://host:port); required for every entry. |
 | `remote.targets.*.apiKey` | string | `null` | global | yes | no | `AWMAN_REMOTE_TARGETS_<NAME>_API_KEY` | Bearer API key for the target. |

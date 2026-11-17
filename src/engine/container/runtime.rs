@@ -249,6 +249,7 @@ impl ContainerRuntime {
         &self,
         options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        options.validate_caller_env()?;
         self.backend.build(options)
     }
 

@@ -91,29 +91,6 @@ Available via: CLI, TUI
 
 ---
 
-## `awman specs`
-
-Manage work item specs (amend).
-
-Available via: CLI, TUI
-
-### `awman specs amend`
-
-Review and amend a completed work item to match the final implementation.
-
-Available via: CLI, TUI
-
-| Argument | Kind | Required | Help |
-|---|---|---|---|
-| `work_item` | string | yes | Work item to amend: a number in the configured workItems.source, or any explicit --work-item form (local:<N>, a path, github:<N>, owner/repo#<N>, a URL, http:<provider>:<id>). |
-
-| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
-|---|---|---|---|---|---|---|
-| `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the agent headless (print mode). |
-| `--allow-docker` | bool | false | — | — | CLI, TUI, API | Mount the host Docker daemon socket into the agent container. |
-
----
-
 ## `awman agents`
 
 Inspect and manage running code agents.
@@ -289,7 +266,7 @@ Available via: CLI, TUI, API
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `-o, --overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a directory or context(repo@<key>[:ro\|rw]) into the agent container. Repeatable. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
-| `--work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
+| `-w, --work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
 | `--interactive` | bool | false | — | `--headless` | CLI, TUI, API | Run the agent interactively in a terminal (PTY). Overrides a daemon worker's headless default where the worker allows it. |
 | `--branch` | string (optional) | — | — | `--pr`, `--worktree` | CLI, TUI | Run in a worktree for this branch. |
 | `--pr` | string (optional) | — | — | `--branch`, `--worktree` | CLI, TUI | Run in a worktree for this GitHub pull request. |
@@ -310,7 +287,7 @@ Available via: CLI, TUI, API
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
-| `--work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
+| `-w, --work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
 | `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the agent headless (print mode). |
 | `--plan` | bool | false | — | `--yolo` | CLI, TUI, API | Run the agent in plan mode (read-only). |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Mount the host Docker daemon socket into the agent container. |
@@ -673,7 +650,7 @@ Runs without a working agent runtime — reachable even when the configured runt
 |---|---|---|---|---|---|---|
 | `--session` | string (optional) | — | — | — | CLI, TUI, API | Session ID to use on the remote host. |
 | `-f, --follow` | bool | false | — | — | CLI, TUI, API | Stream logs via SSE until the command completes. |
-| `--work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
+| `-w, --work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
 | `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the agent headless (print mode). |
 | `--plan` | bool | false | — | `--yolo` | CLI, TUI, API | Run the agent in plan mode (read-only). |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Mount the host Docker daemon socket into the agent container. |
@@ -721,7 +698,7 @@ Runs without a working agent runtime — reachable even when the configured runt
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `-o, --overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a directory or context(repo@<key>[:ro\|rw]) into the agent container. Repeatable. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Repeatable extra argument for the agent command, replacing its agentFlags entry (pass as --agent-flag=--verbose). |
-| `--work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
+| `-w, --work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
 | `--interactive` | bool | false | — | `--headless` | CLI, TUI, API | Run the agent interactively in a terminal (PTY). Overrides a daemon worker's headless default where the worker allows it. |
 | `--read-only-workspace` | bool | false | — | `--allow-docker` | CLI, TUI, API | Mount the workspace read-only; the agent can write only to /awman/output, mounted contexts and /tmp. |
 
@@ -743,7 +720,7 @@ Available via: CLI, TUI
 |---|---|---|---|---|---|---|
 | `--interview` | bool | false | — | — | CLI, TUI, API | Use interview mode. |
 | `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the interview agent headless (print mode). |
-| `--work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
+| `-w, --work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
 
 ### `awman new workflow`
 
@@ -790,6 +767,117 @@ Runs without a working agent runtime — reachable even when the configured runt
 | `--global` | bool | false | — | — | CLI, TUI, API | Write to ~/.awman/agents/<name>.toml instead of the current repo. |
 | `--from` | enum: crush, maki | — | — | — | CLI, TUI, API | Copy a shipped example definition instead of the commented skeleton. |
 | `--force` | bool | false | — | — | CLI, TUI, API | Overwrite an existing definition (and, with --from maki, its Dockerfile). |
+
+---
+
+## `awman edit`
+
+Edit an existing spec, workflow, skill, or agent definition.
+
+Available via: CLI, TUI
+
+### `awman edit spec`
+
+Edit an existing work item spec.
+
+Available via: CLI, TUI
+
+| Argument | Kind | Required | Help |
+|---|---|---|---|
+| `ref` | string | yes | Work item reference: configured-source value, local:<N> or Markdown path, github:<N>, #<N>, owner/repo#N, GitHub URL, or configured HTTP provider reference. |
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `--interview` | bool | false | — | `--headless`, `--json` | CLI, TUI, API | Ask clarifying questions before editing the existing item. |
+| `--amend` | bool | false | — | — | CLI, TUI, API | Review and amend the existing item using available evidence. |
+| `-n, --headless` | bool | false | — | `--interview` | CLI, TUI, API | Run the edit agent without interactive input. |
+| `--prompt` | string (optional) | — | — | — | CLI, TUI, API | Describe the changes to make. |
+| `--json` | bool | false | `--headless` | `--interview` | CLI, TUI, API | Print the edit outcome as JSON and run headless. |
+| `--allow-docker` | bool | false | — | — | CLI, TUI, API | Allow the agent to use Docker when running. |
+| `--yolo` | bool | false | — | — | CLI, TUI, API | Automatically approve agent actions. |
+| `--auto` | bool | false | — | — | CLI, TUI, API | Run the agent in automatic mode. |
+| `--agent` | string (optional) | — | — | — | CLI, TUI, API | Select the agent to run. |
+| `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the selected agent's model. |
+| `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Add an overlay to the agent session. |
+| `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Pass a flag to the agent (replaces configured agent flags). |
+
+### `awman edit workflow`
+
+Edit an existing workflow.
+
+Available via: CLI, TUI
+
+| Argument | Kind | Required | Help |
+|---|---|---|---|
+| `ref` | string | yes | Existing artifact name or path. |
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `--interview` | bool | false | — | `--headless`, `--json` | CLI, TUI, API | Ask clarifying questions before editing the existing item. |
+| `--amend` | bool | false | — | — | CLI, TUI, API | Review and amend the existing item using available evidence. |
+| `-n, --headless` | bool | false | — | `--interview` | CLI, TUI, API | Run the edit agent without interactive input. |
+| `--prompt` | string (optional) | — | — | — | CLI, TUI, API | Describe the changes to make. |
+| `--global` | bool | false | — | — | CLI, TUI, API | Select the global artifact instead of a repository artifact. |
+| `--json` | bool | false | `--headless` | `--interview` | CLI, TUI, API | Print the edit outcome as JSON and run headless. |
+| `--allow-docker` | bool | false | — | — | CLI, TUI, API | Allow the agent to use Docker when running. |
+| `--yolo` | bool | false | — | — | CLI, TUI, API | Automatically approve agent actions. |
+| `--auto` | bool | false | — | — | CLI, TUI, API | Run the agent in automatic mode. |
+| `--agent` | string (optional) | — | — | — | CLI, TUI, API | Select the agent to run. |
+| `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the selected agent's model. |
+| `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Add an overlay to the agent session. |
+| `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Pass a flag to the agent (replaces configured agent flags). |
+
+### `awman edit skill`
+
+Edit an existing skill.
+
+Available via: CLI, TUI
+
+| Argument | Kind | Required | Help |
+|---|---|---|---|
+| `ref` | string | yes | Existing artifact name or path. |
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `--interview` | bool | false | — | `--headless`, `--json` | CLI, TUI, API | Ask clarifying questions before editing the existing item. |
+| `--amend` | bool | false | — | — | CLI, TUI, API | Review and amend the existing item using available evidence. |
+| `-n, --headless` | bool | false | — | `--interview` | CLI, TUI, API | Run the edit agent without interactive input. |
+| `--prompt` | string (optional) | — | — | — | CLI, TUI, API | Describe the changes to make. |
+| `--global` | bool | false | — | — | CLI, TUI, API | Select the global artifact instead of a repository artifact. |
+| `--json` | bool | false | `--headless` | `--interview` | CLI, TUI, API | Print the edit outcome as JSON and run headless. |
+| `--allow-docker` | bool | false | — | — | CLI, TUI, API | Allow the agent to use Docker when running. |
+| `--yolo` | bool | false | — | — | CLI, TUI, API | Automatically approve agent actions. |
+| `--auto` | bool | false | — | — | CLI, TUI, API | Run the agent in automatic mode. |
+| `--agent` | string (optional) | — | — | — | CLI, TUI, API | Select the agent to run. |
+| `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the selected agent's model. |
+| `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Add an overlay to the agent session. |
+| `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Pass a flag to the agent (replaces configured agent flags). |
+
+### `awman edit agent`
+
+Edit an existing custom agent definition.
+
+Available via: CLI, TUI
+
+| Argument | Kind | Required | Help |
+|---|---|---|---|
+| `ref` | string | yes | Existing artifact name or path. |
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `--interview` | bool | false | — | `--headless`, `--json` | CLI, TUI, API | Ask clarifying questions before editing the existing item. |
+| `--amend` | bool | false | — | — | CLI, TUI, API | Review and amend the existing item using available evidence. |
+| `-n, --headless` | bool | false | — | `--interview` | CLI, TUI, API | Run the edit agent without interactive input. |
+| `--prompt` | string (optional) | — | — | — | CLI, TUI, API | Describe the changes to make. |
+| `--global` | bool | false | — | — | CLI, TUI, API | Select the global artifact instead of a repository artifact. |
+| `--json` | bool | false | `--headless` | `--interview` | CLI, TUI, API | Print the edit outcome as JSON and run headless. |
+| `--allow-docker` | bool | false | — | — | CLI, TUI, API | Allow the agent to use Docker when running. |
+| `--yolo` | bool | false | — | — | CLI, TUI, API | Automatically approve agent actions. |
+| `--auto` | bool | false | — | — | CLI, TUI, API | Run the agent in automatic mode. |
+| `--agent` | string (optional) | — | — | — | CLI, TUI, API | Select the agent to run. |
+| `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the selected agent's model. |
+| `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Add an overlay to the agent session. |
+| `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Pass a flag to the agent (replaces configured agent flags). |
 
 ---
 

@@ -101,6 +101,8 @@ mod tests {
         let support = crate::engine::worker::lease_workspace::LeaseRuntimeSupport {
             read_only_workspace: false,
             outputs_mount: false,
+            skill_mounts: true,
+            secret_env: true,
         };
         assert!(super::super::capabilities::for_settings(support, &settings)
             .contains(&awman_wsp::features::LEASE_WORKFLOW_CONTEXT));

@@ -9,6 +9,8 @@
 //! Stateless helpers parse command overlay flags and report launch outcomes;
 //! session-bound policy resolves agent and transport intent against config.
 
+pub mod agent_session;
+
 pub use crate::command::commands::agent_trust::{
     ensure_agent_trusted, ensure_workflow_agents_trusted, AgentTrustFrontend, AgentTrustReview,
     HostCommandReview, TrustDecision, TrustOutcome,

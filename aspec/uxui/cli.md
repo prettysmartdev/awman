@@ -70,9 +70,50 @@ command or flag.
   correctness is declared as an implication (`implies`) rather than
   silently required.
 
+## Editing existing artifacts (`edit`)
+
+`edit` is a grouping parent with four leaves — `spec`, `workflow`, `skill`,
+`agent` — each taking one required positional `ref`. It only changes
+artifacts that exist; creation stays under `new`. There is no `specs`
+command and no alias for the retired spec-amendment subcommand.
+
+- **Flags.** Every leaf has `--interview`, `--amend`, `--prompt`, `--headless`
+  (`-n`), `--json` (implies headless), and the shared agent launch flags
+  (`--agent`, `--model`, `--overlay`, `--agent-flag`, `--auto`, `--yolo`,
+  `--allow-docker`). `workflow`, `skill` and `agent` also take `--global`.
+  `--plan` is not offered.
+- **Usage rules.** `--interview` conflicts with `--headless` and `--json`
+  (it needs a person). A headless edit requires `--prompt` unless `--amend` is
+  set. An empty `--prompt` is treated as absent.
+- **Target resolution** happens before anything launches or is copied.
+  Workflows, skills and agents resolve in the repo first; `--global` selects
+  the personal store; a miss that would hit in the other scope names the flag
+  to use. Ambiguous names list candidates. A path outside the allowed roots,
+  a symlink escaping its root, and first-party agents are refused (first-party
+  agents are read-only). Work items accept every reference form in the grammar
+  below, resolve strictly against the owning provider, and refuse inline items.
+- **Persistence** follows where the target lives: in place through the
+  `/workspace` mount for artifacts in the checkout; a staged copy under the
+  repo context (`scratch/edit/<id>/`) published per file afterwards for
+  global, library or out-of-checkout artifacts; a synced draft for remote
+  work items, saved while the agent runs. Only the artifact's own files are
+  published; other files the agent created are reported, not saved.
+- **Outcome rule.** Success requires the agent to exit 0 and the save and
+  validation to succeed; an edit with no changes succeeds. When both fail,
+  the error reports both. Cancellation is not rollback: whatever was
+  written or uploaded remains, and what is on disk is saved. Drafts kept
+  after a failed save are retained and their paths reported. An in-repo edit
+  that leaves an invalid artifact is left as written with the problems
+  listed.
+- **Trust.** Editing an agent definition never approves, builds, or runs it;
+  the changed definition is pending approval until `ready --agent` reviews it.
+- **Interview and amendment** apply uniformly to every kind and combine:
+  `--amend --interview` discusses uncertain findings before reconciling.
+
 ## Work item reference grammar
 
-Commands that accept a work item use the shared `--work-item <REF>` flag.
+Commands that accept a work item use the shared `--work-item <REF>` flag,
+with `-w <REF>` as its short alias on every command that supports it.
 The value is a single reference, not a comma-separated list. Its grammar is:
 
 - A bare value, resolved using `workItems.source` (`local`, `github`, or

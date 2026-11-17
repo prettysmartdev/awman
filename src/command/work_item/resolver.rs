@@ -1,5 +1,5 @@
 //! Layer 2 work item resolution: one entry point for every command that reads
-//! a work item (`--work-item`, `specs amend <ref>`, `new spec --work-item`).
+//! a work item (`--work-item`, `edit spec <ref>`, `new spec --work-item`).
 //!
 //! The reference grammar is parsed in Layer 0 ([`WorkItemRef::parse`]); this
 //! module decides what a *bare* reference means (it follows
@@ -224,7 +224,7 @@ impl std::fmt::Display for WorkItemError {
             Self::AlreadyExists { reference, scope } => write!(
                 f,
                 "work item {reference} already exists in the configured source ({scope}); \
-                 use `awman specs amend {reference}` to edit it"
+                 use `awman edit spec {reference}` to edit it"
             ),
             Self::InlineReferenceConflict => write!(
                 f,
@@ -615,7 +615,7 @@ impl WorkItemResolver {
     }
 
     /// Refuse to seed a new work item from one that already lives in the
-    /// creation target (that would duplicate it); suggest `specs amend`.
+    /// creation target (that would duplicate it); suggest `edit spec`.
     /// Seeds from another location (a local file elsewhere in the checkout,
     /// another repository, another provider base, inline) are allowed.
     pub fn ensure_new_in_target(
@@ -1088,7 +1088,7 @@ fn url_within_scope(source_id: &str, scope: &str) -> bool {
     }
 }
 
-/// The reference a user would pass to `specs amend` for `seed`.
+/// The reference a user would pass to `edit spec` for `seed`.
 fn seed_reference(seed: &ResolvedWorkItem) -> String {
     match &seed.origin {
         WorkItemOrigin::Local { .. } => match seed.number {

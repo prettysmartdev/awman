@@ -36,6 +36,7 @@ use crate::command::commands::agent_setup::{
 use crate::command::commands::agents::AgentsCommandFrontend;
 use crate::command::commands::chat::ChatCommandFrontend;
 use crate::command::commands::config::{ConfigCommandFrontend, ConfigEditRequest, ConfigFieldRow};
+use crate::command::commands::edit::EditCommandFrontend;
 use crate::command::commands::exec_prompt::ExecPromptCommandFrontend;
 use crate::command::commands::exec_workflow::{
     ExecWorkflowCommandFrontend, WorkflowResumeDecision, WorkflowResumePrompt, WorkflowSummary,
@@ -43,7 +44,6 @@ use crate::command::commands::exec_workflow::{
 use crate::command::commands::mount_scope::{MountScopeDecision, MountScopeFrontend};
 use crate::command::commands::new::NewCommandFrontend;
 use crate::command::commands::remote::RemoteCommandFrontend;
-use crate::command::commands::specs::SpecsCommandFrontend;
 use crate::command::commands::worktree_lifecycle::{
     DirtyMergeTargetDecision, ExistingWorktreeDecision, MergeFailure, PostWorkflowWorktreeAction,
     PreWorktreeDecision, WorktreeLifecycleFrontend, WorktreeMergeMode,
@@ -53,6 +53,7 @@ use crate::command::dispatch::projections::raw_args::ParsedArgs;
 use crate::command::dispatch::CommandFrontend;
 use crate::command::error::CommandError;
 use crate::command::headless::HeadlessDefaults;
+use crate::command::work_item::spec_service::NewSpecFrontend;
 use crate::data::config::work_items::WorkItemsConfig;
 use crate::data::fs::api_command_log::CommandStateWriter;
 use crate::data::fs::api_db::{FailedStep, FailedStepPhase};
@@ -1950,9 +1951,10 @@ impl ExecWorkflowCommandFrontend for ApiDispatchFrontend {
     }
 }
 
-impl SpecsCommandFrontend for ApiDispatchFrontend {}
+impl NewSpecFrontend for ApiDispatchFrontend {}
 
 impl NewCommandFrontend for ApiDispatchFrontend {}
+impl EditCommandFrontend for ApiDispatchFrontend {}
 
 /// No person is behind an HTTP request, so a custom definition that needs
 /// approval is refused (`AgentDefinitionUntrusted`), never approved.

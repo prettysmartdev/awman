@@ -8,12 +8,12 @@ use std::sync::Arc;
 
 use crate::command::dispatch::catalogue::SessionWorktreeTarget;
 use crate::command::error::CommandError;
+use crate::data::checkout_paths::{
+    branch_worktree_dir_name, pull_request_worktree_dir_name, WorktreePaths,
+};
 use crate::data::fs::remote_slug::RemoteSlug;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::Session;
-use crate::data::worktree_paths::{
-    branch_worktree_dir_name, pull_request_worktree_dir_name, WorktreePaths,
-};
 use crate::engine::git::pull_request::{
     match_pull_request_remote, parse_pull_request_input, PullRequestClient, PullRequestState,
 };
@@ -502,7 +502,7 @@ impl Resolver<'_> {
         {
             return self.resolve_branch(&info.head_ref_name, Some(&remote), &name, false);
         }
-        let branch = format!("pr/{}", pr.number);
+        let branch = crate::data::checkout_paths::pull_request_branch_name(pr.number);
         self.git.validate_branch_name(self.root, &branch)?;
         if info.is_cross_repository {
             self.warn(format!("Fork PR #{} uses local branch '{branch}' without tracking the fork branch. Pushing to origin will not update the PR; configure the fork's remote explicitly.", pr.number));
@@ -601,13 +601,10 @@ impl Resolver<'_> {
     fn missing_name(&self, name: &str) -> CommandError {
         let detail = (|| -> Result<String, CommandError> {
             let paths = WorktreePaths::from_env(self.git.env())?;
-            let directories = [
-                paths.named(self.root, name),
-                paths.legacy_named(self.root, name),
-            ]
-            .into_iter()
-            .filter_map(|path| path.parent().map(Path::to_path_buf))
-            .collect::<Vec<_>>();
+            let directories = [paths.named(self.root, name)]
+                .into_iter()
+                .filter_map(|path| path.parent().map(Path::to_path_buf))
+                .collect::<Vec<_>>();
             let canonical_directories = directories
                 .iter()
                 .filter_map(|dir| dir.canonicalize().ok())
@@ -710,7 +707,9 @@ pub(crate) fn parse_existing_worktree_input(
 pub(crate) fn worktree_name_candidates(name: &str) -> Vec<String> {
     let mut candidates = vec![name.to_string()];
     if !name.is_empty() && name.bytes().all(|c| c.is_ascii_digit()) && name.len() < 4 {
-        candidates.push(format!("{name:0>4}"));
+        candidates.push(crate::data::checkout_paths::work_item_dir_name(
+            name.parse().expect("at most three ASCII digits"),
+        ));
     }
     candidates
 }

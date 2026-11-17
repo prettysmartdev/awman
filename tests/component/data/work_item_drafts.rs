@@ -288,3 +288,79 @@ fn an_existing_wide_drafts_directory_is_made_owner_only() {
     );
     draft.remove().unwrap();
 }
+
+// WI 0059: existing-issue edits rely on the safe reader for every save shape.
+
+#[test]
+fn same_size_saves_with_a_restored_timestamp_still_change_the_content_hash() {
+    let sandbox = support::sandbox(
+        "data::work_item_drafts::same_size_saves_with_a_restored_timestamp_still_change_the_content_hash",
+    );
+    let draft = new_draft(&sandbox, "seed\n");
+    let host = draft.paths().host_path.clone();
+    let before = read_work_item_draft(&draft).unwrap();
+    std::fs::write(&host, "seeD\n").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&host)
+        .unwrap()
+        .set_modified(before.stamp.modified)
+        .unwrap();
+    // The cheap stamp cannot tell them apart; the content hash can.
+    assert_eq!(draft.stamp().unwrap(), before.stamp);
+    let after = read_work_item_draft(&draft).unwrap();
+    assert_eq!(after.content, "seeD\n");
+    assert_ne!(after.sha256, before.sha256);
+}
+
+#[test]
+fn an_atomic_rename_save_is_read_as_the_new_content_and_removed_normally() {
+    let sandbox = support::sandbox(
+        "data::work_item_drafts::an_atomic_rename_save_is_read_as_the_new_content_and_removed_normally",
+    );
+    let draft = new_draft(&sandbox, "seed\n");
+    let host = draft.paths().host_path.clone();
+    let sibling = host.with_extension("swap");
+    std::fs::write(&sibling, "saved by rename\n").unwrap();
+    std::fs::rename(&sibling, &host).unwrap();
+    assert_eq!(
+        read_work_item_draft(&draft).unwrap().content,
+        "saved by rename\n"
+    );
+    draft.remove().unwrap();
+    assert!(!host.exists());
+}
+
+#[test]
+fn empty_and_whitespace_drafts_read_back_exactly_so_callers_decide_what_to_publish() {
+    let sandbox = support::sandbox(
+        "data::work_item_drafts::empty_and_whitespace_drafts_read_back_exactly_so_callers_decide_what_to_publish",
+    );
+    let draft = new_draft(&sandbox, "seed\n");
+    for content in ["", " \n\t"] {
+        std::fs::write(&draft.paths().host_path, content).unwrap();
+        assert_eq!(read_work_item_draft(&draft).unwrap().content, content);
+    }
+}
+
+#[test]
+fn removing_a_draft_twice_or_after_it_vanished_is_success_and_retention_is_explicit() {
+    let sandbox = support::sandbox(
+        "data::work_item_drafts::removing_a_draft_twice_or_after_it_vanished_is_success_and_retention_is_explicit",
+    );
+    // A vanished draft is already cleaned up.
+    let draft = new_draft(&sandbox, "seed\n");
+    std::fs::remove_file(&draft.paths().host_path).unwrap();
+    assert!(matches!(
+        read_work_item_draft(&draft),
+        Err(DraftReadError::Missing)
+    ));
+    draft.remove().unwrap();
+    // A retained draft stays until `remove` is called deliberately.
+    let draft = new_draft(&sandbox, "keep me\n");
+    let host = draft.paths().host_path.clone();
+    assert_eq!(read_work_item_draft(&draft).unwrap().content, "keep me\n");
+    assert!(host.exists());
+    draft.remove().unwrap();
+    assert!(!host.exists());
+}

@@ -5,6 +5,7 @@ pub mod draft_sync;
 pub mod edit;
 pub mod input;
 pub mod resolver;
+pub mod spec_service;
 
 pub use input::{prepare_work_item_input, PreparedWorkItemInput};
 pub use resolver::{

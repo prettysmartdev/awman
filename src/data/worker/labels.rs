@@ -70,6 +70,7 @@ pub struct HostFacts {
     pub host: WorkerHostKind,
     /// Agents with a working image.
     pub agents_with_images: Vec<String>,
+    pub skills: Vec<String>,
     pub interactive_allowed: bool,
     pub headless_allowed: bool,
 }
@@ -92,9 +93,15 @@ impl HostFacts {
             runtime_kind: runtime_kind.into(),
             host,
             agents_with_images,
+            skills: Vec::new(),
             interactive_allowed,
             headless_allowed,
         }
+    }
+
+    pub fn with_skills(mut self, skills: Vec<String>) -> Self {
+        self.skills = skills;
+        self
     }
 
     /// Every reported label, each under `awman/`.
@@ -123,6 +130,11 @@ impl HostFacts {
         if self.headless_allowed {
             put("interaction.headless".into(), "true");
         }
+        for name in &self.skills {
+            if let Some((key, value)) = awman_wsp::labels::skill_label(name) {
+                labels.insert(key, value);
+            }
+        }
         labels
     }
 
@@ -132,5 +144,36 @@ impl HostFacts {
         configured: &BTreeMap<String, String>,
     ) -> Result<WorkerLabels, LabelError> {
         WorkerLabels::new(self.reported_labels(), configured.clone())
+    }
+}
+
+#[cfg(test)]
+mod lease_skill_tests {
+    use super::*;
+
+    #[test]
+    fn reviewed_skills_have_reserved_labels_and_invalid_label_keys_are_omitted() {
+        let facts = HostFacts::for_this_build(
+            RuntimeKind::Docker,
+            WorkerHostKind::Daemon,
+            vec![],
+            false,
+            true,
+        )
+        .with_skills(vec![
+            "team-planner".into(),
+            "awman/plan".into(),
+            "BAD_NAME".into(),
+        ]);
+        let labels = facts.reported_labels();
+        assert_eq!(
+            labels.get("awman/skill.team-planner").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            labels.get("awman/skill.awman.plan").map(String::as_str),
+            Some("true")
+        );
+        assert!(!labels.contains_key("awman/skill.BAD_NAME"));
     }
 }

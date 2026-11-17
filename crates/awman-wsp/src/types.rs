@@ -1,8 +1,10 @@
 //! JSON messages shared by work servers and workers.
+use crate::secret::{CommandSecrets, CommandSecretsInvalid, SecretString};
 use crate::{Affinity, ContextChanges, ItemContext, ItemWorkflowContext, WorkflowContextResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub use crate::wire::List;
 
@@ -246,6 +248,137 @@ pub struct Exec {
     pub yolo: bool,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing)]
+    pub secrets: ExecSecrets,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prerequisites: Option<ExecPrerequisites>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflows_dynamic: Option<ExecWorkflowsDynamic>,
+}
+
+/// In-memory lease secrets. Values are accepted on input and only emitted by
+/// the explicit `secret::server_wire` adapter.
+#[derive(Clone, Default)]
+pub struct ExecSecrets(Option<Arc<CommandSecrets>>);
+
+impl ExecSecrets {
+    pub fn new(
+        entries: impl IntoIterator<Item = (String, SecretString)>,
+    ) -> Result<Self, CommandSecretsInvalid> {
+        let secrets = CommandSecrets::new(entries)?;
+        Ok(if secrets.is_empty() {
+            Self::default()
+        } else {
+            Self(Some(Arc::new(secrets)))
+        })
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.as_ref().is_none_or(|s| s.is_empty())
+    }
+    pub fn names(&self) -> Vec<String> {
+        self.0
+            .as_ref()
+            .map(|s| s.names().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+    pub fn get(&self, name: &str) -> Option<&SecretString> {
+        self.0.as_ref()?.get(name)
+    }
+    pub fn shared(&self) -> Option<Arc<CommandSecrets>> {
+        self.0.clone()
+    }
+    pub fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+}
+
+impl std::fmt::Debug for ExecSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(secrets) => std::fmt::Debug::fmt(secrets, f),
+            None => f.write_str("CommandSecrets([])"),
+        }
+    }
+}
+impl PartialEq for ExecSecrets {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a
+                .iter()
+                .map(|(n, v)| (n, v.expose()))
+                .eq(b.iter().map(|(n, v)| (n, v.expose()))),
+            (Some(a), None) => a.is_empty(),
+            (None, Some(b)) => b.is_empty(),
+        }
+    }
+}
+impl Eq for ExecSecrets {}
+
+impl<'de> Deserialize<'de> for ExecSecrets {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{MapAccess, Visitor};
+        struct SecretVisitor;
+        impl<'de> Visitor<'de> for SecretVisitor {
+            type Value = ExecSecrets;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an object mapping secret names to strings")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut entries: Vec<(String, SecretString)> = Vec::new();
+                while let Some(name) = map.next_key::<String>()? {
+                    if entries.len() >= crate::secret::MAX_COMMAND_SECRETS {
+                        return Err(serde::de::Error::custom(CommandSecretsInvalid::TooMany {
+                            count: entries.len() + 1,
+                        }));
+                    }
+                    if entries.iter().any(|(seen, _)| seen == &name) {
+                        return Err(serde::de::Error::custom(CommandSecretsInvalid::Duplicate {
+                            name,
+                        }));
+                    }
+                    let value = map.next_value::<String>()?;
+                    entries.push((name, SecretString::new(value)));
+                }
+                ExecSecrets::new(entries).map_err(serde::de::Error::custom)
+            }
+        }
+        deserializer.deserialize_map(SecretVisitor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecPrerequisites {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_identity: Option<ExecGitIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<ExecCredentialChoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_token: Option<ExecCredentialChoice>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecGitIdentity {
+    pub name: String,
+    pub email: String,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecCredentialChoice {
+    Deny,
+    Allow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecWorkflowsDynamic {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents_to_models: Option<BTreeMap<String, Vec<String>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_leader: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,6 +537,7 @@ impl ApiError {
             "not_found" | "worker_not_found" => 404,
             "expired" => 410,
             "context_too_large" => 413,
+            "access_denied" => 403,
             _ => 400,
         }
     }
@@ -419,6 +553,8 @@ pub mod codes {
     pub const INVALID_EVENT: &str = "invalid_event";
     pub const LINK_PENDING: &str = "authorization_pending";
     pub const LINK_DENIED: &str = "access_denied";
+    pub const PREREQUISITE_WIDENING_REFUSED: &str = "prerequisite_widening_refused";
+    pub const CREDENTIALS_LOST: &str = "credentials_lost";
 }
 pub mod features {
     pub const LEASE_CONTEXT: &str = "lease_context";
@@ -437,6 +573,10 @@ pub mod features {
     pub const LEASE_GIT_AUTH_FAILURE: &str = "lease_git_auth_failure";
     pub const LEASE_PUSH_RETRY: &str = "lease_push_retry";
     pub const LEASE_IMAGE_REUSE: &str = "lease_image_reuse";
+    pub const LEASE_SECRETS: &str = "lease_secrets";
+    pub const LEASE_SKILLS: &str = "lease_skills";
+    pub const LEASE_PREREQUISITES: &str = "lease_prerequisites";
+    pub const LEASE_WORKFLOWS_DYNAMIC: &str = "lease_workflows_dynamic";
     pub const ALL: &[&str] = &[
         LEASE_CONTEXT,
         LEASE_WORKFLOW_CONTEXT,
@@ -454,5 +594,115 @@ pub mod features {
         LEASE_GIT_AUTH_FAILURE,
         LEASE_PUSH_RETRY,
         LEASE_IMAGE_REUSE,
+        LEASE_SECRETS,
+        LEASE_SKILLS,
+        LEASE_PREREQUISITES,
+        LEASE_WORKFLOWS_DYNAMIC,
     ];
+}
+
+#[cfg(test)]
+mod exec_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn exec_secrets_decode_validate_and_never_serialize() {
+        let source = json!({"secrets":{"TOKEN":"needle-secret"}});
+        let exec: Exec = serde_json::from_value(source).unwrap();
+        assert_eq!(exec.secrets.names(), ["TOKEN"]);
+        assert!(!format!("{exec:?}").contains("needle-secret"));
+        assert!(!serde_json::to_string(&exec)
+            .unwrap()
+            .contains("needle-secret"));
+        let item = crate::conformance::work_item("secret-wire");
+        let mut item = item;
+        item.exec.secrets = exec.secrets.clone();
+        assert!(!format!("{item:?}").contains("needle-secret"));
+        assert!(!serde_json::to_string(&item)
+            .unwrap()
+            .contains("needle-secret"));
+        let server_value = crate::secret::server_wire::work_item(&item);
+        assert_eq!(server_value["exec"]["secrets"]["TOKEN"], "needle-secret");
+        let lease = Lease {
+            id: "lease".into(),
+            epoch: 1,
+            expires_at: chrono::Utc::now(),
+            item: item.clone(),
+            terminal: false,
+            remote_input: false,
+        };
+        assert!(!format!("{lease:?}").contains("needle-secret"));
+        assert!(!serde_json::to_string(&lease)
+            .unwrap()
+            .contains("needle-secret"));
+        assert!(serde_json::from_value::<Exec>(json!({"unknown":true})).is_err());
+        for bad in [
+            json!({"secrets":{"bad":"x"}}),
+            json!({"secrets":{"TOKEN":7}}),
+            json!({"secrets":{"TOKEN":""}}),
+            json!({"secrets":{"TOKEN":"x\u{0000}y"}}),
+            json!({"secrets":{"TOKEN":"x"},"prerequisites":{"unknown":true}}),
+            json!({"workflows_dynamic":{"unknown":true}}),
+        ] {
+            assert!(serde_json::from_value::<Exec>(bad).is_err());
+        }
+        let too_large = "x".repeat(8193);
+        let error = serde_json::from_value::<Exec>(json!({"secrets":{"TOKEN":too_large}}))
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains(&"x".repeat(100)));
+        let mut many = serde_json::Map::new();
+        for i in 0..33 {
+            many.insert(format!("KEY_{i}"), json!("x"));
+        }
+        assert!(serde_json::from_value::<Exec>(json!({"secrets":many})).is_err());
+        assert!(serde_json::from_str::<Exec>(r#"{"secrets":{"TOKEN":"a","TOKEN":"b"}}"#).is_err());
+    }
+
+    #[test]
+    fn new_exec_fields_round_trip_and_omit_defaults() {
+        let defaults = Exec {
+            dynamic: false,
+            leader: None,
+            workflow_toml: None,
+            agent: None,
+            model: None,
+            read_only: false,
+            overlays: vec![],
+            interaction: None,
+            yolo: false,
+            timeout_ms: None,
+            secrets: ExecSecrets::default(),
+            prerequisites: None,
+            workflows_dynamic: None,
+        };
+        let value = serde_json::to_value(&defaults).unwrap();
+        assert!(
+            value.get("secrets").is_none()
+                && value.get("prerequisites").is_none()
+                && value.get("workflows_dynamic").is_none()
+        );
+        let mut exec = defaults;
+        exec.prerequisites = Some(ExecPrerequisites {
+            git_identity: Some(ExecGitIdentity {
+                name: "A".into(),
+                email: "a@b".into(),
+            }),
+            ssh: Some(ExecCredentialChoice::Allow),
+            github_token: Some(ExecCredentialChoice::Deny),
+        });
+        exec.workflows_dynamic = Some(ExecWorkflowsDynamic {
+            agents_to_models: Some(BTreeMap::from([("claude".into(), vec!["m".into()])])),
+            default_leader: Some("claude:m".into()),
+            guidance: Some(vec!["g".into()]),
+        });
+        exec.overlays = vec!["env(TOKEN)".into(), "skill(foo)".into(), "ssh()".into()];
+        let json = serde_json::to_value(&exec).unwrap();
+        let decoded: Exec = serde_json::from_value(json).unwrap();
+        assert_eq!(exec, decoded);
+        let item = crate::conformance::work_item("secret-debug");
+        let encoded = serde_json::to_string(&item).unwrap();
+        assert!(!encoded.contains("needle-secret"));
+    }
 }

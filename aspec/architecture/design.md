@@ -49,6 +49,43 @@ Strict unidirectional dependencies between layers prevent cross-cutting concerns
 
 **Constraint**: Imports only from `std`, third-party crates, and `crate::data::*`
 
+### Repository checkout naming
+
+`data::checkout_paths` owns generated Git branch names, checkout directory
+names, repository keys and checkout path construction. Commands choose the
+kind of checkout; engines perform Git operations and verify ownership. Neither
+layer constructs naming prefixes or derives clone directory names itself.
+Domain layout types (API, squad, worker and skill-library paths) delegate their
+checkout locations to this module. There are no legacy naming generators,
+compatibility exports, historical path searches or automatic migrations.
+awman is beta software and does not guarantee naming/path compatibility across
+versions. Existing files are not deleted or renamed by path resolution.
+
+- Local work items retain `awman/work-item-NNNN` and `NNNN/`; workflows retain
+  `awman/workflow-<name>` and `wf-<name>/` under the hashed repository key.
+- GitHub issues use `<number>-<title-slug>` and `awman/<number>-<title-slug>`.
+  Other remote items use their provider slug and stable key. GitHub issues
+  never use that other-provider format as an alternative name.
+- Generated workflow components preserve ordinary names. Unsafe characters,
+  Git-invalid dot sequences, reserved device names and oversized components
+  are encoded with an eight-hex SHA-256 suffix; branch and directory use the
+  same component. Creation, resume and recreation all resolve the same
+  canonical branch and path. Unhashed repository directories, previous GitHub
+  issue names and unencoded workflow spellings are not searched or resumed.
+- Session branch/PR names and paths follow the CLI selector contract. Explicit
+  branches, paths and workflow `into` values are validated by their existing
+  entry points, never slugified as though they were generated names.
+- Remote sessions and workflow clone steps derive their default directory from
+  the same URL/SCP/local-path leaf policy, stripping `.git` and encoding unsafe
+  names. Workflow clones pass that directory explicitly to Git, including when
+  transport credentials change the URL used for cloning.
+  The obsolete per-session `repo/` and `worktree/` checkout slots are removed;
+  API session initialization does not create placeholder checkout directories.
+- Lease clones retain `<workRoot>/leases/<lease_id>/`; rehomed lease worktrees
+  retain `wf-<run_id>/` and `awman/<run_id>`. Squad workspaces and skill-library
+  clones retain their task/library namespaces. These lifetimes are distinct
+  from reusable repository-keyed worktrees.
+
 ### Layer 1: Engine (`src/engine/`)
 - Container-class runtime backends (Docker, Apple containers, builtin microVM)
 - Workflow execution engine

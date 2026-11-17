@@ -683,6 +683,12 @@ impl Host {
                     &self.settings,
                     &LeaseRuntimeSupport::from_capabilities(self.engines.runtime.capabilities()),
                     self.engines.runtime.display_name(),
+                    &policy::LeaseHostView {
+                        features: &[],
+                        worker_env: &crate::data::config::env::host_var,
+                        skills: &|_| policy::SkillStatus::Missing,
+                        prerequisite_policy: None,
+                    },
                 )
             })
             .and_then(|plan| policy::delivery(&lease, &plan, true).map(|()| plan));
@@ -730,6 +736,7 @@ impl Host {
             view.cancels
                 .insert(picked.lease_id.clone(), run.active.control.cancelled());
             let mut engines = self.engines.clone();
+            engines.lease_workflow_review = run.plan.workflow_review.clone();
             view.terminal_input
                 .insert(picked.lease_id.clone(), run.lease.remote_input);
             if let Some(bridge) = run.terminal.clone() {
@@ -1049,7 +1056,7 @@ impl ManualRun {
         git.create_worktree_from_commit(
             invoker.git_root(),
             &path,
-            &format!("awman/{}", self.record.id),
+            &crate::data::checkout_paths::awman_branch_name(self.record.id.as_str()),
             &head,
         )
         .map_err(|e| e.to_string())?;
@@ -1837,6 +1844,7 @@ impl ProxyRun {
             argv: command.iter().chain(&args).cloned().collect(),
         };
         let mut engines = engines.clone();
+        engines.lease_workflow_review = Some(Arc::new(policy::LeaseWorkflowReview::foreground()));
         let read_only = value["read_only"]
             .as_bool()
             .ok_or("missing read_only handoff")?;

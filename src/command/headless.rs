@@ -125,12 +125,12 @@ use crate::command::commands::agent_auth::AgentAuthDecision;
 use crate::command::commands::agent_setup::AgentSetupDecision;
 use crate::command::commands::exec_workflow::{WorkflowResumeDecision, WorkflowResumePrompt};
 use crate::command::commands::mount_scope::MountScopeDecision;
-use crate::command::commands::specs::WorkItemKind;
 use crate::command::commands::workflow_prerequisites::{GapChoice, ToolChoice};
 use crate::command::commands::worktree_lifecycle::{
     DirtyMergeTargetDecision, ExistingWorktreeDecision, PostWorkflowWorktreeAction,
     PostWorkflowWorktreePrompt, PreWorktreeDecision, WorktreeMergeMode,
 };
+use crate::command::work_item::spec_service::WorkItemKind;
 use crate::data::config::work_items::WorkItemsConfig;
 use crate::data::config::workflows::{CredentialUse, UnresolvedMode};
 use crate::data::workflow_prerequisites::PrerequisiteOrigin;
@@ -413,7 +413,7 @@ impl HeadlessDefaults {
         false
     }
 
-    /// Answer for `SpecsCommandFrontend::ask_spec_kind`.
+    /// Answer for `NewSpecFrontend::ask_spec_kind`.
     ///
     /// Uniform: `Task` is the neutral kind, and nothing in a headless
     /// invocation distinguishes a feature from a bug.

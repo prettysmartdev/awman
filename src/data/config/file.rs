@@ -193,6 +193,24 @@ impl ConfigFile {
                     }
                 }
             }
+            for entry in server.allow_env.iter().flatten() {
+                if let Err(reason) =
+                    crate::data::config::work_servers::validate_allow_env_entry(entry)
+                {
+                    return Err(DataError::Other(format!(
+                        "workServers.{name}.allowEnv {entry:?} {reason}"
+                    )));
+                }
+            }
+            for entry in server.allow_skills.iter().flatten() {
+                if let Err(reason) =
+                    crate::data::config::work_servers::validate_allow_skill_entry(entry)
+                {
+                    return Err(DataError::Other(format!(
+                        "workServers.{name}.allowSkills {entry:?} {reason}"
+                    )));
+                }
+            }
         }
         if let Some(remote) = &self.remote {
             for (name, target) in remote.targets.iter().flatten() {
@@ -220,4 +238,50 @@ pub fn repo_config_path(git_root: &Path) -> PathBuf {
 /// A squad task's config file: `<squad root>/tasks/<name>/config.json`.
 pub fn task_config_path(squad: &SquadPaths, task: &str) -> Result<PathBuf, DataError> {
     squad.task_config_file(task)
+}
+
+#[cfg(test)]
+mod work_server_allow_tests {
+    use super::*;
+
+    fn parse_global(json: &str) -> Result<ConfigFile, DataError> {
+        ConfigFile::parse(json, FileKind::Global, Path::new("config.json"))
+    }
+
+    #[test]
+    fn allow_lists_parse_and_default_empty() {
+        let file = parse_global(
+            r#"{"workServers":{"a":{"url":"https://a.example","allowEnv":["TOKEN_1"],"allowSkills":["planner","lib/planner"]},"b":{"url":"https://b.example"}}}"#,
+        )
+        .unwrap();
+        let servers = file.work_servers.unwrap();
+        assert_eq!(servers["a"].resolved().allow_env, ["TOKEN_1"]);
+        assert_eq!(
+            servers["a"].resolved().allow_skills,
+            ["planner", "lib/planner"]
+        );
+        assert!(servers["b"].resolved().allow_env.is_empty());
+        assert!(servers["b"].resolved().allow_skills.is_empty());
+    }
+
+    #[test]
+    fn invalid_allow_env_names_the_field() {
+        let err = parse_global(
+            r#"{"workServers":{"a":{"url":"https://a.example","allowEnv":["lower"]}}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("allowEnv"), "{err}");
+    }
+
+    #[test]
+    fn invalid_allow_skills_names_the_field() {
+        for bad in ["*", "a/b/c", "..", "a,b"] {
+            let json = format!(
+                r#"{{"workServers":{{"a":{{"url":"https://a.example","allowSkills":["{bad}"]}}}}}}"#
+            );
+            let err = parse_global(&json).unwrap_err().to_string();
+            assert!(err.contains("allowSkills"), "{bad}: {err}");
+        }
+    }
 }

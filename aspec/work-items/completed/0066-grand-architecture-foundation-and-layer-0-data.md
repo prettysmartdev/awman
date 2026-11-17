@@ -262,7 +262,7 @@ Define a single `EffectiveConfig` type that owns the merged view (repo + global 
 | `env_passthrough` | `envPassthrough` (camel) | `Option<Vec<String>>` | `None` | |
 | `headless` | `headless` (snake) | `Option<HeadlessConfig>` | `None` | Nested |
 | `headless.work_dirs` | `workDirs` (camel) | `Option<Vec<String>>` | `None` | Absolute paths, canonicalized at server start |
-| `headless.always_non_interactive` | `alwaysNonInteractive` (camel) | `Option<bool>` | `false` | Drives `--non-interactive` injection for `chat`, `ready`, `exec prompt`, `exec workflow`, `specs amend` |
+| `headless.always_non_interactive` | `alwaysNonInteractive` (camel) | `Option<bool>` | `false` | Drives `--non-interactive` injection for `chat`, `ready`, `exec prompt`, `exec workflow`, `edit spec --amend` |
 | `remote` | `remote` (snake) | `Option<RemoteConfig>` | `None` | Nested |
 | `remote.default_addr` | `defaultAddr` (camel) | `Option<String>` | `None` | URL, e.g. `http://1.2.3.4:9876` |
 | `remote.saved_dirs` | `savedDirs` (camel) | `Option<Vec<String>>` | `None` | Pre-saved working dirs for `remote session start` |

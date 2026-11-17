@@ -818,8 +818,11 @@ async fn pull_runner_reuses_mock_server_lease_images_and_cleans_at_lease_end_and
     let token = client.poll_link(&link.link_id).await.unwrap().unwrap();
     let paths = DataPaths::from_env(&support::env_snapshot(&s)).unwrap();
     LinkStore::new(&paths).write("images", &token).unwrap();
+    // This scripted agent exercises image reuse and eviction without a terminal
+    // client. Select headless execution explicitly instead of inheriting the
+    // worker's interactive default and its platform-specific PTY lifecycle.
     let config = json!({"workServers":{"images":{"url":mock.base_url(),"claim":"manual","maxConcurrentJobs":2,"imageBudget":{"maxImages":2}}},
-        "daemon":{"features":{"worker":{"enabled":true,"push":{"enabled":true},"pull":{"enabled":true}}},
+        "daemon":{"features":{"worker":{"enabled":true,"push":{"enabled":true},"pull":{"enabled":true,"interaction":"headless"}}},
         "network":{"listeners":{"component":{"features":["engine","worker"]}}}}});
     let mut docker = None;
     let api = Api::with_docker(&s, config.clone(), |fake| {
@@ -868,15 +871,24 @@ async fn pull_runner_reuses_mock_server_lease_images_and_cleans_at_lease_end_and
             },
         )
         .await;
-        wait_for_async("lease terminal", Duration::from_secs(10), || async {
-            let store = awman::data::worker::lease_store::LeaseStore::open(
-                api.api.worker.as_ref().unwrap().store.clone(),
-            )
-            .unwrap();
-            let row = store.get(&record.id).unwrap().unwrap();
-            (!row.state.is_active()).then_some(row)
-        })
+        wait_for_async(
+            &format!("{id} lease terminal"),
+            Duration::from_secs(10),
+            || async {
+                let store = awman::data::worker::lease_store::LeaseStore::open(
+                    api.api.worker.as_ref().unwrap().store.clone(),
+                )
+                .unwrap();
+                let row = store.get(&record.id).unwrap().unwrap();
+                (!row.state.is_active()).then_some(row)
+            },
+        )
         .await;
+        let result = mock
+            .server()
+            .result_for(id)
+            .expect("lease reported its result");
+        assert_eq!(result.result["outcome"], "done", "{id}: {result:?}");
         let builds = docker
             .calls()
             .iter()
@@ -942,6 +954,11 @@ async fn pull_runner_reuses_mock_server_lease_images_and_cleans_at_lease_end_and
             },
         )
         .await;
+        let result = mock
+            .server()
+            .result_for(&lease.item_id)
+            .expect("concurrent lease reported its result");
+        assert_eq!(result.result["outcome"], "done", "{result:?}");
     }
     assert_eq!(
         docker

@@ -238,7 +238,7 @@ Under the `docker-sbx-experimental` runtime, the flag is delivered through the s
 
 ### `--headless` / `-n`
 
-Run the agent in print/batch mode — no interactivity required. The agent executes, produces output, and exits. `-n` is a short alias for `--headless` and works on every command that has the flag (`chat`, `exec prompt`, `exec workflow`, `ready`, `specs amend`, `new spec`, `new skill`). It also makes awman's own prompts take their non-interactive answer instead of asking, even on a terminal; `--json` implies it.
+Run the agent in print/batch mode — no interactivity required. The agent executes, produces output, and exits. `-n` is a short alias for `--headless` and works on every command that has the flag (`chat`, `exec prompt`, `exec workflow`, `ready`, `edit`, `new spec`, `new skill`). It also makes awman's own prompts take their non-interactive answer instead of asking, even on a terminal; `--json` implies it.
 
 | Agent | Flag used |
 |-------|-----------|
@@ -569,7 +569,7 @@ In the TUI, a freeform text box dialog opens for the summary input. Use **Ctrl+E
 These examples use the default `workItems.source = "local"`, so the issue
 seeds a new local spec. If your configured creation target is that same
 GitHub repository, awman prevents duplicating the issue and recommends
-`specs amend` instead.
+`awman edit spec <ref> --amend` instead.
 
 ```sh
 awman new spec --work-item github:84                                               # issue 84 on origin
@@ -581,13 +581,66 @@ Fetches the GitHub issue and launches an agent to generate a structured work ite
 
 For full details on GitHub integration, authentication, and input formats, see [GitHub Integration](10-github-integration.md).
 
-### Updating a spec after implementation
+## Editing existing artifacts
+
+`awman edit` launches an agent to change something that already exists. It never creates anything; use `awman new` for that. There is one leaf per kind of artifact:
 
 ```sh
-awman specs amend 0001
+awman edit spec 42 --amend --interview               # reconcile a spec with the code, asking you questions
+awman edit workflow release --interview              # the agent interviews you, then changes the workflow
+awman edit skill review --global --amend             # reconcile a personal skill with what it actually does
+awman edit agent custom --headless --prompt "Correct the model setting"
 ```
 
-After implementing a work item, the actual implementation sometimes differs from the original spec. `specs amend` launches the agent to review the code that was written and update the spec to match — adding an "Agent implementation notes" section describing what changed and why. Useful for keeping specs accurate as a long-term reference.
+Every leaf takes one required `ref` that identifies the target:
+
+| Command | `ref` | Where it is found |
+|---|---|---|
+| `edit spec <ref>` | A work item reference: a number, `github:84`, `owner/repo#84`, or an issue URL | The configured work item source (see [GitHub Integration](10-github-integration.md)) |
+| `edit workflow <ref>` | A workflow name, or a path to a workflow file | `.awman/workflows/` or `aspec/workflows/` in the repo; `~/.awman/workflows/` with `--global` |
+| `edit skill <ref>` | A skill name (`<library>/<skill>` for pulled library skills) | `.awman/skills/` in the repo; `~/.awman/skills/` with `--global` |
+| `edit agent <ref>` | A custom agent name | `.awman/agents/` in the repo; `~/.awman/agents/` with `--global` |
+
+### Choosing the target and scope
+
+Workflows, skills, and agents are looked up in the repo first. Add `--global` to look only in your personal `~/.awman/` store. If the name exists only in the other scope, awman says so and tells you to pass (or drop) `--global`. An ambiguous workflow name (for example `release.toml` and `release.yaml` side by side) lists the candidates instead of guessing. The built-in agents (`claude`, `codex`, and so on) are read-only; define your own with `awman new agent`. Resolution failures happen before anything is launched or copied.
+
+### What the agent is asked to do
+
+Choose how the agent approaches the work with the same flags for every kind:
+
+- **A brief.** Give `--prompt "..."` describing the change.
+- **`--interview`.** The agent first asks what you want to change, your constraints, and your acceptance criteria, and only then edits. It needs a terminal, so it conflicts with `--headless` and `--json`.
+- **`--amend`.** The agent reviews the artifact against the available evidence and corrects what has drifted. For a spec that is the code that was written; for a workflow, the commands and files it references; for a skill, the behavior it describes; for an agent definition, the settings it declares. It keeps what it can verify, records what was intended, and reports what it cannot determine instead of guessing. `--amend --headless` can run without `--prompt`; any other headless edit needs one.
+- **`--amend --interview`.** The agent discusses uncertain findings with you before reconciling them.
+
+The agent launch flags (`--agent`, `--model`, `--overlay`, `--agent-flag`, `--auto`, `--yolo`, `--allow-docker`) work as they do for `chat`. `--json` prints the outcome as JSON and implies `--headless`.
+
+### How changes are saved
+
+How an edit reaches its destination depends on where the artifact lives:
+
+- **In the repo.** The agent edits the file directly through the `/workspace` mount and keeps its format (a YAML workflow stays YAML). When the agent exits, awman re-reads and validates the result.
+- **Global, library, or outside the mounted checkout.** The agent works on a staged copy under the repo context (`scratch/edit/<id>/`), and awman publishes the validated files back to the real location when it finishes. Only the artifact's own files are published; any other file the agent created is reported as "not saved". For a skill, the whole skill directory may be edited. This needs a writable `context(repo)` overlay, which awman adds when you have not configured one. An explicit read-only `--overlay context(repo:ro)` is refused before anything is staged, even when a read-write context is also configured.
+- **A remote work item.** The agent edits a draft of the issue body, and awman uploads changes to the tracker *while the agent runs*. See [GitHub Integration](10-github-integration.md#edit-an-existing-issue).
+
+Every edit mounts the whole repository. Run from a subdirectory, awman asks the usual mount-scope question first; choosing to mount only the current directory stops the edit before anything is staged or launched.
+
+An edit that changes nothing is a success.
+
+### When something goes wrong
+
+A run succeeds only if the agent exited cleanly **and** the result saved and validated. If either fails, the error names both problems when both happened.
+
+- **Cancellation is not rollback.** Cancelling stops the agent, and awman still saves what is there. Remote changes already uploaded stay uploaded, and files already written stay written.
+- **An invalid result is left in place.** If an in-repo edit leaves a workflow or agent that no longer parses, the file stays as written and awman lists the problems and paths. Run `awman edit` again to have the agent repair it. An artifact that was already invalid and is left unchanged is not an error.
+- **Concurrent changes are never overwritten.** Before publishing a staged copy, awman checks that every original file of the artifact (including ones the agent left alone, such as an agent's Dockerfile or a skill's supporting files) is unchanged on disk. If any changed, nothing is saved and the draft is kept.
+- **Retained drafts can be recovered.** If publishing a staged copy or syncing a work item draft fails, the stage directory or draft is kept and its path is printed. Copy your changes out of it, or re-run the edit after fixing the cause. A partial publication lists the files that were already written.
+- **If the agent never started** (runtime unavailable, container failed to launch), nothing is changed and any staged copy is discarded.
+
+### Editing agent definitions
+
+Editing a custom agent definition does not approve or run it. After a change, awman reminds you that the definition must be approved again; review and approve it with `awman ready --agent <name>` (see [Custom Agents](15-custom-agents.md#security-and-approval)). The edit never builds an image or runs install steps.
 
 ---
 
@@ -651,6 +704,15 @@ awman exec workflow path/to/workflow.toml --overlay "skill(*)"
 ```
 
 Once mounted, they appear as slash commands. See [Overlays](08-overlays.md).
+
+### Editing a skill
+
+```sh
+awman edit skill review --global --amend
+awman edit skill review --prompt "Mention the security checklist"
+```
+
+`awman edit skill <name>` changes an existing skill's `SKILL.md` and the other files in its directory. Skills in your global store (and pulled library skills, named `<library>/<skill>` with `--global`) are edited on a staged copy and published back when the agent finishes. See [Editing existing artifacts](#editing-existing-artifacts).
 
 ### Pulled skill libraries
 
@@ -1115,7 +1177,7 @@ Each step's `status` is `ok`, `skipped`, `warn`, `failed`, `pending` or `running
 | `--worktree` | — | — | ✓ | Run in an isolated, managed Git worktree (a switch on this command) |
 | `--auto` | ✓ | ✓ | ✓ | Auto-approve file edits, prompt for shell commands |
 | `--yolo` | ✓ | ✓ | ✓ | Fully autonomous mode |
-| `--work-item <REF>` | — | ✓ | ✓ | Supply a local or external work item; see [GitHub Integration](10-github-integration.md) |
+| `--work-item <REF>` | `-w` | ✓ | ✓ | Supply a local or external work item; see [GitHub Integration](10-github-integration.md) |
 | `--dynamic` | — | — | ✓ | Have a leader agent design the workflow; implies `--yolo`, `--worktree`, `context(workflow)` |
 | `--leader <agent::model>` | — | — | ✓ | Leader agent and model for `--dynamic` |
 | `--on-existing-worktree`, `--on-dirty-merge-target`, `--on-merge-failure` | — | — | ✓ | Answer worktree lifecycle questions up front — see [Workflows](05-workflows.md#worktrees) |

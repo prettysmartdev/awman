@@ -296,15 +296,22 @@ impl Client {
         // Retain the fence before decoding requirements. Unknown fields or enum
         // values must never become a weaker executable lease, nor strand a
         // successfully claimed item merely because its requirements are newer.
-        let body: serde_json::Value = decode(response).await?;
+        let body = claim_body(response).await?;
         #[derive(serde::Deserialize)]
         struct Identity {
             id: String,
             epoch: u64,
         }
-        let identity: Identity =
-            serde_json::from_value(body["lease"].clone()).map_err(|_| Error::InvalidResponse)?;
-        let lease = match serde_json::from_value::<ClaimResponse>(body) {
+        #[derive(serde::Deserialize)]
+        struct Envelope {
+            lease: Identity,
+        }
+        // Ignored fields are scanned without materializing the secret-bearing
+        // item. Decode the original bytes again so duplicate keys survive.
+        let identity = serde_json::from_slice::<Envelope>(&body.0)
+            .map_err(|_| Error::InvalidResponse)?
+            .lease;
+        let lease = match serde_json::from_slice::<ClaimResponse>(&body.0) {
             Ok(response) => response.lease,
             Err(_) => {
                 self.with_lease_epoch(&identity.id, identity.epoch)
@@ -433,6 +440,30 @@ impl Client {
         )
         .await
     }
+}
+
+/// Bounded transport buffer, cleared on every decoding/error path. Never turn
+/// a claim into `Value`: doing so erases duplicate secret names and fields.
+struct ClaimBody(Vec<u8>);
+
+impl Drop for ClaimBody {
+    fn drop(&mut self) {
+        self.0.resize(self.0.capacity(), 0);
+        self.0.fill(0);
+        std::hint::black_box(&mut self.0);
+    }
+}
+
+async fn claim_body(mut response: reqwest::Response) -> Result<ClaimBody, Error> {
+    const MAX_CLAIM_BYTES: usize = 8 * 1024 * 1024;
+    let mut body = ClaimBody(Vec::with_capacity(MAX_CLAIM_BYTES));
+    while let Some(chunk) = response.chunk().await? {
+        if body.0.len().saturating_add(chunk.len()) > MAX_CLAIM_BYTES {
+            return Err(Error::InvalidResponse);
+        }
+        body.0.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 pub(crate) fn path_id(id: &str) -> Result<&str, Error> {

@@ -181,7 +181,7 @@ impl Fixture {
                 title: "User title".into(),
             }
         } else {
-            DraftSyncMode::Amend {
+            DraftSyncMode::Update {
                 issue: self.source.remote.lock().unwrap().clone(),
             }
         };
@@ -201,6 +201,16 @@ impl Fixture {
             .await
             .unwrap()
             .unwrap()
+    }
+    /// The next provider mutation. Production re-fetches the issue before
+    /// every update (the conflict check); those reads are expected and skipped.
+    async fn mutation(&mut self) -> Call {
+        loop {
+            match self.call().await {
+                Call::Fetch => continue,
+                other => return other,
+            }
+        }
     }
 }
 
@@ -628,4 +638,350 @@ fn preparation_rejects_config_read_only_and_unsupported_mounts_before_creating_a
         assert!(sink.all().is_empty());
         assert!(collected.context_overlays.is_empty());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Existing-issue updates (WI 0059): `DraftSyncMode::Update` under the paused
+// clock. These sessions never create, and publish only the body.
+// ---------------------------------------------------------------------------
+
+fn only_updates(f: &Fixture) -> Vec<String> {
+    f.source
+        .mutations()
+        .into_iter()
+        .map(|call| match call {
+            Call::Update(body) => body,
+            other => panic!("an existing-issue edit must only update: {other:?}"),
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn updates_publish_user_edits_after_the_quiet_period_and_never_create() {
+    let mut f = Fixture::new(
+        "command::draft_sync::updates_publish_user_edits_after_the_quiet_period_and_never_create",
+    );
+    let (running, mut events) = f.start(false);
+    f.edit("first");
+    assert_eq!(f.mutation().await, Call::Update("first".into()));
+    f.edit("second");
+    assert_eq!(f.mutation().await, Call::Update("second".into()));
+    f.edit("final");
+    let outcome = running.stop().await.unwrap().final_upload().await.unwrap();
+    assert!(outcome.uploaded);
+    let issue = outcome.issue.unwrap();
+    assert_eq!(
+        (issue.body.as_str(), issue.title.as_str()),
+        ("final", "User title")
+    );
+    assert_eq!(only_updates(&f), ["first", "second", "final"]);
+    // Updating an existing issue announces nothing new to open.
+    assert!(!remaining(&mut events)
+        .iter()
+        .any(|e| matches!(e, DraftSyncEvent::Created { .. })));
+    assert_eq!(f.source.remote.lock().unwrap().title, "User title");
+    assert!(!f.path.exists());
+}
+
+#[tokio::test(start_paused = true)]
+async fn unchanged_empty_and_whitespace_drafts_never_update() {
+    for content in ["seed\n", "", " \n\t"] {
+        let mut f =
+            Fixture::new("command::draft_sync::unchanged_empty_and_whitespace_drafts_never_update");
+        let (running, mut events) = f.start(false);
+        f.edit(content);
+        tokio::time::advance(Duration::from_secs(90)).await;
+        let outcome = running.stop().await.unwrap().final_upload().await.unwrap();
+        assert!(!outcome.uploaded, "{content:?}");
+        assert!(f.source.mutations().is_empty(), "{content:?}");
+        assert_eq!(f.source.remote.lock().unwrap().body, "seed\n");
+        assert!(remaining(&mut events).is_empty());
+        assert!(
+            !f.path.exists(),
+            "a draft with nothing to publish is cleaned up"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn same_size_and_renamed_saves_are_detected_by_content_not_metadata() {
+    // Same length and the original modification time restored.
+    let mut f = Fixture::new(
+        "command::draft_sync::same_size_and_renamed_saves_are_detected_by_content_not_metadata",
+    );
+    let (running, _events) = f.start(false);
+    let modified = std::fs::metadata(&f.path).unwrap().modified().unwrap();
+    f.edit("seeD\n");
+    std::fs::File::options()
+        .write(true)
+        .open(&f.path)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(&f.path).unwrap().len(),
+        "seed\n".len() as u64
+    );
+    let outcome = running.stop().await.unwrap().final_upload().await.unwrap();
+    assert!(outcome.uploaded);
+    assert_eq!(only_updates(&f), ["seeD\n"]);
+
+    // An editor's atomic save: write a sibling, rename it over the draft.
+    let mut f = Fixture::new(
+        "command::draft_sync::same_size_and_renamed_saves_are_detected_by_content_not_metadata",
+    );
+    let (running, _events) = f.start(false);
+    let sibling = f.path.with_extension("swap");
+    std::fs::write(&sibling, "renamed save\n").unwrap();
+    std::fs::rename(&sibling, &f.path).unwrap();
+    let outcome = running.stop().await.unwrap().final_upload().await.unwrap();
+    assert!(outcome.uploaded);
+    assert_eq!(only_updates(&f), ["renamed save\n"]);
+    assert!(!f.path.exists());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_draft_removed_and_restored_mid_run_still_publishes_the_restored_content() {
+    let mut f = Fixture::new(
+        "command::draft_sync::a_draft_removed_and_restored_mid_run_still_publishes_the_restored_content",
+    );
+    let (running, _events) = f.start(false);
+    std::fs::remove_file(&f.path).unwrap();
+    tokio::time::advance(Duration::from_secs(3)).await;
+    f.edit("restored\n");
+    let outcome = running.stop().await.unwrap().final_upload().await.unwrap();
+    assert!(outcome.uploaded);
+    assert_eq!(only_updates(&f), ["restored\n"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_conflict_found_only_at_finalization_publishes_nothing_and_keeps_the_draft() {
+    let mut f = Fixture::new(
+        "command::draft_sync::a_conflict_found_only_at_finalization_publishes_nothing_and_keeps_the_draft",
+    );
+    let (running, _events) = f.start(false);
+    f.source.remote.lock().unwrap().body = "someone else's edit".into();
+    f.edit("my edit");
+    let result = running.stop().await.unwrap().final_upload().await;
+    assert!(matches!(
+        result,
+        Err(DraftSyncError::Paused {
+            reason: SyncPauseReason::RemoteConflict,
+            ..
+        })
+    ));
+    assert!(f.source.mutations().is_empty());
+    assert_eq!(f.source.remote.lock().unwrap().body, "someone else's edit");
+    assert_eq!(std::fs::read_to_string(&f.path).unwrap(), "my edit");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_conflict_after_a_periodic_update_stops_publishing_for_good() {
+    let mut f = Fixture::new(
+        "command::draft_sync::a_conflict_after_a_periodic_update_stops_publishing_for_good",
+    );
+    let (running, mut events) = f.start(false);
+    f.edit("first");
+    assert_eq!(f.mutation().await, Call::Update("first".into()));
+    // `update` is recorded before the fake applies it; only change the
+    // tracker once "first" is really there, or the fake overwrites the edit.
+    tracker_holds(&f.source, "first").await;
+    f.source.remote.lock().unwrap().body = "tracker edit".into();
+    f.edit("second");
+    assert!(
+        matches!(event(&mut events).await, DraftSyncEvent::Warning { message } if message.contains("changed on the tracker"))
+    );
+    tokio::time::advance(Duration::from_secs(120)).await;
+    f.edit("third");
+    let result = running.stop().await.unwrap().final_upload().await;
+    assert!(matches!(
+        result,
+        Err(DraftSyncError::Paused {
+            reason: SyncPauseReason::RemoteConflict,
+            ..
+        })
+    ));
+    assert_eq!(only_updates(&f), ["first"]);
+    assert_eq!(std::fs::read_to_string(&f.path).unwrap(), "third");
+}
+
+#[tokio::test(start_paused = true)]
+async fn update_auth_and_permission_failures_pause_publishing_and_retain_the_draft() {
+    for (failure, reason) in [
+        (Failure::Auth, SyncPauseReason::Authentication),
+        (Failure::Permission, SyncPauseReason::Permission),
+    ] {
+        let mut f = Fixture::new(
+            "command::draft_sync::update_auth_and_permission_failures_pause_publishing_and_retain_the_draft",
+        );
+        f.source.failures.lock().unwrap().push_back(failure);
+        let (running, mut events) = f.start(false);
+        f.edit("edited");
+        assert!(matches!(
+            event(&mut events).await,
+            DraftSyncEvent::Warning { .. }
+        ));
+        tokio::time::advance(Duration::from_secs(90)).await;
+        f.edit("edited again");
+        let result = running.stop().await.unwrap().final_upload().await;
+        assert!(
+            matches!(result, Err(DraftSyncError::Paused { reason: actual, .. }) if actual == reason),
+            "{reason:?}"
+        );
+        assert_eq!(
+            only_updates(&f),
+            ["edited"],
+            "never retried, not even at exit"
+        );
+        assert_eq!(std::fs::read_to_string(&f.path).unwrap(), "edited again");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rate_limited_update_backs_off_and_finalization_still_publishes_the_latest() {
+    let mut f = Fixture::new(
+        "command::draft_sync::a_rate_limited_update_backs_off_and_finalization_still_publishes_the_latest",
+    );
+    f.source
+        .failures
+        .lock()
+        .unwrap()
+        .push_back(Failure::RateLimited);
+    let (running, mut events) = f.start(false);
+    f.edit("first");
+    assert!(matches!(
+        event(&mut events).await,
+        DraftSyncEvent::Warning { .. }
+    ));
+    // Inside the rate-limit back-off nothing more is sent.
+    f.edit("during back-off");
+    tokio::time::advance(Duration::from_secs(30)).await;
+    assert_eq!(only_updates(&f), ["first"]);
+    f.edit("latest");
+    let outcome = running.stop().await.unwrap().final_upload().await.unwrap();
+    assert!(outcome.uploaded);
+    assert_eq!(only_updates(&f), ["first", "latest"]);
+    assert!(!f.path.exists());
+}
+
+#[tokio::test(start_paused = true)]
+async fn only_one_update_is_in_flight_and_finalization_publishes_after_it_settles() {
+    let mut f = Fixture::new(
+        "command::draft_sync::only_one_update_is_in_flight_and_finalization_publishes_after_it_settles",
+    );
+    *f.source.block_once.lock().unwrap() = true;
+    let (running, _events) = f.start(false);
+    f.edit("a");
+    assert_eq!(f.mutation().await, Call::Update("a".into()));
+    f.edit("b");
+    tokio::time::advance(Duration::from_secs(120)).await;
+    assert_eq!(
+        only_updates(&f),
+        ["a"],
+        "no second request while one is in flight"
+    );
+    let stopped = tokio::spawn(running.stop());
+    tokio::task::yield_now().await;
+    assert!(!stopped.is_finished(), "finalization waits for the writer");
+    f.source.gate.release();
+    let outcome = stopped
+        .await
+        .unwrap()
+        .unwrap()
+        .final_upload()
+        .await
+        .unwrap();
+    assert!(outcome.uploaded);
+    assert_eq!(only_updates(&f), ["a", "b"]);
+    assert_eq!(f.source.remote.lock().unwrap().body, "b");
+}
+
+#[tokio::test(start_paused = true)]
+async fn unsafe_draft_states_are_never_published_and_finalization_keeps_them() {
+    use awman::data::fs::work_item_draft::MAX_WORK_ITEM_BYTES;
+    for kind in ["directory", "invalid-utf8", "oversized"] {
+        let mut f = Fixture::new(
+            "command::draft_sync::unsafe_draft_states_are_never_published_and_finalization_keeps_them",
+        );
+        let (running, _events) = f.start(false);
+        match kind {
+            "directory" => {
+                std::fs::remove_file(&f.path).unwrap();
+                std::fs::create_dir(&f.path).unwrap();
+            }
+            "invalid-utf8" => std::fs::write(&f.path, [0xff, 0xfe, 0xfd]).unwrap(),
+            _ => std::fs::write(&f.path, vec![b'x'; MAX_WORK_ITEM_BYTES as usize + 1]).unwrap(),
+        }
+        tokio::time::advance(Duration::from_secs(90)).await;
+        let result = running.stop().await.unwrap().final_upload().await;
+        assert!(
+            matches!(result, Err(DraftSyncError::Read { .. })),
+            "{kind}: {result:?}"
+        );
+        assert!(f.source.mutations().is_empty(), "{kind}");
+        assert!(f.path.exists(), "{kind}: kept for recovery");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_final_update_retains_the_draft_and_names_it() {
+    for failure in [Failure::Transient, Failure::RateLimited, Failure::Auth] {
+        let mut f = Fixture::new(
+            "command::draft_sync::a_failed_final_update_retains_the_draft_and_names_it",
+        );
+        f.source.failures.lock().unwrap().push_back(failure);
+        let (running, _events) = f.start(false);
+        f.edit("edited");
+        let error = running
+            .stop()
+            .await
+            .unwrap()
+            .final_upload()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(&f.path.display().to_string()),
+            "{error}"
+        );
+        assert!(!matches!(error, DraftSyncError::Read { .. }));
+        assert_eq!(std::fs::read_to_string(&f.path).unwrap(), "edited");
+        assert_eq!(f.source.remote.lock().unwrap().body, "seed\n");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_update_reverted_to_the_original_body_after_a_periodic_upload_is_published() {
+    let mut f = Fixture::new(
+        "command::draft_sync::an_update_reverted_to_the_original_body_after_a_periodic_upload_is_published",
+    );
+    let (running, _events) = f.start(false);
+    f.edit("interim");
+    assert_eq!(f.mutation().await, Call::Update("interim".into()));
+    tracker_holds(&f.source, "interim").await;
+    // Restore the issue's original body (the seed) and exit.
+    f.edit("seed\n");
+    let outcome = running.stop().await.unwrap().final_upload().await.unwrap();
+    assert!(outcome.uploaded, "the revert must reach the tracker");
+    assert_eq!(outcome.issue.unwrap().body, "seed\n");
+    assert_eq!(only_updates(&f), ["interim", "seed\n"]);
+    assert_eq!(f.source.remote.lock().unwrap().body, "seed\n");
+    assert!(
+        !f.path.exists(),
+        "deleted only after the acknowledged update"
+    );
+}
+
+/// Wait (off the paused runtime) until the fake tracker has applied `body`:
+/// `update` is recorded before the fake writes it.
+async fn tracker_holds(source: &Arc<FakeSource>, body: &'static str) {
+    let source = Arc::clone(source);
+    tokio::task::spawn_blocking(move || {
+        awman_test_support::wait_for(
+            "the fake tracker to apply the update",
+            Duration::from_secs(15),
+            || (source.remote.lock().unwrap().body == body).then_some(()),
+        )
+    })
+    .await
+    .unwrap();
 }

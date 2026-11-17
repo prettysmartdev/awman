@@ -27,6 +27,12 @@ pub struct WorkServerConfig {
     /// `imageBudget`: how many lease-built images the worker keeps (WI 0163).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_budget: Option<ImageBudgetConfig>,
+    /// Worker environment variables a lease may request with `env(NAME)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_env: Option<Vec<String>>,
+    /// Non-default-library skills a lease may request with `skill(name)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_skills: Option<Vec<String>>,
 }
 
 /// `workServers.<name>.imageBudget`: `{maxImages?, maxBytes?}`.
@@ -77,6 +83,8 @@ pub struct ResolvedWorkServer {
     pub interaction: Option<Interaction>,
     pub labels: BTreeMap<String, String>,
     pub image_budget: ImageBudget,
+    pub allow_env: Vec<String>,
+    pub allow_skills: Vec<String>,
 }
 
 impl WorkServerConfig {
@@ -93,6 +101,8 @@ impl WorkServerConfig {
                 .as_ref()
                 .map(ImageBudgetConfig::resolved)
                 .unwrap_or_default(),
+            allow_env: self.allow_env.clone().unwrap_or_default(),
+            allow_skills: self.allow_skills.clone().unwrap_or_default(),
         }
     }
 }
@@ -182,5 +192,84 @@ mod image_budget_tests {
         .is_err());
         let json = serde_json::to_value(&set).unwrap();
         assert_eq!(json["imageBudget"]["maxBytes"], "2GiB");
+    }
+}
+
+/// An `allowEnv` entry must be a valid environment-variable name
+/// (`^[A-Z_][A-Z0-9_]*$`), the same rule as a command secret name.
+pub fn validate_allow_env_entry(name: &str) -> Result<(), String> {
+    crate::data::secret::SecretName::parse(name)
+        .map(|_| ())
+        .map_err(|_| "must match ^[A-Z_][A-Z0-9_]*$ (at most 128 bytes)".to_string())
+}
+
+/// An `allowSkills` entry must be a name `skill(name)` accepts: a skill or
+/// `library/skill`, never `*`, a list, or an empty, `.` or `..` segment.
+pub fn validate_allow_skill_entry(name: &str) -> Result<(), String> {
+    use crate::data::config::overlays::{parse_overlay_list, SkillSpec, TypedOverlay};
+    const HINT: &str = "must be a skill name such as `planner` or `library/planner`";
+    if name.is_empty()
+        || name == "*"
+        || name.trim() != name
+        || name
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '(' | ')' | ',' | '\\'))
+    {
+        return Err(HINT.into());
+    }
+    match parse_overlay_list(&format!("skill({name})")) {
+        Ok(parsed)
+            if matches!(parsed.as_slice(),
+                [TypedOverlay::Skill(SkillSpec::Named(n))] if n == name) =>
+        {
+            Ok(())
+        }
+        Ok(_) => Err(HINT.into()),
+        Err(reason) => Err(reason),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allow_lists_default_empty() {
+        let resolved = WorkServerConfig::default().resolved();
+        assert!(resolved.allow_env.is_empty());
+        assert!(resolved.allow_skills.is_empty());
+    }
+
+    #[test]
+    fn allow_lists_resolve_configured_values() {
+        let config: WorkServerConfig = serde_json::from_str(
+            r#"{"url":"https://w.example","allowEnv":["GATEWAY_TOKEN","_X1"],"allowSkills":["planner","lib/planner"]}"#,
+        )
+        .unwrap();
+        let resolved = config.resolved();
+        assert_eq!(resolved.allow_env, ["GATEWAY_TOKEN", "_X1"]);
+        assert_eq!(resolved.allow_skills, ["planner", "lib/planner"]);
+    }
+
+    #[test]
+    fn allow_env_names_are_validated() {
+        for ok in ["A", "_", "GATEWAY_TOKEN", "A1_B2"] {
+            assert!(validate_allow_env_entry(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "lower", "1A", "A-B", "A B", "A=B", "é", "*"] {
+            assert!(validate_allow_env_entry(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn allow_skill_names_are_validated() {
+        for ok in ["planner", "team-planner", "awman/create-custom-agent"] {
+            assert!(validate_allow_skill_entry(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "", "*", " a", "a ", "a,b", "a/b/c", "a//b", "..", "a/..", "/a", "a)",
+        ] {
+            assert!(validate_allow_skill_entry(bad).is_err(), "{bad}");
+        }
     }
 }
