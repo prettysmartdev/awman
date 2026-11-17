@@ -98,7 +98,7 @@ test-group = "docker"
 
 # component-command
 [[profile.default.overrides]]
-filter = "package(=awman-cli) & binary(=component) & (test(/^command::/) - test(/^command::builtin::/) - test(/^command::daemon::/) - test(/^command::differential::/) - test(/^command::models::/))"
+filter = "package(=awman-cli) & binary(=component) & (test(/^command::/) - test(/^command::builtin::/) - test(/^command::daemon::/) - test(/^command::differential::/) - test(/^command::models::/) - test(/^command::edit_artifacts::/))"
 slow-timeout = { period = "1s", terminate-after = 20 }
 
 # component-command-builtin

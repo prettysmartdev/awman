@@ -352,7 +352,7 @@ target = "test:component"
 contracts = ["component-command"]
 requires = []
 paths = ["tests/component/command/**", "src/command/**"]
-filter = "test(/^command::/) - test(/^command::builtin::/) - test(/^command::daemon::/) - test(/^command::differential::/) - test(/^command::models::/)"
+filter = "test(/^command::/) - test(/^command::builtin::/) - test(/^command::daemon::/) - test(/^command::differential::/) - test(/^command::models::/) - test(/^command::edit_artifacts::/)"
 
 [suites.component-command-edit-artifacts]
 tier = "component"

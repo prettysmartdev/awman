@@ -292,7 +292,10 @@ async fn local_workflow_toml_yaml_and_skill_edit_in_place_preserve_identity_and_
         std::fs::write(w.root.join(path), replacement).unwrap();
         w.docker.release();
         let outcome = finish(task).await.unwrap();
-        assert_eq!(outcome.target.files[0].host_path, w.root.join(path));
+        assert_eq!(
+            outcome.target.files[0].host_path,
+            w.root.join(path).canonicalize().unwrap()
+        );
         assert_eq!(
             std::fs::read_to_string(w.root.join(path)).unwrap(),
             replacement
