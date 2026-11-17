@@ -32,6 +32,25 @@ impl WorkflowFrontend for InstanceCommandFrontend {
         }
     }
     fn report_workflow_state(&mut self, state: &WorkflowState) {
+        let projected = crate::command::instance::feeds::workflow_state_to_view_state(state);
+        self.workflow.update_view(|guard| {
+            let Some(view) = guard.as_mut() else {
+                *guard = Some(projected);
+                return;
+            };
+            // Main-step callbacks carry resolved labels and live presentation
+            // metadata. Phase rows come from the complete ordered engine state,
+            // including pending steps and repeated descriptions.
+            view.steps
+                .retain(|step| step.kind == WorkflowStepKind::Agent);
+            let (setup, teardown): (Vec<_>, Vec<_>) = projected
+                .steps
+                .into_iter()
+                .filter(|step| step.kind != WorkflowStepKind::Agent)
+                .partition(|step| step.kind == WorkflowStepKind::Setup);
+            view.steps.splice(..0, setup);
+            view.steps.extend(teardown);
+        });
         if let Some(recorder) = &self.worker_events {
             recorder.state(state);
         }
@@ -276,8 +295,8 @@ impl WorkflowFrontend for InstanceCommandFrontend {
             });
             // This callback only knows about the main phase, so replacing
             // `view.steps` wholesale would wipe out any setup/teardown
-            // pseudo-steps `on_setup_step_*`/`on_teardown_step_*` already
-            // tracked there — splice the new main steps back between them.
+            // rows published by `report_workflow_state` — splice the new
+            // main steps back between them.
             use crate::command::instance::feeds::WorkflowStepKind;
             let setup: Vec<_> = view
                 .steps
@@ -363,12 +382,6 @@ impl WorkflowFrontend for InstanceCommandFrontend {
             .info(format!("{}: {description}", kind.label()));
         self.phase_stream_title = Some(format!("[{}] {description}", kind.label()));
         self.phase_stream_open = false;
-        upsert_phase_step(
-            &self.workflow,
-            step_kind(kind),
-            description,
-            StepViewStatus::Running,
-        );
     }
 
     /// Only steps on the filtered background stream (those holding a token
@@ -388,12 +401,6 @@ impl WorkflowFrontend for InstanceCommandFrontend {
         self.close_phase_stream(0);
         self.messages
             .success(format!("{}: {description}", kind.label()));
-        upsert_phase_step(
-            &self.workflow,
-            step_kind(kind),
-            description,
-            StepViewStatus::Done,
-        );
     }
 
     fn on_phase_step_failed(
@@ -411,12 +418,6 @@ impl WorkflowFrontend for InstanceCommandFrontend {
             format!("{label} failed: {description} (exit {exit_code}): {stderr}")
         };
         self.messages.error_msg(msg);
-        upsert_phase_step(
-            &self.workflow,
-            step_kind(kind),
-            description,
-            StepViewStatus::Error,
-        );
     }
 
     /// The TUI routes Ctrl-W through the engine's request channel and colours
@@ -627,69 +628,6 @@ fn workflow_step_view_status(status: &WorkflowStepStatus) -> StepViewStatus {
         WorkflowStepStatus::Cancelled => StepViewStatus::Cancelled,
         WorkflowStepStatus::Skipped => StepViewStatus::Skipped,
     }
-}
-
-/// The workflow-view row kind for a phase. The view has a third kind
-/// (`Agent`) for ordinary steps, so it is not the same enum as `PhaseKind`.
-fn step_kind(kind: PhaseKind) -> WorkflowStepKind {
-    match kind {
-        PhaseKind::Setup => WorkflowStepKind::Setup,
-        PhaseKind::Teardown => WorkflowStepKind::Teardown,
-    }
-}
-
-/// Insert or update a setup/teardown pseudo-step in the live Workflow
-/// Overview, so a locally-attached run shows the same `[setup]`/`[teardown]`
-/// column a squad/remote run gets from `workflow_state_to_view_state` — the
-/// engine's `on_phase_step_*` hooks (unlike `report_workflow_progress`) carry
-/// only a description, not the full ordered plan, so entries appear as they
-/// start rather than as `pending` ahead of time.
-///
-/// The hooks carry no stable id, so a step in flight is found by matching
-/// `(kind, description)`; setup/teardown steps run strictly sequentially, so
-/// the most recent match (searched from the end) is always the current one.
-/// A new setup entry is inserted after any earlier setup entries, ahead of
-/// the main/teardown steps already tracked; a new teardown entry is appended,
-/// since teardown can only start once every main step is done.
-fn upsert_phase_step(
-    workflow_view: &crate::command::instance::feeds::SharedWorkflowPresentation,
-    kind: WorkflowStepKind,
-    description: &str,
-    status: StepViewStatus,
-) {
-    use crate::command::instance::feeds::{WorkflowStepView, WorkflowViewState};
-
-    workflow_view.update_view(|guard| {
-        let view = guard.get_or_insert_with(WorkflowViewState::default);
-        if let Some(existing) = view
-            .steps
-            .iter_mut()
-            .rev()
-            .find(|s| s.kind == kind && s.name == description)
-        {
-            existing.status = status;
-            return;
-        }
-        let step = WorkflowStepView {
-            name: description.to_string(),
-            status,
-            agent: None,
-            model: None,
-            depends_on: Vec::new(),
-            kind,
-        };
-        match kind {
-            WorkflowStepKind::Setup => {
-                let pos = view
-                    .steps
-                    .iter()
-                    .position(|s| s.kind != WorkflowStepKind::Setup)
-                    .unwrap_or(view.steps.len());
-                view.steps.insert(pos, step);
-            }
-            WorkflowStepKind::Teardown | WorkflowStepKind::Agent => view.steps.push(step),
-        }
-    });
 }
 
 #[cfg(test)]

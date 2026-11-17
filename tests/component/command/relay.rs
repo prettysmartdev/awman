@@ -12,6 +12,182 @@ use awman::data::{
 };
 use awman::engine::workflow::EngineRequest;
 
+#[test]
+fn complete_phase_plans_reach_the_overview_and_api_before_steps_start() {
+    use awman::command::dispatch::{catalogue::CommandCatalogue, parsed_input};
+    use awman::command::instance::frontend::{DialogChannels, InstanceCommandFrontend};
+    use awman::data::instance_snapshot::{StepViewStatus, WorkflowStepKind};
+    use awman::data::workflow_state::{PhaseKind, PhaseStepState, PhaseStepStatus, WorkflowState};
+    use awman::engine::agent_runtime::frontend::AgentIo;
+    use awman::engine::workflow::{
+        actions::{WorkflowStepProgressInfo, WorkflowStepStatus},
+        frontend::WorkflowFrontend,
+    };
+
+    let s = crate::support::sandbox(
+        "command::relay::complete_phase_plans_reach_the_overview_and_api_before_steps_start",
+    );
+    let session = Session::open_at_directory_root(
+        s.work(),
+        SessionOpenOptions {
+            env: Some(crate::support::env_snapshot(&s)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let feeds = TabCommandFeeds::new();
+    let mut relay = TabRelay::new(
+        TabId::new(),
+        &session,
+        TabKindWire::Normal,
+        feeds.clone(),
+        None,
+        (80, 24),
+    );
+    let (requests, _requests_rx) = std::sync::mpsc::channel();
+    let (_responses, responses_rx) = std::sync::mpsc::channel();
+    let (stdout, _stdout_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut frontend = InstanceCommandFrontend::new(
+        parsed_input::parse("exec workflow example.toml", CommandCatalogue::get()).unwrap(),
+        DialogChannels::new(requests, responses_rx),
+        AgentIo {
+            stdout: stdout.clone(),
+            stderr: stdout,
+            stdin_tx,
+            stdin_rx,
+            resize: None,
+            initial_size: None,
+        },
+        feeds.clone(),
+    );
+    let mut state = WorkflowState::new("example".into(), &[], "hash".into(), None);
+    state.setup_step_states = vec![PhaseStepState {
+        description: "run_shell: prepare".into(),
+        status: PhaseStepStatus::Succeeded,
+    }];
+    // Identical descriptions must keep distinct positions and statuses.
+    state.teardown_step_states = vec![
+        PhaseStepState {
+            description: "run_shell: verify".into(),
+            status: PhaseStepStatus::Pending,
+        };
+        3
+    ];
+    frontend.report_workflow_state(&state);
+    let progress = [WorkflowStepProgressInfo {
+        name: "implement".into(),
+        agent: "claude".into(),
+        model: Some("resolved-model".into()),
+        has_step_override: true,
+        status: WorkflowStepStatus::Succeeded,
+        depends_on: vec![],
+        max_concurrent: Some(2),
+    }];
+    frontend.report_workflow_progress(&progress);
+    state.current_phase = WorkflowPhase::Teardown;
+
+    for (statuses, expected) in [
+        (
+            [
+                PhaseStepStatus::Pending,
+                PhaseStepStatus::Pending,
+                PhaseStepStatus::Pending,
+            ],
+            [
+                StepViewStatus::Pending,
+                StepViewStatus::Pending,
+                StepViewStatus::Pending,
+            ],
+        ),
+        (
+            [
+                PhaseStepStatus::Running,
+                PhaseStepStatus::Pending,
+                PhaseStepStatus::Pending,
+            ],
+            [
+                StepViewStatus::Running,
+                StepViewStatus::Pending,
+                StepViewStatus::Pending,
+            ],
+        ),
+        (
+            [
+                PhaseStepStatus::Succeeded,
+                PhaseStepStatus::Running,
+                PhaseStepStatus::Pending,
+            ],
+            [
+                StepViewStatus::Done,
+                StepViewStatus::Running,
+                StepViewStatus::Pending,
+            ],
+        ),
+        (
+            [
+                PhaseStepStatus::Succeeded,
+                PhaseStepStatus::Failed {
+                    error: "failed".into(),
+                },
+                PhaseStepStatus::Skipped,
+            ],
+            [
+                StepViewStatus::Done,
+                StepViewStatus::Error,
+                StepViewStatus::Skipped,
+            ],
+        ),
+    ] {
+        for (step, status) in state.teardown_step_states.iter_mut().zip(statuses) {
+            step.status = status;
+        }
+        frontend.report_workflow_state(&state);
+        if expected[1] == StepViewStatus::Running {
+            // The engine persists first, then sends the notification.
+            frontend.on_phase_step_started(PhaseKind::Teardown, "run_shell: verify");
+        }
+        // Main-step progress must not remove pending phase rows.
+        frontend.report_workflow_progress(&progress);
+        let overview = feeds.workflow.snapshot().view.unwrap();
+        assert_eq!(overview.steps.len(), 5);
+        assert_eq!(overview.steps[0].kind, WorkflowStepKind::Setup);
+        assert_eq!(overview.steps[0].status, StepViewStatus::Done);
+        assert_eq!(overview.steps[1].kind, WorkflowStepKind::Agent);
+        assert_eq!(overview.steps[1].agent.as_deref(), Some("claude"));
+        assert_eq!(overview.steps[1].model.as_deref(), Some("resolved-model"));
+        assert_eq!(overview.max_concurrent, Some(2));
+        for (step, status) in overview.steps[2..].iter().zip(expected) {
+            assert_eq!(step.kind, WorkflowStepKind::Teardown);
+            assert_eq!(step.name, "run_shell: verify");
+            assert_eq!(step.status, status);
+        }
+        let updates = relay.pump(Some(&session));
+        assert!(updates.iter().any(|event| matches!(event,
+            InstanceEvent::Delta(InstanceDelta::Workflow { view: Some(view), .. })
+                if view == &overview
+        )));
+        let api_snapshot = serde_json::to_value(relay.snapshot()).unwrap();
+        assert_eq!(
+            api_snapshot["workflow"],
+            serde_json::to_value(&overview).unwrap()
+        );
+        let worker_view = awman::command::daemon_api::workflow_view::client_view(
+            serde_json::to_value(&state).unwrap(),
+        );
+        assert_eq!(worker_view["phase"], "teardown");
+        assert_eq!(
+            worker_view["teardown_step_states"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+    drop(relay);
+    s.finish();
+}
+
 #[tokio::test]
 async fn attaching_stuck_events_preserves_workflow_requests_and_parallel_backbone() {
     let s = crate::support::sandbox(

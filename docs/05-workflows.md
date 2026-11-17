@@ -1309,6 +1309,11 @@ Setup and teardown steps get their own dedicated column at the start and end of 
 
 Multiple setup (or teardown) steps share that one leading (or trailing) column, and collapse to a `N steps…` summary in the minimized overview the same way a parallel group of main steps does — the `[setup]`/`[teardown]` title stays on the collapsed box too.
 
+The complete setup and teardown lists appear when the workflow plan is available,
+with steps marked pending until they start. Entering teardown shows all of its
+steps immediately; each keeps its own row and status, even when descriptions
+repeat. The TUI and API instance snapshots and updates share this overview.
+
 ### Remediation in progress
 
 When a setup or teardown step fails and has an `on_failure` block, the step status changes to **🔧** (remediating) while the agent runs. The workflow status indicator shows which remediation attempt is in progress (e.g., "attempt 1 of 2"). After the agent completes, the original step is automatically retried. The status returns to **●** (running) for the retry.
@@ -1359,6 +1364,8 @@ for teardown, including dynamic and yolo workflows. Final agents remain alive
 after reporting `done` or `idle` until you choose **Finish workflow**. Dismissing
 the board lets you review their output and continue interacting; use **Ctrl+W**
 to reopen it. Agents that exit naturally also require final review.
+Pending teardown steps may already be visible in the overview; they do not
+start until you choose **Finish workflow** and the remaining live agents stop.
 `--non-interactive` (also called `--headless`) skips this review, as do unattended
 API, squad, and worker workflow frontends. An interactive agent terminal alone
 does not make an unattended frontend capable of answering the board.
