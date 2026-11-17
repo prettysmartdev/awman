@@ -10,6 +10,16 @@ An overlay "opens a door" from the container into the host, mounting a directory
 
 Overlays are expressed using a unified syntax that works anywhere: `dir()`, `ssh()`, `env()`, `skill()`, and `context()` expressions. No matter where you configure them — config file, environment variable, CLI flag, or workflow TOML — the syntax is consistent.
 
+Work-server leases have a narrower overlay policy: `exec.overlays` may request
+`env(NAME)` and named `skill(name)` only; all other overlay kinds are refused.
+Lease context is provided by the WorkItem's `context` field, not by a
+`context()` overlay. See [Workers and work servers](17-workers-and-work-servers.md#lease-workitem-and-result-shapes)
+for the per-server environment and skill review rules.
+The same env and skill review applies to server-supplied workflow TOML and
+generated or resumed dynamic workflows before their steps start. Lease env
+requests cannot use runtime-control, loader, interpreter, proxy, or terminal variable names
+such as `DOCKER_HOST`, `PATH`, `LD_PRELOAD`, `HTTPS_PROXY`, or `TERM`.
+
 ---
 
 ## Overlay types

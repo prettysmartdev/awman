@@ -244,6 +244,9 @@ pub struct LeaseRecord {
     pub epoch: u64,
     pub item_id: String,
     pub item: awman_wsp::WorkItem,
+    /// Names-only restart marker; values are never persisted.
+    #[serde(default)]
+    pub secret_names: Vec<String>,
     /// The command row (`cmd_…`) once admitted.
     pub job_id: Option<String>,
     pub state: LeaseState,
@@ -267,6 +270,8 @@ impl LeaseRecord {
     ) -> Self {
         let mut item = lease.item.clone();
         item.repo.credentials = None;
+        let secret_names = item.exec.secrets.names();
+        item.exec.secrets.take();
         Self {
             id: LeaseId::new(),
             server: server.to_owned(),
@@ -274,6 +279,7 @@ impl LeaseRecord {
             epoch: lease.epoch,
             item_id: item.id.clone(),
             item,
+            secret_names,
             job_id: None,
             state: LeaseState::Claimed,
             host,

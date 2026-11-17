@@ -28,7 +28,7 @@ type RunResult<T> = Result<T, WorkerEngineError>;
 fn invalid(error: impl std::fmt::Display) -> WorkerEngineError {
     WorkerEngineError::Invalid(error.to_string())
 }
-fn failed(stage: &str, code: &str, message: String) -> CommandResult {
+pub(super) fn failed(stage: &str, code: &str, message: String) -> CommandResult {
     CommandResult {
         outcome: Some(CommandStatusKind::Error),
         exit_code: Some(1),
@@ -51,6 +51,53 @@ fn cancelled(mut result: CommandResult) -> CommandResult {
         step: None,
     });
     result
+}
+
+pub(super) fn secret_redaction(
+    secrets: &awman_wsp::ExecSecrets,
+) -> crate::engine::auth::redaction::RedactionSet {
+    let redaction = crate::engine::auth::redaction::RedactionSet::new();
+    if let Some(values) = secrets.shared() {
+        for value in values.values() {
+            redaction.add(value.clone());
+        }
+    }
+    redaction
+}
+
+/// Restart never re-executes a lease; a durable name marker identifies lost values.
+pub(super) fn restart_release(record: &LeaseRecord) -> ReleaseRequest<CommandResult> {
+    if record.secret_names.is_empty() {
+        ReleaseRequest {
+            context_changes: None,
+            reason: ReleaseReason::Shutdown,
+            message: Some("worker restarted".into()),
+            result: None,
+        }
+    } else {
+        let message = "the worker restarted and this lease's exec.secrets were held in memory only";
+        ReleaseRequest {
+            context_changes: None,
+            reason: ReleaseReason::Error,
+            message: Some(format!("credentials_lost: {message}")),
+            result: Some(failed("preflight", "credentials_lost", message.into())),
+        }
+    }
+}
+
+/// Clear the shared push secret store and its names-only marker on every exit.
+struct LeaseSecretsGuard {
+    id: crate::data::ids::CommandId,
+    ephemeral: Arc<crate::command::dispatch::ephemeral_secrets::EphemeralSecrets>,
+    lifecycle: crate::data::api_lifecycle_store::CommandLifecycleStore,
+}
+impl Drop for LeaseSecretsGuard {
+    fn drop(&mut self) {
+        self.ephemeral.remove(&self.id);
+        if let Err(error) = self.lifecycle.remove_secret_names(&self.id) {
+            tracing::warn!(%error, "could not remove lease secret names");
+        }
+    }
 }
 
 /// Every post-claim operation uses the same fence. An event or credential
@@ -170,6 +217,40 @@ impl Drop for CollectionCancel {
         self.1.abort();
     }
 }
+/// Apply the admitted per-item config to the lease's private session and
+/// return the fixed commit identity for the host's leftover commit.
+///
+/// `exec.workflows_dynamic` becomes the session's task config layer: above
+/// the worker's and the repository's files, below env, `--set` and
+/// `--leader`. The session belongs to this lease only, so nothing reaches
+/// the next item or any config file. The identity is resolved by push's
+/// policy merge over this session and the admitted `--prerequisite-*` flags;
+/// `None` keeps the clone/host identity and the `awman <awman@localhost>`
+/// fallback.
+pub(super) fn apply_item_config(
+    session: &mut Session,
+    plan: &policy::LeasePlan,
+) -> Result<Option<(String, String)>, crate::data::DataError> {
+    if let Some(dynamic) = plan.workflows_dynamic.clone() {
+        session.set_task_config(crate::data::config::ConfigFile {
+            workflows: Some(crate::data::config::workflows::WorkflowsConfig {
+                dynamic: Some(dynamic),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })?;
+    }
+    Ok(plan.prerequisites.as_ref().and_then(|flags| {
+        let policy =
+            crate::command::commands::workflow_prerequisites::policy_for(session, flags, None);
+        match (policy.git_identity.use_, policy.git_identity.fixed) {
+            (crate::data::config::workflows::CredentialUse::Allow, Some(fixed)) => {
+                Some((fixed.name, fixed.email))
+            }
+            _ => None,
+        }
+    }))
+}
 fn command_scratch(
     paths: crate::data::fs::api_paths::ApiPaths,
     command: &crate::data::fs::api_db::CommandRecord,
@@ -204,6 +285,9 @@ struct PushStage {
     output_dir: PathBuf,
     run_root: PathBuf,
     git_source: Option<crate::engine::git::remote_push::WorkflowGitSource>,
+    /// A fixed commit identity resolved from `exec.prerequisites`; `None`
+    /// keeps the clone/host identity and the `awman <awman@localhost>` fallback.
+    commit_identity: Option<(String, String)>,
     scratch: Option<(crate::data::fs::api_paths::ApiPaths, String, String, u32)>,
 }
 #[async_trait::async_trait]
@@ -326,11 +410,15 @@ impl LeasePostProcess for PushStage {
             expiry: Some(self.active.control.expiry_watch()),
             deadline: self.active.control.expires_at(),
         };
+        let identity = self.commit_identity.clone();
         let commit = tokio::task::spawn_blocking(move || {
             commit_git.commit_leftovers_guarded(
                 "Lease work",
                 &mut crate::data::message::RecordingMessageSink::new(),
                 &guard,
+                identity
+                    .as_ref()
+                    .map(|(name, email)| (name.as_str(), email.as_str())),
             )
         })
         .await;
@@ -431,6 +519,7 @@ pub(super) struct ClaimedLease {
     pub(super) lease: Lease,
     pub(super) record: LeaseRecord,
     pub(super) plan: policy::LeasePlan,
+    pub(super) secrets: awman_wsp::ExecSecrets,
     /// Held for the life of the run; proves this process owns the lease.
     pub(super) owner: std::fs::File,
 }
@@ -447,8 +536,10 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             lease,
             record,
             plan,
+            secrets,
             owner,
         } = claimed;
+        let redaction = secret_redaction(&secrets);
         let (control, heartbeat) = HeartbeatLoop::spawn(
             session.clone(),
             LeaseRef::of(&lease),
@@ -509,7 +600,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                         permit = this.share.acquire(crate::data::worker::JobClass::Pull) => permit,
                     },
                 };
-                this.execute_lease(session.clone(), &lease, &mut record, plan, active.clone(), interval).await
+                this.execute_lease(session.clone(), &lease, &mut record, plan, &secrets, active.clone(), interval).await
             })
             .catch_unwind()
             .await;
@@ -543,6 +634,10 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             if session.is_revoked() {
                 active.control.fence();
             }
+            redaction.redact_result(&mut result);
+            let request = request.map(|(reason, message)| {
+                (reason, message.map(|message| redaction.redact(&message)))
+            });
             let outputs = active.outputs.lock().unwrap().take();
             record.state = LeaseState::Lost;
             if active.control.may_report() {
@@ -635,12 +730,14 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_lease(
         &self,
         session: Arc<WspSession>,
         lease: &Lease,
         record: &mut LeaseRecord,
         mut plan: policy::LeasePlan,
+        secrets: &awman_wsp::ExecSecrets,
         active: Arc<Active>,
         interval: Duration,
     ) -> RunResult<(CommandResult, Option<PathBuf>)> {
@@ -722,6 +819,8 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             ));
         }
         run_session.set_inline_work_item(inline.path().to_path_buf());
+        // Before provisioning, which reads the item's agent mapping.
+        let commit_identity = apply_item_config(&mut run_session, &plan).map_err(invalid)?;
         provision::agents_for_lease(
             &self.shared.engines,
             &run_session,
@@ -756,6 +855,23 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             id: run_session_id,
         };
         let job_id = crate::data::ids::CommandId::new().to_string();
+        let command_id = crate::data::ids::CommandId::parse(&job_id).map_err(invalid)?;
+        let _secrets = LeaseSecretsGuard {
+            id: command_id.clone(),
+            ephemeral: self.shared.engines.ephemeral_secrets.clone(),
+            lifecycle: self.shared.lifecycle_store.clone(),
+        };
+        if let Some(values) = secrets.shared() {
+            let names: Vec<_> = values.names().collect();
+            self.shared
+                .lifecycle_store
+                .record_secret_names(&command_id, &names)
+                .map_err(invalid)?;
+            self.shared
+                .engines
+                .ephemeral_secrets
+                .insert(command_id, values);
+        }
         let spec = JobSpec {
             command: plan.command.clone(),
             args: plan.args.clone(),
@@ -799,6 +915,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
         active.control.set_state(HeartbeatState::Running);
         let mut engines = self.shared.engines.clone();
         engines.git_engine = git;
+        engines.lease_workflow_review = plan.workflow_review.clone();
         engines.agent_engine = Arc::new(
             (*engines.agent_engine)
                 .clone()
@@ -844,6 +961,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             output_dir: self.shared.paths.command_output_dir(&session_key, &job_id),
             run_root: workspace.clone_dir().into(),
             git_source: None,
+            commit_identity,
             scratch: Some(command_scratch(
                 self.shared.paths.clone(),
                 &self
@@ -1115,6 +1233,7 @@ pub(super) async fn complete_foreground(
         output_dir,
         run_root,
         git_source: Some(git_source),
+        commit_identity: None,
         scratch: None,
     };
     let result = stage.process(result).await;
@@ -1338,6 +1457,7 @@ mod context_contract_tests {
             output_dir: sandbox.work().join("output"),
             run_root: sandbox.work().to_path_buf(),
             git_source: None,
+            commit_identity: None,
             scratch: Some(command_scratch(paths, &command)),
         };
         post.process(failed("step", "fixture", "already failed".into()))
@@ -1370,5 +1490,231 @@ mod context_contract_tests {
         );
         control.stop();
         heartbeat.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod lease_secret_tests {
+    use super::*;
+
+    fn lease() -> Lease {
+        let mut item = awman_wsp::conformance::work_item("secret-lifetime");
+        item.exec.secrets = awman_wsp::ExecSecrets::new([
+            (
+                "TOKEN".into(),
+                crate::data::secret::SecretString::new("used-lease-secret"),
+            ),
+            (
+                "UNUSED".into(),
+                crate::data::secret::SecretString::new("unused-lease-secret"),
+            ),
+        ])
+        .unwrap();
+        Lease {
+            id: "server-lease".into(),
+            epoch: 1,
+            expires_at: Utc::now() + chrono::Duration::minutes(1),
+            item,
+            terminal: false,
+            remote_input: false,
+        }
+    }
+
+    #[test]
+    fn lease_record_strips_values_but_keeps_restart_marker_and_old_records_decode() {
+        let lease = lease();
+        let record = LeaseRecord::claimed("work", &lease, LeaseHost::Daemon, Utc::now());
+        assert!(record.item.exec.secrets.is_empty());
+        assert_eq!(record.secret_names, ["TOKEN", "UNUSED"]);
+        assert!(!format!("{record:?}").contains("-lease-secret"));
+        let wire = serde_json::to_string(&record).unwrap();
+        assert!(!wire.contains("-lease-secret"));
+        let recovery = restart_release(&record);
+        assert_eq!(recovery.reason, ReleaseReason::Error);
+        assert!(recovery.message.unwrap().starts_with("credentials_lost: "));
+        let failure = recovery.result.unwrap().failure.unwrap();
+        assert_eq!(
+            (failure.stage.as_str(), failure.code.as_str()),
+            ("preflight", "credentials_lost")
+        );
+        let mut old = serde_json::to_value(&record).unwrap();
+        old.as_object_mut().unwrap().remove("secret_names");
+        let old = serde_json::from_value::<LeaseRecord>(old).unwrap();
+        assert!(old.secret_names.is_empty());
+        assert_eq!(restart_release(&old).reason, ReleaseReason::Shutdown);
+    }
+
+    #[test]
+    fn unused_values_are_never_injected_but_redact_results_and_release_messages() {
+        let lease = lease();
+        let redaction = secret_redaction(&lease.item.exec.secrets);
+        let options = crate::engine::agent::AgentRunOptions {
+            command_secrets: lease.item.exec.secrets.shared(),
+            env_passthrough: Some(vec!["TOKEN".into()]),
+            ..Default::default()
+        };
+        let env = options.secret_env();
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "TOKEN");
+        let mut result = failed(
+            "preflight",
+            "setup_failed",
+            "unused-lease-secret used-lease-secret".into(),
+        );
+        result.final_message = Some("unused-lease-secret".into());
+        redaction.redact_result(&mut result);
+        assert_eq!(result.final_message.as_deref(), Some("***"));
+        assert_eq!(result.failure.unwrap().message, "*** ***");
+        assert_eq!(
+            redaction.redact("release unused-lease-secret"),
+            "release ***"
+        );
+    }
+
+    #[test]
+    fn secret_guard_cleans_memory_and_lifecycle_markers_during_unwind() {
+        let sandbox = awman_test_support::TestSandbox::for_test(awman_test_support::TestCase::component("command::worker::runner::lease_secret_tests::secret_guard_cleans_memory_and_lifecycle_markers_during_unwind"));
+        let store = Arc::new(
+            crate::data::fs::api_db::SqliteSessionStore::open(&sandbox.xdg_data()).unwrap(),
+        );
+        let lifecycle =
+            crate::data::api_lifecycle_store::CommandLifecycleStore::open(store).unwrap();
+        let memory =
+            Arc::new(crate::command::dispatch::ephemeral_secrets::EphemeralSecrets::default());
+        let id = crate::data::ids::CommandId::new();
+        let values = lease().item.exec.secrets.shared().unwrap();
+        lifecycle
+            .record_secret_names(&id, &["TOKEN", "UNUSED"])
+            .unwrap();
+        memory.insert(id.clone(), values);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = LeaseSecretsGuard {
+                id: id.clone(),
+                ephemeral: memory.clone(),
+                lifecycle: lifecycle.clone(),
+            };
+            assert!(memory
+                .for_execution(&id, Some(&["TOKEN".into()]))
+                .unwrap()
+                .is_some());
+            panic!("simulate runner unwind");
+        }));
+        assert!(result.is_err());
+        assert!(memory.for_execution(&id, None).unwrap().is_none());
+        assert!(lifecycle.secret_names(&id).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod item_config_tests {
+    use super::*;
+    use crate::data::config::flags::{IdentityFlag, PrerequisiteFlags};
+
+    fn plan(
+        dynamic: Option<crate::data::config::workflows::DynamicConfig>,
+        prerequisites: Option<PrerequisiteFlags>,
+    ) -> policy::LeasePlan {
+        policy::LeasePlan {
+            workflow_review: None,
+            interaction: crate::data::config::daemon::Interaction::Headless,
+            command: vec!["exec".into(), "workflow".into()],
+            args: vec![],
+            prerequisites,
+            workflows_dynamic: dynamic,
+        }
+    }
+
+    #[test]
+    fn per_item_dynamic_config_and_identity_stay_on_that_items_session() {
+        let sandbox = awman_test_support::TestSandbox::for_test(awman_test_support::TestCase::component(
+            "command::worker::runner::item_config_tests::per_item_dynamic_config_and_identity_stay_on_that_items_session",
+        ));
+        let home = sandbox.root().join("data");
+        let env = crate::data::config::env::EnvSnapshot::with_overrides([(
+            "AWMAN_HOME",
+            home.to_string_lossy().into_owned(),
+        )]);
+        let global = crate::data::config::file::global_config_path(&env).unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        let written = r#"{"workflows":{"dynamic":{"defaultLeader":"claude::opus","agentsToModels":{"claude":["opus"]},"guidance":["worker rule"]}}}"#;
+        std::fs::write(&global, written).unwrap();
+        let open = |name: &str| {
+            let root = sandbox.root().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            Session::open_at_directory_root(
+                root,
+                SessionOpenOptions {
+                    env: Some(env.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+
+        let mut first = open("first");
+        let identity = apply_item_config(
+            &mut first,
+            &plan(
+                Some(crate::data::config::workflows::DynamicConfig {
+                    default_leader: Some("codex::gpt-5".into()),
+                    agents_to_models: Some(
+                        [("codex".to_string(), vec!["gpt-5".to_string()])].into(),
+                    ),
+                    guidance: Some(vec!["item rule".into()]),
+                }),
+                Some(PrerequisiteFlags {
+                    identity: Some(IdentityFlag::Fixed {
+                        name: "Lease Bot".into(),
+                        email: "bot@example.test".into(),
+                    }),
+                    ..Default::default()
+                }),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            identity,
+            Some(("Lease Bot".to_string(), "bot@example.test".to_string()))
+        );
+        let resolved = first.effective_config().dynamic_workflows().unwrap();
+        assert_eq!(resolved.default_leader.unwrap().value, "codex::gpt-5");
+        let mapping = resolved.agents_to_models.unwrap().value;
+        assert_eq!(mapping.keys().collect::<Vec<_>>(), ["codex"]);
+        let guidance: Vec<_> = resolved.guidance.iter().map(|g| g.text.as_str()).collect();
+        assert_eq!(guidance, ["worker rule", "item rule"]);
+
+        // The next item gets the worker's configuration back, and the
+        // worker's file was never written.
+        let mut next = open("next");
+        assert_eq!(
+            apply_item_config(&mut next, &plan(None, None)).unwrap(),
+            None
+        );
+        let resolved = next.effective_config().dynamic_workflows().unwrap();
+        assert_eq!(resolved.default_leader.unwrap().value, "claude::opus");
+        assert_eq!(
+            resolved
+                .agents_to_models
+                .unwrap()
+                .value
+                .keys()
+                .collect::<Vec<_>>(),
+            ["claude"]
+        );
+        assert_eq!(std::fs::read_to_string(&global).unwrap(), written);
+
+        // Too much guidance after merging fails like the config key.
+        let mut over = open("over");
+        let error = apply_item_config(
+            &mut over,
+            &plan(
+                Some(crate::data::config::workflows::DynamicConfig {
+                    guidance: Some((0..50).map(|i| format!("rule {i}")).collect()),
+                    ..Default::default()
+                }),
+                None,
+            ),
+        );
+        assert!(error.is_err());
     }
 }

@@ -9,6 +9,7 @@ use std::{
 use tokio::sync::{broadcast, Notify};
 mod http;
 pub mod lease_context;
+pub mod lease_exec;
 pub mod workflow_context;
 pub use http::ServingMock;
 
@@ -18,6 +19,7 @@ pub enum MockFault {
     IgnorePreferences,
     IgnoreEpoch,
     IgnoreWorkflowContextCapability,
+    IgnoreExecCapabilities,
     DuplicateEvents,
     EmptyEvents,
     Wire(&'static str),
@@ -103,6 +105,8 @@ fn eligible<'a>(s: &'a State, worker: &str) -> Result<Vec<&'a Entry>, ApiError> 
             !e.completed
                 && !e.excluded.contains(worker)
                 && lease_context::offer_allowed(&s.workers[worker].request.features, &e.item)
+                && (s.fault == Some(MockFault::IgnoreExecCapabilities)
+                    || lease_exec::offer_allowed(&s.workers[worker].request.features, &e.item))
                 && (s.fault == Some(MockFault::IgnoreWorkflowContextCapability)
                     || workflow_context::offer_allowed(
                         &s.workers[worker].request.features,

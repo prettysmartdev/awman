@@ -142,6 +142,32 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
     fn support(&self) -> LeaseRuntimeSupport {
         LeaseRuntimeSupport::from_capabilities(self.shared.engines.runtime.capabilities())
     }
+    /// The worker's `workflows.prerequisites` policy from its global config,
+    /// env and no request flags, resolved by push's `policy_for`. The session
+    /// is rooted at an awman-owned directory, so no repository config can
+    /// enter. `None` (config unreadable) refuses `exec.prerequisites`.
+    fn global_prerequisite_policy(
+        &self,
+    ) -> Option<crate::data::config::workflows::PrerequisitePolicy> {
+        let session = crate::data::session::Session::open_at_directory_root(
+            self.data_paths().root().join("worker"),
+            crate::data::session::SessionOpenOptions {
+                env: Some(self.shared.sessions.env().clone()),
+                ..Default::default()
+            },
+        )
+        .map_err(
+            |error| tracing::warn!(%error, "could not resolve the worker's prerequisite policy"),
+        )
+        .ok()?;
+        Some(
+            crate::command::commands::workflow_prerequisites::policy_for(
+                &session,
+                &Default::default(),
+                None,
+            ),
+        )
+    }
     fn running(&self, server: &str) -> usize {
         self.active
             .lock()
@@ -167,6 +193,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
         &self,
         configured: BTreeMap<String, String>,
         interaction: Option<crate::data::config::daemon::Interaction>,
+        allow_skills: &[String],
     ) -> Result<awman_wsp::labels::WorkerLabels, WorkerError> {
         let settings = self.settings();
         let interaction = interaction.unwrap_or(settings.pull_interaction);
@@ -187,6 +214,14 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             !interaction.is_headless() || settings.pull_allow_override,
             interaction.is_headless() || settings.pull_allow_override,
         )
+        .with_skills(if self.support().skill_mounts {
+            crate::engine::overlay::OverlayEngine::lease_skill_names(
+                self.shared.sessions.env(),
+                allow_skills,
+            )
+        } else {
+            Vec::new()
+        })
         .worker_labels(&configured)
         .map_err(|e| WorkerError::Invalid(e.to_string()))
     }
@@ -289,7 +324,11 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                     }
                 }
             };
-            let labels = match self.worker_labels(config.labels.clone(), config.interaction) {
+            let labels = match self.worker_labels(
+                config.labels.clone(),
+                config.interaction,
+                &config.allow_skills,
+            ) {
                 Ok(labels) => labels,
                 Err(error) => {
                     tracing::warn!(server = %name, %error, "work server labels are invalid");
@@ -460,23 +499,12 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                         server_lease_id: record.server_lease_id.clone(),
                         epoch: record.epoch,
                     };
-                    if session
-                        .release(
-                            &reference,
-                            &ReleaseRequest {
-                                context_changes: None,
-                                reason: ReleaseReason::Shutdown,
-                                message: Some("worker restarted".into()),
-                                result: None,
-                            },
-                        )
-                        .await
-                        .is_ok()
-                    {
+                    let recovery = runner::restart_release(&record);
+                    if session.release(&reference, &recovery).await.is_ok() {
                         record.state = LeaseState::Released;
                         record.release = Some(LeaseRelease {
-                            reason: ReleaseReason::Shutdown,
-                            message: Some("worker restarted".into()),
+                            reason: recovery.reason,
+                            message: recovery.message,
                         });
                     }
                 }
@@ -790,9 +818,10 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             _ = push_waiting => return Ok(None),
             outcome = claim => outcome?,
         };
-        let ClaimOutcome::Leased(lease) = outcome else {
+        let ClaimOutcome::Leased(mut lease) = outcome else {
             return Ok(None);
         };
+        let claim_redaction = runner::secret_redaction(&lease.item.exec.secrets);
         if stop.is_cancelled()
             || !self.accepting.load(Ordering::SeqCst)
             || !self.settings().pull_enabled
@@ -816,7 +845,9 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                                 // The owner changed policy; the item is fine.
                                 ReleaseReason::UserDeclined
                             },
-                            message: Some("worker policy changed during claim".into()),
+                            message: Some(
+                                claim_redaction.redact("worker policy changed during claim"),
+                            ),
                             result: None,
                         },
                     )
@@ -839,16 +870,17 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                     local_change = true;
                     return Err("work server capacity changed during claim".into());
                 }
-                if foreground {
-                    lease_context::admit(&lease.item, &[])?;
-                    lease_workflow_context::admit(&lease.item, &[])?;
-                }
                 let labels = self
-                    .worker_labels(server.labels.clone(), server.interaction)
+                    .worker_labels(server.labels.clone(), server.interaction, &server.allow_skills)
                     .map_err(|error| error.to_string())?
                     .with_server(server_labels)
                     .map_err(|error| error.to_string())?
                     .merged();
+                // The worker's own global policy, with no request flags: the
+                // ceiling `exec.prerequisites` may not widen. Daemon only (D7).
+                let prerequisite_policy = (!foreground && lease.item.exec.prerequisites.is_some())
+                    .then(|| self.global_prerequisite_policy())
+                    .flatten();
                 policy::plan(
                     &lease.item,
                     &labels,
@@ -856,6 +888,12 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                     &latest,
                     &self.support(),
                     self.shared.engines.runtime.display_name(),
+                    &policy::LeaseHostView {
+                        features: &if foreground { Vec::new() } else { capabilities::for_settings(self.support(), &latest) },
+                        worker_env: &crate::data::config::env::host_var,
+                        skills: &|name| crate::engine::overlay::OverlayEngine::lease_skill_status(self.shared.sessions.env(), name),
+                        prerequisite_policy: prerequisite_policy.as_ref(),
+                    },
                 )
                 .and_then(|plan| policy::delivery(&lease, &plan, true).map(|()| plan))
                 .and_then(|plan| {
@@ -881,13 +919,14 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                                 } else {
                                     ReleaseReason::Ineligible
                                 },
-                                message: Some(reason.clone()),
+                                message: Some(claim_redaction.redact(&reason)),
                                 result: None,
                             },
                         )
                         .await
                         .map_err(|e| Self::map_error(name, e))?;
                 }
+                let reason = claim_redaction.redact(&reason);
                 if local_change {
                     return Err(WorkerError::Busy(reason));
                 }
@@ -1011,6 +1050,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             return Ok(Some(record));
         }
         let record = LeaseRecord::claimed(name, &lease, LeaseHost::Daemon, Utc::now());
+        let secrets = lease.item.exec.secrets.take();
         let owner =
             crate::data::worker::paths::try_lease_owner(self.data_paths().root(), &record.id)?
                 .ok_or_else(|| WorkerError::Invalid("lease already owned".into()))?;
@@ -1021,7 +1061,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                     &ReleaseRequest {
                         context_changes: None,
                         reason: ReleaseReason::Error,
-                        message: Some("could not persist lease".into()),
+                        message: Some(claim_redaction.redact("could not persist lease")),
                         result: None,
                     },
                 )
@@ -1034,6 +1074,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                 lease,
                 record: record.clone(),
                 plan,
+                secrets,
                 owner,
             },
             Some(permit),

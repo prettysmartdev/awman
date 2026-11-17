@@ -1,5 +1,6 @@
 //! Reusable HTTP conformance probes. The admin adapter provisions fixtures out of band.
 pub mod lease_context;
+pub mod lease_exec;
 pub mod workflow_context;
 use crate::*;
 use serde_json::{json, Value};
@@ -87,6 +88,9 @@ pub fn work_item(id: &str) -> WorkItem {
             interaction: None,
             yolo: true,
             timeout_ms: Some(1000),
+            secrets: ExecSecrets::default(),
+            prerequisites: None,
+            workflows_dynamic: None,
         },
         push: None,
         outputs: None,
@@ -561,6 +565,14 @@ impl ConformanceAdmin for crate::mock::MockWorkServer {
     fn request_cancel<'a>(&'a self, id: &'a str) -> AdminFuture<'a> {
         Box::pin(async move {
             self.request_cancel(id, "conformance cancellation");
+        })
+    }
+}
+#[cfg(feature = "mock")]
+impl lease_exec::LeaseExecAdmin for crate::mock::MockWorkServer {
+    fn deny_link<'a>(&'a self, id: &'a str) -> AdminFuture<'a> {
+        Box::pin(async move {
+            self.deny_link(id);
         })
     }
 }

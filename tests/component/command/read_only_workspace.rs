@@ -246,6 +246,9 @@ fn fixture(s: &TestSandbox, name: &str, workflow: &str, can_mount: bool) -> Fixt
         credential_monitor: None,
         global_config: Arc::new(Default::default()),
         ephemeral_secrets: Arc::new(Default::default()),
+        lease_workflow_review: Some(Arc::new(
+            awman::command::worker::policy::LeaseWorkflowReview::foreground(),
+        )),
     };
     Fixture {
         session,

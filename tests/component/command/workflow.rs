@@ -363,6 +363,7 @@ mod work_item_execution {
                 credential_monitor: None,
                 global_config: Arc::new(Default::default()),
                 ephemeral_secrets: Arc::new(Default::default()),
+                lease_workflow_review: None,
             },
             runtime,
         )
@@ -637,6 +638,9 @@ mod work_item_execution {
                 AgentEngine::new(engines.overlay_engine.clone(), runtime.clone())
                     .with_lease_workspace_scope(session.git_root().to_path_buf()),
             );
+            engines.lease_workflow_review = Some(Arc::new(
+                awman::command::worker::policy::LeaseWorkflowReview::foreground(),
+            ));
             let mut flags = workflow_flags(reference, false);
             flags.prerequisites.check_only = false;
             let bus = EventBus::new(1024);

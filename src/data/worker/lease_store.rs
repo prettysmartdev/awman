@@ -35,6 +35,10 @@ fn json_err(e: serde_json::Error) -> DataError {
 fn strip(lease: &LeaseRecord) -> LeaseRecord {
     let mut lease = lease.clone();
     lease.item.repo.credentials = None;
+    if !lease.item.exec.secrets.is_empty() {
+        lease.secret_names = lease.item.exec.secrets.names();
+        lease.item.exec.secrets.take();
+    }
     lease
 }
 
