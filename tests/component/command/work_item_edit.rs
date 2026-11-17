@@ -828,20 +828,17 @@ struct Write {
 }
 
 impl Remote {
-    /// Stop the owned tracker and wait until its port is closed, then run the
-    /// sandbox leak check (which must still see every other resource).
+    /// Stop the tracker and let the sandbox's bounded port-leak check wait for
+    /// closure. An unbounded TCP connect to a closed port incurs Windows' TCP
+    /// retry delay for every fixture, exhausting the multi-case test deadline.
     async fn finish(self) {
         let Remote { w, tracker } = self;
-        let addr = *tracker.address();
         drop(tracker);
-        awman_test_support::wait_for_async("the tracker to stop", LIMIT, || async move {
-            tokio::net::TcpStream::connect(addr)
-                .await
-                .is_err()
-                .then_some(())
-        })
-        .await;
-        w.sandbox.finish();
+        // Keep the runtime available to finish wiremock's asynchronous shutdown
+        // while the sandbox checks all its tracked ports and other resources.
+        tokio::task::spawn_blocking(move || w.sandbox.finish())
+            .await
+            .unwrap();
     }
 
     async fn new(id: &'static str, repo_config: serde_json::Value, files: &[(&str, &str)]) -> Self {
