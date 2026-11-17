@@ -25,6 +25,7 @@ pub enum SetupEventPayload {
     ReadyStepStatus { step: String, status: StepStatus },
     SetupComplete { ready_summary: Box<ReadySummary> },
     SetupFailed { stage: String, error: String },
+    ImageStale(crate::data::execution_event::ImageStaleWarning),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

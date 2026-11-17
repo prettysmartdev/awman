@@ -145,6 +145,47 @@ The `api_init` capability means `init` is available through the worker command
 route and its structured result includes the files it created, updated, kept
 or skipped.
 
+The `api_ready` capability means `ready` is available through the worker
+command route. It checks the runtime and Dockerfiles and builds missing images
+(`--build` and `--no-cache` work as on the command line), reporting progress as
+events; a failed required build ends the command with `error`. Over the API the
+default project Dockerfile is created if it is missing and the optional agent
+audit is skipped, so `--refresh` is refused: "--refresh is unavailable through
+the API because its audit runs an agent outside a command".
+
+The `image_inputs` capability means the daemon's runtime builds images locally
+and rebuilds stale project and agent images during session setup and before a command launches (see
+[Keeping images fresh](11-runtimes.md#keeping-images-fresh-docker-and-apple-containers)).
+It is absent on imported-image runtimes such as `builtin`.
+
+The `lease_image_reuse` capability appears while the daemon's pull worker
+reuses content-keyed images across leases; see
+[Lease images](17-workers-and-work-servers.md#lease-images-and-the-image-budget).
+
+<a id="image-stale-event"></a>
+During setup, the same structured warning appears on the setup event stream as `image_stale`. When a stale image cannot be rebuilt, the command continues on the image it
+has and emits an `image_stale` event (also written to the command's output log
+as `[image] warning: …`):
+
+```json
+{
+  "type": "image_stale",
+  "data": {
+    "build": "build agent image awman-myrepo-claude:latest for 'claude'",
+    "image": "awman-myrepo-claude:latest",
+    "kind": "agent",
+    "agent": "claude",
+    "expected_inputs": "<hash of the working tree>",
+    "installed_inputs": "<label of the image kept>",
+    "reason": "exit code 1: <last line of build output>"
+  }
+}
+```
+
+`kind` is `project` or `agent`. `agent` is present only for agent images, and
+`installed_inputs` is omitted when the kept image has no inputs label. `reason`
+is one redacted line of at most 300 characters.
+
 The `listeners.network` object is keyed by listener name. Browser linking is
 available through the built-in loopback listener when it serves the engine and
 allows the requesting origin. Other listener configurations may report

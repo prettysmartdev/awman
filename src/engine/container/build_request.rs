@@ -22,6 +22,9 @@ impl BuildTarget {
 
 #[derive(Debug, Clone)]
 pub struct BuildRequest {
+    /// Explicit labels supplied by image prep. Legacy runtime callers leave
+    /// this empty and image prep derives them before invoking the backend.
+    pub labels: std::collections::BTreeMap<String, String>,
     /// `Runtime` preserves the selected CLI's ordinary build defaults;
     /// explicit Docker/Apple sources belong to `HostLocalImageBuilder`.
     pub target: BuildTarget,
@@ -41,6 +44,7 @@ impl BuildRequest {
     /// Ordinary runtime builds retain the runtime CLI's platform defaults.
     pub fn runtime(reference: &str, dockerfile: &Path, context: &Path, no_cache: bool) -> Self {
         Self {
+            labels: Default::default(),
             target: BuildTarget::Runtime,
             reference: reference.into(),
             dockerfile: dockerfile.into(),
@@ -49,6 +53,22 @@ impl BuildRequest {
             build_args: Vec::new(),
             no_cache,
         }
+    }
+
+    pub fn with_inputs(
+        mut self,
+        inputs: &crate::data::image_inputs::InputsHash,
+        repo: &crate::data::image_inputs::RepoKey,
+    ) -> Self {
+        self.labels.insert(
+            crate::data::image_inputs::INPUTS_LABEL.into(),
+            inputs.as_str().into(),
+        );
+        self.labels.insert(
+            crate::data::image_inputs::REPO_LABEL.into(),
+            repo.as_str().into(),
+        );
+        self
     }
 
     /// The Docker and Apple runtimes build only ordinary runtime requests:

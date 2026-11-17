@@ -6,7 +6,7 @@ As you use awman it leaves behind stopped containers (or builtin microVM session
 
 ## What gets removed
 
-`awman clean` targets six categories of resources:
+`awman clean` targets seven categories of resources:
 
 1. **Stopped containers** — awman containers from previous runs that have exited or died, on the configured runtime.
 
@@ -19,6 +19,8 @@ As you use awman it leaves behind stopped containers (or builtin microVM session
 5. **Pre-migration database backups** — The `awman.db.pre-migration` backup (and its `-wal`/`-shm` sidecars) left in `~/.awman/api/` when the database moved to its current location. awman never reads it. The live database at `~/.awman/data/awman.db` is never touched.
 
 6. **Squad daemon environment** — The OS keychain item (`awman-squad` / `daemon-env`) where the squad daemon persists the values it holds for tasks' `env()` names, so a daemon the OS restarts comes back armed. It is removed through `security` (macOS) or `secret-tool` (Linux), and is the only category that may hold a secret — see [Squad: Persisting values across a restart](12-squad.md#persisting-values-across-a-restart). Removing it does **not** affect a running daemon, which keeps the values it holds in memory; it only removes what a future restart would read back. With no keychain, or no `secret-tool`, the category never appears.
+
+7. **Lease images** — Images a worker built for pulled leases (see [Lease images and the image budget](17-workers-and-work-servers.md#lease-images-and-the-image-budget)) that no active lease is using. They are listed under "Lease images" and removed by tag after confirmation. An image an active lease uses, or one the worker did not build, is never listed. If the image store is unreachable, awman warns and continues.
 
 ### Builtin runtime state
 

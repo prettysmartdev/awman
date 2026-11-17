@@ -219,6 +219,7 @@ mod tests {
             max_concurrent_jobs: 1,
             interaction: None,
             labels: BTreeMap::new(),
+            image_budget: Default::default(),
         };
         let support = LeaseRuntimeSupport {
             read_only_workspace: false,

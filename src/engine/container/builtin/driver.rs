@@ -92,6 +92,9 @@ pub struct SandboxSummary {
 }
 #[derive(Clone, Default)]
 pub struct SandboxImageConfig {
+    pub id: String,
+    pub labels: BTreeMap<String, String>,
+    pub size_bytes: u64,
     pub home: Option<String>,
     pub user: Option<String>,
     pub workdir: Option<String>,

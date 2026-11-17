@@ -25,6 +25,7 @@ pub mod fs;
 pub mod ids;
 pub mod image_build_lock;
 pub mod image_build_state;
+pub mod image_inputs;
 pub mod image_tags;
 pub mod init_files;
 pub mod issue;

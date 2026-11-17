@@ -2,6 +2,7 @@
 //! live here; HTTP and terminal frontends adapt the typed PullHandle.
 mod capabilities;
 pub mod events;
+pub(crate) mod images;
 pub mod lease_context;
 pub mod lease_workflow_context;
 pub mod pick;
@@ -135,6 +136,14 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
     }
     fn settings(&self) -> WorkerSettings {
         live_daemon_settings(self.shared.clone())().worker
+    }
+    fn cleanup_images(&self) -> tokio::task::JoinHandle<()> {
+        images::schedule_cleanup(
+            self.shared.engines.runtime.clone(),
+            self.shared.sessions.env().clone(),
+            self.shared.store.clone(),
+            images::budgets(&self.settings()),
+        )
     }
     fn data_paths(&self) -> crate::data::fs::DataPaths {
         self.shared.paths.data_paths()
@@ -303,10 +312,14 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                 name: format!("awman-{name}"),
                 labels: labels.merged(),
                 capacity: config.max_concurrent_jobs,
-                features: capabilities::for_settings(self.support(), &registration_settings)
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
+                features: capabilities::for_runtime(
+                    self.support(),
+                    &registration_settings,
+                    self.shared.engines.runtime.as_ref(),
+                )
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             };
             {
                 let mut servers = self.servers.write().unwrap();
@@ -424,6 +437,13 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
     /// Recovery precedes the push pool's generic stale-row recovery. A pull
     /// row must never be re-queued and executed without its original lease.
     pub async fn recover(&self) -> Result<(), WorkerError> {
+        struct Cleanup<'a, F: ApiCommandFrontendFactory + 'static>(&'a PullController<F>);
+        impl<F: ApiCommandFrontendFactory + 'static> Drop for Cleanup<'_, F> {
+            fn drop(&mut self) {
+                let _cleanup = self.0.cleanup_images();
+            }
+        }
+        let _cleanup = Cleanup(self);
         // A feature restart first drains tasks from its prior generation;
         // persisted recovery must not race a still-running lease owner.
         self.stop_now().await;
@@ -1319,7 +1339,11 @@ impl<F: ApiCommandFrontendFactory + 'static> PullHandle for PullHandleAdapter<F>
         }) {
             settings.pull_interaction = crate::data::config::daemon::Interaction::Interactive;
         }
-        let mut caps = capabilities::for_settings(self.0.support(), &settings);
+        let mut caps = capabilities::for_runtime(
+            self.0.support(),
+            &settings,
+            self.0.shared.engines.runtime.as_ref(),
+        );
         caps.push("worker_pull");
         caps
     }
@@ -1434,3 +1458,6 @@ impl Drop for Active {
         }
     }
 }
+
+#[cfg(test)]
+mod image_contracts;

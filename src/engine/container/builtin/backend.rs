@@ -458,6 +458,63 @@ impl BuiltinBackend {
     }
 }
 impl ContainerBackend for BuiltinBackend {
+    fn inspect_image(
+        &self,
+        tag: &str,
+    ) -> Result<Option<super::super::runtime::ImageMetadata>, EngineError> {
+        let _lock = self.paths.lock()?;
+        let Some(config) = self.driver.image_config(tag)? else {
+            return Ok(None);
+        };
+        let record = self.identities()?.remove(tag);
+        let mut labels = config.labels;
+        if let Some(record) = &record {
+            labels.extend(record.labels.clone());
+        }
+        Ok(Some(super::super::runtime::ImageMetadata {
+            id: record
+                .as_ref()
+                .map(|r| r.identity.config_digest.to_string())
+                .unwrap_or(config.id),
+            tags: vec![tag.into()],
+            labels,
+            size_bytes: if config.size_bytes > 0 {
+                config.size_bytes
+            } else {
+                record.map_or(0, |r| r.size_bytes)
+            },
+        }))
+    }
+
+    fn image_id(&self, tag: &str) -> Result<Option<String>, EngineError> {
+        Ok(self.inspect_image(tag)?.map(|image| image.id))
+    }
+
+    fn list_images_by_repo(
+        &self,
+        repo: &crate::data::image_inputs::RepoKey,
+    ) -> Result<Vec<super::super::runtime::ImageMetadata>, EngineError> {
+        // Enumerate only awman-owned imports. Drop the catalog lock before
+        // inspecting each row: inspection takes its own short catalog lock.
+        let tags: Vec<_> = {
+            let _lock = self.paths.lock()?;
+            self.identities()?.into_keys().collect()
+        };
+        let mut images = Vec::new();
+        for tag in tags {
+            if let Some(image) = self.inspect_image(&tag)? {
+                if image
+                    .labels
+                    .get(crate::data::image_inputs::REPO_LABEL)
+                    .map(String::as_str)
+                    == Some(repo.as_str())
+                {
+                    images.push(image);
+                }
+            }
+        }
+        Ok(images)
+    }
     fn name(&self) -> &'static str {
         crate::engine::container::runtime::BUILTIN_RUNTIME_NAME
     }
@@ -777,12 +834,19 @@ impl ContainerBackend for BuiltinBackend {
             self.driver.import_archive(archive, request.tag.clone())?;
         }
         let config = self.driver.image_config(&request.tag)?.unwrap_or_default();
+        let labels = installed_labels(
+            &config.labels,
+            request,
+            &acquired.identity.manifest_digest.to_string(),
+        );
         {
             let _lock = self.paths.lock()?;
             let mut identities = self.identities()?;
             identities.insert(
                 request.tag.clone(),
                 InstalledImageIdentity {
+                    labels,
+                    size_bytes: config.size_bytes,
                     identity: acquired.identity.clone(),
                     acquisition_source: Some(request.source.clone()),
                 },
@@ -803,15 +867,43 @@ impl ContainerBackend for BuiltinBackend {
         Ok(Vec::new())
     }
     fn remove_image(&self, id: &str) -> Result<(), EngineError> {
-        let _image_lease = self.paths.image_lease(id, true)?;
-        let _lock = self.paths.lock()?;
-        let mut identities = self.identities()?;
-        if !identities.contains_key(id) {
+        // Resolve immutable IDs to owned tags, then take the same per-tag
+        // fences as launches and imports. Never use a global force/prune.
+        let tags: Vec<_> = {
+            let _lock = self.paths.lock()?;
+            self.identities()?
+                .into_iter()
+                .filter(|(tag, record)| {
+                    tag == id
+                        || record.identity.config_digest.to_string() == id
+                        || record.identity.manifest_digest.to_string() == id
+                })
+                .map(|(tag, _)| tag)
+                .collect()
+        };
+        if tags.is_empty() {
             return Err(EngineError::Other("image is not owned by awman".into()));
         }
-        self.driver.remove_image(id)?;
-        identities.remove(id);
-        self.save_identities(&identities)
+        let _image_leases = tags
+            .iter()
+            .map(|tag| self.paths.image_lease(tag, true))
+            .collect::<Result<Vec<_>, _>>()?;
+        let _lock = self.paths.lock()?;
+        let mut identities = self.identities()?;
+        for tag in tags {
+            // The tag could have been reimported before its lease was taken.
+            let matches = identities.get(&tag).is_some_and(|record| {
+                tag == id
+                    || record.identity.config_digest.to_string() == id
+                    || record.identity.manifest_digest.to_string() == id
+            });
+            if matches {
+                self.driver.remove_image(&tag)?;
+                identities.remove(&tag);
+                self.save_identities(&identities)?;
+            }
+        }
+        Ok(())
     }
     fn start_background(
         &self,
@@ -1024,6 +1116,28 @@ fn lines(pending: &mut Vec<u8>, bytes: Vec<u8>, callback: &mut dyn FnMut(&str)) 
 /// The acquisition request an import makes. The registry map is the
 /// importing session's own (`ImageImportRequest.registries`), never state the
 /// backend retained from another session.
+fn installed_labels(
+    config_labels: &std::collections::BTreeMap<String, String>,
+    request: &ImageImportRequest,
+    source_digest: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let mut labels = config_labels.clone();
+    labels.extend(request.labels.clone());
+    if matches!(
+        request.source,
+        crate::data::config::image_source::ImageSourceSpec::Registry { .. }
+            | crate::data::config::image_source::ImageSourceSpec::Archive { .. }
+    ) {
+        labels.insert(
+            crate::data::image_inputs::INPUTS_LABEL.into(),
+            crate::data::image_inputs::imported_inputs_hash(source_digest)
+                .as_str()
+                .into(),
+        );
+    }
+    labels
+}
+
 fn acquire_request(request: &ImageImportRequest) -> AcquireRequest {
     AcquireRequest {
         tag: request.tag.clone(),
@@ -1075,8 +1189,107 @@ mod workspace_access_tests {
             panic!("unexpected image import")
         }
         fn remove_image(&self, _: &str) -> Result<(), EngineError> {
-            panic!("unexpected image removal")
+            Ok(())
         }
+    }
+
+    #[test]
+    fn imported_labels_keep_local_build_inputs_and_use_source_digest_for_archives_and_registries() {
+        use crate::data::{
+            config::image_source::ImageSourceSpec,
+            image_inputs::{INPUTS_LABEL, REPO_LABEL},
+        };
+        let source_labels = [
+            (INPUTS_LABEL.into(), "built-inputs".into()),
+            (REPO_LABEL.into(), "foreign-repo".into()),
+        ]
+        .into();
+        for source in [
+            ImageSourceSpec::AppleStore { reference: None },
+            ImageSourceSpec::Registry {
+                registry: None,
+                reference: None,
+            },
+            ImageSourceSpec::Archive {
+                path: PathBuf::from("image.tar"),
+            },
+        ] {
+            let local = matches!(source, ImageSourceSpec::AppleStore { .. });
+            let request = ImageImportRequest {
+                labels: [(REPO_LABEL.into(), "example.test/repo".into())].into(),
+                tag: "image:latest".into(),
+                source,
+                platform: crate::data::oci_identity::OciPlatform::host_linux(),
+                refresh: false,
+                expected_built_identity: None,
+                immutable_export_selector: None,
+                registries: Default::default(),
+            };
+            let labels = installed_labels(&source_labels, &request, "sha256:source");
+            assert_eq!(
+                labels[INPUTS_LABEL],
+                if local {
+                    "built-inputs"
+                } else {
+                    "sha256:source"
+                }
+            );
+            assert_eq!(labels[REPO_LABEL], "example.test/repo");
+        }
+    }
+
+    #[test]
+    fn builtin_catalog_exposes_metadata_filters_repositories_and_removes_owned_ids() {
+        use crate::data::image_inputs::{RepoKey, INPUTS_LABEL, REPO_LABEL};
+        let s = TestSandbox::for_test(TestCase::component("engine::container::builtin::backend::workspace_access_tests::builtin_catalog_exposes_metadata_filters_repositories_and_removes_owned_ids"));
+        let root = s.root().join("builtin");
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = BuiltinBackend {
+            driver: Arc::new(ImageOnlyDriver),
+            paths: BuiltinPaths { home: root.clone() },
+            settings: BuiltinRuntimeSettings {
+                state_dir: root,
+                ambient_overrides: Vec::new(),
+                test_isolation: true,
+            },
+            owner: "test-owner".into(),
+            background_env: Mutex::new(Default::default()),
+            notices: Mutex::new(Vec::new()),
+            cancel_grace: Duration::from_secs(1),
+        };
+        let identity = crate::engine::image_prep::contracts::identity("image:latest");
+        backend
+            .save_identities(
+                &[(
+                    "image:latest".into(),
+                    InstalledImageIdentity {
+                        identity: identity.clone(),
+                        acquisition_source: None,
+                        labels: [
+                            (REPO_LABEL.into(), "example.test/repo".into()),
+                            (INPUTS_LABEL.into(), "inputs".into()),
+                        ]
+                        .into(),
+                        size_bytes: 456,
+                    },
+                )]
+                .into(),
+            )
+            .unwrap();
+        let repo = RepoKey::from_label("example.test/repo");
+        let images = backend.list_images_by_repo(&repo).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].id, identity.config_digest.to_string());
+        assert_eq!(images[0].size_bytes, 456);
+        assert_eq!(images[0].labels[INPUTS_LABEL], "inputs");
+        assert!(backend
+            .list_images_by_repo(&RepoKey::from_label("other"))
+            .unwrap()
+            .is_empty());
+        assert!(backend.remove_image("unowned").is_err());
+        backend.remove_image(&images[0].id).unwrap();
+        assert!(backend.list_images_by_repo(&repo).unwrap().is_empty());
+        s.finish();
     }
 
     #[test]

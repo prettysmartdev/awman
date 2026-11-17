@@ -54,7 +54,7 @@ Available via: CLI, TUI, API
 
 Check Docker daemon, verify Dockerfile.dev, build image, and report status.
 
-Available via: CLI, TUI
+Available via: CLI, TUI, API
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|

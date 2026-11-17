@@ -62,3 +62,21 @@ pub(super) fn for_settings(
     }
     result
 }
+
+pub(super) fn for_runtime(
+    support: LeaseRuntimeSupport,
+    settings: &WorkerSettings,
+    runtime: &dyn crate::engine::agent_runtime::AgentRuntimeEngine,
+) -> Vec<&'static str> {
+    with_image_reuse(for_settings(support, settings), runtime)
+}
+
+pub(super) fn with_image_reuse(
+    mut result: Vec<&'static str>,
+    runtime: &dyn crate::engine::agent_runtime::AgentRuntimeEngine,
+) -> Vec<&'static str> {
+    if super::images::supported(runtime) {
+        result.push(awman_wsp::features::LEASE_IMAGE_REUSE);
+    }
+    result
+}

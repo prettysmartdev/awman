@@ -65,6 +65,7 @@ impl AgentImagePreparer {
                 if let Some(source) = &plan.source {
                     let pending = self.pending_import(source, &tag, frontend).await?;
                     let check = ImageImportRequest {
+                        labels: self.repo_labels(),
                         tag: tag.clone(),
                         source: source.source.clone(),
                         platform: source.platform.clone(),
@@ -234,6 +235,59 @@ impl AgentImagePreparer {
                         Some(prepared)
                     }
                     Err(error) => {
+                        if policy == BuildPolicy::SessionSetup
+                            && self.runtime.image_exists(&tag).unwrap_or(false)
+                            && !self.cancel.is_cancelled()
+                        {
+                            let failed_base = self.base_results.iter_mut().find(|r| {
+                                matches!(r.build, StepStatus::Failed(_) | StepStatus::Warn(_))
+                            });
+                            let (kind, image, warning_agent) = if let Some(base) = failed_base {
+                                base.build = StepStatus::Warn(error.clone());
+                                (
+                                    crate::data::execution_event::StaleImageKind::Project,
+                                    base.tag.clone(),
+                                    None,
+                                )
+                            } else {
+                                (
+                                    crate::data::execution_event::StaleImageKind::Agent,
+                                    tag.clone(),
+                                    Some(agent.to_string()),
+                                )
+                            };
+                            let warning = crate::data::execution_event::ImageStaleWarning {
+                                build: format!("build image {image}"),
+                                image,
+                                kind,
+                                agent: warning_agent,
+                                expected_inputs: self
+                                    .last_build_inputs
+                                    .as_ref()
+                                    .map(|inputs| inputs.as_str().to_string())
+                                    .unwrap_or_else(|| {
+                                        crate::data::image_inputs::project_inputs(
+                                            std::fs::read(&self.context.project_dockerfile)
+                                                .ok()
+                                                .as_deref(),
+                                            &crate::data::image_inputs::DirBuildContext::new(
+                                                &self.context.git_root,
+                                            ),
+                                        )
+                                        .hash
+                                        .as_str()
+                                        .to_string()
+                                    }),
+                                installed_inputs: self.last_installed_inputs.clone(),
+                                reason: crate::engine::agent::image_freshness::failure_reason(
+                                    &EngineError::Other(error.clone()),
+                                ),
+                            };
+                            frontend.report_image_stale(&warning);
+                            image_result.build = StepStatus::Warn(error);
+                            image_result.import = StepStatus::Done;
+                            return Ok(image_result);
+                        }
                         image_result.build = StepStatus::Failed(error.clone());
                         image_result.import = StepStatus::Skipped;
 
@@ -300,6 +354,7 @@ impl AgentImagePreparer {
         );
         let expected = preparation.as_ref().and_then(|p| p.expected.clone());
         let request = ImageImportRequest {
+            labels: self.repo_labels(),
             tag: tag.clone(),
             source,
             platform,

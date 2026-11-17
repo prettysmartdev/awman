@@ -81,7 +81,7 @@ impl WorkflowPreflightPlan {
             WorkflowPrerequisites::from_workflow(workflow),
             agents,
             default.unwrap_or_else(|| session.configured_agent().as_str().to_owned()),
-            session.git_root(),
+            session,
         ))
     }
 
@@ -103,7 +103,7 @@ impl WorkflowPreflightPlan {
             WorkflowPrerequisites::assume_all(),
             agents,
             default_agent,
-            session.git_root(),
+            session,
         ))
     }
 
@@ -111,14 +111,14 @@ impl WorkflowPreflightPlan {
         mut needs: WorkflowPrerequisites,
         mut agents: Vec<String>,
         default_agent: String,
-        git_root: &std::path::Path,
+        session: &Session,
     ) -> Self {
         agents.sort();
         agents.dedup();
         for agent in agents {
             needs.merge_needs(PrerequisiteNeed {
                 prerequisite: WorkflowPrerequisite::AgentImage {
-                    tag: crate::data::image_tags::agent_image_tag(git_root, &agent),
+                    tag: session.agent_image_tag(&agent),
                     agent,
                 },
                 needed_by: vec![],
@@ -142,8 +142,24 @@ impl WorkflowPreflightPlan {
         sink: &mut dyn UserMessageSink,
     ) -> Result<(), CommandError> {
         use crate::command::commands::agent_setup::AgentSetupDecision;
-        use crate::data::image_tags::{agent_image_tag, project_image_tag};
         let paths = crate::data::RepoDockerfilePaths::new(session.git_root());
+        // WI 0163: installed images whose inputs label no longer matches the
+        // working tree are rebuilt before the run (warn-and-continue on a
+        // failed rebuild); the missing ones are prepared below.
+        let agents: Vec<String> = report
+            .checks
+            .iter()
+            .filter_map(|check| match &check.prerequisite {
+                WorkflowPrerequisite::AgentImage { agent, .. } => Some(agent.clone()),
+                _ => None,
+            })
+            .collect();
+        if !agents.is_empty() {
+            crate::command::commands::workflow_preflight::refresh_stale_workflow_images(
+                engines, session, &agents, sink, None,
+            )
+            .await?;
+        }
         for check in &mut report.checks {
             let WorkflowPrerequisite::AgentImage { agent, .. } = &check.prerequisite else {
                 continue;
@@ -164,7 +180,7 @@ impl WorkflowPreflightPlan {
                 !present && runtime.capabilities().image_acquisition == ImageAcquisition::Build
             }) {
                 let default_available = runtime
-                    .image_exists(&agent_image_tag(session.git_root(), &self.default_agent))
+                    .image_exists(&session.agent_image_tag(&self.default_agent))
                     .unwrap_or(false);
                 if defaults.agent_setup(default_available) != AgentSetupDecision::Setup {
                     return Err(CommandError::WorkflowPrerequisitesUnresolved {
@@ -173,7 +189,7 @@ impl WorkflowPreflightPlan {
                 }
             }
             if runtime.capabilities().image_acquisition == ImageAcquisition::Build {
-                let tag = project_image_tag(session.git_root());
+                let tag = session.project_image_tag();
                 if !runtime.image_exists(&tag)? {
                     return Err(
                         crate::engine::error::EngineError::AgentRequiresProjectImage { tag }.into(),

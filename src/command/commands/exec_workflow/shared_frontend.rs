@@ -118,4 +118,8 @@ impl UserMessageSink for SharedWorkflowFrontend {
     fn replay_queued(&mut self) {
         SharedWorkflowFrontend::replay_queued(self);
     }
+
+    fn report_image_stale(&mut self, warning: &crate::data::execution_event::ImageStaleWarning) {
+        self.with(|frontend| frontend.report_image_stale(warning));
+    }
 }

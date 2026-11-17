@@ -93,6 +93,7 @@ pub struct CleanSummary {
     /// restarted still has them, and this is the recommended way to undo that.
     pub squad_daemon_env: Vec<CleanKeychainItem>,
     pub images: Vec<CleanImage>,
+    pub lease_images: Vec<CleanImage>,
     /// Whether the container runtime was reachable during discovery. When
     /// `false`, the container/image categories were skipped.
     pub docker_available: bool,
@@ -107,6 +108,7 @@ impl CleanSummary {
             + self.pre_migration_backups.len()
             + self.squad_daemon_env.len()
             + self.images.len()
+            + self.lease_images.len()
     }
 
     /// Whether there is nothing to clean.
@@ -167,6 +169,12 @@ impl CleanSummary {
             for i in &self.images {
                 let short: String = i.id.chars().take(12).collect();
                 lines.push(format!("  - {} {} ({})", short, i.repo_tag, i.size));
+            }
+        }
+        if !self.lease_images.is_empty() {
+            lines.push(format!("Lease images ({}):", self.lease_images.len()));
+            for image in &self.lease_images {
+                lines.push(format!("  - {} ({})", image.repo_tag, image.size));
             }
         }
         lines.join("\n")
@@ -275,12 +283,75 @@ impl CleanCommand {
         let mut summary = CleanSummary::default();
 
         self.discover_containers_and_images(sink, &mut summary);
+        self.discover_lease_images(sink, &mut summary);
         let terminal_ids = self.discover_repo_workflow_state(sink, &mut summary);
         self.discover_context_dirs(sink, &mut summary, &terminal_ids);
         self.discover_pre_migration_backups_category(sink, &mut summary);
         self.discover_squad_daemon_env_category(&mut summary);
 
         summary
+    }
+
+    fn lease_image_store(
+        &self,
+    ) -> Result<Option<crate::data::worker::lease_image_store::LeaseImageStore>, CommandError> {
+        let paths = crate::data::fs::DataPaths::from_env(self.session.env())?;
+        if !paths.db_path().exists() {
+            return Ok(None);
+        }
+        let db = std::sync::Arc::new(crate::data::fs::api_db::SqliteSessionStore::open_at(
+            &paths.db_path(),
+        )?);
+        // Older installs may not yet have the lease side table.
+        crate::data::worker::lease_store::LeaseStore::open(db.clone())?;
+        Ok(Some(
+            crate::data::worker::lease_image_store::LeaseImageStore::open(db)?,
+        ))
+    }
+
+    fn discover_lease_images(
+        &self,
+        sink: &mut dyn CleanCommandFrontend,
+        summary: &mut CleanSummary,
+    ) {
+        let discover = || -> Result<Vec<CleanImage>, CommandError> {
+            if !crate::command::worker::images::supported(self.engines.runtime.as_ref()) {
+                return Ok(Vec::new());
+            }
+            let Some(store) = self.lease_image_store()? else {
+                return Ok(Vec::new());
+            };
+            let key = crate::command::worker::images::store_key(
+                self.engines.runtime.as_ref(),
+                self.session.env(),
+            )?
+            .describe();
+            let in_use = store.in_use(&key)?;
+            let mut result = Vec::new();
+            for record in store.records(&key, None)? {
+                if in_use.contains(&record.tag) {
+                    continue;
+                }
+                if let Some(image) = self.engines.runtime.inspect_image(&record.tag)? {
+                    if image.id == record.image_id {
+                        result.push(CleanImage {
+                            id: record.image_id,
+                            repo_tag: record.tag,
+                            size: format!("{} bytes", image.size_bytes),
+                        });
+                    }
+                }
+            }
+            Ok(result)
+        };
+        match discover() {
+            Ok(images) => summary.lease_images = images,
+            Err(error) => emit(
+                sink,
+                MessageLevel::Warning,
+                format!("clean: cannot list lease images: {error}"),
+            ),
+        }
     }
 
     /// Categories 1 & 4: stopped containers and dangling images.
@@ -632,6 +703,46 @@ impl CleanCommand {
             }
         }
 
+        for image in &summary.lease_images {
+            let removal = || -> Result<bool, CommandError> {
+                let paths = crate::data::fs::DataPaths::from_env(self.session.env())?;
+                let Some(store) = self.lease_image_store()? else {
+                    return Ok(false);
+                };
+                let key = crate::command::worker::images::store_key(
+                    self.engines.runtime.as_ref(),
+                    self.session.env(),
+                )?;
+                if store.in_use(&key.describe())?.contains(&image.repo_tag) {
+                    return Ok(false);
+                }
+                let Some(record) = store
+                    .records(&key.describe(), None)?
+                    .into_iter()
+                    .find(|r| r.tag == image.repo_tag && r.image_id == image.id)
+                else {
+                    return Ok(false);
+                };
+                crate::command::worker::images::remove_owned(
+                    self.engines.runtime.as_ref(),
+                    &store,
+                    &key,
+                    paths.root(),
+                    &record,
+                )
+                .map_err(CommandError::from)
+            };
+            match removal() {
+                Ok(true) => result.deleted += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    result.errors += 1;
+                    result
+                        .error_details
+                        .push(format!("lease image {}: {error}", image.repo_tag));
+                }
+            }
+        }
         result
     }
 }

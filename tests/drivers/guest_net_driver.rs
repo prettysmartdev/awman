@@ -270,6 +270,7 @@ mod driver {
             return ExitCode::from(77);
         }
         let request = ImageImportRequest {
+            labels: Default::default(),
             tag: args.tag.clone(),
             source: ImageSourceSpec::Archive {
                 path: args.archive.clone(),

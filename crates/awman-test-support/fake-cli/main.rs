@@ -173,6 +173,69 @@ fn list_fds() {
 #[cfg(not(unix))]
 fn list_fds() {}
 
+// Opt-in stateful image metadata. Ordinary fake scenarios remain rule-driven.
+fn image_key(tag: &str) -> String {
+    tag.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+}
+fn json_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+fn docker_store(dir: &Path, args: &[String], call: &Path, exit: i32) -> Option<String> {
+    let store = dir.join("images");
+    if !store.is_dir() {
+        return None;
+    }
+    if args.first().map(String::as_str) == Some("build") && exit == 0 {
+        let tag = args
+            .windows(2)
+            .find(|pair| pair[0] == "-t" || pair[0] == "--tag")?
+            .get(1)?;
+        let labels: Vec<_> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--label")
+            .filter_map(|pair| pair[1].split_once('='))
+            .map(|(key, value)| format!("{}:{}", json_string(key), json_string(value)))
+            .collect();
+        let id = format!("sha256:{}", call.file_name()?.to_string_lossy());
+        let metadata = format!(
+            "[{{\"Id\":{},\"RepoTags\":[{}],\"Size\":100,\"Config\":{{\"Labels\":{{{}}}}}}}]",
+            json_string(&id),
+            json_string(tag),
+            labels.join(",")
+        );
+        let _ = std::fs::write(store.join(image_key(tag)), metadata);
+        let _ = std::fs::write(store.join(format!("{}.id", image_key(tag))), id);
+    }
+    if args.first().map(String::as_str) == Some("rmi") && exit == 0 {
+        if let Some(tag) = args.get(1) {
+            let _ = std::fs::remove_file(store.join(image_key(tag)));
+            let _ = std::fs::remove_file(store.join(format!("{}.id", image_key(tag))));
+        }
+    }
+    if args.len() >= 3 && args[0] == "image" && args[1] == "inspect" {
+        let tag = args.last()?;
+        if args.iter().any(|arg| arg == "{{.Id}}") {
+            return std::fs::read_to_string(store.join(format!("{}.id", image_key(tag)))).ok();
+        }
+        // Standard metadata inspection uses no --format. Other format probes
+        // retain their explicit rules (HOME, labels, and so on).
+        if !args.iter().any(|arg| arg == "--format") {
+            return std::fs::read_to_string(store.join(image_key(tag))).ok();
+        }
+    }
+    None
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -254,12 +317,14 @@ fn main() {
             pause(10);
         }
     }
+    let stored = docker_store(&dir, &args, &call, rule.exit);
+    let effective_exit = if stored.is_some() { 0 } else { rule.exit };
     let mut stdout = std::io::stdout();
-    let _ = stdout.write_all(rule.stdout.as_bytes());
+    let _ = stdout.write_all(stored.as_deref().unwrap_or(&rule.stdout).as_bytes());
     let _ = stdout.flush();
     let mut stderr = std::io::stderr();
     let _ = stderr.write_all(rule.stderr.as_bytes());
     let _ = stderr.flush();
-    let _ = std::fs::write(call.join("done"), format!("{}\n", rule.exit));
-    std::process::exit(rule.exit);
+    let _ = std::fs::write(call.join("done"), format!("{effective_exit}\n"));
+    std::process::exit(effective_exit);
 }

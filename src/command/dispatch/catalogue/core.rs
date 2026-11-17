@@ -63,8 +63,7 @@ pub(super) const INIT: CommandSpec = CommandSpec {
         FlagSpec {
             long: "agent",
             short: None,
-            help:
-                "Code agent to install in the Dockerfile.dev container: claude, codex, opencode, \
+            help: "Code agent to install in the Dockerfile.dev container: claude, codex, opencode, \
                    gemini, copilot, cline, antigravity, or the name of a custom agent defined in \
                    .awman/agents/ or ~/.awman/agents/.",
             kind: FlagKind::String,
@@ -186,7 +185,8 @@ pub(super) const READY: CommandSpec = CommandSpec {
             optional: true,
         },
     ],
-    api_allowed: false,
+    // Worker push clients can run ready and receive typed results/events.
+    api_allowed: true,
     build: crate::command::dispatch::build::ready,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,

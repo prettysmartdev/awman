@@ -817,6 +817,8 @@ have the effective defaults above.
 | `workServers.*.interaction` | enum `interactive\|headless` | `null` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_INTERACTION` | Optional interaction override for this server's jobs. |
 | `workServers.*.labels` | map<string,string> | `{}` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_LABELS` | Owner-configured worker labels for this server. |
 | `workServers.*.labels.*` | string | `null` | global | no | yes | — | One owner-configured worker label; awman/ is reserved. |
+| `workServers.*.imageBudget.maxImages` | int ≥ 1 | `null` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_IMAGE_BUDGET_MAX_IMAGES` | Most lease-built images the worker keeps (20 when imageBudget is unset); oldest unused go first. |
+| `workServers.*.imageBudget.maxBytes` | size | `null` | global | no | yes | `AWMAN_WORK_SERVERS_<NAME>_IMAGE_BUDGET_MAX_BYTES` | Most total bytes of lease-built images the worker keeps; unlimited when unset. |
 | `remote.default` | string | `null` | global | no | no | `AWMAN_REMOTE_DEFAULT` | Target used when --remote names none. |
 | `remote.targets.*.url` | string | `null` | global | no | no | `AWMAN_REMOTE_TARGETS_<NAME>_URL` | Target API URL (https://host:port); required for every entry. |
 | `remote.targets.*.apiKey` | string | `null` | global | yes | no | `AWMAN_REMOTE_TARGETS_<NAME>_API_KEY` | Bearer API key for the target. |

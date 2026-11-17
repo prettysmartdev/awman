@@ -21,6 +21,7 @@ pub mod display;
 mod docker;
 mod host_cli_backend;
 pub mod host_env_denylist;
+mod image_metadata;
 pub mod instance;
 pub mod io_bridge;
 pub mod naming;
@@ -57,6 +58,7 @@ pub(crate) mod host_build {
     pub(crate) use super::host_cli_backend::{
         tail, BuildArgv, HostCommandRunner, ProcessHostCommandRunner, PROBE_TIMEOUT,
     };
+    pub(crate) use super::image_metadata::parse_inspection as parse_image_inspection;
 }
 
 mod build_request;

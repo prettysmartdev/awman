@@ -526,8 +526,43 @@ pub enum EventPayload {
     #[serde(rename = "workflow_state")]
     #[serde(alias = "workflow_state")]
     WorkflowState(serde_json::Value),
+    /// A stale image could not be rebuilt, so the session runs on the
+    /// previous image (WI 0163). A warning, not a failure: the session that
+    /// repairs a broken `Dockerfile.dev` must still be able to run.
+    #[serde(alias = "image_stale")]
+    ImageStale(ImageStaleWarning),
     #[serde(alias = "done")]
     Done,
+}
+
+/// Which image a rebuild was for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StaleImageKind {
+    Project,
+    Agent,
+}
+
+/// Payload of the `image_stale` event: a rebuild of a stale image failed and
+/// the previous image is kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageStaleWarning {
+    /// The failed build, named as the build step reports it (e.g. `build
+    /// project image awman-x:latest`).
+    pub build: String,
+    /// The tag the session keeps running on.
+    pub image: String,
+    pub kind: StaleImageKind,
+    /// The agent, for an agent image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The inputs hash of the working tree the rebuild was for.
+    pub expected_inputs: String,
+    /// The kept image's `dev.awman.inputs` label; `None` when unlabeled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_inputs: Option<String>,
+    /// Why the build failed. Callers pass a redacted, single-line message.
+    pub reason: String,
 }
 
 impl EventPayload {
@@ -551,6 +586,7 @@ impl EventPayload {
             EventPayload::TerminalControl { .. } => "terminal_control",
             EventPayload::TerminalViewerDetached { .. } => "terminal_viewer_detached",
             EventPayload::WorkflowState(_) => "workflow_state",
+            EventPayload::ImageStale(_) => "image_stale",
             EventPayload::Done => "done",
         }
     }
@@ -625,7 +661,46 @@ impl EventPayload {
             | EventPayload::TerminalViewerDetached { .. } => None,
             // A structured snapshot, not a log line.
             EventPayload::WorkflowState(_) => None,
+            EventPayload::ImageStale(w) => Some(format!(
+                "[image] warning: {} failed; still using {} ({})",
+                w.build, w.image, w.reason
+            )),
             EventPayload::Done => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod image_stale_tests {
+    use super::*;
+
+    #[test]
+    fn image_stale_warning_streams_as_image_stale_and_round_trips() {
+        let warning = ImageStaleWarning {
+            build: "build project image awman-x:latest".into(),
+            image: "awman-x:latest".into(),
+            kind: StaleImageKind::Project,
+            agent: None,
+            expected_inputs: "ab".into(),
+            installed_inputs: None,
+            reason: "exit 1".into(),
+        };
+        let event = ExecutionEvent {
+            timestamp: Utc::now(),
+            attempt: FIRST_ATTEMPT,
+            sequence: 0,
+            source: None,
+            payload: EventPayload::ImageStale(warning.clone()),
+        };
+        let public = event.public_value();
+        assert_eq!(public["payload"]["type"], "image_stale");
+        assert_eq!(public["payload"]["data"]["kind"], "project");
+        assert!(public["payload"]["data"].get("agent").is_none());
+        let stored = serde_json::to_string(&event).unwrap();
+        let back: ExecutionEvent = serde_json::from_str(&stored).unwrap();
+        assert!(matches!(back.payload, EventPayload::ImageStale(w) if w == warning));
+        let snake = r#"{"type":"image_stale","data":{"build":"b","image":"i","kind":"agent","agent":"claude","expected_inputs":"e","reason":"r"}}"#;
+        let parsed: EventPayload = serde_json::from_str(snake).unwrap();
+        assert!(parsed.to_plain_text().unwrap().contains("still using i"));
     }
 }

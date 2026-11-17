@@ -10,9 +10,11 @@ use std::collections::BTreeSet;
 
 pub(super) async fn agents_for_lease(
     engines: &Engines,
-    session: &Session,
+    session: &mut Session,
     item: &awman_wsp::WorkItem,
     private_dir: &std::path::Path,
+    db: std::sync::Arc<crate::data::fs::api_db::SqliteSessionStore>,
+    lease: &crate::data::worker::LeaseRecord,
 ) -> Result<(), WorkerEngineError> {
     let invalid = |e: String| WorkerEngineError::Invalid(e);
     let paths = RepoDockerfilePaths::new(session.git_root());
@@ -61,13 +63,98 @@ pub(super) async fn agents_for_lease(
                 .unwrap_or_else(|| session.configured_agent().to_string()),
         );
     }
+    let builder = if super::images::supported(engines.runtime.as_ref()) {
+        Some(
+            super::images::LeaseImageBuilder::new(
+                engines.runtime.clone(),
+                session,
+                db.clone(),
+                lease,
+            )
+            .map_err(|e| invalid(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let repo = crate::data::image_inputs::RepoKey::for_lease(&item.repo.url, session.git_root());
+    let mut binding = crate::data::worker::lease_images::LeaseImageBinding::default();
+    let mut project_id = String::new();
+    if let Some(builder) = &builder {
+        let dockerfile = session
+            .effective_config()
+            .dockerfile_path(session.git_root());
+        let relative = dockerfile
+            .strip_prefix(session.git_root())
+            .map_err(|_| invalid("lease Dockerfile must be inside the repository".into()))?;
+        let bytes = match crate::data::image_inputs::BuildContext::read(
+            &crate::data::image_inputs::DirBuildContext::new(session.git_root()),
+            &relative.to_string_lossy(),
+        ) {
+            Ok(bytes) => Some(bytes),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::symlink_metadata(&dockerfile).is_err() =>
+            {
+                None
+            }
+            Err(error) => return Err(invalid(error.to_string())),
+        };
+        let mut inputs = crate::data::image_inputs::project_inputs_at(
+            bytes.as_deref(),
+            &crate::data::image_inputs::DirBuildContext::new(session.git_root()),
+            &dockerfile
+                .strip_prefix(session.git_root())
+                .map_err(|_| invalid("lease Dockerfile must be inside the repository".into()))?
+                .to_string_lossy(),
+        );
+        for source in &inputs.unresolved {
+            tracing::warn!(source = %source.source, reason = ?source.reason, "lease image input cannot be resolved; use ready --build to refresh fetched or unresolved content");
+        }
+        if !inputs.unresolved.is_empty() {
+            inputs.hash = inputs.hash.scoped_to_lease(lease.id.as_str());
+        }
+        // Repositories with no recipe share awman's default project image.
+        let base_repo = if inputs.dockerfile_present {
+            repo.clone()
+        } else {
+            crate::data::image_inputs::RepoKey::from_label("awman/default-base")
+        };
+        binding.project =
+            crate::data::image_tags::lease_project_image_tag(&base_repo, &inputs.hash);
+        let dockerfile = if bytes.is_none() {
+            let path = private_dir.join("Dockerfile.project");
+            crate::data::fs::config_file::write_config_file_within(
+                private_dir,
+                &path,
+                crate::data::templates::project_dockerfile_dev(),
+            )
+            .map_err(|e| invalid(e.to_string()))?;
+            path
+        } else {
+            dockerfile
+        };
+        project_id = builder
+            .prepare(
+                crate::engine::container::BuildRequest::runtime(
+                    &binding.project,
+                    &dockerfile,
+                    session.git_root(),
+                    false,
+                ),
+                inputs.hash,
+                base_repo,
+                crate::data::worker::lease_images::LeaseImageKind::Project,
+            )
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+    }
     let mut generated = Vec::new();
-    for name in names {
-        let agent = AgentName::new(&name).map_err(|e| invalid(e.to_string()))?;
-        if paths.agent_dockerfile(&name).exists() {
+    for name in &names {
+        let agent = AgentName::new(name.as_str()).map_err(|e| invalid(e.to_string()))?;
+        if paths.agent_dockerfile(name).exists() {
             continue;
         }
-        if !crate::engine::agent::first_party::is_first_party(&name) {
+        if !crate::engine::agent::first_party::is_first_party(name) {
             return Err(invalid(format!("agent '{name}' has no Dockerfile; run `awman init --agent {name}` in the repository")));
         }
         let definition = engines
@@ -77,11 +164,64 @@ pub(super) async fn agents_for_lease(
         crate::engine::agent::provision_agent_dockerfile(
             &definition,
             &paths,
-            &crate::data::image_tags::project_image_tag(session.git_root()),
+            &if builder.is_some() {
+                binding.project.clone()
+            } else {
+                crate::data::image_tags::project_image_tag(session.git_root())
+            },
         )
         .await
         .map_err(|e| invalid(e.to_string()))?;
         generated.push(format!("/.awman/Dockerfile.{name}"));
+    }
+    if let Some(builder) = &builder {
+        for name in &names {
+            let bytes = crate::data::image_inputs::BuildContext::read(
+                &crate::data::image_inputs::DirBuildContext::new(session.git_root()),
+                &format!(".awman/Dockerfile.{name}"),
+            )
+            .map_err(|e| invalid(e.to_string()))?;
+            let mut hash = crate::data::image_inputs::agent_inputs_hash(&bytes, &project_id);
+            if !crate::data::image_inputs::resolve_copy_sources(&String::from_utf8_lossy(&bytes))
+                .is_empty()
+            {
+                tracing::warn!(agent = %name, "agent recipe copies build context; image reuse is limited to this lease");
+                hash = hash.scoped_to_lease(lease.id.as_str());
+            }
+            let tag = crate::data::image_tags::lease_agent_image_tag(&repo, &hash, name);
+            let recipe = super::images::agent_recipe(
+                &bytes,
+                &crate::data::image_tags::project_image_tag(session.git_root()),
+                &project_id,
+                &private_dir.join(format!("Dockerfile.{name}")),
+            )
+            .map_err(|e| invalid(e.to_string()))?;
+            builder
+                .prepare(
+                    crate::engine::container::BuildRequest::runtime(
+                        &tag,
+                        &recipe,
+                        session.git_root(),
+                        false,
+                    ),
+                    hash,
+                    repo.clone(),
+                    crate::data::worker::lease_images::LeaseImageKind::Agent {
+                        agent: name.clone(),
+                    },
+                )
+                .await
+                .map_err(|e| invalid(e.to_string()))?;
+            binding.agents.insert(name.clone(), tag);
+        }
+        session.set_lease_images(binding);
+        let _ = super::images::schedule_cleanup(
+            engines.runtime.clone(),
+            session.env().clone(),
+            db,
+            super::images::budgets(&session.effective_config().daemon().worker),
+        )
+        .await;
     }
     if !generated.is_empty() {
         let path = private_dir.join("generated-recipes");

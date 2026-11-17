@@ -52,6 +52,19 @@ impl DeferredBackend {
 }
 
 impl ContainerBackend for DeferredBackend {
+    fn inspect_image(
+        &self,
+        tag: &str,
+    ) -> Result<Option<super::runtime::ImageMetadata>, EngineError> {
+        self.get()?.inspect_image(tag)
+    }
+    fn list_images_by_repo(
+        &self,
+        repo: &crate::data::image_inputs::RepoKey,
+    ) -> Result<Vec<super::runtime::ImageMetadata>, EngineError> {
+        self.get()?.list_images_by_repo(repo)
+    }
+
     fn name(&self) -> &'static str {
         "builtin"
     }

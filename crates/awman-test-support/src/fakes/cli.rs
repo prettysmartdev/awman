@@ -170,6 +170,13 @@ impl FakeCli {
         temp.persist(self.dir.join("rules")).expect("install rules");
     }
 
+    /// Opt into a private Docker image store. Successful builds publish their
+    /// tag, labels and a new ID; subsequent inspections return that metadata.
+    /// Explicit failing build rules leave the previous image untouched.
+    pub fn enable_docker_image_store(&self) {
+        std::fs::create_dir_all(self.dir.join("images")).expect("fake image store");
+    }
+
     /// Recorded invocations, oldest first.
     pub fn calls(&self) -> Vec<Call> {
         let mut dirs: Vec<PathBuf> = std::fs::read_dir(self.dir.join("calls"))

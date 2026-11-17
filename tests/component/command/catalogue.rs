@@ -73,11 +73,13 @@ pub const CONTRACT_PATHS: &[&str] = &[
     "queue pick",
 ];
 
-/// The worker may execute agents and workflow/squad operations. Local setup,
-/// config, credentials, remote delegation and foreground terminals stay local.
+/// The worker may execute agents, workflow/squad operations and environment
+/// readiness/build checks. Local config, credentials, remote delegation and
+/// foreground terminals stay local.
 /// An independent permission oracle: flipping api_allowed must turn this red.
 const WORKER_COMMANDS: &[&str] = &[
     "init",
+    "ready",
     "agents status",
     "agents list",
     "agents detail",

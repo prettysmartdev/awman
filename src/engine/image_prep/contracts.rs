@@ -15,12 +15,16 @@ use std::sync::Mutex;
 
 #[derive(Default)]
 pub(crate) struct Store {
+    pub source_metadata: Mutex<HashMap<String, crate::engine::container::runtime::ImageMetadata>>,
+    pub installed_metadata:
+        Mutex<HashMap<String, crate::engine::container::runtime::ImageMetadata>>,
     pub source: Mutex<HashSet<String>>,
     pub installed: Mutex<HashMap<String, ImageIdentity>>,
     pub built: Mutex<Vec<String>>,
     pub imports: Mutex<Vec<String>>,
     pub fail_build: std::sync::atomic::AtomicBool,
     pub apple_missing: std::sync::atomic::AtomicBool,
+    pub apple_unbound: std::sync::atomic::AtomicBool,
     pub import_entered: tokio::sync::Notify,
     pub release_import: (Mutex<bool>, std::sync::Condvar),
     pub hold_import: std::sync::atomic::AtomicBool,
@@ -44,6 +48,14 @@ fn built_identity() -> BuiltImageIdentity {
     .unwrap()
 }
 impl LocalImageBuilder for Store {
+    fn inspect_metadata(
+        &self,
+        _: &BuildTarget,
+        reference: &str,
+        _: &BuildControl,
+    ) -> Result<Option<crate::engine::container::runtime::ImageMetadata>, EngineError> {
+        Ok(self.source_metadata.lock().unwrap().get(reference).cloned())
+    }
     fn probe(&self, _: &BuildTarget, _: &BuildControl) -> Result<(), EngineError> {
         Ok(())
     }
@@ -55,7 +67,11 @@ impl LocalImageBuilder for Store {
         _: &BuildControl,
     ) -> Result<SourceImage, EngineError> {
         Ok(if self.source.lock().unwrap().contains(reference) {
-            SourceImage::Present(built_identity())
+            if self.apple_unbound.load(std::sync::atomic::Ordering::SeqCst) {
+                SourceImage::Unbound
+            } else {
+                SourceImage::Present(built_identity())
+            }
         } else {
             SourceImage::Absent
         })
@@ -79,10 +95,51 @@ impl LocalImageBuilder for Store {
             .lock()
             .unwrap()
             .insert(request.reference.clone());
+        self.source_metadata.lock().unwrap().insert(
+            request.reference.clone(),
+            crate::engine::container::runtime::ImageMetadata {
+                id: identity(&request.reference).config_digest.to_string(),
+                tags: vec![request.reference.clone()],
+                labels: request.labels.clone(),
+                size_bytes: 100,
+            },
+        );
         Ok(built_identity())
     }
 }
 impl AgentRuntimeEngine for Store {
+    fn inspect_image(
+        &self,
+        tag: &str,
+    ) -> Result<Option<crate::engine::container::runtime::ImageMetadata>, EngineError> {
+        Ok(self.installed_metadata.lock().unwrap().get(tag).cloned())
+    }
+    fn list_images_by_repo(
+        &self,
+        repo: &crate::data::image_inputs::RepoKey,
+    ) -> Result<Vec<crate::engine::container::runtime::ImageMetadata>, EngineError> {
+        Ok(self
+            .installed_metadata
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|image| {
+                image
+                    .labels
+                    .get(crate::data::image_inputs::REPO_LABEL)
+                    .map(String::as_str)
+                    == Some(repo.as_str())
+            })
+            .cloned()
+            .collect())
+    }
+    fn remove_image(&self, reference: &str) -> Result<(), EngineError> {
+        self.installed_metadata
+            .lock()
+            .unwrap()
+            .retain(|tag, image| tag != reference && image.id != reference);
+        Ok(())
+    }
     fn runtime_name(&self) -> &'static str {
         "builtin"
     }
@@ -155,8 +212,29 @@ impl AgentRuntimeEngine for Store {
     fn build(&self, _: ResolvedAgentOptions) -> Result<Box<dyn AgentInstance>, EngineError> {
         panic!("no agents")
     }
-    fn build_image(&self, _: &BuildRequest, _: &mut dyn FnMut(&str)) -> Result<(), EngineError> {
-        panic!("source builder only")
+    fn build_image(
+        &self,
+        request: &BuildRequest,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), EngineError> {
+        LocalImageBuilder::build(
+            self,
+            request,
+            &BuildControl::source_build(crate::engine::oci::CancelToken::new()),
+            on_line,
+        )?;
+        let metadata = self
+            .source_metadata
+            .lock()
+            .unwrap()
+            .get(&request.reference)
+            .unwrap()
+            .clone();
+        self.installed_metadata
+            .lock()
+            .unwrap()
+            .insert(request.reference.clone(), metadata);
+        Ok(())
     }
     fn ready_agent(
         &self,
@@ -264,7 +342,7 @@ fn missing_image_policy_preserves_installed_disabled_and_unconfigured_behavior()
                 for fallback in [BuildPolicy::CheckOnly, BuildPolicy::ImportOnly] {
                     assert_eq!(
                         prep.missing_image_policy(&tag, "claude", fallback).unwrap(),
-                        if enabled && !installed && source.is_some() {
+                        if enabled && source.is_some() && (!installed || matches!(source, Some(crate::data::config::image_source::ImageSourceSpec::AppleStore { .. }) | Some(crate::data::config::image_source::ImageSourceSpec::DockerStore { .. }))) {
                             BuildPolicy::SessionSetup
                         } else {
                             fallback
@@ -276,5 +354,299 @@ fn missing_image_policy_preserves_installed_disabled_and_unconfigured_behavior()
     }
     assert!(store.built.lock().unwrap().is_empty());
     assert!(store.imports.lock().unwrap().is_empty());
+    s.finish();
+}
+
+fn build_spec(s: &TestSandbox, tag: &str, inputs: &str) -> ImageBuildSpec {
+    ImageBuildSpec {
+        request: BuildRequest::runtime(tag, &s.work().join("Dockerfile.dev"), &s.work(), false),
+        store: BuildStoreKey::AppleLocal,
+        inputs: crate::data::image_inputs::InputsHash::from_label(inputs),
+        repo: crate::data::image_inputs::RepoKey::from_label("example.test/team/repo"),
+        force: false,
+    }
+}
+
+#[test]
+fn freshness_distinguishes_missing_unlabelled_stale_and_fresh() {
+    use crate::data::image_inputs::{InputsHash, INPUTS_LABEL};
+    use crate::engine::container::runtime::ImageMetadata;
+    let expected = InputsHash::from_label("expected");
+    assert_eq!(
+        ImageFreshness::from_image(None, &expected),
+        ImageFreshness::Missing
+    );
+    let mut image = ImageMetadata {
+        id: "id".into(),
+        tags: vec!["tag".into()],
+        labels: Default::default(),
+        size_bytes: 123,
+    };
+    assert!(matches!(
+        ImageFreshness::from_image(Some(image.clone()), &expected),
+        ImageFreshness::Unlabelled(_)
+    ));
+    image.labels.insert(INPUTS_LABEL.into(), "old".into());
+    assert!(matches!(
+        ImageFreshness::from_image(Some(image.clone()), &expected),
+        ImageFreshness::Stale(_)
+    ));
+    image.labels.insert(INPUTS_LABEL.into(), "expected".into());
+    assert!(matches!(
+        ImageFreshness::from_image(Some(image), &expected),
+        ImageFreshness::Fresh(_)
+    ));
+}
+
+struct WaitSink(tokio::sync::mpsc::UnboundedSender<()>);
+impl UserMessageSink for WaitSink {
+    fn write_message(&mut self, message: UserMessage) {
+        if message
+            .text
+            .starts_with("Waiting for another awman process")
+        {
+            let _ = self.0.send(());
+        }
+    }
+    fn replay_queued(&mut self) {}
+}
+impl ImagePreparationSink for WaitSink {
+    fn report_step(&mut self, _: &SetupStep, _: StepStatus) {}
+}
+
+#[tokio::test]
+async fn concurrent_runtime_builds_recheck_inputs_after_the_existing_lease() {
+    let s = TestSandbox::for_test(TestCase::component("engine::image_prep::contracts::concurrent_runtime_builds_recheck_inputs_after_the_existing_lease"));
+    let store = Arc::new(Store::default());
+    let first = preparer(&s, store.clone(), false, None);
+    let second = preparer(&s, store.clone(), false, None);
+    let spec = build_spec(&s, "shared:latest", "inputs");
+    let held = first
+        .build_locks
+        .try_lock(&spec.store, "shared:latest")
+        .unwrap()
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let other_spec = build_spec(&s, "docker.io/library/shared:latest", "inputs");
+    // Use one installed tag; aliases already share the same lock key.
+    assert_eq!(
+        AgentImagePreparer::normalize_build_reference(&other_spec.request.reference),
+        "shared:latest"
+    );
+    let second_spec = build_spec(&s, "shared:latest", "inputs");
+    let first_tx = tx.clone();
+    let a = tokio::spawn(async move { first.build_if_needed(spec, &mut WaitSink(first_tx)).await });
+    let b =
+        tokio::spawn(async move { second.build_if_needed(second_spec, &mut WaitSink(tx)).await });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        rx.recv().await.unwrap();
+        rx.recv().await.unwrap();
+    })
+    .await
+    .unwrap();
+    assert!(store.built.lock().unwrap().is_empty());
+    drop(held);
+    let (a, b) = tokio::join!(a, b);
+    let outcomes = [a.unwrap().unwrap(), b.unwrap().unwrap()];
+    assert!(outcomes.contains(&ImageBuildOutcome::Built));
+    assert!(outcomes.contains(&ImageBuildOutcome::Reused));
+    assert_eq!(*store.built.lock().unwrap(), ["shared:latest"]);
+    let metadata = AgentRuntimeEngine::inspect_image(store.as_ref(), "shared:latest")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        metadata.labels[crate::data::image_inputs::INPUTS_LABEL],
+        "inputs"
+    );
+    assert_eq!(
+        metadata.labels[crate::data::image_inputs::REPO_LABEL],
+        "example.test/team/repo"
+    );
+    s.finish();
+}
+
+#[tokio::test]
+async fn failed_rebuild_preserves_old_image_and_releases_build_lease() {
+    let s = TestSandbox::for_test(TestCase::component("engine::image_prep::contracts::failed_rebuild_preserves_old_image_and_releases_build_lease"));
+    let store = Arc::new(Store::default());
+    let prep = preparer(&s, store.clone(), false, None);
+    prep.build_if_needed(
+        build_spec(&s, "project:latest", "old"),
+        &mut Sink::default(),
+    )
+    .await
+    .unwrap();
+    store
+        .fail_build
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(prep
+        .build_if_needed(
+            build_spec(&s, "project:latest", "new"),
+            &mut Sink::default()
+        )
+        .await
+        .is_err());
+    assert!(matches!(
+        prep.freshness(
+            "project:latest",
+            &crate::data::image_inputs::InputsHash::from_label("old")
+        )
+        .unwrap(),
+        ImageFreshness::Fresh(_)
+    ));
+    assert!(prep
+        .build_locks
+        .try_lock(&BuildStoreKey::AppleLocal, "project:latest")
+        .unwrap()
+        .is_some());
+    store
+        .fail_build
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        prep.build_if_needed(
+            build_spec(&s, "project:latest", "new"),
+            &mut Sink::default()
+        )
+        .await
+        .unwrap(),
+        ImageBuildOutcome::Built
+    );
+    s.finish();
+}
+
+#[tokio::test]
+async fn source_build_labels_and_reuses_matching_inputs_under_lease() {
+    let s = TestSandbox::for_test(TestCase::component(
+        "engine::image_prep::contracts::source_build_labels_and_reuses_matching_inputs_under_lease",
+    ));
+    let store = Arc::new(Store::default());
+    let mut prep = preparer(&s, store.clone(), false, None);
+    let mut spec = build_spec(&s, "source:latest", "source-inputs");
+    spec.request.target = BuildTarget::Apple;
+    let first = prep
+        .build_source_if_needed(&spec, &mut Sink::default())
+        .await
+        .unwrap();
+    assert_eq!(first.outcome, ImageBuildOutcome::Built);
+    assert!(prep
+        .build_locks
+        .try_lock(&spec.store, "source:latest")
+        .unwrap()
+        .is_none());
+    drop(first);
+    store
+        .apple_unbound
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let second = prep
+        .build_source_if_needed(&spec, &mut Sink::default())
+        .await
+        .unwrap();
+    assert_eq!(second.outcome, ImageBuildOutcome::Reused);
+    assert_eq!(store.built.lock().unwrap().len(), 1);
+    drop(second);
+    s.finish();
+}
+
+#[tokio::test]
+async fn ready_source_builds_label_project_and_agent_with_layer_zero_hashes() {
+    use crate::data::image_inputs::{
+        agent_inputs_hash, project_inputs, DirBuildContext, INPUTS_LABEL, REPO_LABEL,
+    };
+    let s = TestSandbox::for_test(TestCase::component("engine::image_prep::contracts::ready_source_builds_label_project_and_agent_with_layer_zero_hashes"));
+    let store = Arc::new(Store::default());
+    let mut prep = preparer(
+        &s,
+        store.clone(),
+        true,
+        Some(crate::data::config::image_source::ImageSourceSpec::AppleStore { reference: None }),
+    );
+    let tag = crate::data::image_tags::agent_image_tag(&s.work(), "claude");
+    let result = prep
+        .prepare(
+            &AgentImageRequest {
+                tag: &tag,
+                agent: "claude",
+                policy: BuildPolicy::Ready {
+                    build: true,
+                    no_cache: false,
+                    refresh: false,
+                },
+            },
+            &mut Sink::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.build, StepStatus::Done);
+    let project_tag = crate::data::image_tags::project_image_tag(&s.work());
+    let metadata = store.source_metadata.lock().unwrap();
+    assert_eq!(
+        metadata[&project_tag].labels[INPUTS_LABEL],
+        project_inputs(Some(b"FROM scratch\n"), &DirBuildContext::new(s.work()))
+            .hash
+            .as_str()
+    );
+    let base_id = metadata[&project_tag].id.clone();
+    assert_eq!(
+        metadata[&tag].labels[INPUTS_LABEL],
+        agent_inputs_hash(b"FROM scratch\n", &base_id).as_str()
+    );
+    assert_eq!(
+        metadata[&project_tag].labels[REPO_LABEL],
+        crate::data::image_inputs::RepoKey::local(&s.work()).as_str()
+    );
+    drop(metadata);
+    s.finish();
+}
+
+#[test]
+fn build_labels_use_layer_zero_hashes_and_explicit_lease_inputs() {
+    use crate::data::image_inputs::*;
+    let s = TestSandbox::for_test(TestCase::component("engine::image_prep::contracts::build_labels_use_layer_zero_hashes_and_explicit_lease_inputs"));
+    std::fs::write(
+        s.work().join("Dockerfile.dev"),
+        "FROM scratch\nCOPY tool /tool\n",
+    )
+    .unwrap();
+    std::fs::write(s.work().join("tool"), "one").unwrap();
+    let env = crate::data::config::env::EnvSnapshot::from_full_env(Default::default());
+    let request = BuildRequest::runtime(
+        "project:latest",
+        &s.work().join("Dockerfile.dev"),
+        &s.work(),
+        false,
+    );
+    let first =
+        super::freshness::label_build(&request, &env, |_| panic!("project has no base lookup"))
+            .unwrap();
+    let expected = project_inputs(
+        Some(b"FROM scratch\nCOPY tool /tool\n"),
+        &DirBuildContext::new(s.work()),
+    )
+    .hash;
+    assert_eq!(first.labels[INPUTS_LABEL], expected.as_str());
+    assert_eq!(first.labels[REPO_LABEL], RepoKey::local(&s.work()).as_str());
+    std::fs::write(s.work().join("tool"), "two").unwrap();
+    let changed = super::freshness::label_build(&request, &env, |_| Ok(None)).unwrap();
+    assert_ne!(first.labels[INPUTS_LABEL], changed.labels[INPUTS_LABEL]);
+    std::fs::create_dir_all(s.work().join(".awman")).unwrap();
+    let agent_file = s.work().join(".awman/Dockerfile.claude");
+    std::fs::write(&agent_file, "FROM project:latest\n").unwrap();
+    let request = BuildRequest::runtime("agent:latest", &agent_file, &s.work(), false);
+    let labels = super::freshness::label_build(&request, &env, |_| Ok(Some("project-id".into())))
+        .unwrap()
+        .labels;
+    assert_eq!(
+        labels[INPUTS_LABEL],
+        agent_inputs_hash(b"FROM project:latest\n", "project-id").as_str()
+    );
+    let request = request.with_inputs(
+        &InputsHash::from_label("lease-inputs"),
+        &RepoKey::from_label("example.test/repo"),
+    );
+    let labels = super::freshness::label_build(&request, &env, |_| panic!("explicit lease hash"))
+        .unwrap()
+        .labels;
+    assert_eq!(labels[INPUTS_LABEL], "lease-inputs");
+    assert_eq!(labels[REPO_LABEL], "example.test/repo");
     s.finish();
 }

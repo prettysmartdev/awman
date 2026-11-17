@@ -207,8 +207,48 @@ impl AgentImagePreparer {
                     .await?,
             );
         }
+        // Check the working tree while both source leases are held. Registry
+        // and archive sources never reach this local-builder path.
+        let project_bytes = std::fs::read(&self.context.project_dockerfile).ok();
+        let project_inputs = crate::data::image_inputs::project_inputs_at(
+            project_bytes.as_deref(),
+            &crate::data::image_inputs::DirBuildContext::new(git_root),
+            &self
+                .context
+                .project_dockerfile
+                .strip_prefix(git_root)
+                .unwrap_or(&self.context.project_dockerfile)
+                .to_string_lossy(),
+        )
+        .hash;
+        let parent = self
+            .source_freshness(target.clone(), project_tag.clone(), &project_inputs)
+            .await
+            .map_err(|e| e.to_string())?;
+        let parent_current = matches!(parent, ImageFreshness::Fresh(_));
+        let parent_id = match &parent {
+            ImageFreshness::Fresh(image)
+            | ImageFreshness::Stale(image)
+            | ImageFreshness::Unlabelled(image) => Some(image.id.clone()),
+            ImageFreshness::Missing => None,
+        };
+        let agent_bytes =
+            std::fs::read(RepoDockerfilePaths::new(git_root).agent_dockerfile(agent)).ok();
+        let inputs_current = if let (Some(parent_id), Some(agent_bytes)) = (parent_id, agent_bytes)
+        {
+            let expected = crate::data::image_inputs::agent_inputs_hash(&agent_bytes, &parent_id);
+            parent_current
+                && matches!(
+                    self.source_freshness(target.clone(), resolved.reference.clone(), &expected)
+                        .await
+                        .map_err(|e| e.to_string())?,
+                    ImageFreshness::Fresh(_)
+                )
+        } else {
+            false
+        };
         let pending = self.load_receipt(&key).await?;
-        if !policy.force_build() {
+        if !policy.force_build() && inputs_current {
             let installed = if self.runtime.image_exists(tag).unwrap_or(false) {
                 self.runtime.image_identity(tag).ok().flatten()
             } else {
@@ -329,20 +369,7 @@ impl AgentImagePreparer {
             return Err(error.clone());
         }
         if !self.prepared_bases.contains_key(&base_key) {
-            let base_exists = if policy.force_build() {
-                false
-            } else {
-                !matches!(
-                    self.inspect_source(
-                        target.clone(),
-                        project_tag.clone(),
-                        resolved.platform.clone()
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?,
-                    SourceImage::Absent
-                )
-            };
+            let base_exists = !policy.force_build() && parent_current;
             if !base_exists {
                 let dockerfile = self.context.project_dockerfile.clone();
                 let step: SetupStep = ReadyStep::BuildBaseImageIn {
@@ -352,6 +379,7 @@ impl AgentImagePreparer {
                 .into();
                 frontend.report_step(&step, StepStatus::Running);
                 let request = BuildRequest {
+                    labels: Default::default(),
                     target: target.clone(),
                     reference: project_tag.clone(),
                     dockerfile,
@@ -360,6 +388,16 @@ impl AgentImagePreparer {
                     build_args: Vec::new(),
                     no_cache: policy.no_cache(),
                 };
+                self.last_installed_inputs = match &parent {
+                    ImageFreshness::Fresh(image)
+                    | ImageFreshness::Stale(image)
+                    | ImageFreshness::Unlabelled(image) => image
+                        .labels
+                        .get(crate::data::image_inputs::INPUTS_LABEL)
+                        .cloned(),
+                    ImageFreshness::Missing => None,
+                };
+                self.last_build_inputs = Some(project_inputs.clone());
                 let result = self.build_source(request, frontend).await;
                 let result = match result {
                     Ok(receipt) => match self
@@ -414,7 +452,40 @@ impl AgentImagePreparer {
                 dockerfile.display()
             ));
         }
+        let parent_id = match self
+            .source_freshness(target.clone(), project_tag.clone(), &project_inputs)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            ImageFreshness::Fresh(image)
+            | ImageFreshness::Stale(image)
+            | ImageFreshness::Unlabelled(image) => Some(image.id),
+            ImageFreshness::Missing => None,
+        };
+        self.last_build_inputs = parent_id.and_then(|id| {
+            std::fs::read(&dockerfile)
+                .ok()
+                .map(|bytes| crate::data::image_inputs::agent_inputs_hash(&bytes, &id))
+        });
+        self.last_installed_inputs = if let Some(expected) = self.last_build_inputs.clone() {
+            match self
+                .source_freshness(target.clone(), resolved.reference.clone(), &expected)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                ImageFreshness::Fresh(image)
+                | ImageFreshness::Stale(image)
+                | ImageFreshness::Unlabelled(image) => image
+                    .labels
+                    .get(crate::data::image_inputs::INPUTS_LABEL)
+                    .cloned(),
+                ImageFreshness::Missing => None,
+            }
+        } else {
+            None
+        };
         let request = BuildRequest {
+            labels: Default::default(),
             target,
             reference: resolved.reference.clone(),
             dockerfile,

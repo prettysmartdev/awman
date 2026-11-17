@@ -90,6 +90,9 @@ pub const CAPABILITIES: &[&str] = &[
     // WI 0148: `init` is available to API clients and returns its project
     // file list in the typed command result.
     "api_init",
+    // WI 0163: `ready` is available to API clients with typed build results
+    // and progress events.
+    "api_ready",
     // WI 0152: `--read-only-workspace` on `exec prompt` / `exec workflow` and
     // per-step `read_only_workspace`. Advertised only by
     // [`advertised_for_runtime`] on a runtime that enforces it, never by
@@ -101,6 +104,7 @@ pub const CAPABILITIES: &[&str] = &[
 /// advertised only while the daemon runs a pull worker that reports it
 /// (`PullHandle::capabilities`), never speculatively.
 pub const PULL_CAPABILITIES: &[&str] = &[
+    "lease_image_reuse",
     "lease_context",
     "lease_workflow_context",
     "worker_pull",
@@ -128,7 +132,14 @@ pub fn advertised_for_runtime(
     caps: &crate::engine::agent_runtime::Capabilities,
     pull: &[&str],
 ) -> Vec<String> {
-    advertised_with(caps.mounts_outputs(true), caps.read_only_workspace(), pull)
+    let mut result = advertised_with(caps.mounts_outputs(true), caps.read_only_workspace(), pull);
+    // Session setup rebuilds stale images only on runtimes that build images
+    // locally. Imported builtin images do not use the image-input freshness
+    // path, so do not advertise the capability there.
+    if caps.image_acquisition == crate::engine::agent_runtime::ImageAcquisition::Build {
+        result.push("image_inputs".to_string());
+    }
+    result
 }
 
 fn advertised_with(mounts_outputs: bool, read_only_workspace: bool, pull: &[&str]) -> Vec<String> {
@@ -280,5 +291,37 @@ mod read_only_workspace_tests {
         let pull_only = advertised_with(true, false, &["lease_read_only"]);
         assert_eq!(count(&pull_only, "lease_read_only"), 1);
         assert_eq!(count(&pull_only, RO), 0);
+    }
+}
+
+#[cfg(test)]
+mod image_inputs_tests {
+    use super::*;
+
+    fn runtime(
+        acquisition: crate::engine::agent_runtime::ImageAcquisition,
+    ) -> crate::engine::agent_runtime::Capabilities {
+        crate::engine::agent_runtime::Capabilities {
+            arbitrary_host_mounts: true,
+            kit_declarative: false,
+            has_image_store: acquisition != crate::engine::agent_runtime::ImageAcquisition::Kit,
+            image_acquisition: acquisition,
+            per_launch_vm_settings: false,
+            reports_resource_stats: false,
+        }
+    }
+
+    #[test]
+    fn api_ready_is_advertised_and_image_inputs_only_on_build_runtimes() {
+        use crate::engine::agent_runtime::ImageAcquisition::{Build, Import, Kit};
+        for acquisition in [Build, Import, Kit] {
+            let caps = advertised_for_runtime(&runtime(acquisition), &[]);
+            assert!(caps.iter().any(|c| c == "api_ready"));
+            assert_eq!(
+                caps.iter().any(|c| c == "image_inputs"),
+                acquisition == Build,
+                "{acquisition:?}: {caps:?}"
+            );
+        }
     }
 }

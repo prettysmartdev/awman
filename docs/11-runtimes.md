@@ -63,6 +63,46 @@ Apple Containers is a macOS-native runtime that runs each agent in a lightweight
 
 ---
 
+## Keeping images fresh (Docker and Apple Containers)
+
+On the runtimes that build images locally (`docker` and `apple`), awman labels every project and agent image it builds with a hash of what went into it, and compares that hash with your working tree before a session or workflow starts.
+
+| Label | Value |
+|---|---|
+| `dev.awman.inputs` | Hash of the inputs the image was built from. |
+| `dev.awman.repo` | Normalised repository key: the `origin` URL without scheme, credentials, default port, `.git` or trailing `/` (such as `github.com/org/repo`), or a short path hash when there is no remote. |
+
+The hash covers:
+
+- **Project image:** the project Dockerfile (`Dockerfile.dev`, or the file named by `runtime.dockerfile`) and the content of every file or directory the Dockerfile `COPY`s or `ADD`s from the build context. File contents, paths and executable permissions count; modification times do not. The root `.dockerignore` and the selected Dockerfile’s `.dockerignore` file also count, so changes to exclusions trigger a rebuild.
+- **Agent image:** the `.awman/Dockerfile.<agent>` file and the ID of the project image it was built on, so rebuilding the project image rebuilds the agent images on top of it.
+
+Some sources cannot be resolved to files, so only the Dockerfile text itself covers them: wildcards (`*`, `?`, `[`), variables (`$`), URLs, paths that escape the context, a whole-context copy (`COPY . .`, which would otherwise rebuild on every change), more than 10,000 files in one directory, more than 512 MiB in total, and unreadable paths. `COPY --from=` is ignored, symlinks are hashed by their link target text and never followed, and ignore patterns are not applied to the files being hashed (so excluded files can cause an extra rebuild). `ONBUILD` instructions and `RUN --mount` inputs are not resolved. Agent hashes do not include files copied from the context by an agent Dockerfile; use `ready --build` after changing those files.
+
+### When images are rebuilt
+
+During API session setup, before `chat`, `exec prompt` and squad tasks launch, and during workflow preflight, awman compares the installed images' `dev.awman.inputs` labels with the current hash:
+
+- A **stale** image (the label differs) is rebuilt: the project image first, then each agent image.
+- An **unlabelled** image, built by an earlier awman, is rebuilt once and is labelled from then on.
+- A **missing** image behaves as before: a missing agent image is built, and a missing project image tells you to run `awman ready`.
+- Concurrent awman processes share one rebuild: a second process waits for the first and reuses its image.
+
+Image tags are named after the repository folder, so alternating between branches whose Dockerfiles or copied files differ rebuilds the image each time you switch.
+
+If a rebuild fails, awman **warns and continues** with the image it already has. The warning reads `[image] warning: <build> failed; still using <image> (<reason>)`, and API clients receive an [`image_stale` event](09-api-and-remote-mode.md#image-stale-event). `awman ready --build` is different: it still fails when its build fails. Plain `awman ready` does not rebuild stale images. When builtin execution uses an enabled Docker-local or Apple-local builder, session setup and launch/preflight also check source image labels, rebuild stale source images, and import the result. Failed source rebuilds keep the installed image and emit the same warning. Registry/archive sources and disabled builders retain their import behavior.
+
+### Content awman cannot see
+
+The hash sees only files in your repository. Anything fetched while the image builds, such as `curl … | sh`, an unpinned `apt-get install` or a moving base-image tag, can change without changing the hash, so awman does not rebuild for it. Pin such content, or force a rebuild yourself:
+
+```sh
+awman ready --build              # rebuild, using the build cache
+awman ready --build --no-cache   # rebuild from scratch
+```
+
+---
+
 ## Builtin microVM (experimental)
 
 `builtin` runs each agent session in a Linux microVM whose VM code, kernel, and guest agent are **embedded in the awman executable** (it is powered by Microsandbox). Each VM starts another process of that same executable. There is no separate runtime to install, and no Docker, `container` or `sbx` is needed to *run* agents.

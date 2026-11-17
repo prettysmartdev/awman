@@ -24,6 +24,16 @@ pub use crate::engine::container::{BuildRequest, BuildTarget};
 /// Fakeable seam for the whole ready flow. Implementations may hold a fake
 /// store and script probe, inspect, build, failure and cancellation outcomes.
 pub trait LocalImageBuilder: Send + Sync {
+    /// Local metadata, without acquiring or building an image. Unknown
+    /// metadata must never be treated as a matching inputs label.
+    fn inspect_metadata(
+        &self,
+        _target: &BuildTarget,
+        _reference: &str,
+        _control: &BuildControl,
+    ) -> Result<Option<crate::engine::container::runtime::ImageMetadata>, EngineError> {
+        Err(EngineError::NotImplemented("source image metadata"))
+    }
     fn probe(&self, target: &BuildTarget, control: &BuildControl) -> Result<(), EngineError>;
     fn inspect(
         &self,
@@ -294,6 +304,37 @@ impl HostLocalImageBuilder {
 }
 
 impl LocalImageBuilder for HostLocalImageBuilder {
+    fn inspect_metadata(
+        &self,
+        target: &BuildTarget,
+        reference: &str,
+        control: &BuildControl,
+    ) -> Result<Option<crate::engine::container::runtime::ImageMetadata>, EngineError> {
+        let mut command = self.bound_command(target);
+        command.args(["image", "inspect", reference]);
+        let mut lines = Vec::new();
+        let status = self.run_host(
+            target,
+            command,
+            &control.bounded(INSPECT_TIMEOUT),
+            &mut |line| lines.push(line.to_owned()),
+        )?;
+        if !status.success() {
+            let error = lines.join("\n").to_ascii_lowercase();
+            if error.contains("no such image") || error.contains("not found") {
+                return Ok(None);
+            }
+            return Err(EngineError::Container(
+                "source image metadata inspection failed".into(),
+            ));
+        }
+        crate::engine::container::host_build::parse_image_inspection(
+            lines.join("\n").as_bytes(),
+            reference,
+            *target == BuildTarget::Apple,
+        )
+        .map(Some)
+    }
     fn probe(&self, target: &BuildTarget, control: &BuildControl) -> Result<(), EngineError> {
         let mut command = self.bound_command(target);
         let what = match target {
@@ -374,6 +415,19 @@ impl LocalImageBuilder for HostLocalImageBuilder {
         control: &BuildControl,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<BuiltImageIdentity, EngineError> {
+        let request = super::freshness::label_build(request, &self.env, |reference| {
+            if let Some(image) = self.inspect_metadata(&request.target, reference, control)? {
+                return Ok(Some(image.id));
+            }
+            match self.inspect(&request.target, reference, &request.platform, control)? {
+                SourceImage::Present(id) => Ok(id
+                    .config_digest()
+                    .or(id.manifest_digest())
+                    .map(ToString::to_string)),
+                _ => Ok(None),
+            }
+        })?;
+        let request = &request;
         self.probe(&request.target, control)?;
         match &request.target {
             BuildTarget::Runtime => Err(EngineError::Config(
@@ -426,6 +480,7 @@ impl LocalImageBuilder for HostLocalImageBuilder {
                 let argv = crate::engine::container::host_build::BuildArgv {
                     platform: Some(&platform),
                     build_args: &request.build_args,
+                    labels: &request.labels,
                     ..crate::engine::container::host_build::BuildArgv::new(
                         &request.reference,
                         &request.dockerfile,
@@ -516,6 +571,7 @@ impl HostLocalImageBuilder {
             platform: Some(&platform),
             iidfile: Some(iid.path()),
             build_args: &request.build_args,
+            labels: &request.labels,
             ..BuildArgv::new(
                 &request.reference,
                 &request.dockerfile,
@@ -639,6 +695,7 @@ mod contracts {
             },
         ] {
             let request = BuildRequest {
+                labels: Default::default(),
                 target,
                 reference: "test:latest".into(),
                 dockerfile: "Dockerfile".into(),

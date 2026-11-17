@@ -67,7 +67,9 @@ impl Fixture {
         }
         let mut fake = None;
         let server = Api::with_docker(s, worker_config(&root), |docker| {
-            docker.on(&["image", "inspect"]).stdout("[]\n").exit(0);
+            docker.enable_docker_image_store();
+            docker.on(&["image", "inspect"]).stdout(&json!([{"Id": format!("sha256:{}", "0".repeat(64)), "RepoTags":[], "Size":100, "Config":{"Labels":{}}}]).to_string()).exit(0);
+            docker.on(&["build"]).stdout("contract builder progress\n").exit(0);
             fake = Some(docker.clone());
         })
         .await;
@@ -131,6 +133,35 @@ impl Fixture {
             )
             .then_some(v)
         })
+        .await
+    }
+
+    async fn create_local_session(&self) -> String {
+        let (code, value) = self
+            .server
+            .request(
+                "POST",
+                "/v1/worker/sessions",
+                Some(&self.key),
+                None,
+                Some(json!({"session_type":"local", "workdir":self.root})),
+            )
+            .await;
+        assert!(code == 201 || code == 202, "{value}");
+        value["id"].as_str().unwrap().to_string()
+    }
+    async fn wait_session(&self, id: &str) -> Value {
+        wait_for_async(
+            "session setup finished",
+            Duration::from_secs(10),
+            || async {
+                let (_, value) = self
+                    .server
+                    .get(&format!("/v1/worker/sessions/{id}"), Some(&self.key))
+                    .await;
+                matches!(value["setup_status"].as_str(), Some("ready" | "failed")).then_some(value)
+            },
+        )
         .await
     }
 
@@ -209,7 +240,91 @@ async fn status_advertises_api_init() {
         .filter(|c| **c == json!("api_init"))
         .count();
     assert_eq!(count, 1, "{status}");
+    for capability in ["api_ready", "image_inputs"] {
+        assert!(
+            status["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c == capability),
+            "missing {capability}: {status}"
+        );
+    }
     server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ready_build_is_available_over_api_and_reports_progress_events() {
+    let mut s = support::sandbox(
+        "daemon::init_api::ready_build_is_available_over_api_and_reports_progress_events",
+    );
+    let f = Fixture::start(
+        &mut s,
+        json!({}),
+        &[("Dockerfile.dev", "FROM scratch\n")],
+        &[],
+    )
+    .await;
+    let done = f.run("ready", json!(["--build"])).await;
+    assert_eq!(done["status"], "done", "{done}");
+    let command_id = done["id"].as_str().expect("command id");
+    let (_, events) = f
+        .server
+        .get(
+            &format!("/v1/worker/commands/{command_id}/events?format=json"),
+            Some(&f.key),
+        )
+        .await;
+    assert!(events.to_string().contains("ready"), "{events}");
+    assert!(
+        events.to_string().contains("contract builder progress"),
+        "{events}"
+    );
+    for call in f
+        .docker
+        .calls()
+        .iter()
+        .filter(|c| c.argv.first().is_some_and(|a| a == "build"))
+    {
+        assert!(
+            call.argv.iter().any(|a| a.starts_with("dev.awman.inputs=")),
+            "{call:?}"
+        );
+        assert!(
+            call.argv.iter().any(|a| a.starts_with("dev.awman.repo=")),
+            "{call:?}"
+        );
+    }
+    f.server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ready_refresh_is_refused_over_api_with_a_clear_error() {
+    let mut s =
+        support::sandbox("daemon::init_api::ready_refresh_is_refused_over_api_with_a_clear_error");
+    let f = Fixture::start(
+        &mut s,
+        json!({}),
+        &[("Dockerfile.dev", "FROM scratch\n")],
+        &[],
+    )
+    .await;
+    let calls_before = f.docker.calls().len();
+    let result = f.run("ready", json!(["--refresh"])).await;
+    assert_eq!(
+        f.docker.calls().len(),
+        calls_before,
+        "refresh refusal must precede all runtime work"
+    );
+    assert_eq!(result["status"], "error", "{result}");
+    assert!(
+        result
+            .to_string()
+            .contains("--refresh is unavailable through the API")
+            && result.to_string().contains("outside a command"),
+        "{result}"
+    );
+    f.server.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -516,4 +631,365 @@ async fn dynamic_workflow_fails_preflight_until_api_init_then_proceeds() {
     assert!(leader_launches(&f.docker) > 0, "{after}");
     assert!(after.to_string().contains("leader agent"), "{after}");
     f.server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ready_build_failure_is_terminal_error_with_streamed_diagnostics() {
+    let mut s = support::sandbox(
+        "daemon::init_api::ready_build_failure_is_terminal_error_with_streamed_diagnostics",
+    );
+    let f = Fixture::start(
+        &mut s,
+        json!({}),
+        &[("Dockerfile.dev", "FROM scratch\n")],
+        &[],
+    )
+    .await;
+    f.docker
+        .on(&["build"])
+        .stdout("injected builder failure\n")
+        .exit(23);
+    let done = f.run("ready", json!(["--build"])).await;
+    assert_eq!(done["status"], "error", "{done}");
+    let (_, events) = f
+        .server
+        .get(
+            &format!(
+                "/v1/worker/commands/{}/events?format=json",
+                done["id"].as_str().unwrap()
+            ),
+            Some(&f.key),
+        )
+        .await;
+    assert!(
+        events.to_string().contains("injected builder failure"),
+        "{events}"
+    );
+    assert!(
+        events.to_string().contains("Failed") || events.to_string().contains("failed"),
+        "{events}"
+    );
+    f.server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_session_setup_refreshes_stale_and_unlabeled_images_once_and_keeps_failed_images() {
+    let mut s = support::sandbox("daemon::init_api::api_session_setup_refreshes_stale_and_unlabeled_images_once_and_keeps_failed_images");
+    let f = Fixture::start(
+        &mut s,
+        json!({}),
+        &[("Dockerfile.dev", "FROM scratch\n")],
+        &[],
+    )
+    .await;
+    assert_eq!(f.session().await["setup_status"], "ready");
+    let builds = || {
+        f.docker
+            .calls()
+            .iter()
+            .filter(|call| call.argv.first().is_some_and(|a| a == "build"))
+            .count()
+    };
+    assert_eq!(
+        builds(),
+        2,
+        "unlabeled installed images converge during setup"
+    );
+    std::fs::write(
+        f.root.join("Dockerfile.dev"),
+        "FROM scratch\nRUN echo new-tools\n",
+    )
+    .unwrap();
+    let stale = f.create_local_session().await;
+    assert_eq!(f.wait_session(&stale).await["setup_status"], "ready");
+    assert_eq!(builds(), 4, "stale project and its agent rebuild in setup");
+    let next = f.create_local_session().await;
+    assert_eq!(f.wait_session(&next).await["setup_status"], "ready");
+    assert_eq!(builds(), 4, "the next session needs no build");
+
+    // Simulate images made by an older awman, retaining their IDs.
+    for entry in std::fs::read_dir(f.docker.dir().join("images")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some() {
+            continue;
+        }
+        let mut image: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        image[0]["Config"]["Labels"]
+            .as_object_mut()
+            .unwrap()
+            .remove("dev.awman.inputs");
+        std::fs::write(path, image.to_string()).unwrap();
+    }
+    let unlabeled = f.create_local_session().await;
+    assert_eq!(f.wait_session(&unlabeled).await["setup_status"], "ready");
+    assert_eq!(builds(), 6);
+    let next = f.create_local_session().await;
+    assert_eq!(f.wait_session(&next).await["setup_status"], "ready");
+    assert_eq!(builds(), 6);
+
+    let before: Vec<_> = std::fs::read_dir(f.docker.dir().join("images"))
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (path.clone(), std::fs::read(path).unwrap())
+        })
+        .collect();
+    std::fs::write(f.root.join("Dockerfile.dev"), "FROM scratch\nRUN false\n").unwrap();
+    f.docker
+        .on(&["build"])
+        .stdout("broken Dockerfile\n")
+        .exit(2)
+        .hold_until_released();
+    let failed = f.create_local_session().await;
+    wait_for_async("stale build held", Duration::from_secs(5), || async {
+        f.docker.calls().iter().any(|call| call.held).then_some(())
+    })
+    .await;
+    let worker = f.server.api.worker.as_ref().unwrap();
+    let mut events = worker
+        .setup_buses
+        .lock()
+        .await
+        .get(&failed)
+        .unwrap()
+        .subscribe();
+    f.docker.release();
+    assert_eq!(
+        f.wait_session(&failed).await["setup_status"],
+        "ready",
+        "a repair session can still run"
+    );
+    let mut warned = false;
+    while let Ok(event) = events.try_recv() {
+        if let awman::data::session_setup_event::SetupEventPayload::ImageStale(warning) =
+            event.payload
+        {
+            assert_eq!(
+                warning.kind,
+                awman::data::execution_event::StaleImageKind::Project
+            );
+            assert!(warning.reason.contains("broken Dockerfile"));
+            warned = true;
+        }
+    }
+    assert!(
+        warned,
+        "setup must publish the structured image_stale event"
+    );
+    for (path, bytes) in before {
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            bytes,
+            "failed rebuild preserves installed image"
+        );
+    }
+    f.server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pull_runner_reuses_mock_server_lease_images_and_cleans_at_lease_end_and_restart() {
+    use awman::data::{
+        fs::DataPaths,
+        worker::{lease_image_store::LeaseImageStore, link_store::LinkStore},
+    };
+    use awman_test_support::fakes::{FakeGitHttp, FakeWorkServer};
+    let mut s = support::sandbox("daemon::init_api::pull_runner_reuses_mock_server_lease_images_and_cleans_at_lease_end_and_restart");
+    let temp_root = s.root().display().to_string();
+    for key in ["TMPDIR", "TMP", "TEMP"] {
+        s.env_mut().set(key, &temp_root);
+    }
+    let endpoint = format!("unix://{}", s.work().join("fake-engine.sock").display());
+    s.env_mut().set("DOCKER_HOST", endpoint);
+    s.require::<LocalGit>();
+    let repo = RepoBuilder::new(&s, "seed-images")
+        .file("Dockerfile.dev", "FROM scratch\n")
+        .file(
+            ".awman/Dockerfile.claude",
+            "FROM awman-project:latest\nRUN echo agent\n",
+        )
+        .init();
+    let bare = repo.bare_remote("origin-images");
+    let git_http = FakeGitHttp::start(&s, bare.parent().unwrap());
+    let mock = FakeWorkServer::start(&s).await;
+    let link = mock.server().link();
+    mock.server()
+        .approve_link(&link.link_id, Default::default());
+    let client = awman_wsp::Client::new(mock.base_url(), String::new()).unwrap();
+    let token = client.poll_link(&link.link_id).await.unwrap().unwrap();
+    let paths = DataPaths::from_env(&support::env_snapshot(&s)).unwrap();
+    LinkStore::new(&paths).write("images", &token).unwrap();
+    let config = json!({"workServers":{"images":{"url":mock.base_url(),"claim":"manual","maxConcurrentJobs":2,"imageBudget":{"maxImages":2}}},
+        "daemon":{"features":{"worker":{"enabled":true,"push":{"enabled":true},"pull":{"enabled":true}}},
+        "network":{"listeners":{"component":{"features":["engine","worker"]}}}}});
+    let mut docker = None;
+    let api = Api::with_docker(&s, config.clone(), |fake| {
+        fake.enable_docker_image_store();
+        fake.on(&["build"]).stdout("lease builder progress\n").exit(0);
+        fake.on(&["rmi"]).exit(0);
+        fake.on(&["ps"]).exit(0);
+        fake.on(&["run"]).stdout("{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"session_id\":\"fixture\"}\n").exit(0);
+        docker = Some(fake.clone());
+    })
+    .await;
+    let docker = docker.unwrap();
+    let pull = api.api.pull.as_ref().expect("pull worker");
+    wait_for_async("worker registration", Duration::from_secs(5), || async {
+        pull.servers()
+            .iter()
+            .any(|server| server.name == "images" && server.state == "registered")
+            .then_some(())
+    })
+    .await;
+    let url = git_http.url(bare.file_name().unwrap().to_str().unwrap());
+    for id in ["image-first", "image-second", "image-changed"] {
+        if id == "image-changed" {
+            repo.write("Dockerfile.dev", "FROM scratch\nRUN echo changed\n")
+                .commit("new tools");
+            repo.git(&["push", bare.to_str().unwrap(), "main"]);
+        }
+        let mut item = awman_wsp::conformance::work_item(id);
+        item.repo.url = url.clone();
+        item.repo.base_ref = "main".into();
+        item.repo.branch = format!("wsp/{id}");
+        item.exec.agent = Some("claude".into());
+        item.exec.timeout_ms = Some(15_000);
+        mock.server().enqueue(item, chrono::Utc::now()).unwrap();
+        let record = wait_for_async(
+            "worker accepting claims",
+            Duration::from_secs(5),
+            || async {
+                match pull.claim(id, Some("images")).await {
+                    Ok(record) => Some(record),
+                    Err(awman::command::daemon_api::worker_pull::WorkerError::PullDisabled(_)) => {
+                        None
+                    }
+                    Err(error) => panic!("claim failed: {error}"),
+                }
+            },
+        )
+        .await;
+        wait_for_async("lease terminal", Duration::from_secs(10), || async {
+            let store = awman::data::worker::lease_store::LeaseStore::open(
+                api.api.worker.as_ref().unwrap().store.clone(),
+            )
+            .unwrap();
+            let row = store.get(&record.id).unwrap().unwrap();
+            (!row.state.is_active()).then_some(row)
+        })
+        .await;
+        let builds = docker
+            .calls()
+            .iter()
+            .filter(|call| call.argv.first().is_some_and(|a| a == "build"))
+            .count();
+        assert_eq!(
+            builds,
+            if id == "image-changed" { 4 } else { 2 },
+            "{id}: {:?}, server result: {:?}",
+            docker.calls(),
+            mock.server().result_for(id)
+        );
+    }
+    wait_for_async(
+        "lease end image eviction",
+        Duration::from_secs(5),
+        || async {
+            (docker
+                .calls()
+                .iter()
+                .filter(|call| call.argv.first().is_some_and(|a| a == "rmi"))
+                .count()
+                == 2)
+                .then_some(())
+        },
+    )
+    .await;
+    repo.write("Dockerfile.dev", "FROM scratch\nRUN echo concurrent\n")
+        .commit("concurrent tools");
+    repo.git(&["push", bare.to_str().unwrap(), "main"]);
+    docker
+        .on(&["build"])
+        .stdout("held lease builder\n")
+        .hold_until_released();
+    for id in ["concurrent-a", "concurrent-b"] {
+        let mut item = awman_wsp::conformance::work_item(id);
+        item.repo.url = url.clone();
+        item.repo.base_ref = "main".into();
+        item.repo.branch = format!("wsp/{id}");
+        item.exec.agent = Some("claude".into());
+        item.exec.timeout_ms = Some(15_000);
+        mock.server().enqueue(item, chrono::Utc::now()).unwrap();
+    }
+    let first = pull.claim("concurrent-a", Some("images")).await.unwrap();
+    let second = pull.claim("concurrent-b", Some("images")).await.unwrap();
+    let db = api.api.worker.as_ref().unwrap().store.clone();
+    wait_for_async("concurrent leases reserve the same project", Duration::from_secs(5), || async {
+        let count: i64 = db.with_conn(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM (SELECT u.tag FROM worker_lease_image_uses u JOIN worker_leases l ON u.lease=l.id WHERE l.state IN ('claimed','preparing','running') GROUP BY u.tag HAVING COUNT(*)=2)", [], |row| row.get(0))?)).unwrap();
+        (count > 0).then_some(())
+    }).await;
+    docker.release();
+    for lease in [&first, &second] {
+        wait_for_async(
+            "concurrent lease terminal",
+            Duration::from_secs(10),
+            || async {
+                let row = awman::data::worker::lease_store::LeaseStore::open(db.clone())
+                    .unwrap()
+                    .get(&lease.id)
+                    .unwrap()
+                    .unwrap();
+                (!row.state.is_active()).then_some(())
+            },
+        )
+        .await;
+    }
+    assert_eq!(
+        docker
+            .calls()
+            .iter()
+            .filter(|call| call.argv.first().is_some_and(|a| a == "build"))
+            .count(),
+        6,
+        "concurrent leases share one project and agent build"
+    );
+    wait_for_async(
+        "concurrent lease end eviction",
+        Duration::from_secs(5),
+        || async {
+            (docker
+                .calls()
+                .iter()
+                .filter(|call| call.argv.first().is_some_and(|a| a == "rmi"))
+                .count()
+                == 4)
+                .then_some(())
+        },
+    )
+    .await;
+    let db = api.api.worker.as_ref().unwrap().store.clone();
+    api.shutdown().await;
+    // Lower the budget while stopped. Startup recovery must evict even with
+    // no new lease ending, retaining only the newest cached image.
+    let mut smaller = config;
+    smaller["workServers"]["images"]["imageBudget"]["maxImages"] = json!(1);
+    let restarted = Api::restart_with_config(&s, smaller).await;
+    wait_for_async(
+        "worker startup image eviction",
+        Duration::from_secs(5),
+        || async {
+            (docker
+                .calls()
+                .iter()
+                .filter(|call| call.argv.first().is_some_and(|a| a == "rmi"))
+                .count()
+                == 5)
+                .then_some(())
+        },
+    )
+    .await;
+    let store = LeaseImageStore::open(db).unwrap();
+    assert!(store.servers("nonexistent").unwrap().is_empty());
+    restarted.shutdown().await;
+    mock.shutdown().await;
+    drop(git_http);
 }

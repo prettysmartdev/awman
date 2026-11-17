@@ -63,6 +63,7 @@ values use these defaults:
 | `workServers.<name>.maxConcurrentJobs` | `1` | Maximum simultaneous leases from this server. |
 | `workServers.<name>.interaction` | inherited | Optional `interactive` or `headless` mode for this server's jobs. |
 | `workServers.<name>.labels` | `{}` | Owner-configured labels reported by this worker. |
+| `workServers.<name>.imageBudget` | `{ "maxImages": 20 }` | Most images built for leases that the worker keeps; see [Lease images](#lease-images-and-the-image-budget). |
 
 The per-server limit and the daemon's shared worker capacity both apply. A
 server cannot run more than `maxConcurrentJobs` (a positive integer), and
@@ -77,6 +78,46 @@ slot is handed to a pushed job as soon as one is waiting for it. `manual`
 registers and lists eligible items but waits for a person to choose one through
 the queue picker. Changing a server to disabled or manual stops new automatic
 claims; accepted leases continue. Settings are live while the daemon runs.
+
+## Lease images and the image budget
+
+On Docker and Apple Containers, a pulled lease builds its project and agent images under names derived from their content rather than from the checkout folder: a repository key (from the origin URL, so every clone of one repository shares it) plus the inputs hash described in [Runtimes](11-runtimes.md#keeping-images-fresh-docker-and-apple-containers). A later lease for the same repository with the same Dockerfiles and copied files finds the images already built and reuses them; changing the project Dockerfile or a copied file produces new images. Leases that start together share one build. A repository with no project Dockerfile uses awman's default base image, which is shared across repositories.
+
+Project recipes with unresolved COPY/ADD sources (including globs and `COPY .`) build separately for each lease. Agent recipes that copy files from the build context also build separately for each lease. This prevents one checkout from reusing another checkout's untracked inputs. Agent bases are pinned to the prepared project image ID; multi-stage recipes, untagged project references and `ARG` defaults are supported. Ambiguous awman project bases or unsupported FROM variables fail with a configuration error.
+
+A lease can launch only agents provisioned from its workflow or configured dynamic agent pool. Include any delegated agent in that pool. Lease Dockerfiles must be regular files inside the checkout; symlinks and paths outside it are refused.
+
+A worker that does this reports the `lease_image_reuse` capability. Runtimes that import images (builtin) keep their previous behaviour and do not report it.
+
+Reused images accumulate, so each work server has an `imageBudget` limiting what the worker keeps:
+
+```json
+{
+  "workServers": {
+    "team": {
+      "url": "https://work.example.com",
+      "imageBudget": { "maxImages": 10, "maxBytes": "20GiB" }
+    }
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `maxImages` | Most lease-built images to keep (integer, at least 1). |
+| `maxBytes` | Most total reported image size to keep, as a size such as `"20GiB"`. Shared layers count in each image’s reported size, so this is a conservative cache budget rather than a measurement of disk space freed. |
+
+Without `imageBudget` the limit is `maxImages: 20` and no byte limit. Once you set `imageBudget`, a key you leave out is unlimited (setting only `maxBytes` puts no limit on the count). The settings are live.
+
+Cleanup runs when the worker starts and recovers, after an image is provisioned, and when a lease ends. It follows these rules:
+
+- Only images the worker built itself are removed. An image that already existed when a lease needed it is reused but never removed.
+- The least recently used images go first, and the budget is re-checked after each removal.
+- Images an active lease uses are never removed. If active leases alone exceed the budget, awman keeps those images and warns once.
+- An image whose tag now points at a different image is left alone.
+- A failed removal never changes a lease's result; the image stays recorded and a later cleanup tries again.
+
+`awman clean` also lists unused lease images; see [Cleaning up](13-cleaning-up.md).
 
 ## Labels and affinity
 

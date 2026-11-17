@@ -626,6 +626,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                 this.shared.command_cancels.unregister(job);
             }
             this.active.lock().unwrap().remove(record.id.as_str());
+            let _ = this.cleanup_images().await;
             if let Err(error) = this.cleanup_retired() {
                 tracing::warn!(%error, "deferred unlink cleanup failed");
             }
@@ -724,9 +725,11 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
         run_session.set_inline_work_item(inline.path().to_path_buf());
         provision::agents_for_lease(
             &self.shared.engines,
-            &run_session,
+            &mut run_session,
             &lease.item,
             workspace.private_dir(),
+            self.shared.store.clone(),
+            record,
         )
         .await?;
         let session_key = crate::data::ids::WorkerSessionId::new().to_string();

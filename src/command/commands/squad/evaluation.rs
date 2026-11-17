@@ -28,8 +28,8 @@ use crate::command::commands::squad::overlay_summary::overlay_inventory;
 use crate::command::commands::squad::runtime_guard::require_container_tier;
 use crate::command::commands::workflow_preflight::{
     build_effective_agents_to_models, ensure_agent_image_with_build_output,
-    format_agents_with_models, format_available_agents, validate_generated_workflow,
-    BuildOutputTarget, MissingDockerfilePolicy,
+    format_agents_with_models, format_available_agents, refresh_stale_workflow_images,
+    validate_generated_workflow, BuildOutputTarget, MissingDockerfilePolicy,
 };
 use crate::command::commands::{parse_overlay_list, CollectedOverlays, Command};
 use crate::command::dispatch::Engines;
@@ -659,6 +659,17 @@ impl LocalTaskEvaluator {
                 }
             }
         }
+        // WI 0163: rebuild the task workspace's stale (or unlabeled) named
+        // images once for the whole pool; a failed rebuild keeps the previous
+        // image and is logged as an `image_stale` warning.
+        refresh_stale_workflow_images(
+            &self.engines,
+            &session,
+            &pool_agents,
+            &mut sink,
+            Some(&mut build_logs),
+        )
+        .await?;
         for pool_agent in &pool_agents {
             ensure_agent_image_with_build_output(
                 &self.engines,

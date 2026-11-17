@@ -436,6 +436,7 @@ pub mod features {
     pub const LEASE_READ_ONLY: &str = "lease_read_only";
     pub const LEASE_GIT_AUTH_FAILURE: &str = "lease_git_auth_failure";
     pub const LEASE_PUSH_RETRY: &str = "lease_push_retry";
+    pub const LEASE_IMAGE_REUSE: &str = "lease_image_reuse";
     pub const ALL: &[&str] = &[
         LEASE_CONTEXT,
         LEASE_WORKFLOW_CONTEXT,
@@ -452,5 +453,6 @@ pub mod features {
         LEASE_READ_ONLY,
         LEASE_GIT_AUTH_FAILURE,
         LEASE_PUSH_RETRY,
+        LEASE_IMAGE_REUSE,
     ];
 }

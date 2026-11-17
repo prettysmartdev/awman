@@ -34,6 +34,20 @@ pub trait UserMessageSink: Send + Sync {
     /// Drain queued messages (no-op for sinks that render live). Idempotent.
     fn replay_queued(&mut self);
 
+    /// A stale image's rebuild failed and the session keeps its previous
+    /// image (WI 0163). Event frontends override this to post the structured
+    /// `image_stale` event; every other sink shows its text as a warning.
+    /// Wrapping sinks must forward it.
+    fn report_image_stale(&mut self, warning: &crate::data::execution_event::ImageStaleWarning) {
+        let text = crate::data::execution_event::EventPayload::ImageStale(warning.clone())
+            .to_plain_text()
+            .unwrap_or_default();
+        self.write_message(UserMessage {
+            level: MessageLevel::Warning,
+            text,
+        });
+    }
+
     fn info(&mut self, text: impl Into<String>)
     where
         Self: Sized,
@@ -89,6 +103,10 @@ impl<S: UserMessageSink + ?Sized> UserMessageSink for std::sync::Arc<std::sync::
 
     fn replay_queued(&mut self) {
         self.lock().unwrap().replay_queued();
+    }
+
+    fn report_image_stale(&mut self, warning: &crate::data::execution_event::ImageStaleWarning) {
+        self.lock().unwrap().report_image_stale(warning);
     }
 }
 

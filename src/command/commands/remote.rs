@@ -519,6 +519,15 @@ async fn run_remote_exec(
                             });
                         }
                     }
+                    // WI 0163: a stale image could not be rebuilt.
+                    payload @ EventPayload::ImageStale(_) => {
+                        if let Some(text) = payload.to_plain_text() {
+                            self.sink.write_message(UserMessage {
+                                level: MessageLevel::Warning,
+                                text,
+                            });
+                        }
+                    }
                     EventPayload::WorkflowStepTransition {
                         step_name,
                         step_index,

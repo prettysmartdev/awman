@@ -8,6 +8,8 @@
 //! [`LeaseRecord`] (`lease_…`) carrying the work server's own lease ID.
 pub mod job_store;
 pub mod labels;
+pub mod lease_image_store;
+pub mod lease_images;
 pub mod lease_store;
 pub mod link_store;
 pub mod paths;
