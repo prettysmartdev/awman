@@ -108,7 +108,7 @@ fn squad_task_slug(git_root: &Path) -> Option<String> {
     let leaf = components.next()?.as_os_str().to_str()?;
     let slug = components.next()?.as_os_str().to_str()?;
     let tasks = components.next()?.as_os_str().to_str()?;
-    if leaf != "workspace" || tasks != "tasks" {
+    if leaf != crate::data::checkout_paths::SQUAD_WORKSPACE_LEAF || tasks != "tasks" {
         return None;
     }
     let is_lower_alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();

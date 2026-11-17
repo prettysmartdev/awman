@@ -92,7 +92,7 @@ impl SkillDirs {
     /// Does not create, delete, or validate the path; callers must pass an
     /// already-validated slug.
     pub fn library_dir(&self, slug: &str) -> PathBuf {
-        self.library_root().join(slug)
+        crate::data::checkout_paths::skill_library_clone_path(&self.library_root(), slug)
     }
 
     /// List the slugs of all currently-pulled skill libraries, in ascending

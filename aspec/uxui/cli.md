@@ -112,7 +112,8 @@ command and no alias for the retired spec-amendment subcommand.
 
 ## Work item reference grammar
 
-Commands that accept a work item use the shared `--work-item <REF>` flag.
+Commands that accept a work item use the shared `--work-item <REF>` flag,
+with `-w <REF>` as its short alias on every command that supports it.
 The value is a single reference, not a comma-separated list. Its grammar is:
 
 - A bare value, resolved using `workItems.source` (`local`, `github`, or

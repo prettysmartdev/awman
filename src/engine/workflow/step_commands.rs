@@ -123,18 +123,6 @@ fn sh_quote(s: &str) -> String {
     out
 }
 
-/// Directory a `clone_repo` step will clone into: the `into` field when set,
-/// otherwise the "humanish" name git derives from the URL (last path
-/// component, trailing `/` and `.git` stripped).
-fn clone_target_dir(url: &str, into: Option<&str>) -> String {
-    if let Some(d) = into {
-        return d.to_string();
-    }
-    let trimmed = url.trim_end_matches('/');
-    let name = trimmed.rsplit(['/', ':']).next().unwrap_or(trimmed);
-    name.strip_suffix(".git").unwrap_or(name).to_string()
-}
-
 /// Translate a setup step into a shell command string and optional env overrides.
 pub fn setup_step_to_shell(step: &SetupStep) -> (String, Option<HashMap<String, String>>) {
     setup_step_to_shell_with(step, &StepCommandOptions::default())
@@ -156,19 +144,16 @@ pub fn setup_step_to_shell_with(
                 clone.push_str(&format!(" -b {}", sh_quote(b)));
             }
             clone.push_str(&format!(
-                " {}{}",
-                if opts.remote_url.is_some() { "-- " } else { "" },
+                " -- {}",
                 sh_quote(opts.remote_url.as_deref().unwrap_or(url))
             ));
-            if let Some(d) = into {
-                clone.push_str(&format!(" {}", sh_quote(d)));
-            }
+            let dir = crate::data::checkout_paths::clone_target_dir(url, into.as_deref());
+            clone.push_str(&format!(" {}", sh_quote(&dir)));
             // The step is a conflict only when the target directory already
             // holds a clone of this exact URL (per remote.origin.url in its
             // .git/config); `conflict_mode` decides what happens then. A
             // directory occupied by anything else is left alone in every mode
             // — `git clone` itself fails on it with a clear error.
-            let dir = clone_target_dir(url, into.as_deref());
             let already_cloned = format!(
                 "[ -f {config_q} ] && [ \"$(git -C {dir_q} config --get remote.origin.url)\" = {url_q} ]",
                 config_q = sh_quote(&format!("{dir}/.git/config")),
@@ -439,7 +424,7 @@ pub fn substitute_teardown_step(
                 Some(t) => Some(sub(t, ctx)),
                 None => ctx.map(|wi| {
                     if wi.title.is_empty() {
-                        format!("Implement awman/work-item-{}", wi.key)
+                        format!("Implement work item {}", wi.key)
                     } else {
                         wi.title.clone()
                     }

@@ -7,6 +7,10 @@ existing issue with `edit spec`. A separate `--pr` option on `chat` and
 `exec prompt` opens a pull request in a worktree; see
 [Pull requests for `--pr`](#pull-requests-for---pr).
 
+Every command that accepts `--work-item` also accepts `-w`, including
+`new spec`, `exec prompt`, `exec workflow`, and the remote execution variants.
+For example, `awman exec prompt -w github:84` uses issue 84 as its prompt.
+
 ## Choose GitHub as the default source
 
 Set this in the repository config to make bare numbers refer to issues in the

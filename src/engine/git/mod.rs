@@ -7,12 +7,10 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
+use crate::data::checkout_paths::WorktreePaths;
 use crate::data::error::DataError;
 use crate::data::message::{MessageLevel, UserMessage};
 use crate::data::session::GitRootResolver;
-use crate::data::worktree_paths::{
-    worktree_branch_name, worktree_branch_name_for_workflow, WorktreePaths,
-};
 use crate::engine::error::{EngineError, MergeFailedDetail};
 
 pub mod auth_classify;
@@ -634,54 +632,16 @@ impl GitEngine {
         Ok(summary)
     }
 
-    /// `~/.awman/worktrees/<dirname>-<hash8>/<NNNN>/` for a work-item, or the
-    /// legacy unhashed path when it holds a worktree of this repository
-    /// (see [`Self::pick_worktree_path`]).
+    /// Canonical work-item directory under the hashed repository key.
     pub fn worktree_path(&self, git_root: &Path, work_item: u32) -> Result<PathBuf, EngineError> {
-        let p = WorktreePaths::from_env(self.env()).map_err(EngineError::Data)?;
-        let root = canonical_or_given(git_root);
-        Ok(self.pick_worktree_path(
-            &root,
-            p.for_work_item(&root, work_item),
-            p.legacy_for_work_item(&root, work_item),
-        ))
+        let paths = WorktreePaths::from_env(self.env()).map_err(EngineError::Data)?;
+        Ok(paths.for_work_item(&canonical_or_given(git_root), work_item))
     }
 
-    /// `~/.awman/worktrees/<dirname>-<hash8>/wf-<name>/` for a named workflow,
-    /// or the legacy unhashed path when it holds a worktree of this repository
-    /// (see [`Self::pick_worktree_path`]).
+    /// Canonical named-workflow directory under the hashed repository key.
     pub fn worktree_path_named(&self, git_root: &Path, name: &str) -> Result<PathBuf, EngineError> {
-        let p = WorktreePaths::from_env(self.env()).map_err(EngineError::Data)?;
-        let root = canonical_or_given(git_root);
-        Ok(self.pick_worktree_path(
-            &root,
-            p.for_workflow(&root, name),
-            p.legacy_for_workflow(&root, name),
-        ))
-    }
-
-    /// The hashed path, unless it does not exist while the legacy path does
-    /// and `git worktree list` in `git_root` names the legacy path — then the
-    /// legacy path, so a worktree made before the hashed key is still found.
-    /// A legacy directory owned by another checkout with the same dirname is
-    /// ignored. A `list_worktrees` failure counts as "not listed".
-    pub fn pick_worktree_path(&self, git_root: &Path, hashed: PathBuf, legacy: PathBuf) -> PathBuf {
-        if hashed.exists() || !legacy.exists() {
-            return hashed;
-        }
-        let legacy_canonical = canonical_or_given(&legacy);
-        let listed = self
-            .list_worktrees(git_root)
-            .map(|wts| {
-                wts.iter()
-                    .any(|wt| canonical_or_given(wt) == legacy_canonical)
-            })
-            .unwrap_or(false);
-        if listed && self.validate_worktree_owner(git_root, &legacy).is_ok() {
-            legacy
-        } else {
-            hashed
-        }
+        let paths = WorktreePaths::from_env(self.env()).map_err(EngineError::Data)?;
+        Ok(paths.for_workflow(&canonical_or_given(git_root), name))
     }
 
     /// Paths of every worktree of `git_root` (including the main checkout,
@@ -834,16 +794,6 @@ impl GitEngine {
             }
         }
         Ok(())
-    }
-
-    /// Branch name for a work-item (`awman/work-item-NNNN`).
-    pub fn branch_name_for_work_item(&self, work_item: u32) -> String {
-        worktree_branch_name(work_item)
-    }
-
-    /// Branch name for a named workflow (`awman/workflow-<name>`).
-    pub fn branch_name_for_workflow(&self, name: &str) -> String {
-        worktree_branch_name_for_workflow(name)
     }
 
     /// `git worktree add <path> [-b] <branch>`.

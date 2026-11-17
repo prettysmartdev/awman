@@ -443,8 +443,8 @@ impl SessionCreateRequest {
                 if self.push && branch.is_none() {
                     return Err(CommandError::SessionFieldRequiresBranch { field: "push" });
                 }
-                let folder = repo_folder_from_url(&repo_url);
-                let cloned = policy.clone_base_dir.join(&folder);
+                let cloned =
+                    crate::data::checkout_paths::clone_path(&policy.clone_base_dir, &repo_url);
                 Ok(SessionCreatePlan {
                     context_key,
                     kind,
@@ -458,27 +458,6 @@ impl SessionCreateRequest {
                 })
             }
         }
-    }
-}
-
-/// Derive a safe folder name for the clone target from a repo URL.
-///
-/// The folder is used as the on-disk repo name under `<session>/`, which in
-/// turn drives the `awman-<repo>:latest` image tag (see `data::image_tags`).
-/// Returning a per-repo name avoids cross-session image collisions when a
-/// frontend hosts multiple remote sessions.
-pub fn repo_folder_from_url(url: &str) -> String {
-    let trimmed = url.trim().trim_end_matches('/');
-    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
-    let last = trimmed.rsplit(['/', ':']).next().unwrap_or("");
-    let safe: String = last
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        .collect();
-    if safe.is_empty() || safe == "." || safe == ".." {
-        "repo".to_string()
-    } else {
-        safe
     }
 }
 

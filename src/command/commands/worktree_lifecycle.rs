@@ -357,7 +357,6 @@ pub struct WorktreeLifecycle {
     git_engine: Arc<GitEngine>,
     git_root: PathBuf,
     worktree_path: PathBuf,
-    creation_path: PathBuf,
     branch: String,
 }
 
@@ -380,31 +379,24 @@ impl WorktreeLifecycle {
                     None => WorktreeName::Workflow(item.key.clone()),
                 };
             }
-            let slug = item.slug.as_deref().unwrap_or("work-item");
-            let legacy_name = format!("{slug}-{}", item.key);
             if let crate::command::work_item::WorkItemOrigin::Remote { provider, .. } = &item.origin
             {
                 if provider == "github" {
                     if let Some(number) = item.number {
-                        let title = crate::data::issue::slugify(&item.title, 40);
-                        let name = if title.is_empty() {
-                            number.to_string()
-                        } else {
-                            format!("{number}-{title}")
-                        };
-                        return WorktreeName::GithubIssue { name, legacy_name };
+                        let name =
+                            crate::data::checkout_paths::github_worktree_name(number, &item.title);
+                        return WorktreeName::GithubIssue(name);
                     }
                 }
             }
-            return WorktreeName::Workflow(legacy_name);
+            return WorktreeName::Workflow(crate::data::checkout_paths::remote_worktree_name(
+                item.slug.as_deref(),
+                &item.key,
+            ));
         }
-        WorktreeName::Workflow(
-            workflow_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("workflow")
-                .to_string(),
-        )
+        WorktreeName::Workflow(crate::data::checkout_paths::workflow_name_from_path(
+            workflow_path,
+        ))
     }
 
     /// Open the lifecycle for a [`WorktreeName`].
@@ -416,31 +408,19 @@ impl WorktreeLifecycle {
         match name {
             WorktreeName::Workflow(name) => Self::for_workflow(git_engine, git_root, name),
             WorktreeName::WorkItem(number) => Self::for_work_item(git_engine, git_root, *number),
-            WorktreeName::GithubIssue { name, legacy_name } => {
-                let legacy = Self::for_workflow(git_engine.clone(), git_root.clone(), legacy_name)?;
-                let path = crate::data::worktree_paths::WorktreePaths::from_env(git_engine.env())?
+            WorktreeName::GithubIssue(name) => {
+                let path = crate::data::checkout_paths::WorktreePaths::from_env(git_engine.env())?
                     .named(
                         &git_root
                             .canonicalize()
                             .map_err(|e| CommandError::Other(e.to_string()))?,
                         name,
                     );
-                // Keep interrupted runs on their original branch. Only reuse
-                // a legacy directory if Git verifies that this repo owns it.
-                if git_engine.pick_worktree_path(
-                    &git_root,
-                    path.clone(),
-                    legacy.worktree_path.clone(),
-                ) != path
-                {
-                    return Ok(legacy);
-                }
                 Ok(Self {
                     git_engine,
                     git_root,
-                    worktree_path: path.clone(),
-                    creation_path: path,
-                    branch: format!("awman/{name}"),
+                    worktree_path: path,
+                    branch: crate::data::checkout_paths::awman_branch_name(name),
                 })
             }
         }
@@ -454,19 +434,11 @@ impl WorktreeLifecycle {
         let worktree_path = git_engine
             .worktree_path_named(&git_root, workflow_name)
             .map_err(CommandError::from)?;
-        let creation_path = crate::data::worktree_paths::WorktreePaths::from_env(git_engine.env())?
-            .for_workflow(
-                &git_root
-                    .canonicalize()
-                    .map_err(|e| CommandError::Other(e.to_string()))?,
-                workflow_name,
-            );
-        let branch = git_engine.branch_name_for_workflow(workflow_name);
+        let branch = crate::data::checkout_paths::worktree_branch_name_for_workflow(workflow_name);
         Ok(Self {
             git_engine,
             git_root,
             worktree_path,
-            creation_path,
             branch,
         })
     }
@@ -479,19 +451,11 @@ impl WorktreeLifecycle {
         let worktree_path = git_engine
             .worktree_path(&git_root, work_item)
             .map_err(CommandError::from)?;
-        let creation_path = crate::data::worktree_paths::WorktreePaths::from_env(git_engine.env())?
-            .for_work_item(
-                &git_root
-                    .canonicalize()
-                    .map_err(|e| CommandError::Other(e.to_string()))?,
-                work_item,
-            );
-        let branch = git_engine.branch_name_for_work_item(work_item);
+        let branch = crate::data::checkout_paths::worktree_branch_name(work_item);
         Ok(Self {
             git_engine,
             git_root,
             worktree_path,
-            creation_path,
             branch,
         })
     }
@@ -625,7 +589,6 @@ impl WorktreeLifecycle {
                         &self.worktree_path,
                         frontend,
                     )?;
-                    self.worktree_path = self.creation_path.clone();
                 }
                 ExistingWorktreeDecision::Fail => {
                     return Err(CommandError::WorktreeExists {
@@ -1107,6 +1070,6 @@ pub enum WorktreeName {
     Workflow(String),
     /// A work item number.
     WorkItem(u32),
-    /// Issue number and sanitized title; legacy naming is only for resume.
-    GithubIssue { name: String, legacy_name: String },
+    /// GitHub issue number and sanitized title.
+    GithubIssue(String),
 }

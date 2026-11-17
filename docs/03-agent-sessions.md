@@ -1177,7 +1177,7 @@ Each step's `status` is `ok`, `skipped`, `warn`, `failed`, `pending` or `running
 | `--worktree` | — | — | ✓ | Run in an isolated, managed Git worktree (a switch on this command) |
 | `--auto` | ✓ | ✓ | ✓ | Auto-approve file edits, prompt for shell commands |
 | `--yolo` | ✓ | ✓ | ✓ | Fully autonomous mode |
-| `--work-item <REF>` | — | ✓ | ✓ | Supply a local or external work item; see [GitHub Integration](10-github-integration.md) |
+| `--work-item <REF>` | `-w` | ✓ | ✓ | Supply a local or external work item; see [GitHub Integration](10-github-integration.md) |
 | `--dynamic` | — | — | ✓ | Have a leader agent design the workflow; implies `--yolo`, `--worktree`, `context(workflow)` |
 | `--leader <agent::model>` | — | — | ✓ | Leader agent and model for `--dynamic` |
 | `--on-existing-worktree`, `--on-dirty-merge-target`, `--on-merge-failure` | — | — | ✓ | Answer worktree lifecycle questions up front — see [Workflows](05-workflows.md#worktrees) |

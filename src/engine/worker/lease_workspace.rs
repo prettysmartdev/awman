@@ -13,8 +13,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::error::WorkerEngineError;
+use crate::data::checkout_paths::{lease_dir, leases_dir};
 use crate::data::ids::LeaseId;
-use crate::data::worker::paths::{lease_dir, leases_dir};
 use crate::engine::agent_runtime::Capabilities;
 
 fn io(path: &Path, e: impl std::fmt::Display) -> WorkerEngineError {

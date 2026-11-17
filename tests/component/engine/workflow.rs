@@ -265,3 +265,44 @@ fn reported_error_waits_for_repair_while_blocked_and_done_keep_their_policies() 
         ReportedResponse::Resume
     );
 }
+
+#[test]
+fn clone_step_uses_the_shared_destination_for_creation_and_conflicts() {
+    use awman::data::checkout_paths::clone_path;
+    use awman::data::workflow_definition::{CloneConflictMode, SetupStep};
+    use awman::engine::workflow::step_commands::setup_step_to_shell;
+
+    let sandbox = support::sandbox(
+        "engine::workflow::clone_step_uses_the_shared_destination_for_creation_and_conflicts",
+    );
+    let source = RepoBuilder::new(&sandbox, "source with spaces")
+        .file("README", "source content")
+        .init();
+    let url = source.path().to_string_lossy().into_owned();
+    let work = sandbox.work().join("clone-step");
+    std::fs::create_dir(&work).unwrap();
+    let dest = clone_path(&work, &url);
+    let command = |mode| {
+        setup_step_to_shell(&SetupStep::CloneRepo {
+            url: url.clone(),
+            branch: None,
+            into: None,
+            conflict_mode: mode,
+        })
+        .0
+    };
+    let run = |mode| sh(&sandbox, &work, &command(mode));
+    assert!(run(CloneConflictMode::Skip).exit.success());
+    assert_eq!(
+        std::fs::read_to_string(dest.join("README")).unwrap(),
+        "source content"
+    );
+    std::fs::write(dest.join("keep"), "local changes").unwrap();
+    assert!(run(CloneConflictMode::Skip).exit.success());
+    assert!(dest.join("keep").exists());
+    assert!(!run(CloneConflictMode::Error).exit.success());
+    assert!(dest.join("keep").exists());
+    assert!(run(CloneConflictMode::Replace).exit.success());
+    assert!(!dest.join("keep").exists());
+    assert!(dest.join("README").exists());
+}

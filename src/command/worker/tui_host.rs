@@ -1034,7 +1034,7 @@ impl ManualRun {
         git.create_worktree_from_commit(
             invoker.git_root(),
             &path,
-            &format!("awman/{}", self.record.id),
+            &crate::data::checkout_paths::awman_branch_name(self.record.id.as_str()),
             &head,
         )
         .map_err(|e| e.to_string())?;

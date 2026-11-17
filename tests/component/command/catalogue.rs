@@ -562,3 +562,47 @@ fn edit_interview_conflicts_with_headless_and_json_and_every_leaf_needs_a_runtim
         .contains(&"interview"));
     assert!(flag_names(&["edit", "spec"]).contains(&"amend"));
 }
+
+#[test]
+fn work_item_short_alias_parses_on_every_supporting_command() {
+    let catalogue = CommandCatalogue::get();
+    let mut supported = Vec::new();
+    for (path, spec) in leaves() {
+        let Some(flag) = spec.find_flag("work-item") else {
+            continue;
+        };
+        supported.push(path.join(" "));
+        assert_eq!(flag.short, Some('w'), "{path:?}");
+        assert_eq!(
+            spec.flags.iter().filter(|f| f.short == Some('w')).count(),
+            1
+        );
+        for spelling in [vec!["-w", "github:42"], vec!["--work-item", "github:42"]] {
+            let parsed = catalogue.parse_raw_args(&path, &args(&spelling)).unwrap();
+            assert_eq!(
+                parsed.flag_string("work-item").as_deref(),
+                Some("github:42"),
+                "{path:?}"
+            );
+            let mut argv = vec!["awman"];
+            argv.extend_from_slice(&path);
+            argv.extend_from_slice(&spelling);
+            let matches = catalogue
+                .build_clap_command()
+                .try_get_matches_from(argv)
+                .unwrap();
+            let mut leaf = &matches;
+            for command in &path {
+                leaf = leaf.subcommand_matches(command).unwrap();
+            }
+            assert_eq!(
+                leaf.get_one::<String>("work-item").map(String::as_str),
+                Some("github:42")
+            );
+        }
+    }
+    assert_eq!(
+        supported.into_iter().collect::<BTreeSet<_>>(),
+        WORK_ITEM_COMMANDS.iter().map(|p| p.join(" ")).collect()
+    );
+}

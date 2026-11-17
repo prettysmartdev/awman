@@ -29,6 +29,37 @@ or falling back to another source. Dynamic workflows also require a work
 item. A regular workflow may still run without one when its template does not
 need work item values.
 
+## Canonical checkout names and paths — breaking beta change
+
+awman is beta software and does not guarantee compatibility between versions.
+Branches, worktrees and clones now have one naming rule per checkout type.
+Creation, resume and recreation use the same canonical location; historical
+names are no longer generated, searched or used as fallbacks.
+
+| Retired case | Current behavior |
+|---|---|
+| Unhashed `~/.awman/worktrees/<repo>/` directories for work items, workflows and session worktrees | Only `~/.awman/worktrees/<repo>-<path-hash>/` is used. Name lookup and missing-name suggestions no longer inspect the unhashed directory. |
+| GitHub issue worktrees named `wf-<provider-slug>-<item-key>/`, with `awman/workflow-<provider-slug>-<item-key>` branches | GitHub issues use `<number>-<title-slug>/` and `awman/<number>-<title-slug>`. Resume and recreate no longer retain the old issue naming scheme. Non-GitHub remote items continue to use their provider slug and stable key. |
+| Unencoded workflow names, including raw Unicode or names containing unsafe characters | The directory `wf-<encoded-name>/` and branch `awman/workflow-<encoded-name>` share one safe name, with a hash suffix when encoding or shortening changes it. Previous spellings are not discovered automatically. |
+| Fixed remote-session `<session>/repo/` clone slot | Remote clones use `<session>/<repository-folder>/`, derived from the repository URL by the shared clone naming policy. There is no alternate `repo/` slot. |
+| Per-session `<session>/worktree/` placeholder | Session initialization no longer creates this unused directory. Managed linked worktrees use the canonical repository-keyed worktree directory. |
+| Branch-shaped fallback PR titles derived from arbitrary work-item keys | A work item with no title uses `Implement work item <key>`; awman no longer invents a legacy `awman/work-item-<key>` branch name for that title. |
+
+Compatibility helpers and exports for the retired naming schemes have been
+removed. Workflow `clone_repo` steps and remote sessions use the same default
+repository-folder rule, and clone steps pass that destination explicitly to
+Git. Explicit `into` paths are unchanged.
+
+No automatic migration, deletion or branch renaming is performed. Review and
+preserve any outstanding work with Git before moving or removing old worktrees.
+An old worktree that still has the requested branch checked out can prevent
+Git from creating a new worktree for that branch. Explicit paths to existing
+linked worktrees remain subject to the normal repository ownership checks;
+they do not trigger legacy-name discovery.
+
+Every command that supports `--work-item` now also accepts `-w`, including
+remote execution commands.
+
 ---
 
 [Back to contents](../contents.md)

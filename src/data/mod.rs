@@ -15,6 +15,7 @@ pub mod ci_poll_event;
 pub mod clock;
 // `command_status::CommandStatus` (API command rows) is not re-exported here;
 // `data::InvocationStatus` names the in-memory session command status.
+pub mod checkout_paths;
 pub mod command_status;
 pub mod config;
 pub mod context;
@@ -59,7 +60,6 @@ pub mod workflow_definition;
 pub mod workflow_prompt_template;
 pub mod workflow_state;
 pub mod workflow_state_store;
-pub mod worktree_paths;
 
 pub use api_lifecycle_store::{CommandLifecycleStore, RunRecord};
 pub use error::DataError;
@@ -78,7 +78,6 @@ pub use workflow_state::{
     WORKFLOW_STATE_SCHEMA_VERSION,
 };
 pub use workflow_state_store::WorkflowStateStore;
-pub use worktree_paths::{worktree_branch_name, worktree_branch_name_for_workflow, WorktreePaths};
 pub mod workflow_prerequisites;
 
 pub mod daemon_state;

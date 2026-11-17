@@ -294,3 +294,36 @@ fn git_metadata_copy_pins_ancestors_and_never_writes_through_links() {
     assert!(GitMetadataCopy::copy(&source.join("HEAD"), &alias.join("HEAD")).is_err());
     std::fs::remove_dir(alias).unwrap();
 }
+
+#[test]
+fn session_initialization_does_not_create_retired_checkout_slots() {
+    use awman::data::checkout_paths::clone_path;
+    use awman::data::fs::api_paths::ApiPaths;
+    let sandbox = support::sandbox(
+        "data::persistence::session_initialization_does_not_create_retired_checkout_slots",
+    );
+    let paths = ApiPaths::from_root(sandbox.work().join("api"));
+    paths.prepare_session_dirs("session").unwrap();
+    let session = paths.remote_session_dir("session");
+    let mut children = std::fs::read_dir(&session)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    children.sort();
+    assert_eq!(
+        children,
+        ["agent-settings", "commands", "jobs"].map(std::ffi::OsString::from)
+    );
+    assert_eq!(
+        clone_path(&session, "https://example.test/team/app.git"),
+        session.join("app")
+    );
+    // Initialization does not migrate or erase pre-existing files either.
+    std::fs::create_dir(session.join("worktree")).unwrap();
+    std::fs::write(session.join("worktree/keep"), "unfinished work").unwrap();
+    paths.prepare_session_dirs("session").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(session.join("worktree/keep")).unwrap(),
+        "unfinished work"
+    );
+}

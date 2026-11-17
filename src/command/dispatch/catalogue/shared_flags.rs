@@ -357,7 +357,7 @@ pub(super) const WORK_ITEM_HELP: &str =
 /// the value as written, so the server resolves it against its own config.
 pub(super) const WORK_ITEM_FLAG: [FlagSpec; 1] = [FlagSpec {
     long: "work-item",
-    short: None,
+    short: Some('w'),
     help: WORK_ITEM_HELP,
     kind: FlagKind::OptionalString,
     default: FlagDefault::None,

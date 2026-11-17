@@ -190,22 +190,12 @@ impl ApiPaths {
             .join("completion.json")
     }
 
-    /// Per-session worktree directory.
-    pub fn session_worktree_dir(&self, session_id: &str) -> PathBuf {
-        self.session_dir(session_id).join("worktree")
-    }
-
     /// Per-session agent settings directory.
     pub fn session_agent_settings_dir(&self, session_id: &str) -> PathBuf {
         self.session_dir(session_id).join("agent-settings")
     }
 
-    /// Directory for a remote session's cloned repository.
-    pub fn remote_session_repo_path(&self, session_id: &str) -> PathBuf {
-        self.session_dir(session_id).join("repo")
-    }
-
-    /// Directory for a remote session (parent of repo/).
+    /// Directory for a remote session (parent of its repository-named clone).
     pub fn remote_session_dir(&self, session_id: &str) -> PathBuf {
         self.session_dir(session_id)
     }
@@ -232,14 +222,15 @@ impl ApiPaths {
     // performed inline. Frontends call them so no presentation layer touches
     // `std::fs`/`tokio::fs` directly (grand-architecture Tenet 2).
 
-    /// Create the full per-session directory set idempotently: `jobs/`,
-    /// `commands/` (legacy, pre-WI-0079 clients), `worktree/`, and
+    /// Create the per-session directory set idempotently: `jobs/`, `commands/`, and
     /// `agent-settings/`. Creating `jobs/` first materializes the session
     /// directory itself.
     pub fn prepare_session_dirs(&self, session_id: &str) -> Result<(), DataError> {
-        let session_dir = self.session_dir(session_id);
-        for sub in ["jobs", "commands", "worktree", "agent-settings"] {
-            let dir = session_dir.join(sub);
+        for dir in [
+            self.session_dir(session_id).join("jobs"),
+            self.session_commands_dir(session_id),
+            self.session_agent_settings_dir(session_id),
+        ] {
             std::fs::create_dir_all(&dir).map_err(|e| DataError::io(&dir, e))?;
         }
         Ok(())

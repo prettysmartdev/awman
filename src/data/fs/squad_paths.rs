@@ -87,7 +87,7 @@ impl SquadPaths {
             &base,
             "task directory must reside under the squad tasks root",
         )?;
-        Ok(base.join("workspace"))
+        Ok(crate::data::checkout_paths::squad_workspace_path(&base))
     }
 
     /// The task-scoped config file for one task:
