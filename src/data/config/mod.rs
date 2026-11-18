@@ -71,7 +71,7 @@ pub use work_items::{
     WorkItemsConfig,
 };
 pub use work_servers::{
-    normalize_work_server_name, ClaimMode, ResolvedWorkServer, WorkServerConfig,
+    normalize_work_server_name, ClaimMode, ImageBudgetConfig, ResolvedWorkServer, WorkServerConfig,
 };
 pub use workflows::{DynamicConfig, WorkflowsConfig};
 pub use worktree::{MergeFixConfig, OnDirtyMergeTarget, OnMergeFailure, WorktreeConfig};

@@ -7,6 +7,7 @@
 use std::path::Path;
 
 use crate::data::fs::hash::sha256_hex;
+use crate::data::image_inputs::{InputsHash, RepoKey};
 
 /// 8-hex-char SHA-256 prefix of the canonicalized git-root path. Used as a
 /// stable identifier for per-repo image tags and per-repo state filenames.
@@ -31,6 +32,47 @@ pub fn project_image_tag(git_root: &Path) -> String {
 /// [`project_image_tag`]).
 pub fn agent_image_tag(git_root: &Path, agent: &str) -> String {
     format!("awman-{}-{agent}:latest", image_stem(git_root))
+}
+
+/// Longest agent-name part of a content-keyed agent tag.
+const LEASE_TAG_AGENT_MAX: usize = 32;
+
+/// Content-keyed project image tag for leases (WI 0163):
+/// `awman-<repo key>-<inputs hash>:latest`, where `<repo key>` is
+/// [`RepoKey::tag_component`] (at most 49 characters) and `<inputs hash>` is
+/// [`InputsHash::short`] (16 hex digits). Independent of the lease clone's
+/// folder, so every lease of one repository and Dockerfile shares the tag.
+pub fn lease_project_image_tag(repo: &RepoKey, inputs: &InputsHash) -> String {
+    format!("{}:latest", lease_name(repo, inputs))
+}
+
+/// Content-keyed agent image tag for leases:
+/// `awman-<repo key>-<agent inputs hash>-<agent>:latest`. `inputs` is the
+/// agent image's own hash ([`crate::data::image_inputs::agent_inputs_hash`]),
+/// which covers the project image id, so a new project image gives a new
+/// agent tag. The agent part is sanitized and capped at 32 characters; the
+/// whole name stays far below the 255-character reference limit.
+pub fn lease_agent_image_tag(repo: &RepoKey, inputs: &InputsHash, agent: &str) -> String {
+    let mut agent: String = sanitize_image_name(agent)
+        .chars()
+        .take(LEASE_TAG_AGENT_MAX)
+        .collect();
+    while agent.ends_with(['.', '_', '-']) {
+        agent.pop();
+    }
+    if agent.is_empty() {
+        agent.push_str("agent");
+    }
+    format!("{}-{agent}:latest", lease_name(repo, inputs))
+}
+
+fn lease_name(repo: &RepoKey, inputs: &InputsHash) -> String {
+    let mut hash = inputs.short();
+    if hash.is_empty() {
+        // A label value with no hex digits; still give a stable name.
+        hash = sha256_hex(inputs.as_str()).chars().take(16).collect();
+    }
+    format!("awman-{}-{hash}", repo.tag_component())
 }
 
 /// The naming stem images for `git_root` are tagged with.
@@ -66,7 +108,7 @@ fn image_stem(git_root: &Path) -> String {
 /// of separators is kept when it is already valid (`.`, `_`, `__`, or only
 /// hyphens) and collapsed to a single `-` otherwise. Leading and trailing
 /// separators are dropped, so the result may be empty.
-fn sanitize_image_name(name: &str) -> String {
+pub(crate) fn sanitize_image_name(name: &str) -> String {
     let is_sep = |c: char| matches!(c, '.' | '_' | '-');
     let mapped: String = name
         .chars()
@@ -117,4 +159,46 @@ fn squad_task_slug(git_root: &Path) -> Option<String> {
         && is_lower_alnum(slug.chars().next()?)
         && is_lower_alnum(slug.chars().next_back()?);
     valid.then(|| slug.to_string())
+}
+
+#[cfg(test)]
+mod lease_tag_tests {
+    use super::*;
+    use crate::data::image_inputs::{agent_inputs_hash, imported_inputs_hash};
+
+    fn valid_name(name: &str) -> bool {
+        let repo = name.strip_suffix(":latest").expect("latest tag");
+        repo.len() <= 255
+            && repo
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
+    }
+
+    #[test]
+    fn lease_tags_key_on_repository_and_inputs_not_the_clone_folder() {
+        let repo = RepoKey::from_remote_url("https://tok@github.com/Org/Repo.git").unwrap();
+        let inputs = agent_inputs_hash(b"FROM x", "sha256:1");
+        let project = lease_project_image_tag(&repo, &inputs);
+        assert!(
+            project.starts_with("awman-github.com-org-repo-"),
+            "{project}"
+        );
+        assert!(project.ends_with(&format!("-{}:latest", inputs.short())));
+        assert!(!project.contains("tok"));
+        let agent = lease_agent_image_tag(&repo, &inputs, "Claude Code");
+        assert!(agent.ends_with("-claude-code:latest"), "{agent}");
+        assert!(valid_name(&project) && valid_name(&agent));
+        let other = agent_inputs_hash(b"FROM y", "sha256:1");
+        assert_ne!(project, lease_project_image_tag(&repo, &other));
+    }
+
+    #[test]
+    fn lease_tags_stay_valid_for_long_names_and_digest_hashes() {
+        let repo = RepoKey::from_remote_url(&format!("https://h/{}", "x".repeat(300))).unwrap();
+        let inputs = imported_inputs_hash("sha256:0123456789abcdef0123");
+        let tag = lease_agent_image_tag(&repo, &inputs, &"a".repeat(200));
+        assert!(valid_name(&tag), "{tag}");
+        assert!(tag.contains("-0123456789abcdef-"));
+        assert!(lease_agent_image_tag(&repo, &inputs, "!!").ends_with("-agent:latest"));
+    }
 }

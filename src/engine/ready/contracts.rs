@@ -394,3 +394,105 @@ async fn setup_never_creates_a_dockerfile_outside_the_git_root() {
         assert_eq!(std::fs::read_dir(&outside_dir).unwrap().count(), 0);
     }
 }
+
+/// WI 0163: sessions keep a stale image when its rebuild fails, but
+/// `ready --build` is the explicit escape hatch and still fails hard.
+#[tokio::test]
+async fn ready_build_failure_is_still_a_failed_stage_not_an_image_stale_warning() {
+    use crate::engine::agent::image_freshness::test_runtime::BuildRuntime;
+    let sandbox = TestSandbox::for_test(TestCase::component(
+        "engine::ready::ready_build_failure_is_still_a_failed_stage_not_an_image_stale_warning",
+    ));
+    std::fs::write(
+        sandbox.work().join("Dockerfile.dev"),
+        "FROM scratch\nRUN false\n",
+    )
+    .unwrap();
+    let env = EnvSnapshot::from_full_env(
+        sandbox
+            .env()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+            .collect(),
+    );
+    let session = Arc::new(
+        Session::open_at_directory_root(
+            sandbox.work(),
+            SessionOpenOptions {
+                env: Some(env.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    let runtime = Arc::new(BuildRuntime::default());
+    let tag = crate::data::image_tags::project_image_tag(&sandbox.work());
+    let previous = runtime.install(&tag, Some("previous"));
+    runtime.fail(&tag, true);
+    let overlay = Arc::new(OverlayEngine::with_auth_resolver(
+        AuthPathResolver::at_home(sandbox.home()),
+    ));
+    let mut engine = ReadyEngine::new(
+        None,
+        sandbox.awman_home(),
+        session,
+        Arc::new(GitEngine::with_env(env)),
+        overlay.clone(),
+        runtime.clone(),
+        Arc::new(AgentEngine::new(overlay, runtime.clone())),
+        ReadyEngineOptions {
+            agent: AgentName::new("claude").unwrap(),
+            refresh: false,
+            build: true,
+            no_cache: true,
+            allow_docker: false,
+            non_interactive: true,
+            env_passthrough: None,
+        },
+    );
+    engine.phase = ReadyPhase::BuildingBaseImage;
+    let mut frontend = Frontend::default();
+    let store = crate::engine::agent::image_freshness::runtime_build_store(
+        runtime.as_ref(),
+        engine.session.env(),
+    );
+    let reference = crate::engine::image_prep::AgentImagePreparer::normalize_build_reference(&tag);
+    let locks =
+        crate::data::image_build_lock::ImageBuildLockStore::under_data_home(&sandbox.awman_home());
+    let held = locks.try_lock(&store, &reference).unwrap().unwrap();
+    let phase = {
+        let step = engine.step(&mut frontend);
+        tokio::pin!(step);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut step)
+                .await
+                .is_err(),
+            "ready must wait for a session holding the same project build lease"
+        );
+        assert!(runtime.built().is_empty());
+        drop(held);
+        step.await.unwrap()
+    };
+    assert_eq!(phase, ReadyPhase::BuildingAgentImage);
+    assert_eq!(
+        runtime.built(),
+        std::slice::from_ref(&tag),
+        "--build rebuilds a labeled image"
+    );
+    assert!(
+        matches!(&engine.summary().base_image, StepStatus::Failed(m) if m.contains("RUN false")),
+        "{:?}",
+        engine.summary().base_image
+    );
+    assert!(!engine.summary().is_ready());
+    assert!(!frontend
+        .messages
+        .iter()
+        .any(|m| m.text.contains("[image] warning")));
+    assert_eq!(runtime.id(&tag), Some(previous));
+}

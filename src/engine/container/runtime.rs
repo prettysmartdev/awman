@@ -10,6 +10,7 @@
 //! `image_home_dir`, `start_background` — are inherent methods; the
 //! cross-paradigm subset is also reachable through `AgentRuntimeEngine`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -38,6 +39,16 @@ pub struct ContainerImageInfo {
     pub repo_tag: String,
     /// Human-readable size string reported by the runtime (e.g. "1.2GB").
     pub size: String,
+}
+
+/// Installed image metadata. Sizes are bytes (zero when the store cannot
+/// report a size); labels come from the image config or the import catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageMetadata {
+    pub id: String,
+    pub tags: Vec<String>,
+    pub labels: BTreeMap<String, String>,
+    pub size_bytes: u64,
 }
 
 /// Capabilities shared by the CLI-driven container backends (Docker, Apple
@@ -254,7 +265,35 @@ impl ContainerRuntime {
         request: &crate::engine::container::BuildRequest,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError> {
-        self.backend.build_image(request, on_line)
+        let request = crate::engine::image_prep::label_runtime_build(self, request)?;
+        self.backend.build_image(&request, on_line)
+    }
+
+    pub fn inspect_image(&self, tag: &str) -> Result<Option<ImageMetadata>, EngineError> {
+        self.backend.inspect_image(tag)
+    }
+
+    /// A missing image or a mismatched inputs label returns `None`.
+    pub fn image_with_inputs(
+        &self,
+        tag: &str,
+        expected: &crate::data::image_inputs::InputsHash,
+    ) -> Result<Option<ImageMetadata>, EngineError> {
+        Ok(self.inspect_image(tag)?.filter(|image| {
+            expected.matches_label(
+                image
+                    .labels
+                    .get(crate::data::image_inputs::INPUTS_LABEL)
+                    .map(String::as_str),
+            )
+        }))
+    }
+
+    pub fn list_images_by_repo(
+        &self,
+        repo: &crate::data::image_inputs::RepoKey,
+    ) -> Result<Vec<ImageMetadata>, EngineError> {
+        self.backend.list_images_by_repo(repo)
     }
 
     /// Read the image's baked-in `$HOME` from its config. Used by
@@ -335,7 +374,7 @@ impl ContainerRuntime {
         self.backend.remove_agent(id)
     }
 
-    /// Remove an image by id. Returns an error when the runtime refuses (e.g.
+    /// Remove an image by id or tag. Returns an error when the runtime refuses (e.g.
     /// the image is still referenced by a container). Used by `awman clean`.
     pub fn remove_image(&self, id: &str) -> Result<(), EngineError> {
         self.backend.remove_image(id)
@@ -410,6 +449,20 @@ impl ContainerRuntime {
 }
 
 impl AgentRuntimeEngine for ContainerRuntime {
+    fn inspect_image(&self, tag: &str) -> Result<Option<ImageMetadata>, EngineError> {
+        self.inspect_image(tag)
+    }
+
+    fn list_images_by_repo(
+        &self,
+        repo: &crate::data::image_inputs::RepoKey,
+    ) -> Result<Vec<ImageMetadata>, EngineError> {
+        self.list_images_by_repo(repo)
+    }
+
+    fn remove_image(&self, reference: &str) -> Result<(), EngineError> {
+        self.remove_image(reference)
+    }
     fn runtime_name(&self) -> &'static str {
         ContainerRuntime::runtime_name(self)
     }

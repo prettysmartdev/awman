@@ -12,7 +12,6 @@ use std::{path::Path, sync::Arc};
 use crate::data::config::agents::LaunchMode;
 use crate::data::config::builtin_launch::BuiltinLaunchSettings;
 use crate::data::config::effective::EffectiveConfig;
-use crate::data::image_tags::{agent_image_tag, project_image_tag};
 use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
 use crate::data::session::{AgentName, Session};
 use crate::data::setup_step::{AgentSetupStep, SetupStep};
@@ -33,6 +32,7 @@ pub mod definition;
 pub mod download;
 pub mod first_party;
 pub mod frontend;
+pub mod image_freshness;
 pub mod registry;
 
 pub use definition::*;
@@ -507,10 +507,19 @@ impl AgentEngine {
         frontend: &mut dyn AgentImageFrontend,
         image_exists: impl Fn(&str) -> bool,
     ) -> Result<(), EngineError> {
+        if session
+            .lease_images()
+            .is_some_and(|images| images.agents.contains_key(agent.as_str()))
+        {
+            return Ok(());
+        }
+        if session.lease_images().is_some() {
+            return Err(EngineError::Config(format!("agent '{agent}' was not provisioned for this lease; include it in the workflow agent pool")));
+        }
         let def = self.resolve_definition(session, agent)?;
         let paths = RepoDockerfilePaths::new(session.git_root());
-        let project_tag = project_image_tag(session.git_root());
-        let agent_tag = agent_image_tag(session.git_root(), agent.as_str());
+        let project_tag = session.project_image_tag();
+        let agent_tag = session.agent_image_tag(agent.as_str());
         let sync = provision_agent_dockerfile(&def, &paths, &project_tag).await?;
         for warning in &sync.warnings {
             frontend.write_message(crate::data::message::UserMessage {
@@ -530,7 +539,7 @@ impl AgentEngine {
             use crate::engine::image_prep::{
                 AgentImagePreparer, AgentImageRequest, BuildPolicy, ImageBuildContext,
             };
-            let tag = agent_image_tag(session.git_root(), agent.as_str());
+            let tag = session.agent_image_tag(agent.as_str());
             let resolved = config.builtin_settings()?;
             let mut preparer = AgentImagePreparer::new(
                 resolved,
@@ -578,14 +587,34 @@ impl AgentEngine {
 
         // Check for the project base image. If absent, fail with a structured
         // error: agent images are layered FROM the project image.
-        let project_tag = project_image_tag(session.git_root());
+        let project_tag = session.project_image_tag();
         if !image_exists(&project_tag) {
             return Err(EngineError::AgentRequiresProjectImage { tag: project_tag });
         }
 
+        // WI 0163: an installed named project or agent image whose inputs
+        // label does not match the working tree (or has none) is rebuilt
+        // under the shared build lease. A failed rebuild keeps the previous
+        // image and reports `image_stale`; a missing agent image is built
+        // below. Lease sessions run content-keyed tags lease provisioning
+        // already resolved, so they are not checked here.
+        if session.lease_images().is_none()
+            && self.runtime.capabilities().image_acquisition
+                == crate::engine::agent_runtime::ImageAcquisition::Build
+        {
+            let inputs = image_freshness::SessionImageInputs::for_repo(session.git_root(), config)?;
+            image_freshness::refresh_stale_images(
+                self.runtime.clone(),
+                &inputs,
+                &[agent.as_str().to_string()],
+                frontend,
+            )
+            .await?;
+        }
+
         let paths = RepoDockerfilePaths::new(session.git_root());
         let agent_dockerfile = paths.agent_dockerfile(agent.as_str());
-        let agent_tag = agent_image_tag(session.git_root(), agent.as_str());
+        let agent_tag = session.agent_image_tag(agent.as_str());
 
         // Ensure agent image is built.
         if !image_exists(&agent_tag) {
@@ -735,6 +764,12 @@ impl AgentEngine {
         run: &AgentRunOptions,
         credentials: &AgentCredentials,
     ) -> Result<Vec<ContainerOption>, EngineError> {
+        if session
+            .lease_images()
+            .is_some_and(|images| !images.agents.contains_key(agent.as_str()))
+        {
+            return Err(EngineError::Config(format!("agent '{agent}' was not provisioned for this lease; include it in the workflow agent pool")));
+        }
         if self.read_only_workspace {
             if !self.runtime.capabilities().read_only_workspace() {
                 return Err(read_only_unsupported(self.runtime.display_name()));
@@ -762,10 +797,12 @@ impl AgentEngine {
         // anything else is prepared for it.
         let builtin_launch = self.builtin_launch_settings(session)?;
 
-        let image_tag = run
-            .image_tag_override
-            .clone()
-            .unwrap_or_else(|| agent_image_tag(session.git_root(), agent.as_str()));
+        let image_tag = session
+            .lease_images()
+            .and_then(|images| images.agents.get(agent.as_str()))
+            .cloned()
+            .or_else(|| run.image_tag_override.clone())
+            .unwrap_or_else(|| session.agent_image_tag(agent.as_str()));
         let image = ImageRef::new(image_tag.clone());
         // ACP launches use the agent's ACP entrypoint (e.g. `cline --acp`) and
         // select the persistent piped-stdio container path instead of a PTY, so

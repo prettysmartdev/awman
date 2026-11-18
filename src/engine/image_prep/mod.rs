@@ -22,8 +22,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-mod bridge;
+pub(crate) mod bridge;
 mod build;
+pub(crate) mod freshness;
+pub(crate) use freshness::label_runtime_build;
+pub use freshness::{
+    repo_key, ImageBuildOutcome, ImageBuildSpec, ImageFreshness, PreparedSourceImage,
+};
 pub mod builder;
 #[cfg(test)]
 pub(crate) mod contracts;
@@ -137,6 +142,9 @@ impl crate::data::message::UserMessageSink for MessageSink<'_> {
     fn replay_queued(&mut self) {
         self.0.replay_queued();
     }
+    fn report_image_stale(&mut self, warning: &crate::data::execution_event::ImageStaleWarning) {
+        self.0.report_image_stale(warning);
+    }
 }
 impl ImagePreparationSink for MessageSink<'_> {
     fn report_step(&mut self, _: &SetupStep, _: StepStatus) {}
@@ -170,6 +178,8 @@ pub struct AgentImagePreparer {
     validated_policy: Option<BuildPolicy>,
     plans: HashMap<(String, String), ImagePlan>,
     warned_tags: HashSet<String>,
+    last_build_inputs: Option<crate::data::image_inputs::InputsHash>,
+    last_installed_inputs: Option<String>,
     cancel: crate::engine::oci::CancelToken,
 }
 impl AgentImagePreparer {
@@ -183,7 +193,8 @@ impl AgentImagePreparer {
         fallback: BuildPolicy,
     ) -> Result<BuildPolicy, EngineError> {
         if self.builder_enabled
-            && !self.runtime.image_exists(tag)?
+            && (!self.runtime.image_exists(tag)?
+                || matches!(self.plan(tag, agent).selection, BuilderSelection::Local(_)))
             && matches!(
                 self.missing_image_plan(tag, agent),
                 ReadyImagePlan::BuildAndImport | ReadyImagePlan::Import
@@ -233,6 +244,8 @@ impl AgentImagePreparer {
             validated_policy: None,
             plans: HashMap::new(),
             warned_tags: HashSet::new(),
+            last_build_inputs: None,
+            last_installed_inputs: None,
             cancel: crate::engine::oci::CancelToken::new(),
         }
     }

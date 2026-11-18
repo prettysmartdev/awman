@@ -106,6 +106,21 @@ impl CommandOwnedRuntime {
 }
 
 impl AgentRuntimeEngine for CommandOwnedRuntime {
+    fn inspect_image(
+        &self,
+        tag: &str,
+    ) -> Result<Option<crate::engine::container::runtime::ImageMetadata>, EngineError> {
+        self.inner.inspect_image(tag)
+    }
+    fn list_images_by_repo(
+        &self,
+        repo: &crate::data::image_inputs::RepoKey,
+    ) -> Result<Vec<crate::engine::container::runtime::ImageMetadata>, EngineError> {
+        self.inner.list_images_by_repo(repo)
+    }
+    fn remove_image(&self, reference: &str) -> Result<(), EngineError> {
+        self.inner.remove_image(reference)
+    }
     fn terminal_hub(&self) -> Option<Arc<crate::engine::terminal_hub::TerminalHub>> {
         self.hub.clone()
     }

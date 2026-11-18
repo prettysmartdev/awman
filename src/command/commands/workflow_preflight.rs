@@ -634,6 +634,9 @@ impl UserMessageSink for StepImageSink<'_, '_> {
     fn replay_queued(&mut self) {
         self.sink.replay_queued();
     }
+    fn report_image_stale(&mut self, warning: &crate::data::execution_event::ImageStaleWarning) {
+        self.sink.report_image_stale(warning);
+    }
 }
 impl crate::engine::image_prep::ImagePreparationSink for StepImageSink<'_, '_> {
     fn report_step(
@@ -680,6 +683,57 @@ impl crate::engine::image_prep::ImagePreparationSink for StepImageSink<'_, '_> {
             },
         });
     }
+}
+
+/// Rebuild the named project image and the agent images of `agents` when
+/// their `dev.awman.inputs` label does not match `session`'s working tree
+/// (WI 0163), once per preflight rather than once per agent so a failing
+/// project build is attempted once. Build runtimes only; a lease session's
+/// content-keyed tags are left to lease provisioning.
+///
+/// Each agent's Dockerfile is provisioned first, so a changed agent
+/// definition is hashed as it will be built. A failed rebuild keeps the
+/// previous image and is reported through
+/// [`UserMessageSink::report_image_stale`]; missing images are left to
+/// [`ensure_agent_image`]. Squad task workspaces use their `squad-<slug>`
+/// stem through the ordinary named tags.
+pub(crate) async fn refresh_stale_workflow_images(
+    engines: &Engines,
+    session: &Session,
+    agents: &[String],
+    sink: &mut dyn UserMessageSink,
+    build_output: Option<&mut dyn BuildOutputTarget>,
+) -> Result<crate::engine::agent::image_freshness::StaleImageRefresh, CommandError> {
+    use crate::engine::agent::image_freshness::{refresh_stale_images, SessionImageInputs};
+    if session.lease_images().is_some()
+        || engines.runtime.capabilities().image_acquisition
+            != crate::engine::agent_runtime::ImageAcquisition::Build
+    {
+        return Ok(Default::default());
+    }
+    let git_root = session.git_root();
+    let paths = crate::data::RepoDockerfilePaths::new(git_root);
+    let project_tag = session.project_image_tag();
+    let mut agents = agents.to_vec();
+    agents.sort();
+    agents.dedup();
+    for agent in &agents {
+        let name =
+            crate::data::session::AgentName::new(agent.as_str()).map_err(EngineError::Data)?;
+        let definition = engines.agent_engine.resolve_definition(session, &name)?;
+        let sync =
+            crate::engine::agent::provision_agent_dockerfile(&definition, &paths, &project_tag)
+                .await?;
+        for warning in sync.warnings {
+            sink.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: warning,
+            });
+        }
+    }
+    let inputs = SessionImageInputs::for_repo(git_root, &session.effective_config())?;
+    let mut sink = StepImageSink { sink, build_output };
+    Ok(refresh_stale_images(engines.runtime.clone(), &inputs, &agents, &mut sink).await?)
 }
 
 /// Ensure a Dockerfile-backed agent image is available for a container runtime,
@@ -814,6 +868,13 @@ pub(crate) async fn ensure_agent_image_with_build_output(
     sink: &mut dyn UserMessageSink,
     mut build_output: Option<&mut dyn BuildOutputTarget>,
 ) -> Result<(), CommandError> {
+    if let Some(images) = session.lease_images() {
+        return if images.agents.contains_key(agent) {
+            Ok(())
+        } else {
+            Err(CommandError::Other(format!("agent '{agent}' was not provisioned for this lease; include it in the workflow agent pool")))
+        };
+    }
     let name = crate::data::session::AgentName::new(agent).map_err(EngineError::Data)?;
     let definition = engines.agent_engine.resolve_definition(session, &name)?;
     if engines.runtime.capabilities().image_acquisition

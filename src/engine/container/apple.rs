@@ -192,6 +192,19 @@ impl AppleBackend {
 }
 
 impl ContainerBackend for AppleBackend {
+    fn inspect_image(
+        &self,
+        tag: &str,
+    ) -> Result<Option<super::runtime::ImageMetadata>, EngineError> {
+        super::image_metadata::inspect(self.cli(), tag)
+    }
+    fn list_images_by_repo(
+        &self,
+        repo: &crate::data::image_inputs::RepoKey,
+    ) -> Result<Vec<super::runtime::ImageMetadata>, EngineError> {
+        super::image_metadata::list_by_repo(self.cli(), repo)
+    }
+
     fn build(
         &self,
         mut options: ResolvedContainerOptions,
@@ -443,7 +456,7 @@ impl ContainerBackend for AppleBackend {
     }
 
     fn image_id(&self, tag: &str) -> Result<Option<String>, EngineError> {
-        host_cli_backend::cli_image_id(self.cli(), tag)
+        Ok(self.inspect_image(tag)?.map(|image| image.id))
     }
 
     fn build_image(
@@ -452,12 +465,8 @@ impl ContainerBackend for AppleBackend {
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError> {
         request.require_runtime_build()?;
-        let tag = request.reference.as_str();
-        let dockerfile = request.dockerfile.as_path();
-        let context = request.context.as_path();
-        let no_cache = request.no_cache;
 
-        host_cli_backend::cli_build_image(self.cli(), tag, dockerfile, context, no_cache, on_line)
+        host_cli_backend::cli_build_image(self.cli(), request, on_line)
     }
 
     fn import_image(
@@ -472,7 +481,7 @@ impl ContainerBackend for AppleBackend {
     }
 
     fn remove_image(&self, id: &str) -> Result<(), EngineError> {
-        host_cli_backend::cli_remove(self.cli(), "rmi", id)
+        super::image_metadata::remove_apple(self.cli(), id)
     }
 
     /// Docker and Apple Containers have no builtin launch settings; the

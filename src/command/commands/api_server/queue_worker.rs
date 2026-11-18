@@ -1958,6 +1958,8 @@ fn spawn_tracing_subscriber(
                     // WI 0145: retries are client events, like status lines.
                     | EventPayload::PushRetry { .. }
                     | EventPayload::WorkflowPrerequisites { .. }
+                    // WI 0163: stale-image warnings are client events.
+                    | EventPayload::ImageStale(_)
                     | EventPayload::WorkflowState(_) => {}
                     // WI 0141 status and terminal events are for clients, not the
                     // daemon log (terminals-api owns any logging it wants here).

@@ -731,6 +731,20 @@ impl SandboxDriver for MsbDriver {
                     .and_then(|passwd| super::driver::passwd_home(passwd, config.user.as_deref()))
             });
             Ok(Some(SandboxImageConfig {
+                id: config.digest,
+                labels: config
+                    .labels
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default(),
+                size_bytes: detail
+                    .layers
+                    .iter()
+                    .filter_map(|layer| {
+                        layer
+                            .erofs_size_bytes
+                            .and_then(|size| u64::try_from(size).ok())
+                    })
+                    .sum(),
                 home,
                 user: config.user,
                 workdir: config.working_dir,

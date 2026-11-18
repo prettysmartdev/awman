@@ -153,6 +153,14 @@ impl UserMessageSink for SetupReadyFrontend {
         });
     }
 
+    fn report_image_stale(&mut self, warning: &crate::data::execution_event::ImageStaleWarning) {
+        let mut warning = warning.clone();
+        warning.reason = self.event_bus.redaction().redact(&warning.reason);
+        self.bus
+            .emit(SetupEventPayload::ImageStale(warning.clone()));
+        self.event_bus.emit(EventPayload::ImageStale(warning));
+    }
+
     fn replay_queued(&mut self) {}
 }
 

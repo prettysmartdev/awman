@@ -301,6 +301,31 @@ impl ReadyEngine {
             return Ok(self.phase.clone());
         }
 
+        if self.phase == ReadyPhase::BuildingBaseImage
+            && self.image_policy == crate::engine::image_prep::BuildPolicy::SessionSetup
+            && self.runtime.capabilities().image_acquisition == ImageAcquisition::Build
+            && self.session.lease_images().is_none()
+        {
+            let paths = RepoDockerfilePaths::new(&git_root);
+            crate::engine::agent::provision_agent_dockerfile(
+                self.definition.as_ref().unwrap(),
+                &paths,
+                &project_image_tag(&git_root),
+            )
+            .await?;
+            let inputs = crate::engine::agent::image_freshness::SessionImageInputs::for_repo(
+                &git_root,
+                &self.session.effective_config(),
+            )?;
+            crate::engine::agent::image_freshness::refresh_stale_images(
+                self.runtime.clone(),
+                &inputs,
+                &[self.options.agent.to_string()],
+                frontend,
+            )
+            .await?;
+        }
+
         let next = match &self.phase {
             ReadyPhase::Preflight => {
                 // Issue 23: Check aspec folder and work-items config presence.
@@ -427,18 +452,17 @@ impl ReadyEngine {
                     frontend
                         .report_step_status(&ReadyStep::BuildBaseImage.into(), StepStatus::Running);
                     let dockerfile_path = self.preparer.project_dockerfile().to_path_buf();
-                    let mut sink = |line: &str| {
-                        frontend.report_step_status(&SetupStep::output(line), StepStatus::Running);
-                    };
-                    let result = self.runtime.build_image(
-                        &crate::engine::container::BuildRequest::runtime(
-                            &tag,
-                            &dockerfile_path,
-                            &git_root,
-                            self.options.no_cache,
-                        ),
-                        &mut sink,
-                    );
+                    let result = self
+                        .coordinated_build(
+                            crate::engine::container::BuildRequest::runtime(
+                                &tag,
+                                &dockerfile_path,
+                                &git_root,
+                                self.options.no_cache,
+                            ),
+                            frontend,
+                        )
+                        .await;
                     match result {
                         Ok(()) => {
                             self.summary.base_image = StepStatus::Done;
@@ -507,18 +531,17 @@ impl ReadyEngine {
                 }
                 frontend
                     .report_step_status(&ReadyStep::BuildAgentImage.into(), StepStatus::Running);
-                let mut sink = |line: &str| {
-                    frontend.report_step_status(&SetupStep::output(line), StepStatus::Running);
-                };
-                let result = self.runtime.build_image(
-                    &crate::engine::container::BuildRequest::runtime(
-                        &tag,
-                        &agent_dockerfile,
-                        &git_root,
-                        self.options.no_cache,
-                    ),
-                    &mut sink,
-                );
+                let result = self
+                    .coordinated_build(
+                        crate::engine::container::BuildRequest::runtime(
+                            &tag,
+                            &agent_dockerfile,
+                            &git_root,
+                            self.options.no_cache,
+                        ),
+                        frontend,
+                    )
+                    .await;
                 match result {
                     Ok(()) => {
                         self.summary.agent_image = StepStatus::Done;
@@ -581,19 +604,17 @@ impl ReadyEngine {
                             &ReadyStep::BuildAgentImageFor(agent_name.to_string()).into(),
                             StepStatus::Running,
                         );
-                        let mut agent_sink = |line: &str| {
-                            frontend
-                                .report_step_status(&SetupStep::output(line), StepStatus::Running);
-                        };
-                        let agent_result = self.runtime.build_image(
-                            &crate::engine::container::BuildRequest::runtime(
-                                &other_tag,
-                                agent_path,
-                                &git_root,
-                                self.options.no_cache,
-                            ),
-                            &mut agent_sink,
-                        );
+                        let agent_result = self
+                            .coordinated_build(
+                                crate::engine::container::BuildRequest::runtime(
+                                    &other_tag,
+                                    agent_path,
+                                    &git_root,
+                                    self.options.no_cache,
+                                ),
+                                frontend,
+                            )
+                            .await;
                         match agent_result {
                             Ok(()) => {
                                 frontend.report_step_status(

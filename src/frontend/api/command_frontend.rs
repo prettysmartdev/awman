@@ -389,6 +389,13 @@ impl UserMessageSink for ApiDispatchFrontend {
     }
 
     fn replay_queued(&mut self) {}
+
+    /// The structured `image_stale` event on the command's stream; its text
+    /// reaches `output.log` through the event's plain-text rendering.
+    fn report_image_stale(&mut self, warning: &crate::data::execution_event::ImageStaleWarning) {
+        self.event_bus
+            .emit(EventPayload::ImageStale(warning.clone()));
+    }
 }
 
 // ─── CommandFrontend (flag/argument access) ─────────────────────────────────

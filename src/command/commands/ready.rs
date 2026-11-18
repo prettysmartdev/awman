@@ -7,6 +7,7 @@ use crate::command::commands::launch_policy::{ensure_agent_trusted, LaunchPolicy
 use crate::command::commands::Command;
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
+use crate::command::headless::HeadlessDefaults;
 use crate::data::message::{MessageLevel, UserMessage};
 use crate::data::ready_image::{ReadyBaseImageResult, ReadyImageResult};
 use crate::data::ready_summary::AgentCredentialHealth;
@@ -201,6 +202,7 @@ pub struct ReadyCommand {
     flags: ReadyCommandFlags,
     engines: Engines,
     session: crate::data::session::Session,
+    headless: Option<HeadlessDefaults>,
 }
 
 impl ReadyCommand {
@@ -213,6 +215,7 @@ impl ReadyCommand {
             flags,
             engines,
             session,
+            headless: None,
         }
     }
 
@@ -220,19 +223,41 @@ impl ReadyCommand {
     /// declares `implies: ["headless"]`, so the implication is already
     /// applied in `flags` and is not re-derived here.
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
-        Ok(Self::new(
-            ReadyCommandFlags {
-                refresh: ctx.flags.bool("refresh"),
-                build: ctx.flags.bool("build"),
-                no_cache: ctx.flags.bool("no-cache"),
-                non_interactive: ctx.flags.bool("headless"),
-                allow_docker: ctx.flags.bool("allow-docker"),
-                json: ctx.flags.bool("json"),
-                agent: ctx.flags.string("agent"),
-            },
-            ctx.engines.clone(),
-            ctx.session.clone(),
-        ))
+        let flags = ReadyCommandFlags {
+            refresh: ctx.flags.bool("refresh"),
+            build: ctx.flags.bool("build"),
+            no_cache: ctx.flags.bool("no-cache"),
+            non_interactive: ctx.flags.bool("headless"),
+            allow_docker: ctx.flags.bool("allow-docker"),
+            json: ctx.flags.bool("json"),
+            agent: ctx.flags.string("agent"),
+        };
+        if flags.refresh && Self::headless_for(ctx.caller.frontend()).is_some() {
+            return Err(CommandError::InvalidFlagValue {
+                command: vec!["ready".into()],
+                flag: "refresh".into(),
+                reason: "--refresh is unavailable through the API because its audit runs an agent outside a command".into(),
+            });
+        }
+        let mut command = Self::new(flags, ctx.engines.clone(), ctx.session.clone());
+        command.headless = Self::headless_for(ctx.caller.frontend());
+        Ok(command)
+    }
+
+    /// API ready answers the two setup questions from the same Layer 2
+    /// profile as API init. Local CLI/TUI invocations retain their frontend's
+    /// interactive or piped-stdin behavior.
+    pub fn headless_for(
+        kind: crate::command::dispatch::catalogue::FrontendKind,
+    ) -> Option<HeadlessDefaults> {
+        match kind {
+            crate::command::dispatch::catalogue::FrontendKind::Daemon { .. }
+                if !kind.is_engine_local() =>
+            {
+                Some(HeadlessDefaults::api())
+            }
+            _ => None,
+        }
     }
 
     pub fn flags(&self) -> &ReadyCommandFlags {
@@ -325,8 +350,12 @@ impl Command for ReadyCommand {
         );
         engine.set_agent_credentials(credential_health(&self.engines.auth_engine, &agent));
         let cancel = engine.cancel_token();
+        let mut answering = HeadlessReadyFrontend {
+            inner: frontend.as_mut(),
+            defaults: self.headless.clone(),
+        };
         let result = {
-            let run = engine.run_to_completion(frontend.as_mut());
+            let run = engine.run_to_completion(&mut answering);
             tokio::pin!(run);
             tokio::select! {
                 result = &mut run => result,
@@ -367,6 +396,68 @@ impl Command for ReadyCommand {
         Ok(outcome)
     }
 }
+
+/// Applies API ready's Layer 2 answers while preserving build progress and
+/// every other frontend report. A missing builtin image source remains the
+/// engine's ordinary non-interactive configuration error; no source prompt
+/// is introduced here.
+struct HeadlessReadyFrontend<'a> {
+    inner: &'a mut dyn ReadyCommandFrontend,
+    defaults: Option<HeadlessDefaults>,
+}
+
+impl crate::data::message::UserMessageSink for HeadlessReadyFrontend<'_> {
+    fn write_message(&mut self, message: UserMessage) {
+        self.inner.write_message(message);
+    }
+    fn replay_queued(&mut self) {
+        self.inner.replay_queued();
+    }
+}
+
+impl crate::engine::agent::AgentImageFrontend for HeadlessReadyFrontend<'_> {
+    fn report_step_status(
+        &mut self,
+        step: &crate::data::setup_step::SetupStep,
+        status: StepStatus,
+    ) {
+        self.inner.report_step_status(step, status);
+    }
+    fn container_frontend(
+        &mut self,
+    ) -> Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend> {
+        self.inner.container_frontend()
+    }
+}
+
+impl ReadyFrontend for HeadlessReadyFrontend<'_> {
+    fn ask_create_dockerfile(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<bool, crate::engine::error::EngineError> {
+        match &self.defaults {
+            Some(defaults) => Ok(defaults.create_dockerfile()),
+            None => self.inner.ask_create_dockerfile(path),
+        }
+    }
+    fn ask_run_audit_on_template(&mut self) -> Result<bool, crate::engine::error::EngineError> {
+        match &self.defaults {
+            Some(defaults) => Ok(defaults.run_audit_on_template()),
+            None => self.inner.ask_run_audit_on_template(),
+        }
+    }
+    fn report_phase(&mut self, phase: &crate::data::ready_phase::ReadyPhase) {
+        self.inner.report_phase(phase);
+    }
+    fn report_summary(&mut self, summary: &ReadySummary) {
+        self.inner.report_summary(summary);
+    }
+    fn report_ping(&mut self, result: &crate::engine::ready::host_agent::LocalAgentPingResult) {
+        self.inner.report_ping(result);
+    }
+}
+
+impl crate::command::commands::agent_trust::AgentTrustFrontend for HeadlessReadyFrontend<'_> {}
 
 fn credential_health(
     auth_engine: &crate::engine::auth::AuthEngine,

@@ -70,7 +70,7 @@ impl Default for Options {
 impl Host {
     /// `prepare` runs on the private home before the daemon boots
     /// (registration reads installed skills); `rules` add fake `docker`
-    /// behavior on top of "every image exists, every agent succeeds".
+    /// behavior on top of a stateful image store and successful builds/agents.
     ///
     /// hygiene-allow(H1): the daemon resolves `docker`, its temp root and worker variables from its process environment; nextest gives each test its own process, and every value points into this test's sandbox (as `daemon::init_api`).
     /// hygiene-allow(H7): reads the process PATH only to prepend this sandbox's fake `bin` to it.
@@ -96,6 +96,9 @@ impl Host {
             s.env_mut().set(key, &temp_root);
             std::env::set_var(key, &temp_root);
         }
+        let endpoint = format!("unix://{}", s.work().join("fake-engine.sock").display());
+        s.env_mut().set("DOCKER_HOST", &endpoint);
+        std::env::set_var("DOCKER_HOST", &endpoint);
         for (name, value) in &options.vars {
             s.env_mut().set(name, value);
             std::env::set_var(name, value);
@@ -130,7 +133,9 @@ impl Host {
         super::support::merge(&mut config, options.extra);
         let mut fake = None;
         let api = Api::with_docker(&s, config.clone(), |docker| {
-            docker.on(&["image", "inspect"]).stdout("[]\n");
+            docker.enable_docker_image_store();
+            docker.on(&["build"]).stdout("lease image built\n");
+            docker.on(&["rmi"]);
             docker.on(&["run"]).stdout("agent finished\n");
             // Recovery and cancellation look for and stop owned containers.
             docker.on(&["ps"]);
@@ -343,7 +348,7 @@ fn mounts(call: &Call) -> Vec<&str> {
 fn image(call: &Call) -> &str {
     call.argv
         .iter()
-        .find(|arg| arg.starts_with("awman-lease_"))
+        .find(|arg| arg.starts_with("awman-") && arg.ends_with(":latest"))
         .expect("an agent image")
 }
 

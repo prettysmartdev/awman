@@ -103,15 +103,21 @@ pub(super) fn cli_image_id(cli: ContainerCli, tag: &str) -> Result<Option<String
 /// exit status is success even if a descendant keeps the output pipes open.
 pub(super) fn cli_build_image(
     cli: ContainerCli,
-    tag: &str,
-    dockerfile: &Path,
-    context: &Path,
-    no_cache: bool,
+    request: &super::BuildRequest,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<(), EngineError> {
     let cli_bin = cli.bin;
     let mut command = cli.command();
-    command.args(build_image_argv(tag, dockerfile, context, no_cache));
+    let argv = BuildArgv {
+        labels: &request.labels,
+        ..BuildArgv::new(
+            &request.reference,
+            &request.dockerfile,
+            &request.context,
+            request.no_cache,
+        )
+    };
+    command.args(argv.to_args());
     let output = crate::engine::agent_runtime::OutputTail::new(20);
     let status = ProcessHostCommandRunner
         .run(
@@ -133,7 +139,7 @@ pub(super) fn cli_build_image(
         })?;
     if !status.success() {
         return Err(EngineError::ImageBuildExitNonzero {
-            tag: tag.to_string(),
+            tag: request.reference.clone(),
             exit_code: status.code().unwrap_or(-1),
             output: output.snapshot_text(),
         });
@@ -355,6 +361,7 @@ pub(crate) struct BuildArgv<'a> {
     pub platform: Option<&'a str>,
     pub iidfile: Option<&'a Path>,
     pub build_args: &'a [(String, String)],
+    pub labels: &'a std::collections::BTreeMap<String, String>,
 }
 
 impl<'a> BuildArgv<'a> {
@@ -368,6 +375,7 @@ impl<'a> BuildArgv<'a> {
             platform: None,
             iidfile: None,
             build_args: &[],
+            labels: empty_labels(),
         }
     }
 
@@ -395,6 +403,9 @@ impl<'a> BuildArgv<'a> {
         if self.no_cache {
             args.push("--no-cache".into());
         }
+        for (key, value) in self.labels {
+            args.extend(["--label".into(), format!("{key}={value}")]);
+        }
         for (key, value) in self.build_args {
             args.extend(["--build-arg".into(), format!("{key}={value}")]);
         }
@@ -409,9 +420,10 @@ impl<'a> BuildArgv<'a> {
     }
 }
 
-/// The ordinary runtime `build` argv, without the leading CLI binary.
-fn build_image_argv(tag: &str, dockerfile: &Path, context: &Path, no_cache: bool) -> Vec<String> {
-    BuildArgv::new(tag, dockerfile, context, no_cache).to_args()
+fn empty_labels() -> &'static std::collections::BTreeMap<String, String> {
+    static LABELS: std::sync::OnceLock<std::collections::BTreeMap<String, String>> =
+        std::sync::OnceLock::new();
+    LABELS.get_or_init(Default::default)
 }
 
 /// `<cli> <subcommand> <target>` — container removal (`rm`) or image removal
@@ -422,13 +434,13 @@ pub(super) fn cli_remove(
     target: &str,
 ) -> Result<(), EngineError> {
     let cli_bin = cli.bin;
-    let output = cli
-        .command()
-        .args([subcommand, target])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| spawn_error(cli, &format!("{subcommand} {target}"), e))?;
+    let output = crate::engine::host_cli::checked_output(
+        cli.command()
+            .args([subcommand, target])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+        cli_bin,
+    )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(EngineError::Container(format!(
@@ -436,17 +448,6 @@ pub(super) fn cli_remove(
         )));
     }
     Ok(())
-}
-
-/// A spawn failure: `NotFound` means the CLI is not installed.
-fn spawn_error(cli: ContainerCli, what: &str, e: std::io::Error) -> EngineError {
-    if e.kind() == std::io::ErrorKind::NotFound {
-        EngineError::ContainerRuntimeUnavailable {
-            binary: cli.bin.to_string(),
-        }
-    } else {
-        EngineError::Container(format!("{} {what}: {e}", cli.bin))
-    }
 }
 
 /// Explicit user stop: keep immutable identity and propagate failures.

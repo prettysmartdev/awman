@@ -254,6 +254,7 @@ impl Command for WorkerLinkCommand {
                     max_concurrent_jobs: None,
                     interaction: None,
                     labels: (!self.labels.is_empty()).then_some(self.labels),
+                    image_budget: None,
                 },
             );
         store.write(&name, &token)?;

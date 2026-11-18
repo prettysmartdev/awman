@@ -180,6 +180,16 @@ impl ReadyEngine {
         engine
     }
 
+    async fn coordinated_build(
+        &self,
+        request: crate::engine::container::BuildRequest,
+        frontend: &mut dyn ReadyFrontend,
+    ) -> Result<(), EngineError> {
+        self.preparer
+            .build_runtime_coordinated(request, frontend)
+            .await
+    }
+
     /// Cancellation handle for an in-flight ready import. Dropping an import
     /// future also cancels it, so async deadlines work on a current-thread runtime.
     pub fn cancel_token(&self) -> crate::engine::oci::CancelToken {

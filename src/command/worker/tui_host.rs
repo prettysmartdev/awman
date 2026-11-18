@@ -156,6 +156,7 @@ impl QueueSource for Source {
 pub struct TuiWorkerController;
 /// Local frontend handoff; all scheduling and command models remain Layer 0.
 pub struct ForegroundPick {
+    pub lease_images: Option<crate::data::worker::lease_images::LeaseImageBinding>,
     pub lease: crate::data::worker::wire::LeaseResource,
     pub command: Vec<String>,
     pub args: Vec<String>,
@@ -295,6 +296,17 @@ impl Host {
         let settings = session.effective_config().daemon().worker;
         let paths =
             crate::data::fs::DataPaths::from_env(session.env()).map_err(|e| e.to_string())?;
+        if paths.db_path().exists() {
+            if let Ok(db) = SqliteSessionStore::open_at(&paths.db_path()) {
+                let _ = super::images::schedule_cleanup(
+                    engines.runtime.clone(),
+                    session.env().clone(),
+                    Arc::new(db),
+                    super::images::budgets(&settings),
+                )
+                .await;
+            }
+        }
         let links = LinkStore::new(&paths);
         let mut servers = BTreeMap::new();
         let (daemon, daemon_servers) = Self::daemon_servers(&session).await?;
@@ -371,13 +383,16 @@ impl Host {
                         name: format!("awman-tui-{name}"),
                         labels: labels.merged(),
                         capacity: config.max_concurrent_jobs,
-                        features: super::capabilities::features(
-                            support,
-                            interaction,
-                            settings.pull_allow_override,
-                            true,
-                            true,
-                            true,
+                        features: super::capabilities::with_image_reuse(
+                            super::capabilities::features(
+                                support,
+                                interaction,
+                                settings.pull_allow_override,
+                                true,
+                                true,
+                                true,
+                            ),
+                            engines.runtime.as_ref(),
                         )
                         .into_iter()
                         .map(str::to_string)
@@ -1051,9 +1066,11 @@ impl ManualRun {
             .set_inline_work_item(self._inline.path().into());
         super::provision::agents_for_lease(
             engines,
-            &self.session,
+            &mut self.session,
             &self.lease.item,
             self.workspace.private_dir(),
+            self.store.clone(),
+            &self.record,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -1079,6 +1096,7 @@ impl ManualRun {
     }
     pub(super) fn handoff(&self) -> ForegroundPick {
         ForegroundPick {
+            lease_images: self.session.lease_images().cloned(),
             lease: (&self.record).into(),
             command: self.plan.command.clone(),
             args: self.plan.args.clone(),
@@ -1236,9 +1254,11 @@ impl ManualRun {
             });
             super::provision::agents_for_lease(
                 engines,
-                &session,
+                &mut session,
                 &lease.item,
                 workspace.private_dir(),
+                store.clone(),
+                &record,
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -1433,6 +1453,17 @@ impl ManualRun {
                     });
                     let _ = leases.update(&record);
                     active.done.cancel();
+                    if let Ok(db) = crate::data::fs::DataPaths::from_env(invoker.env())
+                        .and_then(|p| SqliteSessionStore::open_at(&p.db_path()))
+                    {
+                        let _ = super::images::schedule_cleanup(
+                            engines.runtime.clone(),
+                            invoker.env().clone(),
+                            Arc::new(db),
+                            super::images::budgets(&invoker.effective_config().daemon().worker),
+                        )
+                        .await;
+                    }
                 }
                 control.stop();
                 let _ = heartbeat.await;
@@ -1535,6 +1566,7 @@ impl ManualRun {
             message: Some(message.into()),
         });
         let _ = LeaseStore::open(self.store.clone()).and_then(|s| s.update(&self.record));
+        let _ = self.cleanup_images().await;
         self.active.control.stop();
         result
     }
@@ -1584,6 +1616,7 @@ impl ManualRun {
         };
         self.record.ended_at = Some(Utc::now());
         let _ = LeaseStore::open(self.store.clone()).and_then(|s| s.update(&self.record));
+        let _ = self.cleanup_images().await;
         if let Some(log) = self.log.take() {
             if result.is_ok() {
                 let _ = log.await;
@@ -1593,6 +1626,14 @@ impl ManualRun {
         }
         self.active.control.stop();
         result
+    }
+    fn cleanup_images(&self) -> tokio::task::JoinHandle<()> {
+        super::images::schedule_cleanup(
+            self.runtime.clone(),
+            self.session.env().clone(),
+            self.store.clone(),
+            super::images::budgets(&self.session.effective_config().daemon().worker),
+        )
     }
 }
 impl Drop for ManualRun {
@@ -1652,6 +1693,11 @@ impl ProxyRun {
             .ok_or("lease session missing")?;
         let mut session = Session::open_worktree_for(cwd.clone(), cwd.clone(), invoker)
             .map_err(|e| e.to_string())?;
+        if let Some(images) = response.get("lease_images").filter(|v| !v.is_null()) {
+            session.set_lease_images(
+                serde_json::from_value(images.clone()).map_err(|e| e.to_string())?,
+            );
+        }
         if let Some(inline) = old.inline_work_item() {
             session.set_inline_work_item(inline.into());
         }
@@ -1734,6 +1780,11 @@ impl ProxyRun {
         )
         .map_err(|e| e.to_string())?;
         session.set_inline_work_item(inline);
+        if let Some(images) = value.get("lease_images").filter(|v| !v.is_null()) {
+            session.set_lease_images(
+                serde_json::from_value(images.clone()).map_err(|e| e.to_string())?,
+            );
+        }
         session.set_session_type(SessionType::Remote {
             repo_url: text("repo_url")?,
             branch: text("branch")?,

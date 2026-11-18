@@ -1033,6 +1033,22 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "One owner-configured worker label; awman/ is reserved.",
     ),
     row(
+        "workServers.*.imageBudget.maxImages",
+        POSITIVE,
+        "null",
+        Global,
+        true,
+        "Most lease-built images the worker keeps (20 when imageBudget is unset); oldest unused go first.",
+    ),
+    row(
+        "workServers.*.imageBudget.maxBytes",
+        Size,
+        "null",
+        Global,
+        true,
+        "Most total bytes of lease-built images the worker keeps; unlimited when unset.",
+    ),
+    row(
         "workServers.*.allowEnv",
         StringList,
         "[]",

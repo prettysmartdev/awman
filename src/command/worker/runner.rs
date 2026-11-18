@@ -720,12 +720,16 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             if let Some(job) = &record.job_id {
                 this.shared.command_cancels.unregister(job);
             }
-            this.active.lock().unwrap().remove(record.id.as_str());
+            let _ = this.cleanup_images().await;
             if let Err(error) = this.cleanup_retired() {
                 tracing::warn!(%error, "deferred unlink cleanup failed");
             }
             revocation.abort();
             timeout_task.abort();
+            // Shutdown waits on active tasks. Keep ownership through image
+            // cleanup, which still uses the database and runtime; a successor
+            // must not reopen that state while an ended lease is mutating it.
+            this.active.lock().unwrap().remove(record.id.as_str());
             drop(done_guard);
         });
     }
@@ -823,9 +827,11 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
         let commit_identity = apply_item_config(&mut run_session, &plan).map_err(invalid)?;
         provision::agents_for_lease(
             &self.shared.engines,
-            &run_session,
+            &mut run_session,
             &lease.item,
             workspace.private_dir(),
+            self.shared.store.clone(),
+            record,
         )
         .await?;
         let session_key = crate::data::ids::WorkerSessionId::new().to_string();

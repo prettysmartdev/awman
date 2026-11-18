@@ -143,6 +143,19 @@ impl DockerBackend {
 }
 
 impl ContainerBackend for DockerBackend {
+    fn inspect_image(
+        &self,
+        tag: &str,
+    ) -> Result<Option<super::runtime::ImageMetadata>, EngineError> {
+        super::image_metadata::inspect(self.cli(), tag)
+    }
+    fn list_images_by_repo(
+        &self,
+        repo: &crate::data::image_inputs::RepoKey,
+    ) -> Result<Vec<super::runtime::ImageMetadata>, EngineError> {
+        super::image_metadata::list_by_repo(self.cli(), repo)
+    }
+
     fn build(
         &self,
         mut options: ResolvedContainerOptions,
@@ -336,12 +349,8 @@ impl ContainerBackend for DockerBackend {
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError> {
         request.require_runtime_build()?;
-        let tag = request.reference.as_str();
-        let dockerfile = request.dockerfile.as_path();
-        let context = request.context.as_path();
-        let no_cache = request.no_cache;
 
-        host_cli_backend::cli_build_image(self.cli(), tag, dockerfile, context, no_cache, on_line)
+        host_cli_backend::cli_build_image(self.cli(), request, on_line)
     }
 
     fn import_image(

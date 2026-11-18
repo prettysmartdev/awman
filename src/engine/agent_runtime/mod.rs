@@ -262,6 +262,33 @@ pub trait AgentRuntimeEngine: Send + Sync {
     /// Whether `tag` exists in this runtime's local image store.
     fn image_exists(&self, tag: &str) -> Result<bool, EngineError>;
 
+    /// Read local image metadata without building, pulling or importing.
+    /// Runtimes without an image store explicitly refuse this operation.
+    fn inspect_image(
+        &self,
+        _tag: &str,
+    ) -> Result<Option<crate::engine::container::runtime::ImageMetadata>, EngineError> {
+        Err(EngineError::UnsupportedOnRuntime {
+            runtime: self.runtime_name(),
+            operation: "image inspection",
+        })
+    }
+    fn list_images_by_repo(
+        &self,
+        _repo: &crate::data::image_inputs::RepoKey,
+    ) -> Result<Vec<crate::engine::container::runtime::ImageMetadata>, EngineError> {
+        Err(EngineError::UnsupportedOnRuntime {
+            runtime: self.runtime_name(),
+            operation: "image listing by repository",
+        })
+    }
+    fn remove_image(&self, _reference: &str) -> Result<(), EngineError> {
+        Err(EngineError::UnsupportedOnRuntime {
+            runtime: self.runtime_name(),
+            operation: "image removal",
+        })
+    }
+
     /// The `HOME` baked into `tag`'s image config, when the runtime can read
     /// it. `Ok(None)` means "image present, no `HOME` declared".
     fn image_home_dir(&self, tag: &str) -> Result<Option<String>, EngineError>;
@@ -327,6 +354,9 @@ pub trait AgentRuntimeEngine: Send + Sync {
 /// What [`AgentRuntimeEngine::import_image`] should import.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageImportRequest {
+    /// awman's repository attribution. Local builds retain their baked-in
+    /// inputs label; registry/archive imports use the acquired source digest.
+    pub labels: BTreeMap<String, String>,
     /// The awman tag the image is stored under (`awman-<stem>-<agent>:latest`).
     pub tag: String,
     /// The explicit source. Never inferred from `tag`.

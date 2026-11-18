@@ -38,7 +38,7 @@ impl Drop for CancelOnDrop {
 /// Run blocking work (filesystem receipts, lock waits) off the async
 /// worker, cancelling `cancel` if the awaiting future is dropped.
 impl AgentImagePreparer {
-    pub(super) async fn blocking<T: Send + 'static>(
+    pub(crate) async fn blocking<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> Result<T, EngineError> {
@@ -120,7 +120,7 @@ impl UserMessageSink for Messages {
 }
 
 /// The single bounded, cancellation-on-drop bridge for builds and imports.
-async fn stream<T: Send + 'static, E: Send + 'static>(
+pub(crate) async fn stream<T: Send + 'static, E: Send + 'static>(
     cancel: CancelToken,
     work: impl FnOnce(tokio::sync::mpsc::Sender<E>) -> Result<T, EngineError> + Send + 'static,
     mut report: impl FnMut(E),
@@ -146,18 +146,35 @@ impl AgentImagePreparer {
     ) -> Result<BuiltImageIdentity, EngineError> {
         let builder = self.builder();
         let cancel = self.cancel.clone();
+        let env = self.definition_env.clone();
         let tag = request.reference.clone();
         sink.build_started(&tag);
         let result = stream(
             cancel.clone(),
             move |tx| {
-                builder.build(
-                    &request,
-                    &crate::engine::container::BuildControl::source_build(cancel),
-                    &mut |line| {
-                        let _ = tx.blocking_send(line.to_string());
-                    },
-                )
+                let control = crate::engine::container::BuildControl::source_build(cancel);
+                let request = super::freshness::label_build(&request, &env, |reference| {
+                    match builder.inspect_metadata(&request.target, reference, &control) {
+                        Ok(Some(image)) => return Ok(Some(image.id)),
+                        Ok(None) | Err(EngineError::NotImplemented(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                    match builder.inspect(
+                        &request.target,
+                        reference,
+                        &request.platform,
+                        &control,
+                    )? {
+                        SourceImage::Present(id) => Ok(id
+                            .config_digest()
+                            .or(id.manifest_digest())
+                            .map(ToString::to_string)),
+                        _ => Ok(None),
+                    }
+                })?;
+                builder.build(&request, &control, &mut |line| {
+                    let _ = tx.blocking_send(line.to_string());
+                })
             },
             |line| sink.build_output(&line),
         )

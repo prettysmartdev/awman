@@ -2,6 +2,7 @@
 //! live here; HTTP and terminal frontends adapt the typed PullHandle.
 mod capabilities;
 pub mod events;
+pub(crate) mod images;
 pub mod lease_context;
 pub mod lease_workflow_context;
 pub mod pick;
@@ -88,6 +89,7 @@ pub struct PullController<F: ApiCommandFrontendFactory + 'static> {
     leases: LeaseStore,
     servers: RwLock<BTreeMap<String, Registered>>,
     active: Mutex<BTreeMap<String, Arc<Active>>>,
+    recovery_cleanups: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     foreground: tokio::sync::Mutex<BTreeMap<String, (tui_host::ManualRun, WorkerPermit)>>,
     claim_gates: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
     share: Arc<WorkerExecutorShare>,
@@ -120,6 +122,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             factory,
             servers: Default::default(),
             active: Default::default(),
+            recovery_cleanups: Default::default(),
             foreground: Default::default(),
             claim_gates: Default::default(),
             share: crate::command::commands::api_server::push_job::worker_share(core.executor()),
@@ -135,6 +138,23 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
     }
     fn settings(&self) -> WorkerSettings {
         live_daemon_settings(self.shared.clone())().worker
+    }
+    fn cleanup_images(&self) -> tokio::task::JoinHandle<()> {
+        images::schedule_cleanup(
+            self.shared.engines.runtime.clone(),
+            self.shared.sessions.env().clone(),
+            self.shared.store.clone(),
+            images::budgets(&self.settings()),
+        )
+    }
+    /// Join after the feature task stops: recovery's drop guard may schedule
+    /// cleanup even when that task is cancelled. Blocking cleanup cannot be
+    /// aborted and must release private state before shutdown completes.
+    pub(crate) async fn finish_recovery_cleanup(&self) {
+        let tasks = std::mem::take(&mut *self.recovery_cleanups.lock().unwrap());
+        for task in tasks {
+            let _ = task.await;
+        }
     }
     fn data_paths(&self) -> crate::data::fs::DataPaths {
         self.shared.paths.data_paths()
@@ -342,10 +362,14 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                 name: format!("awman-{name}"),
                 labels: labels.merged(),
                 capacity: config.max_concurrent_jobs,
-                features: capabilities::for_settings(self.support(), &registration_settings)
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
+                features: capabilities::for_runtime(
+                    self.support(),
+                    &registration_settings,
+                    self.shared.engines.runtime.as_ref(),
+                )
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             };
             {
                 let mut servers = self.servers.write().unwrap();
@@ -463,6 +487,14 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
     /// Recovery precedes the push pool's generic stale-row recovery. A pull
     /// row must never be re-queued and executed without its original lease.
     pub async fn recover(&self) -> Result<(), WorkerError> {
+        struct Cleanup<'a, F: ApiCommandFrontendFactory + 'static>(&'a PullController<F>);
+        impl<F: ApiCommandFrontendFactory + 'static> Drop for Cleanup<'_, F> {
+            fn drop(&mut self) {
+                let cleanup = self.0.cleanup_images();
+                self.0.recovery_cleanups.lock().unwrap().push(cleanup);
+            }
+        }
+        let _cleanup = Cleanup(self);
         // A feature restart first drains tasks from its prior generation;
         // persisted recovery must not race a still-running lease owner.
         self.stop_now().await;
@@ -1360,7 +1392,11 @@ impl<F: ApiCommandFrontendFactory + 'static> PullHandle for PullHandleAdapter<F>
         }) {
             settings.pull_interaction = crate::data::config::daemon::Interaction::Interactive;
         }
-        let mut caps = capabilities::for_settings(self.0.support(), &settings);
+        let mut caps = capabilities::for_runtime(
+            self.0.support(),
+            &settings,
+            self.0.shared.engines.runtime.as_ref(),
+        );
         caps.push("worker_pull");
         caps
     }
@@ -1475,3 +1511,6 @@ impl Drop for Active {
         }
     }
 }
+
+#[cfg(test)]
+mod image_contracts;

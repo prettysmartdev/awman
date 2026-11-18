@@ -576,6 +576,7 @@ mod tests {
             max_concurrent_jobs: 1,
             interaction: None,
             labels: BTreeMap::new(),
+            image_budget: Default::default(),
             allow_env: vec![],
             allow_skills: vec![],
         };

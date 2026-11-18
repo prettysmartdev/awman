@@ -142,6 +142,11 @@ pub struct ImageIdentity {
 /// provenance before a builder-enabled check-only launch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledImageIdentity {
+    /// awman's attribution, without changing the acquired config digest.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub size_bytes: u64,
     #[serde(flatten)]
     pub identity: ImageIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]

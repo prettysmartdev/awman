@@ -35,6 +35,14 @@ pub(super) struct ProbeRequest<'a> {
 /// What every container backend must support. The concrete type is hidden
 /// behind `Arc<dyn ContainerBackend>` and never escapes this module.
 pub(super) trait ContainerBackend: Send + Sync {
+    fn inspect_image(
+        &self,
+        tag: &str,
+    ) -> Result<Option<super::runtime::ImageMetadata>, EngineError>;
+    fn list_images_by_repo(
+        &self,
+        repo: &crate::data::image_inputs::RepoKey,
+    ) -> Result<Vec<super::runtime::ImageMetadata>, EngineError>;
     // ─── Identity ───────────────────────────────────────────────────────────
 
     /// Static name used by `ContainerRuntime::runtime_name`.

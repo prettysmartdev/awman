@@ -408,6 +408,7 @@ impl SessionType {
 /// The ruling Layer 0 type that every command and workflow invocation hangs off.
 #[derive(Debug, Clone)]
 pub struct Session {
+    lease_images: Option<crate::data::worker::lease_images::LeaseImageBinding>,
     repo_context: RepoContextBinding,
     id: SessionId,
     inline_work_item: Option<PathBuf>,
@@ -607,6 +608,7 @@ impl Session {
         session.config =
             EffectiveConfig::resolve(layers, session.flags.clone(), session.env.clone())?;
         session.definition_root = invoker.definition_root.clone();
+        session.lease_images = invoker.lease_images.clone();
         session.repo_context = invoker.repo_context.clone();
         session.default_agent = invoker.default_agent.clone();
         Ok(session)
@@ -640,6 +642,7 @@ impl Session {
             flags: invoker.flags.clone(),
             default_agent: invoker.default_agent.clone(),
             available_agents: invoker.available_agents.clone(),
+            lease_images: invoker.lease_images.clone(),
             state: SessionState::new(),
             created_at: now,
             last_active_at: now,
@@ -687,11 +690,36 @@ impl Session {
             flags: opts.flags,
             default_agent,
             available_agents,
+            lease_images: None,
             state: SessionState::new(),
             created_at: now,
             last_active_at: now,
             created_at_instant: Instant::now(),
         })
+    }
+
+    /// Worker preparation pins these references before command admission.
+    pub fn set_lease_images(
+        &mut self,
+        images: crate::data::worker::lease_images::LeaseImageBinding,
+    ) {
+        self.lease_images = Some(images);
+    }
+    pub fn lease_images(&self) -> Option<&crate::data::worker::lease_images::LeaseImageBinding> {
+        self.lease_images.as_ref()
+    }
+    pub fn project_image_tag(&self) -> String {
+        self.lease_images
+            .as_ref()
+            .map(|i| i.project.clone())
+            .unwrap_or_else(|| crate::data::image_tags::project_image_tag(self.git_root()))
+    }
+    pub fn agent_image_tag(&self, agent: &str) -> String {
+        self.lease_images
+            .as_ref()
+            .and_then(|i| i.agents.get(agent))
+            .cloned()
+            .unwrap_or_else(|| crate::data::image_tags::agent_image_tag(self.git_root(), agent))
     }
 
     pub fn set_inline_work_item(&mut self, path: PathBuf) {

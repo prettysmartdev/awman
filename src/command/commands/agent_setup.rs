@@ -72,6 +72,9 @@ impl<F: ?Sized + HasAgentFrontend> UserMessageSink for AgentFrontendAdapter<'_, 
     fn replay_queued(&mut self) {
         self.inner.replay_queued();
     }
+    fn report_image_stale(&mut self, warning: &crate::data::execution_event::ImageStaleWarning) {
+        self.inner.report_image_stale(warning);
+    }
 }
 
 impl<F: ?Sized + HasAgentFrontend> crate::engine::agent::AgentImageFrontend

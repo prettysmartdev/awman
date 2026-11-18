@@ -135,6 +135,7 @@ async fn handle(
                         "lease": pick.lease, "command": pick.command, "args": pick.args,
                         "cwd": pick.cwd, "inline_source": pick.inline_source, "output_dir": pick.output_dir,
                         "repo_url": pick.repo_url, "branch": pick.branch, "read_only": pick.read_only,
+                        "lease_images": pick.lease_images,
                     }))).into_response(),
                     Err(e) => error(e),
                 };
@@ -215,7 +216,10 @@ async fn handle(
             };
             worker_pull::foreground_checkout(&api, &lease_id(&params), workdir)
                 .await
-                .map(|pick| Json(serde_json::json!({"cwd": pick.cwd})).into_response())
+                .map(|pick| {
+                    Json(serde_json::json!({"cwd": pick.cwd, "lease_images": pick.lease_images}))
+                        .into_response()
+                })
         }
         Operation::WorkerLeasesResult => {
             let result = match serde_json::from_slice::<crate::data::worker::wire::ForegroundResult>(

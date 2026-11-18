@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::data::config::daemon::Interaction;
+use crate::data::config::units::Size;
+use crate::data::worker::lease_images::ImageBudget;
 
 /// One `workServers.<name>` entry.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,12 +24,42 @@ pub struct WorkServerConfig {
     pub interaction: Option<Interaction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<BTreeMap<String, String>>,
+    /// `imageBudget`: how many lease-built images the worker keeps (WI 0163).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_budget: Option<ImageBudgetConfig>,
     /// Worker environment variables a lease may request with `env(NAME)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_env: Option<Vec<String>>,
     /// Non-default-library skills a lease may request with `skill(name)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_skills: Option<Vec<String>>,
+}
+
+/// `workServers.<name>.imageBudget`: `{maxImages?, maxBytes?}`.
+///
+/// An absent object, or one with neither field, gives the default
+/// `{maxImages: 20}`. Otherwise each field limits its own axis and an absent
+/// field leaves that axis unlimited. `maxBytes` is a size string
+/// (`"20GiB"`), like every other size key.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImageBudgetConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_images: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<Size>,
+}
+
+impl ImageBudgetConfig {
+    pub fn resolved(&self) -> ImageBudget {
+        if self.max_images.is_none() && self.max_bytes.is_none() {
+            return ImageBudget::default();
+        }
+        ImageBudget {
+            max_images: self.max_images,
+            max_bytes: self.max_bytes.as_ref().map(Size::bytes),
+        }
+    }
 }
 
 /// `workServers.<name>.claim`.
@@ -50,6 +82,7 @@ pub struct ResolvedWorkServer {
     pub max_concurrent_jobs: usize,
     pub interaction: Option<Interaction>,
     pub labels: BTreeMap<String, String>,
+    pub image_budget: ImageBudget,
     pub allow_env: Vec<String>,
     pub allow_skills: Vec<String>,
 }
@@ -63,6 +96,11 @@ impl WorkServerConfig {
             max_concurrent_jobs: self.max_concurrent_jobs.unwrap_or(1),
             interaction: self.interaction,
             labels: self.labels.clone().unwrap_or_default(),
+            image_budget: self
+                .image_budget
+                .as_ref()
+                .map(ImageBudgetConfig::resolved)
+                .unwrap_or_default(),
             allow_env: self.allow_env.clone().unwrap_or_default(),
             allow_skills: self.allow_skills.clone().unwrap_or_default(),
         }
@@ -120,6 +158,41 @@ pub fn validate_configured_label(key: &str) -> Result<(), String> {
     }
     awman_wsp::labels::validate_key(key).map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod image_budget_tests {
+    use super::*;
+
+    #[test]
+    fn image_budget_defaults_to_twenty_images_and_reads_camel_case() {
+        let old: WorkServerConfig = serde_json::from_str(r#"{"url":"https://h"}"#).unwrap();
+        assert_eq!(old.resolved().image_budget, ImageBudget::default());
+        let empty: WorkServerConfig =
+            serde_json::from_str(r#"{"url":"https://h","imageBudget":{}}"#).unwrap();
+        assert_eq!(empty.resolved().image_budget, ImageBudget::default());
+        let set: WorkServerConfig = serde_json::from_str(
+            r#"{"url":"https://h","imageBudget":{"maxImages":5,"maxBytes":"2GiB"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            set.resolved().image_budget,
+            ImageBudget {
+                max_images: Some(5),
+                max_bytes: Some(2 << 30)
+            }
+        );
+        let bytes_only: WorkServerConfig =
+            serde_json::from_str(r#"{"url":"https://h","imageBudget":{"maxBytes":"1MiB"}}"#)
+                .unwrap();
+        assert_eq!(bytes_only.resolved().image_budget.max_images, None);
+        assert!(serde_json::from_str::<WorkServerConfig>(
+            r#"{"url":"https://h","imageBudget":{"maxImage":5}}"#
+        )
+        .is_err());
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["imageBudget"]["maxBytes"], "2GiB");
+    }
 }
 
 /// An `allowEnv` entry must be a valid environment-variable name
