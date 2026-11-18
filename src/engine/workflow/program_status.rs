@@ -458,7 +458,7 @@ impl WorkflowEngine {
                             self.settle_reported_status(step_name, stuck_rx.as_mut());
                             self.set_focused_execution(exec_back);
                             return Ok(Some(InterruptibleStepResult::StepCompleted(
-                                self.finalize_step(step_name, exit_result?)?,
+                                self.finalize_step(step_name, exit_result)?,
                             )));
                         }
                         AgentCountdownEnd::Expired => {
@@ -535,17 +535,17 @@ impl WorkflowEngine {
         let exit = match tokio::time::timeout(KILL_WAIT_LIMIT, &mut *wait_rx).await {
             Ok(Ok((exec_back, result))) => {
                 self.set_focused_execution(exec_back);
-                result?
+                result
             }
             // The wait never resolved: record the kill without its real code.
             Ok(Err(_)) | Err(_) => {
                 let now = chrono::Utc::now();
-                AgentExitInfo {
+                Ok(AgentExitInfo {
                     exit_code: KILLED_EXIT_CODE,
                     signal: None,
                     started_at: now,
                     ended_at: now,
-                }
+                })
             }
         };
         Ok(InterruptibleStepResult::StepCompleted(

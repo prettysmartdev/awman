@@ -129,7 +129,7 @@ impl WorkflowEngine {
                     if self.cancel_requested() {
                         return Ok(GroupOutcome::Ended(self.cancel_parallel_group()?));
                     }
-                    let exit = result?;
+                    let exit = self.resolve_step_exit(result)?;
                     // Persist the buffered output on a genuine failure before the
                     // slot (which owns the tail + container name) is removed.
                     self.maybe_dump_step_failure(&name, exit.exit_code);
@@ -147,14 +147,20 @@ impl WorkflowEngine {
                     // from the execution's tracker first.
                     self.settle_reported_status(&name, None);
                     let problem = self.reported_problem_of(&name);
-                    let auth_recovered = problem.is_none()
+                    let auth_recovered = exit.error_message.is_none()
+                        && problem.is_none()
                         && exit.exit_code != 0
                         && self.recover_auth_failure(&name)?;
                     self.remove_active_step(&name);
                     review_ready.remove(&name);
-                    self.last_exit_info = Some(exit.clone());
+                    self.last_exit_info = exit.info;
 
-                    let (status, step_state) = if let Some(problem) = &problem {
+                    let (status, step_state) = if let Some(reason) = exit.error_message {
+                        (
+                            WorkflowStepStatus::Failed { exit_code: -1 },
+                            StepState::Failed { exit_code: -1, error_message: Some(reason) },
+                        )
+                    } else if let Some(problem) = &problem {
                         (
                             WorkflowStepStatus::Failed { exit_code: exit.exit_code },
                             StepState::Failed {

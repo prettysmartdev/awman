@@ -32,8 +32,15 @@ use std::{
     time::Duration,
 };
 
-fn failed() -> EngineError {
-    EngineError::Other("builtin exec stream closed or failed before reporting exit status".into())
+#[cfg(test)]
+#[path = "exec_bridge_contracts.rs"]
+mod contracts;
+
+fn failed(reason: impl Into<String>) -> EngineError {
+    EngineError::ExecutionStreamFailed {
+        reason: reason.into(),
+        stopped: false,
+    }
 }
 
 struct Execution {
@@ -110,7 +117,9 @@ impl ExecutionBackend for Execution {
     }
 
     fn wait_blocking(self: Box<Self>) -> Result<AgentExitInfo, EngineError> {
-        self.done.recv().map_err(|_| failed())?
+        self.done
+            .recv()
+            .map_err(|_| failed("exec observer ended without a result"))?
     }
     fn cancel(&self) -> Result<(), EngineError> {
         self.cancel.cancel()
@@ -248,8 +257,10 @@ impl ExecBridge {
             // Same bytes as the Docker path: the prompt plus a terminating newline.
             io.stdin_tx
                 .send(prompt.into_bytes())
-                .map_err(|_| failed())?;
-            io.stdin_tx.send(b"\n".to_vec()).map_err(|_| failed())?;
+                .map_err(|_| failed("prompt input channel closed"))?;
+            io.stdin_tx
+                .send(b"\n".to_vec())
+                .map_err(|_| failed("prompt input channel closed"))?;
         }
         let status_config = ProgramStatusBridgeConfig {
             answer_queries: io.initial_size.is_some(),
@@ -368,7 +379,7 @@ impl ExecBridge {
         let query_control = control.clone();
         let event_task = tokio::spawn(async move {
             let mut events = session.events;
-            let outcome = loop {
+            let mut outcome = loop {
                 let event = tokio::select! {
                     biased;
                     _ = released.notified(), if sinks.is_some() => {
@@ -428,17 +439,23 @@ impl ExecBridge {
                                 "builtin exec output lagged".into(),
                             ));
                         }
-                        break Err(EngineError::Other(
-                            "builtin exec output lagged; reconnect or restart the agent".into(),
-                        ));
+                        break Err(failed(format!(
+                            "output receiver lagged; lost {skipped} events"
+                        )));
                     }
-                    Ok(ExecEvent::Failed) | Err(_) => {
+                    event => {
+                        let reason = match event {
+                            Ok(ExecEvent::Failed(reason)) => redaction.redact(&reason),
+                            Err(error) => format!("exec event channel: {error}"),
+                            _ => unreachable!("output and exit events handled above"),
+                        };
                         if let Some(frontend) = frontend_weak.upgrade() {
-                            frontend.lock().unwrap().report_status(AgentStatus::Failed(
-                                "builtin exec stream failed".into(),
-                            ));
+                            frontend
+                                .lock()
+                                .unwrap()
+                                .report_status(AgentStatus::Failed(reason.clone()));
                         }
-                        break Err(failed());
+                        break Err(failed(reason));
                     }
                 }
             };
@@ -486,6 +503,12 @@ impl ExecBridge {
                     })
                     .await;
                     guest_ended |= stop_confirmed(stop, &cleanup_claimed);
+                }
+            }
+            if let Err(EngineError::ExecutionStreamFailed { reason, stopped }) = &mut outcome {
+                *stopped = guest_ended;
+                if !guest_ended {
+                    reason.push_str("; old execution stop is unconfirmed");
                 }
             }
             if guest_ended {
@@ -721,7 +744,9 @@ impl ExecControl for AttachControl {
         Some(self.1.clone())
     }
     fn send(&self, command: Control) -> Result<(), EngineError> {
-        self.0.send(command).map_err(|_| failed())
+        self.0
+            .send(command)
+            .map_err(|_| failed("exec control channel closed"))
     }
 }
 async fn client(
@@ -737,15 +762,15 @@ async fn client(
         loop {
             tokio::select! {
                 Some(bytes) = terminal_input.recv() => {
-                    if write_frame(&mut writer, Tag::Stdin, &bytes).await.is_err() { let _ = events.send(ExecEvent::Failed); return; }
+                    if write_frame(&mut writer, Tag::Stdin, &bytes).await.is_err() { let _ = events.send(ExecEvent::Failed("attach connection closed or interrupted".into())); return; }
                 }
                 frame=&mut frame=>{
-                    let (event,terminal)=match frame {Ok((Tag::Output,b))=>(ExecEvent::Stdout(b),false),Ok((Tag::Stderr,b))=>(ExecEvent::Stderr(b),false),Ok((Tag::Exit,b)) if b.len()==4=>(ExecEvent::Exited(i32::from_le_bytes(b.try_into().unwrap())),true),_=>(ExecEvent::Failed,true)};
+                    let (event,terminal)=match frame {Ok((Tag::Output,b))=>(ExecEvent::Stdout(b),false),Ok((Tag::Stderr,b))=>(ExecEvent::Stderr(b),false),Ok((Tag::Exit,b)) if b.len()==4=>(ExecEvent::Exited(i32::from_le_bytes(b.try_into().unwrap())),true),_=>(ExecEvent::Failed("attach stream ended without an exit frame".into()),true)};
                     let _=events.send(event);if terminal{return;} break;
                 },
                 command=commands.recv()=>{
-                    let (tag,bytes)=match command {Some(Control::Stdin(b))=>(Tag::Stdin,b),Some(Control::Resize(c,r))=>(Tag::Resize,resize_payload(c,r).to_vec()),Some(Control::Interrupt)=>{let _=events.send(ExecEvent::Failed);return;},Some(Control::Eof)=>continue,_=>return};
-                    if write_frame(&mut writer,tag,&bytes).await.is_err(){let _=events.send(ExecEvent::Failed);return;}
+                    let (tag,bytes)=match command {Some(Control::Stdin(b))=>(Tag::Stdin,b),Some(Control::Resize(c,r))=>(Tag::Resize,resize_payload(c,r).to_vec()),Some(Control::Interrupt)=>{let _=events.send(ExecEvent::Failed("attach connection closed or interrupted".into()));return;},Some(Control::Eof)=>continue,_=>return};
+                    if write_frame(&mut writer,tag,&bytes).await.is_err(){let _=events.send(ExecEvent::Failed("attach connection closed or interrupted".into()));return;}
                 }
             }
         }

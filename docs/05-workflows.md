@@ -1234,6 +1234,16 @@ If an agent step's container exits unexpectedly, awman does **not** end the work
 
 There is no "Enter to finish workflow" on a failure board — finishing a run on a failed step is never what you want, so **Ctrl+C** is the deliberate way out. The container's recent output is also saved to a log file; see [Container failure logs](#container-failure-logs).
 
+The same recovery applies when the builtin runtime loses an execution stream
+before receiving the agent's exit status, including in the TUI with the daemon
+backend. The board shows **Exit status unavailable** and the stream failure
+reason. This can happen when the guest execution channel closes, the guest
+reports an execution failure, or the output receiver falls behind and loses
+events. Press **↑** to retry the step in a fresh container using the existing
+workflow worktree. Awman confirms that the old execution has stopped before
+offering recovery; if stopping it fails, the error ends the run. Steps configured
+with `abort_on_failure` keep their abort behavior.
+
 An arrow the board does not offer does nothing. On the *first* step there is no previous step to go back to, and on the *last* one there is nothing to skip ahead to; those arrows are shown greyed out with the reason, and pressing them leaves the board where it is.
 
 In command mode the same choices are printed as a menu on stderr (`[r]` restart, `[b]` back, `[n]` next, `[p]` pause, `[a]` abort), and only the ones that apply are listed.

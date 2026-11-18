@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::{mpsc, Mutex};
 
 struct Running {
+    error: Option<EngineError>,
     exit: mpsc::Receiver<i32>,
     cancel: mpsc::Sender<i32>,
     cancelled: Arc<Mutex<HashSet<String>>>,
@@ -24,6 +25,9 @@ impl ExecutionBackend for Running {
             .exit
             .recv_timeout(Duration::from_secs(5))
             .expect("scenario releases or cancels each execution");
+        if let Some(error) = self.error {
+            return Err(error);
+        }
         Ok(AgentExitInfo {
             exit_code: code,
             signal: None,
@@ -53,6 +57,7 @@ struct Trace {
     contexts: Vec<WorkflowRuntimeContext>,
     stopped: Vec<String>,
     exits: VecDeque<i32>,
+    wait_errors: VecDeque<Option<EngineError>>,
     held: Vec<mpsc::Sender<i32>>,
     reports: HashMap<String, Arc<tokio::sync::broadcast::Sender<StuckEvent>>>,
     cancelled: Arc<Mutex<HashSet<String>>>,
@@ -90,6 +95,7 @@ impl AgentExecutionFactory for Runtime {
                 started_at: chrono::Utc::now(),
             },
             Box::new(Running {
+                error: t.wait_errors.pop_front().flatten(),
                 exit: rx,
                 cancel: tx,
                 cancelled: t.cancelled.clone(),
@@ -109,6 +115,7 @@ impl AgentExecutionFactory for Runtime {
 }
 struct Frontend {
     retries: usize,
+    failures: Option<Arc<Mutex<Vec<StepFailureContext>>>>,
 }
 impl UserMessageSink for Frontend {
     fn write_message(&mut self, _: UserMessage) {}
@@ -120,6 +127,12 @@ impl WorkflowFrontend for Frontend {
         _: &WorkflowState,
         actions: &AvailableActions,
     ) -> Result<NextAction, EngineError> {
+        if let (Some(failures), Some(failure)) = (&self.failures, &actions.step_failure) {
+            assert!(!actions.can_dismiss);
+            assert!(!actions.can_finish_workflow);
+            assert!(actions.can_restart_current_step);
+            failures.lock().unwrap().push(failure.clone());
+        }
         if self.retries > 0 {
             if actions.step_failure.is_some() && actions.can_restart_current_step {
                 self.retries -= 1;
@@ -217,7 +230,10 @@ async fn engine(
     let (started, rx) = tokio::sync::mpsc::unbounded_channel();
     let spec = WorkflowSpec::new(definition(parallel)).with_work_item_context(None);
     let deps = WorkflowEngineDeps {
-        frontend: Box::new(Frontend { retries }),
+        frontend: Box::new(Frontend {
+            retries,
+            failures: None,
+        }),
         agent_factory: Box::new(Runtime {
             trace,
             hold,
@@ -313,7 +329,10 @@ async fn resume_rewind_preserves_completed_parallel_branches() {
     let deps = || {
         let (started, _) = tokio::sync::mpsc::unbounded_channel();
         WorkflowEngineDeps {
-            frontend: Box::new(Frontend { retries: 0 }),
+            frontend: Box::new(Frontend {
+                retries: 0,
+                failures: None,
+            }),
             agent_factory: Box::new(Runtime {
                 trace: trace.clone(),
                 hold: false,
@@ -441,7 +460,10 @@ async fn preallocated_invocation_is_persisted_and_resume_keeps_it() {
     let deps = || {
         let (started, _) = tokio::sync::mpsc::unbounded_channel();
         WorkflowEngineDeps {
-            frontend: Box::new(Frontend { retries: 0 }),
+            frontend: Box::new(Frontend {
+                retries: 0,
+                failures: None,
+            }),
             agent_factory: Box::new(Runtime {
                 trace: trace.clone(),
                 hold: false,
@@ -891,7 +913,10 @@ async fn continue_in_current_container_refuses_a_workspace_access_change() {
             &session,
             WorkflowSpec::new(workflow).with_work_item_context(None),
             WorkflowEngineDeps {
-                frontend: Box::new(Frontend { retries: 0 }),
+                frontend: Box::new(Frontend {
+                    retries: 0,
+                    failures: None,
+                }),
                 agent_factory: Box::new(Runtime {
                     trace: trace.clone(),
                     hold: true,
@@ -916,4 +941,119 @@ async fn continue_in_current_container_refuses_a_workspace_access_change() {
         }
     }
     s.finish();
+}
+
+async fn stream_failure_recovery(parallel: bool) {
+    let s = TestSandbox::for_test(TestCase::component(if parallel {
+        "engine::workflow::contracts::parallel_stream_failure_can_be_retried"
+    } else {
+        "engine::workflow::contracts::stream_failure_can_be_retried"
+    }));
+    let trace = Arc::new(Mutex::new(Trace {
+        wait_errors: VecDeque::from([Some(EngineError::ExecutionStreamFailed {
+            reason: "guest exec channel closed".into(),
+            stopped: true,
+        })]),
+        ..Default::default()
+    }));
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let (mut workflow, _) = engine(&s, trace.clone(), false, 1, parallel, false).await;
+    workflow.frontend = Box::new(Frontend {
+        retries: 1,
+        failures: Some(failures.clone()),
+    });
+    assert_eq!(
+        workflow.run_to_completion().await.unwrap(),
+        WorkflowOutcome::Completed
+    );
+    let launched = &trace.lock().unwrap().launched;
+    assert_eq!(launched.iter().filter(|s| *s == "build").count(), 2);
+    assert_eq!(launched.iter().filter(|s| *s == "lint").count(), 1);
+    assert_eq!(launched.last().unwrap(), "publish");
+    let failures = failures.lock().unwrap();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].step_name, "build");
+    assert_eq!(failures[0].exit_code, -1);
+    assert_eq!(failures[0].signal, None);
+    assert!(failures[0]
+        .detail_lines
+        .iter()
+        .any(|s| s == "Exit status unavailable"));
+    assert!(failures[0]
+        .detail_lines
+        .iter()
+        .any(|s| s.contains("guest exec channel closed")));
+    assert!(!failures[0]
+        .detail_lines
+        .iter()
+        .any(|s| s.starts_with("Ran for")));
+    let saved = WorkflowStateStore::at_git_root(s.work())
+        .load(None, "execution-contract")
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.status_of("build"), Some(&StepState::Succeeded));
+}
+
+#[tokio::test]
+async fn stream_failure_can_be_retried() {
+    stream_failure_recovery(false).await;
+}
+
+#[tokio::test]
+async fn parallel_stream_failure_can_be_retried() {
+    stream_failure_recovery(true).await;
+}
+
+#[tokio::test]
+async fn stream_failure_is_persisted_without_a_fabricated_exit() {
+    let s = TestSandbox::for_test(TestCase::component(
+        "engine::workflow::contracts::stream_failure_is_persisted_without_a_fabricated_exit",
+    ));
+    let trace = Arc::new(Mutex::new(Trace {
+        wait_errors: VecDeque::from([Some(EngineError::ExecutionStreamFailed {
+            reason: "output receiver lagged; lost 42 events".into(),
+            stopped: true,
+        })]),
+        ..Default::default()
+    }));
+    let (mut workflow, _) = engine(&s, trace, false, 0, false, false).await;
+    let outcome = workflow.step_once().await.unwrap();
+    assert_eq!(outcome.status, WorkflowStepStatus::Failed { exit_code: -1 });
+    assert!(workflow.last_exit_info.is_none());
+    let saved = WorkflowStateStore::at_git_root(s.work())
+        .load(None, "execution-contract")
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(saved.status_of("build"), Some(StepState::Failed { exit_code: -1, error_message: Some(reason) }) if reason.contains("lost 42 events"))
+    );
+    assert_eq!(saved.status_of("lint"), Some(&StepState::Pending));
+}
+
+#[tokio::test]
+async fn unconfirmed_stop_and_unrelated_errors_do_not_offer_retry() {
+    let s = TestSandbox::for_test(TestCase::component(
+        "engine::workflow::contracts::unconfirmed_stop_and_unrelated_errors_do_not_offer_retry",
+    ));
+    for error in [
+        EngineError::ExecutionStreamFailed {
+            reason: "guest disconnected; stop failed".into(),
+            stopped: false,
+        },
+        EngineError::Other("unrelated runtime failure".into()),
+    ] {
+        let trace = Arc::new(Mutex::new(Trace {
+            wait_errors: VecDeque::from([Some(error)]),
+            ..Default::default()
+        }));
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let (mut workflow, _) = engine(&s, trace.clone(), false, 1, false, false).await;
+        workflow.frontend = Box::new(Frontend {
+            retries: 1,
+            failures: Some(failures.clone()),
+        });
+        assert!(workflow.run_to_completion().await.is_err());
+        assert_eq!(trace.lock().unwrap().launched, ["build"]);
+        assert!(failures.lock().unwrap().is_empty());
+    }
 }

@@ -226,7 +226,7 @@ impl BuiltinBackend {
         std::thread::spawn(move || {
             let mut events = session.events;
             while let Ok(event) = events.blocking_recv() {
-                let terminal = matches!(event, ExecEvent::Exited(_) | ExecEvent::Failed);
+                let terminal = matches!(event, ExecEvent::Exited(_) | ExecEvent::Failed(_));
                 if tx.send(event).is_err() || terminal {
                     break;
                 }
@@ -1055,7 +1055,7 @@ impl ContainerBackend for BuiltinBackend {
         std::thread::spawn(move || {
             let mut events = session.events;
             while let Ok(event) = events.blocking_recv() {
-                let terminal = matches!(event, ExecEvent::Exited(_) | ExecEvent::Failed);
+                let terminal = matches!(event, ExecEvent::Exited(_) | ExecEvent::Failed(_));
                 if tx.send(event).is_err() || terminal {
                     break;
                 }

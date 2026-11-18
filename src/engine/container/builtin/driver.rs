@@ -113,7 +113,7 @@ pub enum ExecEvent {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     Exited(i32),
-    Failed,
+    Failed(String),
 }
 pub enum Control {
     Stdin(Vec<u8>),

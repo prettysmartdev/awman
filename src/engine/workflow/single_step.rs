@@ -22,7 +22,37 @@ pub(super) struct StepLaunch {
     pub(super) model: Option<String>,
 }
 
+/// A completed execution observation. -1 means no exit status was received;
+/// it must never be presented as a real process exit or an authentication error.
+pub(super) struct StepExit {
+    pub(super) exit_code: i32,
+    pub(super) info: Option<AgentExitInfo>,
+    pub(super) error_message: Option<String>,
+}
+
 impl WorkflowEngine {
+    pub(super) fn resolve_step_exit(
+        &self,
+        result: Result<AgentExitInfo, EngineError>,
+    ) -> Result<StepExit, EngineError> {
+        match result {
+            Ok(info) => Ok(StepExit {
+                exit_code: info.exit_code,
+                info: Some(info),
+                error_message: None,
+            }),
+            Err(error @ EngineError::ExecutionStreamFailed { stopped: true, .. }) => Ok(StepExit {
+                exit_code: -1,
+                info: None,
+                error_message: Some(self.redaction.redact(&error.to_string())),
+            }),
+            // An unconfirmed stop cannot safely be retried against the same
+            // workspace. Configuration, persistence and other errors also keep
+            // their existing fatal behavior.
+            Err(error) => Err(error),
+        }
+    }
+
     pub(super) fn prepare_step_launch(
         &mut self,
         step: &WorkflowStep,
@@ -140,7 +170,7 @@ impl WorkflowEngine {
             let progress = self.workflow_progress_info();
             self.frontend.report_workflow_progress(&progress);
 
-            if self.recover_auth_failure(&outcome.step_name)? {
+            if exit_code != -1 && self.recover_auth_failure(&outcome.step_name)? {
                 self.state
                     .set_status(&outcome.step_name, StepState::Pending);
                 self.persist()?;
@@ -239,7 +269,7 @@ impl WorkflowEngine {
                 .first_mut()
                 .and_then(|s| s.execution.as_mut())
                 .expect("launch_step stored execution");
-            exec.wait().await?
+            exec.wait().await
         };
         self.finalize_step(&step_name, exit)
     }
@@ -313,12 +343,13 @@ impl WorkflowEngine {
     pub(super) fn finalize_step(
         &mut self,
         step_name: &str,
-        exit: AgentExitInfo,
+        result: Result<AgentExitInfo, EngineError>,
     ) -> Result<StepOutcome, EngineError> {
+        let exit = self.resolve_step_exit(result)?;
         // WI 0141: the agent's final status (its tracker at exit) is
         // settled before the exit code is read, on every finalising path.
         self.settle_reported_status(step_name, None);
-        self.last_exit_info = Some(exit.clone());
+        self.last_exit_info = exit.info;
         // The step's container has actually terminated (wait() resolved) —
         // tell the frontend so it can tear down any live container UI.
         self.frontend.report_container_exited(exit.exit_code);
@@ -332,7 +363,15 @@ impl WorkflowEngine {
         // otherwise read as an engine advance) or one that exited by itself,
         // even with 0, is Failed with the agent's reason. After `done` the
         // exit code stands.
-        let (status, step_state) = if let Some(problem) = self.reported_problem_of(step_name) {
+        let (status, step_state) = if let Some(reason) = exit.error_message {
+            (
+                WorkflowStepStatus::Failed { exit_code: -1 },
+                StepState::Failed {
+                    exit_code: -1,
+                    error_message: Some(reason),
+                },
+            )
+        } else if let Some(problem) = self.reported_problem_of(step_name) {
             (
                 WorkflowStepStatus::Failed {
                     exit_code: exit.exit_code,
@@ -415,7 +454,7 @@ impl WorkflowEngine {
                     self.settle_reported_status(&step_name, stuck_rx.as_mut());
                     self.set_focused_execution(exec_back);
                     return Ok(InterruptibleStepResult::StepCompleted(
-                        self.finalize_step(&step_name, exit_result?)?
+                        self.finalize_step(&step_name, exit_result)?
                     ));
                 }
                 // After `wait_rx` (the loop is biased): a container that
@@ -638,7 +677,7 @@ impl WorkflowEngine {
             {
                 MidStepYoloResult::StepCompleted((exec_back, exit_result)) => {
                     self.set_focused_execution(exec_back);
-                    MidStepYoloResult::StepCompleted(self.finalize_step(step_name, exit_result?)?)
+                    MidStepYoloResult::StepCompleted(self.finalize_step(step_name, exit_result)?)
                 }
                 MidStepYoloResult::Advanced => MidStepYoloResult::Advanced,
                 MidStepYoloResult::Cancelled => MidStepYoloResult::Cancelled,

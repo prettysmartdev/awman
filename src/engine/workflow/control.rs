@@ -7,6 +7,14 @@
 
 use super::*;
 
+fn failure_exit_detail(exit_code: i32) -> String {
+    if exit_code == -1 {
+        "exit status unavailable".into()
+    } else {
+        format!("exit {exit_code}")
+    }
+}
+
 impl WorkflowEngine {
     /// Natural exits (or resuming a completed main phase) still require an
     /// explicit Finish before the command layer may enter teardown. Dismissing
@@ -74,7 +82,11 @@ impl WorkflowEngine {
         if let Some(sig) = signal {
             detail_lines.push(format!("Container terminated by signal {sig}"));
         }
-        detail_lines.push(format!("Exit code: {exit_code}"));
+        if exit_code == -1 {
+            detail_lines.push("Exit status unavailable".into());
+        } else {
+            detail_lines.push(format!("Exit code: {exit_code}"));
+        }
         // A step failed on its agent's own report (WI 0141) carries the
         // reason the agent gave; it explains a 0 or 137 exit code.
         if let Some(StepState::Failed {
@@ -115,7 +127,7 @@ impl WorkflowEngine {
             cancel_to_previous_unavailable_reason: previous_step
                 .is_none()
                 .then(|| "this is the first step".to_string()),
-            continue_unavailable_reason: Some("the failed step's container has exited".into()),
+            continue_unavailable_reason: Some("the failed step's container has stopped".into()),
             finish_workflow_unavailable_reason: Some(
                 "a step failed; choose a recovery action or Ctrl-C to cancel".into(),
             ),
@@ -170,8 +182,9 @@ impl WorkflowEngine {
         step_name: &str,
         exit_code: i32,
     ) -> Result<IterationOutcome, EngineError> {
+        let exit_detail = failure_exit_detail(exit_code);
         self.msg_error(format!(
-            "Step '{step_name}' failed (exit {exit_code}); choose how to recover"
+            "Step '{step_name}' failed ({exit_detail}); choose how to recover"
         ));
         loop {
             let available = self.compute_failure_actions(step_name, exit_code)?;
@@ -242,9 +255,10 @@ impl WorkflowEngine {
         step_name: &str,
         exit_code: i32,
     ) -> Result<IterationOutcome, EngineError> {
+        let exit_detail = failure_exit_detail(exit_code);
         if self.auto_retried_steps.contains(step_name) {
             self.msg_error(format!(
-                "Step '{step_name}' failed again after its automatic retry (exit {exit_code}); \
+                "Step '{step_name}' failed again after its automatic retry ({exit_detail}); \
                  failing workflow",
             ));
             for s in &self.workflow.steps {
@@ -257,7 +271,7 @@ impl WorkflowEngine {
                 StepState::Failed {
                     exit_code,
                     error_message: Some(format!(
-                        "failed twice (exit {exit_code}); automatic retry exhausted"
+                        "failed twice ({exit_detail}); automatic retry exhausted"
                     )),
                 },
             );
@@ -271,7 +285,7 @@ impl WorkflowEngine {
         }
 
         self.msg_warning(format!(
-            "Step '{step_name}' failed (exit {exit_code}); retrying once in {}s",
+            "Step '{step_name}' failed ({exit_detail}); retrying once in {}s",
             timing::yolo_countdown_duration().as_secs(),
         ));
         let countdown = self.run_failure_retry_countdown(step_name).await?;
@@ -407,7 +421,7 @@ impl WorkflowEngine {
             NextAction::Dismiss | NextAction::RetryFailedStep { .. } => {
                 if let Some(exit_result) = already_finished {
                     return Ok(MidStepOutcome::StepCompleted(
-                        self.finalize_step(step_name, exit_result?)?,
+                        self.finalize_step(step_name, exit_result)?,
                     ));
                 }
                 Ok(MidStepOutcome::Continue)
@@ -421,7 +435,7 @@ impl WorkflowEngine {
                 }
                 if let Some(exit_result) = already_finished {
                     return Ok(MidStepOutcome::StepCompleted(
-                        self.finalize_step(step_name, exit_result?)?,
+                        self.finalize_step(step_name, exit_result)?,
                     ));
                 }
                 Ok(MidStepOutcome::Continue)

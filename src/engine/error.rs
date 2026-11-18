@@ -35,6 +35,11 @@ pub enum ImageRetryClass {
 
 #[derive(Debug, Error)]
 pub enum EngineError {
+    /// The exec transport ended without a trustworthy process exit status.
+    /// Only a confirmed stop permits workflow recovery in a fresh container.
+    #[error("builtin exec stream closed or failed before reporting exit status: {reason}")]
+    ExecutionStreamFailed { reason: String, stopped: bool },
+
     #[error(transparent)]
     Data(#[from] DataError),
 
