@@ -22,6 +22,9 @@ pub mod squad;
 pub mod terminal_output_filter;
 pub mod tui;
 
+#[cfg(test)]
+mod ready_journey_contracts;
+
 // The headless rule used to live here, as
 // `effective_non_interactive(explicitly_requested)`. It is Layer 2's:
 // `ResolvedFlags::is_headless` (WI 0114 F-50). A frontend reports

@@ -218,6 +218,19 @@ impl WorkflowPreflightPlan {
                 {
                     check.status = PrerequisiteStatus::Missing;
                     check.explanation = error.to_string();
+                    // Name the full config keys and files that give the image a
+                    // source. Only when configuration has none: a configured
+                    // source that failed keeps its own error. Never prompts.
+                    if runtime.capabilities().image_acquisition == ImageAcquisition::Import {
+                        let is_default = agent == session.configured_agent().as_str();
+                        if let Some(guidance) =
+                            crate::data::config::image_source_setup::missing_image_source_guidance(
+                                session, tag, agent, is_default,
+                            )
+                        {
+                            check.explanation = guidance;
+                        }
+                    }
                     return Err(CommandError::WorkflowPrerequisitesUnresolved {
                         report: Box::new(report.clone()),
                     });

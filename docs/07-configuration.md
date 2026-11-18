@@ -668,6 +668,25 @@ The `runtime.builtin.*` keys are read only when `runtime.kind` is `builtin`. The
 }
 ```
 
+`runtime.builtin.imageSource` is the default source for the selected agent image. For a non-default agent or a source that names only one image (such as an archive or fixed `reference`), use `runtime.builtin.images` with the awman image tag as the map key:
+
+```json
+{
+  "runtime": {
+    "builtin": {
+      "images": {
+        "awman-myproject-codex:latest": {
+          "type": "archive",
+          "path": "/opt/images/codex.tar"
+        }
+      }
+    }
+  }
+}
+```
+
+An interactive CLI or TUI `awman ready` offers to set a missing source, previews the exact JSON and effective result, and shows which file will be written. When both scopes are available, you can choose repository or global config; the change is saved only after confirmation. Saving reloads configuration and continues that same `ready` run. Import sources provide existing images; enabling builds is separate and explicit through `runtime.builtin.builder.enabled` (default `false`). For a missing source, `--headless`/`-n`, `--json`, API session setup, and workflow prerequisites do not prompt or write source config; their errors identify `runtime.builtin.imageSource` or the tagged field ``runtime.builtin.images["<tag>"]``. Squad image preparation also does not prompt or write source config; its missing-image failure gives the tag and source setup guidance. See [Interactive image-source setup](11-runtimes.md#interactive-image-source-setup).
+
 To build with Apple Containers instead of Docker, use an `apple-local` source:
 
 ```json
@@ -692,7 +711,7 @@ To build with Apple Containers instead of Docker, use an `apple-local` source:
 | `runtime.builtin.registries.<host>` | `{}` | Per-registry `insecure`, `caCert`, and `auth` |
 | `runtime.builtin.network.*` | `mode: public` | Guest network policy: `mode` (`public`/`allowlist`/`none`), `allow` (allowlist names), `hostPorts` (host loopback ports the guest may reach), `nameservers` and `trustHostCas` (global config only) — see [Runtimes: Network](11-runtimes.md#network) |
 
-Every source object, its fields, the registry settings, and the supported `apple-local` (Apple Containers) releases are described in [Runtimes: Image sources](11-runtimes.md#image-sources). There is no default image source: with none configured, `awman ready` explains how to provide one instead of guessing.
+Every source object, its fields, the registry settings, and the supported `apple-local` (Apple Containers) releases are described in [Runtimes: Image sources](11-runtimes.md#image-sources). There is no default image source: an interactive CLI or TUI `ready` run offers setup, while non-interactive and service flows report the missing fields without prompting or writing config.
 
 The scalar keys can be set with `awman config set`; the object-valued ones (`imageSource`, `images.*`, `registries.*`) show as read-only in `awman config show` and are edited in the JSON file. A setting that fails validation (zero vCPUs or memory, a root disk under 256MiB, a zero mount quota, an empty source field, a `tls` block on a non-`tcp://` Docker host, an unsupported Docker host scheme) is an error that names the offending key.
 

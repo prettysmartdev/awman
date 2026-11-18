@@ -142,6 +142,7 @@ impl AgentImagePreparer {
     pub(super) async fn build_source(
         &mut self,
         request: BuildRequest,
+        endpoint: Option<&crate::engine::oci::docker_engine::Endpoint>,
         sink: &mut (impl ImagePreparationSink + ?Sized),
     ) -> Result<BuiltImageIdentity, EngineError> {
         let builder = self.builder();
@@ -181,7 +182,11 @@ impl AgentImagePreparer {
         .await;
         sink.build_finished(
             &tag,
-            result.as_ref().err().map(ToString::to_string).as_deref(),
+            result
+                .as_ref()
+                .err()
+                .map(|error| crate::engine::oci::docker_engine::failure_message_at(error, endpoint))
+                .as_deref(),
         );
         result
     }

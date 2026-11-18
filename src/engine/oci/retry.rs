@@ -9,8 +9,15 @@
 //!   [`RetryPolicy::deadline`], with exponential backoff between them;
 //! * only *transient transport* failures are retried ([`is_retryable`]):
 //!   connection refused/reset, a disconnect or truncation mid-transfer, a
-//!   5xx from the daemon or registry. HTTP 408 and 429 remain final: this
-//!   fixed backoff policy does not implement server Retry-After scheduling.
+//!   5xx from the daemon or registry. This excludes an absent/refusing local
+//!   Docker socket, classified by the
+//!   Docker adapter as a final `Io` error with `LocalDockerUnavailable`.
+//!   Remote connection refusals retain their transient classification.
+//!   A local socket disappearing after a successful ping is also final:
+//!   readiness reports the lost source and requires an explicit rerun, even
+//!   when a daemon restart caused the refusal during this attempt.
+//!   HTTP 408 and 429 remain final: this fixed backoff policy does not
+//!   implement server Retry-After scheduling.
 //!   Authentication, certificate,
 //!   platform, digest, format, disk-space and configuration failures are
 //!   final on the first occurrence — retrying them cannot succeed and would

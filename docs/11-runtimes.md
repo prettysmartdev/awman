@@ -220,9 +220,27 @@ awman ready
 
 The image is imported into awman's private store. Docker is used only as a *source* at this step (awman talks to the Engine API directly and never runs the `docker` CLI). Agents never run in Docker under this runtime, and after import Docker does not need to be running.
 
-There is no default source. With none configured, `awman ready` fails with `no image source is configured for '<tag>'` followed by the build commands above, rather than guessing a registry or daemon.
+There is no default source. In an interactive CLI or TUI session, `awman ready` offers to configure one when the requested builtin image has no usable source. In headless or other non-interactive flows, it does not guess a registry or daemon: readiness fails with a message naming the missing config fields (see [Interactive image-source setup](#interactive-image-source-setup)).
 
 **`awman init` and `builtin`.** `awman init` builds images through the configured runtime, so with `runtime.kind` set to `builtin` its build step fails (`image building; build externally and import with ready is not supported on the builtin runtime`) and the agent audit is skipped. Run `awman init` before selecting `builtin` (or with `docker` or `apple` temporarily selected), then switch the runtime and run `awman ready` after building externally.
+
+### Interactive image-source setup
+
+When an interactive CLI or TUI `awman ready` run finds that its builtin image has no configured source, it offers these choices:
+
+- **docker-local** — import an image already present in the selected local Docker Engine.
+- **apple-local** — on macOS, import an image already present in the Apple Containers store.
+- **archive** — import an image from a saved image archive.
+- **registry** — pull an image from an OCI registry.
+- **Leave unconfigured** — make no change and let this `ready` run continue with the missing-source result (an already-installed image remains usable).
+
+Importing reads an existing image from the selected store, archive, or registry. It does not build an image. For docker-local and apple-local, `ready` separately offers an explicit builder opt-in when that store supports building and the builder is not already enabled. The default answer is no. Accepting it sets `runtime.builtin.builder.enabled` to `true`; the source selection and builder choice are shown in a preview before any file is written.
+
+The prompt lets you choose the repository config (`<git_root>/.awman/config.json`) or global config (`$AWMAN_HOME/config.json`, normally `~/.awman/config.json`) when both are available. It displays the exact JSON change and the resulting effective source configuration, and saves only after confirmation. After saving, the same `ready` run reloads configuration and continues image preparation; there is no need to run `ready` a second time. With `--build`, `ready` also considers other agent images; a source selected for a non-default agent is saved under that image's tag in `runtime.builtin.images` so a one-image archive or fixed reference does not get applied to other agents.
+
+No source setup prompt is shown for `--headless`/`-n` or `--json`, or for API, workflow, or squad preparation. Those paths do not write source configuration. `ready`, API session setup, and workflow prerequisite errors name `runtime.builtin.imageSource` or the tagged field ``runtime.builtin.images["<tag>"]`` and explain which one to set. Squad image preparation also does not prompt or write source configuration; run `awman ready` in a terminal to set up and prepare a missing image. A source that is configured but fails to import is reported as an import failure and does not trigger this setup prompt.
+
+For example, a headless run with an unconfigured `awman-myproject-codex:latest` image reports that no image source is configured for that tag and agent, then tells you to set `runtime.builtin.imageSource` (the default source for every agent image) or ``runtime.builtin.images["awman-myproject-codex:latest"]`` (for this image only). It includes the config file paths and accepted source types. If you also want `ready` to build into a supported local store, set `runtime.builtin.builder.enabled` to `true` separately.
 
 ### Image sources
 
@@ -454,7 +472,7 @@ For a newer catalog, use the newer awman. Otherwise quit any awman still using t
 | `"awman-macos-arm64" cannot be opened because the developer cannot be verified` | The file is quarantined (downloaded with a browser). Verify its checksum, then `xattr -d com.apple.quarantine <file>` — see [The macOS binary, Gatekeeper and permissions](#the-macos-binary-gatekeeper-and-permissions). |
 | `builtin image <tag> has no absolute effective HOME` | The image sets no `HOME` and its user has no absolute home in `/etc/passwd`. Add `ENV HOME=/path` to the Dockerfile. |
 | `the builtin runtime refuses to start while <variable> is set …` | An environment override would replace the builtin runtime. Unset the variable named in the error and retry. |
-| `no image source is configured for '<tag>'` | Set `runtime.builtin.imageSource` or `runtime.builtin.images` (see [Getting an agent image](#getting-an-agent-image)). The message explains why, depending on whether the builder is off, on without a source, or on with a source it cannot build into. |
+| `no image source is configured for '<tag>'` | In an interactive CLI or TUI run, choose a source in the `ready` setup prompt. In non-interactive runs, set `runtime.builtin.imageSource` for the default source or `runtime.builtin.images.<tag>` for that image, then run `awman ready` (see [Interactive image-source setup](#interactive-image-source-setup)). If building is wanted, also set `runtime.builtin.builder.enabled` to `true`; source selection alone only imports. |
 | ``builtin image <image> is not imported; run `awman ready` to import it``, or ``image '<tag>' is not in the builtin image cache (…); run `awman ready` to import it`` | Run `awman ready`. |
 | ``a builtin sandbox for agent '<name>' already exists; stop or remove it (`awman clean`) or choose another name`` | A session with that name is still present; stop it, run `awman clean`, or pick another name. |
 | `the <builder> image builder is unavailable: <detail>` | `runtime.builtin.builder.enabled` selected Docker or Apple Containers for this image's source, but it cannot be used (CLI missing, daemon or service stopped). Start it, or disable the builder to import only. This is a build failure; awman does not fall back to an older image. |
@@ -477,6 +495,22 @@ For a newer catalog, use the newer awman. Otherwise quit any awman still using t
 | `builtin runtime is busy: another awman process held …` | Retry shortly; another awman is importing an image or updating its catalog. |
 
 See [Cleaning Up](13-cleaning-up.md#builtin-runtime-state) for reclaiming disk space.
+
+### Reading `ready` failures
+
+The CLI and TUI show a readable `ready` summary. Failed and warning rows show their reason once below the row; the summary's recovery hint, when present, appears once as `Tip:`. JSON and API output keep the status and diagnostic in their structured fields; they do not start the interactive source setup flow.
+
+For a `docker-local` source, the diagnosis depends on the endpoint and the failure:
+
+| Message | What it means |
+|---|---|
+| ``Docker is not running at <endpoint>. Start Docker, then run `awman ready` again.`` | The selected Unix socket returned a missing or refused connection. Start Docker and retry. |
+| ``No Docker daemon at the default socket <endpoint>. Start Docker, or set the source's `host` (or DOCKER_HOST) if Docker uses another socket/context, then run `awman ready` again.`` | The platform-default Unix socket is absent or refusing connections. Start Docker, or select the socket/context explicitly in `host` or `DOCKER_HOST`. |
+| ``Cannot access the Docker socket at <endpoint>. Check socket permissions and your Docker connection context (`host` / DOCKER_HOST), then run `awman ready` again.`` | The socket denied access. Check its permissions and the selected Docker connection context. |
+| `Docker Engine at <endpoint> is not reachable: <cause>` | A TCP or other remote endpoint failed. This is reported as an unreachable endpoint with its connection cause; it is not described as Docker being stopped locally. Transient connection failures may be retried a bounded number of times. |
+| ``The Docker endpoint <endpoint> is not a usable Docker socket. Check the source's `host` / DOCKER_HOST, then run `awman ready` again.`` | The selected Unix path is not a usable socket. Correct `host` or `DOCKER_HOST`. |
+
+These messages apply to configured sources. A stopped or inaccessible source does not cause `ready` to ask for another source or silently switch to a different store. Fix the endpoint/service and rerun `ready`.
 
 ---
 

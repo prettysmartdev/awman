@@ -169,6 +169,7 @@ pub struct AgentImagePreparer {
     definitions: HashMap<String, crate::engine::agent::ResolvedAgent>,
     runtime: Arc<dyn AgentRuntimeEngine>,
     context: ImageBuildContext,
+    default_source_agent: String,
     image_sources: ImageSources,
     builder_enabled: bool,
     local_builder: Option<Arc<dyn LocalImageBuilder>>,
@@ -237,6 +238,7 @@ impl AgentImagePreparer {
             builder_enabled,
             image_importer: Arc::new(bridge::RuntimeImageImporter(runtime.clone())),
             runtime,
+            default_source_agent: context.default_agent.clone(),
             context,
             local_builder: None,
             build_locks: ImageBuildLockStore::under_data_home(&data_home),
@@ -251,6 +253,12 @@ impl AgentImagePreparer {
             last_installed_inputs: None,
             cancel: crate::engine::oci::CancelToken::new(),
         }
+    }
+    /// Keep pinned-source ownership separate from the invocation's required image.
+    pub(crate) fn with_default_source_agent(mut self, agent: &str) -> Self {
+        self.default_source_agent = agent.to_string();
+        self.plans.clear();
+        self
     }
     pub fn with_definition_env(mut self, env: crate::data::config::env::EnvSnapshot) -> Self {
         self.definition_env = env;
@@ -322,18 +330,15 @@ impl AgentImagePreparer {
                 let source = resolved.ok();
                 let selection =
                     BuilderSelection::from_source(source.as_ref(), self.builder_enabled);
-                let pinned_default = if agent != self.context.default_agent
+                let pinned_default = if agent != self.default_source_agent
                     && !self.image_sources.images.contains_key(tag)
                 {
                     self.image_sources.default.as_ref().and_then(|spec| {
-                        let single_image = matches!(
-                            spec,
-                            crate::data::config::image_source::ImageSourceSpec::Archive { .. }
-                        ) || spec.reference_or(tag) != tag;
+                        let single_image = spec.names_single_image(tag);
                         if single_image {
                             Some(format!(
-                                "`builtin.imageSource` ({}) names a single image; add a \
-                                 `builtin.images` entry for {tag} to import it",
+                                "`runtime.builtin.imageSource` ({}) names a single image; add a \
+                                 `runtime.builtin.images` entry for {tag} to import it",
                                 spec.kind()
                             ))
                         } else {
@@ -382,7 +387,7 @@ impl AgentImagePreparer {
     }
 
     /// Whether a source is configured for the default agent image (the
-    /// `builtin.images` entry, else `builtin.imageSource`).
+    /// `runtime.builtin.images` entry, else `runtime.builtin.imageSource`).
     pub(crate) fn default_image_has_source(&self) -> bool {
         let tag = crate::data::image_tags::agent_image_tag(
             &self.context.git_root,
@@ -468,7 +473,7 @@ impl AgentImagePreparer {
             for tag in tags {
                 let error = format!(
                     "{names} target the same local image reference {reference}; \
-                     give each agent its own `builtin.images` entry"
+                     give each agent its own `runtime.builtin.images` entry"
                 );
                 self.prevalidation_failures.insert(tag, error);
             }

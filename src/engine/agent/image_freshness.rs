@@ -311,8 +311,7 @@ pub(crate) fn failure_reason(error: &EngineError) -> String {
             Some(line) => format!("exit code {exit_code}: {line}"),
             None => format!("exit code {exit_code}"),
         },
-        other => other
-            .to_string()
+        other => crate::engine::oci::docker_engine::failure_message(other)
             .lines()
             .map(str::trim)
             .find(|line| !line.is_empty())

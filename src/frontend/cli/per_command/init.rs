@@ -15,8 +15,6 @@ use crate::engine::init::{InitFrontend, InitPhase, InitSummary};
 use crate::frontend::cli::command_frontend::CliFrontend;
 
 use super::helpers::{read_line, yes_no};
-use crate::frontend::render_helpers::render_summary_box;
-
 impl InitFrontend for CliFrontend {
     fn ask_replace_aspec(&mut self) -> Result<bool, EngineError> {
         if self.non_interactive {
@@ -128,7 +126,11 @@ impl InitFrontend for CliFrontend {
             ("Docker image", &summary.image_build),
             ("Work items", &summary.work_items_setup),
         ];
-        let box_str = render_summary_box("Init Summary", &rows);
+        let box_str = crate::frontend::render_helpers::render_summary_box_with_width(
+            "Init Summary",
+            &rows,
+            crate::frontend::render_helpers::stderr_render_width(),
+        );
         let footer = "\nWhat's Next?\n  Run `awman` to launch the interactive TUI.\n\n  Available commands:\n    awman chat          — Start a freeform chat session with the agent\n    awman new spec      — Create a new work item from the aspec template\n    awman exec workflow — Run a workflow inside a container\n";
         let _ = std::io::Write::write_all(
             &mut std::io::stderr(),

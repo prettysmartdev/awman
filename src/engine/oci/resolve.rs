@@ -1,7 +1,7 @@
 //! Source resolution — which explicit [`ImageSourceSpec`] an awman image tag
 //! is acquired from. Pure: reads configuration, contacts nothing.
 //!
-//! Order: the per-tag entry in `builtin.images`, then `builtin.imageSource`.
+//! Order: the per-tag entry in `runtime.builtin.images`, then `runtime.builtin.imageSource`.
 //! There is no implicit source. A bare reference never chooses between a
 //! registry and a daemon: the spec's `type` decides, so a registry name can
 //! never pick up a same-named daemon image or the reverse.
@@ -21,11 +21,11 @@ use crate::engine::oci::docker_engine::{resolve_endpoint, Endpoint};
 /// The configured image sources for the builtin runtime.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImageSources {
-    /// `builtin.imageSource`: used for every tag without its own entry.
+    /// `runtime.builtin.imageSource`: used for every tag without its own entry.
     pub default: Option<ImageSourceSpec>,
-    /// `builtin.images`: per-tag sources.
+    /// `runtime.builtin.images`: per-tag sources.
     pub images: BTreeMap<String, ImageSourceSpec>,
-    /// `builtin.registries`: per-host registry settings. Carried with the
+    /// `runtime.builtin.registries`: per-host registry settings. Carried with the
     /// sources so the import that follows a resolution pulls with the same
     /// session's registry settings.
     pub registries: BTreeMap<String, RegistryHostConfig>,
@@ -85,7 +85,9 @@ impl BuilderSelection {
         match (&source.source, &source.docker_endpoint) {
             // Acquisition reads Unix sockets only on Unix hosts, so only
             // there can a build and its import share one endpoint.
-            (ImageSourceSpec::DockerStore { .. }, Some(Endpoint::Unix(_))) if cfg!(unix) => {
+            (ImageSourceSpec::DockerStore { .. }, Some(endpoint))
+                if cfg!(unix) && endpoint.unix_path().is_some() =>
+            {
                 Self::Local(BuildTarget::Docker {
                     endpoint: source.docker_endpoint.as_ref().unwrap().describe(),
                 })
@@ -129,7 +131,7 @@ impl<'a> ImageSourceResolver<'a> {
         let docker_endpoint = match &mut source {
             ImageSourceSpec::DockerStore { host, tls, .. } => {
                 let endpoint = resolve_endpoint(host.as_deref(), tls.as_ref(), self.env)?;
-                if let Endpoint::Unix(path) = &endpoint {
+                if let Some(path) = endpoint.unix_path() {
                     *host = Some(format!("unix://{}", path.display()));
                     *tls = None;
                 } else if let Endpoint::Tcp {
@@ -246,11 +248,11 @@ impl std::fmt::Display for ImageBuildGuidance {
                 );
             }
             BuilderSelection::Disabled => "the builtin runtime imports images; its builder is \
-                 off (`builtin.builder.enabled`), so it does not build them."
+                 off (`runtime.builtin.builder.enabled`), so it does not build them."
                 .to_string(),
             BuilderSelection::Unconfigured => format!(
                 "the builtin builder is enabled, but it builds only into a `docker-local` or \
-                 `apple-local` image source: set `builtin.imageSource` (or a `builtin.images` \
+                 `apple-local` image source: set `runtime.builtin.imageSource` (or a `runtime.builtin.images` \
                  entry for {tag}) to one and run `awman ready --build`, or build the image \
                  yourself."
             ),
@@ -262,7 +264,7 @@ impl std::fmt::Display for ImageBuildGuidance {
         write!(
             f,
             "{lead} Build the image with Docker (or any OCI builder):\n  {}\nthen set \
-             `builtin.imageSource` in awman's config to one of:\n  {{\"type\":\"docker-local\"}}  \
+             `runtime.builtin.imageSource` in awman's config to one of:\n  {{\"type\":\"docker-local\"}}  \
              (export from the local Docker Engine)\n  {{\"type\":\"apple-local\"}}  (macOS: \
              export from the local Apple Containers image store)\n  \
              {{\"type\":\"archive\",\"path\":\"<file>\"}}  (after `docker save {tag} -o <file>`)\n  \

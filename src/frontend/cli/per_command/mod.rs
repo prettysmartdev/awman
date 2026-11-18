@@ -25,7 +25,8 @@ mod daemon;
 mod exec_prompt;
 mod exec_workflow;
 mod init;
-mod ready;
+pub(crate) mod ready;
+pub(crate) mod ready_source_prompt;
 pub(crate) mod relay;
 
 // Engine-level frontend trait impls used by multiple commands.

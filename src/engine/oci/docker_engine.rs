@@ -38,10 +38,16 @@ const METADATA_TIMEOUT: Duration = Duration::from_secs(60);
 /// the whole transfer).
 const EXPORT_STALL_TIMEOUT: Duration = Duration::from_secs(300);
 
+#[cfg(test)]
+#[path = "docker_engine_tests.rs"]
+mod tests;
+
 /// Where the Engine listens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
     Unix(PathBuf),
+    /// Keep the origin for diagnosis; the path still keys the same store.
+    DefaultUnix(PathBuf),
     Tcp {
         host: String,
         port: u16,
@@ -53,13 +59,176 @@ impl Endpoint {
     /// Non-secret description, used in messages and as the cache locator.
     pub fn describe(&self) -> String {
         match self {
-            Self::Unix(p) => format!("unix://{}", p.display()),
+            Self::Unix(p) | Self::DefaultUnix(p) => format!("unix://{}", p.display()),
             Self::Tcp { host, port, tls } => {
                 let scheme = if tls.is_some() { "tcp+tls" } else { "tcp" };
                 format!("{scheme}://{host}:{port}")
             }
         }
     }
+
+    pub(crate) fn unix_path(&self) -> Option<&Path> {
+        match self {
+            Self::Unix(path) | Self::DefaultUnix(path) => Some(path),
+            Self::Tcp { .. } => None,
+        }
+    }
+}
+
+/// A final local source condition, retained inside `EngineError::Io` so
+/// callers can distinguish it without interpreting a diagnostic string.
+#[derive(Debug, thiserror::Error)]
+pub enum LocalDockerUnavailable {
+    #[error("{}", stopped_diagnostic(endpoint, *default_socket))]
+    Stopped {
+        endpoint: String,
+        default_socket: bool,
+    },
+    #[error("Cannot access the Docker socket at {endpoint}. Check socket permissions and your Docker connection context (`host` / DOCKER_HOST), then run `awman ready` again.")]
+    PermissionDenied { endpoint: String },
+    #[error("The Docker endpoint {endpoint} is not a usable Docker socket. Check the source's `host` / DOCKER_HOST, then run `awman ready` again.")]
+    InvalidSocket { endpoint: String },
+}
+
+fn stopped_diagnostic(endpoint: &str, default_socket: bool) -> String {
+    if default_socket {
+        format!("No Docker daemon at the default socket {endpoint}. Start Docker, or set the source's `host` (or DOCKER_HOST) if Docker uses another socket/context, then run `awman ready` again.")
+    } else {
+        format!("Docker is not running at {endpoint}. Start Docker, then run `awman ready` again.")
+    }
+}
+
+/// Format the typed source diagnosis once, without the generic I/O wrapper.
+/// This is presentation only; policy must use `local_unavailability` first.
+pub fn failure_message(error: &EngineError) -> String {
+    match local_unavailability(error) {
+        Some(failure) => failure.to_string(),
+        None => error.to_string(),
+    }
+}
+
+/// Imports and builder CLIs use a frozen explicit host. Restore its original
+/// default-socket diagnosis when preparation still has the resolved source.
+pub(crate) fn failure_message_at(error: &EngineError, endpoint: Option<&Endpoint>) -> String {
+    match (local_unavailability(error), endpoint) {
+        (
+            Some(LocalDockerUnavailable::Stopped { endpoint, .. }),
+            Some(Endpoint::DefaultUnix(_)),
+        ) => stopped_diagnostic(endpoint, true),
+        _ => failure_message(error),
+    }
+}
+
+/// Inspect the typed local failure after acquisition or a source-matched
+/// builder probe. All local socket conditions are final and never authorize fallback.
+pub fn local_unavailability(err: &EngineError) -> Option<&LocalDockerUnavailable> {
+    match err {
+        EngineError::Io { source, .. } => source.get_ref()?.downcast_ref(),
+        _ => None,
+    }
+}
+
+/// Reqwest/hyper wrap the socket's `io::Error`. Walk the source chain
+/// (including an io wrapper's payload), never their display text. A refused
+/// TCP connection is deliberately excluded, even when its host is loopback.
+fn local_socket_failure(
+    endpoint: &Endpoint,
+    error: &(dyn std::error::Error + 'static),
+) -> Option<EngineError> {
+    let path = endpoint.unix_path()?;
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            let failure = match io.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                    #[cfg(unix)]
+                    let not_socket = {
+                        use std::os::unix::fs::FileTypeExt;
+                        std::fs::metadata(path).is_ok_and(|m| !m.file_type().is_socket())
+                    };
+                    #[cfg(not(unix))]
+                    let not_socket = false;
+                    Some(if not_socket {
+                        LocalDockerUnavailable::InvalidSocket {
+                            endpoint: endpoint.describe(),
+                        }
+                    } else {
+                        LocalDockerUnavailable::Stopped {
+                            endpoint: endpoint.describe(),
+                            default_socket: matches!(endpoint, Endpoint::DefaultUnix(_)),
+                        }
+                    })
+                }
+                std::io::ErrorKind::NotADirectory | std::io::ErrorKind::InvalidInput => {
+                    Some(LocalDockerUnavailable::InvalidSocket {
+                        endpoint: endpoint.describe(),
+                    })
+                }
+                std::io::ErrorKind::PermissionDenied => {
+                    Some(LocalDockerUnavailable::PermissionDenied {
+                        endpoint: endpoint.describe(),
+                    })
+                }
+                // A timeout is not evidence of a stopped daemon.
+                std::io::ErrorKind::TimedOut => return None,
+                _ => None,
+            };
+            if let Some(failure) = failure {
+                return Some(EngineError::io(
+                    path,
+                    std::io::Error::new(io.kind(), failure),
+                ));
+            }
+            if let Some(inner) = io.get_ref() {
+                cause = Some(inner);
+                continue;
+            }
+        }
+        cause = error.source();
+    }
+    None
+}
+
+/// After a local builder CLI fails, use the socket itself for an authoritative
+/// diagnosis. The CLI's stderr cannot supply a typed connection error. Other
+/// failures retain the original CLI cause. This check starts no service and
+/// respects the builder's cancellation and deadline, including a full backlog.
+pub(crate) fn check_local_connection(
+    endpoint: &str,
+    control: &crate::engine::container::BuildControl,
+) -> Result<(), EngineError> {
+    control.check()?;
+    #[cfg(not(unix))]
+    let _ = endpoint;
+    #[cfg(unix)]
+    if let Some(path) = endpoint.strip_prefix("unix://") {
+        let endpoint = Endpoint::Unix(PathBuf::from(path));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| EngineError::io(path, e))?;
+        return runtime.block_on(async {
+            let connect = tokio::net::UnixStream::connect(path);
+            tokio::pin!(connect);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep(Duration::from_millis(20)) => control.check()?,
+                    result = &mut connect => {
+                        control.check()?;
+                        return match result {
+                            Err(error) => match local_socket_failure(&endpoint, &error) {
+                                Some(error) => Err(error),
+                                None => Ok(()),
+                            },
+                            Ok(_) => Ok(()),
+                        };
+                    }
+                }
+            }
+        });
+    }
+    Ok(())
 }
 
 fn unsupported(reason: String) -> EngineError {
@@ -198,7 +367,7 @@ fn default_endpoint(env: &EnvSnapshot) -> Result<Endpoint, EngineError> {
             .map(|h| PathBuf::from(h).join(".docker/run/docker.sock"))
         {
             if user.exists() || !system.exists() {
-                return Ok(Endpoint::Unix(user));
+                return Ok(Endpoint::DefaultUnix(user));
             }
         }
     }
@@ -207,7 +376,7 @@ fn default_endpoint(env: &EnvSnapshot) -> Result<Endpoint, EngineError> {
             "Windows named-pipe Docker hosts are not supported by the builtin runtime".into(),
         ));
     }
-    Ok(Endpoint::Unix(system))
+    Ok(Endpoint::DefaultUnix(system))
 }
 
 /// Refuse references that could be mistaken for API paths or queries.
@@ -233,6 +402,7 @@ struct Client {
     transport: Transport,
     base: String,
     endpoint: String,
+    selected_endpoint: Endpoint,
 }
 
 impl Client {
@@ -245,12 +415,12 @@ impl Client {
             .user_agent(concat!("awman/", env!("CARGO_PKG_VERSION")));
         let base = match endpoint {
             #[cfg(unix)]
-            Endpoint::Unix(path) => {
+            Endpoint::Unix(path) | Endpoint::DefaultUnix(path) => {
                 builder = builder.unix_socket(path.clone());
                 "http://docker".to_string()
             }
             #[cfg(not(unix))]
-            Endpoint::Unix(_) => {
+            Endpoint::Unix(_) | Endpoint::DefaultUnix(_) => {
                 return Err(unsupported(
                     "Unix-socket Docker hosts need a Unix platform".into(),
                 ))
@@ -278,6 +448,7 @@ impl Client {
             transport: Transport::new(control)?,
             base,
             endpoint: endpoint.describe(),
+            selected_endpoint: endpoint.clone(),
         })
     }
 
@@ -288,6 +459,11 @@ impl Client {
             .timeout(timeout);
         self.transport.send(req).map_err(|e| {
             e.map_http(|e| {
+                if !e.is_timeout() {
+                    if let Some(error) = local_socket_failure(&self.selected_endpoint, &e) {
+                        return error;
+                    }
+                }
                 ImageRetryClass::http(&e).failure(format!(
                     "Docker Engine at {} is not reachable: {}",
                     self.endpoint,

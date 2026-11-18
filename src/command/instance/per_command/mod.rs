@@ -23,6 +23,7 @@ mod mount_scope;
 mod new;
 mod new_spec;
 mod ready;
+mod ready_source_dialogs;
 mod remote_frontend;
 mod squad;
 mod squad_attach;

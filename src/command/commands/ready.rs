@@ -14,6 +14,10 @@ use crate::data::ready_summary::AgentCredentialHealth;
 use crate::data::step_status::StepStatus;
 use crate::engine::ready::{ReadyEngine, ReadyEngineOptions, ReadyFrontend, ReadySummary};
 
+mod source_setup;
+#[cfg(test)]
+mod source_setup_contracts;
+
 #[derive(Debug, Clone)]
 pub struct ReadyCommandFlags {
     pub refresh: bool,
@@ -203,6 +207,12 @@ pub struct ReadyCommand {
     engines: Engines,
     session: crate::data::session::Session,
     headless: Option<HeadlessDefaults>,
+    /// The caller is a local user's own CLI/TUI session, so a person may be
+    /// asked to choose an image source. `false` unless `from_input` saw a
+    /// local frontend (fail closed).
+    local_user: bool,
+    #[cfg(test)]
+    host_ping: Option<std::sync::Arc<dyn crate::engine::ready::ReadyHostPing>>,
 }
 
 impl ReadyCommand {
@@ -216,7 +226,35 @@ impl ReadyCommand {
             engines,
             session,
             headless: None,
+            local_user: false,
+            #[cfg(test)]
+            host_ping: None,
         }
+    }
+
+    /// Inject a fixed host check; component journeys never execute a host agent.
+    #[cfg(test)]
+    pub(crate) fn with_host_ping(
+        mut self,
+        ping: std::sync::Arc<dyn crate::engine::ready::ReadyHostPing>,
+    ) -> Self {
+        self.host_ping = Some(ping);
+        self
+    }
+
+    /// Let a hand-built command ask for an image source, as `from_input`
+    /// does for a local frontend.
+    #[cfg(test)]
+    pub(crate) fn with_local_user(mut self, local_user: bool) -> Self {
+        self.local_user = local_user;
+        self
+    }
+
+    /// Set the headless defaults `from_input` derives for an API caller.
+    #[cfg(test)]
+    pub(crate) fn with_headless(mut self, headless: Option<HeadlessDefaults>) -> Self {
+        self.headless = headless;
+        self
     }
 
     /// Construct from the catalogue-resolved input (WI 0113 F-10). `--json`
@@ -241,6 +279,7 @@ impl ReadyCommand {
         }
         let mut command = Self::new(flags, ctx.engines.clone(), ctx.session.clone());
         command.headless = Self::headless_for(ctx.caller.frontend());
+        command.local_user = ctx.caller.frontend().is_local_user();
         Ok(command)
     }
 
@@ -279,7 +318,7 @@ impl Command for ReadyCommand {
             text: "ready: checking environment…".into(),
         });
 
-        let session = self.session;
+        let mut session = self.session;
         // Resolve the agent from .awman/config.json (or global default), so
         // the per-agent Dockerfile lookup and image-tag computation match
         // whatever the user actually configured. Falls back to "claude" only
@@ -337,7 +376,17 @@ impl Command for ReadyCommand {
         // refuses a custom agent on a runtime that cannot run one as a failed
         // step, before any kit or image work.
         let runtime = self.engines.runtime.clone();
-        let resolved_builtin = ReadyEngine::builtin_inputs(&session, runtime.as_ref())?;
+        let resolved_builtin = resolve_builtin_inputs(
+            &mut session,
+            runtime.as_ref(),
+            &agent,
+            SourceSetupPolicy {
+                flags: &self.flags,
+                headless: self.headless.as_ref(),
+                local_user: self.local_user,
+            },
+            frontend.as_mut(),
+        )?;
         let mut engine = ReadyEngine::new(
             resolved_builtin,
             crate::data::fs::data_paths::data_home(session.effective_config().env())?,
@@ -348,6 +397,10 @@ impl Command for ReadyCommand {
             self.engines.agent_engine.clone(),
             options,
         );
+        #[cfg(test)]
+        if let Some(ping) = self.host_ping {
+            engine.set_host_ping(ping);
+        }
         engine.set_agent_credentials(credential_health(&self.engines.auth_engine, &agent));
         let cancel = engine.cancel_token();
         let mut answering = HeadlessReadyFrontend {
@@ -368,12 +421,9 @@ impl Command for ReadyCommand {
         let summary = match result {
             Ok(s) => s,
             Err(e) => {
-                let cmd_err = CommandError::from(e);
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("ready: engine run failed: {cmd_err}"),
-                });
-                return Err(cmd_err);
+                // Acquisition owns bounded retries against the selected source.
+                // Never restart ready or reopen source setup on a final failure.
+                return Err(finish_ready_error(e));
             }
         };
         frontend.replay_queued();
@@ -381,19 +431,63 @@ impl Command for ReadyCommand {
         outcome.json_requested = self.flags.json;
         outcome.refresh_requested = self.flags.refresh;
 
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: format!(
-                "ready: complete — runtime={}, dockerfile={:?}, base_image={:?}, agent_image={:?}, local_agent={:?}",
-                outcome.runtime,
-                outcome.dockerfile,
-                outcome.base_image,
-                outcome.agent_image,
-                outcome.local_agent,
-            ),
-        });
+        // Structured log only: the summary already showed every failure once,
+        // so the user never sees a second, unformatted copy of an error.
+        tracing::debug!(
+            runtime = %outcome.runtime,
+            dockerfile = ?outcome.dockerfile,
+            base_image = ?outcome.base_image,
+            agent_image = ?outcome.agent_image,
+            image_source = ?outcome.image_source,
+            local_agent = ?outcome.local_agent,
+            ready = outcome.ready,
+            "ready: complete"
+        );
 
         Ok(outcome)
+    }
+}
+
+/// Who may be asked for an image source in this invocation.
+struct SourceSetupPolicy<'a> {
+    flags: &'a ReadyCommandFlags,
+    headless: Option<&'a HeadlessDefaults>,
+    local_user: bool,
+}
+
+/// The builtin inputs the engine is built from. On an importing runtime, and
+/// only when this invocation may ask a person, an image without a source is
+/// offered once; after a saved choice the session is reloaded and the inputs
+/// are resolved again, so the same `ready` run continues with the new source.
+/// An invalid configured `builtin` block fails here, before any offer.
+fn resolve_builtin_inputs(
+    session: &mut crate::data::session::Session,
+    runtime: &dyn crate::engine::agent_runtime::AgentRuntimeEngine,
+    agent: &crate::data::session::AgentName,
+    policy: SourceSetupPolicy<'_>,
+    frontend: &mut dyn ReadyFrontend,
+) -> Result<Option<crate::data::config::ResolvedBuiltinConfig>, CommandError> {
+    let resolved = ReadyEngine::builtin_inputs(session, runtime)?;
+    if resolved.is_none()
+        || !source_setup::prompt_allowed(policy.flags, policy.headless, policy.local_user)
+    {
+        return Ok(resolved);
+    }
+    let installed = |tag: &str| runtime.image_exists(tag).unwrap_or(false);
+    let setup = source_setup::offer_image_source(
+        source_setup::SourceSetupContext {
+            session,
+            agent,
+            build: policy.flags.build,
+            installed: &installed,
+        },
+        frontend,
+    )?;
+    match setup {
+        source_setup::SourceSetup::Saved { .. } => {
+            Ok(ReadyEngine::builtin_inputs(session, runtime)?)
+        }
+        source_setup::SourceSetup::Unchanged => Ok(resolved),
     }
 }
 
@@ -421,6 +515,13 @@ impl crate::engine::agent::AgentImageFrontend for HeadlessReadyFrontend<'_> {
         step: &crate::data::setup_step::SetupStep,
         status: StepStatus,
     ) {
+        // The final summary owns diagnostics. Progress keeps only the status;
+        // the outcome retains the full reasons for JSON and API consumers.
+        let status = match status {
+            StepStatus::Failed(_) => StepStatus::Failed(String::new()),
+            StepStatus::Warn(_) => StepStatus::Warn(String::new()),
+            other => other,
+        };
         self.inner.report_step_status(step, status);
     }
     fn container_frontend(
@@ -495,4 +596,16 @@ fn credential_health(
         expired,
         read_error: status.read_error.map(|error| error.to_string()),
     }]
+}
+
+/// Consume typed local-source finality before formatting the generic Io carrier.
+/// Remote transient errors retain their type and acquisition's bounded retries.
+/// There is no command-level retry, source-setup recovery or store fallback.
+fn finish_ready_error(error: crate::engine::error::EngineError) -> CommandError {
+    if crate::engine::oci::docker_engine::local_unavailability(&error).is_some() {
+        return CommandError::Engine(crate::engine::error::EngineError::Other(
+            crate::engine::oci::docker_engine::failure_message(&error),
+        ));
+    }
+    error.into()
 }
