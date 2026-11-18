@@ -45,8 +45,8 @@ fn world(s: &TestSandbox) -> World {
         .write(s, None);
     let docker = s.install_fake(support::fake_cli_exe(), "docker");
     awman_test_support::fakes::docker_cli_baseline(&docker);
-    // Every project and agent image is present; its id is stable so the
-    // version probe cache has a key. Launches exit successfully.
+    // Every project and agent image is present. probe_answers updates the
+    // content identity when its version changes. Launches exit successfully.
     docker.on(&["image", "inspect"]).exit(0);
     docker
         .on(&["image", "inspect", "--format", "{{.Id}}"])
@@ -74,6 +74,12 @@ fn env(backend: &Backend, s: &TestSandbox) -> EnvMap {
 
 /// Answer the in-image version probe with `version` from now on.
 fn probe_answers(docker: &FakeCli, version: &str) {
+    // A different binary version means different image contents. Keep the
+    // fake's identity consistent so a surviving daemon runtime cannot reuse
+    // the previous image's cached version proof.
+    docker
+        .on(&["image", "inspect", "--format", "{{.Id}}"])
+        .stdout(&format!("sha256:fixture-{version}\n"));
     let rule = docker.on(&["run", "--rm", "--network", "none"]);
     if version.is_empty() {
         rule.exit(0);
