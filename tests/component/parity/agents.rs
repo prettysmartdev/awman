@@ -157,10 +157,12 @@ fn image_for(repo: &Path, agent: &str) -> String {
     awman::data::image_tags::agent_image_tag(repo, agent)
 }
 
-/// One scenario per backend; the returned trace is compared across backends.
-pub async fn pinned_agents_select_their_own_definition(
+/// One agent per test keeps independent subprocess-heavy scenarios within the
+/// component deadline; the returned trace is compared across backends.
+pub async fn pinned_agent_selects_its_own_definition(
     kind: BackendKind,
     id: &'static str,
+    agent: &str,
     // `false` skips the ready and version-mismatch checks (each backend's own
     // test runs them) so the differential run fits the component budget.
     full: bool,
@@ -174,150 +176,151 @@ pub async fn pinned_agents_select_their_own_definition(
         .file("Dockerfile.dev", "FROM scratch\n")
         .init();
     let repo = repo.path().to_path_buf();
-    let mut trace = Vec::new();
-    for (agent, binary, pinned, wrong) in PINNED {
-        let tag = image_for(&repo, agent);
-        assert!(tag.ends_with(&format!("-{agent}:latest")), "{tag}");
+    let (_, binary, pinned, wrong) = PINNED
+        .into_iter()
+        .find(|(name, ..)| *name == agent)
+        .expect("known pinned agent");
+    let tag = image_for(&repo, agent);
+    assert!(tag.ends_with(&format!("-{agent}:latest")), "{tag}");
 
-        if full {
-            // ready: the probe runs the pinned binary inside this agent's image.
-            probe_answers(&w.docker, pinned);
-            let m = mark(&w.docker);
-            let (exit, text) = run(&s, &env, &repo, &["ready", "--agent", agent, "--json"]);
-            assert_eq!(exit, Exit::Code(0), "{agent} ready: {text}");
-            assert!(text.contains("verified inside"), "{agent} ready: {text}");
-            let calls = calls_since(&w.docker, m);
-            let probes: Vec<_> = calls.iter().filter(|a| is_probe(a)).collect();
-            assert!(
-                !probes.is_empty(),
-                "{agent}: ready did not probe: {calls:#?}"
-            );
-            for probe in &probes {
-                assert!(probe.contains(&tag), "{agent}: probe ran on {probe:?}");
-                assert!(probe.iter().any(|arg| arg == binary), "{probe:?}");
-                if agent == "cursor" {
-                    assert_eq!(
-                        probe.last().map(String::as_str),
-                        Some("--disable-auto-update")
-                    );
-                }
-            }
-
-            // A wrong major in the image fails ready and refuses launch.
-            probe_answers(&w.docker, wrong);
-            let (exit, text) = run(&s, &env, &repo, &["ready", "--agent", agent, "--json"]);
-            assert_ne!(exit, Exit::Code(0), "{agent} ready with {wrong:?}: {text}");
-            assert!(text.contains("ready --build"), "{agent}: {text}");
-            let m = mark(&w.docker);
-            let (exit, text) = run(
-                &s,
-                &env,
-                &repo,
-                &["exec", "prompt", "--agent", agent, "--headless", "hello"],
-            );
-            assert_ne!(
-                exit,
-                Exit::Code(0),
-                "{agent} launched with {wrong:?}: {text}"
-            );
-            assert!(
-                launches(&calls_since(&w.docker, m)).is_empty(),
-                "{agent}: launched despite a version mismatch"
-            );
-        }
-
-        // Launch: headless, then headless --yolo, with the pinned binary.
+    if full {
+        // ready: the probe runs the pinned binary inside this agent's image.
         probe_answers(&w.docker, pinned);
-        let mut shapes = Vec::new();
-        for extra in [&[][..], &["--yolo"][..]] {
-            let m = mark(&w.docker);
-            let mut args = vec!["exec", "prompt", "--agent", agent, "--headless"];
-            args.extend_from_slice(extra);
-            args.push("hello");
-            let (exit, text) = run(&s, &env, &repo, &args);
-            assert_eq!(exit, Exit::Code(0), "{agent} {extra:?}: {text}");
-            let calls = calls_since(&w.docker, m);
-            let launched = launches(&calls);
-            assert_eq!(launched.len(), 1, "{agent}: {calls:#?}");
-            let shape = launch_shape(launched[0]);
-            assert_eq!(shape["image"], tag.as_str());
-            let yolo = !extra.is_empty();
-            let expected: Vec<&str> = match (agent, yolo) {
-                // 1.x: unchanged; --yolo has never mapped to a flag.
-                ("opencode", _) => vec!["opencode", "run", "hello"],
-                // 2.x: always standalone; the seed arrives on stdin.
-                ("opencode-v2", false) => vec!["opencode", "--standalone", "run"],
-                ("opencode-v2", true) => vec!["opencode", "--standalone", "run", "--auto"],
-                ("cursor", false) => vec![
-                    "cursor-agent",
-                    "--disable-auto-update",
-                    "--print",
-                    "--trust",
-                    "--output-format",
-                    "text",
-                    "hello",
-                ],
-                ("cursor", true) => vec![
-                    "cursor-agent",
-                    "--disable-auto-update",
-                    "--print",
-                    "--trust",
-                    "--output-format",
-                    "text",
-                    "--force",
-                    "hello",
-                ],
-                _ => unreachable!(),
-            };
-            assert_eq!(shape["argv"], json!(expected), "{agent} yolo={yolo}");
-            let notice = text.contains("private copy of ~/.config/opencode");
-            assert_eq!(
-                notice,
-                agent == "opencode-v2",
-                "{agent}: launch note: {text}"
-            );
-            shapes.push(json!({"flags": extra, "launch": shape, "launch_note": notice}));
+        let m = mark(&w.docker);
+        let (exit, text) = run(&s, &env, &repo, &["ready", "--agent", agent, "--json"]);
+        assert_eq!(exit, Exit::Code(0), "{agent} ready: {text}");
+        assert!(text.contains("verified inside"), "{agent} ready: {text}");
+        let calls = calls_since(&w.docker, m);
+        let probes: Vec<_> = calls.iter().filter(|a| is_probe(a)).collect();
+        assert!(
+            !probes.is_empty(),
+            "{agent}: ready did not probe: {calls:#?}"
+        );
+        for probe in &probes {
+            assert!(probe.contains(&tag), "{agent}: probe ran on {probe:?}");
+            assert!(probe.iter().any(|arg| arg == binary), "{probe:?}");
+            if agent == "cursor" {
+                assert_eq!(
+                    probe.last().map(String::as_str),
+                    Some("--disable-auto-update")
+                );
+            }
         }
 
-        // Modes the agent cannot honour are refused before any launch.
-        let mut refused = Vec::new();
-        for mode in ["--plan", "--auto"] {
-            let m = mark(&w.docker);
-            let (exit, text) = run(
-                &s,
-                &env,
-                &repo,
-                &[
-                    "exec",
-                    "prompt",
-                    "--agent",
-                    agent,
-                    "--headless",
-                    mode,
-                    "hello",
-                ],
-            );
-            let calls = calls_since(&w.docker, m);
-            // Only OpenCode 1.x keeps an `--auto` mapping; nothing maps --plan.
-            let expect_refused = !(agent == "opencode" && mode == "--auto");
-            assert_eq!(
-                exit != Exit::Code(0),
-                expect_refused,
-                "{agent} {mode}: {text}"
-            );
-            if expect_refused {
-                assert!(launches(&calls).is_empty(), "{agent} {mode}: {calls:#?}");
-            }
-            refused.push(json!({"mode": mode, "refused": exit != Exit::Code(0)}));
-        }
-        trace.push(json!({
-            "agent": agent,
-            "image_suffix": tag.rsplit_once('-').map(|(_, s)| s).unwrap_or_default(),
-            "probe_binary": binary,
-            "launches": shapes,
-            "modes": refused,
-        }));
+        // A wrong major in the image fails ready and refuses launch.
+        probe_answers(&w.docker, wrong);
+        let (exit, text) = run(&s, &env, &repo, &["ready", "--agent", agent, "--json"]);
+        assert_ne!(exit, Exit::Code(0), "{agent} ready with {wrong:?}: {text}");
+        assert!(text.contains("ready --build"), "{agent}: {text}");
+        let m = mark(&w.docker);
+        let (exit, text) = run(
+            &s,
+            &env,
+            &repo,
+            &["exec", "prompt", "--agent", agent, "--headless", "hello"],
+        );
+        assert_ne!(
+            exit,
+            Exit::Code(0),
+            "{agent} launched with {wrong:?}: {text}"
+        );
+        assert!(
+            launches(&calls_since(&w.docker, m)).is_empty(),
+            "{agent}: launched despite a version mismatch"
+        );
     }
+
+    // Launch: headless, then headless --yolo, with the pinned binary.
+    probe_answers(&w.docker, pinned);
+    let mut shapes = Vec::new();
+    for extra in [&[][..], &["--yolo"][..]] {
+        let m = mark(&w.docker);
+        let mut args = vec!["exec", "prompt", "--agent", agent, "--headless"];
+        args.extend_from_slice(extra);
+        args.push("hello");
+        let (exit, text) = run(&s, &env, &repo, &args);
+        assert_eq!(exit, Exit::Code(0), "{agent} {extra:?}: {text}");
+        let calls = calls_since(&w.docker, m);
+        let launched = launches(&calls);
+        assert_eq!(launched.len(), 1, "{agent}: {calls:#?}");
+        let shape = launch_shape(launched[0]);
+        assert_eq!(shape["image"], tag.as_str());
+        let yolo = !extra.is_empty();
+        let expected: Vec<&str> = match (agent, yolo) {
+            // 1.x: unchanged; --yolo has never mapped to a flag.
+            ("opencode", _) => vec!["opencode", "run", "hello"],
+            // 2.x: always standalone; the seed arrives on stdin.
+            ("opencode-v2", false) => vec!["opencode", "--standalone", "run"],
+            ("opencode-v2", true) => vec!["opencode", "--standalone", "run", "--auto"],
+            ("cursor", false) => vec![
+                "cursor-agent",
+                "--disable-auto-update",
+                "--print",
+                "--trust",
+                "--output-format",
+                "text",
+                "hello",
+            ],
+            ("cursor", true) => vec![
+                "cursor-agent",
+                "--disable-auto-update",
+                "--print",
+                "--trust",
+                "--output-format",
+                "text",
+                "--force",
+                "hello",
+            ],
+            _ => unreachable!(),
+        };
+        assert_eq!(shape["argv"], json!(expected), "{agent} yolo={yolo}");
+        let notice = text.contains("private copy of ~/.config/opencode");
+        assert_eq!(
+            notice,
+            agent == "opencode-v2",
+            "{agent}: launch note: {text}"
+        );
+        shapes.push(json!({"flags": extra, "launch": shape, "launch_note": notice}));
+    }
+
+    // Modes the agent cannot honour are refused before any launch.
+    let mut refused = Vec::new();
+    for mode in ["--plan", "--auto"] {
+        let m = mark(&w.docker);
+        let (exit, text) = run(
+            &s,
+            &env,
+            &repo,
+            &[
+                "exec",
+                "prompt",
+                "--agent",
+                agent,
+                "--headless",
+                mode,
+                "hello",
+            ],
+        );
+        let calls = calls_since(&w.docker, m);
+        // Only OpenCode 1.x keeps an `--auto` mapping; nothing maps --plan.
+        let expect_refused = !(agent == "opencode" && mode == "--auto");
+        assert_eq!(
+            exit != Exit::Code(0),
+            expect_refused,
+            "{agent} {mode}: {text}"
+        );
+        if expect_refused {
+            assert!(launches(&calls).is_empty(), "{agent} {mode}: {calls:#?}");
+        }
+        refused.push(json!({"mode": mode, "refused": exit != Exit::Code(0)}));
+    }
+    let trace = json!({
+        "agent": agent,
+        "image_suffix": tag.rsplit_once('-').map(|(_, s)| s).unwrap_or_default(),
+        "probe_binary": binary,
+        "launches": shapes,
+        "modes": refused,
+    });
     for agent in &w.host_agents {
         assert!(
             agent.calls().is_empty(),
@@ -328,7 +331,7 @@ pub async fn pinned_agents_select_their_own_definition(
     backend.shutdown().await;
     s.finish();
     // Repo paths differ per sandbox; the image's repo stem is the same.
-    json!(trace)
+    trace
 }
 
 /// Every entry point that selects `gemini` with no custom definition fails

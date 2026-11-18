@@ -46,10 +46,31 @@ mod builtin {
         .await;
     }
     #[tokio::test(flavor = "multi_thread")]
-    async fn pinned_agents_select_their_own_definition() {
-        super::agents::pinned_agents_select_their_own_definition(
+    async fn opencode_selects_its_own_definition() {
+        super::agents::pinned_agent_selects_its_own_definition(
             super::BackendKind::Builtin,
-            "parity::builtin::pinned_agents_select_their_own_definition",
+            "parity::builtin::opencode_selects_its_own_definition",
+            "opencode",
+            true,
+        )
+        .await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_v2_selects_its_own_definition() {
+        super::agents::pinned_agent_selects_its_own_definition(
+            super::BackendKind::Builtin,
+            "parity::builtin::opencode_v2_selects_its_own_definition",
+            "opencode-v2",
+            true,
+        )
+        .await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cursor_selects_its_own_definition() {
+        super::agents::pinned_agent_selects_its_own_definition(
+            super::BackendKind::Builtin,
+            "parity::builtin::cursor_selects_its_own_definition",
+            "cursor",
             true,
         )
         .await;
@@ -74,10 +95,31 @@ mod builtin {
 }
 mod daemon {
     #[tokio::test(flavor = "multi_thread")]
-    async fn pinned_agents_select_their_own_definition() {
-        super::agents::pinned_agents_select_their_own_definition(
+    async fn opencode_selects_its_own_definition() {
+        super::agents::pinned_agent_selects_its_own_definition(
             super::BackendKind::Daemon,
-            "parity::daemon::pinned_agents_select_their_own_definition",
+            "parity::daemon::opencode_selects_its_own_definition",
+            "opencode",
+            true,
+        )
+        .await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_v2_selects_its_own_definition() {
+        super::agents::pinned_agent_selects_its_own_definition(
+            super::BackendKind::Daemon,
+            "parity::daemon::opencode_v2_selects_its_own_definition",
+            "opencode-v2",
+            true,
+        )
+        .await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cursor_selects_its_own_definition() {
+        super::agents::pinned_agent_selects_its_own_definition(
+            super::BackendKind::Daemon,
+            "parity::daemon::cursor_selects_its_own_definition",
+            "cursor",
             true,
         )
         .await;
@@ -116,11 +158,63 @@ mod differential {
         assert_eq!(builtin, daemon);
     }
     #[tokio::test(flavor = "multi_thread")]
-    async fn pinned_agent_launches_agree_across_backends() {
-        use super::agents::pinned_agents_select_their_own_definition as pinned;
+    async fn opencode_launches_agree_across_backends() {
+        use super::agents::pinned_agent_selects_its_own_definition as pinned;
         use super::BackendKind::{Builtin, Daemon};
-        let builtin = pinned(Builtin, "parity::differential::agents_builtin", false).await;
-        let daemon = pinned(Daemon, "parity::differential::agents_daemon", false).await;
+        let builtin = pinned(
+            Builtin,
+            "parity::differential::opencode_builtin",
+            "opencode",
+            false,
+        )
+        .await;
+        let daemon = pinned(
+            Daemon,
+            "parity::differential::opencode_daemon",
+            "opencode",
+            false,
+        )
+        .await;
+        assert_eq!(builtin, daemon);
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn opencode_v2_launches_agree_across_backends() {
+        use super::agents::pinned_agent_selects_its_own_definition as pinned;
+        use super::BackendKind::{Builtin, Daemon};
+        let builtin = pinned(
+            Builtin,
+            "parity::differential::opencode_v2_builtin",
+            "opencode-v2",
+            false,
+        )
+        .await;
+        let daemon = pinned(
+            Daemon,
+            "parity::differential::opencode_v2_daemon",
+            "opencode-v2",
+            false,
+        )
+        .await;
+        assert_eq!(builtin, daemon);
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cursor_launches_agree_across_backends() {
+        use super::agents::pinned_agent_selects_its_own_definition as pinned;
+        use super::BackendKind::{Builtin, Daemon};
+        let builtin = pinned(
+            Builtin,
+            "parity::differential::cursor_builtin",
+            "cursor",
+            false,
+        )
+        .await;
+        let daemon = pinned(
+            Daemon,
+            "parity::differential::cursor_daemon",
+            "cursor",
+            false,
+        )
+        .await;
         assert_eq!(builtin, daemon);
     }
     #[tokio::test(flavor = "multi_thread")]
