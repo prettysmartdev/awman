@@ -2,7 +2,7 @@
 //!
 //! `awman ready` and the first launch of an image execute the agent binary
 //! **inside the built image** (`<binary> --version`, no mounts, no network)
-//! and classify its answer against the definition's [`CliVersionPin`]. A
+//! and classify its answer against the definition's [`CliMajorRequirement`]. A
 //! host-installed binary is never consulted, so a host `opencode` 2.x can
 //! never satisfy `opencode` (1.x) readiness or vice versa, and the probed
 //! binary is the one the launch runs (`cli_version.binary ==
@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use crate::engine::agent::definition::CliVersionPin;
+use crate::engine::agent::definition::CliMajorRequirement;
 use crate::engine::container::backend::ProbeRequest;
 use crate::engine::container::runtime::ContainerRuntime;
 
@@ -21,10 +21,8 @@ pub const AGENT_VERSION_PROBE_SCRIPT: &str =
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliVersionStatus {
-    /// Required major matched and the version equals the tested pin.
-    Tested { version: String },
-    /// Acceptable (major matches, or no major rule) but not the tested pin.
-    Untested { version: String, tested: String },
+    /// The adapter's required major matched; minor and patch versions are unrestricted.
+    Compatible { version: String },
     /// Wrong major, unparsable output, or the binary is missing.
     Mismatch { found: String, expected: String },
     /// The probe could not run (no image, runtime refused, test isolation).
@@ -63,48 +61,26 @@ fn semver_token(line: &str) -> Option<(&str, u64)> {
     None
 }
 
-fn expected(pin: &CliVersionPin) -> String {
-    match pin.required_major {
-        Some(major) => format!("{} {major}.x", pin.binary),
-        None => format!("{} {}", pin.binary, pin.tested_version),
-    }
-}
-
-/// Pure: classify one version line against a pin.
-pub fn classify_cli_version(pin: &CliVersionPin, first_line: &str) -> CliVersionStatus {
+/// Pure: classify one version line against a breaking-major requirement.
+pub fn classify_cli_version(
+    requirement: &CliMajorRequirement,
+    first_line: &str,
+) -> CliVersionStatus {
     let trimmed = first_line.trim();
-    let found = if trimmed.is_empty() {
-        "nothing".to_string()
-    } else {
-        trimmed.to_string()
-    };
-    let version = match pin.required_major {
-        Some(required) => match semver_token(trimmed) {
-            Some((token, major)) if major == required => token.to_string(),
-            _ => {
-                return CliVersionStatus::Mismatch {
-                    found,
-                    expected: expected(pin),
-                }
+    match semver_token(trimmed) {
+        Some((version, major)) if major == requirement.required_major => {
+            CliVersionStatus::Compatible {
+                version: version.to_string(),
             }
+        }
+        _ => CliVersionStatus::Mismatch {
+            found: if trimmed.is_empty() {
+                "nothing".into()
+            } else {
+                trimmed.into()
+            },
+            expected: format!("{} {}.x", requirement.binary, requirement.required_major),
         },
-        None => {
-            if trimmed != pin.tested_version {
-                return CliVersionStatus::Mismatch {
-                    found,
-                    expected: expected(pin),
-                };
-            }
-            trimmed.to_string()
-        }
-    };
-    if version == pin.tested_version {
-        CliVersionStatus::Tested { version }
-    } else {
-        CliVersionStatus::Untested {
-            version,
-            tested: pin.tested_version.clone(),
-        }
     }
 }
 
@@ -113,7 +89,7 @@ pub fn classify_cli_version(pin: &CliVersionPin, first_line: &str) -> CliVersion
 pub fn probe_cli_version(
     runtime: &ContainerRuntime,
     image: &str,
-    pin: &CliVersionPin,
+    requirement: &CliMajorRequirement,
 ) -> CliVersionStatus {
     let process_env = runtime.env();
     if process_env.test_isolation() && !process_env.test_docker() {
@@ -126,37 +102,34 @@ pub fn probe_cli_version(
             reason: "image is not available locally".into(),
         };
     }
-    let mut tools = vec![pin.binary.as_str()];
-    if pin.required_major.is_none() {
-        tools.push("--disable-auto-update");
-    }
+    let tools = [requirement.binary.as_str()];
     match runtime.run_probe(&ProbeRequest {
         image,
         tools: &tools,
         script: AGENT_VERSION_PROBE_SCRIPT,
         timeout: AGENT_VERSION_PROBE_TIMEOUT,
     }) {
-        Ok(output) => classify_cli_version(pin, output.lines().next().unwrap_or_default()),
+        Ok(output) => classify_cli_version(requirement, output.lines().next().unwrap_or_default()),
         Err(error) => CliVersionStatus::Unknown {
             reason: error.to_string(),
         },
     }
 }
 
-/// Definitive probe results keyed by `(image id, pin)`. `Unknown` results and
+/// Definitive probe results keyed by `(image id, major requirement)`. `Unknown` results and
 /// images without a content identity are never cached.
 pub type AgentVersionCache =
-    std::sync::Mutex<std::collections::HashMap<(String, CliVersionPinKey), CliVersionStatus>>;
+    std::sync::Mutex<std::collections::HashMap<(String, CliMajorRequirementKey), CliVersionStatus>>;
 
-/// The cache's pin component.
-pub type CliVersionPinKey = (String, String, Option<u64>);
+/// The cache's major requirement component.
+pub type CliMajorRequirementKey = (String, u64);
 
 /// [`probe_cli_version`], once per image identity.
 pub fn probe_cli_version_cached(
     runtime: &ContainerRuntime,
     cache: &AgentVersionCache,
     image: &str,
-    pin: &CliVersionPin,
+    requirement: &CliMajorRequirement,
 ) -> CliVersionStatus {
     let process_env = runtime.env();
     if process_env.test_isolation() && !process_env.test_docker() {
@@ -164,22 +137,15 @@ pub fn probe_cli_version_cached(
             reason: "test isolation".into(),
         };
     }
-    let key = runtime.image_id(image).map(|id| {
-        (
-            id,
-            (
-                pin.binary.clone(),
-                pin.tested_version.clone(),
-                pin.required_major,
-            ),
-        )
-    });
+    let key = runtime
+        .image_id(image)
+        .map(|id| (id, (requirement.binary.clone(), requirement.required_major)));
     if let (Some(key), Ok(cache)) = (&key, cache.lock()) {
         if let Some(hit) = cache.get(key) {
             return hit.clone();
         }
     }
-    let status = probe_cli_version(runtime, image, pin);
+    let status = probe_cli_version(runtime, image, requirement);
     if let (Some(key), false, Ok(mut cache)) = (
         key,
         matches!(status, CliVersionStatus::Unknown { .. }),
@@ -199,8 +165,8 @@ pub fn mismatch_message(
     expected: &str,
 ) -> String {
     format!(
-        "{tag} does not contain {display_name}: expected {expected}, found {found}. Delete \
-         .awman/Dockerfile.{agent} and run 'awman ready --build'."
+        "{tag} does not contain {display_name}: expected {expected}, found {found}. Update \
+         .awman/Dockerfile.{agent} to install {expected} and run 'awman ready --build'."
     )
 }
 
@@ -208,105 +174,43 @@ pub fn mismatch_message(
 mod tests {
     use super::*;
 
-    fn pin(binary: &str, tested: &str, major: Option<u64>) -> CliVersionPin {
-        CliVersionPin {
-            binary: binary.into(),
-            tested_version: tested.into(),
+    fn requirement(major: u64) -> CliMajorRequirement {
+        CliMajorRequirement {
+            binary: "opencode".into(),
             required_major: major,
         }
     }
 
-    fn v1() -> CliVersionPin {
-        pin("opencode", "1.19.6", Some(1))
-    }
-    fn v2() -> CliVersionPin {
-        pin("opencode", "2.3.2", Some(2))
-    }
-    fn cursor() -> CliVersionPin {
-        pin("cursor-agent", "2026.11.17-f532c45", None)
+    #[test]
+    fn major_selection_accepts_any_minor_patch_or_prerelease() {
+        for (major, versions) in [
+            (1, ["1.0.0", "opencode v1.99.123", "1.100.0-beta.1"]),
+            (2, ["2.0.0", "opencode v2.99.123", "2.100.0-beta.1"]),
+        ] {
+            for version in versions {
+                assert!(matches!(
+                    classify_cli_version(&requirement(major), version),
+                    CliVersionStatus::Compatible { .. }
+                ));
+                assert!(matches!(
+                    classify_cli_version(&requirement(3 - major), version),
+                    CliVersionStatus::Mismatch { .. }
+                ));
+            }
+        }
     }
 
     #[test]
-    fn v1_and_v2_binaries_are_told_apart() {
-        assert_eq!(
-            classify_cli_version(&v1(), "1.19.6\n"),
-            CliVersionStatus::Tested {
-                version: "1.19.6".into()
-            }
-        );
-        assert_eq!(
-            classify_cli_version(&v2(), "opencode v2.3.2"),
-            CliVersionStatus::Tested {
-                version: "2.3.2".into()
-            }
-        );
-        // A V2 binary never satisfies V1 readiness, nor V1 → V2.
-        assert!(matches!(
-            classify_cli_version(&v1(), "opencode v2.3.2"),
-            CliVersionStatus::Mismatch { .. }
-        ));
-        assert!(matches!(
-            classify_cli_version(&v2(), "1.19.6"),
-            CliVersionStatus::Mismatch { .. }
-        ));
-        // A two-digit major is not mistaken for its last digit.
-        assert!(matches!(
-            classify_cli_version(&v1(), "11.0.0"),
-            CliVersionStatus::Mismatch { .. }
-        ));
-    }
-
-    #[test]
-    fn same_major_other_build_is_untested() {
-        assert_eq!(
-            classify_cli_version(&v1(), "1.19.7"),
-            CliVersionStatus::Untested {
-                version: "1.19.7".into(),
-                tested: "1.19.6".into()
-            }
-        );
-        assert_eq!(
-            classify_cli_version(&cursor(), "2026.12.01-abcdef0"),
-            CliVersionStatus::Mismatch {
-                found: "2026.12.01-abcdef0".into(),
-                expected: "cursor-agent 2026.11.17-f532c45".into()
-            }
-        );
-        assert_eq!(
-            classify_cli_version(&cursor(), "2026.11.17-f532c45"),
-            CliVersionStatus::Tested {
-                version: "2026.11.17-f532c45".into()
-            }
-        );
-    }
-
-    #[test]
-    fn empty_or_garbled_output_is_a_mismatch() {
-        for line in ["", "   ", "command not found", "v1.2"] {
+    fn missing_garbled_or_wrong_major_output_is_rejected() {
+        for version in ["", "   ", "command not found", "v1.2", "11.0.0", "3.0.0"] {
             assert!(
                 matches!(
-                    classify_cli_version(&v1(), line),
+                    classify_cli_version(&requirement(1), version),
                     CliVersionStatus::Mismatch { .. }
                 ),
-                "{line:?}"
+                "{version}"
             );
         }
-        for line in ["", "sh: cursor-agent: not found"] {
-            assert!(
-                matches!(
-                    classify_cli_version(&cursor(), line),
-                    CliVersionStatus::Mismatch { .. }
-                ),
-                "{line:?}"
-            );
-        }
-        assert_eq!(
-            classify_cli_version(&v2(), ""),
-            CliVersionStatus::Mismatch {
-                found: "nothing".into(),
-                expected: "opencode 2.x".into()
-            }
-        );
     }
 
     #[test]
@@ -318,7 +222,7 @@ mod tests {
             "1.19.6",
             "opencode 2.x",
         );
-        assert!(m.contains("Delete .awman/Dockerfile.opencode-v2"));
+        assert!(m.contains("Update .awman/Dockerfile.opencode-v2"));
         assert!(m.contains("awman ready --build"));
     }
 }

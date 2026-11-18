@@ -44,10 +44,10 @@ fn first_party_catalogue_and_opencode_majors_are_distinct() {
     assert_ne!(
         v1.cli_version
             .as_ref()
-            .map(|pin| pin.tested_version.as_str()),
+            .map(|requirement| requirement.required_major),
         v2.cli_version
             .as_ref()
-            .map(|pin| pin.tested_version.as_str())
+            .map(|requirement| requirement.required_major)
     );
     assert!(first_party::first_party("gemini").is_none());
     sandbox.finish();
@@ -138,16 +138,16 @@ fn legacy_agent_keys_keep_the_wi_0139_moved_key_hints() {
 }
 
 /// Design 8.3/8.4: every built-in has a definition, a Dockerfile, a sandbox
-/// kit and an apply script; `gemini` has none of the four; and every pinned
+/// kit and an apply script; `gemini` has none of the four; and every major-specific
 /// definition's tested version is the version its bundled Dockerfile installs
 /// and asserts, probed through the same binary the launch runs.
 #[test]
-fn every_built_in_has_all_artifacts_and_pins_agree_with_templates() {
+fn every_built_in_has_artifacts_and_only_opencode_requires_a_major() {
     use awman::data::templates::{
         agent_dockerfile_for, pinned_cli_version, sbx_apply_script_for, sbx_kit_template_for,
     };
     let sandbox = crate::support::sandbox(
-        "data::agent_catalogue::every_built_in_has_all_artifacts_and_pins_agree_with_templates",
+        "data::agent_catalogue::every_built_in_has_artifacts_and_only_opencode_requires_a_major",
     );
     for agent in FIRST_PARTY_AGENT_NAMES {
         let def =
@@ -161,35 +161,21 @@ fn every_built_in_has_all_artifacts_and_pins_agree_with_templates() {
             sbx_apply_script_for(agent).is_some(),
             "{agent}: no apply script"
         );
-        assert_eq!(
-            def.cli_version
-                .as_ref()
-                .map(|pin| pin.tested_version.as_str()),
-            pinned_cli_version(agent),
-            "{agent}: definition pin and template pin differ"
-        );
-        if let Some(pin) = &def.cli_version {
+        if let Some(requirement) = &def.cli_version {
             assert_eq!(
-                Some(&pin.binary),
+                Some(&requirement.binary),
                 def.interactive_entrypoint.first(),
                 "{agent}: probe binary is not the launched binary"
             );
-            assert!(
-                agent_dockerfile_for(agent)
-                    .unwrap()
-                    .contains(&pin.tested_version),
-                "{agent}: Dockerfile does not install {}",
-                pin.tested_version
-            );
-            assert!(
-                kit.contains(&pin.tested_version),
-                "{agent}: kit does not pin it"
-            );
-            // Pinned agents are probed inside the image, never on the host.
+            assert!(kit.contains(&format!(
+                "expected opencode {}.x",
+                requirement.required_major
+            )));
+            // Major-specific agents are probed inside the image, never on the host.
             assert!(def.ping_argv.is_none(), "{agent}: host ping");
         }
     }
-    for pinned in ["opencode", "opencode-v2", "cursor"] {
+    for pinned in ["opencode", "opencode-v2"] {
         assert!(pinned_cli_version(pinned).is_some(), "{pinned}: unpinned");
     }
     assert!(first_party::first_party("gemini").is_none());
@@ -197,5 +183,6 @@ fn every_built_in_has_all_artifacts_and_pins_agree_with_templates() {
     assert!(sbx_kit_template_for("gemini").is_none());
     assert!(sbx_apply_script_for("gemini").is_none());
     assert!(pinned_cli_version("gemini").is_none());
+    assert!(pinned_cli_version("cursor").is_none());
     sandbox.finish();
 }

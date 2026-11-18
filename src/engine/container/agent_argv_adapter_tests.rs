@@ -438,7 +438,7 @@ fn opencode_v2_standalone_precedes_every_subcommand_and_user_flags() {
 #[test]
 fn cursor_argv_rows() {
     let a = "cursor";
-    let base = ["cursor-agent", "--disable-auto-update"];
+    let base = ["cursor-agent"];
     assert_eq!(argv(a, Shape::default()), s(&base));
     assert_eq!(
         argv(
@@ -449,13 +449,7 @@ fn cursor_argv_rows() {
                 ..Default::default()
             }
         ),
-        s(&[
-            "cursor-agent",
-            "--disable-auto-update",
-            "--model",
-            "gpt-5",
-            SEED
-        ])
+        s(&["cursor-agent", "--model", "gpt-5", SEED])
     );
     assert_eq!(
         argv(
@@ -466,7 +460,7 @@ fn cursor_argv_rows() {
                 ..Default::default()
             }
         ),
-        s(&["cursor-agent", "--disable-auto-update", "--force", SEED])
+        s(&["cursor-agent", "--force", SEED])
     );
     let (text, resolved) = launch(
         a,
@@ -482,7 +476,6 @@ fn cursor_argv_rows() {
         text,
         s(&[
             "cursor-agent",
-            "--disable-auto-update",
             "--print",
             "--trust",
             "--output-format",
@@ -510,7 +503,6 @@ fn cursor_argv_rows() {
         structured,
         s(&[
             "cursor-agent",
-            "--disable-auto-update",
             "--print",
             "--trust",
             "--output-format",
@@ -534,7 +526,6 @@ fn cursor_argv_rows() {
         ),
         s(&[
             "cursor-agent",
-            "--disable-auto-update",
             "--print",
             "--trust",
             "--output-format",
@@ -715,9 +706,9 @@ fn ready_probe_and_launch_use_the_same_executable() {
         let Some(def) = first_party(agent) else {
             continue; // catalogue and table may be briefly out of step
         };
-        if let Some(pin) = &def.cli_version {
+        if let Some(requirement) = &def.cli_version {
             assert_eq!(
-                Some(&pin.binary),
+                Some(&requirement.binary),
                 def.interactive_entrypoint.first(),
                 "{agent}"
             );
@@ -727,7 +718,17 @@ fn ready_probe_and_launch_use_the_same_executable() {
             );
         }
     }
-    for agent in ["opencode", "opencode-v2", "cursor"] {
+    for agent in [
+        "claude",
+        "codex",
+        "cursor",
+        "copilot",
+        "cline",
+        "antigravity",
+    ] {
+        assert!(first_party(agent).unwrap().cli_version.is_none(), "{agent}");
+    }
+    for agent in ["opencode", "opencode-v2"] {
         assert!(first_party(agent).unwrap().cli_version.is_some(), "{agent}");
     }
 }
@@ -737,10 +738,8 @@ fn the_two_opencode_majors_are_distinct_definitions() {
     let v1 = first_party("opencode").unwrap();
     let v2 = first_party("opencode-v2").unwrap();
     assert_ne!(v1.interactive_entrypoint, v2.interactive_entrypoint);
-    assert_eq!(v1.cli_version.as_ref().unwrap().required_major, Some(1));
-    assert_eq!(v2.cli_version.as_ref().unwrap().required_major, Some(2));
-    assert_eq!(v1.cli_version.as_ref().unwrap().tested_version, "1.19.6");
-    assert_eq!(v2.cli_version.as_ref().unwrap().tested_version, "2.3.2");
+    assert_eq!(v1.cli_version.as_ref().unwrap().required_major, 1);
+    assert_eq!(v2.cli_version.as_ref().unwrap().required_major, 2);
     assert_ne!(v1.session_storage_dirs, v2.session_storage_dirs);
     // V2 never mounts the live host config or data (SQLite) directory.
     assert_eq!(v2.settings_mount, crate::engine::agent::SettingsMount::None);

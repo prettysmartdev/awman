@@ -390,6 +390,8 @@ Valid agents: `claude`, `codex`, `opencode`, `opencode-v2`, `cursor`, `cline`, `
 | `<git_root>/.awman/agents/<name>.toml` | This repo (wins over a global definition of the same name) |
 | `<AWMAN_HOME>/agents/<name>.toml` | Every repo |
 
+Agent versions are selected by your agent Dockerfiles, not an awman version allowlist. Upgrade or pin a build in `.awman/Dockerfile.<agent>` and rebuild with `awman ready --build`. Only the OpenCode major is checked for adapter compatibility.
+
 `opencode` selects OpenCode 1.x and `opencode-v2` selects OpenCode 2.x; they are independent agents (see [OpenCode 1.x and 2.x](03-agent-sessions.md#opencode-1x-and-2x)). `cursor` needs `CURSOR_API_KEY` delivered through `env()` (see [Cursor authentication](03-agent-sessions.md#cursor-authentication)).
 
 `gemini` is no longer a built-in agent. If `agents.default` is `"gemini"` and no custom agent named `gemini` exists, awman refuses to run and names the two ways forward: the built-in `antigravity` agent, or a [custom Gemini agent](15-custom-agents.md#example-gemini-cli). It does not change your setting for you. See [Gemini is no longer built in](03-agent-sessions.md#gemini-is-no-longer-built-in) for the scope of Google's consumer-account deprecation.

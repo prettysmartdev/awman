@@ -70,5 +70,5 @@ WORKDIR /workspace
 # ── Smoke test: run as the runtime user so we verify the binary is on PATH and
 # executable from the actual entrypoint context, not just for root. ───────────
 RUN v="$(opencode --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)" || v=; \
-    [ "$v" = "2.3.2" ] \
-      || { echo "awman: expected opencode 2.3.2 (2.x) in this image, found '${v:-nothing}'" >&2; exit 1; }
+    [ "${v%%.*}" = "2" ] \
+      || { echo "awman: expected opencode 2.x in this image, found '${v:-nothing}'" >&2; exit 1; }

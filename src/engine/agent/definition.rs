@@ -114,17 +114,14 @@ pub struct SessionStorageDir {
     pub seed_from_home: Option<String>,
 }
 
-/// The CLI build a first-party image pins, and how to recognise it.
+/// A breaking CLI major required by an agent adapter; exact builds are never gated.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CliVersionPin {
+pub struct CliMajorRequirement {
     /// Binary executed inside the image as `<binary> --version`. Equals
     /// `interactive_entrypoint[0]`.
     pub binary: String,
-    /// The exact version the bundled template installs and awman was tested with.
-    pub tested_version: String,
-    /// Major the image must report (`Some(1)` for opencode, `Some(2)` for
-    /// opencode-v2). `None` for a CLI without semantic versions (cursor).
-    pub required_major: Option<u64>,
+    /// Major the image must report (1 for opencode, 2 for opencode-v2).
+    pub required_major: u64,
 }
 
 /// An interactive `--model` launch for an agent whose full-screen command has
@@ -377,7 +374,7 @@ pub struct AgentDefinition {
     /// full-screen entrypoint (opencode-v2 `mini`).
     pub interactive_model_fallback: Option<InteractiveModelFallback>,
     /// In-image version proof (ready probe and launch check).
-    pub cli_version: Option<CliVersionPin>,
+    pub cli_version: Option<CliMajorRequirement>,
     /// Informational note surfaced once per launch.
     pub launch_note: Option<String>,
     /// Note surfaced on every sandbox-runtime launch.

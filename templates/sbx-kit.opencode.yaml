@@ -61,8 +61,8 @@ commands:
         # Assert as the runtime user, without inheriting installation credentials.
         runuser -u agent -- env -i HOME=/home/agent PATH=/usr/local/bin:/usr/bin:/bin bash -eo pipefail -c '
         v="$(opencode --version 2>/dev/null | grep -Eo '\''[0-9]+\.[0-9]+\.[0-9]+'\'' | head -n 1)" || v=
-        [ "$v" = "1.19.6" ] \
-          || { echo "awman: expected opencode 1.19.6 (1.x) in this image, found '\''${v:-nothing}'\''" >&2; exit 1; }
+        [ "${v%%.*}" = "1" ] \
+          || { echo "awman: expected opencode 1.x in this image, found '\''${v:-nothing}'\''" >&2; exit 1; }
         '
       description: Install and verify pinned opencode 1.19.6
   startup:

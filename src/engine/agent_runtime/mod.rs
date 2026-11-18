@@ -270,7 +270,7 @@ pub trait AgentRuntimeEngine: Send + Sync {
     fn probe_agent_cli_version(
         &self,
         _tag: &str,
-        _pin: &crate::engine::agent::definition::CliVersionPin,
+        _pin: &crate::engine::agent::definition::CliMajorRequirement,
     ) -> crate::engine::container::agent_version::CliVersionStatus {
         crate::engine::container::agent_version::CliVersionStatus::Unknown {
             reason: format!("{} cannot probe images", self.runtime_name()),

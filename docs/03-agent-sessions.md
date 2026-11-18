@@ -916,7 +916,7 @@ awman has two separate OpenCode agents. They are installed, selected, ready-chec
 
 | | `opencode` | `opencode-v2` |
 |---|---|---|
-| OpenCode line | 1.x (pinned 1.19.6) | 2.x (pinned 2.3.2) |
+| OpenCode line | Any 1.x release | Any 2.x release |
 | Launch | `opencode` | `opencode --standalone` (a private server, never shared with another run) |
 | Host config | `~/.config/opencode/` and `~/.local/share/opencode/` mounted directly | Private copy of `~/.config/opencode/`, seeded one way; changes and logins are discarded when the session ends |
 | Plugins | 1.x plugins and `plugin` setting | 1.x plugins and the `plugin` setting do not load |
@@ -927,15 +927,15 @@ awman has two separate OpenCode agents. They are installed, selected, ready-chec
 
 Existing `--agent opencode` users keep OpenCode 1.x; adding `opencode-v2` never changes which version `opencode` runs. To try 2.x, run `awman chat --agent opencode-v2` (awman offers to download `Dockerfile.opencode-v2` and build it on first use) or `awman init --agent opencode-v2`.
 
-OpenCode readiness now checks the image only and skips the former host authentication ping. On Docker Sandboxes, OpenCode 1.x now uses an awman-owned agent kit that installs pinned 1.19.6; existing mixin sandboxes need `awman ready --agent opencode --no-cache` to recreate them. OpenCode 1.x retains its direct writable host config/data mounts and its historical `--yolo` no-op.
+OpenCode readiness now checks the image only and skips the former host authentication ping. On Docker Sandboxes, OpenCode 1.x now uses an awman-owned agent kit that installs OpenCode 1.x; existing mixin sandboxes need `awman ready --agent opencode --no-cache` to recreate them. OpenCode 1.x retains its direct writable host config/data mounts and its historical `--yolo` no-op.
 
 OpenCode 2 and Cursor require an explicit `--yolo` to authorize their broad approval modes. API and worker defaults, dynamic mode and squad leaders do not grant this authorization. A launch with only an implied yolo mode is refused; dynamic workflows using these agents need an explicit `--yolo`. Squad evaluation leaders and their workflows currently cannot use these agents with their automatic yolo mode.
 
 OpenCode 2 is refused on `docker-sbx-experimental` until per-execution state and credential isolation is available. Its host config copy refuses symlinks (including intermediate directories), hard links, protected paths and special files, so policy files are never silently omitted. Make linked policy files regular files before launching. On platforms without secure descriptor-relative copying, an existing host config is refused; a missing config starts empty.
 
-If an image holds the wrong major version, `awman ready` and launch refuse it, for example: `does not contain OpenCode 2: expected opencode 2.x, found 1.19.6. Delete .awman/Dockerfile.opencode-v2 and run 'awman ready --build'.`
+If an image holds the wrong major version, `awman ready` and launch refuse it, for example: `does not contain OpenCode 2: expected opencode 2.x, found 1.19.6. Update .awman/Dockerfile.opencode-v2 to install opencode 2.x and run 'awman ready --build'.`
 
-A version probe that cannot run blocks launch. Cursor requires exactly build `2026.11.17-f532c45`; an older or newer build is refused. Other versions of the correct OpenCode major are allowed, with a readiness warning. To install the tested pin, delete `.awman/Dockerfile.<agent>` and run `awman ready --build`.
+Only the OpenCode major is a compatibility gate: a probe that cannot determine its major blocks launch. Any minor, patch or prerelease of the selected major is accepted without a version warning. Cursor and the other agents have no version gate. To choose or upgrade an agent version, edit `.awman/Dockerfile.<agent>` and run `awman ready --build`; awman does not require its bundled template’s default version. Cursor’s generated image installs the current upstream CLI and awman does not disable its auto-updates.
 
 `opencode-v2` interactive sessions started with `--model` use OpenCode 2.x's minimal interface (`mini`), which has no auto or plan mode, so combining `--model` with `--plan`, `--auto` or `--yolo` there is refused. Every `opencode-v2` launch prints a short note about the private configuration copy.
 
@@ -947,7 +947,7 @@ awman implements only the Cursor options below. Anything else is refused before 
 
 | Option | Behaviour |
 |---|---|
-| Interactive | `cursor-agent --disable-auto-update`, prompt as a positional argument |
+| Interactive | `cursor-agent`, prompt as a positional argument |
 | `--headless` | adds `--print --trust` and one `--output-format` (`text`, or `stream-json` when awman needs structured output such as API runs) |
 | `--yolo` | adds `--force`; the only way awman passes `--force` |
 | `--model <NAME>` | `--model <NAME>` |

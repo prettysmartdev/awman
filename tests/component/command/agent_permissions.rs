@@ -156,21 +156,20 @@ async fn api_cursor_force_requires_explicit_yolo_and_honors_opt_out() {
 
 #[cfg(unix)]
 #[test]
-fn version_probe_preserves_failure_even_when_the_binary_prints_the_pin() {
+fn version_probe_preserves_failure_even_when_the_binary_prints_a_version() {
     use awman::engine::container::agent_version::AGENT_VERSION_PROBE_SCRIPT;
     let s = crate::support::sandbox(
-        "command::agent_permissions::version_probe_preserves_failure_even_when_the_binary_prints_the_pin",
+        "command::agent_permissions::version_probe_preserves_failure_even_when_the_binary_prints_a_version",
     );
     let fake = s.install_fake(crate::support::fake_cli_exe(), "version-fixture");
     for code in [1, 0] {
-        fake.on(&["--disable-auto-update", "--version"])
+        fake.on(&["--version"])
             .stdout("2026.11.17-f532c45\nsecond line\n")
             .exit(code);
         let output = s
             .command("sh")
             .args(["-c", AGENT_VERSION_PROBE_SCRIPT, "sh"])
             .arg(s.bin().join("version-fixture"))
-            .arg("--disable-auto-update")
             .run();
         assert_eq!(output.exit, awman_test_support::Exit::Code(code));
         if code == 0 {

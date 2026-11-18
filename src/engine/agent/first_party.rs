@@ -3,7 +3,7 @@
 //! here; any other agent is a custom definition (`.awman/agents/<name>.toml`).
 
 use super::definition::{
-    AgentDefinition, AgentImageSource, AgentOrigin, AgentOutputFormat, CliVersionPin,
+    AgentDefinition, AgentImageSource, AgentOrigin, AgentOutputFormat, CliMajorRequirement,
     CredentialSource, InteractiveModelFallback, InteractiveSeedDelivery, ModeRefusal,
     ModelFlagDelivery, SbxKitKind, SessionStorageDir, SettingsMount, SystemPromptMode,
 };
@@ -165,14 +165,13 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             // binary starts a shared background service), so readiness is
             // proven inside the image by `cli_version` instead.
             ping_argv: None,
-            // A mixin kit cannot guarantee the major, the pin or the headless
+            // A mixin kit cannot guarantee the major or the headless
             // subcommand; awman owns the kit.
             sbx_kit_kind: SbxKitKind::Agent,
             sandbox_auth_env_vars: strings(&["ANTHROPIC_API_KEY"]),
-            cli_version: Some(CliVersionPin {
+            cli_version: Some(CliMajorRequirement {
                 binary: "opencode".into(),
-                tested_version: "1.19.6".into(),
-                required_major: Some(1),
+                required_major: 1,
             }),
             ..base("opencode", "OpenCode")
         },
@@ -238,10 +237,9 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             ping_argv: None,
             sbx_kit_kind: SbxKitKind::Agent,
             sandbox_auth_env_vars: strings(&["ANTHROPIC_API_KEY"]),
-            cli_version: Some(CliVersionPin {
+            cli_version: Some(CliMajorRequirement {
                 binary: "opencode".into(),
-                tested_version: "2.3.2".into(),
-                required_major: Some(2),
+                required_major: 2,
             }),
             launch_note: Some(
                 "opencode-v2 runs OpenCode 2.x with a private server and a private copy of \
@@ -254,8 +252,7 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             ..base("opencode-v2", "OpenCode 2")
         },
         "cursor" => AgentDefinition {
-            // The pinned build must not update itself mid-run.
-            interactive_entrypoint: strings(&["cursor-agent", "--disable-auto-update"]),
+            interactive_entrypoint: strings(&["cursor-agent"]),
             non_interactive_flag: Some("--print".into()),
             // Answers workspace trust (headless runs otherwise exit 1). This
             // is not `--force`.
@@ -305,11 +302,6 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
                  docker, apple or builtin with env(CURSOR_API_KEY)"
                     .into(),
             ),
-            cli_version: Some(CliVersionPin {
-                binary: "cursor-agent".into(),
-                tested_version: "2026.11.17-f532c45".into(),
-                required_major: None,
-            }),
             ..base("cursor", "Cursor Agent")
         },
         "copilot" => AgentDefinition {

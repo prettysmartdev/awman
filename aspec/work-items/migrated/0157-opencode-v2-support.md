@@ -53,16 +53,18 @@ choose Antigravity or intentionally define Gemini as a custom agent without an u
 
 ### 1. Make built-in identity and version explicit
 
+Agent versions belong to user-edited Dockerfiles. No agent definition may carry an exact-version requirement, and readiness or launch must not gate on a bundled build. Only OpenCode’s breaking major distinction is enforced; template artifact pins, where present, are replaceable installation defaults.
+
 | awman agent | CLI in its own image | Version policy | User-facing behavior |
 |---|---|---|---|
-| `opencode` | `opencode` | Pin an explicit 1.x release | Existing choice and V1 behavior remain stable. |
-| `opencode-v2` | `opencode` | Pin an explicit 2.x release | New opt-in choice; V2-specific invocation and config behavior. |
-| `cursor` | `cursor-agent` | Pin/verify a tested Cursor CLI build | New built-in agent, with version updates reviewed deliberately. |
+| `opencode` | `opencode` | Require major 1; any minor/patch build | Existing choice and V1 behavior remain stable. |
+| `opencode-v2` | `opencode` | Require major 2; any minor/patch build | New opt-in choice; V2-specific invocation and config behavior. |
+| `cursor` | `cursor-agent` | No version gate; user-selected builds | New built-in agent; users can upgrade through their Dockerfile. |
 
 - Update `FIRST_PARTY_AGENT_NAMES`, `first_party.rs`, template lookup, agent discovery, config validation, default choices, `new`/`ready`/launch flows, and generated Docker/Sandbox assets together. Version-specific adapters must live with agent definitions/templates, not as scattered runtime checks. Use distinct image tags and kit names for both OpenCode majors even though both binaries are named `opencode` inside their containers.
 - Replace `templates/Dockerfile.opencode`'s `releases/latest` download with an official, explicitly pinned 1.x artifact and verify `opencode --version` reports 1.x. Add a separate V2 template using the [official V2 installation channel](https://opencode.ai/v2/docs/) and verify 2.x. OpenCode's [V1/V2 migration guide](https://opencode.ai/v2/docs/migrate-v1/) says both majors share the command and config locations and do not install side by side by default; awman's separate images provide the isolation.
-- Add a Cursor image from the [official Cursor CLI installation channel](https://docs.cursor.com/en/cli/installation). The installer attempts auto-update by default, so determine a supported version-pinning/verification strategy before accepting the image; a run must not silently change its tested CLI version. Verify Linux architecture support for every runtime awman advertises. A missing supported package/architecture must fail at build or ready with a precise reason.
-- For Docker Sandboxes, verify which executable the base kit actually invokes. Use an awman-owned `kind: agent` kit or other controlled path where a mixin's baked-in OpenCode/Cursor binary cannot guarantee the selected version and entrypoint. A ready check and an actual launch must report/use the same major and executable.
+- Add a Cursor image from the [official Cursor CLI installation channel](https://docs.cursor.com/en/cli/installation). Install the current upstream release by default and allow users to select another build through their Dockerfile. Do not disable auto-update or enforce an exact Cursor version at build, ready or launch. Verify Linux architecture support for every runtime awman advertises. A missing supported package/architecture must fail at build or ready with a precise reason.
+- For Docker Sandboxes, verify which executable the base kit actually invokes. Use an awman-owned `kind: agent` kit or other controlled path where a mixin's baked-in OpenCode/Cursor binary cannot guarantee the selected OpenCode major and entrypoint. A ready check and an actual launch must report/use the same major and executable.
 
 ### 2. Integrate OpenCode V2 without changing V1
 
@@ -93,7 +95,7 @@ choose Antigravity or intentionally define Gemini as a custom agent without an u
 ## Test Considerations:
 
 - Catalogue/validation tests assert exactly the intended first-party choices, distinguish the two OpenCode majors, allow deliberate custom Gemini, and show migration guidance for stale built-in Gemini references. Cover CLI, TUI, API/workflow, `new`, `ready`, and config defaults.
-- Build and inspect pinned amd64/arm64 images and Sandbox kits where supported. Assert the invoked OpenCode major and Cursor version from inside the launched runtime, not just Dockerfile text or a host binary. Test version drift and missing-architecture errors.
+- Build and inspect amd64/arm64 images and Sandbox kits where supported. Assert the invoked OpenCode major and Cursor executable from inside the launched runtime, not just Dockerfile text or a host binary. Prove same-major OpenCode upgrades and arbitrary Cursor versions are accepted; reject only wrong OpenCode majors and missing-architecture errors.
 - Exercise interactive seed, model selection, non-interactive prompt/output/exit, interruption, skills/instructions, credentials, concurrent launches, and permission/tool restrictions for V1, V2, and Cursor. Use a stub provider or disposable test account where possible. Include a real CLI smoke for each supported major/runtime before declaring it ready.
 - Prove that V2's standalone process uses its own credentials and that Cursor's print mode cannot bypass awman's requested plan/deny boundaries. Verify Gemini removal leaves Antigravity auth and skills functional.
 

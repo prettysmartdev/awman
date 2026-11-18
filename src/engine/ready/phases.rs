@@ -1040,9 +1040,9 @@ impl ReadyEngine {
     }
 
     /// WI 0157: once the default agent's image is built or imported, execute
-    /// its pinned CLI **inside the image** and report the version that runs.
-    /// A wrong major (or no binary) fails ready; an untested build or a probe
-    /// that could not run is a warning, never `Done`. Agents without a pin
+    /// its major-specific CLI **inside the image** and report the version that runs.
+    /// A wrong major (or no binary) fails ready; a probe that could not run is
+    /// a warning, never `Done`. Agents without a major requirement
     /// keep the plain `Done`.
     pub(super) fn verify_agent_cli(&mut self, frontend: &mut dyn ReadyFrontend, tag: &str) {
         use crate::data::message::{MessageLevel, UserMessage};
@@ -1053,29 +1053,25 @@ impl ReadyEngine {
         let Some(def) = self.definition.as_ref() else {
             return;
         };
-        let Some(pin) = def.cli_version.clone() else {
+        let Some(requirement) = def.cli_version.clone() else {
             return;
         };
         let display = def.display_name.clone();
         let agent = def.name.clone();
-        let status = match self.runtime.probe_agent_cli_version(tag, &pin) {
-            CliVersionStatus::Tested { version } => {
+        let status = match self.runtime.probe_agent_cli_version(tag, &requirement) {
+            CliVersionStatus::Compatible { version } => {
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Info,
                     text: format!("{display} CLI {version} verified inside {tag}"),
                 });
                 StepStatus::Done
             }
-            CliVersionStatus::Untested { version, tested } => StepStatus::Warn(format!(
-                "{tag} runs {} {version}; this awman release was tested with {tested}. To use the pin, delete .awman/Dockerfile.{agent} and run 'awman ready --build'",
-                pin.binary
-            )),
             CliVersionStatus::Mismatch { found, expected } => {
                 StepStatus::Failed(mismatch_message(&display, &agent, tag, &found, &expected))
             }
             CliVersionStatus::Unknown { reason } => StepStatus::Warn(format!(
                 "could not verify the {} version inside {tag}: {reason}",
-                pin.binary
+                requirement.binary
             )),
         };
         if let StepStatus::Warn(text) | StepStatus::Failed(text) = &status {

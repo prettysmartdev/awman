@@ -696,7 +696,7 @@ Six built-in agents are supported under `sbx`; two require a container runtime:
 | `claude` | mixin | Extends `docker/sandbox-templates:claude-code-docker` |
 | `codex` | mixin | Extends `docker/sandbox-templates:codex-docker` |
 | `copilot` | mixin | Extends `docker/sandbox-templates:copilot-docker` |
-| `opencode` | agent | OpenCode 1.x (pinned) installed on the `shell-docker` base |
+| `opencode` | agent | OpenCode 1.x installed on the `shell-docker` base |
 | `opencode-v2` | unavailable | Requires per-execution state and credential isolation |
 | `cursor` | unavailable | Requires per-execution state and credential isolation |
 | `antigravity` | agent | Full install on `shell-docker` base |

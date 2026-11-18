@@ -111,9 +111,9 @@ impl AgentRuntimeEngine for CommandOwnedRuntime {
     fn probe_agent_cli_version(
         &self,
         tag: &str,
-        pin: &crate::engine::agent::definition::CliVersionPin,
+        requirement: &crate::engine::agent::definition::CliMajorRequirement,
     ) -> crate::engine::container::agent_version::CliVersionStatus {
-        self.inner.probe_agent_cli_version(tag, pin)
+        self.inner.probe_agent_cli_version(tag, requirement)
     }
     fn inspect_image(
         &self,

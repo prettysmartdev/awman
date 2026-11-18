@@ -108,7 +108,7 @@ pub struct ContainerRuntime {
     env: crate::data::config::env::EnvSnapshot,
     backend: Arc<dyn ContainerBackend>,
     phase_tools_cache: std::sync::Mutex<crate::data::fs::phase_tools_cache::PhaseToolsCache>,
-    /// In-image agent CLI version results by (image id, pin), so a launch
+    /// In-image agent CLI version results by (image id, requirement), so a launch
     /// probes each image identity once (WI 0157).
     agent_version_cache: super::agent_version::AgentVersionCache,
 }
@@ -574,13 +574,13 @@ impl AgentRuntimeEngine for ContainerRuntime {
     fn probe_agent_cli_version(
         &self,
         tag: &str,
-        pin: &crate::engine::agent::definition::CliVersionPin,
+        requirement: &crate::engine::agent::definition::CliMajorRequirement,
     ) -> crate::engine::container::agent_version::CliVersionStatus {
         crate::engine::container::agent_version::probe_cli_version_cached(
             self,
             &self.agent_version_cache,
             tag,
-            pin,
+            requirement,
         )
     }
 

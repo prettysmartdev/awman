@@ -584,7 +584,7 @@ fn ready_reports_the_cli_version_that_runs_inside_the_image() {
     assert_eq!(status, StepStatus::Done);
     let (status, _, probes) = verify_with("cursor", Some("2026.11.17-f532c45"));
     assert_eq!(status, StepStatus::Done);
-    assert_eq!(probes[0].1, "cursor-agent");
+    assert!(probes.is_empty());
 }
 
 #[test]
@@ -592,7 +592,7 @@ fn a_v1_binary_never_satisfies_opencode_v2_readiness_or_vice_versa() {
     let (status, _, _) = verify_with("opencode-v2", Some("1.19.6"));
     assert!(
         matches!(&status, StepStatus::Failed(m) if m.contains("expected opencode 2.x, found 1.19.6")
-            && m.contains("Delete .awman/Dockerfile.opencode-v2")),
+            && m.contains("Update .awman/Dockerfile.opencode-v2")),
         "{status:?}"
     );
     let (status, _, _) = verify_with("opencode", Some("opencode v2.3.2"));
@@ -601,25 +601,22 @@ fn a_v1_binary_never_satisfies_opencode_v2_readiness_or_vice_versa() {
         "{status:?}"
     );
     let (status, _, _) = verify_with("cursor", Some(""));
-    assert!(matches!(status, StepStatus::Failed(_)), "{status:?}");
+    assert_eq!(status, StepStatus::Done);
 }
 
 #[test]
-fn untested_or_unprobed_images_warn_and_are_never_done() {
+fn major_checks_accept_upgrades_and_only_warn_when_unprobed() {
     let (status, _, _) = verify_with("opencode", Some("1.20.0"));
-    assert_eq!(
-        status,
-        StepStatus::Warn(
-            "awman-x-agent:latest runs opencode 1.20.0; this awman release was tested with 1.19.6. To use the pin, delete .awman/Dockerfile.opencode and run 'awman ready --build'"
-                .into()
-        )
-    );
-    let (status, _, _) = verify_with("cursor", None);
+    assert_eq!(status, StepStatus::Done);
+    let (status, _, _) = verify_with("opencode", None);
     assert!(
         matches!(&status, StepStatus::Warn(m) if m.contains("could not verify")),
         "{status:?}"
     );
-    // An agent without a pin is untouched (no probe).
+    let (status, _, probes) = verify_with("cursor", None);
+    assert_eq!(status, StepStatus::Done);
+    assert!(probes.is_empty());
+    // An agent without a major requirement is untouched (no probe).
     let (status, _, probes) = verify_with("claude", Some("garbage"));
     assert_eq!(status, StepStatus::Done);
     assert!(probes.is_empty());

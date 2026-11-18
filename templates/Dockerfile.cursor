@@ -25,31 +25,17 @@ SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 ENTRYPOINT []
 CMD ["/bin/bash"]
 
-# ── Install agent binary ──────────────────────────────────────────────────────
-# Official versioned artifact; changes require reviewed version and checksum updates.
-LABEL awman.agent="cursor" awman.agent.cli.version="2026.11.17-f532c45"
-# Root-owned /opt and the fixed PATH keep self-updates from replacing this binary.
-RUN CA_VERSION=2026.11.17-f532c45; \
-    case "$(uname -m)" in \
-      x86_64|amd64)  CA_ARCH=x64;   CA_SHA=189ed41d8963cd22dcdafbbd62f072cc55ac08374c922dbd04aee525f4018ab6 ;; \
-      aarch64|arm64) CA_ARCH=arm64; CA_SHA=dff929e5e5ace2ced880290095df5938545267d73fd1d84be669be75dbdc1558 ;; \
-      *) echo "awman: cursor-agent ${CA_VERSION} has no Linux package for architecture '$(uname -m)' (supported: x86_64, aarch64)" >&2; exit 1 ;; \
+LABEL awman.agent="cursor"
+
+# ── Supported platform ────────────────────────────────────────────────────────
+RUN case "$(uname -m)" in \
+      x86_64|amd64|aarch64|arm64) ;; \
+      *) echo "awman: cursor-agent has no Linux package for architecture '$(uname -m)' (supported: x86_64, aarch64)" >&2; exit 1 ;; \
     esac; \
     CA_LDD="$(ldd --version 2>&1 || true)"; \
     case "$CA_LDD" in \
-      *musl*) echo "awman: cursor-agent ${CA_VERSION} requires glibc; this base image uses musl" >&2; exit 1 ;; \
-    esac; \
-    CA_ASSET="cursor-agent-linux-${CA_ARCH}-${CA_VERSION}.tar.gz"; \
-    curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 600 -o "/tmp/${CA_ASSET}" \
-      "https://downloads.cursor.com/lab/${CA_VERSION}/linux/${CA_ARCH}/agent-cli-package.tar.gz" \
-      || { echo "awman: cursor-agent ${CA_VERSION} could not download Linux package ${CA_ASSET} for ${CA_ARCH}" >&2; exit 1; }; \
-    echo "${CA_SHA}  /tmp/${CA_ASSET}" | sha256sum -c -; \
-    mkdir -p "/opt/cursor-agent/${CA_VERSION}"; \
-    tar --strip-components=1 -xzf "/tmp/${CA_ASSET}" -C "/opt/cursor-agent/${CA_VERSION}"; \
-    chown -R root:root /opt/cursor-agent; \
-    chmod -R go-w /opt/cursor-agent; \
-    ln -sf "/opt/cursor-agent/${CA_VERSION}/cursor-agent" /usr/local/bin/cursor-agent; \
-    rm -f "/tmp/${CA_ASSET}"
+      *musl*) echo "awman: cursor-agent requires glibc; this base image uses musl" >&2; exit 1 ;; \
+    esac
 
 # ── awman user + workspace (idempotent against a base that already created it) ─
 # Outer braces keep the && chain associated with the user-creation block,
@@ -63,14 +49,11 @@ RUN { id -u awman >/dev/null 2>&1 \
 
 USER awman
 ENV HOME=/home/awman \
-    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+    PATH=/home/awman/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
 WORKDIR /workspace
 
-# ── Smoke test: run as the runtime user so we verify the binary is on PATH and
-# executable from the actual entrypoint context, not just for root. ───────────
-RUN v="$(cursor-agent --disable-auto-update --version 2>/dev/null | head -n 1)" || v=; \
-    [ "$v" = "2026.11.17-f532c45" ] \
-      || { echo "awman: expected cursor-agent 2026.11.17-f532c45 in this image, found '${v:-nothing}'" >&2; exit 1; }; \
-    cursor-agent --disable-auto-update --help >/dev/null; \
-    test ! -w /opt/cursor-agent/2026.11.17-f532c45/cursor-agent; \
-    test ! -w /opt/cursor-agent/2026.11.17-f532c45
+# Install the current upstream CLI as the runtime user. This Dockerfile owns
+# version selection; awman does not restrict upgrades or suppress self-updates.
+RUN curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 600 https://cursor.com/install | bash \
+    && cursor-agent --version \
+    && cursor-agent --help >/dev/null

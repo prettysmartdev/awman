@@ -74,13 +74,12 @@ pub fn sbx_apply_script_for(agent: &str) -> Option<&'static str> {
     })
 }
 
-/// CLI version each bundled first-party template pins, for agents with a pin.
-/// Layer 1 definitions cross-check their tested version against this value.
+/// Default OpenCode artifact selected by the bundled Dockerfile. Users may
+/// choose another build; runtime compatibility checks only the selected major.
 pub fn pinned_cli_version(agent: &str) -> Option<&'static str> {
     match agent {
         "opencode" => Some("1.19.6"),
         "opencode-v2" => Some("2.3.2"),
-        "cursor" => Some("2026.11.17-f532c45"),
         _ => None,
     }
 }
@@ -99,7 +98,7 @@ mod tests {
         "cline",
         "antigravity",
     ];
-    const PINNED: &[&str] = &["opencode", "opencode-v2", "cursor"];
+    const PINNED: &[&str] = &["opencode", "opencode-v2"];
 
     fn sha256_pins(text: &str) -> Vec<&str> {
         text.split(|c: char| !c.is_ascii_hexdigit())
@@ -152,7 +151,10 @@ mod tests {
             assert!(!dockerfile.lines().any(|l| l.starts_with("ARG ")));
             for text in [dockerfile, kit] {
                 assert!(
-                    text.contains(&format!("[ \"$v\" = \"{version}\" ]")),
+                    text.contains(&format!(
+                        "[ \"${{v%%.*}}\" = \"{}\" ]",
+                        if *agent == "opencode" { 1 } else { 2 }
+                    )),
                     "{agent}"
                 );
                 assert!(text.contains("sha256sum -c -"), "{agent}");
@@ -189,12 +191,11 @@ mod tests {
         let v2 = agent_dockerfile_for("opencode-v2").unwrap();
         assert_ne!(v1, v2);
         for (agent, major) in [("opencode", 1), ("opencode-v2", 2)] {
-            let version = pinned_cli_version(agent).unwrap();
             for text in [
                 agent_dockerfile_for(agent).unwrap(),
                 sbx_kit_template_for(agent).unwrap(),
             ] {
-                assert!(text.contains(&format!("expected opencode {version} ({major}.x)")));
+                assert!(text.contains(&format!("expected opencode {major}.x")));
                 assert!(text.contains("https://github.com/anomalyco/opencode/releases/download/v${OC_VERSION}/${OC_ASSET}"));
                 assert!(text.contains("x64-musl)"));
                 assert!(text.contains("arm64-musl)"));
@@ -203,20 +204,18 @@ mod tests {
     }
 
     #[test]
-    fn cursor_pin_is_root_owned_and_checks_the_update_disable_flag() {
+    fn cursor_installs_upstream_without_a_version_gate_or_update_suppression() {
+        assert!(pinned_cli_version("cursor").is_none());
         for text in [
             agent_dockerfile_for("cursor").unwrap(),
             sbx_kit_template_for("cursor").unwrap(),
         ] {
-            assert!(text.contains("https://downloads.cursor.com/lab/${CA_VERSION}/linux/${CA_ARCH}/agent-cli-package.tar.gz"));
-            assert!(text.contains("chown -R root:root /opt/cursor-agent"));
-            assert!(text.contains("chmod -R go-w /opt/cursor-agent"));
-            assert!(text.contains("cursor-agent --disable-auto-update --help"));
-            assert!(text.contains("cursor-agent --disable-auto-update --version"));
-            assert!(text.contains("requires glibc; this base image uses musl"));
-            assert!(!text.contains("/home/awman/.local/bin"));
-            assert!(!text.contains("/home/agent/.local/bin"));
-            assert!(!text.contains("/usr/local/bin/agent\n"));
+            assert!(text.contains("https://cursor.com/install"));
+            assert!(text.contains("cursor-agent --version"));
+            assert!(text.contains("cursor-agent --help"));
+            assert!(!text.contains("disable-auto-update"));
+            assert!(!text.contains("CA_VERSION"));
+            assert!(!text.contains("awman.agent.cli.version"));
         }
     }
 
@@ -225,7 +224,7 @@ mod tests {
         for (agent, entrypoint) in [
             ("opencode", vec!["opencode"]),
             ("opencode-v2", vec!["opencode", "--standalone"]),
-            ("cursor", vec!["cursor-agent", "--disable-auto-update"]),
+            ("cursor", vec!["/home/agent/.local/bin/cursor-agent"]),
         ] {
             let rendered = sbx_kit_template_for(agent)
                 .unwrap()

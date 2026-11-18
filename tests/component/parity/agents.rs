@@ -24,12 +24,17 @@ use std::path::Path;
 const GEMINI_NOTE: &str =
     "'gemini' is no longer a built-in agent, and awman has not changed your selection.";
 
-/// (agent, image suffix, probe binary, pinned version, a version that is the
-/// wrong major or shape for this agent).
-const PINNED: [(&str, &str, &str, &str); 3] = [
-    ("opencode", "opencode", "1.19.6", "2.3.2"),
-    ("opencode-v2", "opencode", "2.3.2", "1.19.6"),
-    ("cursor", "cursor-agent", "2026.11.17-f532c45", ""),
+/// Agent, binary, sample version, and another build (wrong OpenCode major or
+/// an unrestricted Cursor upgrade).
+const AGENT_CASES: [(&str, &str, &str, &str); 3] = [
+    ("opencode", "opencode", "1.99.123", "2.3.2"),
+    ("opencode-v2", "opencode", "2.99.123", "1.19.6"),
+    (
+        "cursor",
+        "cursor-agent",
+        "2026.11.17-f532c45",
+        "2030.12.31-upgraded",
+    ),
 ];
 
 struct World {
@@ -165,7 +170,7 @@ fn image_for(repo: &Path, agent: &str) -> String {
 
 /// One agent per test keeps independent subprocess-heavy scenarios within the
 /// component deadline; the returned trace is compared across backends.
-pub async fn pinned_agent_selects_its_own_definition(
+pub async fn agent_selects_its_own_definition(
     kind: BackendKind,
     id: &'static str,
     agent: &str,
@@ -182,42 +187,46 @@ pub async fn pinned_agent_selects_its_own_definition(
         .file("Dockerfile.dev", "FROM scratch\n")
         .init();
     let repo = repo.path().to_path_buf();
-    let (_, binary, pinned, wrong) = PINNED
+    let (_, binary, selected, wrong) = AGENT_CASES
         .into_iter()
         .find(|(name, ..)| *name == agent)
-        .expect("known pinned agent");
+        .expect("known agent");
     let tag = image_for(&repo, agent);
     assert!(tag.ends_with(&format!("-{agent}:latest")), "{tag}");
 
     if full {
-        // ready: the probe runs the pinned binary inside this agent's image.
-        probe_answers(&w.docker, pinned);
+        // Ready probes only the selected OpenCode major, inside its image.
+        probe_answers(&w.docker, selected);
         let m = mark(&w.docker);
         let (exit, text) = run(&s, &env, &repo, &["ready", "--agent", agent, "--json"]);
         assert_eq!(exit, Exit::Code(0), "{agent} ready: {text}");
-        assert!(text.contains("verified inside"), "{agent} ready: {text}");
+        assert_eq!(
+            text.contains("verified inside"),
+            agent != "cursor",
+            "{agent} ready: {text}"
+        );
         let calls = calls_since(&w.docker, m);
         let probes: Vec<_> = calls.iter().filter(|a| is_probe(a)).collect();
         assert!(
-            !probes.is_empty(),
+            probes.is_empty() == (agent == "cursor"),
             "{agent}: ready did not probe: {calls:#?}"
         );
         for probe in &probes {
             assert!(probe.contains(&tag), "{agent}: probe ran on {probe:?}");
             assert!(probe.iter().any(|arg| arg == binary), "{probe:?}");
-            if agent == "cursor" {
-                assert_eq!(
-                    probe.last().map(String::as_str),
-                    Some("--disable-auto-update")
-                );
-            }
         }
 
-        // A wrong major in the image fails ready and refuses launch.
+        // Wrong OpenCode majors are refused; arbitrary Cursor upgrades are accepted.
         probe_answers(&w.docker, wrong);
         let (exit, text) = run(&s, &env, &repo, &["ready", "--agent", agent, "--json"]);
-        assert_ne!(exit, Exit::Code(0), "{agent} ready with {wrong:?}: {text}");
-        assert!(text.contains("ready --build"), "{agent}: {text}");
+        assert_eq!(
+            exit == Exit::Code(0),
+            agent == "cursor",
+            "{agent} ready with {wrong:?}: {text}"
+        );
+        if agent != "cursor" {
+            assert!(text.contains("ready --build"), "{agent}: {text}");
+        }
         let m = mark(&w.docker);
         let (exit, text) = run(
             &s,
@@ -225,19 +234,20 @@ pub async fn pinned_agent_selects_its_own_definition(
             &repo,
             &["exec", "prompt", "--agent", agent, "--headless", "hello"],
         );
-        assert_ne!(
-            exit,
-            Exit::Code(0),
-            "{agent} launched with {wrong:?}: {text}"
+        assert_eq!(
+            exit == Exit::Code(0),
+            agent == "cursor",
+            "{agent} launch with {wrong:?}: {text}"
         );
-        assert!(
-            launches(&calls_since(&w.docker, m)).is_empty(),
-            "{agent}: launched despite a version mismatch"
+        assert_eq!(
+            launches(&calls_since(&w.docker, m)).len(),
+            usize::from(agent == "cursor"),
+            "{agent}: only major mismatches must refuse launch"
         );
     }
 
-    // Launch: headless, then headless --yolo, with the pinned binary.
-    probe_answers(&w.docker, pinned);
+    // Launch: headless, then headless --yolo, using the selected adapter.
+    probe_answers(&w.docker, selected);
     let mut shapes = Vec::new();
     for extra in [&[][..], &["--yolo"][..]] {
         let m = mark(&w.docker);
@@ -260,7 +270,6 @@ pub async fn pinned_agent_selects_its_own_definition(
             ("opencode-v2", true) => vec!["opencode", "--standalone", "run", "--auto"],
             ("cursor", false) => vec![
                 "cursor-agent",
-                "--disable-auto-update",
                 "--print",
                 "--trust",
                 "--output-format",
@@ -269,7 +278,6 @@ pub async fn pinned_agent_selects_its_own_definition(
             ],
             ("cursor", true) => vec![
                 "cursor-agent",
-                "--disable-auto-update",
                 "--print",
                 "--trust",
                 "--output-format",
@@ -543,7 +551,7 @@ pub async fn cursor_env_output_is_redacted(kind: BackendKind, id: &'static str) 
     s.finish();
 }
 
-pub async fn pinned_readiness_contract(kind: BackendKind, id: &'static str) -> Value {
+pub async fn agent_version_readiness_contract(kind: BackendKind, id: &'static str) -> Value {
     let s = support::sandbox(id);
     let w = world(&s);
     let backend = Backend::start(kind, &s).await;
@@ -552,8 +560,8 @@ pub async fn pinned_readiness_contract(kind: BackendKind, id: &'static str) -> V
         .file("Dockerfile.dev", "FROM scratch\n")
         .init();
     let mut trace = Vec::new();
-    for (agent, binary, pin, wrong) in PINNED {
-        for (version, expected_ready) in [(pin, true), (wrong, false)] {
+    for (agent, binary, version, wrong) in AGENT_CASES {
+        for (version, expected_ready) in [(version, true), (wrong, agent == "cursor")] {
             probe_answers(&w.docker, version);
             let m = mark(&w.docker);
             let (exit, text) = run(&s, &env, repo.path(), &["ready", "--agent", agent]);
@@ -562,7 +570,7 @@ pub async fn pinned_readiness_contract(kind: BackendKind, id: &'static str) -> V
             let tag = image_for(repo.path(), agent);
             let calls = calls_since(&w.docker, m);
             let probes: Vec<_> = calls.iter().filter(|c| is_probe(c)).collect();
-            assert!(!probes.is_empty());
+            assert_eq!(probes.is_empty(), agent == "cursor");
             assert!(probes
                 .iter()
                 .all(|c| c.contains(&tag) && c.iter().any(|a| a == binary)));

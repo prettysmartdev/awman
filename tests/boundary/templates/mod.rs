@@ -71,7 +71,7 @@ fn build_on_project_base(
         engine.has_image(&tag),
         "{tag} is absent after a successful build"
     );
-    if let Some(version) = pinned_cli_version(agent) {
+    if matches!(agent, "opencode" | "opencode-v2" | "cursor") {
         // Run this registered suite on native amd64 and arm64 engines. Record
         // which of those architectures the granted daemon proves in this run.
         let architecture =
@@ -81,7 +81,7 @@ fn build_on_project_base(
         let name = format!("awman-version-{agent}-{id:x}");
         cleanup.container(&name);
         let binary = if agent == "cursor" {
-            "/usr/local/bin/cursor-agent"
+            "/home/awman/.local/bin/cursor-agent"
         } else {
             "/usr/local/bin/opencode"
         };
@@ -96,18 +96,23 @@ fn build_on_project_base(
             binary,
             &tag,
         ];
-        if agent == "cursor" {
-            args.push("--disable-auto-update");
-        }
         args.push("--version");
         let output = engine.run_ok(&args);
         engine.sandbox.note("in_image_cli_version", &output);
-        assert!(
-            output
-                .split_whitespace()
-                .any(|token| token.trim_start_matches('v') == version),
-            "{agent} inside {architecture} image: expected {version}, got {output:?}"
-        );
+        if agent == "cursor" {
+            assert!(
+                !output.trim().is_empty(),
+                "Cursor --version returned no output"
+            );
+        } else {
+            let major = if agent == "opencode" { "1." } else { "2." };
+            assert!(
+                output
+                    .split_whitespace()
+                    .any(|token| token.trim_start_matches('v').starts_with(major)),
+                "{agent} inside {architecture} image: expected major {major}x, got {output:?}"
+            );
+        }
         assert_eq!(
             engine.run_ok(&["image", "inspect", "--format", "{{.Config.User}}", &tag]),
             "awman",
@@ -262,8 +267,8 @@ fn the_opencode_v2_image_runs_2x() {
 }
 
 #[test]
-fn the_cursor_image_runs_the_pinned_build() {
-    let mut sandbox = support::sandbox("templates::the_cursor_image_runs_the_pinned_build");
+fn the_cursor_image_runs_its_installed_binary() {
+    let mut sandbox = support::sandbox("templates::the_cursor_image_runs_its_installed_binary");
     build_on_project_base(&mut sandbox, "cursor", shipped("cursor"));
     sandbox.finish();
 }
@@ -310,10 +315,12 @@ fn pinned_installers_refuse_an_unsupported_architecture_precisely() {
         ("opencode-v2", "opencode-v2"),
         ("cursor", "cursor-agent"),
     ] {
-        let version = pinned_cli_version(agent).unwrap();
+        let version = pinned_cli_version(agent)
+            .map(|v| format!(" {v}"))
+            .unwrap_or_default();
         assert_install_refused(
             &engine, agent, "uname() { echo riscv64; }",
-            &format!("awman: {binary} {version} has no Linux package for architecture 'riscv64' (supported: x86_64, aarch64)"),
+            &format!("awman: {binary}{version} has no Linux package for architecture 'riscv64' (supported: x86_64, aarch64)"),
         );
     }
     sandbox.finish();
@@ -328,7 +335,7 @@ fn cursor_refuses_a_musl_base_even_when_ldd_exits_nonzero() {
         &engine,
         "cursor",
         "uname() { echo aarch64; }; ldd() { echo musl; return 1; }",
-        "awman: cursor-agent 2026.11.17-f532c45 requires glibc; this base image uses musl",
+        "awman: cursor-agent requires glibc; this base image uses musl",
     );
     sandbox.finish();
 }

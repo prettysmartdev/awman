@@ -483,15 +483,15 @@ pub(crate) mod test_runtime {
         fn probe_agent_cli_version(
             &self,
             tag: &str,
-            pin: &crate::engine::agent::definition::CliVersionPin,
+            requirement: &crate::engine::agent::definition::CliMajorRequirement,
         ) -> crate::engine::container::agent_version::CliVersionStatus {
             use crate::engine::container::agent_version::{classify_cli_version, CliVersionStatus};
             self.version_probes
                 .lock()
                 .unwrap()
-                .push((tag.into(), pin.binary.clone()));
+                .push((tag.into(), requirement.binary.clone()));
             match self.cli_version_line.lock().unwrap().as_deref() {
-                Some(line) => classify_cli_version(pin, line),
+                Some(line) => classify_cli_version(requirement, line),
                 None => CliVersionStatus::Unknown {
                     reason: "test builder cannot probe images".into(),
                 },

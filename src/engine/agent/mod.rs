@@ -783,23 +783,22 @@ impl AgentEngine {
         self.check_agent_cli(&def, &agent_tag)
     }
 
-    /// WI 0157: refuse to launch an image whose pinned CLI reports the wrong
+    /// WI 0157: refuse to launch an image whose CLI reports the wrong
     /// major (or none). Probes the same binary the launch executes
     /// (`cli_version.binary == interactive_entrypoint[0]`) inside the image,
-    /// once per image identity. Probe failures block; Cursor requires the exact pin.
+    /// once per image identity. Probe failures block only these major-specific adapters.
     fn check_agent_cli(&self, def: &AgentDefinition, tag: &str) -> Result<(), EngineError> {
         use crate::engine::container::agent_version::{mismatch_message, CliVersionStatus};
-        let Some(pin) = def.cli_version.as_ref() else {
+        let Some(requirement) = def.cli_version.as_ref() else {
             return Ok(());
         };
-        match self.runtime.probe_agent_cli_version(tag, pin) {
+        match self.runtime.probe_agent_cli_version(tag, requirement) {
             CliVersionStatus::Mismatch { found, expected } => Err(EngineError::Config(
                 mismatch_message(&def.display_name, &def.name, tag, &found, &expected),
             )),
             CliVersionStatus::Unknown { reason } => Err(EngineError::Config(format!(
                 "cannot verify {} inside {tag}: {reason}; run 'awman ready --build' before launching", def.name
             ))),
-            CliVersionStatus::Untested { version, tested } if pin.required_major.is_none() => Err(EngineError::Config(format!("{} requires tested CLI {tested}, found {version}; run 'awman ready --build'", def.name))),
             _ => Ok(()),
         }
     }
@@ -1774,21 +1773,24 @@ mod workspace_access_tests {
     }
 
     #[test]
-    fn pinned_launch_refuses_unknown_probe_and_cursor_drift() {
-        let sandbox = TestSandbox::for_test(TestCase::component("engine::agent::workspace_access_tests::pinned_launch_refuses_unknown_probe_and_cursor_drift"));
+    fn only_opencode_major_probes_gate_launch() {
+        let sandbox = TestSandbox::for_test(TestCase::component(
+            "engine::agent::workspace_access_tests::only_opencode_major_probes_gate_launch",
+        ));
         let session = session(&sandbox);
         let runtime = Arc::new(image_freshness::test_runtime::BuildRuntime::default());
         let engine = AgentEngine::new(
             Arc::new(OverlayEngine::new(&session).unwrap()),
             runtime.clone(),
         );
-        for agent in ["opencode", "opencode-v2", "cursor"] {
+        for agent in ["opencode", "opencode-v2"] {
             let def = first_party::first_party(agent).unwrap();
             assert!(engine.check_agent_cli(&def, "fixture").is_err());
         }
         let def = first_party::first_party("cursor").unwrap();
+        engine.check_agent_cli(&def, "fixture").unwrap();
         *runtime.cli_version_line.lock().unwrap() = Some("2025.01.01-aaaaaaa".into());
-        assert!(engine.check_agent_cli(&def, "fixture").is_err());
+        engine.check_agent_cli(&def, "fixture").unwrap();
         *runtime.cli_version_line.lock().unwrap() = Some("2026.11.17-f532c45".into());
         engine.check_agent_cli(&def, "fixture").unwrap();
     }

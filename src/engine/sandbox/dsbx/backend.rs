@@ -354,14 +354,11 @@ pub(in crate::engine::sandbox) fn run_interactive(
     // 5b. WI 0157: the binary the kit launches must be the pinned major.
     //     Probe errors and a wrong major both refuse launch; a stale sandbox
     //     cannot bypass version verification when its exec fails.
-    if let Some(pin) = first_party(&agent).and_then(|d| d.cli_version) {
-        let mut argv = vec!["exec".to_string(), name.clone(), pin.binary.clone()];
-        if pin.required_major.is_none() {
-            argv.push("--disable-auto-update".into());
-        }
+    if let Some(requirement) = first_party(&agent).and_then(|d| d.cli_version) {
+        let mut argv = vec!["exec".to_string(), name.clone(), requirement.binary.clone()];
         argv.push("--version".into());
         let out = SbxCommand::new(argv).in_env(&snapshot).run_quiet()?;
-        verify_sandbox_version(&name, &pin, &out)?;
+        verify_sandbox_version(&name, &requirement, &out)?;
     }
 
     // 6. The launch argv is always the positional-run form — the kit and
@@ -413,7 +410,7 @@ pub(in crate::engine::sandbox) fn run_interactive(
 /// piped stdin otherwise).
 fn verify_sandbox_version(
     name: &str,
-    pin: &crate::engine::agent::definition::CliVersionPin,
+    requirement: &crate::engine::agent::definition::CliMajorRequirement,
     out: &super::spawn::SbxOutput,
 ) -> Result<(), EngineError> {
     use crate::engine::container::agent_version::{classify_cli_version, CliVersionStatus};
@@ -423,7 +420,7 @@ fn verify_sandbox_version(
         )));
     }
     if let CliVersionStatus::Mismatch { found, expected } =
-        classify_cli_version(pin, out.stdout.lines().next().unwrap_or_default())
+        classify_cli_version(requirement, out.stdout.lines().next().unwrap_or_default())
     {
         return Err(EngineError::Sandbox(format!("sandbox '{name}' does not run the expected {expected} (found {found}); run 'awman ready --no-cache'")));
     }
@@ -917,14 +914,14 @@ mod adapter_tail_tests {
 
     #[test]
     fn sandbox_version_failure_cannot_bypass_the_pin() {
-        let pin = first_party("opencode").unwrap().cli_version.unwrap();
+        let requirement = first_party("opencode").unwrap().cli_version.unwrap();
         for (exit_code, stdout) in [(1, "1.19.6"), (0, ""), (0, "2.3.2")] {
             let out = super::super::spawn::SbxOutput {
                 stdout: stdout.into(),
                 stderr: String::new(),
                 exit_code,
             };
-            assert!(verify_sandbox_version("fixture", &pin, &out).is_err());
+            assert!(verify_sandbox_version("fixture", &requirement, &out).is_err());
         }
         let opts = ResolvedSandboxOptions::resolve([SandboxOption::AgentId("cursor".into())]);
         assert!(require_agent(&opts).is_err());
