@@ -24,26 +24,23 @@ Referenced Dockerfiles (see [Escape-hatch Dockerfile](#escape-hatch-dockerfile))
 ### `awman new agent`
 
 ```sh
-awman new agent <name> [--global] [--from crush|maki] [--force]
+awman new agent <name> [--global] [--from crush|maki]
+awman new agent pi --headless --prompt "Define the pi coding agent with its documented install and launch commands" --yolo
 ```
 
-| Flag | Meaning |
-|------|---------|
-| *(none)* | Write a commented skeleton to `.awman/agents/<name>.toml` in the current repo |
-| `--global` | Write to `~/.awman/agents/<name>.toml` instead |
-| `--from crush` / `--from maki` | Copy a shipped example definition instead of the skeleton (see [Migrating from crush and maki](#migrating-from-crush-and-maki)). `--from maki` also writes `maki.Dockerfile` next to the TOML |
-| `--force` | Overwrite an existing definition (and, with `--from maki`, its Dockerfile) |
+Awman collects a summary and launches an agent to author the definition. The
+name identifies `.awman/agents/<name>.toml`; `--global` selects the personal
+store. `--from` seeds the session with a shipped example, and `--from maki`
+also provides its companion Dockerfile. Existing targets are refused; use
+`edit agent` to change them.
 
-`new agent` needs no container runtime. If the target already exists you get `<path> already exists; pass --force to overwrite it` (exit 1). An invalid name, or the name of a built-in agent, exits with status 2.
+A container-capable runtime and repository are required. `--prompt` supplies
+the summary for headless use; `--json` implies headless mode. `--yolo` launches
+the authoring agent in its configured most-permissive mode.
 
-On success it prints where the file was written and what to do next:
-
-```
-Created agent definition (repo): /path/to/repo/.awman/agents/pi.toml
-Fill in display_name, [run] and [image], then run: awman ready --agent pi
-```
-
-The skeleton is not valid until you fill it in, so it is not pre-approved; the first `awman ready --agent <name>` shows it for review. When you create an example that declares `[ping]` with `--from`, the output also repeats the host command so you can see it up front.
+The resulting definition is validated but is never built, run or approved by
+creation. Review it with `awman ready --agent <name>` before using it. Global
+files are authored through a private staged copy, without mounting your home.
 
 ### Letting an agent write it for you
 
@@ -62,7 +59,7 @@ Then ask the agent, for example: *"Add support for the pi coding agent to awman.
 
 ```sh
 awman edit agent custom --headless --prompt "Correct the model setting"
-awman edit agent custom --amend --interview
+awman edit agent custom --amend
 ```
 
 `awman edit agent <name>` changes an existing definition (and its companion Dockerfile) in `.awman/agents/`, or in `~/.awman/agents/` with `--global`. The built-in agents are read-only. A definition that no longer validates after the edit is left as written, with the problems listed. Editing a definition **does not approve or run it**: awman reminds you that the changed definition must be approved again, and nothing is built or executed until you review it with `awman ready --agent <name>`. See [Editing existing artifacts](03-agent-sessions.md#editing-existing-artifacts).
@@ -282,7 +279,7 @@ Approvals are stored per definition in `~/.awman/trusted-agents.json`, keyed by 
 
 - **Repo definitions** always need approval, because anyone who can commit to a repository can change them.
 - **Global definitions** (`~/.awman/agents/`) are your own files and need no approval — unless they declare `[ping]`, in which case they are reviewed like a repo definition.
-- A shipped example copied with `awman new agent --from` is approved for you when you create it, when approval is needed.
+- Definitions authored by `awman new agent`, including sessions seeded with `--from`, follow the same review rules as other definitions.
 
 Run `awman ready --agent <name>` to review a definition interactively. `ready` reports the result as `agent definition: loaded from <scope>:<path> — trusted ✓` or `— approval not needed`.
 

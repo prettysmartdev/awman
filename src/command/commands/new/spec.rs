@@ -20,9 +20,7 @@ pub(super) async fn run(
     let new_outcome = match crate::command::work_item::spec_service::create_new_spec(
         &command.engines,
         command.session.clone(),
-        f.interview,
-        f.non_interactive,
-        f.work_item,
+        f,
         &command.cancel,
         frontend,
     )
@@ -38,7 +36,6 @@ pub(super) async fn run(
         }
     };
     Ok(NewOutcome::Spec(NewSpecOutcome {
-        interview: new_outcome.interview,
         path: new_outcome.created_path,
         url: new_outcome.created_url,
         number: new_outcome.number,

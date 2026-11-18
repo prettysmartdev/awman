@@ -61,6 +61,99 @@ fn draw(app: &mut App, width: u16, height: u16) -> String {
 }
 
 #[tokio::test]
+async fn final_review_reopens_while_the_agent_output_stays_available() {
+    use super::app::Focus;
+    use crate::command::instance::feeds::ContainerSlotIo;
+    use crate::data::dialog::{DialogRequest, DialogResponse};
+    use crate::engine::workflow::frontend::EngineHandles;
+    use crate::engine::workflow::EngineRequest;
+
+    let s = TestSandbox::for_test(TestCase::component(
+        "frontend::tui::contracts::final_review_reopens_while_the_agent_output_stays_available",
+    ));
+    let mut app = app(&s);
+    let (requests, mut requests_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (dialog_tx, dialog_rx) = std::sync::mpsc::channel();
+    let (answer_tx, answer_rx) = std::sync::mpsc::channel();
+    let tab = app.active_tab_mut();
+    tab.start_container("agent".into(), "still-running".into(), 80, 24);
+    tab.execution_phase = tabs::ExecutionPhase::Running {
+        command: "exec workflow".into(),
+    };
+    let controls = tab.shared.container.clone();
+    let mut container = controls.clone();
+    let (output, stdout_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (stdin_tx, _stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (resize_tx, _resize_rx) = tokio::sync::mpsc::unbounded_channel();
+    container.launch(
+        Some("final".into()),
+        ContainerSlotIo {
+            stdout_rx,
+            stdin_tx,
+            resize_tx,
+        },
+    );
+    // Workflow controls are command-scoped even when attached from an
+    // earlier container's lifecycle handle.
+    controls.attach_engine(EngineHandles::requests(requests));
+    tab.drain_container_slot_events();
+    tab.dialog_request_rx = Some(dialog_rx);
+    tab.dialog_response_tx = Some(answer_tx);
+    output.send(b"Final agent output".to_vec()).unwrap();
+    tab.drain_container_output();
+    let board = serde_json::from_value(serde_json::json!({
+        "step_name": "final", "focused_step_name": "final",
+        "can_launch_next": false, "can_continue_current": false,
+        "can_restart": true, "can_go_back": true, "can_finish": true,
+        "continue_unavailable_reason": null, "cancel_to_previous_unavailable_reason": null,
+        "finish_workflow_unavailable_reason": null, "restart_unavailable_reason": null,
+        "can_dismiss": true, "launch_next_label": null,
+        "parallel_peer_count": 0, "parallel_peers_running": 0,
+        "failure_lines": [], "retry_failed_step": null, "in_parallel_group": false
+    }))
+    .unwrap();
+    let request = DialogRequest::WorkflowControlBoard(board);
+    dialog_tx.send(request.clone()).unwrap();
+    app.poll_dialog_requests();
+    for window in [
+        tabs::ContainerWindowState::Maximized,
+        tabs::ContainerWindowState::Minimized,
+    ] {
+        for focus in [Focus::CommandBox, Focus::ExecutionWindow] {
+            app.active_tab_mut().container_window_state = window;
+            app.focus = focus;
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+            assert!(app.active_dialog.is_none());
+            assert_eq!(answer_rx.try_recv().unwrap(), DialogResponse::Dismissed);
+            assert_eq!(
+                app.active_tab()
+                    .focused_slot()
+                    .unwrap()
+                    .vt100_parser
+                    .screen()
+                    .contents(),
+                "Final agent output"
+            );
+            press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+            assert!(matches!(
+                requests_rx.try_recv().unwrap(),
+                EngineRequest::OpenControlBoard { .. }
+            ));
+            dialog_tx.send(request.clone()).unwrap();
+            app.poll_dialog_requests();
+            assert!(matches!(
+                app.active_dialog,
+                Some(Dialog::WorkflowControlBoard(_))
+            ));
+            assert!(draw(&mut app, 100, 40).contains("Finish workflow"));
+        }
+    }
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(answer_rx.try_recv().unwrap(), DialogResponse::Char('f'));
+    assert!(!app.active_tab().shared.command_cancel.is_cancelled());
+}
+
+#[tokio::test]
 async fn multiline_dialog_arrows_follow_word_wrapping_and_resize() {
     let s = TestSandbox::for_test(TestCase::component(
         "frontend::tui::contracts::multiline_dialog_arrows_follow_word_wrapping_and_resize",

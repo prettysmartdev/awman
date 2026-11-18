@@ -14,7 +14,7 @@ impl NewSpecFrontend for InstanceCommandFrontend {
         })?;
         match response {
             DialogResponse::Text(t) if !t.is_empty() => Ok(t),
-            _ => Ok("Untitled work item".to_string()),
+            _ => Err(CommandError::Aborted),
         }
     }
 

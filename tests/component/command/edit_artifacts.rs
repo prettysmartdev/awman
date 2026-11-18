@@ -1,4 +1,4 @@
-//! Component journeys for `edit workflow|skill|agent`. The production command
+//! Component journeys for `new|edit workflow|skill|agent`. The production command
 //! launches a fake Docker CLI; the test edits the mounted host files while the
 //! fake run is held, then releases it to exercise real save/validation paths.
 use crate::support;
@@ -76,6 +76,8 @@ impl AgentLaunchFrontend for Front {
     fn set_pty_active(&mut self, _: bool) {}
 }
 impl EditCommandFrontend for Front {}
+impl awman::command::work_item::spec_service::NewSpecFrontend for Front {}
+impl awman::command::commands::new::NewCommandFrontend for Front {}
 struct Piped;
 impl UserMessageSink for Piped {
     fn write_message(&mut self, _: UserMessage) {}
@@ -203,7 +205,6 @@ fn command_with_overlays(
 ) -> EditCommand {
     let common = EditCommonFlags {
         reference: reference.into(),
-        interview: false,
         amend,
         headless: true,
         prompt: prompt.map(str::to_owned),
@@ -240,6 +241,192 @@ async fn finish<T: Send + 'static>(task: tokio::task::JoinHandle<T>) -> T {
         .await
         .expect("command ended")
         .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn creation_authors_scoped_files_with_supplied_brief_and_yolo() {
+    use awman::command::commands::new::{
+        NewAgentFlags, NewCommand, NewInput, NewSkillFlags, NewSubcommand, NewWorkflowFlags,
+    };
+    for global in [false, true] {
+        for kind in ["toml", "yaml", "skill", "agent"] {
+            let w = world("command::edit_artifacts::creation_authors_scoped_files_with_supplied_brief_and_yolo", &[]);
+            w.docker.on(&["run"]).read_stdin().hold_until_released();
+            let input = NewInput {
+                title: Some("authoring-test".into()),
+                summary: Some("Keep the literal {path} and add useful instructions".into()),
+            };
+            let (sub, relative, content) = match kind {
+                "toml" | "yaml" => (
+                    NewSubcommand::Workflow(NewWorkflowFlags {
+                        input,
+                        non_interactive: true,
+                        global,
+                        format: kind.into(),
+                        yolo: true,
+                    }),
+                    format!("workflows/authoring-test.{kind}"),
+                    if kind == "toml" {
+                        "title = \"Authored\"\n[[step]]\nname = \"check\"\nprompt = \"Check the project\"\n"
+                    } else {
+                        "title: Authored\nsteps:\n  - name: check\n    prompt: Check the project\n"
+                    },
+                ),
+                "skill" => (
+                    NewSubcommand::Skill(NewSkillFlags {
+                        input,
+                        non_interactive: true,
+                        global,
+                        yolo: true,
+                        ..Default::default()
+                    }),
+                    "skills/authoring-test/SKILL.md".into(),
+                    "---\nname: authoring-test\ndescription: Check the project when asked to review it.\n---\n\nReview the project.\n",
+                ),
+                "agent" => (
+                    NewSubcommand::Agent(NewAgentFlags {
+                        input,
+                        name: "authoring-test".into(),
+                        non_interactive: true,
+                        global,
+                        yolo: true,
+                        ..Default::default()
+                    }),
+                    "agents/authoring-test.toml".into(),
+                    awman::command::commands::new::agent::EXAMPLE_CRUSH,
+                ),
+                _ => unreachable!(),
+            };
+            let path = if global {
+                w._sandbox.awman_home()
+            } else if kind == "toml" || kind == "yaml" {
+                w.root.join("aspec")
+            } else if kind == "skill" {
+                w.root.join(".claude")
+            } else {
+                w.root.join(".awman")
+            }
+            .join(relative);
+            let command = NewCommand::new(sub, w.engines.clone(), w.session.clone());
+            let task =
+                tokio::spawn(command.run_with_frontend(Box::new(Front(Messages::default()))));
+            held(&w.docker, 0).await;
+            let run = w
+                .docker
+                .calls()
+                .into_iter()
+                .find(|c| c.argv.first().is_some_and(|a| a == "run"))
+                .unwrap();
+            let argv = run.argv.join(" ");
+            let prompt = String::from_utf8(run.stdin).unwrap();
+            assert!(prompt.contains("Keep the literal {path}"), "{prompt}");
+            assert!(argv.contains("--dangerously-skip-permissions"), "{argv}");
+            assert!(
+                !argv.contains(&format!("{}:", w._sandbox.home().display())),
+                "{argv}"
+            );
+            let editable = if global {
+                assert!(argv.contains("/awman/context/repo"), "{argv}");
+                walk(&w._sandbox.awman_home().join("context"))
+                    .into_iter()
+                    .find(|candidate| candidate.file_name() == path.file_name())
+                    .expect("staged file")
+            } else {
+                path.clone()
+            };
+            std::fs::write(&editable, content)
+                .unwrap_or_else(|e| panic!("{kind} global={global}, {}: {e}", editable.display()));
+            w.docker.release();
+            finish(task)
+                .await
+                .unwrap_or_else(|e| panic!("{kind} global={global}: {e}"));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+            if kind == "agent" && !global {
+                let name = AgentName::new("authoring-test").unwrap();
+                let definition = AgentRegistry::load_untrusted(
+                    w.session.env(),
+                    &name,
+                    Some(w.session.definition_root()),
+                )
+                .unwrap();
+                assert_eq!(
+                    AgentRegistry::trust_status(
+                        w.session.env(),
+                        definition.definition(),
+                        Some(w.session.definition_root())
+                    )
+                    .unwrap(),
+                    TrustStatus::Pending
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn creation_requires_a_brief_and_never_overwrites_existing_targets() {
+    use awman::command::commands::new::{
+        NewAgentFlags, NewCommand, NewInput, NewSkillFlags, NewSubcommand, NewWorkflowFlags,
+    };
+    for kind in ["workflow", "skill", "agent"] {
+        let relative = match kind {
+            "workflow" => "aspec/workflows/existing.toml",
+            "skill" => ".claude/skills/existing/SKILL.md",
+            "agent" => ".awman/agents/existing.toml",
+            _ => unreachable!(),
+        };
+        let w = world(
+            "command::edit_artifacts::creation_requires_a_brief_and_never_overwrites_existing_targets",
+            &[(relative, "keep the original")],
+        );
+        for summary in [None, Some("Revise the instructions".to_string())] {
+            let missing_brief = summary.is_none();
+            let input = NewInput {
+                title: Some("existing".into()),
+                summary,
+            };
+            let sub = match kind {
+                "workflow" => NewSubcommand::Workflow(NewWorkflowFlags {
+                    input,
+                    non_interactive: true,
+                    format: "toml".into(),
+                    ..Default::default()
+                }),
+                "skill" => NewSubcommand::Skill(NewSkillFlags {
+                    input,
+                    non_interactive: true,
+                    ..Default::default()
+                }),
+                "agent" => NewSubcommand::Agent(NewAgentFlags {
+                    input,
+                    non_interactive: true,
+                    name: "existing".into(),
+                    ..Default::default()
+                }),
+                _ => unreachable!(),
+            };
+            let error = NewCommand::new(sub, w.engines.clone(), w.session.clone())
+                .run_with_frontend(Box::new(Front(Messages::default())))
+                .await
+                .unwrap_err();
+            if missing_brief {
+                assert!(
+                    matches!(error, CommandError::InteractiveInputUnavailable { .. }),
+                    "{error}"
+                );
+                assert!(error.to_string().contains("--prompt"), "{error}");
+            }
+            assert_eq!(
+                std::fs::read_to_string(w.root.join(relative)).unwrap(),
+                "keep the original"
+            );
+            assert!(!w
+                .docker
+                .calls()
+                .iter()
+                .any(|c| c.argv.first().is_some_and(|a| a == "run")));
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

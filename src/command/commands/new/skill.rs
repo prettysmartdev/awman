@@ -1,4 +1,4 @@
-//! `awman new skill` — the skill interview, and pulling skill libraries.
+//! `awman new skill` — agent authoring and pulling skill libraries.
 //!
 //! Split out of `commands/new.rs` by WI 0114 F-51: `run_with_frontend` was
 //! one 530-line `match` over three unrelated scaffolds.
@@ -79,7 +79,6 @@ pub(super) async fn run(
             }
 
             NewOutcome::Skill(NewSkillOutcome {
-                interview: false,
                 global: false,
                 path: None,
                 pull: true,
@@ -124,161 +123,60 @@ pub(super) async fn run(
             frontend.write_message(pull_success_message(&outcome));
             let path = outcome.dir.display().to_string();
             NewOutcome::Skill(NewSkillOutcome {
-                interview: false,
                 global: false,
                 path: Some(path),
                 pull: true,
                 libraries: vec![pull_library_outcome(outcome)],
             })
         } else {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Info,
-                text: "new skill: starting skill creation".into(),
-            });
-            let name = frontend.ask_skill_name().unwrap_or_else(|_| "skill".into());
-            let session = if !f.global || f.interview {
-                Some(command.session.clone())
-            } else {
-                None
-            };
-            let git_root = session.as_ref().map(|s| s.git_root().to_path_buf());
-            let skill_dirs = match SkillDirs::from_env(command.session.env(), git_root) {
-                Ok(d) => d,
-                Err(e) => {
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Error,
-                        text: format!("new skill: failed to resolve skill dirs: {e}"),
-                    });
-                    return Err(CommandError::from(e));
-                }
-            };
-            let dir = if f.global {
-                skill_dirs.global_dir().join(&name)
-            } else {
-                skill_dirs.repo_dir().unwrap().join(&name)
-            };
-            let _ = std::fs::create_dir_all(&dir);
-            let path = dir.join("SKILL.md");
-
-            if f.interview {
-                let skeleton = format!("# Skill: {name}\n\n## Description\n\n## Body\n");
-                let _ = std::fs::write(&path, skeleton);
-                let session = session.as_ref().unwrap();
-                let agent = match LaunchPolicy::for_session(session).resolve_agent(&None) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        frontend.write_message(UserMessage {
-                            level: MessageLevel::Error,
-                            text: format!("new skill: failed to resolve agent: {e}"),
-                        });
-                        return Err(e);
-                    }
-                };
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Info,
-                    text: format!("new skill: launching interview agent '{}'", agent.as_str()),
-                });
-                let credentials = match command
-                    .engines
-                    .auth_engine
-                    .resolve_agent_auth(session, &agent)
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        frontend.write_message(UserMessage {
-                            level: MessageLevel::Error,
-                            text: format!("new skill: failed to resolve agent auth: {e}"),
-                        });
-                        return Err(CommandError::from(e));
-                    }
-                };
-                let summary = frontend.ask_skill_summary().unwrap_or_default();
-                // The agent container always mounts the repo at
-                // `/workspace`, which a `--global` skill never lives
-                // under. Mount the new skill's own directory at a
-                // fixed container path instead, and point the prompt
-                // at that path rather than at the host one.
-                let container_file = skill_interview_container_file(&path);
-                let prompt = render_skill_interview_prompt(&container_file, &summary);
-                let run_opts = AgentRunOptions {
-                    initial_prompt: Some(prompt),
-                    non_interactive: f.non_interactive,
-                    env_passthrough: None,
-                    directory_overlays: vec![skill_interview_overlay(&dir)],
-                    ..Default::default()
-                };
-                // Sandbox-class runtimes: agent spawn lands in WI 0090.
-                command
-                    .engines
-                    .require_container_runtime()
-                    .map_err(CommandError::from)?;
-                let mut options = match command.engines.agent_engine.build_options_with_credentials(
-                    session,
-                    &agent,
-                    &run_opts,
-                    &credentials,
-                ) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        frontend.write_message(UserMessage {
-                            level: MessageLevel::Error,
-                            text: format!("new skill: failed to build agent options: {e}"),
-                        });
-                        return Err(CommandError::from(e));
-                    }
-                };
-                if !credentials.env_vars.is_empty()
-                    && matches!(
-                        credentials.delivery,
-                        crate::engine::auth::CredentialDelivery::Env
-                    )
-                {
-                    options.push(ContainerOption::AgentCredentials {
-                        env_vars: credentials.env_vars,
-                    });
-                }
-                let instance =
-                    match crate::engine::agent_runtime::ResolvedAgentOptions::container(options)
-                        .and_then(|o| command.engines.runtime.build(o))
-                    {
-                        Ok(i) => i,
-                        Err(e) => {
-                            frontend.write_message(UserMessage {
-                                level: MessageLevel::Error,
-                                text: format!("new skill: failed to build container: {e}"),
-                            });
-                            return Err(CommandError::from(e));
-                        }
-                    };
-                frontend.set_pty_active(true);
-                let cf = frontend.container_frontend_for_pty();
-                let mut execution = match instance.run_with_frontend(cf) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        frontend.set_pty_active(false);
-                        frontend.replay_queued();
-                        frontend.write_message(UserMessage {
-                            level: MessageLevel::Error,
-                            text: format!("new skill: failed to run container: {e}"),
-                        });
-                        return Err(CommandError::from(e));
-                    }
-                };
-                let _ = execution.wait().await;
-                frontend.set_pty_active(false);
-                frontend.replay_queued();
-            } else {
-                let body = frontend.ask_skill_body().unwrap_or_default();
-                let content = if body.is_empty() {
-                    format!("# Skill: {name}\n\n## Description\n\n## Body\n")
-                } else {
-                    format!("# Skill: {name}\n\n{body}\n")
-                };
-                let _ = std::fs::write(&path, content);
+            command.engines.require_container_runtime()?;
+            let title = f
+                .input
+                .title(f.non_interactive, || frontend.ask_skill_name())?;
+            let summary = f
+                .input
+                .summary(f.non_interactive, || frontend.ask_skill_summary())?;
+            let name = crate::command::work_item::spec_service::slugify(&title);
+            if name.len() > 64 {
+                return Err(CommandError::Other(
+                    "skill name must be at most 64 characters".into(),
+                ));
             }
-
+            let dirs = SkillDirs::from_env(
+                command.session.env(),
+                Some(command.session.git_root().to_path_buf()),
+            )?;
+            let dir = if f.global {
+                dirs.global_dir()
+            } else {
+                dirs.repo_dir().expect("repository session")
+            }
+            .join(&name);
+            let path = dir.join("SKILL.md");
+            let metadata =
+                serde_yaml::to_string(&serde_json::json!({"name": name, "description": summary}))
+                    .map_err(|e| CommandError::Other(e.to_string()))?;
+            let seed = format!("---\n{metadata}---\n\n# {title}\n");
+            let root = if f.global {
+                crate::data::fs::data_paths::data_home(command.session.env())?
+            } else {
+                command.session.git_root().to_path_buf()
+            };
+            write_seed(&root, &path, &seed)?;
+            author_artifact(
+                command,
+                crate::data::fs::edit_target::ArtifactKind::Skill,
+                &path,
+                f.global,
+                NewSession {
+                    headless: f.non_interactive,
+                    yolo: f.yolo,
+                    summary,
+                },
+                frontend,
+            )
+            .await?;
             NewOutcome::Skill(NewSkillOutcome {
-                interview: f.interview,
                 global: f.global,
                 path: Some(path.display().to_string()),
                 pull: false,

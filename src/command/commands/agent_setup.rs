@@ -141,10 +141,10 @@ pub trait AgentLaunchFrontend:
     }
 
     /// Called after the agent container launches. The sender is the broadcast
-    /// channel from the container's stuck detector; the TUI stores it so the
-    /// tab can subscribe for stuck-colouring. CLI and API frontends ignore it,
-    /// so this one keeps its no-op default.
-    /// OSC 7501 `StuckEvent::Reported` is intentionally ignored by setup frontends.
+    /// channel from the container's status detector, carrying both silence
+    /// warnings and OSC 7501 reports. The instance frontend attaches it to the
+    /// container feed so tabs and container windows can display agent status.
+    /// Frontends without a status display may use the no-op default.
     fn set_stuck_sender(
         &mut self,
         _sender: std::sync::Arc<

@@ -4,17 +4,6 @@ use super::*;
 
 const EDIT_FLAGS: &[FlagSpec] = &[
     FlagSpec {
-        long: "interview",
-        short: None,
-        help: "Ask clarifying questions before editing the existing item.",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &["headless", "json"],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
         long: "amend",
         short: None,
         help: "Review and amend the existing item using available evidence.",
@@ -32,7 +21,7 @@ const EDIT_FLAGS: &[FlagSpec] = &[
         kind: FlagKind::Bool,
         default: FlagDefault::Bool(false),
         frontends: FrontendVisibility::All,
-        conflicts_with: &["interview"],
+        conflicts_with: &[],
         implies: &[],
         optional: true,
     },
@@ -54,7 +43,7 @@ const EDIT_FLAGS: &[FlagSpec] = &[
         kind: FlagKind::Bool,
         default: FlagDefault::Bool(false),
         frontends: FrontendVisibility::All,
-        conflicts_with: &["interview"],
+        conflicts_with: &[],
         implies: &["headless"],
         optional: true,
     },
@@ -142,17 +131,6 @@ const EDIT_ARTIFACT_FLAGS: &[FlagSpec] = &[
     EDIT_FLAGS[1],
     EDIT_FLAGS[2],
     EDIT_FLAGS[3],
-    FlagSpec {
-        long: "global",
-        short: None,
-        help: "Select the global artifact instead of a repository artifact.",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
     EDIT_FLAGS[4],
     EDIT_FLAGS[5],
     EDIT_FLAGS[6],
@@ -160,7 +138,17 @@ const EDIT_ARTIFACT_FLAGS: &[FlagSpec] = &[
     EDIT_FLAGS[8],
     EDIT_FLAGS[9],
     EDIT_FLAGS[10],
-    EDIT_FLAGS[11],
+    FlagSpec {
+        long: "global",
+        short: None,
+        help: "Select the global artifact.",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
 ];
 
 pub(super) const EDIT: CommandSpec = CommandSpec {
@@ -257,7 +245,6 @@ mod tests {
             assert_eq!(spec.arguments[0].name, "ref");
             assert!(!spec.arguments[0].optional);
             for name in [
-                "interview",
                 "amend",
                 "headless",
                 "prompt",
@@ -283,10 +270,10 @@ mod tests {
                 assert!(spec.find_flag(name).is_none(), "{kind}: {name}");
             }
             let parsed = catalogue
-                .parse_raw_args(&path, &args(&["target", "--interview"]))
+                .parse_raw_args(&path, &args(&["target", "--yolo"]))
                 .unwrap();
             assert_eq!(parsed.argument("ref").as_deref(), Some("target"));
-            assert_eq!(parsed.flag_bool("interview"), Some(true));
+            assert_eq!(parsed.flag_bool("yolo"), Some(true));
             assert!(!spec.api_allowed);
             assert!(spec.relay_allowed && spec.requires_runtime);
         }
@@ -300,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_requires_ref_and_rejects_interview_conflicts() {
+    fn edit_requires_ref_and_rejects_removed_interview() {
         let catalogue = CommandCatalogue::get();
         let path = ["edit", "spec"];
         // Raw parsing leaves a missing positional to the resolver; the spec
@@ -310,19 +297,9 @@ mod tests {
             .arguments
             .iter()
             .any(|a| a.name == "ref" && !a.optional));
-        for conflicting in ["--headless", "--json"] {
-            let error = catalogue
-                .parse_raw_args(&path, &args(&["42", "--interview", conflicting]))
-                .unwrap_err();
-            assert!(
-                matches!(
-                    &error,
-                    crate::command::error::CommandError::InvalidFlagValue { flag, reason, .. }
-                        if flag == "interview" && reason.contains("conflicts with")
-                ),
-                "{error:?}"
-            );
-        }
+        assert!(catalogue
+            .parse_raw_args(&path, &args(&["42", "--interview"]))
+            .is_err());
         let parsed = catalogue
             .parse_raw_args(&path, &args(&["42", "-n", "--amend", "--allow-docker"]))
             .unwrap();

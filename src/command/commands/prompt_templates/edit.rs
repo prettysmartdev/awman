@@ -1,7 +1,6 @@
-//! Editing prompts for `awman edit spec|workflow|skill|agent`.
+//! Authoring prompts for `awman new|edit spec|workflow|skill|agent`.
 //!
-//! These prompts describe an artifact that already exists; none of them claims
-//! that a skeleton was just created. Every prompt is built in one pass: static
+//! Creation completes a seed; editing changes an existing artifact. Every prompt is built in one pass: static
 //! fragments are chosen from the request and joined into a template that holds
 //! only placeholders, then each placeholder is substituted exactly once with
 //! [`render`]. User text (titles, briefs, names, paths) is only ever a value,
@@ -50,7 +49,7 @@ pub struct EditPromptRequest<'a> {
     pub location: EditLocation,
     /// Global or library artifact: must not become specific to this repository.
     pub global: bool,
-    pub interview: bool,
+    pub creating: bool,
     pub amend: bool,
     pub headless: bool,
     /// `--prompt` text; untrusted.
@@ -62,6 +61,9 @@ pub fn render_edit_prompt(request: &EditPromptRequest<'_>) -> String {
     let brief = request.brief.map(str::trim).filter(|b| !b.is_empty());
     let mut parts: Vec<String> = Vec::new();
 
+    if request.creating {
+        parts.push("Create the artifact by completing the seed file named below. It is not finished merely because a file exists.".into());
+    }
     parts.push(intro(request).to_string());
     if let Some(location) = location_text(request.location) {
         parts.push(location.to_string());
@@ -92,7 +94,9 @@ it specific to the repository you are running in unless the user asks for that."
         parts.push(amend_text(request.subject).to_string());
         parts.push(amend_common_text(request).to_string());
     }
+    parts.push(format_guidance(request.subject).to_string());
     parts.push(boundaries_text(request).to_string());
+    parts.push("When finished, summarize the changes and any unresolved questions or validation limitations. Do not claim checks you did not run.".into());
     if brief.is_some() {
         parts.push(brief_text(request).to_string());
     }
@@ -124,6 +128,14 @@ it specific to the repository you are running in unless the user asks for that."
 }
 
 fn intro(request: &EditPromptRequest<'_>) -> &'static str {
+    if request.creating {
+        return match request.subject {
+            EditSubject::Spec { .. } => "Create the work item \"{title}\" in the seed file at {path}. This is the only file you may edit.",
+            EditSubject::Workflow { .. } => "Create the {format} workflow \"{name}\" in the seed file at {path}. This is the only file you may edit.",
+            EditSubject::Skill => "Create the skill \"{name}\". Its SKILL.md seed is at {path}.",
+            EditSubject::Agent => "Create the custom agent definition \"{name}\". Its TOML seed is at {path}.",
+        };
+    }
     match request.subject {
         EditSubject::Spec { .. } => {
             "You are editing the existing work item \"{title}\". Its markdown is in the file at \
@@ -160,37 +172,31 @@ add a `# <title>` heading; the title is stored separately.",
 }
 
 fn task_text(request: &EditPromptRequest<'_>, has_brief: bool) -> String {
-    let mut out = String::new();
-    if request.interview {
-        out.push_str(
-            "Before you edit anything, interview the user: ask questions to clarify their intent, \
-the constraints that apply, and the acceptance criteria for the change. Ask a few focused \
-questions at a time and wait for the answers. Only start editing once you understand what the \
-user wants.",
-        );
-        if has_brief {
-            out.push_str(" Use the change brief below as the starting point for your questions.");
-        }
-    } else if request.amend {
-        out.push_str(
-            "Your task is to review this item against the current state of the repository and \
-amend it so that it is accurate.",
-        );
+    let task = if request.amend {
+        "Review the artifact against the current repository and available evidence, then amend it to be accurate."
+    } else if request.creating {
+        "Complete the artifact from the user's title, type and summary."
     } else if has_brief {
-        out.push_str("Apply the change described in the change brief below.");
+        "Apply the change described in the change brief below."
     } else {
-        out.push_str(
-            "Start by asking the user what they would like to change, then make that change.",
-        );
+        "Start by asking the user what they would like to change."
+    };
+    let interaction = if request.headless {
+        "This is a headless session: do not wait for answers. Use the supplied brief and verifiable context. If essential information is missing, report the limitation and make no speculative change."
+    } else {
+        "Clarify intent, constraints and acceptance criteria with the user when needed. Ask a few focused questions at a time and wait for the answers before making uncertain changes. The initial summary is a starting point for this conversation."
+    };
+    format!("{task}\n\n{interaction}")
+}
+
+/// Authoring guidance follows the shipped parsers and the Agent Skills specification.
+fn format_guidance(subject: EditSubject<'_>) -> &'static str {
+    match subject {
+        EditSubject::Spec { .. } => "Follow the work-item template already in the file and the repository's AGENTS.md and relevant specifications. Describe the problem, user outcomes, acceptance criteria, implementation plan, edge cases and a proportionate test plan. Read related code to ground the plan. Distinguish verified behavior from intended work and unknowns; do not implement the feature or mark unverified work complete.",
+        EditSubject::Workflow { .. } => "Keep the workflow in {format}. awman TOML uses [[step]] entries; YAML uses a steps list. Each step requires a unique name and a non-empty prompt. depends_on names other steps and must form an acyclic graph. Optional step fields are agent, model, overlays, abort_on_failure and read_only_workspace. Omit agent/model overrides unless the user needs them; never invent available agents or models. Top-level fields include title, agent, model, overlays, setup, teardown and teardown_on_failure. Setup/teardown entries use a type discriminator (for example run_shell with command, or run_script with path); they do not accept agent-step prompts or skill overlays. Use only supported operations and verify referenced paths and commands. Keep prompts actionable and dependencies explicit. Consult existing workflows and available repository documentation for more complex setup/teardown operations. Do not run the workflow, commit, push or create a pull request while authoring it.",
+        EditSubject::Skill => "Use the Agent Skills format (https://agentskills.io/specification): SKILL.md contains YAML frontmatter followed by Markdown. Required name is {name}, the original skill directory name (a staged directory may have another name): 1–64 lowercase letters/digits/hyphens, no leading/trailing or consecutive hyphens. Required description is non-empty, at most 1024 characters, and explains what the skill does and when to use it. Write focused, actionable instructions, examples and failure handling. Keep SKILL.md concise; place detailed references, scripts or assets inside the allowed skill directory and link them relative to that directory. Do not execute the skill's operational actions just to author its instructions.",
+        EditSubject::Agent => concat!("Use awman's custom agent definition schema 1. Unknown fields are rejected. Keep argv as arrays, choose a supported prompt delivery mode, and specify either image.install or image.dockerfile. Never build, install, run or approve this definition; the user reviews it with awman ready afterwards. Only reference a Dockerfile when it is among the allowed companion files. Do not include credentials. The current schema reference is this commented template:\n\n", include_str!("../../../../templates/agent-definition.toml")),
     }
-    if request.interview && request.amend {
-        out.push_str(
-            "\n\nThis is also an amendment: review the item against the current state of the \
-repository first. Discuss every uncertain finding with the user through the interview, then \
-reconcile the item with the evidence and the answers you receive.",
-        );
-    }
-    out
 }
 
 fn amend_text(subject: EditSubject<'_>) -> &'static str {
@@ -251,15 +257,13 @@ fn boundaries_text(request: &EditPromptRequest<'_>) -> &'static str {
             "Only edit the files named above. Preserve all content that is unrelated to the \
 change. The user may be editing the same files at the same time, so re-read a file immediately \
 before each change you make to it. You may read related code to understand the change, but do \
-not implement features that the item describes and do not change unrelated code or files. Do \
-not summarize your work at the end; let the user review the result themselves."
+not implement features that the item describes and do not change unrelated code or files."
         }
         _ => {
             "Only edit the file at {path}. Preserve all content that is unrelated to the change. \
 The user may be editing the same file at the same time, so re-read it immediately before each \
 change you make. You may read related code to understand the change, but do not implement \
-features that the item describes and do not change unrelated code or files. Do not summarize \
-your work at the end; let the user review the result themselves."
+features that the item describes and do not change unrelated code or files."
         }
     }
 }
@@ -285,7 +289,7 @@ mod tests {
             bundle_dir: None,
             location: EditLocation::InPlace,
             global: false,
-            interview: false,
+            creating: false,
             amend: false,
             headless: false,
             brief: None,
@@ -304,10 +308,10 @@ mod tests {
     #[test]
     fn every_kind_and_mode_names_file_and_safety_rules() {
         for subject in subjects() {
-            for (interview, amend) in [(false, false), (true, false), (false, true), (true, true)] {
+            for (headless, amend) in [(false, false), (true, false), (false, true), (true, true)] {
                 let mut r = req(subject);
-                r.interview = interview;
                 r.amend = amend;
+                r.headless = headless;
                 r.brief = Some("make it better");
                 let p = render_edit_prompt(&r);
                 assert!(p.contains("/workspace/x/main.md"), "{subject:?}");
@@ -316,16 +320,7 @@ mod tests {
                 assert!(p.contains("may read related code"), "{subject:?}");
                 assert!(p.contains("make it better"), "{subject:?}");
                 assert!(!p.contains("{path}") && !p.contains("{brief}"));
-                let lower = p.to_lowercase();
-                for banned in [
-                    "has been created",
-                    "skeleton",
-                    "just created",
-                    "has been started",
-                ] {
-                    assert!(!lower.contains(banned), "{subject:?} {banned}");
-                }
-                assert_eq!(p.contains("clarify their intent"), interview);
+                assert_eq!(p.contains("do not wait for answers"), headless);
                 assert_eq!(p.contains("Amendment scope"), amend);
             }
         }
@@ -339,24 +334,22 @@ mod tests {
     }
 
     #[test]
-    fn interview_mentions_intent_constraints_acceptance() {
-        let mut r = req(EditSubject::Skill);
-        r.interview = true;
+    fn interactive_session_clarifies_intent_constraints_acceptance() {
+        let r = req(EditSubject::Skill);
         let p = render_edit_prompt(&r);
         assert!(p.contains("intent"));
         assert!(p.contains("constraints"));
         assert!(p.contains("acceptance criteria"));
-        assert!(p.contains("Before you edit anything"));
+        assert!(p.contains("wait for the answers"));
     }
 
     #[test]
-    fn interview_amend_discusses_then_reconciles() {
+    fn interactive_amend_uses_evidence_and_questions() {
         let mut r = req(EditSubject::Spec { title: "T" });
-        r.interview = true;
         r.amend = true;
         let p = render_edit_prompt(&r);
-        assert!(p.contains("Discuss every uncertain finding"));
-        assert!(p.contains("reconcile"));
+        assert!(p.contains("available evidence"));
+        assert!(p.contains("wait for the answers"));
     }
 
     #[test]

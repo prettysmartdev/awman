@@ -16,16 +16,6 @@ pub const REPO_SKILLS_SUBDIR: &str = "skills";
 /// libraries (e.g. `~/.awman/skills/.library/<slug>/`).
 pub const LIBRARY_SUBDIR: &str = ".library";
 
-/// Container path the new skill's own directory is mounted at during
-/// `new skill --interview`.
-///
-/// This is a structural, always-on mount rather than a user-supplied overlay:
-/// the one file the interview agent has to write is the new skill, and a
-/// `--global` skill lives under `~/.awman/skills/`, which the `/workspace`
-/// repo mount never contains. Fixing the container path lets the interview
-/// prompt name the skill file outright.
-pub const SKILL_INTERVIEW_CONTAINER_DIR: &str = "/awman/skill";
-
 /// Resolves global and per-repo skill directories.
 #[derive(Debug, Clone)]
 pub struct SkillDirs {

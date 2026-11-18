@@ -84,6 +84,7 @@ pub fn render(outcome: &CommandOutcome, json: bool) -> Option<String> {
         CommandOutcome::Daemon(o) => super::daemon::render(o, json),
         CommandOutcome::DaemonApi(o) => Some(super::daemon::render_api(o, json)),
         CommandOutcome::Remote(o) => render_remote(o),
+        CommandOutcome::New(o) if json => Some(to_json(o)),
         CommandOutcome::New(o) => render_new(o),
         CommandOutcome::Edit(o) => render_edit(o, json),
         CommandOutcome::Clean(o) => render_clean(o),
@@ -326,8 +327,7 @@ fn render_new_spec(o: &NewSpecOutcome) -> Option<String> {
         // outcome keeps it, the human summary does not print it twice.
         (None, Some(_)) => None,
         // A remote interview whose draft was never edited creates nothing.
-        (None, None) if o.interview => Some("No work item was created.".to_string()),
-        (None, None) => Some("Work item created.".to_string()),
+        (None, None) => Some("No work item was created.".to_string()),
     }
 }
 
@@ -368,23 +368,22 @@ mod tests {
 
     #[test]
     fn remote_new_spec_url_is_not_rendered_a_second_time() {
-        let spec = |path: Option<&str>, url: Option<&str>, interview| NewSpecOutcome {
-            interview,
+        let spec = |path: Option<&str>, url: Option<&str>| NewSpecOutcome {
             path: path.map(Into::into),
             url: url.map(Into::into),
             number: Some(73),
         };
         // The command announced the URL when the provider confirmed it.
         assert_eq!(
-            render_new_spec(&spec(None, Some("https://x/issues/73"), false)),
+            render_new_spec(&spec(None, Some("https://x/issues/73"))),
             None
         );
         assert_eq!(
-            render_new_spec(&spec(Some("aspec/0007-x.md"), None, false)).as_deref(),
+            render_new_spec(&spec(Some("aspec/0007-x.md"), None)).as_deref(),
             Some("Created work item: aspec/0007-x.md")
         );
         assert_eq!(
-            render_new_spec(&spec(None, None, true)).as_deref(),
+            render_new_spec(&spec(None, None)).as_deref(),
             Some("No work item was created.")
         );
     }

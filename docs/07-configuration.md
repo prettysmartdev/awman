@@ -504,6 +504,10 @@ awman config set workItems.template docs/work-items/0000-template.md
 
 Paths are relative to the repo root. The template must resolve to a regular file inside the repository checkout: an absolute path, a `..` path or a symlink that leads outside the checkout is refused, because `new spec` can publish the template text to a remote tracker.
 
+For local creation, the work item directory must also stay inside the repository
+so the authoring agent can edit it through the repository mount. A missing
+configured template is an error; awman does not substitute a minimal spec.
+
 ### Cap concurrent agents in a workflow
 
 ```sh

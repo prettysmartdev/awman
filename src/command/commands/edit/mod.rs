@@ -10,10 +10,9 @@ use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::Session;
 use crate::engine::agent::AgentRunOptions;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EditCommonFlags {
     pub reference: String,
-    pub interview: bool,
     pub amend: bool,
     pub headless: bool,
     pub prompt: Option<String>,
@@ -126,7 +125,6 @@ pub struct EditTarget {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EditOutcome {
     pub target: EditTarget,
-    pub interview: bool,
     pub amend: bool,
     pub headless: bool,
     pub changed: Vec<String>,
@@ -219,7 +217,6 @@ pub fn conclude(
     match save {
         Ok(summary) if execution.is_none() => Ok(EditOutcome {
             target,
-            interview: flags.interview,
             amend: flags.amend,
             headless: flags.headless,
             changed: summary.changed,
@@ -269,6 +266,7 @@ pub trait EditCommandFrontend: UserMessageSink + AgentLaunchFrontend + Send + Sy
 }
 
 pub struct EditCommand {
+    pub(crate) creating: bool,
     sub: EditSubcommand,
     engines: Engines,
     session: Session,
@@ -278,6 +276,7 @@ pub struct EditCommand {
 impl EditCommand {
     pub fn new(sub: EditSubcommand, engines: Engines, session: Session) -> Self {
         Self {
+            creating: false,
             sub,
             engines,
             session,
@@ -298,7 +297,6 @@ impl EditCommand {
         });
         let common = EditCommonFlags {
             reference,
-            interview: ctx.flags.bool("interview"),
             amend: ctx.flags.bool("amend"),
             headless: ctx.flags.bool("headless"),
             prompt,
@@ -314,9 +312,6 @@ impl EditCommand {
                 .supplied("agent-flag")
                 .then(|| ctx.flags.strs("agent-flag").to_vec()),
         };
-        if common.interview && common.headless {
-            return Err(CommandError::InvalidFlagValue { command, flag: "interview".into(), reason: "--interview needs an interactive session; it cannot run headless or with --json".into() });
-        }
         if common.headless && !common.amend && common.prompt.is_none() {
             return Err(CommandError::InvalidFlagValue {
                 command,
@@ -385,9 +380,9 @@ impl Command for EditCommand {
 /// the target mapping depends on it. Ask for mount-scope consent like other
 /// launches and refuse, rather than silently widen, a current-directory-only
 /// choice. Must run before anything is staged or launched.
-fn require_repository_mount(
+pub(crate) fn require_repository_mount(
     session: &Session,
-    frontend: &mut dyn EditCommandFrontend,
+    frontend: &mut dyn AgentLaunchFrontend,
     label: &str,
     what: &str,
 ) -> Result<(), CommandError> {
@@ -426,7 +421,7 @@ pub(crate) fn run_options(flags: &EditCommonFlags) -> AgentRunOptions {
 }
 
 mod agent;
-mod artifact;
+pub(crate) mod artifact;
 mod skill;
 mod spec;
 mod workflow;

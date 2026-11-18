@@ -143,9 +143,9 @@ pub struct WorkflowControlBoardState {
     /// where restart applies only to the focused container (WI-0096 §10).
     /// Rendered in DarkGray under the dimmed Restart line.
     pub restart_unavailable_reason: Option<String>,
-    /// True when a container is currently running (mid-step). The engine
-    /// computes this from `can_dismiss` in `AvailableActions`.
-    /// Changes rendering: Esc = dismiss (step keeps running), [p] = pause.
+    /// Whether Esc hides the board while keeping the workflow active,
+    /// including final review after containers exit. Copied from
+    /// `AvailableActions::can_dismiss`; [p] remains an explicit pause.
     pub can_dismiss: bool,
     /// Custom label for the right-arrow (launch-next) action, copied from
     /// `AvailableActions.launch_next_label`. `None` renders the default

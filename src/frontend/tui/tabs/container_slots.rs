@@ -126,11 +126,12 @@ impl Tab {
                 requests,
                 stuck,
             } => {
-                let current = self.backbone_mut(launch_id).is_some();
-                if current {
-                    if let Some(requests) = requests {
-                        self.engine_tx = Some(requests);
-                    }
+                // The request channel controls the whole workflow, even when
+                // its originating container has been replaced. This queue is
+                // already isolated per command; only stuck events are scoped
+                // to a particular launch.
+                if let Some(requests) = requests {
+                    self.engine_tx = Some(requests);
                 }
                 if let Some(slot) = self.backbone_mut(launch_id) {
                     if stuck.is_some() {

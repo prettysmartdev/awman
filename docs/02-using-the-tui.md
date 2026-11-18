@@ -734,6 +734,10 @@ The tab bar shows each tab's project name, current or last command, and an arrow
 | *(none)* | Idle. | Green |
 | *(none)* | No status report. | Usual tab colour |
 
+These indicators also appear for agents launched by `new spec`, `new workflow`
+and `new skill`, and by `edit spec|workflow|skill|agent`,
+including specs stored in a remote tracker.
+
 A yolo countdown overrides these colours. A reporting agent is never marked
 stuck: it does not turn yellow from silence or get the `⚠️` silence prefix.
 An agent that does not report keeps the usual colours and the silence warning.
@@ -888,7 +892,7 @@ For workflow tabs, awman goes further: the [workflow control board](05-workflows
 | **Shift+← / Shift+→** | Scroll the Workflow Overview sideways (only while it doesn't fit at full width; mouse wheel and Shift+mouse wheel also scroll it) |
 | **Ctrl+\\** | Detach from the container view, leaving every container running (see [Detaching](#detaching-from-a-container)) |
 | **Ctrl+S** | Switch focus to the next running container (only when [multiple parallel containers](#parallel-containers) are running; otherwise passed to the container's PTY) |
-| **Ctrl+W** | Open workflow control board (between steps or mid-step while running) |
+| **Ctrl+W** | Open workflow control board (during steps, between steps, or at final review after agents exit) |
 | **Ctrl+,** | Open the configuration dialog |
 | **Ctrl+C** | Open the quit or close-tab confirmation, or the workflow-cancel confirmation while a workflow runs (forwarded to the agent while a container is maximized) |
 

@@ -548,21 +548,21 @@ fn the_specs_command_is_gone_with_no_alias() {
 }
 
 #[test]
-fn edit_interview_conflicts_with_headless_and_json_and_every_leaf_needs_a_runtime() {
-    for kind in ["spec", "workflow", "skill", "agent"] {
-        let path = ["edit", kind];
-        let interview = flag(&path, "interview");
-        assert!(interview.conflicts_with.contains(&"headless"), "{kind}");
-        assert!(interview.conflicts_with.contains(&"json"), "{kind}");
-        assert!(CommandCatalogue::get().requires_runtime(&path), "{kind}");
+fn authoring_has_no_interview_switch_and_keeps_headless_json_and_yolo() {
+    for verb in ["new", "edit"] {
+        for kind in ["spec", "workflow", "skill", "agent"] {
+            let path = [verb, kind];
+            let spec = CommandCatalogue::get().lookup(&path).unwrap();
+            assert!(spec.find_flag("interview").is_none());
+            for name in ["headless", "json", "yolo"] {
+                assert!(spec.find_flag(name).is_some(), "{verb} {kind}: {name}");
+            }
+            assert!(CommandCatalogue::get().requires_runtime(&path));
+            assert_eq!(flag(&path, "json").implies, &["headless"]);
+        }
     }
-    assert!(flag(&["edit", "spec"], "headless")
-        .conflicts_with
-        .contains(&"interview"));
-    assert!(flag(&["edit", "spec"], "json")
-        .conflicts_with
-        .contains(&"interview"));
     assert!(flag_names(&["edit", "spec"]).contains(&"amend"));
+    assert!(flag_names(&["new", "skill"]).contains(&"pull"));
 }
 
 #[test]

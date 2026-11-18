@@ -87,8 +87,6 @@ pub(crate) fn render_control_board(
     );
     let (title, frame_colour) = if failed {
         ("Workflow Control — step failed", Color::Red)
-    } else if state.can_dismiss {
-        ("Workflow Control (step running)", Color::Yellow)
     } else {
         ("Workflow Control", Color::Yellow)
     };

@@ -1,6 +1,4 @@
-use awman::command::commands::new::{
-    NewCommand, NewOutcome, NewSkillFlags, NewSubcommand, NewWorkflowFlags,
-};
+use awman::command::commands::new::{NewCommand, NewOutcome, NewSkillFlags, NewSubcommand};
 use awman::command::commands::Command;
 use awman::command::commands::{
     agent_auth::*, agent_setup::*, agent_trust::AgentTrustFrontend, mount_scope::*,
@@ -65,20 +63,13 @@ impl AgentLaunchFrontend for Scaffolder {
     }
 }
 impl NewSpecFrontend for Scaffolder {}
-impl awman::command::commands::new::NewCommandFrontend for Scaffolder {
-    fn ask_workflow_step_name(&mut self) -> Result<String, CommandError> {
-        Ok("one".into())
-    }
-    fn ask_workflow_step_prompt(&mut self) -> Result<String, CommandError> {
-        Ok("literal scaffold prompt".into())
-    }
-}
+impl awman::command::commands::new::NewCommandFrontend for Scaffolder {}
 
-/// Guards: #144 global scaffolding must use the invoking session's roots.
+/// Library imports remain distinct from agent authoring.
 #[tokio::test(flavor = "multi_thread")]
-async fn global_scaffolds_and_empty_pull_all_use_only_the_session_home() {
+async fn empty_library_refresh_uses_session_home_without_launching_an_agent() {
     let s = crate::support::sandbox(
-        "command::scaffolding::global_scaffolds_and_empty_pull_all_use_only_the_session_home",
+        "command::scaffolding::empty_library_refresh_uses_session_home_without_launching_an_agent",
     );
     let env = crate::support::env_snapshot(&s);
     let session = Session::open_at_git_root(
@@ -92,60 +83,9 @@ async fn global_scaffolds_and_empty_pull_all_use_only_the_session_home() {
     .unwrap();
     let engines = Engines::for_env(env).unwrap();
     let command = NewCommand::new(
-        NewSubcommand::Workflow(NewWorkflowFlags {
-            interview: false,
-            non_interactive: true,
-            global: true,
-            format: "toml".into(),
-        }),
-        engines.clone(),
-        session.clone(),
-    );
-    let outcome = command
-        .run_with_frontend(Box::new(Scaffolder))
-        .await
-        .unwrap();
-    let NewOutcome::Workflow(outcome) = outcome else {
-        panic!("expected workflow")
-    };
-    let path = std::path::PathBuf::from(outcome.path.unwrap());
-    assert!(
-        path.starts_with(s.awman_home().join("workflows")),
-        "{}",
-        path.display()
-    );
-    assert!(path.is_file());
-    let flags = NewSkillFlags {
-        interview: false,
-        non_interactive: true,
-        global: true,
-        pull: None,
-        pull_all: false,
-        subdir: None,
-    };
-    let command = NewCommand::new(
-        NewSubcommand::Skill(flags.clone()),
-        engines.clone(),
-        session.clone(),
-    );
-    let outcome = command
-        .run_with_frontend(Box::new(Scaffolder))
-        .await
-        .unwrap();
-    let NewOutcome::Skill(outcome) = outcome else {
-        panic!("expected skill")
-    };
-    let path = std::path::PathBuf::from(outcome.path.unwrap());
-    assert!(
-        path.starts_with(s.awman_home().join("skills")),
-        "{}",
-        path.display()
-    );
-    assert!(path.is_file());
-    let command = NewCommand::new(
         NewSubcommand::Skill(NewSkillFlags {
             pull_all: true,
-            ..flags
+            ..Default::default()
         }),
         engines,
         session,

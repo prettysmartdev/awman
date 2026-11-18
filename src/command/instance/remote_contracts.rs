@@ -212,6 +212,69 @@ fn instance_snapshot(tabs: Vec<TabSnapshot>) -> InstanceSnapshot {
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_requests_survive_sequential_container_replacement() {
+    let mut unit = unit(
+        "command::instance::remote::contracts::workflow_requests_survive_sequential_container_replacement",
+    );
+    let tab_id = TabId::new();
+    let leader = slot("leader", None);
+    unit.welcome(instance_snapshot(vec![tab_snapshot(
+        &unit.root,
+        tab_id.clone(),
+        vec![leader.clone()],
+    )]));
+    let InitialTabOpened::Normal { tab } = unit.backend.open_initial(session_spec(&unit.root))
+    else {
+        panic!("expected the daemon tab");
+    };
+    let requests = tab
+        .feeds
+        .container
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|event| match event {
+            ContainerSlotEvent::EngineAttached { requests, .. } => requests.clone(),
+            _ => None,
+        })
+        .expect("workflow request channel");
+
+    // Ctrl-W can already be queued when the daemon publishes a new container.
+    requests
+        .send(EngineRequest::OpenControlBoard {
+            step_name: String::new(),
+        })
+        .unwrap();
+    unit.delta(InstanceDelta::SlotExited {
+        tab_id: tab_id.clone(),
+        slot_id: leader.slot_id,
+        exit_code: None,
+        final_screen: None,
+    });
+    unit.delta(InstanceDelta::SlotLaunched {
+        tab_id: tab_id.clone(),
+        slot: slot("final", None),
+    });
+    assert!(
+        unit.sent().iter().any(|frame| matches!(frame,
+        FrontendFrame::WorkflowRequest { tab_id: id, .. } if id == &tab_id)),
+        "a container replacement must not discard a queued Ctrl-W"
+    );
+
+    // The presenter may still hold its original sender while processing the
+    // final board and reading output. It must stay usable for this whole run.
+    requests
+        .send(EngineRequest::OpenControlBoard {
+            step_name: "final".into(),
+        })
+        .expect("the running workflow must retain its request channel");
+    assert!(unit.sent().iter().any(|frame| matches!(frame,
+        FrontendFrame::WorkflowRequest { request: WorkflowRequestWire::OpenControlBoard { step_name }, .. }
+            if step_name == "final")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dynamic_sequential_replacement_reattaches_workflow_requests() {
     let mut unit = unit ("command::instance::remote::contracts::dynamic_sequential_replacement_reattaches_workflow_requests") ;
     let tab_id = TabId::new();

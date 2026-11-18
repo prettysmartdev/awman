@@ -220,6 +220,7 @@ pub(super) async fn run(
 
 fn prompt(title: &str, path: &str, location: EditLocation, flags: &EditCommonFlags) -> String {
     render_edit_prompt(&EditPromptRequest {
+        creating: false,
         subject: EditSubject::Spec { title },
         name: title,
         primary_path: path,
@@ -227,7 +228,6 @@ fn prompt(title: &str, path: &str, location: EditLocation, flags: &EditCommonFla
         bundle_dir: None,
         location,
         global: false,
-        interview: flags.interview,
         amend: flags.amend,
         headless: flags.headless,
         brief: flags.prompt.as_deref(),

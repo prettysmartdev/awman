@@ -99,7 +99,7 @@ impl crate::command::commands::squad::commands::SquadCommandFrontend for CliFron
         require_named_input("task name (slug)?")
     }
 
-    /// The same multi-line stdin read `new spec --interview` uses, so the CLI
+    /// The same multi-line stdin read `new spec` uses, so the CLI
     /// interview collects the same freeform description the TUI's multiline
     /// dialog does.
     fn ask_task_description(&mut self) -> Result<String, CommandError> {
@@ -844,49 +844,22 @@ impl ConfigCommandFrontend for CliFrontend {
     }
 }
 impl NewCommandFrontend for CliFrontend {
-    fn ask_workflow_name(&mut self) -> Result<String, CommandError> {
-        require_named_input("workflow name?")
+    fn ask_agent_summary(&mut self) -> Result<String, CommandError> {
+        require_multiline_input("agent summary?")
     }
+
     fn ask_workflow_title(&mut self) -> Result<String, CommandError> {
         require_named_input("workflow title (human-readable)?")
     }
     fn ask_workflow_summary(&mut self) -> Result<String, CommandError> {
         require_multiline_input("workflow description?")
     }
-    fn ask_workflow_step_name(&mut self) -> Result<String, CommandError> {
-        require_named_input("step name?")
-    }
-    fn ask_workflow_step_agent(&mut self) -> Result<Option<String>, CommandError> {
-        match require_optional_input("agent (optional, Enter to skip)?") {
-            Ok(s) if s.is_empty() => Ok(None),
-            Ok(s) => Ok(Some(s)),
-            Err(_) => Ok(None),
-        }
-    }
-    fn ask_workflow_step_model(&mut self) -> Result<Option<String>, CommandError> {
-        match require_optional_input("model (optional, Enter to skip)?") {
-            Ok(s) if s.is_empty() => Ok(None),
-            Ok(s) => Ok(Some(s)),
-            Err(_) => Ok(None),
-        }
-    }
-    fn ask_workflow_step_prompt(&mut self) -> Result<String, CommandError> {
-        require_multiline_input("step prompt?")
-    }
-    fn ask_add_another_step(&mut self) -> Result<bool, CommandError> {
-        match require_optional_input("add another step? [y/N]") {
-            Ok(s) => Ok(matches!(s.trim().to_lowercase().as_str(), "y" | "yes")),
-            Err(_) => Ok(false),
-        }
-    }
+
     fn ask_skill_name(&mut self) -> Result<String, CommandError> {
         require_named_input("skill name?")
     }
     fn ask_skill_summary(&mut self) -> Result<String, CommandError> {
         require_multiline_input("skill description?")
-    }
-    fn ask_skill_body(&mut self) -> Result<String, CommandError> {
-        require_optional_input("skill body (one line)?")
     }
 }
 impl RemoteCommandFrontend for CliFrontend {
@@ -944,17 +917,6 @@ fn require_named_input(prompt: &str) -> Result<String, CommandError> {
     match super::per_command::helpers::read_line(prompt) {
         Some(s) if !s.is_empty() => Ok(s),
         _ => Err(CommandError::InteractiveInputUnavailable {
-            prompt: prompt.to_string(),
-        }),
-    }
-}
-
-/// Read a (possibly empty) line from stdin, but require a TTY so callers that
-/// expect a real answer don't silently get `""` from a piped invocation.
-fn require_optional_input(prompt: &str) -> Result<String, CommandError> {
-    match super::per_command::helpers::read_line(prompt) {
-        Some(s) => Ok(s),
-        None => Err(CommandError::InteractiveInputUnavailable {
             prompt: prompt.to_string(),
         }),
     }

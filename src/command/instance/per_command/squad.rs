@@ -64,7 +64,7 @@ impl SquadCommandFrontend for InstanceCommandFrontend {
 
     /// One freeform description covering both halves of a task — when it fires
     /// and what to do about it — through the same multiline editor
-    /// `new spec --interview` uses. A one-line box could not hold either half.
+    /// `new spec` uses. A one-line box could not hold either half.
     fn ask_task_description(&mut self) -> Result<String, CommandError> {
         let response = self.ask_dialog(DialogRequest::MultilineInput {
             title: TASK_DESCRIPTION_TITLE.into(),

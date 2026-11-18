@@ -8,12 +8,13 @@ use awman::command::commands::edit::{
     EditCommand, EditCommandFrontend, EditCommonFlags, EditSpecFlags, EditSubcommand,
 };
 use awman::command::commands::new::{
-    NewCommand, NewCommandFrontend, NewOutcome, NewSpecFlags, NewSubcommand,
+    NewCommand, NewCommandFrontend, NewOutcome, NewSkillFlags, NewSpecFlags, NewSubcommand,
+    NewWorkflowFlags,
 };
 use awman::command::commands::prompt_templates::edit::{
     render_edit_prompt, EditLocation, EditPromptRequest, EditSubject,
 };
-use awman::command::commands::prompt_templates::render_interview_prompt;
+use awman::command::commands::prompt_templates::render_new_spec_prompt;
 use awman::command::commands::{
     agent_auth::*, agent_setup::*, agent_trust::AgentTrustFrontend, mount_scope::*, Command,
 };
@@ -42,6 +43,7 @@ const ABORT: &str = "<dismissed>";
 enum Event {
     Message(MessageLevel, String),
     Pty(bool),
+    StatusConnected,
 }
 
 #[derive(Clone, Default)]
@@ -55,7 +57,7 @@ impl Log {
             .into_iter()
             .filter_map(|e| match e {
                 Event::Message(_, text) => Some(text),
-                Event::Pty(_) => None,
+                Event::Pty(_) | Event::StatusConnected => None,
             })
             .collect()
     }
@@ -122,6 +124,12 @@ impl AgentLaunchFrontend for Front {
     fn set_pty_active(&mut self, active: bool) {
         self.log.0.lock().unwrap().push(Event::Pty(active));
     }
+    fn set_stuck_sender(
+        &mut self,
+        _: Arc<tokio::sync::broadcast::Sender<awman::engine::agent_runtime::StuckEvent>>,
+    ) {
+        self.log.0.lock().unwrap().push(Event::StatusConnected);
+    }
 }
 impl EditCommandFrontend for Front {}
 impl NewSpecFrontend for Front {
@@ -137,11 +145,14 @@ impl NewSpecFrontend for Front {
     }
 }
 impl NewCommandFrontend for Front {
-    fn ask_workflow_step_name(&mut self) -> Result<String, CommandError> {
-        Ok("one".into())
+    fn ask_workflow_title(&mut self) -> Result<String, CommandError> {
+        Ok("workflow".into())
     }
-    fn ask_workflow_step_prompt(&mut self) -> Result<String, CommandError> {
-        Ok("prompt".into())
+    fn ask_workflow_summary(&mut self) -> Result<String, CommandError> {
+        Ok("create a workflow".into())
+    }
+    fn ask_skill_summary(&mut self) -> Result<String, CommandError> {
+        Ok("create a skill".into())
     }
 }
 
@@ -196,12 +207,12 @@ impl World {
         )
     }
 
-    fn new_spec(&self, interview: bool, work_item: Option<&str>) -> NewCommand {
+    fn new_spec(&self, work_item: Option<&str>) -> NewCommand {
         NewCommand::new(
             NewSubcommand::Spec(NewSpecFlags {
-                interview,
-                non_interactive: true,
+                non_interactive: false,
                 work_item: work_item.map(str::to_string),
+                ..Default::default()
             }),
             self.engines.clone(),
             self.session.clone(),
@@ -213,7 +224,6 @@ impl World {
             EditSubcommand::Spec(EditSpecFlags {
                 common: EditCommonFlags {
                     reference: work_item.into(),
-                    interview: false,
                     amend: true,
                     headless: true,
                     prompt: None,
@@ -421,6 +431,94 @@ fn assert_path_before_launch(log: &Log) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn creation_and_edit_sessions_connect_agent_status_before_waiting() {
+    for (kind, remote) in [
+        ("new spec", false),
+        ("new spec", true),
+        ("edit spec", false),
+        ("edit spec", true),
+        ("new workflow", false),
+        ("new skill", false),
+    ] {
+        let w = world(
+            "command::work_item_edit::creation_and_edit_sessions_connect_agent_status_before_waiting",
+            if remote { github() } else { json!({}) },
+            &[],
+        );
+        let (front, log) = w.front("Status interview");
+        let mut task = if kind == "edit spec" {
+            let command = w.amend(if remote { "73" } else { "local:3" });
+            tokio::spawn(async move { command.run_with_frontend(front).await.map(|_| ()) })
+        } else {
+            let subcommand = match kind {
+                "new spec" => NewSubcommand::Spec(NewSpecFlags {
+                    yolo: true,
+                    input: awman::command::commands::new::NewInput {
+                        title: Some("Status spec".into()),
+                        summary: Some("Status summary".into()),
+                    },
+                    non_interactive: true,
+                    work_item: None,
+                    ..Default::default()
+                }),
+                "new workflow" => NewSubcommand::Workflow(NewWorkflowFlags {
+                    input: awman::command::commands::new::NewInput {
+                        title: Some("workflow".into()),
+                        summary: Some("Status summary".into()),
+                    },
+                    non_interactive: true,
+                    global: false,
+                    format: "toml".into(),
+                    ..Default::default()
+                }),
+                "new skill" => NewSubcommand::Skill(NewSkillFlags {
+                    input: awman::command::commands::new::NewInput {
+                        title: Some("skill".into()),
+                        summary: Some("Status summary".into()),
+                    },
+                    non_interactive: true,
+                    global: false,
+                    pull: None,
+                    pull_all: false,
+                    subdir: None,
+                    ..Default::default()
+                }),
+                _ => unreachable!(),
+            };
+            let command = NewCommand::new(subcommand, w.engines.clone(), w.session.clone());
+            tokio::spawn(async move { command.run_with_frontend(front).await.map(|_| ()) })
+        };
+        agent_running(&w.docker, &mut task).await;
+        if kind == "new spec" {
+            assert!(w.docker_runs()[0]
+                .argv
+                .iter()
+                .any(|a| a == "--dangerously-skip-permissions"));
+        }
+        let events = log.events();
+        assert!(
+            events.contains(&Event::Pty(true)),
+            "{kind}, remote={remote}"
+        );
+        assert!(
+            events.contains(&Event::StatusConnected),
+            "{kind}, remote={remote}: {events:?}"
+        );
+        assert!(!events.contains(&Event::Pty(false)));
+        if kind == "new workflow" {
+            std::fs::write(
+                w.repo.join("aspec/workflows/workflow.toml"),
+                "title = \"workflow\"\n[[step]]\nname = \"one\"\nprompt = \"work\"\n",
+            )
+            .unwrap();
+        }
+        w.docker.release();
+        finish(task).await.unwrap();
+        w.sandbox.finish();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn github_new_spec_creates_an_issue_without_a_file_or_number() {
     let w = world(
         "command::work_item_edit::github_new_spec_creates_an_issue_without_a_file_or_number",
@@ -429,11 +527,14 @@ async fn github_new_spec_creates_an_issue_without_a_file_or_number() {
     );
     let before = w.work_item_files();
     let (front, log) = w.front("-dash title");
-    let outcome = w
-        .new_spec(false, None)
-        .run_with_frontend(front)
-        .await
-        .unwrap();
+    let command = w.new_spec(None);
+    let mut task = tokio::spawn(async move { command.run_with_frontend(front).await });
+    agent_running(&w.docker, &mut task).await;
+    let draft = log.draft_path().expect("remote draft");
+    let seed = std::fs::read_to_string(&draft).unwrap();
+    std::fs::write(&draft, format!("{seed}\nAgent-authored details\n")).unwrap();
+    w.docker.release();
+    let outcome = finish(task).await.unwrap();
     let NewOutcome::Spec(outcome) = outcome else {
         panic!("expected spec")
     };
@@ -452,11 +553,14 @@ async fn github_new_spec_creates_an_issue_without_a_file_or_number() {
     assert!(body.contains("Number: []"), "{body}");
     assert!(body.contains("- the summary"), "{body}");
     assert!(log.all_text().contains(ISSUE_URL), "{}", log.all_text());
-    assert!(w.docker_runs().is_empty(), "no agent without an interview");
+    assert_eq!(
+        w.docker_runs().len(),
+        1,
+        "creation always launches an agent"
+    );
     // The destination is named before anything is published.
     assert!(
-        log.all_text()
-            .contains("creating a github work item in github:acme/widgets"),
+        log.all_text().contains("published to github:acme/widgets"),
         "{}",
         log.all_text()
     );
@@ -474,7 +578,7 @@ async fn interview_creates_the_issue_from_the_draft_even_after_a_failed_agent() 
     w.docker.on(&["run"]).hold_until_released().exit(3);
     let before = w.work_item_files();
     let (front, log) = w.front("Widget title");
-    let command = w.new_spec(true, None);
+    let command = w.new_spec(None);
     let mut task = tokio::spawn(async move { command.run_with_frontend(front).await });
     agent_running(&w.docker, &mut task).await;
     assert_path_before_launch(&log);
@@ -663,7 +767,7 @@ async fn seeding_from_the_configured_source_suggests_amend() {
     );
     let (front, _log) = w.front("unused");
     let error = w
-        .new_spec(false, Some("#73"))
+        .new_spec(Some("#73"))
         .run_with_frontend(front)
         .await
         .unwrap_err();
@@ -688,11 +792,8 @@ async fn local_new_spec_keeps_numbered_files() {
         &[],
     );
     let (front, _log) = w.front("Local thing");
-    let outcome = w
-        .new_spec(false, None)
-        .run_with_frontend(front)
-        .await
-        .unwrap();
+    w.docker.release();
+    let outcome = w.new_spec(None).run_with_frontend(front).await.unwrap();
     let NewOutcome::Spec(outcome) = outcome else {
         panic!("expected spec")
     };
@@ -711,17 +812,20 @@ async fn local_new_spec_keeps_numbered_files() {
 
 #[test]
 fn prompts_name_the_file_and_never_expand_work_item_text() {
-    let interview = render_interview_prompt(
+    let interview = render_new_spec_prompt(
         "/awman/context/repo/scratch/work-items/x.md",
         "Bug",
         "{summary}",
         "body with {path}",
+        false,
+        false,
     );
     assert!(interview.contains("/awman/context/repo/scratch/work-items/x.md"));
     assert!(interview.contains("\"{summary}\""), "{interview}");
     assert!(interview.ends_with("body with {path}"), "{interview}");
-    assert!(interview.contains("Re-read the file"));
+    assert!(interview.contains("re-read"));
     let edit = render_edit_prompt(&EditPromptRequest {
+        creating: false,
         subject: EditSubject::Spec { title: "Title" },
         name: "",
         primary_path: "/workspace/aspec/work-items/0003-x.md",
@@ -729,7 +833,6 @@ fn prompts_name_the_file_and_never_expand_work_item_text() {
         bundle_dir: None,
         location: EditLocation::InPlace,
         global: false,
-        interview: false,
         amend: true,
         headless: false,
         brief: None,
@@ -747,19 +850,35 @@ async fn a_dismissed_question_never_publishes_a_work_item() {
         &[],
     );
     let before = w.work_item_files();
-    for interview in [false, true] {
-        let (front, _log) = w.front(ABORT);
-        let result = w.new_spec(interview, None).run_with_frontend(front).await;
-        assert!(
-            matches!(result, Err(CommandError::Aborted)),
-            "{:?}",
-            result.err()
-        );
-    }
+    let (front, _log) = w.front(ABORT);
+    let result = w.new_spec(None).run_with_frontend(front).await;
+    assert!(
+        matches!(result, Err(CommandError::Aborted)),
+        "{:?}",
+        result.err()
+    );
     assert!(w.gh_calls("create").is_empty(), "nothing was published");
     assert!(w.docker_runs().is_empty(), "no agent was started");
     assert!(w.drafts().is_empty());
     assert_eq!(w.work_item_files(), before);
+    w.sandbox.finish();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn spec_creation_refuses_a_destination_outside_the_mounted_repository() {
+    let w = world(
+        "command::work_item_edit::spec_creation_refuses_a_destination_outside_the_mounted_repository",
+        json!({"workItems": {"dir": "../unmounted-items", "template": "aspec/work-items/0000-template.md"}}),
+        &[],
+    );
+    let (front, _) = w.front("Outside");
+    let error = w.new_spec(None).run_with_frontend(front).await.unwrap_err();
+    assert!(
+        error.to_string().contains("inside the mounted repository"),
+        "{error}"
+    );
+    assert!(!w.repo.parent().unwrap().join("unmounted-items").exists());
+    assert!(w.docker_runs().is_empty());
     w.sandbox.finish();
 }
 
@@ -788,10 +907,10 @@ const BACKENDS: [Backend; 2] = [Backend::Github, Backend::Http];
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Mode {
     Ordinary,
-    Interview,
+    Interactive,
     Amend,
 }
-const MODES: [Mode; 3] = [Mode::Ordinary, Mode::Interview, Mode::Amend];
+const MODES: [Mode; 3] = [Mode::Ordinary, Mode::Interactive, Mode::Amend];
 
 #[derive(Clone, Copy, Debug)]
 enum Reject {
@@ -1014,16 +1133,15 @@ impl Remote {
     }
 
     fn command(&self, reference: &str, mode: Mode) -> EditCommand {
-        let (interview, amend, headless, prompt) = match mode {
-            Mode::Ordinary => (false, false, true, Some("tighten the wording".to_string())),
-            Mode::Interview => (true, false, false, None),
-            Mode::Amend => (false, true, true, None),
+        let (amend, headless, prompt) = match mode {
+            Mode::Ordinary => (false, true, Some("tighten the wording".to_string())),
+            Mode::Interactive => (false, false, None),
+            Mode::Amend => (true, true, None),
         };
         EditCommand::new(
             EditSubcommand::Spec(EditSpecFlags {
                 common: EditCommonFlags {
                     reference: reference.into(),
-                    interview,
                     amend,
                     headless,
                     prompt,
@@ -1131,7 +1249,7 @@ async fn every_edit_mode_updates_the_original_issue_and_never_creates_one() {
                 outcome.changed
             );
             assert_eq!(outcome.amend, mode == Mode::Amend);
-            assert_eq!(outcome.interview, mode == Mode::Interview);
+            assert_eq!(outcome.headless, mode != Mode::Interactive);
             // The other provider and the local tree were never touched.
             let other = if backend == Backend::Github {
                 Backend::Http
@@ -1526,6 +1644,46 @@ async fn unsafe_draft_replacements_are_never_read_or_uploaded() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn seeded_creation_passes_the_source_and_supplied_brief_to_the_agent() {
+    let w = world(
+        "command::work_item_edit::seeded_creation_passes_the_source_and_supplied_brief_to_the_agent",
+        json!({}),
+        &[],
+    );
+    w.docker.on(&["run"]).read_stdin().hold_until_released();
+    let (front, _) = w.front("unused");
+    let command = NewCommand::new(
+        NewSubcommand::Spec(NewSpecFlags {
+            non_interactive: true,
+            work_item: Some("#73".into()),
+            input: awman::command::commands::new::NewInput {
+                title: Some("New title".into()),
+                summary: Some("Keep literal {summary} while refining the source".into()),
+            },
+            ..Default::default()
+        }),
+        w.engines.clone(),
+        w.session.clone(),
+    );
+    let mut task = tokio::spawn(command.run_with_frontend(front));
+    agent_running(&w.docker, &mut task).await;
+    let prompt = String::from_utf8(w.docker_runs()[0].stdin.clone()).unwrap();
+    for supplied in [
+        "New title",
+        "Widget title",
+        "raw body",
+        "Keep literal {summary}",
+    ] {
+        assert!(prompt.contains(supplied), "missing {supplied}: {prompt}");
+    }
+    w.docker.release();
+    finish(task).await.unwrap();
+    assert!(w.gh_calls("create").is_empty());
+    assert!(w.gh_calls("edit").is_empty());
+    w.sandbox.finish();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn seeded_creation_from_a_remote_issue_leaves_the_issue_untouched() {
     // `new spec --work-item` seeds a *new* local item from an issue that is
     // not in the creation target; it never edits or creates remotely.
@@ -1539,7 +1697,7 @@ async fn seeded_creation_from_a_remote_issue_leaves_the_issue_untouched() {
         let (front, _log) = r.w.front("Seeded thing");
         // A seed always runs the interview agent: wait for the held fake
         // container, release it, then await the command.
-        let command = r.w.new_spec(false, Some(r.reference(backend)));
+        let command = r.w.new_spec(Some(r.reference(backend)));
         let mut task = tokio::spawn(async move { command.run_with_frontend(front).await });
         agent_running(&r.w.docker, &mut task).await;
         r.w.docker.release();

@@ -17,7 +17,10 @@ impl WorkflowEngine {
         let progress = self.workflow_progress_info();
         self.frontend.report_workflow_progress(&progress);
         loop {
-            let available = self.compute_available_actions()?;
+            let mut available = self.compute_available_actions()?;
+            // A resumed, completed workflow may have no current step or
+            // container. It still waits here for an explicit review decision.
+            available.can_dismiss = true;
             let action = self
                 .frontend
                 .show_workflow_control_board(&self.state, &available)?;

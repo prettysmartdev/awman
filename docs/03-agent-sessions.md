@@ -545,24 +545,24 @@ awman new spec
 new spec
 ```
 
-Prompts for a type (Feature, Bug, Task, or Enhancement) and a title, then creates a numbered work item file in the configured work items directory using the project's template. Answer with the digit shown next to your choice (`1`-`4`); the CLI and TUI accept exactly the same input here. Dismissing the question (Esc in the TUI, Ctrl-D on the CLI) aborts the interview rather than filing a Task by default.
+Prompts for a type (Feature, Bug, Task, or Enhancement), title and summary, then launches an agent to complete the work item from the configured template. Further questions and edits happen in the agent conversation. Dismissing an initial question aborts creation.
 
-By default, awman writes to `aspec/work-items/` and uses `aspec/work-items/0000-template.md`. If neither exists, awman auto-discovers any `*template.md` file in the work items directory and prompts you to confirm it. You can also configure the paths explicitly:
+By default, awman writes to `aspec/work-items/` and uses `aspec/work-items/0000-template.md`. You can configure the paths explicitly:
 
 ```sh
 awman config set workItems.dir docs/work-items
 awman config set workItems.template docs/work-items/my-template.md
 ```
 
-If no template is found or confirmed, the new file is created with a minimal stub (`# Kind: Title`). See [Configuration: Work item paths](07-configuration.md#custom-work-item-paths) for full details on path resolution and auto-discovery.
+If the configured template is missing, creation fails before a file is written. See [Work item paths](07-configuration.md#custom-work-item-paths).
+
+For headless creation, supply `--title` and `--prompt`; `--kind feature|bug|task|enhancement` selects the type (headless default: `task`). `--json` implies headless mode. Add `--yolo` to use the agent's configured most-permissive mode.
 
 ```sh
-awman new spec --interview
+awman new spec --json --title "Retry failed uploads" --kind feature --prompt "Plan bounded retries and failure recovery" --yolo
 ```
 
-After creating the file, prompts for a brief summary of the work, then launches an agent session to complete the spec — filling in user stories, implementation plan, edge cases, and test plan based on your summary. More thorough specs lead to better implementations.
-
-In the TUI, a freeform text box dialog opens for the summary input. Use **Ctrl+Enter** to submit or **Esc** to cancel.
+In the TUI, **Ctrl+Enter** submits the summary and **Esc** cancels.
 
 ### Creating a local spec from a GitHub issue
 
@@ -577,7 +577,7 @@ awman new spec --work-item prettysmartdev/awman#84                              
 awman new spec --work-item https://github.com/prettysmartdev/awman/issues/84      # full URL
 ```
 
-Fetches the GitHub issue and launches an agent to generate a structured work item spec from its content. Combined with `--interview`, the issue description is pre-populated in the text box for editing before the agent runs.
+Fetches the GitHub issue and gives its title and body to the agent as source material for the new spec. `--prompt` adds a creation brief alongside that source material.
 
 For full details on GitHub integration, authentication, and input formats, see [GitHub Integration](10-github-integration.md).
 
@@ -586,8 +586,8 @@ For full details on GitHub integration, authentication, and input formats, see [
 `awman edit` launches an agent to change something that already exists. It never creates anything; use `awman new` for that. There is one leaf per kind of artifact:
 
 ```sh
-awman edit spec 42 --amend --interview               # reconcile a spec with the code, asking you questions
-awman edit workflow release --interview              # the agent interviews you, then changes the workflow
+awman edit spec 42 --amend               # reconcile a spec with the code, asking you questions
+awman edit workflow release              # the agent interviews you, then changes the workflow
 awman edit skill review --global --amend             # reconcile a personal skill with what it actually does
 awman edit agent custom --headless --prompt "Correct the model setting"
 ```
@@ -598,7 +598,7 @@ Every leaf takes one required `ref` that identifies the target:
 |---|---|---|
 | `edit spec <ref>` | A work item reference: a number, `github:84`, `owner/repo#84`, or an issue URL | The configured work item source (see [GitHub Integration](10-github-integration.md)) |
 | `edit workflow <ref>` | A workflow name, or a path to a workflow file | `.awman/workflows/` or `aspec/workflows/` in the repo; `~/.awman/workflows/` with `--global` |
-| `edit skill <ref>` | A skill name (`<library>/<skill>` for pulled library skills) | `.awman/skills/` in the repo; `~/.awman/skills/` with `--global` |
+| `edit skill <ref>` | A skill name (`<library>/<skill>` for pulled library skills) | `.claude/skills/` in the repo; `~/.awman/skills/` with `--global` |
 | `edit agent <ref>` | A custom agent name | `.awman/agents/` in the repo; `~/.awman/agents/` with `--global` |
 
 ### Choosing the target and scope
@@ -607,14 +607,16 @@ Workflows, skills, and agents are looked up in the repo first. Add `--global` to
 
 ### What the agent is asked to do
 
-Choose how the agent approaches the work with the same flags for every kind:
+Interactive agents clarify the request with you as needed. Choose the starting brief with the same flags for every kind:
 
 - **A brief.** Give `--prompt "..."` describing the change.
-- **`--interview`.** The agent first asks what you want to change, your constraints, and your acceptance criteria, and only then edits. It needs a terminal, so it conflicts with `--headless` and `--json`.
 - **`--amend`.** The agent reviews the artifact against the available evidence and corrects what has drifted. For a spec that is the code that was written; for a workflow, the commands and files it references; for a skill, the behavior it describes; for an agent definition, the settings it declares. It keeps what it can verify, records what was intended, and reports what it cannot determine instead of guessing. `--amend --headless` can run without `--prompt`; any other headless edit needs one.
-- **`--amend --interview`.** The agent discusses uncertain findings with you before reconciling them.
 
 The agent launch flags (`--agent`, `--model`, `--overlay`, `--agent-flag`, `--auto`, `--yolo`, `--allow-docker`) work as they do for `chat`. `--json` prints the outcome as JSON and implies `--headless`.
+
+Agents can summarize their changes when finished, both in edit sessions and in
+`new spec`, `new workflow`, `new skill` and `new agent` sessions. Their status appears in
+TUI tabs and container windows just as it does during `chat`.
 
 ### How changes are saved
 
@@ -646,42 +648,24 @@ Editing a custom agent definition does not approve or run it. After a change, aw
 
 ## Creating skills
 
-Skills are reusable instruction files that teach an agent how to perform a specific task when invoked with `/skill-name`. `awman new skill` scaffolds one:
+Skills are reusable instructions packaged as a directory containing `SKILL.md`.
+Run `awman new skill`, provide a name and summary, and the agent authors the
+instructions and any supporting files inside that skill directory. Continue
+refining the skill in the agent conversation.
 
 ```sh
-# CLI
 awman new skill
-
-# TUI command box
-new skill
+awman new skill --headless --title run-tests --prompt "Run the project tests and explain failures" --yolo
 ```
 
-awman asks for:
+Repository skills are saved in `.claude/skills/<name>/SKILL.md`. Creation refuses
+an existing target. The seed includes YAML `name` and `description` frontmatter;
+the agent follows the [Agent Skills specification](https://agentskills.io/specification)
+and keeps supporting resources inside the selected directory.
 
-1. **Skill name** — used as the directory name and slash-command trigger (e.g. `run-tests`). Use a short kebab-case slug.
-2. **Body** — the skill's instruction text. The CLI reads a single line; the TUI opens a multi-line editor (**Enter** starts a new line, **Ctrl+Enter** or **Ctrl+S** submits, **Esc** cancels).
-
-The file is written to `.claude/skills/<name>/SKILL.md` in the current repo, headed `# Skill: <name>` and followed by your body. An empty body leaves a skeleton with `Description` and `Body` headings to fill in. An existing `SKILL.md` at that path is overwritten.
-
-Write the body in second-person imperative ("Run …", "Check …", "If … then …"):
-
-```markdown
-# Skill: run-tests
-
-Run `make test` and wait for output.
-If tests fail, show the failing test names and exit codes.
-If all tests pass, confirm success and stop.
-```
-
-### Interview mode
-
-```sh
-awman new skill --interview
-```
-
-Instead of a body, describe what the skill should do; a code agent writes the skill for you, adding any commands, code examples, or decision trees it needs. The summary is multi-line: in the TUI, **Ctrl+Enter** submits; on the CLI, end it with a blank line or **Ctrl-D**.
-
-The interview agent runs in a container with the new skill's own directory mounted at `/awman/skill`, and is told to edit `/awman/skill/SKILL.md` and nothing else. That is what lets `--interview` work with `--global`, whose skills live outside the repo the container sees at `/workspace`. Interview mode is not available under the `docker-sbx-experimental` runtime.
+The summary is multi-line: **Ctrl+Enter** submits in the TUI; a blank line or
+**Ctrl-D** ends CLI input. `--title` and `--prompt` supply these answers for
+headless or JSON sessions. `--json` implies headless mode.
 
 ### Global skills
 
@@ -691,7 +675,7 @@ awman new skill --global
 
 Writes to `~/.awman/skills/<name>/SKILL.md` instead of the current repo. Use this to maintain a personal library of skills that travel with you across projects.
 
-`--global` and `--interview` can be combined: the agent's extra mount is only `~/.awman/skills/<name>/`, never your home directory. This still has to be run inside a Git repository, whose agent image the interview uses.
+Global creation and editing use a private staged copy in the repository context, then validate and save the skill after the agent exits. The repository is mounted, but your home directory is not. These sessions require a Git repository and a container-capable runtime.
 
 Global skills reach agent containers through the `skill()` overlay — `skill(*)` for all of them, `skill(<name>)` for one — in config or on the command line:
 
@@ -769,8 +753,10 @@ Mount a pulled library with `skill(<library>)`, or one skill from it with `skill
 
 | Flag | Description |
 |------|-------------|
-| `--interview` | Let a code agent complete the skill body from a short summary |
-| `-n`, `--headless` | Run the interview agent in print mode |
+| `-n`, `--headless` | Run the authoring agent in print mode |
+| `--title`, `--prompt` | Supply the name and summary |
+| `--json` | Print the outcome as JSON; implies headless mode |
+| `--yolo` | Use the agent's configured most-permissive mode |
 | `--global` | Write to `~/.awman/skills/<name>/` instead of the current repo |
 | `--pull <repo>` | Pull a GitHub skills library, or refresh one by its short name |
 | `--pull-all` | Refresh every previously-pulled skills library |

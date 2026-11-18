@@ -62,7 +62,7 @@ pub use kit_paths::SandboxKitPaths;
 pub use log_dirs::WorkflowLogPaths;
 pub use overlay_paths::OverlayPathResolver;
 pub use panic_log::PanicLog;
-pub use skill_dirs::{SkillDirs, SKILL_INTERVIEW_CONTAINER_DIR};
+pub use skill_dirs::SkillDirs;
 pub use squad_paths::{SharedSquadRunLog, SquadPaths, SquadRunLog, SquadRunLogError, SquadRunLogs};
 pub use squad_run_paths::SquadRunPaths;
 pub use squad_verdict::{

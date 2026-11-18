@@ -638,6 +638,34 @@ mod control_board_contracts {
     use crate::engine::workflow::actions::StepFailureContext;
 
     #[test]
+    fn final_review_dismissal_keeps_the_workflow_active_across_the_daemon_wire() {
+        let available = AvailableActions {
+            can_dismiss: true,
+            can_finish_workflow: true,
+            can_pause: true,
+            ..Default::default()
+        };
+        let board = control_board_state_with("final", &available, &PlainPresentation);
+        let request = DialogRequest::WorkflowControlBoard(board);
+        let decoded: DialogRequest =
+            serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        let DialogRequest::WorkflowControlBoard(board) = decoded else {
+            panic!("expected final review");
+        };
+        assert!(board.can_dismiss);
+        assert!(board.can_finish);
+        assert!(!board.can_launch_next);
+        for (response, expected) in [
+            (DialogResponse::Dismissed, NextAction::Dismiss),
+            (DialogResponse::Char('p'), NextAction::Pause),
+            (DialogResponse::Char('f'), NextAction::FinishWorkflow),
+        ] {
+            let decoded = serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+            assert_eq!(wcb_response_to_action(decoded, &available), expected);
+        }
+    }
+
+    #[test]
     fn reports_remain_status_information_across_the_daemon_wire() {
         for (state, kind) in [
             (ProgramState::Working, None),

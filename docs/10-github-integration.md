@@ -72,24 +72,16 @@ numbered local file. Start a new issue from the configured template:
 awman new spec
 ```
 
-Without `--interview`, awman creates the issue immediately from the new spec
-content. The created issue URL and number are reported. Before anything is
-published, awman names the destination (for example
-`creating a github work item in github:acme/widgets`). If you dismiss a question
-(Ctrl+C or closing the dialog), nothing is created. To review and shape
-the content in an interview, use:
+Awman asks for the type, title and summary, then launches an agent with a
+private draft. Before launch it names the destination and explains that edits
+are published while the agent runs. The first meaningful edit creates the
+issue; later edits update it. An unchanged draft creates nothing. Dismissing an
+initial question creates nothing. Cancellation after publication does not undo
+updates; review the reported issue URL if you stop before completion.
 
-```sh
-awman new spec --interview
-```
-
-During an interview, awman publishes edits to the new issue while the agent is
-running. Creation happens on the first meaningful edit. awman says so before the
-agent starts (`draft edits are published to <destination> while the agent
-runs`). If you abandon the
-interview after an issue has been created, that issue may contain only part of
-the intended spec. The issue URL is printed: report the partial issue and
-close it if you do not intend to finish it.
+For unattended creation, use `--headless --title "..." --prompt "..."` (or
+`--json`). `--kind` supplies the type and `--yolo` enables the agent's configured
+most-permissive mode.
 
 You can also seed a new spec from an existing GitHub issue by passing its
 reference with `--work-item` while the configured creation target is local or
@@ -99,7 +91,7 @@ refuses to duplicate it and suggests `awman edit spec <ref> --amend` instead.
 ## Edit an existing issue
 
 ```sh
-awman edit spec github:84 --amend --interview
+awman edit spec github:84 --amend
 awman edit spec github:84 --prompt "Add an acceptance criterion for retries"
 ```
 
@@ -111,7 +103,7 @@ an edit part-way, review the reported URL and restore or close the issue as
 needed. The issue always ends with the final draft: if the draft is changed back
 to the original body after an intermediate save, that restore is uploaded too.
 `--amend` asks the agent to reconcile the issue with the code that was
-written, and `--interview` has it question you first; see
+written. In interactive sessions, the agent asks clarifying questions as needed; see
 [Editing existing artifacts](03-agent-sessions.md#editing-existing-artifacts).
 A failed upload keeps the draft path available for recovery, and the error
 reports the agent result and the upload result separately. awman retries a

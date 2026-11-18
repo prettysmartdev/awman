@@ -718,36 +718,46 @@ Available via: CLI, TUI
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
-| `--interview` | bool | false | — | — | CLI, TUI, API | Use interview mode. |
-| `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the interview agent headless (print mode). |
+| `--json` | bool | false | `--headless` | — | CLI, TUI, API | Print the outcome as JSON and run headless. |
+| `--title` | string (optional) | — | — | — | CLI, TUI, API | Supply the title/name instead of asking for it. |
+| `--prompt` | string (optional) | — | — | — | CLI, TUI, API | Supply the summary for the authoring agent instead of asking for it. |
+| `--yolo` | bool | false | — | — | CLI, TUI, API | Launch the authoring agent in its most permissive mode. |
+| `--kind` | enum: feature, bug, task, enhancement | — | — | — | CLI, TUI, API | Work item type. |
+| `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the authoring agent headless (print mode). |
 | `-w, --work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
 
 ### `awman new workflow`
 
-Interactively create a new workflow file.
+Create a new workflow with an agent.
 
 Available via: CLI, TUI
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
-| `--interview` | bool | false | — | — | CLI, TUI, API | Let a code agent complete the workflow from a summary you provide. |
-| `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the interview agent headless (print mode). |
+| `--json` | bool | false | `--headless` | — | CLI, TUI, API | Print the outcome as JSON and run headless. |
+| `--title` | string (optional) | — | — | — | CLI, TUI, API | Supply the title/name instead of asking for it. |
+| `--prompt` | string (optional) | — | — | — | CLI, TUI, API | Supply the summary for the authoring agent instead of asking for it. |
+| `--yolo` | bool | false | — | — | CLI, TUI, API | Launch the authoring agent in its most permissive mode. |
+| `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the authoring agent headless (print mode). |
 | `--global` | bool | false | — | — | CLI, TUI, API | Write to ~/.awman/workflows/<name> instead of the current repo. |
 | `--format` | enum: toml, yaml | `toml` | — | — | CLI, TUI, API | Output file format. |
 
 ### `awman new skill`
 
-Interactively create a new skill file.
+Create a new skill with an agent, or pull a published library.
 
 Available via: CLI, TUI
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
-| `--interview` | bool | false | — | — | CLI, TUI, API | Let a code agent complete the skill body from a summary you provide. |
-| `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the interview agent headless (print mode). |
+| `--json` | bool | false | `--headless` | — | CLI, TUI, API | Print the outcome as JSON and run headless. |
+| `--title` | string (optional) | — | — | — | CLI, TUI, API | Supply the title/name instead of asking for it. |
+| `--prompt` | string (optional) | — | — | — | CLI, TUI, API | Supply the summary for the authoring agent instead of asking for it. |
+| `--yolo` | bool | false | — | — | CLI, TUI, API | Launch the authoring agent in its most permissive mode. |
+| `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the authoring agent headless (print mode). |
 | `--global` | bool | false | — | — | CLI, TUI, API | Write to ~/.awman/skills/<name>/ instead of the current repo. |
-| `--pull` | string (optional) | — | — | `--pull-all`, `--interview`, `--global` | CLI, TUI, API | Pull (or refresh) a published skills library from GitHub, e.g. github.com/obra/superpowers. |
-| `--pull-all` | bool | false | — | `--pull`, `--subdir`, `--interview`, `--global` | CLI, TUI, API | Refresh every previously-pulled skills library. |
+| `--pull` | string (optional) | — | — | `--pull-all`, `--global` | CLI, TUI, API | Pull (or refresh) a published skills library from GitHub, e.g. github.com/obra/superpowers. |
+| `--pull-all` | bool | false | — | `--pull`, `--subdir`, `--global` | CLI, TUI, API | Refresh every previously-pulled skills library. |
 | `--subdir` | string (optional) | — | — | `--pull-all` | CLI, TUI, API | Subdirectory inside the pulled repo containing skills (default: skills). |
 
 ### `awman new agent`
@@ -756,17 +766,18 @@ Create a custom agent definition in .awman/agents/<name>.toml.
 
 Available via: CLI, TUI
 
-Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
-
 | Argument | Kind | Required | Help |
 |---|---|---|---|
 | `name` | string | yes | Agent name; becomes the file stem (lowercase letters, digits, '-' and '_'). |
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
+| `--json` | bool | false | `--headless` | — | CLI, TUI, API | Print the outcome as JSON and run headless. |
+| `--prompt` | string (optional) | — | — | — | CLI, TUI, API | Supply the summary for the authoring agent instead of asking for it. |
+| `--yolo` | bool | false | — | — | CLI, TUI, API | Launch the authoring agent in its most permissive mode. |
+| `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the authoring agent headless. |
 | `--global` | bool | false | — | — | CLI, TUI, API | Write to ~/.awman/agents/<name>.toml instead of the current repo. |
-| `--from` | enum: crush, maki | — | — | — | CLI, TUI, API | Copy a shipped example definition instead of the commented skeleton. |
-| `--force` | bool | false | — | — | CLI, TUI, API | Overwrite an existing definition (and, with --from maki, its Dockerfile). |
+| `--from` | enum: crush, maki | — | — | — | CLI, TUI, API | Seed the agent session with a shipped example definition. |
 
 ---
 
@@ -788,11 +799,10 @@ Available via: CLI, TUI
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
-| `--interview` | bool | false | — | `--headless`, `--json` | CLI, TUI, API | Ask clarifying questions before editing the existing item. |
 | `--amend` | bool | false | — | — | CLI, TUI, API | Review and amend the existing item using available evidence. |
-| `-n, --headless` | bool | false | — | `--interview` | CLI, TUI, API | Run the edit agent without interactive input. |
+| `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the edit agent without interactive input. |
 | `--prompt` | string (optional) | — | — | — | CLI, TUI, API | Describe the changes to make. |
-| `--json` | bool | false | `--headless` | `--interview` | CLI, TUI, API | Print the edit outcome as JSON and run headless. |
+| `--json` | bool | false | `--headless` | — | CLI, TUI, API | Print the edit outcome as JSON and run headless. |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Allow the agent to use Docker when running. |
 | `--yolo` | bool | false | — | — | CLI, TUI, API | Automatically approve agent actions. |
 | `--auto` | bool | false | — | — | CLI, TUI, API | Run the agent in automatic mode. |
@@ -813,12 +823,10 @@ Available via: CLI, TUI
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
-| `--interview` | bool | false | — | `--headless`, `--json` | CLI, TUI, API | Ask clarifying questions before editing the existing item. |
 | `--amend` | bool | false | — | — | CLI, TUI, API | Review and amend the existing item using available evidence. |
-| `-n, --headless` | bool | false | — | `--interview` | CLI, TUI, API | Run the edit agent without interactive input. |
+| `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the edit agent without interactive input. |
 | `--prompt` | string (optional) | — | — | — | CLI, TUI, API | Describe the changes to make. |
-| `--global` | bool | false | — | — | CLI, TUI, API | Select the global artifact instead of a repository artifact. |
-| `--json` | bool | false | `--headless` | `--interview` | CLI, TUI, API | Print the edit outcome as JSON and run headless. |
+| `--json` | bool | false | `--headless` | — | CLI, TUI, API | Print the edit outcome as JSON and run headless. |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Allow the agent to use Docker when running. |
 | `--yolo` | bool | false | — | — | CLI, TUI, API | Automatically approve agent actions. |
 | `--auto` | bool | false | — | — | CLI, TUI, API | Run the agent in automatic mode. |
@@ -826,6 +834,7 @@ Available via: CLI, TUI
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the selected agent's model. |
 | `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Add an overlay to the agent session. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Pass a flag to the agent (replaces configured agent flags). |
+| `--global` | bool | false | — | — | CLI, TUI, API | Select the global artifact. |
 
 ### `awman edit skill`
 
@@ -839,12 +848,10 @@ Available via: CLI, TUI
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
-| `--interview` | bool | false | — | `--headless`, `--json` | CLI, TUI, API | Ask clarifying questions before editing the existing item. |
 | `--amend` | bool | false | — | — | CLI, TUI, API | Review and amend the existing item using available evidence. |
-| `-n, --headless` | bool | false | — | `--interview` | CLI, TUI, API | Run the edit agent without interactive input. |
+| `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the edit agent without interactive input. |
 | `--prompt` | string (optional) | — | — | — | CLI, TUI, API | Describe the changes to make. |
-| `--global` | bool | false | — | — | CLI, TUI, API | Select the global artifact instead of a repository artifact. |
-| `--json` | bool | false | `--headless` | `--interview` | CLI, TUI, API | Print the edit outcome as JSON and run headless. |
+| `--json` | bool | false | `--headless` | — | CLI, TUI, API | Print the edit outcome as JSON and run headless. |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Allow the agent to use Docker when running. |
 | `--yolo` | bool | false | — | — | CLI, TUI, API | Automatically approve agent actions. |
 | `--auto` | bool | false | — | — | CLI, TUI, API | Run the agent in automatic mode. |
@@ -852,6 +859,7 @@ Available via: CLI, TUI
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the selected agent's model. |
 | `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Add an overlay to the agent session. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Pass a flag to the agent (replaces configured agent flags). |
+| `--global` | bool | false | — | — | CLI, TUI, API | Select the global artifact. |
 
 ### `awman edit agent`
 
@@ -865,12 +873,10 @@ Available via: CLI, TUI
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
-| `--interview` | bool | false | — | `--headless`, `--json` | CLI, TUI, API | Ask clarifying questions before editing the existing item. |
 | `--amend` | bool | false | — | — | CLI, TUI, API | Review and amend the existing item using available evidence. |
-| `-n, --headless` | bool | false | — | `--interview` | CLI, TUI, API | Run the edit agent without interactive input. |
+| `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the edit agent without interactive input. |
 | `--prompt` | string (optional) | — | — | — | CLI, TUI, API | Describe the changes to make. |
-| `--global` | bool | false | — | — | CLI, TUI, API | Select the global artifact instead of a repository artifact. |
-| `--json` | bool | false | `--headless` | `--interview` | CLI, TUI, API | Print the edit outcome as JSON and run headless. |
+| `--json` | bool | false | `--headless` | — | CLI, TUI, API | Print the edit outcome as JSON and run headless. |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Allow the agent to use Docker when running. |
 | `--yolo` | bool | false | — | — | CLI, TUI, API | Automatically approve agent actions. |
 | `--auto` | bool | false | — | — | CLI, TUI, API | Run the agent in automatic mode. |
@@ -878,6 +884,7 @@ Available via: CLI, TUI
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the selected agent's model. |
 | `--overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Add an overlay to the agent session. |
 | `--agent-flag` | string (repeatable) | [] | — | — | CLI, TUI, API | Pass a flag to the agent (replaces configured agent flags). |
+| `--global` | bool | false | — | — | CLI, TUI, API | Select the global artifact. |
 
 ---
 

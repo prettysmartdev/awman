@@ -467,7 +467,11 @@ struct RemoteRun {
     /// Pipes for the first sequential slot (the `slot_io` handed out).
     first_slot: Option<SlotPipes>,
     slots: HashMap<SlotId, RemoteSlot>,
-    engine_requests: Option<UnboundedReceiver<EngineRequest>>,
+    /// Workflow controls belong to the command, not to any one container.
+    /// Replacing a sequential slot must not close a presenter's sender or
+    /// discard requests already queued on it.
+    engine_requests_tx: UnboundedSender<EngineRequest>,
+    engine_requests: UnboundedReceiver<EngineRequest>,
     stuck: Option<tokio::sync::broadcast::Sender<StuckEvent>>,
     cancel_sent: bool,
     finished: bool,
@@ -542,6 +546,7 @@ fn new_run(feeds: TabCommandFeeds) -> (RemoteRun, TabFeeds, ContainerSlotIo) {
     let (dialog_response_tx, dialog_response_rx) = std::sync::mpsc::channel();
     let (command_result_tx, command_result_rx) = std::sync::mpsc::channel();
     let (slot_io, pipes) = slot_channels();
+    let (engine_requests_tx, engine_requests) = tokio::sync::mpsc::unbounded_channel();
     (
         RemoteRun {
             feeds,
@@ -554,7 +559,8 @@ fn new_run(feeds: TabCommandFeeds) -> (RemoteRun, TabFeeds, ContainerSlotIo) {
             dialog_close_barrier: false,
             first_slot: Some(pipes),
             slots: HashMap::new(),
-            engine_requests: None,
+            engine_requests_tx,
+            engine_requests,
             stuck: None,
             cancel_sent: false,
             finished: false,
@@ -1594,17 +1600,15 @@ fn collect_inputs(shared: &Shared) -> Vec<Outbound> {
                     }));
                 }
             }
-            if let Some(requests) = run.engine_requests.as_mut() {
-                while let Ok(request) = requests.try_recv() {
-                    if let EngineRequest::OpenControlBoard { step_name } = request {
-                        frames.push(Outbound::Frame(FrontendFrame::WorkflowRequest {
-                            tab_id: tab_id.clone(),
-                            request: WorkflowRequestWire::OpenControlBoard { step_name },
-                        }));
-                    }
-                    // Stuck/unstuck reports are the engine's own detector's
-                    // in this backend; the presenter's are not relayed.
+            while let Ok(request) = run.engine_requests.try_recv() {
+                if let EngineRequest::OpenControlBoard { step_name } = request {
+                    frames.push(Outbound::Frame(FrontendFrame::WorkflowRequest {
+                        tab_id: tab_id.clone(),
+                        request: WorkflowRequestWire::OpenControlBoard { step_name },
+                    }));
                 }
+                // Stuck/unstuck reports are the engine's own detector's
+                // in this backend; the presenter's are not relayed.
             }
         }
         let touched = tab.feeds.signals.last_user_input();
@@ -2316,19 +2320,15 @@ fn launch_slot(address: &Path, run: &mut RemoteRun, slot: &SlotSnapshot, in_grou
                     pipes
                 }
             };
-            // A dynamic leader or a later sequential step gets a fresh
-            // launch id. Attach the workflow request channel to that launch,
-            // just as the builtin presenter does, so Ctrl-W keeps reaching
-            // the daemon after the initial bound slot is replaced.
-            let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
+            // A new container gets its own stuck feed but keeps the same
+            // command-wide workflow request channel, including queued Ctrl-W.
             let (stuck_tx, stuck_rx) = tokio::sync::broadcast::channel(16);
-            run.engine_requests = Some(requests_rx);
             run.stuck = Some(stuck_tx);
             run.feeds
                 .container
                 .push(ContainerSlotEvent::EngineAttached {
                     launch_id: run.feeds.container.launch_id(),
-                    requests: Some(requests_tx),
+                    requests: Some(run.engine_requests_tx.clone()),
                     stuck: Some(stuck_rx),
                 });
             pipes

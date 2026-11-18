@@ -1182,7 +1182,9 @@ impl WorkflowEngine {
                     available.can_finish_workflow = true;
                     available.finish_workflow_unavailable_reason = None;
                     available.can_launch_next = false;
-                    available.can_dismiss = !self.active_steps.is_empty();
+                    // Final review outlives the containers. Esc must keep
+                    // this loop waiting for Ctrl-W even after the last exit.
+                    available.can_dismiss = true;
                     available.simple_advance = None;
                 }
                 let action = self

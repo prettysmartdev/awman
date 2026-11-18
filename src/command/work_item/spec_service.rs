@@ -21,7 +21,7 @@ use crate::command::commands::launch_policy::agent_session::{
     AgentSessionRequest,
 };
 use crate::command::commands::launch_policy::LaunchPolicy;
-use crate::command::commands::prompt_templates::render_interview_prompt;
+use crate::command::commands::prompt_templates::render_new_spec_prompt;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::issue::Issue;
@@ -39,7 +39,6 @@ use crate::engine::issue::IssueSource;
 /// or nothing (an interview for a remote source that was left unedited).
 #[derive(Debug, Clone, Serialize)]
 pub struct NewSpecOutcome {
-    pub interview: bool,
     pub created_path: Option<String>,
     pub created_url: Option<String>,
     pub number: Option<u32>,
@@ -68,15 +67,18 @@ impl WorkItemKind {
 /// Questions used only by spec creation. Editing needs `AgentLaunchFrontend`.
 pub trait NewSpecFrontend: UserMessageSink + AgentLaunchFrontend + Send + Sync {
     /// Prompt the user for the title of the new spec. Returns the title text.
-    /// CLI implementations gate this on `stdin_is_tty()` and fall back to a
-    /// generated default when not a TTY.
+    /// A frontend without an input surface must refuse to invent an answer.
     fn ask_spec_title(&mut self) -> Result<String, CommandError> {
-        Ok("Untitled work item".to_string())
+        Err(CommandError::InteractiveInputUnavailable {
+            prompt: "spec title".into(),
+        })
     }
 
     /// Prompt for a one-line summary.
     fn ask_spec_summary(&mut self) -> Result<String, CommandError> {
-        Ok(String::new())
+        Err(CommandError::InteractiveInputUnavailable {
+            prompt: "spec summary".into(),
+        })
     }
 
     /// Put `prompt` to the user and return the kind they chose.
@@ -91,13 +93,6 @@ pub trait NewSpecFrontend: UserMessageSink + AgentLaunchFrontend + Send + Sync {
         _prompt: &Prompt<WorkItemKind>,
     ) -> Result<WorkItemKind, CommandError> {
         Ok(WorkItemKind::Task)
-    }
-
-    /// Prompt for a summary pre-populated with `content`. The TUI implementation
-    /// renders the text box pre-filled; headless frontends return the
-    /// content unmodified.
-    fn ask_spec_summary_prefilled(&mut self, content: &str) -> Result<String, CommandError> {
-        Ok(content.to_string())
     }
 }
 
@@ -182,20 +177,20 @@ pub struct RemoteSpecEditEnd {
 }
 
 /// `new spec` body. Resolves the creation target and the template, runs the
-/// Q&A through the supplied frontend, then either writes a numbered local
-/// file or creates a remote work item, and (when `interview` is set, or the
-/// spec is seeded from `--work-item`) hands it to an agent for completion.
+/// title/type/summary questions through the supplied frontend, then hands a
+/// local file or a remote draft to an agent for completion.
 /// Called by `NewCommand::Spec`.
 pub(crate) async fn create_new_spec(
     engines: &Engines,
     session: Session,
-    interview: bool,
-    non_interactive: bool,
-    work_item: Option<String>,
+    flags: crate::command::commands::new::NewSpecFlags,
     cancel: &CancellationToken,
     frontend: &mut dyn NewSpecFrontend,
 ) -> Result<NewSpecOutcome, CommandError> {
     const LABEL: &str = "new spec";
+    let non_interactive = flags.non_interactive;
+    engines.require_container_runtime()?;
+    crate::command::commands::edit::require_repository_mount(&session, frontend, LABEL, "a spec")?;
     let git_root = session.git_root().to_path_buf();
     let config = session.effective_config();
     let template_path = config.work_items_template(&git_root);
@@ -236,67 +231,81 @@ pub(crate) async fn create_new_spec(
     let target = resolver
         .creation_target()
         .map_err(|e| report(frontend, LABEL, e))?;
-    let seed: Option<ResolvedWorkItem> =
-        match resolver.resolve(work_item.as_deref(), &mut *frontend).await {
-            Ok(seed) => seed,
-            Err(e) => return Err(report(frontend, LABEL, e)),
-        };
+    let seed: Option<ResolvedWorkItem> = match resolver
+        .resolve(flags.work_item.as_deref(), &mut *frontend)
+        .await
+    {
+        Ok(seed) => seed,
+        Err(e) => return Err(report(frontend, LABEL, e)),
+    };
     if let Some(seed) = &seed {
         resolver
             .ensure_new_in_target(seed, &target)
             .map_err(|e| report(frontend, LABEL, e))?;
     }
 
-    // When seeded, kind/title/summary come from the seed. The default kind
-    // is Task (the safe default, matching the unseeded path); the interview
-    // agent can revise it from the content. A remote seed contributes its raw
-    // body: the title is passed separately, so no `# <title>` is added.
-    let seed_summary = seed.as_ref().map(|s| match &s.issue {
-        Some(issue) => issue.body.clone(),
-        None => s.content.clone(),
-    });
-    let (kind, title, summary, slug) = match &seed {
-        Some(seed) => (
-            WorkItemKind::Task,
-            seed.title.clone(),
-            seed_summary.clone().unwrap_or_default(),
-            seed.slug.clone().unwrap_or_else(|| slugify(&seed.title)),
-        ),
+    let (kind, title, summary) = match &seed {
+        Some(seed) => {
+            let source_body = seed
+                .issue
+                .as_ref()
+                .map_or(seed.content.as_str(), |issue| issue.body.as_str());
+            let summary = match &flags.input.summary {
+                Some(brief) => format!(
+                    "Creation brief:\n{brief}\n\nSource work item \"{}\":\n{source_body}",
+                    seed.title
+                ),
+                None => source_body.to_owned(),
+            };
+            (
+                flags.kind.unwrap_or(WorkItemKind::Task),
+                flags
+                    .input
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| seed.title.clone()),
+                summary,
+            )
+        }
         None => {
-            // A dismissed question (Ctrl+C, closed dialog) aborts the command;
-            // any other failure keeps the historical default.
-            let kind = keep_aborted(
-                frontend.ask_spec_kind(&crate::command::prompts::work_item_kind()),
-                WorkItemKind::Task,
-            )?;
-            let title = keep_aborted(frontend.ask_spec_title(), "Untitled".into())?;
-            let summary = keep_aborted(frontend.ask_spec_summary(), String::new())?;
-            let slug = slugify(&title);
-            (kind, title, summary, slug)
+            let kind = match flags.kind {
+                Some(kind) => kind,
+                None if non_interactive => WorkItemKind::Task,
+                None => frontend.ask_spec_kind(&crate::command::prompts::work_item_kind())?,
+            };
+            let title = flags
+                .input
+                .title(non_interactive, || frontend.ask_spec_title())?;
+            let summary = flags
+                .input
+                .summary(non_interactive, || frontend.ask_spec_summary())?;
+            (kind, title, summary)
         }
     };
-
-    // --work-item only: implicit interview with the seed's content.
-    // --work-item + --interview: the user may edit the prefilled content.
-    // --interview only: normal interview.
-    let should_interview = interview || seed.is_some();
-    let interview_summary = match &seed_summary {
-        Some(content) if interview => keep_aborted(
-            frontend.ask_spec_summary_prefilled(content),
-            content.clone(),
-        )?,
-        Some(content) => content.clone(),
-        None => summary.clone(),
+    let agent = resolve_agent(&session, &None, LABEL, frontend)?;
+    let credentials = resolve_credentials(engines, &session, &agent, LABEL, frontend)?;
+    let mut run_opts = AgentRunOptions {
+        non_interactive,
+        yolo: flags
+            .yolo
+            .then_some(crate::engine::container::options::YoloMode::Enabled),
+        command_secrets: engines.command_secrets(),
+        ..Default::default()
     };
-
     match target {
         WorkItemCreationTarget::Local { directory } => {
+            crate::data::fs::path_guard::validate_under_root(
+                &git_root,
+                &directory,
+                "new spec requires a work item directory inside the mounted repository",
+            )?;
+            if engines.agent_engine.read_only_workspace() {
+                return Err(CommandError::Other(
+                    "a spec cannot be created through a read-only repository mount".into(),
+                ));
+            }
             let number = crate::data::fs::work_item_files::next_work_item_number(&directory)
                 .map_err(|e| report_data(frontend, LABEL, "failed to number the work item", e))?;
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Info,
-                text: format!("{LABEL}: creating work item {number:04}"),
-            });
             let body = apply_work_item_template(
                 &template,
                 kind,
@@ -305,40 +314,80 @@ pub(crate) async fn create_new_spec(
                 &format!("{number:04}"),
             );
             let dest = crate::data::fs::work_item_files::write_new_local_work_item(
-                &git_root, &directory, number, &slug, &body,
+                &git_root,
+                &directory,
+                number,
+                &slugify(&title),
+                &body,
             )
             .map_err(|e| report_data(frontend, LABEL, "failed to write work item", e))?;
-
-            if should_interview {
-                let agent = resolve_agent(&session, &None, LABEL, frontend)?;
-                let credentials = resolve_credentials(engines, &session, &agent, LABEL, frontend)?;
-                let path = Path::new("/workspace")
-                    .join(crate::command::work_item::resolver::repo_relative_display(
-                        &git_root, &dest,
-                    ))
-                    .display()
-                    .to_string();
-                let prompt =
-                    render_interview_prompt(&path, kind.as_str(), &title, &interview_summary);
-                let run_opts = AgentRunOptions {
-                    non_interactive,
-                    env_passthrough: None,
-                    ..Default::default()
-                };
-                run_local_agent(
-                    engines,
-                    &session,
+            let path = Path::new("/workspace")
+                .join(super::resolver::repo_relative_display(&git_root, &dest))
+                .display()
+                .to_string();
+            let collected =
+                session
+                    .effective_config()
+                    .collected_overlays(Vec::new(), None, None)?;
+            let (context_overlays, system_prompt) = LaunchPolicy::for_session(&session)
+                .with_git(&engines.git_engine)
+                .resolve_context_overlays(
+                    &collected.context_overlays,
                     &agent,
-                    run_opts,
-                    Some(credentials),
-                    prompt,
-                    LABEL,
+                    None,
+                    None,
                     frontend,
-                )
-                .await?;
+                )?;
+            run_opts.context_overlays = context_overlays;
+            run_opts.system_prompt = system_prompt;
+            run_opts.directory_overlays = collected.directories;
+            run_opts.include_all_skills = collected.include_all_skills;
+            run_opts.named_skills = collected.named_skills;
+            run_opts.env_passthrough =
+                (!collected.env_passthrough.is_empty()).then_some(collected.env_passthrough);
+            run_opts.initial_prompt = Some(render_new_spec_prompt(
+                &path,
+                kind.as_str(),
+                &title,
+                &summary,
+                non_interactive,
+                false,
+            ));
+            let execution = run_agent_session(
+                engines,
+                &session,
+                AgentSessionRequest {
+                    label: LABEL,
+                    agent: &agent,
+                    run_opts,
+                    credentials: Some(credentials),
+                },
+                cancel,
+                frontend,
+            )
+            .await;
+            match execution {
+                Ok(info) if info.exit_code == 0 => {}
+                Ok(info) => {
+                    return Err(CommandError::Other(format!(
+                        "new spec: agent exited with code {}; work item kept at {}",
+                        info.exit_code,
+                        dest.display()
+                    )))
+                }
+                Err(AgentSessionError::Launch(error)) => return Err(error),
+                Err(AgentSessionError::Wait(error)) => return Err(error.into()),
+            }
+            let content =
+                crate::data::fs::work_item_files::read_local_work_item(&git_root, &git_root, &dest)
+                    .map_err(|e| CommandError::Other(e.to_string()))?;
+            if content.content.trim().is_empty() {
+                return Err(CommandError::Other(format!(
+                    "new spec: agent left a blank work item at {}",
+                    dest.display()
+                )));
             }
             Ok(NewSpecOutcome {
-                interview: should_interview,
                 created_path: Some(dest.display().to_string()),
                 created_url: None,
                 number: Some(number),
@@ -349,148 +398,51 @@ pub(crate) async fn create_new_spec(
             scope,
             source,
         } => {
-            // The provider assigns the number when the issue is created, so
-            // the template's `{{number}}` renders empty and no local number
-            // or directory is touched.
             let body = apply_work_item_template(&template, kind, &title, &summary, "");
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Info,
-                text: format!("{LABEL}: creating a {provider} work item in {scope}"),
+            frontend.write_message(UserMessage { level: MessageLevel::Info,
+                text: format!("new spec: creating a {provider} work item; draft edits are published to {scope} while the agent runs"),
             });
-            if should_interview {
-                // Say so before launch: the agent's edits leave the machine
-                // while it runs, not only when it exits.
+            let created = run_remote_edit(
+                engines,
+                &session,
+                RemoteSpecEdit {
+                    agent: &agent,
+                    run_opts,
+                    credentials: Some(credentials),
+                    source,
+                    mode: DraftSyncMode::Create {
+                        title: title.clone(),
+                    },
+                    seed: body,
+                    prompt: &|path| {
+                        render_new_spec_prompt(
+                            path,
+                            kind.as_str(),
+                            &title,
+                            &summary,
+                            non_interactive,
+                            true,
+                        )
+                    },
+                    label: LABEL,
+                },
+                cancel,
+                frontend,
+            )
+            .await?;
+            if created.is_none() {
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Info,
-                    text: format!(
-                        "{LABEL}: draft edits are published to {scope} while the agent runs"
-                    ),
+                    text: "new spec: the draft was not changed, so no work item was created".into(),
                 });
             }
-            let created = if should_interview {
-                let agent = resolve_agent(&session, &None, LABEL, frontend)?;
-                let credentials = resolve_credentials(engines, &session, &agent, LABEL, frontend)?;
-                let run_opts = AgentRunOptions {
-                    non_interactive,
-                    env_passthrough: None,
-                    ..Default::default()
-                };
-                let kind = kind.as_str();
-                let created = run_remote_edit(
-                    engines,
-                    &session,
-                    RemoteSpecEdit {
-                        agent: &agent,
-                        run_opts,
-                        credentials: Some(credentials),
-                        source,
-                        mode: DraftSyncMode::Create {
-                            title: title.clone(),
-                        },
-                        seed: body,
-                        prompt: &|path| {
-                            render_interview_prompt(path, kind, &title, &interview_summary)
-                        },
-                        label: LABEL,
-                    },
-                    cancel,
-                    frontend,
-                )
-                .await?;
-                if created.is_none() {
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Info,
-                        text: format!(
-                            "{LABEL}: the draft was not changed, so no work item was created"
-                        ),
-                    });
-                }
-                created
-            } else {
-                if cancel.is_cancelled() {
-                    return Err(CommandError::Aborted);
-                }
-                Some(create_remote_now(engines, &session, source, &title, &body, frontend).await?)
-            };
             Ok(NewSpecOutcome {
-                interview: should_interview,
                 created_path: None,
                 number: created.as_ref().and_then(|i| i.number),
                 created_url: created.map(|i| i.source_id),
             })
         }
     }
-}
-
-/// The answer to a `new spec` question, or `default` when the frontend could
-/// not ask it. A dismissed question is `Aborted` and stops the command, so a
-/// cancelled dialog can never publish an `Untitled` remote work item.
-fn keep_aborted<T>(answer: Result<T, CommandError>, default: T) -> Result<T, CommandError> {
-    match answer {
-        Ok(value) => Ok(value),
-        Err(CommandError::Aborted) => Err(CommandError::Aborted),
-        Err(_) => Ok(default),
-    }
-}
-
-/// Create a remote work item right away (`new spec` without an interview).
-/// The body is first written to a recovery draft in the repo context
-/// directory; it is deleted once the provider confirms the creation, and kept
-/// (with its path printed) when the creation fails.
-async fn create_remote_now(
-    engines: &Engines,
-    session: &Session,
-    source: Arc<dyn IssueSource>,
-    title: &str,
-    body: &str,
-    frontend: &mut dyn NewSpecFrontend,
-) -> Result<Issue, CommandError> {
-    const LABEL: &str = "new spec";
-    let git_root = session.git_root().to_path_buf();
-    let origin_url = engines.git_engine.remote_effective_url(&git_root, "origin");
-    let resolver = crate::data::fs::context_dirs::ContextDirResolver::from_env(session.env())
-        .map_err(|e| report_data(frontend, LABEL, "context directory is unavailable", e))?;
-    let paths =
-        resolver.work_item_draft_paths(origin_url.as_deref(), &git_root, uuid::Uuid::new_v4());
-    let draft = crate::data::fs::work_item_draft::WorkItemDraft::create(paths, body)
-        .map_err(|e| report_data(frontend, LABEL, "failed to write the recovery draft", e))?;
-    let (title, body) = (title.to_string(), body.to_string());
-    let result =
-        tokio::task::spawn_blocking(move || source.create_issue(&title, &body, &git_root)).await;
-    let host_path = draft.paths().host_path.clone();
-    let error = match result {
-        Ok(Ok(issue)) => {
-            announce_created(&issue, LABEL, frontend);
-            if let Err(e) = draft.remove() {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Warning,
-                    text: format!(
-                        "{LABEL}: could not remove the draft at {}: {e}",
-                        host_path.display()
-                    ),
-                });
-            }
-            return Ok(issue);
-        }
-        Ok(Err(e)) => CommandError::WorkItem(WorkItemError::Provider(e)),
-        Err(e) => CommandError::Other(format!("work item creation task failed: {e}")),
-    };
-    frontend.write_message(UserMessage {
-        level: MessageLevel::Error,
-        text: format!(
-            "{LABEL}: failed to create the work item: {error}; draft kept at {}",
-            host_path.display()
-        ),
-    });
-    Err(error)
-}
-
-fn announce_created(issue: &Issue, label: &str, frontend: &mut dyn NewSpecFrontend) {
-    let number = issue.number.map(|n| format!(" (#{n})")).unwrap_or_default();
-    frontend.write_message(UserMessage {
-        level: MessageLevel::Info,
-        text: format!("{label}: created work item {}{number}", issue.source_id),
-    });
 }
 
 /// Input to a remote draft session. Existing issues always use
@@ -605,6 +557,11 @@ pub async fn run_remote_spec_edit_with_overlays(
             Ok((context_overlays, system_prompt)) => {
                 run_opts.context_overlays = context_overlays;
                 run_opts.system_prompt = system_prompt;
+                run_opts.directory_overlays = collected.directories;
+                run_opts.include_all_skills = collected.include_all_skills;
+                run_opts.named_skills = collected.named_skills;
+                run_opts.env_passthrough =
+                    (!collected.env_passthrough.is_empty()).then_some(collected.env_passthrough);
                 run_opts.initial_prompt = Some(prompt(&container_path));
                 build_instance(
                     engines,
@@ -647,6 +604,7 @@ pub async fn run_remote_spec_edit_with_overlays(
             ));
         }
     };
+    frontend.set_stuck_sender(execution.stuck_sender());
     let (running, events) = DraftSync::start(DraftSyncRequest {
         draft: prepared.draft,
         seeded_body: prepared.seeded_body,
@@ -657,6 +615,7 @@ pub async fn run_remote_spec_edit_with_overlays(
     let outcome =
         wait_with_draft_sync(&mut execution, running, events, cancel, &mut *frontend).await;
     frontend.set_pty_active(false);
+    frontend.wait_output_drained().await;
     frontend.replay_queued();
 
     Ok(RemoteSpecEditEnd {
@@ -665,40 +624,7 @@ pub async fn run_remote_spec_edit_with_overlays(
         draft_host_path: host_path,
     })
 }
-/// Compatibility behavior for local creation interviews: wait errors and
-/// nonzero exits have historically been ignored, and cancellation is not wired.
-#[allow(clippy::too_many_arguments)]
-async fn run_local_agent(
-    engines: &Engines,
-    session: &Session,
-    agent: &AgentName,
-    mut run_opts: AgentRunOptions,
-    credentials: Option<AgentCredentials>,
-    prompt: String,
-    label: &str,
-    frontend: &mut dyn NewSpecFrontend,
-) -> Result<(), CommandError> {
-    run_opts.initial_prompt = Some(prompt);
-    match run_agent_session(
-        engines,
-        session,
-        AgentSessionRequest {
-            label,
-            agent,
-            run_opts,
-            credentials,
-        },
-        &CancellationToken::new(),
-        frontend,
-    )
-    .await
-    {
-        Err(AgentSessionError::Launch(error)) => Err(error),
-        Ok(_) | Err(AgentSessionError::Wait(_)) => Ok(()),
-    }
-}
-
-/// Creation retains the legacy error precedence: sync, wait, then exit status.
+/// Report sync failures before agent wait and exit failures. sync, wait, then exit status.
 async fn run_remote_edit(
     engines: &Engines,
     session: &Session,
@@ -785,7 +711,7 @@ fn apply_work_item_template(
 }
 
 /// Slugify a title: lowercase, ASCII alphanumerics + hyphens.
-fn slugify(input: &str) -> String {
+pub(crate) fn slugify(input: &str) -> String {
     let mut out = String::new();
     let mut last_dash = true;
     for c in input.chars() {

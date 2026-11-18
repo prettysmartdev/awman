@@ -76,18 +76,15 @@ impl AgentDirs {
     ///
     /// The repo directory is repo-controlled, so nothing below the git root is
     /// followed: a symlinked `.awman` or `agents` directory, or a symlink at a
-    /// destination name (dangling or not), is refused or replaced, never
-    /// written through. Without `force` publication is no-clobber: an
-    /// existing entry fails before anything is written, and a file created
-    /// concurrently is never replaced. With `force` an existing entry is
-    /// replaced in place, inside the selected directory only. The global
-    /// home itself may be a symlink (it is the user's own), its `agents`
+    /// destination name (dangling or not), is refused, never
+    /// written through. Publication is no-clobber: an existing entry fails
+    /// before anything is written, and a concurrently created file is never
+    /// replaced. The global home itself may be a symlink (it is the user's own), its `agents`
     /// subdirectory may not.
     pub fn publish(
         &self,
         scope: DefinitionScope,
         files: &[(&str, &[u8])],
-        force: bool,
     ) -> Result<Vec<PathBuf>, DataError> {
         let (base, components): (PathBuf, &[&str]) = match scope {
             DefinitionScope::Repo => (
@@ -108,7 +105,7 @@ impl AgentDirs {
                 return Err(DataError::Other(format!("invalid file name {name:?}")));
             }
         }
-        publish_files(&base, components, files, force)?;
+        publish_files(&base, components, files)?;
         Ok(files.iter().map(|(name, _)| dir.join(name)).collect())
     }
 
@@ -134,7 +131,7 @@ impl AgentDirs {
 
 fn already_exists(path: &Path) -> DataError {
     DataError::Other(format!(
-        "{} already exists; pass --force to overwrite it",
+        "{} already exists; use the agent editing command to change it",
         path.display()
     ))
 }
@@ -147,17 +144,16 @@ fn not_a_directory(path: &Path) -> DataError {
 }
 
 /// Descriptor-relative publication: every directory below `base` is opened
-/// with `O_NOFOLLOW`, and files are created, linked and renamed relative to
+/// with `O_NOFOLLOW`, and files are created and linked relative to
 /// that descriptor, so a concurrent symlink swap cannot redirect a write.
 #[cfg(unix)]
 fn publish_files(
     base: &Path,
     components: &[&str],
     files: &[(&str, &[u8])],
-    force: bool,
 ) -> Result<(), DataError> {
     use nix::errno::Errno;
-    use nix::fcntl::{openat, renameat, AtFlags, OFlag, AT_FDCWD};
+    use nix::fcntl::{openat, AtFlags, OFlag, AT_FDCWD};
     use nix::sys::stat::{fstatat, mkdirat, Mode};
     use nix::unistd::{linkat, unlinkat, UnlinkatFlags};
     use std::io::Write;
@@ -183,13 +179,11 @@ fn publish_files(
             e => io(&path, e),
         })?;
     }
-    if !force {
-        for (name, _) in files {
-            match fstatat(&dir, *name, AtFlags::AT_SYMLINK_NOFOLLOW) {
-                Ok(_) => return Err(already_exists(&path.join(name))),
-                Err(Errno::ENOENT) => {}
-                Err(e) => return Err(io(&path.join(name), e)),
-            }
+    for (name, _) in files {
+        match fstatat(&dir, *name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(_) => return Err(already_exists(&path.join(name))),
+            Err(Errno::ENOENT) => {}
+            Err(e) => return Err(io(&path.join(name), e)),
         }
     }
     let mut created: Vec<&str> = Vec::new();
@@ -214,15 +208,11 @@ fn publish_files(
                 .and_then(|()| file.sync_all())
                 .map_err(|e| DataError::io(&target, e));
             let published = written.and_then(|()| {
-                if force {
-                    renameat(&dir, tmp.as_str(), &dir, *name).map_err(|e| io(&target, e))
-                } else {
-                    // link(2) never replaces an entry, symlink or not.
-                    linkat(&dir, tmp.as_str(), &dir, *name, AtFlags::empty()).map_err(|e| match e {
-                        Errno::EEXIST => already_exists(&target),
-                        e => io(&target, e),
-                    })
-                }
+                // link(2) never replaces an entry, symlink or not.
+                linkat(&dir, tmp.as_str(), &dir, *name, AtFlags::empty()).map_err(|e| match e {
+                    Errno::EEXIST => already_exists(&target),
+                    e => io(&target, e),
+                })
             });
             let _ = unlinkat(&dir, tmp.as_str(), UnlinkatFlags::NoRemoveDir);
             published?;
@@ -230,7 +220,7 @@ fn publish_files(
         }
         Ok(())
     })();
-    if result.is_err() && !force {
+    if result.is_err() {
         for name in created {
             let _ = unlinkat(&dir, name, UnlinkatFlags::NoRemoveDir);
         }
@@ -245,7 +235,6 @@ fn publish_files(
     base: &Path,
     components: &[&str],
     files: &[(&str, &[u8])],
-    force: bool,
 ) -> Result<(), DataError> {
     use std::io::Write;
     let mut path = base.to_path_buf();
@@ -260,11 +249,9 @@ fn publish_files(
             Err(e) => return Err(DataError::io(&path, e)),
         }
     }
-    if !force {
-        for (name, _) in files {
-            if std::fs::symlink_metadata(path.join(name)).is_ok() {
-                return Err(already_exists(&path.join(name)));
-            }
+    for (name, _) in files {
+        if std::fs::symlink_metadata(path.join(name)).is_ok() {
+            return Err(already_exists(&path.join(name)));
         }
     }
     for (name, body) in files {
@@ -272,13 +259,8 @@ fn publish_files(
         let mut tmp =
             tempfile::NamedTempFile::new_in(&path).map_err(|e| DataError::io(&path, e))?;
         tmp.write_all(body).map_err(|e| DataError::io(&target, e))?;
-        if force {
-            tmp.persist(&target)
-                .map_err(|e| DataError::io(&target, e.error))?;
-        } else {
-            tmp.persist_noclobber(&target)
-                .map_err(|_| already_exists(&target))?;
-        }
+        tmp.persist_noclobber(&target)
+            .map_err(|_| already_exists(&target))?;
     }
     Ok(())
 }

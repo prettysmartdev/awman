@@ -361,7 +361,7 @@ package = "awman-cli"
 target = "test:component"
 contracts = ["component-command"]
 requires = []
-paths = ["tests/component/command/edit_artifacts.rs", "tests/component/command/mod.rs", "src/command/commands/edit/**", "src/data/fs/edit_*.rs"]
+paths = ["tests/component/command/edit_artifacts.rs", "tests/component/command/mod.rs", "src/command/commands/edit/**", "src/command/commands/new/**", "src/command/commands/prompt_templates*", "src/command/commands/prompt_templates/**", "src/command/commands/launch_policy/agent_session.rs", "src/data/fs/edit_*.rs", "src/data/fs/agent_dirs.rs", "src/data/fs/skill_dirs.rs"]
 filter = "test(/^command::edit_artifacts::/)"
 
 [suites.component-command-builtin]

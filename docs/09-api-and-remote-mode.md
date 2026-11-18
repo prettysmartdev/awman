@@ -402,7 +402,7 @@ awman exec workflow ./aspec/workflows/implement-feature.toml --work-item github:
 awman exec workflow ./aspec/workflows/review.toml --headless
 ```
 
-`awman edit` is also headless-capable. A headless edit needs `--prompt` (or `--amend`, which can run without one); `--interview` needs a terminal and conflicts with `--headless` and `--json`:
+`awman new` and `awman edit` run authoring agents and support headless use. A headless edit needs `--prompt` (or `--amend`, which can run without one). Headless creation needs `--title` and `--prompt`, except that `new agent` takes its name positionally and `new spec --work-item` can use the referenced item's title and body. `--json` implies headless mode. All new/edit authoring commands support `--yolo`:
 
 ```sh
 awman edit agent custom --headless --prompt "Correct the model setting"

@@ -48,58 +48,28 @@ The TUI shows the **Workflow Overview** between the execution window and the com
 
 Use `awman new workflow` to create a workflow file interactively without having to remember the schema by hand.
 
-### Interactive step entry
+### Creating with an agent
 
 ```sh
-# CLI
 awman new workflow
-
-# TUI command box
-new workflow
+awman new workflow --format yaml
+awman new workflow --headless --title "Release checks" --prompt "Lint and test before packaging" --yolo
 ```
 
-Both modes prompt for:
+Awman asks only for a title and summary. The title becomes the filename slug.
+It then launches an agent to author the workflow, including its steps,
+dependencies and prompts. Discuss refinements directly with the agent.
+TOML is the default; `--format yaml` selects YAML. Repository files are created
+under `aspec/workflows/` and existing files are never overwritten by creation.
 
-1. **Workflow name** — used as the filename slug (e.g. `my-workflow`). Must contain only letters, digits, hyphens, and underscores.
-2. **Workflow title** — a human-readable label that appears at the top of the file (may differ from the name).
-3. **Steps** — repeat for each step:
-   - Step name (required)
-   - Agent (optional — press Enter to skip)
-   - Model (optional — press Enter to skip)
-   - Depends-on (optional — comma-separated step names, press Enter to skip)
-   - Prompt text — enter multiple lines and end with a line containing only `.`
-
-After each step you are asked whether to add another. When finished, awman writes the file and prints its path.
-
-**TUI key bindings** (workflow dialog):
-
-| Key | Action |
-|-----|--------|
-| **Tab** / **Shift-Tab** | Cycle through fields |
-| **Ctrl-N** | Commit the current step and start a new one |
-| **Ctrl-Enter** | Finish — write the file and close the dialog |
-| **Esc** | Cancel without writing |
-
-By default awman writes to `aspec/workflows/<name>.toml` inside the current repo. Pass `--format` to choose a different format:
-
-```sh
-awman new workflow --format yaml   # writes aspec/workflows/<name>.yaml
-```
-
-### Interview mode
-
-```sh
-awman new workflow --interview
-```
-
-Enter a one-paragraph summary of what the workflow should accomplish. A code agent writes the complete workflow file for you — filling in step names, dependencies, agents, models, and detailed prompts — the same way `new spec --interview` writes a work item.
-
-In the TUI, the dialog switches to a two-field layout: workflow name and summary. Press **Ctrl-Enter** to start the interview agent.
+Use `--title` and `--prompt` to supply the initial answers. Both are required
+for headless creation. `--json` implies headless mode and prints the outcome as
+JSON. `--yolo` selects the agent's configured most-permissive mode.
 
 ### Editing a workflow
 
 ```sh
-awman edit workflow release --interview             # the agent asks what you want to change, then edits
+awman edit workflow release             # the agent asks what you want to change, then edits
 awman edit workflow release --amend                 # reconcile the workflow with the commands and files it references
 awman edit workflow release --global --prompt "Add a lint step before tests"
 ```
@@ -114,31 +84,23 @@ awman new workflow --global
 
 Writes to `~/.awman/workflows/<name>.<ext>` instead of the current repo. Use this to build a personal library of reusable workflows that travel with you across projects.
 
-`--global` and `--interview` can be combined. When combined, the agent is given access only to the `~/.awman/workflows/` directory — not the whole repo or home directory — so your other files stay safe. This still requires being inside a git repository (for agent image lookup).
+Global authoring uses a private staged copy of the target file in the repository context. The agent sees that copy and the current repository; your home directory is not mounted. After the session, awman validates and saves the file. Run this inside a Git repository.
 
-### Flags
+### Flags and failure handling
 
 | Flag | Description |
 |------|-------------|
-| `--interview` | Let a code agent complete the workflow from a short summary |
-| `--global` | Write to `~/.awman/workflows/` instead of the current repo |
-| `--format <fmt>` | Output format: `toml` (default) or `yaml`. Markdown is not supported |
+| `--title`, `--prompt` | Supply the title and summary instead of asking |
+| `--headless`, `-n` | Run without interactive input |
+| `--json` | Print the result as JSON; implies headless mode |
+| `--yolo` | Use the agent's configured most-permissive mode |
+| `--global` | Save under `~/.awman/workflows/` |
+| `--format` | `toml` (default) or `yaml` |
 
-### Edge cases
-
-| Situation | Behaviour |
-|-----------|-----------|
-| Name contains spaces or path separators | Rejected immediately with a descriptive error |
-| Workflow file already exists | Error with the existing path; awman does not overwrite silently |
-| Not inside a git repo (non-global) | Error: run with `--global` to write to `~/.awman/` |
-| `--global --interview` outside a git repo | Error: agent image lookup requires a git repo |
-| Empty step name in TUI | Inline error; dialog stays open |
-| No steps added before Ctrl-Enter (TUI) | Inline error: "At least one step is required" |
-| Step prompt is empty (CLI) | Warning logged; empty prompt written to file |
-| `depends_on` names non-existent steps | Warning logged; file is still written (steps may be added later) |
-| Load a `.md` workflow file | Error: "Markdown workflow files are no longer supported. Convert to TOML (.toml) or YAML (.yaml/.yml). See docs/05-workflows.md for the current format." |
-
----
+An existing target is refused; use `edit workflow` to change it. An agent failure
+or invalid result fails the command. Local files remain available for repair;
+a failed save of a global workflow retains a draft and reports its path.
+Cancellation does not roll back edits already made.
 
 ## Workflow file formats
 
@@ -1146,6 +1108,11 @@ change them.
 ## Workflow control board (TUI only)
 
 Press **Ctrl+W** at any time to open the **workflow control board** — a popup that lets you redirect execution without waiting for the current step to finish. Ctrl+W works regardless of whether the container window is maximized or minimized.
+
+At final review, **Esc** hides the board so you can read the agents' output.
+Live agents keep running, and **Ctrl+W** reopens the board whether they are
+still running or have exited. This works with both builtin and daemon
+backends; choose **Finish** when you are ready to proceed to teardown.
 
 There are two variants of the control board:
 

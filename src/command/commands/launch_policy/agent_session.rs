@@ -152,6 +152,7 @@ pub async fn run_agent_session(
             return Err(AgentSessionError::Launch(CommandError::from(error)));
         }
     };
+    frontend.set_stuck_sender(execution.stuck_sender());
     let mut cancel_handle = execution.cancel_handle();
     let wait = execution.wait();
     tokio::pin!(wait);
@@ -177,6 +178,7 @@ pub async fn run_agent_session(
         }
     };
     frontend.set_pty_active(false);
+    frontend.wait_output_drained().await;
     frontend.replay_queued();
     result.map_err(AgentSessionError::Wait)
 }

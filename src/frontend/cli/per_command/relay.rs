@@ -311,19 +311,16 @@ fn decode_outcome(
             let body = &payload["payload"];
             O::New(match payload["kind"].as_str() {
                 Some("Spec") => NewOutcome::Spec(NewSpecOutcome {
-                    interview: field(body, "interview")?,
                     path: field(body, "path")?,
                     url: field(body, "url")?,
                     number: field(body, "number")?,
                 }),
                 Some("Workflow") => NewOutcome::Workflow(NewWorkflowOutcome {
-                    interview: field(body, "interview")?,
                     global: field(body, "global")?,
                     format: field(body, "format")?,
                     path: field(body, "path")?,
                 }),
                 Some("Skill") => NewOutcome::Skill(NewSkillOutcome {
-                    interview: field(body, "interview")?,
                     global: field(body, "global")?,
                     path: field(body, "path")?,
                     pull: field(body, "pull")?,
@@ -346,10 +343,7 @@ fn decode_outcome(
                     name: field(body, "name")?,
                     path: field(body, "path")?,
                     scope: field(body, "scope")?,
-                    skeleton: field(body, "skeleton")?,
                     files_written: field(body, "files_written")?,
-                    approved: field(body, "approved")?,
-                    host_command_block: field(body, "host_command_block")?,
                     next_step: field(body, "next_step")?,
                 }),
                 _ => {

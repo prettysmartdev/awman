@@ -63,9 +63,8 @@ pub struct AvailableActions {
     /// (excludes the focused step itself). Finish remains available once the
     /// final group is ready for review.
     pub parallel_peers_running: usize,
-    /// True when a container is currently running (mid-step). The engine
-    /// computes this from `current_execution.is_some()` in
-    /// `compute_available_actions`. Changes Esc semantics from Pause to Dismiss.
+    /// Whether Esc hides the board while keeping the workflow active rather
+    /// than pausing it. Final review remains dismissible after containers exit.
     pub can_dismiss: bool,
     /// Custom label for the right-arrow (launch-next) action. Defaults to
     /// "Next: new container" when `None`. The dynamic leader step sets this to

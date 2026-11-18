@@ -33,14 +33,19 @@ use crate::data::fs::edit_target::{
 use crate::data::WorkflowFormat;
 
 /// Run `edit workflow|skill|agent` for one resolved kind.
-pub(super) async fn run(
+pub(crate) async fn run(
     command: &EditCommand,
     kind: ArtifactKind,
     flags: EditArtifactFlags,
-    frontend: &mut dyn EditCommandFrontend,
+    frontend: &mut dyn AgentLaunchFrontend,
 ) -> Result<EditOutcome, CommandError> {
     let edit_kind = edit_kind(kind);
-    let label = edit_kind.label();
+    let creation_label = format!("new {}", edit_kind.as_str());
+    let label = if command.creating {
+        &creation_label
+    } else {
+        edit_kind.label()
+    };
     let engines = command.engines();
     let session = command.session();
     let common = &flags.common;
@@ -161,7 +166,7 @@ pub(super) async fn run(
         Err(e) => return Err(discard(stage, frontend, label, e)),
     };
     let edit_target = build_edit_target(edit_kind, &target, stage.as_ref());
-    let prompt = render_prompt(&target, &edit_target, common);
+    let prompt = render_prompt(&target, &edit_target, common, command.creating);
 
     let mut run_opts = run_options(common);
     run_opts.command_secrets = engines.command_secrets();
@@ -312,7 +317,12 @@ fn workspace_path(target: &ArtifactTarget, rel: &str) -> String {
     path
 }
 
-fn render_prompt(target: &ArtifactTarget, edit: &EditTarget, flags: &EditCommonFlags) -> String {
+fn render_prompt(
+    target: &ArtifactTarget,
+    edit: &EditTarget,
+    flags: &EditCommonFlags,
+    creating: bool,
+) -> String {
     let format = match target.format {
         Some(WorkflowFormat::Yaml) => "YAML",
         _ => "TOML",
@@ -337,6 +347,7 @@ fn render_prompt(target: &ArtifactTarget, edit: &EditTarget, flags: &EditCommonF
         .map(|f| f.container_path.clone())
         .collect();
     render_edit_prompt(&EditPromptRequest {
+        creating,
         subject,
         name: &target.name,
         primary_path: &primary,
@@ -348,7 +359,6 @@ fn render_prompt(target: &ArtifactTarget, edit: &EditTarget, flags: &EditCommonF
             EditLocation::StagedCopy
         },
         global: target.scope != ArtifactScope::Repo,
-        interview: flags.interview,
         amend: flags.amend,
         headless: flags.headless,
         brief: flags.prompt.as_deref(),
@@ -424,7 +434,7 @@ fn check(target: &ArtifactTarget) -> Result<SaveSummary, SaveFailure> {
 /// The agent never ran: remove the unused draft and return `error`.
 fn discard(
     stage: Option<EditStage>,
-    frontend: &mut dyn EditCommandFrontend,
+    frontend: &mut dyn AgentLaunchFrontend,
     label: &str,
     error: CommandError,
 ) -> CommandError {
@@ -452,14 +462,14 @@ fn bullet_list(items: &[String]) -> String {
     items.iter().map(|i| format!("\n  - {i}")).collect()
 }
 
-fn error(frontend: &mut dyn EditCommandFrontend, label: &str, text: &str) {
+fn error(frontend: &mut dyn AgentLaunchFrontend, label: &str, text: &str) {
     frontend.write_message(UserMessage {
         level: MessageLevel::Error,
         text: format!("{label}: {text}"),
     });
 }
 
-fn warn(frontend: &mut dyn EditCommandFrontend, label: &str, text: &str) {
+fn warn(frontend: &mut dyn AgentLaunchFrontend, label: &str, text: &str) {
     frontend.write_message(UserMessage {
         level: MessageLevel::Warning,
         text: format!("{label}: {text}"),
@@ -513,7 +523,6 @@ mod tests {
     fn flags() -> EditCommonFlags {
         EditCommonFlags {
             reference: "release".into(),
-            interview: false,
             amend: false,
             headless: true,
             prompt: Some("rename step {path}".into()),
@@ -566,7 +575,7 @@ mod tests {
             Some("aspec/workflows"),
         );
         let edit = build_edit_target(EditKind::Workflow, &t, None);
-        let prompt = render_prompt(&t, &edit, &flags());
+        let prompt = render_prompt(&t, &edit, &flags(), false);
         assert!(prompt.contains("/workspace/aspec/workflows/release.yaml"));
         assert!(prompt.contains("YAML"));
         assert!(prompt.contains("rename step {path}"));
@@ -574,7 +583,7 @@ mod tests {
         let a = target(ArtifactKind::Agent, ArtifactScope::Global, Some("x"));
         let edit = build_edit_target(EditKind::Agent, &a, None);
         assert_eq!(edit.scope, EditScope::Global);
-        let prompt = render_prompt(&a, &edit, &flags());
+        let prompt = render_prompt(&a, &edit, &flags(), false);
         assert!(prompt.contains("/workspace/x/Dockerfile.bot"));
     }
 

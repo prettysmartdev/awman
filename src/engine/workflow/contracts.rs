@@ -602,6 +602,10 @@ impl WorkflowFrontend for FinalReviewFrontend {
             "unattended runs must not wait for final review"
         );
         assert!(actions.can_finish_workflow);
+        assert!(
+            actions.can_dismiss,
+            "Esc must leave final review available even after every agent exits"
+        );
         assert!(!actions.can_launch_next);
         assert!(actions.simple_advance.is_none());
         assert_eq!(state.current_phase, WorkflowPhase::Main);

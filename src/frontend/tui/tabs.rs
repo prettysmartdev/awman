@@ -390,8 +390,8 @@ pub struct Tab {
     pub output_lines: Vec<String>,
     pub stuck: bool,
     pub yolo_mode: bool,
-    /// Broadcast receiver for stuck/unstuck events from the container engine.
-    /// Drained non-blockingly in `tick_all_tabs` for tab coloring.
+    /// Requests to the command's workflow engine. Survives container changes
+    /// so Ctrl-W remains available while the workflow waits for final review.
     pub engine_tx:
         Option<tokio::sync::mpsc::UnboundedSender<crate::engine::workflow::EngineRequest>>,
 

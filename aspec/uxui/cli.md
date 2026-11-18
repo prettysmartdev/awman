@@ -77,13 +77,12 @@ command or flag.
 artifacts that exist; creation stays under `new`. There is no `specs`
 command and no alias for the retired spec-amendment subcommand.
 
-- **Flags.** Every leaf has `--interview`, `--amend`, `--prompt`, `--headless`
+- **Flags.** Every leaf has `--amend`, `--prompt`, `--headless`
   (`-n`), `--json` (implies headless), and the shared agent launch flags
   (`--agent`, `--model`, `--overlay`, `--agent-flag`, `--auto`, `--yolo`,
   `--allow-docker`). `workflow`, `skill` and `agent` also take `--global`.
   `--plan` is not offered.
-- **Usage rules.** `--interview` conflicts with `--headless` and `--json`
-  (it needs a person). A headless edit requires `--prompt` unless `--amend` is
+- **Usage rules.** A headless edit requires `--prompt` unless `--amend` is
   set. An empty `--prompt` is treated as absent.
 - **Target resolution** happens before anything launches or is copied.
   Workflows, skills and agents resolve in the repo first; `--global` selects
@@ -107,8 +106,39 @@ command and no alias for the retired spec-amendment subcommand.
   listed.
 - **Trust.** Editing an agent definition never approves, builds, or runs it;
   the changed definition is pending approval until `ready --agent` reviews it.
-- **Interview and amendment** apply uniformly to every kind and combine:
-  `--amend --interview` discusses uncertain findings before reconciling.
+- **Amendment** applies uniformly to every kind. Interactive agents clarify
+  uncertain findings with the user; headless agents report uncertainty without
+  making speculative changes.
+
+## Creation and editing agent sessions
+
+`new spec|workflow|skill|agent` and `edit spec|workflow|skill|agent` always use
+an agent to author the selected files. The only built-in authoring questions
+are simple title/name, type and summary inputs. There is no workflow step
+builder, skill body editor, direct issue-creation shortcut or `--interview`
+flag. Scaffolding establishes the target and its format; it is never a
+successful alternative to running the agent. Existing files are edited only
+through the agent session. Headless and JSON sessions remain supported, with
+explicit inputs replacing questions. Skill-library pulls remain import
+operations and do not launch an authoring agent.
+
+For creation, `--title` and `--prompt` supply the title/name and summary;
+`new agent` takes its name positionally. Headless creation requires these
+inputs, except that a spec seeded with `--work-item` can use the source title
+and body. `--kind` supplies the work-item type; headless specs default to Task.
+All new/edit authoring commands accept `--yolo` and pass it through the normal
+agent launch policy. It selects that agent's configured most-permissive mode;
+it does not bypass awman's mount scope or definition trust checks.
+`new agent --from` is a session seed, not a copy-only operation, and never
+records approval. Creation refuses existing files; it has no overwrite mode.
+Local spec creation requires its configured directory to remain inside the
+mounted repository; it never writes an inaccessible seed outside that scope.
+
+Agents publish their status through the same container
+feed as `chat` and `exec prompt`, including remote work-item draft sessions.
+Tabs and container windows show reported status and use the usual silence
+fallback when an agent does not report. Creation and editing prompts constrain
+which files may change but do not suppress the agent's completion summary.
 
 ## Work item reference grammar
 
@@ -227,6 +257,14 @@ belongs to rather than inventing a new code.
   neither a TTY nor that flag is available.
 - Dismissing a prompt (Esc, or a "No"/"Cancel" choice) never partially
   applies the action it was confirming.
+- In the TUI, Ctrl-W opens workflow controls throughout an active workflow,
+  including final review after all agent containers have exited. Esc at final
+  review only dismisses the board; it does not pause or end the command.
+  Ctrl-W reopens it until the user chooses Finish, Pause, or Abort. Builtin
+  and daemon backends share this behavior.
+  Workflow-control routing belongs to the command lifetime: replacing a
+  container must neither invalidate its sender nor discard queued Ctrl-W
+  requests. Container-specific status feeds remain scoped to their launch.
 
 ## Hint and help-text style
 

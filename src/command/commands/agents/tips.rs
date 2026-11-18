@@ -42,7 +42,7 @@ pub const TIPS: &[&str] = &[
     "`awman exec workflow <file> --on-existing-worktree resume` skips the existing-worktree question.",
     "`awman exec workflow <file> --on-merge-failure agent` has an agent fix a failed merge-back.",
     "Workflow files can be TOML or YAML, with optional setup and teardown phases.",
-    "`awman new workflow` builds a workflow step by step; `--interview` lets an agent draft it.",
+    "`awman new workflow` asks for a title and summary, then an agent authors the workflow.",
     "`awman new workflow --global` saves the workflow to `~/.awman/workflows/` for every repo.",
     "Press Ctrl+W during a workflow to open the workflow control board.",
     "Press Ctrl+O to minimize or maximize the workflow overview.",
@@ -55,7 +55,7 @@ pub const TIPS: &[&str] = &[
     "`awman new skill --pull github.com/obra/superpowers` pulls a published skills library.",
     "`awman new skill --pull-all` refreshes every skills library you've pulled.",
     "`awman new skill --pull builtin` pulls awman's own skills, like `create-custom-agent`.",
-    "`awman new agent <name>` scaffolds a custom agent definition in `.awman/agents/`.",
+    "`awman new agent <name>` launches an agent to author a custom definition in `.awman/agents/`.",
     "`awman new agent crush --from crush` restores `crush` as a custom agent; `maki` works too.",
     // ── Overlays ─────────────────────────────────────────────────────────────
     "`--overlay \"dir(~/notes:/mnt/notes:ro)\"` mounts a host directory into the agent read-only.",

@@ -1,18 +1,7 @@
-//! `awman new agent <name>` — scaffold a custom agent definition.
-//!
-//! Writes files only: the commented skeleton, or one of the shipped examples
-//! (`--from crush|maki`). It never builds. Content the user just asked awman
-//! to write is approved on the spot (repo scope always; global scope when it
-//! declares `[ping]`), so the next `awman ready --agent <name>` does not ask
-//! about it again. A later edit changes the hash and needs a new review.
-
+//! Create a custom agent seed and author it in an isolated agent session.
 use super::*;
-use crate::command::commands::agent_trust::HostCommandReview;
-use crate::data::config::agent_definition::{
-    content_hash, is_first_party_name, load_agent_definition_with_scope, validate_agent_file_stem,
-};
+use crate::data::config::agent_definition::{is_first_party_name, validate_agent_file_stem};
 use crate::data::fs::agent_dirs::{AgentDirs, DefinitionScope};
-use crate::engine::agent::registry::AgentRegistry;
 
 /// The commented skeleton: every key, documented.
 pub const SKELETON: &str = include_str!("../../../../templates/agent-definition.toml");
@@ -48,6 +37,7 @@ pub(super) async fn run(
     f: NewAgentFlags,
     frontend: &mut dyn NewCommandFrontend,
 ) -> Result<NewOutcome, CommandError> {
+    command.engines.require_container_runtime()?;
     let invalid_name = |reason: String| CommandError::InvalidArgumentValue {
         command: vec!["new".into(), "agent".into()],
         argument: "name".into(),
@@ -66,6 +56,9 @@ pub(super) async fn run(
             flag: "from".into(),
             reason,
         })?;
+    let summary = f
+        .input
+        .summary(f.non_interactive, || frontend.ask_agent_summary())?;
 
     let session = &command.session;
     let env = session.env();
@@ -80,32 +73,30 @@ pub(super) async fn run(
         .iter()
         .map(|(file, body)| (file.as_str(), body.as_bytes()))
         .collect();
-    let paths = dirs.publish(scope, &bodies, f.force)?;
+    let paths = dirs.publish(scope, &bodies)?;
     let files_written = paths.iter().map(|p| p.display().to_string()).collect();
     let path = paths[0].clone();
 
-    // The skeleton is incomplete until the user fills it in, so it is never
-    // approved, whatever the file holds by now.
-    let (approved, host_command_block) = match f.from.as_deref() {
-        None => (false, None),
-        Some(example) => {
-            let expected = content_hash(
-                files[0].1.as_bytes(),
-                files.get(1).map(|(_, body)| body.as_bytes()),
-            );
-            approve_bundled(env, root, &f.name, scope, &path, example, &expected)?
-        }
-    };
+    author_artifact(
+        command,
+        crate::data::fs::edit_target::ArtifactKind::Agent,
+        &path,
+        f.global,
+        NewSession {
+            headless: f.non_interactive,
+            yolo: f.yolo,
+            summary,
+        },
+        frontend,
+    )
+    .await?;
 
     let next_step = format!("awman ready --agent {}", f.name);
     let outcome = NewAgentOutcome {
         name: f.name,
         path: path.display().to_string(),
         scope,
-        skeleton: f.from.is_none(),
         files_written,
-        approved,
-        host_command_block,
         next_step,
     };
     frontend.show_new_agent(&outcome);
@@ -113,66 +104,12 @@ pub(super) async fn run(
 }
 
 impl NewAgentOutcome {
-    /// The summary both frontends show: the path, the next step, and — when
-    /// the definition declares `[ping]` — the host-command block.
     pub fn render(&self) -> String {
-        let mut out = format!(
-            "Created agent definition ({}): {}",
+        format!(
+            "Created agent definition ({}): {}\nReview and prepare it with: {}",
             self.scope.as_str(),
-            self.path
-        );
-        if self.skeleton {
-            out.push_str(&format!(
-                "\nFill in display_name, [run] and [image], then run: {}",
-                self.next_step
-            ));
-        } else {
-            out.push_str(&format!("\nNext: {}", self.next_step));
-        }
-        if let Some(block) = &self.host_command_block {
-            out.push_str("\n\n");
-            out.push_str(block);
-        }
-        out
+            self.path,
+            self.next_step
+        )
     }
-}
-
-/// Approve the definition at `path` as the bundled `example` whose content
-/// hash is `expected`. The hash comes from the bytes compiled into awman,
-/// never from what is now on disk: the file is re-read only to build the
-/// definition, and only when its bytes still hash to `expected`. Anything
-/// else (say, a concurrent replacement from a running container) is an
-/// error and stays untrusted. Returns whether an approval was recorded and
-/// the host-command block to show.
-pub(super) fn approve_bundled(
-    env: &crate::data::config::env::EnvSnapshot,
-    root: &std::path::Path,
-    name: &str,
-    scope: DefinitionScope,
-    path: &std::path::Path,
-    example: &str,
-    expected: &str,
-) -> Result<(bool, Option<String>), CommandError> {
-    let loaded = load_agent_definition_with_scope(path, scope).map_err(|e| {
-        CommandError::Other(format!(
-            "the bundled '{example}' example does not validate (please report this): {e}"
-        ))
-    })?;
-    if loaded.sha256 != expected {
-        return Err(CommandError::Other(format!(
-            "{} changed while it was being written, so it was not approved; review it, \
-             then run: awman ready --agent {name}",
-            path.display()
-        )));
-    }
-    let def = crate::engine::agent::custom::convert(&loaded, name, scope);
-    let approved = AgentRegistry::needs_approval(&def);
-    if approved {
-        AgentRegistry::record_approval(env, &def, Some(root))?;
-    }
-    let block = def
-        .ping_argv
-        .as_deref()
-        .map(|argv| HostCommandReview::from_argv(argv).render());
-    Ok((approved, block))
 }

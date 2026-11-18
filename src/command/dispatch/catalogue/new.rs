@@ -1,4 +1,4 @@
-//! `new` — scaffolding a spec, a workflow, a skill or a custom agent definition.
+//! `new` — agent authoring for specs, workflows, skills and custom agent definitions.
 //!
 //! Split out of `dispatch/catalogue.rs` by WI 0114 F-51. The specs are data;
 //! `ROOT` in `mod.rs` is what assembles them into the tree.
@@ -32,12 +32,16 @@ pub(super) const NEW_SPEC: CommandSpec = CommandSpec {
     long_help: None,
     arguments: &[],
     flags: &[
+        NEW_JSON,
+        NEW_TITLE,
+        NEW_PROMPT,
+        NEW_YOLO,
         FlagSpec {
-            long: "interview",
+            long: "kind",
             short: None,
-            help: "Use interview mode.",
-            kind: FlagKind::Bool,
-            default: FlagDefault::Bool(false),
+            help: "Work item type.",
+            kind: FlagKind::Enum(&["feature", "bug", "task", "enhancement"]),
+            default: FlagDefault::None,
             frontends: FrontendVisibility::All,
             conflicts_with: &[],
             implies: &[],
@@ -46,7 +50,7 @@ pub(super) const NEW_SPEC: CommandSpec = CommandSpec {
         FlagSpec {
             long: "headless",
             short: Some('n'),
-            help: "Run the interview agent headless (print mode).",
+            help: "Run the authoring agent headless (print mode).",
             kind: FlagKind::Bool,
             default: FlagDefault::Bool(false),
             frontends: FrontendVisibility::All,
@@ -73,25 +77,18 @@ pub(super) const WORKFLOW_FORMAT_VALUES: &[&str] = &["toml", "yaml"];
 pub(super) const NEW_WORKFLOW: CommandSpec = CommandSpec {
     name: "workflow",
     aliases: &[],
-    help: "Interactively create a new workflow file.",
+    help: "Create a new workflow with an agent.",
     long_help: None,
     arguments: &[],
     flags: &[
-        FlagSpec {
-            long: "interview",
-            short: None,
-            help: "Let a code agent complete the workflow from a summary you provide.",
-            kind: FlagKind::Bool,
-            default: FlagDefault::Bool(false),
-            frontends: FrontendVisibility::All,
-            conflicts_with: &[],
-            implies: &[],
-            optional: true,
-        },
+        NEW_JSON,
+        NEW_TITLE,
+        NEW_PROMPT,
+        NEW_YOLO,
         FlagSpec {
             long: "headless",
             short: Some('n'),
-            help: "Run the interview agent headless (print mode).",
+            help: "Run the authoring agent headless (print mode).",
             kind: FlagKind::Bool,
             default: FlagDefault::Bool(false),
             frontends: FrontendVisibility::All,
@@ -136,25 +133,15 @@ pub(super) const NEW_WORKFLOW: CommandSpec = CommandSpec {
 pub(super) const NEW_SKILL: CommandSpec = CommandSpec {
     name: "skill",
     aliases: &[],
-    help: "Interactively create a new skill file.",
+    help: "Create a new skill with an agent, or pull a published library.",
     long_help: None,
     arguments: &[],
     flags: &[
-        FlagSpec {
-            long: "interview",
-            short: None,
-            help: "Let a code agent complete the skill body from a summary you provide.",
-            kind: FlagKind::Bool,
-            default: FlagDefault::Bool(false),
-            frontends: FrontendVisibility::All,
-            conflicts_with: &[],
-            implies: &[],
-            optional: true,
-        },
+        NEW_JSON, NEW_TITLE, NEW_PROMPT, NEW_YOLO,
         FlagSpec {
             long: "headless",
             short: Some('n'),
-            help: "Run the interview agent headless (print mode).",
+            help: "Run the authoring agent headless (print mode).",
             kind: FlagKind::Bool,
             default: FlagDefault::Bool(false),
             frontends: FrontendVisibility::All,
@@ -180,7 +167,7 @@ pub(super) const NEW_SKILL: CommandSpec = CommandSpec {
             kind: FlagKind::OptionalString,
             default: FlagDefault::None,
             frontends: FrontendVisibility::All,
-            conflicts_with: &["pull-all", "interview", "global"],
+            conflicts_with: &["pull-all", "global"],
             implies: &[],
             optional: true,
         },
@@ -191,7 +178,7 @@ pub(super) const NEW_SKILL: CommandSpec = CommandSpec {
             kind: FlagKind::Bool,
             default: FlagDefault::Bool(false),
             frontends: FrontendVisibility::All,
-            conflicts_with: &["pull", "subdir", "interview", "global"],
+            conflicts_with: &["pull", "subdir", "global"],
             implies: &[],
             optional: true,
         },
@@ -208,7 +195,7 @@ pub(super) const NEW_SKILL: CommandSpec = CommandSpec {
         },
     ],
     api_allowed: false,
-     build: crate::command::dispatch::build::new,
+    build: crate::command::dispatch::build::new,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
     requires_runtime: true,
@@ -218,7 +205,7 @@ pub(super) const NEW_SKILL: CommandSpec = CommandSpec {
     subcommands: &[],
 };
 
-/// The examples `new agent --from` can copy (the builtin skill's examples).
+/// The examples `new agent --from` can use as a seed (the builtin skill's examples).
 pub(super) const AGENT_EXAMPLE_VALUES: &[&str] = &["crush", "maki"];
 
 pub(super) const NEW_AGENT: CommandSpec = CommandSpec {
@@ -233,6 +220,20 @@ pub(super) const NEW_AGENT: CommandSpec = CommandSpec {
         optional: false,
     }],
     flags: &[
+        NEW_JSON,
+        NEW_PROMPT,
+        NEW_YOLO,
+        FlagSpec {
+            long: "headless",
+            short: Some('n'),
+            help: "Run the authoring agent headless.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
         FlagSpec {
             long: "global",
             short: None,
@@ -247,7 +248,7 @@ pub(super) const NEW_AGENT: CommandSpec = CommandSpec {
         FlagSpec {
             long: "from",
             short: None,
-            help: "Copy a shipped example definition instead of the commented skeleton.",
+            help: "Seed the agent session with a shipped example definition.",
             kind: FlagKind::Enum(AGENT_EXAMPLE_VALUES),
             default: FlagDefault::None,
             frontends: FrontendVisibility::All,
@@ -255,27 +256,59 @@ pub(super) const NEW_AGENT: CommandSpec = CommandSpec {
             implies: &[],
             optional: true,
         },
-        FlagSpec {
-            long: "force",
-            short: None,
-            help: "Overwrite an existing definition (and, with --from maki, its Dockerfile).",
-            kind: FlagKind::Bool,
-            default: FlagDefault::Bool(false),
-            frontends: FrontendVisibility::All,
-            conflicts_with: &[],
-            implies: &[],
-            optional: true,
-        },
     ],
-    // Writes files only and never builds, so it needs no runtime. Blocked for
-    // the API like the rest of the `new` subtree.
     api_allowed: false,
     build: crate::command::dispatch::build::new,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
-    requires_runtime: false,
+    requires_runtime: true,
     opens_tui_when_bare: false,
     internal: false,
     relay_allowed: true,
     subcommands: &[],
+};
+
+const NEW_JSON: FlagSpec = FlagSpec {
+    long: "json",
+    short: None,
+    help: "Print the outcome as JSON and run headless.",
+    kind: FlagKind::Bool,
+    default: FlagDefault::Bool(false),
+    frontends: FrontendVisibility::All,
+    conflicts_with: &[],
+    implies: &["headless"],
+    optional: true,
+};
+const NEW_TITLE: FlagSpec = FlagSpec {
+    long: "title",
+    short: None,
+    help: "Supply the title/name instead of asking for it.",
+    kind: FlagKind::OptionalString,
+    default: FlagDefault::None,
+    frontends: FrontendVisibility::All,
+    conflicts_with: &[],
+    implies: &[],
+    optional: true,
+};
+const NEW_PROMPT: FlagSpec = FlagSpec {
+    long: "prompt",
+    short: None,
+    help: "Supply the summary for the authoring agent instead of asking for it.",
+    kind: FlagKind::OptionalString,
+    default: FlagDefault::None,
+    frontends: FrontendVisibility::All,
+    conflicts_with: &[],
+    implies: &[],
+    optional: true,
+};
+const NEW_YOLO: FlagSpec = FlagSpec {
+    long: "yolo",
+    short: None,
+    help: "Launch the authoring agent in its most permissive mode.",
+    kind: FlagKind::Bool,
+    default: FlagDefault::Bool(false),
+    frontends: FrontendVisibility::All,
+    conflicts_with: &[],
+    implies: &[],
+    optional: true,
 };
