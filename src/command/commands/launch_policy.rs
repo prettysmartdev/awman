@@ -174,8 +174,7 @@ impl<'a> LaunchPolicy<'a> {
     /// The note is a per-agent fact and lives in the first-party table
     /// (`AgentDefinition::deprecation_note`, F-32; custom agents carry none).
     /// `chat` and `exec prompt` each carried their own
-    /// `if agent.as_str() == "gemini"` arm with a duplicated copy of the
-    /// text; they now ask here.
+    /// vendor-specific warning text; they now ask here.
     pub fn deprecation_warning(agent: &AgentName) -> Option<UserMessage> {
         first_party(agent.as_str())?
             .deprecation_note
@@ -183,6 +182,39 @@ impl<'a> LaunchPolicy<'a> {
                 level: MessageLevel::Warning,
                 text,
             })
+    }
+
+    /// The per-launch notes a first-party agent declares for this run, in the
+    /// order they are shown: the agent's informational `launch_note`
+    /// (opencode-v2's isolation note) and, when the run takes the interactive
+    /// model fallback, the interface-change warning (opencode-v2 `mini`).
+    ///
+    /// One helper for every launch path (`chat`, `exec prompt`, workflow
+    /// steps, API sessions that go through them) so the same agent shows the
+    /// same notes regardless of runtime. Sandbox runtimes receive them through
+    /// the same frontend; the Layer 1 sandbox builder adds only the
+    /// sandbox-specific `sandbox_auth_note`, so nothing is shown twice.
+    pub fn launch_notices(
+        agent: &AgentName,
+        run: &crate::engine::agent::AgentRunOptions,
+    ) -> Vec<UserMessage> {
+        let Some(def) = first_party(agent.as_str()) else {
+            return Vec::new();
+        };
+        let mut notes = Vec::new();
+        if let Some(text) = &def.launch_note {
+            notes.push(UserMessage {
+                level: MessageLevel::Info,
+                text: text.clone(),
+            });
+        }
+        if let Some(text) = def.interactive_model_notice(run) {
+            notes.push(UserMessage {
+                level: MessageLevel::Warning,
+                text: text.to_string(),
+            });
+        }
+        notes
     }
 
     /// Resolve `ContextOverlaySpec`s into `ContextOverlay`s (host paths ensured-to-exist)

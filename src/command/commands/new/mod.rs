@@ -69,6 +69,7 @@ fn answer(
 struct NewSession {
     headless: bool,
     yolo: bool,
+    yolo_authorized: bool,
     summary: String,
 }
 
@@ -89,6 +90,7 @@ async fn author_artifact(
             reference: path.display().to_string(),
             headless: authoring.headless,
             yolo: authoring.yolo,
+            yolo_authorized: authoring.yolo_authorized,
             prompt: Some(authoring.summary),
             ..Default::default()
         },
@@ -141,6 +143,7 @@ fn write_seed(
 #[derive(Debug, Clone, Default)]
 pub struct NewSpecFlags {
     pub yolo: bool,
+    pub yolo_authorized: bool,
     pub input: NewInput,
     pub kind: Option<crate::command::work_item::spec_service::WorkItemKind>,
     pub non_interactive: bool,
@@ -151,6 +154,7 @@ pub struct NewSpecFlags {
 #[derive(Debug, Clone, Default)]
 pub struct NewWorkflowFlags {
     pub yolo: bool,
+    pub yolo_authorized: bool,
     pub input: NewInput,
     pub non_interactive: bool,
     pub global: bool,
@@ -160,6 +164,7 @@ pub struct NewWorkflowFlags {
 #[derive(Debug, Clone, Default)]
 pub struct NewSkillFlags {
     pub yolo: bool,
+    pub yolo_authorized: bool,
     pub input: NewInput,
     pub non_interactive: bool,
     pub global: bool,
@@ -171,6 +176,7 @@ pub struct NewSkillFlags {
 #[derive(Debug, Clone, Default)]
 pub struct NewAgentFlags {
     pub yolo: bool,
+    pub yolo_authorized: bool,
     pub input: NewInput,
     pub non_interactive: bool,
     /// The positional name; becomes the file stem.
@@ -321,6 +327,7 @@ impl NewCommand {
             "spec" => NewSubcommand::Spec(NewSpecFlags {
                 input: NewInput::from_context(ctx),
                 yolo: ctx.flags.bool("yolo"),
+                yolo_authorized: ctx.flags.explicit("yolo"),
                 kind: ctx.flags.string("kind").map(|kind| match kind.as_str() {
                     "feature" => crate::command::work_item::spec_service::WorkItemKind::Feature,
                     "bug" => crate::command::work_item::spec_service::WorkItemKind::Bug,
@@ -335,6 +342,7 @@ impl NewCommand {
             "workflow" => NewSubcommand::Workflow(NewWorkflowFlags {
                 input: NewInput::from_context(ctx),
                 yolo: ctx.flags.bool("yolo"),
+                yolo_authorized: ctx.flags.explicit("yolo"),
                 non_interactive: ctx.flags.bool("headless"),
                 global: ctx.flags.bool("global"),
                 format: ctx.flags.require_str("format")?,
@@ -356,6 +364,7 @@ impl NewCommand {
                 NewSubcommand::Skill(NewSkillFlags {
                     input: NewInput::from_context(ctx),
                     yolo: ctx.flags.bool("yolo"),
+                    yolo_authorized: ctx.flags.explicit("yolo"),
                     non_interactive: ctx.flags.bool("headless"),
                     global: ctx.flags.bool("global"),
                     pull,
@@ -364,8 +373,14 @@ impl NewCommand {
                 })
             }
             "agent" => NewSubcommand::Agent(NewAgentFlags {
-                input: NewInput::from_context(ctx),
+                // `new agent` takes its name as an argument and declares no
+                // `--title`; reading it would panic in `ResolvedFlags::get`.
+                input: NewInput {
+                    title: None,
+                    summary: ctx.flags.string("prompt"),
+                },
                 yolo: ctx.flags.bool("yolo"),
+                yolo_authorized: ctx.flags.explicit("yolo"),
                 non_interactive: ctx.flags.bool("headless"),
                 name: ctx.args.require("name")?,
                 global: ctx.flags.bool("global"),

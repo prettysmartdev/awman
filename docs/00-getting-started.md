@@ -10,7 +10,7 @@ New to awman? Skim [Concepts](01-concepts.md) after this for the mental model be
 
 - **Git** — your project must be in a Git repository
 - **A container runtime** — Docker (all platforms, daemon running), Apple Containers (macOS 26+), Docker Sandboxes (`sbx` CLI, macOS arm64 / Windows), or the experimental builtin microVM runtime (macOS on Apple Silicon only; included in the `awman-macos-arm64` release — see [Runtimes](11-runtimes.md#builtin-microvm-experimental))
-- **An account with a supported agent** — Claude Code, OpenAI Codex, OpenCode, Google Gemini, GitHub Copilot CLI, Cline, or Google Antigravity (or any other CLI agent you add as a [custom agent](15-custom-agents.md))
+- **An account with a supported agent** — Claude Code, OpenAI Codex, OpenCode (1.x or 2.x), Cursor, GitHub Copilot CLI, Cline, or Google Antigravity (or any other CLI agent you add as a [custom agent](15-custom-agents.md))
 
 ## 1. Install
 
@@ -108,7 +108,7 @@ Then `awman ready` builds the Dockerfiles in that Docker Engine (`apple-local` u
 
 | Flag | Effect |
 |------|--------|
-| `--agent <name>` | Agent to set up: `claude` (default), `codex`, `opencode`, `gemini`, `copilot`, `cline`, `antigravity`, or the name of a [custom agent](15-custom-agents.md) defined in `.awman/agents/` or `~/.awman/agents/` |
+| `--agent <name>` | Agent to set up: `claude` (default), `codex`, `opencode`, `opencode-v2`, `cursor`, `copilot`, `cline`, `antigravity`, or the name of a [custom agent](15-custom-agents.md) defined in `.awman/agents/` or `~/.awman/agents/` |
 | `--aspec` | Download the `aspec/` spec-folder template into the repo |
 
 ### `awman ready`

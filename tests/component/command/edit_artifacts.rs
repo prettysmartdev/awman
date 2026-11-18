@@ -211,6 +211,7 @@ fn command_with_overlays(
         json: false,
         allow_docker: false,
         yolo: false,
+        yolo_authorized: false,
         auto: false,
         agent: None,
         model: None,
@@ -264,6 +265,7 @@ async fn creation_authors_scoped_files_with_supplied_brief_and_yolo() {
                         global,
                         format: kind.into(),
                         yolo: true,
+                        yolo_authorized: true,
                     }),
                     format!("workflows/authoring-test.{kind}"),
                     if kind == "toml" {
@@ -278,6 +280,7 @@ async fn creation_authors_scoped_files_with_supplied_brief_and_yolo() {
                         non_interactive: true,
                         global,
                         yolo: true,
+                        yolo_authorized: true,
                         ..Default::default()
                     }),
                     "skills/authoring-test/SKILL.md".into(),
@@ -290,6 +293,7 @@ async fn creation_authors_scoped_files_with_supplied_brief_and_yolo() {
                         non_interactive: true,
                         global,
                         yolo: true,
+                        yolo_authorized: true,
                         ..Default::default()
                     }),
                     "agents/authoring-test.toml".into(),

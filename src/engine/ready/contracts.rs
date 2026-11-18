@@ -165,7 +165,7 @@ async fn greetings_cover_repo_agents_and_selected_agent_in_one_success_row() {
         "engine::ready::greetings_cover_repo_agents_and_selected_agent_in_one_success_row",
     ));
     // The selected agent is included even without its own Dockerfile.
-    dockerfiles(&sandbox, &["claude", "opencode"]);
+    dockerfiles(&sandbox, &["claude", "copilot"]);
     let pinger = Arc::new(Pinger::default());
     let mut engine = engine(&sandbox, "codex", pinger.clone());
     assert_eq!(
@@ -174,13 +174,13 @@ async fn greetings_cover_repo_agents_and_selected_agent_in_one_success_row() {
     );
     assert_eq!(
         *pinger.calls.lock().unwrap(),
-        ["claude", "codex", "opencode"]
+        ["claude", "codex", "copilot"]
     );
     let summary = engine.summary();
     assert_eq!(summary.local_agent, StepStatus::Done);
     assert_eq!(
         summary.auth_rows(),
-        vec![("Auth: claude, codex, opencode".into(), StepStatus::Done)]
+        vec![("Auth: claude, codex, copilot".into(), StepStatus::Done)]
     );
 }
 
@@ -189,7 +189,7 @@ async fn failed_greetings_do_not_stop_other_agents_and_share_one_failure_row() {
     let sandbox = TestSandbox::for_test(TestCase::component(
         "engine::ready::failed_greetings_do_not_stop_other_agents_and_share_one_failure_row",
     ));
-    dockerfiles(&sandbox, &["claude", "codex", "opencode"]);
+    dockerfiles(&sandbox, &["claude", "codex", "copilot"]);
     let pinger = Arc::new(Pinger {
         failures: HashMap::from([
             ("claude".into(), LocalAgentPingResult::TimedOut),
@@ -203,14 +203,14 @@ async fn failed_greetings_do_not_stop_other_agents_and_share_one_failure_row() {
     // The default is checked once and failures do not prevent later pings.
     assert_eq!(
         *pinger.calls.lock().unwrap(),
-        ["claude", "codex", "opencode"]
+        ["claude", "codex", "copilot"]
     );
     let summary = engine.summary();
     assert!(matches!(summary.local_agent, StepStatus::Failed(_)));
     assert_eq!(
         summary.auth_rows(),
         vec![
-            ("Auth: opencode".into(), StepStatus::Done),
+            ("Auth: copilot".into(), StepStatus::Done),
             (
                 "Auth: claude".into(),
                 StepStatus::Warn("claude: host ping timed out after 10 seconds".into())
@@ -233,7 +233,7 @@ async fn host_checks_start_together_timeout_at_ten_seconds_and_report_after_the_
     let sandbox = TestSandbox::for_test(TestCase::component(
         "engine::ready::host_checks_start_together_timeout_at_ten_seconds_and_report_after_the_batch",
     ));
-    dockerfiles(&sandbox, &["claude", "codex", "opencode"]);
+    dockerfiles(&sandbox, &["claude", "codex", "copilot"]);
     let pinger = Arc::new(Pinger {
         barrier: Some(tokio::sync::Barrier::new(3)),
         pending: vec!["claude".into(), "codex".into()],
@@ -249,7 +249,7 @@ async fn host_checks_start_together_timeout_at_ten_seconds_and_report_after_the_
     assert_eq!(start.elapsed(), std::time::Duration::from_secs(10));
     assert_eq!(
         *pinger.calls.lock().unwrap(),
-        ["claude", "codex", "opencode"]
+        ["claude", "codex", "copilot"]
     );
     assert_eq!(frontend.results.len(), 3);
     assert_eq!(
@@ -516,4 +516,108 @@ async fn ready_build_failure_is_still_a_failed_stage_not_an_image_stale_warning(
     assert_eq!(engine.summary().agent_image, StepStatus::Done);
     assert!(frontend.steps.is_empty(), "{:?}", frontend.steps);
     assert_eq!(runtime.built(), vec![tag], "reuse must not build again");
+}
+
+/// WI 0157: a host-installed `opencode` or `cursor-agent` can never satisfy
+/// readiness for a pinned agent; no host binary is executed for them.
+#[tokio::test]
+async fn pinned_agents_are_never_pinged_on_the_host() {
+    let sandbox = TestSandbox::for_test(TestCase::component(
+        "engine::ready::contracts::pinned_agents_are_never_pinged_on_the_host",
+    ));
+    dockerfiles(&sandbox, &["opencode", "opencode-v2", "cursor"]);
+    let pinger = Arc::new(Pinger::default());
+    let mut engine = engine(&sandbox, "opencode", pinger.clone());
+    let mut frontend = Frontend::default();
+    engine.step(&mut frontend).await.unwrap();
+    assert!(pinger.calls.lock().unwrap().is_empty());
+    let summary = engine.summary();
+    for (name, status) in &summary.agent_auth {
+        assert_eq!(*status, StepStatus::Skipped, "{name}");
+    }
+    assert_eq!(summary.local_agent, StepStatus::Skipped);
+    assert!(frontend.messages.iter().any(|m| m
+        .text
+        .contains("readiness is checked inside the agent image")));
+}
+
+/// Ready with the default agent's image present: run `verify_agent_cli` with
+/// the image answering `--version` with `line`.
+fn verify_with(
+    agent: &str,
+    line: Option<&str>,
+) -> (StepStatus, Vec<UserMessage>, Vec<(String, String)>) {
+    use crate::engine::agent::image_freshness::test_runtime::BuildRuntime;
+    let id: &'static str =
+        Box::leak(format!("engine::ready::contracts::verify_agent_cli::{agent}").into_boxed_str());
+    let sandbox = TestSandbox::for_test(TestCase::component(id));
+    let mut engine = engine(&sandbox, agent, Arc::new(Pinger::default()));
+    let runtime = Arc::new(BuildRuntime::default());
+    *runtime.cli_version_line.lock().unwrap() = line.map(str::to_string);
+    engine.runtime = runtime.clone();
+    engine.definition = Some(
+        engine
+            .agent_engine
+            .resolve_definition(&engine.session, &AgentName::new(agent).unwrap())
+            .unwrap(),
+    );
+    engine.summary.agent_image = StepStatus::Done;
+    let mut frontend = Frontend::default();
+    engine.verify_agent_cli(&mut frontend, "awman-x-agent:latest");
+    let probes = runtime.version_probes.lock().unwrap().clone();
+    (engine.summary().agent_image, frontend.messages, probes)
+}
+
+#[test]
+fn ready_reports_the_cli_version_that_runs_inside_the_image() {
+    let (status, messages, probes) = verify_with("opencode-v2", Some("opencode v2.3.2"));
+    assert_eq!(status, StepStatus::Done);
+    assert_eq!(
+        probes,
+        vec![("awman-x-agent:latest".to_string(), "opencode".to_string())]
+    );
+    assert!(messages
+        .iter()
+        .any(|m| m.text == "OpenCode 2 CLI 2.3.2 verified inside awman-x-agent:latest"));
+
+    let (status, _, _) = verify_with("opencode", Some("1.19.6"));
+    assert_eq!(status, StepStatus::Done);
+    let (status, _, probes) = verify_with("cursor", Some("2026.11.17-f532c45"));
+    assert_eq!(status, StepStatus::Done);
+    assert!(probes.is_empty());
+}
+
+#[test]
+fn a_v1_binary_never_satisfies_opencode_v2_readiness_or_vice_versa() {
+    let (status, _, _) = verify_with("opencode-v2", Some("1.19.6"));
+    assert!(
+        matches!(&status, StepStatus::Failed(m) if m.contains("expected opencode 2.x, found 1.19.6")
+            && m.contains("Update .awman/Dockerfile.opencode-v2")),
+        "{status:?}"
+    );
+    let (status, _, _) = verify_with("opencode", Some("opencode v2.3.2"));
+    assert!(
+        matches!(&status, StepStatus::Failed(m) if m.contains("expected opencode 1.x")),
+        "{status:?}"
+    );
+    let (status, _, _) = verify_with("cursor", Some(""));
+    assert_eq!(status, StepStatus::Done);
+}
+
+#[test]
+fn major_checks_accept_upgrades_and_only_warn_when_unprobed() {
+    let (status, _, _) = verify_with("opencode", Some("1.20.0"));
+    assert_eq!(status, StepStatus::Done);
+    let (status, _, _) = verify_with("opencode", None);
+    assert!(
+        matches!(&status, StepStatus::Warn(m) if m.contains("could not verify")),
+        "{status:?}"
+    );
+    let (status, _, probes) = verify_with("cursor", None);
+    assert_eq!(status, StepStatus::Done);
+    assert!(probes.is_empty());
+    // An agent without a major requirement is untouched (no probe).
+    let (status, _, probes) = verify_with("claude", Some("garbage"));
+    assert_eq!(status, StepStatus::Done);
+    assert!(probes.is_empty());
 }

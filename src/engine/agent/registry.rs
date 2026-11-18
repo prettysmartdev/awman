@@ -13,7 +13,7 @@ use std::sync::Arc;
 use super::definition::{AgentDefinition, AgentOrigin};
 use super::first_party::{first_party, FIRST_PARTY_AGENTS};
 use crate::data::config::agent_definition::{
-    load_agent_definition_with_scope, validate_agent_file_stem,
+    former_builtin_guidance, load_agent_definition_with_scope, validate_agent_file_stem,
 };
 use crate::data::config::env::EnvSnapshot;
 use crate::data::fs::agent_dirs::AgentDirs;
@@ -21,10 +21,6 @@ use crate::data::fs::agent_dirs::{DefinitionScope, SkippedDefinition};
 use crate::data::fs::agent_trust::{TrustKey, TrustStore};
 use crate::data::session::{AgentName, Session};
 use crate::engine::error::EngineError;
-
-/// Agents that used to be first-party and are now example custom
-/// definitions. Naming one without a definition earns a migration hint.
-const FORMER_FIRST_PARTY: &[&str] = &["crush", "maki"];
 
 /// A resolved definition, shared by everything one launch prepares.
 #[derive(Debug, Clone)]
@@ -296,10 +292,8 @@ impl AgentRegistry {
     ) -> EngineError {
         let listing = Self::list(env, git_root);
         let mut notes = Vec::new();
-        if FORMER_FIRST_PARTY.contains(&name) {
-            notes.push(format!(
-                "'{name}' is no longer built in — recreate it with: awman new agent {name} --from {name}"
-            ));
+        if let Some(guidance) = former_builtin_guidance(name) {
+            notes.push(guidance.to_string());
         }
         if runtime_is_sandbox {
             notes.push(

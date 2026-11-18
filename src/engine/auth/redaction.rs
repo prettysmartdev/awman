@@ -324,6 +324,63 @@ fn replace_ranges(haystack: &[u8], mut ranges: Vec<(usize, usize)>) -> Vec<u8> {
     out
 }
 
+pub struct RedactionStream {
+    set: RedactionSet,
+    pending: Vec<u8>,
+}
+impl RedactionStream {
+    pub fn new(set: RedactionSet) -> Self {
+        Self {
+            set,
+            pending: Vec::new(),
+        }
+    }
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.pending.extend_from_slice(bytes);
+        self.drain(false)
+    }
+    pub fn finish(&mut self) -> Vec<u8> {
+        self.drain(true)
+    }
+    fn drain(&mut self, finished: bool) -> Vec<u8> {
+        if self.set.retired.load(std::sync::atomic::Ordering::SeqCst) {
+            self.pending.clear();
+            return RedactionSet::MARK.as_bytes().to_vec();
+        }
+        let secrets = self.set.inner.read().unwrap_or_else(|e| e.into_inner());
+        let mut output = Vec::new();
+        let mut at = 0;
+        while at < self.pending.len() {
+            let rest = &self.pending[at..];
+            if !finished
+                && secrets.iter().any(|s| {
+                    s.expose().len() > rest.len() && s.expose().as_bytes().starts_with(rest)
+                })
+            {
+                break;
+            }
+            if let Some(secret) = secrets
+                .iter()
+                .find(|s| rest.starts_with(s.expose().as_bytes()))
+            {
+                output.extend_from_slice(RedactionSet::MARK.as_bytes());
+                at += secret.expose().len();
+            } else if !finished
+                && secrets
+                    .iter()
+                    .any(|s| s.expose().as_bytes().starts_with(rest))
+            {
+                break;
+            } else {
+                output.push(self.pending[at]);
+                at += 1;
+            }
+        }
+        self.pending.drain(..at);
+        output
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

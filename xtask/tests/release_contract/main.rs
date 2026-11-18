@@ -27,6 +27,7 @@ struct Fixture {
     awman: FakeCli,
     clip: FakeCli,
     cargo: FakeCli,
+    watch: FakeCli,
 }
 impl Fixture {
     fn new(id: &'static str) -> Self {
@@ -128,12 +129,18 @@ impl Fixture {
                 f.on(&[]).read_stdin();
             }
         }
+        let watch = s.install_fake(
+            Path::new(awman_test_support::cargo_bin!("xtask-fake-cli")),
+            "watch-hold",
+        );
+        watch.on(&[]).hold_until_released();
         Self {
             s,
             make,
             awman,
             clip,
             cargo: cargo_fake.unwrap(),
+            watch,
         }
     }
     fn state(&self) -> PathBuf {
@@ -836,7 +843,7 @@ fn teardown_during_signal(sig: nix::sys::signal::Signal) {
         &root().join("xtask/src/release/operator/flow.sh"),
         &["v1.2.3"],
     );
-    c.wait_for_output("WATCH_READY", LIMIT);
+    f.watch.wait_until_held(LIMIT);
     nix::sys::signal::killpg(nix::unistd::Pid::from_raw(c.pid() as i32), sig).unwrap();
     c.wait_for_output("TEARDOWN_READY", LIMIT);
     nix::sys::signal::killpg(nix::unistd::Pid::from_raw(c.pid() as i32), sig).unwrap();
@@ -954,7 +961,10 @@ fn resume_after_interrupt_at_step(phase: usize) {
             write(&f.s.work().join("docs/releases/v1.2.3.md"), "new notes\n");
             f.env("HOLD_AT", "git/push");
         }
-        8 => f.env("WATCH_HOLD", "1"),
+        8 => {
+            f.env("WATCH_HOLD", "1");
+            held_tool = Some(f.watch.clone());
+        }
         _ => unreachable!(),
     }
     let mut child = f.start(
@@ -968,16 +978,12 @@ fn resume_after_interrupt_at_step(phase: usize) {
     if let Some(fake) = &held_tool {
         fake.wait_until_held(LIMIT);
     } else {
-        if phase == 8 {
-            child.wait_for_output("WATCH_READY", LIMIT);
-        } else {
-            awman_test_support::wait_for_with(
-                "held step",
-                LIMIT,
-                || f.state().join("held").exists().then_some(()),
-                || child.output_so_far(),
-            );
-        }
+        awman_test_support::wait_for_with(
+            "held step",
+            LIMIT,
+            || f.state().join("held").exists().then_some(()),
+            || child.output_so_far(),
+        );
     }
     nix::sys::signal::killpg(
         nix::unistd::Pid::from_raw(child.pid() as i32),

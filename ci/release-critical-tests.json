@@ -16,10 +16,12 @@
     "awman-cli::guest strategy::codex_named_skills",
     "awman-cli::guest strategy::copilot_all_skills",
     "awman-cli::guest strategy::copilot_named_skills",
-    "awman-cli::guest strategy::gemini_all_skills",
-    "awman-cli::guest strategy::gemini_named_skills",
+    "awman-cli::guest strategy::cursor_all_skills",
+    "awman-cli::guest strategy::cursor_named_skills",
     "awman-cli::guest strategy::opencode_all_skills",
-    "awman-cli::guest strategy::opencode_named_skills"
+    "awman-cli::guest strategy::opencode_named_skills",
+    "awman-cli::guest strategy::opencode_v2_all_skills",
+    "awman-cli::guest strategy::opencode_v2_named_skills"
   ],
   "artifact.signed-offline-session": [
     "awman-cli::artifact signed_boot::signed_artifact_runs_an_offline_session",

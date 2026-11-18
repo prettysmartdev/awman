@@ -15,6 +15,22 @@ fn emit(sink: &mut dyn UserMessageSink, level: MessageLevel, text: String) {
     sink.write_message(UserMessage { level, text });
 }
 
+/// The top-level `kind:` of an emitted kit spec, if one was emitted before.
+fn kit_kind(spec: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(spec).ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("kind:"))
+        .map(|kind| kind.trim().trim_matches('"').to_string())
+}
+
+fn stale_kit_message(agent: &str, sandboxes: &[String]) -> String {
+    format!(
+        "sbx: the '{agent}' kit changed kind since these sandboxes were created: {}. They still \
+         run the previous kit; run 'awman ready --agent {agent} --no-cache' to recreate them.",
+        sandboxes.join(", ")
+    )
+}
+
 /// Prepare the sbx runtime for a single agent: check the binary + login, emit
 /// the kit, and validate it. Returns an error for launch-blocking failures
 /// (missing binary, kit emission failure, kit validation failure); soft
@@ -31,6 +47,12 @@ pub(in crate::engine::sandbox) fn ready_agent_in(
     no_cache: bool,
     sink: &mut dyn UserMessageSink,
 ) -> Result<(), EngineError> {
+    if let Some(def) = crate::engine::agent::first_party::first_party(agent) {
+        def.validate_run(
+            &Default::default(),
+            crate::engine::agent::definition::RunParadigm::Sandbox,
+        )?;
+    }
     // 1. Is `sbx` installed?
     SbxCommand::new(["version"])
         .in_env(snapshot)
@@ -76,7 +98,26 @@ pub(in crate::engine::sandbox) fn ready_agent_in(
         MessageLevel::Info,
         format!("Preparing {agent} kit (sbx)"),
     );
+    let previous_kind = kit_kind(&kit_dir.join("spec.yaml"));
     DSbxKitEmitter::new().emit_for_agent(agent, &kit_dir)?;
+    // A kit whose `kind` changed (WI 0157: `opencode` moved from a mixin of
+    // the stock kit to an awman-owned agent kit) does not reach sandboxes
+    // created from the old one; only `--no-cache` recreates them.
+    let current_kind = kit_kind(&kit_dir.join("spec.yaml"));
+    if !no_cache && previous_kind.is_some() && previous_kind != current_kind {
+        let suffix = format!("-{agent}");
+        let stale: Vec<String> = super::backend::list_all_sandbox_names_in(snapshot)
+            .into_iter()
+            .filter(|name| name.starts_with("awman-") && name.ends_with(&suffix))
+            .collect();
+        if !stale.is_empty() {
+            emit(
+                sink,
+                MessageLevel::Warning,
+                stale_kit_message(agent, &stale),
+            );
+        }
+    }
 
     // 5. Validate the kit. A real validation failure is surfaced verbatim
     //    with the kit path and fails loudly (WI 0090); only an sbx build that
@@ -113,4 +154,33 @@ pub(in crate::engine::sandbox) fn ready_agent_in(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod stale_kit_tests {
+    use super::*;
+
+    #[test]
+    fn kit_kind_reads_the_emitted_spec_and_the_warning_names_no_cache() {
+        let s = awman_test_support::TestSandbox::for_test(awman_test_support::TestCase::component(
+            "engine::sandbox::dsbx::ready::stale_kit_tests::kit_kind_reads_the_emitted_spec_and_the_warning_names_no_cache",
+        ));
+        let spec = s.work().join("spec.yaml");
+        assert_eq!(kit_kind(&spec), None);
+        std::fs::write(
+            &spec,
+            "# header\nschemaVersion: \"1\"\nkind: mixin\nname: x\n",
+        )
+        .unwrap();
+        assert_eq!(kit_kind(&spec).as_deref(), Some("mixin"));
+        std::fs::write(&spec, "kind: agent\n").unwrap();
+        assert_eq!(kit_kind(&spec).as_deref(), Some("agent"));
+        let text = stale_kit_message("opencode", &["awman-abc-opencode".into()]);
+        assert!(text.contains("awman-abc-opencode"), "{text}");
+        assert!(
+            text.contains("awman ready --agent opencode --no-cache"),
+            "{text}"
+        );
+        s.finish();
+    }
 }

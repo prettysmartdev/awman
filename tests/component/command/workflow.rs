@@ -406,6 +406,7 @@ mod work_item_execution {
             allow_docker: false,
             worktree: false,
             yolo: false,
+            yolo_authorized: false,
             auto: true,
             agent: Some("claude".into()),
             model: None,
@@ -433,6 +434,7 @@ mod work_item_execution {
             plan: false,
             allow_docker: false,
             yolo: false,
+            yolo_authorized: false,
             auto: false,
             agent: Some("claude".into()),
             model: None,
@@ -676,7 +678,7 @@ mod work_item_execution {
         let s = support::sandbox("command::workflow::work_item_execution::preflight_reports_images_and_step_requirements_once_without_preparing_them");
         let session = session(&s, "local", "https://tracker.example/items");
         std::fs::create_dir_all(session.git_root().join(".awman")).unwrap();
-        for agent in ["claude", "codex", "gemini"] {
+        for agent in ["claude", "codex", "opencode"] {
             std::fs::write(
                 session
                     .git_root()
@@ -731,7 +733,7 @@ message = "Done"
             assert_eq!(
                 agents,
                 if dynamic {
-                    vec!["claude", "codex", "gemini"]
+                    vec!["claude", "codex", "opencode"]
                 } else {
                     vec!["codex"]
                 }

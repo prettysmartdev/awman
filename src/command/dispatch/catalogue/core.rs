@@ -64,7 +64,7 @@ pub(super) const INIT: CommandSpec = CommandSpec {
             long: "agent",
             short: None,
             help: "Code agent to install in the Dockerfile.dev container: claude, codex, opencode, \
-                   gemini, copilot, cline, antigravity, or the name of a custom agent defined in \
+                   opencode-v2, cursor, copilot, cline, antigravity, or the name of a custom agent defined in \
                    .awman/agents/ or ~/.awman/agents/.",
             kind: FlagKind::String,
             default: FlagDefault::Str("claude"),

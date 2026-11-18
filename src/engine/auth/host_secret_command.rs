@@ -36,6 +36,7 @@ pub const REFUSED_AGENT_BINARIES: &[&str] = &[
     "claude",
     "codex",
     "opencode",
+    "cursor-agent",
     "gemini",
     "copilot",
     "cline",

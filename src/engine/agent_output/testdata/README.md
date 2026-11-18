@@ -24,3 +24,10 @@ tool_result, tool_use, tool_result, tool_result, message.
 Later tests should also cover unknown JSON shapes, malformed known shapes,
 stderr passthrough, duplicate terminal frames, EOF before terminal frame, empty
 streams, Unicode summaries and tool payloads longer than 200 characters.
+
+- `cursor_stream_json.ndjson` (WI 0157): documentation-derived, built from the
+  event shapes in https://cursor.com/docs/cli/reference/output-format; not a
+  capture from an authenticated Cursor run (none was available). It covers
+  init, the prompt echo, assistant text, `<name>ToolCall` and
+  `function`-shaped tool calls (success and non-success results), the same
+  malformed line, and a success `result` with the same final message.

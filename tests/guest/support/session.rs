@@ -28,8 +28,12 @@ pub fn prepare(s: &TestSandbox, archive: &Path, agent: &str, body: &str) -> Path
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&synthetic, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+    // The executable the definition launches (`agy`, `cursor-agent`, and
+    // `opencode` for both OpenCode majors).
     let name = match agent {
         "antigravity" => "agy",
+        "cursor" => "cursor-agent",
+        "opencode-v2" => "opencode",
         other => other,
     };
     std::fs::write(
@@ -42,10 +46,14 @@ pub fn prepare(s: &TestSandbox, archive: &Path, agent: &str, body: &str) -> Path
     )
     .unwrap();
     let descriptor = awman::engine::agent::first_party::first_party(agent).unwrap();
-    let ping = descriptor.ping_argv.as_ref().unwrap();
-    let fake = s.install_fake(fake_cli_exe(), &ping[0]);
-    let args: Vec<&str> = ping[1..].iter().map(String::as_str).collect();
-    fake.on(&args).stdout("synthetic-ready-ping\n");
+    debug_assert_eq!(descriptor.interactive_entrypoint[0], name);
+    // Pinned agents (opencode, opencode-v2, cursor) have no host ping:
+    // readiness is proven inside the image, never by a host binary.
+    if let Some(ping) = descriptor.ping_argv.as_ref() {
+        let fake = s.install_fake(fake_cli_exe(), &ping[0]);
+        let args: Vec<&str> = ping[1..].iter().map(String::as_str).collect();
+        fake.on(&args).stdout("synthetic-ready-ping\n");
+    }
     configure(s, archive);
     repo.path().to_path_buf()
 }

@@ -103,7 +103,14 @@ impl<'ast> Visit<'ast> for Scan {
             if let Some(Expr::Lit(l)) = e.args.first() {
                 if let syn::Lit::Str(s) = &l.lit {
                     if [
-                        "claude", "codex", "gemini", "opencode", "pi", "crush", "maki",
+                        "claude",
+                        "codex",
+                        "gemini",
+                        "opencode",
+                        "cursor-agent",
+                        "pi",
+                        "crush",
+                        "maki",
                     ]
                     .contains(&s.value().as_str())
                     {

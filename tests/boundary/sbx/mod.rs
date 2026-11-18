@@ -17,8 +17,9 @@ const AGENTS: &[&str] = &[
     "cline",
     "codex",
     "copilot",
-    "gemini",
+    "cursor",
     "opencode",
+    "opencode-v2",
 ];
 
 #[test]
@@ -43,6 +44,45 @@ fn every_agent_kit_is_emitted_and_validated_by_sbx() {
         runtime
             .ready_agent(agent, false, &mut sink)
             .unwrap_or_else(|e| panic!("{agent}: kit emission or validation failed: {e}"));
+        let paths = awman::data::fs::SandboxKitPaths::at_home(sandbox.awman_home());
+        // ready_agent tolerates old sbx versions lacking kit validate. This
+        // boundary contract requires the validator to actually run and pass.
+        sandbox
+            .command(&sbx.cli)
+            .args(["kit", "validate"])
+            .arg(paths.kit_dir(agent))
+            .run()
+            .assert_success();
+        let rendered = std::fs::read_to_string(paths.spec_file(agent)).expect("emitted kit");
+        assert!(!rendered.contains("{{AWMAN_VERSION}}"), "{agent}");
+        if ["opencode", "opencode-v2", "cursor"].contains(agent) {
+            assert!(
+                rendered.lines().any(|line| line == "kind: agent"),
+                "{agent}"
+            );
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| line == format!("name: awman-{agent}")),
+                "{agent}"
+            );
+            // Templates use a block sequence of plain scalar argv tokens. Their
+            // full YAML shape is parsed in data::templates unit contracts and
+            // validated by the real sbx invocation above; read that sequence
+            // from the emitted file to compare against the launch definition.
+            let run = rendered
+                .split("    run:\n")
+                .nth(1)
+                .expect("agent.entrypoint.run");
+            let entrypoint: Vec<_> = run
+                .lines()
+                .take_while(|line| line.starts_with("      - "))
+                .map(|line| line.strip_prefix("      - ").unwrap().to_owned())
+                .collect();
+            let definition = awman::engine::agent::first_party::first_party(agent)
+                .unwrap_or_else(|| panic!("missing first-party definition for {agent}"));
+            assert_eq!(entrypoint, definition.interactive_entrypoint, "{agent}");
+        }
     }
     sandbox.finish();
 }

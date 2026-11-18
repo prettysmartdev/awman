@@ -312,12 +312,14 @@ impl OverlayEngine {
 /// settings directory is inside it, so only its awman-owned children
 /// (`agents/`, `squad/`) are protected in both directions; HOME itself, which
 /// holds the trust store, is never mountable anyway.
-fn overlaps_protected_root(dir: &Path, home: &Path, data_home: Option<&Path>) -> bool {
+pub(crate) fn overlaps_protected_root(dir: &Path, home: &Path, data_home: Option<&Path>) -> bool {
     use crate::data::config::agent_definition::HOST_DIR_DENY_LIST;
     use crate::data::fs::agent_dirs::AGENTS_SUBDIR;
     let fold = |p: &Path| PathBuf::from(p.to_string_lossy().to_ascii_lowercase());
     let canonical = |p: &Path| canonical_through_existing_ancestor(p).map(|p| fold(&p));
-    let dir = fold(dir);
+    let Some(dir) = canonical(dir) else {
+        return true;
+    };
     let overlaps = |root: &PathBuf| dir.starts_with(root) || root.starts_with(&dir);
     let mut both_ways: Vec<PathBuf> = HOST_DIR_DENY_LIST
         .iter()

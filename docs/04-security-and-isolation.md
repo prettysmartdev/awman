@@ -337,7 +337,7 @@ $ docker run --rm -it \
     -v /path/to/repo:/workspace \
     -w /workspace \
     -v /tmp/awman-claude-dir-a1b2c3/.claude:/home/awman/.claude \
-    -e GEMINI_API_KEY \
+    -e ANTHROPIC_API_KEY \
     awman-myapp-claude:latest claude "Implement work item 0001..."
 ```
 

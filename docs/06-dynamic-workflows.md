@@ -12,6 +12,8 @@ Dynamic workflows are useful when:
 - You want a custom workflow per work item rather than reusing a generic template
 - You're running in fully autonomous mode and want end-to-end execution from a single command
 
+When selecting `cursor` or `opencode-v2` for the leader or steps, pass `--yolo` explicitly: implied automation defaults do not authorize their broad approval modes, and such launches are refused.
+
 Dynamic mode always implies `--yolo`, `--worktree`, and a `context(workflow)` overlay. Local runs use an isolated Git worktree; remote sessions reuse their isolated clone. The leader and workflow steps share a context directory for coordination.
 
 ---
@@ -192,7 +194,7 @@ Restricts the leader to a known, approved set of agents and models instead of ev
 
   ```
   Error: workflows.dynamic.agentsToModels references agents that have no Dockerfile in this repo: [foo, bar].
-  Available agents: [claude, codex, gemini].
+  Available agents: [claude, codex, cursor].
   Add a .awman/Dockerfile.<agent> for each missing agent, or remove it from agentsToModels.
   ```
 
@@ -331,7 +333,7 @@ If all 3 repair attempts fail, awman surfaces the final error and the path to th
 
 ```
 leader agent failed to produce a valid workflow.toml after 3 repair attempts; last error: workflow.toml references agents with no Dockerfile in the project:
-  - "gemini" (expected .awman/Dockerfile.gemini)
+  - "cursor" (expected .awman/Dockerfile.cursor)
 Available agents: claude, codex; file is at /home/user/.awman/context/workflows/<run-id>/workflow.toml
 ```
 

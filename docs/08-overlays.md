@@ -701,13 +701,14 @@ Most awman-compatible agents support system prompt injection natively, so the co
 |-------|-----------------|
 | **claude** | CLI flag `--append-system-prompt-file` (recommended) |
 | **codex** | CLI flag `--config developer_instructions=<text>` |
-| **opencode** | Auto-reads `AGENTS.md` in the mounted context directory |
+| **opencode** / **opencode-v2** | Auto-reads `AGENTS.md` in the mounted context directory |
+| **cursor** | Auto-reads `AGENTS.md` in the mounted context directory |
 | **copilot** | Env var `COPILOT_CUSTOM_INSTRUCTIONS_DIRS` |
 | **antigravity (agy)** | CLI flag `--add-dir` + auto-reads `AGENTS.md` |
 
 **No native injection** (directory mounted, prompt not auto-delivered — reference it manually): [custom agents](15-custom-agents.md) whose definition uses `delivery = "none"`.
 
-**Degraded support** (replaces the entire system prompt rather than appending; awman prepends a baseline preamble to restore tool guidance, and logs a `warning` at startup): **gemini** (deprecated), **cline**. Prefer `claude` for the smoothest context experience.
+**Degraded support** (replaces the entire system prompt rather than appending; awman prepends a baseline preamble to restore tool guidance, and logs a `warning` at startup): **cline**. Prefer `claude` for the smoothest context experience.
 
 ### Read-only vs read-write
 

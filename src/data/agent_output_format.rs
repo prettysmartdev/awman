@@ -19,6 +19,8 @@ pub enum AgentOutputFormat {
     ClaudeStreamJson,
     /// Codex's `exec --json` NDJSON.
     CodexJson,
+    /// Cursor Agent's `--print --output-format stream-json` NDJSON.
+    CursorStreamJson,
 }
 
 impl AgentOutputFormat {
@@ -29,6 +31,7 @@ impl AgentOutputFormat {
             AgentOutputFormat::Text => "text",
             AgentOutputFormat::ClaudeStreamJson => "claude_stream_json",
             AgentOutputFormat::CodexJson => "codex_json",
+            AgentOutputFormat::CursorStreamJson => "cursor_stream_json",
         }
     }
 

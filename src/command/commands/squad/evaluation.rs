@@ -1066,6 +1066,7 @@ impl LocalTaskEvaluator {
 
         AgentRunOptions {
             yolo: Some(YoloMode::Enabled),
+            yolo_authorized: false,
             non_interactive: false,
             initial_prompt: Some(prompt.to_string()),
             model: model.map(str::to_string),
@@ -1234,6 +1235,7 @@ fn squad_workflow_flags(
         allow_docker: false,
         worktree: uses_worktree,
         yolo: true,
+        yolo_authorized: false,
         auto: false,
         agent: None,
         model: None,

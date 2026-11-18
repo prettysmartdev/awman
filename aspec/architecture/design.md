@@ -19,6 +19,10 @@ Unit tests, integration tests, and end-to-end tests are combined to achieve maxi
 ### Principle 3: Layered Architecture
 Strict unidirectional dependencies between layers prevent cross-cutting concerns and ensure that lower layers never depend on higher layers.
 
+### Agent version ownership
+
+Users select agent binary versions through agent Dockerfiles and installation templates. Agent definitions, readiness checks and launch admission must never require an exact binary version or reject an upgrade for differing from a bundled default. The sole version distinction is OpenCode 1.x versus 2.x, whose breaking interfaces have separate adapters; those adapters check only the major inside the image. Other agents have no version admission policy. Bundled artifact choices are installation defaults, not compatibility requirements.
+
 ## Four-Layer Architecture
 
 ```

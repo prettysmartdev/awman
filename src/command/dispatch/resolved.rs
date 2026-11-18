@@ -57,6 +57,7 @@ pub struct ResolvedFlags {
     /// Mutual-exclusion validation runs over this set, never over the resolved
     /// values: a default or an implied `true` must not read as a conflict.
     supplied: BTreeSet<&'static str>,
+    explicit: BTreeSet<&'static str>,
 }
 
 impl ResolvedFlags {
@@ -163,6 +164,10 @@ impl ResolvedFlags {
     /// Unlike the value getters this one does not panic on an unknown name —
     /// it answers a question about what the *user* typed, and a name they
     /// typed need not be in the spec.
+    pub fn explicit(&self, name: &str) -> bool {
+        self.explicit.contains(name)
+    }
+
     pub fn supplied(&self, name: &str) -> bool {
         self.supplied.contains(name)
     }
@@ -176,7 +181,7 @@ impl ResolvedFlags {
     /// [`CommandCatalogue::parse_raw_args`]: crate::command::dispatch::catalogue::CommandCatalogue::parse_raw_args
     pub fn supplied_argv(&self, exclude: &[&str]) -> Vec<String> {
         let mut argv = Vec::new();
-        for name in self.supplied.iter().filter(|name| !exclude.contains(name)) {
+        for name in self.explicit.iter().filter(|name| !exclude.contains(name)) {
             let values: Vec<String> = match self.get(name) {
                 ResolvedValue::Bool(true) => {
                     argv.push(format!("--{name}"));
@@ -242,6 +247,11 @@ impl ResolvedFlags {
             values.insert(flag.long, apply_default(read, flag));
         }
 
+        let explicit = supplied
+            .iter()
+            .copied()
+            .filter(|name| frontend.flag_is_explicit(name))
+            .collect();
         let resolved = Self {
             command: command_path
                 .iter()
@@ -249,6 +259,7 @@ impl ResolvedFlags {
                 .collect(),
             values,
             supplied,
+            explicit,
         };
         resolved.validate_conflicts(command_path, spec.flags)?;
         let mut resolved = resolved.close_over_implications(spec.flags);

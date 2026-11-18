@@ -23,11 +23,42 @@ pub const FIRST_PARTY_AGENT_NAMES: &[&str] = &[
     "claude",
     "codex",
     "opencode",
-    "gemini",
+    "opencode-v2",
+    "cursor",
     "copilot",
     "cline",
     "antigravity",
 ];
+
+/// A name that used to be built in, with migration guidance shown only when
+/// no custom definition of that name exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormerBuiltinAgent {
+    pub name: &'static str,
+    pub guidance: &'static str,
+}
+
+pub const FORMER_BUILTIN_AGENTS: &[FormerBuiltinAgent] = &[
+    FormerBuiltinAgent {
+        name: "crush",
+        guidance: "'crush' is no longer built in — recreate it with: awman new agent crush --from crush",
+    },
+    FormerBuiltinAgent {
+        name: "maki",
+        guidance: "'maki' is no longer built in — recreate it with: awman new agent maki --from maki",
+    },
+    FormerBuiltinAgent {
+        name: "gemini",
+        guidance: "'gemini' is no longer a built-in agent, and awman has not changed your selection. Either switch to the built-in 'antigravity' agent (awman chat --agent antigravity, or set agents.default to \"antigravity\"), or define Gemini CLI as your own custom agent with: awman new agent gemini (custom agents go through the normal review and approval step). Google ended Gemini CLI access for consumer Google-login and AI-plan accounts on 2026-06-18; enterprise subscriptions and paid API keys still work, which is what a custom agent would use.",
+    },
+];
+
+pub fn former_builtin_guidance(name: &str) -> Option<&'static str> {
+    FORMER_BUILTIN_AGENTS
+        .iter()
+        .find(|agent| agent.name == name)
+        .map(|agent| agent.guidance)
+}
 
 /// Host directories (relative to `$HOME`) a definition may never mount. Checked at parse
 /// time here and again in `OverlayEngine` (defence in depth).
