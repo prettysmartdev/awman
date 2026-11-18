@@ -989,24 +989,48 @@ async fn pull_runner_reuses_mock_server_lease_images_and_cleans_at_lease_end_and
     // no new lease ending, retaining only the newest cached image.
     let mut smaller = config;
     smaller["workServers"]["images"]["imageBudget"]["maxImages"] = json!(1);
+    // Hold startup eviction across shutdown. Recovery cleanup must remain
+    // owned even after the feature's asynchronous task has stopped.
+    std::fs::remove_file(docker.dir().join("release")).unwrap();
+    docker.on(&["rmi"]).hold_until_released();
     let restarted = Api::restart_with_config(&s, smaller).await;
     wait_for_async(
         "worker startup image eviction",
         Duration::from_secs(5),
         || async {
-            (docker
+            docker
                 .calls()
-                .iter()
-                .filter(|call| call.argv.first().is_some_and(|a| a == "rmi"))
-                .count()
-                == 5)
-                .then_some(())
+                .into_iter()
+                .find(|call| call.argv.first().is_some_and(|a| a == "rmi") && call.held)
         },
     )
     .await;
     let store = LeaseImageStore::open(db).unwrap();
     assert!(store.servers("nonexistent").unwrap().is_empty());
-    restarted.shutdown().await;
+    let shutdown = restarted.shutdown();
+    tokio::pin!(shutdown);
+    let cleanup_pending = tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
+        .await
+        .is_err();
+    docker.release();
+    assert!(
+        cleanup_pending,
+        "shutdown must wait for held recovery image cleanup"
+    );
+    tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("shutdown finishes after recovery cleanup is released");
+    assert_eq!(
+        docker
+            .calls()
+            .iter()
+            .filter(|call| {
+                call.argv.first().is_some_and(|a| a == "rmi") && call.exit == Some(0)
+            })
+            .count(),
+        5,
+        "all image removals finished before shutdown returned"
+    );
     mock.shutdown().await;
     drop(git_http);
 }

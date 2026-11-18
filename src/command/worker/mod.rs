@@ -89,6 +89,7 @@ pub struct PullController<F: ApiCommandFrontendFactory + 'static> {
     leases: LeaseStore,
     servers: RwLock<BTreeMap<String, Registered>>,
     active: Mutex<BTreeMap<String, Arc<Active>>>,
+    recovery_cleanups: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     foreground: tokio::sync::Mutex<BTreeMap<String, (tui_host::ManualRun, WorkerPermit)>>,
     claim_gates: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
     share: Arc<WorkerExecutorShare>,
@@ -121,6 +122,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             factory,
             servers: Default::default(),
             active: Default::default(),
+            recovery_cleanups: Default::default(),
             foreground: Default::default(),
             claim_gates: Default::default(),
             share: crate::command::commands::api_server::push_job::worker_share(core.executor()),
@@ -144,6 +146,15 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             self.shared.store.clone(),
             images::budgets(&self.settings()),
         )
+    }
+    /// Join after the feature task stops: recovery's drop guard may schedule
+    /// cleanup even when that task is cancelled. Blocking cleanup cannot be
+    /// aborted and must release private state before shutdown completes.
+    pub(crate) async fn finish_recovery_cleanup(&self) {
+        let tasks = std::mem::take(&mut *self.recovery_cleanups.lock().unwrap());
+        for task in tasks {
+            let _ = task.await;
+        }
     }
     fn data_paths(&self) -> crate::data::fs::DataPaths {
         self.shared.paths.data_paths()
@@ -479,7 +490,8 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
         struct Cleanup<'a, F: ApiCommandFrontendFactory + 'static>(&'a PullController<F>);
         impl<F: ApiCommandFrontendFactory + 'static> Drop for Cleanup<'_, F> {
             fn drop(&mut self) {
-                let _cleanup = self.0.cleanup_images();
+                let cleanup = self.0.cleanup_images();
+                self.0.recovery_cleanups.lock().unwrap().push(cleanup);
             }
         }
         let _cleanup = Cleanup(self);

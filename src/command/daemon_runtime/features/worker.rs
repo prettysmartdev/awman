@@ -252,6 +252,9 @@ impl<F: ApiCommandFrontendFactory + 'static> DaemonFeature for WorkerFeature<F> 
         if let Some(done) = done {
             done.cancelled().await;
         }
+        if let Some(pull) = self.pull.get() {
+            pull.finish_recovery_cleanup().await;
+        }
     }
     async fn stop_now(&self) {
         if let Some(stop) = self.stop.lock().unwrap().take() {

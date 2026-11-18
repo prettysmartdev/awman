@@ -129,7 +129,7 @@ Reused images accumulate, so each work server has an `imageBudget` limiting what
 
 Without `imageBudget` the limit is `maxImages: 20` and no byte limit. Once you set `imageBudget`, a key you leave out is unlimited (setting only `maxBytes` puts no limit on the count). The settings are live.
 
-Cleanup runs when the worker starts and recovers, after an image is provisioned, and when a lease ends. Stopping the worker waits for finished leases to complete their image cleanup. Cleanup follows these rules:
+Cleanup runs when the worker starts and recovers, after an image is provisioned, and when a lease ends. Stopping the worker waits for image cleanup from recovery and finished leases to complete. Cleanup follows these rules:
 
 - Only images the worker built itself are removed. An image that already existed when a lease needed it is reused but never removed.
 - The least recently used images go first, and the budget is re-checked after each removal.
