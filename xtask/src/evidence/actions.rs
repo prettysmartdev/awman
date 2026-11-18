@@ -135,12 +135,29 @@ with zipfile.ZipFile(sys.argv[1]) as z:
 }
 fn artifact<'a>(all: &'a [Value], name: &str) -> Result<&'a Value> {
     let matching = all.iter().filter(|v| v["name"] == name).collect::<Vec<_>>();
+    ensure!(!matching.is_empty(), "required artifact {name}: not found");
+    if matching.len() == 1 {
+        return Ok(matching[0]);
+    }
+    // Actions retains same-named uploads from earlier attempts. Select the
+    // uniquely newest service-authenticated upload, then apply every existing
+    // digest, source, producer and test-result check to it. Never fall back to
+    // older evidence when the latest upload fails validation.
+    let mut dated = matching
+        .into_iter()
+        .map(|artifact| {
+            let created = chrono::DateTime::parse_from_rfc3339(text(artifact, "created_at")?)
+                .with_context(|| format!("artifact {name}: invalid service creation time"))?;
+            Ok((created, artifact))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    dated.sort_by_key(|(created, _)| *created);
+    let latest = dated.last().expect("multiple matching uploads");
     ensure!(
-        matching.len() == 1,
-        "required artifact {name}: expected one, found {}",
-        matching.len()
+        dated[dated.len() - 2].0 != latest.0,
+        "required artifact {name}: ambiguous newest upload"
     );
-    Ok(matching[0])
+    Ok(latest.1)
 }
 fn job_passed(jobs: &[Value], name: &str, count: usize) -> Result<()> {
     let matching = jobs
@@ -603,6 +620,33 @@ mod tests {
         setup(dir.path());
         fs::remove_file(dir.path().join("expected.json")).unwrap();
         assert!(check().is_err());
+    }
+
+    #[test]
+    fn artifact_selection_uses_the_unique_newest_upload_without_fallback() {
+        let name = "evidence-pr--test-unit-macos-arm64-m0";
+        let older =
+            json!({"name":name, "id":1, "created_at":"2026-11-18T16:07:09Z", "expired":false});
+        let newer =
+            json!({"name":name, "id":2, "created_at":"2026-11-18T16:18:35Z", "expired":false});
+        for uploads in [
+            vec![older.clone(), newer.clone()],
+            vec![newer.clone(), older.clone()],
+        ] {
+            assert_eq!(artifact(&uploads, name).unwrap()["id"], 2);
+        }
+        // Selection must not fall back to older passing evidence if the newest
+        // upload cannot pass the subsequent digest/provenance/result checks.
+        let mut expired = newer.clone();
+        expired["expired"] = json!(true);
+        assert_eq!(artifact(&[older.clone(), expired], name).unwrap()["id"], 2);
+        assert!(artifact(&[], name).is_err());
+        assert!(artifact(&[newer.clone(), newer.clone()], name).is_err());
+        for timestamp in [Value::Null, json!("invalid")] {
+            let mut malformed = newer.clone();
+            malformed["created_at"] = timestamp;
+            assert!(artifact(&[older.clone(), malformed], name).is_err());
+        }
     }
 
     #[test]
