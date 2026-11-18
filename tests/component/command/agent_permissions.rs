@@ -72,7 +72,10 @@ async fn api_cursor_force_requires_explicit_yolo_and_honors_opt_out() {
         args.push("review".into());
         let bus = EventBus::new(128);
         let mut log = bus.subscribe_log();
-        let frontend = ApiDispatchFrontend::new("exec prompt", &args, bus.sender());
+        // Match ApiFrontendFactory: completion belongs to the caller after
+        // the asynchronous output drains, not to the frontend's Drop.
+        let frontend =
+            ApiDispatchFrontend::new("exec prompt", &args, bus.sender()).deferring_done();
         let mark = docker.calls().len();
         let result = Dispatch::new(
             frontend,
@@ -107,6 +110,8 @@ async fn api_cursor_force_requires_explicit_yolo_and_honors_opt_out() {
                     bus.wait_output_drained(std::time::Duration::from_secs(3))
                         .await
                 );
+                bus.sender()
+                    .emit(awman::data::execution_event::EventPayload::Done);
                 let paths =
                     awman::data::fs::api_paths::ApiPaths::from_root(s.tmp().join("api-logs"));
                 let command = if flag == "--yolo" {
