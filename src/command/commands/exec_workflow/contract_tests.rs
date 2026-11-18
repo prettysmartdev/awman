@@ -318,7 +318,10 @@ fn prerequisite_review_describes_the_whole_workflow_and_image_preparation() {
     assert!(dynamic.body.contains("all workflow prerequisites"));
     assert!(dynamic
         .body
-        .contains("prepares the listed missing agent images"));
+        .contains("prepares the listed missing or stale images"));
+    assert!(dynamic
+        .body
+        .contains("failed refresh warns and keeps the installed image"));
     assert!(!dynamic.body.contains("teardown"));
     report.origin = PrerequisiteOrigin::Static;
     let concrete = crate::command::prompts::prerequisite_report(&report, next);

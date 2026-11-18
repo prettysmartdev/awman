@@ -339,6 +339,24 @@ belongs to rather than inventing a new code.
 
 ## Output and configuration
 
+- Across Docker, Apple Containers, builtin and Docker Sandboxes, preparation
+  reports work rather than every internal check. Image preparation is quiet
+  when an installed image can be reused, including
+  when no source is configured. When acquisition is needed, use one progress
+  row, `Preparing <tag> (<source kind>)`, through completion or failure. This
+  includes acquisition-cache checks and does not claim a transfer or extraction.
+  Routine progress omits source references, full digests and duplicate completion
+  summaries; warnings and actionable failures remain visible.
+- Building runtimes report builds only when needed; reuse must never report a
+  completed build. Phase labels describe checks until work is known to be
+  needed. The CLI omits phase transitions and relies on work progress and the
+  final readiness summary. Raw build output is shown without a `running` suffix
+  on every line; there is no additional debug-style completion dump.
+- Sandbox readiness uses `Preparing <agent> kit (sbx)`. Successful `version`,
+  `ls` and `kit validate` probes omit command announcements and stdout, while
+  stderr warnings and failed commands' diagnostics remain visible. Mutating
+  sandbox commands retain their announcements. General networking guidance
+  belongs in the runtime guide, not in every preparation log.
 - Human-readable output goes to stdout, diagnostics to stderr. A
   machine-readable output mode replaces the human renderer entirely rather
   than appending structured data alongside it.
@@ -429,13 +447,12 @@ only through the local Docker Engine or Apple Containers store selected by
 that image's resolved source, then imports from that same source. Registry,
 archive, remote Docker, and unconfigured sources do not select a builder.
 Incompatible requested builds warn and retain normal source import behavior.
-API session setup may also build, when the compatible source store lacks the
-image; it never forces a rebuild. `chat` and `exec prompt` prepare an agent image
-that is not installed the same way, as the Docker and Apple runtimes build a
-missing image at launch; an installed image is only checked against its
-recorded source, and with the builder disabled a launch never acquires. Workflow
-preflight (static and dynamic) and squad image checks may build missing images
-through the same explicitly enabled compatible local builder, then import them.
+API session setup, `chat`, `exec prompt`, workflow preflight (static and dynamic)
+and squad image checks may build missing or stale source images through the
+same explicitly enabled compatible local builder, then import them. The
+workflow prerequisite review reports this pending preparation using the same
+input hashes, including generated recipes and project-image dependencies.
+With the builder disabled a launch never acquires.
 These checks re-acquire an image that is present but was imported from a different
 source than the one now resolved, so an image they accept is the one `ready`
 would have accepted. Like `ready`, they refuse to import a default source that

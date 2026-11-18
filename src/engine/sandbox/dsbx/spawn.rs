@@ -5,6 +5,8 @@
 //! stdout/stderr, and report non-zero exits with the command and captured
 //! stderr wrapped in [`EngineError::Sandbox`]. Secret values are piped via
 //! stdin (never argv) and redacted from any published output.
+//! Readiness probes suppress successful stdout and announcements; their
+//! warnings and failure diagnostics remain visible.
 //!
 //! The interactive `sbx run` PTY session does NOT flow through here — it is
 //! bridged by [`super::io_bridge`] — but its argv announcement still uses
@@ -122,6 +124,36 @@ impl SbxCommand {
         Ok(out)
     }
 
+    /// Readiness probes are quiet on success. Preserve warnings and include
+    /// the command and captured diagnostics on failure for the caller to report.
+    pub fn check_preparation(&self, sink: &mut dyn UserMessageSink) -> Result<(), EngineError> {
+        let out = self.run_quiet()?;
+        self.report_preparation(out, sink)
+    }
+
+    fn report_preparation(
+        &self,
+        out: SbxOutput,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<(), EngineError> {
+        if !out.success() {
+            let detail = format!("{}\n{}", out.stdout.trim(), out.stderr.trim());
+            return Err(EngineError::Sandbox(format!(
+                "`{}` exited with code {}: {}",
+                self.display_line(),
+                out.exit_code,
+                redact(detail.trim(), &self.redactions),
+            )));
+        }
+        for line in out.stderr.lines() {
+            sink.write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Warning,
+                text: redact(line, &self.redactions),
+            });
+        }
+        Ok(())
+    }
+
     /// Run the command without sink reporting — for the trait methods
     /// (`list_running`, `stats`) that have no frontend to report through, and
     /// for availability probing.
@@ -211,4 +243,57 @@ fn redact(line: &str, redactions: &[String]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::message::{MessageLevel, RecordingMessageSink};
+
+    #[test]
+    fn preparation_probes_are_quiet_but_preserve_warnings_and_failure_details() {
+        let mut command = SbxCommand::new(["kit", "validate", "/private/kit"]);
+        command.redactions.push("secret-value".into());
+        let mut sink = RecordingMessageSink::new();
+        command
+            .report_preparation(
+                SbxOutput {
+                    stdout: "kit validated\nverbose source metadata\n".into(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                },
+                &mut sink,
+            )
+            .unwrap();
+        assert!(sink.all().is_empty());
+        command
+            .report_preparation(
+                SbxOutput {
+                    stdout: "kit validated".into(),
+                    stderr: "deprecated field: secret-value".into(),
+                    exit_code: 0,
+                },
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(sink.all().len(), 1);
+        assert_eq!(sink.all()[0].level, MessageLevel::Warning);
+        assert_eq!(sink.all()[0].text, "deprecated field: ***");
+        let error = command
+            .report_preparation(
+                SbxOutput {
+                    stdout: "invalid kit field".into(),
+                    stderr: "validation failed: secret-value".into(),
+                    exit_code: 2,
+                },
+                &mut sink,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("sbx kit validate /private/kit"));
+        assert!(error.contains("exited with code 2"));
+        assert!(error.contains("invalid kit field"));
+        assert!(error.contains("validation failed: ***"));
+        assert!(!error.contains("secret-value"));
+    }
 }

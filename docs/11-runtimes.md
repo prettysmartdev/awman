@@ -2,6 +2,14 @@
 
 awman supports four agent runtimes. The runtime controls how agent processes are isolated from your host machine. All four use the same `awman` commands, the same workflow files, and the same agent names — the runtime is a configuration choice, not a different tool.
 
+Preparation output follows the same rules on every runtime: reusing a ready
+image is quiet, and progress describes work that is needed. Docker and Apple
+Containers show build progress only when building. Builtin shows a short
+`Preparing <image> (<source>)` status, which may reuse cached content. Docker
+Sandboxes shows `Preparing <agent> kit (sbx)` while creating and validating its
+kit. Warnings and failures remain visible, and `ready` finishes with a readiness
+summary. Build output is printed without a `running` suffix on every line.
+
 ---
 
 ## Choosing a runtime
@@ -87,6 +95,14 @@ During API session setup, before `chat`, `exec prompt` and squad tasks launch, a
 - An **unlabelled** image, built by an earlier awman, is rebuilt once and is labelled from then on.
 - A **missing** image behaves as before: a missing agent image is built, and a missing project image tells you to run `awman ready`.
 - Concurrent awman processes share one rebuild: a second process waits for the first and reuses its image.
+
+The workflow prerequisite review checks freshness as well as existence. An image
+that needs rebuilding is shown as requiring preparation, with the reason. This
+also applies when its project image needs rebuilding or its generated agent
+Dockerfile will change. `--check-prerequisites` reports these pending actions
+without writing Dockerfiles, downloading, building or importing images. If a
+refresh fails and awman continues with the installed image, the final report
+retains that warning instead of declaring the image satisfied.
 
 Image tags are named after the repository folder, so alternating between branches whose Dockerfiles or copied files differ rebuilds the image each time you switch.
 
@@ -212,6 +228,12 @@ awman ready
 
 The image is imported into awman's private store. Docker is used only as a *source* at this step (awman talks to the Engine API directly and never runs the `docker` CLI). Agents never run in Docker under this runtime, and after import Docker does not need to be running.
 
+Readiness checks stay quiet when an installed image can be reused. If preparation
+is needed, you see a short status such as
+`Preparing awman-myproject-claude:latest (apple-local)`. Preparation may reuse
+cached content; it does not necessarily download or import the image again.
+Warnings and failures still include the details needed to act on them.
+
 There is no default source. With none configured, `awman ready` fails with `no image source is configured for '<tag>'` followed by the build commands above, rather than guessing a registry or daemon.
 
 **`awman init` and `builtin`.** `awman init` builds images through the configured runtime, so with `runtime.kind` set to `builtin` its build step fails (`image building; build externally and import with ready is not supported on the builtin runtime`) and the agent audit is skipped. Run `awman init` before selecting `builtin` (or with `docker` or `apple` temporarily selected), then switch the runtime and run `awman ready` after building externally.
@@ -279,12 +301,12 @@ With `{ "type": "apple-local" }`, `awman ready` asks the Apple Containers servic
 ### What `awman ready` does under `builtin`
 
 - With the builder disabled, the base project image is reported as **skipped** (it is only an input to your external build). With the builder enabled and a compatible local source, it is built in that source store first (see [Building from a local image source](#building-from-a-local-image-source)). The agent image is **imported**, and an **Image source** row appears in the summary (also in `--json` output).
-- One rule decides whether an image is acquired: it is re-acquired when the configured source differs from the installed image's source, or when a successful build is waiting to be imported; otherwise the installed or cached copy is reused. With `runtime.builtin.builder.enabled` and a compatible local source, session setup, launches, workflow prerequisite solves, worker leases and squad can build missing images before importing. They do not rebuild installed images; use `awman ready --build` to refresh them. The `Dockerfile` path used for builds and hints is the repo's configured one.
+- An image is re-acquired when the configured source differs from the installed image's source, or when a successful build is waiting to be imported; otherwise the installed or cached copy is reused. With `runtime.builtin.builder.enabled` and a compatible local source, session setup, launches, workflow prerequisite solves, worker leases and squad also compare source input hashes and build missing or stale images before importing. Use `awman ready --build` to force a refresh even when those inputs match. The `Dockerfile` path used for builds and hints is the repo's configured one.
 - With the builtin builder enabled, a chat or prompt launch whose agent image is not installed prepares it first, as Docker and Apple Containers do: it builds the base and agent images in the source store if that store lacks them (fetching `.awman/Dockerfile.<agent>` if needed), then imports the result. So `awman chat --agent codex` works without a separate `ready` run. With an incompatible source (a registry, an archive, a remote Docker endpoint) the launch imports from it without building. With the builder disabled, a launch never builds or imports: run `awman ready` first.
-- With the builtin builder enabled, chat and prompt launches check an installed image's recorded source and any pending build receipt without contacting a source or builder. If the source differs or the installed content does not match the pending build, run `awman ready` before launching. An older installation without recorded source details also needs one `ready` run to establish them.
+- With an enabled local builtin builder, chat and prompt launches check source input hashes, the installed image's recorded source and any pending build receipt. A current image from the same source is reused without exporting, acquiring or importing it again, and without import progress messages. Missing or stale source images are built and imported as needed. Other sources keep their check-only behavior for installed images; run `awman ready` if their recorded source differs or provenance is missing.
 - With a configured source, `ready` checks the acquisition cache using the source kind, resolved endpoint or archive path, reference, and platform. Changing any of these selects that source's cache entry or acquires it. A replaced archive is revalidated; a cached archive remains usable after its source is removed. With no source configured, an installed image is reused.
 - With the builder disabled (the default), `awman ready --build` and `--no-cache` **re-acquire** the image from its source; they do not build. `--refresh` (the Dockerfile audit) is unchanged. With the builder enabled, `--build` schedules the usual builds, and `--no-cache` applies to any build that runs and still re-acquires the image from its source.
-- `awman ready --build` also imports the image of **every other agent** that has a `.awman/Dockerfile.<agent>` (one **Import agent image: \<agent\>** row each), so `chat --agent`, workflow steps, and other agents can run without a separate import. Plain `awman ready` imports only the default agent and lists any other agents whose images are missing.
+- `awman ready --build` also prepares the image of **every other agent** that has a `.awman/Dockerfile.<agent>`, with one preparation status per image, so `chat --agent`, workflow steps, and other agents can run without a separate import. Plain `awman ready` prepares only the default agent and lists any other agents whose images are missing.
 - Other agents use their own `runtime.builtin.images` entry when there is one, otherwise `runtime.builtin.imageSource`. A `runtime.builtin.imageSource` that names a single image — an `archive`, or any source with an explicit `reference` — holds only one agent's image, so for other agents `ready` skips it with a warning instead of importing the wrong image. Give each of those agents its own `runtime.builtin.images` entry (for example one archive per agent). Workflow preflight and squad apply the same rule: a step running another agent fails with that warning's text rather than importing the default agent's image under its tag.
 - When the summary reports agent images that are still missing, its closing hint says what to do for each one: `run "ready --build" to import <agents>.` (or `build <agents>` / `build and import <agents>`, depending on what each image's source allows), and ``configure an image source for <agents> (`runtime.builtin.imageSource` or a `runtime.builtin.images` entry), then run "ready --build".`` for an agent with no usable source. A digest-pinned local reference or colliding build output instead asks you to configure a writable, distinct reference in `runtime.builtin.images` before running `ready --build`. A failed image gets its own hint, for example `fix the <agent> image build, then run "awman ready --build" again.` or `the <agent> image was built but not imported; run "awman ready" again to retry the import.`
 - If the `--refresh` audit changes `Dockerfile.dev` and this session cannot rebuild the default image, `ready` warns: ``Dockerfile changed: rebuild the image in its source store (or enable `runtime.builtin.builder.enabled` with a `docker-local` or `apple-local` source), then run `awman ready --build` to re-import it``, or, with no source configured, to rebuild it externally and configure `runtime.builtin.imageSource`.
@@ -540,9 +562,11 @@ awman ready
 
 No credentials are registered at ready time — all secret registration happens at agent launch, scoped to the launched sandbox. See [Credentials](#credentials) below.
 
-No images are built and nothing is pushed to a registry. `awman ready` for sbx is fast: kit emission and credential registration are text-file writes and short subprocess calls.
+No images are built and nothing is pushed to a registry. `awman ready` for sbx writes kit files and runs short validation commands.
 
-Every `sbx` command awman runs is announced in the status log before it executes. You can see exactly what awman is doing on your behalf.
+Successful readiness probes (`sbx version`, `sbx ls`, and `sbx kit validate`)
+stay quiet. Warnings and failures retain their diagnostics; commands that change
+sandboxes, such as removal with `--no-cache`, are still announced.
 
 ### Kits — what they are and where they live
 

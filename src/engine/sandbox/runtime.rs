@@ -37,8 +37,8 @@ pub struct SandboxRuntime {
 impl SandboxRuntime {
     /// Prepare this runtime for a single agent at `awman ready` time: check
     /// the `sbx` binary and login, emit the agent's kit, register
-    /// credentials, and validate the kit. Reports every `sbx` subprocess on
-    /// `sink`.
+    /// credentials, and validate the kit. Successful readiness probes stay
+    /// quiet; mutations, warnings and failures are reported on `sink`.
     ///
     /// `no_cache` removes the agent's existing awman sandboxes (`sbx rm`)
     /// before re-emitting the kit, so the next launch re-runs the kit install

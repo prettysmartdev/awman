@@ -44,7 +44,7 @@ impl PrerequisitePreflight {
     ) -> Vec<PrerequisiteCheck> {
         use WorkflowPrerequisite::*;
         let check = match &need.prerequisite {
-            AgentImage { tag, .. } => {
+            AgentImage { tag, agent } => {
                 if self.options.runtime.capabilities().image_acquisition
                     == crate::engine::agent_runtime::ImageAcquisition::Kit
                 {
@@ -55,15 +55,26 @@ impl PrerequisitePreflight {
                         vec![],
                     )];
                 }
-                let (status, explanation) = match self.options.runtime.image_exists(tag) {
-                    Ok(true) => (
+                let readiness = if let Some(session) = &self.options.image_session {
+                    crate::engine::image_prep::workflow_image_preparation(
+                        self.options.runtime.clone(),
+                        session,
+                        agent,
+                        tag,
+                    )
+                } else {
+                    self.options.runtime.image_exists(tag).map(|present| {
+                        (!present).then(|| {
+                            format!("image {tag} must be prepared before the workflow starts")
+                        })
+                    })
+                };
+                let (status, explanation) = match readiness {
+                    Ok(None) => (
                         PrerequisiteStatus::Satisfied,
                         format!("image {tag} is available"),
                     ),
-                    Ok(false) => (
-                        PrerequisiteStatus::Missing,
-                        format!("image {tag} must be prepared before the workflow starts"),
-                    ),
+                    Ok(Some(reason)) => (PrerequisiteStatus::Missing, reason),
                     Err(error) => (
                         PrerequisiteStatus::Unknown,
                         format!("could not inspect image {tag}: {error}"),

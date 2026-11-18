@@ -39,6 +39,8 @@ pub struct PrerequisitePreflightOptions {
     pub worktree_planned: bool,
     pub phase_image: Option<String>,
     pub runtime: Arc<dyn AgentRuntimeEngine>,
+    /// Image recipes, source configuration and lease tags for read-only readiness.
+    pub image_session: Option<crate::data::session::Session>,
     pub container_runtime: Option<Arc<ContainerRuntime>>,
     /// Remote API sessions use this URL even before the clone exists.
     pub session_type: Option<SessionType>,
@@ -70,6 +72,7 @@ impl PrerequisitePreflightOptions {
             policy,
         );
         options.session_type = Some(session.session_type().clone());
+        options.image_session = Some(session.clone());
         options.container_runtime = container_runtime;
         options
     }
@@ -84,6 +87,7 @@ impl PrerequisitePreflightOptions {
             prerequisites,
             git_root,
             runtime,
+            image_session: None,
             policy,
             phase: PrerequisitePhase::Start,
             worktree: None,

@@ -117,7 +117,10 @@ impl crate::engine::agent::AgentImageFrontend for CliFrontend {
         };
         self.messages.write_message(UserMessage {
             level,
-            text: format!("{step}: {}", super::helpers::step_status_label(&status)),
+            text: match step {
+                crate::data::setup_step::SetupStep::Output(line) => line.clone(),
+                _ => format!("{step}: {}", super::helpers::step_status_label(&status)),
+            },
         });
     }
 

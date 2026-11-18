@@ -6,6 +6,9 @@ use awman_test_support::{
 };
 use serde_json::{json, Value};
 
+const PROJECT_RECIPE: &str = "FROM scratch\n";
+const AGENT_RECIPE: &str = "FROM project\n";
+
 pub fn prepare(s: &TestSandbox) -> Vec<awman_test_support::fakes::FakeCli> {
     ConfigTree::new()
         .global(
@@ -14,11 +17,37 @@ pub fn prepare(s: &TestSandbox) -> Vec<awman_test_support::fakes::FakeCli> {
         .write(s, None);
     let docker = s.install_fake(crate::support::fake_cli_exe(), "docker");
     awman_test_support::fakes::docker_cli_baseline(&docker);
-    // Successful check-only scenarios now include the selected agent image.
-    // Other images retain the baseline's missing-image response.
+    // Successful reviews need matching project and agent input labels, not
+    // merely a successful `image inspect` exit status with no metadata.
     for repo in ["workflow", "read-only"] {
-        let tag = awman::data::image_tags::agent_image_tag(&s.work().join(repo), "claude");
-        docker.on(&["image", "inspect", &tag]).exit(0);
+        use awman::data::image_inputs::{agent_inputs_hash, project_inputs, DirBuildContext};
+        let root = s.work().join(repo);
+        let base_id = format!("sha256:{}", "1".repeat(64));
+        let base_hash = project_inputs(
+            Some(PROJECT_RECIPE.as_bytes()),
+            &DirBuildContext::new(&root),
+        )
+        .hash;
+        let agent_hash = agent_inputs_hash(AGENT_RECIPE.as_bytes(), &base_id);
+        for (tag, id, hash) in [
+            (
+                awman::data::image_tags::project_image_tag(&root),
+                base_id,
+                base_hash,
+            ),
+            (
+                awman::data::image_tags::agent_image_tag(&root, "claude"),
+                format!("sha256:{}", "2".repeat(64)),
+                agent_hash,
+            ),
+        ] {
+            let metadata = json!([{ "Id": id, "RepoTags": [tag], "Size": 1,
+                "Config": { "Labels": { "dev.awman.inputs": hash.as_str() } } }]);
+            docker
+                .on(&["image", "inspect", &tag])
+                .stdout(&metadata.to_string())
+                .exit(0);
+        }
     }
     [
         "claude",
@@ -126,6 +155,8 @@ pub async fn workflow_preflight_is_read_only_and_missing_work_is_typed(
 ) -> Value {
     let repo = RepoBuilder::new(s, "workflow")
         .file("README.md", "fixture\n")
+        .file("Dockerfile.dev", PROJECT_RECIPE)
+        .file(".awman/Dockerfile.claude", AGENT_RECIPE)
         .init();
     let workflow = WorkflowBuilder::new("preflight")
         .step_with(awman_test_support::fixtures::WorkflowStep {
@@ -186,6 +217,8 @@ pub async fn read_only_workspace_refusals_are_typed_and_precede_launch(
 ) -> Value {
     let repo = RepoBuilder::new(s, "read-only")
         .file("README.md", "fixture\n")
+        .file("Dockerfile.dev", PROJECT_RECIPE)
+        .file(".awman/Dockerfile.claude", AGENT_RECIPE)
         .file(
             "setup.toml",
             "title = 's'\nagent = 'claude'\n\n[[setup]]\ntype = 'run_shell'\ncommand = 'true'\n\n[[step]]\nname = 'run'\nprompt = 'look'\n",

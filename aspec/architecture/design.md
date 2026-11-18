@@ -189,16 +189,25 @@ kind. With `builtin.builder.enabled`, a command whose `BuildPolicy` allows it
 may build through the local Docker Engine (Unix socket) or Apple Containers
 store selected by that image's resolved source, then import from that same
 source. `ready` (`Ready`), API session setup, and the agent availability check behind
-`chat`/`exec prompt` for an image that is not installed (`SessionSetup`, only
-when the compatible source store lacks the image) may build. Workflow
-prerequisite solves (static, dynamic and worker leases) and squad evaluation
-use that same missing-image decision: `SessionSetup` for a missing image with
-an enabled builder and a usable source, otherwise `ImportOnly`. Installed
-images are never rebuilt by preflight; `ready --build` refreshes them. Launches
-keep `CheckOnly` for installed images or disabled builders. Other sources retain their normal import behavior and
+`chat`/`exec prompt` may build. With an enabled compatible local builder,
+`SessionSetup` checks source input hashes and builds missing or stale images,
+even when an older copy is installed. Workflow prerequisite solves (static,
+dynamic and worker leases) and squad evaluation use the same decision.
+The prerequisite review reports pending builds and imports before preparation.
+`ready --build` forces a refresh. Launches without a usable enabled builder
+retain their check-only behavior. Other sources retain their normal import behavior and
 never select a substitute builder. Build and import remain separate stages;
 successful build alone is not readiness. Source acquisition is not required
 after an image is cached.
+
+After freshness and pending-receipt handling, image preparation verifies the
+installed image's complete acquisition source, platform and any required built
+identity before opening import progress. A matching installed image is reused
+without entering acquisition/import, even if the acquisition archive cache is
+absent. Explicit refreshes, new builds and pending imports still acquire their
+required content. Archive sources retain acquisition's replaced-file check.
+An import progress row describes an actual acquisition attempt, never an
+unconditional claim that an existing image is being imported again.
 
 The Layer 1 `AgentImagePreparer` owns this lifecycle for one image: it resolves
 the image's source once, derives a single `BuilderSelection` (local Docker,
@@ -312,6 +321,16 @@ All checks use `PrerequisitePreflight` and the serializable
 review, resolves explicit flags, remembered decisions, policy and mode defaults,
 and prepares approved images before any leader or workflow agent starts.
 Image setup has no separate modal or post-leader build pass.
+For building runtimes and enabled local source builders, the initial image
+review compares the same input hashes as preparation, including the effective
+agent recipe after generated-Dockerfile synchronization and the project image
+on which it depends. Stale or unlabelled images, and agents whose project image
+needs rebuilding, are reported as requiring preparation, never satisfied merely
+because their tag exists. Inspection failures remain unknown. The review does
+not write recipes, download them, build, import, or alter build receipts.
+Preparation preserves the installed-image fallback after a failed refresh and
+records the remaining stale/unknown state in the final report; dynamic scope
+narrowing accepts that prepared fallback without retrying the failed build.
 `--check-prerequisites` uses the same plan and probes without granting
 credentials, building/importing images or creating a worktree.
 

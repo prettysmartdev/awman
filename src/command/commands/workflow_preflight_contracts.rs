@@ -311,7 +311,11 @@ async fn concurrent_preflight_holds_build_leases_until_import_finishes() {
     one.await.unwrap().unwrap();
     two.await.unwrap().unwrap();
     assert_eq!(store.built.lock().unwrap().len(), 2);
-    assert_eq!(store.imports.lock().unwrap().len(), 2);
+    assert_eq!(
+        store.imports.lock().unwrap().len(),
+        1,
+        "the waiter reuses the image installed by the first preflight"
+    );
     s.finish();
 }
 
