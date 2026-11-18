@@ -305,6 +305,20 @@ fn local_classification_uses_typed_causes_and_never_display_text_or_timeouts() {
         tls: None,
     };
     assert!(local_socket_failure(&remote, &nested).is_none());
+    #[cfg(unix)]
+    {
+        // macOS returns ENOTSOCK for a regular file, while Linux returns
+        // ConnectionRefused. Exercise the OS error on both platforms.
+        let not_socket = std::io::Error::other(std::io::Error::from_raw_os_error(libc::ENOTSOCK));
+        let error = local_socket_failure(&endpoint, &not_socket)
+            .expect("ENOTSOCK must be a final invalid-socket diagnosis");
+        assert!(matches!(
+            local_unavailability(&error),
+            Some(LocalDockerUnavailable::InvalidSocket { .. })
+        ));
+        assert!(!retry::is_retryable(&error));
+        assert!(local_socket_failure(&remote, &not_socket).is_none());
+    }
     let err = resolve_endpoint(Some("ssh://host"), None, &EnvSnapshot::empty()).unwrap_err();
     assert!(matches!(err, EngineError::UnsupportedImageSource { .. }));
     assert!(!retry::is_retryable(&err));

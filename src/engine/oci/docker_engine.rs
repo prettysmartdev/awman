@@ -164,6 +164,14 @@ fn local_socket_failure(
                         endpoint: endpoint.describe(),
                     })
                 }
+                // macOS reports ENOTSOCK for non-socket paths, which has no
+                // dedicated ErrorKind. Use the OS code, not its display text.
+                #[cfg(unix)]
+                _ if io.raw_os_error() == Some(libc::ENOTSOCK) => {
+                    Some(LocalDockerUnavailable::InvalidSocket {
+                        endpoint: endpoint.describe(),
+                    })
+                }
                 std::io::ErrorKind::PermissionDenied => {
                     Some(LocalDockerUnavailable::PermissionDenied {
                         endpoint: endpoint.describe(),
