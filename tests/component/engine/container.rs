@@ -7,25 +7,27 @@ fn docker_and_apple_build_labels_inspect_filter_and_remove_images() {
     let s = crate::support::sandbox(
         "engine::container::docker_and_apple_build_labels_inspect_filter_and_remove_images",
     );
+    let image_id = format!("sha256:{}", "1".repeat(64));
+    let platform = awman::data::oci_identity::OciPlatform::host_linux();
     for name in ["docker", "container"] {
         let fake = s.install_fake(crate::support::fake_cli_exe(), name);
         fake.on(&["build"]).stdout("built\n");
         let labels =
             serde_json::json!({INPUTS_LABEL: "inputs", REPO_LABEL: "example.test/team/repo"});
         let json = if name == "docker" {
-            serde_json::json!([{"Id": "sha256:image", "RepoTags": ["project:latest"], "Size": 123, "Config": {"Labels": labels}}])
+            serde_json::json!([{"Id": image_id, "RepoTags": ["project:latest"], "Size": 123, "Config": {"Labels": labels}}])
         } else {
-            serde_json::json!([{"configuration": {"name": "project:latest", "descriptor": {"digest": "sha256:index"}}, "variants": [{"digest": "sha256:image", "size": 123, "platform": {"architecture": "arm64", "os": "linux"}, "config": {"architecture": "arm64", "config": {"Labels": labels}}}]}])
+            serde_json::json!([{"configuration": {"name": "project:latest", "descriptor": {"digest": "sha256:index"}}, "variants": [{"digest": image_id, "size": 123, "platform": platform, "config": {"config": {"Labels": labels}}}]}])
         };
         fake.on(&["image", "inspect", "project:latest"])
             .stdout(&format!("{json}\n"));
-        fake.on(&["image", "inspect", "sha256:image"])
+        fake.on(&["image", "inspect", &image_id])
             .stdout(&format!("{json}\n"));
         fake.on(&["image", "inspect", "missing"])
             .stderr("No such image: missing")
             .exit(1);
         fake.on(&["image", "ls"])
-            .stdout("sha256:image\nsha256:image\n");
+            .stdout(&format!("{image_id}\n{image_id}\n"));
         fake.on(&["image", "list"])
             .stdout("[{\"configuration\":{\"name\":\"project:latest\"}}]\n");
         fake.on(&["rmi"]);
@@ -63,7 +65,7 @@ fn docker_and_apple_build_labels_inspect_filter_and_remove_images() {
             .image_with_inputs("project:latest", &inputs)
             .unwrap()
             .unwrap();
-        assert_eq!(image.id, "sha256:image");
+        assert_eq!(image.id, image_id);
         assert_eq!(image.size_bytes, 123);
         assert_eq!(image.labels[REPO_LABEL], repo.as_str());
         assert!(runtime

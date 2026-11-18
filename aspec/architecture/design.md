@@ -210,6 +210,12 @@ cannot start or run an agent, which stays inside the builtin runtime.
 Image-source configuration belongs to the data layer (which also resolves the
 session's builtin settings into process-wide and per-launch parts), acquisition,
 build and import to the engine, and `ready` orchestration to the command layer.
+Apple image freshness inspection accepts both the older `name/index/variants`
+output (including supported Apple Containers 0.12.0) and the newer per-variant
+manifest digests. An index digest can identify build inputs, but is never used
+as a single-platform manifest receipt. A source build requiring such a receipt
+must obtain it from inspection or the build itself. Invalid metadata diagnostics
+identify the image, backend and failed field.
 The builtin runtime itself is process-wide (state directory, embedded runtime,
 ambient-override check), while network policy, vCPUs and memory are per-launch
 settings taken from each session's effective config. Backends do not

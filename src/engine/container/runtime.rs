@@ -46,6 +46,9 @@ pub struct ContainerImageInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageMetadata {
     pub id: String,
+    /// Selected platform manifest, when reported. `id` can instead identify
+    /// a config or an image index and must not be used as an import receipt.
+    pub manifest_digest: Option<crate::data::oci_identity::Digest>,
     pub tags: Vec<String>,
     pub labels: BTreeMap<String, String>,
     pub size_bytes: u64,

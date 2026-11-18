@@ -472,6 +472,7 @@ impl ContainerBackend for BuiltinBackend {
             labels.extend(record.labels.clone());
         }
         Ok(Some(super::super::runtime::ImageMetadata {
+            manifest_digest: record.as_ref().map(|r| r.identity.manifest_digest.clone()),
             id: record
                 .as_ref()
                 .map(|r| r.identity.config_digest.to_string())

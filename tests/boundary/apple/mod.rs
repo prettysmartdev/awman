@@ -100,6 +100,14 @@ fn native_store_export_validates_content_and_reuses_the_cache() {
     let first = acquirer
         .acquire(&request, &mut |_| {})
         .expect("export through native XPC");
+    let metadata = runtime
+        .inspect_image("awman-test/guest:fixture")
+        .expect("read the installed Apple version's inspection format")
+        .expect("loaded fixture is present");
+    assert!(!metadata.id.is_empty());
+    if let Some(manifest) = metadata.manifest_digest {
+        assert_eq!(manifest, first.identity.manifest_digest);
+    }
     assert_eq!(first.identity.source, ImageSourceKind::AppleStore);
     assert!(first.bytes > 0 && first.archive.is_file());
     drop(image);

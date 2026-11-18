@@ -270,7 +270,7 @@ impl AgentImagePreparer {
                 _ => None,
             }
         };
-        let (identity, outcome, lease) = if let Some(image) = cached {
+        let cached_identity = if let Some(image) = cached {
             match self
                 .inspect_source(
                     spec.request.target.clone(),
@@ -279,20 +279,24 @@ impl AgentImagePreparer {
                 )
                 .await?
             {
-                builder::SourceImage::Present(identity) => {
-                    (identity, ImageBuildOutcome::Reused, lease)
-                }
+                builder::SourceImage::Present(identity) => Some(identity),
                 builder::SourceImage::Unbound
                     if spec.request.target == builder::BuildTarget::Apple =>
                 {
-                    // Apple's listing may name an index; JSON inspection
-                    // supplies the selected variant's manifest digest.
-                    let digest = crate::data::oci_identity::Digest::parse(&image.id)
-                        .map_err(EngineError::Config)?;
-                    let identity =
-                        BuiltImageIdentity::new(None, Some(digest), spec.request.platform.clone())
-                            .map_err(EngineError::Config)?;
-                    (identity, ImageBuildOutcome::Reused, lease)
+                    // Older Apple inspection only reports an index. Rebuild
+                    // to obtain a manifest receipt rather than treating that
+                    // index as a selected platform's manifest.
+                    image
+                        .manifest_digest
+                        .map(|digest| {
+                            BuiltImageIdentity::new(
+                                None,
+                                Some(digest),
+                                spec.request.platform.clone(),
+                            )
+                            .map_err(EngineError::Config)
+                        })
+                        .transpose()?
                 }
                 _ => {
                     return Err(EngineError::Container(
@@ -300,6 +304,11 @@ impl AgentImagePreparer {
                     ))
                 }
             }
+        } else {
+            None
+        };
+        let (identity, outcome, lease) = if let Some(identity) = cached_identity {
+            (identity, ImageBuildOutcome::Reused, lease)
         } else {
             let request = spec.request.clone().with_inputs(&spec.inputs, &spec.repo);
             let builder = self.builder();

@@ -298,6 +298,14 @@ Set `runtime.builtin.builder.enabled` to `true` to let `awman ready`, launches a
 
 Plain `awman ready` inspects a compatible local source store when normal readiness rules need to know whether an image exists. If no build is needed, an installed image that matches that source is reused without exporting it again. If the builder cannot be reached but that image is already installed and no build is pending, ready warns and continues with the installed image. A successful build forces a fresh import from the same store and reference, even if the acquisition cache contains an older image.
 
+Apple Containers 0.12.0 reports an image index instead of a per-platform digest
+in its inspection output; awman accepts that format for image freshness checks
+and builds. Inspection failures name the image and the field that could not be
+read. If `chat` still launches, its previously imported builtin
+image remains usable: `ready` also checks the source store, which launch does
+not need. Updating awman fixes older versions that rejected valid Apple 0.12.0
+metadata even with `ready --build --no-cache`.
+
 The project base image is built before dependent agent images in the same source store. Build and import have separate result rows; readiness requires both stages for each required image. A project image built only for a non-default agent's store is optional like that agent's image: if it fails, the row shows the failure, but `ready` still succeeds once every required image is ready. A build can succeed while import fails, in which case `awman ready` reports failure and can retry the import on a later run. `--no-cache` affects builds when a build is scheduled; by itself it does not schedule one, but it does re-acquire the image from its source. Use `--build` to request the usual forced builds.
 
 If a required image stage fails or remains unfinished, `awman ready` reports `awman is not ready.` and exits with status 1, whether or not the builder is enabled. Pending build receipts are stored under the awman data home at `pending-builds/`; per-image build locks are under `locks/image-build/`. Two awman processes preparing the same store and reference take turns; the one that waits (a `chat` launch during a running `awman ready --build`, for example) prints `Waiting for another awman process to finish with <reference> in <store>…`. Source builds disable BuildKit provenance and SBOM attestations so the exported result has a verifiable single-platform image. Docker `npipe://` endpoints are unsupported for builtin image acquisition or building. A configured source is checked again when an image must be acquired; a cached builtin image is reused only when its identity matches the inspected source.

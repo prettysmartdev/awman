@@ -13,13 +13,22 @@ pub(crate) fn parse_inspection(
     tag: &str,
     apple: bool,
 ) -> Result<ImageMetadata, EngineError> {
-    let rows: Value = serde_json::from_slice(bytes).map_err(|_| invalid())?;
-    let row = rows.get(0).ok_or_else(invalid)?;
+    let invalid = |detail: &str| {
+        EngineError::Container(format!(
+            "unreadable image metadata for {tag} ({}): {detail}",
+            if apple { "Apple Containers" } else { "Docker" }
+        ))
+    };
+    let rows: Value = serde_json::from_slice(bytes).map_err(|_| invalid("invalid JSON"))?;
+    let row = rows
+        .get(0)
+        .ok_or_else(|| invalid("expected an image row"))?;
+    let mut manifest_digest = None;
     let (id, config, size) = if apple {
         let variants = row
             .get("variants")
             .and_then(Value::as_array)
-            .ok_or_else(invalid)?;
+            .ok_or_else(|| invalid("missing variants array"))?;
         let platform = crate::data::oci_identity::OciPlatform::host_linux();
         let variant = variants
             .iter()
@@ -28,10 +37,26 @@ pub(crate) fn parse_inspection(
                     .or_else(|| v.pointer("/config/architecture"))
                     .and_then(Value::as_str)
                     == Some(platform.architecture.as_str())
+                    && v.pointer("/platform/os")
+                        .or_else(|| v.pointer("/config/os"))
+                        .and_then(Value::as_str)
+                        == Some("linux")
             })
-            .or_else(|| (variants.len() == 1).then(|| &variants[0]))
-            .ok_or_else(invalid)?;
-        let id = variant.get("digest");
+            .ok_or_else(|| invalid("no variant for the host Linux platform"))?;
+        if let Some(digest) = variant.get("digest") {
+            manifest_digest = Some(
+                digest
+                    .as_str()
+                    .and_then(|s| crate::data::oci_identity::Digest::parse(s).ok())
+                    .ok_or_else(|| invalid("invalid variant manifest digest"))?,
+            );
+        }
+        // Apple 0.12's ImageDetail has only name/index/variants, with no
+        // variant digest. Its index still identifies the inputs for freshness
+        // and parent pinning, but cannot vouch for a single-platform import.
+        let id = variant
+            .get("digest")
+            .or_else(|| row.pointer("/index/digest"));
         let size = variant
             .get("size")
             .and_then(Value::as_u64)
@@ -58,11 +83,15 @@ pub(crate) fn parse_inspection(
     let id = id
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .ok_or_else(invalid)?
+        .ok_or_else(|| invalid("missing image identity"))?
         .to_owned();
+    if apple && crate::data::oci_identity::Digest::parse(&id).is_err() {
+        return Err(invalid("invalid image digest"));
+    }
     let labels = match config.and_then(|v| v.get("Labels")) {
         None | Some(Value::Null) => Default::default(),
-        Some(value) => serde_json::from_value(value.clone()).map_err(|_| invalid())?,
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|_| invalid("labels must be a string map"))?,
     };
     let tags = row
         .get("RepoTags")
@@ -76,6 +105,7 @@ pub(crate) fn parse_inspection(
         .unwrap_or_else(|| vec![tag.into()]);
     Ok(ImageMetadata {
         id,
+        manifest_digest,
         labels,
         tags,
         size_bytes: size,

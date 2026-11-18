@@ -405,6 +405,7 @@ pub(crate) mod test_runtime {
             self.images.lock().unwrap().insert(
                 tag.into(),
                 ImageMetadata {
+                    manifest_digest: None,
                     id: id.clone(),
                     tags: vec![tag.into()],
                     labels,
@@ -514,6 +515,7 @@ pub(crate) mod test_runtime {
             self.images.lock().unwrap().insert(
                 request.reference.clone(),
                 ImageMetadata {
+                    manifest_digest: None,
                     id,
                     tags: vec![request.reference.clone()],
                     labels: request.labels.clone(),

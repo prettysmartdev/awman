@@ -667,6 +667,122 @@ const DOCKER_AMBIENT_ENV: &[&str] = &[
 mod contracts {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    struct Inspection(serde_json::Value);
+    impl HostCommandRunner for Inspection {
+        fn run(
+            &self,
+            command: Command,
+            _: &BuildControl,
+            on_line: &mut dyn FnMut(&str),
+        ) -> Result<std::process::ExitStatus, EngineError> {
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                ["image", "inspect", "project:latest"]
+            );
+            for line in serde_json::to_string_pretty(&self.0).unwrap().lines() {
+                on_line(line);
+            }
+            Ok(std::process::ExitStatus::from_raw(0))
+        }
+    }
+
+    #[test]
+    fn apple_metadata_accepts_legacy_index_and_current_manifest_without_confusing_receipts() {
+        use crate::data::image_inputs::{InputsHash, INPUTS_LABEL};
+        use crate::engine::image_prep::ImageFreshness;
+        let index = format!("sha256:{}", "1".repeat(64));
+        let manifest = format!("sha256:{}", "2".repeat(64));
+        let variant = serde_json::json!({
+            "platform": {"os": "linux", "architecture": OciPlatform::host_linux().architecture},
+            "size": 123,
+            "config": {"config": {"Labels": {INPUTS_LABEL: "inputs"}}}
+        });
+        // Apple 0.12: ClientImage.details() -> ImageDetail; no variant digest.
+        let legacy = serde_json::json!([{
+            "name": "project:latest", "index": {"digest": index},
+            "variants": [variant.clone()]
+        }]);
+        let mut current_variant = variant;
+        current_variant["digest"] = manifest.clone().into();
+        // Apple 1.4/1.5: ImageResource with the selected manifest's digest.
+        let current = serde_json::json!([{
+            "configuration": {"name": "project:latest", "descriptor": {"digest": index}},
+            "variants": [
+                {"platform": {"os": "unknown", "architecture": "unknown"}},
+                current_variant
+            ]
+        }]);
+        let control = BuildControl::source_build(crate::engine::oci::CancelToken::new());
+        for (json, expected_id, expected_manifest) in [
+            (legacy.clone(), index.as_str(), None),
+            (
+                current,
+                manifest.as_str(),
+                Some(Digest::parse(&manifest).unwrap()),
+            ),
+        ] {
+            let builder = HostLocalImageBuilder {
+                env: crate::data::config::env::EnvSnapshot::from_full_env(Default::default()),
+                runner: Arc::new(Inspection(json)),
+            };
+            let image = builder
+                .inspect_metadata(&BuildTarget::Apple, "project:latest", &control)
+                .unwrap()
+                .unwrap();
+            assert_eq!(image.id, expected_id);
+            assert_eq!(image.manifest_digest, expected_manifest);
+            assert_eq!(image.tags, ["project:latest"]);
+            assert_eq!(image.size_bytes, 123);
+            assert!(matches!(
+                ImageFreshness::from_image(Some(image), &InputsHash::from_label("inputs")),
+                ImageFreshness::Fresh(_)
+            ));
+        }
+        for (pointer, value, reason) in [
+            (
+                "/0/index/digest",
+                serde_json::Value::Null,
+                "missing image identity",
+            ),
+            (
+                "/0/variants/0/platform/os",
+                "windows".into(),
+                "no variant for the host Linux platform",
+            ),
+            (
+                "/0/variants/0/digest",
+                "broken".into(),
+                "invalid variant manifest digest",
+            ),
+            (
+                "/0/variants/0/config/config/Labels",
+                serde_json::json!({"key": 1}),
+                "labels must be a string map",
+            ),
+        ] {
+            let mut json = legacy.clone();
+            if pointer.ends_with("/0/digest") {
+                json[0]["variants"][0]["digest"] = value;
+            } else {
+                *json.pointer_mut(pointer).unwrap() = value;
+            }
+            let builder = HostLocalImageBuilder {
+                env: crate::data::config::env::EnvSnapshot::from_full_env(Default::default()),
+                runner: Arc::new(Inspection(json)),
+            };
+            let error = builder
+                .inspect_metadata(&BuildTarget::Apple, "project:latest", &control)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("project:latest (Apple Containers)"),
+                "{error}"
+            );
+            assert!(error.contains(reason), "{error}");
+        }
+    }
+
     struct Failing;
     impl HostCommandRunner for Failing {
         fn run(

@@ -124,6 +124,7 @@ impl AgentRuntimeEngine for Runtime {
         self.images.lock().unwrap().insert(
             request.reference.clone(),
             ImageMetadata {
+                manifest_digest: None,
                 id: format!("sha256:build-{}", self.built.lock().unwrap().len()),
                 tags: vec![request.reference.clone()],
                 labels: request.labels.clone(),
@@ -371,6 +372,7 @@ fn install(
     runtime.images.lock().unwrap().insert(
         tag.into(),
         ImageMetadata {
+            manifest_digest: None,
             id: record.image_id.clone(),
             tags: vec![tag.into()],
             labels: BTreeMap::from([(INPUTS_LABEL.into(), "aa".into())]),
@@ -619,6 +621,7 @@ async fn a_matching_external_image_is_reused_without_becoming_worker_owned() {
     runtime.images.lock().unwrap().insert(
         tag.clone(),
         ImageMetadata {
+            manifest_digest: None,
             id: "external-id".into(),
             tags: vec![tag.clone()],
             labels: BTreeMap::from([

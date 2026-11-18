@@ -25,6 +25,7 @@ pub(crate) struct Store {
     pub fail_build: std::sync::atomic::AtomicBool,
     pub apple_missing: std::sync::atomic::AtomicBool,
     pub apple_unbound: std::sync::atomic::AtomicBool,
+    pub legacy_apple_inspection: std::sync::atomic::AtomicBool,
     pub import_entered: tokio::sync::Notify,
     pub release_import: (Mutex<bool>, std::sync::Condvar),
     pub hold_import: std::sync::atomic::AtomicBool,
@@ -54,7 +55,32 @@ impl LocalImageBuilder for Store {
         reference: &str,
         _: &BuildControl,
     ) -> Result<Option<crate::engine::container::runtime::ImageMetadata>, EngineError> {
-        Ok(self.source_metadata.lock().unwrap().get(reference).cloned())
+        let image = self.source_metadata.lock().unwrap().get(reference).cloned();
+        if self
+            .legacy_apple_inspection
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // Exercise ready through the same parser as the host builder,
+            // including existing, unlabelled Apple 0.12 images.
+            return image
+                .map(|image| {
+                    let json = serde_json::json!([{
+                        "name": reference,
+                        "index": {"digest": image.id},
+                        "variants": [{
+                            "platform": OciPlatform::host_linux(), "size": image.size_bytes,
+                            "config": {"config": {"Labels": image.labels}}
+                        }]
+                    }]);
+                    crate::engine::container::host_build::parse_image_inspection(
+                        &serde_json::to_vec(&json).unwrap(),
+                        reference,
+                        true,
+                    )
+                })
+                .transpose();
+        }
+        Ok(image)
     }
     fn probe(&self, _: &BuildTarget, _: &BuildControl) -> Result<(), EngineError> {
         Ok(())
@@ -98,6 +124,7 @@ impl LocalImageBuilder for Store {
         self.source_metadata.lock().unwrap().insert(
             request.reference.clone(),
             crate::engine::container::runtime::ImageMetadata {
+                manifest_digest: Some(identity(&request.reference).manifest_digest),
                 id: identity(&request.reference).config_digest.to_string(),
                 tags: vec![request.reference.clone()],
                 labels: request.labels.clone(),
@@ -377,6 +404,7 @@ fn freshness_distinguishes_missing_unlabelled_stale_and_fresh() {
         ImageFreshness::Missing
     );
     let mut image = ImageMetadata {
+        manifest_digest: None,
         id: "id".into(),
         tags: vec!["tag".into()],
         labels: Default::default(),
@@ -542,8 +570,27 @@ async fn source_build_labels_and_reuses_matching_inputs_under_lease() {
         .await
         .unwrap();
     assert_eq!(second.outcome, ImageBuildOutcome::Reused);
+    assert_eq!(
+        second.identity.manifest_digest(),
+        built_identity().manifest_digest()
+    );
     assert_eq!(store.built.lock().unwrap().len(), 1);
     drop(second);
+    store
+        .source_metadata
+        .lock()
+        .unwrap()
+        .get_mut("source:latest")
+        .unwrap()
+        .manifest_digest = None;
+    let legacy = prep
+        .build_source_if_needed(&spec, &mut Sink::default())
+        .await
+        .unwrap();
+    assert_eq!(legacy.outcome, ImageBuildOutcome::Built);
+    assert_eq!(legacy.identity, built_identity());
+    assert_eq!(store.built.lock().unwrap().len(), 2);
+    drop(legacy);
     s.finish();
 }
 
@@ -554,6 +601,23 @@ async fn ready_source_builds_label_project_and_agent_with_layer_zero_hashes() {
     };
     let s = TestSandbox::for_test(TestCase::component("engine::image_prep::contracts::ready_source_builds_label_project_and_agent_with_layer_zero_hashes"));
     let store = Arc::new(Store::default());
+    store
+        .legacy_apple_inspection
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    store
+        .apple_unbound
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let project_tag = crate::data::image_tags::project_image_tag(&s.work());
+    store.source_metadata.lock().unwrap().insert(
+        project_tag.clone(),
+        crate::engine::container::runtime::ImageMetadata {
+            id: identity(&project_tag).manifest_digest.to_string(),
+            manifest_digest: None,
+            tags: vec![project_tag.clone()],
+            labels: Default::default(),
+            size_bytes: 123,
+        },
+    );
     let mut prep = preparer(
         &s,
         store.clone(),
@@ -568,7 +632,7 @@ async fn ready_source_builds_label_project_and_agent_with_layer_zero_hashes() {
                 agent: "claude",
                 policy: BuildPolicy::Ready {
                     build: true,
-                    no_cache: false,
+                    no_cache: true,
                     refresh: false,
                 },
             },
@@ -577,7 +641,11 @@ async fn ready_source_builds_label_project_and_agent_with_layer_zero_hashes() {
         .await
         .unwrap();
     assert_eq!(result.build, StepStatus::Done);
-    let project_tag = crate::data::image_tags::project_image_tag(&s.work());
+    assert_eq!(
+        store.built.lock().unwrap().as_slice(),
+        [project_tag.clone(), tag.clone()]
+    );
+    assert_eq!(store.imports.lock().unwrap().as_slice(), [tag.clone()]);
     let metadata = store.source_metadata.lock().unwrap();
     assert_eq!(
         metadata[&project_tag].labels[INPUTS_LABEL],
@@ -595,6 +663,29 @@ async fn ready_source_builds_label_project_and_agent_with_layer_zero_hashes() {
         crate::data::image_inputs::RepoKey::local(&s.work()).as_str()
     );
     drop(metadata);
+    let mut next = preparer(
+        &s,
+        store.clone(),
+        true,
+        Some(crate::data::config::image_source::ImageSourceSpec::AppleStore { reference: None }),
+    );
+    let reused = next
+        .prepare(
+            &AgentImageRequest {
+                tag: &tag,
+                agent: "claude",
+                policy: BuildPolicy::Ready {
+                    build: false,
+                    no_cache: false,
+                    refresh: false,
+                },
+            },
+            &mut Sink::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reused.build, StepStatus::Skipped);
+    assert_eq!(store.built.lock().unwrap().len(), 2);
     s.finish();
 }
 
