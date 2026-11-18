@@ -3,12 +3,12 @@
 //! here; any other agent is a custom definition (`.awman/agents/<name>.toml`).
 
 use super::definition::{
-    AgentDefinition, AgentImageSource, AgentOrigin, AgentOutputFormat, CredentialSource,
-    InteractiveSeedDelivery, ModelFlagDelivery, SbxKitKind, SessionStorageDir, SettingsMount,
-    SystemPromptMode,
+    AgentDefinition, AgentImageSource, AgentOrigin, AgentOutputFormat, CliVersionPin,
+    CredentialSource, InteractiveModelFallback, InteractiveSeedDelivery, ModeRefusal,
+    ModelFlagDelivery, SbxKitKind, SessionStorageDir, SettingsMount, SystemPromptMode,
 };
 
-/// The seven built-in agents. Same slice as the Layer 0 constant so Layer 0
+/// The eight built-in agents. Same slice as the Layer 0 constant so Layer 0
 /// (discovery, reserved stems) and Layer 1 agree without an import in the
 /// wrong direction.
 pub const FIRST_PARTY_AGENTS: &[&str] =
@@ -65,6 +65,15 @@ fn base(name: &str, display_name: &str) -> AgentDefinition {
         sandbox_model_note: None,
         sandbox_auth_env_vars: Vec::new(),
         deprecation_note: None,
+        strict_modes: false,
+        requires_private_session: false,
+        mode_refusals: Vec::new(),
+        headless_only_flags: Vec::new(),
+        headless_text_flags: Vec::new(),
+        interactive_model_fallback: None,
+        cli_version: None,
+        launch_note: None,
+        sandbox_auth_note: None,
     }
 }
 
@@ -128,6 +137,7 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
                 home_relative_path: ".codex-sqlite".into(),
                 env_var: Some("CODEX_SQLITE_HOME".into()),
                 config_override: Some(("--config".into(), "sqlite_home".into())),
+                seed_from_home: None,
             }],
             skills_mount: Some(".codex/skills".into()),
             // The host ping runs in a private empty directory, outside any
@@ -151,33 +161,156 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             settings_mount: SettingsMount::Direct(".config/opencode".into()),
             extra_settings_mounts: strings(&[".local/share/opencode"]),
             skills_mount: Some(".config/opencode/skills".into()),
-            ping_argv: Some(strings(&["opencode", "run"])),
+            // A host `opencode` cannot say which major it is (and a host 2.x
+            // binary starts a shared background service), so readiness is
+            // proven inside the image by `cli_version` instead.
+            ping_argv: None,
+            // A mixin kit cannot guarantee the major, the pin or the headless
+            // subcommand; awman owns the kit.
+            sbx_kit_kind: SbxKitKind::Agent,
             sandbox_auth_env_vars: strings(&["ANTHROPIC_API_KEY"]),
+            cli_version: Some(CliVersionPin {
+                binary: "opencode".into(),
+                tested_version: "1.19.6".into(),
+                required_major: Some(1),
+            }),
             ..base("opencode", "OpenCode")
         },
-        "gemini" => AgentDefinition {
-            non_interactive_flag: Some("--prompt".into()),
-            headless_prompt_in_argv: true,
-            interactive_seed_delivery: InteractiveSeedDelivery::Flag("--prompt-interactive".into()),
-            plan_flags: strings(&["--approval-mode=plan"]),
-            yolo_flags: strings(&["--approval-mode=yolo"]),
-            auto_flags: strings(&["--approval-mode=auto_edit"]),
-            supports_acp: true,
-            acp_entrypoint: Some(strings(&["gemini", "--experimental-acp"])),
-            system_prompt_delivery: SystemPromptMode::EnvFile {
-                var: "GEMINI_SYSTEM_MD".into(),
-            },
-            settings_mount: SettingsMount::Direct(".gemini".into()),
-            skills_mount: Some(".gemini/skills".into()),
-            ping_argv: Some(strings(&["gemini", "-p"])),
-            sandbox_auth_env_vars: strings(&["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
-            deprecation_note: Some(
-                "The 'gemini' agent is deprecated by Google. Migrate to \
-                 'antigravity' — run 'awman chat --agent antigravity' (or \
-                 'awman config set agent antigravity' to change your default)."
+        // OpenCode 2.x. Same `opencode` binary name as 1.x, its own image.
+        "opencode-v2" => AgentDefinition {
+            // Without `--standalone` V2 discovers a shared background service
+            // whose credentials and sessions may belong to another launch.
+            interactive_entrypoint: strings(&["opencode", "--standalone"]),
+            non_interactive_flag: Some("run".into()),
+            // `run` reads a non-TTY stdin message (verified on 2.3.2).
+            headless_prompt_in_argv: false,
+            // V2 `--auto` approves everything not explicitly denied: that is
+            // awman's yolo, not awman's auto.
+            yolo_flags: strings(&["--auto"]),
+            auto_flags: Vec::new(),
+            plan_flags: Vec::new(),
+            strict_modes: true,
+            requires_private_session: true,
+            mode_refusals: vec![ModeRefusal {
+                mode: "auto",
+                reason: "agent 'opencode-v2' has no equivalent of --auto: OpenCode 2.x either \
+                         asks for each permission or, with its own --auto, approves everything \
+                         not explicitly denied. Use --yolo for that behaviour, or launch without \
+                         a mode flag and set permissions in opencode.json."
+                    .into(),
+            }],
+            interactive_seed_delivery: InteractiveSeedDelivery::Flag("--prompt".into()),
+            interactive_model_fallback: Some(InteractiveModelFallback {
+                subcommand: "mini".into(),
+                notice: "OpenCode 2.x has no --model option on its full-screen interface, so \
+                         this session uses the minimal interface (`opencode mini`). Launch \
+                         without --model for the full-screen interface and pick a model inside \
+                         the session."
+                    .into(),
+                allows_mode_flags: false,
+            }),
+            supports_acp: false,
+            system_prompt_delivery: SystemPromptMode::AgentsMd,
+            // Never the live host directory: a private, per-execution copy.
+            settings_mount: SettingsMount::None,
+            session_storage_dirs: vec![
+                SessionStorageDir {
+                    home_relative_path: ".config/opencode".into(),
+                    env_var: None,
+                    config_override: None,
+                    seed_from_home: Some(".config/opencode".into()),
+                },
+                // `opencode.db` (saved credentials) lives here; starts empty.
+                SessionStorageDir {
+                    home_relative_path: ".local/share/opencode".into(),
+                    env_var: None,
+                    config_override: None,
+                    seed_from_home: None,
+                },
+                SessionStorageDir {
+                    home_relative_path: ".local/state/opencode".into(),
+                    env_var: None,
+                    config_override: None,
+                    seed_from_home: None,
+                },
+            ],
+            skills_mount: Some(".config/opencode/skills".into()),
+            ping_argv: None,
+            sbx_kit_kind: SbxKitKind::Agent,
+            sandbox_auth_env_vars: strings(&["ANTHROPIC_API_KEY"]),
+            cli_version: Some(CliVersionPin {
+                binary: "opencode".into(),
+                tested_version: "2.3.2".into(),
+                required_major: Some(2),
+            }),
+            launch_note: Some(
+                "opencode-v2 runs OpenCode 2.x with a private server and a private copy of \
+                 ~/.config/opencode. Changes made inside the session, including logins, are \
+                 discarded when it ends and never reach the configuration OpenCode 1.x reads. \
+                 1.x plugins and the 1.x `plugin` setting do not load in 2.x. Provide provider \
+                 keys with env(), for example env(ANTHROPIC_API_KEY)."
                     .into(),
             ),
-            ..base("gemini", "Gemini CLI")
+            ..base("opencode-v2", "OpenCode 2")
+        },
+        "cursor" => AgentDefinition {
+            // The pinned build must not update itself mid-run.
+            interactive_entrypoint: strings(&["cursor-agent", "--disable-auto-update"]),
+            non_interactive_flag: Some("--print".into()),
+            // Answers workspace trust (headless runs otherwise exit 1). This
+            // is not `--force`.
+            headless_only_flags: strings(&["--trust"]),
+            // Terminal runs print readable text; structured runs replace this
+            // with `--output-format stream-json` (container options).
+            headless_text_flags: strings(&["--output-format", "text"]),
+            headless_prompt_in_argv: true,
+            output_format: AgentOutputFormat::CursorStreamJson,
+            // `--force` only ever on an explicit --yolo.
+            yolo_flags: strings(&["--force"]),
+            auto_flags: Vec::new(),
+            // `--mode plan` is the intended mapping once a real-account smoke
+            // proves it cannot write or run shell; refused until then.
+            plan_flags: Vec::new(),
+            strict_modes: true,
+            requires_private_session: true,
+            mode_refusals: vec![ModeRefusal {
+                mode: "auto",
+                reason: "agent 'cursor' has no verified equivalent of --auto. Launch without a \
+                         mode flag to use Cursor's own allow-list approvals, or use --yolo to \
+                         approve everything (--force)."
+                    .into(),
+            }],
+            model_flag: ModelFlagDelivery::SpaceArg,
+            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
+            supports_acp: false,
+            system_prompt_delivery: SystemPromptMode::AgentsMd,
+            // No host ~/.cursor and no host auth.json reach the container.
+            settings_mount: SettingsMount::None,
+            session_storage_dirs: vec![SessionStorageDir {
+                home_relative_path: ".cursor".into(),
+                env_var: Some("CURSOR_CONFIG_DIR".into()),
+                config_override: None,
+                seed_from_home: None,
+            }],
+            skills_mount: Some(".cursor/skills".into()),
+            credential_source: CredentialSource::None,
+            // CURSOR_API_KEY only when the user names it with env()/a secret.
+            auth_env: Vec::new(),
+            ping_argv: None,
+            sbx_kit_kind: SbxKitKind::Agent,
+            sandbox_auth_env_vars: Vec::new(),
+            sandbox_auth_note: Some(
+                "CURSOR_API_KEY cannot be delivered to 'cursor' under the sandbox runtime yet; \
+                 use runtime.kind \
+                 docker, apple or builtin with env(CURSOR_API_KEY)"
+                    .into(),
+            ),
+            cli_version: Some(CliVersionPin {
+                binary: "cursor-agent".into(),
+                tested_version: "2026.11.17-f532c45".into(),
+                required_major: None,
+            }),
+            ..base("cursor", "Cursor Agent")
         },
         "copilot" => AgentDefinition {
             non_interactive_flag: Some("-p".into()),

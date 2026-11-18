@@ -113,6 +113,9 @@ pub struct AgentIo {
 /// all agent I/O — stdout, stderr, and stdin.
 #[async_trait]
 pub trait AgentFrontend: UserMessageSink + Send {
+    fn output_redaction(&self) -> crate::engine::auth::redaction::RedactionSet {
+        Default::default()
+    }
     fn terminal_launch(&self) -> Option<crate::engine::agent_runtime::execution::TerminalLaunch> {
         None
     }

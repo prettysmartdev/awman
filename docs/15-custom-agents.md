@@ -1,6 +1,6 @@
 # Custom Agents
 
-awman ships with seven built-in agents: `claude`, `codex`, `opencode`, `gemini`, `copilot`, `cline` and `antigravity`. A **custom agent** lets you add any other command-line coding agent without waiting for awman to support it. You describe the agent in a small TOML file — how to install it, how to launch it, which flags it understands — and awman treats it like any other agent: `awman chat --agent pi`, `awman config set agents.default pi`, a `agent = "pi"` workflow step, and so on.
+awman ships with eight built-in agents: `claude`, `codex`, `opencode` (OpenCode 1.x), `opencode-v2` (OpenCode 2.x), `cursor`, `copilot`, `cline` and `antigravity`. A **custom agent** lets you add any other command-line coding agent without waiting for awman to support it. You describe the agent in a small TOML file — how to install it, how to launch it, which flags it understands — and awman treats it like any other agent: `awman chat --agent pi`, `awman config set agents.default pi`, a `agent = "pi"` workflow step, and so on.
 
 Custom agents still run only inside containers. Nothing about a definition lets the agent run on your host (the one optional exception, the `[ping]` host check, is covered in [The optional host check](#the-optional-host-check-ping) and is always shown to you before you approve it).
 
@@ -333,6 +333,36 @@ In workflows, set `agent = "pi"` on a step. awman checks and asks for approval o
 **Workflows and non-interactive mode.** Non-interactive runs rely on `run.non_interactive`. An agent whose definition has none has no print mode to switch to, so in a workflow step it may not exit on its own; you may need to finish or quit the step yourself. Prefer agents with a non-interactive mode for unattended workflows.
 
 Models: `--model` works if `run.model` is `space` or `equals`; with `unsupported`, awman does not pass a model flag.
+
+---
+
+## Example: Gemini CLI
+
+`gemini` is not a built-in agent. Google ended Gemini CLI access for consumer Google-login and AI-plan accounts on June 18, 2026; enterprise subscriptions and paid API keys still work. See [Gemini is no longer built in](03-agent-sessions.md#gemini-is-no-longer-built-in) for the full picture and for the built-in `antigravity` alternative. If you have a paid API key or an enterprise subscription, you can run Gemini CLI as your own custom agent. Create the definition with `awman new agent gemini`, or write `.awman/agents/gemini.toml` yourself:
+
+```toml
+schema = 1
+display_name = "Gemini CLI"
+homepage = "https://github.com/google-gemini/gemini-cli"
+
+[run]
+command = ["gemini"]
+non_interactive = "-p"
+
+[modes]
+yolo = ["--approval-mode=yolo"]
+auto = ["--approval-mode=auto_edit"]
+plan = ["--approval-mode=plan"]
+
+[auth]
+env = ["GEMINI_API_KEY"]
+
+[image]
+needs_node = true
+install = ["npm install -g @google/gemini-cli"]
+```
+
+Then run `awman ready --agent gemini` to review, approve and build it. Existing `agents.default: "gemini"` settings work again once the definition exists; the definition is yours to maintain, including the CLI version you install.
 
 ---
 

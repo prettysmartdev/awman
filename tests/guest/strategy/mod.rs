@@ -32,6 +32,33 @@ printf workflow-write > /awman/context/workflow/writeback
             "grep -q settings-sentinel \"$HOME/.gemini/settings.json\"\n"
         ),
     }
+    // Private per-execution storage (WI 0157): writable, seeded one way from
+    // the host where the definition says so, and pointed at by its env var.
+    for storage in &matrix.session_storage_dirs {
+        let path = &storage.home_relative_path;
+        script.push_str(&format!(
+            "test -d \"$HOME/{path}\"\nprintf storage-writeback > \"$HOME/{path}/writeback\"\n"
+        ));
+        if storage.seed_from_home.is_some() {
+            script.push_str(&format!(
+                "grep -q seed-sentinel \"$HOME/{path}/opencode.json\"\n"
+            ));
+        }
+        if let Some(var) = &storage.env_var {
+            script.push_str(&format!("test \"${var}\" = \"$HOME/{path}\"\n"));
+        }
+    }
+    // The launch shape the definition promises, as the process sees it.
+    for (index, part) in matrix.interactive_entrypoint.iter().skip(1).enumerate() {
+        script.push_str(&format!("test \"${{{n}:-}}\" = '{part}'\n", n = index + 1));
+    }
+    for flag in matrix
+        .headless_only_flags
+        .iter()
+        .chain(&matrix.headless_text_flags)
+    {
+        script.push_str(&format!("printf '%s\\n' \"$@\" | grep -qx -- '{flag}'\n"));
+    }
     if let Some(relative) = &matrix.skills_mount {
         script.push_str(&format!(
             "grep -q skill-sentinel \"$HOME/{relative}/matrix/SKILL.md\"\n"
@@ -102,6 +129,16 @@ fn run(id: &'static str, agent: &str, skill: &str) {
         )
         .unwrap();
     }
+    let seeded: Vec<std::path::PathBuf> = descriptor
+        .session_storage_dirs
+        .iter()
+        .filter_map(|d| d.seed_from_home.as_ref())
+        .map(|relative| s.home().join(relative))
+        .collect();
+    for dir in &seeded {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("opencode.json"), r#"{"fixture":"seed-sentinel"}"#).unwrap();
+    }
     if let Some(path) = paths.config_file {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, "{}").unwrap();
@@ -165,6 +202,14 @@ fn run(id: &'static str, agent: &str, skill: &str) {
         std::fs::read_to_string(rw.join("writeback")).unwrap(),
         "writeback"
     );
+    // The private copy never writes back to the host (WI 0157).
+    for dir in &seeded {
+        assert!(!dir.join("writeback").exists(), "{}", dir.display());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("opencode.json")).unwrap(),
+            r#"{"fixture":"seed-sentinel"}"#
+        );
+    }
 }
 #[test]
 fn claude_named_skills() {
@@ -195,12 +240,28 @@ fn opencode_all_skills() {
     run("strategy::opencode_all_skills", "opencode", "skill(*)");
 }
 #[test]
-fn gemini_named_skills() {
-    run("strategy::gemini_named_skills", "gemini", "skill(matrix)");
+fn opencode_v2_named_skills() {
+    run(
+        "strategy::opencode_v2_named_skills",
+        "opencode-v2",
+        "skill(matrix)",
+    );
 }
 #[test]
-fn gemini_all_skills() {
-    run("strategy::gemini_all_skills", "gemini", "skill(*)");
+fn opencode_v2_all_skills() {
+    run(
+        "strategy::opencode_v2_all_skills",
+        "opencode-v2",
+        "skill(*)",
+    );
+}
+#[test]
+fn cursor_named_skills() {
+    run("strategy::cursor_named_skills", "cursor", "skill(matrix)");
+}
+#[test]
+fn cursor_all_skills() {
+    run("strategy::cursor_all_skills", "cursor", "skill(*)");
 }
 #[test]
 fn copilot_named_skills() {

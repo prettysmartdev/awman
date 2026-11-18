@@ -26,19 +26,31 @@ ENTRYPOINT []
 CMD ["/bin/bash"]
 
 # ── Install agent binary ──────────────────────────────────────────────────────
-# Wipe inherited apt state before updating in case the base left a broken
-# sources.list or stale lock. Then install Node 20 and the agent npm package;
-# nodesource defaults its npm prefix to /usr/local, so the binary lands in
-# /usr/local/bin where the smoke test expects it.
-RUN rm -rf /var/lib/apt/lists/* \
-    && apt-get clean \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends gnupg \
-    && curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 60 https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN npm install -g --prefix=/usr/local @google/gemini-cli
+# Official versioned artifact; changes require reviewed version and checksum updates.
+LABEL awman.agent="opencode-v2" awman.agent.cli.version="2.3.2"
+RUN OC_VERSION=2.3.2; \
+    case "$(uname -m)" in \
+      x86_64|amd64)  OC_ARCH=x64 ;; \
+      aarch64|arm64) OC_ARCH=arm64 ;; \
+      *) echo "awman: opencode-v2 ${OC_VERSION} has no Linux package for architecture '$(uname -m)' (supported: x86_64, aarch64)" >&2; exit 1 ;; \
+    esac; \
+    OC_LDD="$(ldd --version 2>&1 || true)"; \
+    case "$OC_LDD" in *musl*) OC_LIBC=-musl ;; *) OC_LIBC= ;; esac; \
+    case "${OC_ARCH}${OC_LIBC}" in \
+      x64) OC_SHA=563b5d663637226b6e3bb4bb6803281bc39b0d2cd88db06d674b6420aab009b0 ;; \
+      arm64) OC_SHA=9d10185acdb72336e086e699ca363a6065f410fd3c1caed0dc8046e95ac06ccb ;; \
+      x64-musl) OC_SHA=4e952a67874cfdb4f53eeae5840f9813acc9f109c10e61bc26020271f56d7d84 ;; \
+      arm64-musl) OC_SHA=2148ba748f5410177868ed67d59ef70626cb6bd4fb2abc5177c807adfdc24fc3 ;; \
+      *) echo "awman: unsupported OpenCode artifact ${OC_ARCH}${OC_LIBC}" >&2; exit 1 ;; \
+    esac; \
+    OC_ASSET="opencode-linux-${OC_ARCH}${OC_LIBC}.tar.gz"; \
+    curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 300 -o "/tmp/${OC_ASSET}" \
+      "https://github.com/anomalyco/opencode/releases/download/v${OC_VERSION}/${OC_ASSET}" \
+      || { echo "awman: opencode-v2 ${OC_VERSION} could not download Linux package ${OC_ASSET} for ${OC_ARCH}${OC_LIBC}" >&2; exit 1; }; \
+    echo "${OC_SHA}  /tmp/${OC_ASSET}" | sha256sum -c -; \
+    tar -xzf "/tmp/${OC_ASSET}" -C /tmp opencode; \
+    install -m 0755 /tmp/opencode /usr/local/bin/opencode; \
+    rm -f /tmp/opencode "/tmp/${OC_ASSET}"
 
 # ── awman user + workspace (idempotent against a base that already created it) ─
 # Outer braces keep the && chain associated with the user-creation block,
@@ -57,4 +69,6 @@ WORKDIR /workspace
 
 # ── Smoke test: run as the runtime user so we verify the binary is on PATH and
 # executable from the actual entrypoint context, not just for root. ───────────
-RUN test -x "$(command -v gemini)"
+RUN v="$(opencode --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)" || v=; \
+    [ "$v" = "2.3.2" ] \
+      || { echo "awman: expected opencode 2.3.2 (2.x) in this image, found '${v:-nothing}'" >&2; exit 1; }

@@ -279,6 +279,18 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                 .agent_engine
                 .filter_available_agents(&session, paths.discover_agent_dockerfiles());
             for (name, _) in available {
+                // A leftover Dockerfile/image cannot keep a former built-in
+                // advertised after retirement. A deliberate custom definition
+                // is still listed and follows the regular resolver trust path.
+                if crate::data::config::agent_definition::former_builtin_guidance(&name).is_some()
+                    && !crate::engine::agent::AgentRegistry::list(
+                        session.env(),
+                        Some(session.definition_root()),
+                    )
+                    .contains(&name)
+                {
+                    continue;
+                }
                 let tag = crate::data::image_tags::agent_image_tag(&root, &name);
                 if self
                     .shared

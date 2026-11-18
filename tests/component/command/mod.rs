@@ -1,6 +1,7 @@
 //! Layer 2 contracts. Shared scenarios accept an explicit backend.
 
 mod admission;
+mod agent_permissions;
 mod builtin;
 pub mod catalogue;
 mod config;
@@ -13,6 +14,7 @@ mod failures;
 mod models;
 mod read_only_workspace;
 mod relay;
+mod retired_agents;
 mod scaffolding;
 mod scenarios;
 mod secrets;

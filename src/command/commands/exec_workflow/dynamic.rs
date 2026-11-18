@@ -1125,6 +1125,7 @@ impl ExecWorkflowCommand {
             command_secrets: self.engines.command_secrets(),
             env_passthrough: Some(collected.env_passthrough),
             yolo: Some(YoloMode::Enabled),
+            yolo_authorized: self.flags.yolo_authorized,
             initial_prompt: Some(prompt.to_string()),
             model: model.map(|m| m.to_string()),
             allow_docker: self.flags.allow_docker,
@@ -1173,6 +1174,11 @@ impl ExecWorkflowCommand {
             &run_opts,
             &credentials,
         )?;
+        for note in
+            crate::command::commands::launch_policy::LaunchPolicy::launch_notices(agent, &run_opts)
+        {
+            shared.lock().unwrap().write_message(note);
+        }
         // Stamp the squad identity on the dynamic leader too, when this is an
         // squad-generated workflow, so its container carries the task's
         // discoverable name and labels.

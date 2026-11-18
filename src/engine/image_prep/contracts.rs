@@ -645,24 +645,28 @@ async fn ready_source_builds_label_project_and_agent_with_layer_zero_hashes() {
         store.built.lock().unwrap().as_slice(),
         [project_tag.clone(), tag.clone()]
     );
-    assert_eq!(store.imports.lock().unwrap().as_slice(), [tag.clone()]);
-    let metadata = store.source_metadata.lock().unwrap();
     assert_eq!(
-        metadata[&project_tag].labels[INPUTS_LABEL],
-        project_inputs(Some(b"FROM scratch\n"), &DirBuildContext::new(s.work()))
-            .hash
-            .as_str()
+        store.imports.lock().unwrap().as_slice(),
+        std::slice::from_ref(&tag)
     );
-    let base_id = metadata[&project_tag].id.clone();
-    assert_eq!(
-        metadata[&tag].labels[INPUTS_LABEL],
-        agent_inputs_hash(b"FROM scratch\n", &base_id).as_str()
-    );
-    assert_eq!(
-        metadata[&project_tag].labels[REPO_LABEL],
-        crate::data::image_inputs::RepoKey::local(&s.work()).as_str()
-    );
-    drop(metadata);
+    {
+        let metadata = store.source_metadata.lock().unwrap();
+        assert_eq!(
+            metadata[&project_tag].labels[INPUTS_LABEL],
+            project_inputs(Some(b"FROM scratch\n"), &DirBuildContext::new(s.work()))
+                .hash
+                .as_str()
+        );
+        let base_id = metadata[&project_tag].id.clone();
+        assert_eq!(
+            metadata[&tag].labels[INPUTS_LABEL],
+            agent_inputs_hash(b"FROM scratch\n", &base_id).as_str()
+        );
+        assert_eq!(
+            metadata[&project_tag].labels[REPO_LABEL],
+            crate::data::image_inputs::RepoKey::local(&s.work()).as_str()
+        );
+    }
     let mut next = preparer(
         &s,
         store.clone(),

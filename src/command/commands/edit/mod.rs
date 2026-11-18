@@ -19,6 +19,7 @@ pub struct EditCommonFlags {
     pub json: bool,
     pub allow_docker: bool,
     pub yolo: bool,
+    pub yolo_authorized: bool,
     pub auto: bool,
     pub agent: Option<String>,
     pub model: Option<String>,
@@ -303,6 +304,7 @@ impl EditCommand {
             json: ctx.flags.bool("json"),
             allow_docker: ctx.flags.bool("allow-docker"),
             yolo: ctx.flags.bool("yolo"),
+            yolo_authorized: ctx.flags.explicit("yolo"),
             auto: ctx.flags.bool("auto"),
             agent: ctx.flags.string("agent"),
             model: ctx.flags.string("model"),
@@ -406,6 +408,7 @@ pub(crate) fn require_repository_mount(
 
 pub(crate) fn run_options(flags: &EditCommonFlags) -> AgentRunOptions {
     AgentRunOptions {
+        yolo_authorized: flags.yolo_authorized,
         yolo: flags
             .yolo
             .then_some(crate::engine::container::options::YoloMode::Enabled),

@@ -280,10 +280,12 @@ impl ExecBridge {
             }
             _ => None,
         };
+        let redaction = frontend.output_redaction();
         let server = if let Some(path) = attach_path {
             Some(AttachServer::bind(
                 &path,
                 &session,
+                redaction.clone(),
                 terminal
                     .as_ref()
                     .map(|(launch, terminal)| (launch.hub.clone(), terminal.id().clone())),
@@ -360,7 +362,8 @@ impl ExecBridge {
         let released = io_release.clone();
         let mut sinks = Some((io.stdout, io.stderr));
         let mut prompt_files = ObservedPromptFiles(prompt_files);
-        let mut stdout_status = ProgramStatusStream::new(program_status.clone(), status_config);
+        let mut stdout_status = ProgramStatusStream::new(program_status.clone(), status_config)
+            .with_redaction(redaction.clone());
         let mut stderr_status = ProgramStatusStream::new(program_status.clone(), status_config);
         let query_control = control.clone();
         let event_task = tokio::spawn(async move {
@@ -561,6 +564,7 @@ impl AttachServer {
     fn bind(
         path: &Path,
         session: &ExecSession,
+        redaction: crate::engine::auth::redaction::RedactionSet,
         terminal: Option<(
             Arc<crate::engine::terminal_hub::TerminalHub>,
             crate::data::ids::TerminalId,
@@ -592,7 +596,7 @@ impl AttachServer {
                 }
                 let receiver = events.subscribe();
                 let control = control.clone();
-                tokio::spawn(serve_client(stream, receiver, control));
+                tokio::spawn(serve_client(stream, receiver, control, redaction.clone()));
             }
         });
         Ok(Self {
@@ -606,10 +610,15 @@ async fn serve_client(
     stream: tokio::net::UnixStream,
     mut events: tokio::sync::broadcast::Receiver<ExecEvent>,
     control: Arc<dyn ExecControl>,
+    redaction: crate::engine::auth::redaction::RedactionSet,
 ) {
     let (mut reader, mut writer) = stream.into_split();
-    let mut stdout_scanner = crate::engine::agent_runtime::program_status::Osc7501Scanner::new();
-    let mut stderr_scanner = crate::engine::agent_runtime::program_status::Osc7501Scanner::new();
+    let mut stdout_scanner =
+        ProgramStatusStream::new(ProgramStatusTracker::shared(), Default::default())
+            .with_redaction(redaction.clone());
+    let mut stderr_scanner =
+        ProgramStatusStream::new(ProgramStatusTracker::shared(), Default::default())
+            .with_redaction(redaction);
     loop {
         // A frame can arrive in fragments. Keep this future alive while
         // events are forwarded; recreating it in select! discards partially
@@ -637,7 +646,7 @@ async fn serve_client(
                             if !pending.is_empty() && write_chunked_bounded(&mut writer, tag, &pending, ATTACH_WRITE_TIMEOUT).await.is_err() { return; }
                         }
                     }
-                    let bytes = match tag { Tag::Output => stdout_scanner.feed(&bytes).forward, Tag::Stderr => stderr_scanner.feed(&bytes).forward, _ => std::borrow::Cow::Borrowed(bytes.as_slice()) };
+                    let bytes = match tag { Tag::Output => stdout_scanner.feed(&bytes, |_| {}), Tag::Stderr => stderr_scanner.feed(&bytes, |_| {}), _ => std::borrow::Cow::Borrowed(bytes.as_slice()) };
                     let error=write_chunked_bounded(&mut writer,tag,&bytes,ATTACH_WRITE_TIMEOUT).await.is_err();
                     if error||terminal{return;}
                 }

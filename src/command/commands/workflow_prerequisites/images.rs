@@ -37,6 +37,7 @@ mod contracts {
             allow_docker: false,
             worktree: false,
             yolo: false,
+            yolo_authorized: false,
             auto: false,
             agent: None,
             model: None,

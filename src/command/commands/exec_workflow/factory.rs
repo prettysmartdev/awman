@@ -385,6 +385,7 @@ impl CommandLayerFactory {
         let run_opts = AgentRunOptions {
             command_secrets: self.engines.command_secrets(),
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
+            yolo_authorized: self.flags.yolo_authorized,
             auto: self.flags.auto.then_some(AutoMode::Enabled),
             plan: self.flags.plan.then_some(PlanMode::Enabled),
             // Squad agents are always PTY-backed so a later attach reaches
@@ -486,6 +487,18 @@ impl CommandLayerFactory {
             &run_opts,
             &credentials,
         )?;
+        {
+            let mut frontend = self.shared.lock().unwrap();
+            for note in crate::command::commands::launch_policy::LaunchPolicy::launch_notices(
+                &runtime.step_agent,
+                &run_opts,
+            ) {
+                frontend.write_message(UserMessage {
+                    level: note.level,
+                    text: format!("workflow step '{}': {}", step.name, note.text),
+                });
+            }
+        }
         // For a squad-generated workflow, stamp the task's squad name +
         // labels so this step's container is discoverable by prefix, exactly as
         // the evaluation leader is. A non-squad run leaves `resolved` untouched.

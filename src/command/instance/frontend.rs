@@ -704,6 +704,9 @@ impl CommandFrontend for InstanceCommandFrontend {
     fn set_host_output_policy(&mut self, policy: crate::data::terminal::HostOutputPolicy) {
         self.host_output_policy = policy;
     }
+    fn flag_is_explicit(&self, flag: &str) -> bool {
+        self.parsed.args.flag_is_explicit(flag)
+    }
     fn flag_bool(&self, _command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError> {
         Ok(self.parsed.args.flag_bool(flag))
     }

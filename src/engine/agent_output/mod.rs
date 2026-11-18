@@ -24,6 +24,7 @@
 
 mod claude_stream_json;
 mod codex_json;
+mod cursor_stream_json;
 pub mod line_framer;
 
 use std::sync::Arc;
@@ -92,6 +93,7 @@ pub fn translator_for(format: AgentOutputFormat) -> Box<dyn AgentOutputTranslato
         AgentOutputFormat::Text => Box::new(PassthroughTranslator),
         AgentOutputFormat::ClaudeStreamJson => Box::new(claude_stream_json::Translator::default()),
         AgentOutputFormat::CodexJson => Box::new(codex_json::Translator::default()),
+        AgentOutputFormat::CursorStreamJson => Box::new(cursor_stream_json::Translator::default()),
     }
 }
 

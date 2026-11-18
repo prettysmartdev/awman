@@ -107,6 +107,46 @@ pub struct SessionStorageDir {
     /// Optional CLI flag and config key for agents whose config file takes
     /// precedence over the environment variable. Emitted after user flags.
     pub config_override: Option<(String, String)>,
+    /// Copy `$HOME/<path>` from the host into the private directory before
+    /// launch. Regular files and directories only; symlinks, `node_modules`
+    /// and `.git` are skipped; nothing is ever copied back. `None` starts
+    /// empty.
+    pub seed_from_home: Option<String>,
+}
+
+/// The CLI build a first-party image pins, and how to recognise it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliVersionPin {
+    /// Binary executed inside the image as `<binary> --version`. Equals
+    /// `interactive_entrypoint[0]`.
+    pub binary: String,
+    /// The exact version the bundled template installs and awman was tested with.
+    pub tested_version: String,
+    /// Major the image must report (`Some(1)` for opencode, `Some(2)` for
+    /// opencode-v2). `None` for a CLI without semantic versions (cursor).
+    pub required_major: Option<u64>,
+}
+
+/// An interactive `--model` launch for an agent whose full-screen command has
+/// no model option.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractiveModelFallback {
+    /// Inserted directly after `interactive_entrypoint` (opencode-v2: `mini`).
+    pub subcommand: String,
+    /// Shown to the user once, because the interface they get is different.
+    pub notice: String,
+    /// `false`: combining the fallback with yolo/auto/plan is refused.
+    pub allows_mode_flags: bool,
+}
+
+/// Why a requested permission mode is refused for an agent whose
+/// `strict_modes` is set and which declares no flags for it. The text is shown
+/// verbatim as [`EngineError::AgentModeUnsupported`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeRefusal {
+    /// `"yolo"` or `"auto"`.
+    pub mode: &'static str,
+    pub reason: String,
 }
 
 /// State an agent would otherwise write under the workspace, redirected to
@@ -225,9 +265,10 @@ pub struct AgentDefinition {
     /// (`PlanModeUnsupported`).
     pub plan_flags: Vec<String>,
     /// Yolo flags (e.g. `--dangerously-skip-permissions`). Empty means yolo
-    /// silently equates to no permission flags.
+    /// silently equates to no permission flags, unless `strict_modes` is set.
     pub yolo_flags: Vec<String>,
-    /// Auto flags (e.g. `--permission-mode auto`). Empty is a silent no-op.
+    /// Auto flags (e.g. `--permission-mode auto`). Empty is a silent no-op,
+    /// unless `strict_modes` is set.
     pub auto_flags: Vec<String>,
     /// Disallowed-tools flag name (e.g. `--disallowedTools`).
     pub disallowed_tools_flag: Option<String>,
@@ -318,6 +359,29 @@ pub struct AgentDefinition {
     /// Warning surfaced once per launch for an agent its vendor has
     /// deprecated. `None` for every supported agent.
     pub deprecation_note: Option<String>,
+    /// A requested `--yolo` or `--auto` with no flags is
+    /// [`EngineError::AgentModeUnsupported`] rather than a silent no-op.
+    pub strict_modes: bool,
+    /// Requires disposable per-execution state and credential scope.
+    pub requires_private_session: bool,
+    /// Agent-specific refusal text for a strict mode it has no flags for.
+    /// A mode without an entry gets a generic sentence.
+    pub mode_refusals: Vec<ModeRefusal>,
+    /// Appended right after the headless form on every headless, non-ACP
+    /// launch (cursor `--trust`).
+    pub headless_only_flags: Vec<String>,
+    /// Appended on a headless, non-ACP launch that is not using a
+    /// structured output format (cursor `--output-format text`).
+    pub headless_text_flags: Vec<String>,
+    /// Interactive `--model` launches use this subcommand instead of the
+    /// full-screen entrypoint (opencode-v2 `mini`).
+    pub interactive_model_fallback: Option<InteractiveModelFallback>,
+    /// In-image version proof (ready probe and launch check).
+    pub cli_version: Option<CliVersionPin>,
+    /// Informational note surfaced once per launch.
+    pub launch_note: Option<String>,
+    /// Note surfaced on every sandbox-runtime launch.
+    pub sandbox_auth_note: Option<String>,
 }
 
 impl AgentDefinition {
@@ -374,7 +438,169 @@ impl AgentDefinition {
                 "plan and yolo modes are mutually exclusive".into(),
             ));
         }
+        if matches!(paradigm, RunParadigm::Sandbox) && self.requires_private_session {
+            return Err(EngineError::Config(format!("agent '{}' requires per-execution state and credential isolation unavailable on Docker Sandboxes; select a container runtime", self.name)));
+        }
+        // Until the pinned CLI's end-of-options behaviour has runtime proof,
+        // refuse option-shaped prompt operands on both paradigms.
+        if self.output_format
+            == crate::data::agent_output_format::AgentOutputFormat::CursorStreamJson
+            && run
+                .initial_prompt
+                .as_deref()
+                .is_some_and(|p| p.trim_start().starts_with('-'))
+        {
+            return Err(EngineError::Config(
+                "Cursor prompts must not start with '-'; prefix the prompt with a sentence".into(),
+            ));
+        }
+        let yolo = matches!(run.yolo, Some(YoloMode::Enabled));
+        if self.strict_modes && yolo && !run.yolo_authorized {
+            return Err(EngineError::Config(format!("agent '{}' requires explicit --yolo authorization; unattended defaults do not authorize this mode", self.name)));
+        }
+        let auto = matches!(run.auto, Some(AutoMode::Enabled));
+        let plan = matches!(run.plan, Some(PlanMode::Enabled));
+        // A strict agent refuses a mode it has no flags for instead of
+        // launching with weaker (or stronger) permissions than requested.
+        // When both yolo and auto are requested yolo wins, as documented, so
+        // auto is only checked on its own.
+        if self.strict_modes {
+            if yolo && self.yolo_flags.is_empty() {
+                return Err(self.mode_refusal("yolo"));
+            }
+            if !yolo && auto && self.auto_flags.is_empty() {
+                return Err(self.mode_refusal("auto"));
+            }
+        }
+        if !run.non_interactive && !matches!(run.launch_mode, LaunchMode::Acp) {
+            if let (Some(_), Some(fallback)) = (&run.model, &self.interactive_model_fallback) {
+                let mode = if yolo {
+                    Some("yolo")
+                } else if auto {
+                    Some("auto")
+                } else if plan {
+                    Some("plan")
+                } else {
+                    None
+                };
+                if let (Some(mode), false) = (mode, fallback.allows_mode_flags) {
+                    let lacks = if mode == "plan" {
+                        "has no plan option"
+                    } else {
+                        "has no auto-approve option"
+                    };
+                    let binary = self
+                        .interactive_entrypoint
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or(self.name.as_str());
+                    return Err(EngineError::AgentModeUnsupported {
+                        agent: self.name.clone(),
+                        mode,
+                        reason: format!(
+                            "agent '{}' cannot combine --model with --{mode} in an interactive \
+                             session: the interface that accepts a model ({binary} {}) {lacks}. \
+                             Drop one of the two, or run headless (exec prompt), where both are \
+                             supported.",
+                            self.name, fallback.subcommand
+                        ),
+                    });
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn mode_refusal(&self, mode: &'static str) -> EngineError {
+        let reason = self
+            .mode_refusals
+            .iter()
+            .find(|r| r.mode == mode)
+            .map(|r| r.reason.clone())
+            .unwrap_or_else(|| {
+                format!(
+                    "agent '{}' has no equivalent of --{mode}; launch without it",
+                    self.name
+                )
+            });
+        EngineError::AgentModeUnsupported {
+            agent: self.name.clone(),
+            mode,
+            reason,
+        }
+    }
+
+    /// `true` when this run will be delivered in the agent's structured
+    /// output format (so `headless_text_flags` must not also be applied).
+    /// Mirrors the condition `build_options` uses to emit
+    /// `ContainerOption::AgentOutputFormat`.
+    pub fn uses_structured_output(&self, run: &super::AgentRunOptions) -> bool {
+        run.structured_output
+            && run.non_interactive
+            && !matches!(run.launch_mode, LaunchMode::Acp)
+            && self.output_format.is_structured()
+    }
+
+    /// `true` when this run takes the interactive model fallback subcommand.
+    fn uses_model_fallback(&self, non_interactive: bool, model_requested: bool) -> bool {
+        !non_interactive && model_requested && self.interactive_model_fallback.is_some()
+    }
+
+    /// `Some(notice)` when this run uses the interactive model fallback.
+    pub fn interactive_model_notice(&self, run: &super::AgentRunOptions) -> Option<&str> {
+        if matches!(run.launch_mode, LaunchMode::Acp) {
+            return None;
+        }
+        if self.uses_model_fallback(run.non_interactive, run.model.is_some()) {
+            self.interactive_model_fallback
+                .as_ref()
+                .map(|f| f.notice.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// The entrypoint for a non-ACP launch: `interactive_entrypoint`, then
+    /// either the interactive model fallback subcommand (interactive with a
+    /// model), or the headless form plus `headless_only_flags` (and
+    /// `headless_text_flags` unless a structured format is in use), or the
+    /// `interactive_only_flags`. Every option builder (container and sbx)
+    /// derives its launch shape from here so they cannot drift.
+    pub fn entrypoint_for_run(&self, run: &super::AgentRunOptions) -> Entrypoint {
+        Entrypoint(self.launch_shape(
+            run.non_interactive,
+            run.model.is_some(),
+            self.uses_structured_output(run),
+        ))
+    }
+
+    /// The raw parts behind [`Self::entrypoint_for_run`], for callers (the
+    /// sbx tail) that hold resolved options rather than `AgentRunOptions`.
+    pub fn launch_shape(
+        &self,
+        non_interactive: bool,
+        model_requested: bool,
+        structured: bool,
+    ) -> Vec<String> {
+        let mut parts = self.interactive_entrypoint.clone();
+        if self.uses_model_fallback(non_interactive, model_requested) {
+            if let Some(fallback) = &self.interactive_model_fallback {
+                parts.push(fallback.subcommand.clone());
+            }
+            return parts;
+        }
+        if non_interactive {
+            if let Some(flag) = &self.non_interactive_flag {
+                parts.push(flag.clone());
+            }
+            parts.extend(self.headless_only_flags.iter().cloned());
+            if !structured {
+                parts.extend(self.headless_text_flags.iter().cloned());
+            }
+        } else {
+            parts.extend(self.interactive_only_flags.iter().cloned());
+        }
+        parts
     }
 
     /// Sandbox apply scripts deliver tool permissions only for Claude. Check
@@ -441,7 +667,7 @@ impl AgentDefinition {
     /// rather than passed twice.
     pub fn entrypoint_managed_flags(&self, non_interactive: bool) -> &[String] {
         if non_interactive {
-            &[]
+            &self.headless_only_flags
         } else {
             &self.interactive_only_flags
         }

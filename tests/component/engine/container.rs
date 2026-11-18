@@ -169,3 +169,87 @@ fn docker_and_apple_deliver_git_cache_credentials_only_on_private_stdin() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_docker_attach_recovers_env_redaction_before_output_and_failure_tail() {
+    use awman::data::message::{UserMessage, UserMessageSink};
+    use awman::data::session::AgentHandle;
+    use awman::engine::agent_runtime::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
+    use awman::engine::container::ContainerRuntime;
+    struct Frontend(Option<AgentIo>);
+    impl UserMessageSink for Frontend {
+        fn write_message(&mut self, _: UserMessage) {}
+        fn replay_queued(&mut self) {}
+    }
+    impl AgentFrontend for Frontend {
+        fn report_status(&mut self, _: AgentStatus) {}
+        fn report_progress(&mut self, _: AgentProgress) {}
+        fn take_io(&mut self) -> AgentIo {
+            self.0.take().unwrap()
+        }
+    }
+    let mut s = crate::support::sandbox(
+        "engine::container::native_docker_attach_recovers_env_redaction_before_output_and_failure_tail",
+    );
+    let docker = s.install_fake(crate::support::fake_cli_exe(), "docker");
+    awman_test_support::fakes::docker_cli_baseline(&docker);
+    s.env_mut().set("AWMAN_TEST_DOCKER", "1");
+    const KEY: &str = "synthetic-native-attach-canary";
+    docker
+        .on(&[
+            "inspect",
+            "--format",
+            "{{index .Config.Labels \"awman.output-secret-env\"}}",
+        ])
+        .stdout("CURSOR_API_KEY\n");
+    docker
+        .on(&["inspect", "--format", "{{json .Config.Env}}"])
+        .stdout(&serde_json::to_string(&vec![format!("CURSOR_API_KEY={KEY}")]).unwrap());
+    docker
+        .on(&["attach"])
+        .stdout(&format!("attached {KEY}\n"))
+        .stderr(&format!("problem {KEY}\n"))
+        .exit(1);
+    let runtime = ContainerRuntime::docker_in(crate::support::env_snapshot(&s));
+    let handle = AgentHandle {
+        id: "fixture".into(),
+        name: "fixture".into(),
+        image_tag: "awman-cursor".into(),
+        started_at: chrono::Utc::now(),
+    };
+    let instance = runtime.attach(&handle).unwrap();
+    let (stdout, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let (stderr, mut errors) = tokio::sync::mpsc::unbounded_channel();
+    let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut execution = instance
+        .run_with_frontend(Box::new(Frontend(Some(AgentIo {
+            stdout,
+            stderr,
+            stdin_tx,
+            stdin_rx,
+            resize: None,
+            initial_size: None,
+        }))))
+        .unwrap();
+    let tail = execution.output_tail().unwrap();
+    assert_eq!(execution.wait().await.unwrap().exit_code, 1);
+    assert!(tail.wait_for_writers(std::time::Duration::from_secs(3)));
+    let mut output = Vec::new();
+    while let Ok(bytes) = received.try_recv() {
+        output.extend(bytes);
+    }
+    assert_eq!(String::from_utf8(output).unwrap(), "attached ***\n");
+    let mut stderr = Vec::new();
+    while let Ok(bytes) = errors.try_recv() {
+        stderr.extend(bytes);
+    }
+    assert_eq!(String::from_utf8(stderr).unwrap(), "problem ***\n");
+    assert!(!tail.snapshot_text().contains(KEY));
+    assert!(tail.snapshot_text().contains("attached ***"));
+    // Losing required protection refuses attach rather than publishing raw bytes.
+    docker
+        .on(&["inspect", "--format", "{{json .Config.Env}}"])
+        .stdout("[]\n");
+    assert!(runtime.attach(&handle).is_err());
+    s.finish();
+}

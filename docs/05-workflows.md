@@ -138,7 +138,7 @@ All steps support the same fields:
 | `name` | string | yes | Unique step identifier within the workflow |
 | `prompt` | string | yes | Prompt template sent to the agent |
 | `depends_on` | array of strings | no | Names of steps that must complete before this one runs |
-| `agent` | string | no | Run this step with a specific agent instead of the default. Valid values: `claude`, `codex`, `opencode`, `gemini`, `antigravity`, `copilot`, `cline`, or a [custom agent](15-custom-agents.md) name |
+| `agent` | string | no | Run this step with a specific agent instead of the default. Valid values: `claude`, `codex`, `opencode`, `opencode-v2`, `cursor`, `antigravity`, `copilot`, `cline`, or a [custom agent](15-custom-agents.md) name |
 | `model` | string | no | Run this step with a specific model. Overrides any `--model` flag |
 | `overlays` | array of strings | no | Overlays applied to this step only — see [Workflow step overlays](08-overlays.md#workflow-step-overlays) |
 | `abort_on_failure` | bool | no | When `true`, a failure here stops the whole workflow (and kills any running parallel peers) instead of prompting. Defaults to `false` |
@@ -1274,7 +1274,7 @@ Running: plan     ┃  ● implement    ✓ review    ⚠️ docs
 When a step declares its own `agent` and/or `model`, the box shows the resolved **`agent/model`** on its top border (for example `claude/opus-4-8`) so you can see at a glance which agent and model will run each step:
 
 ```
- ╭claude/opus-4-8──╮   ╭gemini───────────╮
+ ╭claude/opus-4-8──╮   ╭codex────────────╮
  │ ● implement     │ → │ ○ review        │
  ╰─────────────────╯   ╰─────────────────╯
 ```

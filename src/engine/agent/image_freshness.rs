@@ -393,6 +393,11 @@ pub(crate) mod test_runtime {
         pub hold: AtomicBool,
         pub build_entered: tokio::sync::Notify,
         released: (Mutex<bool>, Condvar),
+        /// What `<binary> --version` prints inside every image (WI 0157).
+        /// `None` keeps the trait default (`Unknown`).
+        pub cli_version_line: Mutex<Option<String>>,
+        /// `(tag, binary)` of every in-image version probe.
+        pub version_probes: Mutex<Vec<(String, String)>>,
     }
 
     impl BuildRuntime {
@@ -480,6 +485,23 @@ pub(crate) mod test_runtime {
         }
         fn image_home_dir(&self, _: &str) -> Result<Option<String>, EngineError> {
             Ok(None)
+        }
+        fn probe_agent_cli_version(
+            &self,
+            tag: &str,
+            pin: &crate::engine::agent::definition::CliVersionPin,
+        ) -> crate::engine::container::agent_version::CliVersionStatus {
+            use crate::engine::container::agent_version::{classify_cli_version, CliVersionStatus};
+            self.version_probes
+                .lock()
+                .unwrap()
+                .push((tag.into(), pin.binary.clone()));
+            match self.cli_version_line.lock().unwrap().as_deref() {
+                Some(line) => classify_cli_version(pin, line),
+                None => CliVersionStatus::Unknown {
+                    reason: "test builder cannot probe images".into(),
+                },
+            }
         }
         fn build_image(
             &self,

@@ -27,6 +27,7 @@ if [ "$SCHEMA_VERSION" != "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Agent-specific config rendering for opencode is minimal.
 # env_config entries are written to $HOME/.awman/env.sh (sourceable).
 # ---------------------------------------------------------------------------
 mkdir -p "$HOME/.awman"
@@ -40,47 +41,6 @@ jq -r '
   to_entries[] |
   "export \(.key)=\(.value|@sh)"
 ' "$SESSION_FILE" >> "$ENV_SH" || true
-
-# ---------------------------------------------------------------------------
-# Dynamic session fields opencode can express natively.
-# ---------------------------------------------------------------------------
-
-# Model → ~/.config/opencode/opencode.json (merged into any existing config).
-MODEL="$(jq -r '.model // empty' "$SESSION_FILE")"
-if [ -n "$MODEL" ]; then
-  CONFIG_DIR="$HOME/.config/opencode"
-  mkdir -p "$CONFIG_DIR"
-  CONFIG="$CONFIG_DIR/opencode.json"
-  EXISTING='{}'
-  if [ -f "$CONFIG" ]; then
-    EXISTING="$(jq '.' "$CONFIG" 2>/dev/null || echo '{}')"
-  fi
-  jq -n --argjson base "$EXISTING" --arg model "$MODEL" \
-    '$base + { model: $model }' > "$CONFIG"
-fi
-
-# System prompt: opencode reads AGENTS.md from the workspace. The container path
-# plants AGENTS.md into the mounted context directories, which the sandbox VM
-# already sees through the workspace mount, so nothing inline is delivered here.
-# If a future option carries inline text, surface it so it is not lost.
-SYS_PROMPT="$(jq -r '.system_prompt_inline.text // empty' "$SESSION_FILE")"
-if [ -n "$SYS_PROMPT" ]; then
-  printf '%s\n' "$SYS_PROMPT" > "$HOME/.awman/system-prompt.md"
-  echo "awman: opencode system prompt staged at ~/.awman/system-prompt.md (opencode reads AGENTS.md from the workspace)." >&2
-fi
-
-# Tool allow/deny lists are not expressible through a mixin-safe opencode config
-# — warn rather than silently drop them.
-if [ "$(jq -r '((.allowed_tools // []) + (.disallowed_tools // [])) | length' "$SESSION_FILE")" != "0" ]; then
-  echo "awman: opencode does not support allow/deny tool lists via config; ignoring them." >&2
-fi
-
-# Seeded prompt — staged for reference; awman delivers it via the agent's
-# stdin at launch.
-SEEDED="$(jq -r '.seeded_prompt // empty' "$SESSION_FILE")"
-if [ -n "$SEEDED" ]; then
-  printf '%s' "$SEEDED" > "$HOME/.awman/seeded-prompt.txt"
-fi
 
 # Write a marker file so external tooling can confirm config was applied.
 cp "$SESSION_FILE" "$HOME/.awman/session-applied.json"

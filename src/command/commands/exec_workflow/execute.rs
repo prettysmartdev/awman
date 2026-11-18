@@ -183,7 +183,7 @@ impl Command for ExecWorkflowCommand {
             PrerequisiteStart::CheckOnly(outcome) => return Ok(outcome),
         };
 
-        // Track whether the gemini deprecation warning has already been emitted
+        // Track whether the vendor deprecation warning has already been emitted
         // so we never fire it twice (early CLI check + post-load TOML scan).
         let mut deprecation_warned = false;
         if let Some(agent) = self.flags.agent.as_deref() {

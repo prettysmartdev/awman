@@ -165,6 +165,11 @@ pub trait CommandFrontend: UserMessageSink + Send + Sync {
         Err(CommandError::Other("--token - requires CLI stdin".into()))
     }
 
+    /// Whether a value came from caller input rather than a frontend profile.
+    fn flag_is_explicit(&self, _flag: &str) -> bool {
+        true
+    }
+
     fn flag_bool(&self, command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError>;
 
     fn flag_string(

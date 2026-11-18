@@ -104,6 +104,7 @@ pub(crate) type CancelFn = Arc<dyn Fn() + Send + Sync>;
 /// Per-bridge configuration. Bundled into one struct so the bridge functions
 /// don't grow an unwieldy parameter list as more knobs land.
 pub(crate) struct BridgeConfig {
+    pub output_redaction: crate::engine::auth::redaction::RedactionSet,
     pub terminal: Option<crate::engine::agent_runtime::execution::TerminalLaunch>,
     pub program_status: ProgramStatusBridgeConfig,
     pub grace_timeout: Duration,
@@ -390,13 +391,14 @@ pub(crate) fn bridge_pty(
     // A writer handle, so a caller can wait for this thread to finish.
     let tail = config.output_tail.writer();
     let broadcast = config.output_broadcast.clone();
-    let mut status_stream = ProgramStatusStream::new(
+    let status_stream = ProgramStatusStream::new(
         program_status.clone(),
         ProgramStatusBridgeConfig {
             answer_queries: true,
             ..config.program_status
         },
     );
+    let mut status_stream = status_stream.with_redaction(config.output_redaction.clone());
     let query_stdin = io.stdin_tx.clone();
     std::thread::spawn(move || {
         use std::io::Read;
@@ -536,13 +538,14 @@ pub(crate) fn bridge_piped(
         // A writer handle, so a caller can wait for this thread to finish.
         let tail = config.output_tail.writer();
         let broadcast = config.output_broadcast.clone();
-        let mut status_stream = ProgramStatusStream::new(
+        let status_stream = ProgramStatusStream::new(
             program_status.clone(),
             ProgramStatusBridgeConfig {
                 answer_queries: false,
                 ..config.program_status
             },
         );
+        let mut status_stream = status_stream.with_redaction(config.output_redaction.clone());
         std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stdout;
@@ -585,13 +588,14 @@ pub(crate) fn bridge_piped(
         // A writer handle, so a caller can wait for this thread to finish.
         let tail = config.output_tail.writer();
         let broadcast = config.output_broadcast.clone();
-        let mut status_stream = ProgramStatusStream::new(
+        let status_stream = ProgramStatusStream::new(
             program_status.clone(),
             ProgramStatusBridgeConfig {
                 answer_queries: false,
                 ..config.program_status
             },
         );
+        let mut status_stream = status_stream.with_redaction(config.output_redaction.clone());
         std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stderr;

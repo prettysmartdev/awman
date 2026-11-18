@@ -419,6 +419,9 @@ impl CommandFrontend for ApiDispatchFrontend {
     fn kind(&self) -> crate::command::dispatch::catalogue::FrontendKind {
         self.frontend_kind
     }
+    fn flag_is_explicit(&self, flag: &str) -> bool {
+        self.parsed().is_ok_and(|p| p.flag_is_explicit(flag))
+    }
     fn flag_bool(&self, _command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError> {
         self.parsed()?;
         // The resolved decision is authoritative for both spellings, so a

@@ -104,6 +104,15 @@ pub fn convert(
         sandbox_model_note: None,
         sandbox_auth_env_vars: vec![],
         deprecation_note: None,
+        strict_modes: false,
+        requires_private_session: false,
+        mode_refusals: Vec::new(),
+        headless_only_flags: Vec::new(),
+        headless_text_flags: Vec::new(),
+        interactive_model_fallback: None,
+        cli_version: None,
+        launch_note: None,
+        sandbox_auth_note: None,
     }
 }
 

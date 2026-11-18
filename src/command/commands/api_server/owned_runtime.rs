@@ -106,6 +106,15 @@ impl CommandOwnedRuntime {
 }
 
 impl AgentRuntimeEngine for CommandOwnedRuntime {
+    // Forwarded so API-owned `ready` and launches verify the same in-image
+    // CLI version as the CLI path instead of reporting `Unknown`.
+    fn probe_agent_cli_version(
+        &self,
+        tag: &str,
+        pin: &crate::engine::agent::definition::CliVersionPin,
+    ) -> crate::engine::container::agent_version::CliVersionStatus {
+        self.inner.probe_agent_cli_version(tag, pin)
+    }
     fn inspect_image(
         &self,
         tag: &str,

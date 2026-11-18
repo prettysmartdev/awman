@@ -21,7 +21,14 @@ pub fn prepare(s: &TestSandbox) -> Vec<awman_test_support::fakes::FakeCli> {
         docker.on(&["image", "inspect", &tag]).exit(0);
     }
     [
-        "claude", "codex", "gemini", "opencode", "pi", "crush", "maki",
+        "claude",
+        "codex",
+        "opencode",
+        "cursor-agent",
+        "gemini",
+        "pi",
+        "crush",
+        "maki",
     ]
     .into_iter()
     .map(|name| s.install_fake(crate::support::fake_cli_exe(), name))

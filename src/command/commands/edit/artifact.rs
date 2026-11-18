@@ -529,6 +529,7 @@ mod tests {
             json: false,
             allow_docker: false,
             yolo: false,
+            yolo_authorized: false,
             auto: false,
             agent: None,
             model: None,

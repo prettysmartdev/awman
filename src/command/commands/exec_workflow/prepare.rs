@@ -55,7 +55,7 @@ pub(crate) fn report_work_item_drift(
 /// The wording is the one per-agent table's
 /// (`AgentDefinition::deprecation_note`, reached through
 /// `LaunchPolicy::deprecation_warning`). This used to be a third hand-written
-/// copy of the gemini text, alongside `chat`'s and `exec prompt`'s (F-32).
+/// copy of the vendor deprecation text, alongside `chat`'s and `exec prompt`'s (F-32).
 pub(crate) fn workflow_resume_start_points(
     dag: &crate::data::workflow_dag::WorkflowDag,
     state: &crate::data::workflow_state::WorkflowState,
@@ -1420,8 +1420,7 @@ pub(crate) fn finalize_policy(
 /// the workflow engine uses (`step.agent` > `workflow.agent` > session
 /// default), in first-seen order.
 ///
-/// Was `workflow_resolves_to_gemini`, which answered one hard-coded question
-/// about one agent name (F-32). The caller now asks the per-agent table
+/// Was a one-agent hard-coded question (F-32). The caller now asks the per-agent table
 /// whether each one carries a deprecation note.
 pub(crate) fn workflow_agents(workflow: &Workflow, session: &Session) -> Vec<String> {
     let workflow_default = workflow.agent.as_deref();

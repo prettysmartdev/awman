@@ -1,11 +1,11 @@
 # Agent Sessions
 
-An agent session is a container (on whichever [runtime](11-runtimes.md) you use) running your configured AI agent (Claude Code, Codex, OpenCode, Gemini, Antigravity, GitHub Copilot CLI, Cline, or any [custom agent](15-custom-agents.md) you define) against your project. awman handles starting the container, injecting your credentials, and connecting your terminal to the agent's input/output.
+An agent session is a container (on whichever [runtime](11-runtimes.md) you use) running your configured AI agent (Claude Code, Codex, OpenCode 1.x or 2.x, Cursor, Antigravity, GitHub Copilot CLI, Cline, or any [custom agent](15-custom-agents.md) you define) against your project. awman handles starting the container, injecting your credentials, and connecting your terminal to the agent's input/output.
 
 Sessions normally use the standard stdio launch mode. You can also use
 [ACP mode](#acp-launch-mode) when you want awman to render structured agent
 activity instead of the agent's raw terminal stream. ACP currently supports
-**Cline**, **OpenCode**, and **Gemini CLI**.
+**Cline** and **OpenCode 1.x** (`opencode`).
 
 ---
 
@@ -39,8 +39,9 @@ agent session. Instead of showing the agent's terminal stream directly, awman
 renders the agent's messages, tool activity, plans, and permission requests in
 its own interface.
 
-ACP is supported by **Cline**, **OpenCode** (`opencode acp`), and **Gemini CLI**
-(`gemini --experimental-acp`). Other agents use the standard stdio launch mode.
+ACP is supported by **Cline** and **OpenCode 1.x** (`opencode acp`). `opencode-v2`
+and `cursor` do not offer ACP and refuse it before launch. Other agents use the
+standard stdio launch mode.
 
 ACP is available with the Docker and Apple Containers runtimes. The
 `docker-sbx-experimental` runtime does not currently support ACP. The `builtin-experimental` runtime carries ACP over its own binary-clean stream: frames reach the agent byte-for-byte, and closing the client's stdin ends the agent's input as it does on Docker.
@@ -170,12 +171,12 @@ an error, so a one-off request cannot silently change modes. See
 
 ### `--agent <name>`
 
-Override the configured agent for this session. Available agents: `claude`, `codex`, `opencode`, `gemini`, `antigravity`, `copilot`, `cline`, plus any [custom agent](15-custom-agents.md).
+Override the configured agent for this session. Available agents: `claude`, `codex`, `opencode`, `opencode-v2`, `cursor`, `antigravity`, `copilot`, `cline`, plus any [custom agent](15-custom-agents.md).
 
 ```sh
 # CLI
 awman chat --agent codex               # launch a Codex session for this project
-awman exec workflow path/to/workflow.toml --agent gemini    # run workflow with Gemini instead of the configured agent
+awman exec workflow path/to/workflow.toml --agent cursor    # run workflow with Cursor instead of the configured agent
 awman chat --agent=copilot             # --flag=value form is also accepted
 
 # TUI command box
@@ -194,7 +195,7 @@ Interactive Codex sessions run as `codex --no-daemon`: recent Codex releases oth
 Passing an unknown agent name exits immediately with a list of valid options:
 
 ```
-error: unknown agent 'foo'; first-party: claude, codex, opencode, gemini, copilot, cline, antigravity; custom: (none); define one with: awman new agent foo
+error: unknown agent 'foo'; first-party: claude, codex, opencode, opencode-v2, cursor, copilot, cline, antigravity; custom: (none); define one with: awman new agent foo
 ```
 
 ### `--model <NAME>`
@@ -222,9 +223,10 @@ Per-agent translation and expected `<NAME>` format:
 |-------|--------------|-----------------|
 | `claude` | `--model <NAME>` | bare model ID (e.g. `claude-opus-4-6`) |
 | `codex` | `--model <NAME>` | bare model ID (e.g. `gpt-4o`) |
-| `gemini` | `--model <NAME>` | bare model ID (e.g. `gemini-2.0-flash`) |
 | `antigravity` | `--model <NAME>` | model slug from `agy models` |
 | `opencode` | `--model <NAME>` | **`provider/model` required** (e.g. `anthropic/claude-3-5-sonnet`) |
+| `opencode-v2` | `--model <NAME>` | `provider/model`, as for `opencode`. Interactive sessions with `--model` use OpenCode 2.x's minimal interface (`opencode mini`); see [OpenCode 1.x and 2.x](#opencode-1x-and-2x) |
+| `cursor` | `--model <NAME>` | model name as listed by `cursor-agent models` |
 | `cline` | `--model <NAME>` | model ID for the selected provider; use `--agent-flag --provider` to select a provider for one run |
 | `copilot` | `--model <NAME>` | bare model ID; cannot be applied under the `docker-sbx-experimental` runtime (use the `/model` slash command there) |
 
@@ -244,15 +246,16 @@ Run the agent in print/batch mode — no interactivity required. The agent execu
 |-------|-----------|
 | Claude | `--print` |
 | Codex | `exec` subcommand |
-| OpenCode | `run` subcommand |
-| Gemini | `--prompt` / `-p` |
+| OpenCode 1.x | `run` subcommand |
+| OpenCode 2.x | `run` subcommand, prompt on stdin |
+| Cursor | `--print --trust` (text output, or `stream-json` for structured and API runs) |
 | Antigravity | `--print` |
 | Copilot | `-p <prompt>` |
 | Cline | positional prompt (one-shot) |
 
 Useful for CI pipelines, scripting, or when you want the output captured rather than live.
 
-Under the `docker-sbx-experimental` runtime, agents that launch through Docker's built-in sandbox templates (`claude`, `codex`, `gemini`, `copilot`, `opencode`) cannot have their non-interactive flag enabled — awman warns at launch and pipes the prompt to the interactive entrypoint instead. See [Runtimes](11-runtimes.md#known-limitations).
+Under the `docker-sbx-experimental` runtime, agents that launch through Docker's built-in sandbox templates (`claude`, `codex`, `copilot`) cannot have their non-interactive flag enabled — awman warns at launch and pipes the prompt to the interactive entrypoint instead. See [Runtimes](11-runtimes.md#known-limitations).
 
 ### `--interactive`
 
@@ -432,7 +435,8 @@ Start the agent in its planning mode. Each CLI enforces its own planning permiss
 | `claude` | `--permission-mode plan` |
 | `codex` | *(no startup plan flag — refused; use `/plan` interactively)* |
 | `opencode` | *(not supported — refused)* |
-| `gemini` | `--approval-mode=plan` |
+| `opencode-v2` | *(not supported — refused)* |
+| `cursor` | *(not supported — refused)* |
 | `antigravity` | `--mode plan` |
 | `copilot` | `--plan` |
 | `cline` | `--plan` |
@@ -448,7 +452,8 @@ Enable the agent's intermediate automatic approval mode. The exact permissions v
 | `claude` | `--permission-mode auto` |
 | `codex` | `--sandbox workspace-write` |
 | `opencode` | `--auto` |
-| `gemini` | `--approval-mode=auto_edit` |
+| `opencode-v2` | *(not supported — refused)* |
+| `cursor` | *(not supported — refused)* |
 | `antigravity` | `--mode accept-edits` |
 | `copilot` | *(no equivalent — flag omitted)* |
 | `cline` | `--auto-approve true` |
@@ -475,7 +480,8 @@ Yolo mode is a good fit when you have a well-specified work item you trust the a
 | `claude` | `--dangerously-skip-permissions` |
 | `codex` | `--dangerously-bypass-approvals-and-sandbox` |
 | `opencode` | *(no equivalent — flag omitted)* |
-| `gemini` | `--approval-mode=yolo` |
+| `opencode-v2` | `--auto` |
+| `cursor` | `--force` |
 | `antigravity` | `--dangerously-skip-permissions` |
 | `copilot` | `--yolo` (allow all permissions) |
 | `cline` | `--yolo` |
@@ -523,7 +529,7 @@ Commands submitted through the API (`POST /v1/worker/commands`) run with `--yolo
 
 - `--yolo` removes the human checkpoints that catch unintended agent actions. Only use it with agents and work items you trust.
 - `exec workflow --yolo` is the recommended autonomous pattern: isolated branch, structured phases, auto-advancing, easy to discard if the output isn't right.
-- Gemini's `--yolo` skips all tool confirmations including shell commands; `--auto` (`--approval-mode=auto_edit`) is the more conservative choice.
+- Cursor's `--force` (what `--yolo` passes) runs commands unless Cursor explicitly denies them. awman passes `--force` only for `--yolo`; headless runs also pass `--trust` (workspace trust), which is a separate flag.
 - Copilot supports `--yolo` only — `--auto` has no equivalent and is dropped.
 - Cline's `--auto` enables tool auto-approval; its `--yolo` skips confirmations and exits after the turn.
 
@@ -867,7 +873,8 @@ The token value is never shown in displayed container commands; the mounted `~/.
 | `claude` | OAuth credential read from macOS Keychain (or `~/.claude/.credentials.json`), delivered as a live-refreshed `.credentials.json` file in the staged `~/.claude` mount — never as an env var |
 | `codex` | `~/.codex/` mounted directly when present (including file-backed `auth.json`); or `OPENAI_API_KEY` through `env()`. Each container launch also receives a private temporary SQLite directory at `$HOME/.codex-sqlite`. |
 | `opencode` | `~/.config/opencode/` config and `~/.local/share/opencode/` provider credentials mounted directly when present; or provider key through `env()` |
-| `gemini` | API key via `env()` overlay and/or `~/.gemini/` OAuth directory (auto-mounted) |
+| `opencode-v2` | Provider key through `env()` (for example `env(ANTHROPIC_API_KEY)`). A private copy of `~/.config/opencode/` is seeded one way; nothing is mounted live and logins made inside the session are discarded |
+| `cursor` | `CURSOR_API_KEY` through `env()` or a secret overlay. No host `~/.cursor/` is mounted; Cursor's state lives in a private per-launch directory |
 | `antigravity` | Google account credential staged under `~/.gemini/antigravity-cli/`, or `GEMINI_API_KEY` through `env()` when `modelProvider` is `gemini` |
 | `copilot` | `~/.copilot/` mounted directly when present (including `settings.json` and any file-backed token in `config.json`); or GitHub token via `env()` overlay (`COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN`) |
 | `cline` | `~/.cline/data/` mounted directly when present (current provider settings are in `settings/providers.json`) |
@@ -889,47 +896,67 @@ Your original files are never modified. The copies are created in a temporary di
 
 ---
 
-## Gemini authentication
+## Cursor authentication
 
-Gemini supports two authentication paths. You can use either or both — awman sets up both automatically.
-
-### API key (`env()` overlay)
-
-Add `GEMINI_API_KEY` (or one of the Vertex AI variables) to your overlays config:
+`cursor` authenticates with an API key from your Cursor account. Pass it with an `env()` overlay or a secret overlay:
 
 ```json
-{ "overlays": ["env(GEMINI_API_KEY)"] }
+{ "overlays": ["env(CURSOR_API_KEY)"] }
 ```
 
-Or pass it per-command: `awman chat --agent gemini --overlay "env(GEMINI_API_KEY)"`.
+Or per command: `awman chat --agent cursor --overlay "env(CURSOR_API_KEY)"`. awman reads the value from your host shell and injects it into the container; it is masked (`***`) in agent output, terminal replay and failure logs, and never appears in the launch arguments. awman does not mount a host `~/.cursor/` directory and does not run `cursor-agent login` for you.
 
-Get an API key from [Google AI Studio](https://aistudio.google.com/apikey). awman reads the value from your host shell and injects it into the container. The value is masked (`***`) in displayed Docker commands.
-
-Supported Gemini auth environment variables:
-
-| Variable | Description |
-|----------|-------------|
-| `GEMINI_API_KEY` | API key from Google AI Studio |
-| `GOOGLE_API_KEY` | Alternate Gemini API key variable; select the appropriate auth method in Gemini CLI |
-| `GOOGLE_CLOUD_PROJECT` | Vertex AI project ID |
-| `GOOGLE_CLOUD_LOCATION` | Vertex AI region |
-| `GOOGLE_GENAI_USE_VERTEXAI` | Set to `true` to enable the Vertex AI auth path |
-
-> **Note on `GOOGLE_APPLICATION_CREDENTIALS`:** This variable points to a file path on the host. Passing it via `env()` overlay injects the path string but not the file itself, so the container cannot read it. Service account JSON authentication requires either embedding the key in your `Dockerfile.dev` or mounting it with a `dir()` overlay. For most users, `GEMINI_API_KEY` is simpler.
-
-### OAuth token (`~/.gemini/` mount)
-
-Gemini's Google sign-in caches its credential under `~/.gemini/` (typically `oauth_creds.json`); `settings.json` holds configuration, not the token. When the host directory exists, awman mounts it at the container user's `$HOME/.gemini`.
-
-If `~/.gemini/` does not exist on the host, awman does not mount it. Gemini will need an API key or an interactive sign-in.
-
-The mount is a live bind mount. Gemini can update the host's credential cache while a session runs.
-
-### Auth precedence
-
-The selected Gemini CLI authentication method determines which credential is used. awman does not choose between a key and Google sign-in.
+Cursor is refused on `docker-sbx-experimental`: that runtime reuses state and credential scopes between executions. Use `docker`, `apple` or `builtin` with `env(CURSOR_API_KEY)`.
 
 ---
+
+## OpenCode 1.x and 2.x
+
+awman has two separate OpenCode agents. They are installed, selected, ready-checked and run independently, each with its own image (`awman-{project}-opencode:latest` and `awman-{project}-opencode-v2:latest`), and `awman ready` verifies the version inside the image rather than trusting a host binary.
+
+| | `opencode` | `opencode-v2` |
+|---|---|---|
+| OpenCode line | 1.x (pinned 1.19.6) | 2.x (pinned 2.3.2) |
+| Launch | `opencode` | `opencode --standalone` (a private server, never shared with another run) |
+| Host config | `~/.config/opencode/` and `~/.local/share/opencode/` mounted directly | Private copy of `~/.config/opencode/`, seeded one way; changes and logins are discarded when the session ends |
+| Plugins | 1.x plugins and `plugin` setting | 1.x plugins and the `plugin` setting do not load |
+| Provider keys | host credentials or `env()` | `env()` (for example `env(ANTHROPIC_API_KEY)`) |
+| ACP | `opencode acp` | not supported |
+| `--plan` / `--auto` | `--plan` refused; `--auto` accepted | both refused |
+| `--yolo` | accepted, passes no flag | `--auto` |
+
+Existing `--agent opencode` users keep OpenCode 1.x; adding `opencode-v2` never changes which version `opencode` runs. To try 2.x, run `awman chat --agent opencode-v2` (awman offers to download `Dockerfile.opencode-v2` and build it on first use) or `awman init --agent opencode-v2`.
+
+OpenCode readiness now checks the image only and skips the former host authentication ping. On Docker Sandboxes, OpenCode 1.x now uses an awman-owned agent kit that installs pinned 1.19.6; existing mixin sandboxes need `awman ready --agent opencode --no-cache` to recreate them. OpenCode 1.x retains its direct writable host config/data mounts and its historical `--yolo` no-op.
+
+OpenCode 2 and Cursor require an explicit `--yolo` to authorize their broad approval modes. API and worker defaults, dynamic mode and squad leaders do not grant this authorization. A launch with only an implied yolo mode is refused; dynamic workflows using these agents need an explicit `--yolo`. Squad evaluation leaders and their workflows currently cannot use these agents with their automatic yolo mode.
+
+OpenCode 2 is refused on `docker-sbx-experimental` until per-execution state and credential isolation is available. Its host config copy refuses symlinks (including intermediate directories), hard links, protected paths and special files, so policy files are never silently omitted. Make linked policy files regular files before launching. On platforms without secure descriptor-relative copying, an existing host config is refused; a missing config starts empty.
+
+If an image holds the wrong major version, `awman ready` and launch refuse it, for example: `does not contain OpenCode 2: expected opencode 2.x, found 1.19.6. Delete .awman/Dockerfile.opencode-v2 and run 'awman ready --build'.`
+
+A version probe that cannot run blocks launch. Cursor requires exactly build `2026.11.17-f532c45`; an older or newer build is refused. Other versions of the correct OpenCode major are allowed, with a readiness warning. To install the tested pin, delete `.awman/Dockerfile.<agent>` and run `awman ready --build`.
+
+`opencode-v2` interactive sessions started with `--model` use OpenCode 2.x's minimal interface (`mini`), which has no auto or plan mode, so combining `--model` with `--plan`, `--auto` or `--yolo` there is refused. Every `opencode-v2` launch prints a short note about the private configuration copy.
+
+---
+
+## Cursor modes
+
+awman implements only the Cursor options below. Anything else is refused before an image build or launch, never silently dropped.
+
+| Option | Behaviour |
+|---|---|
+| Interactive | `cursor-agent --disable-auto-update`, prompt as a positional argument |
+| `--headless` | adds `--print --trust` and one `--output-format` (`text`, or `stream-json` when awman needs structured output such as API runs) |
+| `--yolo` | adds `--force`; the only way awman passes `--force` |
+| `--model <NAME>` | `--model <NAME>` |
+| `--plan`, `--auto` | refused (unsupported) |
+| ACP, allow/deny tool lists | refused |
+
+---
+
+Cursor prompts starting with `-` (after any leading whitespace) are refused to keep prompt text from becoming CLI options. Prefix a Markdown bullet list with a sentence.
 
 ## Antigravity authentication
 
@@ -967,21 +994,16 @@ Use awman's `--model <slug>` for one session; `agy models` lists available slugs
 
 ---
 
-## Gemini deprecation notice
+## Gemini is no longer built in
 
-The `gemini` agent is deprecated by Google in favor of Antigravity. When you launch a `gemini` session using `awman chat --agent gemini` or set `agent = "gemini"` in your config, a deprecation warning appears before the container starts:
+awman no longer ships a built-in `gemini` agent. That is awman's product choice. Separately, [Google ended Gemini CLI access for consumer Google-login and AI-plan accounts on June 18, 2026](https://developers.google.com/gemini-code-assist/docs/deprecations/code-assist-individuals); it did not shut Gemini CLI down for everyone, and enterprise subscriptions and paid API-key access continue.
 
-```
-The 'gemini' agent is deprecated by Google. Migrate to 'antigravity' — run 'awman chat --agent antigravity' (or 'awman config set agent antigravity' to change your default).
-```
+Selecting `gemini` (`--agent gemini`, `agents.default: "gemini"`, a workflow step's agent) fails with an error naming the options below. awman never substitutes another agent and never rewrites your configuration.
 
-The warning does not block execution — your gemini session still starts. However, you should plan to migrate to `antigravity`:
+1. **Use the built-in `antigravity` agent.** Run `awman chat --agent antigravity` once (awman downloads `Dockerfile.antigravity` and builds the image), then `awman config set agents.default antigravity` (add `--global` for every repo). Set up authentication as described in [Antigravity authentication](#antigravity-authentication).
+2. **Define Gemini CLI as a custom agent** if you use an enterprise subscription or a paid API key: `awman new agent gemini`. Custom agents go through the normal review and approval step; see [Custom agents](15-custom-agents.md#example-gemini-cli).
 
-1. Try it once — `awman chat --agent antigravity` automatically downloads `Dockerfile.antigravity` and builds the agent image on first use.
-2. Make it your default: `awman config set agent antigravity` (add `--global` to apply across all repos).
-3. Set up authentication as described in [Antigravity authentication](#antigravity-authentication) above.
-
-Antigravity uses a separate `agy` CLI and its own settings and authentication paths.
+A legacy top-level `agent` or `default_agent` key keeps its own moved-key error; use `agents.default`.
 
 ---
 
@@ -1057,7 +1079,7 @@ Initialises the current Git repository for use with awman. See [Getting Started]
 
 | Flag | Values | Default |
 |------|--------|---------|
-| `--agent` | `claude`, `codex`, `opencode`, `gemini`, `antigravity`, `copilot`, `cline`, or a [custom agent](15-custom-agents.md) name | `claude` |
+| `--agent` | `claude`, `codex`, `opencode`, `opencode-v2`, `cursor`, `antigravity`, `copilot`, `cline`, or a [custom agent](15-custom-agents.md) name | `claude` |
 | `--aspec` | (flag) | off |
 
 `--aspec` downloads the `aspec/` folder from `github.com/prettysmartdev/aspec`, providing spec templates and work item scaffolding. Skipped without the flag.

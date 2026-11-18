@@ -262,6 +262,21 @@ pub trait AgentRuntimeEngine: Send + Sync {
     /// Whether `tag` exists in this runtime's local image store.
     fn image_exists(&self, tag: &str) -> Result<bool, EngineError>;
 
+    /// Execute `<pin.binary> --version` inside image `tag` and classify the
+    /// answer (WI 0157). Container-class runtimes override this; any other
+    /// runtime (and a wrapper that does not forward it) reports `Unknown`,
+    /// which never satisfies readiness as `Done` and never blocks a launch.
+    /// Never runs a host binary.
+    fn probe_agent_cli_version(
+        &self,
+        _tag: &str,
+        _pin: &crate::engine::agent::definition::CliVersionPin,
+    ) -> crate::engine::container::agent_version::CliVersionStatus {
+        crate::engine::container::agent_version::CliVersionStatus::Unknown {
+            reason: format!("{} cannot probe images", self.runtime_name()),
+        }
+    }
+
     /// Read local image metadata without building, pulling or importing.
     /// Runtimes without an image store explicitly refuse this operation.
     fn inspect_image(

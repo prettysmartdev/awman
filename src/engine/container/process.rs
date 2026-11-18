@@ -181,6 +181,7 @@ pub(super) fn bridge_config_for(
             .status();
     });
     BridgeConfig {
+        output_redaction: Default::default(),
         grace_timeout,
         stuck_timeout,
         container_start_delay: cli.start_delay,
@@ -291,6 +292,7 @@ impl AgentInstance for ContainerInstance {
         let mut bridge_cfg =
             bridge_config_for(cli.clone(), &self.name, grace_timeout, stuck_timeout);
         bridge_cfg.program_status = self.options.program_status;
+        bridge_cfg.output_redaction = self.options.output_redaction.clone();
         bridge_cfg.terminal = frontend.terminal_launch();
         if self.options.full_transcript {
             bridge_cfg.output_tail =

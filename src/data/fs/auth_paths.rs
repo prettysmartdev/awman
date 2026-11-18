@@ -59,17 +59,17 @@ impl AuthPathResolver {
                 config_file: None,
                 settings_dir: Some(self.home.join(".codex")),
             },
-            "gemini" => AgentAuthPaths {
-                agent: agent.to_string(),
-                config_file: None,
-                settings_dir: Some(self.home.join(".gemini")),
-            },
             "antigravity" => AgentAuthPaths {
                 agent: agent.to_string(),
                 config_file: None,
                 settings_dir: Some(self.home.join(".gemini")),
             },
             "opencode" => AgentAuthPaths {
+                agent: agent.to_string(),
+                config_file: None,
+                settings_dir: Some(self.home.join(".config").join("opencode")),
+            },
+            "opencode-v2" => AgentAuthPaths {
                 agent: agent.to_string(),
                 config_file: None,
                 settings_dir: Some(self.home.join(".config").join("opencode")),
