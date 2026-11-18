@@ -496,10 +496,21 @@ async fn repeated_launch_ready_and_preflight_reuse_current_images_without_import
         .unwrap();
     assert_eq!(result.import, StepStatus::Done);
     assert_eq!(store.imports.lock().unwrap().len(), 1);
-    assert!(initial
+    let preparation = format!("Preparing {tag} (apple-local)");
+    let image_steps: Vec<_> = initial
         .steps
         .iter()
-        .any(|(name, status)| name.starts_with("Importing ") && *status == StepStatus::Running));
+        .filter(|(name, _)| name.contains(&tag))
+        .cloned()
+        .collect();
+    assert_eq!(
+        image_steps,
+        vec![
+            (preparation.clone(), StepStatus::Running),
+            (preparation, StepStatus::Done),
+        ],
+        "one preparation row, without a duplicate identity summary"
+    );
 
     // Each invocation has a new preparer. Match chat's policy selection, and
     // exercise ready/preflight plus older Apple index-only inspection too.
@@ -550,6 +561,25 @@ async fn repeated_launch_ready_and_preflight_reuse_current_images_without_import
             assert_eq!(store.built.lock().unwrap().len(), 2);
         }
     }
+    // Removing source configuration still permits installed reuse, without
+    // adding an identity/digest preamble to every launch.
+    let mut prep = preparer(&s, store.clone(), false, None);
+    let mut seen = ProgressSink::default();
+    let result = prep
+        .prepare(
+            &AgentImageRequest {
+                tag: &tag,
+                agent: "claude",
+                policy: BuildPolicy::ImportOnly,
+            },
+            &mut seen,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.import, StepStatus::Done);
+    assert!(seen.steps.is_empty(), "{:?}", seen.steps);
+    assert!(seen.messages.is_empty(), "{:?}", seen.messages);
+    assert_eq!(store.imports.lock().unwrap().len(), 1);
     s.finish();
 }
 

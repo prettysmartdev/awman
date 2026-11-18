@@ -445,8 +445,6 @@ impl ReadyEngine {
                     self.options.build || !self.runtime.image_exists(&tag).unwrap_or(false);
                 if !needs_build {
                     self.summary.base_image = StepStatus::Done;
-                    frontend
-                        .report_step_status(&ReadyStep::BuildBaseImage.into(), StepStatus::Done);
                     ReadyPhase::BuildingAgentImage
                 } else {
                     frontend
@@ -522,8 +520,6 @@ impl ReadyEngine {
                     || !self.runtime.image_exists(&tag).unwrap_or(false);
                 if !needs_build {
                     self.summary.agent_image = StepStatus::Done;
-                    frontend
-                        .report_step_status(&ReadyStep::BuildAgentImage.into(), StepStatus::Done);
                     return Ok({
                         self.phase = ReadyPhase::CheckingNonDefaultAgents;
                         self.phase.clone()
@@ -1112,14 +1108,18 @@ impl ReadyEngine {
             if self.cancel.check().is_err() {
                 return;
             }
-            let step: SetupStep = ReadyStep::ImportAgentImageFor(agent.clone()).into();
-            frontend.report_step_status(&step, StepStatus::Running);
-
             let status = match self.prepare_agent_image(frontend, git_root, agent).await {
                 Ok(status) => status,
                 Err(msg) => StepStatus::Failed(msg),
             };
-            frontend.report_step_status(&step, status);
+            // The preparer owns progress. Keep early refusals visible without
+            // wrapping successful preparation in a second import row.
+            if matches!(status, StepStatus::Failed(_) | StepStatus::Warn(_)) {
+                frontend.report_step_status(
+                    &ReadyStep::ImportAgentImageFor(agent.clone()).into(),
+                    status,
+                );
+            }
         }
     }
 

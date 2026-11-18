@@ -381,18 +381,6 @@ impl Command for ReadyCommand {
         outcome.json_requested = self.flags.json;
         outcome.refresh_requested = self.flags.refresh;
 
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: format!(
-                "ready: complete — runtime={}, dockerfile={:?}, base_image={:?}, agent_image={:?}, local_agent={:?}",
-                outcome.runtime,
-                outcome.dockerfile,
-                outcome.base_image,
-                outcome.agent_image,
-                outcome.local_agent,
-            ),
-        });
-
         Ok(outcome)
     }
 }

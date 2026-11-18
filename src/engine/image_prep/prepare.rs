@@ -143,19 +143,9 @@ impl AgentImagePreparer {
         };
         let refresh = policy.refresh_import();
         if !refresh && self.runtime.image_exists(&tag).unwrap_or(false) {
-            let identity = self.runtime.image_identity(&tag).ok().flatten();
             // Nothing configured to compare against: keep the image.
             let current = matches!(resolved, Err(EngineError::ImageSourceUnconfigured { .. }));
             if current {
-                if let Some(identity) = identity {
-                    frontend.report_step(
-                        &SetupStep::output(format!(
-                            "{tag}: cached {} ({}, from {})",
-                            identity.manifest_digest, identity.platform, identity.source
-                        )),
-                        StepStatus::Done,
-                    );
-                }
                 image_result.import = StepStatus::Done;
                 return Ok(image_result);
             }
@@ -346,12 +336,14 @@ impl AgentImagePreparer {
                 return Ok(image_result);
             }
         }
-        // Only real acquisition opens import progress. Ordinary chat,
-        // workflow and ready reuse stays quiet instead of claiming a re-import.
-        let importing = SetupStep::output(format!(
-            "Importing {tag} from {} ({reference})",
-            request.source.kind()
-        ));
+        // Acquisition may itself reuse cached content (especially archives).
+        // Describe preparation without claiming a transfer or extraction, and
+        // keep one progress row for the whole operation. Installed reuse above
+        // stays quiet across ready, chat and workflow callers.
+        let importing = SetupStep::PrepareImage {
+            tag: tag.clone(),
+            source: request.source.kind(),
+        };
         frontend.report_step(&importing, StepStatus::Running);
         let imported_result = self.import_source(request, frontend).await;
         match imported_result {
@@ -373,15 +365,6 @@ impl AgentImagePreparer {
                     }
                 }
                 frontend.report_step(&importing, StepStatus::Done);
-                frontend.report_step(
-                    &SetupStep::output(format!(
-                        "{tag}: imported {} ({}, from {})",
-                        imported.identity.manifest_digest,
-                        imported.identity.platform,
-                        imported.identity.source
-                    )),
-                    StepStatus::Done,
-                );
                 Ok(image_result)
             }
             Err(e) => {

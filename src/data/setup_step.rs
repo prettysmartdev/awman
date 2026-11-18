@@ -124,6 +124,11 @@ pub enum SetupStep {
     Agent(AgentSetupStep),
     Ready(ReadyStep),
     Init(InitStep),
+    /// Acquisition may reuse cached content; it is not necessarily an import.
+    PrepareImage {
+        tag: String,
+        source: crate::data::config::image_source::ImageSourceKind,
+    },
     /// One line of runtime build output, forwarded as a transient step label.
     ///
     /// The engines stream an image build's stdout through the same method,
@@ -139,6 +144,7 @@ impl fmt::Display for SetupStep {
             Self::Agent(step) => step.fmt(f),
             Self::Ready(step) => step.fmt(f),
             Self::Init(step) => step.fmt(f),
+            Self::PrepareImage { tag, source } => write!(f, "Preparing {tag} ({source})"),
             Self::Output(line) => f.write_str(line),
         }
     }

@@ -1,9 +1,8 @@
 //! `awman ready` orchestration for the Docker Sandbox runtime.
 //!
 //! Replaces the Docker path's "build images" work with kit emission plus
-//! subprocess validation: there is no `docker build`, no registry push. Every
-//! `sbx` invocation is announced on the user message sink per WI 0090's
-//! subprocess-transparency requirement.
+//! subprocess validation: there is no `docker build`, no registry push.
+//! Successful probes stay quiet; mutations, warnings and failures are reported.
 
 use crate::data::fs::SandboxKitPaths;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
@@ -33,30 +32,19 @@ pub(in crate::engine::sandbox) fn ready_agent_in(
     sink: &mut dyn UserMessageSink,
 ) -> Result<(), EngineError> {
     // 1. Is `sbx` installed?
-    if SbxCommand::new(["version"])
+    SbxCommand::new(["version"])
         .in_env(snapshot)
-        .run_announced(sink)
-        .is_err()
-    {
-        return Err(EngineError::Sandbox(
-            "`sbx` binary not found on PATH. Install Docker Sandboxes with \
-             `brew install docker/tap/sbx`, then re-run `awman ready`."
-                .into(),
-        ));
-    }
+        .check_preparation(sink)?;
 
     // 2. Logged in? `sbx ls` fails with an auth error when not.
-    if SbxCommand::new(["ls"])
+    if let Err(error) = SbxCommand::new(["ls"])
         .in_env(snapshot)
-        .run_announced(sink)
-        .is_err()
+        .check_preparation(sink)
     {
         emit(
             sink,
             MessageLevel::Warning,
-            "sbx: `sbx ls` failed — you may not be logged in. Run `sbx login` to \
-             authenticate Docker Sandboxes, then re-run `awman ready`."
-                .to_string(),
+            format!("Sandbox check failed: {error}. Check `sbx login`, then retry `awman ready`."),
         );
     }
 
@@ -86,7 +74,7 @@ pub(in crate::engine::sandbox) fn ready_agent_in(
     emit(
         sink,
         MessageLevel::Info,
-        format!("Emitting sbx kit for '{agent}' at {}", kit_dir.display()),
+        format!("Preparing {agent} kit (sbx)"),
     );
     DSbxKitEmitter::new().emit_for_agent(agent, &kit_dir)?;
 
@@ -96,7 +84,7 @@ pub(in crate::engine::sandbox) fn ready_agent_in(
     let kit_dir_str = kit_dir.display().to_string();
     if let Err(e) = SbxCommand::new(["kit", "validate", &kit_dir_str])
         .in_env(snapshot)
-        .run_announced(sink)
+        .check_preparation(sink)
     {
         let msg = e.to_string();
         let lower = msg.to_lowercase();
@@ -123,16 +111,6 @@ pub(in crate::engine::sandbox) fn ready_agent_in(
             )));
         }
     }
-
-    // 6. Networking note — raw TCP/UDP is blocked by default.
-    emit(
-        sink,
-        MessageLevel::Info,
-        "sbx: only HTTP/HTTPS egress via the sandbox proxy is available by default; raw \
-         TCP/UDP (SSH git, databases) is blocked unless added to the kit's \
-         network.allowedDomains."
-            .to_string(),
-    );
 
     Ok(())
 }

@@ -57,6 +57,7 @@ impl ReadyHostPing for Pinger {
 #[derive(Default)]
 struct Frontend {
     messages: Vec<UserMessage>,
+    steps: Vec<(SetupStep, StepStatus)>,
     active_pings: Option<Arc<AtomicUsize>>,
     results: Vec<LocalAgentPingResult>,
 }
@@ -67,7 +68,9 @@ impl UserMessageSink for Frontend {
     fn replay_queued(&mut self) {}
 }
 impl crate::engine::agent::AgentImageFrontend for Frontend {
-    fn report_step_status(&mut self, _: &SetupStep, _: StepStatus) {}
+    fn report_step_status(&mut self, step: &SetupStep, status: StepStatus) {
+        self.steps.push((step.clone(), status));
+    }
     fn container_frontend(
         &mut self,
     ) -> Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend> {
@@ -495,4 +498,22 @@ async fn ready_build_failure_is_still_a_failed_stage_not_an_image_stale_warning(
         .iter()
         .any(|m| m.text.contains("[image] warning")));
     assert_eq!(runtime.id(&tag), Some(previous));
+
+    // The same build-capability path serves Docker and Apple Containers.
+    // Plain ready may reuse these images, but must not claim it built them.
+    engine.options.build = false;
+    engine.options.no_cache = false;
+    engine.phase = ReadyPhase::BuildingBaseImage;
+    frontend.steps.clear();
+    engine.step(&mut frontend).await.unwrap();
+    assert_eq!(engine.summary().base_image, StepStatus::Done);
+    assert!(frontend.steps.is_empty(), "{:?}", frontend.steps);
+
+    dockerfiles(&sandbox, &["claude"]);
+    let agent_tag = crate::data::image_tags::agent_image_tag(&sandbox.work(), "claude");
+    runtime.install(&agent_tag, Some("previous-agent"));
+    engine.step(&mut frontend).await.unwrap();
+    assert_eq!(engine.summary().agent_image, StepStatus::Done);
+    assert!(frontend.steps.is_empty(), "{:?}", frontend.steps);
+    assert_eq!(runtime.built(), vec![tag], "reuse must not build again");
 }
