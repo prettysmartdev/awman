@@ -28,9 +28,7 @@ use crate::data::config::effective::EffectiveConfig;
 use crate::data::config::env::EnvSnapshot;
 use crate::data::execution_event::{ImageStaleWarning, StaleImageKind};
 use crate::data::image_build_lock::BuildStoreKey;
-use crate::data::image_inputs::{
-    agent_inputs_hash, project_inputs_at, DirBuildContext, InputsHash, INPUTS_LABEL,
-};
+use crate::data::image_inputs::{agent_inputs_hash, InputsHash, INPUTS_LABEL};
 use crate::data::image_tags::{agent_image_tag, project_image_tag};
 use crate::data::message::{MessageLevel, UserMessage};
 use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
@@ -116,17 +114,9 @@ where
     // Project image first: every agent image is layered on it and keyed on
     // its id.
     let project_tag = project_image_tag(root);
-    if let Some(dockerfile) = read_optional(&inputs.project_dockerfile)? {
-        let expected = project_inputs_at(
-            Some(&dockerfile),
-            &DirBuildContext::new(root),
-            &inputs
-                .project_dockerfile
-                .strip_prefix(root)
-                .unwrap_or(&inputs.project_dockerfile)
-                .to_string_lossy(),
-        )
-        .hash;
+    if let Some(expected) =
+        crate::engine::image_prep::project_inputs_from_disk(root, &inputs.project_dockerfile)?
+    {
         if let Some(installed) = stale_image(&preparer, &project_tag, &expected, sink) {
             let request =
                 BuildRequest::runtime(&project_tag, &inputs.project_dockerfile, root, false);
@@ -386,6 +376,7 @@ pub(crate) mod test_runtime {
         pub images: Mutex<HashMap<String, ImageMetadata>>,
         pub builds: Mutex<Vec<String>>,
         pub recipes: Mutex<Vec<String>>,
+        pub inspection_error: Mutex<Option<String>>,
         /// Tags whose builds exit non-zero.
         pub failing: Mutex<HashSet<String>>,
         next_id: AtomicUsize,
@@ -476,6 +467,9 @@ pub(crate) mod test_runtime {
             Ok(self.images.lock().unwrap().contains_key(tag))
         }
         fn inspect_image(&self, tag: &str) -> Result<Option<ImageMetadata>, EngineError> {
+            if let Some(error) = self.inspection_error.lock().unwrap().as_ref() {
+                return Err(EngineError::Other(error.clone()));
+            }
             Ok(self.images.lock().unwrap().get(tag).cloned())
         }
         fn image_home_dir(&self, _: &str) -> Result<Option<String>, EngineError> {

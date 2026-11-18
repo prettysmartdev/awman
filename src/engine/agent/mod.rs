@@ -66,6 +66,19 @@ impl DockerfilePreview {
     pub fn definition_changed(&self) -> bool {
         self.action == DockerfileSync::Written && self.previous_hash.is_some()
     }
+
+    /// Bytes provisioning would leave on disk, without writing or downloading.
+    /// A missing download recipe remains unknown until preparation runs.
+    pub fn effective_bytes(&self, path: &Path) -> Result<Option<Vec<u8>>, EngineError> {
+        if self.action == DockerfileSync::Written {
+            return Ok(self.rendered.as_ref().map(|text| text.as_bytes().to_vec()));
+        }
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(EngineError::io(path, e)),
+        }
+    }
 }
 
 /// Inspect without writing, so approval UIs can describe the Dockerfile actually used.
@@ -552,12 +565,10 @@ impl AgentEngine {
             )
             .with_definition_env(session.env().clone())
             .with_definition(def.clone());
-            // With the builder on, a launch whose image is missing prepares
-            // it as the building runtimes do: build into the source store
-            // only when it lacks the image, then import (API session setup's
-            // policy). An installed image keeps `CheckOnly`'s provenance
-            // check, and without a usable source `CheckOnly` reports the
-            // typed configuration error.
+            // An enabled local builder checks source freshness even for an
+            // installed image. Preparation reuses current, provenance-matched
+            // images without importing. Without a usable builder, retain the
+            // normal check-only policy for installed images.
 
             let policy =
                 preparer.missing_image_policy(&tag, agent.as_str(), BuildPolicy::CheckOnly)?;

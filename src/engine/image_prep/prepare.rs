@@ -3,8 +3,8 @@ use crate::engine::oci::ImageBuildGuidance;
 impl AgentImagePreparer {
     /// Prepare one image. Build/import failures are separate result stages;
     /// inability to use the runtime and check-only refusals return `Err`.
-    /// Configured sources always pass through provenance-checked acquisition,
-    /// even when this tag is already installed.
+    /// Installed images are reused after source, content and refresh checks;
+    /// acquisition only runs when preparation actually requires it.
     pub async fn prepare(
         &mut self,
         request: &AgentImageRequest<'_>,
@@ -142,9 +142,6 @@ impl AgentImagePreparer {
             }),
         };
         let refresh = policy.refresh_import();
-        // Progress rows reported Running here are resolved to Done/Failed
-        // once the import finishes, so no row is left spinning.
-        let mut pending: Vec<SetupStep> = Vec::new();
         if !refresh && self.runtime.image_exists(&tag).unwrap_or(false) {
             let identity = self.runtime.image_identity(&tag).ok().flatten();
             // Nothing configured to compare against: keep the image.
@@ -161,18 +158,6 @@ impl AgentImagePreparer {
                 }
                 image_result.import = StepStatus::Done;
                 return Ok(image_result);
-            }
-            if let (Ok(source), Some(id)) = (&resolved, &identity) {
-                let reference = &source.reference;
-                let step = SetupStep::output(format!(
-                    "{tag}: cached from {} ({}); the configured source is {} ({reference}), \
-                     importing again",
-                    id.source,
-                    id.reference,
-                    source.source.kind()
-                ));
-                frontend.report_step(&step, StepStatus::Running);
-                pending.push(step);
             }
         }
 
@@ -218,9 +203,6 @@ impl AgentImagePreparer {
                     image_result.build = StepStatus::Failed(error.clone());
                     image_result.import = StepStatus::Skipped;
 
-                    for step in &pending {
-                        frontend.report_step(step, StepStatus::Failed(error.clone()));
-                    }
                     return Ok(image_result);
                 }
                 match self
@@ -291,9 +273,6 @@ impl AgentImagePreparer {
                         image_result.build = StepStatus::Failed(error.clone());
                         image_result.import = StepStatus::Skipped;
 
-                        for step in &pending {
-                            frontend.report_step(step, StepStatus::Failed(error.clone()));
-                        }
                         return Ok(image_result);
                     }
                 }
@@ -308,9 +287,6 @@ impl AgentImagePreparer {
                     Err(error) => {
                         let text = error.to_string();
                         image_result.import = StepStatus::Failed(text.clone());
-                        for step in &pending {
-                            frontend.report_step(step, StepStatus::Failed(text.clone()));
-                        }
                         return Ok(image_result);
                     }
                 }
@@ -318,9 +294,6 @@ impl AgentImagePreparer {
         if let Some(blocked) = preparation.as_ref().and_then(|p| p.blocked.clone()) {
             image_result.import = StepStatus::Failed(blocked.clone());
 
-            for step in &pending {
-                frontend.report_step(step, StepStatus::Failed(blocked.clone()));
-            }
             return Ok(image_result);
         }
         let built_here = preparation
@@ -330,24 +303,6 @@ impl AgentImagePreparer {
             .as_ref()
             .is_some_and(|p| p.pending_key.is_some());
 
-        // Preflight and squad prepare every step agent on every run; an image
-        // already installed is verified against its source (normally a cache
-        // hit), which is not worth a line each time.
-        if policy == BuildPolicy::ImportOnly && !self.runtime.image_exists(&tag).unwrap_or(false) {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Info,
-                text: format!(
-                    "Importing image for agent '{agent}' ({tag}) from {} ({reference})…",
-                    source.kind()
-                ),
-            });
-        }
-        let importing = SetupStep::output(format!(
-            "Importing {tag} from {} ({reference})",
-            source.kind()
-        ));
-        frontend.report_step(&importing, StepStatus::Running);
-        pending.push(importing);
         let docker_source = matches!(
             source,
             crate::data::config::image_source::ImageSourceSpec::DockerStore { .. }
@@ -371,6 +326,33 @@ impl AgentImagePreparer {
             // resolved with.
             registries: self.image_sources.registries.clone(),
         };
+        // Decide only after source builds and pending receipts have resolved,
+        // while their leases are still held. Matching a tag alone is not enough.
+        // Explicit refreshes and newly built content must reach acquisition.
+        // Archives retain acquisition's replaced-file fingerprint check.
+        if !request.refresh
+            && !matches!(
+                request.source,
+                crate::data::config::image_source::ImageSourceSpec::Archive { .. }
+            )
+        {
+            let runtime = self.runtime.clone();
+            let check = request.clone();
+            if self
+                .blocking(move || runtime.image_matches_source(&check))
+                .await??
+            {
+                image_result.import = StepStatus::Done;
+                return Ok(image_result);
+            }
+        }
+        // Only real acquisition opens import progress. Ordinary chat,
+        // workflow and ready reuse stays quiet instead of claiming a re-import.
+        let importing = SetupStep::output(format!(
+            "Importing {tag} from {} ({reference})",
+            request.source.kind()
+        ));
+        frontend.report_step(&importing, StepStatus::Running);
         let imported_result = self.import_source(request, frontend).await;
         match imported_result {
             Ok(imported) => {
@@ -390,9 +372,7 @@ impl AgentImagePreparer {
                         );
                     }
                 }
-                for step in &pending {
-                    frontend.report_step(step, StepStatus::Done);
-                }
+                frontend.report_step(&importing, StepStatus::Done);
                 frontend.report_step(
                     &SetupStep::output(format!(
                         "{tag}: imported {} ({}, from {})",
@@ -413,9 +393,7 @@ impl AgentImagePreparer {
                 let text = e.to_string();
                 image_result.import = StepStatus::Failed(text.clone());
 
-                for step in &pending {
-                    frontend.report_step(step, StepStatus::Failed(text.clone()));
-                }
+                frontend.report_step(&importing, StepStatus::Failed(text.clone()));
                 if crate::engine::oci::retry::is_cancelled(&e) {
                     return Ok(image_result);
                 }

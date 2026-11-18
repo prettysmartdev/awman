@@ -130,7 +130,7 @@ impl WorkflowPreflightPlan {
         }
     }
 
-    /// Prepare only images the single collected report found unavailable.
+    /// Prepare missing and stale images advertised by the collected report.
     /// Interactive Continue authorizes these advertised actions. Unattended
     /// runs use the same agent-setup mode defaults as other launch commands.
     pub async fn prepare_images(
@@ -161,14 +161,30 @@ impl WorkflowPreflightPlan {
             .await?;
         }
         for check in &mut report.checks {
-            let WorkflowPrerequisite::AgentImage { agent, .. } = &check.prerequisite else {
+            let WorkflowPrerequisite::AgentImage { agent, tag } = &check.prerequisite else {
                 continue;
             };
             let runtime = &engines.runtime;
-            let present = check.status == PrerequisiteStatus::Satisfied;
+            if runtime.capabilities().image_acquisition == ImageAcquisition::Kit {
+                Self::record_image_readiness(check, engines, session);
+                continue;
+            }
+            if runtime.capabilities().image_acquisition == ImageAcquisition::Build {
+                let tag = session.project_image_tag();
+                if !runtime.image_exists(&tag)? {
+                    return Err(
+                        crate::engine::error::EngineError::AgentRequiresProjectImage { tag }.into(),
+                    );
+                }
+            }
+            // A stale installed image is not a missing image. In particular,
+            // headless missing-image policy must not block refresh or retry a
+            // failed refresh that deliberately retained the old image.
+            let present = runtime.image_exists(tag)?;
             // Importing runtimes must also validate a cached image's source
             // provenance against this invocation's effective configuration.
             if present && runtime.capabilities().image_acquisition != ImageAcquisition::Import {
+                Self::record_image_readiness(check, engines, session);
                 continue;
             }
             if !runtime.is_available() {
@@ -186,14 +202,6 @@ impl WorkflowPreflightPlan {
                     return Err(CommandError::WorkflowPrerequisitesUnresolved {
                         report: Box::new(report.clone()),
                     });
-                }
-            }
-            if runtime.capabilities().image_acquisition == ImageAcquisition::Build {
-                let tag = session.project_image_tag();
-                if !runtime.image_exists(&tag)? {
-                    return Err(
-                        crate::engine::error::EngineError::AgentRequiresProjectImage { tag }.into(),
-                    );
                 }
             }
             if runtime.capabilities().image_acquisition != ImageAcquisition::Kit {
@@ -215,11 +223,45 @@ impl WorkflowPreflightPlan {
                     });
                 }
             }
-            check.status = PrerequisiteStatus::Satisfied;
-            check.explanation = "image prepared for this workflow".into();
-            check.remediations.clear();
+            Self::record_image_readiness(check, engines, session);
         }
         Ok(())
+    }
+
+    fn record_image_readiness(
+        check: &mut crate::data::workflow_prerequisites::PrerequisiteCheck,
+        engines: &Engines,
+        session: &Session,
+    ) {
+        let WorkflowPrerequisite::AgentImage { agent, tag } = &check.prerequisite else {
+            return;
+        };
+        // Report the result of preparation, including warn-and-continue when
+        // a refresh failed. Do not turn a retained stale image into success.
+        match crate::engine::image_prep::workflow_image_preparation(
+            engines.runtime.clone(),
+            session,
+            agent,
+            tag,
+        ) {
+            Ok(None) => {
+                check.status = PrerequisiteStatus::Satisfied;
+                check.explanation = "image prepared for this workflow".into();
+                check.remediations.clear();
+            }
+            Ok(Some(reason)) => {
+                check.status = PrerequisiteStatus::Missing;
+                check.explanation = format!("{reason}; continuing with the installed image");
+                check.remediations =
+                    vec![crate::data::workflow_prerequisites::Remediation::PrepareImage];
+            }
+            Err(error) => {
+                check.status = PrerequisiteStatus::Unknown;
+                check.explanation = format!("could not verify image {tag} after preparation: {error}; continuing with the installed image");
+                check.remediations =
+                    vec![crate::data::workflow_prerequisites::Remediation::PrepareImage];
+            }
+        }
     }
 }
 
@@ -237,8 +279,10 @@ impl super::PreparedPrerequisites {
         let mut images = Vec::new();
         for need in &concrete.needs.needs {
             if let WorkflowPrerequisite::AgentImage { agent, .. } = &need.prerequisite {
+                // Successful preparation guarantees availability, including
+                // the explicitly reported stale-image fallback. Its report
+                // must remain honest without rejecting a dynamic repair run.
                 let check = self.report.find(&need.prerequisite)
-                    .filter(|check| check.status == PrerequisiteStatus::Satisfied)
                     .ok_or_else(|| CommandError::Other(format!(
                         "generated workflow selected agent '{agent}' outside the prepared workflow prerequisites"
                     )))?;

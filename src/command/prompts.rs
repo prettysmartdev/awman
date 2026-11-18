@@ -871,7 +871,7 @@ pub fn prerequisite_report(
         );
     }
     if has_images && matches!(next, PrerequisiteReportNext::Questions { .. }) {
-        body.push("Continue prepares the listed missing agent images before any agent starts. Image preparation must succeed to run the workflow.".into());
+        body.push("Continue prepares the listed missing or stale images before any agent starts. A failed refresh warns and keeps the installed image; a missing image must be prepared successfully.".into());
     }
     let choices = match next {
         PrerequisiteReportNext::CheckOnly => {

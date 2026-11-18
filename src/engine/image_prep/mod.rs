@@ -24,6 +24,9 @@ use std::sync::Arc;
 
 pub(crate) mod bridge;
 mod build;
+mod readiness;
+pub(crate) use readiness::project_inputs_from_disk;
+pub(crate) use readiness::workflow_image_preparation;
 pub(crate) mod freshness;
 pub(crate) use freshness::label_runtime_build;
 pub use freshness::{
@@ -184,8 +187,8 @@ pub struct AgentImagePreparer {
 }
 impl AgentImagePreparer {
     /// On-demand preparation shared by launches and workflow prerequisites.
-    /// Installed images and disabled/unusable builders retain the caller's
-    /// existing check/import policy. Only ready's explicit flags refresh builds.
+    /// An enabled local builder checks installed images' source inputs too.
+    /// Disabled/unusable builders retain the caller's check/import policy.
     pub fn missing_image_policy(
         &mut self,
         tag: &str,

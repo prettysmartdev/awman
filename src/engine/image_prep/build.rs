@@ -209,18 +209,22 @@ impl AgentImagePreparer {
         }
         // Check the working tree while both source leases are held. Registry
         // and archive sources never reach this local-builder path.
-        let project_bytes = std::fs::read(&self.context.project_dockerfile).ok();
-        let project_inputs = crate::data::image_inputs::project_inputs_at(
-            project_bytes.as_deref(),
-            &crate::data::image_inputs::DirBuildContext::new(git_root),
-            &self
-                .context
-                .project_dockerfile
-                .strip_prefix(git_root)
-                .unwrap_or(&self.context.project_dockerfile)
-                .to_string_lossy(),
-        )
-        .hash;
+        let project_inputs =
+            super::project_inputs_from_disk(git_root, &self.context.project_dockerfile)
+                .map_err(|e| e.to_string())?
+                .unwrap_or_else(|| {
+                    crate::data::image_inputs::project_inputs_at(
+                        None,
+                        &crate::data::image_inputs::DirBuildContext::new(git_root),
+                        &self
+                            .context
+                            .project_dockerfile
+                            .strip_prefix(git_root)
+                            .unwrap_or(&self.context.project_dockerfile)
+                            .to_string_lossy(),
+                    )
+                    .hash
+                });
         let parent = self
             .source_freshness(target.clone(), project_tag.clone(), &project_inputs)
             .await

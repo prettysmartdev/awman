@@ -20,8 +20,11 @@ pub(crate) struct Store {
         Mutex<HashMap<String, crate::engine::container::runtime::ImageMetadata>>,
     pub source: Mutex<HashSet<String>>,
     pub installed: Mutex<HashMap<String, ImageIdentity>>,
+    pub installed_sources:
+        Mutex<HashMap<String, crate::data::config::image_source::ImageSourceSpec>>,
     pub built: Mutex<Vec<String>>,
     pub imports: Mutex<Vec<String>>,
+    pub import_requests: Mutex<Vec<ImageImportRequest>>,
     pub fail_build: std::sync::atomic::AtomicBool,
     pub apple_missing: std::sync::atomic::AtomicBool,
     pub apple_unbound: std::sync::atomic::AtomicBool,
@@ -38,6 +41,93 @@ pub(crate) fn identity(reference: &str) -> ImageIdentity {
         platform: OciPlatform::host_linux(),
         source: ImageSourceKind::AppleStore,
     }
+}
+
+#[tokio::test]
+async fn prerequisite_review_checks_source_inputs_provenance_and_pending_imports_without_mutation()
+{
+    let s = TestSandbox::for_test(TestCase::component("engine::image_prep::contracts::prerequisite_review_checks_source_inputs_provenance_and_pending_imports_without_mutation"));
+    let store = Arc::new(Store::default());
+    let mut prep = preparer(
+        &s,
+        store.clone(),
+        true,
+        Some(crate::data::config::image_source::ImageSourceSpec::AppleStore { reference: None }),
+    );
+    let tag = crate::data::image_tags::agent_image_tag(&s.work(), "claude");
+    prep.prepare(
+        &AgentImageRequest {
+            tag: &tag,
+            agent: "claude",
+            policy: BuildPolicy::SessionSetup,
+        },
+        &mut Sink::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(prep.preparation_reason(&tag, "claude").unwrap(), None);
+    let builds = store.built.lock().unwrap().len();
+    let imports = store.imports.lock().unwrap().len();
+    std::fs::write(
+        s.work().join(".awman/Dockerfile.claude"),
+        "FROM scratch\nRUN echo changed\n",
+    )
+    .unwrap();
+    assert!(prep
+        .preparation_reason(&tag, "claude")
+        .unwrap()
+        .unwrap()
+        .contains("rebuild required"));
+    std::fs::write(
+        s.work().join("Dockerfile.dev"),
+        "FROM scratch\nRUN echo base\n",
+    )
+    .unwrap();
+    let reason = prep.preparation_reason(&tag, "claude").unwrap().unwrap();
+    assert!(reason.contains(&crate::data::image_tags::project_image_tag(&s.work())));
+    assert_eq!(store.built.lock().unwrap().len(), builds);
+    assert_eq!(store.imports.lock().unwrap().len(), imports);
+    let source = prep.plan(&tag, "claude").source.unwrap();
+    let receipt = PendingBuiltImage {
+        key: PendingBuildKey {
+            store: source.store_key.unwrap(),
+            reference: AgentImagePreparer::normalize_build_reference(&source.reference),
+            platform: source.platform,
+            install_tag: tag.clone(),
+        },
+        identity: built_identity(),
+    };
+    prep.pending_builds.save(&receipt, || Ok(())).unwrap();
+    assert!(prep
+        .preparation_reason(&tag, "claude")
+        .unwrap()
+        .unwrap()
+        .contains("awaiting import"));
+    assert_eq!(
+        prep.pending_builds.load(&receipt.key).unwrap(),
+        Some(receipt.clone())
+    );
+    prep.pending_builds.remove(&receipt.key).unwrap();
+    // A disabled builder still checks the configured acquisition source.
+    let mut prep = preparer(
+        &s,
+        store.clone(),
+        false,
+        Some(
+            crate::data::config::image_source::ImageSourceSpec::Registry {
+                reference: None,
+                registry: None,
+            },
+        ),
+    );
+    assert!(prep
+        .preparation_reason(&tag, "claude")
+        .unwrap()
+        .unwrap()
+        .contains("configured source"));
+    assert_eq!(store.built.lock().unwrap().len(), builds);
+    assert_eq!(store.imports.lock().unwrap().len(), imports);
+    s.finish();
 }
 fn built_identity() -> BuiltImageIdentity {
     let id = identity("unused");
@@ -193,6 +283,23 @@ impl AgentRuntimeEngine for Store {
     fn image_identity(&self, tag: &str) -> Result<Option<ImageIdentity>, EngineError> {
         Ok(self.installed.lock().unwrap().get(tag).cloned())
     }
+    fn image_matches_source(&self, request: &ImageImportRequest) -> Result<bool, EngineError> {
+        Ok(
+            self.installed_sources.lock().unwrap().get(&request.tag) == Some(&request.source)
+                && self
+                    .installed
+                    .lock()
+                    .unwrap()
+                    .get(&request.tag)
+                    .is_some_and(|identity| {
+                        request.platform.matches(&identity.platform)
+                            && request
+                                .expected_built_identity
+                                .as_ref()
+                                .is_none_or(|built| built.matches(identity))
+                    }),
+        )
+    }
     fn image_home_dir(&self, _: &str) -> Result<Option<String>, EngineError> {
         Ok(None)
     }
@@ -202,6 +309,7 @@ impl AgentRuntimeEngine for Store {
         _: &mut dyn UserMessageSink,
     ) -> Result<ImportedImage, EngineError> {
         self.imports.lock().unwrap().push(request.tag.clone());
+        self.import_requests.lock().unwrap().push(request.clone());
         if self
             .apple_missing
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -225,6 +333,10 @@ impl AgentRuntimeEngine for Store {
             assert!(*guard, "test must release held import");
         }
         let identity = identity(&request.tag);
+        self.installed_sources
+            .lock()
+            .unwrap()
+            .insert(request.tag.clone(), request.source.clone());
         self.installed
             .lock()
             .unwrap()
@@ -339,6 +451,295 @@ impl UserMessageSink for Sink {
 }
 impl ImagePreparationSink for Sink {
     fn report_step(&mut self, _: &SetupStep, _: StepStatus) {}
+}
+
+#[derive(Default)]
+struct ProgressSink {
+    messages: Vec<String>,
+    steps: Vec<(String, StepStatus)>,
+}
+impl UserMessageSink for ProgressSink {
+    fn write_message(&mut self, message: UserMessage) {
+        self.messages.push(message.text);
+    }
+    fn replay_queued(&mut self) {}
+}
+impl ImagePreparationSink for ProgressSink {
+    fn report_step(&mut self, step: &SetupStep, status: StepStatus) {
+        self.steps.push((step.to_string(), status));
+    }
+}
+
+#[tokio::test]
+async fn repeated_launch_ready_and_preflight_reuse_current_images_without_import_progress() {
+    use crate::data::config::image_source::ImageSourceSpec;
+    let s = TestSandbox::for_test(TestCase::component("engine::image_prep::contracts::repeated_launch_ready_and_preflight_reuse_current_images_without_import_progress"));
+    let store = Arc::new(Store::default());
+    let source = Some(ImageSourceSpec::AppleStore { reference: None });
+    let tag = crate::data::image_tags::agent_image_tag(&s.work(), "claude");
+    let mut first = preparer(&s, store.clone(), true, source.clone());
+    let policy = first
+        .missing_image_policy(&tag, "claude", BuildPolicy::CheckOnly)
+        .unwrap();
+    assert_eq!(policy, BuildPolicy::SessionSetup);
+    let mut initial = ProgressSink::default();
+    let result = first
+        .prepare(
+            &AgentImageRequest {
+                tag: &tag,
+                agent: "claude",
+                policy,
+            },
+            &mut initial,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.import, StepStatus::Done);
+    assert_eq!(store.imports.lock().unwrap().len(), 1);
+    assert!(initial
+        .steps
+        .iter()
+        .any(|(name, status)| name.starts_with("Importing ") && *status == StepStatus::Running));
+
+    // Each invocation has a new preparer. Match chat's policy selection, and
+    // exercise ready/preflight plus older Apple index-only inspection too.
+    for unbound in [false, true] {
+        store
+            .apple_unbound
+            .store(unbound, std::sync::atomic::Ordering::SeqCst);
+        for policy in [
+            BuildPolicy::SessionSetup,
+            BuildPolicy::Ready {
+                build: false,
+                no_cache: false,
+                refresh: false,
+            },
+            BuildPolicy::ImportOnly,
+        ] {
+            let mut prep = preparer(&s, store.clone(), true, source.clone());
+            assert_eq!(
+                prep.missing_image_policy(&tag, "claude", BuildPolicy::CheckOnly)
+                    .unwrap(),
+                BuildPolicy::SessionSetup
+            );
+            let mut seen = ProgressSink::default();
+            let result = prep
+                .prepare(
+                    &AgentImageRequest {
+                        tag: &tag,
+                        agent: "claude",
+                        policy,
+                    },
+                    &mut seen,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.build, StepStatus::Skipped);
+            assert_eq!(result.import, StepStatus::Done);
+            assert!(
+                seen.steps.is_empty(),
+                "reuse must not claim an import: {:?}",
+                seen.steps
+            );
+            assert!(seen.messages.is_empty(), "{:?}", seen.messages);
+            assert_eq!(
+                store.imports.lock().unwrap().len(),
+                1,
+                "no acquisition/import call on reuse"
+            );
+            assert_eq!(store.built.lock().unwrap().len(), 2);
+        }
+    }
+    s.finish();
+}
+
+#[tokio::test]
+async fn reuse_never_hides_changed_sources_content_receipts_or_explicit_refresh() {
+    use crate::data::config::image_source::ImageSourceSpec;
+    let s = TestSandbox::for_test(TestCase::component("engine::image_prep::contracts::reuse_never_hides_changed_sources_content_receipts_or_explicit_refresh"));
+    let store = Arc::new(Store::default());
+    let local = Some(ImageSourceSpec::AppleStore { reference: None });
+    let tag = crate::data::image_tags::agent_image_tag(&s.work(), "claude");
+    let mut prep = preparer(&s, store.clone(), true, local.clone());
+    prep.prepare(
+        &AgentImageRequest {
+            tag: &tag,
+            agent: "claude",
+            policy: BuildPolicy::SessionSetup,
+        },
+        &mut Sink::default(),
+    )
+    .await
+    .unwrap();
+    // Matching source, different installed content: source inspection binds a
+    // fresh acquisition to the actual built identity.
+    store
+        .installed
+        .lock()
+        .unwrap()
+        .get_mut(&tag)
+        .unwrap()
+        .config_digest = Digest::parse(&format!("sha256:{}", "3".repeat(64))).unwrap();
+    let mut prep = preparer(&s, store.clone(), true, local.clone());
+    let result = prep
+        .prepare(
+            &AgentImageRequest {
+                tag: &tag,
+                agent: "claude",
+                policy: BuildPolicy::SessionSetup,
+            },
+            &mut Sink::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.import, StepStatus::Done);
+    assert_eq!(store.imports.lock().unwrap().len(), 2);
+    assert!(
+        store
+            .import_requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .refresh
+    );
+    assert_eq!(
+        store
+            .import_requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .expected_built_identity,
+        Some(built_identity())
+    );
+
+    let resolved = prep.plan(&tag, "claude").source.unwrap();
+    let receipt = PendingBuiltImage {
+        key: PendingBuildKey {
+            store: resolved.store_key.unwrap(),
+            reference: AgentImagePreparer::normalize_build_reference(&resolved.reference),
+            platform: resolved.platform,
+            install_tag: tag.clone(),
+        },
+        identity: built_identity(),
+    };
+    prep.pending_builds.save(&receipt, || Ok(())).unwrap();
+    let result = prep
+        .prepare(
+            &AgentImageRequest {
+                tag: &tag,
+                agent: "claude",
+                policy: BuildPolicy::ImportOnly,
+            },
+            &mut Sink::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.import, StepStatus::Done);
+    assert_eq!(store.imports.lock().unwrap().len(), 3);
+    assert_eq!(prep.pending_builds.load(&receipt.key).unwrap(), None);
+
+    let result = prep
+        .prepare(
+            &AgentImageRequest {
+                tag: &tag,
+                agent: "claude",
+                policy: BuildPolicy::Ready {
+                    build: false,
+                    no_cache: true,
+                    refresh: false,
+                },
+            },
+            &mut Sink::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.import, StepStatus::Done);
+    assert_eq!(
+        store.imports.lock().unwrap().len(),
+        4,
+        "explicit refresh still acquires"
+    );
+    assert!(
+        store
+            .import_requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .refresh
+    );
+
+    let other = ImageSourceSpec::AppleStore {
+        reference: Some("other:latest".into()),
+    };
+    let mut prep = preparer(&s, store.clone(), false, Some(other.clone()));
+    let result = prep
+        .prepare(
+            &AgentImageRequest {
+                tag: &tag,
+                agent: "claude",
+                policy: BuildPolicy::ImportOnly,
+            },
+            &mut Sink::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.import, StepStatus::Done);
+    assert_eq!(
+        store.imports.lock().unwrap().len(),
+        5,
+        "same tag from another source must be acquired"
+    );
+    assert_eq!(
+        store.import_requests.lock().unwrap().last().unwrap().source,
+        other
+    );
+    store.installed_sources.lock().unwrap().clear();
+    let result = prep
+        .prepare(
+            &AgentImageRequest {
+                tag: &tag,
+                agent: "claude",
+                policy: BuildPolicy::ImportOnly,
+            },
+            &mut Sink::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.import, StepStatus::Done);
+    assert_eq!(
+        store.imports.lock().unwrap().len(),
+        6,
+        "unknown provenance is never reused"
+    );
+
+    // Archives must still reach acquisition's replacement fingerprint check.
+    let archive = s.work().join("image.tar");
+    std::fs::write(&archive, "fake importer fixture").unwrap();
+    let mut prep = preparer(
+        &s,
+        store.clone(),
+        false,
+        Some(ImageSourceSpec::Archive { path: archive }),
+    );
+    for _ in 0..2 {
+        let result = prep
+            .prepare(
+                &AgentImageRequest {
+                    tag: &tag,
+                    agent: "claude",
+                    policy: BuildPolicy::ImportOnly,
+                },
+                &mut Sink::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.import, StepStatus::Done);
+    }
+    assert_eq!(store.imports.lock().unwrap().len(), 8);
+    s.finish();
 }
 
 #[test]
@@ -645,24 +1046,28 @@ async fn ready_source_builds_label_project_and_agent_with_layer_zero_hashes() {
         store.built.lock().unwrap().as_slice(),
         [project_tag.clone(), tag.clone()]
     );
-    assert_eq!(store.imports.lock().unwrap().as_slice(), [tag.clone()]);
-    let metadata = store.source_metadata.lock().unwrap();
     assert_eq!(
-        metadata[&project_tag].labels[INPUTS_LABEL],
-        project_inputs(Some(b"FROM scratch\n"), &DirBuildContext::new(s.work()))
-            .hash
-            .as_str()
+        store.imports.lock().unwrap().as_slice(),
+        std::slice::from_ref(&tag)
     );
-    let base_id = metadata[&project_tag].id.clone();
-    assert_eq!(
-        metadata[&tag].labels[INPUTS_LABEL],
-        agent_inputs_hash(b"FROM scratch\n", &base_id).as_str()
-    );
-    assert_eq!(
-        metadata[&project_tag].labels[REPO_LABEL],
-        crate::data::image_inputs::RepoKey::local(&s.work()).as_str()
-    );
-    drop(metadata);
+    {
+        let metadata = store.source_metadata.lock().unwrap();
+        assert_eq!(
+            metadata[&project_tag].labels[INPUTS_LABEL],
+            project_inputs(Some(b"FROM scratch\n"), &DirBuildContext::new(s.work()))
+                .hash
+                .as_str()
+        );
+        let base_id = metadata[&project_tag].id.clone();
+        assert_eq!(
+            metadata[&tag].labels[INPUTS_LABEL],
+            agent_inputs_hash(b"FROM scratch\n", &base_id).as_str()
+        );
+        assert_eq!(
+            metadata[&project_tag].labels[REPO_LABEL],
+            crate::data::image_inputs::RepoKey::local(&s.work()).as_str()
+        );
+    }
     let mut next = preparer(
         &s,
         store.clone(),
