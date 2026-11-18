@@ -958,6 +958,13 @@ and omit the output path. CLI and TUI workflow runs do not mount `/awman/output`
 
 ## Running a workflow
 
+Large step prompts, including expanded work item contents, are delivered intact.
+On Docker, Apple Containers and builtin, when a prompt is too large to pass as
+a command-line argument, awman mounts it as a temporary read-only file and tells
+the agent to read and follow the entire file. The agent may show that file read
+as its first action. Its normal file-reading permissions still apply. Agents
+that receive prompts through stdin or ACP keep those delivery methods.
+
 ### In the TUI
 
 ```

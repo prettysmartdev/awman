@@ -214,6 +214,13 @@ pub enum ContainerOption {
         env_var: Option<String>,
         guard: MountGuard,
     },
+    /// A read-only file inside a private temporary directory owned by `guard`.
+    /// Retained until confirmed guest exit, like system prompt files.
+    TemporaryFileMount {
+        host_path: PathBuf,
+        container_path: PathBuf,
+        guard: MountGuard,
+    },
     EnvPassthrough(EnvVar),
     /// Per-launch value, kept out of argv and redacted in Debug.
     EnvOverride {
@@ -844,6 +851,18 @@ impl ResolvedContainerOptions {
             ContainerOption::Overlay(v) => self.overlays.push(v),
             ContainerOption::Tmpfs(v) => self.tmpfs.push(v),
             ContainerOption::ReadOnlyWorkspace(v) => self.read_only_workspace |= v,
+            ContainerOption::TemporaryFileMount {
+                host_path,
+                container_path,
+                guard,
+            } => {
+                self.overlays.push(OverlaySpec {
+                    host_path,
+                    container_path,
+                    permission: OverlayPermission::ReadOnly,
+                });
+                self.prompt_files.push(guard);
+            }
             ContainerOption::TemporaryDirectoryMount {
                 container_path,
                 env_var,

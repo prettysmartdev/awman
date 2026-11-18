@@ -34,6 +34,7 @@ pub mod first_party;
 pub mod frontend;
 pub mod image_freshness;
 pub mod registry;
+mod seeded_prompt;
 pub mod session_seed;
 
 pub use definition::*;
@@ -965,6 +966,7 @@ impl AgentEngine {
         // Entrypoint, modes, tools, seed and model: the agent's argv contract,
         // pure and shared with the argv unit tests.
         options.extend(launch_argv_options(&def, run)?);
+        seeded_prompt::stage_large_argv_prompt(session.env(), &def, run, &mut options)?;
 
         // User-configured extra agent args (`agentFlags` / `--agent-flag`). One
         // that the entrypoint already carries for this launch (codex

@@ -168,6 +168,15 @@ and logs remain runtime state on disk.
 
 ### Runtime backend operations
 
+Container-tier agent launches keep initial prompts of at most 64 KiB in their
+normal delivery channel. Larger prompts that would be argv operands are staged
+verbatim in a private temporary file, mounted read-only, and replaced with a
+short instruction to read and follow the entire file as the user's task. This
+applies equally to interactive and argv-based headless agents on Docker, Apple
+and builtin; stdin and ACP delivery stay unchanged. Prompt mounts follow the
+existing confirmed-exit lifetime guards, including failed launches and retries.
+No prompt content is truncated, shell-expanded or promoted to a system prompt.
+
 The engine owns a backend contract expressed as operations, not as a required
 CLI binary. It selects a backend, checks availability, creates/attaches/stops
 agent instances, streams execution, lists and removes agents, inspects/removes
