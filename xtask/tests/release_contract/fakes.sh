@@ -65,7 +65,9 @@ case "$persona" in
    'run rerun') rm -f "$FAKE_STATE/conclusion" ;;
    'run watch')
     [ "${WATCH_FAIL:-0}" = 0 ] || exit 7
-    [ "${WATCH_HOLD:-0}" = 0 ] || { echo WATCH_READY; while :; do /bin/sleep 0.1; done; }
+    # Use the native fake's held-call readiness: Bash can lose INT around
+    # its foreground-command/read handling even with an INT trap installed.
+    [ "${WATCH_HOLD:-0}" = 0 ] || exec watch-hold
     echo verified > "$FAKE_STATE/state"
     "$REAL_GIT" rev-parse 'v1.2.3^{commit}' > "$FAKE_STATE/remote-tag"
     mkdir -p "$FAKE_STATE/assets"
