@@ -56,8 +56,9 @@ fn expected(text: &str) -> Result<BTreeSet<String>> {
     Ok(out)
 }
 pub(super) fn check_results(out: &Path, p: &Packet, m: &Manifest) -> Result<()> {
+    let platform = Platform::for_target(&p.target)?;
     ensure!(
-        p.suites == suites(m),
+        p.suites == suites(m, platform),
         "packet omits or changes required native suites"
     );
     for id in &p.suites {
@@ -68,7 +69,7 @@ pub(super) fn check_results(out: &Path, p: &Packet, m: &Manifest) -> Result<()> 
         ensure!(
             raw["failed_suites"] == serde_json::json!([])
                 && raw["runner"] == "nextest"
-                && raw["build"] == BUILD,
+                && raw["build"] == platform.build,
             "{id}: unsuccessful or wrong runner"
         );
         let inv = raw["invocations"]
@@ -106,7 +107,7 @@ pub(super) fn verify(root: &Path, out: &Path, m: &Manifest) -> Result<()> {
         p.schema == 1 && p.verdict == "passed" && p.error.is_none(),
         "packet is not a successful schema-1 run"
     );
-    ensure!(p.target == TARGET, "wrong hardware target");
+    let platform = Platform::for_target(&p.target)?;
     ensure!(
         p.commit == git(root, &["rev-parse", "HEAD"])?
             && p.tree == git(root, &["rev-parse", "HEAD^{tree}"])?,
@@ -140,15 +141,13 @@ pub(super) fn verify(root: &Path, out: &Path, m: &Manifest) -> Result<()> {
     for s in &p.steps {
         ensure!(names.insert(s.name.as_str()), "duplicate command evidence");
     }
-    for name in [
+    let mut required = vec![
         "host-os",
         "host-arch",
         "hypervisor",
         "os-version",
         "rust-version",
         "docker-version",
-        "apple-service",
-        "sbx-service",
         "docker-context",
         "install-runner",
         "fetch-payload",
@@ -157,14 +156,32 @@ pub(super) fn verify(root: &Path, out: &Path, m: &Manifest) -> Result<()> {
         "base-provenance",
         "save-base",
         "build-fixture",
-        "fetch-previous",
-        "sign-awman",
-        "sign-awman-guest-driver",
-        "sign-awman-guest-net-driver",
         "build-artifact",
-        "sign-artifact",
-        "verify-artifact",
-    ] {
+    ];
+    if platform.apple() {
+        required.extend([
+            "apple-service",
+            "sbx-service",
+            "sign-awman",
+            "sign-awman-guest-driver",
+            "sign-awman-guest-net-driver",
+            "sign-artifact",
+            "verify-artifact",
+        ]);
+    }
+    if m.previous_release.contains_key(platform.target) {
+        required.push("fetch-previous");
+    }
+    if !platform.apple() {
+        required.extend([
+            "start-registry",
+            "registry-address",
+            "registry-ready",
+            "remove-registry",
+            "run-boundary-private-memory",
+        ]);
+    }
+    for name in required {
         ensure!(names.contains(name), "missing required command {name}");
         ensure!(
             out.join(format!("{name}.stdout")).is_file()
@@ -173,8 +190,8 @@ pub(super) fn verify(root: &Path, out: &Path, m: &Manifest) -> Result<()> {
         );
     }
     for (name, value) in [
-        ("host-os", "Darwin"),
-        ("host-arch", "arm64"),
+        ("host-os", platform.os),
+        ("host-arch", platform.arch),
         ("hypervisor", "1"),
     ] {
         ensure!(
@@ -207,6 +224,51 @@ pub(super) fn verify(root: &Path, out: &Path, m: &Manifest) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_platforms_select_their_boundaries_and_keep_guest_and_artifact_contracts() {
+        let mut m = crate::manifest::load(&crate::gates::root()).unwrap();
+        for target in [
+            "aarch64-apple-darwin",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
+        ] {
+            let platform = Platform::for_target(target).unwrap();
+            assert!(m.builds.contains_key(platform.build));
+            let ids = suites(&m, platform);
+            for required in [
+                "guest-boot",
+                "guest-upgrade",
+                "guest-builder",
+                "guest-import",
+                "artifact-signed-boot",
+            ] {
+                assert!(ids.iter().any(|id| id == required), "{target}: {required}");
+            }
+            assert_eq!(
+                ids.iter().any(|id| id == "boundary-apple"),
+                platform.apple()
+            );
+            assert_eq!(
+                ids.iter().any(|id| id == "boundary-registry"),
+                !platform.apple()
+            );
+        }
+        let linux = Platform::for_target("x86_64-unknown-linux-gnu").unwrap();
+        assert!(!suites(&m, linux)
+            .iter()
+            .any(|id| id == "guest-linux-published-upgrade"));
+        m.previous_release.insert(
+            linux.target.into(),
+            m.previous_release["aarch64-apple-darwin"].clone(),
+        );
+        for id in [
+            "guest-linux-published-upgrade",
+            "artifact-linux-published-upgrade",
+        ] {
+            assert!(suites(&m, linux).iter().any(|selected| selected == id));
+        }
+        assert!(Platform::for_target("x86_64-pc-windows-msvc").is_err());
+    }
     fn listing(ignored: bool) -> String {
         serde_json::json!({"rust-suites":{"guest":{"binary-id":"awman-cli::guest","testcases":{"boot::actual_guest":{"ignored":ignored,"filter-match":{"status":"matches"}}}}}}).to_string()
     }

@@ -186,6 +186,7 @@ sqlx = { workspace = true, optional = true }
 msb_krun = { workspace = true, optional = true }
 
 [patch.crates-io]
+microsandbox-runtime = { path = "third_party/microsandbox-runtime-0.7.8" }
 sqlx-sqlite = { path = "third_party/sqlx-sqlite-0.9.0" }
 microsandbox-filesystem = { path = "third_party/microsandbox-filesystem-0.7.8" }
 microsandbox = { path = "third_party/microsandbox-0.7.8" }

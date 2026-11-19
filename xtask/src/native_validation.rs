@@ -13,8 +13,57 @@ use std::{
     time::Instant,
 };
 
-const BUILD: &str = "macos-arm64-ci-guest-builtin";
-const TARGET: &str = "aarch64-apple-darwin";
+#[derive(Clone, Copy)]
+struct Platform {
+    target: &'static str,
+    build: &'static str,
+    os: &'static str,
+    arch: &'static str,
+    image_platform: &'static str,
+}
+impl Platform {
+    fn for_target(target: &str) -> Result<Self> {
+        match target {
+            "aarch64-apple-darwin" => Ok(Self {
+                target: "aarch64-apple-darwin",
+                build: "macos-arm64-ci-guest-builtin",
+                os: "Darwin",
+                arch: "arm64",
+                image_platform: "linux/arm64",
+            }),
+            "x86_64-unknown-linux-gnu" => Ok(Self {
+                target: "x86_64-unknown-linux-gnu",
+                build: "linux-x64-native-builtin",
+                os: "Linux",
+                arch: "x86_64",
+                image_platform: "linux/amd64",
+            }),
+            "aarch64-unknown-linux-gnu" => Ok(Self {
+                target: "aarch64-unknown-linux-gnu",
+                build: "linux-arm64-native-builtin",
+                os: "Linux",
+                arch: "aarch64",
+                image_platform: "linux/arm64",
+            }),
+            _ => anyhow::bail!(
+                "native validation requires Apple Silicon macOS or Linux x86_64/aarch64 KVM"
+            ),
+        }
+    }
+    fn host() -> Result<Self> {
+        let output = Command::new("rustc").arg("-vV").output()?;
+        ensure!(output.status.success(), "cannot determine Rust host target");
+        let version = String::from_utf8(output.stdout)?;
+        let target = version
+            .lines()
+            .find_map(|line| line.strip_prefix("host: "))
+            .context("Rust host target missing")?;
+        Self::for_target(target)
+    }
+    fn apple(self) -> bool {
+        self.os == "Darwin"
+    }
+}
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,12 +92,27 @@ struct Step {
     milliseconds: u128,
 }
 struct Run {
+    platform: Platform,
     root: PathBuf,
     out: PathBuf,
     work: PathBuf,
     build: PathBuf,
     env: BTreeMap<String, String>,
     packet: Packet,
+    registry: Option<String>,
+}
+impl Drop for Run {
+    fn drop(&mut self) {
+        if let Some(id) = &self.registry {
+            // Last-resort cleanup for preparation errors; successful runs record removal.
+            let _ = Command::new("docker")
+                .args(["rm", "--force", id])
+                .envs(&self.env)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
 }
 impl Run {
     fn command(&mut self, name: &str, program: &str, args: &[&str]) -> Result<String> {
@@ -92,14 +156,32 @@ fn git(root: &Path, args: &[&str]) -> Result<String> {
     ensure!(out.status.success(), "git {} failed", args.join(" "));
     Ok(String::from_utf8(out.stdout)?.trim().into())
 }
-fn suites(m: &Manifest) -> Vec<String> {
+fn suites(m: &Manifest, platform: Platform) -> Vec<String> {
     m.suites
         .iter()
         .filter(|(id, s)| {
+            if [
+                "guest-linux-published-upgrade",
+                "artifact-linux-published-upgrade",
+            ]
+            .contains(&id.as_str())
+            {
+                return !platform.apple() && m.previous_release.contains_key(platform.target);
+            }
             s.kind == "nextest"
                 && (s.tier == "guest"
                     || s.tier == "artifact"
-                    || ["boundary-apple", "boundary-sbx"].contains(&id.as_str()))
+                    || if platform.apple() {
+                        ["boundary-apple", "boundary-sbx"].contains(&id.as_str())
+                    } else {
+                        [
+                            "boundary-docker",
+                            "boundary-registry",
+                            "boundary-conformance",
+                            "boundary-templates",
+                        ]
+                        .contains(&id.as_str())
+                    })
         })
         .map(|(id, _)| id.clone())
         .collect()
@@ -111,6 +193,7 @@ fn source_hashes(root: &Path) -> Result<BTreeMap<String, String>> {
         "rust-toolchain.toml",
         ".config/nextest.toml",
         "packaging/macos/awman.entitlements",
+        "tools/msb-payloads/check-private-memory.sh",
     ]
     .into_iter()
     .map(|p| Ok((p.into(), sha256_file(&root.join(p))?)))
@@ -121,27 +204,51 @@ fn execute(r: &mut Run, m: &Manifest) -> Result<()> {
         git(&r.root, &["status", "--porcelain"])?.is_empty(),
         "commit all source changes before native validation"
     );
+    let platform = r.platform;
     ensure!(
-        r.command("host-os", "uname", &["-s"])?.trim() == "Darwin",
-        "Apple Silicon macOS required"
+        r.command("host-os", "uname", &["-s"])?.trim() == platform.os,
+        "wrong native OS"
     );
     ensure!(
-        r.command("host-arch", "uname", &["-m"])?.trim() == "arm64",
-        "native arm64 required (no Rosetta)"
+        r.command("host-arch", "uname", &["-m"])?.trim() == platform.arch,
+        "native architecture required (no emulation)"
     );
-    ensure!(
-        r.command("hypervisor", "sysctl", &["-n", "kern.hv_support"])?
-            .trim()
-            == "1",
-        "native hypervisor unavailable"
-    );
-    r.command("os-version", "sw_vers", &[])?;
+    if platform.apple() {
+        ensure!(
+            r.command("hypervisor", "sysctl", &["-n", "kern.hv_support"])?
+                .trim()
+                == "1",
+            "native hypervisor unavailable"
+        );
+        r.command("os-version", "sw_vers", &[])?;
+    } else {
+        r.command(
+            "hypervisor",
+            "sh",
+            &[
+                "-c",
+                "test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm && echo 1",
+            ],
+        )?;
+        r.command("os-version", "uname", &["-a"])?;
+    }
     r.command("rust-version", "rustc", &["-vV"])?;
     prepare::run(r, m)?;
-    let features = &m.features[&m.builds[BUILD].features].cargo_args;
+    if !platform.apple() {
+        let work = r.work.join("upstream-memory");
+        r.command(
+            "run-boundary-private-memory",
+            "bash",
+            &[
+                "tools/msb-payloads/check-private-memory.sh",
+                work.to_str().context("private-memory work path")?,
+            ],
+        )?;
+    }
+    let features = &m.features[&m.builds[platform.build].features].cargo_args;
     // Compile and independently enumerate each selected suite before executing any tests.
     // Enumeration is separate from JUnit: a missing/ignored result cannot become a pass.
-    for id in &suites(m) {
+    for id in &suites(m, platform) {
         let s = &m.suites[id];
         let mut args = vec![
             "nextest",
@@ -165,33 +272,35 @@ fn execute(r: &mut Run, m: &Manifest) -> Result<()> {
         }
         r.command(&format!("list-{id}"), "cargo", &args)?;
     }
-    for name in ["awman", "awman-guest-driver", "awman-guest-net-driver"] {
-        // Cargo can copy a hashed executable back over debug/<name> on the
-        // next invocation. Sign both copies before any guest can execute.
-        let prefix = format!("{}-", name.replace('-', "_"));
-        let mut copies = fs::read_dir(r.build.join("debug/deps"))?
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.extension().is_none()
-                    && p.file_name()
-                        .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
-            })
-            .collect::<Vec<_>>();
-        copies.sort();
-        ensure!(!copies.is_empty(), "missing Cargo executable for {name}");
-        for (index, bin) in copies.iter().enumerate() {
+    if platform.apple() {
+        for name in ["awman", "awman-guest-driver", "awman-guest-net-driver"] {
+            // Cargo can copy a hashed executable back over debug/<name> on the
+            // next invocation. Sign both copies before any guest can execute.
+            let prefix = format!("{}-", name.replace('-', "_"));
+            let mut copies = fs::read_dir(r.build.join("debug/deps"))?
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.extension().is_none()
+                        && p.file_name()
+                            .is_some_and(|n| n.to_string_lossy().starts_with(&prefix))
+                })
+                .collect::<Vec<_>>();
+            copies.sort();
+            ensure!(!copies.is_empty(), "missing Cargo executable for {name}");
+            for (index, bin) in copies.iter().enumerate() {
+                r.command(
+                    &format!("sign-cargo-{name}-{index}"),
+                    "bash",
+                    &["tools/macos-sign.sh", bin.to_str().unwrap()],
+                )?;
+            }
+            let bin = r.build.join("debug").join(name);
             r.command(
-                &format!("sign-cargo-{name}-{index}"),
+                &format!("sign-{name}"),
                 "bash",
                 &["tools/macos-sign.sh", bin.to_str().unwrap()],
             )?;
         }
-        let bin = r.build.join("debug").join(name);
-        r.command(
-            &format!("sign-{name}"),
-            "bash",
-            &["tools/macos-sign.sh", bin.to_str().unwrap()],
-        )?;
     }
     r.command(
         "build-artifact",
@@ -211,11 +320,13 @@ fn execute(r: &mut Run, m: &Manifest) -> Result<()> {
     fs::create_dir_all(r.out.join("candidate"))?;
     let artifact = r.out.join("candidate/awman");
     fs::copy(r.build.join("release/awman"), &artifact)?;
-    r.command(
-        "sign-artifact",
-        "bash",
-        &["tools/macos-sign.sh", artifact.to_str().unwrap()],
-    )?;
+    if platform.apple() {
+        r.command(
+            "sign-artifact",
+            "bash",
+            &["tools/macos-sign.sh", artifact.to_str().unwrap()],
+        )?;
+    }
     r.packet.artifact_sha256 = sha256_file(&artifact)?;
     r.env
         .insert("AWMAN_TEST_ARTIFACT".into(), artifact.display().to_string());
@@ -224,7 +335,7 @@ fn execute(r: &mut Run, m: &Manifest) -> Result<()> {
         r.packet.artifact_sha256.clone(),
     );
     let mut failures = Vec::new();
-    for id in &suites(m) {
+    for id in &suites(m, platform) {
         let dir = r.out.join(id);
         if let Err(e) = r.xtask(
             &format!("run-{id}"),
@@ -234,7 +345,7 @@ fn execute(r: &mut Run, m: &Manifest) -> Result<()> {
                 "--suite",
                 id,
                 "--build",
-                BUILD,
+                platform.build,
                 "--evidence-dir",
                 dir.to_str().unwrap(),
             ],
@@ -242,15 +353,17 @@ fn execute(r: &mut Run, m: &Manifest) -> Result<()> {
             failures.push(format!("{id}: {e:#}"));
         }
     }
-    r.command(
-        "verify-artifact",
-        "bash",
-        &[
-            "tools/macos-sign.sh",
-            "--verify",
-            artifact.to_str().unwrap(),
-        ],
-    )?;
+    if platform.apple() {
+        r.command(
+            "verify-artifact",
+            "bash",
+            &[
+                "tools/macos-sign.sh",
+                "--verify",
+                artifact.to_str().unwrap(),
+            ],
+        )?;
+    }
     ensure!(
         sha256_file(&artifact)? == r.packet.artifact_sha256,
         "candidate changed during validation"
@@ -277,7 +390,11 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
             println!("Packet checks passed. Review native provenance and coverage before closing the work item; this is not a CI attestation.");
             Ok(ExitCode::SUCCESS)
         }
-        Some("run") if args.len() == 1 => {
+        Some("run") if args.len() == 1 || (args.len() == 3 && args[1] == "--platform") => {
+            let platform = Platform::host()?;
+            if args.len() == 3 {
+                ensure!(args[2] == "linux" && !platform.apple(), "--platform linux requires native Linux KVM");
+            }
             let stamp = format!(
                 "{}-{}",
                 chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
@@ -292,6 +409,8 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
             fs::create_dir_all(&out)?;
             fs::create_dir_all(&work)?;
             let mut r = Run {
+                platform,
+                registry: None,
                 root: root.clone(),
                 out: out.clone(),
                 work: work.clone(),
@@ -311,14 +430,20 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
                     schema: 1,
                     commit: git(&root, &["rev-parse", "HEAD"])?,
                     tree: git(&root, &["rev-parse", "HEAD^{tree}"])?,
-                    target: TARGET.into(),
+                    target: platform.target.into(),
                     started: chrono::Utc::now().to_rfc3339(),
                     source: source_hashes(&root)?,
-                    suites: suites(&m),
+                    suites: suites(&m, platform),
                     ..Default::default()
                 },
             };
             let result = execute(&mut r, &m);
+            let cleanup = if let Some(id) = r.registry.clone() {
+                r.command("remove-registry", "docker", &["rm", "--force", &id]).map(|_| {
+                    r.registry = None;
+                })
+            } else { Ok(()) };
+            let result = result.and(cleanup);
             r.packet.finished = chrono::Utc::now().to_rfc3339();
             r.packet.verdict = if result.is_ok() { "passed" } else { "failed" }.into();
             r.packet.error = result.as_ref().err().map(|e| format!("{e:#}"));
@@ -355,7 +480,7 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         _ => anyhow::bail!(
-            "usage: cargo xtask native-validation run | verify <extracted-evidence-directory>"
+            "usage: cargo xtask native-validation run [--platform linux] | verify <extracted-evidence-directory>"
         ),
     }
 }

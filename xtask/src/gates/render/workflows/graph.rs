@@ -33,10 +33,10 @@ pub fn test_job_id(m: &Manifest, tier: &str, platform: &str, build: &str) -> Str
         .cargo_args
         .iter()
         .any(|a| a.contains("builtin"))
-        && platform.starts_with("linux-arm64")
+        && platform.starts_with("linux-")
         && ["unit", "component"].contains(&tier)
     {
-        // The hermetic builtin-feature unit suites, native on arm64 hosted Linux.
+        // Separate native builtin-feature suites from default-feature Linux builds.
         format!("builtin-hermetic-{platform}")
     } else {
         format!("test-{tier}-{platform}")

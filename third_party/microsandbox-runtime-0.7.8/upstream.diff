@@ -1,0 +1,16 @@
+--- a/lib/runner/vm.rs
++++ b/lib/runner/vm.rs
+@@ -2726,6 +2726,13 @@
+     let mut vm = builder
+         .build()
+         .map_err(|e| RuntimeError::Custom(format!("build VM: {e}")))?;
++    // The embedded x86 kernel callback is process-owned and idempotent. Copy
++    // it into this VM's private RAM rather than mapping that shared allocation
++    // writable. Restores supply their own independently owned memory below.
++    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
++    if config.vm.checkpoint_restore.is_none() {
++        vm.set_private_memory_boot(true);
++    }
+     let restored_agent = if let Some(restore) = &config.vm.checkpoint_restore {
+         let prepared = prepared_restore.expect("restore was admitted before device construction");
+         // Local branches and durable restores both retain exact immutable disk bindings.

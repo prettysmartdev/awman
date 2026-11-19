@@ -7,6 +7,9 @@
 //! run names none) and removes what it created, even when it fails.
 
 pub mod engine;
+mod source;
+#[cfg(unix)]
+pub(crate) mod tls;
 
 use crate::support;
 use awman::engine::auth::credential::SecretString;

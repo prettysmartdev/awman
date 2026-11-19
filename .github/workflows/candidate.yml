@@ -270,7 +270,7 @@ jobs:
         if: ${{ matrix.target.self_hosted }}
         run: cargo run --locked --quiet --manifest-path controller/Cargo.toml --target-dir "$XTASK_TARGET" -p xtask -- ci sweep
       - name: Prepare the verified builtin payload
-        if: ${{ matrix.target.sign }}
+        if: ${{ matrix.target.builtin }}
         working-directory: candidate
         run: |
           bash tools/msb-payloads/fetch.sh "${{ matrix.target.target }}"

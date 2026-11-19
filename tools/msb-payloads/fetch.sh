@@ -67,9 +67,8 @@ EOF
 cat "$dest/provenance.txt"
 cat "$dest/kernel.meta"
 if [ "$(field status)" != verified ]; then
-    # Exit 4 (not 3) so `make payloads-verify` can tell "recorded, awaiting
-    # verification" apart from a download or hash failure.
-    echo "Payload evidence was recorded. Run \`make payloads-verify\` on this native host to run the required gates and mark the payload verified." >&2
+    # Exit 4 distinguishes recorded, awaiting native review from a hash failure.
+    echo "Payload evidence was recorded. A maintainer must review the native guest/artifact acceptance packet before updating the manifest; make payloads-verify does not promote records." >&2
     exit 4
 fi
 bash "$root/tools/msb-payloads/verify.sh" "$target"

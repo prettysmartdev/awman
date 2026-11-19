@@ -33,3 +33,98 @@ fn a_real_registry_conforms_to_the_acquirer_contract() {
     drop(world);
     sandbox.finish();
 }
+
+/// A real registry reached through a private-CA TLS terminator must obey the
+/// same content, platform, cache isolation and failure contract as HTTP.
+#[test]
+#[cfg(unix)]
+fn a_private_ca_registry_conforms_to_the_acquirer_contract() {
+    let mut sandbox =
+        support::sandbox("registry::a_private_ca_registry_conforms_to_the_acquirer_contract");
+    sandbox
+        .env_mut()
+        .set("AWMAN_REGISTRY_TEST_USER", "awman-test-user");
+    sandbox.env_mut().set(
+        "AWMAN_REGISTRY_TEST_PASSWORD",
+        "test-secret-registry-password",
+    );
+    sandbox.redact("test-secret-registry-password");
+    let registry = sandbox.require::<LocalRegistry>();
+    let world = world::RealRegistryWorld::new(&sandbox, registry.addr).with_tls();
+    let report = oci_registry(&world);
+    report.assert_conforms();
+    assert!(report.not_applicable.is_empty());
+    drop(world);
+    sandbox.finish();
+}
+
+#[test]
+#[cfg(unix)]
+fn private_registry_rejects_wrong_credentials_without_publishing_cached_success() {
+    use awman::data::config::image_source::ImageSourceSpec;
+    use awman::data::oci_identity::OciPlatform;
+    use awman::engine::conformance::registry::{RegistryWorld, HOST_TAG, REPOSITORY};
+    use awman::engine::oci::{
+        AcquireLimits, AcquirePolicy, AcquireProgress, AcquireRequest, CachingAcquirer, DiskSpace,
+        ImageAcquirer,
+    };
+    let mut sandbox = support::sandbox(
+        "registry::private_registry_rejects_wrong_credentials_without_publishing_cached_success",
+    );
+    sandbox
+        .env_mut()
+        .set("AWMAN_REGISTRY_TEST_USER", "awman-test-user");
+    sandbox
+        .env_mut()
+        .set("AWMAN_REGISTRY_TEST_PASSWORD", "test-secret-wrong-password");
+    sandbox.redact("test-secret-wrong-password");
+    let registry = sandbox.require::<LocalRegistry>();
+    let world = world::RealRegistryWorld::new(&sandbox, registry.addr).with_tls();
+    world.given_host_image();
+    struct Space;
+    impl DiskSpace for Space {
+        fn available(&self, _: &std::path::Path) -> Option<u64> {
+            Some(u64::MAX)
+        }
+    }
+    let acquirer = CachingAcquirer::new(
+        &world.state_dir(),
+        AcquireLimits {
+            min_free_bytes: 0,
+            ..AcquireLimits::default()
+        },
+        world.env(),
+        std::sync::Arc::new(Space),
+    );
+    let registry = world.registry();
+    let mut request = AcquireRequest {
+        tag: "private-registry:latest".into(),
+        source: ImageSourceSpec::Registry {
+            registry: Some(registry.clone()),
+            reference: Some(format!("{REPOSITORY}:{HOST_TAG}")),
+        },
+        platform: OciPlatform::host_linux(),
+        policy: AcquirePolicy::Refresh,
+        registries: [(registry, world.host_config())].into(),
+    };
+    let mut published = false;
+    let error = acquirer
+        .acquire(&request, &mut |p| {
+            published |= matches!(p, AcquireProgress::Cached { .. });
+        })
+        .unwrap_err();
+    assert!(!published, "failed authentication emitted cached success");
+    assert!(!error.to_string().contains("test-secret-wrong-password"));
+    assert_eq!(
+        world.requests_served(),
+        0,
+        "unauthenticated request reached the registry"
+    );
+    request.policy = AcquirePolicy::CachedOnly;
+    assert!(
+        acquirer.acquire(&request, &mut |_| {}).is_err(),
+        "failed pull populated cache"
+    );
+    drop(world);
+    sandbox.finish();
+}

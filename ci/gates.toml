@@ -196,6 +196,12 @@ features = "default"
 profile = "test"
 packages = ["awman", "awman-cli", "awman-host-shims", "awman-wsp", "awman-test-support", "xtask"]
 
+[builds.linux-x64-builtin]
+platform = "linux-x64"
+features = "builtin"
+profile = "test"
+packages = ["awman", "awman-cli", "awman-host-shims", "awman-wsp", "awman-test-support", "xtask"]
+
 [builds.linux-arm64-builtin]
 platform = "linux-arm64"
 features = "builtin"
@@ -224,7 +230,7 @@ kind = "build-smoke"
 
 [builds.linux-x64-release]
 platform = "linux-x64"
-features = "default"
+features = "builtin"
 profile = "release"
 packages = ["awman-cli"]
 kind = "release"
@@ -625,7 +631,7 @@ target = "test:guest"
 contracts = ["guest-upgrade"]
 requires = []
 paths = ["src/engine/**", "tests/guest/**"]
-filter = "test(/^upgrade::/)"
+filter = "test(/^upgrade::/) - test(=upgrade::linux_published_previous_state_upgrades_and_boots)"
 group = "vm"
 
 [suites.guest-builder]
@@ -678,7 +684,7 @@ target = "test:artifact"
 contracts = ["artifact-signed-boot"]
 requires = ["hypervisor", "guest-fixtures", "previous-release", "offline"]
 paths = ["src/**", "tests/artifact/**"]
-filter = "test(/^signed_boot::/)"
+filter = "test(/^signed_boot::/) - test(=signed_boot::linux_published_previous_state_upgrades_offline)"
 group = "vm"
 
 [suites.artifact-upgrade-policy]
@@ -930,7 +936,7 @@ builds = ["linux-x64-default"]
 
 [[gates.pr.cells]]
 suites = ["unit-awman-builtin"]
-builds = ["linux-arm64-builtin"]
+builds = ["linux-x64-builtin", "linux-arm64-builtin"]
 
 [[gates.pr.cells]]
 suites = ["lint-fmt", "lint-clippy", "lint-architecture", "lint-hygiene", "lint-shell", "lint-workflows", "lint-deny", "lint-notice", "doctests", "web"]
@@ -1232,3 +1238,67 @@ requires = []
 paths = ["src/command/**", "tests/component/command/models.rs"]
 filter = "test(/^command::models::/)"
 budget_seconds = 120
+
+# Local operator evidence only; no hosted runner is advertised as having KVM.
+[platforms.linux-x64-native]
+toolchain = "1.94.0"
+trust = "ci-guest"
+runs_on = ["self-hosted", "Linux", "X64", "awman-native-kvm"]
+triple = "x86_64-unknown-linux-gnu"
+image = "operator-recorded-in-native-packet"
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "hypervisor", "builtin-payload", "guest-fixtures", "docker", "release-artifact", "offline"]
+max_vms = 2
+
+[builds.linux-x64-native-builtin]
+platform = "linux-x64-native"
+features = "builtin"
+profile = "test"
+packages = ["awman", "awman-cli", "awman-host-shims", "awman-wsp", "awman-test-support", "xtask"]
+
+# Local operator evidence only; no hosted runner is advertised as having KVM.
+[platforms.linux-arm64-native]
+toolchain = "1.94.0"
+trust = "ci-guest"
+runs_on = ["self-hosted", "Linux", "ARM64", "awman-native-kvm"]
+triple = "aarch64-unknown-linux-gnu"
+image = "operator-recorded-in-native-packet"
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "hypervisor", "builtin-payload", "guest-fixtures", "docker", "release-artifact", "offline"]
+max_vms = 2
+
+[builds.linux-arm64-native-builtin]
+platform = "linux-arm64-native"
+features = "builtin"
+profile = "test"
+packages = ["awman", "awman-cli", "awman-host-shims", "awman-wsp", "awman-test-support", "xtask"]
+
+# The first Linux builtin release has no published builtin predecessor. The
+# native runner requires these suites as soon as that target has a reviewed pin.
+[suites.guest-linux-published-upgrade]
+tier = "guest"
+kind = "nextest"
+package = "awman-cli"
+target = "test:guest"
+contracts = ["guest-linux-published-upgrade"]
+requires = ["previous-release"]
+paths = ["src/engine/**", "tests/guest/upgrade/**"]
+filter = "test(=upgrade::linux_published_previous_state_upgrades_and_boots)"
+group = "vm"
+
+[suites.artifact-linux-published-upgrade]
+tier = "artifact"
+kind = "nextest"
+package = "awman-cli"
+target = "test:artifact"
+contracts = ["artifact-linux-published-upgrade"]
+requires = ["hypervisor", "guest-fixtures", "previous-release", "offline"]
+paths = ["src/**", "tests/artifact/signed_boot/**"]
+filter = "test(=signed_boot::linux_published_previous_state_upgrades_offline)"
+group = "vm"
+
+[suites.boundary-private-memory]
+tier = "boundary"
+kind = "command"
+contracts = ["linux-private-memory-isolation"]
+requires = []
+paths = ["crates/awman-host-shims/src/kernel.rs", "tools/msb-payloads/check-private-memory.sh"]
+command = ["bash", "tools/msb-payloads/check-private-memory.sh"]

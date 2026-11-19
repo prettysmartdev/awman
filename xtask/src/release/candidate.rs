@@ -312,7 +312,9 @@ fn preflight(f: &Flags) -> Step {
         .iter()
         .map(|t| {
             serde_json::json!({"asset": t.asset, "target": t.triple, "build": t.build,
-                "runs_on": t.runs_on, "sign": t.sign, "self_hosted": t.runs_on.iter().any(|l| l == "self-hosted")})
+                "runs_on": t.runs_on, "sign": t.sign,
+                "builtin": m.builds[&t.build].features == "builtin",
+                "self_hosted": t.runs_on.iter().any(|l| l == "self-hosted")})
         })
         .collect();
     outputs(&[

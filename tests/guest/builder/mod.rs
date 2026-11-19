@@ -106,6 +106,7 @@ fn docker_build_import_rebuild_then_cached_execution() {
     );
 }
 #[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn apple_build_import_rebuild_then_cached_execution() {
     run(
         "builder::apple_build_import_rebuild_then_cached_execution",

@@ -50,7 +50,6 @@ static IMAGE: OnceLock<Result<Image, String>> = OnceLock::new();
 pub fn prepare() -> Result<(), String> {
     IMAGE
         .get_or_init(|| {
-            require_copying_consumer(std::env::consts::ARCH)?;
             let layout = validate_image(
                 &KERNEL.0,
                 GUEST_ADDRESS,
@@ -68,19 +67,6 @@ pub fn prepare() -> Result<(), String> {
         .as_ref()
         .map(|_| ())
         .map_err(Clone::clone)
-}
-
-/// The x86_64 pinned runner maps the callback allocation directly as guest RAM.
-/// Repeated callbacks are idempotent, so that runner would share writable kernel
-/// data between VMs. Until it enables Vm::set_private_memory_boot(true), fail
-/// closed even if someone later verifies an x86_64 payload (WI 0124).
-fn require_copying_consumer(arch: &str) -> Result<(), String> {
-    if arch == "x86_64" {
-        return Err(
-            "embedded x86_64 kernel requires a private-memory boot consumer (WI 0124)".into(),
-        );
-    }
-    Ok(())
 }
 
 /// Exercise the actual accessor before any VM exists in this private process.
@@ -222,8 +208,8 @@ fn writable_aligned_copy(source: &[u8]) -> *mut u8 {
 ///   leaked, writable, 64 KiB-aligned allocation of `*size` bytes, never freed
 ///   and never aliased by a Rust reference after [`prepare`]. Repeated and
 ///   concurrent calls return the same address and metadata. Consumers must copy
-///   it into independent guest memory before a guest writes. Direct-mapping
-///   x86_64 consumers are refused by prepare().
+///   it into independent guest memory before a guest writes. On x86_64 the
+///   patched runner requests the upstream private-memory boot path.
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn krunfw_get_kernel(

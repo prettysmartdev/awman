@@ -13,10 +13,11 @@ The release inputs, checksums and extraction process are recorded in
 and [libkrunfw revision](https://github.com/superradcompany/libkrunfw/tree/21f169f7e94798c8916315f8ac6f5999d5b88566).
 Unverified target records are not release acceptance evidence.
 
-Five carried crate patches remain, listed in [third_party/README.md](third_party/README.md):
+Six carried crate patches remain, listed in [third_party/README.md](third_party/README.md):
 [SDK](third_party/microsandbox-0.7.8/PATCH.md),
 [filesystem](third_party/microsandbox-filesystem-0.7.8/PATCH.md),
 [network](third_party/microsandbox-network-0.7.8/PATCH.md),
+[runtime](third_party/microsandbox-runtime-0.7.8/PATCH.md),
 [types](third_party/microsandbox-types-0.7.8/PATCH.md) (all Apache-2.0), and
 [SQLx SQLite](third_party/sqlx-sqlite-0.9.0/PATCH.md) (MIT OR Apache-2.0).
 Their original license texts are retained in those directories.

@@ -131,6 +131,37 @@ and reproduce tests. Locally:
   not require the symbol name. `make payloads` fetches and checksum-verifies the
   host's payload (`tools/msb-payloads/fetch.sh`); `make payloads-verify` verifies bytes against the reviewed payload record. A new payload status requires reviewed native evidence; the command does not automatically promote a record.
 
+### Linux builtin development and prerelease acceptance
+
+Linux x86_64 GNU builds include the experimental builtin runtime. Install the
+pinned Rust toolchain, a C/C++ compiler, pkg-config, Clang/libclang and CMake.
+On Debian/Ubuntu: `sudo apt-get install build-essential pkg-config clang libclang-dev cmake`.
+`make build` fetches and verifies missing pinned kernel and guest-agent build
+inputs; it does not install a separate runtime. `make install` builds as the
+invoking user, then atomically installs to `/usr/local/bin`; use
+`INSTALL_PATH=/your/bin` for a user-owned location. Restart long-running awman
+daemons after upgrading the executable.
+
+Run `make linux-prerelease` from a clean, committed checkout on Linux x86_64
+with read/write `/dev/kvm` access and a running Docker Engine on a local Unix
+socket. Docker supplies image-source and builder evidence; agents execute only
+inside guests. The runner needs curl, tar, network access during preparation,
+and enough disk for debug/test and release artifacts. Offline acceptance uses
+an unprivileged user/network namespace, so the host must allow those namespaces.
+On Debian, add the user to `kvm` and `docker` groups and log in again first.
+
+The target uses the manifest native-validation runner, prepares private fixtures
+and an owned loopback registry, runs the registered guest, Docker/registry
+boundary and artifact suites, and removes its registry even on failure.
+Evidence is written under `target/native-validation/` and archived as a tarball.
+Verify an extracted packet with
+`cargo xtask native-validation verify /path/to/evidence`.
+Missing prerequisites fail the run; they never count as passing skips.
+
+The first Linux release proves atomic executable replacement and cached restart.
+It does not claim migration from a previous Linux builtin release, because none
+exists. Linux ARM64 remains unavailable pending independent native acceptance.
+
 ### Pinned tooling
 
 | Tool | Version | Used for | Installed by |

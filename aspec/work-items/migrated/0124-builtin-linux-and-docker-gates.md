@@ -1,10 +1,44 @@
 # Work Item: Task
 
-Title: Optional future work: builtin runtime on Linux KVM, Docker Engine sources and registry edge cases
-Issue: n/a
+Title: Enable and validate the builtin runtime on Linux KVM
+Issue: https://github.com/prettysmartdev/awman/issues/47
 
-Status: Open, **optional future work** for a later release. Nothing here
-blocks WI 0123, and WI 0119/0121 are resolved without it.
+Status: In progress on `fix/linux-builtin-runtime`, based on `nextgen`.
+
+## Current execution contract (2026-11-19)
+
+This section supersedes the historical commands and optional-release framing
+below. WI 0144's `ci/gates.toml` suites and `awman-test-support` are mandatory;
+retired native scripts and test-count claims are not acceptance evidence.
+
+- Enable Linux x86_64 GNU builds only after native KVM guest and optimized
+  artifact acceptance. Validate `/dev/kvm` access as an ordinary user, the
+  embedded kernel's private-memory boot path, concurrent guests, lifecycle,
+  networking, mounts, source imports, and local Docker builder fallback.
+- The supplied native machine is Linux x86_64. Linux ARM64 remains a separate
+  hardware acceptance obligation; its compile/payload checks cannot establish
+  that it boots. Do not enable an architecture on borrowed evidence.
+- Support explicit archive, OCI registry, and Docker Engine sources. Apple
+  Containers is a macOS source and must refuse explicitly on Linux. Preserve
+  source identity and cached execution without a source service or builder.
+- Provide `make linux-prerelease` through the existing native-validation
+  runner, with private fixtures, registered suites, exact candidate digests,
+  per-test results, portable logs and independent packet verification.
+- There is no previous published Linux builtin executable. Keep genuine
+  previous-release catalog acceptance for macOS; record Linux executable
+  replacement and cached restart separately without claiming an old-release
+  upgrade. Future Linux releases must pin their published predecessor.
+- Repair ordinary Linux `make build` / `make install` and distribution asset
+  selection; privilege escalation is restricted to installation. Release
+  assets must include their documented runtime and declare their ABI honestly.
+- Review WI 0120 / issue #46 and keep every changed upstream patch, provenance,
+  removal condition and saved upstream proposal current. Submit no upstream PR.
+- Update current user documentation, create a PR targeting `nextgen`, and
+  require green CI plus the native evidence before declaring merge readiness.
+
+The work packages below retain the historical coverage backlog. Real TLS/mTLS,
+private-CA/proxy, failure and format coverage must be accounted for explicitly;
+unavailable ARM64, Windows or Docker Sandboxes infrastructure is not a pass.
 Parent: [WI 0121](completed/0121-complete-builtin-runtime-and-native-verification.md)
 Split from: [WI 0123](completed/0123-builtin-native-verification-and-release-closure.md)
 (the macOS Apple Silicon `builtin-experimental` release)

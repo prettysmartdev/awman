@@ -52,10 +52,9 @@ mod paths;
 #[cfg_attr(not(awman_builtin), allow(dead_code))]
 mod resources;
 
-/// The subset released as `builtin-experimental`. Linux stays compiled and
-/// unit-tested, but users cannot select it until its native gates pass
-/// (WI 0124).
-pub(super) const RELEASED_TARGETS: &[(&str, &str)] = &[("macos", "aarch64")];
+/// Platforms with native builtin runtime acceptance evidence. Linux arm64
+/// remains gated until its own KVM acceptance has passed.
+pub(super) const RELEASED_TARGETS: &[(&str, &str)] = &[("macos", "aarch64"), ("linux", "x86_64")];
 
 /// Open the builtin backend with `settings`.
 ///

@@ -4,28 +4,26 @@ INSTALL_PATH ?= /usr/local/bin
 # default of `target`.
 TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 
-.PHONY: all build sign-macos install payloads payloads-verify clean release apple-silicon-prerelease architecture-lint docs-reference
+.PHONY: all build sign-macos install payloads payloads-verify clean release apple-silicon-prerelease linux-prerelease architecture-lint docs-reference
 
 all: build
 
 # The workspace has one distribution executable (awman-cli's awman target).
 # awman and awman-host-shims are libraries, including the private re-exec worker.
 
-# On Apple Silicon the experimental builtin runtime requires a verified
-# payload, and the binary is then ad-hoc signed with the hypervisor
-# entitlement (tools/macos-sign.sh): macOS refuses to start a VM otherwise.
-# Other hosts build the existing backends only; the builtin runtime is released
-# for macOS on Apple Silicon only (WI 0124 tracks Linux).
+# Released builtin hosts embed the pinned payload. Fetch missing inputs during
+# the normal build, so a fresh checkout supports `make install` directly.
+# Apple Silicon also requires an ad-hoc hypervisor entitlement signature.
 build:
-	@host="$$(rustc -vV | sed -n 's/^host: //p')"; \
-	if [ "$$host" = aarch64-apple-darwin ]; then \
-		bash tools/msb-payloads/verify.sh "$$host" || { echo 'Apple Silicon builtin payload is unavailable; run make payloads before installing' >&2; exit 1; }; \
-		cargo build -p awman-cli --bin $(BINARY) --release --features builtin-runtime && \
-		bash tools/macos-sign.sh "$(TARGET_DIR)/release/$(BINARY)"; \
-	else \
+	@set -eu; host="$$(rustc -vV | sed -n 's/^host: //p')"; \
+	case "$$host" in aarch64-apple-darwin|x86_64-unknown-linux-gnu) \
+		bash tools/msb-payloads/verify.sh "$$host" || bash tools/msb-payloads/fetch.sh "$$host"; \
+		cargo build --locked -p awman-cli --bin $(BINARY) --release --features builtin-runtime; \
+		if [ "$$host" = aarch64-apple-darwin ]; then bash tools/macos-sign.sh "$(TARGET_DIR)/release/$(BINARY)"; fi ;; \
+	*) \
 		echo 'Builtin runtime not included for this host; building existing backends'; \
-		cargo build -p awman-cli --bin $(BINARY) --release; \
-	fi
+		cargo build --locked -p awman-cli --bin $(BINARY) --release ;; \
+	esac
 
 # Re-sign an existing build, e.g. after stripping or copying it elsewhere:
 # `make sign-macos BIN=/usr/local/bin/awman`.
@@ -35,10 +33,8 @@ sign-macos:
 payloads:
 	bash tools/msb-payloads/fetch.sh "$$(rustc -vV | sed -n 's/^host: //p')"
 
-# Native, one-time promotion of a new payload pin: fetches the payload, writes
-# a candidate verified record, runs the guest and artifact tiers, and keeps the
-# record only if all pass. Needs a clean checkout, HVF or KVM, and a running
-# Docker or Apple Containers engine for the guest fixtures.
+# Verify bytes against a reviewed payload record. Native validation is separate;
+# this target never promotes an unverified payload record.
 payloads-verify:
 	bash tools/msb-payloads/payloads-verify.sh "$$(rustc -vV | sed -n 's/^host: //p')"
 
@@ -154,6 +150,10 @@ clean:
 # For a local Apple Silicon acceptance packet, use validate-native instead.
 apple-silicon-prerelease:
 	@cargo xtask release validate
+
+# Local Linux KVM acceptance and portable evidence for the current commit.
+linux-prerelease:
+	CARGO_TARGET_DIR=target/native-validation-tools cargo xtask native-validation run --platform linux
 
 # Release VERSION. A managed Apple Silicon runner verifies the manifest fixtures
 # in its private runner directory, registers for the candidate job, and
