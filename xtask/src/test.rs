@@ -604,7 +604,7 @@ fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
             None
         };
         // A failed startup must not copy a previous invocation's JUnit as evidence.
-        let junit = target_dir(root).join(format!("nextest/{PROFILE}/junit.xml"));
+        let junit = nextest_junit_path(root)?;
         if o.evidence_dir.is_some() && junit.exists() {
             std::fs::remove_file(&junit)?;
         }
@@ -617,7 +617,11 @@ fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
             "execution_ms": started.elapsed().as_millis() as u64,
         }));
         if let (Some(dir), Runner::Nextest) = (&o.evidence_dir, o.runner) {
-            let junit = target_dir(root).join(format!("nextest/{PROFILE}/junit.xml"));
+            ensure!(
+                code != 0 || junit.is_file(),
+                "nextest passed but produced no current JUnit evidence at {}",
+                junit.display()
+            );
             if junit.exists() {
                 let name = format!(
                     "junit-{}-{}-{}.xml",
@@ -777,11 +781,25 @@ fn describe(command: &Command) -> String {
         .join(" ")
 }
 
-fn target_dir(root: &Path) -> PathBuf {
-    std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .map(|p| if p.is_absolute() { p } else { root.join(p) })
-        .unwrap_or_else(|| root.join("target"))
+fn nextest_junit_path(root: &Path) -> Result<PathBuf> {
+    // Nextest's report store is relative to the workspace, independently of
+    // Cargo's build directory (including CARGO_TARGET_DIR). Resolve the same
+    // generated configuration nextest uses; never search stale report paths.
+    let config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(root.join(".config/nextest.toml"))?)?;
+    let store = config
+        .get("store")
+        .and_then(|s| s.get("dir"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("target/nextest");
+    let report = config
+        .get("profile")
+        .and_then(|p| p.get(PROFILE))
+        .and_then(|p| p.get("junit"))
+        .and_then(|j| j.get("path"))
+        .and_then(toml::Value::as_str)
+        .context("nextest profile must declare its JUnit evidence path")?;
+    Ok(root.join(store).join(PROFILE).join(report))
 }
 
 /// Deterministic permutation of the suite order from a seed (flake hunt).
@@ -982,6 +1000,29 @@ fn update_golden(root: &Path, o: &Options) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn junit_evidence_follows_the_nextest_store_not_cargo_build_output() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".config")).unwrap();
+        let path = root.path().join(".config/nextest.toml");
+        std::fs::write(&path, "[profile.default.junit]\npath = 'junit.xml'\n").unwrap();
+        assert_eq!(
+            nextest_junit_path(root.path()).unwrap(),
+            root.path().join("target/nextest/default/junit.xml")
+        );
+        std::fs::write(
+            &path,
+            "[store]\ndir = 'reports'\n[profile.default.junit]\npath = 'results.xml'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            nextest_junit_path(root.path()).unwrap(),
+            root.path().join("reports/default/results.xml")
+        );
+        std::fs::write(&path, "[profile.default]\nretries = 0\n").unwrap();
+        assert!(nextest_junit_path(root.path()).is_err());
+    }
 
     #[test]
     fn runtime_features_follow_the_selected_package() {
