@@ -398,13 +398,13 @@ impl ReadySummary {
         }
         if let Some(names) = agents(ReadyImagePlan::ConfigureSource) {
             steps.push(format!(
-                "configure an image source for {names} (`builtin.imageSource` or a \
-                 `builtin.images` entry), then run \"ready --build\"."
+                "configure an image source for {names} (`runtime.builtin.imageSource` or a \
+                 `runtime.builtin.images` entry), then run \"ready --build\"."
             ));
         }
         if let Some(names) = agents(ReadyImagePlan::ConfigureBuildOutput) {
             steps.push(format!(
-                "configure a writable, distinct image source reference for {names} (`builtin.images`), then run \"ready --build\"."
+                "configure a writable, distinct image source reference for {names} (`runtime.builtin.images`), then run \"ready --build\"."
             ));
         }
         Some(steps.join(" "))
@@ -415,8 +415,8 @@ impl ReadySummary {
         let agent = &image.agent;
         if image.source_kind.is_none() {
             format!(
-                "configure an image source for {agent} (`builtin.imageSource` or a \
-                 `builtin.images` entry), then run \"awman ready\" again."
+                "configure an image source for {agent} (`runtime.builtin.imageSource` or a \
+                 `runtime.builtin.images` entry), then run \"awman ready\" again."
             )
         } else if matches!(image.build, StepStatus::Failed(_)) {
             format!("fix the {agent} image build, then run \"awman ready --build\" again.")

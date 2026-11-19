@@ -48,4 +48,22 @@ pub trait ReadyFrontend: AgentImageFrontend {
             });
         }
     }
+
+    /// Present the builtin image-source choice and return the typed answer.
+    ///
+    /// Called only by Layer 2's `ReadyCommand`, at most once per stage per
+    /// run. A frontend displays the request and returns what the person
+    /// chose; it never validates, picks a destination, or writes
+    /// configuration. Infallible on purpose: an I/O or channel failure is
+    /// `Cancelled` (or `Eof` for ended input).
+    ///
+    /// The default never prompts: every frontend that does not override this
+    /// (API, session setup, test fakes, the headless wrapper) answers
+    /// `Unavailable`. `ReadyEngine` never calls it.
+    fn ask_image_source(
+        &mut self,
+        _prompt: &crate::data::config::image_source_prompt::ImageSourcePrompt,
+    ) -> crate::data::config::image_source_prompt::ImageSourceAnswer {
+        crate::data::config::image_source_prompt::ImageSourceAnswer::Unavailable
+    }
 }

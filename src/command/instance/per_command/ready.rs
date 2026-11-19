@@ -1,6 +1,7 @@
 //! `ReadyFrontend` impl for the TUI.
 
 use crate::command::instance::frontend::InstanceCommandFrontend;
+use crate::data::config::image_source_prompt::{ImageSourceAnswer, ImageSourcePrompt};
 use crate::data::dialog::{DialogRequest, DialogResponse};
 use crate::data::message::UserMessageSink;
 use crate::data::ready_phase::ReadyPhase;
@@ -47,6 +48,22 @@ impl ReadyFrontend for InstanceCommandFrontend {
         ))
     }
 
+    fn ask_image_source(&mut self, prompt: &ImageSourcePrompt) -> ImageSourceAnswer {
+        // The CLI profile (relayed `--headless`) never opens a dialog.
+        if self.cli_defaults().is_some() {
+            return ImageSourceAnswer::Unavailable;
+        }
+        if let ImageSourcePrompt::Choose(request) = prompt {
+            for line in super::ready_source_dialogs::context_lines(request) {
+                self.messages.info(line);
+            }
+        }
+        let frontend = &*self;
+        super::ready_source_dialogs::ask_prompt(prompt, &mut |request| {
+            frontend.ask_dialog(request).ok()
+        })
+    }
+
     fn report_phase(&mut self, phase: &ReadyPhase) {
         // The shared `ReadyPhase` Display text, as the API reports it.
         self.messages.info(format!("ready: {phase}"));
@@ -59,10 +76,6 @@ impl ReadyFrontend for InstanceCommandFrontend {
         let text = self.presentation.ready_summary(summary);
         for line in text.lines() {
             self.messages.info(line.to_string());
-        }
-
-        if let Some(hint) = summary.hint() {
-            self.messages.info(format!("Tip: {hint}"));
         }
 
         if summary.is_ready() {

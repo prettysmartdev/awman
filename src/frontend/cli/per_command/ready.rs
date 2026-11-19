@@ -4,6 +4,7 @@
 //! otherwise returns the CLI profile's answers from
 //! `src/command/headless.rs`.
 
+use crate::data::config::image_source_prompt::{ImageSourceAnswer, ImageSourcePrompt};
 use crate::engine::error::EngineError;
 use crate::engine::ready::{ReadyFrontend, ReadyPhase, ReadySummary};
 
@@ -40,6 +41,17 @@ impl ReadyFrontend for CliFrontend {
         .unwrap_or_else(|| self.headless.run_audit_on_template()))
     }
 
+    fn ask_image_source(&mut self, prompt: &ImageSourcePrompt) -> ImageSourceAnswer {
+        if self.non_interactive {
+            return ImageSourceAnswer::Unavailable;
+        }
+        super::ready_source_prompt::ask(
+            prompt,
+            &mut super::helpers::read_input_line,
+            &mut std::io::stderr(),
+        )
+    }
+
     fn report_phase(&mut self, _phase: &ReadyPhase) {
         // Steps report actual work and the final summary reports readiness.
         // Phase transitions would duplicate those and announce work even when
@@ -55,22 +67,23 @@ impl ReadyFrontend for CliFrontend {
         // The rows, outcome line and hint are the summary's own (F-23;
         // readiness now accounts for per-image build/import results too):
         // this renders them without recomputing any of that itself.
-        let box_str = crate::frontend::render_helpers::render_ready_summary(summary);
-        let outcome_line = summary.outcome_line();
         // Write the summary box directly to stderr without the per-line
         // "awman:" prefix used for status updates — the box is multi-line
         // content that reads better unprefixed.
-        let _ = std::io::Write::write_all(
+        let _ = write_summary(
+            summary,
+            crate::frontend::render_helpers::stderr_render_width(),
             &mut std::io::stderr(),
-            format!("\n{box_str}{outcome_line}\n").as_bytes(),
         );
-
-        if let Some(hint) = summary.hint() {
-            let _ = std::io::Write::write_all(
-                &mut std::io::stderr(),
-                format!("Tip: {hint}\n").as_bytes(),
-            );
-        }
-        let _ = std::io::Write::flush(&mut std::io::stderr());
     }
+}
+
+pub(crate) fn write_summary(
+    summary: &ReadySummary,
+    width: usize,
+    stderr: &mut impl std::io::Write,
+) -> std::io::Result<()> {
+    let text = crate::frontend::render_helpers::render_ready_summary_with_width(summary, width);
+    writeln!(stderr, "\n{text}{}", summary.outcome_line())?;
+    stderr.flush()
 }

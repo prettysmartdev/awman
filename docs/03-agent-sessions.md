@@ -1172,6 +1172,12 @@ Verifies your environment is ready for agent sessions. Progress lines read `read
 | `--json` | Emit machine-readable JSON instead of the summary table. Implies `--headless`. See [`ready --json`](#ready---json) |
 | `--agent <name>` | Check and build this agent instead of the configured one. For a [custom agent](15-custom-agents.md) whose definition needs approval, this is where you review and approve it |
 
+When `runtime.kind` is `builtin`, `ready` imports the selected agent image from its configured source. If no usable source is configured, an interactive CLI or TUI run offers `docker-local`, `apple-local` (macOS), `archive`, `registry`, or **Leave unconfigured**. The prompt previews the JSON change and shows which file will be written; when both scopes are available, you can choose repository or global config. Saving reloads the config and lets that same `ready` run continue. Local-store imports need an image that already exists there. Enabling `runtime.builtin.builder.enabled` is a separate, explicit opt-in offered only for supported local sources; it allows building into that store before import. See [Interactive image-source setup](11-runtimes.md#interactive-image-source-setup).
+
+For a missing source, `--headless`/`-n`, `--json`, API session setup, workflow prerequisites, and squad preparation do not prompt or write source config. `ready`, API session setup, and workflow prerequisite errors identify `runtime.builtin.imageSource` or the tagged field ``runtime.builtin.images["<tag>"]``; squad image failures give the tag and source setup guidance. The operation continues or fails according to its required image check. An import failure from a source that is already configured does not offer source setup.
+
+The human-readable `ready` summary prints each failure reason once; when a recovery hint is available, it appears once as `Tip:`. With `--json`, the diagnostic appears in the corresponding status `message` field instead of as an interactive prompt.
+
 Use `--refresh` after your project's toolchain changes. The audit only edits `Dockerfile.dev`; agent Dockerfiles are not touched.
 
 ### Other agents' images

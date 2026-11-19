@@ -107,7 +107,11 @@ impl AgentImagePreparer {
         // A fixed default source cannot represent another agent. Decide
         // before opening a progress row, just as ready's old skip path did.
         if let Some(reason) = plan.pinned_default {
-            if policy.allows_build() && matches!(plan.selection, BuilderSelection::Local(_)) {
+            if matches!(policy, BuildPolicy::Ready { .. })
+                && agent == self.context.default_agent
+                && !self.runtime.image_exists(&tag).unwrap_or(false)
+                || policy.allows_build() && matches!(plan.selection, BuilderSelection::Local(_))
+            {
                 image_result.build = StepStatus::Failed(reason);
                 image_result.import = StepStatus::Skipped;
             } else {
@@ -166,7 +170,7 @@ impl AgentImagePreparer {
                     .await?;
                 }
                 let text = e.to_string();
-                if policy.allows_build() {
+                if policy.allows_build() && !matches!(policy, BuildPolicy::Ready { .. }) {
                     frontend.write_message(UserMessage {
                         level: MessageLevel::Warning,
                         text: text.clone(),
@@ -275,7 +279,10 @@ impl AgentImagePreparer {
                 match self.pending_import(&frozen, &tag, frontend).await {
                     Ok(prepared) => Some(prepared),
                     Err(error) => {
-                        let text = error.to_string();
+                        let text = crate::engine::oci::docker_engine::failure_message_at(
+                            &error,
+                            frozen.docker_endpoint.as_ref(),
+                        );
                         image_result.import = StepStatus::Failed(text.clone());
                         return Ok(image_result);
                     }
@@ -373,11 +380,18 @@ impl AgentImagePreparer {
                         crate::data::ready_image::ReadyImageImportFailure::AppleContentMissing,
                     );
                 }
-                let text = e.to_string();
+                let text = crate::engine::oci::docker_engine::failure_message_at(
+                    &e,
+                    frozen.docker_endpoint.as_ref(),
+                );
                 image_result.import = StepStatus::Failed(text.clone());
 
                 frontend.report_step(&importing, StepStatus::Failed(text.clone()));
-                if crate::engine::oci::retry::is_cancelled(&e) {
+                // A lost local source is final, even after a successful build.
+                // Do not suggest rebuilding or start another recovery attempt.
+                if crate::engine::oci::docker_engine::local_unavailability(&e).is_some()
+                    || crate::engine::oci::retry::is_cancelled(&e)
+                {
                     return Ok(image_result);
                 }
                 if built_here {

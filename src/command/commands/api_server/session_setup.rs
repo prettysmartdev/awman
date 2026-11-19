@@ -430,3 +430,35 @@ fn format_step_status(status: &StepStatus) -> String {
         StepStatus::Failed(s) => format!("failed({s})"),
     }
 }
+
+#[cfg(test)]
+mod source_choice_contracts {
+    use super::*;
+    use crate::data::config::image_source_prompt::{ImageSourceAnswer, ImageSourcePrompt};
+
+    /// API session setup drives `ReadyEngine` through this frontend: it
+    /// keeps the trait default and never asks for an image source.
+    #[test]
+    fn session_setup_frontend_answers_unavailable() {
+        let bus = SessionSetupBus::new(16);
+        let events = super::super::event_bus::EventBus::new(16);
+        let mut frontend = SetupReadyFrontend::new("s-1", bus.sender(), events.sender(), false);
+        let prompt = ImageSourcePrompt::Confirm(
+            crate::data::config::image_source_prompt::ImageSourcePreview {
+                scope: crate::data::config::image_source_prompt::ImageSourceScope::Global,
+                path: "/nowhere/config.json".into(),
+                field: "runtime.builtin.imageSource".into(),
+                fragment: "{}".into(),
+                effective: vec![],
+                builder: crate::data::config::image_source_prompt::BuilderPreview::Unchanged {
+                    effective: false,
+                },
+                notes: vec![],
+            },
+        );
+        assert_eq!(
+            ReadyFrontend::ask_image_source(&mut frontend, &prompt),
+            ImageSourceAnswer::Unavailable
+        );
+    }
+}

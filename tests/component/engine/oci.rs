@@ -255,8 +255,9 @@ fn a_truncated_export_leaves_no_cache_state() {
 
 #[cfg(unix)]
 #[test]
-fn an_unreachable_engine_is_a_network_error() {
-    let sandbox = support::sandbox("engine::oci::an_unreachable_engine_is_a_network_error");
+fn a_stopped_local_engine_is_a_final_unavailable_source() {
+    let sandbox =
+        support::sandbox("engine::oci::a_stopped_local_engine_is_a_final_unavailable_source");
     #[cfg(unix)]
     {
         let state = state(&sandbox);
@@ -264,9 +265,24 @@ fn an_unreachable_engine_is_a_network_error() {
         let socket = sandbox.ports().unix_socket("absent.sock");
         let err =
             engine_acquire(&state, &engine_request(&socket, AcquirePolicy::IfMissing)).unwrap_err();
+        use awman::engine::oci::{docker_engine, retry};
         assert!(
-            matches!(err, EngineError::Network(ref m) if m.contains("not reachable")),
+            matches!(
+                docker_engine::local_unavailability(&err),
+                Some(docker_engine::LocalDockerUnavailable::Stopped { .. })
+            ),
             "{err:?}"
+        );
+        assert!(!retry::is_retryable(&err));
+        let text = err.to_string();
+        assert!(text.contains("Docker is not running"), "{text}");
+        assert!(
+            text.contains(&format!("unix://{}", socket.display())),
+            "{text}"
+        );
+        assert!(
+            text.contains("Start Docker, then run `awman ready` again."),
+            "{text}"
         );
     }
     sandbox.finish();
