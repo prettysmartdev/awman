@@ -37,6 +37,35 @@ fn tracked_child_addresses_are_checked_too() {
     assert!(text.contains("still accepts connections"), "{text}");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reused_address_is_not_a_leaked_listener() {
+    let sandbox = sandbox("ports::a_reused_address_is_not_a_leaked_listener");
+    let original = sandbox.ports().tcp_listener();
+    let addr = original.local_addr().unwrap();
+    // Also exercise registration of a child-reported address.
+    sandbox.ports().track(addr);
+    drop(original);
+    // hygiene-allow(H4): intentionally reuse the closed endpoint to model another concurrent test; this test owns and drops the replacement listener.
+    #[allow(clippy::disallowed_methods)]
+    let replacement = std::net::TcpListener::bind(addr).unwrap();
+    TcpStream::connect(addr).unwrap();
+    sandbox.finish();
+    drop(replacement);
+}
+
+#[test]
+fn a_cloned_listener_remains_owned_after_the_original_is_dropped() {
+    let (_parent, sandbox) =
+        leaky_sandbox("ports::a_cloned_listener_remains_owned_after_the_original_is_dropped");
+    let listener = sandbox.ports().tcp_listener();
+    let survivor = listener.try_clone().unwrap();
+    drop(listener);
+    let text = expect_panic(|| sandbox.finish());
+    assert!(text.contains("still accepts connections"), "{text}");
+    drop(survivor);
+}
+
 #[test]
 fn tcp_readiness_waits_for_accepting() {
     let sandbox = sandbox("ports::tcp_readiness_waits_for_accepting");

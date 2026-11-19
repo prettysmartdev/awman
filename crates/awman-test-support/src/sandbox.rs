@@ -11,7 +11,6 @@ use crate::tier::{TestCase, Tier};
 use crate::Leak;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -99,7 +98,7 @@ pub(crate) struct Shared {
     allowed: Mutex<BTreeSet<PathBuf>>,
     fakes: Mutex<BTreeSet<PathBuf>>,
     pub exes: Mutex<BTreeMap<String, PathBuf>>,
-    pub tcp: Mutex<Vec<SocketAddr>>,
+    pub tcp: Mutex<Vec<net::TrackedTcp>>,
     pub sockets: Mutex<Vec<PathBuf>>,
     pub(crate) probes: Mutex<Vec<(String, LeakProbe)>>,
     granted: Mutex<Vec<(&'static str, capability::Reprobe)>>,

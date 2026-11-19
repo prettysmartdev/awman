@@ -48,7 +48,10 @@ actual_agent_hash=$agent_hash
 actual_kernel_hash=$(hash_file "$dest/kernel.bin")
 source_revision=$(awk -F'"' '/^microsandbox_revision =/ {print $2; exit}' "$manifest")
 libkrun_revision=$(awk -F'"' '/^libkrun_revision =/ {print $2; exit}' "$manifest")
-cat > "$dest/provenance.txt" <<EOF
+# Keep this machine's extraction receipt out of tracked source. Compiler/host
+# details vary between developer and release machines; the manifest pins bytes.
+provenance="$dest/provenance.generated.txt"
+cat > "$provenance" <<EOF
 target=$target
 architecture=$arch
 host_os=$(uname -s)
@@ -64,7 +67,7 @@ kernel_sha256=$actual_kernel_hash
 agent=$agent
 agent_sha256=$actual_agent_hash
 EOF
-cat "$dest/provenance.txt"
+cat "$provenance"
 cat "$dest/kernel.meta"
 if [ "$(field status)" != verified ]; then
     # Exit 4 distinguishes recorded, awaiting native review from a hash failure.

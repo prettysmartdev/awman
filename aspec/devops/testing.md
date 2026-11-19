@@ -171,6 +171,9 @@ tests, never run on the host.
 At the end of a test every owned process, port, socket and directory is checked.
 A survivor, an address still accepting connections, or a socket file left in
 `sock_dir` is reported as a `LEAK` and fails the test.
+On Linux, when procfs is available, TCP ownership includes the original socket
+inode: an unrelated test reusing a closed address is not a surviving resource.
+Without that identity evidence the checker conservatively probes the address.
 
 Release database handles and other file owners before calling `finish()`. For
 ordinary scoped tests, declare the sandbox first and let its checked `Drop` run
