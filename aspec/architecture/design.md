@@ -4,7 +4,9 @@
 
 awman follows a **four-layer architecture** that separates data, business logic, command dispatch, and presentation. This design ensures functional parity across four frontend adapters (CLI, TUI, API, squad) while maintaining code health and enabling future frontend implementations.
 
-Pattern: single statically-linked binary
+Pattern: one executable with application/runtime dependencies statically linked
+or embedded; only the platform system ABI may remain dynamic, as specified in
+[`aspec/foundation.md`](../foundation.md) and checked by the release pipeline.
 
 For the complete architectural specification, see [`aspec/architecture/2026-grand-architecture.md`](./2026-grand-architecture.md).
 

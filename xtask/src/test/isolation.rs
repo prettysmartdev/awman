@@ -87,13 +87,23 @@ impl Run {
     }
     fn for_home(home: PathBuf) -> Result<Self> {
         let before = protected_snapshot(&home)?;
-        let root = tempfile::Builder::new().prefix("awman-run-").tempdir_in(
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("awman-run-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let root = builder.tempdir_in(
             std::env::var_os("AWMAN_TEST_TMPROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir),
         )?;
         for dir in ["home", "awman", "tmp", "config", "data", "cache"] {
-            std::fs::create_dir(root.path().join(dir))?;
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder.create(root.path().join(dir))?;
         }
         Ok(Self { root, home, before })
     }
@@ -303,6 +313,31 @@ mod tests {
         assert!(Path::new(vars[std::ffi::OsStr::new("AWMAN_TEST_TMPROOT")])
             .starts_with(run.root.path()));
         assert_eq!(vars[std::ffi::OsStr::new("AWMAN_TEST_ISOLATION")], "1");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Both the runner root and every exposed ancestor must be private:
+            // native builtin state checks its entire parent chain.
+            for path in std::iter::once(run.root.path().to_owned()).chain(
+                [
+                    "HOME",
+                    "AWMAN_HOME",
+                    "AWMAN_TEST_TMPROOT",
+                    "XDG_CONFIG_HOME",
+                    "XDG_DATA_HOME",
+                    "XDG_CACHE_HOME",
+                ]
+                .into_iter()
+                .map(|key| PathBuf::from(vars[std::ffi::OsStr::new(key)])),
+            ) {
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o700,
+                    "runner exposed a non-private directory: {}",
+                    path.display()
+                );
+            }
+        }
         for secret in ["GITHUB_TOKEN", "GH_TOKEN", "SSH_AUTH_SOCK", "DOCKER_HOST"] {
             assert!(!vars.contains_key(std::ffi::OsStr::new(secret)));
         }

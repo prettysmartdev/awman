@@ -1111,12 +1111,12 @@ evidence = "AWMAN_TEST_EVIDENCE_DIR"
 host_resources = "AWMAN_TEST_HOST_RESOURCES"
 
 # Lexically present but never read from a shipped process: namespace identifiers,
-# compile-time support metadata, reserved inert countdown spellings and cfg(test)
-# child protocols. Runtime controls above remain separate from shipped_switch.
+# compile-time support metadata, cfg(test) retired-control regressions and child
+# protocols. Runtime controls above remain separate from shipped_switch.
 reserved_namespace_literal = "AWMAN_TEST_"
 reserved_namespace_identifier = "AWMAN_TEST_PREFIX"
-reserved_agent_countdown = "AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS"
-reserved_yolo_countdown = "AWMAN_TEST_YOLO_COUNTDOWN_MS"
+test_retired_agent_countdown = "AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS"
+test_retired_yolo_countdown = "AWMAN_TEST_YOLO_COUNTDOWN_MS"
 test_apple_image = "AWMAN_TEST_APPLE_IMAGE"
 test_apple_keep_archive = "AWMAN_TEST_APPLE_KEEP_ARCHIVE"
 test_apple_kill_helper = "AWMAN_TEST_APPLE_KILL_HELPER"

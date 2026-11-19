@@ -94,18 +94,6 @@ pub const AWMAN_TEST_SBX: &str = "AWMAN_TEST_SBX";
 /// runtime's state directory.
 pub const AWMAN_TEST_BUILTIN: &str = "AWMAN_TEST_BUILTIN";
 
-/// `AWMAN_TEST_YOLO_COUNTDOWN_MS` — under [`AWMAN_TEST_ISOLATION`], a shorter
-/// yolo / failure-retry countdown in milliseconds, so an integration test that
-/// drives a real `awman` process through the countdown need not wait out the
-/// 60 s default. Ignored outside test isolation; see
-/// `engine::workflow::timing::yolo_countdown_duration`.
-pub const AWMAN_TEST_YOLO_COUNTDOWN_MS: &str = "AWMAN_TEST_YOLO_COUNTDOWN_MS";
-
-/// `AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS` — under [`AWMAN_TEST_ISOLATION`], a
-/// shorter `AgentDone` countdown (WI 0141) in milliseconds; see
-/// `engine::workflow::timing::agent_done_countdown_duration`.
-pub const AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS: &str = "AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS";
-
 /// Every `AWMAN_*` name awman reads as a **process variable** rather than as
 /// config: the storage root, the session id, the squad bearer key and the
 /// test switches. None of these is ever resolved against the key table, and
@@ -122,8 +110,6 @@ pub const PROCESS_VARS: &[&str] = &[
     AWMAN_TEST_APPLE_CONTAINER,
     AWMAN_TEST_SBX,
     AWMAN_TEST_BUILTIN,
-    AWMAN_TEST_YOLO_COUNTDOWN_MS,
-    AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS,
 ];
 
 /// Whether `name` is an `AWMAN_*` config variable (as opposed to a process
@@ -612,33 +598,6 @@ impl EnvSnapshot {
         self.truthy(AWMAN_TEST_BUILTIN)
     }
 
-    /// The yolo countdown `AWMAN_TEST_YOLO_COUNTDOWN_MS` asks for, when it
-    /// holds a whole number of milliseconds and `AWMAN_TEST_ISOLATION` is on.
-    /// `None` in every normal run, whatever the variable holds.
-    pub fn test_yolo_countdown(&self) -> Option<std::time::Duration> {
-        if !self.test_isolation() {
-            return None;
-        }
-        self.get(AWMAN_TEST_YOLO_COUNTDOWN_MS)?
-            .trim()
-            .parse()
-            .ok()
-            .map(std::time::Duration::from_millis)
-    }
-
-    /// The `AgentDone` countdown `AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS` asks for,
-    /// under the same rules as [`Self::test_yolo_countdown`].
-    pub fn test_agent_done_countdown(&self) -> Option<std::time::Duration> {
-        if !self.test_isolation() {
-            return None;
-        }
-        self.get(AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS)?
-            .trim()
-            .parse()
-            .ok()
-            .map(std::time::Duration::from_millis)
-    }
-
     /// The [`AMBIENT_MSB_OVERRIDES`] present in this snapshot, in list order.
     /// Set counts, even to an empty value: the SDK does not distinguish.
     pub fn ambient_msb_overrides(&self) -> Vec<&'static str> {
@@ -1055,5 +1014,36 @@ impl std::fmt::Debug for DaemonEnvMap {
         f.debug_struct("DaemonEnvMap")
             .field("names", &self.names())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Retired test controls remain inert even when inherited by an isolated
+    /// process, without registering their spellings in the shipped env schema.
+    #[test]
+    fn retired_countdown_controls_are_not_process_or_config_overrides() {
+        let retired = [
+            "AWMAN_TEST_YOLO_COUNTDOWN_MS",
+            "AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS",
+        ];
+        for name in retired {
+            assert!(!PROCESS_VARS.contains(&name));
+            assert!(!RESERVED_ENV.contains(&name));
+        }
+        for isolated in ["0", "1"] {
+            let env = EnvSnapshot::with_overrides([
+                (AWMAN_TEST_ISOLATION, isolated),
+                (retired[0], "1"),
+                (retired[1], "1"),
+                ("AWMAN_AGENTS_DEFAULT", "claude"),
+            ]);
+            assert_eq!(
+                ConfigOverrides::from_env(&env, |_| Vec::new()).unwrap().0,
+                [("agents.default".into(), Value::String("claude".into()))]
+            );
+        }
     }
 }
