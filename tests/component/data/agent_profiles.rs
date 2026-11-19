@@ -34,6 +34,7 @@ fn stage(lease: &ProfileLease, generation: u64) -> std::path::PathBuf {
     p
 }
 #[test]
+#[cfg(unix)] // settings profiles are unix-only
 fn layout_private_publication_and_retention() {
     let s = TestSandbox::new();
     let (layout, mut m) = fixture(&s);
@@ -101,6 +102,7 @@ fn lease_contention_and_reopen_preserves_durable_state() {
     );
 }
 #[test]
+#[cfg(unix)] // settings profiles are unix-only
 fn orphan_generation_never_becomes_current_and_next_publication_recovers() {
     let s = TestSandbox::new();
     let (layout, mut m) = fixture(&s);
@@ -146,6 +148,7 @@ fn identity_schema_links_and_portable_names_fail_closed() {
     }
 }
 #[test]
+#[cfg(unix)] // settings profiles are unix-only
 fn inactive_deletion_and_delete_launch_race_use_one_namespace() {
     let s = TestSandbox::new();
     let (layout, m) = fixture(&s);

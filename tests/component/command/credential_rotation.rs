@@ -149,7 +149,6 @@ async fn idle_staging_requires_new_generation_consumption_and_isolates_profiles(
         .unwrap();
     assert_eq!(replay, op);
     drop(enrollment);
-    sandbox.finish();
 }
 #[tokio::test]
 async fn cancellation_fences_ack_and_a_file_write_never_passes_live_coverage() {
@@ -209,7 +208,6 @@ async fn cancellation_fences_ack_and_a_file_write_never_passes_live_coverage() {
     assert_eq!(result.status, CredentialUpdateStatus::Failed);
     assert_eq!(result.generation_state, GenerationState::Unknown);
     drop(enrollment);
-    sandbox.finish();
 }
 
 #[cfg(unix)]
@@ -296,7 +294,6 @@ async fn private_fake_request_consumes_staged_generation_before_live_ack() {
     assert_eq!(op.status, CredentialUpdateStatus::Applied);
     assert!(op.new_execution_id.is_none());
     drop(enrollment);
-    sandbox.finish();
 }
 
 struct SourceFailure;
@@ -425,7 +422,6 @@ async fn source_expiry_is_pollable_and_preserves_confirmed_generation_and_refres
     assert_eq!(failure.credential_generation, slot.credential_generation);
     assert_eq!(failure.generation_state, GenerationState::Confirmed);
     drop(enrollment);
-    sandbox.finish();
 }
 
 fn credential_host(
@@ -496,7 +492,6 @@ async fn restart_refusal_has_no_process_turn_terminal_or_command_side_effects() 
     assert!(runtime.staged.lock().unwrap().is_none());
     assert!(redaction.is_empty());
     drop(_enrollment);
-    sandbox.finish();
 }
 
 #[tokio::test]
@@ -564,7 +559,6 @@ async fn rejected_material_never_changes_redaction_revision_or_admission() {
         e.revision
     );
     drop(_enrollment);
-    sandbox.finish();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -616,7 +610,6 @@ async fn concurrent_controller_retries_return_one_operation() {
     assert_eq!(first.request_id, second.request_id);
     assert_eq!(first.new_generation, second.new_generation);
     drop(_enrollment);
-    sandbox.finish();
 }
 
 #[tokio::test]
@@ -701,7 +694,6 @@ async fn ordinary_profile_terminal_requires_a_real_input_grant() {
         .unwrap();
     assert_eq!(accepted.old_execution_id, e.execution_id);
     drop(_enrollment);
-    sandbox.finish();
 }
 
 struct OwnedStage {
@@ -789,7 +781,6 @@ async fn cancelled_delivery_keeps_its_owned_task_until_late_writer_cleanup() {
     )
     .await;
     drop(_enrollment);
-    sandbox.finish();
 }
 
 #[tokio::test]
@@ -840,7 +831,6 @@ async fn redaction_capacity_failure_is_pollable_without_retiring_existing_output
     assert_eq!(redaction.redact("ordinary output"), "ordinary output");
     assert!(runtime.staged.lock().unwrap().is_none());
     drop(_enrollment);
-    sandbox.finish();
 }
 
 #[tokio::test]
@@ -918,5 +908,4 @@ async fn timed_out_delivery_is_pollable_before_owned_writer_finishes() {
         Some(failure)
     );
     drop(enrollment);
-    sandbox.finish();
 }

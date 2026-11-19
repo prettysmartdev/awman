@@ -183,6 +183,7 @@ fn transcript(p: &ProfileSession, id: &str) {
     .unwrap();
 }
 #[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
 async fn contention_retention_two_profiles_under_one_home_and_exact_resume() {
     let s = TestSandbox::new();
     let session = session(&s);
@@ -273,6 +274,7 @@ async fn contention_retention_two_profiles_under_one_home_and_exact_resume() {
     ));
 }
 #[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
 async fn crash_free_lock_never_authorizes_a_second_writer_and_close_is_idempotent() {
     let s = TestSandbox::new();
     let session = session(&s);
@@ -343,6 +345,7 @@ async fn crash_free_lock_never_authorizes_a_second_writer_and_close_is_idempoten
     lease.remove_profile().unwrap();
 }
 #[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
 async fn restart_after_cleanup_before_inactive_and_unavailable_runtime() {
     let s = TestSandbox::new();
     let session = session(&s);
@@ -380,6 +383,7 @@ async fn restart_after_cleanup_before_inactive_and_unavailable_runtime() {
 }
 
 #[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
 async fn crash_after_generation_commit_never_reexports_partial_run_tree() {
     let s = TestSandbox::new();
     let session = session(&s);
@@ -446,6 +450,7 @@ async fn crash_after_generation_commit_never_reexports_partial_run_tree() {
 }
 
 #[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
 async fn runtime_listing_miss_keeps_profile_closing() {
     let s = TestSandbox::new();
     let session = session(&s);
@@ -482,6 +487,7 @@ async fn runtime_listing_miss_keeps_profile_closing() {
 }
 
 #[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
 async fn missing_definition_close_keeps_previous_generation() {
     let s = TestSandbox::new();
     let session = session(&s);
@@ -545,6 +551,7 @@ async fn unsafe_unrelated_profile_directory_does_not_block_admission() {
 }
 
 #[test]
+#[cfg(unix)] // settings profiles are unix-only
 fn native_ids_are_taken_only_from_provider_transcript_paths() {
     let s = TestSandbox::new();
     let root = s.tmp().join("history-tree");
@@ -591,6 +598,7 @@ fn native_ids_are_taken_only_from_provider_transcript_paths() {
     );
 }
 #[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
 async fn rejected_snapshot_stays_closing_until_explicit_close_retains_previous() {
     let s = TestSandbox::new();
     let session = session(&s);
@@ -692,6 +700,7 @@ async fn explicit_close_retains_previous_and_removes_guest_planted_special_file(
     assert!(!lease.run_dir(&id).exists());
 }
 #[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
 async fn reused_resource_identity_is_left_alone_and_close_delete_launch_contend() {
     let s = TestSandbox::new();
     let session = session(&s);
@@ -802,6 +811,7 @@ async fn profile_command(
     Ok(serde_json::to_value(outcome).unwrap())
 }
 #[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
 async fn profile_commands_are_image_independent_and_close_delete_launch_serialize() {
     let s = TestSandbox::new();
     let session = session(&s);
@@ -977,6 +987,7 @@ async fn profile_api_admission_requires_authenticated_local_owner() {
         .is_err());
 }
 #[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
 async fn identity_mismatch_never_publishes_a_replacement_conversation() {
     let s = TestSandbox::new();
     let session = session(&s);
@@ -1053,6 +1064,7 @@ fn sanitizer_allowlists_preserve_restrictions_and_drop_credential_endpoints() {
 }
 
 #[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
 async fn credential_injection_is_execution_private_and_never_exported() {
     use awman::data::fs::AuthPathResolver;
     use awman::engine::{
@@ -1124,6 +1136,7 @@ async fn credential_injection_is_execution_private_and_never_exported() {
 }
 
 #[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
 async fn crash_during_import_never_publishes_a_partial_policy_copy() {
     let s = TestSandbox::new();
     let session = session(&s);
@@ -1156,6 +1169,7 @@ async fn crash_during_import_never_publishes_a_partial_policy_copy() {
 }
 
 #[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
 async fn credential_replacement_retains_the_profile_lease_and_imports_only_safe_exact_history() {
     let s = TestSandbox::new();
     let session = session(&s);
@@ -1234,6 +1248,7 @@ async fn credential_replacement_retains_the_profile_lease_and_imports_only_safe_
 }
 
 #[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
 async fn intermediate_and_final_history_publications_redact_retained_credentials() {
     use awman::engine::auth::{credential::SecretString, redaction::RedactionSet};
     let s = crate::support::sandbox("command::settings_profiles::intermediate_and_final_history_publications_redact_retained_credentials");
@@ -1283,6 +1298,7 @@ async fn intermediate_and_final_history_publications_redact_retained_credentials
 }
 
 #[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
 async fn retired_or_lost_profile_redaction_withholds_new_history() {
     use awman::engine::auth::{credential::SecretString, redaction::RedactionSet};
     let s = crate::support::sandbox(
@@ -1341,6 +1357,7 @@ async fn retired_or_lost_profile_redaction_withholds_new_history() {
 }
 
 #[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
 async fn intermediate_publication_without_retained_redaction_is_withheld() {
     let s = crate::support::sandbox("command::settings_profiles::intermediate_publication_without_retained_redaction_is_withheld");
     let session = session(&s);

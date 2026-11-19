@@ -2515,6 +2515,7 @@ mod native_plan_option_tests {
     }
 
     #[test]
+    #[cfg(unix)] // secure session config copying is unix-only
     fn opencode_v2_tui_plan_patches_only_its_private_config_copy() {
         let sb = sandbox("opencode_v2_tui_plan_patches_only_its_private_config_copy");
         let host_config = sb.home().join(".config/opencode");

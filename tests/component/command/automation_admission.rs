@@ -84,7 +84,6 @@ impl Default for Options {
 
 /// One owned execution with its store, hub terminal and writer.
 struct Rig {
-    _sandbox: awman_test_support::TestSandbox,
     store: AutomationStore,
     command: CommandId,
     hub: Arc<TerminalHub>,
@@ -98,6 +97,9 @@ struct Rig {
     nonce: String,
     sequence: u64,
     events: Arc<Mutex<Vec<EventPayload>>>,
+    // Last: fields drop in order, and Windows cannot remove the tempdir
+    // while the store above still holds its database open.
+    _sandbox: awman_test_support::TestSandbox,
 }
 
 impl Rig {

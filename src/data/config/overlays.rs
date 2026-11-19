@@ -313,13 +313,37 @@ fn parse_single_typed_overlay(expr: &str) -> Result<TypedOverlay, String> {
     }
 }
 
+/// Split a leading Windows drive (`C:` before `\` or `/`) from `args`.
+/// Other platforms have no drives, so their parsing is unchanged.
+fn split_windows_drive(args: &str) -> (&str, &str) {
+    if cfg!(windows) {
+        let bytes = args.as_bytes();
+        if bytes.len() > 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/')
+        {
+            return args.split_at(2);
+        }
+    }
+    ("", args)
+}
+
 fn parse_dir_overlay_args(args: &str, full_expr: &str) -> Result<DirectorySpec, String> {
     if args.is_empty() {
         return Err(format!(
             "empty arguments in overlay expression: '{full_expr}'"
         ));
     }
-    let parts: Vec<&str> = args.splitn(3, ':').collect();
+    // A Windows host path starts with a drive (`C:\` or `C:/`) whose colon is
+    // not the host/container separator.
+    let (drive, rest) = split_windows_drive(args);
+    let mut parts: Vec<&str> = rest.splitn(3, ':').collect();
+    let with_drive;
+    if !drive.is_empty() {
+        with_drive = format!("{drive}{}", parts[0]);
+        parts[0] = &with_drive;
+    }
     let (host_str, container_str, perm_str) = match parts.len() {
         2 => (parts[0], parts[1], None),
         3 => {
@@ -503,5 +527,28 @@ mod context_key_tests {
         ] {
             assert!(parse_overlay_list(raw).is_err(), "{raw}");
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_drive_tests {
+    use super::*;
+    #[test]
+    fn a_drive_letter_is_part_of_the_host_path() {
+        for (raw, host) in [
+            (
+                r"dir(C:\work\payload.json:/workspace/x.json:ro)",
+                r"C:\work\payload.json",
+            ),
+            ("dir(d:/work:/work)", "d:/work"),
+        ] {
+            let parsed = parse_overlay_list(raw).unwrap();
+            let TypedOverlay::Directory(spec) = &parsed[0] else {
+                panic!("expected dir");
+            };
+            assert_eq!(spec.host, host, "{raw}");
+            assert!(spec.container.starts_with('/'), "{raw}");
+        }
+        assert!(parse_overlay_list(r"dir(C:\work:/x:bad)").is_err());
     }
 }

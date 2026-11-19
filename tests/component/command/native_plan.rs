@@ -512,24 +512,28 @@ async fn chat_plan_maps_each_agent_without_touching_mounts() {
         assert_eq!(reported[0]["workspace_access"], "read_write", "{agent}");
     }
     // OpenCode 2's full TUI: a private default_agent, no argv, host untouched.
-    let host = s.home().join(".config/opencode");
-    std::fs::create_dir_all(&host).unwrap();
-    std::fs::write(host.join("opencode.json"), "{\"default_agent\": \"build\"}").unwrap();
-    let (_, _) = chat(
-        &f,
-        chat_flags("opencode-v2", true),
-        WorkspaceAccess::ReadWrite,
-    )
-    .await;
-    let launch = f.last();
-    assert_eq!(launch.argv, ["opencode", "--standalone"]);
-    let private: Value =
-        serde_json::from_str(launch.private_opencode_config.as_deref().unwrap()).unwrap();
-    assert_eq!(private["default_agent"], "plan");
-    assert_eq!(
-        std::fs::read_to_string(host.join("opencode.json")).unwrap(),
-        "{\"default_agent\": \"build\"}"
-    );
+    // Its private config copy is unix-only.
+    #[cfg(unix)]
+    {
+        let host = s.home().join(".config/opencode");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(host.join("opencode.json"), "{\"default_agent\": \"build\"}").unwrap();
+        let (_, _) = chat(
+            &f,
+            chat_flags("opencode-v2", true),
+            WorkspaceAccess::ReadWrite,
+        )
+        .await;
+        let launch = f.last();
+        assert_eq!(launch.argv, ["opencode", "--standalone"]);
+        let private: Value =
+            serde_json::from_str(launch.private_opencode_config.as_deref().unwrap()).unwrap();
+        assert_eq!(private["default_agent"], "plan");
+        assert_eq!(
+            std::fs::read_to_string(host.join("opencode.json")).unwrap(),
+            "{\"default_agent\": \"build\"}"
+        );
+    }
     s.finish();
 }
 

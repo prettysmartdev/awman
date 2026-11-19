@@ -108,7 +108,6 @@ fn credential_state_and_execution_revision_commit_or_rollback_together() {
     );
     let record = store.read_execution(&e.execution_id).unwrap();
     assert_eq!(record.snapshot.unwrap().revision, confirmed.revision);
-    sandbox.finish();
 }
 pub(crate) fn enroll(
     store: &AutomationStore,
@@ -251,7 +250,6 @@ fn generations_burn_on_failure_and_terminal_results_are_immutable() {
         .effective_credentials(&e.owner_key, &e.execution_id)
         .unwrap();
     assert_eq!(effective.slots[0].pending_generation, Some(3));
-    sandbox.finish();
 }
 #[test]
 fn two_store_instances_serialize_active_updates_and_recovery_loses_material() {
@@ -288,7 +286,6 @@ fn two_store_instances_serialize_active_updates_and_recovery_loses_material() {
     assert_eq!(failed.failure.unwrap().code, "credentials_lost");
     let connection = awman::data::fs::api_db::SqliteSessionStore::open(&path).unwrap();
     let _ = AutomationStore::open(std::sync::Arc::new(connection)).unwrap();
-    sandbox.finish();
 }
 
 #[test]
@@ -335,7 +332,6 @@ fn concurrent_identical_reservations_share_one_generation_and_request_namespace(
     assert!(!db
         .windows(b"test-secret".len())
         .any(|s| s == b"test-secret"));
-    sandbox.finish();
 }
 
 #[test]
@@ -367,7 +363,6 @@ fn pre_rotation_database_migrates_twice_without_losing_request_replay() {
             }
         ));
     }
-    sandbox.finish();
 }
 
 #[test]
@@ -401,7 +396,6 @@ fn initial_consumption_is_confirmed_only_before_a_new_generation_is_allocated() 
             None
         )
         .is_err());
-    sandbox.finish();
 }
 
 #[test]
@@ -443,7 +437,6 @@ fn restart_requires_continuity_before_reservation_and_rejects_old_consumption() 
             .status,
         CredentialUpdateStatus::Pending
     );
-    sandbox.finish();
 }
 
 #[test]
@@ -494,7 +487,6 @@ fn crash_recovery_preserves_confirmed_material_until_delivery_started() {
         assert_eq!(slot.update_method, slot.route.method(slot.generation_state));
         assert!(slot.latest_update.unwrap().status.is_terminal());
     }
-    sandbox.finish();
 }
 
 #[test]
@@ -536,5 +528,4 @@ fn exposed_column_upgrade_is_idempotent_and_new_reservations_remain_unexposed() 
         Ok(())
     })
     .unwrap();
-    sandbox.finish();
 }

@@ -58,11 +58,13 @@ fn binding() -> ExecutionProfileBinding {
 
 /// A durable command row plus its automation store.
 struct Host {
-    sandbox: awman_test_support::TestSandbox,
     db: Arc<SqliteSessionStore>,
     store: AutomationStore,
     command: CommandId,
     events: Arc<Mutex<Vec<EventPayload>>>,
+    // Last: fields drop in order, and Windows cannot remove the tempdir
+    // while the store above still holds its database open.
+    sandbox: awman_test_support::TestSandbox,
 }
 
 impl Host {

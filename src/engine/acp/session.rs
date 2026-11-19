@@ -178,7 +178,9 @@ impl AcpSession {
     }
 
     async fn initialize_session(&mut self, cwd: &Path) -> Result<String, EngineError> {
-        if !cwd.is_absolute() {
+        // A container path is POSIX whatever the host is: `Path::is_absolute`
+        // rejects "/workspace" on a Windows host.
+        if !cwd.to_str().is_some_and(|path| path.starts_with('/')) {
             return Err(EngineError::Acp(
                 "ACP session cwd must be absolute inside the container".into(),
             ));

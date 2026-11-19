@@ -1397,6 +1397,7 @@ pub(crate) mod workspace_access_tests {
     /// The configured endpoint (`DOCKER_HOST`) protects its ancestors even
     /// when nothing is listening there yet.
     #[test]
+    #[cfg(unix)] // DOCKER_HOST unix:// endpoints are unix-only
     fn final_check_protects_the_configured_runtime_endpoint() {
         let sandbox = TestSandbox::for_test(TestCase::component("engine::container::options::workspace_access_tests::final_check_protects_the_configured_runtime_endpoint"));
         let endpoint_dir = sandbox.root().join("engine-home");

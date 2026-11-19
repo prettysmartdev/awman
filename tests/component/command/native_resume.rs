@@ -263,6 +263,7 @@ async fn native_stream_requires_exact_first_identity_across_split_frames() {
 }
 
 #[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
 async fn profile_plan_patches_both_private_opencode_settings_files() {
     use awman::{
         command::commands::launch_policy::settings_profile::{enter, ProfileRequest},
