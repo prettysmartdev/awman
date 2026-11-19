@@ -7,6 +7,7 @@ use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
@@ -106,9 +107,9 @@ impl Drop for Run {
     fn drop(&mut self) {
         if let Some(id) = &self.registry {
             // Last-resort cleanup for preparation errors; successful runs record removal.
-            let _ = Command::new("docker")
+            let _ = self
+                .native_command("docker")
                 .args(["rm", "--force", id])
-                .envs(&self.env)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -116,15 +117,26 @@ impl Drop for Run {
     }
 }
 impl Run {
+    fn native_command(&self, program: &str) -> Command {
+        let mut command = Command::new(program);
+        command.current_dir(&self.root).envs(&self.env);
+        remove_cargo_package_metadata(
+            &mut command,
+            std::env::vars_os()
+                .map(|(name, _)| name)
+                .chain(self.env.keys().map(OsString::from)),
+        );
+        command
+    }
+
     fn command(&mut self, name: &str, program: &str, args: &[&str]) -> Result<String> {
         eprintln!("native validation: {name} (logs: {})", self.out.display());
         let stdout = self.out.join(format!("{name}.stdout"));
         let stderr = self.out.join(format!("{name}.stderr"));
         let start = Instant::now();
-        let status = Command::new(program)
+        let status = self
+            .native_command(program)
             .args(args)
-            .current_dir(&self.root)
-            .envs(&self.env)
             .stdin(Stdio::null())
             .stdout(fs::File::create(&stdout)?)
             .stderr(fs::File::create(stderr)?)
@@ -166,6 +178,86 @@ impl Run {
                 dir.to_str().unwrap(),
             ],
         )
+    }
+}
+
+/// `cargo run -p xtask` injects metadata about xtask into this process. Passing
+/// it to another Cargo invocation changes dependency build-script fingerprints
+/// (ring tracks these names), forcing rebuilds when switching to `make install`.
+/// Keep actual Cargo/toolchain settings and PATH; the child Cargo supplies its
+/// own package metadata to each build script and executable.
+fn remove_cargo_package_metadata(command: &mut Command, names: impl IntoIterator<Item = OsString>) {
+    for name in names {
+        let metadata = name.to_str().is_some_and(|name| {
+            name.starts_with("CARGO_PKG_")
+                || matches!(
+                    name,
+                    "CARGO_MANIFEST_DIR" | "CARGO_MANIFEST_PATH" | "CARGO_MANIFEST_LINKS"
+                )
+        });
+        if metadata {
+            command.env_remove(name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    /// hygiene-allow(H2): Inspects child environment directives without starting a process.
+    fn native_children_drop_parent_package_metadata_but_keep_build_settings() {
+        let metadata = [
+            "CARGO_MANIFEST_DIR",
+            "CARGO_MANIFEST_PATH",
+            "CARGO_MANIFEST_LINKS",
+            "CARGO_PKG_NAME",
+            "CARGO_PKG_VERSION",
+            "CARGO_PKG_VERSION_MAJOR",
+            "CARGO_PKG_VERSION_MINOR",
+            "CARGO_PKG_VERSION_PATCH",
+            "CARGO_PKG_VERSION_PRE",
+            "CARGO_PKG_AUTHORS",
+            "CARGO_PKG_DESCRIPTION",
+        ];
+        let settings = [
+            ("PATH", "/pinned-tools:/usr/bin"),
+            ("CARGO_TARGET_DIR", "/private/build"),
+            ("CARGO_HOME", "/tools/cargo"),
+            ("RUSTUP_HOME", "/tools/rustup"),
+            ("RUSTUP_TOOLCHAIN", "1.94.0"),
+            ("CARGO_BUILD_TARGET", "x86_64-unknown-linux-gnu"),
+            ("CARGO_BUILD_JOBS", "2"),
+            ("CARGO_MAKEFLAGS", "--jobserver-auth=8,9"),
+            ("CARGO_PROFILE_RELEASE_LTO", "thin"),
+            ("RUSTFLAGS", "-C debuginfo=0"),
+            ("CARGO_ENCODED_RUSTFLAGS", "-C\u{1f}debuginfo=0"),
+        ];
+        let mut command = Command::new("cargo");
+        command.envs(metadata.iter().map(|name| (name, "parent-xtask-value")));
+        command.envs(settings);
+        remove_cargo_package_metadata(
+            &mut command,
+            metadata
+                .iter()
+                .copied()
+                .chain(settings.iter().map(|(name, _)| *name))
+                .map(OsString::from),
+        );
+        let environment: BTreeMap<_, _> = command.get_envs().collect();
+        for name in metadata {
+            // None is an explicit removal, preventing inherited parent values.
+            assert_eq!(environment[OsStr::new(name)], None, "{name}");
+        }
+        for (name, value) in settings {
+            assert_eq!(
+                environment[OsStr::new(name)],
+                Some(OsStr::new(value)),
+                "{name}"
+            );
+        }
     }
 }
 fn git(root: &Path, args: &[&str]) -> Result<String> {
