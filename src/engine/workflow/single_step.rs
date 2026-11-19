@@ -135,6 +135,8 @@ impl WorkflowEngine {
     /// attempt this launch is.
     pub(super) fn main_step_source(&self, step_name: &str, step_attempt: u32) -> EventSource {
         EventSource {
+            execution_id: None,
+            turn_id: None,
             phase: EventSourcePhase::Main,
             step_name: Some(step_name.to_string()),
             step_index: self.state.step_index(step_name),
@@ -269,7 +271,11 @@ impl WorkflowEngine {
                 .first_mut()
                 .and_then(|s| s.execution.as_mut())
                 .expect("launch_step stored execution");
-            exec.wait().await
+            let result = exec.wait().await;
+            self.agent_factory
+                .execution_finished(exec.handle().clone())
+                .await;
+            result
         };
         self.finalize_step(&step_name, exit)
     }
@@ -435,8 +441,10 @@ impl WorkflowEngine {
             .expect("launch_step stored execution");
         let (wait_tx, mut wait_rx) =
             tokio::sync::oneshot::channel::<(AgentExecution, Result<AgentExitInfo, EngineError>)>();
+        let factory = self.agent_factory.clone();
         tokio::spawn(async move {
             let result = exec.wait().await;
+            factory.execution_finished(exec.handle().clone()).await;
             let _ = wait_tx.send((exec, result));
         });
 

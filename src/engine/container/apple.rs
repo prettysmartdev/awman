@@ -426,6 +426,30 @@ impl ContainerBackend for AppleBackend {
         host_cli_backend::cli_is_available(self.cli(), &["system", "status"])
     }
 
+    fn resource_label(
+        &self,
+        handle: &AgentHandle,
+        key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        let cli = self.cli();
+        let out = crate::engine::host_cli::checked_output(
+            cli.command().args(["inspect", &handle.id]),
+            cli.bin,
+        )?;
+        if !out.status.success() {
+            return Err(EngineError::Container(
+                "resource identity inspection failed".into(),
+            ));
+        }
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .map_err(|e| EngineError::Container(e.to_string()))?;
+        let row = value.as_array().and_then(|v| v.first()).unwrap_or(&value);
+        let labels = row
+            .pointer("/configuration/labels")
+            .or_else(|| row.get("labels"))
+            .ok_or_else(|| EngineError::Container("resource labels unavailable".into()))?;
+        Ok(labels.get(key).and_then(|v| v.as_str()).map(str::to_owned))
+    }
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
         host_cli_backend::cli_stop_checked(self.cli(), &handle.id)
     }

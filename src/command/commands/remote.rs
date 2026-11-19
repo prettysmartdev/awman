@@ -498,6 +498,7 @@ async fn run_remote_exec(
                 }
                 let prefix = self.step_prefix(&event);
                 match event.payload {
+                    EventPayload::AgentCredentialsChanged { .. } | EventPayload::AgentExecutionReplaced { .. } | EventPayload::AgentState { .. } | EventPayload::AgentIdentity { .. } | EventPayload::AgentTurnStarted { .. } | EventPayload::AgentTurnCompleted { .. } => {},
                     EventPayload::StdoutLine(line) => {
                         println!("{prefix}{line}");
                     }

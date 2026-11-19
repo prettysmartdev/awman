@@ -108,6 +108,7 @@ pub enum SessionCommandAdmission {
 /// Persistable command metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandRecord {
+    pub automation: Option<crate::data::automation_records::AutomationSnapshot>,
     pub listener_name: Option<String>,
     pub allow_remote_input: bool,
     pub listener: String,
@@ -263,6 +264,8 @@ impl std::fmt::Display for WorkerId {
 /// filled only where it is known; the pre-0137 fields keep their meaning.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommandResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation: Option<crate::data::automation_records::CommandAutomationResult>,
     pub exit_code: Option<i32>,
     /// How the command ended, refining the row's coarse `done | error |
     /// cancelled` status (an `error` row has outcome `error`, `aborted` or
@@ -670,6 +673,8 @@ impl SqliteSessionStore {
         Self::add_column_if_missing(conn, "idempotency_keys", "intent_body", "TEXT")?;
         Self::add_column_if_missing(conn, "idempotency_keys", "resource_kind", "TEXT")?;
         Self::add_column_if_missing(conn, "idempotency_keys", "resource_id", "TEXT")?;
+        Self::add_column_if_missing(conn, "commands", "active_execution_id", "TEXT")?;
+        crate::data::automation_store::migrate(conn)?;
         crate::data::fs::schema_version::migrate_ids(conn)?;
         Ok(())
     }
@@ -979,7 +984,7 @@ impl SqliteSessionStore {
         filter: &CommandListFilter<'_>,
     ) -> Result<Vec<CommandRecord>, DataError> {
         let mut sql = String::from(
-            "SELECT c.id,c.session_id,c.subcommand,c.args,c.status,c.exit_code,c.started_at,c.finished_at,c.log_path,c.worker_id,c.queued_at,c.result,c.attempt,c.listener,c.trace_parent,c.allow_remote_input,c.listener_name FROM commands c WHERE 1=1",
+            "SELECT c.id,c.session_id,c.subcommand,c.args,c.status,c.exit_code,c.started_at,c.finished_at,c.log_path,c.worker_id,c.queued_at,c.result,c.attempt,c.listener,c.trace_parent,c.allow_remote_input,c.listener_name,(SELECT CASE WHEN snapshot_json IS NULL OR (revision=json_extract(snapshot_json,'$.revision') AND active_turn_id IS json_extract(snapshot_json,'$.active_turn_id') AND execution_id=json_extract(snapshot_json,'$.execution_id') AND native_session_id IS json_extract(snapshot_json,'$.native_session_id')) THEN snapshot_json ELSE 'corrupt automation snapshot' END FROM agent_executions e WHERE e.execution_id=c.active_execution_id) FROM commands c WHERE 1=1",
         );
         let mut args: Vec<Value> = Vec::new();
         if let Some(session) = filter.session_id {
@@ -1055,7 +1060,8 @@ impl SqliteSessionStore {
     ) -> Result<Vec<(String, usize)>, DataError> {
         let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
         let cutoff_str = cutoff.to_rfc3339();
-        let conn = self.lock();
+        let mut conn = self.lock();
+        let conn = conn.transaction()?;
         let session_ids: Vec<String> = {
             let mut stmt = conn.prepare(
                 "SELECT id FROM sessions \
@@ -1069,6 +1075,12 @@ impl SqliteSessionStore {
 
         let mut deleted = Vec::with_capacity(session_ids.len());
         for sid in &session_ids {
+            // Keep profile cleanup ownership reachable until its final assurance
+            // confirms cleanup. Reconciliation belongs to the profile owner.
+            let unfinished: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM agent_executions e JOIN commands c ON c.id=e.command_id WHERE c.session_id=? AND (e.launch_phase!='ended' OR e.final_assurance_json IS NULL OR json_extract(e.final_assurance_json,'$.cleanup_status')!='complete'))",params![sid],|r|r.get(0))?;
+            if unfinished {
+                continue;
+            }
             let cmd_count: usize = conn.query_row(
                 "SELECT COUNT(*) FROM commands WHERE session_id = ?1",
                 params![sid],
@@ -1079,10 +1091,17 @@ impl SqliteSessionStore {
                 params![sid],
             )?;
             conn.execute("DELETE FROM labels WHERE owner_kind='command' AND owner_id IN (SELECT id FROM commands WHERE session_id=?1)", params![sid])?;
+            conn.execute("DELETE FROM agent_credential_updates WHERE command_id IN (SELECT id FROM commands WHERE session_id=?)",params![sid])?;
+            conn.execute("DELETE FROM agent_credential_slots WHERE command_id IN (SELECT id FROM commands WHERE session_id=?)",params![sid])?;
+            conn.execute("DELETE FROM agent_credential_authorities WHERE authority_id NOT IN (SELECT authority_id FROM agent_credential_slots)",[])?;
+            conn.execute("DELETE FROM agent_request_dedup WHERE command_id IN (SELECT id FROM commands WHERE session_id=?)",params![sid])?;
+            conn.execute("DELETE FROM agent_turns WHERE command_id IN (SELECT id FROM commands WHERE session_id=?)",params![sid])?;
+            conn.execute("DELETE FROM agent_executions WHERE command_id IN (SELECT id FROM commands WHERE session_id=?)",params![sid])?;
             conn.execute("DELETE FROM commands WHERE session_id = ?1", params![sid])?;
             conn.execute("DELETE FROM sessions WHERE id = ?1", params![sid])?;
             deleted.push((sid.clone(), cmd_count));
         }
+        conn.commit()?;
         Ok(deleted)
     }
 
@@ -1126,7 +1145,7 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, subcommand, args, status, exit_code, \
-                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent, allow_remote_input, listener_name
+                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent, allow_remote_input, listener_name,(SELECT CASE WHEN snapshot_json IS NULL OR (revision=json_extract(snapshot_json,'$.revision') AND active_turn_id IS json_extract(snapshot_json,'$.active_turn_id') AND execution_id=json_extract(snapshot_json,'$.execution_id') AND native_session_id IS json_extract(snapshot_json,'$.native_session_id')) THEN snapshot_json ELSE 'corrupt automation snapshot' END FROM agent_executions e WHERE e.execution_id=commands.active_execution_id)
              FROM commands WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], command_record_from_row)?;
@@ -1154,7 +1173,7 @@ impl SqliteSessionStore {
     ) -> Result<(), DataError> {
         let conn = self.lock();
         conn.execute(
-            "UPDATE commands SET status = ?1, exit_code = ?2, finished_at = ?3 WHERE id = ?4",
+            "UPDATE commands SET status = ?1, exit_code = ?2, finished_at = ?3 WHERE id = ?4 AND NOT EXISTS (SELECT 1 FROM agent_executions WHERE command_id = commands.id AND (launch_phase != 'ended' OR pending_events_json IS NOT NULL))",
             params![status.as_str(), exit_code, finished_at, id],
         )?;
         Ok(())
@@ -1549,7 +1568,7 @@ impl SqliteSessionStore {
                  LIMIT 1
              )
              RETURNING id, session_id, subcommand, args, status, exit_code,
-                       started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent, allow_remote_input, listener_name",
+                       started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent, allow_remote_input, listener_name,(SELECT CASE WHEN snapshot_json IS NULL OR (revision=json_extract(snapshot_json,'$.revision') AND active_turn_id IS json_extract(snapshot_json,'$.active_turn_id') AND execution_id=json_extract(snapshot_json,'$.execution_id') AND native_session_id IS json_extract(snapshot_json,'$.native_session_id')) THEN snapshot_json ELSE 'corrupt automation snapshot' END FROM agent_executions e WHERE e.execution_id=commands.active_execution_id)",
         )?;
         let mut rows = stmt.query_map(params![worker_id, now], command_record_from_row)?;
         match rows.next() {
@@ -1567,11 +1586,23 @@ impl SqliteSessionStore {
     ) -> Result<(), DataError> {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.lock();
-        conn.execute(
+        let changed = conn.execute(
             "UPDATE commands SET status = ?1, exit_code = ?2, finished_at = COALESCE(finished_at, ?3), result = ?4
-             WHERE id = ?5",
+             WHERE id = ?5 AND (active_execution_id IS NULL OR (status = 'running' AND NOT EXISTS (SELECT 1 FROM agent_executions WHERE command_id=commands.id AND (launch_phase!='ended' OR pending_events_json IS NOT NULL))))",
             params![status.as_str(), exit_code, now, result_json, id],
         )?;
+        if changed == 0 {
+            let fenced: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM commands WHERE id=?1 AND active_execution_id IS NOT NULL AND (status IS NOT ?2 OR exit_code IS NOT ?3 OR result IS NOT ?4))",
+                params![id, status.as_str(), exit_code, result_json],
+                |r| r.get(0),
+            )?;
+            if fenced {
+                return Err(DataError::Other(
+                    "command finalization fenced by execution".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1586,7 +1617,7 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let changed = conn.execute(
             "UPDATE commands SET status = ?1, exit_code = ?2, finished_at = ?3, result = ?4
-             WHERE id = ?5 AND status = 'running' AND attempt = ?6",
+             WHERE id = ?5 AND status = 'running' AND attempt = ?6 AND NOT EXISTS (SELECT 1 FROM agent_executions WHERE command_id=commands.id AND (launch_phase!='ended' OR pending_events_json IS NOT NULL))",
             params![
                 completion.status.as_str(),
                 completion.exit_code,
@@ -1607,7 +1638,7 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, subcommand, args, status, exit_code,
-                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent, allow_remote_input, listener_name
+                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent, allow_remote_input, listener_name,(SELECT CASE WHEN snapshot_json IS NULL OR (revision=json_extract(snapshot_json,'$.revision') AND active_turn_id IS json_extract(snapshot_json,'$.active_turn_id') AND execution_id=json_extract(snapshot_json,'$.execution_id') AND native_session_id IS json_extract(snapshot_json,'$.native_session_id')) THEN snapshot_json ELSE 'corrupt automation snapshot' END FROM agent_executions e WHERE e.execution_id=commands.active_execution_id)
              FROM commands
              WHERE session_id = ?1
              ORDER BY queued_at DESC, rowid DESC
@@ -1650,7 +1681,7 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, subcommand, args, status, exit_code,
-                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent, allow_remote_input, listener_name
+                    started_at, finished_at, log_path, worker_id, queued_at, result, attempt, listener, trace_parent, allow_remote_input, listener_name,(SELECT CASE WHEN snapshot_json IS NULL OR (revision=json_extract(snapshot_json,'$.revision') AND active_turn_id IS json_extract(snapshot_json,'$.active_turn_id') AND execution_id=json_extract(snapshot_json,'$.execution_id') AND native_session_id IS json_extract(snapshot_json,'$.native_session_id')) THEN snapshot_json ELSE 'corrupt automation snapshot' END FROM agent_executions e WHERE e.execution_id=commands.active_execution_id)
              FROM commands
              WHERE session_id = ?1 AND status = 'running'
              LIMIT 1",
@@ -1689,7 +1720,8 @@ impl SqliteSessionStore {
             let mut stmt = conn.prepare(
                 "SELECT id FROM commands
                  WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1
-                   AND worker_id IS NOT 'pull'",
+                   AND worker_id IS NOT 'pull'
+                   AND NOT EXISTS (SELECT 1 FROM agent_executions WHERE command_id = commands.id AND launch_phase IN ('launching', 'running', 'ended'))",
             )?;
             let rows = stmt
                 .query_map(params![cutoff_str], |row| row.get(0))?
@@ -1700,7 +1732,8 @@ impl SqliteSessionStore {
             "UPDATE commands SET status = 'queued', worker_id = NULL, started_at = NULL,
                  attempt = attempt + 1
              WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1
-                   AND worker_id IS NOT 'pull'",
+                   AND worker_id IS NOT 'pull'
+                   AND NOT EXISTS (SELECT 1 FROM agent_executions WHERE command_id = commands.id AND launch_phase IN ('launching', 'running', 'ended'))",
             params![cutoff_str],
         )?;
         Ok(ids)
@@ -1799,6 +1832,16 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
 
 fn command_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CommandRecord> {
     Ok(CommandRecord {
+        automation: {
+            let value: Option<String> = row.get(17)?;
+            value
+                .map(|json| {
+                    serde_json::from_str(&json).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(17, Type::Text, Box::new(e))
+                    })
+                })
+                .transpose()?
+        },
         listener_name: row.get(16)?,
         allow_remote_input: row.get(15)?,
         listener: row.get(13)?,

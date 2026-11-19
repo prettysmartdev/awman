@@ -45,6 +45,8 @@ awman ready
 
 This checks your container runtime, Dockerfiles, images, and agent authentication (it sends the agent a test greeting and shows the response). All green means you're ready.
 
+If you only need the images built — for example in CI, or before you have logged in to a provider — use `awman ready --prepare-only`. It builds, imports and trust-checks the images but never runs a host agent, reads a credential or audits your Dockerfile, and it reports authentication as **not checked**. "Images ready" and "authenticated" are separate answers; see [`ready --prepare-only`](03-agent-sessions.md#preparing-images-without-authentication-ready---prepare-only). To pick up a newer agent CLI, rebuild with `awman ready --prepare-only --build --agent <name>`; awman needs no update and version diagnostics never block a launch (only a confirmed wrong OpenCode major does).
+
 ## 4. Run your first session
 
 ```sh
@@ -65,10 +67,10 @@ That's it — you have an isolated agent working in your repo.
 
 - [Concepts](01-concepts.md) — the mental model: images, work items, overlays, modes
 - [Using the TUI](02-using-the-tui.md) — tabs, keybindings, the container window
-- [Agent Sessions](03-agent-sessions.md) — all `chat` flags and session management
+- [Agent Sessions](03-agent-sessions.md) — all `chat` flags, settings profiles, native resume and `--automation`
 - [Workflows](05-workflows.md) — multi-step agent runs with setup and teardown
 - [Dynamic Workflows](06-dynamic-workflows.md) — let a leader agent design and run a workflow for you, no file to write
-- [Permission modes](03-agent-sessions.md#permission-modes) — `--plan`, `--auto`, and fully autonomous `--yolo`
+- [Permission modes](03-agent-sessions.md#permission-modes) — `--plan` (native starting mode), `--auto`, and fully autonomous `--yolo`; `--read-only-workspace` is separate
 - [GitHub Integration](10-github-integration.md) — drive `new spec`, `exec workflow`, and `exec prompt` from GitHub issues with `--work-item`
 - [squad](12-squad.md) — hand recurring work to a group of agents that watches for it and runs a workflow unattended
 - [Runtimes](11-runtimes.md) — Docker, Apple Containers, Docker Sandboxes, and the builtin embedded microVM runtime

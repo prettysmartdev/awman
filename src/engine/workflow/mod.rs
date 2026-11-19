@@ -340,7 +340,7 @@ pub struct WorkflowEngine {
     state_store: WorkflowStateStore,
     effective_config: EffectiveConfig,
     frontend: Box<dyn WorkflowFrontend>,
-    agent_factory: Box<dyn AgentExecutionFactory>,
+    agent_factory: std::sync::Arc<dyn AgentExecutionFactory>,
     /// Containers currently alive. The single-step path keeps exactly one
     /// entry (the focused step); the parallel path keeps up to `max_concurrent`.
     active_steps: Vec<ActiveParallelStep>,
@@ -866,7 +866,7 @@ impl WorkflowEngine {
             state_store,
             effective_config,
             frontend,
-            agent_factory,
+            agent_factory: agent_factory.into(),
             active_steps: Vec::new(),
             max_concurrent,
             current_step_name: None,

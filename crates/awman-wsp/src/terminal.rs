@@ -42,6 +42,35 @@ pub struct LeaseTerminalFrame {
     pub frame: TerminalFrame,
 }
 
+impl TerminalFrame {
+    /// WSP carries only ordinary terminal controls toward a worker.
+    pub fn is_client_frame(&self) -> bool {
+        matches!(
+            self,
+            Self::Input { .. } | Self::Resize { .. } | Self::TakeControl | Self::Detached { .. }
+        )
+    }
+    pub fn is_server_frame(&self) -> bool {
+        matches!(
+            self,
+            Self::Snapshot { .. }
+                | Self::Output { .. }
+                | Self::Resize { .. }
+                | Self::Exit { .. }
+                | Self::Lagged
+                | Self::Error { .. }
+        )
+    }
+}
+impl LeaseTerminalFrame {
+    pub fn decode_input(text: &str) -> Result<Self, &'static str> {
+        let frame: Self = serde_json::from_str(text).map_err(|_| "invalid_frame")?;
+        if !frame.frame.is_client_frame() {
+            return Err("invalid_frame");
+        }
+        Ok(frame)
+    }
+}
 fn default_has_output() -> bool {
     true
 }
@@ -79,7 +108,8 @@ mod transport {
                 match std::task::ready!(Pin::new(&mut self.0).poll_next(cx)) {
                     Some(Ok(Message::Text(text))) => {
                         return Poll::Ready(Some(
-                            serde_json::from_str(&text).map_err(|_| Error::InvalidResponse),
+                            LeaseTerminalFrame::decode_input(&text)
+                                .map_err(|_| Error::InvalidResponse),
                         ))
                     }
                     Some(Ok(Message::Close(_))) | None => return Poll::Ready(None),
@@ -167,3 +197,52 @@ mod transport {
 }
 #[cfg(feature = "terminal")]
 pub use transport::TerminalSocket;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn shared_fixture_pins_the_ordinary_wsp_subset_and_rejects_guarded_input() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../web/test/lib/fixtures/terminal-frames.json"
+        ))
+        .unwrap();
+        assert_eq!(SUBPROTOCOL, "awman.terminal.v1");
+        for frame in fixture["server"].as_array().unwrap() {
+            let allowed = fixture["wsp"]["server"]
+                .as_array()
+                .unwrap()
+                .contains(&frame["type"]);
+            let decoded = serde_json::from_value::<TerminalFrame>(frame.clone());
+            assert_eq!(decoded.is_ok(), allowed);
+            if let Ok(decoded) = decoded {
+                assert!(decoded.is_server_frame());
+            }
+        }
+        for frame in fixture["client"].as_array().unwrap() {
+            let mut input = frame.clone();
+            input["terminal_id"] = "term_11111111111111111111111111111111".into();
+            let allowed = fixture["wsp"]["client"]
+                .as_array()
+                .unwrap()
+                .contains(&frame["type"]);
+            assert_eq!(
+                LeaseTerminalFrame::decode_input(&input.to_string()).is_ok(),
+                allowed
+            );
+        }
+        for frame in fixture["server"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["type"] != "resize")
+        {
+            let mut input = frame.clone();
+            input["terminal_id"] = "term_11111111111111111111111111111111".into();
+            assert_eq!(
+                LeaseTerminalFrame::decode_input(&input.to_string()).unwrap_err(),
+                "invalid_frame"
+            );
+        }
+    }
+}

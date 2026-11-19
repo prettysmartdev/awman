@@ -526,6 +526,19 @@ impl OverlayEngine {
         lease_scope: Option<&Path>,
         command_mounts: &[DirectorySpec],
     ) -> Result<(Vec<OverlaySpec>, Vec<StagedCredentialFile>), EngineError> {
+        self.build_scoped_profile_overlays(session, request, lease_scope, command_mounts, None)
+    }
+
+    /// Profile mounts replace only the provider settings delivery. Other
+    /// overlays and skill resolution still use the common path.
+    pub fn build_scoped_profile_overlays(
+        &self,
+        session: &Session,
+        request: &OverlayRequest,
+        lease_scope: Option<&Path>,
+        command_mounts: &[DirectorySpec],
+        profile: Option<&crate::engine::agent::profile_state::ProfileRunState>,
+    ) -> Result<(Vec<OverlaySpec>, Vec<StagedCredentialFile>), EngineError> {
         let lease_scope = lease_scope
             .map(std::fs::canonicalize)
             .transpose()
@@ -574,17 +587,29 @@ impl OverlayEngine {
         //    and the request's container_home so settings paths agree with
         //    user-supplied overlays.
         if let Some(agent) = &request.agent {
-            let (agent_overlays, staged) = self.agent_settings_overlays_with_credentials(
-                agent,
-                definition.as_deref(),
-                request.yolo,
-                session.git_root(),
-                request.container_home.as_deref(),
-                request.materialize_credentials,
-                crate::data::fs::data_paths::data_home(session.env())
-                    .ok()
-                    .as_deref(),
-            )?;
+            let (agent_overlays, staged) = if let Some(profile) = profile {
+                self.profile_settings_overlays(
+                    agent,
+                    definition
+                        .as_deref()
+                        .ok_or_else(|| EngineError::Config("profile definition absent".into()))?,
+                    profile,
+                    request.container_home.as_deref().unwrap_or("/root"),
+                    request.materialize_credentials,
+                )?
+            } else {
+                self.agent_settings_overlays_with_credentials(
+                    agent,
+                    definition.as_deref(),
+                    request.yolo,
+                    session.git_root(),
+                    request.container_home.as_deref(),
+                    request.materialize_credentials,
+                    crate::data::fs::data_paths::data_home(session.env())
+                        .ok()
+                        .as_deref(),
+                )?
+            };
             staged_credentials.extend(staged);
             for spec in agent_overlays {
                 let key = OverlayPathResolver::conflict_key(&spec.host_path);
@@ -898,6 +923,7 @@ fn insert_or_merge(map: &mut HashMap<String, OverlaySpec>, key: String, spec: Ov
 // split by what is being staged. All private: `OverlayEngine` is declared in
 // this file, so the module's public surface is unchanged.
 mod agent_settings;
+pub(crate) use agent_settings::apply_native_settings_patch;
 pub(crate) use agent_settings::overlaps_protected_root as seed_overlaps_protected_root;
 mod claude;
 mod credential_file;

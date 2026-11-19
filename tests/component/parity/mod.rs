@@ -38,6 +38,14 @@ async fn config_round_trip(kind: BackendKind, id: &'static str) -> String {
 }
 mod builtin {
     #[tokio::test(flavor = "multi_thread")]
+    async fn plan_and_mount_access_reach_the_final_launch_independently() {
+        super::agents::plan_and_mount_access_reach_the_final_launch_independently(
+            super::BackendKind::Builtin,
+            "parity::builtin::plan_and_mount_access_reach_the_final_launch_independently",
+        )
+        .await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
     async fn cursor_env_output_is_redacted() {
         super::agents::cursor_env_output_is_redacted(
             super::BackendKind::Builtin,

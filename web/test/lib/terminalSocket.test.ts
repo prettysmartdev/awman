@@ -256,3 +256,28 @@ describe('TerminalConnection policy close (1008) classification', () => {
     expect(h.hub.sockets).toHaveLength(1);
   });
 });
+
+describe('terminal automation v1 contract', () => {
+  const automation = fixture<{ server: TerminalFrame[]; automation_examples: Record<string, TerminalFrame>; invalid: { server: unknown[] } }>('terminal-frames.json');
+  it('observes every notification independently of PTY output and exit', async () => {
+    const { hub, connection, timers } = await setup();
+    hub.last.open('awman.terminal.v1');
+    const frames: string[] = [], outputs: Uint8Array[] = [], exits: number[] = [];
+    connection.onAutomation(frame => frames.push(frame.type)); connection.onOutput(bytes => outputs.push(bytes)); connection.onExit(code => exits.push(code));
+    const control = connection.takeControl(); await timers.runAll(); await control;
+    for (const frame of automation.server.filter(frame => ['automation_state', 'turn_accepted', 'turn_result', 'execution_closed', 'execution_replaced', 'operation_error'].includes(frame.type))) hub.last.receive(frame);
+    expect(frames).toEqual(['automation_state', 'turn_accepted', 'turn_result', 'execution_closed', 'execution_replaced', 'operation_error']);
+    expect(outputs).toEqual([]); expect(exits).toEqual([]); expect(connection.state.get()).toBe('open');
+    expect(connection.control.get().holder).toBe('none'); expect(connection.automation.get()).toBeNull();
+    expect(hub.last.frames().some(frame => frame.type === 'submit_turn' || frame.type === 'close_execution')).toBe(false);
+    hub.last.receive(automation.automation_examples.best_effort); expect(connection.automation.get()?.status_support).toBe('best_effort');
+    hub.last.receive(automation.automation_examples.none); expect(connection.automation.get()?.status_support).toBe('none');
+    connection.close(); expect(hub.last.frames().at(-1)).toEqual({ type: 'detached', reason: 'user' });
+  });
+  it('rejects malformed correlation, unsafe counters and invalid native ids', async () => {
+    for (const frame of automation.invalid.server) {
+      const { hub, connection } = await setup(); hub.last.open('awman.terminal.v1'); hub.last.receive(frame);
+      expect(connection.state.get()).not.toBe('open'); connection.close();
+    }
+  });
+});

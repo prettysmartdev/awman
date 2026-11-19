@@ -30,6 +30,7 @@ pub mod image_inputs;
 pub mod image_tags;
 pub mod init_files;
 pub mod issue;
+pub mod jsonc;
 pub mod merge_fix_prompt;
 pub mod message;
 pub mod network;
@@ -96,3 +97,17 @@ pub mod secret;
 pub mod git_transport;
 pub mod launch_context;
 pub mod workspace;
+
+// WI 0070 — shared Layer 0 vocabulary for native modes, preparation,
+// settings profiles, automation and credential updates. Definitions only;
+// the layers above own every decision made with them.
+pub mod agent_failure;
+pub mod agent_policy;
+pub mod automation;
+pub mod automation_observation;
+pub mod credential_update;
+pub mod preparation;
+pub mod settings_profile;
+
+pub mod automation_records;
+pub mod automation_store;

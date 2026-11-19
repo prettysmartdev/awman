@@ -104,6 +104,8 @@ pub(crate) type CancelFn = Arc<dyn Fn() + Send + Sync>;
 /// Per-bridge configuration. Bundled into one struct so the bridge functions
 /// don't grow an unwieldy parameter list as more knobs land.
 pub(crate) struct BridgeConfig {
+    /// Whether the first-byte grace kill applies (WI 0070).
+    pub startup_timing: crate::data::automation::StartupTiming,
     pub output_redaction: crate::engine::auth::redaction::RedactionSet,
     pub terminal: Option<crate::engine::agent_runtime::execution::TerminalLaunch>,
     pub program_status: ProgramStatusBridgeConfig,
@@ -173,6 +175,8 @@ impl OutputActivity {
 
 /// Timing knobs and the grace-expiry callback for one [`StuckDetector`].
 pub(crate) struct StuckConfig {
+    /// `LifecycleDeadline` disables the grace kill (automation launches).
+    pub startup_timing: crate::data::automation::StartupTiming,
     pub program_status: Option<SharedProgramStatusTracker>,
     pub grace_timeout: Duration,
     pub stuck_timeout: Duration,
@@ -222,6 +226,7 @@ impl StuckDetector {
         output: &OutputActivity,
     ) -> Arc<tokio::sync::broadcast::Sender<StuckEvent>> {
         let StuckConfig {
+            startup_timing,
             program_status,
             grace_timeout,
             stuck_timeout,
@@ -294,6 +299,11 @@ impl StuckDetector {
                 }
 
                 if !first_byte.load(Ordering::Acquire) {
+                    if startup_timing == crate::data::automation::StartupTiming::LifecycleDeadline {
+                        // The automation lifecycle deadline owns startup; a
+                        // silent agent is not killed here.
+                        continue;
+                    }
                     // Grace phase — measure from end of the start-delay window.
                     if grace_start.elapsed() >= grace_timeout {
                         let _ = tx.send(StuckEvent::StartupGraceExpired);
@@ -489,6 +499,7 @@ pub(crate) fn bridge_pty(
 
     let stuck_tx = StuckDetector::spawn(
         StuckConfig {
+            startup_timing: config.startup_timing,
             grace_timeout: config.grace_timeout,
             stuck_timeout: config.stuck_timeout,
             container_start_delay: config.container_start_delay,
@@ -650,6 +661,7 @@ pub(crate) fn bridge_piped(
 
     let stuck_tx = StuckDetector::spawn(
         StuckConfig {
+            startup_timing: config.startup_timing,
             grace_timeout: config.grace_timeout,
             stuck_timeout: config.stuck_timeout,
             container_start_delay: config.container_start_delay,
@@ -665,5 +677,137 @@ pub(crate) fn bridge_piped(
         stuck_tx,
         output_tail: config.output_tail,
         program_status,
+    }
+}
+
+#[cfg(test)]
+mod inactivity_tests {
+    use super::*;
+    use crate::data::config::{
+        effective::{ConfigLayers, EffectiveConfig},
+        env::EnvSnapshot,
+        file::ConfigFile,
+    };
+    use crate::engine::agent_runtime::frontend::{with_stuck_timeout, AgentFrontend};
+
+    use awman_test_support::{TestCase, TestSandbox};
+
+    struct NullAgentFrontend;
+    impl crate::data::message::UserMessageSink for NullAgentFrontend {
+        fn write_message(&mut self, _: crate::data::message::UserMessage) {}
+        fn replay_queued(&mut self) {}
+    }
+    #[async_trait::async_trait]
+    impl AgentFrontend for NullAgentFrontend {
+        fn report_status(&mut self, _: crate::engine::agent_runtime::frontend::AgentStatus) {}
+        fn report_progress(&mut self, _: crate::engine::agent_runtime::frontend::AgentProgress) {}
+        fn take_io(&mut self) -> AgentIo {
+            panic!("detector test does not bind process I/O")
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn effective_stuck_timeout_changes_only_advisory_silence_events() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::io_bridge::inactivity_tests::effective_stuck_timeout_changes_only_advisory_silence_events"));
+        for (duration, expected_stuck) in [("30s", true), ("60s", false)] {
+            let layers = ConfigLayers {
+                global: serde_json::from_value::<ConfigFile>(
+                    serde_json::json!({"agents":{"stuckTimeout":duration}}),
+                )
+                .unwrap(),
+                ..Default::default()
+            };
+            let config =
+                EffectiveConfig::resolve(layers, Default::default(), EnvSnapshot::empty()).unwrap();
+            let frontend =
+                with_stuck_timeout(Box::new(NullAgentFrontend), config.agent_stuck_timeout());
+            assert_eq!(
+                frontend.grace_timeout(),
+                crate::engine::container::timing::DEFAULT_GRACE_TIMEOUT
+            );
+            let output = OutputActivity::new();
+            output.touch();
+            *output.last.lock().unwrap() = Some(Instant::now() - Duration::from_secs(45));
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let flag = cancelled.clone();
+            let sender = StuckDetector::spawn(
+                StuckConfig {
+                    program_status: None,
+                    startup_timing: frontend.startup_timing(),
+                    grace_timeout: frontend.grace_timeout(),
+                    stuck_timeout: frontend.stuck_timeout(),
+                    container_start_delay: Duration::ZERO,
+                    cancel_on_grace_expired: Some(Arc::new(move || {
+                        flag.store(true, Ordering::SeqCst);
+                    })),
+                    poll_interval: Duration::from_millis(1),
+                },
+                &output,
+            );
+            let mut receiver = sender.subscribe();
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(2)).await;
+            tokio::task::yield_now().await;
+            if expected_stuck {
+                assert!(matches!(receiver.try_recv(), Ok(StuckEvent::Stuck)));
+                output.touch();
+                tokio::time::advance(Duration::from_millis(2)).await;
+                tokio::task::yield_now().await;
+                assert!(matches!(receiver.try_recv(), Ok(StuckEvent::Unstuck)));
+            } else {
+                assert!(matches!(
+                    receiver.try_recv(),
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                ));
+            }
+            assert!(!cancelled.load(Ordering::SeqCst));
+            drop(sender);
+        }
+        sandbox.finish();
+    }
+}
+
+/// WI 0070: the automation lifecycle deadline replaces the first-byte grace
+/// kill (including after an Apple-style start delay); ordinary launches keep
+/// it. Real short deadlines: the detector measures with `std::time`.
+#[cfg(test)]
+mod startup_timing_tests {
+    use super::*;
+    use crate::data::automation::StartupTiming;
+
+    /// hygiene-allow(H3): proving that no grace kill happens needs real elapsed time past the grace window; the detector measures with std::time.
+    async fn killed_by_grace(timing: StartupTiming, start_delay: Duration) -> bool {
+        let output = OutputActivity::new();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let sender = StuckDetector::spawn(
+            StuckConfig {
+                program_status: None,
+                startup_timing: timing,
+                grace_timeout: Duration::from_millis(60),
+                stuck_timeout: Duration::from_secs(3600),
+                container_start_delay: start_delay,
+                cancel_on_grace_expired: Some(Arc::new(move || {
+                    flag.store(true, Ordering::SeqCst);
+                })),
+                poll_interval: Duration::from_millis(5),
+            },
+            &output,
+        );
+        // Silent well beyond the grace (and beyond any start delay).
+        tokio::time::sleep(start_delay + Duration::from_millis(400)).await;
+        let killed = cancelled.load(Ordering::SeqCst);
+        drop(sender);
+        killed
+    }
+
+    #[tokio::test]
+    async fn ordinary_grace_kills_but_the_lifecycle_deadline_never_does() {
+        assert!(killed_by_grace(StartupTiming::FirstByteGrace, Duration::ZERO).await);
+        assert!(!killed_by_grace(StartupTiming::LifecycleDeadline, Duration::ZERO).await);
+        // The Apple start-delay window adds nothing for automation.
+        assert!(
+            !killed_by_grace(StartupTiming::LifecycleDeadline, Duration::from_millis(80)).await
+        );
+        assert!(killed_by_grace(StartupTiming::FirstByteGrace, Duration::from_millis(80)).await);
     }
 }

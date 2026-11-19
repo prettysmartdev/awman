@@ -136,7 +136,8 @@ impl CommandLifecycleStore {
         self.store.with_conn(|conn| {
             let changed = conn.execute(
                 "UPDATE commands SET status = 'cancelled', exit_code = ?1, finished_at = ?2, result = ?3
-                 WHERE id = ?4 AND status = 'running'",
+                 WHERE id = ?4 AND status = 'running'
+                   AND NOT EXISTS (SELECT 1 FROM agent_executions WHERE command_id = commands.id AND (launch_phase != 'ended' OR pending_events_json IS NOT NULL))",
                 params![CANCELLED_EXIT_CODE, finished_at, result, command_id],
             )?;
             Ok(changed > 0)
@@ -202,7 +203,8 @@ impl CommandLifecycleStore {
             for (id, requested_at) in &rows {
                 conn.execute(
                     "UPDATE commands SET status = 'cancelled', exit_code = ?1, finished_at = ?2, result = ?3
-                     WHERE id = ?4 AND status IN ('queued', 'pending', 'running')",
+                     WHERE id = ?4 AND status IN ('queued', 'pending', 'running')
+                       AND NOT EXISTS (SELECT 1 FROM agent_executions WHERE command_id = commands.id AND (launch_phase != 'ended' OR pending_events_json IS NOT NULL))",
                     params![
                         CANCELLED_EXIT_CODE,
                         finished_at,

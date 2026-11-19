@@ -12,6 +12,7 @@ mod operations;
 mod policy;
 
 pub use operations::{
-    OwnerEventLog, OwnerResolver, TerminalOperations, TerminalRefusal, TerminalSession,
+    AutomationRefusal, ClientFrameResponse, OperationReply, OwnerEventLog, OwnerResolver,
+    TerminalAutomation, TerminalOperations, TerminalRefusal, TerminalSession,
 };
 pub use policy::{AccessPolicy, InputGrants};

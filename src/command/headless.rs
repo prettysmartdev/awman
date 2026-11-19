@@ -114,7 +114,7 @@
 //! ## What is deliberately not here
 //!
 //! - **`confirm_deletion`** (`awman clean`). The API answers `false` from an
-//!   impl that never runs (`clean` is `api_allowed: false` at the catalogue).
+//!   impl that never runs (`clean` is `ApiAvailability::Disabled` at the catalogue).
 //!   The CLI does *not* default: with no TTY and no `--yes` it raises
 //!   `CommandError::InteractiveInputUnavailable`, refusing to guess about
 //!   deletion. That is a gate, not an answer, so only the API delegates.

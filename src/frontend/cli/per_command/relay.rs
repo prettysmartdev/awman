@@ -261,7 +261,7 @@ fn field<T: serde::de::DeserializeOwned>(
 
 /// Decode just the relayable command outcomes. This translation is kept
 /// beside their CLI renderers; no wire payload is treated as display text.
-fn decode_outcome(
+pub(crate) fn decode_outcome(
     value: serde_json::Value,
     json: bool,
 ) -> Result<crate::command::CommandOutcome, serde_json::Error> {
@@ -274,12 +274,16 @@ fn decode_outcome(
     Ok(match value["kind"].as_str() {
         Some("Empty" | "Init") => O::Empty,
         Some("Chat") => O::Chat(ChatOutcome {
+            automation: field(payload, "automation")?,
+            automation_final_message: None,
             agent: field(payload, "agent")?,
-            exit_code: field(payload, "exit_code")?,
+            exit_code: Some(field(payload, "exit_code")?),
         }),
         Some("ExecPrompt") => O::ExecPrompt(ExecPromptOutcome {
+            automation: field(payload, "automation")?,
+            automation_final_message: None,
             agent: field(payload, "agent")?,
-            exit_code: field(payload, "exit_code")?,
+            exit_code: Some(field(payload, "exit_code")?),
         }),
         Some("ExecWorkflow") => O::ExecWorkflow(ExecWorkflowOutcome {
             workflow: field(payload, "workflow")?,
@@ -304,6 +308,12 @@ fn decode_outcome(
             base_image_results: field::<Option<_>>(payload, "base_image_results")?
                 .unwrap_or_default(),
             ready: field(payload, "ready")?,
+            // Older workers omit the preparation fields: they ran the full policy.
+            preparation_policy: field::<Option<_>>(payload, "preparation_policy")?
+                .unwrap_or_default(),
+            images_ready: field::<Option<_>>(payload, "images_ready")?
+                .unwrap_or_else(|| payload["ready"].as_bool().unwrap_or(false)),
+            authentication: field::<Option<_>>(payload, "authentication")?.unwrap_or_default(),
             json_requested: json,
             refresh_requested: payload["refresh_requested"].as_bool().unwrap_or(false),
         }),

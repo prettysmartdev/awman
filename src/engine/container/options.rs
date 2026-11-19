@@ -228,6 +228,10 @@ pub enum ContainerOption {
         value: crate::engine::auth::credential::SecretString,
     },
     EnvLiteral(EnvLiteral),
+    NativeResume {
+        tokens: Vec<String>,
+        position: crate::engine::agent::definition::ResumePosition,
+    },
     SeededPrompt(String),
     HeadlessPromptInArgv(bool),
     /// Flag used to deliver the seeded prompt in *interactive* mode (e.g.
@@ -236,6 +240,10 @@ pub enum ContainerOption {
     /// alongside `SeededPrompt` by `build_options` when the agent matrix's
     /// `interactive_seed_delivery` is `Flag`.
     InteractiveSeedFlag(String),
+    /// Flag placed directly before a headless argv prompt (copilot `-p`),
+    /// after every other agent flag, so nothing can land between the flag
+    /// and its value.
+    HeadlessPromptFlag(String),
     Interactive(bool),
     /// Structured stdout protocol for a headless stdio launch.
     AgentOutputFormat(AgentOutputFormat),
@@ -551,6 +559,8 @@ pub struct ResolvedContainerOptions {
     /// it is delivered as `<flag> <text>` (e.g. opencode `--prompt <text>`,
     /// since opencode treats a bare positional as a project directory).
     pub interactive_seed_flag: Option<String>,
+    /// From `ContainerOption::HeadlessPromptFlag`.
+    pub headless_prompt_flag: Option<String>,
     pub interactive: bool,
     /// The protocol actually selected by the launch builder (never inferred
     /// from the agent name or by parsing stdout).
@@ -564,6 +574,10 @@ pub struct ResolvedContainerOptions {
     pub auto: AutoMode,
     pub plan: PlanMode,
     pub working_dir: Option<PathBuf>,
+    pub native_resume: Option<(
+        Vec<String>,
+        crate::engine::agent::definition::ResumePosition,
+    )>,
     pub name: Option<ContainerName>,
     pub cpu: Option<CpuLimit>,
     pub memory: Option<MemoryLimit>,
@@ -614,17 +628,161 @@ pub struct ResolvedContainerOptions {
 /// A container runtime control socket lets the agent start a sibling container
 /// with the checkout mounted writable, so no mount of one (or of a directory
 /// that exposes one) is allowed for a read-only workspace, whatever the
-/// overlay's own permission says: a `:ro` socket bind is still a usable API.
+/// overlay's own permission says: a `:ro` socket bind is still a usable API
+/// (Linux does not apply a read-only mount to `connect(2)` on a socket).
+///
+/// Two layers: the runtime endpoints awman can name (well-known defaults
+/// plus the host environment's `DOCKER_HOST`/`CONTAINER_HOST`, runtime
+/// directory and per-user runtime homes) protect their ancestors lexically;
+/// and every mounted directory except the workspace and its Git
+/// directories is inspected, without following links, for sockets and other
+/// special files ([`reject_special_files`]).
 fn reject_runtime_control_mounts(
     overlays: &[OverlaySpec],
+    env: Option<&crate::data::config::env::EnvSnapshot>,
+    skip_inspection: &[PathBuf],
 ) -> Result<(), crate::engine::error::EngineError> {
-    // Well-known default locations; any socket named directly as a source is
-    // caught by the special-file check below, wherever it lives.
-    let sockets: Vec<PathBuf> = ["/var/run/docker.sock", "/run/docker.sock", "/run/user"]
-        .into_iter()
-        .map(PathBuf::from)
-        .collect();
-    reject_runtime_control_mounts_at(overlays, &sockets)
+    reject_runtime_control_mounts_at(overlays, &runtime_endpoints(env))?;
+    reject_special_files(overlays, skip_inspection, SPECIAL_FILE_SCAN_LIMIT)
+}
+
+/// Runtime control endpoints (sockets or the directories that hold them)
+/// whose ancestors a read-only launch may not mount.
+fn runtime_endpoints(env: Option<&crate::data::config::env::EnvSnapshot>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = [
+        "/var/run/docker.sock",
+        "/run/docker.sock",
+        "/run/user",
+        "/run/podman",
+        "/var/run/podman",
+        "/run/containerd",
+        "/var/run/containerd",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect();
+    let Some(env) = env else {
+        return paths;
+    };
+    for key in ["DOCKER_HOST", "CONTAINER_HOST"] {
+        if let Some(path) = env
+            .get(key)
+            .and_then(|value| value.trim().strip_prefix("unix://"))
+            .filter(|path| path.starts_with('/'))
+        {
+            paths.push(PathBuf::from(path));
+        }
+    }
+    if let Some(dir) = env
+        .get("XDG_RUNTIME_DIR")
+        .filter(|dir| dir.starts_with('/'))
+    {
+        paths.push(PathBuf::from(dir));
+    }
+    if let Some(home) = env.home_dir() {
+        for relative in [
+            ".docker/run",
+            ".colima",
+            ".lima",
+            ".rd",
+            ".orbstack",
+            ".local/share/containers",
+        ] {
+            paths.push(home.join(relative));
+        }
+    }
+    paths
+}
+
+/// Most directory entries [`reject_special_files`] visits under one mount
+/// source; a larger source is refused as unverifiable.
+const SPECIAL_FILE_SCAN_LIMIT: usize = 50_000;
+
+/// Refuse a mount whose source is, or contains, a socket, FIFO or device
+/// file. Directories are walked without following symlinks (a link inside
+/// the mount resolves in the guest's namespace, where no host socket is
+/// mounted). Sources at or under `skip` (the workspace and its Git
+/// directories, which awman mounts itself and the read-only check already
+/// constrains) are not walked. Fails closed when a directory cannot be read
+/// or the source holds more than `limit` entries. A socket created on the
+/// host after this check is outside it: do not mount live runtime state.
+fn reject_special_files(
+    overlays: &[OverlaySpec],
+    skip: &[PathBuf],
+    limit: usize,
+) -> Result<(), crate::engine::error::EngineError> {
+    let refuse = |source: &Path, why: String| {
+        crate::engine::error::EngineError::Config(format!(
+            "read-only workspace cannot mount '{}': {why}",
+            source.display()
+        ))
+    };
+    for overlay in overlays {
+        let source =
+            std::fs::canonicalize(&overlay.host_path).unwrap_or_else(|_| overlay.host_path.clone());
+        if skip.iter().any(|root| source.starts_with(root)) {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&source) else {
+            continue;
+        };
+        if meta.is_file() {
+            continue;
+        }
+        if !meta.is_dir() {
+            return Err(refuse(
+                &overlay.host_path,
+                "it exposes a container runtime control socket or special file".into(),
+            ));
+        }
+        let mut budget = limit;
+        let mut stack = vec![source.clone()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir).map_err(|e| {
+                refuse(
+                    &overlay.host_path,
+                    format!("awman cannot inspect {} for sockets ({e})", dir.display()),
+                )
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|e| {
+                    refuse(
+                        &overlay.host_path,
+                        format!("awman cannot inspect {} for sockets ({e})", dir.display()),
+                    )
+                })?;
+                if budget == 0 {
+                    return Err(refuse(
+                        &overlay.host_path,
+                        format!(
+                            "it holds more than {limit} entries to inspect for sockets; mount a \
+                             narrower directory"
+                        ),
+                    ));
+                }
+                budget -= 1;
+                let kind = entry.file_type().map_err(|e| {
+                    refuse(
+                        &overlay.host_path,
+                        format!("awman cannot inspect {} ({e})", entry.path().display()),
+                    )
+                })?;
+                if kind.is_dir() {
+                    stack.push(entry.path());
+                } else if !kind.is_file() && !kind.is_symlink() {
+                    return Err(refuse(
+                        &overlay.host_path,
+                        format!(
+                            "it contains {}, a socket or special file that may be a container \
+                             runtime control endpoint",
+                            entry.path().display()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn reject_runtime_control_mounts_at(
@@ -663,6 +821,12 @@ fn reject_runtime_control_mounts_at(
 }
 
 impl ResolvedContainerOptions {
+    /// Render the provider argv with the one runtime-neutral argv builder.
+    pub fn agent_argv(&self) -> Result<Vec<String>, crate::engine::error::EngineError> {
+        Ok(super::agent_argv::AgentArgv::from_options(self)?
+            .append_to(self.entrypoint.clone().map(|e| e.0).unwrap_or_default()))
+    }
+
     /// Final backend check. Reuse the lease overlay enforcement, but refuse
     /// any correction here: options reaching a spawn must already be safe.
     pub(crate) fn validate_read_only_workspace(
@@ -703,7 +867,6 @@ impl ResolvedContainerOptions {
                 permission: OverlayPermission::ReadOnly,
             });
         }
-        reject_runtime_control_mounts(&overlays)?;
         let workspaces: Vec<_> = overlays
             .iter()
             .filter(|o| o.container_path == Path::new(WORKSPACE_GUEST_PATH))
@@ -732,6 +895,12 @@ impl ResolvedContainerOptions {
             ));
         }
         let workspace = workspaces[0].host_path.clone();
+        let mut skip_inspection =
+            vec![std::fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.clone())];
+        skip_inspection.extend(crate::engine::worker::lease_workspace::workspace_git_dirs(
+            &workspace,
+        )?);
+        reject_runtime_control_mounts(&overlays, self.host_env.as_ref(), &skip_inspection)?;
         let mut checked: Vec<_> = overlays
             .iter()
             .cloned()
@@ -823,6 +992,14 @@ impl ResolvedContainerOptions {
         // backend. ACP and interactive launches never receive structured flags.
         if !r.interactive && !r.acp {
             r.agent_mode_flags.extend(match r.agent_output_format {
+                AgentOutputFormat::OpenCodeJson | AgentOutputFormat::OpenCodeV2Json => {
+                    vec!["--format".into(), "json".into()]
+                }
+                AgentOutputFormat::CopilotJson => vec!["--output-format".into(), "json".into()],
+                AgentOutputFormat::ClineJson => vec!["--json".into()],
+                AgentOutputFormat::AntigravityStreamJson => {
+                    vec!["--output-format".into(), "stream-json".into()]
+                }
                 AgentOutputFormat::Text => Vec::new(),
                 AgentOutputFormat::ClaudeStreamJson => vec![
                     "--output-format".into(),
@@ -884,9 +1061,13 @@ impl ResolvedContainerOptions {
             ContainerOption::EnvPassthrough(v) => self.env_passthrough.push(v),
             ContainerOption::EnvOverride { key, value } => self.env_overrides.push((key, value)),
             ContainerOption::EnvLiteral(v) => self.env_literal.push(v),
+            ContainerOption::NativeResume { tokens, position } => {
+                self.native_resume = Some((tokens, position))
+            }
             ContainerOption::SeededPrompt(v) => self.seeded_prompt = Some(v),
             ContainerOption::HeadlessPromptInArgv(v) => self.headless_prompt_in_argv = v,
             ContainerOption::InteractiveSeedFlag(v) => self.interactive_seed_flag = Some(v),
+            ContainerOption::HeadlessPromptFlag(v) => self.headless_prompt_flag = Some(v),
             ContainerOption::Interactive(v) => self.interactive = v,
             ContainerOption::AgentOutputFormat(v) => self.agent_output_format = v,
             ContainerOption::Acp(v) => self.acp = v,
@@ -1141,27 +1322,123 @@ pub(crate) mod workspace_access_tests {
         for p in ["/var/run", "/run", "/var", "/"] {
             for perm in [OverlayPermission::ReadOnly, OverlayPermission::ReadWrite] {
                 assert!(
-                    super::reject_runtime_control_mounts(&[overlay(p, perm)]).is_err(),
+                    super::reject_runtime_control_mounts(&[overlay(p, perm)], None, &[]).is_err(),
                     "{p}"
                 );
             }
         }
         // Unix device files are refused regardless of path.
         #[cfg(unix)]
-        assert!(super::reject_runtime_control_mounts(&[overlay(
-            "/dev/null",
-            OverlayPermission::ReadOnly
-        )])
+        assert!(super::reject_runtime_control_mounts(
+            &[overlay("/dev/null", OverlayPermission::ReadOnly)],
+            None,
+            &[]
+        )
         .is_err());
         let dir = sandbox.tmp();
         // Ordinary directories remain accepted.
-        assert!(super::reject_runtime_control_mounts(&[overlay(
-            dir.to_str().unwrap(),
-            OverlayPermission::ReadWrite
-        )])
+        assert!(super::reject_runtime_control_mounts(
+            &[overlay(dir.to_str().unwrap(), OverlayPermission::ReadWrite)],
+            None,
+            &[]
+        )
         .is_ok());
     }
 
+    /// WI 0070 review finding 1: a runtime socket at a non-default location
+    /// (or a special file nested inside an otherwise ordinary directory)
+    /// must not reach a read-only launch through its parent, whatever the
+    /// mount permission.
+    /// hygiene-allow(H4): Socket path is leased by TestSandbox Ports and the listener is dropped and its file removed before the test ends.
+    #[cfg(unix)]
+    #[test]
+    fn final_check_refuses_parents_of_non_default_runtime_sockets() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::options::workspace_access_tests::final_check_refuses_parents_of_non_default_runtime_sockets"));
+        let socket = sandbox.ports().unix_socket("d.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let socket_dir = socket.parent().unwrap().to_path_buf();
+        let nested = sandbox.root().join("rt/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        nix::unistd::mkfifo(&nested.join("pipe"), nix::sys::stat::Mode::S_IRWXU).unwrap();
+        for (source, permission) in [
+            (socket_dir.clone(), OverlayPermission::ReadOnly),
+            (socket_dir.clone(), OverlayPermission::ReadWrite),
+            (sandbox.root().join("rt"), OverlayPermission::ReadOnly),
+            (nested.clone(), OverlayPermission::ReadOnly),
+        ] {
+            let mut options = options(&sandbox);
+            options.overlays.push(OverlaySpec {
+                host_path: source.clone(),
+                container_path: "/control".into(),
+                permission,
+            });
+            let err = options.validate_read_only_workspace().unwrap_err();
+            assert!(
+                err.to_string().contains("socket"),
+                "{}: {err}",
+                source.display()
+            );
+        }
+        // The same directories without the special files are ordinary mounts.
+        drop(listener);
+        std::fs::remove_file(&socket).unwrap();
+        std::fs::remove_file(nested.join("pipe")).unwrap();
+        for source in [socket_dir, sandbox.root().join("rt")] {
+            let mut options = options(&sandbox);
+            options.overlays.push(OverlaySpec {
+                host_path: source,
+                container_path: "/control".into(),
+                permission: OverlayPermission::ReadOnly,
+            });
+            options.validate_read_only_workspace().unwrap();
+        }
+    }
+
+    /// The configured endpoint (`DOCKER_HOST`) protects its ancestors even
+    /// when nothing is listening there yet.
+    #[test]
+    fn final_check_protects_the_configured_runtime_endpoint() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::options::workspace_access_tests::final_check_protects_the_configured_runtime_endpoint"));
+        let endpoint_dir = sandbox.root().join("engine-home");
+        std::fs::create_dir_all(&endpoint_dir).unwrap();
+        let mut options = options(&sandbox);
+        options.host_env = Some(crate::data::config::env::EnvSnapshot::from_full_env(
+            [(
+                "DOCKER_HOST".to_string(),
+                format!("unix://{}/engine.sock", endpoint_dir.display()),
+            )]
+            .into_iter()
+            .collect(),
+        ));
+        options.validate_read_only_workspace().unwrap();
+        options.overlays.push(OverlaySpec {
+            host_path: endpoint_dir,
+            container_path: "/engine".into(),
+            permission: OverlayPermission::ReadOnly,
+        });
+        assert!(options.validate_read_only_workspace().is_err());
+    }
+
+    /// A source too large to inspect fails closed rather than unchecked.
+    #[test]
+    fn special_file_inspection_fails_closed_past_its_limit() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::options::workspace_access_tests::special_file_inspection_fails_closed_past_its_limit"));
+        let dir = sandbox.root().join("many");
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..4 {
+            std::fs::write(dir.join(format!("f{i}")), b"").unwrap();
+        }
+        let overlay = OverlaySpec {
+            host_path: dir.clone(),
+            container_path: "/many".into(),
+            permission: OverlayPermission::ReadOnly,
+        };
+        super::reject_special_files(std::slice::from_ref(&overlay), &[], 4).unwrap();
+        assert!(super::reject_special_files(std::slice::from_ref(&overlay), &[], 3).is_err());
+        // A skipped root (the workspace) is not walked.
+        super::reject_special_files(&[overlay], &[std::fs::canonicalize(&dir).unwrap()], 0)
+            .unwrap();
+    }
     #[cfg(unix)]
     #[test]
     fn final_check_keeps_symlinked_socket_parents_protected() {

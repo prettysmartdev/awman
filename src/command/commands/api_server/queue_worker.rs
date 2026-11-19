@@ -149,6 +149,15 @@ impl QueuedCommandResult {
             outcome = CommandStatusKind::Error;
         }
         let mut json = CommandResult {
+            automation: match result {
+                Ok(outcome) => outcome.automation().cloned(),
+                Err(CommandError::AutomationFailed { automation, .. }) => {
+                    automation.as_deref().cloned()
+                }
+                // A cancelled (or otherwise failed) automation command keeps
+                // its frozen execution assurance.
+                Err(_) => contributions.automation_result.clone(),
+            },
             exit_code: Some(exit_code),
             outcome: Some(outcome),
             error: result.as_ref().err().map(ToString::to_string),
@@ -173,7 +182,18 @@ impl QueuedCommandResult {
                 _ => None,
             },
             pull_request: contributions.pull_request,
-            final_message: contributions.final_message,
+            // Automation never promotes an ordinary candidate, whatever the
+            // outcome shape (success, failure or cancellation): the answer is
+            // the last accepted turn's native-confirmed one, or none. Only a
+            // command that ran no automation keeps the translator fallback.
+            final_message: match result {
+                Ok(outcome) if outcome.automation().is_some() || contributions.automation => {
+                    outcome.automation_final_message().map(str::to_owned)
+                }
+                Err(CommandError::AutomationFailed { final_message, .. }) => final_message.clone(),
+                Err(_) if contributions.automation => None,
+                _ => contributions.final_message,
+            },
             data: contributions.data,
             ..CommandResult::default()
         };
@@ -459,6 +479,15 @@ impl QueuedCommandResult {
             row.result = Some(self.result_json.clone());
             row
         });
+        // WI 0070: a controller-owned terminal publishes its close result and
+        // one logical exit after the result is stored and before the command's
+        // terminal event.
+        if let (Ok(id), Some(result)) = (
+            crate::data::ids::CommandId::parse(&command.id),
+            row.result.as_deref().and_then(read_command_result),
+        ) {
+            crate::command::automation::controller::global().command_finalized(&id, &result);
+        }
         sender.finish(terminal_payload(&row));
         if persisted.is_ok() {
             if let Err(error) = paths.remove_command_completion(&command.session_id, &command.id) {
@@ -466,6 +495,107 @@ impl QueuedCommandResult {
             }
         }
     }
+}
+
+/// WI 0070 crash recovery, before generic stale recovery: automation
+/// executions whose owner died are finalized `execution_lost`
+/// (unacknowledged turns `delivery_unknown`), never requeued or replayed.
+/// Executions a live owner still holds are left alone. A command whose
+/// execution already ended (the owner died before storing the command
+/// result) is finalized from that durable execution: its frozen assurance,
+/// its recorded primary failure (cancellation included) and the last turn's
+/// confirmed answer. Returns the finalized command IDs.
+pub(crate) fn recover_automation_executions(
+    store: &SqliteSessionStore,
+    paths: &ApiPaths,
+) -> Result<Vec<String>, crate::data::error::DataError> {
+    use crate::data::command_status::{CommandCompletion, CommandStatus};
+    let automation = crate::data::automation_store::AutomationStore::from_store(store);
+    let commands = crate::command::automation::ExecutionController::recover(&automation)
+        .map_err(crate::data::error::DataError::Other)?;
+    let mut finalized = Vec::new();
+    for id in commands {
+        let Some(command) = store.get_command(id.as_str())? else {
+            continue;
+        };
+        if command.status != CommandStatus::Running {
+            continue;
+        }
+        let execution = automation.current_execution(&id)?;
+        let assurance = execution.as_ref().and_then(|e| e.final_assurance.clone());
+        let end_failure = execution.as_ref().and_then(|e| e.end_failure.clone());
+        let lost_message = "awman stopped while this execution was running; it was finalized without replay (use an explicit native resume to continue)";
+        let cancelled = end_failure
+            .as_ref()
+            .is_some_and(|f| f.code == crate::command::automation::admission::codes::CANCELLED);
+        // The last turn's confirmed answer, from the durable rows only.
+        let final_message = match &execution {
+            Some(e) if end_failure.is_none() => {
+                let mut cursor = None;
+                let mut turns = Vec::new();
+                loop {
+                    let page = automation.list_turns(&id, cursor.as_deref(), Some(200))?;
+                    turns.extend(page.items);
+                    match page.next_cursor {
+                        Some(next) => cursor = Some(next),
+                        None => break,
+                    }
+                }
+                turns.retain(|t| t.execution_id == e.execution_id);
+                crate::command::automation::results::final_message(&turns)
+            }
+            _ => None,
+        };
+        let (status, kind, exit_code, failure_record) = match &end_failure {
+            None => (CommandStatus::Done, CommandStatusKind::Done, 0, None),
+            Some(_) if cancelled => (
+                CommandStatus::Cancelled,
+                CommandStatusKind::Aborted,
+                130,
+                None,
+            ),
+            Some(f) => (
+                CommandStatus::Error,
+                CommandStatusKind::Error,
+                1,
+                Some(failure(
+                    crate::data::fs::api_db::failure_stages::STEP,
+                    crate::data::agent_failure::ALL
+                        .iter()
+                        .copied()
+                        .find(|known| *known == f.code)
+                        .unwrap_or(crate::data::agent_failure::EXECUTION_LOST),
+                    if f.code == crate::data::agent_failure::EXECUTION_LOST {
+                        lost_message
+                    } else {
+                        &f.message
+                    },
+                    None,
+                )),
+            ),
+        };
+        let result = CommandResult {
+            outcome: Some(kind),
+            exit_code: Some(exit_code),
+            error: failure_record.as_ref().map(|f| f.message.clone()),
+            failure: failure_record,
+            automation: assurance,
+            final_message,
+            ..CommandResult::default()
+        };
+        let completion = CommandCompletion {
+            attempt: command.attempt,
+            status,
+            exit_code,
+            result_json: serde_json::to_string(&result).expect("typed command result"),
+            finished_at: chrono::Utc::now().to_rfc3339(),
+        };
+        if store.finalize_running_command(id.as_str(), &completion)? {
+            finalize_unowned_command(store, paths, id.as_str())?;
+            finalized.push(id.as_str().to_owned());
+        }
+    }
+    Ok(finalized)
 }
 
 /// Read the terminal event from the same row the status route serves. The row
@@ -510,6 +640,11 @@ pub(super) fn finalize_unowned_command(
     if !command.status.is_terminal() {
         return Ok(());
     }
+    CommandLogWriter::recover_lifecycle(
+        paths,
+        &command,
+        &crate::data::automation_store::AutomationStore::from_store(store),
+    )?;
     // Completed history (including pre-0137 rows) is immutable. A restart
     // must not describe today's checkout or change the original finish time.
     if paths
@@ -530,7 +665,12 @@ pub(super) fn finalize_unowned_command(
         // An already structured terminal row is immutable. Only repair a
         // missing terminal pair after a crash; never recompute checkout facts
         // from a checkout that may have changed since this command ended.
-        return CommandLogWriter::append_terminal(paths, &command, terminal_payload(&command));
+        return CommandLogWriter::append_terminal(
+            paths,
+            &command,
+            store,
+            terminal_payload(&command),
+        );
     }
     result.exit_code = result.exit_code.or(command.exit_code);
     if result.outcome.is_none() {
@@ -568,7 +708,7 @@ pub(super) fn finalize_unowned_command(
     let completion = QueuedCommandResult::from_result(result);
     completion.persist(store, id)?;
     if let Some(command) = store.get_command(id)? {
-        CommandLogWriter::append_terminal(paths, &command, terminal_payload(&command))?;
+        CommandLogWriter::append_terminal(paths, &command, store, terminal_payload(&command))?;
     }
     Ok(())
 }
@@ -601,10 +741,15 @@ pub(crate) fn finalize_completed_from_sidecars(
                 // The previous daemon stopped between the row and the sidecar's
                 // removal, possibly before logging the terminal pair (a no-op
                 // when the pair is already there).
-                if let Err(error) =
-                    CommandLogWriter::append_terminal(paths, &command, terminal_payload(&command))
-                {
+                if let Err(error) = CommandLogWriter::append_terminal(
+                    paths,
+                    &command,
+                    store,
+                    terminal_payload(&command),
+                ) {
                     tracing::error!(%error, session_id, command_id = id, "Failed to append terminal events");
+                    failures.push(error.to_string());
+                    continue;
                 }
                 remove_applied_sidecar(paths, session_id, id);
             }
@@ -657,6 +802,11 @@ pub(super) fn finalize_running_from_sidecar(
         remove_applied_sidecar(paths, session_id, id);
         return Ok(false);
     }
+    CommandLogWriter::recover_lifecycle(
+        paths,
+        command,
+        &crate::data::automation_store::AutomationStore::from_store(store),
+    )?;
     if !store.finalize_running_command(id, &completion)? {
         return Ok(false);
     }
@@ -940,6 +1090,17 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             .await
     }
     pub async fn run_until(self, stop: tokio_util::sync::CancellationToken) {
+        for session in self.sessions.list().await {
+            if let Err(error) =
+                crate::command::commands::launch_policy::settings_profile::reconcile_repository(
+                    &session,
+                    self.engines.runtime.clone(),
+                )
+                .await
+            {
+                tracing::warn!(%error,"profile startup reconciliation remains pending");
+            }
+        }
         loop {
             if stop.is_cancelled() {
                 return;
@@ -1411,7 +1572,40 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             .unwrap_or_default();
         // The command's `/awman/output` directory (WI 0137 §3): the command
         // that mounts it creates (or, for `exec prompt`, clears) it.
+        let catalogue = crate::command::dispatch::catalogue::CommandCatalogue::get();
+        let profile_access = catalogue.parse_raw_args(&path_parts, &args).is_ok_and(|p| {
+            crate::command::commands::launch_policy::settings_profile::requires_local_owner(&p)
+        }) || catalogue.lookup(&path_parts).is_some_and(|s| {
+            s.api_availability == crate::command::dispatch::catalogue::ApiAvailability::LocalOwner
+        });
+        if profile_access
+            && (cmd.listener != "local"
+                || !crate::data::fs::agent_profiles::command_owner(
+                    &self.paths,
+                    &session_id,
+                    &command_id,
+                )
+                .unwrap_or(false))
+        {
+            let completion = QueuedCommandResult::new(
+                &Err(crate::command::error::CommandError::ProfileOwnerRequired),
+                &Ok(PushBackOutcome::NotConfigured),
+            );
+            completion
+                .publish(&self.store, &self.paths, &cmd, &event_bus.sender())
+                .await;
+            return;
+        }
         let dispatch = Dispatch::new(frontend, session, engines)
+            .with_profile_owner(
+                cmd.listener == "local"
+                    && crate::data::fs::agent_profiles::command_owner(
+                        &self.paths,
+                        &session_id,
+                        &command_id,
+                    )
+                    .unwrap_or(false),
+            )
             .with_cancellation(cancel)
             .with_command_secrets(command_secrets)
             .with_output_dir(self.paths.command_output_dir(&session_id, &command_id));
@@ -1770,6 +1964,19 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
     /// one `ApiSessionLifecycle::close`, so a remote clone is deleted exactly
     /// as `DELETE /v1/worker/sessions/{id}` would.
     async fn post_execution_check(&self, session_id: &str, command_id: &str) {
+        if let Some(session) = self.sessions.get_by_key(session_id) {
+            let snapshot = session.read().await.clone();
+            if let Err(error) =
+                crate::command::commands::launch_policy::settings_profile::reconcile_repository(
+                    &snapshot,
+                    self.engines.runtime.clone(),
+                )
+                .await
+            {
+                tracing::warn!(%error,"profile completion reconciliation remains pending");
+            }
+        }
+
         let closing = match self.store.get_session(session_id) {
             Ok(session) => session.is_some_and(|s| s.status == SessionStatus::Closing),
             Err(error) => {
@@ -1826,6 +2033,7 @@ fn spawn_tracing_subscriber(
         loop {
             match rx.recv().await {
                 Ok(event) => match event.payload {
+                    EventPayload::AgentCredentialsChanged { .. } | EventPayload::AgentExecutionReplaced { .. } | EventPayload::AgentState { .. } | EventPayload::AgentIdentity { .. } | EventPayload::AgentTurnStarted { .. } | EventPayload::AgentTurnCompleted { .. } => {},
                     EventPayload::WorkflowStepTransition {
                         step_name,
                         step_index,
@@ -2169,7 +2377,7 @@ mod command_secrets_tests {
         assert!(!serde_json::to_string(&terminal_payload(&row))
             .unwrap()
             .contains(secret));
-        CommandLogWriter::append_terminal(&paths, &row, terminal_payload(&row)).unwrap();
+        CommandLogWriter::append_terminal(&paths, &row, &store, terminal_payload(&row)).unwrap();
         for path in [
             paths.command_events_log_path(sid.as_str(), cid.as_str()),
             paths.command_log_path(sid.as_str(), cid.as_str()),

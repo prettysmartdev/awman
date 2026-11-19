@@ -10,6 +10,7 @@ use super::{
 
 #[derive(Default)]
 pub struct Translator {
+    observation: super::NativeObservation,
     tools: HashMap<String, String>,
     candidate: Option<String>,
     finalized: bool,
@@ -17,6 +18,37 @@ pub struct Translator {
 
 impl Translator {
     fn translate(&mut self, event: &Value) -> Option<Vec<Translated>> {
+        let kind = event.get("type").and_then(Value::as_str);
+        let identity = match kind {
+            Some("system") if event.get("subtype").and_then(Value::as_str) == Some("init") => {
+                event.get("session_id")
+            }
+            _ => None,
+        };
+        if let Some(id) = identity
+            .and_then(Value::as_str)
+            .and_then(|s| crate::data::settings_profile::NativeSessionId::parse(s).ok())
+        {
+            self.observation.identity = Some(id);
+        }
+        if kind == Some("result") {
+            // A terminal result needs its schema: an error flag or error
+            // subtype, or (for success) the answer text. Later records cannot
+            // reset an outcome.
+            let errored = event.get("is_error").and_then(Value::as_bool) == Some(true)
+                || event
+                    .get("subtype")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.starts_with("error"));
+            match (errored, event.get("result").and_then(Value::as_str)) {
+                (true, _) => self.observation.terminal(false, None),
+                (false, Some(answer)) => self.observation.terminal(true, Some(answer.to_owned())),
+                _ => self
+                    .observation
+                    .protocol("terminal result record without a valid schema"),
+            }
+        }
+
         match event.get("type")?.as_str()? {
             "system" if event.get("subtype").and_then(Value::as_str) == Some("init") => {
                 Some(vec![])
@@ -104,6 +136,9 @@ fn content_bytes(value: &Value) -> usize {
 }
 
 impl AgentOutputTranslator for Translator {
+    fn native_observation(&self) -> super::NativeObservation {
+        self.observation.clone()
+    }
     fn feed_line(&mut self, stream: OutputStream, line: &str) -> Vec<Translated> {
         if stream == OutputStream::Stderr {
             return passthrough(stream, line);

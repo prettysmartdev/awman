@@ -20,7 +20,11 @@ command = ["agent"] # required argv entrypoint; no shell
 [modes]
 # yolo = ["--yolo"]
 # auto = []
-# plan = ["--plan"]
+# plan = ["--plan"] # native plan argv; --plan is refused when no route declares one
+# plan_interactive = ["--mode", "plan"] # omitted: inherit plan; [] = interactive unsupported
+# plan_headless = [] # omitted: inherit plan; [] = headless unsupported
+# plan_kind = "custom" # plan, read_only or custom (default)
+# plan_acp_mode = "plan" # ACP session mode; needs [acp]; never inferred from argv
 
 [tools]
 # allowed_flag = "--allowed-tools"

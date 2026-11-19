@@ -521,6 +521,13 @@ impl AgentRuntimeEngine for ContainerRuntime {
         ContainerRuntime::list_stopped(self)
     }
 
+    fn resource_label(
+        &self,
+        handle: &AgentHandle,
+        key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        self.backend.resource_label(handle, key)
+    }
     fn inspect(&self, handle: &AgentHandle) -> Result<AgentDetail, EngineError> {
         self.backend.inspect(handle)
     }

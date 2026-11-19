@@ -150,3 +150,19 @@ pub fn link(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
         crate::command::commands::link::LinkCommand::from_input(ctx)?,
     ))
 }
+
+/// The builder for a leaf the catalogue declares before its Layer 2 command
+/// exists (WI 0070, `catalogue::PENDING_OPTIONS`). Its flags and arguments
+/// have already been parsed and validated; the command is then refused as
+/// invalid usage instead of being reported as unknown. The step that
+/// implements the command replaces this with its real builder and deletes
+/// the pending row.
+pub fn pending(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
+    Err(CommandError::option_pending(&ctx.path(), None))
+}
+
+pub fn agents_profile(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
+    Ok(BuiltCommand::Agents(AgentsCommand::Profile(Box::new(
+        crate::command::commands::agents::profile::ProfileCommand::from_input(ctx)?,
+    ))))
+}

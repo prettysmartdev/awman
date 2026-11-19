@@ -113,6 +113,12 @@ pub struct AgentIo {
 /// all agent I/O — stdout, stderr, and stdin.
 #[async_trait]
 pub trait AgentFrontend: UserMessageSink + Send {
+    /// Already translated native output. True when the frontend consumed it;
+    /// other frontends receive its ordinary rendered lines through AgentIo.
+    fn translated_output(&mut self, _item: crate::engine::agent_output::Translated) -> bool {
+        false
+    }
+
     fn output_redaction(&self) -> crate::engine::auth::redaction::RedactionSet {
         Default::default()
     }
@@ -162,10 +168,24 @@ pub trait AgentFrontend: UserMessageSink + Send {
         DEFAULT_GRACE_TIMEOUT
     }
 
+    /// Which startup clock applies (WI 0070). Automation launches return
+    /// `LifecycleDeadline`, which disables the first-byte grace kill in every
+    /// bridge; wrappers must forward it.
+    fn startup_timing(&self) -> crate::data::automation::StartupTiming {
+        Default::default()
+    }
+
+    /// The automation binding a launch registers with its terminal.
+    fn terminal_automation(
+        &self,
+    ) -> Option<crate::engine::agent_runtime::execution::TerminalAutomationBinding> {
+        None
+    }
+
     /// Stuck timeout: how long the agent can go without producing any
     /// further output (after its first byte) before the engine publishes
-    /// `StuckEvent::Stuck`. CLI, TUI, and API all use 30s; only the
-    /// grace timeout differs between modes.
+    /// `StuckEvent::Stuck`. This is advisory only: it never kills the agent
+    /// or changes readiness. Layer 2 snapshots `agents.stuckTimeout` at launch.
     fn stuck_timeout(&self) -> Duration {
         DEFAULT_STUCK_TIMEOUT
     }
@@ -217,8 +237,88 @@ impl<F: AgentFrontend + ?Sized> AgentFrontend for std::sync::Arc<std::sync::Mute
     fn grace_timeout(&self) -> Duration {
         self.lock().unwrap().grace_timeout()
     }
+    fn startup_timing(&self) -> crate::data::automation::StartupTiming {
+        self.lock().unwrap().startup_timing()
+    }
+    fn terminal_automation(
+        &self,
+    ) -> Option<crate::engine::agent_runtime::execution::TerminalAutomationBinding> {
+        self.lock().unwrap().terminal_automation()
+    }
 
     fn stuck_timeout(&self) -> Duration {
         self.lock().unwrap().stuck_timeout()
+    }
+}
+
+/// Bind a launch's resolved advisory timeout to a detached frontend sink.
+pub fn with_stuck_timeout(
+    frontend: Box<dyn AgentFrontend>,
+    timeout: Duration,
+) -> Box<dyn AgentFrontend> {
+    Box::new(InactivityFrontend { frontend, timeout })
+}
+struct InactivityFrontend {
+    frontend: Box<dyn AgentFrontend>,
+    timeout: Duration,
+}
+impl UserMessageSink for InactivityFrontend {
+    fn write_message(&mut self, message: crate::data::message::UserMessage) {
+        self.frontend.write_message(message);
+    }
+    fn replay_queued(&mut self) {
+        self.frontend.replay_queued();
+    }
+    fn report_image_stale(&mut self, warning: &crate::data::execution_event::ImageStaleWarning) {
+        self.frontend.report_image_stale(warning);
+    }
+}
+#[async_trait]
+impl AgentFrontend for InactivityFrontend {
+    fn translated_output(&mut self, item: crate::engine::agent_output::Translated) -> bool {
+        self.frontend.translated_output(item)
+    }
+    fn output_redaction(&self) -> crate::engine::auth::redaction::RedactionSet {
+        self.frontend.output_redaction()
+    }
+    fn terminal_launch(&self) -> Option<crate::engine::agent_runtime::execution::TerminalLaunch> {
+        self.frontend.terminal_launch()
+    }
+    fn terminal_source(&self) -> Option<crate::data::execution_event::EventSource> {
+        self.frontend.terminal_source()
+    }
+    fn program_status_config(
+        &self,
+    ) -> crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig {
+        self.frontend.program_status_config()
+    }
+    fn report_status(&mut self, status: AgentStatus) {
+        self.frontend.report_status(status);
+    }
+    fn report_progress(&mut self, progress: AgentProgress) {
+        self.frontend.report_progress(progress);
+    }
+    fn take_io(&mut self) -> AgentIo {
+        self.frontend.take_io()
+    }
+    fn set_agent_output_format(
+        &mut self,
+        format: crate::data::agent_output_format::AgentOutputFormat,
+    ) {
+        self.frontend.set_agent_output_format(format);
+    }
+    fn grace_timeout(&self) -> Duration {
+        self.frontend.grace_timeout()
+    }
+    fn startup_timing(&self) -> crate::data::automation::StartupTiming {
+        self.frontend.startup_timing()
+    }
+    fn terminal_automation(
+        &self,
+    ) -> Option<crate::engine::agent_runtime::execution::TerminalAutomationBinding> {
+        self.frontend.terminal_automation()
+    }
+    fn stuck_timeout(&self) -> Duration {
+        self.timeout
     }
 }

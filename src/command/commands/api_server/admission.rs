@@ -188,6 +188,52 @@ pub struct ApiAdmission {
 }
 
 impl ApiAdmission {
+    fn validate_profile_owner(
+        &self,
+        command: &CommandSubmission,
+        parsed: &ParsedArgs,
+    ) -> Result<(), AdmissionError> {
+        let path: Vec<_> = command.subcommand.split_whitespace().collect();
+        let selected =
+            crate::command::commands::launch_policy::settings_profile::requires_local_owner(parsed)
+                || CommandCatalogue::get()
+                    .lookup(&path)
+                    .is_some_and(|s| s.api_availability.is_local_owner_only());
+        if selected
+            && (!self.request_context.profile_owner
+                || self.request_context.listener
+                    != crate::data::daemon_state::CommandListener::Local)
+        {
+            return Err(AdmissionError::CommandAdmission(
+                CommandError::ProfileOwnerRequired,
+            ));
+        }
+        crate::command::commands::launch_policy::settings_profile::ProfileRequest::parse(
+            parsed.flag_string("settings-profile").as_deref(),
+            parsed.flag_string("agent-session").as_deref(),
+        )
+        .map_err(AdmissionError::CommandValidation)?;
+        // WI 0070: `chat` is reachable only as an owner-local automation
+        // terminal: `--automation`, `--settings-profile` and an effective
+        // interactive mode (400 otherwise; access was checked above).
+        if CommandCatalogue::get().lookup(&path).is_some_and(|s| {
+            s.api_availability
+                == crate::command::dispatch::catalogue::ApiAvailability::LocalAutomationTerminal
+        }) {
+            let interactive = command.interaction
+                == Some(crate::data::config::daemon::Interaction::Interactive)
+                && parsed.flag_bool("headless") != Some(true);
+            if !parsed.has_flag("automation")
+                || !parsed.has_flag("settings-profile")
+                || !interactive
+            {
+                return Err(AdmissionError::CommandValidation(CommandError::InvalidRequest(
+                    "API chat requires --automation, --settings-profile and interactive mode: it opens an owner-local idle automation terminal".into(),
+                )));
+            }
+        }
+        Ok(())
+    }
     fn frontend_kind(&self) -> FrontendKind {
         FrontendKind::Daemon {
             feature: crate::data::daemon_state::FeatureName::Worker,
@@ -357,7 +403,8 @@ impl ApiAdmission {
             .await
             .map_err(AdmissionError::SessionCreation)?;
         if let Some(command) = &command {
-            command.validate_for(self.frontend_kind())?;
+            let parsed = command.validate_for(self.frontend_kind())?;
+            self.validate_profile_owner(command, &parsed)?;
         }
 
         // Create session storage directories (Layer 0).
@@ -562,6 +609,7 @@ impl ApiAdmission {
     ) -> Result<AdmittedCommand, AdmissionError> {
         let submission = self.resolve_interaction(submission)?;
         let parsed = submission.validate_for(self.frontend_kind())?;
+        self.validate_profile_owner(&submission, &parsed)?;
         match self
             .store
             .command_admission(session_id)
@@ -597,6 +645,14 @@ impl ApiAdmission {
                 .map(|(flag, value)| (flag.replace('-', "_"), flag_default_json(&value)))
                 .collect(),
         );
+        for (flag, key) in [
+            ("settings-profile", "settings_profile"),
+            ("agent-session", "agent_session"),
+        ] {
+            if let Some(value) = parsed.flag_string(flag) {
+                flags_applied[key] = serde_json::json!(value);
+            }
+        }
         if flags_applied.get("headless").is_some() {
             flags_applied["headless"] = serde_json::json!(
                 submission.interaction
@@ -647,6 +703,13 @@ impl ApiAdmission {
             return Err(storage("Failed to create command directory", e));
         }
 
+        crate::data::fs::agent_profiles::record_command_owner(
+            &self.paths,
+            session_id,
+            command_id,
+            self.request_context.profile_owner,
+        )
+        .map_err(|e| storage("Failed to record command ownership", e))?;
         let log_path = self.paths.command_log_path(session_id, command_id);
 
         let id = crate::data::ids::CommandId::parse(command_id).expect("generated command id");

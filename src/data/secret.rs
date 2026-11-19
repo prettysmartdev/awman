@@ -26,3 +26,21 @@ pub mod frontend_wire {
         String::deserialize(deserializer).map(SecretString::new)
     }
 }
+
+/// Compare transient idempotency material without secret-derived hashes.
+pub fn same_bundle(a: &CommandSecrets, b: &CommandSecrets) -> bool {
+    if a.names().collect::<Vec<_>>() != b.names().collect::<Vec<_>>() {
+        return false;
+    }
+    a.iter().fold(true, |equal, (name, value)| {
+        let other = b.get(name).expect("matching names");
+        let bytes = value.expose().as_bytes();
+        let rhs = other.expose().as_bytes();
+        let mut diff = bytes.len() ^ rhs.len();
+        for i in 0..bytes.len().max(rhs.len()) {
+            diff |=
+                usize::from(bytes.get(i).copied().unwrap_or(0) ^ rhs.get(i).copied().unwrap_or(0));
+        }
+        equal & (diff == 0)
+    })
+}

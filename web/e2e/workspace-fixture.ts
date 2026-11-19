@@ -71,6 +71,7 @@ export class TerminalConnection {
   constructor(client, terminalId, opts = {}) {
     this.terminalId = terminalId; this.readOnly = !!opts.readOnly; this.closed = false;
     this.state = new Subject('open');
+    this.automation = new Subject(null);
     const viewer = new URLSearchParams(location.search).get('viewer') === '1';
     this.control = new Subject({ holder: this.readOnly || viewer ? 'none' : 'me', inputAllowed: !this.readOnly });
     this.listeners = { snapshot: new Set(), resize: new Set(), output: new Set(), exit: new Set(), error: new Set() };

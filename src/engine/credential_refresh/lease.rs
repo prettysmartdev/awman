@@ -33,9 +33,23 @@ impl LeaseGeneration {
     }
 }
 
+/// Managed leases notify Layer 2; they never rewrite credential files directly.
+#[derive(Clone)]
+pub struct SourceSink(
+    pub Arc<dyn Fn(Arc<crate::engine::auth::credential::CredentialSnapshot>) -> bool + Send + Sync>,
+);
+impl std::fmt::Debug for SourceSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SourceSink(..)")
+    }
+}
+
 /// Registry-side record of one live lease. Carries no secret.
 #[derive(Debug, Clone)]
 struct LeaseRecord {
+    authority: uuid::Uuid,
+    sink: Option<SourceSink>,
+    redaction: Option<crate::engine::auth::redaction::RedactionSet>,
     agent: AgentName,
     spec_agent: &'static str,
     staged_path: PathBuf,
@@ -153,6 +167,9 @@ impl std::fmt::Debug for CredentialLease {
 /// A tick-time copy of one live lease. Carries no secret.
 #[derive(Debug, Clone)]
 pub struct LeaseSnapshot {
+    pub authority: uuid::Uuid,
+    pub sink: Option<SourceSink>,
+    pub redaction: Option<crate::engine::auth::redaction::RedactionSet>,
     pub generation: LeaseGeneration,
     pub agent: AgentName,
     pub spec_agent: &'static str,
@@ -197,13 +214,38 @@ impl LeaseRegistry {
         delivery: &RefreshableCredentialDelivery,
         container: &str,
     ) -> CredentialLease {
+        self.register_bound(delivery, container, uuid::Uuid::nil(), None)
+    }
+    pub fn register_bound(
+        &self,
+        delivery: &RefreshableCredentialDelivery,
+        container: &str,
+        authority: uuid::Uuid,
+        sink: Option<SourceSink>,
+    ) -> CredentialLease {
+        self.register_protected(delivery, container, authority, sink, None)
+    }
+    pub fn register_protected(
+        &self,
+        delivery: &RefreshableCredentialDelivery,
+        container: &str,
+        authority: uuid::Uuid,
+        sink: Option<SourceSink>,
+        redaction: Option<crate::engine::auth::redaction::RedactionSet>,
+    ) -> CredentialLease {
         let mut inner = self.shared.inner.lock().unwrap();
         let was_empty = inner.entries.is_empty();
         let generation = LeaseGeneration(inner.next_gen);
-        inner.next_gen += 1;
+        inner.next_gen = inner
+            .next_gen
+            .checked_add(1)
+            .expect("credential lease identity exhausted");
         inner.entries.insert(
             generation,
             LeaseRecord {
+                authority,
+                sink,
+                redaction,
                 agent: delivery.agent.clone(),
                 spec_agent: delivery.spec_agent,
                 staged_path: delivery.staged_path.clone(),
@@ -232,6 +274,9 @@ impl LeaseRegistry {
             .entries
             .iter()
             .map(|(generation, rec)| LeaseSnapshot {
+                authority: rec.authority,
+                sink: rec.sink.clone(),
+                redaction: rec.redaction.clone(),
                 generation: *generation,
                 agent: rec.agent.clone(),
                 spec_agent: rec.spec_agent,

@@ -121,7 +121,11 @@ fn bind(
     owner: u32,
 ) -> Result<(LocalListener, LocalBind), CommandError> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-    let router = router.layer(axum::Extension(OwnerAuthenticated));
+    let router = router
+        .layer(axum::Extension(OwnerAuthenticated))
+        .layer(axum::Extension(
+            crate::data::daemon_state::RequestOrigin::OwnerSocket,
+        ));
     let fail = |what: &str, e: &dyn std::fmt::Display| {
         CommandError::Other(format!(
             "could not secure the local listener at {}: {what}: {e}",
@@ -196,7 +200,11 @@ fn bind(
     _owner: u32,
 ) -> Result<(LocalListener, LocalBind), CommandError> {
     use crate::engine::remote::local::{owner_pipe, verify_pipe_client};
-    let router = router.layer(axum::Extension(OwnerAuthenticated));
+    let router = router
+        .layer(axum::Extension(OwnerAuthenticated))
+        .layer(axum::Extension(
+            crate::data::daemon_state::RequestOrigin::OwnerSocket,
+        ));
     // Named pipes vanish with their server; there is no stale file to remove.
     // `first = true` fails if any instance exists, so a squatter is refused.
     let mut listener = owner_pipe(endpoint, true).map_err(|e| {

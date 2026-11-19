@@ -56,17 +56,13 @@ impl Default for MonitorConfig {
     }
 }
 
-/// What one refresh attempt did. `fingerprint` is the 8-hex short form — the
-/// ONLY credential-derived value permitted in logs or status output (INV-5).
+/// A refresh result. Contains no credential-derived identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefreshOutcome {
     /// Credential was still comfortably valid; nothing done.
     NotNeeded { expires_in: Duration },
     /// Host rotated (or independently changed) and live leases were rewritten.
-    Refreshed {
-        leases_written: usize,
-        fingerprint: String,
-    },
+    Refreshed { leases_written: usize },
     /// Host ping ran but `expiresAt` did not advance. Last-known-good file is
     /// retained; `remediation` is user-facing text.
     Stale { remediation: String },
@@ -78,6 +74,7 @@ pub enum RefreshOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshStatus {
     pub agent: AgentName,
+    pub authority_id: uuid::Uuid,
     pub live_leases: usize,
     pub expires_at: Option<SystemTime>,
     pub last_outcome: Option<RefreshOutcome>,
@@ -106,7 +103,11 @@ pub struct CredentialRefreshMonitor {
     config: MonitorConfig,
     registry: LeaseRegistry,
     binding: CredentialBinding,
-    state: Mutex<HashMap<String, AgentState>>,
+    lock_root: std::path::PathBuf,
+    state: Mutex<HashMap<uuid::Uuid, AgentState>>,
+    sources: Mutex<HashMap<uuid::Uuid, (AgentName, CredentialBinding)>>,
+    authority_keys: Mutex<HashMap<String, uuid::Uuid>>,
+    delivered: Mutex<HashMap<super::LeaseGeneration, CredentialFingerprint>>,
     /// Serializes host-refresh operations so the single-use refresh token is
     /// never raced by the tick loop and a concurrent `refresh_now` (INV-4).
     refresh_gate: tokio::sync::Mutex<()>,
@@ -133,18 +134,45 @@ impl CredentialRefreshMonitor {
     /// [`CredentialBinding::to_file`] for an isolation that holds on every
     /// platform.
     pub fn with_resolver(config: MonitorConfig, resolver: AuthPathResolver) -> Arc<Self> {
-        Self::with_binding(config, CredentialBinding::platform_default(resolver))
+        Self::with_binding_in(
+            config,
+            CredentialBinding::platform_default(resolver),
+            &crate::engine::host_cli::process_env(),
+        )
     }
 
     /// Construct a monitor bound to an explicit credential source, so the tick
     /// loop never reads a developer's real credential nor spawns a real host
     /// ping (F3) — on any platform.
     pub fn with_binding(config: MonitorConfig, binding: CredentialBinding) -> Arc<Self> {
+        let root = binding
+            .resolver()
+            .home()
+            .join(".cache/awman-credential-authorities");
+        Self::with_lock_root(config, binding, root)
+    }
+    pub fn with_binding_in(
+        config: MonitorConfig,
+        binding: CredentialBinding,
+        env: &crate::data::config::env::EnvSnapshot,
+    ) -> Arc<Self> {
+        let root = super::authority::lock_root(env, binding.resolver().home());
+        Self::with_lock_root(config, binding, root)
+    }
+    fn with_lock_root(
+        config: MonitorConfig,
+        binding: CredentialBinding,
+        lock_root: std::path::PathBuf,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            lock_root,
             config,
             registry: LeaseRegistry::new(),
             binding,
             state: Mutex::new(HashMap::new()),
+            sources: Mutex::new(HashMap::new()),
+            authority_keys: Mutex::new(HashMap::new()),
+            delivered: Mutex::new(HashMap::new()),
             refresh_gate: tokio::sync::Mutex::new(()),
             thread_started: std::sync::Once::new(),
             host_agent: HostAgentPinger::new(),
@@ -160,8 +188,11 @@ impl CredentialRefreshMonitor {
     ) -> CredentialLease {
         // Seed change detection from the fingerprint the staged file was first
         // written with, so an unchanged first tick performs no rewrite.
-        self.seed_state(delivery);
-        let lease = self.registry.register(delivery, container);
+        let authority = self.ensure_authority(&delivery.agent, self.binding.clone());
+        self.seed_state(authority, delivery);
+        let lease = self
+            .registry
+            .register_bound(delivery, container, authority, None);
         self.ensure_thread();
         tracing::debug!(
             agent = %delivery.agent,
@@ -180,7 +211,13 @@ impl CredentialRefreshMonitor {
         agent: &AgentName,
         timeout: Duration,
     ) -> RefreshOutcome {
-        match tokio::time::timeout(timeout, self.refresh_agent(agent)).await {
+        let authority = self.ensure_authority(agent, self.binding.clone());
+        match tokio::time::timeout(
+            timeout,
+            self.refresh_authority(authority, agent, &self.binding),
+        )
+        .await
+        {
             Ok(outcome) => outcome,
             Err(_elapsed) => {
                 tracing::warn!(
@@ -188,11 +225,11 @@ impl CredentialRefreshMonitor {
                     remediation = REMEDIATION,
                     "credential refresh timed out; keeping last-known-good"
                 );
-                let expires_at = self.recorded_expiry(agent);
+                let expires_at = self.recorded_expiry(authority);
                 let outcome = RefreshOutcome::Stale {
                     remediation: REMEDIATION.to_string(),
                 };
-                self.record_status(agent, expires_at, outcome.clone(), true);
+                self.record_status(authority, expires_at, outcome.clone(), true);
                 outcome
             }
         }
@@ -200,31 +237,21 @@ impl CredentialRefreshMonitor {
 
     /// Per-agent health for status surfacing. Never returns a secret.
     pub fn status(&self) -> Vec<RefreshStatus> {
-        let mut live_counts: HashMap<String, usize> = HashMap::new();
-        for lease in self.registry.snapshot() {
-            *live_counts
-                .entry(lease.agent.as_str().to_string())
-                .or_default() += 1;
-        }
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let mut names: Vec<String> = state.keys().cloned().collect();
-        for name in live_counts.keys() {
-            if !names.contains(name) {
-                names.push(name.clone());
-            }
-        }
-        names
-            .into_iter()
-            .filter_map(|name| {
-                let agent = AgentName::new(&name).ok()?;
-                let st = state.get(&name);
-                Some(RefreshStatus {
-                    agent,
-                    live_leases: live_counts.get(&name).copied().unwrap_or(0),
+        let leases = self.registry.snapshot();
+        let sources = self.sources.lock().unwrap_or_else(|p| p.into_inner());
+        let states = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        sources
+            .iter()
+            .map(|(id, (agent, _))| {
+                let st = states.get(id);
+                RefreshStatus {
+                    agent: agent.clone(),
+                    authority_id: *id,
+                    live_leases: leases.iter().filter(|l| l.authority == *id).count(),
                     expires_at: st.and_then(|s| s.expires_at),
                     last_outcome: st.and_then(|s| s.last_outcome.clone()),
-                    consecutive_failures: st.map(|s| s.consecutive_failures).unwrap_or(0),
-                })
+                    consecutive_failures: st.map_or(0, |s| s.consecutive_failures),
+                }
             })
             .collect()
     }
@@ -235,11 +262,9 @@ impl CredentialRefreshMonitor {
 
     // ── internals ───────────────────────────────────────────────────────────
 
-    fn seed_state(&self, delivery: &RefreshableCredentialDelivery) {
+    fn seed_state(&self, authority: uuid::Uuid, delivery: &RefreshableCredentialDelivery) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let st = state
-            .entry(delivery.agent.as_str().to_string())
-            .or_default();
+        let st = state.entry(authority).or_default();
         if st.last_materialized.is_none() {
             st.last_materialized = Some(delivery.initial_fingerprint);
         }
@@ -261,34 +286,42 @@ impl CredentialRefreshMonitor {
     /// One tick: refresh every agent that has live leases, honouring per-agent
     /// backoff so a persistently unreachable host is retried, not hammered.
     async fn tick(self: &Arc<Self>) {
-        let mut agents: Vec<AgentName> = Vec::new();
+        self.delivered
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|generation, _| self.registry.is_live(*generation));
+        let mut sources = Vec::new();
         for lease in self.registry.snapshot() {
-            if !agents.contains(&lease.agent) {
-                agents.push(lease.agent.clone());
+            if !sources.contains(&lease.authority) {
+                sources.push(lease.authority);
             }
         }
-        for agent in agents {
-            if self.in_backoff(&agent) {
+        for authority in sources {
+            if self.in_backoff(authority) {
                 continue;
             }
-            // Bound the background refresh exactly as `refresh_now` bounds the
-            // pre-step guard, so a wedged host ping (interactive auth prompt,
-            // stuck network) cannot stall the tick loop for every live session
-            // (F1). A timeout is a loud, retried failure — never silent.
-            match tokio::time::timeout(self.config.tick_interval, self.refresh_agent(&agent)).await
-            {
-                Ok(_outcome) => {}
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        agent = %agent,
-                        remediation = REMEDIATION,
-                        "credential refresh: background tick timed out; keeping last-known-good"
+            let source = self
+                .sources
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&authority)
+                .cloned();
+            if let Some((agent, binding)) = source {
+                if tokio::time::timeout(
+                    self.config.tick_interval,
+                    self.refresh_authority(authority, &agent, &binding),
+                )
+                .await
+                .is_err()
+                {
+                    self.record_status(
+                        authority,
+                        self.recorded_expiry(authority),
+                        RefreshOutcome::Stale {
+                            remediation: REMEDIATION.into(),
+                        },
+                        true,
                     );
-                    let expires_at = self.recorded_expiry(&agent);
-                    let outcome = RefreshOutcome::Stale {
-                        remediation: REMEDIATION.to_string(),
-                    };
-                    self.record_status(&agent, expires_at, outcome, true);
                 }
             }
         }
@@ -297,7 +330,12 @@ impl CredentialRefreshMonitor {
     /// Read the host credential, refresh the host if near expiry, and rewrite
     /// every live lease when the snapshot changed. Shared by the tick loop and
     /// `refresh_now`. Never returns an error: a failure is an outcome.
-    async fn refresh_agent(self: &Arc<Self>, agent: &AgentName) -> RefreshOutcome {
+    async fn refresh_authority(
+        self: &Arc<Self>,
+        authority: uuid::Uuid,
+        agent: &AgentName,
+        binding: &CredentialBinding,
+    ) -> RefreshOutcome {
         // Serialize host-refresh so parallel containers never race the
         // single-use refresh token, and the tick loop never collides with a
         // concurrent `refresh_now`.
@@ -308,7 +346,46 @@ impl CredentialRefreshMonitor {
                 reason: CredentialReadError::Unsupported,
             };
         };
-        let source = self.binding.source_for(spec);
+        let source = binding.source_for(spec);
+        let lock = super::authority::lock_source_at(
+            &self.lock_root,
+            &source,
+            spec.agent,
+            Duration::from_secs(5),
+        )
+        .await;
+        let _authority = match lock {
+            Ok(lock) => Some(lock),
+            // Explicit compatibility exception for legacy Windows delivery.
+            // Managed slots still require cross-process serialization.
+            Err("safe_authority_lock_unavailable")
+                if cfg!(windows)
+                    && !self
+                        .registry
+                        .snapshot()
+                        .iter()
+                        .any(|l| l.authority == authority && l.sink.is_some()) =>
+            {
+                tracing::warn!("legacy credential refresh uses process-local locking on Windows; cross-process locking unavailable");
+                None
+            }
+            Err(reason) => {
+                let outcome = RefreshOutcome::Unavailable {
+                    reason: CredentialReadError::Unavailable(reason.into()),
+                };
+                self.record_status(
+                    authority,
+                    self.recorded_expiry(authority),
+                    outcome.clone(),
+                    true,
+                );
+                tracing::warn!(
+                    reason,
+                    "credential authority lock refused; keeping last-known-good"
+                );
+                return outcome;
+            }
+        };
 
         let snapshot = match (spec.read)(&source) {
             Ok(snapshot) => snapshot,
@@ -322,7 +399,7 @@ impl CredentialRefreshMonitor {
                 let outcome = RefreshOutcome::Unavailable {
                     reason: reason.clone(),
                 };
-                self.record_status(agent, None, outcome.clone(), true);
+                self.record_status(authority, None, outcome.clone(), true);
                 return outcome;
             }
         };
@@ -344,11 +421,7 @@ impl CredentialRefreshMonitor {
         // its last-known-good file — loudly, never silently.
         let mut stale_remediation: Option<String> = None;
         let snapshot = if near_expiry {
-            match self
-                .host_agent
-                .refresh_credential(spec, &self.binding)
-                .await
-            {
+            match self.host_agent.refresh_credential(spec, binding).await {
                 HostRefreshOutcome::Advanced { .. } => match (spec.read)(&source) {
                     Ok(fresh) => fresh,
                     Err(reason) => {
@@ -360,7 +433,7 @@ impl CredentialRefreshMonitor {
                         let outcome = RefreshOutcome::Unavailable {
                             reason: reason.clone(),
                         };
-                        self.record_status(agent, None, outcome.clone(), true);
+                        self.record_status(authority, None, outcome.clone(), true);
                         return outcome;
                     }
                 },
@@ -396,11 +469,11 @@ impl CredentialRefreshMonitor {
         let fingerprint = CredentialFingerprint::of(&snapshot);
         let expiry_now = (spec.expiry)(&snapshot);
         let file = (spec.materialize)(&snapshot);
-        let (leases_written, write_failures) = self.rewrite_live_leases(agent, &file);
+        let (leases_written, write_failures) =
+            self.rewrite_live_leases(authority, agent, &file, &snapshot);
         if leases_written > 0 {
             tracing::info!(
                 agent = %agent,
-                fingerprint = %fingerprint.to_hex(),
                 leases_written,
                 "credential refresh: staged credential rewritten"
             );
@@ -409,13 +482,13 @@ impl CredentialRefreshMonitor {
         // current. A partial write failure must be retried on the next tick,
         // not permanently masked by a matching host fingerprint (HIGH-4).
         if write_failures == 0 {
-            self.set_last_materialized(agent, fingerprint);
+            self.set_last_materialized(authority, fingerprint);
         }
 
         // A stale host is a failure (drives backoff) but never fatal.
         if let Some(remediation) = stale_remediation {
             let outcome = RefreshOutcome::Stale { remediation };
-            self.record_status(agent, expiry_now, outcome.clone(), true);
+            self.record_status(authority, expiry_now, outcome.clone(), true);
             return outcome;
         }
 
@@ -426,22 +499,19 @@ impl CredentialRefreshMonitor {
             let outcome = RefreshOutcome::Stale {
                 remediation: STAGED_WRITE_REMEDIATION.to_string(),
             };
-            self.record_status(agent, expiry_now, outcome.clone(), true);
+            self.record_status(authority, expiry_now, outcome.clone(), true);
             return outcome;
         }
 
         let outcome = if leases_written > 0 {
-            RefreshOutcome::Refreshed {
-                leases_written,
-                fingerprint: fingerprint.to_hex(),
-            }
+            RefreshOutcome::Refreshed { leases_written }
         } else {
             let expires_in = expiry_now
                 .and_then(|e| e.duration_since(now).ok())
                 .unwrap_or(Duration::ZERO);
             RefreshOutcome::NotNeeded { expires_in }
         };
-        self.record_status(agent, expiry_now, outcome.clone(), false);
+        self.record_status(authority, expiry_now, outcome.clone(), false);
         outcome
     }
 
@@ -460,16 +530,46 @@ impl CredentialRefreshMonitor {
     /// the write; a lease dropped since the snapshot loses the race safely. A
     /// write error warns, counts as a failure (so the fingerprint is NOT
     /// advanced and the write is retried next tick), and is never fatal.
-    fn rewrite_live_leases(&self, agent: &AgentName, file: &CredentialFile) -> (usize, usize) {
+    fn rewrite_live_leases(
+        &self,
+        authority: uuid::Uuid,
+        agent: &AgentName,
+        file: &CredentialFile,
+        snapshot: &crate::engine::auth::credential::CredentialSnapshot,
+    ) -> (usize, usize) {
         let mut written = 0;
         let mut failures = 0;
         for lease in self.registry.snapshot() {
-            if &lease.agent != agent {
+            if &lease.agent != agent || lease.authority != authority {
                 continue;
             }
             // Generation re-check immediately before the write: a lease dropped
             // since the snapshot loses the race safely.
             if !self.registry.is_live(lease.generation) {
+                continue;
+            }
+            if let Some(redaction) = &lease.redaction {
+                redaction.add(snapshot.secret.clone());
+            }
+            if let Some(sink) = &lease.sink {
+                let fingerprint = CredentialFingerprint::of(snapshot);
+                let delivered = self
+                    .delivered
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&lease.generation)
+                    .copied();
+                if delivered != Some(fingerprint) {
+                    if sink.0(Arc::new(snapshot.clone())) {
+                        self.delivered
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(lease.generation, fingerprint);
+                        written += 1;
+                    } else {
+                        failures += 1;
+                    }
+                }
                 continue;
             }
             // Skip a target that no longer exists — the monitor never recreates
@@ -516,23 +616,20 @@ impl CredentialRefreshMonitor {
         (written, failures)
     }
 
-    fn set_last_materialized(&self, agent: &AgentName, fingerprint: CredentialFingerprint) {
+    fn set_last_materialized(&self, authority: uuid::Uuid, fingerprint: CredentialFingerprint) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state
-            .entry(agent.as_str().to_string())
-            .or_default()
-            .last_materialized = Some(fingerprint);
+        state.entry(authority).or_default().last_materialized = Some(fingerprint);
     }
 
     fn record_status(
         &self,
-        agent: &AgentName,
+        authority: uuid::Uuid,
         expires_at: Option<SystemTime>,
         outcome: RefreshOutcome,
         failed: bool,
     ) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let st = state.entry(agent.as_str().to_string()).or_default();
+        let st = state.entry(authority).or_default();
         st.expires_at = expires_at;
         st.last_outcome = Some(outcome);
         if failed {
@@ -546,21 +643,21 @@ impl CredentialRefreshMonitor {
         }
     }
 
-    fn in_backoff(&self, agent: &AgentName) -> bool {
+    fn in_backoff(&self, authority: uuid::Uuid) -> bool {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(agent.as_str())
+            .get(&authority)
             .and_then(|s| s.retry_after)
             .map(|t| Instant::now() < t)
             .unwrap_or(false)
     }
 
-    fn recorded_expiry(&self, agent: &AgentName) -> Option<SystemTime> {
+    fn recorded_expiry(&self, authority: uuid::Uuid) -> Option<SystemTime> {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(agent.as_str())
+            .get(&authority)
             .and_then(|s| s.expires_at)
     }
 }
@@ -618,3 +715,101 @@ fn run_monitor_loop(weak: Weak<CredentialRefreshMonitor>, shared: Arc<RegistrySh
 // options built without one take no leases, which is exactly what the absent
 // global used to mean — including for the `authRefresh.enabled: false` kill
 // switch, which now simply passes no factory.
+
+impl CredentialRefreshMonitor {
+    fn ensure_authority(&self, agent: &AgentName, binding: CredentialBinding) -> uuid::Uuid {
+        let Some(spec) = refreshable_spec_for(agent) else {
+            return uuid::Uuid::nil();
+        };
+        let key = super::authority::source_key(&binding.source_for(spec), spec.agent);
+        let id = *self
+            .authority_keys
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(key)
+            .or_insert_with(uuid::Uuid::new_v4);
+        self.sources
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(id)
+            .or_insert_with(|| (agent.clone(), binding));
+        id
+    }
+    /// Bind a selected private source independently of the agent name. The
+    /// callback reserves through ExecutionController and returns false while
+    /// busy, so another profile's acceptance cannot mark this lease delivered.
+    pub fn register_managed(
+        self: &Arc<Self>,
+        delivery: &RefreshableCredentialDelivery,
+        container: &str,
+        binding: CredentialBinding,
+        authority: uuid::Uuid,
+        sink: super::lease::SourceSink,
+    ) -> Result<CredentialLease, &'static str> {
+        // Refuse enrollment itself until this platform has a cross-process
+        // primitive. A managed lease cannot join an already-running legacy
+        // refresh after that refresh selected its compatibility exception.
+        if cfg!(not(unix)) {
+            return Err("safe_authority_lock_unavailable");
+        }
+        if authority.is_nil() {
+            return Err("invalid_authority");
+        }
+        let spec = refreshable_spec_for(&delivery.agent).ok_or("native_capability_unavailable")?;
+        let key = super::authority::source_key(&binding.source_for(spec), spec.agent);
+        let mut keys = self
+            .authority_keys
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if keys.get(&key).is_some_and(|id| *id != authority)
+            || keys.iter().any(|(k, id)| k != &key && *id == authority)
+        {
+            return Err("authority_conflict");
+        }
+        keys.insert(key, authority);
+        self.sources
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(authority)
+            .or_insert_with(|| (delivery.agent.clone(), binding));
+        drop(keys);
+        self.seed_state(authority, delivery);
+        let lease = self
+            .registry
+            .register_bound(delivery, container, authority, Some(sink));
+        self.ensure_thread();
+        Ok(lease)
+    }
+    pub async fn refresh_bound(
+        self: &Arc<Self>,
+        agent: &AgentName,
+        binding: CredentialBinding,
+        timeout: Duration,
+    ) -> RefreshOutcome {
+        let authority = self.ensure_authority(agent, binding.clone());
+        tokio::time::timeout(timeout, self.refresh_authority(authority, agent, &binding))
+            .await
+            .unwrap_or_else(|_| RefreshOutcome::Stale {
+                remediation: REMEDIATION.into(),
+            })
+    }
+}
+
+impl CredentialRefreshMonitor {
+    /// Legacy file delivery keeps its behavior while every refreshed value is
+    /// enrolled in the launch's existing streaming redactor before publication.
+    pub fn register_redacted(
+        self: &Arc<Self>,
+        delivery: &RefreshableCredentialDelivery,
+        container: &str,
+        redaction: crate::engine::auth::redaction::RedactionSet,
+    ) -> CredentialLease {
+        let authority = self.ensure_authority(&delivery.agent, self.binding.clone());
+        self.seed_state(authority, delivery);
+        let lease =
+            self.registry
+                .register_protected(delivery, container, authority, None, Some(redaction));
+        self.ensure_thread();
+        lease
+    }
+}

@@ -288,6 +288,7 @@ async fn terminal_relay_forwards_snapshot_then_output_and_stops_cleanly() {
     let (stdin, _rx) = input_channel();
     let handle = hub.register(
         TerminalRegistration {
+            automation: None,
             owner: TerminalOwnerInfo {
                 owner: owner.clone(),
                 feature: FeatureName::Worker,

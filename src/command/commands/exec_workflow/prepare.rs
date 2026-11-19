@@ -290,7 +290,19 @@ pub(crate) async fn execute_prepared_with_outputs(
     cancel: &tokio_util::sync::CancellationToken,
     output_dir: Option<&Path>,
     workspace_access: crate::data::workspace::WorkspaceAccess,
+    settings_profile: Option<&crate::data::settings_profile::SettingsProfileName>,
+    profile_owner: bool,
 ) -> Result<ExecWorkflowOutcome, CommandError> {
+    if !profile_owner
+        && (settings_profile.is_some()
+            || prepared
+                .workflow
+                .steps
+                .iter()
+                .any(|s| s.settings_profile.is_some()))
+    {
+        return Err(CommandError::ProfileOwnerRequired);
+    }
     if engines.agent_engine.is_lease_workspace() {
         crate::command::worker::policy::validate_workflow(&prepared.workflow)
             .map_err(CommandError::Other)?;
@@ -516,6 +528,8 @@ pub(crate) async fn execute_prepared_with_outputs(
     let (engine_result, step_counts, mut engine) = {
         let proxy = shared.clone();
         let factory = CommandLayerFactory {
+            settings_profile: settings_profile.cloned(),
+            profiles: Default::default(),
             shared: shared.clone(),
             engines: engines.clone(),
             flags: Arc::clone(&flags_arc),
@@ -775,6 +789,17 @@ pub(crate) async fn execute_prepared_with_outputs(
         } else {
             engine.run_to_completion().await
         };
+        if profile_owner {
+            if let Err(error) =
+                crate::command::commands::launch_policy::settings_profile::reconcile_repository(
+                    &session,
+                    engines.runtime.clone(),
+                )
+                .await
+            {
+                tracing::warn!(%error,"workflow profile cleanup remains pending");
+            }
+        }
         // A runtime wait error may race the token too. Reconcile before
         // deciding which teardown policy to apply, rather than after cleanup.
         let result =

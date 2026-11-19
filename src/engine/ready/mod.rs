@@ -2,6 +2,7 @@
 
 use crate::data::config::resolved_builtin::ResolvedBuiltinConfig;
 
+use crate::data::preparation::PreparationPolicy;
 use crate::data::session::{AgentName, Session};
 use crate::data::setup_step::{ReadyStep, SetupStep};
 use crate::data::step_status::StepStatus;
@@ -42,6 +43,10 @@ pub struct ReadyEngineOptions {
     pub non_interactive: bool,
     /// Env-passthrough list for audit container runs.
     pub env_passthrough: Option<Vec<String>>,
+    /// `Full` keeps the host-agent ping and optional audit. `ImagesOnly`
+    /// (an explicit `ready --prepare-only`) prepares images and never
+    /// runs either.
+    pub preparation: PreparationPolicy,
 }
 
 pub struct ReadyEngine {
@@ -128,6 +133,7 @@ impl ReadyEngine {
             refresh: options.refresh,
         };
         let mut summary = ReadySummary::new(runtime_name);
+        summary.preparation_policy = options.preparation;
         summary.image_action =
             match runtime.capabilities().image_acquisition == ImageAcquisition::Import {
                 true if builder_enabled => ReadyImageAction::BuildAndImport,

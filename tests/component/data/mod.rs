@@ -10,3 +10,8 @@ mod persistence;
 mod context_store;
 mod work_item_drafts;
 mod work_item_files;
+
+pub(crate) mod automation_store;
+pub(crate) mod credential_updates;
+
+mod agent_profiles;

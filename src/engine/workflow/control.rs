@@ -656,6 +656,12 @@ impl WorkflowEngine {
             .is_some_and(|cur| cur.read_only_workspace == next.read_only_workspace)
     }
 
+    fn settings_scope_matches_current(&self, next: &WorkflowStep) -> bool {
+        self.current_step_name
+            .as_deref()
+            .and_then(|n| self.find_step(n).ok())
+            .is_some_and(|current| self.agent_factory.settings_scope_matches(&current, next))
+    }
     pub(super) fn handle_continue_in_current_container(
         &mut self,
         prompt: &str,
@@ -678,6 +684,11 @@ impl WorkflowEngine {
         let model_ok = self.current_step_model == next_model;
         // A running container keeps the workspace access it was launched with;
         // never carry a prompt across a read-only/writable boundary.
+        if !self.settings_scope_matches_current(&next_step) {
+            return Err(EngineError::InvalidAdvanceAction(
+                "settings profiles differ; use LaunchNext for a fresh private execution".into(),
+            ));
+        }
         if !self.access_matches_current(&next_step) {
             return Err(EngineError::InvalidAdvanceAction(
                 "ContinueInCurrentContainer requires the same workspace access \
@@ -736,6 +747,7 @@ impl WorkflowEngine {
                     *curr_a == next_agent
                         && *curr_m == next_model
                         && self.access_matches_current(&next)
+                        && self.settings_scope_matches_current(&next)
                 }
                 _ => false,
             };
@@ -746,7 +758,7 @@ impl WorkflowEngine {
                 a.continue_unavailable_reason = Some(if self.current_step_agent.is_none() {
                     "no current container".into()
                 } else {
-                    "next step targets a different agent, model or workspace access".into()
+                    "next step targets a different agent, model, workspace access or settings profile".into()
                 });
             }
         }

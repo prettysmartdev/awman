@@ -351,14 +351,17 @@ pub(in crate::engine::sandbox) fn run_interactive(
         }
     }
 
-    // 5b. WI 0157: the binary the kit launches must be the pinned major.
-    //     Probe errors and a wrong major both refuse launch; a stale sandbox
-    //     cannot bypass version verification when its exec fails.
+    // Refuse only a confirmed breaking-major mismatch. Metadata and probe
+    // failures are advisory; the actual launch reports runtime/executable failures.
     if let Some(requirement) = first_party(&agent).and_then(|d| d.cli_version) {
         let mut argv = vec!["exec".to_string(), name.clone(), requirement.binary.clone()];
         argv.push("--version".into());
-        let out = SbxCommand::new(argv).in_env(&snapshot).run_quiet()?;
-        verify_sandbox_version(&name, &requirement, &out)?;
+        match SbxCommand::new(argv).in_env(&snapshot).run_quiet() {
+            Ok(out) => verify_sandbox_version(&name, &requirement, &out)?,
+            Err(error) => {
+                tracing::warn!(sandbox = %name, %error, "agent CLI version probe failed; continuing launch")
+            }
+        }
     }
 
     // 6. The launch argv is always the positional-run form — the kit and
@@ -415,14 +418,16 @@ fn verify_sandbox_version(
 ) -> Result<(), EngineError> {
     use crate::engine::container::agent_version::{classify_cli_version, CliVersionStatus};
     if !out.success() {
-        return Err(EngineError::Sandbox(format!(
-            "cannot verify CLI inside sandbox '{name}'; run 'awman ready --no-cache'"
-        )));
+        tracing::warn!(
+            sandbox = name,
+            "agent CLI version probe failed; continuing launch"
+        );
+        return Ok(());
     }
-    if let CliVersionStatus::Mismatch { found, expected } =
-        classify_cli_version(requirement, out.stdout.lines().next().unwrap_or_default())
-    {
-        return Err(EngineError::Sandbox(format!("sandbox '{name}' does not run the expected {expected} (found {found}); run 'awman ready --no-cache'")));
+    match classify_cli_version(requirement, out.stdout.lines().next().unwrap_or_default()) {
+        CliVersionStatus::Mismatch { found, expected } => return Err(EngineError::Sandbox(format!("sandbox '{name}' does not run the expected {expected} (found {found}); run 'awman ready --no-cache'"))),
+        CliVersionStatus::Unknown { reason } => tracing::warn!(sandbox = name, %reason, "agent CLI version is unknown; continuing launch"),
+        CliVersionStatus::Compatible { .. } => {},
     }
     Ok(())
 }
@@ -537,6 +542,9 @@ fn agent_args_for(
             {
                 args.push(flag.clone());
             }
+        } else if let Some(flag) = &def.headless_prompt_flag {
+            // WI 0070: same contract as the container argv tail.
+            args.push(flag.clone());
         }
         args.push(prompt.clone());
     }
@@ -913,15 +921,25 @@ mod adapter_tail_tests {
     }
 
     #[test]
-    fn sandbox_version_failure_cannot_bypass_the_pin() {
+    fn sandbox_version_metadata_is_advisory_except_confirmed_wrong_major() {
         let requirement = first_party("opencode").unwrap().cli_version.unwrap();
-        for (exit_code, stdout) in [(1, "1.19.6"), (0, ""), (0, "2.3.2")] {
+        for (exit_code, stdout, compatible) in [
+            (1, "1.19.6", true),
+            (1, "2.3.2", true),
+            (0, "", true),
+            (0, "nightly", true),
+            (0, "1.999.999", true),
+            (0, "2.3.2", false),
+        ] {
             let out = super::super::spawn::SbxOutput {
                 stdout: stdout.into(),
                 stderr: String::new(),
                 exit_code,
             };
-            assert!(verify_sandbox_version("fixture", &requirement, &out).is_err());
+            assert_eq!(
+                verify_sandbox_version("fixture", &requirement, &out).is_ok(),
+                compatible
+            );
         }
         let opts = ResolvedSandboxOptions::resolve([SandboxOption::AgentId("cursor".into())]);
         assert!(require_agent(&opts).is_err());

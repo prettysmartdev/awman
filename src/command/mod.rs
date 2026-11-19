@@ -5,6 +5,7 @@
 //! `*Command` struct per awman command. No upward calls into Layer 3
 //! (frontends) or Layer 4 (the binary entrypoints).
 
+pub mod automation;
 pub mod commands;
 pub mod context;
 pub mod daemon_api;

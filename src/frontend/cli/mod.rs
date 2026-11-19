@@ -66,7 +66,7 @@ async fn run_command(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode {
     // The runtime-tier guard and the squad gateway are catalogue-driven and
     // resolved by `Dispatch::run_command` (WI 0113 F-04). The CLI names no
     // squad subcommand of its own.
-    let argv = ctx
+    let argv: Vec<String> = ctx
         .session
         .read()
         .await
@@ -77,6 +77,10 @@ async fn run_command(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode {
         .collect();
     let frontend = CliFrontend::new(matches);
     let json = frontend.is_json_mode();
+    let frontend = match frontend.with_argv(&argv) {
+        Ok(frontend) => frontend,
+        Err(error) => return render_error_for_mode(&error, json),
+    };
     let dispatch = Dispatch::new(frontend, ctx.session, ctx.engines);
     match dispatch.run_relayed(&path_strs, argv).await {
         Ok(crate::command::dispatch::CliCompletion::Local(result)) => match *result {
@@ -152,6 +156,10 @@ pub(crate) fn format_outcome(outcome: &CommandOutcome, json: bool) -> Option<Str
 /// is consistent across error types.
 pub(crate) fn format_error(err: &CommandError) -> String {
     let body = match err {
+        CommandError::SettingsProfileBusy(_) | CommandError::NativeSessionNotFound | CommandError::ProfileOwnerRequired => err.to_string(),
+        CommandError::NativeCapabilityUnavailable(_)
+        | CommandError::AutomationFailed { .. }
+        | CommandError::InvalidRequest(_) => err.to_string(),
         CommandError::Aborted => "command aborted by user".to_string(),
         CommandError::UnknownCommand { path, suggestions } => {
             let mut body = format!("unknown command: {}", path.join(" "));
@@ -260,7 +268,8 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         | CommandError::DaemonAlreadyRunning { .. }
         | CommandError::DaemonNoFeatures
         | CommandError::DaemonHttpStatus { .. }
-        | CommandError::ReadOnlyWorkspaceUnsupported { .. } => err.to_string(),
+        | CommandError::ReadOnlyWorkspaceUnsupported { .. }
+        | CommandError::OptionPending { .. } => err.to_string(),
         CommandError::RemoteSessionMissing => {
             "no remote session id; pass --session <id> or run `awman remote session start` first".into()
         }
@@ -273,6 +282,7 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         CommandError::Edit(e) => e.to_string(),
         CommandError::DraftSync(e) => e.to_string(),
         CommandError::Other(msg) => msg.to_string(),
+        CommandError::RuntimeWaitFailed(message) => format!("runtime wait failed: {message}"),
         CommandError::WorkItemNotFound { number } => {
             format!("work item {number} not found in aspec/work-items/")
         }
@@ -381,3 +391,6 @@ fn render_error(err: &CommandError) -> ExitCode {
 pub(crate) fn error_exit_code(err: &CommandError) -> u8 {
     err.exit_code()
 }
+
+#[cfg(test)]
+mod wait_failure_tests;

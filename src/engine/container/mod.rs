@@ -10,6 +10,8 @@
 //! `AgentHandle`, …) live in `src/engine/agent_runtime/`.
 
 mod agent_argv;
+#[cfg(test)]
+pub(crate) use agent_argv::AgentArgv;
 pub mod agent_version;
 mod apple;
 pub(crate) mod attach_protocol;

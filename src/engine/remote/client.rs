@@ -427,6 +427,22 @@ impl RemoteClient {
         self.get(&["worker", "commands", command_id]).await
     }
 
+    /// `GET /v1/worker/sessions/{id}/agent-capabilities` (WI 0070). Owner-
+    /// local: a network listener answers 403.
+    pub async fn agent_capabilities(
+        &self,
+        session_id: &str,
+    ) -> Result<RemoteResponse, EngineError> {
+        self.get(&["worker", "sessions", session_id, "agent-capabilities"])
+            .await
+    }
+
+    /// `GET /v1/worker/commands/{id}/turns` (WI 0070). Owner-local: a
+    /// network listener answers 403.
+    pub async fn command_turns(&self, command_id: &str) -> Result<RemoteResponse, EngineError> {
+        self.get(&["worker", "commands", command_id, "turns"]).await
+    }
+
     /// `GET /v1/worker/commands/{id}` — the typed job status used by
     /// remote workflow polling.
     pub async fn job_status(&self, id: &str) -> Result<JobStatus, EngineError> {

@@ -40,9 +40,28 @@ fn snapshot_frame(snapshot: TerminalSnapshot) -> TerminalFrame {
 impl TerminalSubscription {
     pub(super) fn new(id: TerminalId, entry: &TerminalEntry, state: Weak<Mutex<HubState>>) -> Self {
         let mut pending = VecDeque::from([snapshot_frame(entry.mirror.snapshot())]);
+        if let Some(snapshot) = &entry.record.automation {
+            pending.push_back(TerminalFrame::AutomationState {
+                snapshot: Box::new(snapshot.clone()),
+            });
+        }
+        if let Some(credentials) = &entry.record.credential_updates {
+            pending.push_back(TerminalFrame::CredentialUpdateState {
+                snapshot: Box::new(credentials.public_state()),
+            });
+        }
+        // A close result published before finalization stays recoverable.
+        if entry.output.is_some() {
+            if let Some(frame) = &entry.close_result {
+                pending.push_back((**frame).clone());
+            }
+        }
         let rx = if let Some(output) = &entry.output {
             output.subscribe()
         } else {
+            if let Some(frame) = &entry.close_result {
+                pending.push_back((**frame).clone());
+            }
             pending.push_back(TerminalFrame::Exit {
                 code: entry
                     .record
@@ -79,7 +98,7 @@ impl TerminalSubscription {
             return Some(frame);
         }
         match self.rx.recv().await {
-            Ok(HubMessage::Frame(frame)) => Some(frame),
+            Ok(HubMessage::Frame(frame)) => Some((*frame).clone()),
             Ok(HubMessage::Finished { code, .. }) => {
                 self.ended = true;
                 Some(TerminalFrame::Exit { code })
@@ -107,9 +126,28 @@ impl TerminalSubscription {
             if let Ok(entry) = state.entry(&self.id) {
                 self.pending
                     .push_back(snapshot_frame(entry.mirror.snapshot()));
+                if let Some(credentials) = &entry.record.credential_updates {
+                    self.pending
+                        .push_back(TerminalFrame::CredentialUpdateState {
+                            snapshot: Box::new(credentials.public_state()),
+                        });
+                }
+                if let Some(snapshot) = &entry.record.automation {
+                    self.pending.push_back(TerminalFrame::AutomationState {
+                        snapshot: Box::new(snapshot.clone()),
+                    });
+                }
+                if entry.output.is_some() {
+                    if let Some(frame) = &entry.close_result {
+                        self.pending.push_back((**frame).clone());
+                    }
+                }
                 if let Some(output) = &entry.output {
                     self.rx = output.subscribe();
                 } else {
+                    if let Some(frame) = &entry.close_result {
+                        self.pending.push_back((**frame).clone());
+                    }
                     self.pending.push_back(TerminalFrame::Exit {
                         code: entry
                             .record
@@ -124,8 +162,21 @@ impl TerminalSubscription {
         // The bounded queue's last message still carries the final screen.
         loop {
             match self.rx.try_recv() {
-                Ok(HubMessage::Finished { code, snapshot }) => {
+                Ok(HubMessage::Finished {
+                    code,
+                    snapshot,
+                    automation,
+                    close_result,
+                }) => {
                     self.pending.push_back(snapshot_frame((*snapshot).clone()));
+                    if let Some(snapshot) = automation {
+                        self.pending.push_back(TerminalFrame::AutomationState {
+                            snapshot: Box::new((*snapshot).clone()),
+                        });
+                    }
+                    if let Some(frame) = close_result {
+                        self.pending.push_back((*frame).clone());
+                    }
                     self.pending.push_back(TerminalFrame::Exit { code });
                     return true;
                 }

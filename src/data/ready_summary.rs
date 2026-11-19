@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::data::preparation::{AuthenticationCheck, PreparationPolicy};
 use crate::data::ready_image::{
     MissingAgentImage, ReadyBaseImageResult, ReadyImagePlan, ReadyImageResult, ReadyImageWarning,
 };
@@ -55,6 +56,11 @@ pub struct ReadySummary {
     /// wording.
     #[serde(default)]
     pub image_action: ReadyImageAction,
+    /// How much readiness this run establishes. `ImagesOnly` never checks
+    /// provider authentication; the summary then says so instead of
+    /// reporting a pass.
+    #[serde(default)]
+    pub preparation_policy: PreparationPolicy,
 }
 
 impl ReadySummary {
@@ -78,7 +84,28 @@ impl ReadySummary {
             image_results: Vec::new(),
             base_image_results: Vec::new(),
             image_action: ReadyImageAction::Build,
+            preparation_policy: PreparationPolicy::Full,
         }
+    }
+
+    /// What this run established about provider authentication. Under
+    /// `ImagesOnly` it is always `NotChecked`: an image-ready result never
+    /// implies authentication succeeded.
+    pub fn authentication(&self) -> AuthenticationCheck {
+        if !self.preparation_policy.checks_authentication() {
+            return AuthenticationCheck::NotChecked;
+        }
+        match &self.local_agent {
+            StepStatus::Failed(_) => AuthenticationCheck::Failed,
+            StepStatus::Done => AuthenticationCheck::Passed,
+            _ => AuthenticationCheck::Unknown,
+        }
+    }
+
+    /// Whether every required image prerequisite succeeded. Named for the
+    /// `images_ready` JSON field; the same reading as [`Self::is_ready`].
+    pub fn images_ready(&self) -> bool {
+        self.is_ready()
     }
 
     /// The summary's rows, in display order, as `(label, status)`.
@@ -108,11 +135,20 @@ impl ReadySummary {
                 self.work_items_config.clone(),
             ),
         ];
-        let auth_rows = self.auth_rows();
-        if auth_rows.is_empty() {
+        if !self.preparation_policy.checks_authentication() {
+            // No host ping or audit ran. One explicit row replaces them.
+            rows.retain(|(label, _)| label != "Audit");
+            rows.insert(
+                3,
+                (
+                    "Authentication (not checked)".to_string(),
+                    StepStatus::Skipped,
+                ),
+            );
+        } else if self.auth_rows().is_empty() {
             rows.insert(3, ("Local agent".to_string(), self.local_agent.clone()));
         } else {
-            rows.splice(3..3, auth_rows);
+            rows.splice(3..3, self.auth_rows());
         }
         if let Some(status) = &self.image_source {
             rows.insert(3, ("Image source".to_string(), status.clone()));
@@ -294,7 +330,11 @@ impl ReadySummary {
     /// The closing line every frontend prints after the summary.
     pub fn outcome_line(&self) -> &'static str {
         if self.is_ready() {
-            "awman is ready."
+            if self.preparation_policy.checks_authentication() {
+                "awman is ready."
+            } else {
+                "awman images are ready; authentication was not checked."
+            }
         } else {
             "awman is not ready."
         }
@@ -437,5 +477,69 @@ impl AgentCredentialHealth {
             _ => format!("Credential {}", self.agent),
         };
         (label, status)
+    }
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+
+    fn images_ready_summary(policy: PreparationPolicy) -> ReadySummary {
+        let mut summary = ReadySummary::new("docker");
+        summary.preparation_policy = policy;
+        summary.dockerfile = StepStatus::Done;
+        summary.base_image = StepStatus::Done;
+        summary.agent_image = StepStatus::Done;
+        summary
+    }
+
+    #[test]
+    fn a_new_summary_is_full_and_old_summaries_deserialize_as_full() {
+        assert_eq!(
+            ReadySummary::new("docker").preparation_policy,
+            PreparationPolicy::Full
+        );
+        let mut json = serde_json::to_value(ReadySummary::new("docker")).unwrap();
+        json.as_object_mut().unwrap().remove("preparation_policy");
+        let back: ReadySummary = serde_json::from_value(json).unwrap();
+        assert_eq!(back.preparation_policy, PreparationPolicy::Full);
+    }
+
+    #[test]
+    fn images_only_never_reports_authentication_as_checked() {
+        let mut summary = images_ready_summary(PreparationPolicy::ImagesOnly);
+        // Even a stale "Done" local-agent row cannot read as a pass.
+        summary.local_agent = StepStatus::Done;
+        assert_eq!(summary.authentication(), AuthenticationCheck::NotChecked);
+        assert!(summary.images_ready());
+        assert_eq!(
+            summary.outcome_line(),
+            "awman images are ready; authentication was not checked."
+        );
+        assert!(summary
+            .rows()
+            .iter()
+            .any(|(label, _)| label == "Authentication (not checked)"));
+    }
+
+    #[test]
+    fn full_policy_derives_authentication_from_the_host_check() {
+        let mut summary = images_ready_summary(PreparationPolicy::Full);
+        assert_eq!(summary.authentication(), AuthenticationCheck::Unknown);
+        summary.local_agent = StepStatus::Done;
+        assert_eq!(summary.authentication(), AuthenticationCheck::Passed);
+        summary.local_agent = StepStatus::Failed("claude: not installed".into());
+        assert_eq!(summary.authentication(), AuthenticationCheck::Failed);
+        assert_eq!(summary.outcome_line(), "awman is ready.");
+    }
+
+    #[test]
+    fn a_failed_image_is_not_ready_under_either_policy() {
+        for policy in PreparationPolicy::ALL {
+            let mut summary = images_ready_summary(policy);
+            summary.agent_image = StepStatus::Failed("build failed".into());
+            assert!(!summary.images_ready(), "{policy:?}");
+            assert_eq!(summary.outcome_line(), "awman is not ready.");
+        }
     }
 }

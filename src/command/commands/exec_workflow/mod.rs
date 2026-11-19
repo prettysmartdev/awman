@@ -158,6 +158,15 @@ pub trait ExecWorkflowCommandFrontend:
     ) {
     }
 
+    /// The resolved native start mode, mount access and transport of one
+    /// agent step (WI 0070), with `step: Some(name)`. Presentation only.
+    fn report_agent_policy(
+        &mut self,
+        _policy: crate::data::agent_policy::ResolvedAgentPolicy,
+        _step: Option<&str>,
+    ) {
+    }
+
     /// Persist teardown inputs before starting work on a durable API command.
     fn record_cancel_cleanup(
         &mut self,
@@ -357,6 +366,8 @@ pub enum WorkflowResumeDecision {
 /// before it, and the step after it. Empty when that run has nothing left to do
 /// — every step succeeded or was skipped.
 pub struct ExecWorkflowCommand {
+    profile_owner: bool,
+    settings_profile: Option<crate::data::settings_profile::SettingsProfileName>,
     flags: ExecWorkflowCommandFlags,
     engines: Engines,
     session: Session,
@@ -401,6 +412,8 @@ pub struct ExecWorkflowCommand {
 impl ExecWorkflowCommand {
     pub fn new(flags: ExecWorkflowCommandFlags, engines: Engines, session: Session) -> Self {
         Self {
+            profile_owner: true,
+            settings_profile: None,
             flags,
             engines,
             session,
@@ -516,10 +529,12 @@ impl ExecWorkflowCommand {
         }
         Ok(Self::new(flags, ctx.engines.clone(), ctx.session.clone())
             .with_frontend_kind(ctx.caller.frontend())
+            .with_profile_owner(ctx.caller.profile_owner())
             .mirroring_into(Arc::clone(&ctx.managed_session))
             .with_cancellation(ctx.cancel.clone())
             .with_output_dir(ctx.output_dir.clone())
-            .with_workspace_access(workspace_access))
+            .with_settings_profile(crate::command::commands::launch_policy::settings_profile::ProfileRequest::from_context(ctx)?.name)
+        .with_workspace_access(workspace_access))
     }
 
     /// Carry a squad container identity so every generated-workflow step
@@ -573,6 +588,17 @@ impl ExecWorkflowCommand {
         self
     }
 
+    pub fn with_profile_owner(mut self, owner: bool) -> Self {
+        self.profile_owner = owner;
+        self
+    }
+    pub fn with_settings_profile(
+        mut self,
+        name: Option<crate::data::settings_profile::SettingsProfileName>,
+    ) -> Self {
+        self.settings_profile = name;
+        self
+    }
     pub fn flags(&self) -> &ExecWorkflowCommandFlags {
         &self.flags
     }

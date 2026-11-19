@@ -436,12 +436,14 @@ mod work_item_execution {
             yolo: false,
             yolo_authorized: false,
             auto: false,
+            auto_explicit: false,
             agent: Some("claude".into()),
             model: None,
             launch_mode: None,
             overlay: vec![],
             agent_flags: None,
             session_worktree: None,
+            automation: None,
         }
     }
     async fn run_workflow(

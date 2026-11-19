@@ -48,6 +48,7 @@ use std::time::Duration;
 /// The TUI populates these channels from `App::spawn_command`; the engine's
 /// container backend drains them against a real PTY master.
 pub struct InstanceCommandFrontend {
+    pub(crate) agent_stuck_timeout: std::time::Duration,
     pub(crate) worker_events: Option<crate::command::worker::events::ForegroundRecorder>,
     pub(crate) command_bytes: super::output::CommandBytes,
     input_available: bool,
@@ -226,6 +227,7 @@ impl InstanceCommandFrontend {
         );
         Self {
             command_bytes,
+            agent_stuck_timeout: crate::engine::container::timing::DEFAULT_STUCK_TIMEOUT,
             input_available: true,
             wake: None,
 
@@ -658,6 +660,9 @@ impl UserMessageSink for InstanceCommandFrontend {
 // ─── CommandFrontend ──────────────────────────────────────────────────────
 
 impl CommandFrontend for InstanceCommandFrontend {
+    fn set_agent_stuck_timeout(&mut self, timeout: std::time::Duration) {
+        self.agent_stuck_timeout = timeout;
+    }
     fn pick_queue_item(
         &mut self,
         items: &[crate::command::daemon_api::worker_pull::QueueRow],
@@ -757,6 +762,10 @@ impl CommandFrontend for InstanceCommandFrontend {
 
     fn argument(&self, _command_path: &[&str], name: &str) -> Result<Option<String>, CommandError> {
         Ok(self.parsed.args.argument(name))
+    }
+
+    fn literal_tail(&self) -> bool {
+        self.parsed.args.literal_tail()
     }
 
     fn arguments(&self, _command_path: &[&str], name: &str) -> Result<Vec<String>, CommandError> {

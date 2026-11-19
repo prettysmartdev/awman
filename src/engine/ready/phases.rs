@@ -192,6 +192,13 @@ impl ReadyEngine {
         use crate::data::templates;
 
         self.cancel.check()?;
+        if !self.options.preparation.checks_authentication() && self.options.refresh {
+            // `--refresh` runs an agent audit; it cannot join a preparation
+            // that promises no agent runs.
+            return Err(EngineError::Other(
+                "--prepare-only cannot be combined with --refresh (an agent audit)".into(),
+            ));
+        }
         frontend.report_phase(&self.phase);
         let git_root = self.session.git_root().to_path_buf();
         let _ = &self.git_engine;
@@ -292,6 +299,9 @@ impl ReadyEngine {
             self.summary.base_image = StepStatus::Skipped;
             self.summary.local_agent = StepStatus::Skipped;
             self.summary.audit = StepStatus::Skipped;
+            if !self.options.preparation.checks_authentication() {
+                self.summary.agent_credentials.clear();
+            }
             self.summary.agent_image = match &result {
                 Ok(()) => StepStatus::Done,
                 Err(e) => StepStatus::Failed(e.to_string()),
@@ -569,9 +579,9 @@ impl ReadyEngine {
                 // ENG-1: When --build is set, also build all other agent images.
                 if self.options.build {
                     let all_agents = paths.discover_agent_dockerfiles();
-                    let default_agent = self.options.agent.as_str();
+                    let default_agent = self.options.agent.as_str().to_string();
                     for (agent_name, agent_path) in &all_agents {
-                        if agent_name == default_agent {
+                        if *agent_name == default_agent {
                             continue;
                         }
                         let provision = async {
@@ -592,6 +602,11 @@ impl ReadyEngine {
                                 frontend.report_step_status(
                                     &ReadyStep::BuildAgentImageFor(agent_name.clone()).into(),
                                     StepStatus::Failed(error.to_string()),
+                                );
+                                self.record_requested_image_failure(
+                                    &git_root,
+                                    agent_name,
+                                    error.to_string(),
                                 );
                                 continue;
                             }
@@ -626,13 +641,13 @@ impl ReadyEngine {
                                 );
                             }
                             Err(e) => {
+                                let message =
+                                    crate::engine::agent::custom_build_failure(&definition, e);
                                 frontend.report_step_status(
                                     &ReadyStep::BuildAgentImageFor(agent_name.to_string()).into(),
-                                    StepStatus::Failed(crate::engine::agent::custom_build_failure(
-                                        &definition,
-                                        e,
-                                    )),
+                                    StepStatus::Failed(message.clone()),
                                 );
+                                self.record_requested_image_failure(&git_root, agent_name, message);
                             }
                         }
                     }
@@ -643,7 +658,7 @@ impl ReadyEngine {
             ReadyPhase::CheckingNonDefaultAgents => {
                 let paths = RepoDockerfilePaths::new(&git_root);
                 let all_agents = paths.discover_agent_dockerfiles();
-                let default_agent = self.options.agent.as_str();
+                let default_agent = self.options.agent.as_str().to_string();
 
                 let mut missing_agents: Vec<(String, String)> = Vec::new();
                 let mut missing_images = Vec::new();
@@ -651,7 +666,7 @@ impl ReadyEngine {
                 let mut all_ok = true;
                 let mut count = 0usize;
                 for (agent_name, _agent_path) in &all_agents {
-                    if agent_name == default_agent {
+                    if *agent_name == default_agent {
                         continue;
                     }
                     count += 1;
@@ -665,6 +680,13 @@ impl ReadyEngine {
                         self.summary
                             .non_default_agent_images
                             .push((agent_name.clone(), status));
+                        if self.options.build {
+                            self.record_requested_image_failure(
+                                &git_root,
+                                agent_name,
+                                error.to_string(),
+                            );
+                        }
                         continue;
                     }
                     let other_tag = agent_image_tag(&git_root, agent_name);
@@ -701,6 +723,16 @@ impl ReadyEngine {
                     }
                 }
 
+                if self.options.build {
+                    // `--build` requested every discovered image, so a
+                    // failed or unfinished one is a required failure.
+                    for result in &mut self.summary.image_results {
+                        if result.agent != default_agent {
+                            result.optional = false;
+                        }
+                    }
+                }
+
                 if count > 0 {
                     if all_ok {
                         // All non-default agents have valid images → single consolidated row.
@@ -732,7 +764,14 @@ impl ReadyEngine {
                     }
                 }
 
-                ReadyPhase::CheckingLocalAgent
+                if self.options.preparation.checks_authentication() {
+                    ReadyPhase::CheckingLocalAgent
+                } else {
+                    // `--prepare-only`: no host ping, refresh or audit. The
+                    // summary records that authentication was not checked.
+                    self.skip_authentication_phases(frontend);
+                    ReadyPhase::RebuildingAfterAudit
+                }
             }
             // SECURITY EXCEPTION: this is the ONE sanctioned host-side agent
             // execution in awman (see `aspec/architecture/security.md`). The
@@ -743,6 +782,13 @@ impl ReadyEngine {
             // auth token before credentials are mounted into containerized
             // agents. Do not add other host-side agent invocations.
             ReadyPhase::CheckingLocalAgent => {
+                // Defense in depth: this arm is the one host-side agent
+                // execution and is unreachable under `ImagesOnly`.
+                if !self.options.preparation.checks_authentication() {
+                    self.skip_authentication_phases(frontend);
+                    self.phase = ReadyPhase::RebuildingAfterAudit;
+                    return Ok(self.phase.clone());
+                }
                 frontend
                     .report_step_status(&ReadyStep::CheckLocalAgent.into(), StepStatus::Running);
                 self.check_local_agents(frontend).await?;
@@ -751,6 +797,11 @@ impl ReadyEngine {
                 ReadyPhase::RunningAudit
             }
             ReadyPhase::RunningAudit => {
+                if !self.options.preparation.checks_authentication() {
+                    self.summary.audit = StepStatus::Skipped;
+                    self.phase = ReadyPhase::RebuildingAfterAudit;
+                    return Ok(self.phase.clone());
+                }
                 // Issue 7: When --refresh is not set, skip the audit entirely.
                 if !self.options.refresh {
                     self.summary.audit = StepStatus::Skipped;
@@ -1177,9 +1228,50 @@ impl ReadyEngine {
         }
     }
 
+    /// `--build` asked for this discovered agent's image, so its refusal or
+    /// build failure is a required image failure, not an optional warning.
+    /// Idempotent per tag.
+    fn record_requested_image_failure(
+        &mut self,
+        git_root: &std::path::Path,
+        agent: &str,
+        message: String,
+    ) {
+        let tag = crate::data::image_tags::agent_image_tag(git_root, agent);
+        if self
+            .summary
+            .image_results
+            .iter()
+            .any(|r| r.tag == tag && r.has_failure())
+        {
+            return;
+        }
+        let mut result = crate::data::ready_image::ReadyImageResult::new(agent, tag.clone());
+        result.build = StepStatus::Failed(message);
+        result.import = StepStatus::Skipped;
+        self.summary.image_results.retain(|r| r.tag != tag);
+        self.summary.image_results.push(result);
+    }
+
     fn record_import_failure(&mut self, msg: String) {
         self.summary.agent_image = StepStatus::Failed(msg.clone());
         self.summary.image_source = Some(StepStatus::Failed(msg));
+    }
+
+    /// `ImagesOnly`: record that the host-agent check and the audit did not
+    /// run. Neither is a pass; the summary reports authentication as
+    /// `not_checked`.
+    fn skip_authentication_phases(&mut self, frontend: &mut dyn ReadyFrontend) {
+        self.summary.agent_auth.clear();
+        self.summary.local_agent = StepStatus::Skipped;
+        self.summary.audit = StepStatus::Skipped;
+        self.summary.agent_credentials.clear();
+        frontend.write_message(crate::data::message::UserMessage {
+            level: crate::data::message::MessageLevel::Info,
+            text:
+                "--prepare-only: host agent checks and audits skipped; authentication not checked"
+                    .into(),
+        });
     }
 
     /// Drive to completion: advance phases in a loop until terminal.

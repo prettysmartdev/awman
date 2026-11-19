@@ -125,6 +125,20 @@ impl TerminalStream {
     }
 
     /// Say `Detached{reason}` and close.
+    /// Explicit owner-local mutation. No reconnect path retries or reacquires control.
+    pub async fn submit_turn(
+        &mut self,
+        request: crate::data::automation_records::SubmitTurnRequest,
+    ) -> Result<(), EngineError> {
+        self.send(TerminalClientFrame::SubmitTurn { request }).await
+    }
+    pub async fn close_execution(
+        &mut self,
+        request: crate::data::automation_records::CloseExecutionRequest,
+    ) -> Result<(), EngineError> {
+        self.send(TerminalClientFrame::CloseExecution { request })
+            .await
+    }
     pub async fn close(mut self) -> Result<(), EngineError> {
         self.inner
             .close(None)

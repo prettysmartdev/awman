@@ -369,7 +369,7 @@ pub(crate) fn read_only_unsupported(runtime: &str) -> EngineError {
 
 /// Include linked-worktree administrative state, which can live outside the
 /// checkout and is often mounted as a sidecar so Git works in the guest.
-fn workspace_git_dirs(workspace: &Path) -> Result<Vec<PathBuf>, EngineError> {
+pub(crate) fn workspace_git_dirs(workspace: &Path) -> Result<Vec<PathBuf>, EngineError> {
     let dot_git = workspace.join(".git");
     let metadata = match std::fs::metadata(&dot_git) {
         Ok(metadata) => metadata,

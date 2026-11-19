@@ -356,3 +356,120 @@ fn canonical_through_existing_ancestor(path: &Path) -> Option<PathBuf> {
         existing = existing.parent()?;
     }
 }
+
+/// Merge a native-mode settings `patch` (shallow, keys replace) into
+/// `relative_file` inside `private_dir`, an execution-private directory awman
+/// created and seeded for this launch (WI 0070, opencode-v2 `default_agent`).
+/// Never receives a host settings path.
+///
+/// Target: the named file when it exists; else a sibling `.jsonc` of the
+/// same stem, rewritten as plain JSON (valid JSONC; it is a private copy);
+/// else a new file holding only the patch. A non-object root is refused.
+/// Written `0600` through a private sibling and a rename. Returns a notice
+/// for each key whose different value was replaced.
+pub(crate) fn apply_native_settings_patch(
+    private_dir: &Path,
+    relative_file: &Path,
+    patch: &serde_json::Value,
+) -> Result<Vec<String>, EngineError> {
+    use crate::data::fs::private_files::write_private_json_atomic;
+    if !relative_file
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(EngineError::Config(format!(
+            "invalid native settings path: {}",
+            relative_file.display()
+        )));
+    }
+    let Some(patch) = patch.as_object() else {
+        return Err(EngineError::Config(
+            "a native settings patch must be a JSON object".into(),
+        ));
+    };
+    let primary = private_dir.join(relative_file);
+    let jsonc = primary.with_extension("jsonc");
+    let target = [&primary, &jsonc]
+        .into_iter()
+        .find(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file()))
+        .cloned();
+    let mut root = match &target {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).map_err(|e| EngineError::io(path, e))?;
+            crate::data::jsonc::parse_tolerant(&text).map_err(|e| {
+                EngineError::Config(format!(
+                    "{} in the private settings copy cannot be parsed ({e}); --plan cannot \
+                     select the native mode",
+                    relative_file.display()
+                ))
+            })?
+        }
+        None => serde_json::Value::Object(Default::default()),
+    };
+    let Some(object) = root.as_object_mut() else {
+        return Err(EngineError::Config(format!(
+            "{} in the private settings copy is not a JSON object; --plan cannot select the \
+             native mode",
+            relative_file.display()
+        )));
+    };
+    let mut notices = Vec::new();
+    for (key, value) in patch {
+        if let Some(previous) = object.insert(key.clone(), value.clone()) {
+            if &previous != value {
+                notices.push(format!(
+                    "overrode {key}={previous} for this session; host configuration unchanged"
+                ));
+            }
+        }
+    }
+    let path = target.unwrap_or(primary);
+    if let Some(parent) = path.parent().filter(|p| !p.exists()) {
+        crate::data::fs::private_files::create_private_dir(parent)?;
+    }
+    write_private_json_atomic(&path, &root, || Ok(()))?;
+    Ok(notices)
+}
+
+impl OverlayEngine {
+    pub(crate) fn profile_settings_overlays(
+        &self,
+        agent: &AgentName,
+        def: &AgentDefinition,
+        profile: &crate::engine::agent::profile_state::ProfileRunState,
+        home: &str,
+        materialize: bool,
+    ) -> Result<(Vec<OverlaySpec>, Vec<StagedCredentialFile>), EngineError> {
+        let spec = def
+            .profile_state
+            .as_ref()
+            .ok_or_else(|| EngineError::Config("profile state layout absent".into()))?;
+        let mut staged = Vec::new();
+        match def.settings_mount {
+            SettingsMount::Claude => self.plant_credential_file(
+                agent,
+                &profile.run_dir.join(".claude"),
+                materialize,
+                &mut staged,
+            )?,
+            SettingsMount::Antigravity => {
+                let root = profile.run_dir.join(".gemini");
+                for file in (self.secret_files_provider)(agent) {
+                    super::credential_file::write_secret_file(&root, &file)
+                        .map_err(|e| EngineError::io(&root, e))?;
+                }
+            }
+            _ => {}
+        }
+        let overlays = spec
+            .roots
+            .iter()
+            .map(|r| OverlaySpec {
+                host_path: profile.run_dir.join(&r.home_relative),
+                container_path: Path::new(home).join(&r.home_relative),
+                permission: OverlayPermission::ReadWrite,
+            })
+            .collect();
+        Ok((overlays, staged))
+    }
+}

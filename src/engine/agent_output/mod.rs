@@ -26,6 +26,8 @@ mod claude_stream_json;
 mod codex_json;
 mod cursor_stream_json;
 pub mod line_framer;
+pub mod native_observation;
+mod provider_json;
 
 use std::sync::Arc;
 
@@ -57,7 +59,56 @@ pub enum Translated {
 
 /// Turns an agent's output stream into [`Translated`] items, one input line
 /// at a time. Implementations are plain state machines: no I/O, no clocks.
+#[derive(Debug, Clone, Default)]
+pub struct NativeObservation {
+    pub identity: Option<crate::data::settings_profile::NativeSessionId>,
+    /// A valid terminal success record was seen (and nothing contradicted it).
+    pub completed: bool,
+    /// A terminal failure record was seen. Latched: no later record clears it.
+    pub failed: bool,
+    /// The confirmed answer carried by the terminal success record.
+    pub final_message: Option<String>,
+    /// A recognized terminal record was malformed, or terminal records
+    /// conflicted. Latched; it defeats any success.
+    pub protocol_error: Option<String>,
+}
+
+impl NativeObservation {
+    /// Fold one terminal outcome record. The first outcome latches; an
+    /// identical duplicate is ignored and a conflicting one (a different
+    /// outcome or answer) is a protocol error, never a reset.
+    pub fn terminal(&mut self, success: bool, answer: Option<String>) {
+        if self.protocol_error.is_some() {
+            return;
+        }
+        if self.completed || self.failed {
+            if self.completed != success || (success && self.final_message != answer) {
+                self.completed = false;
+                self.protocol_error = Some("conflicting terminal records".into());
+            }
+            return;
+        }
+        if success {
+            self.completed = true;
+            self.final_message = answer;
+        } else {
+            self.failed = true;
+        }
+    }
+
+    /// A recognized required record failed validation.
+    pub fn protocol(&mut self, reason: &str) {
+        if self.protocol_error.is_none() {
+            self.protocol_error = Some(reason.to_owned());
+        }
+        self.completed = false;
+    }
+}
 pub trait AgentOutputTranslator: Send {
+    fn native_observation(&self) -> NativeObservation {
+        NativeObservation::default()
+    }
+
     /// Feed one line (without its trailing newline). Returns what the line
     /// produced, in emission order; an empty vector is fine.
     fn feed_line(&mut self, stream: OutputStream, line: &str) -> Vec<Translated>;
@@ -90,6 +141,13 @@ impl AgentOutputTranslator for PassthroughTranslator {
 /// `Text` is the passthrough; structured formats each have one parser.
 pub fn translator_for(format: AgentOutputFormat) -> Box<dyn AgentOutputTranslator> {
     match format {
+        AgentOutputFormat::OpenCodeJson
+        | AgentOutputFormat::OpenCodeV2Json
+        | AgentOutputFormat::CopilotJson
+        | AgentOutputFormat::ClineJson
+        | AgentOutputFormat::AntigravityStreamJson => {
+            Box::new(provider_json::Translator::new(format))
+        }
         AgentOutputFormat::Text => Box::new(PassthroughTranslator),
         AgentOutputFormat::ClaudeStreamJson => Box::new(claude_stream_json::Translator::default()),
         AgentOutputFormat::CodexJson => Box::new(codex_json::Translator::default()),
@@ -108,6 +166,9 @@ pub fn translator_for_redacted(
         redaction: crate::engine::auth::redaction::RedactionSet,
     }
     impl AgentOutputTranslator for Redacted {
+        fn native_observation(&self) -> NativeObservation {
+            self.inner.native_observation()
+        }
         fn feed_line(&mut self, stream: OutputStream, line: &str) -> Vec<Translated> {
             self.inner.feed_line(stream, &self.redaction.redact(line))
         }

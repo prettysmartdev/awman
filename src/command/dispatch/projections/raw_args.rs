@@ -43,6 +43,8 @@ pub enum ParsedFlag {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedArgs {
     flags: BTreeMap<String, ParsedFlag>,
+    /// A `--` before the first positional makes the complete tail literal.
+    literal_tail: bool,
     implicit_flags: BTreeSet<String>,
     /// Positional arguments, keyed by their catalogue name. Stored as a vector
     /// so a greedy trailing argument keeps every token; single-valued
@@ -69,7 +71,12 @@ impl ParsedArgs {
                 .collect(),
             path_arguments: BTreeSet::new(),
             implicit_flags: BTreeSet::new(),
+            literal_tail: false,
         }
+    }
+
+    pub fn literal_tail(&self) -> bool {
+        self.literal_tail
     }
 
     /// Whether the invocation set `flag`, whatever its type.
@@ -152,7 +159,8 @@ impl ParsedArgs {
     /// catalogue parser instead of trusting a parse it did not make (D3).
     ///
     /// Flags use the inline `--name=value` form, so a value starting with `-`
-    /// stays a value; positionals follow a `--` in the spec's order.
+    /// stays a value. A literal trailing positional retains its `--` marker;
+    /// ordinary greedy tails keep their original validation on relay.
     pub fn to_argv(&self, spec: &CommandSpec) -> Vec<String> {
         let mut argv = Vec::new();
         for (name, value) in &self.flags {
@@ -177,7 +185,14 @@ impl ParsedArgs {
             .flat_map(|argument| self.arguments(argument.name))
             .collect();
         if !positionals.is_empty() {
-            argv.push("--".into());
+            if self.literal_tail
+                || !spec
+                    .arguments
+                    .iter()
+                    .any(|a| matches!(a.kind, ArgumentKind::TrailingVarArgs))
+            {
+                argv.push("--".into());
+            }
             argv.extend(positionals);
         }
         argv
@@ -440,6 +455,9 @@ pub(crate) fn parse_against_spec(
         let arg = cursor.peek().expect("not done").clone();
 
         if greedy || after_double_dash {
+            if greedy && !after_double_dash {
+                refuse_misplaced_flags(spec, path, std::slice::from_ref(&arg))?;
+            }
             positionals.push(arg);
             cursor.advance();
             continue;
@@ -468,18 +486,22 @@ pub(crate) fn parse_against_spec(
                 ));
             };
             cursor.apply_flag(flag_spec, inline, &mut flags)?;
-        } else if let Some(short) = arg.strip_prefix('-') {
-            // Only single-character short flags are supported (clap parity).
-            if short.chars().count() != 1 {
-                return Err(CommandError::unknown_flag(path, arg.clone()));
+        } else if arg != "-" && arg.starts_with('-') {
+            let shorts = arg[1..].to_string();
+            let mut chars = shorts.char_indices().peekable();
+            while let Some((offset, ch)) = chars.next() {
+                let flag_spec = applicable_flags(spec)
+                    .find(|f| f.short == Some(ch))
+                    .ok_or_else(|| CommandError::unknown_flag(path, format!("-{ch}")))?;
+                if matches!(flag_spec.kind, FlagKind::Bool) && chars.peek().is_some() {
+                    flags.insert(flag_spec.long.into(), ParsedFlag::Bool(true));
+                    continue;
+                }
+                let rest = &shorts[offset + ch.len_utf8()..];
+                let inline = (!rest.is_empty()).then(|| rest.trim_start_matches('=').to_string());
+                cursor.apply_flag(flag_spec, inline, &mut flags)?;
+                break;
             }
-            let ch = short.chars().next().unwrap();
-            let flag_spec = spec
-                .flags
-                .iter()
-                .find(|f| f.short == Some(ch))
-                .ok_or_else(|| CommandError::unknown_flag(path, format!("-{ch}")))?;
-            cursor.apply_flag(flag_spec, None, &mut flags)?;
         } else {
             positionals.push(arg);
             // Begin greedy capture once we have started filling a trailing
@@ -510,6 +532,17 @@ pub(crate) fn parse_against_spec(
             });
         }
     }
+
+    // A declared flag whose behavior is not wired yet is refused here, so
+    // the TUI command box and API admission reject it before anything is
+    // queued or launched (WI 0070). Prompt tokens were never parsed as flags.
+    CommandCatalogue::get().refuse_pending_flags(
+        path,
+        flags
+            .keys()
+            .map(String::as_str)
+            .filter(|name| flag_is_active(&flags, name)),
+    )?;
 
     // Map collected positionals onto the declared arguments in order.
     let mut arguments: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -550,10 +583,130 @@ pub(crate) fn parse_against_spec(
 
     Ok(ParsedArgs {
         implicit_flags: BTreeSet::new(),
+        literal_tail: after_double_dash && trailing,
         flags,
         arguments,
         path_arguments,
     })
+}
+
+/// Applicable command options plus inherited global options, from the catalogue.
+fn applicable_flags(spec: &CommandSpec) -> impl Iterator<Item = &FlagSpec> {
+    let catalogue = CommandCatalogue::get();
+    spec.flags.iter().chain(catalogue.global_flags())
+}
+
+/// Check whole argv tokens only. Prose containing option spellings is never scanned.
+pub(crate) fn refuse_misplaced_flags(
+    spec: &CommandSpec,
+    path: &[&str],
+    tokens: &[String],
+) -> Result<(), CommandError> {
+    for token in tokens {
+        let known = if matches!(token.as_str(), "-h" | "--help" | "-V" | "--version") {
+            true
+        } else if let Some(long) = token.strip_prefix("--") {
+            let name = long.split_once('=').map_or(long, |(name, _)| name);
+            applicable_flags(spec).any(|flag| flag.long == name)
+        } else if let Some(shorts) = token.strip_prefix('-') {
+            let mut recognized = false;
+            for (offset, ch) in shorts.char_indices() {
+                let Some(flag) = applicable_flags(spec).find(|flag| flag.short == Some(ch)) else {
+                    recognized = false;
+                    break;
+                };
+                recognized = true;
+                // A value-taking short option owns the rest of its token.
+                if !matches!(flag.kind, FlagKind::Bool) {
+                    break;
+                }
+                if shorts[offset + ch.len_utf8()..].starts_with('=') {
+                    break;
+                }
+            }
+            recognized
+        } else {
+            false
+        };
+        if known {
+            return Err(CommandError::InvalidArgumentValue {
+                command: path.iter().map(|s| (*s).to_string()).collect(),
+                argument: "prompt".into(),
+                reason: format!("`{token}` appears after prompt text. Move awman flags before the prompt, or put `--` before the first prompt token to make the entire prompt literal."),
+            });
+        }
+    }
+    Ok(())
+}
+
+impl CommandCatalogue {
+    /// Recover a trailing positional's token boundaries and literal delimiter from
+    /// CLI argv. Path and prefix options use the same catalogue cursor.
+    pub fn parse_cli_tail(&self, argv: &[String]) -> Result<Option<ParsedArgs>, CommandError> {
+        let mut spec = self.root();
+        let mut path = Vec::new();
+        let mut cursor = RawArgCursor::new(argv.get(1..).unwrap_or_default(), &[]);
+        let mut prefix = BTreeMap::new();
+        while let Some(token) = cursor.peek() {
+            if spec
+                .arguments
+                .iter()
+                .any(|a| matches!(a.kind, ArgumentKind::TrailingVarArgs))
+            {
+                return self
+                    .parse_raw_args(&path, &cursor.args[cursor.i..])
+                    .map(Some);
+            }
+            if let Some(sub) = spec.find_subcommand(token) {
+                path.push(sub.name);
+                spec = sub;
+                cursor.advance();
+            } else if let Some(long) = token.strip_prefix("--") {
+                let (name, inline) = long
+                    .split_once('=')
+                    .map_or((long, None), |(n, v)| (n, Some(v.to_string())));
+                let Some(flag) = applicable_flags(spec).find(|f| f.long == name) else {
+                    return Ok(None);
+                };
+                cursor.apply_flag(flag, inline, &mut prefix)?;
+            } else if let Some(short) = token.strip_prefix('-') {
+                let Some(_) = short.char_indices().next() else {
+                    return Ok(None);
+                };
+                let mut chars = short.char_indices().peekable();
+                while let Some((offset, ch)) = chars.next() {
+                    let Some(flag) = applicable_flags(spec).find(|f| f.short == Some(ch)) else {
+                        return Ok(None);
+                    };
+                    let rest_offset = offset + ch.len_utf8();
+                    let rest = &short[rest_offset..];
+                    if matches!(flag.kind, FlagKind::Bool)
+                        && chars.peek().is_some()
+                        && !rest.starts_with('=')
+                    {
+                        prefix.insert(flag.long.to_string(), ParsedFlag::Bool(true));
+                        continue;
+                    }
+                    {
+                        let inline = (!rest.is_empty())
+                            .then(|| rest.strip_prefix('=').unwrap_or(rest).to_string());
+                        cursor.apply_flag(flag, inline, &mut prefix)?;
+                        break;
+                    }
+                }
+            } else {
+                return Ok(None);
+            }
+        }
+        if spec
+            .arguments
+            .iter()
+            .any(|a| matches!(a.kind, ArgumentKind::TrailingVarArgs))
+        {
+            return self.parse_raw_args(&path, &[]).map(Some);
+        }
+        Ok(None)
+    }
 }
 
 /// A position in an argument vector, and the command path errors are
@@ -627,7 +780,26 @@ impl<'a> RawArgCursor<'a> {
                 flags.insert(key, ParsedFlag::Str(val));
                 Ok(())
             }
-            FlagKind::VecString => {
+            FlagKind::OptionalEnum { .. } => {
+                // `=`-only: a bare flag takes its missing-value default and
+                // the next token is never consumed as the value.
+                let earlier = match flags.get(&key) {
+                    Some(ParsedFlag::Str(value)) => Some(value.clone()),
+                    _ => None,
+                };
+                let occurrences = earlier
+                    .as_deref()
+                    .map(Some)
+                    .into_iter()
+                    .chain(std::iter::once(inline.as_deref()));
+                let value = flag_spec
+                    .resolve_optional_enum(path, occurrences)?
+                    .expect("at least one occurrence");
+                flags.insert(key, ParsedFlag::Str(value));
+                self.advance();
+                Ok(())
+            }
+            FlagKind::VecString | FlagKind::AgentArg => {
                 let val = self.read_value(inline, flag_spec.long)?;
                 match flags.get_mut(&key) {
                     Some(ParsedFlag::Strings(items)) => items.push(val),
@@ -681,7 +853,7 @@ impl<'a> RawArgCursor<'a> {
             return Ok(v);
         }
         match self.args.get(self.i + 1) {
-            Some(v) if !v.starts_with('-') => {
+            Some(v) if !v.starts_with('-') || self.hyphen_value_allowed(flag, v)? => {
                 let v = v.clone();
                 self.advance();
                 self.advance();
@@ -693,6 +865,42 @@ impl<'a> RawArgCursor<'a> {
                 reason: "flag requires a value".to_string(),
             }),
         }
+    }
+
+    fn hyphen_value_allowed(&self, flag_name: &str, value: &str) -> Result<bool, CommandError> {
+        let spec = CommandCatalogue::get()
+            .lookup(self.path)
+            .ok_or_else(|| CommandError::unknown_command(self.path))?;
+        let Some(flag) = applicable_flags(spec).find(|flag| flag.long == flag_name) else {
+            return Ok(false);
+        };
+        if !flag.allows_hyphen_value() {
+            return Ok(false);
+        }
+        let collides = value == "--"
+            || value == "-h"
+            || value == "--help"
+            || value == "-V"
+            || value == "--version"
+            || if let Some(long) = value.strip_prefix("--") {
+                let name = long.split_once('=').map_or(long, |(name, _)| name);
+                applicable_flags(spec).any(|known| known.long == name)
+            } else if let Some(shorts) = value.strip_prefix('-') {
+                let mut chars = shorts.chars();
+                chars.next().is_some_and(|first| {
+                    applicable_flags(spec).any(|known| known.short == Some(first))
+                })
+            } else {
+                false
+            };
+        if collides {
+            return Err(CommandError::InvalidArgumentValue {
+                command: self.path.iter().map(|s| (*s).to_string()).collect(),
+                argument: "prompt".into(),
+                reason: format!("`{value}` is an awman option or delimiter; use `--{flag_name}={value}` to pass it literally to the agent"),
+            });
+        }
+        Ok(true)
     }
 }
 
@@ -743,6 +951,165 @@ mod permission_provenance_tests {
                     opt.is_some()
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod misplaced_flag_tests {
+    use super::*;
+    const PATH: &[&str] = &["exec", "prompt"];
+    fn args(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|s| (*s).into()).collect()
+    }
+    fn parse(tokens: &[&str]) -> Result<ParsedArgs, CommandError> {
+        CommandCatalogue::get().parse_raw_args(PATH, &args(tokens))
+    }
+
+    #[test]
+    fn catalogue_options_aliases_inline_values_and_clusters_are_refused() {
+        for token in [
+            "--agent",
+            "--model=m",
+            "--headless",
+            "--work-item=70",
+            "--branch=b",
+            "--remote=host",
+            "--set=agents.stuckTimeout=60s",
+            "-n",
+            "-nn",
+            "-noenv(X)",
+            "-w70",
+        ] {
+            let error = parse(&["review", token]).unwrap_err();
+            assert_eq!(
+                (error.exit_code(), error.http_status(), error.code()),
+                (2, 400, "invalid_request"),
+                "{token}: {error}"
+            );
+            assert!(error.to_string().contains("before the prompt"));
+            assert!(error.to_string().contains("`--`"));
+        }
+    }
+
+    #[test]
+    fn literal_marker_round_trips_and_a_late_delimiter_does_not_disable_the_guard() {
+        let spec = CommandCatalogue::get().lookup(PATH).unwrap();
+        for tokens in [
+            &["--", "--model"][..],
+            &["--", "review", "--", "--model=m"][..],
+            &["review", "--", "unknown-option"][..],
+        ] {
+            let parsed = parse(tokens).unwrap();
+            assert_eq!(parsed.literal_tail(), tokens[0] == "--");
+            assert_eq!(
+                parse(
+                    &parsed
+                        .to_argv(spec)
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                )
+                .unwrap(),
+                parsed
+            );
+        }
+        assert!(parse(&["review", "--", "--model=m"]).is_err());
+    }
+
+    #[test]
+    fn prose_unknown_words_and_hyphenated_agent_flag_values_keep_their_tokens() {
+        let parsed = parse(&[
+            "--agent-flag",
+            "--effort",
+            "--agent-flag=unsupported",
+            "Explain --model and --headless",
+            "--unknown",
+            "-xyz",
+            "-",
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.flag_strings("agent-flag"),
+            ["--effort", "unsupported"]
+        );
+        assert_eq!(
+            parsed.arguments("prompt"),
+            ["Explain --model and --headless", "--unknown", "-xyz", "-"]
+        );
+        let clustered = parse(&["-n", "-oenv(TEST)", "review"]).unwrap();
+        assert_eq!(clustered.flag_bool("headless"), Some(true));
+        assert_eq!(clustered.flag_strings("overlay"), ["env(TEST)"]);
+    }
+
+    #[test]
+    fn agent_flag_does_not_consume_awman_options_or_delimiter() {
+        for value in ["--headless", "--model", "--", "-n", "--help", "-V"] {
+            let error = parse(&["--agent-flag", value, "task"]).unwrap_err();
+            assert!(error.to_string().contains("use `--agent-flag="), "{error}");
+        }
+        let parsed = parse(&["--agent-flag=--headless", "task"]).unwrap();
+        assert_eq!(parsed.flag_strings("agent-flag"), ["--headless"]);
+    }
+
+    #[test]
+    fn help_and_version_after_prompt_text_are_misplaced_flags() {
+        for token in ["-h", "--help", "-V", "--version"] {
+            let error = parse(&["task", token]).unwrap_err();
+            assert!(
+                error.to_string().contains("appears after prompt text"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_tail_rejects_awman_flag_as_separate_agent_flag_value() {
+        let argv = args(&[
+            "awman",
+            "exec",
+            "prompt",
+            "--agent-flag",
+            "--headless",
+            "task",
+        ]);
+        let error = CommandCatalogue::get().parse_cli_tail(&argv).unwrap_err();
+        assert!(error.to_string().contains("use `--agent-flag="));
+    }
+
+    #[test]
+    fn cli_tail_keeps_clusters_before_the_prompt_in_the_shared_raw_parser() {
+        let argv = args(&["awman", "exec", "prompt", "-nn", "task"]);
+        let parsed = CommandCatalogue::get()
+            .parse_cli_tail(&argv)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.flag_bool("headless"), Some(true));
+        assert_eq!(parsed.arguments("prompt"), ["task"]);
+    }
+
+    #[test]
+    fn cli_prefix_options_and_literal_tail_use_the_shared_parser() {
+        for prefix in [
+            &["awman"][..],
+            &["awman", "--set", "agents.stuckTimeout=60s"][..],
+        ] {
+            let mut argv = args(prefix);
+            argv.extend(args(&[
+                "exec",
+                "prompt",
+                "--agent-flag",
+                "--effort",
+                "--",
+                "--model",
+            ]));
+            let parsed = CommandCatalogue::get()
+                .parse_cli_tail(&argv)
+                .unwrap()
+                .unwrap();
+            assert!(parsed.literal_tail());
+            assert_eq!(parsed.arguments("prompt"), ["--model"]);
+            assert_eq!(parsed.flag_strings("agent-flag"), ["--effort"]);
         }
     }
 }

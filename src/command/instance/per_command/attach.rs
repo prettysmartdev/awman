@@ -105,7 +105,13 @@ impl AttachCommandFrontend for InstanceCommandFrontend {
                                 messages.write_message(crate::data::message::UserMessage { level: crate::data::message::MessageLevel::Warning, text: "terminal control unavailable; watching read-only".into() });
                             }
                         }
-                        Ok(Some(TerminalFrame::Resize { .. } | TerminalFrame::Lagged)) => {}
+                        Ok(Some(TerminalFrame::AutomationState { snapshot })) => {
+                            if snapshot.status_support == crate::data::automation::StatusSupport::BestEffort {
+                                use crate::data::message::UserMessageSink;
+                                let mut messages = messages.clone();messages.write_message(crate::data::message::UserMessage {level:crate::data::message::MessageLevel::Warning,text:"Best-effort automation status".into()});
+                            }
+                        }
+                        Ok(Some(TerminalFrame::Resize { .. } | TerminalFrame::Lagged | TerminalFrame::TurnAccepted { .. } | TerminalFrame::TurnResult { .. } | TerminalFrame::ExecutionClosed { .. } | TerminalFrame::ExecutionReplaced { .. } | TerminalFrame::CredentialUpdateState { .. } | TerminalFrame::OperationError { .. })) => {}
                     }
                 }
             }

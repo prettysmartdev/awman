@@ -351,6 +351,7 @@ impl ExecBridge {
         });
         let stuck = StuckDetector::spawn(
             StuckConfig {
+                startup_timing: frontend.startup_timing(),
                 grace_timeout: frontend.grace_timeout(),
                 stuck_timeout: frontend.stuck_timeout(),
                 container_start_delay: Duration::ZERO,

@@ -2264,6 +2264,7 @@ impl FrontendSession {
             Some(tab_id) => EngineFrame::CommandFinished {
                 tab_id,
                 result: CommandResultWire {
+                    automation: None,
                     exit_code: match &error {
                         HostError::Command(error) => i32::from(error.exit_code()),
                         _ => 1,

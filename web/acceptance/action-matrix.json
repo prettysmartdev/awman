@@ -6829,6 +6829,294 @@
       "feature": "engine",
       "status": "required",
       "parity": "view_only"
+    },
+    {
+      "id": "term.automation_state",
+      "screen": "terminal",
+      "title": "automation_state",
+      "tui": {
+        "key": "n/a",
+        "interaction": "TUI reconnects to the hub"
+      },
+      "daemon": {
+        "kind": "terminal_frame",
+        "detail": "automation_state in awman.terminal.v1"
+      },
+      "browser": {
+        "availability": "available",
+        "control": "status notification",
+        "shortcut": null,
+        "alt_shortcut": null,
+        "reason": null
+      },
+      "goal": "Read execution status and assurance",
+      "web_entry": {
+        "surface": "automatic",
+        "location": "Stage: agent pane",
+        "also": [],
+        "state": "present",
+        "gap": null
+      },
+      "capability": "terminal",
+      "feature": "engine",
+      "status": "required",
+      "parity": "view_only"
+    },
+    {
+      "id": "term.turn_accepted",
+      "screen": "terminal",
+      "title": "turn_accepted",
+      "tui": {
+        "key": "n/a",
+        "interaction": "TUI reconnects to the hub"
+      },
+      "daemon": {
+        "kind": "terminal_frame",
+        "detail": "turn_accepted in awman.terminal.v1"
+      },
+      "browser": {
+        "availability": "available",
+        "control": "status notification",
+        "shortcut": null,
+        "alt_shortcut": null,
+        "reason": null
+      },
+      "goal": "Observe turn accepted",
+      "web_entry": {
+        "surface": "automatic",
+        "location": "Stage: agent pane",
+        "also": [],
+        "state": "present",
+        "gap": null
+      },
+      "capability": "terminal",
+      "feature": "engine",
+      "status": "required",
+      "parity": "view_only"
+    },
+    {
+      "id": "term.turn_result",
+      "screen": "terminal",
+      "title": "turn_result",
+      "tui": {
+        "key": "n/a",
+        "interaction": "TUI reconnects to the hub"
+      },
+      "daemon": {
+        "kind": "terminal_frame",
+        "detail": "turn_result in awman.terminal.v1"
+      },
+      "browser": {
+        "availability": "available",
+        "control": "status notification",
+        "shortcut": null,
+        "alt_shortcut": null,
+        "reason": null
+      },
+      "goal": "Observe turn result",
+      "web_entry": {
+        "surface": "automatic",
+        "location": "Stage: agent pane",
+        "also": [],
+        "state": "present",
+        "gap": null
+      },
+      "capability": "terminal",
+      "feature": "engine",
+      "status": "required",
+      "parity": "view_only"
+    },
+    {
+      "id": "term.execution_closed",
+      "screen": "terminal",
+      "title": "execution_closed",
+      "tui": {
+        "key": "n/a",
+        "interaction": "TUI reconnects to the hub"
+      },
+      "daemon": {
+        "kind": "terminal_frame",
+        "detail": "execution_closed in awman.terminal.v1"
+      },
+      "browser": {
+        "availability": "available",
+        "control": "status notification",
+        "shortcut": null,
+        "alt_shortcut": null,
+        "reason": null
+      },
+      "goal": "Observe execution closed",
+      "web_entry": {
+        "surface": "automatic",
+        "location": "Stage: agent pane",
+        "also": [],
+        "state": "present",
+        "gap": null
+      },
+      "capability": "terminal",
+      "feature": "engine",
+      "status": "required",
+      "parity": "view_only"
+    },
+    {
+      "id": "term.execution_replaced",
+      "screen": "terminal",
+      "title": "execution_replaced",
+      "tui": {
+        "key": "n/a",
+        "interaction": "TUI reconnects to the hub"
+      },
+      "daemon": {
+        "kind": "terminal_frame",
+        "detail": "execution_replaced in awman.terminal.v1"
+      },
+      "browser": {
+        "availability": "available",
+        "control": "status notification",
+        "shortcut": null,
+        "alt_shortcut": null,
+        "reason": null
+      },
+      "goal": "Observe execution replaced",
+      "web_entry": {
+        "surface": "automatic",
+        "location": "Stage: agent pane",
+        "also": [],
+        "state": "present",
+        "gap": null
+      },
+      "capability": "terminal",
+      "feature": "engine",
+      "status": "required",
+      "parity": "view_only"
+    },
+    {
+      "id": "term.operation_error",
+      "screen": "terminal",
+      "title": "operation_error",
+      "tui": {
+        "key": "n/a",
+        "interaction": "TUI reconnects to the hub"
+      },
+      "daemon": {
+        "kind": "terminal_frame",
+        "detail": "operation_error in awman.terminal.v1"
+      },
+      "browser": {
+        "availability": "available",
+        "control": "status notification",
+        "shortcut": null,
+        "alt_shortcut": null,
+        "reason": null
+      },
+      "goal": "Observe operation error",
+      "web_entry": {
+        "surface": "automatic",
+        "location": "Stage: agent pane",
+        "also": [],
+        "state": "present",
+        "gap": null
+      },
+      "capability": "terminal",
+      "feature": "engine",
+      "status": "required",
+      "parity": "view_only"
+    },
+    {
+      "id": "term.submit_turn",
+      "screen": "terminal",
+      "title": "submit_turn",
+      "tui": {
+        "key": "n/a",
+        "interaction": "TUI reconnects to the hub"
+      },
+      "daemon": {
+        "kind": "terminal_frame",
+        "detail": "submit_turn in awman.terminal.v1"
+      },
+      "browser": {
+        "availability": "unavailable",
+        "control": null,
+        "shortcut": null,
+        "alt_shortcut": null,
+        "reason": "Authenticated local owner operation; unavailable to browser grants"
+      },
+      "goal": "Use an owner-local automation operation",
+      "web_entry": {
+        "surface": "native",
+        "location": "Stage: agent pane",
+        "also": [],
+        "state": "unavailable",
+        "gap": "Authenticated local owner operation; unavailable to browser grants"
+      },
+      "capability": "terminal",
+      "feature": "engine",
+      "status": "required",
+      "parity": "view_only"
+    },
+    {
+      "id": "term.close_execution",
+      "screen": "terminal",
+      "title": "close_execution",
+      "tui": {
+        "key": "n/a",
+        "interaction": "TUI reconnects to the hub"
+      },
+      "daemon": {
+        "kind": "terminal_frame",
+        "detail": "close_execution in awman.terminal.v1"
+      },
+      "browser": {
+        "availability": "unavailable",
+        "control": null,
+        "shortcut": null,
+        "alt_shortcut": null,
+        "reason": "Authenticated local owner operation; unavailable to browser grants"
+      },
+      "goal": "Use an owner-local automation operation",
+      "web_entry": {
+        "surface": "native",
+        "location": "Stage: agent pane",
+        "also": [],
+        "state": "unavailable",
+        "gap": "Authenticated local owner operation; unavailable to browser grants"
+      },
+      "capability": "terminal",
+      "feature": "engine",
+      "status": "required",
+      "parity": "view_only"
+    },
+    {
+      "id": "term.credential_update_state",
+      "screen": "terminal",
+      "title": "credential_update_state",
+      "tui": {
+        "key": "n/a",
+        "interaction": "TUI reconnects to the hub"
+      },
+      "daemon": {
+        "kind": "terminal_frame",
+        "detail": "credential_update_state in awman.terminal.v1"
+      },
+      "browser": {
+        "availability": "available",
+        "control": "status notification",
+        "shortcut": null,
+        "alt_shortcut": null,
+        "reason": null
+      },
+      "goal": "Observe pending and confirmed credential generations",
+      "web_entry": {
+        "surface": "automatic",
+        "location": "Stage: agent pane",
+        "also": [],
+        "state": "present",
+        "gap": null
+      },
+      "capability": "terminal",
+      "feature": "engine",
+      "status": "required",
+      "parity": "view_only"
     }
   ]
 }

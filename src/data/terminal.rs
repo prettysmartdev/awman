@@ -11,9 +11,13 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::data::daemon_state::{CommandListener, FeatureName};
+use crate::data::automation::{StatusSource, StatusSupport};
+use crate::data::automation_records::*;
+use crate::data::daemon_state::{CommandListener, FeatureName, RequestOrigin};
 use crate::data::execution_event::EventSource;
 use crate::data::ids::{CommandId, IdError, LeaseId, RunId, TabId, TaskId, TerminalId};
+use crate::data::ids::{ExecutionId, TurnId};
+use uuid::Uuid;
 
 /// The WebSocket subprotocol every terminal viewer negotiates (0139 §1).
 pub const TERMINAL_SUBPROTOCOL: &str = "awman.terminal.v1";
@@ -122,6 +126,10 @@ pub struct TerminalOwnerInfo {
 /// The record `GET /v1/terminals` returns and the hub keeps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalRecord {
+    #[serde(default)]
+    pub credential_updates: Option<crate::data::credential_update::EffectiveCredentialUpdates>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation: Option<AutomationSnapshot>,
     pub id: TerminalId,
     pub owner_id: TerminalOwner,
     pub feature: FeatureName,
@@ -200,6 +208,43 @@ pub enum TerminalFrame {
     },
     /// This viewer missed output; a `Snapshot` follows.
     Lagged,
+    AutomationState {
+        #[serde(flatten)]
+        snapshot: Box<AutomationSnapshot>,
+    },
+    TurnAccepted {
+        request_id: Uuid,
+        execution_id: ExecutionId,
+        turn_id: TurnId,
+        status_support: StatusSupport,
+        status_source: StatusSource,
+    },
+    TurnResult {
+        request_id: Uuid,
+        execution_id: ExecutionId,
+        turn_id: TurnId,
+        result: TurnResult,
+    },
+    ExecutionClosed {
+        request_id: Uuid,
+        execution_id: ExecutionId,
+        result: Box<crate::data::CommandResult>,
+    },
+    ExecutionReplaced {
+        request_id: Uuid,
+        previous_execution_id: ExecutionId,
+        execution_id: ExecutionId,
+        #[serde(deserialize_with = "safe_counter")]
+        credential_generation: u64,
+    },
+    CredentialUpdateState {
+        snapshot: Box<crate::data::credential_update::CredentialUpdateState>,
+    },
+    OperationError {
+        request_id: Uuid,
+        code: String,
+        error: String,
+    },
 }
 
 /// Why a viewer left.
@@ -226,6 +271,14 @@ impl DetachReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TerminalClientFrame {
+    SubmitTurn {
+        #[serde(flatten)]
+        request: SubmitTurnRequest,
+    },
+    CloseExecution {
+        #[serde(flatten)]
+        request: CloseExecutionRequest,
+    },
     Input {
         #[serde(with = "base64_bytes")]
         bytes: Vec<u8>,
@@ -276,6 +329,7 @@ impl ControlHolder {
 /// from the connection (listener, headers, CLI flags); judged by Layer 2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewerIdentity {
+    pub origin: RequestOrigin,
     pub principal: crate::data::daemon_state::Principal,
     pub listener_name: Option<String>,
     pub listener: CommandListener,
@@ -289,6 +343,7 @@ pub struct ViewerIdentity {
 impl ViewerIdentity {
     pub fn local() -> Self {
         Self {
+            origin: RequestOrigin::LocalProcess,
             listener: CommandListener::Local,
             principal: crate::data::daemon_state::Principal::Owner,
             listener_name: None,
@@ -352,4 +407,97 @@ pub enum ProgramStatusMode {
 pub struct HostOutputPolicy {
     pub allow_notifications: bool,
     pub program_status: ProgramStatusMode,
+}
+
+#[cfg(test)]
+mod automation_frame_tests {
+    use super::*;
+    fn fixture() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../web/test/lib/fixtures/terminal-frames.json"
+        ))
+        .unwrap()
+    }
+    #[test]
+    fn shared_v1_frames_round_trip_and_reject_malformed_identity() {
+        let fixture = fixture();
+        assert_eq!(TERMINAL_SUBPROTOCOL, "awman.terminal.v1");
+        for frame in fixture["server"].as_array().unwrap() {
+            let typed: TerminalFrame = serde_json::from_value(frame.clone()).unwrap();
+            let encoded = serde_json::to_value(&typed).unwrap();
+            for (key, value) in frame.as_object().unwrap() {
+                assert_eq!(&encoded[key], value);
+            }
+            assert_eq!(
+                serde_json::from_value::<TerminalFrame>(encoded).unwrap(),
+                typed
+            );
+        }
+        for frame in fixture["client"].as_array().unwrap() {
+            let typed: TerminalClientFrame = serde_json::from_value(frame.clone()).unwrap();
+            assert_eq!(serde_json::to_value(typed).unwrap(), *frame);
+        }
+        for frame in fixture["invalid"]["client"].as_array().unwrap() {
+            assert!(
+                serde_json::from_value::<TerminalClientFrame>(frame.clone()).is_err(),
+                "{frame}"
+            );
+        }
+        for frame in fixture["invalid"]["server"].as_array().unwrap() {
+            assert!(
+                serde_json::from_value::<TerminalFrame>(frame.clone()).is_err(),
+                "{frame}"
+            );
+        }
+        let state = serde_json::to_value(TerminalFrame::AutomationState {
+            snapshot: serde_json::from_value(fixture["automation_examples"]["snapshot"].clone())
+                .unwrap(),
+        })
+        .unwrap();
+        assert!(state.get("snapshot").is_none());
+        assert!(state.get("automation").is_none());
+        assert!(state.get("execution_id").is_some());
+        let types = include_str!("../../web/src/lib/client/types.ts");
+        let matrix = include_str!("../../web/acceptance/action-matrix.json");
+        for frame in [
+            "automation_state",
+            "turn_accepted",
+            "turn_result",
+            "execution_closed",
+            "execution_replaced",
+            "operation_error",
+            "submit_turn",
+            "close_execution",
+        ] {
+            assert!(matrix.contains(&format!("term.{frame}")));
+        }
+        for direction in ["server", "client"] {
+            for frame in fixture[direction].as_array().unwrap() {
+                assert!(types.contains(&format!("'{}'", frame["type"].as_str().unwrap())));
+            }
+        }
+    }
+    #[test]
+    fn uuid_comparison_is_by_value_and_counters_do_not_wrap() {
+        let fixture = fixture();
+        let mut request = fixture["client"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["type"] == "submit_turn")
+            .unwrap()
+            .clone();
+        request["request_id"] = request["request_id"]
+            .as_str()
+            .unwrap()
+            .to_uppercase()
+            .into();
+        let typed: TerminalClientFrame = serde_json::from_value(request).unwrap();
+        assert_eq!(
+            serde_json::to_value(typed).unwrap()["request_id"],
+            "12345678-1234-4234-8234-123456789abc"
+        );
+        assert!(next_counter(MAX_SAFE_COUNTER).is_err());
+        assert_eq!(next_counter(MAX_SAFE_COUNTER - 1), Ok(MAX_SAFE_COUNTER));
+    }
 }

@@ -217,3 +217,45 @@ impl Api {
         self.api.runtime.reload_config().await.unwrap()
     }
 }
+
+impl Api {
+    pub async fn serve_owner_on_private_address(&self, sandbox: &TestSandbox) -> Served {
+        self.serve_ingress_on_private_address(
+            sandbox,
+            Some(awman::data::daemon_state::RequestOrigin::OwnerSocket),
+        )
+        .await
+    }
+    pub async fn serve_ingress_on_private_address(
+        &self,
+        sandbox: &TestSandbox,
+        origin: Option<awman::data::daemon_state::RequestOrigin>,
+    ) -> Served {
+        let listener = sandbox.ports().tcp_listener();
+        let addr = listener.local_addr().unwrap();
+        let router = build_router_for_listener(self.api.clone(), ListenerPolicy::Local).layer(
+            axum::Extension(awman::frontend::api::local::OwnerAuthenticated),
+        );
+        let router = if let Some(origin) = origin {
+            router.layer(axum::Extension(origin))
+        } else {
+            router
+        };
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let stop = CancellationToken::new();
+        let stopped = stop.clone();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(stopped.cancelled_owned())
+                .await
+                .unwrap();
+        });
+        Served {
+            addr: addr.to_string(),
+            base: format!("http://{addr}"),
+            stop,
+            task,
+        }
+    }
+}

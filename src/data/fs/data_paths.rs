@@ -132,6 +132,12 @@ impl DataPaths {
         self.root.parent().unwrap_or(&self.root)
     }
 
+    /// Owner-private provider profiles for the invoking repository.
+    pub fn agent_profiles_dir(&self, repo_root: &Path) -> PathBuf {
+        self.repo_state_dir(repo_root)
+            .join(crate::data::settings_profile::AGENT_PROFILES_DIR)
+    }
+
     /// Per-repo state directory: `<root>/repos/<first 16 hex of sha256(git_root)>`.
     pub fn repo_state_dir(&self, git_root: &Path) -> PathBuf {
         let hash = crate::data::fs::hash::sha256_hex(git_root.to_string_lossy().as_bytes());

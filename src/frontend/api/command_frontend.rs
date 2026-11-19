@@ -80,6 +80,7 @@ use crate::engine::workflow::frontend::{ContainerSource, WorkflowFrontend};
 /// The API dispatch frontend. Emits typed events to an `EventBusSender`
 /// for distribution to logfile writers and SSE clients.
 pub struct ApiDispatchFrontend {
+    pub(crate) agent_stuck_timeout: std::time::Duration,
     /// Initial prerequisite progress follows its structured report on the wire.
     prerequisite_messages: Option<Vec<UserMessage>>,
 
@@ -210,6 +211,7 @@ impl ApiDispatchFrontend {
             CommandCatalogue::get().parse_raw_args_with_profile(&path, args, frontend_kind);
 
         Self {
+            agent_stuck_timeout: crate::engine::container::timing::DEFAULT_STUCK_TIMEOUT,
             prerequisite_messages: None,
             interaction: None,
             pty_sink_sender: None,
@@ -288,6 +290,8 @@ impl ApiDispatchFrontend {
     fn step_sender(&mut self, name: &str) -> EventBusSender {
         let index = self.step_index_for(name);
         self.event_bus.with_source(EventSource {
+            execution_id: None,
+            turn_id: None,
             phase: EventSourcePhase::Main,
             step_name: Some(name.to_string()),
             step_index: index,
@@ -413,6 +417,9 @@ impl ApiDispatchFrontend {
 }
 
 impl CommandFrontend for ApiDispatchFrontend {
+    fn set_agent_stuck_timeout(&mut self, timeout: std::time::Duration) {
+        self.agent_stuck_timeout = timeout;
+    }
     fn input_available(&self) -> bool {
         self.is_interactive()
     }
@@ -484,6 +491,10 @@ impl CommandFrontend for ApiDispatchFrontend {
         Ok(self.parsed()?.argument(name))
     }
 
+    fn literal_tail(&self) -> bool {
+        self.parsed().is_ok_and(|p| p.literal_tail())
+    }
+
     fn arguments(&self, _command_path: &[&str], name: &str) -> Result<Vec<String>, CommandError> {
         Ok(self.parsed()?.arguments(name))
     }
@@ -493,6 +504,13 @@ impl CommandFrontend for ApiDispatchFrontend {
 
 #[async_trait]
 impl AgentFrontend for ApiDispatchFrontend {
+    fn translated_output(&mut self, item: Translated) -> bool {
+        emit_translated(&self.event_bus, self.final_message_sink().as_ref(), item);
+        true
+    }
+    fn stuck_timeout(&self) -> std::time::Duration {
+        self.agent_stuck_timeout
+    }
     fn report_status(&mut self, status: AgentStatus) {
         // The proxy has already written the container name into its source;
         // remember it so the step's own workflow events carry it too.
@@ -738,11 +756,14 @@ impl ApiDispatchFrontend {
 impl HasAgentFrontend for ApiDispatchFrontend {
     /// Image setup, probes and other helper containers: always piped.
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
-        Box::new(ApiContainerSink::new(
-            &self.event_bus,
-            self.final_message_sink(),
-            self.state_writer.clone(),
-        ))
+        let inner = {
+            Box::new(ApiContainerSink::new(
+                &self.event_bus,
+                self.final_message_sink(),
+                self.state_writer.clone(),
+            ))
+        };
+        crate::engine::agent_runtime::frontend::with_stuck_timeout(inner, self.agent_stuck_timeout)
     }
 
     /// The single-agent launch (`exec prompt`, `chat`): it carries the
@@ -750,14 +771,17 @@ impl HasAgentFrontend for ApiDispatchFrontend {
     /// (`AgentIo::initial_size = decision.pty_size`). ACP launches bind
     /// their own piped transport and never call this.
     fn container_frontend_for_pty(&mut self) -> Box<dyn AgentFrontend> {
-        let mut sink = ApiContainerSink::new(
-            &self.event_bus,
-            self.final_message_sink(),
-            self.state_writer.clone(),
-        );
-        sink.pty_size = self.interaction.and_then(|d| d.pty_size);
-        self.pty_sink_sender = Some(sink.event_bus.clone());
-        Box::new(sink)
+        let inner = {
+            let mut sink = ApiContainerSink::new(
+                &self.event_bus,
+                self.final_message_sink(),
+                self.state_writer.clone(),
+            );
+            sink.pty_size = self.interaction.and_then(|d| d.pty_size);
+            self.pty_sink_sender = Some(sink.event_bus.clone());
+            Box::new(sink)
+        };
+        crate::engine::agent_runtime::frontend::with_stuck_timeout(inner, self.agent_stuck_timeout)
     }
 }
 
@@ -948,6 +972,10 @@ fn emit_user_message(sender: &EventBusSender, msg: UserMessage) {
 
 #[async_trait]
 impl AgentFrontend for ApiContainerSink {
+    fn translated_output(&mut self, item: Translated) -> bool {
+        emit_translated(&self.event_bus, self.final_message.as_ref(), item);
+        true
+    }
     fn terminal_source(&self) -> Option<EventSource> {
         self.source.lock().ok().map(|s| s.clone())
     }
@@ -1803,7 +1831,7 @@ impl ConfigCommandFrontend for ApiDispatchFrontend {
 }
 
 // `awman clean` is blocked for the API frontend at the catalogue layer
-// (`api_allowed: false`); this impl exists only to satisfy the `DispatchFrontend`
+// (`ApiAvailability::Disabled`); this impl exists only to satisfy the `DispatchFrontend`
 // supertrait bound and never runs. It never confirms a deletion.
 impl crate::command::commands::clean::CleanCommandFrontend for ApiDispatchFrontend {
     fn confirm_deletion(
@@ -1829,12 +1857,60 @@ impl crate::command::commands::daemon::lifecycle::DaemonCommandFrontend for ApiD
     }
 }
 
-impl ChatCommandFrontend for ApiDispatchFrontend {}
+impl ChatCommandFrontend for ApiDispatchFrontend {
+    fn report_agent_policy(
+        &mut self,
+        policy: crate::data::agent_policy::ResolvedAgentPolicy,
+        step: Option<&str>,
+    ) {
+        emit_agent_policy(&self.event_bus, policy, step);
+    }
+}
+
+/// The resolved native start mode / workspace access of one launch (WI
+/// 0070) as a `status_message` with phase `agent_policy` whose message is
+/// the JSON object `{native_start_mode, workspace_access, launch_mode, step}`.
+fn emit_agent_policy(
+    bus: &EventBusSender,
+    policy: crate::data::agent_policy::ResolvedAgentPolicy,
+    step: Option<&str>,
+) {
+    let mut value = serde_json::to_value(policy).unwrap_or_default();
+    value["step"] = serde_json::json!(step);
+    bus.emit(EventPayload::StatusMessage {
+        phase: "agent_policy".to_string(),
+        message: value.to_string(),
+    });
+}
 
 /// One `AgentLaunchFrontend` for the API frontend. There is no host terminal
 /// behind an HTTP request, so there is nothing for `set_pty_active` to gate.
 impl crate::command::commands::agent_setup::AgentLaunchFrontend for ApiDispatchFrontend {
     fn set_pty_active(&mut self, _active: bool) {}
+
+    fn automation_host(&self) -> Option<crate::command::automation::AutomationHost> {
+        let writer = self.state_writer.as_ref()?;
+        writer.record_automation();
+        let db =
+            crate::data::fs::api_db::SqliteSessionStore::open_at(&writer.paths().db_path()).ok()?;
+        let store =
+            crate::data::automation_store::AutomationStore::open(std::sync::Arc::new(db)).ok()?;
+        let command_id = crate::data::ids::CommandId::parse(writer.command_id()).ok()?;
+        let bus = self.event_bus.clone();
+        Some(crate::command::automation::AutomationHost {
+            store,
+            command_id,
+            attempt: self.event_bus.attempt(),
+            owner_key: crate::command::automation::controller::local_owner_key(
+                &writer.paths().db_path(),
+            ),
+            events: Some(std::sync::Arc::new(move |payload| bus.emit(payload))),
+            finished: Some({
+                let writer = writer.clone();
+                std::sync::Arc::new(move |result| writer.record_automation_result(result))
+            }),
+        })
+    }
 
     /// WI 0141: a single-agent command's OSC 7501 reports become
     /// `program_status` events, attributed to the launched container (the
@@ -1874,6 +1950,14 @@ impl AcpFrontend for ApiDispatchFrontend {
 }
 
 impl ExecPromptCommandFrontend for ApiDispatchFrontend {
+    fn report_agent_policy(
+        &mut self,
+        policy: crate::data::agent_policy::ResolvedAgentPolicy,
+        step: Option<&str>,
+    ) {
+        emit_agent_policy(&self.event_bus, policy, step);
+    }
+
     fn report_workspace_access(
         &mut self,
         access: crate::data::workspace::WorkspaceAccess,
@@ -1892,6 +1976,14 @@ impl ExecPromptCommandFrontend for ApiDispatchFrontend {
 
 #[async_trait]
 impl ExecWorkflowCommandFrontend for ApiDispatchFrontend {
+    fn report_agent_policy(
+        &mut self,
+        policy: crate::data::agent_policy::ResolvedAgentPolicy,
+        step: Option<&str>,
+    ) {
+        emit_agent_policy(&self.event_bus, policy, step);
+    }
+
     fn report_workspace_access(
         &mut self,
         access: crate::data::workspace::WorkspaceAccess,

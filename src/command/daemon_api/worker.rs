@@ -421,3 +421,110 @@ pub struct PushStatus {
     pub running: usize,
     pub queued: usize,
 }
+
+/// `GET /v1/worker/sessions/{id}/agent-capabilities` (WI 0070): the
+/// admitted session's adapter declarations on this daemon's runtime. Never
+/// launches or contacts a provider; support fields stay `null` until a
+/// launch observes them. `None` when the session is unknown.
+pub async fn sessions_agent_capabilities(
+    api: &WorkerApi,
+    id: &WorkerSessionId,
+) -> Option<crate::data::wire::List<crate::data::automation_records::AutomationCapabilities>> {
+    let session = api.sessions.get_by_key(id.as_str())?;
+    let session = session.read().await.clone();
+    Some(crate::data::wire::List {
+        items: crate::command::automation::capabilities::agent_capabilities(
+            &session,
+            api.engines.runtime.runtime_name(),
+        ),
+        next_cursor: None,
+    })
+}
+
+/// `GET /v1/worker/commands/{id}/turns` (WI 0070): the command's turn
+/// records, ascending command-wide ordinals, pending results included.
+/// `Ok(None)` when the command is unknown.
+pub fn commands_turns(
+    api: &WorkerApi,
+    id: &CommandId,
+    query: &crate::data::wire::ListQuery,
+) -> Result<Option<crate::data::wire::List<crate::data::automation_records::TurnRecord>>, DataError>
+{
+    if api.store.get_command(id.as_str())?.is_none() {
+        return Ok(None);
+    }
+    let store = crate::data::automation_store::AutomationStore::from_store(&api.store);
+    let page = store.list_turns(id, query.cursor.as_deref(), query.limit)?;
+    Ok(Some(crate::data::wire::List {
+        items: page.items,
+        next_cursor: page.next_cursor,
+    }))
+}
+
+fn credential_host(
+    api: &WorkerApi,
+    command: &CommandId,
+) -> Result<crate::command::automation::controller::AutomationHost, &'static str> {
+    let store = crate::data::automation_store::AutomationStore::open(api.store.clone())
+        .map_err(|_| "credential_update_failed")?;
+    let execution = store
+        .current_execution(command)
+        .map_err(|_| "not_found")?
+        .ok_or("not_found")?;
+    let owner = crate::command::automation::controller::local_owner_key(&api.paths.db_path());
+    if execution.owner_key != owner {
+        return Err("not_found");
+    }
+    // The durable row was admitted by this daemon. The data-home owner is
+    // checked against the live binding too; no network principal reaches it.
+    Ok(crate::command::automation::controller::AutomationHost {
+        store,
+        command_id: command.clone(),
+        attempt: execution.attempt,
+        owner_key: execution.owner_key,
+        events: None,
+        finished: None,
+    })
+}
+pub fn credentials_update(
+    api: &WorkerApi,
+    viewer: &crate::data::terminal::ViewerIdentity,
+    command: &CommandId,
+    request: crate::data::credential_update::CredentialUpdateRequest,
+    _grant_epoch: Option<u64>,
+) -> Result<crate::data::credential_update::CredentialUpdateOperation, &'static str> {
+    if !crate::command::automation::controller::is_local_owner(viewer) {
+        return Err("forbidden");
+    }
+    let host = credential_host(api, command)?;
+    crate::command::automation::controller::global().stage_update(viewer, &host, request, None)
+}
+pub fn credentials_get(
+    api: &WorkerApi,
+    viewer: &crate::data::terminal::ViewerIdentity,
+    command: &CommandId,
+    request: uuid::Uuid,
+) -> Result<Option<crate::data::credential_update::CredentialUpdateOperation>, &'static str> {
+    if !crate::command::automation::controller::is_local_owner(viewer) {
+        return Err("forbidden");
+    }
+    let host = credential_host(api, command)?;
+    host.store
+        .get_credential_update(&host.owner_key, command, request)
+        .map_err(|_| "credential_update_failed")
+}
+
+/// Owner-only effective projection, including ordinary profile executions.
+/// No secret source is read and no slot is allocated by discovery.
+pub fn credentials_snapshot(
+    api: &WorkerApi,
+    viewer: &crate::data::terminal::ViewerIdentity,
+    command: &CommandId,
+) -> Result<Option<crate::data::credential_update::OwnedExecutionSnapshot>, DataError> {
+    if !crate::command::automation::controller::is_local_owner(viewer) {
+        return Ok(None);
+    }
+    let store = crate::data::automation_store::AutomationStore::open(api.store.clone())?;
+    let owner = crate::command::automation::controller::local_owner_key(&api.paths.db_path());
+    store.owned_execution_snapshot(&owner, command)
+}

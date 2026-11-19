@@ -152,8 +152,17 @@ impl LocalClient {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<HttpResponse, EngineError> {
+        self.send_epoch(method, path, body, None).await
+    }
+    async fn send_epoch(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        epoch: Option<u64>,
+    ) -> Result<HttpResponse, EngineError> {
         tokio::time::timeout(self.timeout, async {
-            let response = self.send_raw_inner(method, path, body).await?;
+            let response = self.send_raw_epoch(method, path, body, epoch).await?;
             let status = response.status().as_u16();
             use http_body_util::BodyExt;
             let bytes = response
@@ -172,6 +181,84 @@ impl LocalClient {
         })
         .await
         .map_err(|_| failure("timed out".into()))?
+    }
+
+    /// `GET /v1/worker/sessions/{id}/agent-capabilities` (WI 0070): typed
+    /// capability declarations; owner-local, never launches a provider.
+    pub async fn agent_capabilities(
+        &self,
+        session: &crate::data::ids::WorkerSessionId,
+    ) -> Result<
+        crate::data::wire::List<crate::data::automation_records::AutomationCapabilities>,
+        EngineError,
+    > {
+        let path = format!(
+            "/v1/worker/sessions/{}/agent-capabilities",
+            session.as_str()
+        );
+        typed(self.send("GET", &path, None).await?)
+    }
+
+    /// `GET /v1/worker/commands/{id}/turns` (WI 0070): one page of a
+    /// command's turn records with the standard pagination envelope.
+    pub async fn command_turns(
+        &self,
+        command: &crate::data::ids::CommandId,
+        query: &crate::data::wire::ListQuery,
+    ) -> Result<crate::data::wire::List<crate::data::automation_records::TurnRecord>, EngineError>
+    {
+        let mut path = format!("/v1/worker/commands/{}/turns", command.as_str());
+        let mut sep = '?';
+        if let Some(limit) = query.limit {
+            path.push_str(&format!("{sep}limit={limit}"));
+            sep = '&';
+        }
+        if let Some(cursor) = &query.cursor {
+            path.push_str(&format!("{sep}cursor={}", url_component(cursor)));
+        }
+        typed(self.send("GET", &path, None).await?)
+    }
+
+    /// Equal-metadata retries return the recorded operation after comparison
+    /// material is dropped; they never apply a different supplied secret.
+    pub async fn update_credentials(
+        &self,
+        command: &crate::data::ids::CommandId,
+        request: &crate::data::credential_update::CredentialUpdateRequest,
+        input_epoch: Option<u64>,
+    ) -> Result<crate::data::credential_update::CredentialUpdateOperation, EngineError> {
+        let body = credential_request_body(request)?;
+        let response = tokio::time::timeout(self.timeout, async {
+            let response = self
+                .send_raw_body(
+                    "POST",
+                    &format!("/v1/worker/commands/{}/credentials", command.as_str()),
+                    Some(body),
+                    input_epoch,
+                )
+                .await?;
+            buffered_response(response).await
+        })
+        .await
+        .map_err(|_| failure("timed out".into()))??;
+        typed(response)
+    }
+    pub async fn credential_update(
+        &self,
+        command: &crate::data::ids::CommandId,
+        request: uuid::Uuid,
+    ) -> Result<crate::data::credential_update::CredentialUpdateOperation, EngineError> {
+        typed(
+            self.send(
+                "GET",
+                &format!(
+                    "/v1/worker/commands/{}/credential-updates/{request}",
+                    command.as_str()
+                ),
+                None,
+            )
+            .await?,
+        )
     }
 
     /// Same, returning the raw response for streaming bodies (SSE). The
@@ -193,6 +280,29 @@ impl LocalClient {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<hyper::Response<hyper::body::Incoming>, EngineError> {
+        self.send_raw_epoch(method, path, body, None).await
+    }
+    async fn send_raw_epoch(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        epoch: Option<u64>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, EngineError> {
+        let bytes = body
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|e| failure(e.to_string()))?
+            .map(hyper::body::Bytes::from);
+        self.send_raw_body(method, path, bytes, epoch).await
+    }
+    async fn send_raw_body(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<hyper::body::Bytes>,
+        epoch: Option<u64>,
+    ) -> Result<hyper::Response<hyper::body::Incoming>, EngineError> {
         let stream = connect(&self.endpoint).await?;
         let (mut sender, connection) =
             hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
@@ -207,16 +317,14 @@ impl LocalClient {
             .method(method)
             .uri(path)
             .header("host", "localhost");
-        let bytes = body
-            .map(serde_json::to_vec)
-            .transpose()
-            .map_err(|e| failure(e.to_string()))?
-            .unwrap_or_default();
+        if let Some(epoch) = epoch {
+            request = request.header("x-awman-input-epoch", epoch.to_string());
+        }
         if body.is_some() {
             request = request.header("content-type", "application/json");
         }
         let request = request
-            .body(http_body_util::Full::new(hyper::body::Bytes::from(bytes)))
+            .body(http_body_util::Full::new(body.unwrap_or_default()))
             .map_err(|e| failure(e.to_string()))?;
         match sender.send_request(request).await {
             Ok(response) => Ok(response),
@@ -372,4 +480,146 @@ pub fn owner_pipe(
 #[cfg(windows)]
 pub fn verify_pipe_client(server: &tokio::net::windows::named_pipe::NamedPipeServer) -> bool {
     shims().is_ok_and(|(_, verify)| verify(server).unwrap_or(false))
+}
+
+/// Decode a 2xx JSON body into a typed value; otherwise the API error.
+fn typed<T: serde::de::DeserializeOwned>(response: HttpResponse) -> Result<T, EngineError> {
+    if !(200..300).contains(&response.status) {
+        return Err(failure(format!(
+            "daemon returned HTTP {}: {}",
+            response.status,
+            response.body["error"]["message"]
+                .as_str()
+                .or_else(|| response.body["error"].as_str())
+                .unwrap_or("request failed")
+        )));
+    }
+    serde_json::from_value(response.body)
+        .map_err(|e| failure(format!("invalid daemon response: {e}")))
+}
+
+/// Percent-encode an opaque cursor for a query string.
+fn url_component(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
+struct CredentialBodyBytes(Vec<u8>);
+impl AsRef<[u8]> for CredentialBodyBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+impl Drop for CredentialBodyBytes {
+    fn drop(&mut self) {
+        self.0.resize(self.0.capacity(), 0);
+        self.0.fill(0);
+        std::hint::black_box(&mut self.0);
+    }
+}
+fn credential_request_body(
+    request: &crate::data::credential_update::CredentialUpdateRequest,
+) -> Result<hyper::body::Bytes, EngineError> {
+    use serde::{ser::SerializeMap, Serialize};
+    struct Secrets<'a>(&'a crate::data::secret::CommandSecrets);
+    impl Serialize for Secrets<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let mut map = serializer.serialize_map(None)?;
+            for (name, secret) in self.0.iter() {
+                map.serialize_entry(name, secret.expose())?;
+            }
+            map.end()
+        }
+    }
+    struct Request<'a>(&'a crate::data::credential_update::CredentialUpdateRequest);
+    impl Serialize for Request<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let request = self.0;
+            let mut map = serializer.serialize_map(None)?;
+            map.serialize_entry("request_id", &request.intent.request_id)?;
+            map.serialize_entry("execution_id", &request.intent.execution_id)?;
+            map.serialize_entry("expected_revision", &request.intent.expected_revision)?;
+            map.serialize_entry("credential_slot", &request.intent.credential_slot)?;
+            map.serialize_entry(
+                "expected_credential_generation",
+                &request.intent.expected_credential_generation,
+            )?;
+            if let Some(secrets) = &request.secrets {
+                map.serialize_entry("secrets", &Secrets(secrets))?;
+            } else {
+                map.serialize_entry("reread_source", &true)?;
+            }
+            map.end()
+        }
+    }
+    // Reserve the route's maximum escaped body size up front: serializer growth
+    // must never free an earlier, non-zeroed allocation containing a token.
+    if request.intent.credential_slot.len() > 128 {
+        return Err(failure("invalid credential request".into()));
+    }
+    let mut bytes = CredentialBodyBytes(Vec::with_capacity(32 * (8192 + 128) * 6 + 8192));
+    serde_json::to_writer(&mut bytes.0, &Request(request))
+        .map_err(|_| failure("invalid credential request".into()))?;
+    Ok(hyper::body::Bytes::from_owner(bytes))
+}
+async fn buffered_response(
+    response: hyper::Response<hyper::body::Incoming>,
+) -> Result<HttpResponse, EngineError> {
+    use http_body_util::BodyExt;
+    let status = response.status().as_u16();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| failure(e.to_string()))?
+        .to_bytes();
+    let body = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).to_string().into())
+    };
+    Ok(HttpResponse { status, body })
+}
+
+#[cfg(test)]
+mod credential_wire_tests {
+    #[test]
+    fn borrowed_secret_body_escapes_values_and_carries_only_request_fields() {
+        use crate::data::{credential_update::*, ids::ExecutionId, secret::*};
+        let request = CredentialUpdateRequest {
+            intent: CredentialUpdateIntent {
+                request_id: uuid::Uuid::new_v4(),
+                execution_id: ExecutionId::new(),
+                expected_revision: 2,
+                credential_slot: "cred_fixture".into(),
+                expected_credential_generation: 1,
+                reread_source: false,
+                secret_names: vec!["TOKEN".into()],
+            },
+            secrets: Some(std::sync::Arc::new(
+                CommandSecrets::new(vec![(
+                    "TOKEN".into(),
+                    SecretString::new("test-secret-\"escaped\"\n"),
+                )])
+                .unwrap(),
+            )),
+        };
+        let bytes = super::credential_request_body(&request).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["secrets"]["TOKEN"], "test-secret-\"escaped\"\n");
+        assert_eq!(body["expected_revision"], 2);
+        assert!(body.get("secret_names").is_none());
+        assert!(body.get("reread_source").is_none());
+        let clone = bytes.clone();
+        drop(bytes);
+        assert!(!clone.is_empty());
+    }
 }

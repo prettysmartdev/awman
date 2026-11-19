@@ -142,8 +142,10 @@ All steps support the same fields:
 | `model` | string | no | Run this step with a specific model. Overrides any `--model` flag |
 | `overlays` | array of strings | no | Overlays applied to this step only — see [Workflow step overlays](08-overlays.md#workflow-step-overlays) |
 | `abort_on_failure` | bool | no | When `true`, a failure here stops the whole workflow (and kills any running parallel peers) instead of prompting. Defaults to `false` |
+| `read_only_workspace` | bool | no | Mount the workspace read-only for this agent step. Independent of `--plan`; see [`--read-only-workspace`](03-agent-sessions.md#--read-only-workspace) |
+| `settings_profile` | string | no | Use this [settings profile](03-agent-sessions.md#settings-profiles) for the step instead of the command's `--settings-profile`. The same validated name rules apply |
 
-Field names are **lowercase only** (`name`, `depends_on`, `agent`, `model`, `prompt`, `overlays`, `abort_on_failure`). Uppercase variants are not accepted. Unknown fields (e.g. `dependson`, `Prompt`) are rejected as errors so that typos do not silently take effect.
+Field names are **lowercase only** (`name`, `depends_on`, `agent`, `model`, `prompt`, `overlays`, `abort_on_failure`, `read_only_workspace`, `settings_profile`). Uppercase variants are not accepted. Unknown fields (e.g. `dependson`, `Prompt`) are rejected as errors so that typos do not silently take effect.
 
 ### TOML (`.toml`)
 
@@ -881,6 +883,37 @@ A step that runs an agent other than the repo's default one stops when `runtime.
 
 An unknown agent name in an `agent` field is caught at parse time, before any container runs, and exits with a list of valid options.
 
+### Planning, read-only and profile settings
+
+`exec workflow --plan` starts **every agent step** in that agent's native plan mode
+(the table in [`--plan`](03-agent-sessions.md#--plan)); it does not change the
+workspace mount. Use `read_only_workspace = true` on a step (or
+`--read-only-workspace` on the command) for a runtime-enforced read-only checkout; the
+two are independent and can be combined. A step that cannot start in its plan mode —
+a custom agent with no plan delivery, or a route that cannot carry it — fails the
+workflow's preflight before any setup, worktree or step runs, rather than running that
+step with write access. An explicit `--plan` with `--auto` or `--yolo` is a conflict;
+a yolo or auto level that only came from defaults is dropped for `--plan` steps, with a
+notice. `--plan` is not allowed to mix with a step's own provider selector in
+`agents.flags`/`--agent-flag` that picks a different mode (`agent_mode_conflict`).
+
+`--settings-profile NAME` applies to every step, scoped separately per provider, so a
+Claude step and a Codex step each get their own profile named `NAME`. A step's
+`settings_profile` overrides it. Two steps of the same provider that run in parallel
+need different profile names; otherwise the second is refused with
+`settings_profile_busy`. A step's continuation container is never shared across
+different profile scopes.
+
+### Retired and custom agents in workflows
+
+`gemini` is not a built-in agent. A workflow step, workflow-level `agent`, or
+`agents.default` that selects `gemini` with no custom agent of that name fails before
+any step runs and names the migration: use the built-in `antigravity` agent or define
+your own `gemini` [custom agent](15-custom-agents.md#example-gemini-cli). A custom agent
+named `gemini` is an ordinary custom agent; no built-in is restored behind it.
+A custom agent used with `--plan` must declare `[modes].plan` (or `plan_interactive`/`plan_headless`)
+in its definition, see [Custom agents](15-custom-agents.md#modes-and-tools).
+
 
 ---
 
@@ -1014,8 +1047,10 @@ The main `exec workflow` flags (see the [Command Reference](14-command-reference
 | `--model <NAME>` | Default model for steps that don't set one (a workflow-level `model` takes precedence) |
 | `--agent-flag=<ARG>` | Extra argument for the default agent's command, replacing its `agents.flags` entry. Repeatable |
 | `-n, --headless` | Run each step's agent in print mode, and answer every prompt with its headless default |
-| `--plan` / `--auto` / `--yolo` | [Permission mode](03-agent-sessions.md#permission-modes) for every step. `--auto` and `--yolo` imply `--worktree`; `--yolo` also auto-advances stuck steps |
+| `--plan` / `--auto` / `--yolo` | [Permission mode](03-agent-sessions.md#permission-modes) for every step; `--plan` selects each agent's native plan mode only (see [Planning, read-only and profile settings](#planning-read-only-and-profile-settings)). `--auto` and `--yolo` imply `--worktree`; `--yolo` also auto-advances stuck steps |
 | `--allow-docker` | Mount the Docker socket into each step's container |
+| `--read-only-workspace` | Mount the workspace read-only for every agent step (not with `--dynamic`) |
+| `--settings-profile <NAME>` | Retain private settings and history for each provider's steps; steps may override with `settings_profile` |
 | `--overlay <SPEC>` | Apply overlay(s) to every step; see [Overlays](08-overlays.md). Repeatable |
 | `--worktree` | Run all steps in an isolated Git worktree — see [Worktrees](#worktrees) |
 | `--on-existing-worktree <POLICY>` | `ask`, `resume`, `recreate` or `fail` when the run's worktree already exists |

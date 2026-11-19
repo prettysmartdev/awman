@@ -1033,6 +1033,8 @@ impl ExecWorkflowCommand {
             &self.cancel,
             self.output_dir.as_deref(),
             self.workspace_access,
+            self.settings_profile.as_ref(),
+            self.profile_owner,
         )
         .await
     }

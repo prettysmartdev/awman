@@ -262,6 +262,11 @@ impl ResolvedFlags {
             explicit,
         };
         resolved.validate_conflicts(command_path, spec.flags)?;
+        // A declared flag whose behavior is not wired yet is refused, never
+        // silently accepted (WI 0070). This is the CLI's check; the raw-args
+        // parser applies the same rule for the TUI and API.
+        crate::command::dispatch::catalogue::CommandCatalogue::get()
+            .refuse_pending_flags(command_path, resolved.supplied.iter().copied())?;
         let mut resolved = resolved.close_over_implications(spec.flags);
         resolved.apply_headless_rule(spec, frontend.input_available());
         Ok(resolved)
@@ -364,8 +369,12 @@ fn read_flag<F: CommandFrontend>(
         FlagKind::String | FlagKind::OptionalString => {
             ResolvedValue::Str(frontend.flag_string(command_path, flag.long)?)
         }
-        FlagKind::Enum(_) => ResolvedValue::Str(frontend.flag_enum(command_path, flag.long)?),
-        FlagKind::VecString => ResolvedValue::Strs(frontend.flag_strings(command_path, flag.long)?),
+        FlagKind::Enum(_) | FlagKind::OptionalEnum { .. } => {
+            ResolvedValue::Str(frontend.flag_enum(command_path, flag.long)?)
+        }
+        FlagKind::VecString | FlagKind::AgentArg => {
+            ResolvedValue::Strs(frontend.flag_strings(command_path, flag.long)?)
+        }
         FlagKind::Path | FlagKind::OptionalPath => {
             ResolvedValue::Path(frontend.flag_path(command_path, flag.long)?)
         }
@@ -465,10 +474,21 @@ impl ResolvedArgs {
                 argument.kind,
                 ArgumentKind::TrailingVarArgs | ArgumentKind::VarArgs
             ) {
-                trailing.insert(
-                    argument.name,
-                    frontend.arguments(command_path, argument.name)?,
-                );
+                let tokens = frontend.arguments(command_path, argument.name)?;
+                if matches!(argument.kind, ArgumentKind::TrailingVarArgs)
+                    && !frontend.literal_tail()
+                {
+                    if let Some(spec) = crate::command::dispatch::catalogue::CommandCatalogue::get()
+                        .lookup(command_path)
+                    {
+                        super::projections::raw_args::refuse_misplaced_flags(
+                            spec,
+                            command_path,
+                            &tokens,
+                        )?;
+                    }
+                }
+                trailing.insert(argument.name, tokens);
             }
         }
         Ok(Self {
@@ -493,6 +513,7 @@ impl ResolvedArgs {
 /// decide between `show`, `get` and `set`.
 #[derive(Debug, Clone)]
 pub struct CallerContext {
+    profile_owner: bool,
     path: Vec<String>,
     frontend: FrontendKind,
     local_user: bool,
@@ -512,8 +533,24 @@ impl CallerContext {
                 .map(|part| (*part).to_string())
                 .collect(),
             frontend,
+            profile_owner: matches!(frontend, FrontendKind::Cli | FrontendKind::Tui),
             local_user: frontend.is_local_user(),
         }
+    }
+
+    pub fn with_profile_owner(mut self, owner: bool) -> Self {
+        self.profile_owner |= owner
+            && matches!(
+                self.frontend,
+                FrontendKind::Daemon {
+                    feature: crate::data::daemon_state::FeatureName::Worker,
+                    listener: crate::data::daemon_state::CommandListener::Local
+                }
+            );
+        self
+    }
+    pub fn profile_owner(&self) -> bool {
+        self.profile_owner
     }
 
     /// Which frontend is running this command.

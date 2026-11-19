@@ -159,7 +159,7 @@ Components of this layer:
   - No specific persistence logic may reside in the API frontend package, all should be delegated to objects and functions in lower-level packages
   - The server/API frontend's only job is to translate the lower-level package's functionality into an HTTP-powered API.
   - Server endpoint handler should be nearly identical to their CLI and TUI counterparts, using `Dispatch` to parse inputs and then execute the resolved `Command` and providing `frontend_...` trait implementations. 
-  - Interactive/PTY commands such as `squad attach` are the sanctioned P2 exception and remain excluded from the API (`api_allowed: false`).
+  - Interactive/PTY commands such as `squad attach` are the sanctioned P2 exception and remain excluded from the API (`ApiAvailability::Disabled`). The one narrow exception is the owner-local, daemon-owned `chat --automation` terminal (`ApiAvailability::LocalAutomationTerminal`): the PTY is owned by an execution record held in Layer 2, not by the HTTP request, and the API frontend only translates its transport. Request-owned PTYs stay excluded, and the Layer 3 and Session rules above are unchanged.
 
 - Squad frontend (`src/frontend/squad/`): builds the squad HTTP router, binds
   and serves it over the already-bootstrapped `SquadDaemonHandles`, maps HTTP

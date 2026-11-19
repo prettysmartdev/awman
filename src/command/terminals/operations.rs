@@ -1,7 +1,8 @@
 //! The typed operations behind `/v1/terminals` and `awman attach`.
 
+use crate::data::automation_records::{CloseExecutionRequest, SubmitTurnRequest};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::data::daemon_state::CommandListener;
 use crate::data::execution_event::{EventPayload, EventSource};
@@ -92,9 +93,68 @@ pub trait OwnerResolver: Send + Sync {
     fn active_run(&self, task: &TaskId) -> Option<RunId>;
 }
 
+/// Short synchronous admission seam; callbacks may not be retained or awaited.
+/// Lock order: controller admission -> grant book -> hub. Never call from a hub sink.
+pub trait TerminalAutomation: Send + Sync {
+    fn submit(
+        &self,
+        terminal_id: &TerminalId,
+        viewer: &ViewerIdentity,
+        grant: Option<&InputGrant>,
+        request: SubmitTurnRequest,
+    ) -> Result<OperationReply, AutomationRefusal>;
+    fn close(
+        &self,
+        terminal_id: &TerminalId,
+        viewer: &ViewerIdentity,
+        grant: Option<&InputGrant>,
+        request: CloseExecutionRequest,
+    ) -> Result<OperationReply, AutomationRefusal>;
+    fn with_control_change(
+        &self,
+        terminal_id: &TerminalId,
+        viewer: &ViewerIdentity,
+        action: &mut dyn FnMut() -> Result<(), TerminalRefusal>,
+    ) -> Result<(), TerminalRefusal>;
+    fn with_manual_input(
+        &self,
+        terminal_id: &TerminalId,
+        viewer: &ViewerIdentity,
+        grant: &InputGrant,
+        bytes: &[u8],
+        action: &mut dyn FnMut() -> Result<(), TerminalRefusal>,
+    ) -> Result<(), TerminalRefusal>;
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationReply {
+    PendingPublication,
+    Replay(Vec<TerminalFrame>),
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutomationRefusal {
+    pub request_id: uuid::Uuid,
+    pub code: String,
+    pub error: String,
+}
+impl AutomationRefusal {
+    pub fn into_frame(self) -> TerminalFrame {
+        TerminalFrame::OperationError {
+            request_id: self.request_id,
+            code: self.code,
+            error: self.error,
+        }
+    }
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientFrameResponse {
+    pub frames: Vec<TerminalFrame>,
+    pub detached: bool,
+}
+
 /// The one Layer 2 object every terminal transport uses.
 pub struct TerminalOperations {
     hub: Arc<TerminalHub>,
+    automation: OnceLock<Arc<dyn TerminalAutomation>>,
     grants: Mutex<InputGrants>,
     /// Re-read per call so live config applies.
     policy: Arc<dyn Fn() -> AccessPolicy + Send + Sync>,
@@ -117,6 +177,7 @@ impl TerminalOperations {
     ) -> Self {
         Self {
             hub,
+            automation: OnceLock::new(),
             grants: Mutex::new(InputGrants::new()),
             policy,
             events,
@@ -124,10 +185,30 @@ impl TerminalOperations {
         }
     }
 
+    /// Installed once at daemon/foreground bootstrap by the automation owner.
+    pub fn install_automation(
+        &self,
+        controller: Arc<dyn TerminalAutomation>,
+    ) -> Result<(), Arc<dyn TerminalAutomation>> {
+        self.automation.set(controller)
+    }
+
     pub fn hub(&self) -> &Arc<TerminalHub> {
         &self.hub
     }
 
+    /// Controller-serialized revocation/rebind action. Invoke outside hub/grant locks.
+    pub fn with_control_change(
+        &self,
+        id: &TerminalId,
+        viewer: &ViewerIdentity,
+        action: &mut dyn FnMut() -> Result<(), TerminalRefusal>,
+    ) -> Result<(), TerminalRefusal> {
+        match self.automation.get() {
+            Some(controller) => controller.with_control_change(id, viewer, action),
+            None => action(),
+        }
+    }
     /// The policy as configured right now.
     pub fn policy(&self) -> AccessPolicy {
         (self.policy)()
@@ -164,6 +245,12 @@ impl TerminalOperations {
             .list(owner)
             .into_iter()
             .filter(|record| policy.admit(record, viewer).is_ok())
+            .map(|mut record| {
+                if !crate::command::automation::controller::is_local_owner(viewer) {
+                    record.credential_updates = None;
+                }
+                record
+            })
             .collect();
         Ok(crate::command::daemon_api::core::page(items, query)?)
     }
@@ -174,8 +261,11 @@ impl TerminalOperations {
         id: &TerminalId,
         viewer: &ViewerIdentity,
     ) -> Result<TerminalRecord, TerminalRefusal> {
-        let record = self.hub.get(id)?;
+        let mut record = self.hub.get(id)?;
         self.policy().admit(&record, viewer)?;
+        if !crate::command::automation::controller::is_local_owner(viewer) {
+            record.credential_updates = None;
+        }
         Ok(record)
     }
 
@@ -261,6 +351,7 @@ impl TerminalOperations {
             let mut owners = owners.lock().unwrap_or_else(|p| p.into_inner());
             match event {
                 TerminalHubEvent::Opened(record) => {
+                    let record = *record;
                     events.append_with_source(
                         &record.owner_id,
                         record.source.as_ref(),
@@ -274,9 +365,13 @@ impl TerminalOperations {
                     );
                     owners.insert(record.id, (record.owner_id, record.source));
                 }
-                TerminalHubEvent::Closed { id, exit_code } => {
+                TerminalHubEvent::Closed {
+                    id,
+                    exit_code,
+                    source,
+                } => {
                     let owner = owners.remove(&id);
-                    if let Some((owner, source)) = owner {
+                    if let Some((owner, _)) = owner {
                         events.append_with_source(
                             &owner,
                             source.as_ref(),
@@ -351,6 +446,14 @@ impl TerminalSession {
         }
     }
 
+    fn event_source(&self) -> Option<EventSource> {
+        self.ops
+            .hub
+            .get(&self.id)
+            .map(|record| record.source)
+            .unwrap_or_else(|_| self.source.clone())
+    }
+
     pub fn id(&self) -> &TerminalId {
         &self.id
     }
@@ -360,7 +463,7 @@ impl TerminalSession {
     }
 
     pub fn holds_grant(&self) -> bool {
-        self.grant.is_some() && self.ops.hub.has_input_holder(&self.id).unwrap_or(false)
+        self.grant.as_ref().is_some_and(InputGrant::is_valid)
     }
 
     /// The reason the client declared with a `detached` frame, if it did.
@@ -379,6 +482,12 @@ impl TerminalSession {
             return None;
         }
         let frame = self.subscription.next().await?;
+        if let TerminalFrame::AutomationState { snapshot } = &frame {
+            if let Some(source) = &mut self.source {
+                source.execution_id = Some(snapshot.execution_id.clone());
+                source.turn_id = None;
+            }
+        }
         if matches!(frame, TerminalFrame::Exit { .. }) {
             self.release_grant();
         }
@@ -411,14 +520,15 @@ impl TerminalSession {
             return Err(TerminalRefusal::InputNotAllowed);
         }
         let policy = self.ops.policy();
-        let allowed = match self.ops.hub.get(&self.id) {
-            Ok(record) => {
-                record.state == TerminalState::Open
-                    && policy.admit(&record, &self.viewer).is_ok()
-                    && policy.input_allowed(&record, &self.viewer)
-            }
-            Err(_) => false,
-        };
+        let allowed = self.grant.as_ref().is_some_and(InputGrant::is_valid)
+            && match self.ops.hub.get(&self.id) {
+                Ok(record) => {
+                    record.state == TerminalState::Open
+                        && policy.admit(&record, &self.viewer).is_ok()
+                        && policy.input_allowed(&record, &self.viewer)
+                }
+                Err(_) => false,
+            };
         if allowed {
             Ok(())
         } else {
@@ -434,13 +544,40 @@ impl TerminalSession {
     pub fn handle_client_frame(
         &mut self,
         frame: TerminalClientFrame,
-    ) -> Result<(), TerminalRefusal> {
+    ) -> Result<ClientFrameResponse, TerminalRefusal> {
         match frame {
-            TerminalClientFrame::TakeControl => self.take_control(),
+            TerminalClientFrame::SubmitTurn { request } => return Ok(self.guarded_submit(request)),
+            TerminalClientFrame::CloseExecution { request } => {
+                return Ok(self.guarded_close(request))
+            }
+            TerminalClientFrame::TakeControl if self.grant.is_some() => self.revalidate_grant(),
+            TerminalClientFrame::TakeControl => {
+                let controller = self.ops.automation.get().cloned();
+                let id = self.id.clone();
+                let viewer = self.viewer.clone();
+                match controller {
+                    Some(controller) => {
+                        controller.with_control_change(&id, &viewer, &mut || self.take_control())
+                    }
+                    None => self.take_control(),
+                }
+            }
             TerminalClientFrame::Input { bytes } => {
                 self.revalidate_grant()?;
                 match &self.grant {
-                    Some(grant) => Ok(grant.send_input(bytes)?),
+                    Some(grant) => {
+                        let mut action = || Ok(grant.send_input(bytes.clone())?);
+                        match self.ops.automation.get() {
+                            Some(controller) => controller.with_manual_input(
+                                &self.id,
+                                &self.viewer,
+                                grant,
+                                &bytes,
+                                &mut action,
+                            ),
+                            None => action(),
+                        }
+                    }
                     None => Err(TerminalRefusal::InputNotAllowed),
                 }
             }
@@ -456,7 +593,51 @@ impl TerminalSession {
                 self.release_grant();
                 Ok(())
             }
+        }?;
+        Ok(ClientFrameResponse {
+            frames: Vec::new(),
+            detached: self.declared_detach.is_some(),
+        })
+    }
+
+    fn operation_response(
+        result: Result<OperationReply, AutomationRefusal>,
+    ) -> ClientFrameResponse {
+        let frames = match result {
+            Ok(OperationReply::PendingPublication) => Vec::new(),
+            Ok(OperationReply::Replay(frames)) => frames,
+            Err(refusal) => vec![refusal.into_frame()],
+        };
+        ClientFrameResponse {
+            frames,
+            detached: false,
         }
+    }
+    fn guarded_submit(&self, request: SubmitTurnRequest) -> ClientFrameResponse {
+        let result = match self.ops.automation.get() {
+            Some(controller) => {
+                controller.submit(&self.id, &self.viewer, self.grant.as_ref(), request)
+            }
+            None => Err(AutomationRefusal {
+                request_id: request.request_id,
+                code: "native_capability_unavailable".into(),
+                error: "terminal automation is unavailable".into(),
+            }),
+        };
+        Self::operation_response(result)
+    }
+    fn guarded_close(&self, request: CloseExecutionRequest) -> ClientFrameResponse {
+        let result = match self.ops.automation.get() {
+            Some(controller) => {
+                controller.close(&self.id, &self.viewer, self.grant.as_ref(), request)
+            }
+            None => Err(AutomationRefusal {
+                request_id: request.request_id,
+                code: "native_capability_unavailable".into(),
+                error: "terminal automation is unavailable".into(),
+            }),
+        };
+        Self::operation_response(result)
     }
 
     fn take_control(&mut self) -> Result<(), TerminalRefusal> {
@@ -485,7 +666,7 @@ impl TerminalSession {
             self.grant = Some(grant);
             self.ops.append(
                 &self.owner,
-                self.source.as_ref(),
+                self.event_source().as_ref(),
                 EventPayload::TerminalControl {
                     terminal_id: self.id.clone(),
                     holder: holder.as_str().to_owned(),
@@ -500,16 +681,35 @@ impl TerminalSession {
     /// `holder` (nobody holds input now). The capability is dropped first,
     /// so the PTY is back at its fallback size before anyone reads the log.
     fn release_grant(&mut self) {
+        let controller = self.ops.automation.get().cloned();
+        let id = self.id.clone();
+        let viewer = self.viewer.clone();
+        if let Some(controller) = controller {
+            let _ = controller.with_control_change(&id, &viewer, &mut || {
+                self.release_grant_inner();
+                Ok(())
+            });
+        } else {
+            self.release_grant_inner();
+        }
+    }
+    fn release_grant_inner(&mut self) {
         let Some(grant) = self.grant.take() else {
             return;
         };
         {
             let mut grants = self.ops.grants.lock().expect("terminal grants poisoned");
+            // A disconnected viewer from the previous execution must not erase
+            // the replacement viewer's name merely because both are "local".
+            if !grant.is_valid() && self.ops.hub.has_input_holder(&self.id).unwrap_or(false) {
+                drop(grant);
+                return;
+            }
             grants.release(&self.id, &self.viewer.holder());
             drop(grant);
             self.ops.append(
                 &self.owner,
-                self.source.as_ref(),
+                self.event_source().as_ref(),
                 EventPayload::TerminalControl {
                     terminal_id: self.id.clone(),
                     holder: String::new(),
@@ -536,7 +736,7 @@ impl TerminalSession {
         if self.viewer.listener == CommandListener::Local {
             self.ops.append(
                 &self.owner,
-                self.source.as_ref(),
+                self.event_source().as_ref(),
                 EventPayload::TerminalViewerDetached {
                     terminal_id: self.id.clone(),
                     reason,

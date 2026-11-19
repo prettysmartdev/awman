@@ -132,6 +132,58 @@ pub(crate) fn check_workflow_access(
     )
 }
 
+/// One agent step's route, as the `--plan` workflow preflight sees it.
+#[derive(Debug, Clone)]
+pub struct NativeModeStep {
+    pub step: String,
+    pub agent: crate::data::session::AgentName,
+    pub launch_mode: crate::data::config::agents::LaunchMode,
+    pub non_interactive: bool,
+    pub model_requested: bool,
+}
+
+/// The workflow-wide native mode preflight of `exec workflow --plan` (WI
+/// 0070): every agent step's agent must be able to deliver `--plan` on its
+/// own route. Fails before setup, any worktree or any container. A no-op
+/// when `plan` is false. Independent of the mount preflight above.
+pub fn preflight_workflow_native_mode(
+    steps: &[NativeModeStep],
+    plan: bool,
+    session: &crate::data::session::Session,
+    paradigm: crate::engine::agent::definition::RunParadigm,
+) -> Result<(), CommandError> {
+    if !plan {
+        return Ok(());
+    }
+    for step in steps {
+        let def = crate::engine::agent::AgentRegistry::resolve_for_session(session, &step.agent)?;
+        let probe = crate::engine::agent::AgentRunOptions {
+            plan: Some(crate::engine::container::options::PlanMode::Enabled),
+            non_interactive: step.non_interactive,
+            model: step.model_requested.then(String::new),
+            launch_mode: step.launch_mode,
+            ..Default::default()
+        };
+        // The typed refusal is kept (its code is the client's to act on);
+        // a route refusal also names the step.
+        def.native_plan_delivery(&probe, paradigm)
+            .map_err(|e| match e {
+                crate::engine::error::EngineError::NativePlanRouteUnsupported {
+                    agent,
+                    route,
+                    reason,
+                } => crate::engine::error::EngineError::NativePlanRouteUnsupported {
+                    agent,
+                    route,
+                    reason: format!("workflow step '{}': {reason}", step.step),
+                },
+                other => other,
+            })
+            .map_err(CommandError::from)?;
+    }
+    Ok(())
+}
+
 /// The flag-level rule of `exec workflow`: `--read-only-workspace` and
 /// `--dynamic` are mutually exclusive. Checked by the command, not the
 /// catalogue, because the flag spec is shared with `exec prompt`, which has

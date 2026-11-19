@@ -20,7 +20,7 @@ use crate::engine::acp::frontend::AcpFrontend;
 use crate::engine::acp::protocol::{
     ContentBlock, InitializeRequest, InitializeResponse, JsonRpcId, NewSessionRequest,
     NewSessionResponse, PermissionDecision, PermissionRequest, PromptRequest, PromptResponse,
-    SessionUpdate,
+    SessionUpdate, SetSessionModeRequest,
 };
 use crate::engine::agent_runtime::execution::{AgentExecution, AgentExitInfo};
 use crate::engine::error::EngineError;
@@ -53,6 +53,16 @@ pub struct AcpSession {
     pending_permissions: Mutex<HashSet<JsonRpcId>>,
     updates_rx: mpsc::UnboundedReceiver<SessionUpdate>,
     permissions: PermissionPolicy,
+    /// The starting mode `initialize` was asked to establish, if any.
+    requested_mode: Option<String>,
+    /// The mode the agent acknowledged (`session/new` already in it, or a
+    /// successful `session/set_mode`). No prompt is sent while a requested
+    /// mode is unacknowledged.
+    current_mode: Option<String>,
+    /// The `modes` of the `session/new` response, consumed by `initialize`.
+    advertised_modes: Option<crate::engine::acp::protocol::SessionModeState>,
+    /// Named in a start-mode refusal.
+    agent_name: String,
 }
 
 impl AcpSession {
@@ -80,13 +90,94 @@ impl AcpSession {
             pending_permissions: Mutex::new(HashSet::new()),
             updates_rx,
             permissions,
+            requested_mode: None,
+            current_mode: None,
+            advertised_modes: None,
+            agent_name: "agent".into(),
         }
     }
 
     /// Negotiate ACP v1 then create a session rooted at the supplied absolute
     /// *container* working directory.
-    pub async fn initialize(&mut self, cwd: impl AsRef<Path>) -> Result<String, EngineError> {
-        let cwd = cwd.as_ref();
+    ///
+    /// With `start_mode` (a definition's `acp_mode_id` for `--plan`), the
+    /// session must advertise that mode and be in it before this returns:
+    /// `session/set_mode` is sent when it is not already current, and its
+    /// success response is the acknowledgement. Anything else is a
+    /// `NativePlanRouteUnsupported` refusal; the caller shuts the execution
+    /// down. No prompt can be sent until the mode is acknowledged.
+    pub async fn initialize(
+        &mut self,
+        cwd: impl AsRef<Path>,
+        start_mode: Option<&str>,
+    ) -> Result<String, EngineError> {
+        self.requested_mode = start_mode.map(str::to_string);
+        let session_id = self.initialize_session(cwd.as_ref()).await?;
+        if let Some(mode) = start_mode {
+            self.establish_mode(&session_id, mode).await?;
+        }
+        Ok(session_id)
+    }
+
+    async fn establish_mode(&mut self, session_id: &str, mode: &str) -> Result<(), EngineError> {
+        let agent = self.agent_name.clone();
+        let refuse = |reason: String| EngineError::NativePlanRouteUnsupported {
+            agent: agent.clone(),
+            route: "acp",
+            reason,
+        };
+        let advertised = self.advertised_modes.take();
+        let Some(state) = advertised else {
+            return Err(refuse(format!(
+                "agent does not advertise session mode '{mode}'; use agents.launchMode=stdio or \
+                 launch without --plan"
+            )));
+        };
+        if !state.available_modes.iter().any(|m| m.id == mode) {
+            return Err(refuse(format!(
+                "agent does not advertise session mode '{mode}'; use agents.launchMode=stdio or \
+                 launch without --plan"
+            )));
+        }
+        if state.current_mode_id != mode {
+            self.handshake_request(
+                "session/set_mode",
+                SetSessionModeRequest {
+                    session_id: session_id.to_string(),
+                    mode_id: mode.to_string(),
+                },
+            )
+            .await
+            .map_err(|e| {
+                refuse(format!(
+                    "session/set_mode '{mode}' was not acknowledged: {e}"
+                ))
+            })?;
+        }
+        self.current_mode = Some(mode.to_string());
+        Ok(())
+    }
+
+    /// Name the agent in a start-mode refusal.
+    pub fn with_agent_name(mut self, name: impl Into<String>) -> Self {
+        self.agent_name = name.into();
+        self
+    }
+
+    /// The mode the agent acknowledged at start, if one was requested.
+    pub fn current_mode(&self) -> Option<&str> {
+        self.current_mode.as_deref()
+    }
+
+    /// Refuse a prompt while a requested start mode is unacknowledged.
+    fn ensure_start_mode(&self) -> Result<(), EngineError> {
+        match (&self.requested_mode, &self.current_mode) {
+            (Some(_), None) => Err(EngineError::Acp("start mode not established".into())),
+            _ => Ok(()),
+        }
+    }
+
+    async fn initialize_session(&mut self, cwd: &Path) -> Result<String, EngineError> {
         if !cwd.is_absolute() {
             return Err(EngineError::Acp(
                 "ACP session cwd must be absolute inside the container".into(),
@@ -120,6 +211,7 @@ impl AcpSession {
             .await?,
         )?;
         *self.session_id.lock().await = Some(created.session_id.clone());
+        self.advertised_modes = created.modes;
         Ok(created.session_id)
     }
 
@@ -152,6 +244,7 @@ impl AcpSession {
     }
 
     pub async fn prompt(&mut self, text: impl Into<String>) -> Result<PromptResponse, EngineError> {
+        self.ensure_start_mode()?;
         let session_id = self
             .session_id
             .lock()
@@ -229,6 +322,7 @@ impl AcpSession {
         frontend: &mut dyn AcpFrontend,
         initial: Option<String>,
     ) -> Result<AgentExitInfo, EngineError> {
+        self.ensure_start_mode()?;
         let mut next = initial;
         loop {
             let prompt = match next.take() {
@@ -330,4 +424,248 @@ impl AcpSession {
 fn decode<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> Result<T, EngineError> {
     serde_json::from_value(value)
         .map_err(|e| EngineError::Acp(format!("invalid ACP response: {e}")))
+}
+
+#[cfg(test)]
+mod start_mode_tests {
+    //! WI 0070: an ACP `--plan` launch selects and confirms the declared
+    //! session mode before the first prompt, through a fake agent speaking
+    //! JSON-RPC over the real transport.
+    use super::*;
+    use crate::data::message::{UserMessage, UserMessageSink};
+    use crate::engine::agent_runtime::execution::{CancelHandle, ExecutionBackend};
+    use crate::engine::agent_runtime::frontend::AgentFrontend;
+    use serde_json::{json, Value};
+    use std::sync::Mutex as StdMutex;
+
+    struct Quiet;
+    impl UserMessageSink for Quiet {
+        fn write_message(&mut self, _msg: UserMessage) {}
+        fn replay_queued(&mut self) {}
+    }
+
+    struct Done;
+    impl ExecutionBackend for Done {
+        fn wait_blocking(self: Box<Self>) -> Result<AgentExitInfo, EngineError> {
+            let now = chrono::DateTime::from_timestamp(0, 0).unwrap();
+            Ok(AgentExitInfo {
+                exit_code: 0,
+                signal: None,
+                started_at: now,
+                ended_at: now,
+            })
+        }
+        fn cancel(&self) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn cancel_handle(&self) -> CancelHandle {
+            CancelHandle::new(|| Ok(()))
+        }
+    }
+
+    /// Start a fake ACP agent. `modes` is the `session/new` `modes` value;
+    /// `set_mode_error` makes `session/set_mode` fail. Returns the session
+    /// and the methods the agent received, in order.
+    fn session(
+        modes: Option<Value>,
+        set_mode_error: bool,
+    ) -> (AcpSession, Arc<StdMutex<Vec<String>>>) {
+        let (mut frontend, transport) = AcpTransport::channel();
+        let io = frontend.take_io();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let stdout = io.stdout;
+        let mut stdin = io.stdin_rx;
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            while let Some(bytes) = stdin.recv().await {
+                buf.extend(bytes);
+                while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=pos).collect();
+                    let Ok(msg) = serde_json::from_slice::<Value>(&line) else {
+                        continue;
+                    };
+                    let (Some(method), Some(id)) = (msg["method"].as_str(), msg.get("id")) else {
+                        continue;
+                    };
+                    log.lock().unwrap().push(method.to_string());
+                    let reply = match method {
+                        "initialize" => json!({"protocolVersion": 1, "agentCapabilities": {}}),
+                        "session/new" => {
+                            let mut r = json!({"sessionId": "s1"});
+                            if let Some(modes) = &modes {
+                                r["modes"] = modes.clone();
+                            }
+                            r
+                        }
+                        "session/set_mode" if set_mode_error => {
+                            let err = json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": "no such mode"}});
+                            let _ = stdout.send(format!("{err}\n").into_bytes());
+                            continue;
+                        }
+                        "session/set_mode" => json!({}),
+                        "session/prompt" => json!({"stopReason": "end_turn"}),
+                        _ => json!({}),
+                    };
+                    let response = json!({"jsonrpc": "2.0", "id": id, "result": reply});
+                    let _ = stdout.send(format!("{response}\n").into_bytes());
+                }
+            }
+        });
+        let (stuck, _) = tokio::sync::broadcast::channel(4);
+        let execution = AgentExecution::new(
+            crate::data::session::AgentHandle {
+                id: "fake".into(),
+                name: "fake".into(),
+                image_tag: "fake:latest".into(),
+                started_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            },
+            Box::new(Done),
+            Arc::new(stuck),
+            None,
+        );
+        let session = AcpSession::from_transport(
+            execution,
+            transport,
+            Box::new(Quiet),
+            PermissionPolicy::Ask,
+        )
+        .with_agent_name("cline");
+        (session, seen)
+    }
+
+    fn modes(current: &str) -> Value {
+        json!({
+            "currentModeId": current,
+            "availableModes": [
+                {"id": "act", "name": "Act"},
+                {"id": "plan", "name": "Plan", "description": "plan first"}
+            ]
+        })
+    }
+
+    fn methods(seen: &Arc<StdMutex<Vec<String>>>) -> Vec<String> {
+        seen.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn an_advertised_mode_is_selected_and_acknowledged_before_the_first_prompt() {
+        let (mut acp, seen) = session(Some(modes("act")), false);
+        acp.initialize("/workspace", Some("plan")).await.unwrap();
+        assert_eq!(acp.current_mode(), Some("plan"));
+        acp.prompt("hello").await.unwrap();
+        assert_eq!(
+            methods(&seen),
+            [
+                "initialize",
+                "session/new",
+                "session/set_mode",
+                "session/prompt"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_already_current_mode_sends_no_set_mode() {
+        let (mut acp, seen) = session(Some(modes("plan")), false);
+        acp.initialize("/workspace", Some("plan")).await.unwrap();
+        acp.prompt("hello").await.unwrap();
+        assert_eq!(
+            methods(&seen),
+            ["initialize", "session/new", "session/prompt"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unadvertised_mode_is_refused_and_no_prompt_can_follow() {
+        for advertised in [
+            None,
+            Some(json!({"currentModeId": "act", "availableModes": [{"id": "act", "name": "Act"}]})),
+        ] {
+            let (mut acp, seen) = session(advertised, false);
+            let err = acp
+                .initialize("/workspace", Some("plan"))
+                .await
+                .unwrap_err();
+            match &err {
+                EngineError::NativePlanRouteUnsupported {
+                    agent,
+                    route,
+                    reason,
+                } => {
+                    assert_eq!((agent.as_str(), *route), ("cline", "acp"));
+                    assert!(
+                        reason.contains("does not advertise session mode 'plan'"),
+                        "{reason}"
+                    );
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+            assert!(err.is_native_capability_unavailable());
+            let refused = acp.prompt("hello").await.unwrap_err();
+            assert!(
+                refused.to_string().contains("start mode not established"),
+                "{refused}"
+            );
+            assert!(!methods(&seen).contains(&"session/prompt".to_string()));
+            acp.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_set_mode_error_is_a_refusal_not_a_silent_default() {
+        let (mut acp, seen) = session(Some(modes("act")), true);
+        let err = acp
+            .initialize("/workspace", Some("plan"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, EngineError::NativePlanRouteUnsupported { reason, .. } if reason.contains("not acknowledged")),
+            "{err:?}"
+        );
+        let mut frontend = NoPrompts;
+        let driven = acp
+            .drive_with_initial_prompt(&mut frontend, Some("x".into()))
+            .await;
+        assert!(driven
+            .unwrap_err()
+            .to_string()
+            .contains("start mode not established"));
+        assert!(!methods(&seen).contains(&"session/prompt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn without_a_start_mode_nothing_changes() {
+        let (mut acp, seen) = session(None, false);
+        acp.initialize("/workspace", None).await.unwrap();
+        assert_eq!(acp.current_mode(), None);
+        acp.prompt("hello").await.unwrap();
+        assert_eq!(
+            methods(&seen),
+            ["initialize", "session/new", "session/prompt"]
+        );
+    }
+
+    #[test]
+    fn a_later_mode_change_is_a_tolerated_update() {
+        let update: SessionUpdate = serde_json::from_value(
+            json!({"sessionUpdate": "current_mode_update", "currentModeId": "act"}),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::engine::acp::protocol::summarize_update(&update),
+            "mode changed to act"
+        );
+    }
+
+    struct NoPrompts;
+    impl AcpFrontend for NoPrompts {
+        fn render_update(&mut self, _update: SessionUpdate) {}
+        fn request_permission(&mut self, _request: PermissionRequest) -> PermissionDecision {
+            PermissionDecision::Cancelled
+        }
+        fn next_prompt(&mut self) -> Option<String> {
+            None
+        }
+    }
 }

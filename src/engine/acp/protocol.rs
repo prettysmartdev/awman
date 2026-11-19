@@ -126,6 +126,17 @@ pub struct NewSessionRequest {
 #[serde(rename_all = "camelCase")]
 pub struct NewSessionResponse {
     pub session_id: String,
+    /// The session modes the agent advertises, when it has any.
+    #[serde(default)]
+    pub modes: Option<SessionModeState>,
+}
+
+/// `session/set_mode` parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionModeRequest {
+    pub session_id: String,
+    pub mode_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -158,6 +169,8 @@ pub use crate::data::acp_protocol::AvailableCommand;
 pub use crate::data::acp_protocol::SessionUpdate;
 
 pub use crate::data::acp_protocol::SessionUpdateNotification;
+
+pub use crate::data::acp_protocol::{SessionMode, SessionModeState};
 
 pub use crate::data::acp_protocol::PermissionOption;
 
@@ -344,6 +357,12 @@ pub fn summarize_update(update: &SessionUpdate) -> String {
         SessionUpdate::Plan { entries } => format!("plan: {} step(s)", entries.len()),
         SessionUpdate::AvailableCommandsUpdate { available_commands } => {
             format!("available commands: {}", available_commands.len())
+        }
+        SessionUpdate::CurrentModeUpdate { current_mode_id } => {
+            format!(
+                "mode changed to {}",
+                sanitize_terminal_text(current_mode_id)
+            )
         }
     }
 }

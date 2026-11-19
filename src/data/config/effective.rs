@@ -484,6 +484,16 @@ impl EffectiveConfig {
             .map_or(Duration::from_secs(30), |d| d.to_duration())
     }
 
+    /// `agents.automation.*` (WI 0070): the startup, cancel and output-drain
+    /// budgets a launch snapshots, resolved over every config source with
+    /// the key-table defaults applied. Fails when the merged drain budget
+    /// exceeds the merged cancel budget.
+    pub fn automation_timeouts(
+        &self,
+    ) -> Result<crate::data::config::agents::AutomationTimeouts, DataError> {
+        self.agents().automation.unwrap_or_default().resolve()
+    }
+
     /// `agents.launchMode`.
     pub fn launch_mode(&self) -> LaunchMode {
         self.agents().launch_mode.unwrap_or_default()

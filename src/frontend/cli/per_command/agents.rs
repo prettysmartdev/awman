@@ -198,6 +198,7 @@ fn render_agents_with_width(
     if json {
         return Some(
             match outcome {
+                AgentsOutcome::Profile(profile) => serde_json::to_string_pretty(profile),
                 AgentsOutcome::Status(status) => serde_json::to_string_pretty(&status.overview),
                 AgentsOutcome::List(list) => serde_json::to_string_pretty(&list.agents),
                 AgentsOutcome::Detail(detail) => serde_json::to_string_pretty(&detail.detail),
@@ -208,6 +209,9 @@ fn render_agents_with_width(
         );
     }
     let rendered = match outcome {
+        AgentsOutcome::Profile(profile) => {
+            Some(serde_json::to_string_pretty(profile).unwrap_or_default())
+        }
         AgentsOutcome::Status(status) => Some(render_overview(&status.overview, width, None)),
         AgentsOutcome::List(list) => {
             if list.quiet {

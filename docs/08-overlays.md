@@ -936,6 +936,29 @@ If you see this error for a path that should exist, check:
 - The context directory is writable by agents. Files written by one session will be visible to the next session.
 - If you want to prevent agents from modifying context, use `:ro` (e.g. `context(repo:ro)`).
 
+
+## Overlays and settings profiles
+
+With `--settings-profile NAME`, provider settings mounts come from that execution's
+private [profile](03-agent-sessions.md#settings-profiles) copy instead of your host
+directories. Supported settings are sanitized on import and again before retention;
+executable hooks, plugins, credentials and permissive approval rules are excluded.
+Unsupported restrictive rules cause a refusal so that a deny or ask policy is never
+silently lost. Only the execution copy is mounted; profile manifests and saved snapshots
+stay outside the container.
+
+- **Overlays cannot replace profile settings or history.** A `dir()` overlay whose
+  destination is a profile-managed settings or history path is refused.
+- **Credentials still follow your overlays.** An `env()` overlay, or the agent's normal
+  authentication selection (`agents.auth.mode`), supplies credentials for each execution.
+  They are never copied into the saved profile, so changing an `env()` overlay changes the
+  next run's credential without touching saved history.
+- **`--plan` and mounted settings.** With `--plan`, an overlay or settings mount that would
+  replace an inspected OpenCode config file is refused (`agent_mode_conflict`) because it could
+  change the starting mode.
+- **`--read-only-workspace`.** Overlays that expose a runtime control socket or its protected
+  parents are refused; see [`--read-only-workspace`](03-agent-sessions.md#--read-only-workspace).
+
 ---
 
 [← Configuration](07-configuration.md) · [Next: API & Remote Mode →](09-api-and-remote-mode.md)

@@ -127,6 +127,30 @@ pub enum SessionUpdate {
     AvailableCommandsUpdate {
         available_commands: Vec<AvailableCommand>,
     },
+    /// The agent changed its session mode (a legitimate later transition,
+    /// e.g. Plan to Act); never a failure.
+    CurrentModeUpdate {
+        #[serde(rename = "currentModeId")]
+        current_mode_id: String,
+    },
+}
+
+/// One session mode an ACP agent advertises.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMode {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// The modes an ACP session offers and the one it is in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModeState {
+    pub current_mode_id: String,
+    pub available_modes: Vec<SessionMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

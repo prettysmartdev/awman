@@ -199,6 +199,7 @@ fn definition(parallel: bool) -> Workflow {
         ]
         .into_iter()
         .map(|(name, deps)| WorkflowStep {
+            settings_profile: None,
             name: name.into(),
             depends_on: deps.into_iter().map(str::to_string).collect(),
             prompt_template: "contract task".into(),
@@ -296,6 +297,7 @@ async fn resume_rewind_preserves_completed_parallel_branches() {
     ]
     .into_iter()
     .map(|(name, deps)| WorkflowStep {
+        settings_profile: None,
         name: name.into(),
         depends_on: deps.into_iter().map(str::to_string).collect(),
         ..workflow.steps[0].clone()

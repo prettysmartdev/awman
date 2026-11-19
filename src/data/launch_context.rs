@@ -40,3 +40,11 @@ pub struct RefreshLaunchContext {
     pub root: PathBuf,
     pub env: crate::data::frontend_protocol::HelloEnv,
 }
+
+/// A source reference carries only names already granted at launch. It cannot
+/// authorize a process-global env reread or a new launch context.
+#[derive(Debug, Clone)]
+pub struct LaunchCredentialSource {
+    pub context_id: LaunchContextId,
+    pub secret_names: Vec<crate::data::secret::SecretName>,
+}

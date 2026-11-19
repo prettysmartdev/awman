@@ -263,8 +263,12 @@ contracts = ["unit-awman"]
 requires = []
 paths = []
 always = true
-filter = "test(/^command::commands::exec_workflow::contract_tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/) | test(/^data::checkout_paths::tests::/) | test(/^data::workspace::tests::/) | test(/^data::workflow_definition::read_only_workspace_tests::/) | test(/^data::image_inputs::tests::/) | test(/^data::image_tags::lease_tag_tests::/) | test(/^data::worker::lease_images::tests::/) | test(/^data::execution_event::image_stale_tests::/) | test(/^data::config::work_servers::image_budget_tests::/) | test(/^engine::agent::image_freshness::failure_reason_tests::/) | test(/^engine::container::agent_argv::adapter_tests::/) | test(/^engine::container::agent_version::tests::/) | test(/^engine::agent_output::cursor_stream_json::tests::/) | test(/^engine::agent::session_seed::tests::/) | test(/^engine::sandbox::dsbx::backend::adapter_tail_tests::/)"
+filter = "test(/^command::commands::exec_workflow::contract_tests::/) | test(/^command::commands::exec_workflow::factory::stuck_timeout_tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/) | test(/^data::checkout_paths::tests::/) | test(/^data::workspace::tests::/) | test(/^data::workflow_definition::read_only_workspace_tests::/) | test(/^data::image_inputs::tests::/) | test(/^data::image_tags::lease_tag_tests::/) | test(/^data::worker::lease_images::tests::/) | test(/^data::execution_event::image_stale_tests::/) | test(/^data::config::work_servers::image_budget_tests::/) | test(/^engine::agent::image_freshness::failure_reason_tests::/) | test(/^engine::container::agent_argv::adapter_tests::/) | test(/^engine::container::agent_version::tests::/) | test(/^engine::agent_output::cursor_stream_json::tests::/) | test(/^engine::agent::session_seed::tests::/) | test(/^engine::sandbox::dsbx::backend::adapter_tail_tests::/) | test(/^data::agent_policy::tests::/) | test(/^data::agent_failure::tests::/) | test(/^data::automation::tests::/) | test(/^engine::agent::credential_routes::tests::/) | test(/^data::credential_update::tests::/) | test(/^data::preparation::tests::/) | test(/^data::settings_profile::tests::/) | test(/^data::ids::tests::/) | test(/^data::config::agents::automation_timeout_tests::/) | test(/^command::dispatch::catalogue::pending::tests::/) | test(/^command::dispatch::projections::optional_enum_tests::/) | test(/^command::dispatch::projections::raw_args::misplaced_flag_tests::/) | test(/^command::dispatch::outcomes::wait_failure_tests::/) | test(/^data::ready_summary::preparation_tests::/) | test(/^data::terminal::automation_frame_tests::/) | test(/^data::execution_event::automation_event_tests::/) | test(/^engine::agent::definition::native_plan_tests::/) | test(/^data::config::agent_definition::native_plan_tests::/) | test(/^command::automation::admission::tests::/) | test(/^command::automation::results::tests::/) | test(/^engine::agent::automation::osc7501::tests::/) | test(/^engine::agent::automation::observer::tests::/) | test(/^engine::agent::automation::tests::/) | test(/^command::daemon_api::capabilities::credential_enrollment_tests::/) | test(/^engine::remote::local::credential_wire_tests::/) | test(/^engine::auth::credential::protected_equality_tests::/)"
 
+# Includes frontend::cli::wait_failure_tests and container::io_bridge::inactivity_tests.
+# WI 0070 native plan: also command::commands::launch_policy::agent_policy_tests,
+# engine::acp::session::start_mode_tests, engine::agent::native_plan_option_tests and
+# data::jsonc::tests; tests/component/command/native_plan.rs is in component-command.
 [suites.component-core-internals]
 tier = "component"
 kind = "nextest"
@@ -274,7 +278,7 @@ contracts = ["component-core-internals"]
 requires = []
 paths = []
 always = true
-filter = "not (test(/^command::commands::exec_workflow::contract_tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/) | test(/^data::checkout_paths::tests::/) | test(/^data::workspace::tests::/) | test(/^data::workflow_definition::read_only_workspace_tests::/) | test(/^data::image_inputs::tests::/) | test(/^data::image_tags::lease_tag_tests::/) | test(/^data::worker::lease_images::tests::/) | test(/^data::execution_event::image_stale_tests::/) | test(/^data::config::work_servers::image_budget_tests::/) | test(/^engine::agent::image_freshness::failure_reason_tests::/) | test(/^engine::container::agent_argv::adapter_tests::/) | test(/^engine::container::agent_version::tests::/) | test(/^engine::agent_output::cursor_stream_json::tests::/) | test(/^engine::agent::session_seed::tests::/) | test(/^engine::sandbox::dsbx::backend::adapter_tail_tests::/))"
+filter = "not (test(/^command::commands::exec_workflow::contract_tests::/) | test(/^command::commands::exec_workflow::factory::stuck_timeout_tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/) | test(/^data::checkout_paths::tests::/) | test(/^data::workspace::tests::/) | test(/^data::workflow_definition::read_only_workspace_tests::/) | test(/^data::image_inputs::tests::/) | test(/^data::image_tags::lease_tag_tests::/) | test(/^data::worker::lease_images::tests::/) | test(/^data::execution_event::image_stale_tests::/) | test(/^data::config::work_servers::image_budget_tests::/) | test(/^engine::agent::image_freshness::failure_reason_tests::/) | test(/^engine::container::agent_argv::adapter_tests::/) | test(/^engine::container::agent_version::tests::/) | test(/^engine::agent_output::cursor_stream_json::tests::/) | test(/^engine::agent::session_seed::tests::/) | test(/^engine::sandbox::dsbx::backend::adapter_tail_tests::/) | test(/^data::agent_policy::tests::/) | test(/^data::agent_failure::tests::/) | test(/^data::automation::tests::/) | test(/^engine::agent::credential_routes::tests::/) | test(/^data::credential_update::tests::/) | test(/^data::preparation::tests::/) | test(/^data::settings_profile::tests::/) | test(/^data::ids::tests::/) | test(/^data::config::agents::automation_timeout_tests::/) | test(/^command::dispatch::catalogue::pending::tests::/) | test(/^command::dispatch::projections::optional_enum_tests::/) | test(/^command::dispatch::projections::raw_args::misplaced_flag_tests::/) | test(/^command::dispatch::outcomes::wait_failure_tests::/) | test(/^data::ready_summary::preparation_tests::/) | test(/^data::terminal::automation_frame_tests::/) | test(/^data::execution_event::automation_event_tests::/) | test(/^engine::agent::definition::native_plan_tests::/) | test(/^data::config::agent_definition::native_plan_tests::/) | test(/^command::automation::admission::tests::/) | test(/^command::automation::results::tests::/) | test(/^engine::agent::automation::osc7501::tests::/) | test(/^engine::agent::automation::observer::tests::/) | test(/^engine::agent::automation::tests::/) | test(/^command::daemon_api::capabilities::credential_enrollment_tests::/) | test(/^engine::remote::local::credential_wire_tests::/) | test(/^engine::auth::credential::protected_equality_tests::/))"
 
 
 
@@ -324,6 +328,8 @@ always = true
 
 
 
+# Includes data::automation_store: shared SQLite reservation/CAS/dedup, immutable
+# results and bounded lifecycle recovery (WI 0070 Part A).
 [suites.component-data]
 tier = "component"
 kind = "nextest"
@@ -331,9 +337,11 @@ package = "awman-cli"
 target = "test:component"
 contracts = ["component-data"]
 requires = []
-paths = ["tests/component/data/**", "src/data/**"]
-filter = "test(/^data::/)"
+paths = ["tests/component/data/**", "src/data/**", "web/test/lib/fixtures/terminal-frames.json"]
+filter = "test(/^data::/) - test(/^data::agent_profiles::/)"
 
+# Includes engine::terminal: deferred EOF/drain, reconnect, replacement fences
+# and private TerminalAutomation replies. Fixtures are shared with the browser/WSP.
 [suites.component-engine]
 tier = "component"
 kind = "nextest"
@@ -341,9 +349,11 @@ package = "awman-cli"
 target = "test:component"
 contracts = ["component-engine"]
 requires = []
-paths = ["tests/component/engine/**", "src/engine/**"]
+paths = ["tests/component/engine/**", "src/engine/**", "src/data/terminal.rs", "src/command/terminals/**", "web/test/lib/fixtures/terminal-frames.json"]
 filter = "test(/^engine::/)"
 
+# Includes command::{misplaced_flags,wait_failures,agent_version_policy}; the
+# reserved unit-awman paths cover the pure argument and wait-outcome contracts.
 [suites.component-command]
 tier = "component"
 kind = "nextest"
@@ -351,8 +361,8 @@ package = "awman-cli"
 target = "test:component"
 contracts = ["component-command"]
 requires = []
-paths = ["tests/component/command/**", "src/command/**"]
-filter = "test(/^command::/) - test(/^command::builtin::/) - test(/^command::daemon::/) - test(/^command::differential::/) - test(/^command::models::/) - test(/^command::edit_artifacts::/)"
+paths = ["tests/component/command/**", "src/command/**", "src/data/credential_update.rs", "src/data/automation_store/credentials*", "src/engine/credential_refresh/**", "src/engine/agent/credential_routes.rs"]
+filter = "test(/^command::/) - test(/^command::settings_profiles::/) - test(/^command::native_resume::/) - test(/^command::builtin::/) - test(/^command::daemon::/) - test(/^command::differential::/) - test(/^command::models::/) - test(/^command::edit_artifacts::/)"
 
 [suites.component-command-edit-artifacts]
 tier = "component"
@@ -921,7 +931,7 @@ required_check = "gate"
 build_smokes = ["linux-x64-musl-static"]
 
 [[gates.pr.cells]]
-suites = ["component-core-internals", "component-command-models", "unit-awman", "unit-wsp", "unit-test-support", "unit-xtask", "component-data", "component-engine", "component-command", "component-command-edit-artifacts", "component-command-builtin", "component-command-daemon", "component-command-differential", "component-frontend", "component-daemon", "component-squad", "component-worker", "component-security", "component-tools", "component-parity-builtin", "component-parity-daemon", "component-parity-differential"]
+suites = ["component-agent-profiles", "component-profile-commands", "component-core-internals", "component-command-models", "unit-awman", "unit-wsp", "unit-test-support", "unit-xtask", "component-data", "component-engine", "component-command", "component-command-edit-artifacts", "component-command-builtin", "component-command-daemon", "component-command-differential", "component-frontend", "component-daemon", "component-squad", "component-worker", "component-security", "component-tools", "component-parity-builtin", "component-parity-daemon", "component-parity-differential"]
 builds = ["linux-x64-default", "macos-arm64-default", "windows-x64-default"]
 
 [[gates.pr.cells]]
@@ -1232,3 +1242,25 @@ requires = []
 paths = ["src/command/**", "tests/component/command/models.rs"]
 filter = "test(/^command::models::/)"
 budget_seconds = 120
+
+# WI 0070: private generations, lease contention, crash reconciliation,
+# inactive-only deletion, concurrent profiles, and exact provider resume argv.
+[suites.component-agent-profiles]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-data"]
+requires = []
+paths = ["tests/component/data/agent_profiles.rs", "src/data/fs/**", "src/data/settings_profile.rs"]
+filter = "test(/^data::agent_profiles::/)"
+
+[suites.component-profile-commands]
+tier = "component"
+kind = "nextest"
+package = "awman-cli"
+target = "test:component"
+contracts = ["component-command"]
+requires = []
+paths = ["tests/component/command/settings_profiles.rs", "tests/component/command/native_resume.rs", "src/command/**", "src/engine/agent/**", "src/engine/agent_output/**", "src/engine/overlay/**", "src/engine/container/**", "src/data/fs/**", "src/data/settings_profile.rs"]
+filter = "test(/^command::settings_profiles::/) | test(/^command::native_resume::/)"

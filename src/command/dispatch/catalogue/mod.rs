@@ -35,6 +35,9 @@ pub enum FlagKind {
     Enum(&'static [&'static str]),
     /// Repeatable string flag (`--foo a --foo b`).
     VecString,
+    /// Repeatable provider argv item, which may start with `-` when passed
+    /// as a separate token. Awman options are still protected by the parser.
+    AgentArg,
     /// `--foo PATH` optional path.
     Path,
     /// `--foo PATH` optional path.
@@ -43,6 +46,19 @@ pub enum FlagKind {
     U16,
     /// `--foo N` usize number, must be >= 1.
     UsizeAtLeastOne,
+    /// `--foo` or `--foo=VALUE`, from a fixed set of values (WI 0070).
+    ///
+    /// The value is optional and `=`-only: a bare `--foo` means `missing`,
+    /// and the token after it is never consumed as the value. An empty or
+    /// unknown explicit value is refused; identical repeats normalize to one
+    /// value and conflicting repeats are refused. Every projection (clap,
+    /// raw args, relay argv, generated reference) follows this one rule, and
+    /// the resolved value reads through the same getters as [`FlagKind::Enum`].
+    OptionalEnum {
+        values: &'static [&'static str],
+        /// What a bare `--foo` means. Must be one of `values`.
+        missing: &'static str,
+    },
 }
 
 /// Default value for a flag.
@@ -73,8 +89,64 @@ pub struct FlagSpec {
 }
 
 impl FlagSpec {
+    /// Whether this flag may take a leading-hyphen value as a separate argv
+    /// token. Provider passthrough values need this for `--agent-flag --x`;
+    /// the parser still rejects values that collide with awman options.
+    pub fn allows_hyphen_value(&self) -> bool {
+        matches!(self.kind, FlagKind::AgentArg)
+    }
+
     pub fn conflicts_with(&self, other: &str) -> bool {
         self.conflicts_with.contains(&other)
+    }
+
+    /// Fold every occurrence of a [`FlagKind::OptionalEnum`] flag into its
+    /// one value. Each occurrence is `None` for a bare `--flag` and
+    /// `Some(value)` for `--flag=value`.
+    ///
+    /// This is the single rule behind every projection: a bare occurrence
+    /// means the kind's `missing` value; an empty or unknown explicit value
+    /// is refused; identical repeats (bare and its explicit equivalent
+    /// included) normalize to one value; conflicting repeats are refused.
+    /// No occurrence at all is `Ok(None)` — the flag was omitted.
+    ///
+    /// For any other kind the first explicit value is returned unchanged, so
+    /// a frontend may route every enum read through here.
+    pub fn resolve_optional_enum<'a>(
+        &self,
+        command_path: &[&str],
+        occurrences: impl IntoIterator<Item = Option<&'a str>>,
+    ) -> Result<Option<String>, crate::command::error::CommandError> {
+        let FlagKind::OptionalEnum { values, missing } = self.kind else {
+            return Ok(occurrences.into_iter().flatten().next().map(str::to_string));
+        };
+        let invalid = |reason: String| crate::command::error::CommandError::InvalidFlagValue {
+            command: command_path
+                .iter()
+                .map(|part| (*part).to_string())
+                .collect(),
+            flag: self.long.to_string(),
+            reason,
+        };
+        let mut resolved: Option<&str> = None;
+        for occurrence in occurrences {
+            let value = occurrence.unwrap_or(missing);
+            let Some(known) = values.iter().copied().find(|known| *known == value) else {
+                return Err(invalid(format!(
+                    "'{value}' is not one of {values:?}; write --{long} or --{long}=<value>",
+                    long = self.long
+                )));
+            };
+            match resolved {
+                Some(earlier) if earlier != known => {
+                    return Err(invalid(format!(
+                        "conflicting values '{earlier}' and '{known}'"
+                    )));
+                }
+                _ => resolved = Some(known),
+            }
+        }
+        Ok(resolved.map(str::to_string))
     }
 }
 
@@ -127,6 +199,66 @@ pub struct ArgumentSpec {
     pub help: &'static str,
     pub kind: ArgumentKind,
     pub optional: bool,
+}
+
+/// Whether, and under which conditions, a command may be submitted through
+/// the daemon's command API (`POST /v1/worker/commands` and friends).
+///
+/// Replaces the former `api_allowed: bool`: `Disabled` and `Standard` are its
+/// `false` and `true`, unchanged. The two local variants are conditional, and
+/// the condition is checked by shared catalogue/admission validation after
+/// argument parsing and interaction resolution, and again at execution
+/// admission, so a queued command cannot bypass it. Until that admission is
+/// wired for a variant, a daemon frontend is refused exactly as for
+/// `Disabled` (see [`CommandCatalogue::is_allowed_for_frontend`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ApiAvailability {
+    /// Never available through the API. Interactive/PTY commands whose
+    /// terminal a request would own are deliberately excluded as long-term
+    /// policy (`squad attach`).
+    Disabled,
+    /// Available to every caller the worker feature admits, on the local and
+    /// network listeners alike.
+    Standard,
+    /// Available only to the authenticated local owner over the local
+    /// socket or named pipe: profile management.
+    LocalOwner,
+    /// `chat`: available only to the authenticated local owner over the
+    /// local socket or named pipe, with `--automation`, `--settings-profile`
+    /// and an effective interactive mode. The daemon, not the request, owns
+    /// the terminal.
+    LocalAutomationTerminal,
+}
+
+impl ApiAvailability {
+    /// Available to any admitted API caller with no further condition.
+    pub fn is_standard(self) -> bool {
+        self == Self::Standard
+    }
+
+    /// Never reachable through the API.
+    pub fn is_disabled(self) -> bool {
+        self == Self::Disabled
+    }
+
+    /// Reachable only by the local owner on the local listener, whatever
+    /// other conditions also apply.
+    pub fn is_local_owner_only(self) -> bool {
+        matches!(self, Self::LocalOwner | Self::LocalAutomationTerminal)
+    }
+
+    /// The generated reference's "Available via" text.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Disabled => "CLI, TUI",
+            Self::Standard => "CLI, TUI, API",
+            Self::LocalOwner => "CLI, TUI, API (local owner only)",
+            Self::LocalAutomationTerminal => {
+                "CLI, TUI, API (local owner only; requires --automation, \
+                 --settings-profile and interactive mode)"
+            }
+        }
+    }
 }
 
 /// Which frontend kinds are allowed to invoke a command.
@@ -313,13 +445,15 @@ pub struct CommandSpec {
     pub arguments: &'static [ArgumentSpec],
     pub flags: &'static [FlagSpec],
     pub subcommands: &'static [&'static CommandSpec],
-    /// Whether this command can be invoked via the API frontend.
+    /// Whether, and under which conditions, this command can be invoked via
+    /// the API frontend.
     ///
     /// Interactive/PTY commands are deliberately excluded as long-term
     /// policy: an HTTP request cannot safely own their terminal lifecycle.
-    /// `squad attach` is therefore `false` even though its non-presentation
-    /// flow is implemented in Layer 2 and shared by CLI and TUI.
-    pub api_allowed: bool,
+    /// `squad attach` is therefore `Disabled` even though its
+    /// non-presentation flow is implemented in Layer 2 and shared by CLI and
+    /// TUI.
+    pub api_availability: ApiAvailability,
 
     /// How `Dispatch` constructs this command (WI 0113 F-10).
     ///
@@ -513,7 +647,23 @@ impl CommandCatalogue {
             FrontendKind::Daemon {
                 feature: crate::data::daemon_state::FeatureName::Worker,
                 ..
-            } => self.is_api_allowed(path),
+            } => {
+                self.is_api_allowed(path)
+                    || (matches!(
+                        frontend,
+                        FrontendKind::Daemon {
+                            listener: crate::data::daemon_state::CommandListener::Local,
+                            ..
+                        }
+                    ) && self
+                        .lookup(path)
+                        .is_some_and(|s| s.api_availability == ApiAvailability::LocalOwner))
+                    // Conditional owner-local availability is decided after
+                    // parsing and interaction resolution (network: 403).
+                    || self.lookup(path).is_some_and(|s| {
+                        s.api_availability == ApiAvailability::LocalAutomationTerminal
+                    })
+            }
             FrontendKind::Daemon {
                 feature: crate::data::daemon_state::FeatureName::Squad,
                 ..
@@ -545,7 +695,10 @@ impl CommandCatalogue {
     fn is_api_allowed(&self, path: &[&str]) -> bool {
         let canonical = self.canonical_path(path);
         match self.lookup(&canonical) {
-            Some(spec) => spec.api_allowed,
+            // Fail closed: the conditional local variants are refused here
+            // until their owner-local admission is wired (WI 0070). They
+            // must never be admitted on the strength of this check alone.
+            Some(spec) => spec.api_availability.is_standard(),
             None => false,
         }
     }
@@ -665,7 +818,15 @@ impl CommandCatalogue {
         }
     }
 
-    /// Return all command paths where `api_allowed == true` as
+    /// The declared API availability of `path` (aliases resolved), or
+    /// `Disabled` for an unknown path.
+    pub fn api_availability(&self, path: &[&str]) -> ApiAvailability {
+        let canonical = self.canonical_path(path);
+        self.lookup(&canonical)
+            .map_or(ApiAvailability::Disabled, |spec| spec.api_availability)
+    }
+
+    /// Return all command paths that are [`ApiAvailability::Standard`] as
     /// (parent_name, subcommand_name) pairs. Only immediate (leaf)
     /// api-allowed specs are returned; the root is never included.
     pub fn api_allowed_commands(&self) -> Vec<(&'static str, &'static str)> {
@@ -680,7 +841,7 @@ impl CommandCatalogue {
         out: &mut Vec<(&'static str, &'static str)>,
     ) {
         for sub in node.subcommands {
-            if sub.api_allowed {
+            if sub.api_availability.is_standard() {
                 out.push((node.name, sub.name));
             }
             self.collect_api_allowed_rec(sub, out);
@@ -727,7 +888,7 @@ const ROOT: CommandSpec = CommandSpec {
     help: "awman — containerized code agent manager",
     long_help: None,
     arguments: &[],
-    api_allowed: false,
+    api_availability: ApiAvailability::Disabled,
     build: crate::command::dispatch::build::unsupported,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
@@ -888,6 +1049,8 @@ mod daemon;
 mod edit;
 mod exec;
 mod new;
+mod pending;
+pub use pending::{PendingOption, PENDING_OPTIONS};
 mod remote;
 mod shared_flags;
 pub use shared_flags::SessionWorktreeTarget;

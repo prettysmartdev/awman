@@ -299,6 +299,9 @@ impl AgentFrontend for CliParallelFrontend {
     fn grace_timeout(&self) -> Duration {
         self.inner.grace_timeout()
     }
+    fn startup_timing(&self) -> crate::data::automation::StartupTiming {
+        self.inner.startup_timing()
+    }
 
     fn stuck_timeout(&self) -> Duration {
         self.inner.stuck_timeout()

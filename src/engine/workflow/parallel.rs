@@ -470,9 +470,11 @@ impl WorkflowEngine {
         let name = step.name.clone();
         let launch_id = self.next_launch_id;
         self.next_launch_id += 1;
+        let factory = self.agent_factory.clone();
         waits.push(Box::pin(async move {
             let mut execution = execution;
             let r = execution.wait().await;
+            factory.execution_finished(execution.handle().clone()).await;
             (name, launch_id, r)
         }));
 

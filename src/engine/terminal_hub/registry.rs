@@ -17,10 +17,12 @@ use crate::data::terminal::{
 /// all receivers, and is never sent as an extra wire frame on a healthy stream.
 #[derive(Clone)]
 pub(super) enum HubMessage {
-    Frame(TerminalFrame),
+    Frame(Arc<TerminalFrame>),
     Finished {
         code: i32,
         snapshot: Arc<TerminalSnapshot>,
+        automation: Option<Arc<crate::data::automation_records::AutomationSnapshot>>,
+        close_result: Option<Arc<TerminalFrame>>,
     },
 }
 
@@ -32,6 +34,9 @@ pub(super) struct TerminalEntry {
     pub input: Option<TerminalInput>,
     pub default_size: (u16, u16),
     pub holder: Option<u64>,
+    pub generation: u64,
+    pub deferred: bool,
+    pub close_result: Option<Arc<TerminalFrame>>,
 }
 
 impl TerminalEntry {
@@ -53,7 +58,10 @@ impl TerminalEntry {
         self.record.cols = cols;
         self.record.rows = rows;
         if let Some(output) = &self.output {
-            let _ = output.send(HubMessage::Frame(TerminalFrame::Resize { cols, rows }));
+            let _ = output.send(HubMessage::Frame(Arc::new(TerminalFrame::Resize {
+                cols,
+                rows,
+            })));
         }
     }
 }
@@ -110,6 +118,8 @@ impl HubState {
                 let _ = output.send(HubMessage::Finished {
                     code,
                     snapshot: Arc::new(entry.mirror.snapshot()),
+                    automation: entry.record.automation.clone().map(Arc::new),
+                    close_result: entry.close_result.clone(),
                 });
             }
         }

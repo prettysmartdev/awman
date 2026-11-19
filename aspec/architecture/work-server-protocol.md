@@ -153,3 +153,22 @@ A manual pick runs the same steps in the person's TUI or terminal, interactive b
 | Layer 3 | `src/frontend/api`, `src/frontend/tui`, `src/frontend/cli` | `/v1/worker/*` routes, the queue panel, `awman queue`. |
 
 A server author can run the conformance suite against any base URL: implement `ConformanceAdmin` (fixture provisioning and link approval) and call `awman_wsp::conformance::run(base_url, &admin)`.
+
+### Terminal frame subset
+
+The WSP multiplexed `awman.terminal.v1` stream carries the ordinary server
+`error`, `snapshot`, `output`, `resize`, `exit`, `lagged` frames and client
+`input`, `resize`, `take_control`, `detached` frames. It deliberately excludes
+local-only automation notifications and mutations. `submit_turn`,
+`close_execution`, unknown frame types, and ordinary server-only frames received
+in the input direction fail as `invalid_frame`; they never become PTY input.
+The daemon hub's six automation notification variants are explicitly filtered
+from WSP output. The subprotocol identifier remains unchanged.
+
+Lease execution does not carry settings-profile selection, native resume
+(`--agent-session`), `--automation` or any credential-update request: those are
+owner-local daemon operations, and a relayed command that names them is refused.
+A relay reconstruction preserves the literal-tail marker for prompt arguments but
+never forwards the three owner-local flags. The raw relay input path is subject to
+the same input gate as direct terminal input, so a relayed writer cannot bypass an
+owned execution's guarded-turn admission.

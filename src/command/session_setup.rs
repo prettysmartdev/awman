@@ -747,6 +747,9 @@ impl SessionSetup {
             allow_docker: true,
             non_interactive: true,
             env_passthrough: None,
+            // Default session setup keeps its full checks; only an explicit
+            // `ready --prepare-only` selects image-only preparation.
+            preparation: crate::data::preparation::PreparationPolicy::Full,
         };
         let (resolved_builtin, data_home) = match ReadyEngine::builtin_inputs(
             &session_guard,
