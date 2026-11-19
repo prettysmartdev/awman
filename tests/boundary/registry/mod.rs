@@ -6,8 +6,10 @@
 //! when the run does not name them.
 
 mod client;
+mod connect;
 mod faults;
 mod proxy;
+mod proxy_contract;
 mod resilience;
 mod world;
 
