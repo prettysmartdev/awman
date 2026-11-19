@@ -1,6 +1,7 @@
 mod lifecycle;
 
 mod api;
+mod automation_routes;
 mod browser;
 mod browser_reauth;
 mod git_results;
@@ -18,3 +19,5 @@ mod contexts;
 
 mod lease_exec;
 mod workflow_context;
+
+mod credential_updates;

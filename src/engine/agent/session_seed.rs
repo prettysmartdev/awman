@@ -18,6 +18,8 @@ use std::path::{Component, Path};
 
 use crate::engine::error::EngineError;
 
+type FileTransform<'a> = dyn Fn(&Path, Vec<u8>) -> Result<Vec<u8>, EngineError> + 'a;
+
 /// Most entries (files plus directories) one seed may copy.
 pub const SEED_MAX_ENTRIES: usize = 5_000;
 /// Most file bytes one seed may copy.
@@ -172,6 +174,98 @@ fn copy_dir(
     dest: &Path,
     budget: &mut Budget,
 ) -> Result<(), EngineError> {
+    copy_selected_dir(
+        dir,
+        source,
+        dest,
+        budget,
+        Path::new(""),
+        &|_| true,
+        &|_, bytes| Ok(bytes),
+        true,
+    )
+}
+
+/// Profile import/export uses the same descriptor-relative traversal as seed.
+/// Selection runs before opening an excluded entry (credential sockets too).
+#[cfg(unix)]
+pub fn copy_profile_tree(
+    source: &Path,
+    dest: &Path,
+    include: &dyn Fn(&Path) -> bool,
+    transform: &FileTransform<'_>,
+) -> Result<(), EngineError> {
+    copy_profile_tree_with_owner(source, dest, include, transform, true)
+}
+
+/// Run trees may be owned by the container's user rather than the host user.
+/// They still use no-follow traversal, regular-file checks and the same byte
+/// and entry limits. Host-side seed and import retain the ownership check.
+#[cfg(unix)]
+pub fn copy_profile_tree_with_owner(
+    source: &Path,
+    dest: &Path,
+    include: &dyn Fn(&Path) -> bool,
+    transform: &FileTransform<'_>,
+    require_owner: bool,
+) -> Result<(), EngineError> {
+    let dir = crate::data::fs::safe_tree::platform::context_root(source, false)
+        .map(std::fs::File::from)
+        .map_err(|e| EngineError::io(source, e))?;
+    let mut budget = Budget {
+        entries: 0,
+        bytes: 0,
+        max_entries: 50_000,
+        max_bytes: 2 * 1024 * 1024 * 1024,
+        root: "profile state".into(),
+    };
+    copy_selected_dir(
+        dir,
+        source,
+        dest,
+        &mut budget,
+        Path::new(""),
+        include,
+        transform,
+        require_owner,
+    )
+}
+#[cfg(not(unix))]
+pub fn copy_profile_tree(
+    _source: &Path,
+    _dest: &Path,
+    _include: &dyn Fn(&Path) -> bool,
+    _transform: &FileTransform<'_>,
+) -> Result<(), EngineError> {
+    Err(EngineError::Config(
+        "secure profile copying unavailable on this platform".into(),
+    ))
+}
+#[cfg(not(unix))]
+pub fn copy_profile_tree_with_owner(
+    _source: &Path,
+    _dest: &Path,
+    _include: &dyn Fn(&Path) -> bool,
+    _transform: &FileTransform<'_>,
+    _require_owner: bool,
+) -> Result<(), EngineError> {
+    Err(EngineError::Config(
+        "secure profile copying unavailable on this platform".into(),
+    ))
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn copy_selected_dir(
+    dir: std::fs::File,
+    source: &Path,
+    dest: &Path,
+    budget: &mut Budget,
+    relative: &Path,
+    include: &dyn Fn(&Path) -> bool,
+    transform: &FileTransform<'_>,
+    require_owner: bool,
+) -> Result<(), EngineError> {
     use nix::fcntl::{openat, OFlag};
     use nix::sys::stat::Mode;
     use std::os::unix::ffi::OsStrExt;
@@ -183,6 +277,10 @@ fn copy_dir(
         let entry = entry.map_err(|e| EngineError::io(source, e.into()))?;
         let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
         if name == "." || name == ".." || SKIPPED_NAMES.iter().any(|skip| name == *skip) {
+            continue;
+        }
+        let rel = relative.join(name);
+        if !include(&rel) {
             continue;
         }
         let from = source.join(name);
@@ -198,10 +296,25 @@ fn copy_dir(
         .map_err(|e| EngineError::io(&from, e.into()))?;
         let input = std::fs::File::from(fd);
         let meta = input.metadata().map_err(|e| EngineError::io(&from, e))?;
+        {
+            use std::os::unix::fs::MetadataExt;
+            if foreign_profile_owner(meta.uid(), nix::unistd::geteuid().as_raw(), require_owner) {
+                return Err(EngineError::Config("foreign profile state owner".into()));
+            }
+        }
         if meta.is_dir() {
             budget.take(0)?;
             create_private_dir(&to)?;
-            copy_dir(input, &from, &to, budget)?;
+            copy_selected_dir(
+                input,
+                &from,
+                &to,
+                budget,
+                &rel,
+                include,
+                transform,
+                require_owner,
+            )?;
         } else if meta.is_file() {
             use std::os::unix::fs::MetadataExt;
             if meta.nlink() != 1 {
@@ -210,6 +323,9 @@ fn copy_dir(
                     from.display()
                 )));
             }
+            if meta.len() > 512 * 1024 * 1024 {
+                return Err(EngineError::Config("profile file exceeds 512 MiB".into()));
+            }
             budget.take(meta.len())?;
             // Bound the actual read too, even if a file grows after metadata.
             use std::io::Read;
@@ -217,7 +333,16 @@ fn copy_dir(
                 .max_bytes
                 .saturating_sub(budget.bytes)
                 .saturating_add(meta.len());
-            let copied = copy_private_file(&mut input.take(remaining + 1), &to)?;
+            let mut bytes = Vec::new();
+            input
+                .take(remaining + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| EngineError::io(&from, e))?;
+            let copied = bytes.len() as u64;
+            if copied <= remaining {
+                let bytes = transform(&rel, bytes)?;
+                copy_private_file(&mut bytes.as_slice(), &to)?;
+            }
             if copied > remaining {
                 return Err(EngineError::Config(format!(
                     "{} grew beyond the session seed byte limit",
@@ -236,6 +361,11 @@ fn copy_dir(
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn foreign_profile_owner(file_uid: u32, host_uid: u32, require_owner: bool) -> bool {
+    require_owner && file_uid != host_uid
 }
 
 #[cfg(unix)]
@@ -282,6 +412,13 @@ mod tests {
         let path = sandbox.tmp().join("dir");
         std::fs::create_dir_all(&path).unwrap();
         Dir(sandbox, path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_tree_export_does_not_require_host_uid_ownership() {
+        assert!(foreign_profile_owner(2000, 1000, true));
+        assert!(!foreign_profile_owner(2000, 1000, false));
     }
 
     #[cfg(unix)]

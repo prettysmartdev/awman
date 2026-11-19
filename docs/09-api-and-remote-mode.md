@@ -1275,7 +1275,7 @@ curl -sk -X POST https://localhost:9876/v1/worker/commands \
 
 Dispatches a subcommand to the session named by the `session_id` field in the JSON body. The `x-awman-session` header is still supported as an alternative; if both are sent they must name the same session, otherwise the request is rejected with HTTP 400 `invalid_request`. Idempotency comparison covers whichever form was sent.
 
-The API accepts `init`, `exec prompt`, `exec workflow`, `agents status|list|detail|kill` (see [Agent commands](#agent-commands)), and the `squad` task and daemon commands except `squad attach` (which needs an interactive PTY) and `squad env`. Other commands — including `chat`, `ready`, `config`, `new`, `clean` and `remote` — are refused with HTTP 400 `invalid_request` ("command not available via API"), and the response lists the available commands. The [Command Reference](14-command-reference.md) marks each command's frontends.
+The API accepts `init`, `exec prompt`, `exec workflow`, `agents status|list|detail|kill` (see [Agent commands](#agent-commands)), and the `squad` task and daemon commands except `squad attach` (which needs an interactive PTY) and `squad env`. `chat` is available only as an [owner-local automation terminal](#automation-turns-and-terminals). Other commands — including `ready`, `config`, `new`, `clean` and `remote` — are refused with HTTP 400 `invalid_request` ("command not available via API"), and the response lists the available commands. The [Command Reference](14-command-reference.md) marks each command's frontends.
 
 #### Initialize a project
 
@@ -2893,8 +2893,6 @@ Your **client** still holds the old strings, and the old form is not accepted: r
 
 ---
 
-[← Overlays](08-overlays.md) · [Next: GitHub Integration →](10-github-integration.md)
-
 
 ### Worker lease and event conventions
 
@@ -2903,3 +2901,135 @@ Your **client** still holds the old strings, and the old form is not accepted: r
 The production daemon registers linked work servers and runs automatic and manual claims on its worker share. Pull routes remain local-only. Unsupported lease execution requirements are released as ineligible; see [Workers and Work Servers](17-workers-and-work-servers.md#running-pulled-work). Expiry or revocation fences execution, events, credentials, push and result reporting together.
 
 SSE, `?format=json` and WSP forward the same public event projection: `emitted_at` is an RFC 3339 UTC timestamp, and `payload.type` is snake_case. Stored older logs with `timestamp` and Rust-style tags such as `StdoutLine` are read compatibly and projected on replay. Clients should accept the public spelling for new streams.
+
+### Automation, turns and terminals
+
+Automation lets a local program own an agent's whole lifecycle: start it with a settings
+profile, learn when it is ready, hand it tasks one turn at a time and see exactly how
+much awman could verify. It is available only to the **local owner** of the daemon —
+the owner-only socket or named pipe, or an authenticated owner request on the loopback
+listener. Requests from a network listener, a browser grant, a forwarded/relayed hop or
+a work server are refused with HTTP 403 `forbidden`. Remote TCP integration with
+automation is not qualified.
+
+**Idle chat versus a task.**
+
+| Goal | Request |
+|------|---------|
+| An idle agent terminal that waits for turns | `subcommand: "chat"`, `interaction: "interactive"`, args `--automation` and `--settings-profile NAME` |
+| An agent that starts with a task | `subcommand: "exec prompt"` with a non-blank prompt (or work item), `--settings-profile NAME`, and `--automation` |
+
+```json
+{"session_id":"ses_…","subcommand":"chat","interaction":"interactive",
+  "args":["--automation=require_full","--settings-profile","ci","--agent","claude"]}
+```
+
+`chat` is otherwise refused for API callers. Over the API it requires `--automation`,
+`--settings-profile` and interactive mode; a missing piece or `--headless` is
+`400 invalid_request`. `exec prompt` always needs a non-blank task, even with
+`--automation` and `interaction: "interactive"`: an empty one is `400 invalid_request`
+before any image, profile or agent work, with a hint to use `chat` for an idle terminal.
+With `interaction: "interactive"` the initial task is held by awman and submitted exactly
+once, after the agent reports readiness. With `interaction: "headless"` it is delivered
+through the provider's one-shot entrypoint, which must produce the agent's structured
+result. `--automation` takes an optional value only with `=`: `--automation` and
+`--automation=auto` prefer native lifecycle status and fall back to OSC 7501 status
+reports; `--automation=require_full` requires full native status before every automated
+task delivery. `flags_applied.automation` is `"auto"`, `"require_full"` or `null`, and
+`flags_applied.agent_session`, `settings_profile` and the resolved native start mode and
+workspace access are reported alongside. An unknown or conflicting value is
+`400 invalid_request`.
+
+**Discovering support.** `GET /v1/status` lists the capabilities `settings_profiles`,
+`native_session_resume`, `agent_capabilities`, `agent_automation`, `terminal_turns`,
+`automation_results` and `agent_turn_records`, plus the event kinds `agent_state`,
+`agent_identity`, `agent_turn_started` and `agent_turn_completed`. These say the
+operations exist, not that every agent supports them on this runtime.
+`GET /v1/worker/sessions/{id}/agent-capabilities` (owner-local) returns one record per
+agent visible to that session: its native plan routes, headless and terminal turn
+support, native resume, whether settings profiles apply, and the credential
+live-update routes. It starts no agent and contacts no provider; support fields that only
+a running agent can prove are `null` until observed. Credential live update and restart
+are not advertised (see [Credentials during long sessions](03-agent-sessions.md#credentials-during-long-sessions)),
+and `ready --prepare-only` is an ordinary `ready` flag, not a separate capability.
+
+**Terminal lifetime.** The daemon owns the agent's terminal. It keeps running with no
+viewer attached, so you can close your connection and reconnect. It ends when the agent
+exits, the command is cancelled, or the owner sends `close_execution`. Reconnecting
+shows the current screen and `automation_state`; it never replays earlier turns,
+resubmits a task or takes input control. A daemon restart does not resume the execution:
+it is recorded as `execution_lost` (or `delivery_unknown` if a task was reserved but its
+delivery was never observed) and is never re-queued.
+
+**Terminal protocol.** Terminal WebSockets use the single `awman.terminal.v1`
+subprotocol; there is no negotiation and no second codec. In addition to the frames
+above, the server may send:
+
+| Frame | Meaning |
+|-------|---------|
+| `automation_state` | The execution's current snapshot: `execution_id`, `provider`, `provider_version`, `native_session_id`, `automation_mode`, `minimum_status_support`, `state`, `revision`, `active_turn_id`, `native_start_mode`, `workspace_access`, `status_support`, `status_source`, `status_reason`, `capabilities` (nullable fields are present as `null`) |
+| `turn_accepted` | A submitted turn was admitted: `request_id`, `execution_id`, `turn_id`, `status_support`, `status_source` |
+| `turn_result` | The turn finished: `request_id`, `execution_id`, `turn_id`, `result` |
+| `execution_closed` | A `close_execution` finished: `request_id`, `execution_id`, final command `result` |
+| `execution_replaced` | A new execution continues in the same terminal (reserved for credential-driven restarts, which are not currently offered) |
+| `operation_error` | A correlated refusal: `request_id`, `code`, `error` |
+
+The client sends `submit_turn` (`request_id`, `execution_id`, `expected_revision`,
+`prompt`) and `close_execution` (`request_id`, `execution_id`, `expected_revision`).
+`request_id` is a UUID you choose; a repeat of the same request returns the original
+outcome without a second delivery, and the same ID with different content is
+`idempotency_conflict`. `expected_revision` is the `revision` of the `automation_state`
+you acted on; a mismatch is `stale_revision`, and an ended or replaced execution is
+`stale_execution`. A prompt is at most 64 KiB. Only the owner holding input control
+(`take_control`) can submit; others get `input_not_allowed`. Typing into the terminal by
+hand while a turn is active is refused. A turn result does not replace the terminal's
+final `exit` frame. Browsers observe these notifications but cannot send guarded
+operations; work-server terminal relays carry only the ordinary frame subset.
+
+**Readiness and refusals.** `state` moves through `starting`, `unknown`, `ready`,
+`submitting`, `working`, `blocked_auth`, `blocked_permission`, `blocked_input`,
+`stopping` and `ended`. A task is delivered only in `ready`; a request in another state is
+`agent_not_ready` (HTTP 409 where it is a request). `status_support` is `full` (native
+lifecycle events), `best_effort` (OSC 7501 reports) or `none`. Under
+`--automation=require_full`, a confirmed missing native lifecycle facility is
+`status_support_insufficient`, and one that has not arrived by
+`agents.automation.startupTimeout` is `startup_timeout`; neither writes any input. The
+requirement is rechecked before each delivery, so it guards admission, not completion:
+a turn delivered at full support is never withdrawn if the source is later lost, and its
+result truthfully reports what could be verified. An uncertain delivery is never retried.
+Where an agent's native lifecycle records are not available, awman reports
+`best_effort` status and `require_full` refuses rather than guess.
+
+**Turn results.** `turn_result.result` has `status` (`completed`, `completed_unverified`,
+`failed`, `cancelled`, `delivery_unknown`), `status_support`, `readiness_source`,
+`completion_source` (`native`, `none`), `completion_verified`, `native_turn_id`,
+`final_message` (an empty verified answer is `""`; an unverified one is `null`),
+`output_status` (`complete`, `incomplete`) and `failure`. A command result carries
+`automation`: `execution_id`, `native_session_id`, `last_turn_id`, `native_start_mode`,
+`workspace_access`, `status_support` (the weakest tier seen), `completion_verified`,
+`output_status` and `cleanup_status` (`complete`, `pending`, `failed`). `GET
+/v1/worker/commands/{id}` and the events stream carry the same execution, native
+conversation ID and snapshot, and `GET /v1/worker/commands/{id}/turns` pages the turn
+records (ascending command-wide ordinal, `limit` default 50, max 200, opaque `cursor`).
+Failure codes you may see in `result.failure` or a frame: `agent_mode_conflict`,
+`native_capability_unavailable`, `native_session_not_found`, `settings_profile_busy`,
+`agent_not_ready`, `stale_execution`, `stale_revision`, `startup_timeout`,
+`status_support_insufficient`, `delivery_unknown`, `agent_turn_failed`,
+`agent_protocol_error`, `runtime_wait_failed`, `output_incomplete`, `cleanup_timeout` and
+`execution_lost`.
+
+**Cancellation and deadlines.** Cancelling the command stops the owned agent within
+`agents.automation.cancelTimeout` — an interrupt first, then a forced stop of only that
+agent's own resources. Remaining output is collected for at most `outputDrainTimeout`;
+if it is not finished the result says `output_status: "incomplete"`. If cleanup cannot be
+confirmed, `cleanup_status` is `pending` and the profile stays `closing`. These are
+distinct from the first-byte grace period used by ordinary API runs, which automation
+launches do not use; the only startup deadline is `startupTimeout`. Output, lifecycle
+events and results are redacted of secrets before they are stored or sent.
+
+`agents profile list`, `close` and `delete` are likewise owner-local operations over the
+API.
+
+---
+
+[← Overlays](08-overlays.md) · [Next: GitHub Integration →](10-github-integration.md)

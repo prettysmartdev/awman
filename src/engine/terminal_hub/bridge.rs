@@ -19,7 +19,8 @@ use super::{input_channel, TerminalHandle, TerminalHub, TerminalInput, TerminalR
 pub struct BridgedTerminal {
     pub handle: TerminalHandle,
     /// Ends when `stdout_rx` closes (the agent's output ended); the terminal
-    /// is then marked exited with code 0 unless `handle.exit` already ran.
+    /// is then marked exited with code 0 for ordinary terminals. Controller-owned
+    /// terminals seal input and await explicit finalization with the real result.
     pub task: tokio::task::JoinHandle<()>,
     stdout: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>>,
 }
@@ -65,6 +66,7 @@ impl TerminalHub {
         let stdout = Arc::new(Mutex::new(stdout_rx));
         let task_stdout = Arc::clone(&stdout);
         let task = tokio::spawn(async move {
+            let mut input_open = true;
             loop {
                 tokio::select! {
                     open = futures_util::future::poll_fn(|cx| {
@@ -82,16 +84,18 @@ impl TerminalHub {
                     }) => if !open { break },
                     // Drained here, by the writer itself, so a stalled agent
                     // pushes back on viewers through the bounded queue.
-                    input = input_rx.recv() => match input {
+                    input = input_rx.recv(), if input_open => match input {
                         Some(bytes) => {
                             if stdin_tx.send(bytes).is_err() {
-                                break;
+                                input_open = false;
                             }
                         }
-                        None => break,
+                        None => input_open = false,
                     },
                 }
             }
+            // TerminalHandle::exit seals controller-owned input; it does not
+            // synthesize a successful logical exit or close its frame stream.
             output.exit(0);
         });
         BridgedTerminal {

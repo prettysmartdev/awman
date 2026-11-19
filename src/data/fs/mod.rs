@@ -5,6 +5,7 @@
 //! `std::fs::*` or `rusqlite::*` directly.
 
 pub mod agent_dirs;
+pub mod agent_profiles;
 pub mod agent_trust;
 pub mod api_command_log;
 pub mod api_db;

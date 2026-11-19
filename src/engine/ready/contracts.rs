@@ -99,6 +99,15 @@ impl ReadyFrontend for Frontend {
 }
 
 fn engine(sandbox: &TestSandbox, selected: &str, pinger: Arc<Pinger>) -> ReadyEngine {
+    engine_with(sandbox, selected, pinger, PreparationPolicy::Full)
+}
+
+fn engine_with(
+    sandbox: &TestSandbox,
+    selected: &str,
+    pinger: Arc<Pinger>,
+    preparation: PreparationPolicy,
+) -> ReadyEngine {
     let env = EnvSnapshot::from_full_env(
         sandbox
             .env()
@@ -144,6 +153,7 @@ fn engine(sandbox: &TestSandbox, selected: &str, pinger: Arc<Pinger>) -> ReadyEn
             allow_docker: false,
             non_interactive: true,
             env_passthrough: None,
+            preparation,
         },
     );
     engine.host_agent = pinger;
@@ -456,6 +466,7 @@ async fn ready_build_failure_is_still_a_failed_stage_not_an_image_stale_warning(
             allow_docker: false,
             non_interactive: true,
             env_passthrough: None,
+            preparation: crate::data::preparation::PreparationPolicy::Full,
         },
     );
     engine.phase = ReadyPhase::BuildingBaseImage;
@@ -622,6 +633,238 @@ fn major_checks_accept_upgrades_and_only_warn_when_unprobed() {
     assert!(probes.is_empty());
 }
 
+// ---- `ready --prepare-only` (PreparationPolicy::ImagesOnly) ----
+
+use crate::data::preparation::{AuthenticationCheck, PreparationPolicy};
+
+fn images_only(sandbox: &TestSandbox, selected: &str, pinger: Arc<Pinger>) -> ReadyEngine {
+    engine_with(sandbox, selected, pinger, PreparationPolicy::ImagesOnly)
+}
+
+/// A frontend that fails the test on any audit prompt or container launch.
+/// (`Frontend` already panics on both; this documents the intent.)
+fn assert_no_agent_ran(pinger: &Pinger, frontend: &Frontend) {
+    assert!(
+        pinger.calls.lock().unwrap().is_empty(),
+        "preparation-only pinged a host agent: {:?}",
+        pinger.calls.lock().unwrap()
+    );
+    assert!(
+        frontend.results.is_empty(),
+        "no ping result may be reported"
+    );
+}
+
+#[tokio::test]
+async fn prepare_only_skips_pings_for_selected_and_discovered_agents() {
+    let sandbox = TestSandbox::for_test(TestCase::component(
+        "engine::ready::prepare_only_skips_pings_for_selected_and_discovered_agents",
+    ));
+    dockerfiles(&sandbox, &["claude", "codex", "copilot"]);
+    let pinger = Arc::new(Pinger::default());
+    let mut engine = images_only(&sandbox, "claude", pinger.clone());
+    engine.phase = ReadyPhase::CheckingNonDefaultAgents;
+    let mut frontend = Frontend::default();
+    // Image checks finish, then the ping and the audit phases are skipped.
+    assert_eq!(
+        engine.step(&mut frontend).await.unwrap(),
+        ReadyPhase::RebuildingAfterAudit
+    );
+    assert_eq!(
+        engine.step(&mut frontend).await.unwrap(),
+        ReadyPhase::Complete
+    );
+    assert_no_agent_ran(&pinger, &frontend);
+    let summary = engine.summary();
+    assert_eq!(summary.preparation_policy, PreparationPolicy::ImagesOnly);
+    assert_eq!(summary.authentication(), AuthenticationCheck::NotChecked);
+    assert_eq!(summary.local_agent, StepStatus::Skipped);
+    assert_eq!(summary.audit, StepStatus::Skipped);
+    assert!(summary.agent_auth.is_empty());
+    assert!(summary.auth_rows().is_empty());
+    assert!(frontend
+        .messages
+        .iter()
+        .any(|m| m.text.contains("authentication not checked")));
+}
+
+#[tokio::test]
+async fn prepare_only_never_pings_even_if_the_ping_phase_is_entered() {
+    let sandbox = TestSandbox::for_test(TestCase::component(
+        "engine::ready::prepare_only_never_pings_even_if_the_ping_phase_is_entered",
+    ));
+    dockerfiles(&sandbox, &["claude", "codex"]);
+    let pinger = Arc::new(Pinger::default());
+    let mut engine = images_only(&sandbox, "claude", pinger.clone());
+    // `engine_with` starts at CheckingLocalAgent: the arm that pings.
+    let mut frontend = Frontend::default();
+    assert_eq!(
+        engine.step(&mut frontend).await.unwrap(),
+        ReadyPhase::RebuildingAfterAudit
+    );
+    assert_no_agent_ran(&pinger, &frontend);
+}
+
+#[tokio::test]
+async fn prepare_only_never_reaches_the_template_audit() {
+    let sandbox = TestSandbox::for_test(TestCase::component(
+        "engine::ready::prepare_only_never_reaches_the_template_audit",
+    ));
+    dockerfiles(&sandbox, &["claude"]);
+    let pinger = Arc::new(Pinger::default());
+    let mut engine = images_only(&sandbox, "claude", pinger.clone());
+    // Even a forced `refresh` flag at the audit phase must not prompt for or
+    // run the audit (the test frontend panics if it is asked).
+    engine.phase = ReadyPhase::RunningAudit;
+    engine.options.refresh = false;
+    let mut frontend = Frontend::default();
+    assert_eq!(
+        engine.step(&mut frontend).await.unwrap(),
+        ReadyPhase::RebuildingAfterAudit
+    );
+    assert_eq!(engine.summary().audit, StepStatus::Skipped);
+    assert_no_agent_ran(&pinger, &frontend);
+}
+
+#[tokio::test]
+async fn prepare_only_rejects_an_audit_request() {
+    let sandbox = TestSandbox::for_test(TestCase::component(
+        "engine::ready::prepare_only_rejects_an_audit_request",
+    ));
+    let pinger = Arc::new(Pinger::default());
+    let mut engine = images_only(&sandbox, "claude", pinger.clone());
+    engine.options.refresh = true;
+    let mut frontend = Frontend::default();
+    let error = engine.step(&mut frontend).await.unwrap_err().to_string();
+    assert!(
+        error.contains("--prepare-only") && error.contains("--refresh"),
+        "{error}"
+    );
+    assert_no_agent_ran(&pinger, &frontend);
+}
+
+#[tokio::test]
+async fn prepare_only_keeps_definition_trust_failures() {
+    let sandbox = TestSandbox::for_test(TestCase::component(
+        "engine::ready::prepare_only_keeps_definition_trust_failures",
+    ));
+    let repo = sandbox.work().join(".awman/agents");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join("untrusted.toml"),
+        "schema = 1\ndisplay_name = \"U\"\n[run]\ncommand = [\"u\"]\n[image]\ninstall = [\"echo i\"]\n[ping]\ncommand = [\"u\"]\n",
+    )
+    .unwrap();
+    let pinger = Arc::new(Pinger::default());
+    let mut engine = images_only(&sandbox, "untrusted", pinger.clone());
+    engine.phase = ReadyPhase::Preflight;
+    let mut frontend = Frontend::default();
+    let error = engine.run_to_completion(&mut frontend).await.unwrap_err();
+    assert!(
+        matches!(error, EngineError::AgentDefinitionUntrusted { .. }),
+        "{error}"
+    );
+    assert!(matches!(
+        engine.summary().agent_definition,
+        Some(StepStatus::Failed(_))
+    ));
+    assert_no_agent_ran(&pinger, &frontend);
+}
+
+#[tokio::test]
+async fn prepare_only_build_failure_is_a_failure_and_still_reports_authentication_skipped() {
+    use crate::engine::agent::image_freshness::test_runtime::BuildRuntime;
+    let sandbox = TestSandbox::for_test(TestCase::component(
+        "engine::ready::prepare_only_build_failure_is_a_failure_and_still_reports_authentication_skipped",
+    ));
+    std::fs::write(
+        sandbox.work().join("Dockerfile.dev"),
+        "FROM scratch\nRUN false\n",
+    )
+    .unwrap();
+    dockerfiles(&sandbox, &["claude"]);
+    let pinger = Arc::new(Pinger::default());
+    let mut engine = images_only(&sandbox, "claude", pinger.clone());
+    let runtime = Arc::new(BuildRuntime::default());
+    let tag = crate::data::image_tags::project_image_tag(&sandbox.work());
+    runtime.fail(&tag, true);
+    engine.runtime = runtime;
+    engine.options.build = true;
+    engine.phase = ReadyPhase::Preflight;
+    let mut frontend = Frontend::default();
+    let summary = engine.run_to_completion(&mut frontend).await.unwrap();
+    assert!(!summary.is_ready() && !summary.images_ready());
+    assert!(matches!(summary.base_image, StepStatus::Failed(_)));
+    assert_eq!(summary.authentication(), AuthenticationCheck::NotChecked);
+    assert_eq!(summary.outcome_line(), "awman is not ready.");
+    assert_no_agent_ran(&pinger, &frontend);
+}
+
+#[tokio::test]
+async fn prepare_only_success_says_authentication_was_not_checked() {
+    use crate::engine::agent::image_freshness::test_runtime::BuildRuntime;
+    let sandbox = TestSandbox::for_test(TestCase::component(
+        "engine::ready::prepare_only_success_says_authentication_was_not_checked",
+    ));
+    std::fs::write(sandbox.work().join("Dockerfile.dev"), "FROM scratch\n").unwrap();
+    dockerfiles(&sandbox, &["claude", "codex"]);
+    let pinger = Arc::new(Pinger::default());
+    let mut engine = images_only(&sandbox, "claude", pinger.clone());
+    let runtime = Arc::new(BuildRuntime::default());
+    runtime.install(
+        &crate::data::image_tags::project_image_tag(&sandbox.work()),
+        Some("p"),
+    );
+    for agent in ["claude", "codex"] {
+        runtime.install(
+            &crate::data::image_tags::agent_image_tag(&sandbox.work(), agent),
+            Some(agent),
+        );
+    }
+    engine.runtime = runtime;
+    engine.phase = ReadyPhase::Preflight;
+    let mut frontend = Frontend::default();
+    let summary = engine.run_to_completion(&mut frontend).await.unwrap();
+    assert!(summary.images_ready(), "{:?}", summary.not_ready_reason());
+    assert_eq!(summary.authentication(), AuthenticationCheck::NotChecked);
+    assert_eq!(
+        summary.outcome_line(),
+        "awman images are ready; authentication was not checked."
+    );
+    let rows = summary.rows();
+    assert!(rows
+        .iter()
+        .any(|(label, _)| label == "Authentication (not checked)"));
+    assert!(!rows
+        .iter()
+        .any(|(label, _)| label == "Audit" || label == "Local agent"));
+    assert_no_agent_ran(&pinger, &frontend);
+}
+
+#[tokio::test]
+async fn default_policy_still_runs_the_full_checks() {
+    let sandbox = TestSandbox::for_test(TestCase::component(
+        "engine::ready::default_policy_still_runs_the_full_checks",
+    ));
+    dockerfiles(&sandbox, &["claude", "codex"]);
+    let pinger = Arc::new(Pinger::default());
+    let mut engine = engine(&sandbox, "claude", pinger.clone());
+    engine.phase = ReadyPhase::CheckingNonDefaultAgents;
+    let mut frontend = Frontend::default();
+    assert_eq!(
+        engine.step(&mut frontend).await.unwrap(),
+        ReadyPhase::CheckingLocalAgent
+    );
+    assert_eq!(
+        engine.step(&mut frontend).await.unwrap(),
+        ReadyPhase::RunningAudit
+    );
+    assert_eq!(*pinger.calls.lock().unwrap(), ["claude", "codex"]);
+    let summary = engine.summary();
+    assert_eq!(summary.preparation_policy, PreparationPolicy::Full);
+    assert_eq!(summary.authentication(), AuthenticationCheck::Passed);
+}
+
 /// A `ReadyEngine` over the in-memory importing runtime, built from the
 /// session's resolved builtin inputs exactly as `ReadyCommand` builds it.
 fn importing_engine(
@@ -673,6 +916,7 @@ fn importing_engine(
             allow_docker: false,
             non_interactive: true,
             env_passthrough: None,
+            preparation: PreparationPolicy::Full,
         },
     )
 }

@@ -275,6 +275,46 @@ control. TLS and API keys protect requests to awman; they do not make an
 untrusted Docker socket mount safe. Restrict access to the container and its
 socket mount accordingly.
 
+## Automation terminals and settings profiles
+
+The daemon can own an agent's terminal on behalf of a local program. A client
+sends `chat` with `--automation` and `--settings-profile NAME` (or `exec prompt`
+with `--automation` and `interaction: "interactive"`) over the **owner-only local
+socket or named pipe**, then drives the agent with guarded turns over the
+terminal WebSocket. See [Automation, turns and terminals](09-api-and-remote-mode.md#automation-turns-and-terminals)
+for the protocol.
+
+- **Local owner only.** Profile selection, `agents profile list|close|delete` and the
+  automation `chat` are refused on the network listener, to browsers, through a
+  forwarded hop and to work servers (HTTP 403 `forbidden`). The owner check is repeated
+  when a queued command actually starts. Remote TCP use of these features is not
+  qualified.
+- **The daemon owns the terminal.** The agent keeps running with no client attached.
+  A viewer can disconnect and reconnect, which restores the screen and the current
+  status but never replays turns, resubmits a task or takes control. The terminal
+  ends when the agent exits, the command is cancelled or the owner closes the
+  execution.
+- **Restarts.** If the daemon stops while an execution is running, the execution is
+  recorded as lost (`execution_lost`, or `delivery_unknown` when a task was reserved but
+  never seen consumed) and is **not** re-queued or replayed. Its profile stays `closing`
+  until cleanup is confirmed; `awman agents profile close NAME --agent AGENT` retries it
+  once the container is gone. Use the saved native conversation with
+  `--agent-session` to continue in a new execution.
+- **Timeouts.** `agents.automation.startupTimeout`, `cancelTimeout` and
+  `outputDrainTimeout` ([Configuration](07-configuration.md#automation-timeouts)) are read
+  when each launch starts; changing them never affects a running execution. They are
+  separate from `agents.stuckTimeout`, which only reports a quiet agent.
+- **What the daemon advertises.** `/v1/status` lists `settings_profiles`,
+  `native_session_resume`, `agent_capabilities`, `agent_automation`, `terminal_turns`,
+  `automation_results` and `agent_turn_records`, and the four agent lifecycle event kinds.
+  It does not advertise credential live update or restart, which are not offered.
+- **Image preparation.** `awman ready --prepare-only` is an ordinary `ready` option and
+  works for the daemon's runtime and agents like any other launch;
+  see [Runtimes](11-runtimes.md#native-modes-profiles-and-automation-by-runtime).
+- **Windows.** The refresh coordination that prevents two awman processes from refreshing
+  one credential at once is not available on Windows, where each process serializes its own
+  refreshes and logs that limitation.
+
 ## Configuration reference
 
 The daemon-specific settings live under `daemon.*` in global configuration.

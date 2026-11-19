@@ -178,7 +178,8 @@ impl AttachCommandFrontend for CliFrontend {
                                 eprintln!("awman: terminal control unavailable; watching read-only");
                             }
                         }
-                        Ok(Some(TerminalFrame::Resize { .. } | TerminalFrame::Lagged)) => {}
+                        Ok(Some(TerminalFrame::AutomationState { snapshot })) => { if snapshot.status_support == crate::data::automation::StatusSupport::BestEffort { eprintln!("awman: Best-effort automation status"); } }
+                        Ok(Some(TerminalFrame::Resize { .. } | TerminalFrame::Lagged | TerminalFrame::TurnAccepted { .. } | TerminalFrame::TurnResult { .. } | TerminalFrame::ExecutionClosed { .. } | TerminalFrame::ExecutionReplaced { .. } | TerminalFrame::CredentialUpdateState { .. } | TerminalFrame::OperationError { .. })) => {}
                         Ok(None) | Err(_) => { reason = DetachReason::Hangup; break; }
                     }
                 }

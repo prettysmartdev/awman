@@ -21,7 +21,10 @@ pub(super) fn features(
             &[WORKFLOW_DYNAMIC, WORKFLOW_FILE][..],
         ),
     ] {
-        if catalogue.lookup(path).is_some_and(|spec| spec.api_allowed) {
+        if catalogue
+            .lookup(path)
+            .is_some_and(|spec| spec.api_availability.is_standard())
+        {
             result.extend_from_slice(names);
         }
     }
@@ -63,7 +66,7 @@ pub(super) fn for_settings(
     // Both ride on `exec workflow`; advertise them only where it runs.
     if CommandCatalogue::get()
         .lookup(&["exec", "workflow"])
-        .is_some_and(|spec| spec.api_allowed)
+        .is_some_and(|spec| spec.api_availability.is_standard())
     {
         result.extend([
             awman_wsp::features::LEASE_PREREQUISITES,

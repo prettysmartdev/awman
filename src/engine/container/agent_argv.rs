@@ -66,6 +66,11 @@ impl AgentArgv {
         // already part of the entrypoint (`AgentDefinition::entrypoint_for`); it
         // is never repeated here.
         // Per-agent mode flags (yolo, auto, plan) — literal args.
+        if let Some((tokens, crate::engine::agent::definition::ResumePosition::Options)) =
+            &options.native_resume
+        {
+            argv.extend(tokens.clone());
+        }
         argv.extend(options.agent_mode_flags.iter().cloned());
         for (tools, flag, restriction) in [
             (
@@ -106,6 +111,11 @@ impl AgentArgv {
         // every awman-generated flag, before the seeded prompt positional.
         argv.extend(options.agent_flags.iter().cloned());
         argv.extend(options.managed_agent_flags.iter().cloned());
+        if let Some((tokens, crate::engine::agent::definition::ResumePosition::SubcommandTail)) =
+            &options.native_resume
+        {
+            argv.extend(tokens.clone());
+        }
         // Interactive + seeded prompt: most agents take the prompt as the final
         // positional; agents with an `interactive_seed_flag` (opencode
         // `--prompt`) take a flag pair, because their bare positional means
@@ -113,10 +123,13 @@ impl AgentArgv {
         // either a final argv operand or stdin.
         if options.interactive || options.headless_prompt_in_argv {
             if let Some(prompt) = &options.seeded_prompt {
-                if options.interactive {
-                    if let Some(flag) = &options.interactive_seed_flag {
-                        argv.push(flag.clone());
-                    }
+                let flag = if options.interactive {
+                    &options.interactive_seed_flag
+                } else {
+                    &options.headless_prompt_flag
+                };
+                if let Some(flag) = flag {
+                    argv.push(flag.clone());
                 }
                 argv.push(prompt.clone());
             }

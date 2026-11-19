@@ -139,6 +139,14 @@ pub(super) trait ContainerBackend: Send + Sync {
     }
 
     /// Explicitly stop the resolved agent; propagate failures. Removal is separate.
+    /// Read an execution label from a runtime-owned resource, never its name alone.
+    fn resource_label(
+        &self,
+        _handle: &AgentHandle,
+        _key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        Err(EngineError::NotImplemented("resource label inspection"))
+    }
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError>;
 
     /// Remove a stopped agent by id or name. Errors when the runtime refuses

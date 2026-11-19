@@ -609,6 +609,55 @@ awman config set agents.auth.mode passthrough
 
 `agents.auth.*` is repo scope (global or repo file), never task scope. Cloud harnesses that do not declare an anthropic env var remain on the default `keychain` path and continue to receive keychain OAuth unaffected.
 
+### Automation timeouts
+
+Three keys set the time budgets for [`--automation`](03-agent-sessions.md#automation---automation) launches. They use the normal duration syntax (`"90s"`, `"2m"`), the usual precedence (defaults, global config, repo config, task, environment, then `--set`) and can be reset with `awman config unset`. Each launch takes a snapshot of its values; a running execution keeps its own even if you change the config.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `agents.automation.startupTimeout` | `120s` | How long an automation launch may take to become ready for its task. Distinct from the first-output grace period used by ordinary launches |
+| `agents.automation.cancelTimeout` | `10s` | Total time allowed to stop an owned agent after a cancellation is accepted: a graceful interrupt first, then a forced stop of only that agent's own resources |
+| `agents.automation.outputDrainTimeout` | `5s` | How long to collect remaining output after the agent exits; it may not exceed the cancel timeout |
+
+Values must be between `1s` and `1h`. There are no timeout command-line flags; use `--set`, for example `awman exec prompt --settings-profile ci --automation --set agents.automation.startupTimeout=300s "…"`, or the derived variables such as `AWMAN_AGENTS_AUTOMATION_STARTUP_TIMEOUT=300s`. The keys can be set without enabling automation. Profile-backed launches without `--automation` use the same cancel and drain budgets when closing a profile, and do not gain automation's startup and admission requirements. Normal turns have no fixed duration limit.
+
+`agents.stuckTimeout` is separate and advisory: it reports an agent that has gone quiet after its first output byte and never kills the agent or changes startup, readiness or completion. Each launch snapshots its effective value, including environment and `--set` overrides.
+
+### Agent settings profiles
+
+Named profiles (see [Settings profiles](03-agent-sessions.md#settings-profiles)) live below the repository's data directory:
+`<data-home>/data/repos/<repo-key>/agent-profiles/<agent>/<name>/`.
+`AWMAN_HOME` selects the data home; otherwise awman uses
+`$XDG_DATA_HOME/awman`, falling back to `~/.awman`. A linked checkout invoked
+directly has its own profiles. OpenCode 1.x and 2.x also have separate profiles.
+Profile directories are private to you (mode 0700/0600), are refused if they would
+fall inside the mounted workspace, and symlinked ancestors inside the private store
+are refused.
+
+Profile names use lowercase letters, digits, underscores and hyphens, starting
+with a letter or digit, with at most 63 characters. Portable reserved device
+names such as `con` and `nul` are refused. awman keeps the current and previous
+consistent snapshot of each profile, with no time-based expiry; nothing deletes a
+profile except you.
+
+A profile has one writer at a time, enforced by an operating-system lock held for
+the whole execution. States you may see in `awman agents profile list`:
+
+| State | Meaning |
+|---|---|
+| `inactive` | No execution owns it; it can be launched with or deleted |
+| `active` | An execution is running with it |
+| `closing` | An execution ended or crashed and awman has not yet confirmed the container is gone and the snapshot is safe |
+
+A `closing` profile cannot be launched with or deleted. Run
+`awman agents profile close NAME --agent AGENT` to retry cleanup; if awman still
+cannot sanitize the new snapshot, close keeps the previous consistent one. A profile
+used by a live command is never taken over by `close` — cancel that command instead.
+`awman agents profile delete NAME --agent AGENT --yes` removes an inactive profile and
+its history; two simultaneous commands on one profile name get `settings_profile_busy`
+(HTTP 409) rather than sharing it.
+
+
 ### Control credential refresh (`agents.auth.refresh.*`)
 
 Under `keychain` auth mode, awman keeps Claude's containerized OAuth credential fresh for the life of a session: it periodically pings your host's Claude Code installation to rotate the token, then rewrites the staged credential file — see [Live credential refresh](04-security-and-isolation.md#live-credential-refresh). This is on by default. Tune it, or turn it off:
@@ -626,6 +675,8 @@ Under `keychain` auth mode, awman keeps Claude's containerized OAuth credential 
 | `agents.auth.refresh.tick` | duration | `60s` | How often the refresh monitor checks token expiry while a credentialed session is live |
 
 Precedence is per key: a repository value overrides the matching global value, which overrides the built-in default. **The squad daemon reads these from the global config only.** It builds its refresh monitor once, when the daemon starts, before any request has named a repository — so a repository-level value does not apply to work the squad daemon runs. Set them in the global file if you want them to govern squad.
+
+**Who owns a credential.** Each agent's credential is refreshed by exactly one party: awman (Claude's Keychain-backed token, above), the provider's own CLI inside the container, or you (a fixed `env()` value that never changes during a run). awman never starts a second refresher and never writes a refreshed credential into a saved settings profile. Replacing a credential inside a running agent and restarting an agent to pick up a new one are not currently offered; the daemon does not advertise those capabilities (see [Credentials during long sessions](03-agent-sessions.md#credentials-during-long-sessions)). On Windows, awman's refresh keeps its previous per-process serialization, and awman logs that cross-process locking is unavailable there; on other platforms a lock shared by all awman processes on the same credential prevents two refreshes at once.
 
 ---
 
@@ -757,6 +808,9 @@ have the effective defaults above.
 | `agents.auth.refresh.threshold` | duration | `"20m"` | repo | no | no | `AWMAN_AGENTS_AUTH_REFRESH_THRESHOLD` | Refresh a credential when it expires sooner than this. |
 | `agents.auth.refresh.tick` | duration | `"60s"` | repo | no | no | `AWMAN_AGENTS_AUTH_REFRESH_TICK` | How often credential expiry is checked. |
 | `agents.programStatus.enabled` | bool | `true` | repo | no | no | `AWMAN_AGENTS_PROGRAM_STATUS_ENABLED` | Collect program status from agents. |
+| `agents.automation.startupTimeout` | duration | `"120s"` | task | no | no | `AWMAN_AGENTS_AUTOMATION_STARTUP_TIMEOUT` | How long an automation launch may take to become ready for a task (1s to 1h). |
+| `agents.automation.cancelTimeout` | duration | `"10s"` | task | no | no | `AWMAN_AGENTS_AUTOMATION_CANCEL_TIMEOUT` | Total time to stop an owned agent after cancellation is accepted (1s to 1h). |
+| `agents.automation.outputDrainTimeout` | duration | `"5s"` | task | no | no | `AWMAN_AGENTS_AUTOMATION_OUTPUT_DRAIN_TIMEOUT` | How long to collect remaining output after an agent exits; at most the cancel timeout. |
 | `runtime.kind` | enum `docker\|apple\|sbx\|builtin` | `"docker"` | global | no | no | `AWMAN_RUNTIME_KIND` | Container runtime agents run in; sbx and builtin are experimental. |
 | `runtime.baseImage` | string | `null` | repo | no | no | `AWMAN_RUNTIME_BASE_IMAGE` | Base image tag for setup and teardown containers. |
 | `runtime.dockerfile` | string | `"Dockerfile.dev"` | repo | no | no | `AWMAN_RUNTIME_DOCKERFILE` | Dockerfile, relative to the repo root, that agent images are built from. |

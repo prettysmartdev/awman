@@ -181,6 +181,7 @@ pub(super) fn bridge_config_for(
             .status();
     });
     BridgeConfig {
+        startup_timing: Default::default(),
         output_redaction: Default::default(),
         grace_timeout,
         stuck_timeout,
@@ -294,6 +295,7 @@ impl AgentInstance for ContainerInstance {
         bridge_cfg.program_status = self.options.program_status;
         bridge_cfg.output_redaction = self.options.output_redaction.clone();
         bridge_cfg.terminal = frontend.terminal_launch();
+        bridge_cfg.startup_timing = frontend.startup_timing();
         if self.options.full_transcript {
             bridge_cfg.output_tail =
                 Arc::new(crate::engine::agent_runtime::output_tail::OutputTail::unbounded());

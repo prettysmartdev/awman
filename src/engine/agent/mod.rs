@@ -27,12 +27,15 @@ use crate::engine::overlay::{ContextOverlay, DirectorySpec, OverlayEngine, Overl
 use crate::engine::sandbox::options::SandboxOption;
 use crate::engine::worker::lease_workspace::{read_only_unsupported, validate_workspace_mounts};
 
+pub mod automation;
 pub mod custom;
 pub mod definition;
 pub mod download;
 pub mod first_party;
 pub mod frontend;
 pub mod image_freshness;
+pub mod opencode_plan_guard;
+pub mod profile_state;
 pub mod registry;
 mod seeded_prompt;
 pub mod session_seed;
@@ -199,6 +202,13 @@ pub enum AutoMode {
 /// Options governing how an agent container is invoked.
 #[derive(Debug, Default, Clone)]
 pub struct AgentRunOptions {
+    pub native_session: Option<crate::data::settings_profile::NativeSessionId>,
+    pub profile_state: Option<profile_state::ProfileRunState>,
+    /// WI 0070: the execution-private native lifecycle channel mounted at
+    /// `/awman/automation` for an interactive automation launch. Container
+    /// runtimes only; a sandbox runtime launches without it (native
+    /// facility then stays unknown, never claimed).
+    pub automation_channel: Option<crate::engine::agent::automation::observer::ChannelMount>,
     /// Caller values are used only for explicit env overlay names.
     pub command_secrets: Option<Arc<crate::data::secret::CommandSecrets>>,
     /// Explicit caller authorization, independent of unattended defaults.
@@ -299,6 +309,10 @@ pub(crate) fn launch_argv_options(
         options.push(ContainerOption::AgentOutputFormat(def.output_format));
     }
 
+    if let Some((tokens, position)) = def.native_resume_tokens(run)? {
+        options.push(ContainerOption::NativeResume { tokens, position });
+    }
+
     // Mode flags.
     if let Some(y) = run.yolo {
         options.push(ContainerOption::Yolo(y));
@@ -326,8 +340,9 @@ pub(crate) fn launch_argv_options(
         }
     }
 
-    // Resolve per-agent mode flags into literal argv strings.
-    let mode_flags = def.mode_flags(run);
+    // Resolve per-agent mode flags into literal argv strings. The plan part
+    // is this route's native plan delivery (WI 0070).
+    let mode_flags = def.mode_flags(run, RunParadigm::Container)?;
     if !mode_flags.is_empty() {
         options.push(ContainerOption::AgentModeFlags(mode_flags));
     }
@@ -341,6 +356,9 @@ pub(crate) fn launch_argv_options(
         options.push(ContainerOption::SeededPrompt(prompt.clone()));
         if def.headless_prompt_in_argv {
             options.push(ContainerOption::HeadlessPromptInArgv(true));
+            if let (true, Some(flag)) = (run.non_interactive, &def.headless_prompt_flag) {
+                options.push(ContainerOption::HeadlessPromptFlag(flag.clone()));
+            }
         }
         if let InteractiveSeedDelivery::Flag(flag) = &def.interactive_seed_delivery {
             options.push(ContainerOption::InteractiveSeedFlag(flag.to_string()));
@@ -356,7 +374,329 @@ pub(crate) fn launch_argv_options(
     Ok(options)
 }
 
-fn resolve_agent_flags(session: &Session, agent: &AgentName, run: &AgentRunOptions) -> Vec<String> {
+/// The execution-private host directory and inner path that hold
+/// `relative` (HOME-relative), from a launch's seeded session storage.
+fn private_dir<'a>(
+    private_dirs: &'a [(String, std::path::PathBuf)],
+    relative: &'a Path,
+) -> Option<(&'a Path, &'a Path)> {
+    private_dirs
+        .iter()
+        .find(|(base, _)| relative.starts_with(base))
+        .map(|(base, dir)| {
+            (
+                dir.as_path(),
+                relative.strip_prefix(base).unwrap_or(relative),
+            )
+        })
+}
+
+/// HOME-relative directory of OpenCode's global configuration.
+const OPENCODE_GLOBAL_CONFIG: &str = ".config/opencode";
+
+/// The host directory a container launch delivers as OpenCode's global
+/// configuration: the execution-private seeded copy (v2) or the host
+/// directory (1.x).
+fn plan_global_config_dir(
+    session: &Session,
+    def: &AgentDefinition,
+    private_dirs: &[(String, std::path::PathBuf)],
+) -> Option<std::path::PathBuf> {
+    match def.plan_config_guard {
+        definition::PlanConfigGuard::None => None,
+        definition::PlanConfigGuard::OpenCodeV2 => {
+            private_dir(private_dirs, Path::new(OPENCODE_GLOBAL_CONFIG))
+                .map(|(dir, inner)| dir.join(inner))
+        }
+        definition::PlanConfigGuard::OpenCodeV1 => {
+            private_dir(private_dirs, Path::new(OPENCODE_GLOBAL_CONFIG))
+                .map(|(dir, inner)| dir.join(inner))
+                .or_else(|| {
+                    session
+                        .env()
+                        .home_dir()
+                        .map(|home| home.join(OPENCODE_GLOBAL_CONFIG))
+                })
+        }
+    }
+}
+
+/// The definition's Plan-profile guard over the configuration a launch
+/// delivers (WI 0070): `global` is the global directory the guest is given
+/// (`None` when it is given none, e.g. a sandbox VM), the workspace is
+/// `session.git_root()`, and the environment is exactly what the launch
+/// passes. Shared by the container and sandbox builders. A no-op for a
+/// definition without a guard.
+fn verify_plan_config(
+    session: &Session,
+    def: &AgentDefinition,
+    run: &AgentRunOptions,
+    env_pass: &[String],
+    global: Option<&Path>,
+    settings_delivery: bool,
+) -> Result<(), EngineError> {
+    if def.plan_config_guard == definition::PlanConfigGuard::None {
+        return Ok(());
+    }
+    // Only names the guest really receives: a passthrough name unset on
+    // the host is not passed.
+    let mut guest_env: Vec<(String, Option<String>)> = env_pass
+        .iter()
+        .filter_map(|name| {
+            session
+                .env()
+                .get(name)
+                .map(|value| (name.clone(), Some(value.to_string())))
+        })
+        .collect();
+    guest_env.extend(
+        run.secret_env()
+            .into_iter()
+            .map(|(name, value)| (name, Some(value.expose().to_string()))),
+    );
+    guest_env.extend(
+        def.static_env
+            .iter()
+            .map(|(name, value)| (name.clone(), Some(value.clone()))),
+    );
+    let sources = opencode_plan_guard::collect_opencode_sources(
+        &def.name,
+        def.plan_config_guard,
+        global,
+        session.git_root(),
+        &guest_env,
+    )?;
+    for notice in opencode_plan_guard::check_opencode_plan(
+        def.plan_config_guard,
+        &def.name,
+        &sources,
+        settings_delivery,
+    )? {
+        tracing::info!(agent = %def.name, "--plan: {notice}");
+    }
+    Ok(())
+}
+
+/// The Plan-profile guard and private settings patch of a `--plan` launch
+/// (WI 0070). `private_dirs` maps each `session_storage_dirs` entry's
+/// HOME-relative path to its execution-private host directory, already
+/// seeded. A no-op when `--plan` is not requested.
+fn prepare_native_plan(
+    session: &Session,
+    def: &AgentDefinition,
+    run: &AgentRunOptions,
+    env_pass: &[String],
+    private_dirs: &[(String, std::path::PathBuf)],
+) -> Result<(), EngineError> {
+    let Some(delivery) = def.native_plan_delivery(run, RunParadigm::Container)? else {
+        return Ok(());
+    };
+    verify_plan_config(
+        session,
+        def,
+        run,
+        env_pass,
+        plan_global_config_dir(session, def, private_dirs).as_deref(),
+        delivery.settings.is_some(),
+    )?;
+    if let Some(settings) = &delivery.settings {
+        let relative = Path::new(&settings.home_relative_file);
+        let (dir, inner) = private_dir(private_dirs, relative).ok_or_else(|| {
+            EngineError::Config(format!(
+                "agent '{}' declares a plan settings file outside its private session storage: {}",
+                def.name, settings.home_relative_file
+            ))
+        })?;
+        let jsonc = inner.with_extension("jsonc");
+        if inner.extension().is_some_and(|e| e == "json")
+            && dir.join(&jsonc).symlink_metadata().is_ok()
+        {
+            crate::engine::overlay::apply_native_settings_patch(dir, &jsonc, &settings.patch)?;
+        }
+        for notice in
+            crate::engine::overlay::apply_native_settings_patch(dir, inner, &settings.patch)?
+        {
+            tracing::info!(agent = %def.name, "--plan: {notice}");
+        }
+    }
+    Ok(())
+}
+
+/// Lexical host path, resolved through symlinks when it exists, so two
+/// spellings of one directory compare equal.
+fn comparable_host_path(path: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Prove that every OpenCode configuration file the guest can read for a
+/// `--plan` launch is the host file the Plan-profile guard inspected
+/// (WI 0070). For each protected guest file, the most specific mount that
+/// covers it (equal path or an ancestor directory) must map it to the
+/// inspected host file; a tmpfs, a different host source, or a file mount
+/// replacing it is refused. Runs on the final option list, so it covers user
+/// overlays, settings, skills, context, private storage and system prompt
+/// mounts alike, with or without a read-only workspace.
+fn verify_plan_config_mounts(
+    session: &Session,
+    def: &AgentDefinition,
+    run: &AgentRunOptions,
+    container_home: &Path,
+    private_dirs: &[(String, std::path::PathBuf)],
+    options: &[ContainerOption],
+) -> Result<(), EngineError> {
+    if def.plan_config_guard == definition::PlanConfigGuard::None
+        || def
+            .native_plan_delivery(run, RunParadigm::Container)?
+            .is_none()
+    {
+        return Ok(());
+    }
+    // (guest file, host file the guard read or would have read).
+    let mut protected: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    let workspace = Path::new(crate::data::workspace::WORKSPACE_GUEST_PATH);
+    let git_root = comparable_host_path(session.git_root());
+    for file in opencode_plan_guard::project_config_files() {
+        protected.push((workspace.join(&file), git_root.join(&file)));
+    }
+    if let Some(global) = plan_global_config_dir(session, def, private_dirs) {
+        let global = comparable_host_path(&global);
+        let guest = container_home.join(OPENCODE_GLOBAL_CONFIG);
+        for file in opencode_plan_guard::config_dir_files() {
+            protected.push((guest.join(&file), global.join(&file)));
+        }
+    }
+    // (guest path, host source; `None` for memory-backed mounts).
+    let mut mounts: Vec<(&Path, Option<&Path>)> = Vec::new();
+    for option in options {
+        match option {
+            ContainerOption::Overlay(spec) => {
+                mounts.push((&spec.container_path, Some(&spec.host_path)))
+            }
+            ContainerOption::AgentSettingsPassthrough(settings) => {
+                mounts.extend(settings.overlays.iter().map(|spec| {
+                    (
+                        spec.container_path.as_path(),
+                        Some(spec.host_path.as_path()),
+                    )
+                }))
+            }
+            ContainerOption::Tmpfs(path) => mounts.push((path, None)),
+            ContainerOption::TemporaryDirectoryMount {
+                container_path,
+                guard,
+                ..
+            } => mounts.push((container_path, Some(guard.host_path()))),
+            ContainerOption::TemporaryFileMount {
+                host_path,
+                container_path,
+                ..
+            }
+            | ContainerOption::SystemPromptFile {
+                host_path,
+                container_path,
+                ..
+            }
+            | ContainerOption::SystemPromptEnvFile {
+                host_path,
+                container_path,
+                ..
+            } => mounts.push((container_path, Some(host_path))),
+            _ => {}
+        }
+    }
+    for (guest, inspected) in &protected {
+        let Some(depth) = mounts
+            .iter()
+            .filter(|(target, _)| guest.starts_with(target))
+            .map(|(target, _)| target.components().count())
+            .max()
+        else {
+            // Not mounted: the guest sees the image's own (absent) file.
+            continue;
+        };
+        for (target, source) in mounts
+            .iter()
+            .filter(|(target, _)| guest.starts_with(target) && target.components().count() == depth)
+        {
+            let delivered = source.map(|source| {
+                comparable_host_path(source).join(guest.strip_prefix(target).unwrap_or(guest))
+            });
+            if delivered.as_deref() != Some(inspected.as_path()) {
+                return Err(EngineError::AgentModeConflict {
+                    agent: def.name.clone(),
+                    selector: format!("mount at {}", target.display()),
+                    origin: "overlay",
+                    reason: format!(
+                        "it replaces {} with configuration awman did not verify for --plan; \
+                         remove the mount or launch without --plan",
+                        guest.display()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Where a run's agent flags come from, for an `AgentModeConflict`.
+fn agent_flags_origin(run: &AgentRunOptions) -> &'static str {
+    if run.agent_flags.is_some() {
+        "--agent-flag"
+    } else {
+        "agents.flags"
+    }
+}
+
+/// The env passthrough list of a launch, without the definition's
+/// `plan_env_drop` names when `--plan` is requested. A command secret with
+/// one of those names is an explicit request, so it is refused.
+fn plan_env_passthrough(
+    def: &AgentDefinition,
+    run: &AgentRunOptions,
+) -> Result<Vec<String>, EngineError> {
+    let names = run.env_passthrough.clone().unwrap_or_default();
+    if !matches!(run.plan, Some(PlanMode::Enabled)) || def.plan_env_drop.is_empty() {
+        return Ok(names);
+    }
+    if let Some((name, _)) = run
+        .secret_env()
+        .into_iter()
+        .find(|(name, _)| def.plan_env_drop.contains(name))
+    {
+        return Err(EngineError::AgentModeConflict {
+            agent: def.name.clone(),
+            selector: name,
+            origin: "environment",
+            reason: "it selects the agent's permissions and would override the native plan \
+                     mode; do not pass it with --plan"
+                .into(),
+        });
+    }
+    Ok(names
+        .into_iter()
+        .filter(|name| !def.plan_env_drop.contains(name))
+        .collect())
+}
+
+/// The names `plan_env_passthrough` removes from this run, for the launch
+/// notice (`LaunchPolicy::launch_notices`).
+pub fn plan_env_dropped(def: &AgentDefinition, run: &AgentRunOptions) -> Vec<String> {
+    if !matches!(run.plan, Some(PlanMode::Enabled)) {
+        return Vec::new();
+    }
+    run.env_passthrough
+        .iter()
+        .flatten()
+        .filter(|name| def.plan_env_drop.contains(name))
+        .cloned()
+        .collect()
+}
+
+pub fn resolve_agent_flags(
+    session: &Session,
+    agent: &AgentName,
+    run: &AgentRunOptions,
+) -> Vec<String> {
     match &run.agent_flags {
         Some(values) => values.clone(),
         None => session.effective_config().agent_flags(agent.as_str()),
@@ -785,9 +1125,9 @@ impl AgentEngine {
     }
 
     /// WI 0157: refuse to launch an image whose CLI reports the wrong
-    /// major (or none). Probes the same binary the launch executes
+    /// major. Missing or unparseable metadata is advisory. Probes the same binary the launch executes
     /// (`cli_version.binary == interactive_entrypoint[0]`) inside the image,
-    /// once per image identity. Probe failures block only these major-specific adapters.
+    /// once per image identity. Probe failures warn and never gate launch.
     fn check_agent_cli(&self, def: &AgentDefinition, tag: &str) -> Result<(), EngineError> {
         use crate::engine::container::agent_version::{mismatch_message, CliVersionStatus};
         let Some(requirement) = def.cli_version.as_ref() else {
@@ -797,9 +1137,10 @@ impl AgentEngine {
             CliVersionStatus::Mismatch { found, expected } => Err(EngineError::Config(
                 mismatch_message(&def.display_name, &def.name, tag, &found, &expected),
             )),
-            CliVersionStatus::Unknown { reason } => Err(EngineError::Config(format!(
-                "cannot verify {} inside {tag}: {reason}; run 'awman ready --build' before launching", def.name
-            ))),
+            CliVersionStatus::Unknown { reason } => {
+                tracing::warn!(agent = %def.name, image = tag, %reason, "agent CLI version is unknown; continuing launch");
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -975,16 +1316,25 @@ impl AgentEngine {
         // about it (`LaunchPolicy::warn_config`). An ACP entrypoint carries
         // none of them.
         let mut agent_flags = resolve_agent_flags(session, agent, run);
+        def.verify_resume_flags(run, &agent_flags)?;
         if !acp {
             let managed = def.entrypoint_managed_flags(run.non_interactive);
             agent_flags.retain(|flag| !managed.contains(flag));
         }
+        // A provider selector that contradicts --plan is refused; a matching
+        // duplicate is dropped once (WI 0070).
+        let agent_flags =
+            def.reconcile_agent_flags_for_plan(run, agent_flags, agent_flags_origin(run))?;
         if !agent_flags.is_empty() {
             options.push(ContainerOption::AgentFlags(agent_flags));
         }
 
-        // Env passthrough.
-        let env_pass = run.env_passthrough.as_deref().unwrap_or(&[]);
+        // Env passthrough. A --plan launch does not pass names that would
+        // select an incompatible starting mode in the guest (the host
+        // environment is never modified); a caller-supplied secret of that
+        // name is explicit, so it is refused instead.
+        let env_pass = plan_env_passthrough(&def, run)?;
+        let env_pass = env_pass.as_slice();
         let auth_env = custom_auth_env_in(session.env(), &def, env_pass);
         let mut emitted = std::collections::HashSet::new();
         for name in env_pass.iter().chain(auth_env.iter()) {
@@ -1052,7 +1402,63 @@ impl AgentEngine {
         // Private writable mounts are definition facts. The generic mount
         // option owns each tempdir through the execution's guest-exit guard;
         // an OverlayEngine-wide TempDir would be shared across launches.
-        for storage in &def.session_storage_dirs {
+        let mut private_dirs: Vec<(String, std::path::PathBuf)> = Vec::new();
+        if let Some(profile) = &run.profile_state {
+            let spec = def
+                .profile_state
+                .as_ref()
+                .ok_or_else(|| EngineError::Config("profile state layout absent".into()))?;
+            for root in &spec.roots {
+                private_dirs.push((
+                    root.home_relative.clone(),
+                    profile.run_dir.join(&root.home_relative),
+                ));
+                if let Some(var) = &root.env_var {
+                    options.push(ContainerOption::EnvLiteral(
+                        crate::engine::container::options::EnvLiteral {
+                            key: var.clone(),
+                            value: Path::new(container_home.as_deref().unwrap_or("/root"))
+                                .join(&root.home_relative)
+                                .display()
+                                .to_string(),
+                        },
+                    ));
+                }
+            }
+            for storage in &def.session_storage_dirs {
+                let guest = Path::new(container_home.as_deref().unwrap_or("/root"))
+                    .join(&storage.home_relative_path);
+                if let Some(var) = &storage.env_var {
+                    options.push(ContainerOption::EnvLiteral(
+                        crate::engine::container::options::EnvLiteral {
+                            key: var.clone(),
+                            value: guest.display().to_string(),
+                        },
+                    ));
+                }
+                if let Some((flag, key)) = &storage.config_override {
+                    options.push(ContainerOption::ManagedAgentFlags(vec![
+                        flag.clone(),
+                        format!("{key}={}", guest.display()),
+                    ]));
+                }
+            }
+            options.push(ContainerOption::Name(
+                crate::engine::container::options::ContainerName(format!(
+                    "awman-profile-{}",
+                    profile.execution_id.as_str()
+                )),
+            ));
+            options.push(ContainerOption::Label {
+                key: "awman.profile-execution".into(),
+                value: profile.execution_id.as_str().into(),
+            });
+        }
+        for storage in def
+            .session_storage_dirs
+            .iter()
+            .filter(|_| run.profile_state.is_none())
+        {
             let relative = std::path::Path::new(&storage.home_relative_path);
             if storage.home_relative_path.is_empty()
                 || !relative
@@ -1084,6 +1490,7 @@ impl AgentEngine {
                     session_seed::SEED_MAX_BYTES,
                 )?;
             }
+            private_dirs.push((storage.home_relative_path.clone(), dir.path().to_path_buf()));
             options.push(ContainerOption::TemporaryDirectoryMount {
                 container_path: guest_path.clone(),
                 env_var: storage.env_var.clone(),
@@ -1096,6 +1503,10 @@ impl AgentEngine {
                 ]));
             }
         }
+        // Native plan prerequisites (WI 0070): verify the configuration the
+        // plan selection relies on, then stage any private settings patch.
+        // Both run before any container exists and never touch host files.
+        prepare_native_plan(session, &def, run, env_pass, &private_dirs)?;
         let request = OverlayRequest {
             directories: run.directory_overlays.clone(),
             include_all_skills: run.include_all_skills,
@@ -1110,12 +1521,34 @@ impl AgentEngine {
         let mut request = request;
         request.materialize_credentials =
             matches!(&credentials.delivery, CredentialDelivery::File(_));
-        let (overlays, staged_credentials) = self.overlay_engine.build_scoped_overlays(
+        let (overlays, staged_credentials) = self.overlay_engine.build_scoped_profile_overlays(
             session,
             &request,
             self.lease_workspace_scope.as_deref(),
             &run.command_mounts,
+            run.profile_state.as_ref(),
         )?;
+        if let Some(profile) = &run.profile_state {
+            if let Some(spec) = &def.profile_state {
+                let home = Path::new(container_home.as_deref().unwrap_or("/root"));
+                for mount in &overlays {
+                    for root in &spec.roots {
+                        let guest = home.join(&root.home_relative);
+                        if mount.container_path.starts_with(&guest)
+                            || guest.starts_with(&mount.container_path)
+                        {
+                            let expected = profile.run_dir.join(&root.home_relative);
+                            if mount.container_path != guest
+                                || comparable_host_path(&mount.host_path)
+                                    != comparable_host_path(&expected)
+                            {
+                                return Err(EngineError::Config("an overlay replaces private profile settings or history; remove the conflicting overlay".into()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let sanctioned_mounts = overlays.clone();
         for spec in overlays {
             options.push(ContainerOption::Overlay(spec));
@@ -1200,6 +1633,16 @@ impl AgentEngine {
                 &sanctioned_mounts,
             )?;
         }
+        // The configuration the guard verified must be what the guest reads:
+        // no overlay may replace it (WI 0070).
+        verify_plan_config_mounts(
+            session,
+            &def,
+            run,
+            Path::new(container_home.as_deref().unwrap_or("/root")),
+            &private_dirs,
+            &options,
+        )?;
         Ok(options)
     }
 
@@ -1252,6 +1695,9 @@ impl AgentEngine {
                 options.push(ContainerOption::AgentCredentials {
                     env_vars: credentials.env_vars.clone(),
                 });
+            }
+            if let Some(channel) = &run.automation_channel {
+                options.extend(channel.container_options());
             }
             Ok(ResolvedAgentOptions::Container(Box::new(
                 crate::engine::container::options::ResolvedContainerOptions::resolve_in(
@@ -1335,8 +1781,18 @@ impl AgentEngine {
         // equivalent (`permissions.defaultMode`, rendered by its apply
         // script from `session.json`); the other mixins have none awman
         // manages, so the request is warned about rather than dropped.
-        let mode_flags = def.mode_flags(run);
-        if !mode_flags.is_empty() {
+        //
+        // A requested --plan never takes the "note and continue" path: the
+        // delivery was proven by `validate_run` above (a mixin without a
+        // managed settings route is refused there, before provisioning).
+        let plan_delivery = def.native_plan_delivery(run, RunParadigm::Sandbox)?;
+        let mode_flags = def.mode_flags(run, RunParadigm::Sandbox)?;
+        if plan_delivery
+            .as_ref()
+            .is_some_and(|delivery| delivery.sandbox_permission_mode)
+        {
+            options.push(SandboxOption::PermissionMode("plan".to_string()));
+        } else if !mode_flags.is_empty() {
             match def.sbx_kit_kind {
                 SbxKitKind::Agent => {
                     options.push(SandboxOption::AgentModeFlags(mode_flags));
@@ -1344,8 +1800,6 @@ impl AgentEngine {
                 SbxKitKind::Mixin => {
                     let mode = if matches!(run.yolo, Some(YoloMode::Enabled)) {
                         "yolo"
-                    } else if matches!(run.plan, Some(PlanMode::Enabled)) {
-                        "plan"
                     } else {
                         "auto"
                     };
@@ -1372,6 +1826,8 @@ impl AgentEngine {
             let managed = def.entrypoint_managed_flags(run.non_interactive);
             agent_flags.retain(|flag| !managed.contains(flag));
         }
+        let agent_flags =
+            def.reconcile_agent_flags_for_plan(run, agent_flags, agent_flags_origin(run))?;
         if !agent_flags.is_empty() {
             match def.sbx_kit_kind {
                 SbxKitKind::Agent => {
@@ -1403,7 +1859,11 @@ impl AgentEngine {
         // own headless mode just cannot be enabled. Warn, don't drop
         // silently.
         if run.non_interactive && matches!(def.sbx_kit_kind, SbxKitKind::Mixin) {
-            if let Some(flag) = &def.non_interactive_flag {
+            if let Some(flag) = def
+                .non_interactive_flag
+                .as_ref()
+                .or(def.headless_prompt_flag.as_ref())
+            {
                 options.push(SandboxOption::UnsupportedNote(format!(
                     "headless mode ('{flag}') cannot be enabled for '{agent}' \
                      under the sandbox runtime (the built-in template owns the launch \
@@ -1425,8 +1885,21 @@ impl AgentEngine {
         // Env passthrough. Credential-class names are filtered out of the
         // workspace-readable session.json by `DSbxSessionConfig`; non-sensitive
         // names reach the apply script.
-        let env_pass = run.env_passthrough.as_deref().unwrap_or(&[]);
-        for name in env_pass {
+        let env_pass = plan_env_passthrough(&def, run)?;
+        // The Plan-profile guard verifies what the sandbox VM is given: the
+        // workspace and the passed environment. No host-global configuration
+        // directory reaches the VM, so none is inspected (WI 0070).
+        if let Some(delivery) = &plan_delivery {
+            verify_plan_config(
+                session,
+                &def,
+                run,
+                &env_pass,
+                None,
+                delivery.settings.is_some(),
+            )?;
+        }
+        for name in &env_pass {
             options.push(SandboxOption::EnvPassthrough(EnvVar(name.clone())));
         }
 
@@ -1787,7 +2260,23 @@ mod workspace_access_tests {
         );
         for agent in ["opencode", "opencode-v2"] {
             let def = first_party::first_party(agent).unwrap();
-            assert!(engine.check_agent_cli(&def, "fixture").is_err());
+            assert!(engine.check_agent_cli(&def, "fixture").is_ok());
+        }
+        for (version, v1_ok, v2_ok) in [
+            ("1.999.999", true, false),
+            ("2.999.999", false, true),
+            ("nightly", true, true),
+            ("", true, true),
+        ] {
+            *runtime.cli_version_line.lock().unwrap() = Some(version.into());
+            for (agent, expected) in [("opencode", v1_ok), ("opencode-v2", v2_ok)] {
+                assert_eq!(
+                    engine
+                        .check_agent_cli(&first_party::first_party(agent).unwrap(), "fixture")
+                        .is_ok(),
+                    expected
+                );
+            }
         }
         let def = first_party::first_party("cursor").unwrap();
         engine.check_agent_cli(&def, "fixture").unwrap();
@@ -1891,3 +2380,678 @@ mod workspace_access_tests {
         assert_eq!(std::fs::read_to_string(&agents).unwrap(), "instructions");
     }
 }
+
+#[cfg(test)]
+mod native_plan_option_tests {
+    //! WI 0070: what the production option builders emit for `--plan`,
+    //! `--read-only-workspace` and both, independently.
+    use super::*;
+    use awman_test_support::{TestCase, TestSandbox};
+
+    fn sandbox(name: &str) -> TestSandbox {
+        let id: &'static str =
+            Box::leak(format!("engine::agent::native_plan_option_tests::{name}").into_boxed_str());
+        TestSandbox::for_test(TestCase::component(id))
+    }
+
+    fn session(sandbox: &TestSandbox) -> Session {
+        Session::open_at_directory_root(
+            sandbox.work(),
+            crate::data::session::SessionOpenOptions {
+                env: Some(crate::data::config::env::EnvSnapshot::from_full_env(
+                    sandbox
+                        .env()
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                k.to_string_lossy().into_owned(),
+                                v.to_string_lossy().into_owned(),
+                            )
+                        })
+                        .collect(),
+                )),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn engine(session: &Session) -> AgentEngine {
+        AgentEngine::new(
+            Arc::new(OverlayEngine::new(session).unwrap()),
+            Arc::new(image_freshness::test_runtime::BuildRuntime::default()),
+        )
+    }
+
+    fn plan(headless: bool) -> AgentRunOptions {
+        AgentRunOptions {
+            plan: Some(PlanMode::Enabled),
+            non_interactive: headless,
+            initial_prompt: Some("look".into()),
+            system_prompt: Some("context".into()),
+            ..Default::default()
+        }
+    }
+
+    fn agent(name: &str) -> AgentName {
+        AgentName::new(name).unwrap()
+    }
+
+    fn mode_flags(options: &[ContainerOption]) -> Vec<String> {
+        options
+            .iter()
+            .filter_map(|o| match o {
+                ContainerOption::AgentModeFlags(f) => Some(f.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn read_only_traces(options: &[ContainerOption]) -> Vec<String> {
+        let mut traces = Vec::new();
+        for option in options {
+            match option {
+                ContainerOption::Tmpfs(p) => traces.push(format!("tmpfs {}", p.display())),
+                ContainerOption::ReadOnlyWorkspace(true) => traces.push("read-only".into()),
+                ContainerOption::TemporaryDirectoryMount { container_path, .. }
+                    if container_path == Path::new(READ_ONLY_SCRATCH_PATH) =>
+                {
+                    traces.push("scratch".into())
+                }
+                ContainerOption::EnvLiteral(v)
+                    if ["XDG_CACHE_HOME", "XDG_STATE_HOME", "TMPDIR"].contains(&v.key.as_str()) =>
+                {
+                    traces.push(v.key.clone())
+                }
+                _ => {}
+            }
+        }
+        traces
+    }
+
+    #[test]
+    fn plan_only_adds_native_argv_and_no_mount_restriction() {
+        let sb = sandbox("plan_only_adds_native_argv_and_no_mount_restriction");
+        let session = session(&sb);
+        let options = engine(&session)
+            .build_options(&session, &agent("claude"), &plan(false))
+            .unwrap();
+        assert_eq!(mode_flags(&options), ["--permission-mode", "plan"]);
+        assert!(
+            read_only_traces(&options).is_empty(),
+            "{:?}",
+            read_only_traces(&options)
+        );
+    }
+
+    #[test]
+    fn read_only_only_adds_mount_restriction_and_no_plan_tokens() {
+        let sb = sandbox("read_only_only_adds_mount_restriction_and_no_plan_tokens");
+        let session = session(&sb);
+        let mut run = plan(false);
+        run.plan = None;
+        let engine = engine(&session).with_read_only_workspace(true);
+        for name in ["claude", "codex"] {
+            let options = engine.build_options(&session, &agent(name), &run).unwrap();
+            assert!(
+                mode_flags(&options).is_empty(),
+                "{name}: {:?}",
+                mode_flags(&options)
+            );
+            let traces = read_only_traces(&options);
+            assert!(
+                traces.contains(&"scratch".to_string()),
+                "{name}: {traces:?}"
+            );
+            assert!(traces.contains(&"TMPDIR".to_string()), "{name}: {traces:?}");
+        }
+        // Both: plan tokens and the read-only mount, each from its own input.
+        let both = engine
+            .build_options(&session, &agent("codex"), &plan(false))
+            .unwrap();
+        assert_eq!(mode_flags(&both), ["--sandbox", "read-only"]);
+        assert!(read_only_traces(&both).contains(&"scratch".to_string()));
+    }
+
+    #[test]
+    #[cfg(unix)] // secure session config copying is unix-only
+    fn opencode_v2_tui_plan_patches_only_its_private_config_copy() {
+        let sb = sandbox("opencode_v2_tui_plan_patches_only_its_private_config_copy");
+        let host_config = sb.home().join(".config/opencode");
+        std::fs::create_dir_all(&host_config).unwrap();
+        let host_text = "{ // mine\n \"default_agent\": \"build\", \"theme\": \"dark\" }";
+        std::fs::write(host_config.join("opencode.jsonc"), host_text).unwrap();
+        let session = session(&sb);
+        let options = engine(&session)
+            .build_options(&session, &agent("opencode-v2"), &plan(false))
+            .unwrap();
+        assert!(
+            mode_flags(&options).is_empty(),
+            "the full TUI takes no plan argv"
+        );
+        let private = options
+            .iter()
+            .find_map(|o| match o {
+                ContainerOption::TemporaryDirectoryMount {
+                    container_path,
+                    guard,
+                    ..
+                } if container_path.ends_with(".config/opencode") => {
+                    Some(guard.host_path().to_path_buf())
+                }
+                _ => None,
+            })
+            .expect("private config copy");
+        assert!(!private.starts_with(sb.home()), "never the host directory");
+        let patched: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(private.join("opencode.jsonc")).unwrap())
+                .unwrap();
+        assert_eq!(patched["default_agent"], "plan");
+        assert_eq!(patched["theme"], "dark");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(private.join("opencode.jsonc"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "private file");
+        }
+        assert_eq!(
+            std::fs::read_to_string(host_config.join("opencode.jsonc")).unwrap(),
+            host_text
+        );
+
+        // Headless uses argv and writes no patch.
+        let headless = engine(&session)
+            .build_options(&session, &agent("opencode-v2"), &plan(true))
+            .unwrap();
+        assert_eq!(mode_flags(&headless), ["--agent", "plan"]);
+    }
+
+    #[test]
+    fn a_redefined_plan_agent_or_outranking_default_fails_before_any_container() {
+        let sb = sandbox("a_redefined_plan_agent_or_outranking_default_fails_before_any_container");
+        let session = session(&sb);
+        std::fs::write(
+            session.git_root().join("opencode.json"),
+            "{\"agent\": {\"plan\": {\"permission\": {\"edit\": \"allow\"}}}}",
+        )
+        .unwrap();
+        for name in ["opencode", "opencode-v2"] {
+            let err = engine(&session)
+                .build_options(&session, &agent(name), &plan(true))
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    EngineError::AgentModeConflict {
+                        origin: "settings",
+                        ..
+                    }
+                ),
+                "{name}: {err:?}"
+            );
+        }
+        std::fs::write(
+            session.git_root().join("opencode.json"),
+            "{\"default_agent\": \"build\"}",
+        )
+        .unwrap();
+        assert!(matches!(
+            engine(&session).build_options(&session, &agent("opencode-v2"), &plan(false)),
+            Err(EngineError::AgentModeConflict { .. })
+        ));
+        engine(&session)
+            .build_options(&session, &agent("opencode-v2"), &plan(true))
+            .unwrap();
+        // Without --plan the guard is never consulted.
+        let mut no_plan = plan(false);
+        no_plan.plan = None;
+        engine(&session)
+            .build_options(&session, &agent("opencode-v2"), &no_plan)
+            .unwrap();
+    }
+
+    #[test]
+    fn plan_drops_inherited_permission_env_and_refuses_contradicting_agent_flags() {
+        let sb =
+            sandbox("plan_drops_inherited_permission_env_and_refuses_contradicting_agent_flags");
+        let session = session(&sb);
+        let env_names = |options: &[ContainerOption]| -> Vec<String> {
+            options
+                .iter()
+                .filter_map(|o| match o {
+                    ContainerOption::EnvPassthrough(v) => Some(v.0.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut run = plan(true);
+        run.env_passthrough = Some(vec!["OPENCODE_PERMISSION".into(), "KEEP".into()]);
+        let options = engine(&session)
+            .build_options(&session, &agent("opencode"), &run)
+            .unwrap();
+        assert_eq!(env_names(&options), ["KEEP"]);
+        assert_eq!(
+            plan_env_dropped(&first_party::first_party("opencode").unwrap(), &run),
+            ["OPENCODE_PERMISSION"]
+        );
+        run.plan = None;
+        let options = engine(&session)
+            .build_options(&session, &agent("opencode"), &run)
+            .unwrap();
+        assert_eq!(env_names(&options), ["OPENCODE_PERMISSION", "KEEP"]);
+
+        let mut flags = plan(false);
+        flags.agent_flags = Some(vec!["--permission-mode".into(), "acceptEdits".into()]);
+        assert!(matches!(
+            engine(&session).build_options(&session, &agent("claude"), &flags),
+            Err(EngineError::AgentModeConflict {
+                origin: "--agent-flag",
+                ..
+            })
+        ));
+        flags.agent_flags = Some(vec![
+            "--permission-mode".into(),
+            "plan".into(),
+            "--verbose".into(),
+        ]);
+        let options = engine(&session)
+            .build_options(&session, &agent("claude"), &flags)
+            .unwrap();
+        assert_eq!(mode_flags(&options), ["--permission-mode", "plan"]);
+        let user: Vec<String> = options
+            .iter()
+            .filter_map(|o| match o {
+                ContainerOption::AgentFlags(f) => Some(f.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(user, ["--verbose"], "duplicate normalised once");
+    }
+
+    #[test]
+    fn sandbox_plan_is_delivered_or_refused_never_noted() {
+        let sb = sandbox("sandbox_plan_is_delivered_or_refused_never_noted");
+        let session = session(&sb);
+        let engine = engine(&session);
+        let claude = engine
+            .build_sandbox_options(&session, &agent("claude"), &plan(false))
+            .unwrap();
+        assert!(claude
+            .iter()
+            .any(|o| matches!(o, SandboxOption::PermissionMode(m) if m == "plan")));
+        assert!(!claude
+            .iter()
+            .any(|o| matches!(o, SandboxOption::UnsupportedNote(n) if n.contains("plan"))));
+        for name in ["codex", "copilot"] {
+            assert!(
+                matches!(
+                    engine.build_sandbox_options(&session, &agent(name), &plan(false)),
+                    Err(EngineError::NativePlanRouteUnsupported { .. })
+                ),
+                "{name}"
+            );
+        }
+        let kit = engine
+            .build_sandbox_options(&session, &agent("opencode"), &plan(true))
+            .unwrap();
+        assert!(kit
+            .iter()
+            .any(|o| matches!(o, SandboxOption::AgentModeFlags(f) if f == &["--agent", "plan"])));
+        // yolo on a mixin keeps its existing note behaviour.
+        let yolo = AgentRunOptions {
+            yolo: Some(YoloMode::Enabled),
+            ..Default::default()
+        };
+        assert!(engine
+            .build_sandbox_options(&session, &agent("codex"), &yolo)
+            .unwrap()
+            .iter()
+            .any(|o| matches!(o, SandboxOption::UnsupportedNote(n) if n.contains("--yolo"))));
+    }
+
+    fn session_with_env(sandbox: &TestSandbox, extra: &[(&str, &str)]) -> Session {
+        let mut env: std::collections::BTreeMap<String, String> = sandbox
+            .env()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        env.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        Session::open_at_directory_root(
+            sandbox.work(),
+            crate::data::session::SessionOpenOptions {
+                env: Some(crate::data::config::env::EnvSnapshot::from_full_env(env)),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn conflict_origin(result: Result<impl std::fmt::Debug, EngineError>) -> &'static str {
+        match result {
+            Err(EngineError::AgentModeConflict { origin, .. }) => origin,
+            other => panic!("expected an agent mode conflict, got {other:?}"),
+        }
+    }
+
+    /// WI 0070 review finding 2: `.opencode/opencode.json[c]` is project
+    /// configuration that outranks the direct files, so the guard reads it
+    /// (and refuses a symlinked configuration directory it cannot map).
+    #[test]
+    fn nested_project_opencode_config_is_inspected() {
+        let sb = sandbox("nested_project_opencode_config_is_inspected");
+        let session = session(&sb);
+        let nested = session.git_root().join(".opencode");
+        std::fs::create_dir_all(&nested).unwrap();
+        for name in ["opencode.json", "opencode.jsonc"] {
+            std::fs::write(nested.join(name), "{\"default_agent\": \"build\"}").unwrap();
+            assert_eq!(
+                conflict_origin(engine(&session).build_options(
+                    &session,
+                    &agent("opencode-v2"),
+                    &plan(false)
+                )),
+                "settings",
+                "{name}"
+            );
+            std::fs::write(
+                nested.join(name),
+                "{\"agent\": {\"plan\": {\"disable\": true}}}",
+            )
+            .unwrap();
+            for name in ["opencode", "opencode-v2"] {
+                assert_eq!(
+                    conflict_origin(engine(&session).build_options(
+                        &session,
+                        &agent(name),
+                        &plan(true)
+                    )),
+                    "settings"
+                );
+            }
+            std::fs::remove_file(nested.join(name)).unwrap();
+        }
+        engine(&session)
+            .build_options(&session, &agent("opencode-v2"), &plan(false))
+            .unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir(&nested).unwrap();
+            let elsewhere = sb.root().join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &nested).unwrap();
+            assert_eq!(
+                conflict_origin(engine(&session).build_options(
+                    &session,
+                    &agent("opencode"),
+                    &plan(true)
+                )),
+                "settings"
+            );
+        }
+    }
+
+    /// WI 0070 review finding 4: the configuration the guard checked must be
+    /// the configuration the guest reads, so no overlay may replace a
+    /// project file, a `.opencode` directory or a (private) global file,
+    /// with or without the read-only workspace restriction.
+    #[test]
+    fn an_overlay_cannot_replace_the_verified_plan_configuration() {
+        let sb = sandbox("an_overlay_cannot_replace_the_verified_plan_configuration");
+        let session = session(&sb);
+        let payload = sb.root().join("payload.json");
+        std::fs::write(&payload, "{\"agent\": {\"plan\": {\"disable\": true}}}").unwrap();
+        let payload_dir = sb.root().join("payload-dir");
+        std::fs::create_dir_all(&payload_dir).unwrap();
+        let overlay = |host: &Path, guest: &str| DirectorySpec {
+            host: host.display().to_string(),
+            container: guest.into(),
+            permission: crate::engine::container::options::OverlayPermission::ReadOnly,
+        };
+        // A read-only OpenCode launch carries its instructions in a context
+        // directory; it is unrelated to the configuration under test.
+        let context = sb.root().join("context");
+        std::fs::create_dir_all(&context).unwrap();
+        let with = |overlays: Vec<DirectorySpec>| AgentRunOptions {
+            directory_overlays: overlays,
+            context_overlays: vec![ContextOverlay {
+                scope: crate::engine::overlay::ContextScope::Repo,
+                host_path: context.clone(),
+                container_path: "/awman/context/repo".into(),
+                permission: crate::engine::container::options::OverlayPermission::ReadOnly,
+            }],
+            ..plan(true)
+        };
+        // The guest home of the v2 private configuration copy.
+        let private_config = engine(&session)
+            .build_options(&session, &agent("opencode-v2"), &plan(false))
+            .unwrap()
+            .into_iter()
+            .find_map(|o| match o {
+                ContainerOption::TemporaryDirectoryMount { container_path, .. }
+                    if container_path.ends_with(".config/opencode") =>
+                {
+                    Some(container_path.display().to_string())
+                }
+                _ => None,
+            })
+            .expect("private config mount");
+        for read_only in [false, true] {
+            let engine = engine(&session).with_read_only_workspace(read_only);
+            for (name, run) in [
+                (
+                    "opencode",
+                    with(vec![overlay(&payload, "/workspace/opencode.json")]),
+                ),
+                (
+                    "opencode",
+                    with(vec![overlay(
+                        &payload,
+                        "/workspace/.opencode/opencode.jsonc",
+                    )]),
+                ),
+                (
+                    "opencode",
+                    with(vec![overlay(&payload_dir, "/workspace/.opencode")]),
+                ),
+                (
+                    "opencode-v2",
+                    with(vec![overlay(
+                        &payload,
+                        &format!("{private_config}/opencode.json"),
+                    )]),
+                ),
+                (
+                    "opencode-v2",
+                    with(vec![overlay(
+                        &payload_dir,
+                        &format!("{private_config}/agents"),
+                    )]),
+                ),
+            ] {
+                assert_eq!(
+                    conflict_origin(engine.build_options(&session, &agent(name), &run)),
+                    "overlay",
+                    "{name} read_only={read_only}: {:?}",
+                    run.directory_overlays
+                );
+            }
+            // An unrelated overlay and the same overlay without --plan pass.
+            engine
+                .build_options(
+                    &session,
+                    &agent("opencode"),
+                    &with(vec![overlay(&payload_dir, "/mnt/reference")]),
+                )
+                .unwrap();
+            if !read_only {
+                let mut no_plan = with(vec![overlay(&payload, "/workspace/opencode.json")]);
+                no_plan.plan = None;
+                engine
+                    .build_options(&session, &agent("opencode"), &no_plan)
+                    .unwrap();
+            }
+        }
+    }
+
+    /// WI 0070 review finding 5: the Docker Sandboxes builder runs the same
+    /// Plan-profile guard over what the VM is given (workspace and passed
+    /// environment) before emitting `--agent plan`.
+    #[test]
+    fn sandbox_plan_runs_the_opencode_configuration_guard() {
+        let sb = sandbox("sandbox_plan_runs_the_opencode_configuration_guard");
+        let session = session(&sb);
+        std::fs::write(
+            session.git_root().join("opencode.json"),
+            "{\"agent\": {\"plan\": {\"disable\": true}}}",
+        )
+        .unwrap();
+        assert_eq!(
+            conflict_origin(engine(&session).build_sandbox_options(
+                &session,
+                &agent("opencode"),
+                &plan(true)
+            )),
+            "settings"
+        );
+        std::fs::remove_file(session.git_root().join("opencode.json")).unwrap();
+        engine(&session)
+            .build_sandbox_options(&session, &agent("opencode"), &plan(true))
+            .unwrap();
+        for (name, value, origin) in [
+            ("OPENCODE_CONFIG", "/elsewhere/opencode.json", "environment"),
+            (
+                "OPENCODE_CONFIG_CONTENT",
+                "{\"agent\": {\"plan\": {\"disable\": true}}}",
+                "settings",
+            ),
+        ] {
+            let session = session_with_env(&sb, &[(name, value)]);
+            let run = AgentRunOptions {
+                env_passthrough: Some(vec![name.into()]),
+                ..plan(true)
+            };
+            assert_eq!(
+                conflict_origin(engine(&session).build_sandbox_options(
+                    &session,
+                    &agent("opencode"),
+                    &run
+                )),
+                origin,
+                "{name}"
+            );
+            // The container route refuses the same input.
+            assert_eq!(
+                conflict_origin(engine(&session).build_options(&session, &agent("opencode"), &run)),
+                origin,
+                "{name}"
+            );
+        }
+        // A host-global file the VM never receives is not inspected.
+        let host = sb.home().join(".config/opencode");
+        std::fs::create_dir_all(&host).unwrap();
+        std::fs::write(
+            host.join("opencode.json"),
+            "{\"agent\": {\"plan\": {\"disable\": true}}}",
+        )
+        .unwrap();
+        engine(&session)
+            .build_sandbox_options(&session, &agent("opencode"), &plan(true))
+            .unwrap();
+    }
+
+    use definition::PlanConfigGuard;
+    use opencode_plan_guard::{SourceKind, SourceScope};
+
+    #[test]
+    fn relocated_or_unreadable_opencode_config_cannot_be_verified() {
+        use crate::engine::agent::opencode_plan_guard::collect_opencode_sources;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR"] {
+            let err = collect_opencode_sources(
+                "opencode",
+                PlanConfigGuard::OpenCodeV1,
+                None,
+                dir.path(),
+                &[(name.to_string(), Some("/x".into()))],
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    EngineError::AgentModeConflict {
+                        origin: "environment",
+                        ..
+                    }
+                ),
+                "{err:?}"
+            );
+        }
+        let inline = collect_opencode_sources(
+            "opencode",
+            PlanConfigGuard::OpenCodeV1,
+            None,
+            dir.path(),
+            &[("OPENCODE_CONFIG_CONTENT".into(), Some("{}".into()))],
+        )
+        .unwrap();
+        assert_eq!(inline.len(), 1);
+        assert_eq!(inline[0].scope, SourceScope::Environment);
+        // Oversize and symlinked files are conflicts; absent files are not.
+        std::fs::write(
+            dir.path().join("opencode.json"),
+            vec![b' '; 1024 * 1024 + 1],
+        )
+        .unwrap();
+        assert!(collect_opencode_sources(
+            "opencode",
+            PlanConfigGuard::OpenCodeV1,
+            None,
+            dir.path(),
+            &[]
+        )
+        .is_err());
+        std::fs::remove_file(dir.path().join("opencode.json")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/hostname", dir.path().join("opencode.jsonc")).unwrap();
+            assert!(collect_opencode_sources(
+                "opencode",
+                PlanConfigGuard::OpenCodeV1,
+                None,
+                dir.path(),
+                &[]
+            )
+            .is_err());
+            std::fs::remove_file(dir.path().join("opencode.jsonc")).unwrap();
+        }
+        std::fs::create_dir_all(dir.path().join(".opencode/agents")).unwrap();
+        std::fs::write(dir.path().join(".opencode/agents/plan.md"), "x").unwrap();
+        let found = collect_opencode_sources(
+            "opencode",
+            PlanConfigGuard::OpenCodeV1,
+            None,
+            dir.path(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].kind, SourceKind::MarkdownAgent);
+        assert!(
+            collect_opencode_sources("claude", PlanConfigGuard::None, None, dir.path(), &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+pub mod credential_routes;

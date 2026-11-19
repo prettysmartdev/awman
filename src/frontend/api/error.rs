@@ -115,6 +115,9 @@ constructors! {
     workflow_prerequisites_unresolved => (failure_codes::WORKFLOW_PREREQUISITES_UNRESOLVED, CONFLICT),
     unknown_agent => (failure_codes::UNKNOWN_AGENT, NOT_FOUND),
     agent_untrusted => (failure_codes::AGENT_UNTRUSTED, FORBIDDEN),
+    // WI 0070 native plan mode.
+    agent_mode_conflict => (crate::data::agent_failure::AGENT_MODE_CONFLICT, BAD_REQUEST),
+    native_capability_unavailable => (crate::data::agent_failure::NATIVE_CAPABILITY_UNAVAILABLE, CONFLICT),
     // WI 0141: a command asked for an interaction mode its feature's
     // `allowOverride: false` forbids.
     interaction_override_refused => (crate::command::interaction::INTERACTION_OVERRIDE_REFUSED, BAD_REQUEST),

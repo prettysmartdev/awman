@@ -49,8 +49,8 @@ impl TerminalChannel for awman_wsp::terminal::TerminalSocket {
 }
 
 /// Map a hub frame to its wire form.
-pub fn wire_frame(frame: TerminalFrame) -> WireFrame {
-    match frame {
+pub fn wire_frame(frame: TerminalFrame) -> Option<WireFrame> {
+    Some(match frame {
         TerminalFrame::Error { code, error } => WireFrame::Error { code, error },
         TerminalFrame::Snapshot {
             has_output,
@@ -69,7 +69,14 @@ pub fn wire_frame(frame: TerminalFrame) -> WireFrame {
         TerminalFrame::Resize { cols, rows } => WireFrame::Resize { cols, rows },
         TerminalFrame::Exit { code } => WireFrame::Exit { code: Some(code) },
         TerminalFrame::Lagged => WireFrame::Lagged,
-    }
+        TerminalFrame::AutomationState { .. }
+        | TerminalFrame::TurnAccepted { .. }
+        | TerminalFrame::TurnResult { .. }
+        | TerminalFrame::ExecutionClosed { .. }
+        | TerminalFrame::ExecutionReplaced { .. }
+        | TerminalFrame::CredentialUpdateState { .. }
+        | TerminalFrame::OperationError { .. } => return None,
+    })
 }
 
 pub struct TerminalRelay {
@@ -126,9 +133,12 @@ impl TerminalRelay {
                     frame = subscription.next() => frame,
                 };
                 let Some(frame) = frame else { return };
+                let Some(frame) = wire_frame(frame) else {
+                    continue;
+                };
                 let tagged = LeaseTerminalFrame {
                     terminal_id: id.to_string(),
-                    frame: wire_frame(frame),
+                    frame,
                 };
                 if out.send(tagged).await.is_err() {
                     return;
@@ -206,6 +216,13 @@ impl TerminalRelay {
             if let (WireFrame::Detached { .. }, Some(id)) = (&frame.frame, &id) {
                 grants.remove(id);
             }
+            if !matches!(frame.frame, WireFrame::Detached { .. }) {
+                return Some(error_frame(
+                    &tid,
+                    "invalid_frame",
+                    "server-only terminal frame",
+                ));
+            }
             return None;
         }
         let Some(id) = id else {
@@ -223,6 +240,24 @@ impl TerminalRelay {
                     "remote input is not allowed for this lease",
                 )
             });
+        }
+        // WI 0070: a controller-owned automation terminal accepts raw input
+        // only through the owner-local admission gate, never a relay.
+        if self
+            .hub
+            .get(&id)
+            .is_ok_and(|record| record.automation.is_some())
+        {
+            return Some(error_frame(
+                &tid,
+                INPUT_REFUSED,
+                "remote input is not available for an automation terminal",
+            ));
+        }
+        // A sealed or rebound binding revokes grants: drop a stale one and
+        // re-acquire instead of failing every later keystroke.
+        if grants.get(&id).is_some_and(|grant| !grant.is_valid()) {
+            grants.remove(&id);
         }
         if !grants.contains_key(&id) {
             match self.hub.take_control(&id) {

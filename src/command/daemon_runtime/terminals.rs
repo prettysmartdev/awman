@@ -29,6 +29,8 @@ impl DaemonRuntime {
                         runtime: Arc::downgrade(self),
                     }),
                 ));
+                // WI 0070: the one execution controller guards every transport.
+                let _ = ops.install_automation(crate::command::automation::controller::global());
                 if tokio::runtime::Handle::try_current().is_ok() {
                     ops.spawn_lifecycle_publisher();
                 }

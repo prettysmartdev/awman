@@ -160,10 +160,12 @@ impl ContainerBackend for DockerBackend {
         &self,
         mut options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
-        options.validate_read_only_workspace()?;
+        // The host environment first: it names the runtime endpoint
+        // (`DOCKER_HOST`) the read-only check must protect.
         if options.host_env.is_none() {
             options.host_env = self.env.clone();
         }
+        options.validate_read_only_workspace()?;
         let cli = options
             .host_env
             .as_ref()
@@ -326,6 +328,26 @@ impl ContainerBackend for DockerBackend {
         host_cli_backend::cli_is_available(self.cli(), &["info", "--format", "{{.ServerVersion}}"])
     }
 
+    fn resource_label(
+        &self,
+        handle: &AgentHandle,
+        key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        let format = format!("{{{{index .Config.Labels \"{key}\"}}}}");
+        let cli = self.cli();
+        let out = crate::engine::host_cli::checked_output(
+            cli.command()
+                .args(["inspect", "--format", &format, &handle.id]),
+            cli.bin,
+        )?;
+        if !out.status.success() {
+            return Err(EngineError::Container(
+                "resource identity inspection failed".into(),
+            ));
+        }
+        let value = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        Ok((!value.is_empty() && value != "<no value>").then_some(value))
+    }
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
         host_cli_backend::cli_stop_checked(self.cli(), &handle.id)
     }
@@ -464,6 +486,7 @@ pub(super) fn attach_bridge_config(
 ) -> crate::engine::container::io_bridge::BridgeConfig {
     crate::engine::container::io_bridge::BridgeConfig {
         output_redaction: Default::default(),
+        startup_timing: Default::default(),
         grace_timeout,
         stuck_timeout,
         container_start_delay: std::time::Duration::ZERO,
@@ -581,10 +604,12 @@ impl AgentInstance for AttachInstance {
             },
         );
 
+        let startup_timing = frontend.startup_timing();
         let grace_timeout = frontend.grace_timeout();
         let stuck_timeout = frontend.stuck_timeout();
         let io = frontend.take_io();
         let mut bridge_cfg = attach_bridge_config(grace_timeout, stuck_timeout);
+        bridge_cfg.startup_timing = startup_timing;
         bridge_cfg.program_status = frontend.program_status_config();
         bridge_cfg.output_redaction = frontend.output_redaction();
 

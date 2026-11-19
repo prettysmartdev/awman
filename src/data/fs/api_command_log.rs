@@ -62,6 +62,12 @@ pub struct ResultContributions {
     /// (`None` until the command reaches its launch decision). An empty
     /// output directory and a missing mount are therefore distinguishable.
     pub outputs_mounted: Option<bool>,
+    /// The command ran an automation execution (WI 0070): its answer is
+    /// only ever the native-confirmed one, whatever the outcome shape.
+    pub automation: bool,
+    /// The frozen execution assurance, recorded when the execution
+    /// finishes, so a cancelled or otherwise failed command still reports it.
+    pub automation_result: Option<crate::data::automation_records::CommandAutomationResult>,
 }
 
 impl CommandStateWriter {
@@ -143,6 +149,21 @@ impl CommandStateWriter {
     /// an earlier one: an `exec prompt` restart reruns from scratch.
     pub fn record_final_message(&self, message: impl Into<String>) {
         self.contributions().final_message = Some(message.into());
+    }
+
+    /// Record that this command runs an automation execution.
+    pub fn record_automation(&self) {
+        self.contributions().automation = true;
+    }
+
+    /// Record the frozen automation assurance of the finished execution.
+    pub fn record_automation_result(
+        &self,
+        result: &crate::data::automation_records::CommandAutomationResult,
+    ) {
+        let mut contributions = self.contributions();
+        contributions.automation = true;
+        contributions.automation_result = Some(result.clone());
     }
 
     /// Record the pull request a teardown step opened (WI 0137 §1).
@@ -250,8 +271,14 @@ impl CommandLogWriter {
     pub fn append_terminal(
         paths: &ApiPaths,
         command: &crate::data::fs::api_db::CommandRecord,
+        store: &crate::data::fs::api_db::SqliteSessionStore,
         payload: crate::data::execution_event::EventPayload,
     ) -> Result<(), DataError> {
+        Self::recover_lifecycle(
+            paths,
+            command,
+            &crate::data::automation_store::AutomationStore::from_store(store),
+        )?;
         use crate::data::execution_event::{EventPayload, ExecutionEvent};
         use std::io::{BufRead, Read, Seek, Write};
         paths.prepare_command_dir(&command.session_id, &command.id)?;
@@ -334,6 +361,120 @@ impl CommandLogWriter {
         })
     }
 
+    /// Fallible lifecycle append; the caller owns ordering and its deadline.
+    pub async fn try_write_event(&mut self, event: &ExecutionEvent) -> std::io::Result<()> {
+        let json = serde_json::to_string(event)?;
+        self.events_file
+            .write_all(format!("{json}\n").as_bytes())
+            .await?;
+        if let Some(text) = event.payload.to_plain_text() {
+            self.output_file
+                .write_all(format!("{text}\n").as_bytes())
+                .await?;
+        }
+        Ok(())
+    }
+    pub async fn try_flush(&mut self) -> std::io::Result<()> {
+        self.events_file.flush().await?;
+        self.output_file.flush().await
+    }
+    /// Repair only the owning execution's reserved projection, before opening publication.
+    /// Exact cursor/content matches replay harmlessly; conflicting or later final records fail.
+    pub fn recover_lifecycle(
+        paths: &ApiPaths,
+        command: &crate::data::fs::api_db::CommandRecord,
+        store: &crate::data::automation_store::AutomationStore,
+    ) -> Result<(), DataError> {
+        use crate::data::execution_event::EventPayload;
+        use std::io::{Read, Seek, Write};
+        let pending = store
+            .list_recoverable()?
+            .into_iter()
+            .filter(|e| e.command_id.as_str() == command.id && e.pending_events.is_some())
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        paths.prepare_command_dir(&command.session_id, &command.id)?;
+        let path = paths.command_events_log_path(&command.session_id, &command.id);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&path)
+            .map_err(|e| DataError::io(&path, e))?;
+        for execution in pending {
+            let batch = execution.pending_events.expect("filtered batch");
+            // Scan by byte lines: a crash may tear the last UTF-8 scalar as
+            // well as JSON. Keep only matches for this bounded projection.
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(
+                std::fs::File::open(&path).map_err(|e| DataError::io(&path, e))?,
+            );
+            let mut found = std::collections::HashSet::new();
+            let mut latest = None;
+            let mut finalized = false;
+            for line in reader.split(b'\n') {
+                let line = line.map_err(|e| DataError::io(&path, e))?;
+                let Ok(saved) = serde_json::from_slice::<ExecutionEvent>(&line) else {
+                    continue;
+                };
+                latest = Some(latest.map_or(
+                    saved.cursor(),
+                    |cursor: crate::data::execution_event::EventCursor| cursor.max(saved.cursor()),
+                ));
+                finalized |= saved.attempt == execution.attempt
+                    && matches!(
+                        saved.payload,
+                        EventPayload::CommandStatus { .. } | EventPayload::Done
+                    );
+                if let Some(expected) = batch.iter().find(|event| event.cursor() == saved.cursor())
+                {
+                    if serde_json::to_value(&saved).ok() != serde_json::to_value(expected).ok() {
+                        return Err(DataError::Other("conflicting lifecycle cursor".into()));
+                    }
+                    found.insert(saved.cursor());
+                }
+            }
+            for event in &batch {
+                if !found.contains(&event.cursor()) {
+                    if latest.is_some_and(|cursor| cursor >= event.cursor()) || finalized {
+                        return Err(DataError::Other(
+                            "lifecycle event follows finalization or unflushed cursor".into(),
+                        ));
+                    }
+                    if file.metadata().map_err(|e| DataError::io(&path, e))?.len() > 0 {
+                        let mut tail =
+                            std::fs::File::open(&path).map_err(|e| DataError::io(&path, e))?;
+                        tail.seek(SeekFrom::End(-1))
+                            .map_err(|e| DataError::io(&path, e))?;
+                        let mut byte = [0];
+                        tail.read_exact(&mut byte)
+                            .map_err(|e| DataError::io(&path, e))?;
+                        if byte[0] != b'\n' {
+                            file.write_all(b"\n").map_err(|e| DataError::io(&path, e))?;
+                        }
+                    }
+                    let encoded = serde_json::to_vec(event)
+                        .map_err(|_| DataError::Other("invalid lifecycle event".into()))?;
+                    file.write_all(&encoded)
+                        .and_then(|_| file.write_all(b"\n"))
+                        .map_err(|e| DataError::io(&path, e))?;
+                    latest = Some(event.cursor());
+                }
+            }
+            file.flush()
+                .and_then(|_| file.sync_data())
+                .map_err(|e| DataError::io(&path, e))?;
+            store.clear_pending_events(
+                &execution.execution_id,
+                execution
+                    .pending_event_cursor
+                    .ok_or_else(|| DataError::Other("missing lifecycle cursor".into()))?,
+            )?;
+        }
+        Ok(())
+    }
     /// Append one event: its JSON line to `events.log`, and — when the payload
     /// has a plain-text rendering — that text to `output.log`. Write errors are
     /// swallowed (best-effort logging), matching the previous inline behavior.

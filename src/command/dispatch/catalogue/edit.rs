@@ -117,7 +117,7 @@ const EDIT_FLAGS: &[FlagSpec] = &[
         long: "agent-flag",
         short: None,
         help: "Pass a flag to the agent (replaces configured agent flags).",
-        kind: FlagKind::VecString,
+        kind: FlagKind::AgentArg,
         default: FlagDefault::EmptyVec,
         frontends: FrontendVisibility::All,
         conflicts_with: &[],
@@ -158,7 +158,7 @@ pub(super) const EDIT: CommandSpec = CommandSpec {
     long_help: None,
     arguments: &[],
     flags: &[],
-    api_allowed: false,
+    api_availability: ApiAvailability::Disabled,
     build: crate::command::dispatch::build::unsupported,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
@@ -181,7 +181,7 @@ const EDIT_SPEC: CommandSpec = CommandSpec {
         optional: false,
     }],
     flags: EDIT_FLAGS,
-    api_allowed: false,
+    api_availability: ApiAvailability::Disabled,
     build: crate::command::dispatch::build::edit,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
@@ -206,7 +206,7 @@ macro_rules! edit_artifact {
                 optional: false,
             }],
             flags: EDIT_ARTIFACT_FLAGS,
-            api_allowed: false,
+            api_availability: ApiAvailability::Disabled,
             build: crate::command::dispatch::build::edit,
             gateway_need: GatewayNeed::None,
             requires_container_tier: false,
@@ -274,7 +274,7 @@ mod tests {
                 .unwrap();
             assert_eq!(parsed.argument("ref").as_deref(), Some("target"));
             assert_eq!(parsed.flag_bool("yolo"), Some(true));
-            assert!(!spec.api_allowed);
+            assert!(!spec.api_availability.is_standard());
             assert!(spec.relay_allowed && spec.requires_runtime);
         }
         assert!(

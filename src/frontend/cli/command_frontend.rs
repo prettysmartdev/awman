@@ -37,8 +37,10 @@ use crate::command::headless::HeadlessDefaults;
 /// in `src/frontend/cli/per_command/`.
 pub struct CliFrontend {
     pub(crate) worker_json: bool,
+    pub(crate) agent_stuck_timeout: std::time::Duration,
     pub(crate) worker_events: Option<crate::command::worker::events::ForegroundRecorder>,
     pub(crate) matches: ArgMatches,
+    parsed_tail: Option<crate::command::dispatch::projections::raw_args::ParsedArgs>,
     /// Cached canonical command path (resolved via `command_path_from_matches`).
     pub(crate) command_path: Vec<String>,
     pub(crate) messages: CliUserMessageQueue,
@@ -346,6 +348,18 @@ impl Drop for RawModeGuard {
 }
 
 impl CliFrontend {
+    pub fn with_argv(mut self, argv: &[String]) -> Result<Self, CommandError> {
+        self.parsed_tail = CommandCatalogue::get().parse_cli_tail(argv)?;
+        if self.parsed_tail.is_none() && self.command_path.as_slice() == ["exec", "prompt"] {
+            return Err(CommandError::InvalidArgumentValue {
+                command: self.command_path.iter().map(|part| (*part).to_string()).collect(),
+                argument: "prompt".into(),
+                reason: "could not safely reconstruct the prompt arguments from argv; place awman flags before the prompt and use `--` before literal prompt text".into(),
+            });
+        }
+        Ok(self)
+    }
+
     /// Render a completion returned by `Dispatch::run_relayed` using the
     /// builtin CLI outcome renderers and the engine's process exit code.
     pub fn render_relay_result(
@@ -445,9 +459,11 @@ impl CliFrontend {
             ResolvedFlags::is_headless(explicit_flag, super::output::stdin_is_tty());
         Self {
             matches,
+            parsed_tail: None,
             command_path,
             worker_events: None,
             worker_json: false,
+            agent_stuck_timeout: crate::engine::container::timing::DEFAULT_STUCK_TIMEOUT,
             messages: CliUserMessageQueue::new(),
             non_interactive,
             headless: HeadlessDefaults::cli(),
@@ -630,6 +646,9 @@ impl UserMessageSink for CliFrontend {
 // ─── CommandFrontend ───────────────────────────────────────────────────────
 
 impl CommandFrontend for CliFrontend {
+    fn set_agent_stuck_timeout(&mut self, timeout: std::time::Duration) {
+        self.agent_stuck_timeout = timeout;
+    }
     fn pick_queue_item(
         &mut self,
         items: &[crate::command::daemon_api::worker_pull::QueueRow],
@@ -764,8 +783,26 @@ impl CommandFrontend for CliFrontend {
     }
 
     fn flag_enum(&self, command_path: &[&str], flag: &str) -> Result<Option<String>, CommandError> {
-        // Enum flags are stored as strings in our clap projection.
-        self.flag_string(command_path, flag)
+        // Enum flags are stored as strings in our clap projection. An
+        // optional-valued enum may repeat; the catalogue folds its
+        // occurrences (clap has already applied the missing-value default),
+        // so the rule is the same one the raw-args projection applies.
+        let Some(m) = self.matches_for(command_path) else {
+            return Ok(None);
+        };
+        let occurrences: Vec<&str> = m
+            .get_many::<String>(flag)
+            .map(|values| values.map(String::as_str).collect())
+            .unwrap_or_default();
+        match CommandCatalogue::get()
+            .lookup(command_path)
+            .and_then(|spec| spec.find_flag(flag))
+        {
+            Some(spec) => {
+                spec.resolve_optional_enum(command_path, occurrences.into_iter().map(Some))
+            }
+            None => Ok(occurrences.first().map(|value| (*value).to_string())),
+        }
     }
 
     fn flag_u16(&self, command_path: &[&str], flag: &str) -> Result<Option<u16>, CommandError> {
@@ -786,6 +823,9 @@ impl CommandFrontend for CliFrontend {
         let Some(m) = self.matches_for(command_path) else {
             return Ok(None);
         };
+        if let Some(parsed) = &self.parsed_tail {
+            return Ok(parsed.argument(name));
+        }
         // For trailing-var-args arguments, take the joined string when only
         // a single positional value was provided. For typed positionals,
         // clap stores the single value as a String.
@@ -810,7 +850,14 @@ impl CommandFrontend for CliFrontend {
         Ok(m.get_one::<String>(name).cloned())
     }
 
+    fn literal_tail(&self) -> bool {
+        self.parsed_tail.as_ref().is_some_and(|p| p.literal_tail())
+    }
+
     fn arguments(&self, command_path: &[&str], name: &str) -> Result<Vec<String>, CommandError> {
+        if let Some(parsed) = &self.parsed_tail {
+            return Ok(parsed.arguments(name));
+        }
         let Some(m) = self.matches_for(command_path) else {
             return Ok(Vec::new());
         };

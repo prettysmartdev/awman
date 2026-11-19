@@ -355,3 +355,48 @@ probes or asking again. An unreviewed agent is rejected; an unapproved credentia
 remains unavailable under the unresolved policy. The bounded, noninteractive
 credential freshness recheck immediately before teardown remains separate from
 startup consent and can never widen it.
+
+### Terminal transport and execution records
+
+`data::terminal` owns the single `awman.terminal.v1` codec. The existing endpoint,
+base64 bytes, snapshots, resize, ownership and reconnect behavior remain shared
+by all clients. Guarded `submit_turn` and `close_execution` use typed UUID request
+identities and execution/revision fences. Notifications are `automation_state`
+(flattened snapshot), `turn_accepted`, `turn_result`, `execution_closed`,
+`execution_replaced` and correlated `operation_error`. No legacy codec or
+protocol negotiation is introduced. Browser clients observe these notifications;
+they do not expose guarded mutation methods.
+
+Layer 0 stores execution, turn and dedup records on the existing shared SQLite
+connection. Command records project automation from `active_execution_id` rather
+than keeping a second mutable snapshot. A pending lifecycle projection is bounded
+recovery metadata for the existing event log. Layer 2 supplies already-decided
+state, owns admission and publishes only after commit and acknowledged log flush.
+Layer 1's hub provides deferred finalization and execution-bound producer handles;
+it neither writes records nor decides readiness. An absent automation controller
+refuses guarded requests without writing task bytes.
+
+### Native automation ownership
+
+The shared `ExecutionController` (Layer 2, `command::automation`) is the only owner
+of automation admission, turn reservation, credential-operation state and
+execution lifecycle; it is installed once into `TerminalOperations` by the daemon
+runtime. A pure admission cell derives the status tier (`full` native, `best_effort`
+OSC 7501, `none`) from ordered observations; every tier change invalidates readiness,
+and `--automation=require_full` is re-evaluated under the same lock immediately before
+each delivery and again at writer ingress. Admission order is: owner-local check, dedup
+lookup, current-state checks, validate/encode, reserve turn + dedup + submitting
+snapshot atomically, publish, ingress recheck, one write; delivery is never retried.
+Layer 1 supplies adapters, the native channel reader and OSC decoder, and the hub's
+deferred finalization and execution-bound producer handles; Layer 0 owns the records,
+the SQLite store on the shared connection and the OS execution leases. Headless
+automation reserves exactly one durable turn before the one-shot runs and requires
+identity, a correlated native outcome and exit 0. Recovery runs before generic command
+recovery: an unacknowledged turn becomes `delivery_unknown`, an acknowledged one
+`execution_lost`, and a command is never re-queued.
+
+`chat --automation` is the single sanctioned API-interactivity exception: a
+daemon-owned PTY reachable only by the local owner (see `aspec/uxui/cli.md`). The
+terminal's lifetime belongs to the execution, not to the HTTP request or any viewer.
+Credential-update controller operations and replacement drivers are not part of the
+advertised surface until native consumption is evidenced.

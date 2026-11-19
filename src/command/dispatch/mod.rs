@@ -191,6 +191,14 @@ pub trait CommandFrontend: UserMessageSink + Send + Sync {
 
     fn argument(&self, command_path: &[&str], name: &str) -> Result<Option<String>, CommandError>;
 
+    /// Whether a delimiter preceded the first positional token.
+    fn literal_tail(&self) -> bool {
+        false
+    }
+
+    /// Snapshot the advisory inactivity threshold for this invocation.
+    fn set_agent_stuck_timeout(&mut self, _timeout: std::time::Duration) {}
+
     fn arguments(&self, command_path: &[&str], name: &str) -> Result<Vec<String>, CommandError>;
 }
 
@@ -305,6 +313,7 @@ impl LaunchDisplay {
 // ─── Dispatch ───────────────────────────────────────────────────────────────
 
 pub struct Dispatch<F: CommandFrontend> {
+    profile_owner: bool,
     catalogue: &'static CommandCatalogue,
     frontend: F,
     session: Arc<RwLock<Session>>,
@@ -334,6 +343,7 @@ impl<F: CommandFrontend> Dispatch<F> {
             );
         }
         Self {
+            profile_owner: false,
             catalogue: CommandCatalogue::get(),
             frontend,
             session,
@@ -343,6 +353,12 @@ impl<F: CommandFrontend> Dispatch<F> {
             output_dir: None,
             picked_lease: None,
         }
+    }
+
+    /// Immutable owner-local admission, rechecked when the command builds.
+    pub fn with_profile_owner(mut self, owner: bool) -> Self {
+        self.profile_owner = owner;
+        self
     }
 
     /// Scope values to this invocation's engine bundle, never to its Session.
@@ -515,7 +531,8 @@ impl<F: CommandFrontend> Dispatch<F> {
                 GatewayNeed::None => None,
                 _ => self.squad_gateway.clone(),
             },
-            caller: CallerContext::new(&canonical, self.frontend.kind()),
+            caller: CallerContext::new(&canonical, self.frontend.kind())
+                .with_profile_owner(self.profile_owner),
             cancel: self.cancel.clone(),
             output_dir: self.output_dir.clone(),
             command_secrets: self.engines.command_secrets(),
@@ -567,7 +584,8 @@ impl<F: CommandFrontend> Dispatch<F> {
             session,
             managed_session: self.session.clone(),
             gateway: self.squad_gateway.clone(),
-            caller: CallerContext::new(&canonical, self.frontend.kind()),
+            caller: CallerContext::new(&canonical, self.frontend.kind())
+                .with_profile_owner(self.profile_owner),
             cancel: self.cancel.clone(),
             output_dir: self.output_dir.clone(),
             command_secrets: self.engines.command_secrets(),
@@ -727,6 +745,10 @@ impl<F: DispatchFrontend> Dispatch<F> {
         // forever, which is why the TUI grew an outbox of its own (F-22).
         let mut outcome_guard = UnfinishedCommandGuard::arm(Arc::clone(&session));
 
+        let mut launch_session = session.read().await.clone();
+        self.apply_set_overrides(path, &mut launch_session)?;
+        self.frontend
+            .set_agent_stuck_timeout(launch_session.effective_config().agent_stuck_timeout());
         let result = built.run_with_frontend(self.frontend).await;
 
         {
@@ -878,7 +900,13 @@ impl<F: CommandFrontend> Dispatch<F> {
                     .frontend
                     .flag_string(&refs, flag.long)?
                     .map(ParsedFlag::Str),
-                FlagKind::VecString => {
+                // Read through `flag_enum` so repeats are folded to the one
+                // value; it is forwarded as `--flag=value` below.
+                FlagKind::OptionalEnum { .. } => self
+                    .frontend
+                    .flag_enum(&refs, flag.long)?
+                    .map(ParsedFlag::Str),
+                FlagKind::VecString | FlagKind::AgentArg => {
                     let list = self.frontend.flag_strings(&refs, flag.long)?;
                     (!list.is_empty()).then_some(ParsedFlag::Strings(list))
                 }
@@ -914,8 +942,16 @@ impl<F: CommandFrontend> Dispatch<F> {
             }
         }
         argv.extend(values);
-        // `--` preserves positional values that begin with a dash.
-        argv.push("--".into());
+        // Preserve invocation intent: adding a delimiter would turn an invalid
+        // misplaced option into a literal prompt during relay.
+        if self.frontend.literal_tail()
+            || !spec
+                .arguments
+                .iter()
+                .any(|a| matches!(a.kind, catalogue::ArgumentKind::TrailingVarArgs))
+        {
+            argv.push("--".into());
+        }
         for argument in spec.arguments {
             argv.extend(self.frontend.arguments(&refs, argument.name)?);
         }

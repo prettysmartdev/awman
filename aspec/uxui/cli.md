@@ -193,11 +193,19 @@ The selectors are catalogued for the CLI and TUI only; every other frontend
 refuses them with the standard "not available" error. The workflow command's
 boolean worktree switch is unrelated and keeps its workflow-managed lifecycle.
 
-Flags precede the prompt. The one-shot prompt is a greedy trailing argument,
-so a selector written after the prompt text would become prompt words and the
-session would run un-isolated. That order is refused with an error saying to
-move the selector before the prompt, or to quote the prompt as one argument
-when the words are intended.
+Flags precede the prompt. The shared catalogue parser rejects standalone known
+options in a greedy prompt tail, including global/inherited options, short
+aliases and recognized clusters, and `--name=value` forms. It never scans inside
+a prose argument. A `--` before the first prompt token marks the entire tail
+literal; a later `--` is prompt text and does not disable the guard. This intent
+survives CLI/TUI/API forwarding. Errors use usage exit 2 / API `invalid_request`
+and explain moving options before the prompt or using a pre-prompt `--`.
+Correctly positioned `--agent-flag` consumes one value even if it begins with `-`.
+
+`exec prompt` requires a nonblank task or resolved work-item content in every
+interaction mode, before image preparation or launch. Runtime wait failures are
+command failures (`runtime_wait_failed`, nonzero exit), and known provider
+nonzero exit codes are preserved, including when cancellation races completion.
 
 Host Git that contacts a remote for these selectors refuses repository-scoped
 (local or worktree) configuration that selects a transport program, proxy,
@@ -293,10 +301,26 @@ belongs to rather than inventing a new code.
   visibility across them is catalogue data, not a frontend-side branch —
   see the visibility field on each catalogue entry and its projection into
   `docs/14-command-reference.md`.
-- An interactive or PTY-bound command is excluded from the API frontend as
-  long-term policy: an HTTP request cannot safely own a PTY's terminal
-  lifecycle for the duration of the command. This exclusion is expressed
-  once, at the catalogue entry, never re-derived per frontend.
+- Each command's API availability is a catalogue value (`ApiAvailability`), never
+  a frontend-side branch: `Disabled`, `Standard`, `LocalOwner` (authenticated
+  owner on the local listener only) and `LocalAutomationTerminal`. Long-term
+  policy still excludes request-owned PTYs: an HTTP request cannot safely own a
+  PTY's terminal lifecycle for the duration of the command, so an interactive
+  or PTY-bound command stays `Disabled` for the API.
+- **Narrow exception — `chat --automation`.** `chat` is `LocalAutomationTerminal`.
+  It is reachable through the daemon command API only for the authenticated
+  owner on the local listener, only with `--automation`, `--settings-profile`
+  and effective interactive mode (admission fails `invalid_request` otherwise,
+  `forbidden` for any other principal or listener, including forwarded, network,
+  browser and relay origins; the owner/listener check is re-run when a queued
+  command starts). The PTY is owned by the daemon's execution, not by the HTTP
+  request: it outlives viewers and is driven through the single terminal
+  protocol with ownership, revision and idempotency fences. All other
+  interactive and PTY-bound commands (`squad attach`, `chat` without
+  `--automation`, and so on) remain excluded. `agents profile list|delete|close`
+  are `LocalOwner`; `exec prompt` and `exec workflow` remain `Standard` but their
+  `--settings-profile`, `--agent-session` and `--automation` flags are owner-local
+  and excluded from `remote exec`.
 - Where the same decision is available from more than one frontend, its
   label, default, and behavior are identical — verified by parity tests
   that assert against the catalogue and the shared prompt/dialog data, not
@@ -490,3 +514,80 @@ flags. The builtin runtime rejects ambient `MSB_PATH`,
 `MSB_VOLUMES_DIR`, `MSB_SNAPSHOTS_DIR`, `MSB_LOGS_DIR`, or `MSB_SECRETS_DIR`
 overrides instead of loading an installed runtime.
 
+
+
+## Native modes, preparation and automation options
+
+- **Starting mode and filesystem access are separate options.** `--plan`
+  selects only the agent's native starting mode (all eight first-party agents
+  declare a mapping: Claude `--permission-mode plan`; Codex `--sandbox read-only`;
+  OpenCode 1.x `--agent plan`; OpenCode 2.x a private `default_agent` setting
+  interactively and `--agent plan` headlessly; Cursor `--mode plan`; Copilot
+  `--plan`; Cline `--plan`; Antigravity `--mode plan`). `--read-only-workspace`
+  (on `chat`, `exec prompt`, `exec workflow`) selects only a read-only workspace
+  mount. Neither reads the other's input; all four combinations are valid, and
+  awman adds no mode lock, so provider mode transitions in the same container
+  stay available. An explicit `--plan` conflicts with explicit `--auto` and
+  `--yolo`; an inherited yolo/auto level is suppressed with a notice.
+  A route that cannot deliver the mode (custom agent without a `[modes]`
+  delivery, an ACP agent that cannot select a mode, a sandbox kit that cannot
+  carry it) is refused with `native_capability_unavailable` before image setup;
+  a contradictory provider selector in `--agent-flag`, `agents.flags` or mounted
+  configuration is `agent_mode_conflict` (usage error).
+- **`ready --prepare-only`** selects image-only preparation: runtime and
+  definition-trust checks, image inspect/build/import and registry auth remain;
+  the host agent ping, credential-health read, refresh and audit never run, so
+  authentication is reported `not_checked`. It conflicts with `--refresh` and
+  composes with `--agent`, `--build`, `--no-cache`, `--headless` and `--json`
+  (`preparation_policy`, `images_ready`, `authentication` in the result). The
+  security spec's host-ping exception does not apply to it.
+- **`--settings-profile NAME`, `--agent-session ID`, `--automation[=auto|require_full]`**
+  are explicit invocation intent with no global default. NAME is a validated
+  name, never a path. `--agent-session` and `--automation` require
+  `--settings-profile`; `--agent-session` is not an awman session ID and never
+  selects "latest". `--automation` is a catalogue enum with an optional value
+  and missing-value default `auto`; an explicit value uses `=` only (a following
+  token is never consumed), unknown/empty/conflicting values fail before
+  preparation, and the result reports `flags_applied.automation` as
+  `auto|require_full|null`. Optional-valued enums are a catalogue feature
+  (`FlagKind::OptionalEnum`) shared by CLI, TUI and API parsing, not clap-only.
+  `chat --automation` starts an idle terminal and rejects headless;
+  `exec prompt` always needs a nonblank task, including with
+  `--automation --interactive`, and refuses an empty one (exit 2) with a hint to
+  use `chat --automation`.
+- **Admission and ready semantics.** `--automation=require_full` snapshots
+  `minimum_status_support = full` and is checked under the execution lock
+  immediately before each automated task delivery, never against a cached
+  answer; it is an admission guarantee, not a completion guarantee.
+  Version metadata never gates launch (only a confirmed wrong OpenCode major
+  does). Readiness for a task comes from the agent's actual native interfaces
+  or OSC reports; `status_support_insufficient`, `startup_timeout` and
+  `agent_not_ready` describe refusals, and an uncertain delivery is never
+  retried.
+- **Timeouts** are config keys, not flags: `agents.automation.startupTimeout`
+  (120s), `cancelTimeout` (10s) and `outputDrainTimeout` (5s, at most the cancel
+  timeout), each 1s–1h, snapshotted at launch. `agents.stuckTimeout` stays advisory.
+- **Credential updates.** Each agent's credential has one refresh owner; awman
+  never starts a second refresher. Live replacement and restart-based rotation are
+  discoverable per agent through the capability declarations and are advertised
+  only when implemented and evidenced; currently neither is advertised and a
+  restart request is refused before the agent is stopped.
+### Named private agent settings and native resume
+
+`chat` and `exec prompt` accept `--settings-profile NAME` and `--agent-session ID`.
+`exec workflow` accepts `--settings-profile NAME`, overridden by a step's
+`settings_profile`. Names bind to the invoking repository and provider; selection
+alone does not resume. The exact native ID requires a selected profile, its
+manifest record and retained provider history. No `--native-session` alias exists.
+Provider resume argv uses the definition's route selector and the shared argv
+builder. Command projections report `settings_profile` and `agent_session`,
+independently of the awman `session_id`.
+
+`agents profile list [--agent NAME] [--json]`, `delete NAME --agent NAME --yes
+[--json]`, and `close NAME --agent NAME [--json]` are local data operations with
+no image requirement. Daemon use requires the authenticated owner on the local
+listener, rechecked on queued execution; network, browser and relay callers are
+refused. Listing exposes state and counts, never native IDs, host paths or history.
+Deletion requires inactive state under the lease. Close is idempotent for inactive
+profiles; it cannot displace a live awman lease. Runtime uncertainty preserves
+closing state, blocking both deletion and another writer.

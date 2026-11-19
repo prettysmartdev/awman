@@ -13,33 +13,39 @@ use crate::frontend::cli::command_frontend::CliFrontend;
 
 impl HasAgentFrontend for CliFrontend {
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
-        if self.worker_events.is_some() {
-            let io = self.take_non_interactive_io();
-            return crate::command::worker::events::recording_frontend(
+        let inner = (|| {
+            if self.worker_events.is_some() {
+                let io = self.take_non_interactive_io();
+                return crate::command::worker::events::recording_frontend(
+                    Box::new(
+                        super::container_frontend_marker::CliInteractiveContainerProxy {
+                            container_io: Some(io),
+                        },
+                    ),
+                    self.worker_events.clone(),
+                );
+            }
+            Box::new(super::container_frontend_marker::CliContainerProxy)
+        })();
+        crate::engine::agent_runtime::frontend::with_stuck_timeout(inner, self.agent_stuck_timeout)
+    }
+
+    fn container_frontend_for_pty(&mut self) -> Box<dyn AgentFrontend> {
+        let inner = (|| {
+            if self.non_interactive {
+                return self.container_frontend();
+            }
+            let io = self.take_interactive_io();
+            crate::command::worker::events::recording_frontend(
                 Box::new(
                     super::container_frontend_marker::CliInteractiveContainerProxy {
                         container_io: Some(io),
                     },
                 ),
                 self.worker_events.clone(),
-            );
-        }
-        Box::new(super::container_frontend_marker::CliContainerProxy)
-    }
-
-    fn container_frontend_for_pty(&mut self) -> Box<dyn AgentFrontend> {
-        if self.non_interactive {
-            return self.container_frontend();
-        }
-        let io = self.take_interactive_io();
-        crate::command::worker::events::recording_frontend(
-            Box::new(
-                super::container_frontend_marker::CliInteractiveContainerProxy {
-                    container_io: Some(io),
-                },
-            ),
-            self.worker_events.clone(),
-        )
+            )
+        })();
+        crate::engine::agent_runtime::frontend::with_stuck_timeout(inner, self.agent_stuck_timeout)
     }
 }
 

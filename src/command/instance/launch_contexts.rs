@@ -26,6 +26,7 @@ pub struct LaunchContextRegistry {
     file: Option<PathBuf>,
     metadata: LaunchContextFile,
     env: HashMap<LaunchContextId, EnvSnapshot>,
+    revisions: HashMap<LaunchContextId, u64>,
     fallback: EnvSnapshot,
     load_error: Option<String>,
 }
@@ -35,6 +36,7 @@ impl Default for LaunchContextRegistry {
             file: None,
             metadata: Default::default(),
             env: HashMap::new(),
+            revisions: HashMap::new(),
             fallback: EnvSnapshot::empty(),
             load_error: None,
         }
@@ -49,6 +51,7 @@ impl LaunchContextRegistry {
             load_error: loaded.as_ref().err().map(ToString::to_string),
             metadata: loaded.unwrap_or_default(),
             env: HashMap::new(),
+            revisions: HashMap::new(),
         }
     }
     fn check(&self) -> Result<(), ContextError> {
@@ -138,6 +141,7 @@ impl LaunchContextRegistry {
         metadata.contexts.push(record.clone());
         self.save(&metadata)?;
         self.metadata = metadata;
+        self.revisions.insert(record.id.clone(), 1);
         self.env.insert(
             record.id.clone(),
             EnvSnapshot::from_instance_env(
@@ -163,10 +167,15 @@ impl LaunchContextRegistry {
         if canonical_directory(&input.root).ok().as_ref() != Some(&c.root) {
             return Err(err("invalid_request", "run refresh from the context root"));
         }
+        let revision = crate::data::automation_records::next_counter(
+            self.revisions.get(id).copied().unwrap_or(0),
+        )
+        .map_err(|_| err("invalid_request", "source revision exhausted"))?;
         c.refreshed_at = chrono::Utc::now();
         let root = c.root.clone();
         self.save(&metadata)?;
         self.metadata = metadata;
+        self.revisions.insert(id.clone(), revision);
         self.env.insert(
             id.clone(),
             EnvSnapshot::from_instance_env(
@@ -188,7 +197,40 @@ impl LaunchContextRegistry {
         self.save(&metadata)?;
         self.metadata = metadata;
         self.env.remove(id);
+        self.revisions.remove(id);
         Ok(())
+    }
+    pub fn reread_credentials(
+        &self,
+        source: &LaunchCredentialSource,
+    ) -> Result<(u64, crate::data::secret::CommandSecrets), ContextError> {
+        self.check()?;
+        let snapshot = self
+            .env
+            .get(&source.context_id)
+            .ok_or_else(|| err("credentials_lost", "source environment lost"))?;
+        let revision = *self
+            .revisions
+            .get(&source.context_id)
+            .ok_or_else(|| err("credentials_lost", "source environment lost"))?;
+        let entries = source
+            .secret_names
+            .iter()
+            .map(|name| {
+                snapshot
+                    .get(name.as_str())
+                    .map(|s| {
+                        (
+                            name.as_str().to_owned(),
+                            crate::data::secret::SecretString::new(s),
+                        )
+                    })
+                    .ok_or_else(|| err("credential_update_failed", "source unavailable"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let secrets = crate::data::secret::CommandSecrets::new(entries)
+            .map_err(|_| err("invalid_secrets", "source material invalid"))?;
+        Ok((revision, secrets))
     }
     pub fn resolve_env(&self, id: &LaunchContextId) -> Result<(EnvSnapshot, bool), ContextError> {
         self.check()?;

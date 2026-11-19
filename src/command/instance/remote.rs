@@ -2396,6 +2396,7 @@ async fn subscribe_terminal(
     let options = TerminalClientOptions::default();
     let mut delay = RECONNECT_BACKOFF_INITIAL;
     let mut lost_at: Option<Instant> = None;
+    let mut had_terminal_output = false;
     loop {
         let mut stream = tokio::select! {
             _ = cancel.cancelled() => return,
@@ -2426,11 +2427,16 @@ async fn subscribe_terminal(
                         // A pristine hub screen is metadata, not agent output.
                         // Feeding its ANSI redraw into the presenter would
                         // open a container overlay for commands with no PTY.
-                        if has_output && !output.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).send_live(screen) {
+                        // Once this slot displayed output, even an empty fresh
+                        // snapshot is authoritative after rebind or reconnect.
+                        let redraw = has_output || had_terminal_output;
+                        had_terminal_output |= has_output;
+                        if redraw && !output.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).send_live(screen) {
                             return;
                         }
                     }
                     Ok(Some(TerminalFrame::Output { bytes })) => {
+                        had_terminal_output = true;
                         if !output.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).send_live(bytes) {
                             return;
                         }
@@ -2439,7 +2445,8 @@ async fn subscribe_terminal(
                     Ok(Some(TerminalFrame::Error { code, error })) => {
                         tracing::debug!(terminal = %terminal_id, code, "slot terminal refused an operation: {error}");
                     }
-                    Ok(Some(TerminalFrame::Resize { .. } | TerminalFrame::Lagged)) => {}
+                    Ok(Some(TerminalFrame::ExecutionReplaced { .. })) => {}
+                    Ok(Some(TerminalFrame::Resize { .. } | TerminalFrame::Lagged | TerminalFrame::AutomationState { .. } | TerminalFrame::TurnAccepted { .. } | TerminalFrame::TurnResult { .. } | TerminalFrame::ExecutionClosed { .. } | TerminalFrame::CredentialUpdateState { .. } | TerminalFrame::OperationError { .. })) => {}
                     Ok(None) | Err(_) => break,
                 },
                 bytes = pipes.stdin_rx.recv() => match bytes {

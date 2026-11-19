@@ -52,7 +52,7 @@ pub(super) const LINK: CommandSpec = CommandSpec {
         },
     ],
     subcommands: &[],
-    api_allowed: false,
+    api_availability: ApiAvailability::Disabled,
     build: crate::command::dispatch::build::link,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,

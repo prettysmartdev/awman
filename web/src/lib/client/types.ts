@@ -228,6 +228,7 @@ export interface ErrorWire {
 
 // Rust: data::frontend_protocol::CommandResultWire
 export interface CommandResultWire {
+  automation?: CommandAutomationResult;
   exit_code: number;
   outcome: JsonValue | null;
   error: ErrorWire | null;
@@ -1016,8 +1017,67 @@ export type DialogAnswerOutcome =
 
 /* ─────────────────────────────── awman.terminal.v1 ─────────────────────────── */
 
+
+export type StatusSupport = 'full' | 'best_effort' | 'none';
+export type StatusSource = 'native' | 'osc7501' | 'none';
+export type AutomationState = 'starting' | 'unknown' | 'ready' | 'submitting' | 'working' | 'blocked_auth' | 'blocked_permission' | 'blocked_input' | 'credential_updating' | 'restarting' | 'stopping' | 'ended';
+export interface AutomationCapabilities {
+  agent: string; runtime: string; provider_version: string | null; image_digest: string | null;
+  minimum_version: string | null; version_warning: string | null; evidence: 'declaration' | 'probe' | 'observed' | 'none';
+  native_plan: { interactive: boolean | null; headless: boolean | null; acp: boolean | null; kind: 'plan' | 'read_only' | 'custom' | null };
+  headless_turns: { supported: boolean | null; reason: string | null };
+  terminal_turns: { supported: boolean | null; status_support: StatusSupport | null; sources: ('native' | 'osc7501')[]; reason: string | null };
+  native_resume: { interactive: boolean | null; headless: boolean | null; reason: string | null };
+  settings_profiles: boolean;
+  credential_updates: { routes: CredentialUpdateRoute[] };
+}
+export interface CredentialUpdateRoute {
+  credential_kind: 'api_key' | 'oauth_access_token' | 'github_token' | 'provider_managed' | 'unknown'; delivery: 'env' | 'file' | 'helper' | 'native_store' | 'unknown'; model_provider: string | null;
+  live_update: boolean | null; restart_supported: boolean | null; refresh_owner: 'awman' | 'provider' | 'caller' | 'none';
+  update_boundary: 'immediate' | 'next_request' | 'idle' | null; max_apply_delay: number | null;
+  restart_scope: 'process' | 'execution' | null; conversation_continuity: 'native_resume' | 'new_session_required' | null; reason: string | null;
+}
+export interface AutomationSnapshot {
+  execution_id: string; provider: string; provider_version: string | null; native_session_id: string | null;
+  automation_mode: 'auto' | 'require_full'; minimum_status_support: 'full' | 'best_effort'; state: AutomationState;
+  revision: number; active_turn_id: string | null; native_start_mode: 'default' | 'plan' | 'read_only' | 'custom';
+  workspace_access: 'read_write' | 'read_only'; status_support: StatusSupport; status_source: StatusSource;
+  status_reason: string | null; capabilities: AutomationCapabilities;
+}
+export interface TurnResult {
+  status: 'completed' | 'completed_unverified' | 'failed' | 'cancelled' | 'delivery_unknown'; status_support: StatusSupport;
+  readiness_source: 'native' | 'osc7501'; completion_source: StatusSource; completion_verified: boolean;
+  native_turn_id: string | null; final_message: string | null; output_status: 'complete' | 'incomplete';
+  failure: { code: string; message: string } | null;
+}
+export interface CommandAutomationResult {
+  execution_id: string; native_session_id: string | null; last_turn_id: string | null;
+  native_start_mode: AutomationSnapshot['native_start_mode']; workspace_access: AutomationSnapshot['workspace_access'];
+  status_support: StatusSupport; completion_verified: boolean; output_status: 'complete' | 'incomplete'; cleanup_status: 'complete' | 'pending' | 'failed';
+}
+export interface TurnRecord {
+  request_id: string; turn_id: string; execution_id: string; command_id: string; attempt: number; ordinal: number;
+  native_session_id: string | null; native_turn_id: string | null; accepted_at: string; started_at: string | null; completed_at: string | null;
+  accepted_revision: number; status_support: StatusSupport; status_source: StatusSource; result: TurnResult | null;
+}
+/** Stored command completion, shared by execution_closed and the command route. */
+export interface CommandResult {
+  exit_code: number | null; automation?: CommandAutomationResult; outcome?: 'done' | 'paused' | 'aborted' | 'error' | 'cancelled';
+  failure?: { stage: string; code: string; message: string; step?: string }; final_message?: string;
+  [key: string]: unknown;
+}
+export type TerminalAutomationFrame =
+  | ({ type: 'automation_state' } & AutomationSnapshot)
+  | { type: 'turn_accepted'; request_id: string; execution_id: string; turn_id: string; status_support: StatusSupport; status_source: StatusSource }
+  | { type: 'turn_result'; request_id: string; execution_id: string; turn_id: string; result: TurnResult }
+  | { type: 'execution_closed'; request_id: string; execution_id: string; result: CommandResult }
+  | { type: 'credential_update_state'; snapshot: CredentialUpdateState }
+  | { type: 'execution_replaced'; request_id: string; previous_execution_id: string; execution_id: string; credential_generation: number }
+  | { type: 'operation_error'; request_id: string; code: string; error: string };
+
 // Rust: data::terminal::TerminalFrame (tag = "type") — server → client, JSON text messages
 export type TerminalFrame =
+  | TerminalAutomationFrame
   /** A refused client frame (`input_not_allowed`, `control_held`, `input_backpressure`, `conflict`, `invalid_request`…); socket stays open. */
   | { type: 'error'; code: string; error: string }
   /** On connect and after `lagged`. `screen` = ANSI that redraws the screen (base64). `has_output` defaults to true when absent. */
@@ -1040,7 +1100,9 @@ export type TerminalClientFrame =
   | { type: 'resize'; cols: number; rows: number }
   /** Request the exclusive input grant. Success is silent; refusal is an `error` frame. */
   | { type: 'take_control' }
-  | { type: 'detached'; reason: TerminalDetachReason };
+  | { type: 'detached'; reason: TerminalDetachReason }
+  | { type: 'submit_turn'; request_id: string; execution_id: string; expected_revision: number; prompt: string }
+  | { type: 'close_execution'; request_id: string; execution_id: string; expected_revision: number };
 
 export type TerminalClientFrameType = TerminalClientFrame['type'];
 
@@ -1055,6 +1117,8 @@ export type EventSourcePhase = 'leader' | 'setup' | 'main' | 'teardown' | 'merge
 
 // Rust: data::execution_event::EventSource
 export interface EventSource {
+  execution_id?: string;
+  turn_id?: string;
   phase: EventSourcePhase;
   step_name?: string;
   step_index?: number;
@@ -1064,6 +1128,8 @@ export interface EventSource {
 
 // Rust: data::terminal::TerminalRecord — `GET /v1/terminals[?owner_id=]` items, `GET /v1/terminals/{id}`
 export interface TerminalRecord {
+  credential_updates?: EffectiveCredentialUpdates | null;
+  automation?: AutomationSnapshot;
   id: TerminalId;
   /** TerminalOwner as its prefixed id: cmd_… | tab_… | lease_… | run_… */
   owner_id: string;
@@ -1680,8 +1746,8 @@ export const DETACH_REASONS = [
   'protocol_error',
 ] as const;
 
-export const TERMINAL_FRAME_TYPES = ['error', 'snapshot', 'output', 'resize', 'exit', 'lagged'] as const;
-export const TERMINAL_CLIENT_FRAME_TYPES = ['input', 'resize', 'take_control', 'detached'] as const;
+export const TERMINAL_FRAME_TYPES = ['error', 'snapshot', 'output', 'resize', 'exit', 'lagged', 'automation_state', 'turn_accepted', 'turn_result', 'execution_closed', 'execution_replaced', 'credential_update_state', 'operation_error'] as const;
+export const TERMINAL_CLIENT_FRAME_TYPES = ['input', 'resize', 'take_control', 'detached', 'submit_turn', 'close_execution'] as const;
 
 /* Compile-time guarantees that the runtime lists match the unions exactly. */
 type SameSet<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
@@ -1697,3 +1763,29 @@ export type _TagListChecks = [
   Assert<SameSet<(typeof TERMINAL_FRAME_TYPES)[number], TerminalFrameType>>,
   Assert<SameSet<(typeof TERMINAL_CLIENT_FRAME_TYPES)[number], TerminalClientFrameType>>,
 ];
+
+export interface CredentialUpdateState { execution_id: string; revision: number; generations: { credential_generation: number; pending_generation: number | null; generation_state: 'confirmed' | 'unknown'; refresh_owner: 'awman' | 'provider' | 'caller' | 'none'; status: 'pending' | 'applying' | 'restarting' | 'applied' | 'failed' | null }[] }
+
+export interface CredentialUpdateOperation {
+  request_id: string; command_id: string; credential_slot: string;
+  status: 'pending' | 'applying' | 'restarting' | 'applied' | 'failed';
+  method: 'live' | 'restart' | 'unavailable' | 'unknown';
+  old_execution_id: string; new_execution_id: string | null;
+  old_generation: number; new_generation: number; pending_generation: number | null;
+  credential_generation: number; generation_state: 'confirmed' | 'unknown';
+  refresh_owner: 'awman' | 'provider' | 'caller' | 'none';
+  conversation_continuity: 'native_resume' | 'new_session_required' | null;
+  restart_scope: 'process' | 'execution' | null;
+  reason: string | null; failure: { code: string; message: string } | null;
+  created_at: string; apply_deadline: string; completed_at: string | null;
+}
+export interface EffectiveCredentialUpdates {
+  execution_id: string; revision: number;
+  slots: { route: CredentialUpdateRoute; update_method: CredentialUpdateOperation['method'];
+    credential_slot: string; secret_names: string[]; credential_generation: number;
+    pending_generation: number | null; generation_state: 'confirmed' | 'unknown';
+    admission_while_pending: boolean;
+    available_operation: { operation: string; replacement_secrets: boolean; reread_source: boolean } | null;
+    latest_update: CredentialUpdateOperation | null;
+    identity_continuity: 'verified' | 'unverified' | 'unknown'; }[];
+}

@@ -23,13 +23,15 @@ pub const AGENT_VERSION_PROBE_SCRIPT: &str =
 pub enum CliVersionStatus {
     /// The adapter's required major matched; minor and patch versions are unrestricted.
     Compatible { version: String },
-    /// Wrong major, unparsable output, or the binary is missing.
+    /// A confirmed breaking-major mismatch.
     Mismatch { found: String, expected: String },
-    /// The probe could not run (no image, runtime refused, test isolation).
+    /// Missing/unparseable metadata or a failed probe; advisory only.
     Unknown { reason: String },
 }
 
-/// First `\d+\.\d+\.\d+` token in `line` (`opencode v2.3.2` → `2.3.2`).
+/// A version line is accepted only when it is the version itself or starts
+/// with the expected executable name followed by the version. Runtime banners
+/// often contain unrelated semver values and cannot prove the agent version.
 fn semver_token(line: &str) -> Option<(&str, u64)> {
     let bytes = line.as_bytes();
     let mut start = 0;
@@ -67,19 +69,33 @@ pub fn classify_cli_version(
     first_line: &str,
 ) -> CliVersionStatus {
     let trimmed = first_line.trim();
-    match semver_token(trimmed) {
+    let candidate = trimmed
+        .strip_prefix(&requirement.binary)
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .map(str::trim_start)
+        .unwrap_or(trimmed);
+    let candidate = candidate.strip_prefix('v').unwrap_or(candidate);
+    let parsed = semver_token(candidate).filter(|(version, _)| {
+        candidate
+            .get(version.len()..)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(['-', '+']))
+    });
+    match parsed {
         Some((version, major)) if major == requirement.required_major => {
             CliVersionStatus::Compatible {
                 version: version.to_string(),
             }
         }
-        _ => CliVersionStatus::Mismatch {
+        Some(_) => CliVersionStatus::Mismatch {
             found: if trimmed.is_empty() {
                 "nothing".into()
             } else {
                 trimmed.into()
             },
             expected: format!("{} {}.x", requirement.binary, requirement.required_major),
+        },
+        None => CliVersionStatus::Unknown {
+            reason: format!("no parseable version for {}: {trimmed}", requirement.binary),
         },
     }
 }
@@ -236,14 +252,49 @@ mod tests {
     }
 
     #[test]
-    fn missing_garbled_or_wrong_major_output_is_rejected() {
-        for version in ["", "   ", "command not found", "v1.2", "11.0.0", "3.0.0"] {
+    fn only_confirmed_wrong_major_output_is_rejected() {
+        for version in ["11.0.0", "3.0.0"] {
             assert!(
                 matches!(
                     classify_cli_version(&requirement(1), version),
                     CliVersionStatus::Mismatch { .. }
                 ),
                 "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_or_unparseable_versions_are_advisory() {
+        for version in [
+            "",
+            "   ",
+            "command not found",
+            "v1.2",
+            "nightly",
+            "2026-11-18",
+        ] {
+            assert!(matches!(
+                classify_cli_version(&requirement(1), version),
+                CliVersionStatus::Unknown { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn noisy_version_banners_cannot_prove_a_breaking_major() {
+        for banner in [
+            "warning: node 18.19.0 is deprecated",
+            "glibc 2.35.0 detected; opencode is ready",
+            "npm notice: engine 3.0.0 is unsupported",
+            "OpenCode version 3.0.0",
+        ] {
+            assert!(
+                matches!(
+                    classify_cli_version(&requirement(1), banner),
+                    CliVersionStatus::Unknown { .. }
+                ),
+                "{banner}"
             );
         }
     }

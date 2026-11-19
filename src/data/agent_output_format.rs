@@ -15,6 +15,11 @@ pub enum AgentOutputFormat {
     /// Plain text: output lines only, no activity feed, no final message.
     #[default]
     Text,
+    OpenCodeJson,
+    OpenCodeV2Json,
+    CopilotJson,
+    ClineJson,
+    AntigravityStreamJson,
     /// Claude Code's `--output-format stream-json --verbose` NDJSON.
     ClaudeStreamJson,
     /// Codex's `exec --json` NDJSON.
@@ -28,6 +33,11 @@ impl AgentOutputFormat {
     /// `[run] output_format` and shown in logs.
     pub fn as_str(self) -> &'static str {
         match self {
+            AgentOutputFormat::OpenCodeJson => "opencode_json",
+            AgentOutputFormat::OpenCodeV2Json => "opencode_v2_json",
+            AgentOutputFormat::CopilotJson => "copilot_json",
+            AgentOutputFormat::ClineJson => "cline_json",
+            AgentOutputFormat::AntigravityStreamJson => "antigravity_stream_json",
             AgentOutputFormat::Text => "text",
             AgentOutputFormat::ClaudeStreamJson => "claude_stream_json",
             AgentOutputFormat::CodexJson => "codex_json",

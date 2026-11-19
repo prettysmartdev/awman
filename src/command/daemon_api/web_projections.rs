@@ -26,7 +26,9 @@ pub fn catalogue() -> Value {
                 let kind = match f.kind {
                     FlagKind::Bool => "bool",
                     FlagKind::VecString => "vec_string",
+                    FlagKind::AgentArg => "vec_string",
                     FlagKind::Enum(_) => "enum",
+                    FlagKind::OptionalEnum { .. } => "optional_enum",
                     FlagKind::Path | FlagKind::OptionalPath => "path",
                     FlagKind::U16 | FlagKind::UsizeAtLeastOne => "number",
                     _ => "string",
@@ -37,6 +39,11 @@ pub fn catalogue() -> Value {
                 });
                 if let FlagKind::Enum(values) = f.kind {
                     value["values"] = json!(values);
+                }
+                // `--flag` or `--flag=value`; a bare flag means `missing`.
+                if let FlagKind::OptionalEnum { values, missing } = f.kind {
+                    value["values"] = json!(values);
+                    value["missing"] = json!(missing);
                 }
                 value
             })

@@ -119,6 +119,11 @@ typed_id!(LeaseId, "lease", "work lease");
 typed_id!(KeyId, "key", "API key");
 typed_id!(BrowserLinkId, "blk", "browser link");
 typed_id!(BrowserGrantId, "brw", "browser grant");
+// One per actual provider process (WI 0070). A credential restart or a native
+// resume is a new execution under the same command.
+typed_id!(ExecutionId, "exe", "execution");
+// One per user turn submitted to an execution. Never a provider's own turn id.
+typed_id!(TurnId, "turn", "turn");
 
 pub const ID_PREFIXES: &[(&str, &str)] = &[
     ("ses", "worker session"),
@@ -135,7 +140,61 @@ pub const ID_PREFIXES: &[(&str, &str)] = &[
     ("key", "API key"),
     ("blk", "browser link"),
     ("brw", "browser grant"),
+    ("exe", "execution"),
+    ("turn", "turn"),
     // Upgrade tickets are opaque `awt_<43 base64url>` secrets, not typed ids;
     // the prefix is reserved so no resource id can collide with it.
     ("awt", "browser upgrade ticket"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execution_and_turn_ids_use_their_own_prefixes() {
+        let execution = ExecutionId::new();
+        let turn = TurnId::new();
+        assert!(execution.as_str().starts_with("exe_"));
+        assert!(turn.as_str().starts_with("turn_"));
+        assert_eq!(execution.as_str().len(), "exe_".len() + 32);
+        assert_eq!(ExecutionId::parse(execution.as_str()).unwrap(), execution);
+        assert_eq!(TurnId::parse(turn.as_str()).unwrap(), turn);
+
+        // An id of one kind is never accepted as another.
+        assert!(ExecutionId::parse(turn.as_str()).is_err());
+        assert!(TurnId::parse(execution.as_str()).is_err());
+        assert!(ExecutionId::parse(CommandId::new().as_str()).is_err());
+        for bad in [
+            "exe_",
+            "exe_xyz",
+            "exe_ABCDEF0123456789abcdef0123456789",
+            "exe",
+        ] {
+            assert!(ExecutionId::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn execution_and_turn_ids_round_trip_on_the_wire() {
+        let execution = ExecutionId::new();
+        let json = serde_json::to_string(&execution).unwrap();
+        assert_eq!(json, format!("\"{execution}\""));
+        assert_eq!(
+            serde_json::from_str::<ExecutionId>(&json).unwrap(),
+            execution
+        );
+        assert!(serde_json::from_str::<TurnId>(&json).is_err());
+    }
+
+    #[test]
+    fn every_typed_prefix_is_listed_once() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (prefix, _) in ID_PREFIXES {
+            assert!(seen.insert(*prefix), "duplicate id prefix {prefix}");
+        }
+        for prefix in [ExecutionId::PREFIX, TurnId::PREFIX] {
+            assert!(seen.contains(prefix), "{prefix} missing from ID_PREFIXES");
+        }
+    }
+}

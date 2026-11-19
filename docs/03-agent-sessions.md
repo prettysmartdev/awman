@@ -297,7 +297,7 @@ See [Security & Isolation](04-security-and-isolation.md#overlay-mounts) for secu
 
 Append an extra argument to the agent's command for this run. Repeat it for multiple arguments; they are appended in order, after awman's own flags and before the initial prompt. Available on `chat`, `exec prompt`, and `exec workflow`. `remote exec` forwards it to the remote host, where it replaces that host's `agents.flags` entry for the run.
 
-Because the value usually starts with `-`, write it in the `--agent-flag=<value>` form:
+A value may start with `-`: both `--agent-flag --effort` and `--agent-flag=--effort` preserve it as one provider argument. Repeat the flag to pass the value as a separate token:
 
 ```sh
 awman chat --agent codex --agent-flag=--search
@@ -312,7 +312,7 @@ Mount the host Docker socket into the container, giving the agent the ability to
 
 ### `--read-only-workspace`
 
-Use `exec prompt --read-only-workspace` when you want an agent to inspect a
+Use `--read-only-workspace` (on `chat`, `exec prompt` or `exec workflow`) when you want an agent to inspect a
 checkout without changing it. This is useful for running several planning or
 review prompts concurrently against the same checkout: each agent can read the
 same files, while its workspace mount prevents it from creating, changing, or
@@ -377,7 +377,9 @@ awman exec prompt --pr 482 "Fix the failing test"
 awman chat --worktree pr-482
 ```
 
-Put these flags, like every other flag, before the prompt text. `exec prompt` reads everything after the prompt as more prompt, so `awman exec prompt "Fix the failing test" --pr 482` would send `--pr 482` to the agent and run in your checkout. awman refuses that order with an error rather than launching outside the worktree; quote the whole prompt as one argument if those words really belong in it.
+Put awman flags before the prompt text. `awman exec prompt "Fix the failing test" --pr 482` fails with an ordering hint before launch. This applies to known options, short aliases and clusters, and `--name=value` forms, including global options such as `--set`. Prose within one argument, such as `"Explain --model and --headless"`, stays literal. To pass standalone flag-looking tokens as prompt text, put `--` before the first prompt token: `awman exec prompt -- --model`. A `--` after prompt text has started is itself prompt text and does not disable this check.
+
+`exec prompt` requires a nonblank task or `--work-item`, in both interactive and headless modes. Missing task input exits with usage code 2 before image preparation or launch. Provider failures retain their nonzero exit codes; runtime wait failures also fail the command.
 
 Before launch awman prints the worktree path and branch. The session's container mounts that worktree (see [Security & Isolation](04-security-and-isolation.md#session-worktrees)).
 
@@ -418,30 +420,90 @@ Every agent-launching command (`chat`, `exec prompt`, `exec workflow`, and their
 | Level | Flag | The agent… |
 |-------|------|-----------|
 | **Ask** (default) | *(none)* | Prompts before every file edit and shell command |
-| **Plan** | `--plan` | Reads and analyses only — cannot modify files at all |
+| **Plan** | `--plan` | Starts in the agent's native plan or read-only mode; the workspace stays writable unless you add `--read-only-workspace` |
 | **Auto** | `--auto` | Auto-approves file edits and writes; still prompts before shell commands and other high-risk operations |
 | **Yolo** | `--yolo` | Skips every permission prompt and never pauses for confirmation |
 
-When both `--yolo` and `--auto` are passed, `--yolo` wins. `--plan` and `--yolo` together are refused (`plan and yolo modes are mutually exclusive`).
+When both `--yolo` and `--auto` are passed, `--yolo` wins. `--plan` together with an explicit `--yolo` or `--auto` is refused (`plan and yolo modes are mutually exclusive`).
 
-Not every agent implements every level. `--plan` on an agent with no plan mode is refused before launch, so a read-only request never runs with write access. For `--auto` and `--yolo`, awman simply omits the flag where an agent has no equivalent — the session still launches, but at the agent's own default permission level rather than the one you asked for. **Under the container runtimes this is silent**, so check the tables below before relying on a mode. (Under `docker-sbx-experimental` the unsupported combinations are warned about at launch — see [Runtimes](11-runtimes.md#known-limitations).)
+Not every agent implements every level. `--plan` on a custom agent with no native plan delivery is refused before launch, so a plan request never silently runs at the agent's default level. For `--auto` and `--yolo`, awman simply omits the flag where an agent has no equivalent — the session still launches, but at the agent's own default permission level rather than the one you asked for. **Under the container runtimes this is silent**, so check the tables below before relying on a mode. (Under `docker-sbx-experimental` the unsupported combinations are warned about at launch — see [Runtimes](11-runtimes.md#known-limitations).)
 
 ### `--plan`
 
-Start the agent in its planning mode. Each CLI enforces its own planning permissions; use this to explore an approach before implementation.
+Start the agent in its native planning or read-only mode. `--plan` selects only the
+agent's **starting mode**: it adds the agent's own plan selector and nothing else.
+It does not make the workspace read-only (see [`--read-only-workspace`](#--read-only-workspace))
+and awman does not lock the mode — the agent's own mode switch still works, so you
+can plan and then move to implementation in the same container and conversation.
 
-| Agent | Plan mode |
-|-------|-----------|
-| `claude` | `--permission-mode plan` |
-| `codex` | *(no startup plan flag — refused; use `/plan` interactively)* |
-| `opencode` | *(not supported — refused)* |
-| `opencode-v2` | *(not supported — refused)* |
-| `cursor` | *(not supported — refused)* |
-| `antigravity` | `--mode plan` |
-| `copilot` | `--plan` |
-| `cline` | `--plan` |
+All eight built-in agents support `--plan`:
 
-`--plan` can be combined with `--headless`.
+| Agent | Interactive | Headless (`--headless`) | Starting mode |
+|-------|-------------|-------------------------|---------------|
+| `claude` | `--permission-mode plan` | same | Claude plan mode |
+| `codex` | `--sandbox read-only` | `codex exec --sandbox read-only` | Read-only sandbox (Codex has no separate plan mode) |
+| `opencode` | `--agent plan` | `run --agent plan` | OpenCode's `plan` agent |
+| `opencode-v2` | private settings set `default_agent` to `plan` | `run --agent plan` | OpenCode's `plan` agent |
+| `cursor` | `--mode plan` | `--print --trust … --mode plan` | Cursor plan mode |
+| `copilot` | `--plan` | `--plan … -p <prompt>` | Copilot plan mode |
+| `cline` | `--tui --plan` | `--plan` | Cline plan mode |
+| `antigravity` | `--mode plan` | `--print --mode plan` | Antigravity plan mode |
+
+Things to know:
+
+- `--plan` conflicts with an explicit `--auto` or `--yolo` (usage error, exit 2). A
+  yolo or auto level that comes only from configuration or an API default is not
+  applied to a `--plan` launch, and awman prints a notice saying so.
+- awman refuses, before building an image or starting a container, a launch whose
+  `--agent-flag` values, `agents.flags` entry or mounted provider settings select a
+  different mode than the one `--plan` asks for (`agent_mode_conflict`). For OpenCode, an
+  `OPENCODE_PERMISSION` variable is not passed to a `--plan` launch (a warning says so);
+  a config that redefines or disables the `plan` agent is refused. A symlinked
+  `~/.config/opencode/opencode.json` cannot be verified and is refused.
+- An agent or route that cannot deliver its starting mode is refused with
+  `native_capability_unavailable` (HTTP 409) rather than launching with write
+  permissions. This covers custom agents without a plan delivery, ACP launches
+  for agents that cannot select a mode, and Docker Sandboxes for agents whose
+  sandbox kit cannot carry the mode (`codex`, `copilot`; `cursor` and `opencode-v2`
+  are refused there for their own reasons). On `opencode-v2`, `--plan` combined with
+  `--model` in an interactive session is refused (that interface has no plan mode).
+- Copilot's one-shot prompt flag moved to directly before the prompt, so headless
+  Copilot now runs `copilot --yolo -p <prompt>` rather than `copilot -p --yolo <prompt>`.
+- Codex's `--sandbox read-only` is a Codex sandbox, not an awman mount. Escalating
+  from it inside the session uses Codex's own permission controls.
+- Matching selectors you also pass yourself (for example
+  `--agent-flag=--permission-mode=plan`) are de-duplicated; `--plan` combined with
+  `--headless` and `--read-only-workspace` is allowed.
+
+### Plan mode and read-only workspace are independent
+
+`--plan` and `--read-only-workspace` answer different questions and can be combined
+freely. Neither one implies the other.
+
+| Flags | Agent starts in | Workspace mount |
+|-------|-----------------|-----------------|
+| neither | its normal mode | read-write |
+| `--plan` | its plan mode | read-write — the agent can still be switched to implement in the same container |
+| `--read-only-workspace` | its normal mode (including any configured `--auto`/`--yolo`) | read-only |
+| `--plan --read-only-workspace` | its plan mode | read-only |
+
+```sh
+awman chat --plan                                      # plan first, then switch to implementing
+awman exec prompt --plan "Outline the migration"        # plan mode, workspace still writable
+awman exec prompt --read-only-workspace "Review auth"   # normal mode, files cannot change
+awman exec prompt --plan --read-only-workspace "Plan"   # both guarantees
+```
+
+The guarantees are separate. `--plan` is the agent's own behavior and is only as
+strong as that agent enforces it. `--read-only-workspace` is enforced by the
+runtime mount, whatever the agent does. Use `--read-only-workspace` when files
+must not change, and `--plan` when you want the agent to start by planning.
+Switching from plan mode to implementation inside the same session (for
+example with Claude's or Cursor's mode toggle) needs no awman involvement and
+keeps one container and one conversation; with `--read-only-workspace` it can
+plan and discuss but cannot write the repository.
+
+`chat` accepts `--read-only-workspace` as well as `exec prompt` and `exec workflow`.
 
 ### `--auto`
 
@@ -864,7 +926,9 @@ awman mounts supported on-disk credentials or passes the host environment variab
 
 For Claude Code, awman reads your OAuth credential from the macOS Keychain (service: `Claude Code-credentials`) — or, on non-macOS hosts, from `~/.claude/.credentials.json` — and writes an awman-authored `.credentials.json` (access token, expiry, and scopes only) into the staged `~/.claude` directory that's mounted into the container. Your refresh token is never captured from the host credential and never mounted into a container.
 
-While the session is running, a background monitor tracks the token's expiry and, before it runs out, pings your host's local Claude Code installation — the same sanctioned check `awman ready` uses — so it rotates its own Keychain entry. awman then atomically rewrites the staged credential file for every live session, so a long-running container picks up the new token on its next request with no restart. If the host can't refresh (asleep, logged out, offline), awman keeps the last-known-good token, warns you, and retries; a workflow step that fails on an auth error is retried once automatically after a fresh refresh. See [Control credential refresh](07-configuration.md#control-credential-refresh-agentsauthrefresh) to change the refresh threshold or turn this off.
+While the session is running, a background monitor tracks the token's expiry and, before it runs out, pings your host's local Claude Code installation — the same sanctioned check `awman ready` uses — so it rotates its own Keychain entry. awman then atomically rewrites the staged credential file for matching live sessions. This stages the new token; whether the running agent reloads it depends on its native credential cache. A file write alone does not prove that a request used the replacement. If the host can't refresh (asleep, logged out, offline), awman keeps the last-known-good token, warns you, and retries; a workflow step that fails on an auth error is retried once automatically after a fresh refresh. See [Control credential refresh](07-configuration.md#control-credential-refresh-agentsauthrefresh) to change the refresh threshold or turn this off.
+
+Credential-update operations are not yet advertised in `/v1/status`: production launch enrollment and owned credential restarts are unavailable. A restart request is refused before stopping the current execution. Legacy refresh on Windows retains process-local serialization and logs that cross-process locking is unavailable.
 
 The token value is never shown in displayed container commands; the mounted `~/.claude` directory appears only as an ordinary bind-mount path.
 
@@ -922,7 +986,7 @@ awman has two separate OpenCode agents. They are installed, selected, ready-chec
 | Plugins | 1.x plugins and `plugin` setting | 1.x plugins and the `plugin` setting do not load |
 | Provider keys | host credentials or `env()` | `env()` (for example `env(ANTHROPIC_API_KEY)`) |
 | ACP | `opencode acp` | not supported |
-| `--plan` / `--auto` | `--plan` refused; `--auto` accepted | both refused |
+| `--plan` / `--auto` | `--agent plan`; `--auto` accepted | `--plan` via private `default_agent`; `--auto` refused |
 | `--yolo` | accepted, passes no flag | `--auto` |
 
 Existing `--agent opencode` users keep OpenCode 1.x; adding `opencode-v2` never changes which version `opencode` runs. To try 2.x, run `awman chat --agent opencode-v2` (awman offers to download `Dockerfile.opencode-v2` and build it on first use) or `awman init --agent opencode-v2`.
@@ -935,9 +999,9 @@ OpenCode 2 is refused on `docker-sbx-experimental` until per-execution state and
 
 If an image holds the wrong major version, `awman ready` and launch refuse it, for example: `does not contain OpenCode 2: expected opencode 2.x, found 1.19.6. Update .awman/Dockerfile.opencode-v2 to install opencode 2.x and run 'awman ready --build'.`
 
-Only the OpenCode major is a compatibility gate: a probe that cannot determine its major blocks launch. Any minor, patch or prerelease of the selected major is accepted without a version warning. Cursor and the other agents have no version gate. To choose or upgrade an agent version, edit `.awman/Dockerfile.<agent>` and run `awman ready --build`; awman does not require its bundled template’s default version. Cursor’s generated image installs the current upstream CLI and awman does not disable its auto-updates.
+Only a confirmed incompatible OpenCode major is a version compatibility gate. Missing or unparseable version metadata and failed probes warn and allow launch. Any minor, patch or prerelease of the selected major is accepted without a version warning. Cursor and the other agents have no version gate. To choose or upgrade an agent version, edit `.awman/Dockerfile.<agent>` and run `awman ready --build`; awman does not require its bundled template’s default version. Cursor’s generated image installs the current upstream CLI and awman does not disable its auto-updates.
 
-`opencode-v2` interactive sessions started with `--model` use OpenCode 2.x's minimal interface (`mini`), which has no auto or plan mode, so combining `--model` with `--plan`, `--auto` or `--yolo` there is refused. Every `opencode-v2` launch prints a short note about the private configuration copy.
+`opencode-v2` interactive sessions started with `--model` use OpenCode 2.x's minimal interface (`mini`), which has no auto or plan mode, so combining `--model` with `--plan`, `--auto` or `--yolo` there is refused. Interactive `--plan` without `--model` writes `default_agent: "plan"` into the run's private copy of the config; your host config is untouched. Every `opencode-v2` launch prints a short note about the private configuration copy.
 
 ---
 
@@ -951,7 +1015,8 @@ awman implements only the Cursor options below. Anything else is refused before 
 | `--headless` | adds `--print --trust` and one `--output-format` (`text`, or `stream-json` when awman needs structured output such as API runs) |
 | `--yolo` | adds `--force`; the only way awman passes `--force` |
 | `--model <NAME>` | `--model <NAME>` |
-| `--plan`, `--auto` | refused (unsupported) |
+| `--plan` | `--mode plan` (interactive and `--print`) |
+| `--auto` | refused (unsupported) |
 | ACP, allow/deny tool lists | refused |
 
 ---
@@ -1091,7 +1156,7 @@ When `--aspec` is not passed and no `aspec/` folder exists, `init` offers to con
 ## Reference: `awman ready`
 
 ```sh
-awman ready [--refresh] [--build] [--no-cache] [-n|--headless] [--allow-docker] [--json] [--agent <name>]
+awman ready [--refresh | --prepare-only] [--build] [--no-cache] [-n|--headless] [--allow-docker] [--json] [--agent <name>]
 ```
 
 Verifies your environment is ready for agent sessions. Progress lines read `ready: <phase>` on stderr (suppressed with `--json`). A Docker or Apple Containers runtime error exits with status 3; every other engine failure, including builtin and image-builder errors, exits with status 1, and the CLI prints the same message the TUI and API show.
@@ -1099,6 +1164,7 @@ Verifies your environment is ready for agent sessions. Progress lines read `read
 | Flag | Description |
 |------|-------------|
 | `--refresh` | Run the Dockerfile agent audit, which updates `Dockerfile.dev` for your project's toolchain (skipped by default) |
+| `--prepare-only` | Prepare images only: build, import and trust-check them, but run no host agent check, credential refresh or audit. Authentication is reported as not checked. Conflicts with `--refresh`; composes with `--agent`, `--build`, `--no-cache`, `--headless` and `--json` |
 | `--build` | Rebuild the project base image and every agent image with a `.awman/Dockerfile.<agent>` (on the [builtin runtime](11-runtimes.md), re-acquire them from their image source) |
 | `--no-cache` | Skip the build cache for any build `ready` runs; on the builtin runtime, also force a fresh image import |
 | `--headless` / `-n` | Run the audit agent in print mode, and answer `ready`'s own questions non-interactively |
@@ -1143,6 +1209,35 @@ Credential claude (68432s remaining)   ✓
 
 If the credential can't be read, has already expired, or its expiry can't be determined, the row shows a warning instead (`credential unreadable: ...`, `credential expired`, or `credential expiry unknown`) rather than failing the whole `ready` check.
 
+### Preparing images without authentication (`ready --prepare-only`)
+
+`ready` has two separate questions: *are the images ready?* and *is the agent
+authenticated?* A plain `awman ready` answers both. `awman ready --prepare-only`
+answers only the first. It still checks the runtime, verifies definition trust, and
+inspects, builds or imports the project and agent images, but it never runs the host
+agent greeting, never reads or refreshes a credential and never runs the Dockerfile
+audit. It is the right command for CI, image-baking jobs and a freshly provisioned
+machine that has no login yet.
+
+```sh
+awman ready --prepare-only --agent claude                 # prepare the Claude image
+awman ready --prepare-only --build --agent codex          # rebuild/import Codex's image
+awman ready --prepare-only --build --no-cache --agent claude --json
+```
+
+The summary shows `Authentication (not checked)` and ends `awman images are ready;
+authentication was not checked.` A failed build, import or trust check still fails
+with a non-zero exit. `--prepare-only` conflicts with `--refresh` (usage error, exit 2).
+With `--json` the object adds `"preparation_policy": "images_only"`,
+`"images_ready": true` and `"authentication": "not_checked"` (a full `ready` reports
+`passed`, `failed` or `unknown` there). `ready: true` means ready for the policy you
+selected; it never claims authentication passed.
+
+To pick up a newer agent CLI, rebuild its image with
+`awman ready --prepare-only --build --agent <name>`. A newer CLI version needs no awman
+update: an unreadable or unrecognized version only produces a warning, and the only
+version refusal is a confirmed wrong OpenCode major version.
+
 ### `ready --json`
 
 With `--json`, `awman ready` prints one JSON object on stdout instead of the summary table — useful for CI and scripts:
@@ -1181,7 +1276,8 @@ Each step's `status` is `ok`, `skipped`, `warn`, `failed`, `pending` or `running
 | `--model=<NAME>` | ✓ | ✓ | ✓ | Override the model used by the agent |
 | `--headless` / `-n` | ✓ | ✓ | ✓ | Print/batch mode |
 | `--set agents.launchMode=<stdio\|acp>` | ✓ | ✓ | ✓ | Choose standard stdio or ACP mode |
-| `--plan` | ✓ | ✓ | ✓ | Read-only analysis mode |
+| `--plan` | ✓ | ✓ | ✓ | Start in the agent's native plan mode (workspace stays writable) |
+| `--read-only-workspace` | ✓ | ✓ | ✓ | Mount the workspace read-only (independent of `--plan`) |
 | `--allow-docker` | ✓ | ✓ | ✓ | Mount host Docker socket |
 | `--overlay=<SPEC>` | ✓ | ✓ | ✓ | `dir()`, `env()`, `skill()`, `ssh()` overlays (repeatable) |
 | `--agent-flag=<ARG>` | ✓ | ✓ | ✓ | Extra argument for the agent command (repeatable); replaces its `agents.flags` entry |
@@ -1191,6 +1287,9 @@ Each step's `status` is `ok`, `skipped`, `warn`, `failed`, `pending` or `running
 | `--worktree` | — | — | ✓ | Run in an isolated, managed Git worktree (a switch on this command) |
 | `--auto` | ✓ | ✓ | ✓ | Auto-approve file edits, prompt for shell commands |
 | `--yolo` | ✓ | ✓ | ✓ | Fully autonomous mode |
+| `--settings-profile <NAME>` | ✓ | ✓ | ✓ | Persistent private settings and history; see [Settings profiles](#settings-profiles) |
+| `--agent-session <ID>` | ✓ | ✓ | — | Resume an exact native conversation from the profile |
+| `--automation[=auto\|require_full]` | ✓ | ✓ | — | Owned execution with turn and assurance reporting; requires `--settings-profile` |
 | `--work-item <REF>` | `-w` | ✓ | ✓ | Supply a local or external work item; see [GitHub Integration](10-github-integration.md) |
 | `--dynamic` | — | — | ✓ | Have a leader agent design the workflow; implies `--yolo`, `--worktree`, `context(workflow)` |
 | `--leader <agent::model>` | — | — | ✓ | Leader agent and model for `--dynamic` |
@@ -1199,6 +1298,124 @@ Each step's `status` is `ok`, `skipped`, `warn`, `failed`, `pending` or `running
 | `--json` | — | — | ✓ | Print the workflow outcome and prerequisite report as JSON |
 
 The [Command Reference](14-command-reference.md) lists every flag with its exact values.
+
+---
+
+## Persistent settings, native resume and automation
+
+### Settings profiles
+
+Use `--settings-profile NAME` with `chat`, `exec prompt`, or `exec workflow` to
+retain private, sanitized agent settings and conversation history for this
+repository and agent. The first launch imports supported settings from your HOME;
+later launches use the saved profile. Each execution receives its own writable copy,
+and only that copy is mounted into the container — the saved snapshot, manifest and
+your real HOME settings stay outside it. Credentials are resolved for each launch
+through the usual authentication and `env()` overlay selection and are excluded from
+saved snapshots. Executable hooks, plugins and permissive approval rules are not
+imported; a restrictive rule that cannot be preserved causes a refusal rather than
+being dropped silently.
+
+A profile name is a name, not a path: lowercase letters, digits, `_` and `-`,
+starting with a letter or digit, at most 63 characters. Profiles are scoped to the
+repository and provider (OpenCode 1.x and 2.x are separate providers). In a
+workflow, steps inherit the command's `--settings-profile`; a step can choose its own
+with `settings_profile = "NAME"`. Two parallel steps of the same provider need
+different profile names, otherwise the second is refused with
+`settings_profile_busy`. ACP launches and runtimes that use declarative agent kits (Docker Sandboxes) do not support
+profiles.
+
+```sh
+awman exec prompt --agent claude --settings-profile review 'Review the parser'
+awman agents profile list
+awman agents profile close review --agent claude
+awman agents profile delete review --agent claude --yes
+```
+
+Only one execution can write a profile at a time. A crashed or unfinished execution
+leaves it `closing` until awman confirms the container is gone and the snapshot is
+safe. `profile close` retries that cleanup; if sanitizing fails, the previous
+consistent snapshot is kept. A live execution must be cancelled through its own
+command controls. Only an `inactive` profile can be deleted, and deletion removes its
+history. awman keeps the current and previous snapshot with no time-based expiry.
+`profile list` shows state and counts, never conversation IDs, transcript text or
+host paths. See [Configuration](07-configuration.md#agent-settings-profiles) for where
+profiles live.
+
+### Resuming a native conversation (`--agent-session`)
+
+`--agent-session ID` (on `chat` and `exec prompt`) passes the provider's own
+conversation ID to the agent's native resume option. It is **not** an awman session
+ID. It requires `--settings-profile` and looks only inside that profile: there is no
+"latest", no prefix matching and no fallback to a new conversation. An unknown ID, an
+ID from another profile, or history that was not retained fails before launch
+(`native_session_not_found`).
+
+Resuming starts a new process over the saved provider history; it does not attach to
+a running one and never re-sends an unfinished task. If the previous run was
+interrupted or its outcome is unknown, resume it with an explicit follow-up prompt
+instead of an idle `chat`. OpenCode databases are exported only for a known schema;
+for an unknown one settings are still kept but exact resume is refused with
+`native_capability_unavailable`. The saved history of OpenCode 1.x and 2.x is not
+interchangeable. Native-resume evidence in awman's own tests uses POSIX hosts only.
+
+### Automation (`--automation`)
+
+`--automation` makes awman own the agent's execution so that a program can drive it
+and know what happened. It is available on `chat` and `exec prompt`, requires
+`--settings-profile`, and does not by itself approve anything, enable headless
+mode, plan mode or change mounts.
+
+| Form | Meaning |
+|------|---------|
+| `--automation` or `--automation=auto` | Prefer the agent's native lifecycle status; fall back automatically to the agent's OSC 7501 status reports |
+| `--automation=require_full` | Deliver an automated task only while full native lifecycle status is available |
+
+The optional value must be attached with `=`; `--automation require_full` treats
+`require_full` as the next argument, not the value. Omitting the flag disables
+automation. `require_full` is an admission-only guarantee: awman checks it
+immediately before delivering each automated task, and refuses delivery with
+`status_support_insufficient` when only best-effort status exists. It does not
+promise that the task will finish or that completion was verified, and a task already
+delivered is neither replayed nor retroactively undelivered if status later degrades.
+An untested agent version never refuses a strict launch; support is established from the
+agent's actual native interfaces. If full status never arrives, the initial task waits
+until `agents.automation.startupTimeout`.
+
+- **Idle terminal versus a task.** `chat --automation` (with `--settings-profile`)
+  starts an idle agent terminal with no task and requires interactive mode;
+  `--headless` is refused. `exec prompt` always needs a non-blank prompt or work
+  item, even with `--automation --interactive` — a missing one is a usage error (exit
+  2) before any image, profile or container work, with a hint to use
+  `chat --automation` for an idle terminal. In interactive mode awman submits the
+  initial task once, after readiness, through the same guarded path as later turns;
+  headless mode delivers it through the provider's one-shot entrypoint and requires the
+  agent's structured native result (OSC status alone is never accepted as success).
+- **What you get back.** Command results carry `flags_applied.automation`
+  (`auto`, `require_full` or `null`) and an automation record with the execution ID,
+  the agent's native conversation ID, the last turn, the status tier reached, whether
+  completion was verified, whether output was fully collected and whether cleanup
+  finished. The weakest tier observed is the one reported. See
+  [API & Remote Mode](09-api-and-remote-mode.md#automation-turns-and-terminals).
+- **Timeouts.** `agents.automation.startupTimeout` (default `120s`),
+  `cancelTimeout` (`10s`) and `outputDrainTimeout` (`5s`, at most the cancel
+  timeout) are set through [configuration](07-configuration.md#automation-timeouts)
+  or `--set`; there are no timeout flags. Ordinary turns have no time limit.
+- **Inactivity is advisory.** `agents.stuckTimeout` only reports a quiet agent as stuck
+  after its first output; it never ends an automation launch.
+
+### Credentials during long sessions
+
+awman resolves credentials for each execution and, for agents whose credential
+can be refreshed (currently Claude's Keychain-backed OAuth token),
+keeps refreshing it while the agent runs; see
+[Configuration](07-configuration.md#control-credential-refresh-agentsauthrefresh). Replacing a credential
+in a running agent, and restarting an agent to pick up a new one, are **not currently
+offered**: the status endpoint does not advertise them and a request is refused without
+stopping the agent. When a run's credential can no longer be refreshed, start a new
+execution — with `--settings-profile` and `--agent-session` it can continue the same
+native conversation. Credential values never appear in profile snapshots, results, logs
+or events.
 
 ---
 

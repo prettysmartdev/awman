@@ -393,6 +393,9 @@ impl WorkerServices {
         // and the stale recovery below must not run the command a second time.
         super::queue_worker::finalize_completed_from_sidecars(&store, &paths)
             .map_err(CommandError::Data)?;
+        // WI 0070: started automation executions are finalized, never requeued.
+        super::queue_worker::recover_automation_executions(&store, &paths)
+            .map_err(CommandError::Data)?;
 
         // A command that was asked to cancel before the restart is finalised
         // as `cancelled` here, so the stale recovery below (which requeues

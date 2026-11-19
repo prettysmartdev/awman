@@ -91,6 +91,11 @@ pub enum Operation {
     WorkerCommandsWorkflow,
     WorkerCommandsOutputs,
     WorkerCommandsOutput,
+    // WI 0070 owner-local automation records.
+    WorkerSessionsAgentCapabilities,
+    WorkerCommandsTurns,
+    WorkerCommandsCredentialsUpdate,
+    WorkerCommandsCredentialsGet,
     WorkerRunsCreate,
     WorkerServersList,
     WorkerServersGet,
@@ -181,6 +186,10 @@ impl Operation {
             Self::WorkerCommandsList => Feature::Worker,
             Self::WorkerCommandsCreate => Feature::Worker,
             Self::WorkerCommandsGet => Feature::Worker,
+            Self::WorkerSessionsAgentCapabilities
+            | Self::WorkerCommandsTurns
+            | Self::WorkerCommandsCredentialsUpdate
+            | Self::WorkerCommandsCredentialsGet => Feature::Worker,
             Self::WorkerCommandsCancel => Feature::Worker,
             Self::WorkerCommandsEvents => Feature::Worker,
             Self::WorkerCommandsWorkflow => Feature::Worker,
@@ -273,6 +282,10 @@ impl Operation {
             Self::WorkerCommandsList => "worker.commands.list",
             Self::WorkerCommandsCreate => "worker.commands.create",
             Self::WorkerCommandsGet => "worker.commands.get",
+            Self::WorkerSessionsAgentCapabilities => "worker.sessions.agent_capabilities",
+            Self::WorkerCommandsTurns => "worker.commands.turns",
+            Self::WorkerCommandsCredentialsUpdate => "worker.commands.credentials.update",
+            Self::WorkerCommandsCredentialsGet => "worker.commands.credentials.get",
             Self::WorkerCommandsCancel => "worker.commands.cancel",
             Self::WorkerCommandsEvents => "worker.commands.events",
             Self::WorkerCommandsWorkflow => "worker.commands.workflow",
@@ -362,6 +375,18 @@ impl Operation {
                 | Self::BrowsersList
                 | Self::BrowsersDelete
         ) || self.pull()
+            || self.owner_local_automation()
+    }
+    /// WI 0070: owner-local automation records. A network caller gets 403
+    /// (a known owner-only operation), not a disguised 404.
+    pub fn owner_local_automation(self) -> bool {
+        matches!(
+            self,
+            Self::WorkerSessionsAgentCapabilities
+                | Self::WorkerCommandsTurns
+                | Self::WorkerCommandsCredentialsUpdate
+                | Self::WorkerCommandsCredentialsGet
+        )
     }
     /// The pull routes (WI 0143) remain owner-socket only.
     pub fn pull(self) -> bool {

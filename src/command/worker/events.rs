@@ -352,6 +352,9 @@ impl crate::engine::agent_runtime::frontend::AgentFrontend for RecordedFrontend 
     fn grace_timeout(&self) -> std::time::Duration {
         self.inner.grace_timeout()
     }
+    fn startup_timing(&self) -> crate::data::automation::StartupTiming {
+        self.inner.startup_timing()
+    }
     fn stuck_timeout(&self) -> std::time::Duration {
         self.inner.stuck_timeout()
     }

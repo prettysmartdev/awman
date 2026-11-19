@@ -285,6 +285,7 @@ async fn run(
             allow_docker: false,
             json: matches!(mode, Mode::Json),
             agent: selected.map(str::to_string),
+            prepare_only: false,
         },
         engines,
         session,

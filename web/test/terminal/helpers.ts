@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Emitter, Subject } from '@/lib/client/observable';
 import type { TerminalConnection, TerminalConnectionState, TerminalControl, TerminalErrorEvent, TerminalSnapshot } from '@/lib/client/terminalSocket';
+import type { AutomationSnapshot } from '@/lib/client/types';
 import type { CoreFactory } from '@/terminal/core/loadCore';
 
 const require = createRequire(import.meta.url);
@@ -36,6 +37,7 @@ export const nodeCoreFactory: CoreFactory = async ({ cols, rows, scrollbackLines
 
 export class FakeConnection {
   readonly terminalId = 'term-1';
+  readonly automation = new Subject<AutomationSnapshot | null>(null);
   readonly stateSubject = new Subject<TerminalConnectionState>('open');
   readonly state = this.stateSubject;
   readonly controlSubject: Subject<TerminalControl>;

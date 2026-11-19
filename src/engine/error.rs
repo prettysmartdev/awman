@@ -35,6 +35,8 @@ pub enum ImageRetryClass {
 
 #[derive(Debug, Error)]
 pub enum EngineError {
+    #[error("agent '{agent}' cannot resume: {reason}")]
+    NativeResumeUnsupported { agent: String, reason: String },
     /// The exec transport ended without a trustworthy process exit status.
     /// Only a confirmed stop permits workflow recovery in a fresh container.
     #[error("builtin exec stream closed or failed before reporting exit status: {reason}")]
@@ -154,8 +156,32 @@ pub enum EngineError {
     #[error("workflow resume incompatible: {0}")]
     WorkflowResumeIncompatible(String),
 
-    #[error("plan mode is not supported by agent {agent}")]
+    #[error(
+        "plan mode is not supported by agent {agent}: it declares no native plan or read-only \
+         starting mode; launch without --plan (--read-only-workspace alone still protects the \
+         workspace)"
+    )]
     PlanModeUnsupported { agent: String },
+
+    /// The agent has a native plan mode, but this launch route cannot
+    /// deliver it (WI 0070). Refused before anything is prepared.
+    #[error("agent '{agent}' cannot start in its native plan mode on the {route} route: {reason}")]
+    NativePlanRouteUnsupported {
+        agent: String,
+        route: &'static str,
+        reason: String,
+    },
+
+    /// A provider selector, environment value or setting contradicts the
+    /// requested native plan mode (WI 0070). Never resolved by
+    /// last-argument-wins.
+    #[error("agent '{agent}': {selector} (from {origin}) contradicts --plan: {reason}")]
+    AgentModeConflict {
+        agent: String,
+        selector: String,
+        origin: &'static str,
+        reason: String,
+    },
 
     /// A permission mode (or mode combination) this agent cannot honour;
     /// refused before anything is prepared.
@@ -730,7 +756,9 @@ impl EngineError {
             EngineError::Container(_) | EngineError::ContainerRuntimeUnavailable { .. } => 3,
             EngineError::UnknownRuntime { .. }
             | EngineError::AgentDefinitionUntrusted { .. }
-            | EngineError::CustomAgentRuntimeUnsupported { .. } => 2,
+            | EngineError::CustomAgentRuntimeUnsupported { .. }
+            // A contradictory mode selector is invalid usage (WI 0070).
+            | EngineError::AgentModeConflict { .. } => 2,
             // A refused or failed in-place catalog upgrade is an ordinary
             // engine failure, never "Docker is missing" (3).
             EngineError::BuiltinCatalogMismatch { .. }
@@ -739,6 +767,19 @@ impl EngineError {
             | EngineError::MergeRefConflict { .. } => 1,
             _ => 1,
         }
+    }
+
+    /// A requested native plan mode this agent or route cannot deliver (WI
+    /// 0070): no native plan at all, an unsupported route, or PR #71's
+    /// interactive `--model` fallback refusal of `--plan`.
+    pub fn is_native_capability_unavailable(&self) -> bool {
+        matches!(
+            self,
+            EngineError::NativeResumeUnsupported { .. }
+                | EngineError::PlanModeUnsupported { .. }
+                | EngineError::NativePlanRouteUnsupported { .. }
+                | EngineError::AgentModeUnsupported { mode: "plan", .. }
+        )
     }
 
     pub fn io(path: impl Into<PathBuf>, source: std::io::Error) -> Self {

@@ -74,11 +74,7 @@ fn render_command(
 
     out.push_str(&format!(
         "Available via: {}\n\n",
-        if spec.api_allowed {
-            "CLI, TUI, API"
-        } else {
-            "CLI, TUI"
-        }
+        spec.api_availability.describe()
     ));
 
     if !spec.requires_runtime {
@@ -147,7 +143,11 @@ fn flag_kind_label(kind: FlagKind) -> String {
         FlagKind::String => "string".to_string(),
         FlagKind::OptionalString => "string (optional)".to_string(),
         FlagKind::Enum(values) => format!("enum: {}", values.join(", ")),
-        FlagKind::VecString => "string (repeatable)".to_string(),
+        FlagKind::OptionalEnum { values, missing } => format!(
+            "enum, optional (`=value` only; bare = `{missing}`): {}",
+            values.join(", ")
+        ),
+        FlagKind::VecString | FlagKind::AgentArg => "string (repeatable)".to_string(),
         FlagKind::Path => "path".to_string(),
         FlagKind::OptionalPath => "path (optional)".to_string(),
         FlagKind::U16 => "u16".to_string(),

@@ -838,6 +838,7 @@ impl WorkflowEngine {
         spec: RemediationAgentSpec,
     ) -> Result<i32, RemediationAgentError> {
         let synthetic_step = WorkflowStep {
+            settings_profile: None,
             name: "__on_failure__".to_string(),
             depends_on: Vec::new(),
             prompt_template: spec.prompt,
@@ -942,8 +943,11 @@ impl WorkflowEngine {
 
         let (wait_tx, mut wait_rx) =
             tokio::sync::oneshot::channel::<Result<AgentExitInfo, EngineError>>();
+        let factory = self.agent_factory.clone();
         tokio::spawn(async move {
-            let _ = wait_tx.send(exec.wait().await);
+            let result = exec.wait().await;
+            factory.execution_finished(exec.handle().clone()).await;
+            let _ = wait_tx.send(result);
         });
 
         loop {

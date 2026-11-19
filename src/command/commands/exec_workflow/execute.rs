@@ -126,6 +126,12 @@ impl Command for ExecWorkflowCommand {
             }
         };
 
+        if !self.profile_owner
+            && (self.settings_profile.is_some()
+                || workflow.steps.iter().any(|s| s.settings_profile.is_some()))
+        {
+            return Err(CommandError::ProfileOwnerRequired);
+        }
         // Read-only workspace (WI 0152), workflow level: one read-only step
         // on a runtime that cannot honour it fails here, before prerequisites,
         // the worktree or setup — not midway through the run.
@@ -163,6 +169,30 @@ impl Command for ExecWorkflowCommand {
             Ok(modes) => modes,
             Err(e) => return Err(CommandError::from(e)),
         };
+
+        // Native plan (WI 0070) is workflow-wide too: every agent step must
+        // deliver --plan on its own route, checked before step 1. Independent
+        // of the read-only mount preflight above.
+        if let Err(e) = native_mode_steps(&workflow, &self.session, &self.flags, &launch_modes)
+            .and_then(|steps| {
+                crate::command::commands::workspace_access::preflight_workflow_native_mode(
+                    &steps,
+                    self.flags.plan,
+                    &self.session,
+                    if self.engines.runtime.capabilities().kit_declarative {
+                        crate::engine::agent::definition::RunParadigm::Sandbox
+                    } else {
+                        crate::engine::agent::definition::RunParadigm::Container
+                    },
+                )
+            })
+        {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: {e}"),
+            });
+            return Err(e);
+        }
 
         // Collect the complete workflow scope before any worktree or agent starts.
         let preflight =
@@ -422,6 +452,8 @@ impl Command for ExecWorkflowCommand {
             &self.cancel,
             self.output_dir.as_deref(),
             self.workspace_access,
+            self.settings_profile.as_ref(),
+            self.profile_owner,
         )
         .await
     }
@@ -441,4 +473,47 @@ pub(crate) fn existing_worktree_choice(
         (None, true) => ExistingWorktreeChoice::ResumeAccepted,
         (None, false) => ExistingWorktreeChoice::Ask,
     }
+}
+
+/// Each agent step's route for the `--plan` preflight (WI 0070), resolved
+/// the way the step will launch: agent step > workflow > config, model step
+/// > workflow > config, launch mode from the ACP preflight.
+fn native_mode_steps(
+    workflow: &crate::data::workflow_definition::Workflow,
+    session: &Session,
+    flags: &ExecWorkflowCommandFlags,
+    launch_modes: &std::collections::HashMap<String, crate::data::config::agents::LaunchMode>,
+) -> Result<Vec<crate::command::commands::workspace_access::NativeModeStep>, CommandError> {
+    if !flags.plan {
+        return Ok(Vec::new());
+    }
+    let config = workflow_effective_config(session, flags)?;
+    let default_agent = config.agent();
+    let default_model = config.model();
+    workflow
+        .steps
+        .iter()
+        .map(|step| {
+            let name = step
+                .agent
+                .as_deref()
+                .or(workflow.agent.as_deref())
+                .or(default_agent.as_deref())
+                .ok_or_else(|| {
+                    CommandError::Other(format!(
+                        "workflow step '{}' resolves to no agent",
+                        step.name
+                    ))
+                })?;
+            Ok(crate::command::commands::workspace_access::NativeModeStep {
+                step: step.name.clone(),
+                agent: crate::data::session::AgentName::new(name)?,
+                launch_mode: launch_modes.get(&step.name).copied().unwrap_or_default(),
+                non_interactive: flags.non_interactive,
+                model_requested: step.model.is_some()
+                    || workflow.model.is_some()
+                    || default_model.is_some(),
+            })
+        })
+        .collect()
 }

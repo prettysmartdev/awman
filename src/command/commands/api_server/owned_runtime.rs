@@ -236,7 +236,7 @@ impl AgentRuntimeEngine for CommandOwnedRuntime {
         let instance = self.inner.build(options)?;
         Ok(match (&self.hub, &self.owner) {
             (Some(hub), Some(owner)) => crate::engine::agent_runtime::execution::with_terminal_launch(instance,
-                crate::engine::agent_runtime::execution::TerminalLaunch { hub: hub.clone(), owner: owner.clone(), agent, model, handle: Default::default(), drain: Arc::new(crate::engine::agent_runtime::output_tail::OutputTail::with_default_capacity()) }),
+                crate::engine::agent_runtime::execution::TerminalLaunch { hub: hub.clone(), owner: owner.clone(), agent, model, handle: Default::default(), drain: Arc::new(crate::engine::agent_runtime::output_tail::OutputTail::with_default_capacity()), automation: None }),
             _ => instance,
         })
     }
@@ -273,6 +273,13 @@ impl AgentRuntimeEngine for CommandOwnedRuntime {
         self.inner.list_stopped()
     }
 
+    fn resource_label(
+        &self,
+        handle: &AgentHandle,
+        key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        self.inner.resource_label(handle, key)
+    }
     fn inspect(&self, handle: &AgentHandle) -> Result<AgentDetail, EngineError> {
         self.inner.inspect(handle)
     }

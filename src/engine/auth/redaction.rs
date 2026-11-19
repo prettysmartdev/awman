@@ -17,6 +17,7 @@ pub struct RedactionSet {
 }
 
 impl RedactionSet {
+    pub const MAX_BYTES: usize = 16 * 1024 * 1024;
     pub const MARK: &'static str = "***";
     /// Shorter secrets are not registered: replacing them would mangle
     /// ordinary output without protecting anything meaningful.
@@ -60,20 +61,72 @@ impl RedactionSet {
         forms.push(base64::engine::general_purpose::STANDARD.encode(text));
         forms.push(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text));
         let mut secrets = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if self.retired.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         if secrets.iter().any(|s| s.expose() == secret.expose()) {
             return;
         }
-        secrets.push(secret);
-        for line in forms
+        let mut incoming = vec![secret];
+        for value in forms
             .into_iter()
             .filter(|s| !s.is_empty())
             .map(SecretString::new)
         {
-            if !secrets.iter().any(|s| s.expose() == line.expose()) {
-                secrets.push(line);
+            if !secrets
+                .iter()
+                .chain(incoming.iter())
+                .any(|s| s.expose() == value.expose())
+            {
+                incoming.push(value);
             }
         }
+        let retained = secrets.iter().map(|s| s.expose().len()).sum::<usize>();
+        let additional = incoming.iter().map(|s| s.expose().len()).sum::<usize>();
+        if retained.saturating_add(additional) > Self::MAX_BYTES {
+            self.retired
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            secrets.clear();
+            return;
+        }
+        secrets.extend(incoming);
         secrets.sort_by_key(|s| std::cmp::Reverse(s.expose().len()));
+    }
+
+    /// Transactional enrollment for an accepted update. A refused bundle leaves
+    /// existing output and its budget intact, including encoded forms.
+    pub fn try_add_many(
+        &self,
+        values: impl IntoIterator<Item = SecretString>,
+    ) -> Result<(), &'static str> {
+        let incoming = Self::new();
+        for value in values {
+            incoming.add(value);
+        }
+        if incoming.is_retired() || self.is_retired() {
+            return Err("output_incomplete");
+        }
+        let incoming = incoming.inner.read().unwrap_or_else(|p| p.into_inner());
+        let mut retained = self.inner.write().unwrap_or_else(|p| p.into_inner());
+        if self.is_retired() {
+            return Err("output_incomplete");
+        }
+        let additions: Vec<_> = incoming
+            .iter()
+            .filter(|value| !retained.iter().any(|v| v.expose() == value.expose()))
+            .cloned()
+            .collect();
+        let size = retained
+            .iter()
+            .chain(additions.iter())
+            .map(|s| s.expose().len())
+            .sum::<usize>();
+        if size > Self::MAX_BYTES {
+            return Err("output_incomplete");
+        }
+        retained.extend(additions);
+        retained.sort_by_key(|s| std::cmp::Reverse(s.expose().len()));
+        Ok(())
     }
 
     /// Replace every exact occurrence of a registered secret with [`Self::MARK`].
@@ -82,6 +135,9 @@ impl RedactionSet {
             return Self::MARK.into();
         }
         let secrets = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        if self.is_retired() {
+            return Self::MARK.into();
+        }
         let mut ranges = Vec::new();
         for secret in secrets.iter() {
             let needle = secret.expose();
@@ -131,6 +187,10 @@ impl RedactionSet {
         replace_ranges(bytes, ranges)
     }
 
+    pub fn is_retired(&self) -> bool {
+        self.retired.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn is_empty(&self) -> bool {
         !self.retired.load(std::sync::atomic::Ordering::SeqCst)
             && self
@@ -138,6 +198,28 @@ impl RedactionSet {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty()
+    }
+
+    /// Register every secret `other` holds now (its later registrations are
+    /// not followed). Absorbing a set into itself is a no-op.
+    pub fn absorb(&self, other: &RedactionSet) {
+        if other.is_retired() {
+            self.clear();
+            return;
+        }
+        if Arc::ptr_eq(&self.inner, &other.inner) {
+            return;
+        }
+        let values: Vec<SecretString> = other
+            .inner
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|s| SecretString::new(s.expose().to_owned()))
+            .collect();
+        for value in values {
+            self.add(value);
+        }
     }
 
     /// Retire values once publication has permanently closed for the command.
@@ -348,6 +430,10 @@ impl RedactionStream {
             return RedactionSet::MARK.as_bytes().to_vec();
         }
         let secrets = self.set.inner.read().unwrap_or_else(|e| e.into_inner());
+        if self.set.is_retired() {
+            self.pending.clear();
+            return RedactionSet::MARK.as_bytes().to_vec();
+        }
         let mut output = Vec::new();
         let mut at = 0;
         while at < self.pending.len() {
@@ -550,5 +636,21 @@ mod tests {
                 }
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod credential_retention_tests {
+    use super::*;
+    #[test]
+    fn accumulated_generations_retire_without_evicting_old_secrets() {
+        let set = RedactionSet::new();
+        set.add(SecretString::new("x".repeat(4 * 1024 * 1024)));
+        assert!(!set.is_retired());
+        set.add(SecretString::new("y".repeat(4 * 1024 * 1024)));
+        assert!(set.is_retired());
+        assert_eq!(set.redact("any later output"), "***");
+        set.add(SecretString::new("test-secret-later"));
+        assert!(set.is_retired());
     }
 }

@@ -4,8 +4,9 @@
 
 use super::definition::{
     AgentDefinition, AgentImageSource, AgentOrigin, AgentOutputFormat, CliMajorRequirement,
-    CredentialSource, InteractiveModelFallback, InteractiveSeedDelivery, ModeRefusal,
-    ModelFlagDelivery, SbxKitKind, SessionStorageDir, SettingsMount, SystemPromptMode,
+    CredentialSource, InteractiveModelFallback, InteractiveSeedDelivery, ModeRefusal, ModeSelector,
+    ModelFlagDelivery, NativePlanKind, NativePlanSpec, NativeSettingsPatch, PlanConfigGuard,
+    SbxKitKind, SelectorArity, SessionStorageDir, SettingsMount, SystemPromptMode,
 };
 
 /// The eight built-in agents. Same slice as the Layer 0 constant so Layer 0
@@ -23,9 +24,55 @@ fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|s| s.to_string()).collect()
 }
 
+/// A native plan mapping delivered by the same argv on interactive and
+/// headless stdio launches, with no ACP mode.
+fn argv_plan(kind: NativePlanKind, argv: &[&str]) -> Option<NativePlanSpec> {
+    Some(NativePlanSpec {
+        kind,
+        interactive_argv: Some(strings(argv)),
+        interactive_settings: None,
+        headless_argv: Some(strings(argv)),
+        acp_mode_id: None,
+    })
+}
+
+/// A value selector; `plan_values` are the duplicates of awman's own plan
+/// mapping (dropped once), any other value is a conflict.
+fn value_selector(flags: &[&str], plan_values: &[&str]) -> ModeSelector {
+    ModeSelector {
+        flags: strings(flags),
+        arity: SelectorArity::Value,
+        plan_values: strings(plan_values),
+        value_prefix: None,
+    }
+}
+
+/// A switch that always contradicts plan.
+fn conflicting_switch(flags: &[&str]) -> ModeSelector {
+    ModeSelector {
+        flags: strings(flags),
+        arity: SelectorArity::Bare,
+        plan_values: Vec::new(),
+        value_prefix: None,
+    }
+}
+
+/// A switch that duplicates awman's own plan mapping (dropped once).
+fn duplicate_switch(flags: &[&str]) -> ModeSelector {
+    ModeSelector {
+        flags: strings(flags),
+        arity: SelectorArity::Bare,
+        plan_values: strings(flags),
+        value_prefix: None,
+    }
+}
+
 /// The fields every first-party entry shares; each arm overrides the rest.
 fn base(name: &str, display_name: &str) -> AgentDefinition {
     AgentDefinition {
+        automation_adapter: automation_adapter(name),
+        profile_state: profile_spec(name),
+        native_resume: resume_spec(name),
         name: name.to_string(),
         display_name: display_name.to_string(),
         homepage: None,
@@ -36,7 +83,11 @@ fn base(name: &str, display_name: &str) -> AgentDefinition {
         headless_prompt_in_argv: false,
         output_format: AgentOutputFormat::Text,
         interactive_only_flags: Vec::new(),
-        plan_flags: Vec::new(),
+        native_plan: None,
+        mode_selectors: Vec::new(),
+        plan_env_drop: Vec::new(),
+        plan_config_guard: PlanConfigGuard::None,
+        headless_prompt_flag: None,
         yolo_flags: Vec::new(),
         auto_flags: Vec::new(),
         disallowed_tools_flag: None,
@@ -85,7 +136,11 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
         "claude" => AgentDefinition {
             non_interactive_flag: Some("--print".into()),
             output_format: AgentOutputFormat::ClaudeStreamJson,
-            plan_flags: strings(&["--permission-mode", "plan"]),
+            native_plan: argv_plan(NativePlanKind::Plan, &["--permission-mode", "plan"]),
+            mode_selectors: vec![
+                value_selector(&["--permission-mode"], &["plan"]),
+                conflicting_switch(&["--dangerously-skip-permissions"]),
+            ],
             yolo_flags: strings(&["--dangerously-skip-permissions"]),
             auto_flags: strings(&["--permission-mode", "auto"]),
             disallowed_tools_flag: Some("--disallowedTools".into()),
@@ -115,10 +170,23 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             // the TUI exits 1 ("daemon executable not found"). `codex exec`
             // never uses the daemon and rejects the flag, so interactive only.
             interactive_only_flags: strings(&["--no-daemon"]),
-            // Codex exposes Plan through its interactive /plan command, not a
-            // startup flag. Reject awman's --plan instead of passing an
-            // unknown --approval-mode option.
-            plan_flags: Vec::new(),
+            // Codex has no startup flag for its semantic /plan command; its
+            // supported equivalent is the native read-only sandbox policy, on
+            // both `codex` and `codex exec`. In-session `/permissions` changes
+            // stay available; awman adds no lock.
+            native_plan: argv_plan(NativePlanKind::ReadOnly, &["--sandbox", "read-only"]),
+            mode_selectors: vec![
+                value_selector(&["--sandbox", "-s"], &["read-only"]),
+                ModeSelector {
+                    flags: strings(&["--config", "-c"]),
+                    arity: SelectorArity::Value,
+                    plan_values: strings(&["sandbox_mode=read-only", "sandbox_mode=\"read-only\""]),
+                    value_prefix: Some("sandbox_mode=".into()),
+                },
+                conflicting_switch(&["--full-auto"]),
+                conflicting_switch(&["--dangerously-bypass-approvals-and-sandbox"]),
+                conflicting_switch(&["--yolo"]),
+            ],
             // `--full-auto` is exec-only (and deprecated); the global flag
             // below is accepted by both interactive `codex` and `codex exec`.
             yolo_flags: strings(&["--dangerously-bypass-approvals-and-sandbox"]),
@@ -148,9 +216,23 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             ..base("codex", "Codex")
         },
         "opencode" => AgentDefinition {
+            output_format: AgentOutputFormat::OpenCodeJson,
             non_interactive_flag: Some("run".into()),
             headless_prompt_in_argv: true,
             auto_flags: strings(&["--auto"]),
+            // The built-in Plan agent on the TUI and `run`; ACP selects the
+            // advertised `plan` session mode. Tab/agent switch to Build later
+            // is the provider's own transition.
+            native_plan: Some(NativePlanSpec {
+                kind: NativePlanKind::Plan,
+                interactive_argv: Some(strings(&["--agent", "plan"])),
+                interactive_settings: None,
+                headless_argv: Some(strings(&["--agent", "plan"])),
+                acp_mode_id: Some("plan".into()),
+            }),
+            mode_selectors: vec![value_selector(&["--agent"], &["plan"])],
+            plan_env_drop: strings(&["OPENCODE_PERMISSION"]),
+            plan_config_guard: PlanConfigGuard::OpenCodeV1,
             // opencode's bare command treats a positional as a project dir, so a
             // seeded prompt must go through `--prompt <text>`; a positional
             // prompt makes opencode `open()` the prompt as a path (ENAMETOOLONG).
@@ -177,6 +259,7 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
         },
         // OpenCode 2.x. Same `opencode` binary name as 1.x, its own image.
         "opencode-v2" => AgentDefinition {
+            output_format: AgentOutputFormat::OpenCodeV2Json,
             // Without `--standalone` V2 discovers a shared background service
             // whose credentials and sessions may belong to another launch.
             interactive_entrypoint: strings(&["opencode", "--standalone"]),
@@ -187,7 +270,27 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             // awman's yolo, not awman's auto.
             yolo_flags: strings(&["--auto"]),
             auto_flags: Vec::new(),
-            plan_flags: Vec::new(),
+            // Headless: `run --agent plan`. The full TUI has no agent flag, so
+            // its private copy of ~/.config/opencode (seeded below, never the
+            // host directory) gets `default_agent: "plan"`; the Plan profile
+            // guard verifies nothing outranks it. `mini` (the --model
+            // fallback) has no plan option and stays refused.
+            native_plan: Some(NativePlanSpec {
+                kind: NativePlanKind::Plan,
+                interactive_argv: None,
+                interactive_settings: Some(NativeSettingsPatch {
+                    home_relative_file: ".config/opencode/opencode.json".into(),
+                    patch: serde_json::json!({ "default_agent": "plan" }),
+                }),
+                headless_argv: Some(strings(&["--agent", "plan"])),
+                acp_mode_id: None,
+            }),
+            mode_selectors: vec![
+                value_selector(&["--agent"], &["plan"]),
+                conflicting_switch(&["--auto"]),
+            ],
+            plan_env_drop: strings(&["OPENCODE_PERMISSION"]),
+            plan_config_guard: PlanConfigGuard::OpenCodeV2,
             strict_modes: true,
             requires_private_session: true,
             mode_refusals: vec![ModeRefusal {
@@ -265,9 +368,15 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             // `--force` only ever on an explicit --yolo.
             yolo_flags: strings(&["--force"]),
             auto_flags: Vec::new(),
-            // `--mode plan` is the intended mapping once a real-account smoke
-            // proves it cannot write or run shell; refused until then.
-            plan_flags: Vec::new(),
+            // `--mode plan` on both cursor-agent and `--print`. Shift+Tab mode
+            // rotation later is the provider's own transition; `--trust`
+            // (headless) and `--force` (explicit yolo only) are unchanged.
+            native_plan: argv_plan(NativePlanKind::Plan, &["--mode", "plan"]),
+            mode_selectors: vec![
+                value_selector(&["--mode"], &["plan"]),
+                conflicting_switch(&["--force", "-f"]),
+                conflicting_switch(&["--yolo"]),
+            ],
             strict_modes: true,
             requires_private_session: true,
             mode_refusals: vec![ModeRefusal {
@@ -305,10 +414,23 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             ..base("cursor", "Cursor Agent")
         },
         "copilot" => AgentDefinition {
-            non_interactive_flag: Some("-p".into()),
+            output_format: AgentOutputFormat::CopilotJson,
+            // `-p` takes the next token as the prompt, so it is delivered
+            // directly before the prompt (`copilot --plan … -p PROMPT`) rather
+            // than in the entrypoint, where mode flags would follow it.
+            non_interactive_flag: None,
             headless_prompt_in_argv: true,
+            headless_prompt_flag: Some("-p".into()),
             interactive_seed_delivery: InteractiveSeedDelivery::Flag("-i".into()),
-            plan_flags: strings(&["--plan"]),
+            native_plan: argv_plan(NativePlanKind::Plan, &["--plan"]),
+            // COPILOT_PLAN_THEN_AUTOPILOT really starts in plan, so it is kept.
+            mode_selectors: vec![
+                value_selector(&["--mode"], &["plan"]),
+                duplicate_switch(&["--plan"]),
+                conflicting_switch(&["--autopilot"]),
+                conflicting_switch(&["--yolo"]),
+                conflicting_switch(&["--allow-all"]),
+            ],
             yolo_flags: strings(&["--yolo"]),
             // TODO(acp): verify and wire up if/when copilot ships ACP support
             supports_acp: false,
@@ -328,12 +450,26 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             ..base("copilot", "GitHub Copilot CLI")
         },
         "cline" => AgentDefinition {
+            output_format: AgentOutputFormat::ClineJson,
             // A positional prompt starts a one-shot run. A seeded interactive
             // prompt therefore needs `--tui`, and `task` is not a subcommand.
             non_interactive_flag: None,
             headless_prompt_in_argv: true,
             interactive_only_flags: strings(&["--tui"]),
-            plan_flags: strings(&["--plan"]),
+            // TUI and one-shot `--plan`; ACP selects the advertised `plan` mode.
+            native_plan: Some(NativePlanSpec {
+                kind: NativePlanKind::Plan,
+                interactive_argv: Some(strings(&["--plan"])),
+                interactive_settings: None,
+                headless_argv: Some(strings(&["--plan"])),
+                acp_mode_id: Some("plan".into()),
+            }),
+            mode_selectors: vec![
+                duplicate_switch(&["--plan", "-p"]),
+                conflicting_switch(&["--act", "-a"]),
+                conflicting_switch(&["--yolo", "-y"]),
+                value_selector(&["--auto-approve"], &[]),
+            ],
             yolo_flags: strings(&["--yolo"]),
             auto_flags: strings(&["--auto-approve", "true"]),
             supports_acp: true,
@@ -347,11 +483,17 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             ..base("cline", "Cline")
         },
         "antigravity" => AgentDefinition {
+            output_format: AgentOutputFormat::AntigravityStreamJson,
             // Antigravity CLI exposes startup execution modes and models.
             interactive_entrypoint: strings(&["agy"]),
             non_interactive_flag: Some("--print".into()),
             headless_prompt_in_argv: true,
-            plan_flags: strings(&["--mode", "plan"]),
+            // Planning steers the agent; shell permission rules stay separate.
+            native_plan: argv_plan(NativePlanKind::Plan, &["--mode", "plan"]),
+            mode_selectors: vec![
+                value_selector(&["--mode"], &["plan"]),
+                conflicting_switch(&["--dangerously-skip-permissions"]),
+            ],
             yolo_flags: strings(&["--dangerously-skip-permissions"]),
             auto_flags: strings(&["--mode", "accept-edits"]),
             interactive_seed_delivery: InteractiveSeedDelivery::Flag("--prompt-interactive".into()),
@@ -368,5 +510,212 @@ pub fn first_party(name: &str) -> Option<AgentDefinition> {
             ..base("antigravity", "Antigravity")
         },
         _ => return None,
+    })
+}
+
+/// Each first-party definition selects its own automation adapter.
+fn automation_adapter(name: &str) -> Option<crate::data::automation::AutomationAdapterKind> {
+    use crate::data::automation::AutomationAdapterKind as A;
+    Some(match name {
+        "claude" => A::Claude,
+        "codex" => A::Codex,
+        "opencode" => A::Opencode,
+        "opencode-v2" => A::OpencodeV2,
+        "cursor" => A::Cursor,
+        "copilot" => A::Copilot,
+        "cline" => A::Cline,
+        "antigravity" => A::Antigravity,
+        _ => return None,
+    })
+}
+
+fn resume_spec(name: &str) -> Option<super::definition::NativeResumeSpec> {
+    use super::definition::{IdForm, NativeResumeSpec, ResumePosition, ResumeSelector};
+    let (flag, position, equals) = match name {
+        "claude" | "cursor" => ("--resume", ResumePosition::Options, false),
+        "codex" => ("resume", ResumePosition::SubcommandTail, false),
+        "opencode" | "opencode-v2" => ("--session", ResumePosition::Options, false),
+        "copilot" => ("--resume", ResumePosition::Options, true),
+        "cline" => ("--id", ResumePosition::Options, false),
+        "antigravity" => ("--conversation", ResumePosition::Options, false),
+        _ => return None,
+    };
+    let interactive = ResumeSelector {
+        before_id: if equals { vec![] } else { strings(&[flag]) },
+        form: if equals {
+            IdForm::Equals(flag.into())
+        } else {
+            IdForm::Separate
+        },
+        after_id: vec![],
+        position,
+        no_auto_continue: false,
+    };
+    let mut headless = interactive.clone();
+    if name == "codex" {
+        headless.after_id.push("-".into());
+    }
+    Some(NativeResumeSpec {
+        interactive: Some(interactive.clone()),
+        headless: Some(headless),
+        model_fallback: (name == "opencode-v2").then_some(interactive),
+    })
+}
+fn profile_spec(name: &str) -> Option<super::profile_state::ProfileStateSpec> {
+    use super::profile_state::{ProfileRoot, ProfileStateSpec, SeedRule, SeedSanitizer::*};
+    type ProfileRow = (
+        Vec<(&'static str, bool, Option<&'static str>)>,
+        Vec<(&'static str, super::profile_state::SeedSanitizer)>,
+        Vec<&'static str>,
+        Vec<&'static str>,
+        bool,
+    );
+    let (roots, settings, history, exclude, db): ProfileRow = match name {
+        "claude" => (
+            vec![(".claude", false, None), (".claude.json", true, None)],
+            vec![
+                (".claude.json", ClaudeConfig),
+                (".claude/settings.json", ClaudeSettings),
+            ],
+            vec![
+                ".claude/projects",
+                ".claude/todos",
+                ".claude/plans",
+                ".claude/history.jsonl",
+            ],
+            vec![
+                ".claude/statsig",
+                ".claude/shell-snapshots",
+                ".claude/ide",
+                ".claude/debug",
+            ],
+            false,
+        ),
+        "codex" => (
+            vec![
+                (".codex", false, None),
+                (".codex-sqlite", false, Some("CODEX_SQLITE_HOME")),
+            ],
+            vec![(".codex/config.toml", CodexToml)],
+            vec![".codex/sessions", ".codex/history.jsonl"],
+            vec![
+                ".codex-sqlite",
+                ".codex/packages",
+                ".codex/log",
+                ".codex/tmp",
+            ],
+            false,
+        ),
+        "opencode" | "opencode-v2" => (
+            vec![
+                (".config/opencode", false, None),
+                (".local/share/opencode", false, None),
+                (".local/state/opencode", false, None),
+            ],
+            vec![
+                (".config/opencode/opencode.json", OpenCodeJson),
+                (".config/opencode/opencode.jsonc", OpenCodeJson),
+            ],
+            if name == "opencode" {
+                vec![".local/share/opencode/storage"]
+            } else {
+                vec![]
+            },
+            vec![
+                ".local/share/opencode/log",
+                ".local/share/opencode/bin",
+                ".local/share/opencode/snapshot",
+                ".config/opencode/node_modules",
+            ],
+            name == "opencode-v2",
+        ),
+        "cursor" => (
+            vec![(".cursor", false, Some("CURSOR_CONFIG_DIR"))],
+            vec![(".cursor/cli-config.json", CursorCliConfig)],
+            vec![".cursor/chats"],
+            vec![".cursor/logs", ".cursor/extensions"],
+            false,
+        ),
+        "copilot" => (
+            vec![(".copilot", false, None)],
+            vec![(".copilot/config.json", CopilotConfig)],
+            vec![".copilot/session-state", ".copilot/history-session-state"],
+            vec![".copilot/logs", ".copilot/pkg"],
+            false,
+        ),
+        "cline" => (
+            vec![(".cline/data", false, None)],
+            vec![(".cline/data/globalState.json", ClineSettings)],
+            vec![".cline/data/tasks", ".cline/data/state/taskHistory.json"],
+            vec![".cline/data/logs"],
+            false,
+        ),
+        "antigravity" => (
+            vec![(".gemini", false, None)],
+            vec![(".gemini/settings.json", AntigravitySettings)],
+            vec![
+                ".gemini/antigravity-cli/conversations",
+                ".gemini/antigravity-cli/brain",
+            ],
+            vec![".gemini/tmp"],
+            false,
+        ),
+        _ => return None,
+    };
+    Some(ProfileStateSpec {
+        allow_leading_dash: name == "copilot",
+        identity: match name {
+            "claude" => super::profile_state::HistoryIdentity::Claude,
+            "codex" => super::profile_state::HistoryIdentity::Codex,
+            "opencode" | "opencode-v2" => super::profile_state::HistoryIdentity::OpenCode,
+            "cursor" => super::profile_state::HistoryIdentity::Cursor,
+            "copilot" => super::profile_state::HistoryIdentity::Copilot,
+            "cline" => super::profile_state::HistoryIdentity::Cline,
+            _ => super::profile_state::HistoryIdentity::Antigravity,
+        },
+        roots: roots
+            .into_iter()
+            .map(|(r, f, e)| ProfileRoot {
+                home_relative: r.into(),
+                file: f,
+                env_var: e.map(str::to_owned),
+            })
+            .collect(),
+        settings: settings
+            .into_iter()
+            .map(|(p, s)| SeedRule {
+                path: p.into(),
+                sanitizer: s,
+            })
+            .collect(),
+        history: strings(&history),
+        exclude: strings(&exclude)
+            .into_iter()
+            .chain(strings(match name {
+                "claude" => &[".claude/.credentials.json"],
+                "codex" => &[".codex/auth.json"],
+                "opencode" | "opencode-v2" => &[
+                    ".local/share/opencode/auth.json",
+                    ".local/share/opencode/mcp-auth.json",
+                ],
+                "cursor" => &[".cursor/auth.json"],
+                "cline" => &[".cline/data/secrets.json"],
+                "antigravity" => &[
+                    ".gemini/oauth_creds.json",
+                    ".gemini/google_accounts.json",
+                    ".gemini/antigravity-cli/antigravity-oauth-token",
+                ],
+                _ => &[],
+            }))
+            .collect(),
+        exclude_basename_prefixes: match name {
+            "cline" => vec![(".cline/data".into(), "secrets".into())],
+            "antigravity" => vec![(".gemini".into(), "credentials".into())],
+            "opencode" | "opencode-v2" => {
+                vec![(".local/share/opencode".into(), "opencode.db".into())]
+            }
+            _ => vec![],
+        },
+        database_history: db,
     })
 }

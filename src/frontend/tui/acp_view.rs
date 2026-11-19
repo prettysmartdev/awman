@@ -340,6 +340,12 @@ fn push_update_lines(lines: &mut Vec<Line<'static>>, update: &SessionUpdate) {
                 Style::default().fg(Color::DarkGray),
             )));
         }
+        SessionUpdate::CurrentModeUpdate { .. } => {
+            lines.push(Line::from(Span::styled(
+                crate::engine::acp::protocol::summarize_update(update),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
 }
 

@@ -260,6 +260,7 @@ impl InstanceCommandFrontend {
             .bridge(
                 &terminals.hub,
                 TerminalRegistration {
+                    automation: None,
                     owner: terminals.owner.clone(),
                     agent: title.to_string(),
                     model: None,

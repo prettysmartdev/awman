@@ -82,6 +82,8 @@ pub const HOST_DIR_DENY_LIST: &[&str] = &[
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDefinitionFile {
+    #[serde(default)]
+    pub automation: Option<AutomationTable>,
     pub schema: u32,
     pub display_name: String,
     #[serde(default)]
@@ -165,6 +167,20 @@ pub struct ModesTable {
     pub auto: Vec<String>,
     #[serde(default)]
     pub plan: Vec<String>,
+    /// Interactive plan argv. Omitted inherits `plan`; an explicitly empty
+    /// array declares the interactive route unsupported.
+    #[serde(default)]
+    pub plan_interactive: Option<Vec<String>>,
+    /// Headless plan argv, with the same inheritance as `plan_interactive`.
+    #[serde(default)]
+    pub plan_headless: Option<Vec<String>>,
+    /// What the plan mapping selects; default `custom`.
+    #[serde(default)]
+    pub plan_kind: Option<crate::data::agent_policy::NativePlanKind>,
+    /// ACP session mode selected (and acknowledged) before the first prompt.
+    /// Never inferred from stdio argv.
+    #[serde(default)]
+    pub plan_acp_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -342,6 +358,60 @@ fn check_array_len(field: &str, len: usize, problems: &mut Vec<String>) {
     }
 }
 
+impl ModesTable {
+    /// Whether any plan delivery is declared: a `plan` fallback, a non-empty
+    /// route array or an ACP mode.
+    pub fn declares_plan(&self) -> bool {
+        !self.plan.is_empty()
+            || self
+                .plan_interactive
+                .as_ref()
+                .is_some_and(|v| !v.is_empty())
+            || self.plan_headless.as_ref().is_some_and(|v| !v.is_empty())
+            || self.plan_acp_mode.is_some()
+    }
+
+    /// Rules for the native plan keys (WI 0070).
+    fn validate_plan(&self, has_acp: bool, problems: &mut Vec<String>) {
+        for (field, argv) in [
+            ("modes.plan_interactive", &self.plan_interactive),
+            ("modes.plan_headless", &self.plan_headless),
+        ] {
+            if let Some(argv) = argv {
+                check_argv(field, argv, false, problems);
+            }
+        }
+        if let Some(mode) = &self.plan_acp_mode {
+            if !has_acp {
+                problems.push(
+                    "modes.plan_acp_mode: requires an [acp] table; ACP support is never inferred \
+                     from stdio argv"
+                        .into(),
+                );
+            }
+            if mode.is_empty()
+                || mode.len() > 64
+                || !mode
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
+            {
+                problems
+                    .push("modes.plan_acp_mode: must be 1-64 characters of [A-Za-z0-9_.:-]".into());
+            }
+        }
+        let route_keys = self.plan_kind.is_some()
+            || self.plan_interactive.is_some()
+            || self.plan_headless.is_some();
+        if route_keys && !self.declares_plan() {
+            problems.push(
+                "modes: declares a plan kind or route but no plan delivery (set modes.plan, a \
+                 non-empty plan_interactive/plan_headless, or plan_acp_mode)"
+                    .into(),
+            );
+        }
+    }
+}
+
 fn check_argv(field: &str, argv: &[String], command: bool, problems: &mut Vec<String>) {
     check_array_len(field, argv.len(), problems);
     if command && argv.is_empty() {
@@ -468,6 +538,7 @@ impl AgentDefinitionFile {
         check_argv("modes.yolo", &self.modes.yolo, false, &mut problems);
         check_argv("modes.auto", &self.modes.auto, false, &mut problems);
         check_argv("modes.plan", &self.modes.plan, false, &mut problems);
+        self.modes.validate_plan(self.acp.is_some(), &mut problems);
         if let Some(tools) = &self.tools {
             for (field, token) in [
                 ("tools.allowed_flag", &tools.allowed_flag),
@@ -900,4 +971,125 @@ fn field_location(source: &str, field: &str) -> String {
         table = child_table;
     }
     source_location(source, span)
+}
+
+#[cfg(test)]
+mod native_plan_tests {
+    use super::*;
+    use crate::data::agent_policy::NativePlanKind;
+
+    const BASE: &str = "schema = 1\ndisplay_name = \"Custom\"\n[run]\ncommand = [\"custom\"]\n\
+                        [image]\ninstall = [\"echo i\"]\n";
+
+    fn parse(extra: &str) -> Result<AgentDefinitionFile, String> {
+        toml::from_str(&format!("{BASE}{extra}")).map_err(|e| e.to_string())
+    }
+
+    fn plan_problems(file: &AgentDefinitionFile) -> Vec<String> {
+        file.validate()
+            .into_iter()
+            .filter(|p| p.starts_with("modes"))
+            .collect()
+    }
+
+    #[test]
+    fn the_four_route_keys_parse_and_default() {
+        let file = parse(
+            "[modes]\nplan = [\"--plan\"]\nplan_interactive = [\"--mode\", \"plan\"]\n\
+             plan_headless = []\nplan_kind = \"read_only\"\n",
+        )
+        .unwrap();
+        assert_eq!(file.modes.plan, vec!["--plan"]);
+        assert_eq!(
+            file.modes.plan_interactive,
+            Some(vec!["--mode".to_string(), "plan".to_string()])
+        );
+        assert_eq!(file.modes.plan_headless, Some(Vec::new()));
+        assert_eq!(file.modes.plan_kind, Some(NativePlanKind::ReadOnly));
+        assert!(plan_problems(&file).is_empty(), "{:?}", file.validate());
+
+        let omitted = parse("[modes]\nplan = [\"--plan\"]\n").unwrap();
+        assert_eq!(omitted.modes.plan_interactive, None);
+        assert_eq!(omitted.modes.plan_headless, None);
+        assert_eq!(omitted.modes.plan_kind, None, "kind defaults at conversion");
+        assert_eq!(omitted.modes.plan_acp_mode, None);
+    }
+
+    #[test]
+    fn an_unknown_modes_key_and_kind_are_still_rejected() {
+        assert!(parse("[modes]\nplan_tui = [\"--plan\"]\n").is_err());
+        assert!(parse("[modes]\nplan = [\"--plan\"]\nplan_kind = \"planning\"\n").is_err());
+    }
+
+    #[test]
+    fn plan_acp_mode_requires_acp_and_a_safe_id() {
+        let without_acp = parse("[modes]\nplan_acp_mode = \"plan\"\n").unwrap();
+        let problems = plan_problems(&without_acp);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("requires an [acp] table")),
+            "{problems:?}"
+        );
+        let with_acp =
+            parse("[modes]\nplan_acp_mode = \"plan\"\n[acp]\ncommand = [\"custom\", \"--acp\"]\n")
+                .unwrap();
+        assert!(
+            plan_problems(&with_acp).is_empty(),
+            "{:?}",
+            with_acp.validate()
+        );
+        for bad in ["", "has space", "x/y", &"a".repeat(65)] {
+            let file = parse(&format!(
+                "[modes]\nplan_acp_mode = \"{bad}\"\n[acp]\ncommand = [\"custom\"]\n"
+            ))
+            .unwrap();
+            assert!(
+                plan_problems(&file)
+                    .iter()
+                    .any(|p| p.contains("1-64 characters")),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kind_or_route_without_any_delivery_is_a_problem() {
+        for extra in [
+            "[modes]\nplan_kind = \"plan\"\n",
+            "[modes]\nplan_interactive = []\nplan_headless = []\n",
+        ] {
+            let file = parse(extra).unwrap();
+            assert!(
+                plan_problems(&file)
+                    .iter()
+                    .any(|p| p.contains("no plan delivery")),
+                "{extra}"
+            );
+        }
+        // An explicitly empty route beside a fallback is a declared refusal.
+        let file = parse("[modes]\nplan = [\"--plan\"]\nplan_headless = []\n").unwrap();
+        assert!(file.modes.declares_plan());
+        assert!(plan_problems(&file).is_empty());
+        // No plan keys at all: nothing to check.
+        assert!(plan_problems(&parse("").unwrap()).is_empty());
+    }
+
+    #[test]
+    fn route_argv_tokens_are_checked_like_plan() {
+        let file = parse("[modes]\nplan_interactive = [\"\"]\n").unwrap();
+        assert!(
+            plan_problems(&file)
+                .iter()
+                .any(|p| p.starts_with("modes.plan_interactive[0]")),
+            "{:?}",
+            file.validate()
+        );
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationTable {
+    pub adapter: crate::data::automation::AutomationAdapterKind,
 }

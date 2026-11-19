@@ -13,10 +13,40 @@ use crate::engine::error::EngineError;
 
 #[derive(Debug, Error)]
 pub enum CommandError {
+    #[error("settings profile busy: {0}; run 'awman agents profile close <NAME> --agent <agent>' after cancelling its command")]
+    SettingsProfileBusy(String),
+    #[error("native session not found in this profile")]
+    NativeSessionNotFound,
+    #[error("owner-local profile access required")]
+    ProfileOwnerRequired,
     #[error(transparent)]
     Edit(#[from] crate::command::commands::edit::EditError),
     #[error(transparent)]
     Engine(EngineError),
+
+    #[error("runtime wait failed: {0}")]
+    RuntimeWaitFailed(String),
+
+    /// WI 0070: a request that is well-formed but not admissible as
+    /// sent (`invalid_request`, usage exit 2 / HTTP 400).
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+
+    /// WI 0070: the selected agent/route lacks a native facility (409).
+    #[error("native capability unavailable: {0}")]
+    NativeCapabilityUnavailable(String),
+
+    /// WI 0070: an automation execution's primary asynchronous failure
+    /// (`startup_timeout`, `delivery_unknown`, `agent_turn_failed`, …).
+    #[error("{code}: {message}")]
+    AutomationFailed {
+        code: String,
+        message: String,
+        automation: Option<Box<crate::data::automation_records::CommandAutomationResult>>,
+        /// The last turn's native-confirmed answer, if any (never an
+        /// ordinary output candidate).
+        final_message: Option<String>,
+    },
 
     #[error(transparent)]
     Data(DataError),
@@ -289,6 +319,18 @@ pub enum CommandError {
     #[error("the {runtime} runtime cannot mount the workspace read-only; --read-only-workspace is refused rather than run with a writable workspace")]
     ReadOnlyWorkspaceUnsupported { runtime: String },
 
+    // ── Declared, not yet available (WI 0070) ─────────────────────────────
+    /// A flag or command the catalogue declares whose behavior is not wired
+    /// in this build. Refused as invalid usage before any side effect; it is
+    /// never silently accepted. `option` is the flag's long name, or `None`
+    /// when the command itself is pending. See
+    /// `dispatch::catalogue::PENDING_OPTIONS`.
+    #[error("{}", option_pending_message(command, option.as_deref()))]
+    OptionPending {
+        command: Vec<String>,
+        option: Option<String>,
+    },
+
     // ── Agents (`awman agents …`) ─────────────────────────────────────────
     #[error("no agent matches {reference:?}; run `awman agents ls` to see running agents")]
     AgentNotFound { reference: String },
@@ -326,7 +368,27 @@ pub enum CommandError {
     Other(String),
 }
 
+/// The user-facing text of [`CommandError::OptionPending`].
+fn option_pending_message(command: &[String], option: Option<&str>) -> String {
+    let command = command.join(" ");
+    match option {
+        Some(option) => format!(
+            "--{option} is not available yet on `{command}` in this build; it is refused \
+             rather than ignored"
+        ),
+        None => format!("`{command}` is not available yet in this build"),
+    }
+}
+
 impl CommandError {
+    /// The refusal for a declared-but-unwired flag (`option`) or command.
+    pub fn option_pending(command: &[&str], option: Option<&str>) -> Self {
+        CommandError::OptionPending {
+            command: command.iter().map(|part| (*part).to_string()).collect(),
+            option: option.map(str::to_string),
+        }
+    }
+
     /// Kept for callers of the slice that introduced command secrets.
     pub fn command_secrets_lost() -> Self {
         Self::CommandSecretsLost
@@ -353,12 +415,25 @@ impl CommandError {
                 flag: flag.clone(),
                 reason: reason.clone(),
             },
+            CommandError::InvalidArgumentValue {
+                command,
+                argument,
+                reason,
+            } => CommandError::InvalidArgumentValue {
+                command: command.clone(),
+                argument: argument.clone(),
+                reason: reason.clone(),
+            },
             CommandError::UnexpectedArgument { command, argument } => {
                 CommandError::UnexpectedArgument {
                     command: command.clone(),
                     argument: argument.clone(),
                 }
             }
+            CommandError::OptionPending { command, option } => CommandError::OptionPending {
+                command: command.clone(),
+                option: option.clone(),
+            },
             _ => return None,
         })
     }
@@ -477,6 +552,7 @@ impl CommandError {
         | CommandError::PrerequisiteWideningRefused { .. }
         | CommandError::PrerequisiteFlagUnsupported { .. }
         | CommandError::ReadOnlyWorkspaceUnsupported { .. }
+        | CommandError::OptionPending { .. }
         // Session-creation validation failures are invalid-usage class.
         | CommandError::SessionInvalidType { .. }
         | CommandError::SessionWorkdirRequired
@@ -508,7 +584,12 @@ impl CommandError {
         // Engine failures carry their own class (3 only for a missing or
         // failing Docker/Apple Containers backend, 1 otherwise).
         CommandError::Engine(e) => e.exit_code(),
-        CommandError::Data(_) => 1,
+        CommandError::Data(_) | CommandError::RuntimeWaitFailed(_) => 1,
+        CommandError::NativeCapabilityUnavailable(_) => 1,
+        CommandError::InvalidRequest(_) => 2,
+        // A known nonzero provider exit is reported through the outcome; a
+        // failed automation result is a runtime failure.
+        CommandError::AutomationFailed { .. } => 1,
         CommandError::MergeConflict { .. } => 1,
         CommandError::MergeTargetDirty { .. } | CommandError::WorktreeExists { .. } => 1,
         CommandError::MissingRemoteAddress
@@ -530,6 +611,7 @@ impl CommandError {
         CommandError::GitAuthFailed { .. }
         | CommandError::CredentialsLost
         | CommandError::CommandSecretsLost => 1,
+        CommandError::SettingsProfileBusy(_) | CommandError::NativeSessionNotFound | CommandError::ProfileOwnerRequired => 1,
         CommandError::Other(_) => 1,
     }
     }
@@ -544,8 +626,16 @@ impl CommandError {
     /// resource 404, anything else 500.
     pub fn http_status(&self) -> u16 {
         match self {
+            CommandError::SettingsProfileBusy(_)
+            | CommandError::Data(DataError::ProfileLockBusy) => 409,
+            CommandError::NativeSessionNotFound => 404,
+            CommandError::NativeCapabilityUnavailable(_) => 409,
+            CommandError::ProfileOwnerRequired => 403,
             CommandError::Engine(EngineError::AgentDefinitionUntrusted { .. }) => 403,
             CommandError::Engine(EngineError::UnknownAgent { .. }) => 404,
+            // WI 0070: a missing native capability is a conflict with the
+            // selected agent/route, not a server failure.
+            CommandError::Engine(e) if e.is_native_capability_unavailable() => 409,
             CommandError::SessionWorkdirNotAllowed { .. } => 403,
             CommandError::PrerequisiteWideningRefused { .. } => 403,
             CommandError::WorkflowPrerequisitesUnresolved { .. } => 409,
@@ -619,6 +709,10 @@ impl CommandError {
             CommandError::GitAuthFailed { .. } | CommandError::CredentialsLost => {
                 crate::data::fs::api_db::failure_stages::GIT_AUTH
             }
+            CommandError::SettingsProfileBusy(_)
+            | CommandError::NativeSessionNotFound
+            | CommandError::ProfileOwnerRequired => PREFLIGHT,
+            CommandError::Data(DataError::ProfileLockBusy) => PREFLIGHT,
             CommandError::CommandSecretsLost => PREFLIGHT,
             CommandError::WorkItem(_) => PREFLIGHT,
             CommandError::DraftSync(_) => STEP,
@@ -626,6 +720,12 @@ impl CommandError {
 
             CommandError::MergeConflict { .. } | CommandError::MergeTargetDirty { .. } => MERGE,
 
+            CommandError::Engine(e)
+                if e.is_native_capability_unavailable()
+                    || matches!(e, EngineError::AgentModeConflict { .. }) =>
+            {
+                PREFLIGHT
+            }
             CommandError::Engine(EngineError::UnknownAgent { .. })
             | CommandError::Engine(EngineError::AgentDefinitionUntrusted { .. })
             | CommandError::WorktreeExists { .. }
@@ -670,15 +770,20 @@ impl CommandError {
             | CommandError::PrerequisiteWideningRefused { .. }
             | CommandError::PrerequisiteFlagUnsupported { .. }
             | CommandError::ReadOnlyWorkspaceUnsupported { .. }
+            | CommandError::OptionPending { .. }
             | CommandError::AgentNotFound { .. }
             | CommandError::AgentNoLongerRunning { .. }
             | CommandError::AgentNotRunning { .. }
             | CommandError::AgentReplaced { .. }
             | CommandError::AgentAmbiguous { .. }
             | CommandError::AgentReferenceEmpty
-            | CommandError::NotImplemented(_) => PREFLIGHT,
+            | CommandError::NotImplemented(_)
+            | CommandError::NativeCapabilityUnavailable(_)
+            | CommandError::InvalidRequest(_) => PREFLIGHT,
 
+            CommandError::AutomationFailed { .. } => STEP,
             CommandError::Engine(_)
+            | CommandError::RuntimeWaitFailed(_)
             | CommandError::Data(_)
             | CommandError::Aborted
             | CommandError::RemoteTimeout
@@ -712,14 +817,38 @@ impl CommandError {
     pub fn code(&self) -> &'static str {
         use crate::data::fs::api_db::failure_codes as outcome_codes;
         match self {
+            CommandError::SettingsProfileBusy(_)
+            | CommandError::Data(DataError::ProfileLockBusy) => {
+                crate::data::agent_failure::SETTINGS_PROFILE_BUSY
+            }
+            CommandError::NativeSessionNotFound => {
+                crate::data::agent_failure::NATIVE_SESSION_NOT_FOUND
+            }
+            CommandError::ProfileOwnerRequired => "forbidden",
             CommandError::Engine(EngineError::UnknownAgent { .. }) => failure_codes::UNKNOWN_AGENT,
             CommandError::Engine(EngineError::AgentDefinitionUntrusted { .. }) => {
                 failure_codes::AGENT_UNTRUSTED
+            }
+            CommandError::Engine(EngineError::AgentModeConflict { .. }) => {
+                crate::data::agent_failure::AGENT_MODE_CONFLICT
+            }
+            CommandError::Engine(e) if e.is_native_capability_unavailable() => {
+                crate::data::agent_failure::NATIVE_CAPABILITY_UNAVAILABLE
             }
             CommandError::Engine(_) | CommandError::Data(_) | CommandError::Other(_) => {
                 outcome_codes::INTERNAL
             }
 
+            CommandError::RuntimeWaitFailed(_) => crate::data::agent_failure::RUNTIME_WAIT_FAILED,
+            CommandError::InvalidRequest(_) => "invalid_request",
+            CommandError::NativeCapabilityUnavailable(_) => {
+                crate::data::agent_failure::NATIVE_CAPABILITY_UNAVAILABLE
+            }
+            CommandError::AutomationFailed { code, .. } => crate::data::agent_failure::ALL
+                .iter()
+                .copied()
+                .find(|known| known == code)
+                .unwrap_or(crate::data::agent_failure::AGENT_TURN_FAILED),
             CommandError::UnknownCommand { .. } => failure_codes::UNKNOWN_SUBCOMMAND,
             CommandError::NotAvailableForFrontend { .. } => "not_available_for_frontend",
             CommandError::UnknownFlag { .. } => failure_codes::UNKNOWN_FLAG,
@@ -728,6 +857,9 @@ impl CommandError {
             CommandError::UnexpectedArgument { .. } => "unexpected_argument",
             CommandError::MutuallyExclusive { .. } => "mutually_exclusive_flags",
             CommandError::InvalidFlagValue { .. } => "invalid_flag_value",
+            CommandError::InvalidArgumentValue { argument, .. } if argument == "prompt" => {
+                "invalid_request"
+            }
             CommandError::InvalidArgumentValue { .. } => "invalid_argument_value",
             CommandError::CommandBoxParse(_) => "command_box_parse_failed",
 
@@ -787,6 +919,7 @@ impl CommandError {
             CommandError::PrerequisiteWideningRefused { .. } => "prerequisite_widening_refused",
             CommandError::PrerequisiteFlagUnsupported { .. } => "prerequisite_flag_unsupported",
             CommandError::ReadOnlyWorkspaceUnsupported { .. } => "read_only_workspace_unsupported",
+            CommandError::OptionPending { .. } => failure_codes::INVALID_REQUEST,
 
             CommandError::AgentNotFound { .. } => "agent_not_found",
             CommandError::AgentNoLongerRunning { .. } => "agent_no_longer_running",

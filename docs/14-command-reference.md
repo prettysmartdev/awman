@@ -65,6 +65,7 @@ Available via: CLI, TUI, API
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Mount the host Docker daemon socket into the agent container. |
 | `--json` | bool | false | `--headless` | — | CLI, TUI, API | Suppress human output and print structured JSON. Implies --headless. |
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to check and build (overrides .awman/config.json). Reviews and approves a custom agent definition that needs approval. |
+| `--prepare-only` | bool | false | — | `--refresh` | CLI, TUI, API | Prepare images only: skip the host agent check, credential refresh and agent audit. Authentication is reported as not checked. |
 
 ---
 
@@ -72,15 +73,15 @@ Available via: CLI, TUI, API
 
 Start a freeform chat session with the configured agent in a container.
 
-Available via: CLI, TUI
+Available via: CLI, TUI, API (local owner only; requires --automation, --settings-profile and interactive mode)
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
 | `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the agent headless (print mode). |
-| `--plan` | bool | false | — | `--yolo` | CLI, TUI, API | Run the agent in plan mode (read-only). |
+| `--plan` | bool | false | — | `--yolo`, `--auto` | CLI, TUI, API | Start the agent in its native plan (or read-only) mode. Does not change workspace mounts. |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Mount the host Docker daemon socket into the agent container. |
 | `--yolo` | bool | false | — | `--plan` | CLI, TUI, API | Enable fully autonomous mode. |
-| `--auto` | bool | false | — | — | CLI, TUI, API | Enable auto permission mode. |
+| `--auto` | bool | false | — | `--plan` | CLI, TUI, API | Enable auto permission mode. |
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to use (overrides .awman/config.json). |
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `-o, --overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a directory or context(repo@<key>[:ro\|rw]) into the agent container. Repeatable. |
@@ -88,6 +89,10 @@ Available via: CLI, TUI
 | `--branch` | string (optional) | — | — | `--pr`, `--worktree` | CLI, TUI | Run in a worktree for this branch. |
 | `--pr` | string (optional) | — | — | `--branch`, `--worktree` | CLI, TUI | Run in a worktree for this GitHub pull request. |
 | `--worktree` | string (optional) | — | — | `--branch`, `--pr` | CLI, TUI | Reuse an existing named or path-based Git worktree. |
+| `--read-only-workspace` | bool | false | — | `--allow-docker` | CLI, TUI, API | Mount the workspace read-only; the agent can write only to /awman/output, mounted contexts and /tmp. |
+| `--settings-profile` | string (optional) | — | — | — | CLI, TUI, API | Use a named private settings/history profile for the agent in this repository ([a-z0-9][a-z0-9_-]{0,62}; a name, not a path). |
+| `--agent-session` | string (optional) | — | — | — | CLI, TUI, API | Resume this exact agent-owned conversation id from the selected settings profile (requires --settings-profile; not an awman session id). |
+| `--automation` | enum, optional (`=value` only; bare = `auto`): auto, require_full | — | — | — | CLI, TUI, API | Own the agent's turn lifecycle and report status assurance: --automation (auto) or --automation=require_full (requires --settings-profile). |
 
 ---
 
@@ -155,6 +160,62 @@ Available via: CLI, TUI, API
 |---|---|---|---|---|---|---|
 | `--json` | bool | false | — | — | CLI, TUI, API | Emit JSON output. |
 | `-y, --yes` | bool | false | — | — | CLI, TUI, API | Skip the confirmation prompt (for scripting). |
+
+### `awman agents profile`
+
+Manage named agent settings profiles for this repository.
+
+Available via: CLI, TUI
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+#### `awman agents profile list`
+
+List settings profiles and their state (active, inactive or closing).
+
+Available via: CLI, TUI, API (local owner only)
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `--agent` | string (optional) | — | — | — | CLI, TUI, API | Only list profiles of this agent. |
+| `--json` | bool | false | — | — | CLI, TUI, API | Emit JSON output. |
+
+#### `awman agents profile delete`
+
+Delete an inactive settings profile and its retained history.
+
+Available via: CLI, TUI, API (local owner only)
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+| Argument | Kind | Required | Help |
+|---|---|---|---|
+| `name` | string | yes | Settings profile name ([a-z0-9][a-z0-9_-]{0,62}); a name, not a path. |
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `--agent` | string | — | — | — | CLI, TUI, API | Agent the profile belongs to. |
+| `--yes` | bool | false | — | — | CLI, TUI, API | Confirm the deletion; required. |
+| `--json` | bool | false | — | — | CLI, TUI, API | Emit JSON output. |
+
+#### `awman agents profile close`
+
+Finish closing a settings profile whose agent has ended, so it can be reused or deleted.
+
+Available via: CLI, TUI, API (local owner only)
+
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
+| Argument | Kind | Required | Help |
+|---|---|---|---|
+| `name` | string | yes | Settings profile name ([a-z0-9][a-z0-9_-]{0,62}); a name, not a path. |
+
+| Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
+|---|---|---|---|---|---|---|
+| `--agent` | string | — | — | — | CLI, TUI, API | Agent the profile belongs to. |
+| `--json` | bool | false | — | — | CLI, TUI, API | Emit JSON output. |
 
 ---
 
@@ -258,10 +319,10 @@ Available via: CLI, TUI, API
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
 | `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the agent headless (print mode). |
-| `--plan` | bool | false | — | `--yolo` | CLI, TUI, API | Run the agent in plan mode (read-only). |
+| `--plan` | bool | false | — | `--yolo`, `--auto` | CLI, TUI, API | Start the agent in its native plan (or read-only) mode. Does not change workspace mounts. |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Mount the host Docker daemon socket into the agent container. |
 | `--yolo` | bool | false | — | `--plan` | CLI, TUI, API | Enable fully autonomous mode. |
-| `--auto` | bool | false | — | — | CLI, TUI, API | Enable auto permission mode. |
+| `--auto` | bool | false | — | `--plan` | CLI, TUI, API | Enable auto permission mode. |
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to use (overrides .awman/config.json). |
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `-o, --overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a directory or context(repo@<key>[:ro\|rw]) into the agent container. Repeatable. |
@@ -272,6 +333,9 @@ Available via: CLI, TUI, API
 | `--pr` | string (optional) | — | — | `--branch`, `--worktree` | CLI, TUI | Run in a worktree for this GitHub pull request. |
 | `--worktree` | string (optional) | — | — | `--branch`, `--pr` | CLI, TUI | Reuse an existing named or path-based Git worktree. |
 | `--read-only-workspace` | bool | false | — | `--allow-docker` | CLI, TUI, API | Mount the workspace read-only; the agent can write only to /awman/output, mounted contexts and /tmp. |
+| `--settings-profile` | string (optional) | — | — | — | CLI, TUI, API | Use a named private settings/history profile for the agent in this repository ([a-z0-9][a-z0-9_-]{0,62}; a name, not a path). |
+| `--agent-session` | string (optional) | — | — | — | CLI, TUI, API | Resume this exact agent-owned conversation id from the selected settings profile (requires --settings-profile; not an awman session id). |
+| `--automation` | enum, optional (`=value` only; bare = `auto`): auto, require_full | — | — | — | CLI, TUI, API | Own the agent's turn lifecycle and report status assurance: --automation (auto) or --automation=require_full (requires --settings-profile). |
 
 ### `awman exec workflow`
 
@@ -289,12 +353,12 @@ Available via: CLI, TUI, API
 |---|---|---|---|---|---|---|
 | `-w, --work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
 | `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the agent headless (print mode). |
-| `--plan` | bool | false | — | `--yolo` | CLI, TUI, API | Run the agent in plan mode (read-only). |
+| `--plan` | bool | false | — | `--yolo`, `--auto` | CLI, TUI, API | Start the agent in its native plan (or read-only) mode. Does not change workspace mounts. |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Mount the host Docker daemon socket into the agent container. |
 | `--interactive` | bool | false | — | `--headless` | CLI, TUI, API | Run the agent interactively in a terminal (PTY). Overrides a daemon worker's headless default where the worker allows it. |
 | `--worktree` | bool | false | — | — | CLI, TUI, API | Run in an isolated Git worktree under ~/.awman/worktrees/. |
 | `--yolo` | bool | false | `--worktree` | `--plan` | CLI, TUI, API | Enable fully autonomous mode. Implies --worktree. |
-| `--auto` | bool | false | `--worktree` | — | CLI, TUI, API | Enable auto permission mode. Implies --worktree. |
+| `--auto` | bool | false | `--worktree` | `--plan` | CLI, TUI, API | Enable auto permission mode. Implies --worktree. |
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to use. |
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `-o, --overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a directory or context(repo@<key>[:ro\|rw]) into the agent container. Repeatable. |
@@ -311,6 +375,7 @@ Available via: CLI, TUI, API
 | `--check-prerequisites` | bool | false | — | — | CLI, TUI, API | Run only the workflow prerequisite checks, print the report and exit 0 when all checks are satisfied or 1 when any check is missing, needs consent or is unknown. |
 | `--json` | bool | false | `--headless` | — | CLI, TUI, API | Print the workflow outcome and prerequisite report as JSON. |
 | `--read-only-workspace` | bool | false | — | `--allow-docker` | CLI, TUI, API | Mount the workspace read-only; the agent can write only to /awman/output, mounted contexts and /tmp. |
+| `--settings-profile` | string (optional) | — | — | — | CLI, TUI, API | Use a named private settings/history profile for the agent in this repository ([a-z0-9][a-z0-9_-]{0,62}; a name, not a path). |
 
 ---
 
@@ -652,11 +717,11 @@ Runs without a working agent runtime — reachable even when the configured runt
 | `-f, --follow` | bool | false | — | — | CLI, TUI, API | Stream logs via SSE until the command completes. |
 | `-w, --work-item` | string (optional) | — | — | — | CLI, TUI, API | Work item to use. A bare value (42, 0042, WI-42, PROJ-123) is looked up in the configured workItems.source. Explicit forms ignore that setting: local:<N>, a path to a local .md file, github:<N> or #<N> (issue on origin), owner/repo#<N>, a GitHub issue URL, http:<provider>:<id>, or a URL under a configured workItems.providers baseUrl. |
 | `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the agent headless (print mode). |
-| `--plan` | bool | false | — | `--yolo` | CLI, TUI, API | Run the agent in plan mode (read-only). |
+| `--plan` | bool | false | — | `--yolo`, `--auto` | CLI, TUI, API | Start the agent in its native plan (or read-only) mode. Does not change workspace mounts. |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Mount the host Docker daemon socket into the agent container. |
 | `--interactive` | bool | false | — | `--headless` | CLI, TUI, API | Run the agent interactively in a terminal (PTY). Overrides a daemon worker's headless default where the worker allows it. |
 | `--yolo` | bool | false | — | `--plan` | CLI, TUI, API | Enable fully autonomous mode. Implies --worktree. |
-| `--auto` | bool | false | — | — | CLI, TUI, API | Enable auto permission mode. Implies --worktree. |
+| `--auto` | bool | false | — | `--plan` | CLI, TUI, API | Enable auto permission mode. Implies --worktree. |
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to use. |
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `-o, --overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a directory or context(repo@<key>[:ro\|rw]) into the agent container. Repeatable. |
@@ -690,10 +755,10 @@ Runs without a working agent runtime — reachable even when the configured runt
 | `--session` | string (optional) | — | — | — | CLI, TUI, API | Session ID to use on the remote host. |
 | `-f, --follow` | bool | false | — | — | CLI, TUI, API | Stream logs via SSE until the command completes. |
 | `-n, --headless` | bool | false | — | — | CLI, TUI, API | Run the agent headless (print mode). |
-| `--plan` | bool | false | — | `--yolo` | CLI, TUI, API | Run the agent in plan mode (read-only). |
+| `--plan` | bool | false | — | `--yolo`, `--auto` | CLI, TUI, API | Start the agent in its native plan (or read-only) mode. Does not change workspace mounts. |
 | `--allow-docker` | bool | false | — | — | CLI, TUI, API | Mount the host Docker daemon socket into the agent container. |
 | `--yolo` | bool | false | — | `--plan` | CLI, TUI, API | Enable fully autonomous mode. |
-| `--auto` | bool | false | — | — | CLI, TUI, API | Enable auto permission mode. |
+| `--auto` | bool | false | — | `--plan` | CLI, TUI, API | Enable auto permission mode. |
 | `--agent` | string (optional) | — | — | — | CLI, TUI, API | Agent to use (overrides .awman/config.json). |
 | `--model` | string (optional) | — | — | — | CLI, TUI, API | Override the model used by the launched agent. |
 | `-o, --overlay` | string (repeatable) | [] | — | — | CLI, TUI, API | Mount a directory or context(repo@<key>[:ro\|rw]) into the agent container. Repeatable. |

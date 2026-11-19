@@ -10,6 +10,8 @@ use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum DataError {
+    #[error("profile path is busy; retry after the concurrent operation finishes")]
+    ProfileLockBusy,
     #[error("git root not found for working directory {working_dir}")]
     GitRootNotFound { working_dir: PathBuf },
 

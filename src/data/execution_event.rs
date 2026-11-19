@@ -109,6 +109,10 @@ impl std::fmt::Display for EventSourcePhase {
 /// same way without each variant defining its own copy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventSource {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<crate::data::ids::ExecutionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<crate::data::ids::TurnId>,
     pub phase: EventSourcePhase,
     /// Absent for the leader and for shell setup/teardown output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -131,6 +135,8 @@ impl EventSource {
     /// A source with only its phase set.
     pub fn phase(phase: EventSourcePhase) -> Self {
         Self {
+            execution_id: None,
+            turn_id: None,
             phase,
             step_name: None,
             step_index: None,
@@ -143,6 +149,8 @@ impl EventSource {
     /// with the builder methods once known.
     pub fn step(phase: EventSourcePhase, step_name: impl Into<String>, step_index: usize) -> Self {
         Self {
+            execution_id: None,
+            turn_id: None,
             phase,
             step_name: Some(step_name.into()),
             step_index: Some(step_index),
@@ -197,7 +205,7 @@ pub const STEP_ACTIVITY_SUMMARY_MAX_CHARS: usize = 200;
 /// SSE `id:` of every persisted frame and the value of `Last-Event-ID` /
 /// `?after=`. Ordering is lexicographic (attempt first), which is the order
 /// events are appended to `events.log`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EventCursor {
     pub attempt: u32,
     pub sequence: u64,
@@ -387,6 +395,47 @@ impl std::fmt::Display for PhaseStatusKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum EventPayload {
+    #[serde(alias = "agent_credentials_changed")]
+    AgentCredentialsChanged {
+        request_id: uuid::Uuid,
+        execution_id: crate::data::ids::ExecutionId,
+        credential_generation: u64,
+        refresh_owner: crate::data::credential_update::RefreshOwner,
+    },
+    #[serde(alias = "agent_execution_replaced")]
+    AgentExecutionReplaced {
+        request_id: uuid::Uuid,
+        previous_execution_id: crate::data::ids::ExecutionId,
+        execution_id: crate::data::ids::ExecutionId,
+        credential_generation: u64,
+    },
+    #[serde(alias = "agent_state")]
+    AgentState {
+        snapshot: Box<crate::data::automation_records::AutomationSnapshot>,
+    },
+    #[serde(alias = "agent_identity")]
+    AgentIdentity {
+        execution_id: crate::data::ids::ExecutionId,
+        native_session_id: crate::data::settings_profile::NativeSessionId,
+    },
+    #[serde(alias = "agent_turn_started")]
+    AgentTurnStarted {
+        request_id: uuid::Uuid,
+        execution_id: crate::data::ids::ExecutionId,
+        turn_id: crate::data::ids::TurnId,
+        native_session_id: Option<crate::data::settings_profile::NativeSessionId>,
+        #[serde(deserialize_with = "crate::data::automation_records::native_turn_id")]
+        native_turn_id: Option<String>,
+        status_support: crate::data::automation::StatusSupport,
+        status_source: crate::data::automation::StatusSource,
+    },
+    #[serde(alias = "agent_turn_completed")]
+    AgentTurnCompleted {
+        request_id: uuid::Uuid,
+        execution_id: crate::data::ids::ExecutionId,
+        turn_id: crate::data::ids::TurnId,
+        result: crate::data::automation_records::TurnResult,
+    },
     #[serde(alias = "workflow_prerequisites")]
     WorkflowPrerequisites {
         phase: PrerequisitePhase,
@@ -568,6 +617,12 @@ pub struct ImageStaleWarning {
 impl EventPayload {
     pub fn sse_event_type(&self) -> &'static str {
         match self {
+            EventPayload::AgentCredentialsChanged { .. } => "agent_credentials_changed",
+            EventPayload::AgentExecutionReplaced { .. } => "agent_execution_replaced",
+            EventPayload::AgentState { .. } => "agent_state",
+            EventPayload::AgentIdentity { .. } => "agent_identity",
+            EventPayload::AgentTurnStarted { .. } => "agent_turn_started",
+            EventPayload::AgentTurnCompleted { .. } => "agent_turn_completed",
             EventPayload::WorkflowPrerequisites { .. } => "workflow_prerequisites",
             EventPayload::StdoutLine(_) => "stdout_line",
             EventPayload::StderrLine(_) => "stderr_line",
@@ -593,6 +648,12 @@ impl EventPayload {
 
     pub fn to_plain_text(&self) -> Option<String> {
         match self {
+            EventPayload::AgentCredentialsChanged { .. }
+            | EventPayload::AgentExecutionReplaced { .. }
+            | EventPayload::AgentState { .. }
+            | EventPayload::AgentIdentity { .. }
+            | EventPayload::AgentTurnStarted { .. }
+            | EventPayload::AgentTurnCompleted { .. } => None,
             EventPayload::WorkflowPrerequisites { report, .. } => {
                 Some(format!("[prerequisites] {}", report.summary_line()))
             }
@@ -702,5 +763,64 @@ mod image_stale_tests {
         let snake = r#"{"type":"image_stale","data":{"build":"b","image":"i","kind":"agent","agent":"claude","expected_inputs":"e","reason":"r"}}"#;
         let parsed: EventPayload = serde_json::from_str(snake).unwrap();
         assert!(parsed.to_plain_text().unwrap().contains("still using i"));
+    }
+}
+
+#[cfg(test)]
+mod automation_event_tests {
+    use super::*;
+    #[test]
+    fn lifecycle_events_keep_sources_and_do_not_become_pty_text() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../web/test/lib/fixtures/terminal-frames.json"
+        ))
+        .unwrap();
+        let snapshot: crate::data::automation_records::AutomationSnapshot =
+            serde_json::from_value(fixture["automation_examples"]["snapshot"].clone()).unwrap();
+        let result =
+            serde_json::from_value(fixture["automation_examples"]["turn_result"].clone()).unwrap();
+        let turn = crate::data::ids::TurnId::new();
+        let request_id = uuid::Uuid::new_v4();
+        let payloads = [
+            EventPayload::AgentState {
+                snapshot: Box::new(snapshot.clone()),
+            },
+            EventPayload::AgentIdentity {
+                execution_id: snapshot.execution_id.clone(),
+                native_session_id: crate::data::settings_profile::NativeSessionId::parse("session")
+                    .unwrap(),
+            },
+            EventPayload::AgentTurnStarted {
+                request_id,
+                execution_id: snapshot.execution_id.clone(),
+                turn_id: turn.clone(),
+                native_session_id: None,
+                native_turn_id: None,
+                status_support: snapshot.status_support,
+                status_source: snapshot.status_source,
+            },
+            EventPayload::AgentTurnCompleted {
+                request_id,
+                execution_id: snapshot.execution_id.clone(),
+                turn_id: turn.clone(),
+                result,
+            },
+        ];
+        for (sequence, payload) in payloads.into_iter().enumerate() {
+            assert!(payload.to_plain_text().is_none());
+            assert!(payload.sse_event_type().starts_with("agent_"));
+            let mut source = EventSource::phase(EventSourcePhase::Main);
+            source.execution_id = Some(snapshot.execution_id.clone());
+            source.turn_id = Some(turn.clone());
+            let event = ExecutionEvent {
+                timestamp: Utc::now(),
+                attempt: 1,
+                sequence: sequence as u64,
+                source: Some(source.clone()),
+                payload,
+            };
+            let decoded: ExecutionEvent = serde_json::from_value(event.public_value()).unwrap();
+            assert_eq!(decoded.source, Some(source));
+        }
     }
 }

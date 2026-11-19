@@ -8,6 +8,12 @@
 use super::*;
 use crate::data::config::effective::EffectiveConfig;
 
+fn workflow_step_stuck_timeout() -> std::time::Duration {
+    // Workflow `--yolo` gives Stuck its own lifecycle meaning in the engine.
+    // The advisory inactivity setting must not change that countdown.
+    crate::engine::container::timing::DEFAULT_STUCK_TIMEOUT
+}
+
 // ─── AgentFrontendProxy ──────────────────────────────────────────────────
 //
 // Passed to `AgentInstance::run_with_frontend`. Unlike the deleted
@@ -83,6 +89,9 @@ fn attributed<T>(
 
 #[async_trait]
 impl AgentFrontend for AgentFrontendProxy {
+    fn translated_output(&mut self, item: crate::engine::agent_output::Translated) -> bool {
+        self.with_attributed(|f| f.translated_output(item))
+    }
     fn terminal_source(&self) -> Option<crate::data::execution_event::EventSource> {
         self.source
             .as_ref()
@@ -148,9 +157,12 @@ impl AgentFrontend for AgentFrontendProxy {
     fn grace_timeout(&self) -> std::time::Duration {
         self.frontend.with(|frontend| frontend.grace_timeout())
     }
+    fn startup_timing(&self) -> crate::data::automation::StartupTiming {
+        self.frontend.with(|frontend| frontend.startup_timing())
+    }
 
     fn stuck_timeout(&self) -> std::time::Duration {
-        self.frontend.with(|frontend| frontend.stuck_timeout())
+        workflow_step_stuck_timeout()
     }
 }
 
@@ -177,6 +189,11 @@ impl UserMessageSink for AgentFrontendProxy {
 // setup/teardown containers, through `apply_grant_overlays` in `prepare.rs`.
 
 pub(crate) struct CommandLayerFactory {
+    pub(crate) settings_profile: Option<crate::data::settings_profile::SettingsProfileName>,
+    pub(crate) profiles: std::sync::Mutex<
+        HashMap<String, crate::command::commands::launch_policy::settings_profile::ProfileSession>,
+    >,
+
     pub(crate) shared: SharedWorkflowFrontend,
     pub(crate) engines: Engines,
     pub(crate) flags: Arc<ExecWorkflowCommandFlags>,
@@ -382,11 +399,16 @@ impl CommandLayerFactory {
             outputs_dir.is_some(),
             &context_overlays,
         );
-        let run_opts = AgentRunOptions {
+        let mut run_opts = AgentRunOptions {
+            native_session: None,
+            profile_state: None,
+            automation_channel: None,
             command_secrets: self.engines.command_secrets(),
-            yolo: self.flags.yolo.then_some(YoloMode::Enabled),
+            // --plan conflicts with an explicit --yolo/--auto in the catalogue and
+            // suppresses an inherited one (WI 0070).
+            yolo: (self.flags.yolo && !self.flags.plan).then_some(YoloMode::Enabled),
             yolo_authorized: self.flags.yolo_authorized,
-            auto: self.flags.auto.then_some(AutoMode::Enabled),
+            auto: (self.flags.auto && !self.flags.plan).then_some(AutoMode::Enabled),
             plan: self.flags.plan.then_some(PlanMode::Enabled),
             // Squad agents are always PTY-backed so a later attach reaches
             // the real agent UI. ACP is inherently a piped JSON-RPC transport
@@ -423,6 +445,24 @@ impl CommandLayerFactory {
             system_prompt,
             context_overlays,
         };
+        let request = crate::command::commands::launch_policy::settings_profile::ProfileRequest {
+            name: step
+                .settings_profile
+                .clone()
+                .or_else(|| self.settings_profile.clone()),
+            agent_session: None,
+        };
+        let def = launch_engine.resolve_definition(session, &runtime.step_agent)?;
+        let mut profile = crate::command::commands::launch_policy::settings_profile::enter_sync(
+            session,
+            &runtime.step_agent,
+            &request,
+            &run_opts,
+            &def,
+            self.engines.runtime.clone(),
+        )
+        .map_err(|e| EngineError::Other(e.to_string()))?;
+        run_opts.profile_state = profile.as_ref().map(|p| p.run_state());
         // Resolve keychain credentials so the agent can reach its backend.
         // Mirrors the same step in `chat` and `exec_prompt`. The centralized
         // builder folds them into the paradigm-appropriate option (container
@@ -506,6 +546,51 @@ impl CommandLayerFactory {
             Some(identity) => identity.stamp(resolved)?,
             None => resolved,
         };
+        // The step's native start mode and mount access, resolved by the same
+        // pure rule as chat and exec prompt (WI 0070). The workflow preflight
+        // already proved every step can deliver a requested --plan.
+        let plan_kind = if self.flags.plan {
+            crate::engine::agent::AgentRegistry::resolve_for_session(session, &runtime.step_agent)?
+                .native_plan
+                .as_ref()
+                .map(|spec| spec.kind)
+        } else {
+            None
+        };
+        let policy = crate::command::commands::launch_policy::resolve_agent_policy_pure(
+            &crate::command::commands::launch_policy::PureRequest {
+                agent: runtime.step_agent.as_str(),
+                plan: self.flags.plan,
+                yolo: Default::default(),
+                auto: Default::default(),
+                requested_access: workspace_access,
+                engine_read_only: self.engines.agent_engine.read_only_workspace(),
+                runtime_supports_read_only: self
+                    .engines
+                    .runtime
+                    .capabilities()
+                    .read_only_workspace(),
+                runtime_name: self.engines.runtime.display_name(),
+                allow_docker: self.flags.allow_docker,
+                plan_kind,
+                launch: if run_opts.launch_mode == crate::data::config::agents::LaunchMode::Acp {
+                    crate::command::commands::launch_policy::LaunchModeDecision::Acp
+                } else {
+                    crate::command::commands::launch_policy::LaunchModeDecision::Stdio
+                },
+            },
+        )
+        .map_err(|e| EngineError::Other(e.to_string()))?
+        .policy;
+        {
+            let mut frontend = self.shared.lock().unwrap();
+            if let Some(message) =
+                LaunchPolicy::native_mode_message(&runtime.step_agent, &policy, Some(&step.name))
+            {
+                frontend.write_message(message);
+            }
+            frontend.report_agent_policy(policy, Some(&step.name));
+        }
         let instance = self.engines.runtime.build(resolved)?;
         if workspace_access.is_read_only() {
             let mut frontend = self.shared.lock().unwrap();
@@ -519,11 +604,59 @@ impl CommandLayerFactory {
             run_opts.launch_mode == crate::data::config::agents::LaunchMode::Acp,
         )
         .with_source(runtime.source.clone());
-        instance.run_with_frontend(Box::new(proxy))
+        if let Some(profile) = profile.as_mut() {
+            let redaction = instance.output_redaction();
+            redaction.absorb(&proxy.output_redaction());
+            profile
+                .bind_redaction(redaction)
+                .map_err(|e| EngineError::Other(e.to_string()))?;
+            profile
+                .bind_resource(&instance.handle_preview().name)
+                .map_err(|e| EngineError::Other(e.to_string()))?;
+        }
+        let execution = instance.run_with_frontend(Box::new(proxy))?;
+        if let Some(profile) = profile {
+            self.profiles
+                .lock()
+                .unwrap()
+                .insert(execution.handle().id.clone(), profile);
+        }
+        Ok(execution)
     }
 }
 
 impl AgentExecutionFactory for CommandLayerFactory {
+    fn settings_scope_matches(&self, current: &WorkflowStep, next: &WorkflowStep) -> bool {
+        current
+            .settings_profile
+            .as_ref()
+            .or(self.settings_profile.as_ref())
+            == next
+                .settings_profile
+                .as_ref()
+                .or(self.settings_profile.as_ref())
+    }
+
+    fn execution_finished(
+        &self,
+        handle: crate::data::session::AgentHandle,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        let profile = self.profiles.lock().unwrap().remove(&handle.id);
+        Box::pin(async move {
+            if let Some(profile) = profile {
+                if let Err(error) = profile
+                    .leave(
+                        self.engines.runtime.clone(),
+                        crate::data::fs::agent_profiles::TurnStateAtExit::Unknown,
+                    )
+                    .await
+                {
+                    tracing::warn!(%error,"workflow profile remains closing");
+                }
+            }
+        })
+    }
+
     fn execution_for_step(
         &self,
         step: &WorkflowStep,
@@ -608,5 +741,16 @@ impl AgentExecutionFactory for CommandLayerFactory {
             handle,
         )
         .map(|_removed| ())
+    }
+}
+
+#[cfg(test)]
+mod stuck_timeout_tests {
+    #[test]
+    fn workflow_stuck_countdown_keeps_its_lifecycle_default() {
+        assert_eq!(
+            super::workflow_step_stuck_timeout(),
+            crate::engine::container::timing::DEFAULT_STUCK_TIMEOUT
+        );
     }
 }

@@ -50,7 +50,9 @@ async fn api_cursor_force_requires_explicit_yolo_and_honors_opt_out() {
             })
             .collect(),
     );
-    for permission in [None, Some("--yolo"), Some("--yolo=false")] {
+    // WI 0070: `--plan` suppresses the API profile's inherited --yolo, so
+    // Cursor launches in its native plan mode without --force.
+    for permission in [None, Some("--yolo"), Some("--yolo=false"), Some("--plan")] {
         let session = Session::open_at_git_root(
             repo.path().into(),
             repo.path().into(),
@@ -114,10 +116,10 @@ async fn api_cursor_force_requires_explicit_yolo_and_honors_opt_out() {
                     .emit(awman::data::execution_event::EventPayload::Done);
                 let paths =
                     awman::data::fs::api_paths::ApiPaths::from_root(s.tmp().join("api-logs"));
-                let command = if flag == "--yolo" {
-                    "forced"
-                } else {
-                    "ordinary"
+                let command = match flag {
+                    "--yolo" => "forced",
+                    "--plan" => "planned",
+                    _ => "ordinary",
                 };
                 paths.prepare_command_dir("fixture", command).unwrap();
                 let mut writer = awman::data::fs::api_command_log::CommandLogWriter::open_append(
@@ -147,6 +149,10 @@ async fn api_cursor_force_requires_explicit_yolo_and_honors_opt_out() {
                 assert_eq!(
                     calls[0].argv.iter().any(|a| a == "--force"),
                     flag == "--yolo"
+                );
+                assert_eq!(
+                    calls[0].argv.windows(2).any(|a| a == ["--mode", "plan"]),
+                    flag == "--plan"
                 );
             }
         }

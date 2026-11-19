@@ -53,6 +53,7 @@ export function createTerminalView(coreFactory: CoreFactory) {
     const [ctrlLatched, setCtrlLatched] = useState(false);
     const [scrolledBack, setScrolledBack] = useState(0);
     const state = useObservableValue(connection.state);
+    const automation = useObservableValue(connection.automation);
     const { holder, inputAllowed } = control;
     const holding = holder === 'me';
 
@@ -339,7 +340,7 @@ export function createTerminalView(coreFactory: CoreFactory) {
         <div className={[styles.bar, barStart || barEnd ? styles.header : ''].filter(Boolean).join(' ')}>
           {barStart}
           <span className={styles.status} role="status">
-            {statusText(state, holder, inputAllowed)}
+            {statusText(state, holder, inputAllowed)}{automation?.status_support === 'best_effort' ? ' · Best-effort automation status' : ''}
           </span>
           {inputAllowed && holder !== 'me' && state === 'open' && (
             <button type="button" onClick={() => { requestControl(); inputRef.current?.focus({ preventScroll: true }); }}>

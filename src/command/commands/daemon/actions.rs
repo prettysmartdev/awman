@@ -228,6 +228,27 @@ pub const ACTIONS: &[Action] = &[
         args: &[arg("id", Location::Path, ArgKind::Id("run"))],
         doc: "Cancel one squad run (id=run_…)",
     },
+    Action {name:"worker.commands.credentials.update",method:"POST",path:"/v1/worker/commands/{id}/credentials",args:&[arg("id",Location::Path,ArgKind::Id("cmd")),arg("request_id",Location::Body,ArgKind::Text),arg("execution_id",Location::Body,ArgKind::Id("exe")),arg("expected_revision",Location::Body,ArgKind::Json),arg("credential_slot",Location::Body,ArgKind::Text),arg("expected_credential_generation",Location::Body,ArgKind::Json),optional_body("reread_source",ArgKind::Json)],doc:"Replace credentials from the bound source; submit request-only secrets using the authenticated typed client"},
+    Action {name:"worker.commands.credentials.get",method:"GET",path:"/v1/worker/commands/{id}/credential-updates/{request_id}",args:&[arg("id",Location::Path,ArgKind::Id("cmd")),arg("request_id",Location::Path,ArgKind::Text)],doc:"Poll an owner's credential replacement operation"},
+    // WI 0070 owner-local automation records.
+    Action {
+        name: "worker.sessions.agent_capabilities",
+        method: "GET",
+        path: "/v1/worker/sessions/{id}/agent-capabilities",
+        args: &[arg("id", Location::Path, ArgKind::Id("ses"))],
+        doc: "Automation capability declarations for a session's agents; never launches a provider (id=ses_…)",
+    },
+    Action {
+        name: "worker.commands.turns",
+        method: "GET",
+        path: "/v1/worker/commands/{id}/turns",
+        args: &[
+            arg("id", Location::Path, ArgKind::Id("cmd")),
+            optional("limit", ArgKind::Limit),
+            optional("cursor", ArgKind::Cursor),
+        ],
+        doc: "A command's guarded turn records, oldest first, pending results included (id=cmd_…)",
+    },
     Action {
         name: "leases.list",
         method: "GET",

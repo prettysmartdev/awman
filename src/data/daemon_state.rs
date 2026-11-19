@@ -98,6 +98,8 @@ impl CommandListener {
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommandRequestContext {
+    /// Transport-authenticated owner, never a request body claim.
+    pub profile_owner: bool,
     pub listener_name: Option<String>,
     pub listener: CommandListener,
     pub trace_parent: Option<String>,
@@ -126,6 +128,7 @@ impl CommandRequestContext {
                 && parts[2].bytes().any(|b| b != b'0')
         };
         Self {
+            profile_owner: false,
             listener,
             listener_name: None,
             trace_parent: header.filter(valid).map(str::to_string),
@@ -154,4 +157,18 @@ impl Principal {
             Self::Browser { grant_id, .. } => grant_id,
         }
     }
+}
+
+/// Trusted ingress provenance, preserved across internal hops.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestOrigin {
+    LocalProcess,
+    OwnerSocket,
+    Network,
+    Browser,
+    WorkServer,
+    Relay,
+    #[default]
+    Unknown,
 }

@@ -77,7 +77,8 @@ A definition is a TOML file with `schema = 1`. Unknown keys are rejected, so a t
 | `description` | string | no | Short description |
 | `homepage` | string | no | Project URL shown in the approval review |
 | `[run]` | table | yes | How the agent is launched |
-| `[modes]` | table | no | Flags for `--yolo`, `--auto` and `--plan` |
+| `[modes]` | table | no | Flags for `--yolo`, `--auto` and `--plan`, and how `--plan` is delivered |
+| `[automation]` | table | no | Lets `--automation`, `--settings-profile` and native resume reuse a first-party adapter (`adapter`) |
 | `[tools]` | table | no | Flags for allowed / disallowed tool lists |
 | `[system_prompt]` | table | no | How awman delivers system prompt text (default `delivery = "none"`) |
 | `[acp]` | table | no | Presence enables ACP launch mode |
@@ -100,9 +101,25 @@ A definition is a TOML file with `schema = 1`. Unknown keys are rejected, so a t
 
 ### `[modes]` and `[tools]`
 
-`[modes]` takes optional arrays of argv tokens: `yolo`, `auto` and `plan`. A missing `yolo` or `auto` is a silent no-op; a missing or empty `plan` makes `--plan` fail as unsupported for this agent.
+`[modes]` takes optional arrays of argv tokens: `yolo`, `auto` and `plan`. A missing `yolo` or `auto` is a silent no-op.
+
+**`--plan` is a native starting mode only.** It never makes the workspace read-only; use `--read-only-workspace` for that. A custom agent opts in by declaring how its own CLI starts in a plan or read-only mode:
+
+| Key | Meaning |
+|-----|---------|
+| `plan` | Argv tokens added to every launch with `--plan` |
+| `plan_interactive` | Override for interactive launches. Omitted: inherit `plan`. `[]`: interactive `--plan` is unsupported |
+| `plan_headless` | Override for `--headless` launches. Omitted: inherit `plan`. `[]`: headless `--plan` is unsupported |
+| `plan_kind` | `plan`, `read_only` or `custom` (default). Reported as the launch's native start mode |
+| `plan_acp_mode` | ACP session mode id to select before the first prompt. Requires an `[acp]` table, is 1–64 characters of `A-Za-z0-9_.:-` and is never inferred from argv |
+
+With no declared delivery for a route, `--plan` is refused with `native_capability_unavailable` before any image, mount or container work; the agent is never started with write access in its place. A kind or route key with no delivery at all is a validation problem. `--read-only-workspace` works on a custom agent with no plan declaration. awman checks `--agent-flag` and `agents.flags` values against the agent's declared mode selector and refuses a conflicting selection (`agent_mode_conflict`); only whole tokens are compared. `templates/agent-definition.toml` documents these keys.
 
 `[tools]` takes optional `allowed_flag` and `disallowed_flag`. If a launch carries a tool list for an agent that declares no matching flag, awman refuses to launch rather than silently dropping the restriction.
+
+### `[automation]`
+
+`[automation]` has one key, `adapter`, naming the first-party adapter whose native profile layout, resume selector and lifecycle observation your agent shares: `claude`, `codex`, `opencode`, `opencode-v2`, `cursor`, `copilot`, `cline`, `antigravity` or `osc7501`. Selecting it gives your agent `--settings-profile`, `--agent-session` and `--automation` using that adapter's mechanics. It does **not** grant a first-party credential source: credentials still come from your `[auth]` and `env()` overlays. `osc7501` provides best-effort interactive status only — no native identity, exact resume or structured headless result — and has no native full-lifecycle status, so `--automation=require_full` cannot deliver a task on it. Without `[automation]`, the profile and automation flags are refused for the agent.
 
 ### `[system_prompt]`
 
@@ -361,6 +378,8 @@ env = ["GEMINI_API_KEY"]
 needs_node = true
 install = ["npm install -g @google/gemini-cli"]
 ```
+
+Defining this agent is the whole migration: no built-in `gemini` is restored behind it. Until a `gemini` definition (or a switch to `antigravity`) exists, a `gemini` selection in `agents.default`, a workflow's `agent` field or a step is refused before any step starts, and the error names both options. Add `plan_kind = "plan"` to `[modes]` if you want `--plan` reported as a plan-mode launch.
 
 Then run `awman ready --agent gemini` to review, approve and build it. Existing `agents.default: "gemini"` settings work again once the definition exists; the definition is yours to maintain, including the CLI version you install.
 

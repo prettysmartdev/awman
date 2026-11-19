@@ -1,8 +1,8 @@
 //! `awman attach` (WI 0141, 0139 §7).
 
 use super::{
-    ArgumentKind, ArgumentSpec, CommandSpec, FlagDefault, FlagKind, FlagSpec, FrontendVisibility,
-    GatewayNeed,
+    ApiAvailability, ArgumentKind, ArgumentSpec, CommandSpec, FlagDefault, FlagKind, FlagSpec,
+    FrontendVisibility, GatewayNeed,
 };
 
 pub(super) const ATTACH_TARGET_ARGUMENT: ArgumentSpec = ArgumentSpec {
@@ -57,7 +57,7 @@ pub(super) const ATTACH: CommandSpec = CommandSpec {
             optional: true,
         },
     ],
-    api_allowed: false,
+    api_availability: ApiAvailability::Disabled,
     build: crate::command::dispatch::build::attach,
     gateway_need: GatewayNeed::Running,
     requires_container_tier: false,

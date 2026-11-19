@@ -11,6 +11,7 @@ fn recover(codes: &[u8]) {
         .iter()
         .enumerate()
         .map(|(index, _)| WorkflowStep {
+            settings_profile: None,
             name: format!("step-{index}"),
             prompt_template: "literal".into(),
             depends_on: if index == 0 {
@@ -128,6 +129,7 @@ fn resume_rewind_follows_dependencies_in_any_definition_order() {
     ]
     .into_iter()
     .map(|(name, deps)| WorkflowStep {
+        settings_profile: None,
         name: name.into(),
         depends_on: deps.into_iter().map(str::to_string).collect(),
         prompt_template: "literal".into(),

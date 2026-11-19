@@ -1,4 +1,19 @@
 pub const CAPABILITIES: &[&str] = &[
+    crate::data::settings_profile::SETTINGS_PROFILES_CAPABILITY,
+    crate::data::settings_profile::NATIVE_SESSION_RESUME_CAPABILITY,
+    // WI 0070 automation: owner-local capability declarations and turn
+    // records, guarded terminal turns, typed automation results and the
+    // four lifecycle event features. Route support is refined per agent by
+    // runtime evidence, never implied by these names.
+    crate::data::automation::AGENT_CAPABILITIES_CAPABILITY,
+    crate::data::automation::AGENT_AUTOMATION_CAPABILITY,
+    crate::data::automation::TERMINAL_TURNS_CAPABILITY,
+    crate::data::automation::AUTOMATION_RESULTS_CAPABILITY,
+    crate::data::automation::AGENT_TURN_RECORDS_CAPABILITY,
+    crate::data::automation::AGENT_STATE_EVENT,
+    crate::data::automation::AGENT_IDENTITY_EVENT,
+    crate::data::automation::AGENT_TURN_STARTED_EVENT,
+    crate::data::automation::AGENT_TURN_COMPLETED_EVENT,
     "context_api",
     "workflow_context",
     "daemon_features",
@@ -332,6 +347,22 @@ mod image_inputs_tests {
                 acquisition == Build,
                 "{acquisition:?}: {caps:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod credential_enrollment_tests {
+    #[test]
+    fn credential_features_stay_unadvertised_until_production_enrollment_exists() {
+        for feature in [
+            "agent_credential_updates",
+            "agent_credentials_changed",
+            "agent_execution_replaced",
+        ] {
+            assert!(!super::advertised(true, super::PULL_CAPABILITIES)
+                .iter()
+                .any(|c| c == feature));
         }
     }
 }

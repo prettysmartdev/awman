@@ -147,6 +147,10 @@ impl<F: ApiCommandFrontendFactory + 'static> DaemonFeature for WorkerFeature<F> 
                 &shared.store,
                 &shared.paths,
             )?;
+            crate::command::commands::api_server::queue_worker::recover_automation_executions(
+                &shared.store,
+                &shared.paths,
+            )?;
             shared
                 .lifecycle_store
                 .finalize_interrupted_cancellations(&chrono::Utc::now().to_rfc3339())?;

@@ -781,7 +781,8 @@ Six built-in agents are supported under `sbx`; two require a container runtime:
 | Option | claude | codex | copilot |
 |---|---|---|---|
 | `--model` | applied (settings file) | applied (settings/config file) | **not deliverable** — warned; use the `/model` slash command in-session |
-| `--plan` / `--auto` / `--yolo` | applied (`permissions.defaultMode`) | **not deliverable** — warned | **not deliverable** — warned |
+| `--yolo` / `--auto` | applied (`permissions.defaultMode`) | **not deliverable** — warned | **not deliverable** — warned |
+| `--plan` | applied (`permissions.defaultMode = plan`) | **refused** before the sandbox is created (`native_capability_unavailable`) | **refused** before the sandbox is created (`native_capability_unavailable`) |
 | `--headless` | **not deliverable** — warned; the prompt is still piped to the agent's interactive entrypoint | same | same |
 | `agents.flags` / `--agent-flag` | **not deliverable** — warned | **not deliverable** — warned | **not deliverable** — warned |
 
@@ -829,6 +830,25 @@ ERROR: failed to create sandbox: <error from sbx>
 When `sbx run` exits non-zero, awman replays the tail of sbx's output into the execution window alongside the exit code, so the failure is diagnosable without re-running the announced `sbx` command by hand.
 
 ---
+
+## Native modes, profiles and automation by runtime
+
+The native-agent features — `--plan`, `--read-only-workspace`, `--settings-profile`, `--agent-session` and `--automation` — behave the same on Docker, Apple Containers and the builtin runtime, on the host platforms each is released for. awman refuses, before building anything, a combination a runtime cannot honor; it never starts the agent with weaker guarantees instead.
+
+| Feature | Docker, Apple Containers, builtin | Docker Sandboxes (`sbx`) |
+|---|---|---|
+| `--plan` | All eight agents | `claude`, `opencode`, `cline`, `antigravity`; `codex` and `copilot` refused; `cursor` and `opencode-v2` refused by the sandbox's existing rules |
+| `--read-only-workspace` | Enforced by the workspace mount where the runtime can; otherwise refused at preflight | Refused where the runtime cannot enforce it |
+| `--settings-profile`, `--agent-session` | Supported; only the private per-execution profile copy is mounted | Not supported (declarative kits cannot take per-execution mounts) |
+| `--automation` | Supported; a private channel directory is mounted at `/awman/automation` for native lifecycle records | Starts without that channel, so only best-effort OSC 7501 status is available and `--automation=require_full` cannot deliver a task |
+
+Things that depend on the runtime and are reported honestly rather than assumed:
+
+- **Image versus authentication readiness.** `awman ready --prepare-only` prepares the images for the selected runtime without checking authentication (see [`ready --prepare-only`](03-agent-sessions.md#preparing-images-without-authentication-ready---prepare-only)). On Docker and Apple Containers it builds the images; on the builtin runtime it imports them from the configured image source (`--build` re-acquires, `--no-cache` forces a fresh import). To refresh Claude or Codex with a newer CLI, rebuild their images with `awman ready --prepare-only --build --agent claude` (or `codex`); no awman release or version approval is needed, and an unreadable CLI version is only a warning.
+- **Discovering what a runtime offers.** `GET /v1/status` lists `read_only_workspace` only when the daemon's runtime can enforce it, and `GET /v1/worker/sessions/{id}/agent-capabilities` names the runtime each declaration applies to, without starting an agent. Declarations are not guarantees: the per-agent status tier is established from the running agent.
+- **Native status versus OSC.** Full native lifecycle status needs the provider to emit its own lifecycle records into the automation channel. Where that is not available, the OSC 7501 reports the agent already sends supply `best_effort` status; `agents.programStatus.enabled=false` turns that off and with it OSC-based admission. Consumers see which tier applied in every turn result and command result.
+- **First-byte grace versus automation startup.** Ordinary launches use a first-output grace period; automation launches instead use `agents.automation.startupTimeout`, and a slow runtime start (for example the Apple Containers start delay) does not trigger the ordinary grace-period kill.
+- **Credentials.** Replacing a credential inside a running agent or restarting an agent to apply one is not currently offered on any runtime.
 
 ## Switching runtimes
 

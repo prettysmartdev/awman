@@ -37,7 +37,8 @@ impl<'de> Deserialize<'de> for SecretsBody {
                         return Err(M::Error::custom("at most 32 command secrets are accepted"));
                     }
                 }
-                let secrets = CommandSecrets::new(entries).map_err(M::Error::custom)?;
+                let secrets = CommandSecrets::new(entries)
+                    .map_err(|_| M::Error::custom("invalid command secret bundle"))?;
                 Ok(SecretsBody(
                     (!secrets.is_empty()).then(|| Arc::new(secrets)),
                 ))
@@ -264,5 +265,155 @@ mod misplaced_tests {
             r#"{"secrets":{"TOKEN":"test-secret"}}"#
         )
         .is_err());
+    }
+}
+
+/// Strict credential request visitor: unknown names, duplicate fields and
+/// serde's unexpected values are never echoed by the authenticated boundary.
+pub(super) struct CredentialBody(pub crate::data::credential_update::CredentialUpdateRequest);
+impl<'de> Deserialize<'de> for CredentialBody {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct RequestVisitor;
+        impl<'de> Visitor<'de> for RequestVisitor {
+            type Value = CredentialBody;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a credential update request")
+            }
+            fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                use crate::data::credential_update::*;
+                let mut seen = std::collections::HashSet::new();
+                let (mut request, mut execution, mut revision, mut slot, mut generation) =
+                    (None, None, None, None, None);
+                let mut secrets = None;
+                let mut reread = None;
+                while let Some(key) = map
+                    .next_key::<String>()
+                    .map_err(|_| M::Error::custom("invalid_request"))?
+                {
+                    if !seen.insert(key.clone()) {
+                        return Err(M::Error::custom("invalid_request"));
+                    }
+                    match key.as_str() {
+                        "request_id" => {
+                            request = Some(
+                                map.next_value::<uuid::Uuid>()
+                                    .map_err(|_| M::Error::custom("invalid_request"))?,
+                            )
+                        }
+                        "execution_id" => {
+                            execution = Some(
+                                map.next_value::<crate::data::ids::ExecutionId>()
+                                    .map_err(|_| M::Error::custom("invalid_request"))?,
+                            )
+                        }
+                        "expected_revision" => {
+                            revision = Some(
+                                map.next_value::<u64>()
+                                    .map_err(|_| M::Error::custom("invalid_request"))?,
+                            )
+                        }
+                        "credential_slot" => {
+                            slot = Some(
+                                map.next_value::<String>()
+                                    .map_err(|_| M::Error::custom("invalid_request"))?,
+                            )
+                        }
+                        "expected_credential_generation" => {
+                            generation = Some(
+                                map.next_value::<u64>()
+                                    .map_err(|_| M::Error::custom("invalid_request"))?,
+                            )
+                        }
+                        "secrets" => {
+                            secrets = Some(
+                                map.next_value::<SecretsBody>()
+                                    .map_err(|_| M::Error::custom("invalid_secrets"))?
+                                    .0
+                                    .ok_or_else(|| M::Error::custom("invalid_secrets"))?,
+                            )
+                        }
+                        "reread_source" => {
+                            reread = Some(
+                                map.next_value::<bool>()
+                                    .map_err(|_| M::Error::custom("invalid_request"))?,
+                            )
+                        }
+                        _ => return Err(M::Error::custom("invalid_request")),
+                    }
+                }
+                if !matches!(
+                    (secrets.is_some(), reread),
+                    (true, None) | (false, Some(true))
+                ) {
+                    return Err(M::Error::custom("invalid_request"));
+                }
+                let intent = CredentialUpdateIntent {
+                    request_id: request.ok_or_else(|| M::Error::custom("invalid_request"))?,
+                    execution_id: execution.ok_or_else(|| M::Error::custom("invalid_request"))?,
+                    expected_revision: revision
+                        .ok_or_else(|| M::Error::custom("invalid_request"))?,
+                    credential_slot: slot.ok_or_else(|| M::Error::custom("invalid_request"))?,
+                    expected_credential_generation: generation
+                        .ok_or_else(|| M::Error::custom("invalid_request"))?,
+                    reread_source: reread == Some(true),
+                    secret_names: secrets
+                        .as_ref()
+                        .map(|s| s.names().map(str::to_owned).collect())
+                        .unwrap_or_default(),
+                };
+                if intent.expected_revision > crate::data::automation_records::MAX_SAFE_COUNTER
+                    || intent.expected_credential_generation
+                        > crate::data::automation_records::MAX_SAFE_COUNTER
+                    || intent.credential_slot.len() > 64
+                    || !intent.credential_slot.starts_with("cred_")
+                    || uuid::Uuid::parse_str(&intent.credential_slot[5..]).is_err()
+                {
+                    return Err(M::Error::custom("invalid_request"));
+                }
+                Ok(CredentialBody(CredentialUpdateRequest { intent, secrets }))
+            }
+        }
+        d.deserialize_map(RequestVisitor).map_err(|e| {
+            D::Error::custom(if e.to_string().contains("invalid_secrets") {
+                "invalid_secrets"
+            } else {
+                "invalid_request"
+            })
+        })
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+    fn body(extra: &str) -> String {
+        format!(
+            r#"{{"request_id":"d83d459b-5b9d-47fb-b563-bc1509f952f7","execution_id":"exe_123456789abcdef0123456789abcdef0","expected_revision":0,"credential_slot":"cred_d83d459b-5b9d-47fb-b563-bc1509f952f7","expected_credential_generation":0,{extra}}}"#
+        )
+    }
+    #[test]
+    fn typed_rotation_decode_rejects_duplicates_names_values_and_alternative_ambiguity() {
+        let request: CredentialBody = serde_json::from_str(&body(
+            r#""secrets":{"OPENAI_API_KEY":"test-secret-private"}"#,
+        ))
+        .unwrap();
+        assert!(!format!("{:?}", request.0).contains("test-secret-private"));
+        for extra in [
+            r#""secrets":{"OPENAI_API_KEY":"test-secret-one","OPENAI_API_KEY":"test-secret-two"}"#,
+            r#""secrets":{"test-secret-name":"test-secret-value"}"#,
+            r#""test-secret-unknown":"test-secret-value""#,
+            r#""secrets":{"OPENAI_API_KEY":123456789}"#,
+            r#""reread_source":false"#,
+            r#""reread_source":null"#,
+            r#""reread_source":true,"secrets":{"OPENAI_API_KEY":"test-secret-value"}"#,
+            r#""reread_source":true,"credential_slot":"test-secret-slot""#,
+        ] {
+            let error = serde_json::from_str::<CredentialBody>(&body(extra))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(!error.contains("test-secret"));
+            assert!(!error.contains("123456789"));
+        }
     }
 }

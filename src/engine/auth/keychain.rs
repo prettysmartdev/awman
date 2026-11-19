@@ -30,7 +30,7 @@ use crate::engine::auth::credential::{
 /// before mounting the overlay into the container. Lifecycle: produced from
 /// the host keychain, copied into a per-session tempdir alongside the rest of
 /// the agent's settings, then bind-mounted under the agent's `$HOME`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AgentSecretFile {
     /// Path **relative** to the agent's settings dir. E.g. for antigravity
     /// this is `antigravity-cli/antigravity-oauth-token`, joined with the
@@ -40,6 +40,15 @@ pub struct AgentSecretFile {
     pub contents: Vec<u8>,
     /// Unix permission mode (e.g. `0o600`). Ignored on non-Unix.
     pub mode: u32,
+}
+
+impl std::fmt::Debug for AgentSecretFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentSecretFile")
+            .field("mode", &self.mode)
+            .field("contents_len", &self.contents.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Env-var credentials for the agent. Empty when the platform has no keychain
@@ -116,6 +125,7 @@ fn claude_keychain_credentials_in(
     }
     let source = HostCredentialSource::MacosKeychain {
         service: CLAUDE_KEYCHAIN_SERVICE,
+        account: None,
     };
     match credential::read_claude_credential_in(snapshot, &source) {
         Ok(snap) => vec![(
@@ -158,26 +168,18 @@ fn antigravity_keychain_files_in(
     let Some(raw) = read_antigravity_secret_in(snapshot) else {
         return Vec::new();
     };
-    let Some(decoded) = decode_go_keyring_payload(&raw) else {
+    let raw = crate::data::secret::SecretString::new(raw);
+    let Some(mut decoded) = decode_go_keyring_payload(raw.expose()) else {
         return Vec::new();
     };
-    // Sanity-check the JSON shape so we never plant a malformed token file
-    // that would itself fail the container's silent-auth path.
-    let parsed: serde_json::Value = match serde_json::from_slice(&decoded) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    if parsed
-        .get("token")
-        .and_then(|t| t.get("access_token"))
-        .and_then(|v| v.as_str())
-        .is_none()
-    {
+    let contents = access_only_antigravity(&decoded);
+    decoded.fill(0);
+    let Some(contents) = contents else {
         return Vec::new();
-    }
+    };
     vec![AgentSecretFile {
         relative_path: PathBuf::from("antigravity-cli").join("antigravity-oauth-token"),
-        contents: decoded,
+        contents,
         mode: 0o600,
     }]
 }
@@ -693,4 +695,43 @@ fn non_empty(stdout: &[u8]) -> Option<String> {
     } else {
         Some(raw)
     }
+}
+
+/// Render only access-token fields; operator refresh grants are discarded.
+pub fn access_only_antigravity(bytes: &[u8]) -> Option<Vec<u8>> {
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct Payload {
+        token: Token,
+        auth_method: String,
+    }
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct Token {
+        access_token: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_type: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expiry: Option<String>,
+    }
+    let payload: Payload = serde_json::from_slice(bytes).ok()?;
+    if payload.auth_method != "consumer"
+        || payload
+            .token
+            .token_type
+            .as_deref()
+            .is_some_and(|s| !s.eq_ignore_ascii_case("bearer"))
+        || payload
+            .token
+            .expiry
+            .as_ref()
+            .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_err())
+    {
+        return None;
+    }
+    if payload.token.access_token.is_empty()
+        || payload.token.access_token.len() > 8192
+        || payload.token.access_token.contains('\0')
+    {
+        return None;
+    }
+    serde_json::to_vec(&payload).ok()
 }

@@ -69,10 +69,14 @@ fn execution_outcomes_preserve_nonzero_and_absent_agent_exit_codes() {
     for exit in [None, Some(0), Some(1), Some(17), Some(130), Some(255)] {
         for outcome in [
             CommandOutcome::Chat(ChatOutcome {
+                automation: None,
+                automation_final_message: None,
                 agent: None,
                 exit_code: exit,
             }),
             CommandOutcome::ExecPrompt(ExecPromptOutcome {
+                automation: None,
+                automation_final_message: None,
                 agent: None,
                 exit_code: exit,
             }),
@@ -83,7 +87,11 @@ fn execution_outcomes_preserve_nonzero_and_absent_agent_exit_codes() {
                 worktree_used: false,
             }),
         ] {
-            assert_eq!(outcome.exit_code(), exit.unwrap_or(0));
+            let expected = match &outcome {
+                CommandOutcome::Chat(_) | CommandOutcome::ExecPrompt(_) => exit.unwrap_or(1),
+                _ => exit.unwrap_or(0),
+            };
+            assert_eq!(outcome.exit_code(), expected);
             let wire = serde_json::to_value(outcome).unwrap();
             assert_eq!(wire["payload"]["exit_code"], serde_json::json!(exit));
             assert!(wire["kind"].is_string());

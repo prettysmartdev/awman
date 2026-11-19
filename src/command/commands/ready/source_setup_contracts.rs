@@ -225,6 +225,7 @@ fn flags() -> ReadyCommandFlags {
         allow_docker: false,
         json: false,
         agent: None,
+        prepare_only: false,
     }
 }
 

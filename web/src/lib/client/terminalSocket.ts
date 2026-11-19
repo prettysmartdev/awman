@@ -39,7 +39,10 @@ import {
   TERMINAL_PASTE_MAX_BYTES,
   type TerminalClientFrame,
   type TerminalFrame,
+  type TerminalAutomationFrame,
+  type AutomationSnapshot,
 } from './types';
+import { validateAutomationFrame } from './terminalValidation';
 import type { DaemonClient } from './daemonClient';
 
 export type TerminalConnectionState = 'connecting' | 'open' | 'reconnecting' | 'closed' | 'exited';
@@ -62,7 +65,7 @@ export const RESIZE_DEBOUNCE_MS = 150;
 export const TAKE_CONTROL_SETTLE_MS = 300;
 export const MAX_TERMINAL_RECONNECTS = 20;
 /** Incoming frame bound: an output frame carries at most a hub chunk; snapshots can be a full screen. */
-export const MAX_TERMINAL_FRAME_CHARS = 8 * 1024 * 1024;
+export const MAX_TERMINAL_FRAME_CHARS = 16 * 1024 * 1024;
 
 export interface TerminalConnectionDeps {
   socketFactory?: SocketFactory;
@@ -76,6 +79,9 @@ export class TerminalConnection {
   private readonly controlSubject: Subject<TerminalControl>;
   readonly control: Observable<TerminalControl>;
   private readonly snapshots = new Emitter<TerminalSnapshot>();
+  private readonly automationSubject = new Subject<AutomationSnapshot | null>(null);
+  readonly automation: Observable<AutomationSnapshot | null> = this.automationSubject;
+  private readonly automationEvents = new Emitter<TerminalAutomationFrame>();
   private readonly outputs = new Emitter<Uint8Array>();
   private readonly resizes = new Emitter<{ cols: number; rows: number }>();
   private readonly exits = new Emitter<number>();
@@ -108,6 +114,8 @@ export class TerminalConnection {
   onSnapshot(callback: (snapshot: TerminalSnapshot) => void): () => void {
     return this.snapshots.on(callback);
   }
+  /** Public notifications only. Browser connections have no guarded mutation methods. */
+  onAutomation(callback: (frame: TerminalAutomationFrame) => void): () => void { return this.automationEvents.on(callback); }
   onOutput(callback: (bytes: Uint8Array) => void): () => void {
     return this.outputs.on(callback);
   }
@@ -250,6 +258,7 @@ export class TerminalConnection {
       return this.dropSocket(socket, CLOSE_CLIENT_PROTOCOL_ERROR);
     }
     try {
+      if (['automation_state', 'turn_accepted', 'turn_result', 'execution_closed', 'execution_replaced', 'credential_update_state', 'operation_error'].includes(frame.type)) validateAutomationFrame(frame);
       this.dispatch(frame);
     } catch {
       this.dropSocket(socket, CLOSE_CLIENT_PROTOCOL_ERROR);
@@ -258,6 +267,22 @@ export class TerminalConnection {
 
   private dispatch(frame: TerminalFrame): void {
     switch (frame.type) {
+      case 'automation_state':
+        if (this.automationSubject.get()?.execution_id !== frame.execution_id) this.invalidateExecution();
+        this.automationSubject.set(frame);
+        this.automationEvents.emit(frame);
+        return;
+      case 'credential_update_state':
+      case 'execution_replaced':
+        this.invalidateExecution();
+        this.automationEvents.emit(frame);
+        return;
+      case 'turn_accepted':
+      case 'turn_result':
+      case 'execution_closed':
+      case 'operation_error':
+        this.automationEvents.emit(frame);
+        return;
       case 'snapshot':
         this.attempt = 0;
         this.snapshots.emit({ cols: frame.cols, rows: frame.rows, screen: decodeBase64(frame.screen), hasOutput: frame.has_output ?? true });
@@ -278,6 +303,14 @@ export class TerminalConnection {
         this.onRefusal(frame.code, frame.error);
         return;
     }
+  }
+
+  private invalidateExecution(): void {
+    this.cancelResize();
+    const waiter = this.controlWaiter;
+    if (waiter) { this.clearTimer(waiter.timer); waiter.reject(new Error('Execution changed.')); this.controlWaiter = null; }
+    this.controlSubject.set({ holder: 'none', inputAllowed: !this.opts.readOnly });
+    this.automationSubject.set(null);
   }
 
   private onRefusal(code: string, message: string): void {

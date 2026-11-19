@@ -137,6 +137,10 @@ pub(crate) fn render_update_text(update: &SessionUpdate) -> RenderedUpdate {
         SessionUpdate::AvailableCommandsUpdate { available_commands } => {
             RenderedUpdate::Block(format_available_commands(available_commands))
         }
+        SessionUpdate::CurrentModeUpdate { .. } => RenderedUpdate::Block(format!(
+            "{}\n",
+            crate::engine::acp::protocol::summarize_update(update)
+        )),
     }
 }
 

@@ -51,6 +51,8 @@ pub fn detect_format(path: &Path) -> Result<WorkflowFormat, DataError> {
 /// A single step in a multi-agent workflow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowStep {
+    #[serde(default)]
+    pub settings_profile: Option<crate::data::settings_profile::SettingsProfileName>,
     pub name: String,
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -333,6 +335,8 @@ impl Workflow {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawStep {
+    #[serde(default)]
+    settings_profile: Option<crate::data::settings_profile::SettingsProfileName>,
     name: Option<String>,
     prompt: Option<String>,
     #[serde(default)]
@@ -408,6 +412,7 @@ fn raw_to_steps(raw: Vec<RawStep>) -> Result<Vec<WorkflowStep>, DataError> {
         })?;
         let prompt_template = prompt_raw.trim().to_string();
         steps.push(WorkflowStep {
+            settings_profile: r.settings_profile,
             name,
             depends_on: r.depends_on,
             prompt_template,

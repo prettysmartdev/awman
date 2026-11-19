@@ -83,6 +83,7 @@ async fn main() {
         let resize_master = master.clone();
         let (stdin, mut inputs) = input_channel();
         let handle = hub.register(TerminalRegistration {
+            automation: None,
             owner: TerminalOwnerInfo { owner: TerminalOwner::Tab(tab.clone()), feature: FeatureName::Engine,
                 source: None, attempt:1, allow_remote_input:false },
             agent:format!("geometry-{index}"), model:None, cols:80, rows:24,

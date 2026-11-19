@@ -2,7 +2,8 @@
 //!
 //! Each frontend chooses its own grace + stuck timeouts via the
 //! `AgentFrontend` trait; the constants here are the defaults baked into
-//! that trait. CLI/TUI accept the defaults (30s/30s); API overrides to
+//! that trait. Launches snapshot `agents.stuckTimeout` for advisory inactivity.
+//! CLI/TUI use 30s startup grace; API overrides to
 //! 15min grace so a long image pull or model warm-up doesn't kill the run.
 
 use std::time::Duration;

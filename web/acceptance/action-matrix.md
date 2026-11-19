@@ -234,6 +234,15 @@ Legend: parity `engine_trace` = identical engine-side outcome for the scripted a
 | `term.terminal_release` | Host process terminal (TerminalRelease/Restore) | Use a host program that needs the terminal | n/a | frontend_frame: DialogRequest::TerminalRelease{terminal_id} ⇒ inline hub terminal, DialogResponse::Yes; TerminalRestore ⇒ Dismissed | inline release view | display: Dialog sheet: inline terminal | present | `frontend_protocol` | engine | required | wire_frame |
 | `term.parallel` | Several terminals at once | Work with several agent terminals independently | Ctrl+S cycles | terminal_frame: one socket per visible terminal; background terminals keep a socket only while shown as bars (snapshot on focus) | container tabs | visible_control: Stage: agent switcher | present | `frontend_protocol` | engine | required | view_only |
 | `term.attach_interrupt` | Ctrl+C during attach ends the attach | Leave an attached agent without interrupting it | Ctrl+C | frontend_frame: Cancel{tab_id, repeat:false} for the attach command; no Input{0x03} | Composer 'Stop' while attach is running; Actions → Stop command (both send Cancel{repeat:false}, no terminal Ctrl+C byte) | visible_control: Composer dock: Stop while attach runs (also command_menu) | present | `frontend_protocol` | engine | required | engine_trace |
+| `term.automation_state` | automation_state | Read execution status and assurance | n/a | terminal_frame: automation_state in awman.terminal.v1 | status notification | automatic: Stage: agent pane | present | `terminal` | engine | required | view_only |
+| `term.turn_accepted` | turn_accepted | Observe turn accepted | n/a | terminal_frame: turn_accepted in awman.terminal.v1 | status notification | automatic: Stage: agent pane | present | `terminal` | engine | required | view_only |
+| `term.turn_result` | turn_result | Observe turn result | n/a | terminal_frame: turn_result in awman.terminal.v1 | status notification | automatic: Stage: agent pane | present | `terminal` | engine | required | view_only |
+| `term.execution_closed` | execution_closed | Observe execution closed | n/a | terminal_frame: execution_closed in awman.terminal.v1 | status notification | automatic: Stage: agent pane | present | `terminal` | engine | required | view_only |
+| `term.execution_replaced` | execution_replaced | Observe execution replaced | n/a | terminal_frame: execution_replaced in awman.terminal.v1 | status notification | automatic: Stage: agent pane | present | `terminal` | engine | required | view_only |
+| `term.operation_error` | operation_error | Observe operation error | n/a | terminal_frame: operation_error in awman.terminal.v1 | status notification | automatic: Stage: agent pane | present | `terminal` | engine | required | view_only |
+| `term.submit_turn` | submit_turn | Use an owner-local automation operation | n/a | terminal_frame: submit_turn in awman.terminal.v1 | unavailable: Authenticated local owner operation; unavailable to browser grants — null | native: Stage: agent pane | unavailable | `terminal` | engine | required | view_only |
+| `term.close_execution` | close_execution | Use an owner-local automation operation | n/a | terminal_frame: close_execution in awman.terminal.v1 | unavailable: Authenticated local owner operation; unavailable to browser grants — null | native: Stage: agent pane | unavailable | `terminal` | engine | required | view_only |
+| `term.credential_update_state` | credential_update_state | Observe pending and confirmed credential generations | n/a | terminal_frame: credential_update_state in awman.terminal.v1 | status notification | automatic: Stage: agent pane | present | `terminal` | engine | required | view_only |
 
 ## dialogs
 
@@ -329,13 +338,13 @@ None.
 
 | status | rows |
 |---|---|
-| required | 209 |
-| total | 209 |
+| required | 218 |
+| total | 218 |
 
 ## Entry-point counts
 
 | entry | rows |
 |---|---|
-| present | 207 |
-| unavailable | 2 |
-| total | 209 |
+| present | 214 |
+| unavailable | 4 |
+| total | 218 |

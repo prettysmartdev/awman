@@ -226,6 +226,8 @@ pub struct ErrorWire {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CommandResultWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation: Option<crate::data::automation_records::CommandAutomationResult>,
     pub exit_code: i32,
     pub outcome: Option<serde_json::Value>,
     pub error: Option<ErrorWire>,

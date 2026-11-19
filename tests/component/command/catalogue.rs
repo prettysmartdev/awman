@@ -1,5 +1,7 @@
 //! The derived list is also the Layer 3 parity inventory (design 8.4).
-use awman::command::dispatch::catalogue::{CommandCatalogue, CommandSpec, FrontendKind};
+use awman::command::dispatch::catalogue::{
+    ApiAvailability, CommandCatalogue, CommandSpec, FrontendKind,
+};
 use awman::command::error::CommandError;
 use std::collections::BTreeSet;
 
@@ -40,6 +42,9 @@ pub const CONTRACT_PATHS: &[&str] = &[
     "agents list",
     "agents detail",
     "agents kill",
+    "agents profile list",
+    "agents profile delete",
+    "agents profile close",
     "config show",
     "config get",
     "config set",
@@ -100,6 +105,20 @@ const WORKER_COMMANDS: &[&str] = &[
     "squad cancel",
 ];
 
+/// Owner-local commands (WI 0070): declared for the API, but only for the
+/// authenticated local owner on the local listener. Until that admission is
+/// wired they are refused for network, browser and relay callers, like a disabled
+/// command. An independent oracle, like `WORKER_COMMANDS`.
+const LOCAL_OWNER_COMMANDS: &[&str] = &[
+    "agents profile list",
+    "agents profile delete",
+    "agents profile close",
+];
+
+/// Commands the API offers only as an owner-local automation terminal
+/// (`--automation`, `--settings-profile`, interactive; WI 0070).
+const LOCAL_AUTOMATION_TERMINAL_COMMANDS: &[&str] = &["chat"];
+
 #[test]
 fn every_catalogue_leaf_has_a_reviewed_command_contract() {
     let actual: BTreeSet<_> = leaves().iter().map(|(p, _)| p.join(" ")).collect();
@@ -133,14 +152,29 @@ fn authorization_is_checked_for_every_leaf_and_alias() {
     let cat = CommandCatalogue::get();
     for (path, spec) in leaves() {
         let worker_allowed = WORKER_COMMANDS.contains(&path.join(" ").as_str());
+        let expected = if worker_allowed {
+            ApiAvailability::Standard
+        } else if LOCAL_OWNER_COMMANDS.contains(&path.join(" ").as_str()) {
+            ApiAvailability::LocalOwner
+        } else if LOCAL_AUTOMATION_TERMINAL_COMMANDS.contains(&path.join(" ").as_str()) {
+            ApiAvailability::LocalAutomationTerminal
+        } else {
+            ApiAvailability::Disabled
+        };
         assert_eq!(
-            spec.api_allowed, worker_allowed,
+            spec.api_availability, expected,
             "review permission changes explicitly: {path:?}"
         );
+        assert_eq!(cat.api_availability(&path), expected, "{path:?}");
         for (frontend, allowed) in [
             (FrontendKind::Cli, true),
             (FrontendKind::Tui, true),
-            (FrontendKind::WORKER_LOCAL, worker_allowed),
+            (
+                FrontendKind::WORKER_LOCAL,
+                worker_allowed
+                    || LOCAL_OWNER_COMMANDS.contains(&path.join(" ").as_str())
+                    || LOCAL_AUTOMATION_TERMINAL_COMMANDS.contains(&path.join(" ").as_str()),
+            ),
             (
                 FrontendKind::SQUAD_LOCAL,
                 worker_allowed && path.first() == Some(&"squad"),
@@ -328,9 +362,13 @@ fn exec_prompt_flags_are_the_base_set_plus_work_item() {
             "pr",
             "worktree",
             "read-only-workspace",
+            "settings-profile",
+            "agent-session",
+            "automation",
         ]
     );
-    // Remote derivation drops the local-only selectors and adds transport.
+    // Remote derivation drops the local-only selectors (worktree selectors and the
+    // owner-local profile, native-session and automation flags) and adds transport.
     assert_eq!(
         flag_names(&["remote", "exec", "prompt"]),
         [
@@ -396,6 +434,7 @@ fn exec_workflow_flags_keep_their_documented_order() {
         "check-prerequisites",
         "json",
         "read-only-workspace",
+        "settings-profile",
     ];
     assert_eq!(flag_names(&["exec", "workflow"]), expected);
     let remote: Vec<&str> = ["session", "follow"]
@@ -403,7 +442,7 @@ fn exec_workflow_flags_keep_their_documented_order() {
         .chain(
             expected
                 .into_iter()
-                .filter(|name| !["worktree", "json"].contains(name)),
+                .filter(|name| !["worktree", "json", "settings-profile"].contains(name)),
         )
         .collect();
     assert_eq!(flag_names(&["remote", "exec", "workflow"]), remote);
@@ -607,4 +646,62 @@ fn work_item_short_alias_parses_on_every_supporting_command() {
         supported.into_iter().collect::<BTreeSet<_>>(),
         WORK_ITEM_COMMANDS.iter().map(|p| p.join(" ")).collect()
     );
+}
+
+/// WI 0070: `--plan` is a native starting mode only. It conflicts with an
+/// explicit `--yolo` / `--auto` on every launch path (so the API's default
+/// `--yolo` is not applied beside it) and has no edge to
+/// `--read-only-workspace` in either direction.
+#[test]
+fn plan_conflicts_with_yolo_and_auto_and_never_touches_mount_access() {
+    let catalogue = CommandCatalogue::get();
+    for path in [
+        &["chat"][..],
+        &["exec", "prompt"][..],
+        &["exec", "workflow"][..],
+        &["remote", "exec", "prompt"][..],
+        &["remote", "exec", "workflow"][..],
+    ] {
+        let spec = catalogue.lookup(path).unwrap();
+        let plan = spec.find_flag("plan").unwrap();
+        assert_eq!(plan.conflicts_with, &["yolo", "auto"], "{path:?}");
+        assert!(plan.implies.is_empty(), "{path:?}");
+        assert!(
+            !plan.help.contains("(read-only)"),
+            "{path:?}: {}",
+            plan.help
+        );
+        assert!(
+            plan.help.contains("Does not change workspace mounts"),
+            "{path:?}"
+        );
+        assert!(
+            spec.find_flag("auto")
+                .unwrap()
+                .conflicts_with
+                .contains(&"plan"),
+            "{path:?}"
+        );
+        assert!(
+            spec.find_flag("yolo")
+                .unwrap()
+                .conflicts_with
+                .contains(&"plan"),
+            "{path:?}"
+        );
+        if let Some(ro) = spec.find_flag("read-only-workspace") {
+            assert!(
+                !ro.conflicts_with.contains(&"plan") && ro.implies.is_empty(),
+                "{path:?}"
+            );
+        }
+        for mode in ["--yolo", "--auto"] {
+            assert!(
+                catalogue
+                    .parse_raw_args(path, &args(&["--plan", mode]))
+                    .is_err(),
+                "{path:?} accepted --plan {mode}"
+            );
+        }
+    }
 }

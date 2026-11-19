@@ -125,11 +125,13 @@ pub enum InstanceEvent {
 pub fn command_result_wire(result: &Result<CommandOutcome, CommandError>) -> CommandResultWire {
     match result {
         Ok(outcome) => CommandResultWire {
+            automation: outcome.automation().cloned(),
             exit_code: outcome.exit_code(),
             outcome: serde_json::to_value(outcome).ok(),
             error: None,
         },
         Err(error) => CommandResultWire {
+            automation: None,
             exit_code: i32::from(error.exit_code()),
             outcome: None,
             error: Some(ErrorWire {
@@ -447,6 +449,7 @@ impl TabRelay {
         let terminal = match (io, &self.hub) {
             (Some(io), Some(hub)) => Some(hub.bridge_agent_channels(
                 TerminalRegistration {
+                    automation: None,
                     owner: TerminalOwnerInfo {
                         owner: TerminalOwner::Tab(self.tab_id.clone()),
                         feature: FeatureName::Engine,

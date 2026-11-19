@@ -29,6 +29,21 @@ pub struct TerminalLaunch {
     pub model: Option<String>,
     pub(crate) handle: Arc<Mutex<Option<TerminalHandle>>>,
     pub(crate) drain: Arc<crate::engine::agent_runtime::output_tail::OutputTail>,
+    /// Automation ownership for this terminal (WI 0070): the initial
+    /// snapshot registered atomically with the terminal, and the controller
+    /// callback told the registered id before any producer runs.
+    pub automation: Option<TerminalAutomationBinding>,
+}
+
+/// Told the registered terminal id before any producer runs.
+pub type TerminalRegisteredHook =
+    Arc<dyn Fn(&crate::data::ids::TerminalId, &Arc<TerminalHub>) + Send + Sync>;
+
+/// How an automation launch binds its terminal at registration.
+#[derive(Clone)]
+pub struct TerminalAutomationBinding {
+    pub snapshot: crate::data::automation_records::AutomationSnapshot,
+    pub on_registered: TerminalRegisteredHook,
 }
 
 impl std::fmt::Debug for TerminalLaunch {
@@ -77,6 +92,7 @@ impl TerminalLaunch {
     pub fn register(&self, cols: u16, rows: u16, input: TerminalInput) -> TerminalHandle {
         let handle = self.hub.register(
             TerminalRegistration {
+                automation: self.automation.as_ref().map(|a| a.snapshot.clone()),
                 owner: self.owner.clone(),
                 agent: self.agent.clone(),
                 model: self.model.clone(),
@@ -86,6 +102,9 @@ impl TerminalLaunch {
             input,
         );
         *self.handle.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle.clone());
+        if let Some(binding) = &self.automation {
+            (binding.on_registered)(handle.id(), &self.hub);
+        }
         handle
     }
 }
@@ -227,6 +246,14 @@ pub trait AgentInstance: Send + Sync {
         self: Box<Self>,
         frontend: Box<dyn AgentFrontend>,
     ) -> Result<AgentExecution, EngineError>;
+
+    /// The launch's shared output redaction set (every registered
+    /// credential and env grant), for side channels that read guest-written
+    /// data outside the frontend's output path (the automation lifecycle
+    /// channel). Wrappers forward it; a runtime without one returns empty.
+    fn output_redaction(&self) -> crate::engine::auth::redaction::RedactionSet {
+        crate::engine::auth::redaction::RedactionSet::default()
+    }
 }
 
 /// Carry a launch's structured stdout protocol through a runtime-neutral
@@ -262,6 +289,9 @@ struct ProgramStatusInstance {
 impl AgentInstance for ProgramStatusInstance {
     fn handle_preview(&self) -> AgentHandlePreview {
         self.instance.handle_preview()
+    }
+    fn output_redaction(&self) -> crate::engine::auth::redaction::RedactionSet {
+        self.instance.output_redaction()
     }
     fn run_with_frontend(
         self: Box<Self>,
@@ -349,6 +379,9 @@ impl AgentFrontend for ProgramStatusFrontend {
     fn grace_timeout(&self) -> std::time::Duration {
         self.frontend.grace_timeout()
     }
+    fn startup_timing(&self) -> crate::data::automation::StartupTiming {
+        self.frontend.startup_timing()
+    }
     fn stuck_timeout(&self) -> std::time::Duration {
         self.frontend.stuck_timeout()
     }
@@ -357,6 +390,9 @@ impl AgentFrontend for ProgramStatusFrontend {
 impl AgentInstance for OutputFormatInstance {
     fn handle_preview(&self) -> AgentHandlePreview {
         self.instance.handle_preview()
+    }
+    fn output_redaction(&self) -> crate::engine::auth::redaction::RedactionSet {
+        self.instance.output_redaction()
     }
 
     fn run_with_frontend(
@@ -757,6 +793,9 @@ impl AgentInstance for TerminalInstance {
     fn handle_preview(&self) -> AgentHandlePreview {
         self.instance.handle_preview()
     }
+    fn output_redaction(&self) -> crate::engine::auth::redaction::RedactionSet {
+        self.instance.output_redaction()
+    }
     fn run_with_frontend(
         self: Box<Self>,
         frontend: Box<dyn AgentFrontend>,
@@ -772,6 +811,7 @@ impl AgentInstance for TerminalInstance {
         }
         let config = frontend.program_status_config();
         let mut launch = self.launch;
+        launch.automation = frontend.terminal_automation();
         let mut source = frontend
             .terminal_source()
             .or_else(|| launch.owner.source.clone())
@@ -815,6 +855,9 @@ impl AgentInstance for RedactedInstance {
     fn handle_preview(&self) -> AgentHandlePreview {
         self.instance.handle_preview()
     }
+    fn output_redaction(&self) -> crate::engine::auth::redaction::RedactionSet {
+        self.redaction.clone()
+    }
     fn run_with_frontend(
         self: Box<Self>,
         frontend: Box<dyn AgentFrontend>,
@@ -827,5 +870,50 @@ impl AgentInstance for RedactedInstance {
                 terminal: None,
                 redaction: self.redaction,
             }))
+    }
+}
+
+#[cfg(test)]
+mod output_redaction_tests {
+    use super::*;
+
+    struct Stub;
+    impl AgentInstance for Stub {
+        fn handle_preview(&self) -> AgentHandlePreview {
+            AgentHandlePreview {
+                id: "stub".into(),
+                name: "stub".into(),
+                image: "stub".into(),
+            }
+        }
+        fn run_with_frontend(
+            self: Box<Self>,
+            _frontend: Box<dyn AgentFrontend>,
+        ) -> Result<AgentExecution, EngineError> {
+            Err(EngineError::Other("stub".into()))
+        }
+    }
+
+    /// WI 0070 automation finding 1: side channels (the automation lifecycle
+    /// reader) obtain the launch's own redaction set through every wrapper,
+    /// not a frontend's empty default.
+    #[test]
+    fn the_launch_redaction_set_is_reachable_through_instance_wrappers() {
+        let set = crate::engine::auth::redaction::RedactionSet::new();
+        set.add(crate::data::secret::SecretString::new(
+            "launch-secret-value",
+        ));
+        let instance = with_output_redaction(Box::new(Stub), set);
+        let instance = with_output_format(
+            instance,
+            crate::data::agent_output_format::AgentOutputFormat::ClaudeStreamJson,
+        );
+        assert_eq!(
+            instance
+                .output_redaction()
+                .redact("x launch-secret-value y"),
+            "x *** y"
+        );
+        assert!(Stub.output_redaction().is_empty());
     }
 }

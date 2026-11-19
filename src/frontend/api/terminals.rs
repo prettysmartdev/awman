@@ -124,6 +124,11 @@ fn viewer_identity(
             .map_err(invalid_annotation)?;
     }
     Ok(ViewerIdentity {
+        origin: if listener == CommandListener::Local {
+            crate::data::daemon_state::RequestOrigin::OwnerSocket
+        } else {
+            crate::data::daemon_state::RequestOrigin::Network
+        },
         principal: crate::data::daemon_state::Principal::Owner,
         listener_name: None,
         listener,
@@ -149,6 +154,7 @@ async fn grant_ended(grant: Option<&GrantWatch>) -> &'static str {
 /// input holder is `Actor(<grant id>)`.
 fn browser_viewer(viewer: &mut ViewerIdentity, principal: crate::data::daemon_state::Principal) {
     if let Some(browser) = BrowserPrincipal::from_principal(&principal) {
+        viewer.origin = crate::data::daemon_state::RequestOrigin::Browser;
         viewer.actor = Some(browser.grant_id.to_string());
     }
     viewer.principal = principal;
@@ -337,7 +343,7 @@ async fn close(socket: &mut WebSocket, code: u16, reason: &'static str) {
 /// What one client message asks the loop to do.
 enum ClientStep {
     Continue,
-    Reply(Message),
+    Reply(Vec<Message>),
     Detach,
     Close(u16, &'static str),
 }
@@ -353,11 +359,10 @@ fn client_step(session: &mut TerminalSession, message: Message) -> ClientStep {
         Ok(frame) => frame,
         Err(_) => return ClientStep::Close(1007, "malformed awman.terminal.v1 frame"),
     };
-    let detaching = matches!(frame, TerminalClientFrame::Detached { .. });
     match session.handle_client_frame(frame) {
-        Ok(()) if detaching => ClientStep::Detach,
-        Ok(()) => ClientStep::Continue,
-        Err(refusal) => ClientStep::Reply(error_message(&refusal)),
+        Ok(response) if response.detached => ClientStep::Detach,
+        Ok(response) => ClientStep::Reply(response.frames.iter().map(frame_message).collect()),
+        Err(refusal) => ClientStep::Reply(vec![error_message(&refusal)]),
     }
 }
 
@@ -403,10 +408,12 @@ pub(super) async fn serve_terminal_socket(
                 let Some(Ok(message)) = message else { break };
                 match client_step(&mut session, message) {
                     ClientStep::Continue => {}
-                    ClientStep::Reply(reply) => {
+                    ClientStep::Reply(replies) => {
+                        for reply in replies {
                         if socket.send(reply).with_subscriber(tracing::subscriber::NoSubscriber::default()).await.is_err() {
                             break;
                         }
+                    }
                     }
                     ClientStep::Detach => {
                         close(&mut socket, 1000, "detached").await;

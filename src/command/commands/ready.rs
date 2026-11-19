@@ -9,6 +9,7 @@ use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::command::headless::HeadlessDefaults;
 use crate::data::message::{MessageLevel, UserMessage};
+use crate::data::preparation::{AuthenticationCheck, PreparationPolicy};
 use crate::data::ready_image::{ReadyBaseImageResult, ReadyImageResult};
 use crate::data::ready_summary::AgentCredentialHealth;
 use crate::data::step_status::StepStatus;
@@ -26,6 +27,9 @@ pub struct ReadyCommandFlags {
     pub non_interactive: bool,
     pub allow_docker: bool,
     pub json: bool,
+    /// `--prepare-only`: image preparation without host-agent pings, credential
+    /// checks or audits.
+    pub prepare_only: bool,
     /// `--agent`; `None` readies the configured agent.
     pub agent: Option<String>,
 }
@@ -62,6 +66,14 @@ pub struct ReadyOutcome {
     /// exit code; the legacy JSON `ready` field also requires the host-side
     /// checks to have passed.
     pub ready: bool,
+    /// Which policy this run used.
+    pub preparation_policy: PreparationPolicy,
+    /// Every requested non-authentication prerequisite succeeded (same
+    /// reading as `ready`). Never implies authentication passed.
+    pub images_ready: bool,
+    /// What was established about provider authentication; `not_checked`
+    /// under `images_only`.
+    pub authentication: AuthenticationCheck,
     /// `true` when `--json` was passed; controls how the CLI renders the outcome.
     #[serde(skip)]
     pub json_requested: bool,
@@ -73,6 +85,8 @@ pub struct ReadyOutcome {
 impl From<ReadySummary> for ReadyOutcome {
     fn from(s: ReadySummary) -> Self {
         let ready = s.is_ready();
+        let preparation_policy = s.preparation_policy;
+        let authentication = s.authentication();
         Self {
             runtime: s.runtime_name,
             dockerfile: s.dockerfile,
@@ -89,6 +103,9 @@ impl From<ReadySummary> for ReadyOutcome {
             image_results: s.image_results,
             base_image_results: s.base_image_results,
             ready,
+            preparation_policy,
+            images_ready: ready,
+            authentication,
             json_requested: false,
             refresh_requested: false,
         }
@@ -151,6 +168,9 @@ impl ReadyOutcome {
 
         let mut result = serde_json::json!({
             "ready": checks_passed,
+            "preparation_policy": self.preparation_policy.as_str(),
+            "images_ready": self.images_ready,
+            "authentication": self.authentication.as_str(),
             "runtime": self.runtime,
             "agent_credentials": self.agent_credentials,
             "agent_auth": self.agent_auth,
@@ -268,8 +288,20 @@ impl ReadyCommand {
             non_interactive: ctx.flags.bool("headless"),
             allow_docker: ctx.flags.bool("allow-docker"),
             json: ctx.flags.bool("json"),
+            prepare_only: ctx.flags.bool("prepare-only"),
             agent: ctx.flags.string("agent"),
         };
+        // `--refresh` runs an agent audit; preparation-only runs no agent.
+        // The catalogue declares the conflict; this keeps every route that
+        // builds the command directly honest too.
+        if flags.prepare_only && flags.refresh {
+            return Err(CommandError::InvalidFlagValue {
+                command: vec!["ready".into()],
+                flag: "prepare-only".into(),
+                reason: "--prepare-only runs no agent audit and cannot be combined with --refresh"
+                    .into(),
+            });
+        }
         if flags.refresh && Self::headless_for(ctx.caller.frontend()).is_some() {
             return Err(CommandError::InvalidFlagValue {
                 command: vec!["ready".into()],
@@ -351,6 +383,7 @@ impl Command for ReadyCommand {
             allow_docker: self.flags.allow_docker,
             non_interactive: self.flags.non_interactive,
             env_passthrough: None,
+            preparation: PreparationPolicy::from_prepare_only(self.flags.prepare_only),
         };
 
         frontend.write_message(UserMessage {
@@ -401,7 +434,10 @@ impl Command for ReadyCommand {
         if let Some(ping) = self.host_ping {
             engine.set_host_ping(ping);
         }
-        engine.set_agent_credentials(credential_health(&self.engines.auth_engine, &agent));
+        // Preparation-only does not look at provider credentials either.
+        if !self.flags.prepare_only {
+            engine.set_agent_credentials(credential_health(&self.engines.auth_engine, &agent));
+        }
         let cancel = engine.cancel_token();
         let mut answering = HeadlessReadyFrontend {
             inner: frontend.as_mut(),

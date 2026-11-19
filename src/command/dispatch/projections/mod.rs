@@ -5,5 +5,7 @@
 
 pub mod clap;
 pub mod markdown;
+#[cfg(test)]
+mod optional_enum_tests;
 pub mod raw_args;
 pub mod tui_hints;

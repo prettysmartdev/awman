@@ -217,7 +217,12 @@ async fn dispatch_inner(
                         match incoming {
                             Some(Ok(Message::Text(text)))=> {
                                 if super::http::identity(&server,&headers).is_err() || lease_auth(&server,&lease.id,&worker_id(&server,&lease.id),&headers).is_err() { break; }
-                                let Ok(frame)=serde_json::from_str::<LeaseTerminalFrame>(&text) else { break; };
+                                let Ok(frame)=serde_json::from_str::<LeaseTerminalFrame>(&text) else {
+                                    let _=socket.send(Message::Close(Some(axum::extract::ws::CloseFrame{code:1007,reason:"invalid_frame".into()}))).await; break;
+                                };
+                                if !frame.frame.is_server_frame() {
+                                    let _=socket.send(Message::Close(Some(axum::extract::ws::CloseFrame{code:1007,reason:"invalid_frame".into()}))).await; break;
+                                }
                                 let mut s=server.inner.lock().unwrap(); expire(&mut s,Utc::now());
                                 if s.leases.get(&lease.id).is_none_or(|l| l.lease.epoch != lease.epoch) { break; }
                                 s.frames.entry(lease.id.clone()).or_default().push(frame);

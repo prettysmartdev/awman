@@ -224,6 +224,10 @@ struct CreateCommandRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CommandResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credential_updates: Option<crate::data::credential_update::EffectiveCredentialUpdates>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    automation: Option<crate::data::automation_records::AutomationSnapshot>,
     #[serde(default)]
     allow_remote_input: bool,
     #[serde(default)]
@@ -437,7 +441,27 @@ fn command_response(
         .map_err(|_| internal_error("Failed to read queue position"))?;
     let job = worker::commands_job(state, &c.id)
         .map_err(|_| internal_error("Failed to read the job record"))?;
+    let execution_snapshot = if peer.1 {
+        let command = crate::data::ids::CommandId::parse(&c.id)
+            .map_err(|_| internal_error("invalid command id"))?;
+        worker::credentials_snapshot(
+            state,
+            &crate::data::terminal::ViewerIdentity::local(),
+            &command,
+        )
+        .map_err(|_| internal_error("credential projection unavailable"))?
+    } else {
+        None
+    };
+    let credential_updates = execution_snapshot
+        .as_ref()
+        .and_then(|s| s.credential_updates.clone());
+    let automation = execution_snapshot
+        .and_then(|s| s.automation)
+        .or_else(|| c.automation.clone());
     Ok(CommandResponse {
+        credential_updates,
+        automation,
         origin: job.origin,
         outputs_mounted: job.outputs_mounted,
         allow_remote_input: c.allow_remote_input,
@@ -1098,6 +1122,35 @@ pub const ROUTES: &[RouteSpec] = &[
         capability: None,
     },
     RouteSpec {
+        method: "POST",
+        path: "/v1/worker/commands/{id}/credentials",
+        op: Operation::WorkerCommandsCredentialsUpdate,
+        local_only: true,
+        capability: Some("agent_credential_updates"),
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/commands/{id}/credential-updates/{request_id}",
+        op: Operation::WorkerCommandsCredentialsGet,
+        local_only: true,
+        capability: Some("agent_credential_updates"),
+    },
+    // WI 0070 owner-local automation records (network: 403).
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/commands/{id}/turns",
+        op: Operation::WorkerCommandsTurns,
+        local_only: true,
+        capability: Some("agent_turn_records"),
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/v1/worker/sessions/{id}/agent-capabilities",
+        op: Operation::WorkerSessionsAgentCapabilities,
+        local_only: true,
+        capability: Some("agent_capabilities"),
+    },
+    RouteSpec {
         method: "GET",
         path: "/v1/worker/commands/{id}/workflow",
         op: Operation::WorkerCommandsWorkflow,
@@ -1416,6 +1469,37 @@ pub fn build_router_for_listener(api: Arc<DaemonApi>, policy: ListenerPolicy) ->
                 let api = gate_api.clone();
                 let policy = gate_policy.clone();
                 async move {
+                    if spec.op == Operation::WorkerCommandsCredentialsUpdate
+                        && request.headers().contains_key("content-encoding")
+                    {
+                        return ApiError::unsupported_media_type(
+                            "compressed credential requests are not supported",
+                        )
+                        .into_response();
+                    }
+                    let foreign_origin = request
+                        .extensions()
+                        .get::<crate::data::daemon_state::RequestOrigin>()
+                        .is_none_or(|o| {
+                            !matches!(
+                                o,
+                                crate::data::daemon_state::RequestOrigin::OwnerSocket
+                                    | crate::data::daemon_state::RequestOrigin::LocalProcess
+                            )
+                        });
+                    let browser_or_forwarded = request.headers().contains_key("origin")
+                        || request.headers().contains_key("forwarded")
+                        || request.headers().contains_key("x-forwarded-for");
+                    if (matches!(&policy, ListenerPolicy::Network { .. })
+                        || foreign_origin
+                        || browser_or_forwarded)
+                        && spec.op.owner_local_automation()
+                    {
+                        return ApiError::request_forbidden(
+                            "this operation is available only to the local owner",
+                        )
+                        .into_response();
+                    }
                     if matches!(&policy, ListenerPolicy::Network { .. }) && spec.local_only {
                         return ApiError::not_found("resource not found").into_response();
                     }
@@ -1523,6 +1607,16 @@ fn worker_route(op: Operation, filter: MethodFilter) -> MethodRouter<Arc<AppStat
         Operation::WorkerSessionsGet => axum::routing::on(filter, handle_get_session),
         Operation::WorkerSessionsDelete => axum::routing::on(filter, handle_close_session),
         Operation::WorkerSessionsQueue => axum::routing::on(filter, handle_get_session_queue),
+        Operation::WorkerSessionsAgentCapabilities => {
+            axum::routing::on(filter, handle_agent_capabilities)
+        }
+        Operation::WorkerCommandsCredentialsUpdate => {
+            axum::routing::on(filter, handle_credentials_update)
+        }
+        Operation::WorkerCommandsCredentialsGet => {
+            axum::routing::on(filter, handle_credentials_get)
+        }
+        Operation::WorkerCommandsTurns => axum::routing::on(filter, handle_command_turns),
         Operation::WorkerCommandsList => axum::routing::on(filter, handle_list_commands),
         Operation::WorkerCommandsCreate => axum::routing::on(filter, handle_create_command),
         Operation::WorkerCommandsGet => axum::routing::on(filter, handle_get_command),
@@ -1572,7 +1666,8 @@ async fn daemon_auth(
                 .requires_feature()
                 .and_then(|f| f.feature_name())
                 .is_some_and(|f| !api.runtime.listener_serves(name, f))
-                || spec.op.local_only()
+                // Known owner-local automation operations answer 403 below.
+                || (spec.op.local_only() && !spec.op.owner_local_automation())
                 || spec
                     .op
                     .owner()
@@ -1598,6 +1693,22 @@ async fn daemon_auth(
         ListenerPolicy::Local => crate::data::daemon_state::CommandListener::Local,
         ListenerPolicy::Network { .. } => crate::data::daemon_state::CommandListener::Network,
     });
+    // Provenance comes from the receiving transport. Owner authentication alone
+    // does not turn an internal forwarding request into an owner-socket request.
+    if request
+        .extensions()
+        .get::<crate::data::daemon_state::RequestOrigin>()
+        .is_none()
+    {
+        let origin = if request.extensions().get::<BrowserRequest>().is_some() {
+            crate::data::daemon_state::RequestOrigin::Browser
+        } else if matches!(policy, ListenerPolicy::Network { .. }) {
+            crate::data::daemon_state::RequestOrigin::Network
+        } else {
+            crate::data::daemon_state::RequestOrigin::Unknown
+        };
+        request.extensions_mut().insert(origin);
+    }
     if request
         .extensions()
         .get::<super::local::OwnerAuthenticated>()
@@ -1632,6 +1743,12 @@ async fn daemon_auth(
                             .listener_settings(name)
                             .is_some_and(|l| spec.op.allowed_for(&principal, &l))
                         {
+                            if spec.op.owner_local_automation() {
+                                return ApiError::request_forbidden(
+                                    "this operation is available only to the local owner",
+                                )
+                                .into_response();
+                            }
                             return ApiError::not_found("resource not found").into_response();
                         }
                     }
@@ -1830,6 +1947,7 @@ async fn handle_create_session(
         headers.get("traceparent").and_then(|v| v.to_str().ok()),
     );
     context.listener_name = receiving.map(|r| r.0 .0);
+    context.profile_owner = matches!(principal, Principal::Owner);
     let st = &state;
     with_idempotency(
         &state,
@@ -1873,6 +1991,7 @@ async fn handle_create_run(
         headers.get("traceparent").and_then(|v| v.to_str().ok()),
     );
     context.listener_name = receiving.map(|r| r.0 .0);
+    context.profile_owner = matches!(principal, Principal::Owner);
     let st = &state;
     let canonical = value.to_string();
     with_idempotency(
@@ -2279,6 +2398,7 @@ async fn handle_create_command(
         headers.get("traceparent").and_then(|v| v.to_str().ok()),
     );
     context.listener_name = receiving.map(|r| r.0 .0);
+    context.profile_owner = matches!(principal, Principal::Owner);
     let mut body: CreateCommandRequest = match serde_json::from_value(value.clone()) {
         Ok(body) => body,
         Err(error) => return bad_request(error.to_string()),
@@ -2524,6 +2644,40 @@ fn execution_event_to_sse(event: &ExecutionEvent, cursor: Option<EventCursor>) -
     };
     frame.event(event.payload.sse_event_type()).data(data)
 }
+/// `GET /v1/worker/sessions/{id}/agent-capabilities` (WI 0070).
+async fn handle_agent_capabilities(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    let id = crate::data::ids::WorkerSessionId::parse(&id).expect("route validated session id");
+    match worker::sessions_agent_capabilities(&state, &id).await {
+        Some(list) => Json(list).into_response(),
+        None => ApiError::session_not_found(format!("Session '{id}' not found")).into_response(),
+    }
+}
+
+/// `GET /v1/worker/commands/{id}/turns` (WI 0070).
+async fn handle_command_turns(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<crate::data::wire::ListQuery>,
+) -> Response {
+    let id = crate::data::ids::CommandId::parse(&id).expect("route validated command id");
+    match worker::commands_turns(&state, &id, &query) {
+        Ok(Some(list)) => Json(list).into_response(),
+        Ok(None) => {
+            ApiError::command_not_found(format!("Command '{id}' not found")).into_response()
+        }
+        Err(crate::data::error::DataError::Other(m)) if m == "invalid_request" => {
+            ApiError::invalid_request("invalid turn page cursor or limit").into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to list command turns");
+            ApiError::internal("Failed to list command turns").into_response()
+        }
+    }
+}
+
 async fn handle_get_session_queue(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -3003,7 +3157,7 @@ async fn listener_gate(
         .iter()
         .find(|s| Some(s.path) == matched)
         .is_some_and(|spec| {
-            spec.op.local_only()
+            (spec.op.local_only() && !spec.op.owner_local_automation())
                 || spec
                     .op
                     .owner()
@@ -3198,4 +3352,93 @@ async fn listener_gate(
         }
     }
     response
+}
+
+fn credential_api_error(code: &'static str) -> ApiError {
+    let status = match code {
+        "forbidden" => StatusCode::FORBIDDEN,
+        "not_found" => StatusCode::NOT_FOUND,
+        "invalid_request" | "invalid_secrets" => StatusCode::BAD_REQUEST,
+        _ => StatusCode::CONFLICT,
+    };
+    ApiError {
+        status,
+        code,
+        message: code.into(),
+    }
+}
+async fn handle_credentials_update(
+    origin: Option<axum::Extension<crate::data::daemon_state::RequestOrigin>>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    axum::Extension(listener): axum::Extension<crate::data::daemon_state::CommandListener>,
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    input: Result<
+        Json<super::command_secrets::CredentialBody>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    let viewer = crate::data::terminal::ViewerIdentity {
+        principal,
+        listener,
+        origin: origin.map(|o| o.0).unwrap_or_default(),
+        ..crate::data::terminal::ViewerIdentity::local()
+    };
+    if !crate::command::automation::controller::is_local_owner(&viewer) {
+        return credential_api_error("forbidden").into_response();
+    }
+    let request = match input {
+        Ok(body) => body.0 .0,
+        Err(e) => {
+            return if e.status() == StatusCode::UNSUPPORTED_MEDIA_TYPE {
+                ApiError::unsupported_media_type("JSON is required")
+            } else if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                ApiError::request_too_large("request too large")
+            } else {
+                credential_api_error(if e.body_text().contains("invalid_secrets") {
+                    "invalid_secrets"
+                } else {
+                    "invalid_request"
+                })
+            }
+            .into_response()
+        }
+    };
+    let Ok(command) = crate::data::ids::CommandId::parse(&id) else {
+        return credential_api_error("not_found").into_response();
+    };
+    let epoch = headers
+        .get("x-awman-input-epoch")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.parse().ok());
+    match worker::credentials_update(&state, &viewer, &command, request, epoch) {
+        Ok(op) => (StatusCode::ACCEPTED, Json(op)).into_response(),
+        Err(code) => credential_api_error(code).into_response(),
+    }
+}
+async fn handle_credentials_get(
+    origin: Option<axum::Extension<crate::data::daemon_state::RequestOrigin>>,
+    axum::Extension(principal): axum::Extension<Principal>,
+    axum::Extension(listener): axum::Extension<crate::data::daemon_state::CommandListener>,
+    State(state): State<Arc<AppState>>,
+    AxumPath((id, request)): AxumPath<(String, String)>,
+) -> Response {
+    let viewer = crate::data::terminal::ViewerIdentity {
+        principal,
+        listener,
+        origin: origin.map(|o| o.0).unwrap_or_default(),
+        ..crate::data::terminal::ViewerIdentity::local()
+    };
+    let (Ok(command), Ok(request)) = (
+        crate::data::ids::CommandId::parse(&id),
+        uuid::Uuid::parse_str(&request),
+    ) else {
+        return credential_api_error("not_found").into_response();
+    };
+    match worker::credentials_get(&state, &viewer, &command, request) {
+        Ok(Some(op)) => Json(op).into_response(),
+        Ok(None) => credential_api_error("not_found").into_response(),
+        Err(code) => credential_api_error(code).into_response(),
+    }
 }

@@ -10,6 +10,7 @@ use crate::support;
 use awman::command::{
     commands::{
         api_server::event_bus::EventBus,
+        chat::{ChatCommand, ChatCommandFlags},
         exec_prompt::{ExecPromptCommand, ExecPromptCommandFlags},
         exec_workflow::{ExecWorkflowCommand, ExecWorkflowCommandFlags},
         Command,
@@ -57,6 +58,8 @@ struct Launch {
     /// prompt file, concatenated: whatever text the agent is told.
     prompt_text: String,
     tmpdir: Option<String>,
+    /// Native mode flags (WI 0070): never added by the mount flag.
+    mode_flags: Vec<String>,
 }
 
 impl Launch {
@@ -162,6 +165,7 @@ impl AgentRuntimeEngine for Runtime {
                     .iter()
                     .find(|e| e.key == "TMPDIR")
                     .map(|e| e.value.clone()),
+                mode_flags: options.agent_mode_flags.clone(),
             });
         }
         Err(EngineError::Other("captured by test runtime".into()))
@@ -274,12 +278,14 @@ fn prompt_flags(allow_docker: bool) -> ExecPromptCommandFlags {
         yolo: false,
         yolo_authorized: false,
         auto: false,
+        auto_explicit: false,
         agent: Some("claude".into()),
         model: None,
         launch_mode: None,
         overlay: vec![],
         agent_flags: None,
         session_worktree: None,
+        automation: None,
     }
 }
 
@@ -416,7 +422,15 @@ async fn exec_prompt_default_launch_stays_read_write_without_tmpfs_or_prompt_lin
     );
     assert!(launch.tmpfs.is_empty());
     assert!(!launch.prompt_text.contains(PROMPT_LINE));
-    assert!(!events.contains("workspace_access"), "{events}");
+    // No read-only status message; the policy report says read_write.
+    assert!(
+        !events.contains("\"phase\":\"workspace_access\""),
+        "{events}"
+    );
+    assert!(
+        events.contains("\\\"workspace_access\\\":\\\"read_write\\\""),
+        "{events}"
+    );
     s.finish();
 }
 
@@ -595,8 +609,127 @@ fn catalogue_projection_accepts_the_option_on_every_exec_path_and_refuses_allow_
             "{path:?} accepted both flags"
         );
     }
-    // Not offered on chat: the option is an exec-only policy.
+    // WI 0070: offered on chat too, with the same --allow-docker refusal.
     assert!(catalogue
         .parse_raw_args(&["chat"], &tokens(&["--read-only-workspace"]))
+        .is_ok());
+    assert!(catalogue
+        .parse_raw_args(
+            &["chat"],
+            &tokens(&["--read-only-workspace", "--allow-docker"])
+        )
         .is_err());
+}
+
+fn chat_flags(allow_docker: bool) -> ChatCommandFlags {
+    ChatCommandFlags {
+        non_interactive: false,
+        plan: false,
+        allow_docker,
+        yolo: false,
+        yolo_authorized: false,
+        auto: false,
+        auto_explicit: false,
+        agent: Some("claude".into()),
+        model: None,
+        launch_mode: None,
+        overlay: vec![],
+        agent_flags: None,
+        session_worktree: None,
+        automation: None,
+    }
+}
+
+async fn run_chat(
+    f: &Fixture,
+    access: WorkspaceAccess,
+    allow_docker: bool,
+) -> (Result<(), CommandError>, String) {
+    let bus = EventBus::new(1024);
+    let mut log = bus.subscribe_log();
+    let frontend = ApiDispatchFrontend::new("chat", &[], bus.sender());
+    let result = ChatCommand::new(
+        chat_flags(allow_docker),
+        f.engines.clone(),
+        f.session.clone(),
+    )
+    .with_workspace_access(access)
+    .run_with_frontend(Box::new(frontend))
+    .await
+    .map(|_| ());
+    (result, drain(&mut log))
+}
+
+/// WI 0070: `chat --read-only-workspace` mirrors `exec prompt`: read-only
+/// mount, scratch tmpfs, the prompt section, and no native plan tokens.
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_read_only_launch_mounts_ro_tells_the_agent_and_adds_no_plan_tokens() {
+    let s = support::sandbox("command::read_only_workspace::chat_read_only_launch_mounts_ro_tells_the_agent_and_adds_no_plan_tokens");
+    let f = fixture(&s, "chat-ro", ONE_STEP, true);
+    let (_, events) = run_chat(&f, WorkspaceAccess::ReadOnly, false).await;
+    let launches = f.launches();
+    assert_eq!(launches.len(), 1, "{events}");
+    let launch = &launches[0];
+    assert!(launch.read_only_workspace);
+    assert!(launch.workspace_is_read_only(), "{launch:?}");
+    assert_eq!(launch.tmpfs, [PathBuf::from("/tmp")]);
+    assert_eq!(launch.tmpdir.as_deref(), Some("/tmp"));
+    assert!(launch.prompt_text.contains(PROMPT_LINE), "{launch:?}");
+    assert!(launch.mode_flags.is_empty(), "{:?}", launch.mode_flags);
+    assert!(
+        events.contains("\\\"workspace_access\\\":\\\"read_only\\\""),
+        "{events}"
+    );
+    assert!(
+        events.contains("\\\"native_start_mode\\\":\\\"default\\\""),
+        "{events}"
+    );
+
+    // The default chat stays writable with no section.
+    let (_, _) = run_chat(&f, WorkspaceAccess::ReadWrite, false).await;
+    let launch = f.launches().pop().unwrap();
+    assert!(!launch.read_only_workspace);
+    assert_eq!(
+        launch.permission("/workspace"),
+        Some(OverlayPermission::ReadWrite)
+    );
+    assert!(!launch.prompt_text.contains(PROMPT_LINE));
+    s.finish();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_read_only_is_refused_before_any_effect_where_it_cannot_be_enforced() {
+    let s = support::sandbox("command::read_only_workspace::chat_read_only_is_refused_before_any_effect_where_it_cannot_be_enforced");
+    let f = fixture(&s, "chat-sbx", ONE_STEP, false);
+    let (result, events) = run_chat(&f, WorkspaceAccess::ReadOnly, false).await;
+    let err = result.expect_err("refused on a runtime without read-only mounts");
+    assert_eq!(err.code(), "read_only_workspace_unsupported", "{err}");
+    assert_eq!(f.builds(), 0, "{events}");
+
+    let f = fixture(&s, "chat-docker", ONE_STEP, true);
+    let (result, _) = run_chat(&f, WorkspaceAccess::ReadOnly, true).await;
+    assert!(
+        matches!(&result, Err(CommandError::InvalidFlagValue { flag, .. }) if flag == READ_ONLY_WORKSPACE_FLAG),
+        "{result:?}"
+    );
+    assert_eq!(f.builds(), 0);
+    s.finish();
+}
+
+#[test]
+fn chat_declares_read_only_workspace_and_no_implication_with_plan() {
+    let catalogue = CommandCatalogue::get();
+    let spec = catalogue.lookup(&["chat"]).unwrap();
+    let flag = spec.find_flag(READ_ONLY_WORKSPACE_FLAG).unwrap();
+    assert!(flag.implies.is_empty());
+    let plan = spec.find_flag("plan").unwrap();
+    assert!(plan.implies.is_empty());
+    assert!(!plan.conflicts_with.contains(&READ_ONLY_WORKSPACE_FLAG));
+    assert!(!catalogue.is_pending_flag(&["chat"], READ_ONLY_WORKSPACE_FLAG));
+    catalogue
+        .parse_raw_args(
+            &["chat"],
+            &["--plan".into(), "--read-only-workspace".into()],
+        )
+        .unwrap();
 }

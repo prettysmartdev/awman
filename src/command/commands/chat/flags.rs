@@ -13,6 +13,8 @@ pub struct ChatCommandFlags {
     pub yolo: bool,
     pub yolo_authorized: bool,
     pub auto: bool,
+    /// `--auto` was supplied by the caller, not a frontend default.
+    pub auto_explicit: bool,
     pub agent: Option<String>,
     pub model: Option<String>,
     pub launch_mode: Option<LaunchMode>,
@@ -20,6 +22,8 @@ pub struct ChatCommandFlags {
     /// `--agent-flag` values; `None` lets config `agentFlags` apply.
     pub agent_flags: Option<Vec<String>>,
     pub session_worktree: Option<SessionWorktreeTarget>,
+    /// `--automation[=auto|require_full]` (WI 0070); `None` when omitted.
+    pub automation: Option<crate::data::automation::AutomationMode>,
 }
 
 impl super::ChatCommand {
@@ -33,6 +37,7 @@ impl super::ChatCommand {
                 yolo: ctx.flags.bool("yolo"),
                 yolo_authorized: ctx.flags.explicit("yolo"),
                 auto: ctx.flags.bool("auto"),
+                auto_explicit: ctx.flags.explicit("auto"),
                 agent: ctx.flags.string("agent"),
                 model: ctx.flags.string("model"),
                 launch_mode: None, // `--set agents.launchMode=…` (WI 0139)
@@ -46,10 +51,20 @@ impl super::ChatCommand {
                     ctx.flags.string("pr"),
                     ctx.flags.string("worktree"),
                 ),
+                automation: ctx
+                    .flags
+                    .r#enum(crate::data::automation::AUTOMATION_FLAG)
+                    .and_then(crate::data::automation::AutomationMode::parse),
             },
             ctx.engines.clone(),
             ctx.session.clone(),
-        ))
+        )
+        .with_cancellation(ctx.cancel.clone())
+        .with_profile(crate::command::commands::launch_policy::settings_profile::ProfileRequest::from_context(ctx)?)
+        .with_workspace_access(crate::data::workspace::WorkspaceAccess::from_read_only(
+            ctx.flags
+                .bool(crate::data::workspace::READ_ONLY_WORKSPACE_FLAG),
+        )))
     }
 }
 

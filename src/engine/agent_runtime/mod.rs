@@ -172,6 +172,14 @@ pub trait AgentRuntimeEngine: Send + Sync {
 
     /// Explicitly stop a running agent, reporting runtime failures.
     /// Call `remove_agent` afterwards to request cleanup of its resources.
+    /// Read an execution label from a runtime-owned resource, never its name alone.
+    fn resource_label(
+        &self,
+        _handle: &AgentHandle,
+        _key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        Err(EngineError::NotImplemented("resource label inspection"))
+    }
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError>;
 
     /// Attach to an already-running agent this process did not start.

@@ -101,7 +101,7 @@ pub enum CredentialDelivery {
 }
 
 /// Credentials resolved for one agent launch.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct AgentCredentials {
     /// Env-var pairs to inject. MUST be empty when `delivery` is `File` — that
     /// emptiness is the mechanical guarantee that `CLAUDE_CODE_OAUTH_TOKEN`
@@ -111,6 +111,13 @@ pub struct AgentCredentials {
     pub delivery: CredentialDelivery,
 }
 
+impl std::fmt::Debug for AgentCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentCredentials")
+            .field("delivery", &self.delivery)
+            .finish_non_exhaustive()
+    }
+}
 /// A file-delivered credential for one container launch. Carries **no secret**:
 /// the secret lives only in the staged file. The value travels
 /// auth → agent engine → container options → backend `build()` → lease.
@@ -395,6 +402,11 @@ impl AuthEngine {
         session: &Session,
         agent: &AgentName,
     ) -> Result<AgentCredentials, EngineError> {
+        let definition =
+            crate::engine::agent::registry::AgentRegistry::resolve_for_session(session, agent)?;
+        if definition.origin != crate::engine::agent::definition::AgentOrigin::FirstParty {
+            return Ok(AgentCredentials::default());
+        }
         match session.effective_config().auth_mode() {
             AgentAuthMode::Keychain => {
                 if session.effective_config().auth_refresh().enabled {

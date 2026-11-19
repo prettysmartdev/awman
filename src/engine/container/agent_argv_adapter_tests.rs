@@ -164,16 +164,30 @@ fn opencode_v1_argv_is_pinned() {
         ),
         s(&["opencode", "--prompt", SEED])
     );
-    assert!(matches!(
-        refusal(
+    // WI 0070: the built-in Plan agent on both routes.
+    assert_eq!(
+        argv(
             a,
             Shape {
                 plan: true,
+                seed: true,
                 ..Default::default()
             }
         ),
-        EngineError::PlanModeUnsupported { .. }
-    ));
+        s(&["opencode", "--agent", "plan", "--prompt", SEED])
+    );
+    assert_eq!(
+        argv(
+            a,
+            Shape {
+                plan: true,
+                headless: true,
+                seed: true,
+                ..Default::default()
+            }
+        ),
+        s(&["opencode", "run", "--agent", "plan", SEED])
+    );
     let mut tools = run(Shape::default());
     tools.allowed_tools = s(&["Read"]);
     assert!(matches!(
@@ -367,16 +381,43 @@ fn opencode_v2_refusals() {
             && combo.to_string().contains("opencode mini"),
         "{combo}"
     );
-    assert!(matches!(
-        refusal(
+    // WI 0070: headless `run --agent plan`; the full TUI gets no plan argv
+    // (a private default_agent patch); `mini` (--model) has no plan option.
+    assert_eq!(
+        argv(
+            a,
+            Shape {
+                plan: true,
+                headless: true,
+                ..Default::default()
+            }
+        ),
+        s(&["opencode", "--standalone", "run", "--agent", "plan"])
+    );
+    assert_eq!(
+        argv(
             a,
             Shape {
                 plan: true,
                 ..Default::default()
             }
         ),
-        EngineError::PlanModeUnsupported { .. }
-    ));
+        s(&["opencode", "--standalone"])
+    );
+    let plan_model = refusal(
+        a,
+        Shape {
+            plan: true,
+            model: Some("m"),
+            ..Default::default()
+        },
+    );
+    assert!(
+        plan_model
+            .to_string()
+            .contains("cannot combine --model with --plan"),
+        "{plan_model}"
+    );
     assert!(matches!(
         refusal(
             a,
@@ -592,8 +633,9 @@ fn cursor_refusals() {
             .contains("no verified equivalent of --auto"),
         "{auto}"
     );
-    assert!(matches!(
-        refusal(
+    // WI 0070: `--mode plan` on --print; --force stays explicit-yolo only.
+    assert_eq!(
+        argv(
             a,
             Shape {
                 plan: true,
@@ -601,8 +643,16 @@ fn cursor_refusals() {
                 ..Default::default()
             }
         ),
-        EngineError::PlanModeUnsupported { .. }
-    ));
+        s(&[
+            "cursor-agent",
+            "--print",
+            "--trust",
+            "--output-format",
+            "text",
+            "--mode",
+            "plan"
+        ])
+    );
     assert!(matches!(
         refusal(
             a,

@@ -316,8 +316,9 @@ pub async fn agent_selects_its_own_definition(
             ],
         );
         let calls = calls_since(&w.docker, m);
-        // Only OpenCode 1.x keeps an `--auto` mapping; nothing maps --plan.
-        let expect_refused = !(agent == "opencode" && mode == "--auto");
+        // Only OpenCode 1.x keeps an `--auto` mapping. WI 0070: all three
+        // map `--plan` to their native plan mode on the headless route.
+        let expect_refused = mode == "--auto" && agent != "opencode";
         assert_eq!(
             exit != Exit::Code(0),
             expect_refused,
@@ -325,6 +326,25 @@ pub async fn agent_selects_its_own_definition(
         );
         if expect_refused {
             assert!(launches(&calls).is_empty(), "{agent} {mode}: {calls:#?}");
+        }
+        if mode == "--plan" {
+            let launched = launches(&calls);
+            assert_eq!(launched.len(), 1, "{agent} --plan: {calls:#?}");
+            let argv = launch_shape(launched[0])["argv"].clone();
+            let tokens = match agent {
+                "cursor" => json!(["--mode", "plan"]),
+                _ => json!(["--agent", "plan"]),
+            };
+            let argv: Vec<Value> = argv.as_array().cloned().unwrap_or_default();
+            assert!(
+                argv.windows(2).any(|w| json!(w) == tokens),
+                "{agent} --plan: {argv:?}"
+            );
+            // Native mode only: no awman permission flag rides along.
+            assert!(
+                !argv.iter().any(|a| a == "--force" || a == "--auto"),
+                "{agent} --plan: {argv:?}"
+            );
         }
         refused.push(json!({"mode": mode, "refused": exit != Exit::Code(0)}));
     }
@@ -346,6 +366,83 @@ pub async fn agent_selects_its_own_definition(
     s.finish();
     // Repo paths differ per sandbox; the image's repo stem is the same.
     trace
+}
+
+/// WI 0070: `--plan` (native starting mode) and `--read-only-workspace`
+/// (mount access) through the real binary and the production Docker backend
+/// (a fake `docker` CLI records the final `docker run` argv and lets the
+/// launch complete). Each of the four combinations launches once and exits
+/// successfully; the native tokens follow only `--plan` and the `:ro`
+/// workspace mount follows only `--read-only-workspace`. In-session mode
+/// transitions belong to the provider and are qualified on the boundary
+/// tier, not here.
+pub async fn plan_and_mount_access_reach_the_final_launch_independently(
+    kind: BackendKind,
+    id: &'static str,
+) {
+    let s = support::sandbox(id);
+    let w = world(&s);
+    let backend = Backend::start(kind, &s).await;
+    let env = env(&backend, &s);
+    let repo = RepoBuilder::new(&s, "plan-access")
+        .file("README.md", "fixture\n")
+        .file("Dockerfile.dev", "FROM scratch\n")
+        .init();
+    let repo = repo.path().to_path_buf();
+    let agent = "opencode";
+    probe_answers(&w.docker, "1.99.123");
+    for (plan, read_only) in [(false, false), (true, false), (false, true), (true, true)] {
+        let m = mark(&w.docker);
+        let mut args = vec!["exec", "prompt", "--agent", agent, "--headless"];
+        if plan {
+            args.push("--plan");
+        }
+        if read_only {
+            // A read-only OpenCode launch carries its instructions in a
+            // context directory.
+            args.extend(["--read-only-workspace", "--overlay", "context(global:ro)"]);
+        }
+        args.push("hello");
+        let (exit, text) = run(&s, &env, &repo, &args);
+        assert_eq!(exit, Exit::Code(0), "plan={plan} ro={read_only}: {text}");
+        let calls = calls_since(&w.docker, m);
+        let launched = launches(&calls);
+        assert_eq!(launched.len(), 1, "plan={plan} ro={read_only}: {calls:#?}");
+        let argv = launched[0];
+        let shape = launch_shape(argv);
+        let after_image: Vec<String> = serde_json::from_value(shape["argv"].clone()).unwrap();
+        let native = after_image.windows(2).any(|w| w == ["--agent", "plan"]);
+        assert_eq!(native, plan, "plan={plan} ro={read_only}: {after_image:?}");
+        // The native tokens sit between the entrypoint and the prompt.
+        if plan {
+            assert_eq!(
+                after_image,
+                ["opencode", "run", "--agent", "plan", "hello"],
+                "ro={read_only}"
+            );
+        }
+        let workspace: Vec<&String> = argv
+            .windows(2)
+            .filter(|pair| pair[0] == "-v")
+            .map(|pair| &pair[1])
+            .filter(|spec| spec.ends_with(":/workspace") || spec.ends_with(":/workspace:ro"))
+            .collect();
+        assert_eq!(workspace.len(), 1, "{argv:?}");
+        assert_eq!(
+            workspace[0].ends_with(":ro"),
+            read_only,
+            "plan={plan} ro={read_only}: {argv:?}"
+        );
+    }
+    for agent in &w.host_agents {
+        assert!(
+            agent.calls().is_empty(),
+            "host agent invoked: {:?}",
+            agent.calls()
+        );
+    }
+    backend.shutdown().await;
+    s.finish();
 }
 
 /// Every entry point that selects `gemini` with no custom definition fails

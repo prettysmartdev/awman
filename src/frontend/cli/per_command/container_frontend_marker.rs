@@ -15,6 +15,9 @@ use crate::frontend::terminal_output_filter::HostOutputFilter;
 
 #[async_trait]
 impl AgentFrontend for CliFrontend {
+    fn stuck_timeout(&self) -> std::time::Duration {
+        self.agent_stuck_timeout
+    }
     fn set_agent_output_format(
         &mut self,
         format: crate::data::agent_output_format::AgentOutputFormat,

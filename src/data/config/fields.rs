@@ -304,6 +304,32 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         false,
         "Collect program status from agents.",
     ),
+    // Snapshotted at launch (`live: false`): an active execution keeps the
+    // budgets it started with. `1s..1h`; drain must not exceed cancel.
+    row(
+        "agents.automation.startupTimeout",
+        Duration,
+        "\"120s\"",
+        Task,
+        false,
+        "How long an automation launch may take to become ready for a task (1s to 1h).",
+    ),
+    row(
+        "agents.automation.cancelTimeout",
+        Duration,
+        "\"10s\"",
+        Task,
+        false,
+        "Total time to stop an owned agent after cancellation is accepted (1s to 1h).",
+    ),
+    row(
+        "agents.automation.outputDrainTimeout",
+        Duration,
+        "\"5s\"",
+        Task,
+        false,
+        "How long to collect remaining output after an agent exits; at most the cancel timeout.",
+    ),
     // runtime
     row(
         "runtime.kind",

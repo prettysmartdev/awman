@@ -224,6 +224,25 @@ mod unix_impl {
         }
     }
 
+    /// An attach client's input grant: releasing it (disconnect) is reported
+    /// to the raw-input gate after the grant is dropped, outside every lock.
+    struct GatedGrant {
+        grant: Option<crate::engine::terminal_hub::InputGrant>,
+        hub: std::sync::Weak<crate::engine::terminal_hub::TerminalHub>,
+        id: crate::data::ids::TerminalId,
+    }
+
+    impl Drop for GatedGrant {
+        fn drop(&mut self) {
+            if let Some(grant) = self.grant.take() {
+                drop(grant);
+                if let Some(hub) = self.hub.upgrade() {
+                    hub.report_control_released(&self.id);
+                }
+            }
+        }
+    }
+
     /// The internal binary attach transport subscribes to the same daemon hub
     /// and exclusive capability as WebSocket viewers.
     pub(crate) async fn serve_hub_client(
@@ -235,7 +254,16 @@ mod unix_impl {
         let Ok(mut output) = hub.subscribe(&id) else {
             return;
         };
-        let grant = hub.take_control(&id).ok();
+        // Control changes and raw bytes pass the automation owner's gate
+        // exactly like the typed terminal operations: taking control
+        // invalidates readiness, and bytes are admitted only in the states
+        // that allow manual input; releasing control is reported too.
+        let grant = GatedGrant {
+            grant: hub.take_control_gated(&id).ok(),
+            hub: Arc::downgrade(&hub),
+            id: id.clone(),
+        };
+        let gate_hub = Arc::downgrade(&hub);
         drop(hub); // subscription and grant deliberately retain only weak references
         let (mut reader, mut writer) = stream.into_split();
         loop {
@@ -247,7 +275,7 @@ mod unix_impl {
                         let (tag, bytes, exited) = match frame {
                             Some(TerminalFrame::Snapshot { screen, .. } | TerminalFrame::Output { bytes: screen }) => (Tag::Output, screen, false),
                             Some(TerminalFrame::Exit { code }) => (Tag::Exit, code.to_le_bytes().to_vec(), true),
-                            Some(_) => continue,
+                            Some(TerminalFrame::Error { .. } | TerminalFrame::Resize { .. } | TerminalFrame::Lagged | TerminalFrame::AutomationState { .. } | TerminalFrame::TurnAccepted { .. } | TerminalFrame::TurnResult { .. } | TerminalFrame::ExecutionClosed { .. } | TerminalFrame::ExecutionReplaced { .. } | TerminalFrame::CredentialUpdateState { .. } | TerminalFrame::OperationError { .. }) => continue,
                             None => return,
                         };
                         if write_frame_bounded(&mut writer, tag, &bytes, WRITE_TIMEOUT).await.is_err() || exited { return; }
@@ -255,12 +283,15 @@ mod unix_impl {
                     frame = &mut input => {
                         match frame {
                             Ok((Tag::Stdin, bytes)) => {
-                                if let Some(grant) = &grant {
+                                let admitted = gate_hub
+                                    .upgrade()
+                                    .is_some_and(|hub| hub.admit_raw_input(&id));
+                                if let Some(grant) = grant.grant.as_ref().filter(|_| admitted) {
                                     if matches!(grant.send_input(bytes), Err(crate::engine::terminal_hub::TerminalHubError::InputBackpressure)) { return; }
                                 }
                             }
                             Ok((Tag::Resize, bytes)) => {
-                                if let (Some(grant), Some((cols, rows))) = (&grant, parse_resize(&bytes)) {
+                                if let (Some(grant), Some((cols, rows))) = (&grant.grant, parse_resize(&bytes)) {
                                     // Exit may revoke the grant while this
                                     // frame is in flight. Keep reading so the
                                     // queued terminal exit code still arrives.
@@ -366,6 +397,7 @@ mod unix_impl {
                     container_name: handle.name.clone(),
                 },
             );
+            let startup_timing = frontend.startup_timing();
             let grace_timeout = frontend.grace_timeout();
             let stuck_timeout = frontend.stuck_timeout();
             let mut status_config = frontend.program_status_config();
@@ -494,6 +526,7 @@ mod unix_impl {
 
             let stuck_tx = StuckDetector::spawn(
                 StuckConfig {
+                    startup_timing,
                     grace_timeout,
                     stuck_timeout,
                     container_start_delay: std::time::Duration::ZERO,

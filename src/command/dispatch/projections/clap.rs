@@ -106,7 +106,20 @@ fn build_clap_flag(spec: &FlagSpec) -> Arg {
                 arg = arg.default_value(s);
             }
         }
-        FlagKind::VecString => {
+        FlagKind::OptionalEnum { values, missing } => {
+            // `--flag` or `--flag=value`: `require_equals` keeps the token
+            // after a bare flag from being consumed as its value (it may be
+            // the first prompt word). `Append` lets repeats through so the
+            // CLI frontend folds them with `FlagSpec::resolve_optional_enum`,
+            // the same rule the raw-args projection applies.
+            arg = arg
+                .action(ArgAction::Append)
+                .num_args(0..=1)
+                .require_equals(true)
+                .default_missing_value(missing)
+                .value_parser(values.to_vec());
+        }
+        FlagKind::VecString | FlagKind::AgentArg => {
             arg = arg.action(ArgAction::Append);
         }
         FlagKind::Path | FlagKind::OptionalPath => {
@@ -126,6 +139,9 @@ fn build_clap_flag(spec: &FlagSpec) -> Arg {
                 .action(ArgAction::Set)
                 .value_parser(clap::builder::RangedU64ValueParser::<usize>::new().range(1..));
         }
+    }
+    if spec.allows_hyphen_value() {
+        arg = arg.allow_hyphen_values(true);
     }
     for c in spec.conflicts_with {
         arg = arg.conflicts_with(*c);

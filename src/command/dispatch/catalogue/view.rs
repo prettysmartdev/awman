@@ -6,7 +6,9 @@
 //!
 //! Contract: `/awman/context/workflow/0142-design.md` §4.10.
 
-use super::{CommandSpec, FlagDefault, FlagKind, FlagSpec, FrontendVisibility, GatewayNeed};
+use super::{
+    ApiAvailability, CommandSpec, FlagDefault, FlagKind, FlagSpec, FrontendVisibility, GatewayNeed,
+};
 
 pub(super) const VIEW: CommandSpec = CommandSpec {
     name: "view",
@@ -52,7 +54,7 @@ pub(super) const VIEW: CommandSpec = CommandSpec {
             optional: true,
         },
     ],
-    api_allowed: false,
+    api_availability: ApiAvailability::Disabled,
     build: crate::command::dispatch::build::view,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
