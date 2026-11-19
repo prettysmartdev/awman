@@ -35,6 +35,17 @@ fn run(id: &'static str, apple: bool) {
         "claude",
         "#!/bin/sh\nIFS= read -r p\necho BUILDER_UID=$(id -u)\ncat /etc/builder-marker\n",
     );
+    // The shared archive fixture never builds its placeholder agent image.
+    // This builder journey needs the rendered project tag, as provisioning
+    // writes it after substituting the bundled template's base-image marker.
+    std::fs::write(
+        repo.join(".awman/Dockerfile.claude"),
+        format!(
+            "FROM {}\n",
+            awman::data::image_tags::project_image_tag(&repo)
+        ),
+    )
+    .unwrap();
     std::fs::write(
         repo.join("Dockerfile.dev"),
         "FROM awman-test/guest:fixture\nUSER root\nRUN printf 'v1\\n' > /etc/builder-marker\nUSER probe\n",

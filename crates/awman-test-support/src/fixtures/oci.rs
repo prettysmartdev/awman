@@ -4,7 +4,7 @@
 
 use super::sha256_hex;
 use serde::Serialize;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -107,6 +107,98 @@ pub struct OciImage {
 }
 
 impl OciImage {
+    /// Read one image from a verified fixture archive without extracting it.
+    /// Descriptor digests and sizes are checked before any layer is reused.
+    pub fn read_archive(path: &Path) -> Self {
+        let mut files = std::collections::BTreeMap::new();
+        for entry in tar::Archive::new(std::fs::File::open(path).expect("fixture archive"))
+            .entries()
+            .expect("archive entries")
+        {
+            let mut entry = entry.expect("archive entry");
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+            let name = entry
+                .path()
+                .expect("archive path")
+                .to_string_lossy()
+                .trim_start_matches("./")
+                .to_string();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).expect("archive body");
+            assert!(
+                files.insert(name, bytes).is_none(),
+                "duplicate archive member"
+            );
+        }
+        let index = files["index.json"].clone();
+        let parsed: serde_json::Value = serde_json::from_slice(&index).expect("fixture index");
+        assert_eq!(
+            parsed["manifests"].as_array().unwrap().len(),
+            1,
+            "fixture must select one image"
+        );
+        let blob = |descriptor: &serde_json::Value| {
+            let digest = descriptor["digest"].as_str().expect("descriptor digest");
+            let hex = digest.strip_prefix("sha256:").expect("sha256 fixture blob");
+            let blob = Blob::new(
+                descriptor["mediaType"].as_str().expect("media type"),
+                files[&format!("blobs/sha256/{hex}")].clone(),
+            );
+            assert_eq!(blob.digest, digest);
+            assert_eq!(
+                blob.bytes.len() as u64,
+                descriptor["size"].as_u64().unwrap()
+            );
+            blob
+        };
+        let manifest = blob(&parsed["manifests"][0]);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&manifest.bytes).expect("fixture manifest");
+        Self {
+            config: blob(&parsed["config"]),
+            layers: parsed["layers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(blob)
+                .collect(),
+            manifest,
+            index,
+        }
+    }
+
+    /// Derive a private fixture by appending regular files while retaining its
+    /// architecture, image user, environment and original layer identities.
+    pub fn with_files(mut self, files: &[(&str, &[u8], u32)]) -> Self {
+        let layer = Blob::new(LAYER_TAR, tar_bytes(files.iter().copied()));
+        let mut config: serde_json::Value = serde_json::from_slice(&self.config.bytes).unwrap();
+        config["rootfs"]["diff_ids"]
+            .as_array_mut()
+            .unwrap()
+            .push(layer.digest.clone().into());
+        if let Some(history) = config
+            .get_mut("history")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            history.push(serde_json::json!({"created_by":"awman synthetic guest probe"}));
+        }
+        self.config = Blob::new(CONFIG_TYPE, serde_json::to_vec(&config).unwrap());
+        self.layers.push(layer);
+        let mut manifest: serde_json::Value = serde_json::from_slice(&self.manifest.bytes).unwrap();
+        manifest["config"] = serde_json::to_value(self.config.descriptor()).unwrap();
+        manifest["layers"] =
+            serde_json::to_value(self.layers.iter().map(Blob::descriptor).collect::<Vec<_>>())
+                .unwrap();
+        self.manifest = Blob::new(MANIFEST_TYPE, serde_json::to_vec(&manifest).unwrap());
+        let mut index: serde_json::Value = serde_json::from_slice(&self.index).unwrap();
+        index["manifests"][0]["digest"] = self.manifest.digest.clone().into();
+        index["manifests"][0]["size"] = self.manifest.bytes.len().into();
+        self.index = serde_json::to_vec(&index).unwrap();
+        self
+    }
+
     /// Write an OCI image layout directory; returns `dir`.
     pub fn write_layout(&self, dir: &Path) -> PathBuf {
         let blobs = dir.join("blobs/sha256");
@@ -381,5 +473,37 @@ mod tests {
         let a = std::fs::read(image.write_archive(&dir.path().join("a.tar"))).unwrap();
         let b = std::fs::read(image.write_archive(&dir.path().join("b.tar"))).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn derived_archive_preserves_base_metadata_and_adds_verified_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = OciImageBuilder::new()
+            .architecture("arm64")
+            .env("HOME=/home/probe")
+            .layer(&[("base", b"base")])
+            .build();
+        let path = base.write_archive(&dir.path().join("base.tar"));
+        let derived = OciImage::read_archive(&path).with_files(&[(
+            "usr/bin/probe",
+            b"#!/bin/sh\necho 2.0.0\n",
+            0o755,
+        )]);
+        assert_eq!(derived.layers[0], base.layers[0]);
+        let config: serde_json::Value = serde_json::from_slice(&derived.config.bytes).unwrap();
+        let base_config: serde_json::Value = serde_json::from_slice(&base.config.bytes).unwrap();
+        assert_eq!(config["architecture"], "arm64");
+        assert_eq!(config["config"], base_config["config"]);
+        assert_eq!(config["rootfs"]["diff_ids"].as_array().unwrap().len(), 2);
+        let reloaded =
+            OciImage::read_archive(&derived.write_archive(&dir.path().join("derived.tar")));
+        assert_eq!(reloaded.manifest, derived.manifest);
+        let mut archive = tar::Archive::new(reloaded.layers[1].bytes.as_slice());
+        let mut entry = archive.entries().unwrap().next().unwrap().unwrap();
+        assert_eq!(entry.path().unwrap().to_str(), Some("usr/bin/probe"));
+        assert_eq!(entry.header().mode().unwrap(), 0o755);
+        let mut contents = String::new();
+        entry.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "#!/bin/sh\necho 2.0.0\n");
     }
 }

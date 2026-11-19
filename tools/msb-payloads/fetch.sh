@@ -11,6 +11,12 @@ esac
 if [ "$(uname -s)" != "$os" ] || [ "$(uname -m | sed 's/^arm64$/aarch64/')" != "$arch" ]; then
     echo "native $target host required to extract firmware" >&2; exit 2
 fi
+# Preserve build-input mtimes when every cached byte and its provenance still
+# match the reviewed manifest. Re-extraction would force otherwise warm builds.
+if bash "$root/tools/msb-payloads/verify.sh" "$target" >/dev/null 2>&1; then
+    printf 'PASS verified cached payload %s (unchanged)\n' "$target"
+    exit 0
+fi
 manifest="$root/third_party/msb-payloads/manifest.toml"
 version=$(awk -F'"' '/^version =/ {print $2; exit}' "$manifest")
 field() { awk -v section="[targets.\"$target\"]" -v key="$1" '$0 == section {inside=1;next} /^\[/ {inside=0} inside && $1 == key {gsub(/"/, "", $3); print $3; exit}' "$manifest"; }

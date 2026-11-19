@@ -47,6 +47,12 @@ insufficient. SQLx compatibility remains an independent removal gate.
 Saved proposal bundles are in `aspec/review-notes/0120-evidence/upstream-prs/`.
 Their base, application checks and outstanding upstream tests are explicit in
 each `PR.md`; they are local drafts, not upstream acceptance evidence.
+Proposal 07's runtime test target compiled against the inspected upstream base
+with Rust 1.95.0 on Linux aarch64. All three lifecycle tests passed under both
+`0002` and `0077`: private creation, exclusivity/reuse, inherited descriptor
+ownership, and asynchronous wait/timeout behavior. Its bundle retains commands,
+source hashes and complete logs in `VALIDATION.md`. Latest-upstream Linux x86_64
+and macOS guest acceptance and the full upstream suite remain outstanding.
 Linux native evidence belongs to WI 0124, and does not validate new upstream
 0.7.16 sources. Linux ARM64 remains gated; the current release scope is x86_64.
 
@@ -346,7 +352,8 @@ with the Phase 2 bump.
 
 The carried sources and their patch notes are listed in
 [`third_party/README.md`](../../third_party/README.md) and each tree's
-`PATCH.md`. None of the five remaining patches has been accepted or released upstream. The
+`PATCH.md`. The six remaining patched crates still require the published equivalents
+and acceptance gates listed above before removal. The
 `msb_krun` patch was unnecessary once upstream shipped `static-krunfw`. The historical
 spike under `tools/oci-runtime-spike/` remains evidence only and is not a
 production runtime dependency.

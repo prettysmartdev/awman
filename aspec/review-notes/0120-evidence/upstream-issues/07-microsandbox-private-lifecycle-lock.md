@@ -1,4 +1,4 @@
-> Saved proposal only; not submitted. Reconciled 2026-11-19 against the exact base below. Upstream compilation and native acceptance remain required before submission.
+> Saved proposal only; not submitted. Reconciled 2026-11-19 against the exact base below. The runtime test target compiled and all three focused lifecycle tests passed under umasks `0002` and `0077` on Linux aarch64. Full upstream tests and latest-upstream native guest acceptance on Linux x86_64 and macOS remain required before submission.
 
 # Create private Unix lifecycle locks independently of umask
 
@@ -17,9 +17,12 @@ the process umask is not changed, and the descriptor validation contract remains
 strict. The lifecycle exclusivity/reuse regression also checks that newly
 created locks have no group/other permissions.
 
-Before submission, run the focused lifecycle tests with umask `0002` and `0077`,
-including inherited-descriptor ownership, then boot native guests on Linux and
-macOS. Verify migration expectations for pre-existing permissive lock files;
+The focused lifecycle tests passed with umasks `0002` and `0077`, including
+creation permissions, exclusivity/reuse, inherited-descriptor ownership, and
+asynchronous wait/timeout behavior. See `VALIDATION.md` and the included logs for
+the exact commands, source hashes and limitations. Before submission, boot native
+guests on Linux x86_64 and macOS against this latest-upstream base and verify
+migration expectations for pre-existing permissive lock files;
 this patch deliberately does not take ownership of or alter existing files.
 
 Removal gate: pin a published runtime with equivalent creation permissions and

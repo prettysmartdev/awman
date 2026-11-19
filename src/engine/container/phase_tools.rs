@@ -23,7 +23,7 @@ pub(crate) fn probe(
     cache: &mut PhaseToolsCache,
 ) -> PhaseToolsStatus {
     let process_env = runtime.env();
-    if process_env.test_isolation() && !process_env.test_docker() {
+    if !super::runtime::probe_isolation_permits(runtime.runtime_name(), process_env) {
         return PhaseToolsStatus::Unknown {
             reason: "test isolation".into(),
         };

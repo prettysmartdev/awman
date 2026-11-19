@@ -385,7 +385,7 @@ Importing enforces safety limits: a total archive of up to 32 GiB, up to 8 GiB p
 |---|---|---|
 | `runtime.builtin.stateDir` | `<AWMAN_HOME>/builtin` | Private builtin runtime state root for imported images, VM/session state, catalog and control sockets. The directory is process-wide: every builtin session in the awman process uses it, and a repo `runtime.builtin.stateDir` that resolves to a different directory is rejected at launch with an error naming both paths. Must be an absolute path without `..`, owned by you with mode `0700`, and contain no symlinks. Keep it short: control sockets live below it and paths are limited to about 100 bytes (`socket path … is longer than the … limit; configure a shorter builtin state directory`). `AWMAN_BUILTIN_STATE_DIR` overrides config for the process. |
 | `runtime.builtin.vcpus` | `2` | Whole vCPUs per session VM, 1–255. Fractional values are rejected, never rounded. |
-| `runtime.builtin.memory` | `4GiB` | Guest memory, 128MiB or more. |
+| `runtime.builtin.memory` | `4GiB` | Requested guest RAM, 128MiB or more. Allow additional host memory for VM overhead. |
 | `runtime.builtin.rootDisk` | `30GiB` | Writable root disk per session VM, 256MiB or more: the space the agent has for everything outside its mounts (`/`, its home directory, installed packages). The disk file is sparse, so it only uses host space as the agent writes. |
 | `runtime.builtin.mountQuota` | `30GiB` | How much the agent may add to each host mount, the workspace included, beyond what it already held; 1 or more. Writes past it fail with "no space left on device" in the guest. This keeps an agent from filling your disk through a mount. |
 | `runtime.builtin.builder.enabled` | `false` | Let `ready`, and a launch whose agent image is missing, build in a `docker-local` or `apple-local` source store before importing. See [Building from a local image source](#building-from-a-local-image-source). |
@@ -488,7 +488,7 @@ For a newer catalog, use the newer awman. Otherwise quit any awman still using t
 |---|---|---|
 | Image creation | `ready` builds from Dockerfiles | `ready` imports from a configured source; with `runtime.builtin.builder.enabled` it can first build in a local Docker or Apple Containers store |
 | Fractional CPU | Supported | Rejected (`cannot honour …`): whole vCPUs only |
-| Resource limit enforcement | Container-level limits | VM allocation: the guest sees exactly the configured vCPUs and memory, and memory exhaustion is handled by the guest's own OOM killer without affecting the host or other VMs |
+| Resource limit enforcement | Container-level limits | Whole vCPUs and a requested RAM allocation per VM. Guest-visible memory depends on the platform boot layout and excludes kernel reservations. Guest allocation exhaustion uses the guest's OOM killer; budget host memory for VM overhead and concurrent sessions too. |
 | `--allow-docker` | Mounts the host Docker socket (Docker only) | **Rejected.** No socket is ever mounted and there is no host daemon bridge |
 | Reattach after the launching awman exits | Docker: yes. Apple: no | No |
 | Host `localhost` / MCP services | Per the container network | Inside the VM, `127.0.0.1` is the VM itself; a host loopback service is reachable only if its port is listed in `runtime.builtin.network.hostPorts` (see [Network](#network)) |
