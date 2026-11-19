@@ -3,6 +3,9 @@
 
 use crate::data::dialog::{DialogRequest, DialogResponse};
 use crate::frontend::cli::command_frontend::CliFrontend;
+use crate::frontend::render_helpers::{
+    terminal_safe_line as safe_line, terminal_safe_text as safe_text,
+};
 use tokio_util::sync::CancellationToken;
 
 pub(crate) fn render_dialog(
@@ -69,7 +72,7 @@ pub(crate) fn render_dialog(
         // Headless answers are resolved by Layer 2 from the CLI profile.
         // A generic dialog renderer never invents an affirmative answer.
         _ if frontend.non_interactive => R::Dismissed,
-        DialogRequest::YesNo { body, .. } => match helpers::yes_no_required(&body) {
+        DialogRequest::YesNo { body, .. } => match helpers::yes_no_required(&safe_text(&body)) {
             Some(true) => R::Yes,
             Some(false) => R::No,
             None => R::Dismissed,
@@ -86,7 +89,7 @@ pub(crate) fn render_dialog(
             prompt,
             default_text,
             ..
-        } => helpers::read_line(&prompt)
+        } => helpers::read_line(&safe_line(&prompt))
             .map(|text| {
                 R::Text(if text.is_empty() {
                     default_text.unwrap_or_default()
@@ -116,8 +119,9 @@ pub(crate) fn render_dialog(
                 .unwrap_or(R::Dismissed)
         }
         DialogRequest::ListPicker { title, items } => {
-            let items: Vec<&str> = items.iter().map(String::as_str).collect();
-            helpers::pick_numbered(&title, &items, 1)
+            let shown: Vec<String> = items.iter().map(|item| safe_line(item)).collect();
+            let shown: Vec<&str> = shown.iter().map(String::as_str).collect();
+            helpers::pick_numbered(&safe_line(&title), &shown, 1)
                 .and_then(|n| n.checked_sub(1))
                 .filter(|n| *n < items.len())
                 .map(R::Index)
@@ -132,8 +136,8 @@ pub(crate) fn render_dialog(
                 .unwrap_or(R::Dismissed)
         }
         DialogRequest::Custom { title, body, keys } => {
-            eprintln!("awman: {title}");
-            keyed(&body, &keys)
+            eprintln!("awman: {}", safe_line(&title));
+            keyed(&safe_text(&body), &keys)
         }
         DialogRequest::Review(review) => {
             use crate::data::dialog::ReviewBody;
@@ -141,11 +145,11 @@ pub(crate) fn render_dialog(
                 ReviewBody::Exact(text) | ReviewBody::Prose(text) => text.clone(),
                 ReviewBody::Prerequisites(report) => report.render_lines().join("\n"),
             };
-            eprintln!("awman: {}", review.title);
+            eprintln!("awman: {}", safe_line(&review.title));
             if !review.note.is_empty() {
-                eprintln!("awman: {}", review.note);
+                eprintln!("awman: {}", safe_line(&review.note));
             }
-            keyed(&body, &review.keys)
+            keyed(&safe_text(&body), &review.keys)
         }
         DialogRequest::WorkflowStepConfirm(state) => keyed(
             &format!(

@@ -1110,7 +1110,10 @@ impl ReadyEngine {
         agent: &str,
     ) -> Result<StepStatus, String> {
         let tag = crate::data::image_tags::agent_image_tag(git_root, agent);
-        let result = self
+        // Decided from configuration alone, before the source is contacted:
+        // only an image with no usable source gets the missing-source text.
+        let missing = self.missing_source_message(&tag, agent);
+        let prepared = self
             .preparer
             .prepare(
                 &crate::engine::image_prep::AgentImageRequest {
@@ -1120,8 +1123,24 @@ impl ReadyEngine {
                 },
                 frontend,
             )
-            .await
-            .map_err(|e| e.to_string())?;
+            .await;
+        let mut result = match (prepared, &missing) {
+            (Ok(result), _) => result,
+            (Err(EngineError::ImageSourceUnconfigured { .. }), Some(message)) => {
+                return Err(message.clone())
+            }
+            (Err(e), _) => return Err(crate::engine::oci::docker_engine::failure_message(&e)),
+        };
+        if let Some(message) = &missing {
+            // Keep the status variant (a kept installed image stays `Done`,
+            // a pinned-default warning stays `Warn`); only a failure's text
+            // becomes the one-line, config-naming explanation.
+            for status in [&mut result.build, &mut result.import] {
+                if let StepStatus::Failed(text) = status {
+                    *text = message.clone();
+                }
+            }
+        }
         self.summary
             .base_image_results
             .extend(self.preparer.take_base_results());
@@ -1142,6 +1161,22 @@ impl ReadyEngine {
             None => Ok(status),
         }
     }
+    /// The one-line missing-source explanation for `tag`, when the runtime
+    /// imports images and configuration gives `tag` no usable source. It
+    /// names the tag, the config keys and files that fix it, and the
+    /// accepted values; `None` for a configured source, however it fails.
+    fn missing_source_message(&self, tag: &str, agent: &str) -> Option<String> {
+        if !self.imports_images() {
+            return None;
+        }
+        crate::data::config::image_source_setup::missing_image_source_guidance(
+            &self.session,
+            tag,
+            agent,
+            agent == self.session.configured_agent().as_str(),
+        )
+    }
+
     /// `ready --build` on an importing runtime: acquire every non-default
     /// agent's image too, one row per agent. The agents are the ones with a
     /// `.awman/Dockerfile.<agent>` — the same set `CheckingNonDefaultAgents`

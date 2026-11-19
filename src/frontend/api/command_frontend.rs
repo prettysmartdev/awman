@@ -1703,16 +1703,21 @@ impl ReadyFrontend for ApiDispatchFrontend {
     /// `ready` progress line already uses, rather than discarding the
     /// summary as before.
     fn report_summary(&mut self, summary: &ReadySummary) {
-        for (label, status) in summary.rows() {
+        for (label, status) in crate::frontend::render_helpers::ready_rows_for_display(summary) {
             self.event_bus.emit(EventPayload::StatusMessage {
                 phase: "ready".to_string(),
-                message: format!("{label}: {}", status.label()),
+                message: crate::frontend::render_helpers::sanitize_ready_text(&format!(
+                    "{label}: {}",
+                    status.label()
+                )),
             });
         }
         if let Some(hint) = summary.hint() {
             self.event_bus.emit(EventPayload::StatusMessage {
                 phase: "ready".to_string(),
-                message: format!("Tip: {hint}"),
+                message: crate::frontend::render_helpers::sanitize_ready_text(&format!(
+                    "Tip: {hint}"
+                )),
             });
         }
         self.event_bus.emit(EventPayload::StatusMessage {
@@ -1991,5 +1996,47 @@ impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFront
             phase: report.phase,
             report: report.clone(),
         });
+    }
+}
+
+#[cfg(test)]
+mod source_choice_contracts {
+    use super::*;
+    use crate::command::commands::api_server::event_bus::EventBus;
+    use crate::data::config::image_source_prompt::{
+        BuilderPreview, ImageSourceAnswer, ImageSourcePreview, ImageSourcePrompt, ImageSourceScope,
+    };
+
+    /// T-F-08: the API frontend keeps the non-prompting default. It answers
+    /// `Unavailable` and puts no dialog, question or any other event on the
+    /// bus.
+    #[test]
+    fn api_frontend_answers_unavailable_without_emitting_a_dialog() {
+        let bus = EventBus::new(16);
+        let mut events = bus.subscribe();
+        let mut frontend = ApiDispatchFrontend::for_frontend(
+            "ready",
+            &[],
+            bus.sender(),
+            FrontendKind::Daemon {
+                feature: crate::data::daemon_state::FeatureName::Worker,
+                listener: crate::data::daemon_state::CommandListener::Local,
+            },
+        );
+        frontend.emit_done_on_drop = false;
+        let prompt = ImageSourcePrompt::Confirm(ImageSourcePreview {
+            scope: ImageSourceScope::Global,
+            path: "/nowhere/config.json".into(),
+            field: "runtime.builtin.imageSource".into(),
+            fragment: "{}".into(),
+            effective: vec![],
+            builder: BuilderPreview::Unchanged { effective: false },
+            notes: vec![],
+        });
+        assert_eq!(
+            ReadyFrontend::ask_image_source(&mut frontend, &prompt),
+            ImageSourceAnswer::Unavailable
+        );
+        assert!(events.try_recv().is_err(), "no event may be emitted");
     }
 }

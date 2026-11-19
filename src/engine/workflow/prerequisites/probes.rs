@@ -37,6 +37,28 @@ impl PrerequisitePreflight {
             .map_err(|_| ())
     }
 
+    /// `reason`, followed (on an importing runtime, when configuration gives
+    /// `tag` no source) by the full config keys, files and accepted values
+    /// that fix it. A configured source that fails is not "missing", so it
+    /// gets no guidance. Never prompts or writes.
+    fn with_missing_source_guidance(&self, reason: String, agent: &str, tag: &str) -> String {
+        if self.options.runtime.capabilities().image_acquisition
+            != crate::engine::agent_runtime::ImageAcquisition::Import
+        {
+            return reason;
+        }
+        let Some(session) = &self.options.image_session else {
+            return reason;
+        };
+        let is_default = agent == session.configured_agent().as_str();
+        match crate::data::config::image_source_setup::missing_image_source_guidance(
+            session, tag, agent, is_default,
+        ) {
+            Some(guidance) => format!("{reason}; {guidance}"),
+            None => reason,
+        }
+    }
+
     pub(super) fn probe(
         &self,
         need: &PrerequisiteNeed,
@@ -74,7 +96,10 @@ impl PrerequisitePreflight {
                         PrerequisiteStatus::Satisfied,
                         format!("image {tag} is available"),
                     ),
-                    Ok(Some(reason)) => (PrerequisiteStatus::Missing, reason),
+                    Ok(Some(reason)) => (
+                        PrerequisiteStatus::Missing,
+                        self.with_missing_source_guidance(reason, agent, tag),
+                    ),
                     Err(error) => (
                         PrerequisiteStatus::Unknown,
                         format!("could not inspect image {tag}: {error}"),

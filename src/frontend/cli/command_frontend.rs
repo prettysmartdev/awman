@@ -868,7 +868,10 @@ impl RemoteCommandFrontend for CliFrontend {
     fn report_ready_summary(&mut self, summary: &crate::data::ready_summary::ReadySummary) {
         self.write_message(UserMessage {
             level: MessageLevel::Info,
-            text: crate::frontend::render_helpers::render_ready_summary(summary),
+            text: crate::frontend::render_helpers::render_ready_summary_with_width(
+                summary,
+                crate::frontend::render_helpers::stderr_render_width(),
+            ),
         });
     }
 }

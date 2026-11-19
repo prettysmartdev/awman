@@ -650,4 +650,116 @@ mod contracts {
         }
         s.finish();
     }
+
+    /// Workflow preflight prepares images without `ReadyCommand`: a missing
+    /// builtin source is reported, never prompted for, and no config file is
+    /// written whichever way the review is answered.
+    #[tokio::test]
+    async fn workflow_image_prerequisites_leave_config_unchanged_without_a_source() {
+        let s = TestSandbox::for_test(TestCase::component("command::commands::workflow_prerequisites::images::contracts::workflow_image_prerequisites_leave_config_unchanged_without_a_source"));
+        std::fs::create_dir_all(s.work().join(".awman")).unwrap();
+        std::fs::write(s.work().join("Dockerfile.dev"), "FROM scratch\n").unwrap();
+        let repo = s.work().join(".awman/config.json");
+        std::fs::write(&repo, r#"{"runtime":{"builtin":{"vcpus":2}}}"#).unwrap();
+        let env = EnvSnapshot::from_full_env(
+            s.env()
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect(),
+        );
+        let global = crate::data::config::global_config_path(&env).unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, r#"{"runtime":{"kind":"builtin"}}"#).unwrap();
+        let before = (
+            std::fs::read(&repo).unwrap(),
+            std::fs::read(&global).unwrap(),
+        );
+        let session = Session::open_at_git_root(
+            s.work(),
+            s.work(),
+            SessionOpenOptions {
+                env: Some(env.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let runtime = Arc::new(Store::default());
+        let auth = AuthPathResolver::at_home(s.home());
+        let overlay = Arc::new(OverlayEngine::with_auth_resolver(auth.clone()));
+        let engines = Engines {
+            runtime: runtime.clone(),
+            container_runtime: None,
+            sandbox_runtime: None,
+            git_engine: Arc::new(GitEngine::with_env(env.clone())),
+            overlay_engine: overlay.clone(),
+            auth_engine: Arc::new(AuthEngine::with_paths(
+                auth,
+                ApiPaths::from_env(&env).unwrap(),
+            )),
+            agent_engine: Arc::new(AgentEngine::new(overlay, runtime.clone())),
+            workflow_state_store: Arc::new(crate::data::WorkflowStateStore::new(&session)),
+            credential_monitor: None,
+            global_config: Arc::new(Default::default()),
+            ephemeral_secrets: Arc::new(Default::default()),
+            lease_workflow_review: None,
+        };
+        let agents = vec!["claude".to_string()];
+        for (interactive, check_only) in [(true, true), (true, false), (false, false)] {
+            let mut frontend = Frontend {
+                interactive,
+                accept: true,
+                ..Default::default()
+            };
+            let outcome = prepare_images(
+                &engines,
+                &session,
+                &agents,
+                PrerequisiteOrigin::Static,
+                check_only,
+                &mut frontend,
+            )
+            .await;
+            let report = match outcome {
+                Ok(report) => report,
+                Err(CommandError::WorkflowPrerequisitesUnresolved { report }) => *report,
+                Err(other) => panic!("unexpected error: {other}"),
+            };
+            assert_ne!(report.checks[0].status, PrerequisiteStatus::Satisfied);
+            assert!(
+                report.checks[0]
+                    .explanation
+                    .contains(&session.agent_image_tag("claude")),
+                "{}",
+                report.checks[0].explanation
+            );
+            // Review finding 6: the public report says the source is missing
+            // and names the full keys that fix it.
+            let tag = session.agent_image_tag("claude");
+            for needle in [
+                "no image source is configured".to_string(),
+                "`runtime.builtin.imageSource`".to_string(),
+                format!("`runtime.builtin.images[\"{tag}\"]`"),
+            ] {
+                assert!(
+                    report.checks[0].explanation.contains(&needle),
+                    "interactive={interactive} check_only={check_only}: {needle} missing from {}",
+                    report.checks[0].explanation
+                );
+            }
+            assert_eq!(
+                (
+                    std::fs::read(&repo).unwrap(),
+                    std::fs::read(&global).unwrap()
+                ),
+                before
+            );
+        }
+        assert!(runtime.imports.lock().unwrap().is_empty());
+        s.finish();
+    }
 }

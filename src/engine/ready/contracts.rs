@@ -621,3 +621,122 @@ fn major_checks_accept_upgrades_and_only_warn_when_unprobed() {
     assert_eq!(status, StepStatus::Done);
     assert!(probes.is_empty());
 }
+
+/// A `ReadyEngine` over the in-memory importing runtime, built from the
+/// session's resolved builtin inputs exactly as `ReadyCommand` builds it.
+fn importing_engine(
+    sandbox: &TestSandbox,
+    store: Arc<crate::engine::image_prep::contracts::Store>,
+    build: bool,
+) -> ReadyEngine {
+    let env = EnvSnapshot::from_full_env(
+        sandbox
+            .env()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+            .collect(),
+    );
+    std::fs::write(sandbox.work().join("Dockerfile.dev"), "FROM scratch\n").unwrap();
+    dockerfiles(sandbox, &["claude"]);
+    let session = Session::open_at_git_root(
+        sandbox.work(),
+        sandbox.work(),
+        SessionOpenOptions {
+            env: Some(env.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let resolved = ReadyEngine::builtin_inputs(&session, store.as_ref()).unwrap();
+    let overlay = Arc::new(OverlayEngine::with_auth_resolver(
+        AuthPathResolver::at_home(sandbox.home()),
+    ));
+    let agent_engine = Arc::new(AgentEngine::new(overlay.clone(), store.clone()));
+    ReadyEngine::new(
+        resolved,
+        sandbox.awman_home(),
+        Arc::new(session),
+        Arc::new(GitEngine::with_env(env)),
+        overlay,
+        store,
+        agent_engine,
+        ReadyEngineOptions {
+            agent: AgentName::new("claude").unwrap(),
+            refresh: false,
+            build,
+            no_cache: false,
+            allow_docker: false,
+            non_interactive: true,
+            env_passthrough: None,
+        },
+    )
+}
+
+#[tokio::test]
+async fn missing_source_failure_text_names_tag_and_config_fields() {
+    let sandbox = TestSandbox::for_test(TestCase::component(
+        "engine::ready::missing_source_failure_text_names_tag_and_config_fields",
+    ));
+    let store = Arc::new(crate::engine::image_prep::contracts::Store::default());
+    let mut engine = importing_engine(&sandbox, store.clone(), false);
+    let tag = crate::data::image_tags::agent_image_tag(&sandbox.work(), "claude");
+    engine
+        .import_default_agent_image(&mut Frontend::default(), &sandbox.work())
+        .await;
+    let summary = engine.summary();
+    let Some(StepStatus::Failed(text)) = &summary.image_source else {
+        panic!(
+            "expected a failed image source, got {:?}",
+            summary.image_source
+        )
+    };
+    assert_eq!(summary.agent_image, StepStatus::Failed(text.clone()));
+    assert!(
+        text.starts_with(&format!(
+            "no image source is configured for '{tag}' (agent claude)"
+        )),
+        "{text}"
+    );
+    for needle in [
+        "`runtime.builtin.imageSource`".to_string(),
+        format!("`runtime.builtin.images[\"{tag}\"]`"),
+        crate::data::config::repo_config_path(&sandbox.work())
+            .display()
+            .to_string(),
+        r#"{"type":"docker-local"}"#.to_string(),
+        "`runtime.builtin.builder.enabled`".to_string(),
+    ] {
+        assert!(text.contains(&needle), "{needle}: {text}");
+    }
+    assert!(!text.chars().any(char::is_control), "{text}");
+    assert!(!summary.is_ready());
+    assert!(store.imports.lock().unwrap().is_empty());
+    sandbox.finish();
+}
+
+#[tokio::test]
+async fn an_installed_image_without_a_source_stays_done() {
+    let sandbox = TestSandbox::for_test(TestCase::component(
+        "engine::ready::an_installed_image_without_a_source_stays_done",
+    ));
+    let store = Arc::new(crate::engine::image_prep::contracts::Store::default());
+    let tag = crate::data::image_tags::agent_image_tag(&sandbox.work(), "claude");
+    store.installed.lock().unwrap().insert(
+        tag.clone(),
+        crate::engine::image_prep::contracts::identity(&tag),
+    );
+    let mut engine = importing_engine(&sandbox, store.clone(), false);
+    engine
+        .import_default_agent_image(&mut Frontend::default(), &sandbox.work())
+        .await;
+    let summary = engine.summary();
+    assert_eq!(summary.agent_image, StepStatus::Done);
+    assert_eq!(summary.image_source, Some(StepStatus::Done));
+    assert!(store.imports.lock().unwrap().is_empty());
+    sandbox.finish();
+}

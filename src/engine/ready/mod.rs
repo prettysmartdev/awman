@@ -121,7 +121,8 @@ impl ReadyEngine {
                 context,
             ),
         }
-        .with_definition_env(session.env().clone());
+        .with_definition_env(session.env().clone())
+        .with_default_source_agent(session.configured_agent().as_str());
         let image_policy = crate::engine::image_prep::BuildPolicy::Ready {
             build: options.build,
             no_cache: options.no_cache,
@@ -152,6 +153,11 @@ impl ReadyEngine {
             image_policy,
             cancel,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_host_ping(&mut self, ping: Arc<dyn ReadyHostPing>) {
+        self.host_agent = ping;
     }
 
     /// API setup builds missing source images without forcing a rebuild.

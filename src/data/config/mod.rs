@@ -17,6 +17,8 @@ pub mod fields;
 pub mod file;
 pub mod flags;
 pub mod image_source;
+pub mod image_source_prompt;
+pub mod image_source_setup;
 pub mod integrations;
 pub mod leader_spec;
 pub mod network;

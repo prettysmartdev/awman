@@ -15,6 +15,7 @@ use std::sync::Mutex;
 
 #[derive(Default)]
 pub(crate) struct Store {
+    pub importer: Option<Arc<dyn ImageImporter>>,
     pub source_metadata: Mutex<HashMap<String, crate::engine::container::runtime::ImageMetadata>>,
     pub installed_metadata:
         Mutex<HashMap<String, crate::engine::container::runtime::ImageMetadata>>,
@@ -310,6 +311,22 @@ impl AgentRuntimeEngine for Store {
     ) -> Result<ImportedImage, EngineError> {
         self.imports.lock().unwrap().push(request.tag.clone());
         self.import_requests.lock().unwrap().push(request.clone());
+        if let Some(importer) = &self.importer {
+            let imported = importer.import(
+                request,
+                &crate::engine::oci::CancelToken::new(),
+                &mut Sink::default(),
+            )?;
+            self.installed_sources
+                .lock()
+                .unwrap()
+                .insert(request.tag.clone(), request.source.clone());
+            self.installed
+                .lock()
+                .unwrap()
+                .insert(request.tag.clone(), imported.identity.clone());
+            return Ok(imported);
+        }
         if self
             .apple_missing
             .swap(false, std::sync::atomic::Ordering::SeqCst)

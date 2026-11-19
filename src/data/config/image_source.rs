@@ -141,6 +141,27 @@ impl ImageSourceSpec {
             .to_string()
     }
 
+    /// Whether this source can only ever provide one image: an archive, or a
+    /// source whose configured `reference` differs from `tag`. Such a source
+    /// must not be applied to another agent's tag.
+    pub fn names_single_image(&self, tag: &str) -> bool {
+        matches!(self, Self::Archive { .. }) || self.reference_or(tag) != tag
+    }
+
+    /// Whether this source is fixed to one image whatever tag it is used
+    /// for: an archive, or any explicit nonempty `reference` (even one equal
+    /// to the current tag, which is still another agent's image elsewhere).
+    /// A newly chosen source like this is written only as an `images` entry.
+    pub fn is_fixed_to_one_image(&self) -> bool {
+        let reference = match self {
+            Self::Registry { reference, .. }
+            | Self::DockerStore { reference, .. }
+            | Self::AppleStore { reference } => reference.as_deref(),
+            Self::Archive { .. } => return true,
+        };
+        reference.is_some_and(|r| !r.trim().is_empty())
+    }
+
     /// Reject a spec that cannot mean anything: an empty string where a
     /// value is required, a Docker host with an unsupported scheme, or TLS
     /// settings on a non-TCP Docker host. Returns a human-readable reason.

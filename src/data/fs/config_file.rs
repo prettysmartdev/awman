@@ -59,15 +59,214 @@ pub fn read_config_file_within(root: &Path, path: &Path) -> Result<Option<String
     }
 }
 
-/// [`write_config_file_atomically`] for a config under `root`, refusing a
-/// symlink at any component below `root` (not only the file itself), so a
-/// symlinked `.awman/` cannot redirect the write out of the repo.
+/// Atomically replace a config under `root`, refusing a symlink at any
+/// component below `root` (not only the file itself), so a symlinked
+/// `.awman/` cannot redirect the write out of the repo.
 ///
-/// The check is path-based, so it is repeated immediately before the write;
-/// what remains is the window between that check and the rename.
+/// On Unix the write is anchored to directory handles: every directory below
+/// `root` is opened with `O_NOFOLLOW`, the temporary file is created and
+/// renamed relative to the held handle, and the path from `root` is checked
+/// to still lead to that handle immediately before the rename. Replacing an
+/// ancestor during the write is refused, and the rename can never land
+/// outside the directory that was verified. Elsewhere the check is
+/// path-based and repeated immediately before the write.
 pub fn write_config_file_within(root: &Path, path: &Path, content: &str) -> Result<(), DataError> {
     refuse_symlinks_below(root, path)?;
-    write_config_file_atomically(path, content)
+    #[cfg(unix)]
+    {
+        anchored::write_within(root, path, content, &mut || {})
+    }
+    #[cfg(not(unix))]
+    {
+        write_config_file_atomically(path, content)
+    }
+}
+
+/// [`write_config_file_within`] with a hook that runs after the directory
+/// handles are held and the temporary file is written, before the final
+/// ancestor check and rename: the window a concurrent swap would use.
+#[cfg(all(unix, test))]
+pub(crate) fn write_config_file_within_racing(
+    root: &Path,
+    path: &Path,
+    content: &str,
+    mut race: impl FnMut(),
+) -> Result<(), DataError> {
+    refuse_symlinks_below(root, path)?;
+    anchored::write_within(root, path, content, &mut race)
+}
+
+#[cfg(unix)]
+mod anchored {
+    use std::ffi::OsStr;
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Component, Path};
+
+    use nix::errno::Errno;
+    use nix::fcntl::{open, openat, renameat, AtFlags, OFlag};
+    use nix::sys::stat::{fchmod, fstatat, mkdirat, Mode, SFlag};
+    use nix::unistd::{unlinkat, UnlinkatFlags};
+
+    use super::symlink_refusal;
+    use crate::data::error::DataError;
+
+    fn dir_flags() -> OFlag {
+        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY
+    }
+
+    fn errno(path: &Path, error: Errno) -> DataError {
+        DataError::io(path, error.into())
+    }
+
+    fn swapped(path: &Path) -> DataError {
+        DataError::Other(format!(
+            "{} was replaced while the config was being written; refusing to write config \
+             through it",
+            path.display()
+        ))
+    }
+
+    fn file_kind(mode: nix::sys::stat::mode_t) -> SFlag {
+        SFlag::from_bits_truncate(mode) & SFlag::S_IFMT
+    }
+
+    /// The path from `root` through `names` still leads to `held[i + 1]`
+    /// for every directory, without following a symlink.
+    fn verify_chain(held: &[File], names: &[&OsStr], root: &Path) -> Result<(), DataError> {
+        let mut current = root.to_path_buf();
+        for (index, name) in names.iter().enumerate() {
+            current.push(name);
+            let stat = fstatat(&held[index], *name, AtFlags::AT_SYMLINK_NOFOLLOW)
+                .map_err(|_| swapped(&current))?;
+            let expected = held[index + 1]
+                .metadata()
+                .map_err(|e| DataError::io(&current, e))?;
+            if file_kind(stat.st_mode) != SFlag::S_IFDIR
+                || stat.st_dev as u64 != expected.dev()
+                || stat.st_ino as u64 != expected.ino()
+            {
+                return Err(swapped(&current));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn write_within(
+        root: &Path,
+        path: &Path,
+        content: &str,
+        before_commit: &mut dyn FnMut(),
+    ) -> Result<(), DataError> {
+        let outside = || {
+            DataError::Other(format!(
+                "{} is outside {}; refusing to use it as config",
+                path.display(),
+                root.display()
+            ))
+        };
+        let relative = path.strip_prefix(root).map_err(|_| outside())?;
+        let mut names = Vec::new();
+        for component in relative.components() {
+            match component {
+                Component::Normal(name) => names.push(name),
+                _ => return Err(outside()),
+            }
+        }
+        let (leaf, directories) = names.split_last().ok_or_else(outside)?;
+        // The root (the git root) itself is trusted.
+        let mut held: Vec<File> = vec![open(root, dir_flags(), Mode::empty())
+            .map(File::from)
+            .map_err(|e| errno(root, e))?];
+        let mut current = root.to_path_buf();
+        for name in directories {
+            current.push(name);
+            let parent = held.last().expect("root is held");
+            match mkdirat(parent, *name, Mode::from_bits_truncate(0o777)) {
+                Ok(()) | Err(Errno::EEXIST) => {}
+                Err(e) => return Err(errno(&current, e)),
+            }
+            let child = openat(parent, *name, dir_flags(), Mode::empty())
+                .map(File::from)
+                .map_err(|e| match e {
+                    Errno::ELOOP | Errno::ENOTDIR => symlink_refusal(&current),
+                    e => errno(&current, e),
+                })?;
+            held.push(child);
+        }
+        let directory = held.last().expect("root is held");
+        let existing_mode = match fstatat(directory, *leaf, AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(stat) => {
+                let kind = file_kind(stat.st_mode);
+                if kind == SFlag::S_IFLNK {
+                    return Err(symlink_refusal(path));
+                }
+                if kind != SFlag::S_IFREG {
+                    return Err(DataError::Other(format!(
+                        "{} is not a regular file; refusing to write config to it",
+                        path.display()
+                    )));
+                }
+                // Opening without truncation changes nothing; it proves the
+                // file is ours to replace.
+                openat(
+                    directory,
+                    *leaf,
+                    OFlag::O_WRONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|e| {
+                    DataError::io(
+                        path,
+                        std::io::Error::new(
+                            std::io::Error::from(e).kind(),
+                            format!("config file is not writable ({e})"),
+                        ),
+                    )
+                })?;
+                Some(Mode::from_bits_truncate(stat.st_mode & 0o7777))
+            }
+            Err(Errno::ENOENT) => None,
+            Err(e) => return Err(errno(path, e)),
+        };
+        let temporary = format!(
+            ".{}.{}.tmp",
+            leaf.to_string_lossy(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let result = (|| {
+            let file = openat(
+                directory,
+                temporary.as_str(),
+                OFlag::O_WRONLY
+                    | OFlag::O_CREAT
+                    | OFlag::O_EXCL
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_CLOEXEC,
+                // A new config gets what `fs::write` gave it (0666 less the
+                // umask); a replaced one keeps its mode below.
+                existing_mode.unwrap_or(Mode::from_bits_truncate(0o666)),
+            )
+            .map_err(|e| errno(path, e))?;
+            if let Some(mode) = existing_mode {
+                fchmod(&file, mode).map_err(|e| errno(path, e))?;
+            }
+            let mut file = File::from(file);
+            file.write_all(content.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|e| DataError::io(path, e))?;
+            before_commit();
+            verify_chain(&held, directories, root)?;
+            renameat(directory, temporary.as_str(), directory, *leaf).map_err(|e| errno(path, e))
+        })();
+        if let Err(error) = result {
+            let _ = unlinkat(directory, temporary.as_str(), UnlinkatFlags::NoRemoveDir);
+            return Err(error);
+        }
+        let _ = directory.sync_all();
+        Ok(())
+    }
 }
 
 /// [`write_config_file_atomically`] for the user's own global config, which
@@ -216,4 +415,77 @@ pub fn write_config_file_atomically(path: &Path, content: &str) -> Result<(), Da
         let _ = directory.sync_all();
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use awman_test_support::{TestCase, TestSandbox};
+
+    #[test]
+    fn repo_write_refuses_an_ancestor_swapped_for_a_symlink_mid_write() {
+        let s = TestSandbox::for_test(TestCase::component(
+            "data::fs::config_file::tests::repo_write_refuses_an_ancestor_swapped_for_a_symlink_mid_write",
+        ));
+        let root = s.work();
+        let awman = root.join(".awman");
+        std::fs::create_dir_all(&awman).unwrap();
+        std::fs::write(awman.join("config.json"), "{}").unwrap();
+        // A host directory outside the repo, holding unrelated config.
+        let outside = s.home().join("host-config");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("config.json"), "host").unwrap();
+        let error = write_config_file_within_racing(
+            &root,
+            &awman.join("config.json"),
+            "{\"new\":true}",
+            || {
+                std::fs::rename(&awman, root.join(".awman-moved")).unwrap();
+                std::os::unix::fs::symlink(&outside, &awman).unwrap();
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("was replaced"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("config.json")).unwrap(),
+            "host"
+        );
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            1,
+            "no temporary file outside the repo"
+        );
+        let moved = root.join(".awman-moved");
+        assert_eq!(
+            std::fs::read_to_string(moved.join("config.json")).unwrap(),
+            "{}"
+        );
+        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 1);
+        s.finish();
+    }
+
+    #[test]
+    fn repo_write_creates_missing_directories_and_keeps_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = TestSandbox::for_test(TestCase::component(
+            "data::fs::config_file::tests::repo_write_creates_missing_directories_and_keeps_the_mode",
+        ));
+        let root = s.work();
+        let path = root.join(".awman/config.json");
+        write_config_file_within(&root, &path, "{}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_config_file_within(&root, &path, "{\"a\":1}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":1}");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join(".awman")).unwrap().count(),
+            1,
+            "no temporary file is left behind"
+        );
+        s.finish();
+    }
 }
