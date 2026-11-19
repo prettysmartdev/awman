@@ -4,7 +4,7 @@
 //! lifecycle records; the writer is an in-memory channel. Real deadlines.
 use awman::command::automation::admission::{codes, AdmissionConfig, TurnPhase};
 use awman::command::automation::controller::{
-    global, AutomationHost, ControllerLaunch, ExecutionController, ExitFacts, OwnedExecution,
+    AutomationHost, ControllerLaunch, ExecutionController, ExitFacts, OwnedExecution,
 };
 use awman::command::terminals::{
     AccessPolicy, OwnerEventLog, OwnerResolver, TerminalAutomation, TerminalOperations,
@@ -84,6 +84,9 @@ impl Default for Options {
 
 /// One owned execution with its store, hub terminal and writer.
 struct Rig {
+    /// This rig's own controller: the process-wide one keeps retired
+    /// terminals (and their store) for replay, past the sandbox.
+    controller: Arc<ExecutionController>,
     store: AutomationStore,
     command: CommandId,
     hub: Arc<TerminalHub>,
@@ -100,15 +103,6 @@ struct Rig {
     // Last: fields drop in order, and Windows cannot remove the tempdir
     // while the store above still holds its database open.
     _sandbox: awman_test_support::TestSandbox,
-}
-
-/// The controller is process-wide: forget this execution and its held
-/// leases so nothing outlives the sandbox's database.
-impl Drop for Rig {
-    fn drop(&mut self) {
-        self.owned.clone().abandon();
-        global().release_leases(&self.command);
-    }
 }
 
 impl Rig {
@@ -129,7 +123,8 @@ impl Rig {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
         let execution = ExecutionId::new();
-        let owned = global()
+        let controller = Arc::new(ExecutionController::default());
+        let owned = controller
             .start(ControllerLaunch {
                 host: AutomationHost {
                     store: store.clone(),
@@ -169,7 +164,7 @@ impl Rig {
             Arc::new(NoLog),
             Arc::new(NoResolver),
         ));
-        let _ = ops.install_automation(global());
+        let _ = ops.install_automation(controller.clone());
         let terminal = options.terminal.then(|| {
             let (stdin, _input) = awman::engine::terminal_hub::input_channel();
             std::mem::forget(_input);
@@ -200,6 +195,7 @@ impl Rig {
         owned.running();
         let nonce = new_nonce();
         Self {
+            controller,
             _sandbox: sandbox,
             store,
             command,
@@ -545,7 +541,7 @@ async fn idle_chat_creates_no_turn_and_closes_with_one_final_publication() {
         .store
         .finalize_command(&rig.command, &completion)
         .unwrap());
-    global().command_finalized(&rig.command, &result);
+    rig.controller.command_finalized(&rig.command, &result);
     let mut saw_closed = false;
     loop {
         match tokio::time::timeout(Duration::from_secs(5), viewer.next())
@@ -1165,7 +1161,9 @@ async fn attach_transport_control_and_raw_input_pass_the_automation_gate() {
         expected_revision: revision,
         prompt: "guarded".into(),
     };
-    let reply = global().submit(&terminal, &ViewerIdentity::local(), Some(&grant), request);
+    let reply = rig
+        .controller
+        .submit(&terminal, &ViewerIdentity::local(), Some(&grant), request);
     assert!(reply.is_ok(), "{reply:?}");
     rig.settle();
     assert_eq!(rig.state().state, AutomationState::Submitting);

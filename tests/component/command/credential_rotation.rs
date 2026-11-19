@@ -37,9 +37,9 @@ fn secrets(value: &str) -> Arc<CommandSecrets> {
         CommandSecrets::new(vec![("OPENAI_API_KEY".into(), SecretString::new(value))]).unwrap(),
     )
 }
-#[tokio::test]
-async fn idle_staging_requires_new_generation_consumption_and_isolates_profiles() {
-    let sandbox=crate::support::sandbox("command::credential_rotation::idle_staging_requires_new_generation_consumption_and_isolates_profiles");
+#[test]
+fn idle_staging_requires_new_generation_consumption_and_isolates_profiles() {
+    run(false, crate::support::sandbox("command::credential_rotation::idle_staging_requires_new_generation_consumption_and_isolates_profiles"), |sandbox| async move {
     let (_db, store, e) = crate::data::automation_store::setup(&sandbox.tmp().join("a"));
     let (_db2, store2, e2) = crate::data::automation_store::setup(&sandbox.tmp().join("b"));
     let slot = enroll(&store, &e, CredentialUpdateMethod::Live);
@@ -149,10 +149,11 @@ async fn idle_staging_requires_new_generation_consumption_and_isolates_profiles(
         .unwrap();
     assert_eq!(replay, op);
     drop(enrollment);
+    });
 }
-#[tokio::test]
-async fn cancellation_fences_ack_and_a_file_write_never_passes_live_coverage() {
-    let sandbox=crate::support::sandbox("command::credential_rotation::cancellation_fences_ack_and_a_file_write_never_passes_live_coverage");
+#[test]
+fn cancellation_fences_ack_and_a_file_write_never_passes_live_coverage() {
+    run(false, crate::support::sandbox("command::credential_rotation::cancellation_fences_ack_and_a_file_write_never_passes_live_coverage"), |sandbox| async move {
     let (_db, store, e) = crate::data::automation_store::setup(&sandbox.tmp().join("db"));
     let slot = enroll(&store, &e, CredentialUpdateMethod::Live);
     let host = AutomationHost {
@@ -208,13 +209,14 @@ async fn cancellation_fences_ack_and_a_file_write_never_passes_live_coverage() {
     assert_eq!(result.status, CredentialUpdateStatus::Failed);
     assert_eq!(result.generation_state, GenerationState::Unknown);
     drop(enrollment);
+    });
 }
 
 #[cfg(unix)]
-#[tokio::test]
-async fn private_fake_request_consumes_staged_generation_before_live_ack() {
+#[test]
+fn private_fake_request_consumes_staged_generation_before_live_ack() {
     use awman::engine::credential_refresh::delivery::HelperDirectory;
-    let sandbox=crate::support::sandbox("command::credential_rotation::private_fake_request_consumes_staged_generation_before_live_ack");
+    run(false, crate::support::sandbox("command::credential_rotation::private_fake_request_consumes_staged_generation_before_live_ack"), |sandbox| async move {
     sandbox.redact("test-secret-fake-request");
     let (_db, store, e) = crate::data::automation_store::setup(&sandbox.tmp().join("db"));
     let slot = enroll(&store, &e, CredentialUpdateMethod::Live);
@@ -294,6 +296,7 @@ async fn private_fake_request_consumes_staged_generation_before_live_ack() {
     assert_eq!(op.status, CredentialUpdateStatus::Applied);
     assert!(op.new_execution_id.is_none());
     drop(enrollment);
+    });
 }
 
 struct SourceFailure;
@@ -315,9 +318,9 @@ impl CredentialDriver for SourceFailure {
         Box::pin(async { Err("source_expired") })
     }
 }
-#[tokio::test]
-async fn source_expiry_is_pollable_and_preserves_confirmed_generation_and_refresh_owner() {
-    let sandbox=crate::support::sandbox("command::credential_rotation::source_expiry_is_pollable_and_preserves_confirmed_generation_and_refresh_owner");
+#[test]
+fn source_expiry_is_pollable_and_preserves_confirmed_generation_and_refresh_owner() {
+    run(false, crate::support::sandbox("command::credential_rotation::source_expiry_is_pollable_and_preserves_confirmed_generation_and_refresh_owner"), |sandbox| async move {
     let (_db, store, e) = crate::data::automation_store::setup(&sandbox.tmp().join("db"));
     let slot = crate::data::credential_updates::enroll_source(
         &store,
@@ -422,6 +425,7 @@ async fn source_expiry_is_pollable_and_preserves_confirmed_generation_and_refres
     assert_eq!(failure.credential_generation, slot.credential_generation);
     assert_eq!(failure.generation_state, GenerationState::Confirmed);
     drop(enrollment);
+    });
 }
 
 fn credential_host(
@@ -438,9 +442,9 @@ fn credential_host(
     }
 }
 
-#[tokio::test]
-async fn restart_refusal_has_no_process_turn_terminal_or_command_side_effects() {
-    let sandbox = crate::support::sandbox("command::credential_rotation::restart_refusal_has_no_process_turn_terminal_or_command_side_effects");
+#[test]
+fn restart_refusal_has_no_process_turn_terminal_or_command_side_effects() {
+    run(false, crate::support::sandbox("command::credential_rotation::restart_refusal_has_no_process_turn_terminal_or_command_side_effects"), |sandbox| async move {
     let (_db, store, e) = crate::data::automation_store::setup(&sandbox.tmp().join("db"));
     let slot = enroll(&store, &e, CredentialUpdateMethod::Restart);
     let host = credential_host(&store, &e);
@@ -492,11 +496,12 @@ async fn restart_refusal_has_no_process_turn_terminal_or_command_side_effects() 
     assert!(runtime.staged.lock().unwrap().is_none());
     assert!(redaction.is_empty());
     drop(_enrollment);
+    });
 }
 
-#[tokio::test]
-async fn rejected_material_never_changes_redaction_revision_or_admission() {
-    let sandbox = crate::support::sandbox("command::credential_rotation::rejected_material_never_changes_redaction_revision_or_admission");
+#[test]
+fn rejected_material_never_changes_redaction_revision_or_admission() {
+    run(false, crate::support::sandbox("command::credential_rotation::rejected_material_never_changes_redaction_revision_or_admission"), |sandbox| async move {
     let (_db, store, e) = crate::data::automation_store::setup(&sandbox.tmp().join("db"));
     let slot = enroll(&store, &e, CredentialUpdateMethod::Live);
     let host = credential_host(&store, &e);
@@ -559,141 +564,152 @@ async fn rejected_material_never_changes_redaction_revision_or_admission() {
         e.revision
     );
     drop(_enrollment);
+    });
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_controller_retries_return_one_operation() {
-    let sandbox = crate::support::sandbox(
-        "command::credential_rotation::concurrent_controller_retries_return_one_operation",
+#[test]
+fn concurrent_controller_retries_return_one_operation() {
+    run(
+        true,
+        crate::support::sandbox(
+            "command::credential_rotation::concurrent_controller_retries_return_one_operation",
+        ),
+        |sandbox| async move {
+            let (_db, store, e) = crate::data::automation_store::setup(&sandbox.tmp().join("db"));
+            let slot = enroll(&store, &e, CredentialUpdateMethod::Live);
+            let host = credential_host(&store, &e);
+            let controller = Arc::new(ExecutionController::default());
+            let runtime = Arc::new(Runtime {
+                staged: Mutex::new(None),
+                refuse: false,
+            });
+            let _enrollment = controller
+                .register_credentials(
+                    host.clone(),
+                    e.execution_id.clone(),
+                    runtime,
+                    RedactionSet::new(),
+                )
+                .unwrap();
+            let request = intent(&e, &slot);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let mut tasks = Vec::new();
+            for _ in 0..2 {
+                let (controller, host, request, barrier) = (
+                    controller.clone(),
+                    host.clone(),
+                    request.clone(),
+                    barrier.clone(),
+                );
+                tasks.push(tokio::task::spawn_blocking(move || {
+                    barrier.wait();
+                    controller.stage_update(
+                        &ViewerIdentity::local(),
+                        &host,
+                        CredentialUpdateRequest {
+                            intent: request,
+                            secrets: Some(secrets("test-secret-identical")),
+                        },
+                        None,
+                    )
+                }));
+            }
+            let first = tasks.remove(0).await.unwrap().unwrap();
+            let second = tasks.remove(0).await.unwrap().unwrap();
+            assert_eq!(first.request_id, second.request_id);
+            assert_eq!(first.new_generation, second.new_generation);
+            drop(_enrollment);
+        },
     );
-    let (_db, store, e) = crate::data::automation_store::setup(&sandbox.tmp().join("db"));
-    let slot = enroll(&store, &e, CredentialUpdateMethod::Live);
-    let host = credential_host(&store, &e);
-    let controller = Arc::new(ExecutionController::default());
-    let runtime = Arc::new(Runtime {
-        staged: Mutex::new(None),
-        refuse: false,
-    });
-    let _enrollment = controller
-        .register_credentials(
-            host.clone(),
-            e.execution_id.clone(),
-            runtime,
-            RedactionSet::new(),
-        )
-        .unwrap();
-    let request = intent(&e, &slot);
-    let barrier = Arc::new(std::sync::Barrier::new(2));
-    let mut tasks = Vec::new();
-    for _ in 0..2 {
-        let (controller, host, request, barrier) = (
-            controller.clone(),
-            host.clone(),
-            request.clone(),
-            barrier.clone(),
-        );
-        tasks.push(tokio::task::spawn_blocking(move || {
-            barrier.wait();
-            controller.stage_update(
-                &ViewerIdentity::local(),
-                &host,
-                CredentialUpdateRequest {
-                    intent: request,
-                    secrets: Some(secrets("test-secret-identical")),
-                },
-                None,
-            )
-        }));
-    }
-    let first = tasks.remove(0).await.unwrap().unwrap();
-    let second = tasks.remove(0).await.unwrap().unwrap();
-    assert_eq!(first.request_id, second.request_id);
-    assert_eq!(first.new_generation, second.new_generation);
-    drop(_enrollment);
 }
 
-#[tokio::test]
-async fn ordinary_profile_terminal_requires_a_real_input_grant() {
-    let sandbox = crate::support::sandbox(
-        "command::credential_rotation::ordinary_profile_terminal_requires_a_real_input_grant",
-    );
-    let (db, store, e) = crate::data::automation_store::setup(&sandbox.tmp().join("db"));
-    use awman::{
-        data::{
-            daemon_state::FeatureName,
-            terminal::{TerminalOwner, TerminalOwnerInfo},
-        },
-        engine::terminal_hub::{TerminalHub, TerminalInput, TerminalRegistration},
-    };
-    let hub = Arc::new(TerminalHub::new(Default::default()));
-    let (stdin, _input) = awman::engine::terminal_hub::input_channel();
-    let handle = hub.register(
-        TerminalRegistration {
-            automation: None,
-            owner: TerminalOwnerInfo {
-                owner: TerminalOwner::Command(e.command_id.clone()),
-                feature: FeatureName::Worker,
-                source: None,
-                attempt: 1,
-                allow_remote_input: false,
-            },
-            agent: "fixture".into(),
-            model: None,
-            cols: 80,
-            rows: 24,
-        },
-        TerminalInput {
-            stdin,
-            resize: None,
-        },
-    );
-    let id = handle.id().clone();
-    let grant = hub.take_control(&id).unwrap();
-
-    db.with_conn(|c| { c.execute("UPDATE agent_executions SET terminal_id=?, automation_mode=NULL, minimum_status_support=NULL, snapshot_json=NULL WHERE execution_id=?", rusqlite::params![id.as_str(), e.execution_id.as_str()])?; Ok(()) }).unwrap();
-    let e = store.read_execution(&e.execution_id).unwrap();
-    let slot = enroll(&store, &e, CredentialUpdateMethod::Live);
-    let host = credential_host(&store, &e);
-    let controller = Arc::new(ExecutionController::default());
-    let runtime = Arc::new(Runtime {
-        staged: Mutex::new(None),
-        refuse: false,
-    });
-    let _enrollment = controller
-        .register_credentials(
-            host.clone(),
-            e.execution_id.clone(),
-            runtime,
-            RedactionSet::new(),
-        )
-        .unwrap();
-    assert_eq!(
-        controller
-            .stage_update(
-                &ViewerIdentity::local(),
-                &host,
-                CredentialUpdateRequest {
-                    intent: intent(&e, &slot),
-                    secrets: Some(secrets("test-secret-terminal"))
+#[test]
+fn ordinary_profile_terminal_requires_a_real_input_grant() {
+    run(
+        false,
+        crate::support::sandbox(
+            "command::credential_rotation::ordinary_profile_terminal_requires_a_real_input_grant",
+        ),
+        |sandbox| async move {
+            let (db, store, e) = crate::data::automation_store::setup(&sandbox.tmp().join("db"));
+            use awman::{
+                data::{
+                    daemon_state::FeatureName,
+                    terminal::{TerminalOwner, TerminalOwnerInfo},
                 },
-                None
-            )
-            .unwrap_err(),
-        "control_held"
+                engine::terminal_hub::{TerminalHub, TerminalInput, TerminalRegistration},
+            };
+            let hub = Arc::new(TerminalHub::new(Default::default()));
+            let (stdin, _input) = awman::engine::terminal_hub::input_channel();
+            let handle = hub.register(
+                TerminalRegistration {
+                    automation: None,
+                    owner: TerminalOwnerInfo {
+                        owner: TerminalOwner::Command(e.command_id.clone()),
+                        feature: FeatureName::Worker,
+                        source: None,
+                        attempt: 1,
+                        allow_remote_input: false,
+                    },
+                    agent: "fixture".into(),
+                    model: None,
+                    cols: 80,
+                    rows: 24,
+                },
+                TerminalInput {
+                    stdin,
+                    resize: None,
+                },
+            );
+            let id = handle.id().clone();
+            let grant = hub.take_control(&id).unwrap();
+
+            db.with_conn(|c| { c.execute("UPDATE agent_executions SET terminal_id=?, automation_mode=NULL, minimum_status_support=NULL, snapshot_json=NULL WHERE execution_id=?", rusqlite::params![id.as_str(), e.execution_id.as_str()])?; Ok(()) }).unwrap();
+            let e = store.read_execution(&e.execution_id).unwrap();
+            let slot = enroll(&store, &e, CredentialUpdateMethod::Live);
+            let host = credential_host(&store, &e);
+            let controller = Arc::new(ExecutionController::default());
+            let runtime = Arc::new(Runtime {
+                staged: Mutex::new(None),
+                refuse: false,
+            });
+            let _enrollment = controller
+                .register_credentials(
+                    host.clone(),
+                    e.execution_id.clone(),
+                    runtime,
+                    RedactionSet::new(),
+                )
+                .unwrap();
+            assert_eq!(
+                controller
+                    .stage_update(
+                        &ViewerIdentity::local(),
+                        &host,
+                        CredentialUpdateRequest {
+                            intent: intent(&e, &slot),
+                            secrets: Some(secrets("test-secret-terminal"))
+                        },
+                        None
+                    )
+                    .unwrap_err(),
+                "control_held"
+            );
+            let accepted = controller
+                .stage_update(
+                    &ViewerIdentity::local(),
+                    &host,
+                    CredentialUpdateRequest {
+                        intent: intent(&e, &slot),
+                        secrets: Some(secrets("test-secret-held-terminal")),
+                    },
+                    Some(&grant),
+                )
+                .unwrap();
+            assert_eq!(accepted.old_execution_id, e.execution_id);
+            drop(_enrollment);
+        },
     );
-    let accepted = controller
-        .stage_update(
-            &ViewerIdentity::local(),
-            &host,
-            CredentialUpdateRequest {
-                intent: intent(&e, &slot),
-                secrets: Some(secrets("test-secret-held-terminal")),
-            },
-            Some(&grant),
-        )
-        .unwrap();
-    assert_eq!(accepted.old_execution_id, e.execution_id);
-    drop(_enrollment);
 }
 
 struct OwnedStage {
@@ -723,9 +739,9 @@ impl CredentialDriver for OwnedStage {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
-#[tokio::test]
-async fn cancelled_delivery_keeps_its_owned_task_until_late_writer_cleanup() {
-    let sandbox = crate::support::sandbox("command::credential_rotation::cancelled_delivery_keeps_its_owned_task_until_late_writer_cleanup");
+#[test]
+fn cancelled_delivery_keeps_its_owned_task_until_late_writer_cleanup() {
+    run(false, crate::support::sandbox("command::credential_rotation::cancelled_delivery_keeps_its_owned_task_until_late_writer_cleanup"), |sandbox| async move {
     let (_db, store, e) = crate::data::automation_store::setup(&sandbox.tmp().join("db"));
     let slot = enroll(&store, &e, CredentialUpdateMethod::Live);
     let host = credential_host(&store, &e);
@@ -781,11 +797,12 @@ async fn cancelled_delivery_keeps_its_owned_task_until_late_writer_cleanup() {
     )
     .await;
     drop(_enrollment);
+    });
 }
 
-#[tokio::test]
-async fn redaction_capacity_failure_is_pollable_without_retiring_existing_output() {
-    let sandbox = crate::support::sandbox("command::credential_rotation::redaction_capacity_failure_is_pollable_without_retiring_existing_output");
+#[test]
+fn redaction_capacity_failure_is_pollable_without_retiring_existing_output() {
+    run(false, crate::support::sandbox("command::credential_rotation::redaction_capacity_failure_is_pollable_without_retiring_existing_output"), |sandbox| async move {
     let (_db, store, e) = crate::data::automation_store::setup(&sandbox.tmp().join("db"));
     let slot = enroll(&store, &e, CredentialUpdateMethod::Live);
     let host = credential_host(&store, &e);
@@ -831,13 +848,14 @@ async fn redaction_capacity_failure_is_pollable_without_retiring_existing_output
     assert_eq!(redaction.redact("ordinary output"), "ordinary output");
     assert!(runtime.staged.lock().unwrap().is_none());
     drop(_enrollment);
+    });
 }
 
-#[tokio::test]
-async fn timed_out_delivery_is_pollable_before_owned_writer_finishes() {
-    let sandbox = crate::support::sandbox(
+#[test]
+fn timed_out_delivery_is_pollable_before_owned_writer_finishes() {
+    run(false, crate::support::sandbox(
         "command::credential_rotation::timed_out_delivery_is_pollable_before_owned_writer_finishes",
-    );
+    ), |sandbox| async move {
     let (_db, store, e) = crate::data::automation_store::setup(&sandbox.tmp().join("db"));
     let slot = enroll(&store, &e, CredentialUpdateMethod::Live);
     let host = credential_host(&store, &e);
@@ -908,4 +926,30 @@ async fn timed_out_delivery_is_pollable_before_owned_writer_finishes() {
         Some(failure)
     );
     drop(enrollment);
+    });
+}
+
+/// Run `body` on its own runtime and close the sandbox only once that
+/// runtime, and every task it spawned, is gone. A delivery task parked on its
+/// stop token still holds the store, and Windows cannot remove an open
+/// database.
+fn run<F, Fut>(multi_thread: bool, sandbox: awman_test_support::TestSandbox, body: F)
+where
+    F: FnOnce(Arc<awman_test_support::TestSandbox>) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let sandbox = Arc::new(sandbox);
+    let mut builder = if multi_thread {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.worker_threads(2);
+        builder
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+    };
+    let runtime = builder.enable_all().build().unwrap();
+    runtime.block_on(body(sandbox.clone()));
+    drop(runtime);
+    Arc::try_unwrap(sandbox)
+        .unwrap_or_else(|_| panic!("the test body kept the sandbox"))
+        .finish();
 }
