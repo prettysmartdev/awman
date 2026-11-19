@@ -103,7 +103,8 @@ fn run(id: &'static str, apple: bool) {
             .assert_success();
     }
     // Switch PATH to private traps, preserving source endpoint identity. Cached
-    // launch must succeed without invoking any builder or rebuilding a fixture.
+    // launch retains the source freshness check, but must survive its failure
+    // without building, exporting or acquiring another image.
     let fake_exe = support::fake_cli_exe();
     let docker = s.install_fake(fake_exe, "docker");
     docker.on(&[]).exit(91);
@@ -112,9 +113,80 @@ fn run(id: &'static str, apple: bool) {
     let out = support::session::exec(&s, support::awman_exe(), &repo, "claude", "cached");
     out.assert_success();
     assert!(out.stdout_text().contains("v2"), "{out:?}");
+    // Enabled builders check the source's input labels even for an installed
+    // image (the image freshness contract). Only the first read-only project
+    // inspection may reach the unavailable CLI; no build or export is allowed.
+    let expected = if apple {
+        vec![
+            "image".into(),
+            "inspect".into(),
+            awman::data::image_tags::project_image_tag(&repo),
+        ]
+    } else {
+        vec![
+            "--host".into(),
+            global["runtime"]["builtin"]["imageSource"]["host"]
+                .as_str()
+                .unwrap()
+                .into(),
+            "image".into(),
+            "inspect".into(),
+            awman::data::image_tags::project_image_tag(&repo),
+        ]
+    };
+    let selected_calls = if apple {
+        container.calls()
+    } else {
+        docker.calls()
+    };
+    let other_calls = if apple {
+        docker.calls()
+    } else {
+        container.calls()
+    };
     assert!(
-        docker.calls().is_empty() && container.calls().is_empty(),
-        "cached execution reached builder"
+        !selected_calls.is_empty(),
+        "enabled builder omitted its source freshness check"
+    );
+    assert!(
+        selected_calls
+            .iter()
+            .all(|call| call.argv == expected && call.exit == Some(91)),
+        "cached launch exceeded its failed metadata inspection: {selected_calls:#?}"
+    );
+    assert!(
+        other_calls.is_empty(),
+        "cached launch reached another source: {other_calls:#?}"
+    );
+
+    // Disabling the builder gives a truly source-independent cached launch:
+    // even read-only CLI probes are forbidden, and both traps stay installed.
+    global["runtime"]["builtin"]["builder"]["enabled"] = false.into();
+    std::fs::write(
+        s.awman_home().join("config.json"),
+        serde_json::to_vec(&global).unwrap(),
+    )
+    .unwrap();
+    let docker_before = docker.calls();
+    let container_before = container.calls();
+    let out = support::session::exec(
+        &s,
+        support::awman_exe(),
+        &repo,
+        "claude",
+        "cached-builder-disabled",
+    );
+    out.assert_success();
+    assert!(out.stdout_text().contains("v2"), "{out:?}");
+    assert_eq!(
+        docker.calls(),
+        docker_before,
+        "disabled builder invoked Docker"
+    );
+    assert_eq!(
+        container.calls(),
+        container_before,
+        "disabled builder invoked Apple Containers"
     );
 }
 #[test]
