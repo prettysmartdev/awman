@@ -6,6 +6,13 @@ members = [".", "crates/awman-cli", "crates/awman-host-shims", "crates/awman-wsp
 default-members = [".", "crates/awman-cli", "crates/awman-host-shims", "crates/awman-wsp"]
 resolver = "2"
 
+# Local prerelease acceptance and distribution builds use the same optimized,
+# LTO-linked and stripped executable. Kernel checks exercise the actual callback
+# rather than requiring its symbol name to survive stripping.
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
 # Each integration test links the awman library (and, with builtin-runtime,
 # the VM stack). Full debug info and incremental copies exhaust small runners.
 # Keep the normal unoptimized test behavior, including debug assertions.

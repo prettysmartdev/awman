@@ -37,15 +37,51 @@ fn runtime_dependencies_are_embedded_and_helpers_are_not_extracted() {
     }
     #[cfg(target_os = "linux")]
     {
+        // GNU releases may use the operating system's C ABI and compiler
+        // unwinder. Runtime providers, databases, TLS and compression must not
+        // become machine-local shared-library prerequisites.
+        let allowed = [
+            "libc.so.6",
+            "libgcc_s.so.1",
+            "libm.so.6",
+            "libpthread.so.0",
+            "libdl.so.2",
+            "librt.so.1",
+            "libutil.so.1",
+            "ld-linux-x86-64.so.2",
+            "ld-linux-aarch64.so.1",
+        ];
+        for line in text.lines().filter(|line| line.contains("(needed)")) {
+            let library = line
+                .split_once('[')
+                .and_then(|(_, rest)| rest.split_once(']'))
+                .map(|(name, _)| name)
+                .expect("readelf NEEDED entry contains a library name");
+            assert!(
+                allowed.contains(&library),
+                "unexpected shared dependency: {library}"
+            );
+        }
+        let versions = s
+            .command("/usr/bin/readelf")
+            .args(["--version-info", "--wide"])
+            .arg(&a.exe)
+            .run();
+        versions.assert_success();
+        support::record(
+            &format!("abi-{}.json", a.sha256),
+            &serde_json::json!({"artifact_sha256":a.sha256,"versions":versions.stdout_text()}),
+        );
         let sections = s
             .command("/usr/bin/readelf")
             .args(["--sections", "--wide"])
             .arg(&a.exe)
             .run();
         sections.assert_success();
-        assert!(
+        assert_eq!(
             sections.stdout_text().contains(".msbver"),
-            "embedded provider section missing"
+            cfg!(target_arch = "x86_64"),
+            "embedded provider section differs from this platform's release policy"
         );
     }
     #[cfg(target_os = "macos")]
@@ -62,10 +98,13 @@ fn runtime_dependencies_are_embedded_and_helpers_are_not_extracted() {
         .env("PATH", "")
         .arg("__awman-builtin-kernel-check")
         .run();
-    if cfg!(windows) {
-        assert_eq!(out.exit, awman_test_support::Exit::Code(70));
-    } else {
+    if cfg!(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )) {
         out.assert_success();
+    } else {
+        assert_eq!(out.exit, awman_test_support::Exit::Code(70));
     }
     support::no_helpers(&s);
 }

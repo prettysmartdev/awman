@@ -37,7 +37,7 @@ fn published_previous_protocol_is_accepted_by_exact_candidate() {
 /// The first Linux builtin candidate has no published builtin predecessor.
 /// Its retained worker protocol policy must still be complete and unambiguous.
 #[test]
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn linux_candidate_retains_an_unambiguous_worker_protocol_policy() {
     let mut s = support::sandbox(
         "upgrade_policy::linux_candidate_retains_an_unambiguous_worker_protocol_policy",
@@ -61,4 +61,16 @@ fn linux_candidate_retains_an_unambiguous_worker_protocol_policy() {
             "duplicate upgrade protocol {protocol}"
         );
     }
+}
+
+#[test]
+#[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+fn unreleased_linux_builtin_provider_is_explicitly_absent() {
+    let mut s =
+        support::sandbox("upgrade_policy::unreleased_linux_builtin_provider_is_explicitly_absent");
+    let a = support::artifact(&mut s);
+    let out = support::run_artifact(&s, &a)
+        .arg("__awman-builtin-info")
+        .run();
+    assert_eq!(out.exit, awman_test_support::Exit::Code(70));
 }

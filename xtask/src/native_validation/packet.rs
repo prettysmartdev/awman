@@ -179,6 +179,7 @@ pub(super) fn verify(root: &Path, out: &Path, m: &Manifest) -> Result<()> {
             "registry-ready",
             "remove-registry",
             "run-boundary-private-memory",
+            "offline-isolation",
         ]);
     }
     for name in required {
@@ -254,6 +255,7 @@ mod tests {
             );
         }
         let linux = Platform::for_target("x86_64-unknown-linux-gnu").unwrap();
+        m.previous_release.remove(linux.target);
         assert!(!suites(&m, linux)
             .iter()
             .any(|id| id == "guest-linux-published-upgrade"));

@@ -9,6 +9,14 @@ case "$work" in /*) ;; *) echo 'absolute private work directory required' >&2; e
 mkdir -m 700 -p "$work"
 version=0.1.41
 expected=400ebdfc24faad502a5f0ef7e1e91625873dfb54cf4ed7aa8b3ad6944f46c0bf
+locked_field() {
+    awk -v key="$1" '$0 == "name = \"msb_krun_vmm\"" {selected=1; next}
+        selected && $1 == key {gsub(/"/, "", $3); print $3; exit}' "$root/Cargo.lock"
+}
+[ "$(locked_field version)" = "$version" ] && [ "$(locked_field checksum)" = "$expected" ] || {
+    echo 'VMM verification pin differs from Cargo.lock; review and update the mapping proof' >&2
+    exit 1
+}
 archive="$work/msb_krun_vmm-$version.crate"
 curl -fsSL --retry 3 "https://static.crates.io/crates/msb_krun_vmm/msb_krun_vmm-$version.crate" -o "$archive"
 printf '%s  %s\n' "$expected" "$archive" | sha256sum --check

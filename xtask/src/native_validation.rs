@@ -231,6 +231,8 @@ fn execute(r: &mut Run, m: &Manifest) -> Result<()> {
             ],
         )?;
         r.command("os-version", "uname", &["-a"])?;
+        r.command("offline-isolation", "unshare", &["--user", "--map-root-user", "--net", "--", "/bin/true"])
+            .context("Linux offline validation requires unprivileged user and network namespaces (unshare --user --map-root-user --net)")?;
     }
     r.command("rust-version", "rustc", &["-vV"])?;
     prepare::run(r, m)?;

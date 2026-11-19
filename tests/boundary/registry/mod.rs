@@ -6,7 +6,9 @@
 //! when the run does not name them.
 
 mod client;
+mod faults;
 mod proxy;
+mod resilience;
 mod world;
 
 use crate::support;

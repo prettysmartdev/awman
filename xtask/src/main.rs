@@ -32,7 +32,7 @@ usage: cargo xtask <command> [args]
   fixtures fetch|verify|build  content-addressed test fixtures
   lint hygiene|shell|pins|...  repository lints that are not clippy
   matrix render|check          acceptance matrix
-  native-validation run|verify local Apple Silicon evidence packet
+  native-validation run|verify local Apple Silicon or Linux KVM evidence packet
   ci <helper>                  helpers called by the GitHub workflows
   release <subcommand>         release operator and pipeline commands
 ";
