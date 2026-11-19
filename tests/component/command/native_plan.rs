@@ -714,8 +714,25 @@ async fn a_read_only_lease_engine_and_plan_resolve_separately() {
 
 /// Workflow steps: the command flag selects the native mode of every agent
 /// step; a step that cannot deliver it fails the whole run before step 1.
-#[tokio::test(flavor = "multi_thread")]
-async fn exec_workflow_plan_applies_per_step_and_refuses_up_front() {
+#[test]
+fn exec_workflow_plan_applies_per_step_and_refuses_up_front() {
+    // Match the API command worker's stack for the full workflow future (the
+    // default test thread overflows on Windows).
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(exec_workflow_plan_scenario());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn exec_workflow_plan_scenario() {
     let s =
         sandbox("command::native_plan::exec_workflow_plan_applies_per_step_and_refuses_up_front");
     let f = fixture(&s, "workflow-plan", json!({}), ONE_STEP, true);
