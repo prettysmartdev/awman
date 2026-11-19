@@ -346,7 +346,15 @@ pub fn write_config_file_atomically(path: &Path, content: &str) -> Result<(), Da
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent).map_err(|e| DataError::io(parent, e))?;
+    // Config may be the first operation creating the global awman home.
+    // Create it private regardless of umask; never chmod an existing parent.
+    let mut directories = std::fs::DirBuilder::new();
+    directories.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut directories, 0o700);
+    directories
+        .create(parent)
+        .map_err(|e| DataError::io(parent, e))?;
     if std::fs::metadata(parent)
         .map_err(|e| DataError::io(parent, e))?
         .permissions()

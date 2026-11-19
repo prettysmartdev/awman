@@ -7,6 +7,9 @@
 //! run names none) and removes what it created, even when it fails.
 
 pub mod engine;
+mod source;
+#[cfg(unix)]
+pub(crate) mod tls;
 
 use crate::support;
 use awman::engine::auth::credential::SecretString;
@@ -152,8 +155,8 @@ fn secret_values_with_equals_and_newline_arrive_byte_for_byte() {
 
 /// The engine store source exports an image from the real engine over its
 /// Unix socket, reuses it from awman's cache, and reports a missing image as
-/// final. (Replaces `store_docker_real_engine_unix_roundtrip`; the TLS and
-/// mutual-TLS variants need a TLS-enabled engine no runner provisions yet.)
+/// final. The source module separately proves TLS and mutual-TLS exports through
+/// owned endpoints forwarding to this same real Engine.
 #[test]
 fn the_engine_store_exports_an_image_and_serves_it_from_cache() {
     use awman::data::config::image_source::{ImageSourceKind, ImageSourceSpec};

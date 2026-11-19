@@ -3,7 +3,8 @@
 //! No function returns a "free port number": a listener is bound to port 0
 //! and handed over, or a child binds port 0 and reports its address (seam
 //! S4), which the test then [`Ports::track`]s. Every tracked endpoint must be
-//! closed when the test ends (leak check).
+//! closed when the test ends (leak check). Linux checks the original socket's
+//! inode when procfs is available: another test may reuse a closed address.
 
 use crate::sandbox::Shared;
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -18,6 +19,74 @@ pub const MAX_SOCKET_PATH: usize = 103;
 /// How long a closed listener may stay reachable (fork-to-exec window of a
 /// concurrent spawn) before it counts as leaked.
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
+
+/// An address is reusable as soon as its listener closes. On Linux retain the
+/// kernel socket identity as well, so a concurrent test reusing that address
+/// cannot be mistaken for a survivor of this test.
+pub(crate) struct TrackedTcp {
+    addr: SocketAddr,
+    #[cfg(target_os = "linux")]
+    inode: Option<u64>,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_listeners(addr: SocketAddr) -> Option<Vec<(String, u64)>> {
+    let table = if addr.is_ipv4() {
+        "/proc/net/tcp"
+    } else {
+        "/proc/net/tcp6"
+    };
+    let text = std::fs::read_to_string(table).ok()?;
+    let mut listeners = Vec::new();
+    for line in text.lines().skip(1) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if *fields.get(3)? == "0A" {
+            listeners.push((fields.get(1)?.to_string(), fields.get(9)?.parse().ok()?));
+        }
+    }
+    Some(listeners)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_address(addr: SocketAddr) -> String {
+    let ip = match addr.ip() {
+        std::net::IpAddr::V4(ip) => format!("{:08X}", u32::from_ne_bytes(ip.octets())),
+        std::net::IpAddr::V6(ip) => ip
+            .octets()
+            .chunks_exact(4)
+            .map(|chunk| format!("{:08X}", u32::from_ne_bytes(chunk.try_into().unwrap())))
+            .collect::<String>(),
+    };
+    format!("{ip}:{:04X}", addr.port())
+}
+
+impl TrackedTcp {
+    fn from_address(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            #[cfg(target_os = "linux")]
+            inode: linux_listeners(addr).and_then(|listeners| {
+                listeners
+                    .into_iter()
+                    .find(|(local, _)| *local == linux_address(addr))
+                    .map(|(_, inode)| inode)
+                    .filter(|inode| *inode != 0)
+            }),
+        }
+    }
+
+    fn closed(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let (Some(inode), Some(listeners)) = (self.inode, linux_listeners(self.addr)) {
+            return !listeners
+                .iter()
+                .any(|(local, found)| *found == inode && *local == linux_address(self.addr));
+        }
+        // Procfs may be unavailable, and other hosts have no Linux socket table.
+        // Keep the conservative address check when identity cannot be proved.
+        TcpStream::connect_timeout(&self.addr, Duration::from_millis(200)).is_err()
+    }
+}
 
 /// Owned ports and Unix sockets of one sandbox ([`crate::TestSandbox::ports`]).
 pub struct Ports {
@@ -39,7 +108,18 @@ impl Ports {
         let listener = TcpListener::bind("127.0.0.1:0")
             .unwrap_or_else(|e| panic!("BLOCKED[loopback]: cannot bind 127.0.0.1:0: {e}"));
         let addr = listener.local_addr().expect("listener address");
-        self.track(addr);
+        let tracked = TrackedTcp::from_address(addr);
+        #[cfg(target_os = "linux")]
+        let tracked = {
+            use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+            let inode = std::fs::metadata(format!("/proc/self/fd/{}", listener.as_raw_fd()))
+                .ok()
+                .map(|meta| meta.ino())
+                .filter(|inode| *inode != 0)
+                .or(tracked.inode);
+            TrackedTcp { addr, inode }
+        };
+        self.shared.tcp.lock().unwrap().push(tracked);
         listener
     }
 
@@ -63,10 +143,14 @@ impl Ports {
         path
     }
 
-    /// Track an address a child reported, so the leak check verifies that
-    /// nothing accepts on it any more when the test ends.
+    /// Track an address a child reported while its listener is still open.
+    /// The leak check verifies that the owned listener has closed at test end.
     pub fn track(&self, addr: SocketAddr) {
-        self.shared.tcp.lock().unwrap().push(addr);
+        self.shared
+            .tcp
+            .lock()
+            .unwrap()
+            .push(TrackedTcp::from_address(addr));
     }
 
     /// The directory Unix sockets live in.
@@ -75,23 +159,19 @@ impl Ports {
     }
 }
 
-/// Leak check: tracked TCP addresses still accepting, socket files left.
+/// Leak check: tracked TCP listeners still accepting, socket files left.
 pub(crate) fn leak_check(shared: &Shared, sock_dir: &Path) -> Vec<crate::Leak> {
     let mut leaks = Vec::new();
-    for addr in shared.tcp.lock().unwrap().iter() {
+    for endpoint in shared.tcp.lock().unwrap().iter() {
         // A closed listener can stay reachable for a moment while another
         // thread of the test process is between fork and exec (the child
         // holds a duplicate until exec closes it). Only an address that keeps
         // accepting past the grace period is a leak.
-        let closed = crate::wait::poll(CLOSE_GRACE, || {
-            TcpStream::connect_timeout(addr, Duration::from_millis(200))
-                .is_err()
-                .then_some(())
-        });
+        let closed = crate::wait::poll(CLOSE_GRACE, || endpoint.closed().then_some(()));
         if closed.is_none() {
             leaks.push(crate::Leak::new(
                 "port",
-                format!("{addr} still accepts connections"),
+                format!("{} still accepts connections", endpoint.addr),
             ));
         }
     }

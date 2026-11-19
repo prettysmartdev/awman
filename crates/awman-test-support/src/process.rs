@@ -146,6 +146,8 @@ pub struct OwnedCommand {
     deadline: Duration,
     ready: Ready,
     max_output: usize,
+    #[cfg(target_os = "linux")]
+    offline: bool,
 }
 
 impl OwnedCommand {
@@ -162,6 +164,8 @@ impl OwnedCommand {
             deadline,
             ready: Ready::Immediately,
             max_output: RETAIN_BYTES,
+            #[cfg(target_os = "linux")]
+            offline: false,
         }
     }
 
@@ -199,6 +203,19 @@ impl OwnedCommand {
     /// Remove a variable from the child's environment.
     pub fn env_remove(mut self, name: impl AsRef<OsStr>) -> Self {
         self.env.remove(name);
+        self
+    }
+
+    /// Deny creation of non-Unix sockets in this child and every descendant.
+    /// Linux seccomp enforcement preserves host UID and filesystem ownership;
+    /// Unix IPC remains available to the builtin worker. Installation failure
+    /// prevents the child from executing. Requires an explicit offline grant.
+    #[cfg(target_os = "linux")]
+    pub fn offline(
+        mut self,
+        _grant: &crate::capability::Granted<crate::capability::Offline>,
+    ) -> Self {
+        self.offline = true;
         self
     }
 
@@ -294,6 +311,10 @@ impl OwnedCommand {
                 Stdin::Piped | Stdin::Bytes(_) => Stdio::piped(),
             });
         sys::prepare(&mut cmd);
+        #[cfg(target_os = "linux")]
+        if self.offline {
+            sys::deny_ip_network(&mut cmd);
+        }
 
         let mut child = spawn_retrying_busy(&mut cmd, self.deadline, &label, &command_line);
         let group = match sys::after_spawn(&child) {

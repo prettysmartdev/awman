@@ -144,12 +144,43 @@ fn select<'m>(m: &'m Manifest, o: &Options, build: &str) -> Result<Vec<(&'m str,
             "unknown tier {tier}"
         );
         let before = chosen.len();
+        let applicable = if tier == "guest" || tier == "artifact" {
+            let b = &m.builds[build];
+            if tier == "guest" {
+                ensure!(
+                    b.features == "builtin",
+                    "guest tests require a builtin build; omit --build to select this native host"
+                );
+                Some(crate::native_validation::suites_for_target(
+                    m,
+                    b.target
+                        .as_deref()
+                        .unwrap_or(&m.platforms[&b.platform].triple),
+                )?)
+            } else {
+                // Hosted release verification runs the declared artifact cells.
+                // Linux KVM boot/upgrade contracts are selected explicitly by
+                // native-validation on a host with the required resources.
+                Some(
+                    m.gates
+                        .values()
+                        .flat_map(|gate| &gate.cells)
+                        .filter(|cell| cell.builds.iter().any(|id| id == build))
+                        .flat_map(|cell| cell.suites.iter().cloned())
+                        .collect::<Vec<_>>(),
+                )
+            }
+        } else {
+            None
+        };
         for (id, s) in &m.suites {
             // A tier selection runs test suites only. Lints and other command
             // suites run through `cargo xtask lint` or an explicit --suite.
             if &s.tier == tier
                 && s.kind == "nextest"
-                && suite_runs_on_build(m, id, build)
+                && applicable
+                    .as_ref()
+                    .map_or_else(|| suite_runs_on_build(m, id, build), |ids| ids.contains(id))
                 && !chosen.iter().any(|(c, _)| c == id)
             {
                 chosen.push((id.as_str(), s));
@@ -217,6 +248,44 @@ fn host_build(m: &Manifest) -> Result<String> {
     bail!("no default test build in ci/gates.toml for host {host}; pass --build")
 }
 
+fn requested_build(m: &Manifest, o: &Options) -> Result<String> {
+    if let Some(build) = &o.build {
+        return Ok(build.clone());
+    }
+    if o.tiers.iter().any(|tier| tier == "guest")
+        || o.suites
+            .iter()
+            .any(|id| m.suites.get(id).is_some_and(|suite| suite.tier == "guest"))
+    {
+        return crate::native_validation::guest_host_build();
+    }
+    if o.tiers.iter().any(|tier| tier == "artifact")
+        || o.suites.iter().any(|id| {
+            m.suites
+                .get(id)
+                .is_some_and(|suite| suite.tier == "artifact")
+        })
+    {
+        return artifact_build(m, &host_triple()?);
+    }
+    host_build(m)
+}
+
+fn artifact_build(m: &Manifest, target: &str) -> Result<String> {
+    m.builds
+        .iter()
+        .find(|(_, build)| {
+            build.kind == "release"
+                && build
+                    .target
+                    .as_deref()
+                    .unwrap_or(&m.platforms[&build.platform].triple)
+                    == target
+        })
+        .map(|(id, _)| id.clone())
+        .with_context(|| format!("no release build for artifact host {target}; pass --build"))
+}
+
 fn host_triple() -> Result<String> {
     let out = Command::new("rustc")
         .arg("-vV")
@@ -237,6 +306,40 @@ fn target_flags(target: &str) -> Result<Vec<String>> {
         Some(("test", name)) => vec!["--test".into(), name.into()],
         _ => bail!("unsupported suite target {target}"),
     })
+}
+
+/// Build cells cover the workspace, but an individual suite selects one package.
+/// Infrastructure crates have no runtime features, and guest drivers belong to
+/// the CLI alone. Preserve all other manifest arguments so unknown flags/features
+/// still fail in Cargo instead of being silently discarded.
+pub(crate) fn package_features(features: &[String], package: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut input = features.iter();
+    while let Some(arg) = input.next() {
+        if arg != "--features" {
+            args.push(arg.clone());
+            continue;
+        }
+        let Some(values) = input.next() else {
+            args.push(arg.clone());
+            break;
+        };
+        let enabled = values
+            .split(',')
+            .filter(|feature| match *feature {
+                "guest-drivers" => package == "awman-cli",
+                "builtin-runtime" => {
+                    !["awman-test-support", "awman-wsp", "xtask"].contains(&package)
+                }
+                _ => true,
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        if !enabled.is_empty() {
+            args.extend([arg.clone(), enabled]);
+        }
+    }
+    args
 }
 
 /// The nextest filterset of one suite, scoped to its package and binary.
@@ -402,10 +505,7 @@ fn install_runner(root: &Path) -> Result<ExitCode> {
 
 fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
     let m = crate::manifest::load(root)?;
-    let build_id = match &o.build {
-        Some(b) => b.clone(),
-        None => host_build(&m)?,
-    };
+    let build_id = requested_build(&m, o)?;
     let build = m
         .builds
         .get(&build_id)
@@ -443,6 +543,7 @@ fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
     let mut failed = Vec::new();
     let mut records = Vec::new();
     for inv in invocations(&chosen)? {
+        let features = package_features(&features, &inv.package);
         let mut command = match o.runner {
             Runner::Nextest => nextest_command(root, &inv, &features, o)?,
             Runner::Libtest => libtest_command(&inv, &chosen, &features)?,
@@ -503,7 +604,7 @@ fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
             None
         };
         // A failed startup must not copy a previous invocation's JUnit as evidence.
-        let junit = target_dir(root).join(format!("nextest/{PROFILE}/junit.xml"));
+        let junit = nextest_junit_path(root)?;
         if o.evidence_dir.is_some() && junit.exists() {
             std::fs::remove_file(&junit)?;
         }
@@ -516,7 +617,11 @@ fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
             "execution_ms": started.elapsed().as_millis() as u64,
         }));
         if let (Some(dir), Runner::Nextest) = (&o.evidence_dir, o.runner) {
-            let junit = target_dir(root).join(format!("nextest/{PROFILE}/junit.xml"));
+            ensure!(
+                code != 0 || junit.is_file(),
+                "nextest passed but produced no current JUnit evidence at {}",
+                junit.display()
+            );
             if junit.exists() {
                 let name = format!(
                     "junit-{}-{}-{}.xml",
@@ -676,11 +781,25 @@ fn describe(command: &Command) -> String {
         .join(" ")
 }
 
-fn target_dir(root: &Path) -> PathBuf {
-    std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .map(|p| if p.is_absolute() { p } else { root.join(p) })
-        .unwrap_or_else(|| root.join("target"))
+fn nextest_junit_path(root: &Path) -> Result<PathBuf> {
+    // Nextest's report store is relative to the workspace, independently of
+    // Cargo's build directory (including CARGO_TARGET_DIR). Resolve the same
+    // generated configuration nextest uses; never search stale report paths.
+    let config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(root.join(".config/nextest.toml"))?)?;
+    let store = config
+        .get("store")
+        .and_then(|s| s.get("dir"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("target/nextest");
+    let report = config
+        .get("profile")
+        .and_then(|p| p.get(PROFILE))
+        .and_then(|p| p.get("junit"))
+        .and_then(|j| j.get("path"))
+        .and_then(toml::Value::as_str)
+        .context("nextest profile must declare its JUnit evidence path")?;
+    Ok(root.join(store).join(PROFILE).join(report))
 }
 
 /// Deterministic permutation of the suite order from a seed (flake hunt).
@@ -773,7 +892,7 @@ fn package_of(path: &str) -> Option<&'static str> {
 fn list(root: &Path, o: &Options) -> Result<ExitCode> {
     let m = crate::manifest::load(root)?;
     require_nextest(root, &m)?;
-    let build = o.build.clone().map_or_else(|| host_build(&m), Ok)?;
+    let build = requested_build(&m, o)?;
     let features = m.features[&m.builds[&build].features].cargo_args.clone();
     let mut c = Command::new("cargo");
     c.current_dir(root)
@@ -867,6 +986,7 @@ fn update_golden(root: &Path, o: &Options) -> Result<ExitCode> {
     require_nextest(root, &m)?;
     let mut code = 0;
     for inv in invocations(&chosen)? {
+        let features = package_features(&features, &inv.package);
         let mut c = nextest_command(root, &inv, &features, &o2)?;
         c.env("PATH", tool_path(root))
             .env("INSTA_UPDATE", "always")
@@ -880,6 +1000,47 @@ fn update_golden(root: &Path, o: &Options) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn junit_evidence_follows_the_nextest_store_not_cargo_build_output() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".config")).unwrap();
+        let path = root.path().join(".config/nextest.toml");
+        std::fs::write(&path, "[profile.default.junit]\npath = 'junit.xml'\n").unwrap();
+        assert_eq!(
+            nextest_junit_path(root.path()).unwrap(),
+            root.path().join("target/nextest/default/junit.xml")
+        );
+        std::fs::write(
+            &path,
+            "[store]\ndir = 'reports'\n[profile.default.junit]\npath = 'results.xml'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            nextest_junit_path(root.path()).unwrap(),
+            root.path().join("reports/default/results.xml")
+        );
+        std::fs::write(&path, "[profile.default]\nretries = 0\n").unwrap();
+        assert!(nextest_junit_path(root.path()).is_err());
+    }
+
+    #[test]
+    fn runtime_features_follow_the_selected_package() {
+        let m = crate::manifest::load(&crate::gates::root()).unwrap();
+        let builtin = &m.features["builtin"].cargo_args;
+        assert_eq!(package_features(builtin, "awman-cli"), *builtin);
+        for package in ["awman", "awman-host-shims"] {
+            assert_eq!(
+                package_features(builtin, package),
+                ["--features", "builtin-runtime"]
+            );
+        }
+        for package in ["awman-test-support", "awman-wsp", "xtask"] {
+            assert!(package_features(builtin, package).is_empty());
+        }
+        let unknown = ["--no-default-features", "--features", "future-feature"].map(String::from);
+        assert_eq!(package_features(&unknown, "xtask"), unknown);
+    }
 
     #[test]
     fn target_flags_follow_manifest_target_ids() {
@@ -968,6 +1129,92 @@ mod tests {
             .iter()
             .any(|(id, _)| *id == "component-parity-daemon"));
         assert!(!chosen.iter().any(|(id, _)| *id == "unit-awman-builtin"));
+    }
+    #[test]
+    fn guest_tier_uses_native_contracts_and_requires_a_builtin_build() {
+        let mut m = crate::manifest::load(&crate::gates::root()).unwrap();
+        let o = Options {
+            tiers: vec!["guest".into()],
+            ..Options::default()
+        };
+        let ids = |manifest: &Manifest, build: &str| {
+            select(manifest, &o, build)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id.to_string())
+                .collect::<Vec<_>>()
+        };
+        m.previous_release.remove("x86_64-unknown-linux-gnu");
+        let linux = ids(&m, "linux-x64-native-builtin");
+        assert!(linux.iter().any(|id| id == "guest-boot"));
+        assert!(linux.iter().any(|id| id == "guest-linux-replacement"));
+        assert!(!linux
+            .iter()
+            .any(|id| id == "guest-upgrade" || id == "guest-linux-published-upgrade"));
+        let mac = ids(&m, "macos-arm64-ci-guest-builtin");
+        assert!(mac.iter().any(|id| id == "guest-upgrade"));
+        assert!(!mac.iter().any(|id| id.starts_with("guest-linux-")));
+        assert!(select(&m, &o, "linux-x64-default").is_err());
+        m.previous_release.insert(
+            "x86_64-unknown-linux-gnu".into(),
+            m.previous_release["aarch64-apple-darwin"].clone(),
+        );
+        assert!(ids(&m, "linux-x64-native-builtin")
+            .iter()
+            .any(|id| id == "guest-linux-published-upgrade"));
+    }
+    #[test]
+    fn artifact_tier_selects_release_cells_while_native_upgrades_follow_predecessor_pins() {
+        use std::collections::BTreeSet;
+        let mut m = crate::manifest::load(&crate::gates::root()).unwrap();
+        let o = Options {
+            tiers: vec!["artifact".into()],
+            ..Options::default()
+        };
+        let ids = |manifest: &Manifest, target: &str| {
+            let build = artifact_build(manifest, target).unwrap();
+            select(manifest, &o, &build)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id.to_string())
+                .collect::<BTreeSet<_>>()
+        };
+        let common = BTreeSet::from([
+            "artifact-entrypoints".to_string(),
+            "artifact-deps-scan".into(),
+            "artifact-upgrade-policy".into(),
+            "artifact-smoke".into(),
+            "artifact-switches".into(),
+            "artifact-measure".into(),
+        ]);
+        let linux_target = "x86_64-unknown-linux-gnu";
+        m.previous_release.remove(linux_target);
+        let linux_build = artifact_build(&m, linux_target).unwrap();
+        assert_eq!(m.builds[&linux_build].features, "builtin");
+        assert_eq!(ids(&m, linux_target), common);
+        let native = crate::native_validation::suites_for_target(&m, linux_target).unwrap();
+        assert!(native.iter().any(|id| id == "artifact-linux-boot"));
+        assert!(!native
+            .iter()
+            .any(|id| id == "artifact-linux-published-upgrade"));
+        for target in ["aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
+            assert_eq!(ids(&m, target), common, "{target}");
+        }
+        let mut apple = common.clone();
+        apple.insert("artifact-signed-boot".into());
+        assert_eq!(ids(&m, "aarch64-apple-darwin"), apple);
+        m.previous_release.insert(
+            linux_target.into(),
+            m.previous_release["aarch64-apple-darwin"].clone(),
+        );
+        assert_eq!(ids(&m, linux_target), common);
+        assert!(
+            crate::native_validation::suites_for_target(&m, linux_target)
+                .unwrap()
+                .iter()
+                .any(|id| id == "artifact-linux-published-upgrade")
+        );
+        assert!(artifact_build(&m, "unsupported-target").is_err());
     }
     #[test]
     fn a_clean_changed_checkout_runs_the_selected_suites() {

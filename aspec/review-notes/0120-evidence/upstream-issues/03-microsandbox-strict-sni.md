@@ -1,3 +1,5 @@
+> Reviewed 2026-11-19 against Microsandbox `abff71505fc46416b3d704ee2787f8e55ae66efa`. Local proposal only; not filed. See the saved PR bundle for current API changes and validation status.
+
 **Title:** `feat(network): opt-in strict_sni — accept visible SNI with an exact DNS binding under strict mode`
 
 **Labels:** 💗 enhancement
@@ -105,3 +107,8 @@ DNS cache. That changes existing behaviour, so it's raised separately in
   design?
 - Should it be a separate flag, as proposed, or a mode, for example
   `strict = "inspect" | "sni"`?
+
+Exact-name DNS binding for suffix rules depends on proposal 04 (or equivalent).
+Current upstream allows sibling-name bindings; accepting strict-SNI alone does
+not establish the downstream exact-name guarantee. Review and test that policy
+change before deleting the corresponding downstream network patch.

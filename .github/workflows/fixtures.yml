@@ -45,7 +45,8 @@ jobs:
           mkdir -p out
           cargo xtask fixtures build guest-oci-base --base base.tar --sha256 "$BASE_SHA256" --out built
           cp built/fixture-oci.tar out/guest-oci-base.tar
-          (cd out && sha256sum guest-oci-base.tar > SHA256SUMS)
+          cp built/fixture-docker.tar out/guest-docker-base.tar
+          (cd out && sha256sum guest-oci-base.tar guest-docker-base.tar > SHA256SUMS)
           cp fixture-plan.json out/
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

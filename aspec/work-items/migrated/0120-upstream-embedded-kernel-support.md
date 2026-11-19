@@ -2,8 +2,65 @@
 
 > Testing policy update (WI144): test commands, harness paths and test counts in this historical record are superseded by [the current testing contract](/aspec/devops/testing.md). Use manifest suites and `make validate-native` for native acceptance. Removed test sources and raw evidence bundles are available only in Git history; they must not be restored as test patterns.
 
-Title: Replace the vendored embedded-kernel patch with upstream libkrun support
-Issue: n/a
+Title: Retire downstream Microsandbox patches through published upstream APIs
+Issue: https://github.com/prettysmartdev/awman/issues/46
+
+## Current reconciliation (2026-11-19)
+
+This section supersedes the historical upstream snapshot and patch counts
+below. The Linux enablement work is tracked in issue #47 on `nextgen`.
+No upstream fork, branch, commit, issue or PR was created or submitted.
+
+Upstream source was fetched directly and inspected at:
+
+| Repository | Default-branch revision | Workspace version |
+|---|---|---|
+| Microsandbox | `abff71505fc46416b3d704ee2787f8e55ae66efa` | `0.7.16`, pins `msb_krun =0.1.46` |
+| libkrun | `35cf9e345365b9500e3ef1c9823c3edcfb35a52b` | `0.1.46` |
+
+These are inspected source revisions, not a claim that awman adopted or
+validated those releases. Awman remains pinned to Microsandbox `0.7.8` and
+published `msb_krun 0.1.41`; a dependency migration requires separate protocol,
+catalog, payload and native acceptance. Current upstream also changed storage
+protection and context APIs, so a version bump is not a mechanical patch deletion.
+
+The current patch inventory is six crates: SQLx plus SDK, filesystem, network,
+types, and the newly carried Microsandbox runtime patch. There is still no
+libkrun fork. Exact archive/diff digests and removal conditions are maintained
+in `third_party/README.md` and each `PATCH.md`.
+
+| Saved proposal | Current finding and required next step |
+|---|---|
+| 01 isolated construction | Upstream renamed the backend to `LocalContext`; the proposal now targets `LocalContextBuilder::build_isolated`. The pinned awman SDK still needs `build_lazy_isolated`. Preserve refusal of ambient runtime overrides and hostile user/managed config tests. |
+| 02 per-architecture embedded Agentd | `MSB_EMBED_ARTIFACTS_ROOT` remains absent. Rebase around upstream's new Agentd storage-capability validation; retain validation and fail-closed missing-architecture behavior. |
+| 03 strict visible SNI | `strict_sni` remains absent. Reconcile the new DNS-forwarder/proxy APIs and context paths; require positive TLS and denied-before-connect tests plus protocol capability negotiation. |
+| 04 suffix DNS binding | Upstream still explicitly allows sibling DNS bindings. This proposal intentionally tightens behavior and requires a maintainer decision; do not call it an accepted fix. |
+| 05 kernel allocation documentation | Heap alignment guidance remains useful. The example must also explain that an idempotent process-owned kernel buffer is not proof of independent writable guest memory. |
+| 06 fresh x86_64 private-memory boot | New proposal: call existing `Vm::set_private_memory_boot(true)` for fresh Linux x86_64 guests before entry, leaving restore memory ownership intact. This retires its part of the runtime patch only after a published equivalent passes mapping-isolation, concurrent guest and final-artifact tests. |
+| 07 private Unix lifecycle locks | Native Linux validation found inherited locks created group-writable under `umask 0002`. Both pinned 0.7.8 and current 0.7.16 need explicit `0600` creation. Preserve strict descriptor validation; require native boot with permissive umask and published equivalents of both 06 and 07 before retiring the runtime patch. |
+
+The `host.builtin.internal` alias rename remains awman-specific. Removing the
+network fork completely also needs a configurable upstream alias (or an
+explicitly reviewed compatibility change); merging SNI proposals alone is
+insufficient. SQLx compatibility remains an independent removal gate.
+
+Saved proposal bundles are in `aspec/review-notes/0120-evidence/upstream-prs/`.
+Their base, application checks and outstanding upstream tests are explicit in
+each `PR.md`; they are local drafts, not upstream acceptance evidence.
+Proposal 07's runtime test target compiled against the inspected upstream base
+with Rust 1.95.0 on Linux aarch64. All three lifecycle tests passed under both
+`0002` and `0077`: private creation, exclusivity/reuse, inherited descriptor
+ownership, and asynchronous wait/timeout behavior. Its bundle retains commands,
+source hashes and complete logs in `VALIDATION.md`. Latest-upstream Linux x86_64
+and macOS guest acceptance and the full upstream suite remain outstanding.
+Linux native evidence belongs to WI 0124, and does not validate new upstream
+0.7.16 sources. Linux ARM64 remains gated; the current release scope is x86_64.
+
+WI 0124's [native acceptance record](../../review-notes/0124-evidence/notes.md)
+now validates the carried 0.7.8 runtime on Linux x86_64, including private-memory
+boot, private locks under umask `0002`, source/builder journeys and the exact
+optimized artifact. This earns no acceptance for the newer upstream source;
+published equivalents of proposals 06 and 07 still require replacement testing.
 
 Distribution policy (2026-09-29, from
 [WI 0123](completed/0123-builtin-native-verification-and-release-closure.md);
@@ -273,8 +330,8 @@ Result of this work item (2026-10-21, aarch64 Linux build host without `/dev/kvm
 
 ### Downstream patch inventory and migration
 
-Five published crates are patched (`[patch.crates-io]` in `Cargo.toml`: SQLx plus
-four Microsandbox 0.7.8 trees), plus awman's own integration glue. The vendored
+Six published crates are patched (`[patch.crates-io]` in `Cargo.toml`: SQLx plus
+five Microsandbox 0.7.8 trees), plus awman's own integration glue. The vendored
 `msb_krun` patch was removed by this work item. Each item has a separate
 replacement gate, and replacing one does not mean the others can be removed. Hashes
 were checked against the tree with `sha256sum` on 2026-10-21 after the 0.7.8 rebase.
@@ -285,11 +342,12 @@ were checked against the tree with `sha256sum` on 2026-10-21 after the 0.7.8 reb
 | ~~libkrun kernel-provider loader~~ (**removed by WI 0120**) | Was `third_party/msb_krun-0.1.39/` (patch SHA-256 `cf6d58d0574d8bfefad6137b3f6435ec5524dbf11e8f6b24ff2133c8610dcfba`). The tree is deleted and no `[patch.crates-io]` entry remains. | Published `msb_krun =0.1.41` with `static-krunfw` and the awman-owned `krunfw_get_kernel` callback (Track A). | Done: build/link gates, plus the Apple Silicon boot, signed-artifact and strict-fixture gates (see the register). Still open: Linux KVM boots (WI 0124). A future `msb_krun` bump must re-read `load_krunfw_library`, because Rust cannot type-check the `no_mangle` signature against the C declaration. |
 | Microsandbox guest-agent artifact-root glue | `third_party/microsandbox-filesystem-0.7.8/` (published crate SHA-256 `e890749fd6c87b7966865a4f7a0add888926adce222fdd4525eb64e047fee30b`; patch SHA-256 `b87c1e5f67fe0b9b3044bc43ff332601233280012bd35ea4145b6b75b9feab61`). Only `build.rs` changes: it adds target-aware lookup at `MSB_EMBED_ARTIFACTS_ROOT/<target-arch>/agentd`, and existing inputs remain. Published 0.7.8 still has only `MSB_EMBED_ARTIFACTS_DIR`. | An equivalent upstream target-aware build input, or awman setting `MSB_EMBED_ARTIFACTS_DIR` per target in its own build. | Pin the release/commit, remove the vendor patch and path override, and verify clean builds for all required targets plus guest-agent hash/architecture checks. |
 | Awman-side worker and provider integration (not a vendored dependency patch) | `crates/awman-host-shims/src/{worker.rs,kernel.rs,version.rs}` (built behind `cfg(awman_builtin)`), `src/engine/container/builtin/embedded/mod.rs` (`set_libkrunfw_path`), `src/engine/container/builtin/msb_driver.rs` (firmware-path check), constants in `src/data/builtin_runtime.rs`, and the single early call `awman_host_shims::dispatch_worker(...)` in `src/main.rs`. `kernel::prepare()` arms the process (validation plus the aligned copy) before the worker runs; `krunfw_get_kernel` is the one documented exported symbol. | Remove the firmware-path transport only when the SDK can represent an embedded origin directly. Keep the worker protocol and early dispatch while the SDK still launches the same executable. Scope any needed Microsandbox runtime patch as its own upstream change and record it here before carrying it. | Test worker launch/version compatibility first, then remove only the glue the upstream API makes redundant. Verify same-executable boot, installed-runtime refusal, protocol compatibility, and no symbol/path workaround beyond the one documented callback. |
-| Awman-side macOS builtin fixes (WI 0122; awman code, not dependency patches) | `crates/awman-host-shims/src/kernel.rs` uses the aligned process-lifetime copy on every serving target (Mach-O caps section alignment below 64 KiB). x86_64 serving is refused until its runner uses private-memory boot. `crates/awman-host-shims/src/worker.rs` accepts the SDK's umask-mode lifecycle lock (no group/other write). `src/engine/container/builtin/msb_driver.rs` canonicalizes bind-source ancestors, because the SDK's no-follow root open refuses macOS `/tmp` and `/var` symlinks; a symlinked leaf is still refused. The fourth WI 0122 fix (`only_lo` probe tolerates the kernel's inert `dummy0`) is test-only and has no upstream counterpart. | Upstream: a kernel provider that owns alignment (Track A keeps the copy in awman), an SDK lock created `0600`, and SDK root resolution that tolerates system symlink ancestors while refusing a symlinked leaf. | Remove each only after the matching upstream change is pinned and the macOS actual-awman guest tests pass again. All three are platform-neutral and must be revalidated on Linux in WI 0124. |
+| Awman-side macOS builtin fixes (WI 0122; awman code, not dependency patches) | `crates/awman-host-shims/src/kernel.rs` uses the aligned process-lifetime copy on every serving target (Mach-O caps section alignment below 64 KiB). Linux x86_64 serving is enabled together with the private-memory/runtime-lock patch below; Linux ARM64 remains gated. `crates/awman-host-shims/src/worker.rs` accepts the SDK's umask-mode lifecycle lock (no group/other write). `src/engine/container/builtin/msb_driver.rs` canonicalizes bind-source ancestors, because the SDK's no-follow root open refuses macOS `/tmp` and `/var` symlinks; a symlinked leaf is still refused. The fourth WI 0122 fix (`only_lo` probe tolerates the kernel's inert `dummy0`) is test-only and has no upstream counterpart. | Upstream: a kernel provider that owns alignment (Track A keeps the copy in awman), an SDK lock created `0600`, and SDK root resolution that tolerates system symlink ancestors while refusing a symlinked leaf. | Remove each only after the matching upstream change is pinned and the macOS actual-awman guest tests pass again. All three are platform-neutral and must be revalidated on Linux in WI 0124. |
 | Awman-side Apple Containers XPC transport (WI 0122; not a vendored dependency patch, no upstream code carried) | `crates/awman-host-shims/src/apple_xpc.rs` (macOS only; moved by WI 0126 D1), adapted by `crates/awman-cli/src/apple_transport.rs` (`NativeXpc`), and registered at startup in `src/main.rs` through `engine::oci::apple_store::install_transport`. Unsafe scope: public libxpc/libSystem symbols (`xpc_connection_*`, `xpc_dictionary_*`, `xpc_get_type`, `xpc_retain`/`xpc_release`, type/error singletons) and one capture-free global block with `_NSConcreteGlobalBlock` isa. No Swift toolchain, framework, DSO or executable is added. The protocol (keys, routes, release pins by version and full commit) lives in the safe library (`src/engine/oci/apple_store.rs`, contract in `crates/awman-host-shims/src/xpc.rs`). Provenance is `apple/container` tags 0.12.0/1.4.1/1.5.0, each natively validated, recorded in [WI 0122 notes](../review-notes/0122-evidence/notes.md). Unrelated to libkrun. | A supported, versioned public client API from Apple (e.g. a C-ABI or documented XPC protocol version). | Replace the transport, keep the library's release gate and output checks, and rerun the native `apple_native_*` tests and template exports on Apple Silicon. Each new Apple release needs a source comparison and pin entry before it is accepted. |
 | Microsandbox isolated configuration builder (WI 0121 downstream patch) | `third_party/microsandbox-0.7.8/` vendors published `microsandbox 0.7.8` (crate SHA-256 `d4e2876d9ac789a99f9c7641be568ee8996d78eeebd19aa524aa2662273b3e44`, Apache-2.0, upstream revision `7b7b9dc89e9a1c77801918f7833c3381d1754579`). Its method-and-regression [`upstream.diff`](../../third_party/microsandbox-0.7.8/upstream.diff) (SHA-256 `196167178dc241f18d15aa55ed0abb76e67565a181dbf6e3a319afa46c441e42`) adds `LocalBackendBuilder::build_lazy_isolated(self) -> MicrosandboxResult<LocalBackend>` using `BackendConfig::new(...).prepare_for_local_backend(...)` with built-in defaults and an empty managed layer (0.7.8's validation is fallible, so the return type changed from 0.7.2). Not upstream as of `v0.7.8`. See [`PATCH.md`](../../third_party/microsandbox-0.7.8/PATCH.md). | A pinned upstream SDK release with equivalent isolated-builder semantics. A small, self-contained candidate for a separate Microsandbox PR. | Update the dependency and lockfile, remove the path patch and vendor tree, then rerun hostile installed-config tests, SDK runtime origin/path checks, native installed-runtime coexistence and guest boots on Apple Silicon (Linux KVM in WI 0124). Do not claim native coexistence from a feature compile alone. |
 | Microsandbox visible-SNI network enforcement (WI 0121) | `third_party/microsandbox-network-0.7.8/`, published crate SHA-256 `9bfc80d59e60d46b44d19c60e3e9abe5c1b3b41c92cad739f661b752376902c2`, Apache-2.0, same upstream revision. Seven files: six policy files add default-off `strict_sni` to config/builder/poll/TCP proxy and tighten suffix policies to require the exact claimed name's DNS/IP binding, and the guest host alias is renamed to `host.builtin.internal`. [`upstream.diff`](../../third_party/microsandbox-network-0.7.8/upstream.diff) SHA-256 `5dbe1bbd4ee65adb2a518ded77e6737c87225dab1d4ad76a39b8c4538c17a665`; [provenance and boundary](../../third_party/microsandbox-network-0.7.8/PATCH.md). Upstream `strict` now defaults to true; `strict_sni` stays off. Ordinary strict opaque-TLS refusal is unchanged unless explicitly opted in, and suffix-binding tightening applies in every mode. | A pinned upstream release with explicit visible-SNI enforcement and exact DNS binding without TLS interception. The alias rename stays awman-specific unless upstream accepts a configurable alias. | Remove alongside the types patch after actual SDK TLS positive/negative, missing/wrong/shared-IP/sibling-binding, config roundtrip and native non-root guest network tests pass on Apple Silicon (Linux KVM in WI 0124). Do not infer encrypted HTTP authority or ECH inner-name enforcement, or native packet routing, from host-side TLS tests. |
 | Microsandbox network option transport (WI 0121) | `third_party/microsandbox-types-0.7.8/`, published crate SHA-256 `74af7e859dcfb714bf612e7e27ad682aaedc946be419ace40e661d7e6ae74ba6`, Apache-2.0, same upstream revision. Three Rust files add default-false `strict_sni` to local/cloud NetworkSpec and preserve both conversions, so the SDK builder cannot silently drop the network option. [`upstream.diff`](../../third_party/microsandbox-types-0.7.8/upstream.diff) SHA-256 `f0db5e8555259e07288a97a45a4d3dcb66a561a98cd4c1229bbd26b0f4b0fa41`; [provenance](../../third_party/microsandbox-types-0.7.8/PATCH.md). | The paired upstream networking release must carry the explicit option through all configuration conversions. | Remove with the network patch only after actual SandboxBuilder NetworkConfig→NetworkSpec→NetworkConfig roundtrip, backward-compatible defaults and SDK/native enforcement tests pass. No enforcement by an unpatched cloud server is claimed. |
+| Microsandbox private-memory boot and Unix lifecycle locks (WI 0124) | `third_party/microsandbox-runtime-0.7.8/`, published crate SHA-256 `b9748ae73d3b183f52f13bf1c41fe216268978ff24fbd8a3a628f14cf8cc874e`; patch SHA-256 `ad1a9ff8973c5029b85d35ad715652d1605cc88d9e8b2eeddf70d77c8e77caa9`. The fresh x86_64 runner calls the existing `Vm::set_private_memory_boot(true)` before entry; restore ownership is unchanged. New lifecycle locks use `0600` independently of umask; existing files are not chmodded. | Published equivalents of saved proposals 06 and 07; no new libkrun fork is needed. | Remove only after exact upstream mapping-isolation tests, native concurrent/repeated guest boots and optimized artifact acceptance pass with the published replacement. |
 
 WI 0121's completion follow-up also added direct manifest edges (normal Rustls
 for the shared API/squad TLS server's ring provider, a feature-gated
@@ -300,7 +358,8 @@ with the Phase 2 bump.
 
 The carried sources and their patch notes are listed in
 [`third_party/README.md`](../../third_party/README.md) and each tree's
-`PATCH.md`. None of the five remaining patches has been accepted or released upstream. The
+`PATCH.md`. The six remaining patched crates still require the published equivalents
+and acceptance gates listed above before removal. The
 `msb_krun` patch was unnecessary once upstream shipped `static-krunfw`. The historical
 spike under `tools/oci-runtime-spike/` remains evidence only and is not a
 production runtime dependency.

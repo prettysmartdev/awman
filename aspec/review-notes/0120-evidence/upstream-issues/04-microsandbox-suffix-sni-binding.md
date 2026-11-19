@@ -1,3 +1,5 @@
+> Reviewed 2026-11-19 against Microsandbox `abff71505fc46416b3d704ee2787f8e55ae66efa`. Local proposal only; not filed. See the saved PR bundle for current API changes and validation status.
+
 **Title:** `network: should DomainSuffix allows require a DNS binding for the SNI name itself?`
 
 **Labels:** 💗 enhancement (or a discussion, if you'd rather)

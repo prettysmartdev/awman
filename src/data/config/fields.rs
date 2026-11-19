@@ -164,8 +164,6 @@ pub const RESERVED_ENV: &[&str] = &[
     "AWMAN_TEST_APPLE_CONTAINER",
     "AWMAN_TEST_SBX",
     "AWMAN_TEST_BUILTIN",
-    "AWMAN_TEST_YOLO_COUNTDOWN_MS",
-    "AWMAN_TEST_AGENT_DONE_COUNTDOWN_MS",
 ];
 
 /// Whether `name` matches [`MAP_NAME`].

@@ -151,7 +151,17 @@ impl DataPaths {
 
     /// Create the data root (and parents) on disk.
     pub fn ensure_root(&self) -> Result<(), DataError> {
-        std::fs::create_dir_all(&self.root).map_err(|e| DataError::io(&self.root, e))
+        // The data home is also the ancestor of builtin state. A permissive
+        // user umask must not make a fresh installation group-writable.
+        // Existing directories retain their permissions and are checked by
+        // the consumer that requires a private/trusted path.
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(&self.root)
+            .map_err(|e| DataError::io(&self.root, e))
     }
 
     /// Relocate the database from a pre-squad API root, preserving SQLite's WAL

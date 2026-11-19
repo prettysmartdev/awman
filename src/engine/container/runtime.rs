@@ -104,6 +104,21 @@ impl BuiltinRuntimeSettings {
 /// [`ContainerRuntime::runtime_name`] of the builtin microVM backend.
 pub const BUILTIN_RUNTIME_NAME: &str = "builtin";
 
+/// Image probes must honor the selected runtime's grant. A Docker grant cannot
+/// authorize builtin or Apple execution, and vice versa.
+pub(crate) fn probe_isolation_permits(
+    runtime: &str,
+    env: &crate::data::config::env::EnvSnapshot,
+) -> bool {
+    !env.test_isolation()
+        || match runtime {
+            "docker" => env.test_docker(),
+            "apple-containers" => env.test_apple_container(),
+            BUILTIN_RUNTIME_NAME => env.test_builtin(),
+            _ => false,
+        }
+}
+
 pub struct ContainerRuntime {
     env: crate::data::config::env::EnvSnapshot,
     backend: Arc<dyn ContainerBackend>,

@@ -28,6 +28,18 @@ slow-timeout = { period = "1s", terminate-after = 300 }
 filter = "package(=awman-cli) & binary(=artifact) & (test(/^entrypoints::/))"
 slow-timeout = { period = "1s", terminate-after = 300 }
 
+# artifact-linux-boot
+[[profile.default.overrides]]
+filter = "package(=awman-cli) & binary(=artifact) & (test(=signed_boot::linux_artifact_runs_an_offline_session) | test(=signed_boot::exact_linux_candidate_replacement_preserves_cached_state_offline))"
+slow-timeout = { period = "1s", terminate-after = 300 }
+test-group = "vm"
+
+# artifact-linux-published-upgrade
+[[profile.default.overrides]]
+filter = "package(=awman-cli) & binary(=artifact) & (test(=signed_boot::linux_published_previous_state_upgrades_offline))"
+slow-timeout = { period = "1s", terminate-after = 300 }
+test-group = "vm"
+
 # artifact-measure
 [[profile.default.overrides]]
 filter = "package(=awman-cli) & binary(=artifact) & (test(/^measure::/))"
@@ -35,7 +47,7 @@ slow-timeout = { period = "1s", terminate-after = 300 }
 
 # artifact-signed-boot
 [[profile.default.overrides]]
-filter = "package(=awman-cli) & binary(=artifact) & (test(/^signed_boot::/))"
+filter = "package(=awman-cli) & binary(=artifact) & (test(=signed_boot::signed_artifact_runs_an_offline_session) | test(=signed_boot::signed_artifact_upgrades_previous_state_offline))"
 slow-timeout = { period = "1s", terminate-after = 300 }
 test-group = "vm"
 
@@ -77,6 +89,11 @@ test-group = "docker"
 filter = "package(=awman-cli) & binary(=boundary) & (test(/^git::/))"
 slow-timeout = { period = "1s", terminate-after = 120 }
 test-group = "docker"
+
+# boundary-offline
+[[profile.default.overrides]]
+filter = "package(=awman-test-support) & binary(=component) & (test(=ports::offline_commands_deny_ip_preserve_unix_identity_and_inherit))"
+slow-timeout = { period = "1s", terminate-after = 120 }
 
 # boundary-registry
 [[profile.default.overrides]]
@@ -133,7 +150,7 @@ slow-timeout = { period = "1s", terminate-after = 120 }
 
 # component-core-internals
 [[profile.default.overrides]]
-filter = "package(=awman) & kind(lib) & (not (test(/^command::commands::exec_workflow::contract_tests::/) | test(/^command::commands::exec_workflow::factory::stuck_timeout_tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/) | test(/^data::checkout_paths::tests::/) | test(/^data::workspace::tests::/) | test(/^data::workflow_definition::read_only_workspace_tests::/) | test(/^data::image_inputs::tests::/) | test(/^data::image_tags::lease_tag_tests::/) | test(/^data::worker::lease_images::tests::/) | test(/^data::execution_event::image_stale_tests::/) | test(/^data::config::work_servers::image_budget_tests::/) | test(/^engine::agent::image_freshness::failure_reason_tests::/) | test(/^engine::container::agent_argv::adapter_tests::/) | test(/^engine::container::agent_version::tests::/) | test(/^engine::agent_output::cursor_stream_json::tests::/) | test(/^engine::agent::session_seed::tests::/) | test(/^engine::sandbox::dsbx::backend::adapter_tail_tests::/) | test(/^data::agent_policy::tests::/) | test(/^data::agent_failure::tests::/) | test(/^data::automation::tests::/) | test(/^engine::agent::credential_routes::tests::/) | test(/^data::credential_update::tests::/) | test(/^data::preparation::tests::/) | test(/^data::settings_profile::tests::/) | test(/^data::ids::tests::/) | test(/^data::config::agents::automation_timeout_tests::/) | test(/^command::dispatch::catalogue::pending::tests::/) | test(/^command::dispatch::projections::optional_enum_tests::/) | test(/^command::dispatch::projections::raw_args::misplaced_flag_tests::/) | test(/^command::dispatch::outcomes::wait_failure_tests::/) | test(/^data::ready_summary::preparation_tests::/) | test(/^data::terminal::automation_frame_tests::/) | test(/^data::execution_event::automation_event_tests::/) | test(/^engine::agent::definition::native_plan_tests::/) | test(/^data::config::agent_definition::native_plan_tests::/) | test(/^command::automation::admission::tests::/) | test(/^command::automation::results::tests::/) | test(/^engine::agent::automation::osc7501::tests::/) | test(/^engine::agent::automation::observer::tests::/) | test(/^engine::agent::automation::tests::/) | test(/^command::daemon_api::capabilities::credential_enrollment_tests::/) | test(/^engine::remote::local::credential_wire_tests::/) | test(/^engine::auth::credential::protected_equality_tests::/ | test(/^frontend::render_helpers::tests::/))))"
+filter = "package(=awman) & kind(lib) & (not (test(/^command::commands::exec_workflow::contract_tests::/) | test(/^command::commands::exec_workflow::factory::stuck_timeout_tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/) | test(/^data::checkout_paths::tests::/) | test(/^data::workspace::tests::/) | test(/^data::workflow_definition::read_only_workspace_tests::/) | test(/^data::image_inputs::tests::/) | test(/^data::image_tags::lease_tag_tests::/) | test(/^data::worker::lease_images::tests::/) | test(/^data::execution_event::image_stale_tests::/) | test(/^data::config::work_servers::image_budget_tests::/) | test(/^engine::agent::image_freshness::failure_reason_tests::/) | test(/^engine::container::agent_argv::adapter_tests::/) | test(/^engine::container::agent_version::tests::/) | test(/^engine::agent_output::cursor_stream_json::tests::/) | test(/^engine::agent::session_seed::tests::/) | test(/^engine::sandbox::dsbx::backend::adapter_tail_tests::/) | test(/^data::agent_policy::tests::/) | test(/^data::agent_failure::tests::/) | test(/^data::automation::tests::/) | test(/^engine::agent::credential_routes::tests::/) | test(/^data::credential_update::tests::/) | test(/^data::preparation::tests::/) | test(/^data::settings_profile::tests::/) | test(/^data::ids::tests::/) | test(/^data::config::agents::automation_timeout_tests::/) | test(/^command::dispatch::catalogue::pending::tests::/) | test(/^command::dispatch::projections::optional_enum_tests::/) | test(/^command::dispatch::projections::raw_args::misplaced_flag_tests::/) | test(/^command::dispatch::outcomes::wait_failure_tests::/) | test(/^data::ready_summary::preparation_tests::/) | test(/^data::terminal::automation_frame_tests::/) | test(/^data::execution_event::automation_event_tests::/) | test(/^engine::agent::definition::native_plan_tests::/) | test(/^data::config::agent_definition::native_plan_tests::/) | test(/^command::automation::admission::tests::/) | test(/^command::automation::results::tests::/) | test(/^engine::agent::automation::osc7501::tests::/) | test(/^engine::agent::automation::observer::tests::/) | test(/^engine::agent::automation::tests::/) | test(/^command::daemon_api::capabilities::credential_enrollment_tests::/) | test(/^engine::remote::local::credential_wire_tests::/) | test(/^engine::auth::credential::protected_equality_tests::/) | test(/^frontend::render_helpers::tests::/)))"
 slow-timeout = { period = "1s", terminate-after = 20 }
 
 # component-daemon
@@ -188,7 +205,7 @@ slow-timeout = { period = "1s", terminate-after = 20 }
 
 # component-test-support
 [[profile.default.overrides]]
-filter = "package(=awman-test-support) & binary(=component)"
+filter = "package(=awman-test-support) & binary(=component) & (not test(=ports::offline_commands_deny_ip_preserve_unix_identity_and_inherit))"
 slow-timeout = { period = "1s", terminate-after = 20 }
 
 # component-tools
@@ -225,6 +242,18 @@ filter = "package(=awman-cli) & binary(=guest) & (test(/^import::/))"
 slow-timeout = { period = "1s", terminate-after = 300 }
 test-group = "vm"
 
+# guest-linux-published-upgrade
+[[profile.default.overrides]]
+filter = "package(=awman-cli) & binary(=guest) & (test(=upgrade::linux_published_previous_state_upgrades_and_boots))"
+slow-timeout = { period = "1s", terminate-after = 300 }
+test-group = "vm"
+
+# guest-linux-replacement
+[[profile.default.overrides]]
+filter = "package(=awman-cli) & binary(=guest) & (test(=upgrade::cached_state_survives_atomic_executable_replacement))"
+slow-timeout = { period = "1s", terminate-after = 300 }
+test-group = "vm"
+
 # guest-network
 [[profile.default.overrides]]
 filter = "package(=awman-cli) & binary(=guest) & (test(/^network::/))"
@@ -239,7 +268,7 @@ test-group = "vm"
 
 # guest-upgrade
 [[profile.default.overrides]]
-filter = "package(=awman-cli) & binary(=guest) & (test(/^upgrade::/))"
+filter = "package(=awman-cli) & binary(=guest) & (test(=upgrade::previous_release_state_upgrades_and_boots))"
 slow-timeout = { period = "1s", terminate-after = 300 }
 test-group = "vm"
 
@@ -282,6 +311,11 @@ slow-timeout = { period = "1s", terminate-after = 1 }
 [[profile.default.overrides]]
 filter = "package(=awman) & kind(lib)"
 slow-timeout = { period = "1s", terminate-after = 20 }
+
+# unit-host-shims
+[[profile.default.overrides]]
+filter = "package(=awman-host-shims) & kind(lib) & (test(/^worker::tests::/))"
+slow-timeout = { period = "1s", terminate-after = 1 }
 
 # unit-test-support
 [[profile.default.overrides]]

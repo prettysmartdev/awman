@@ -71,6 +71,64 @@ fn prevent_group_escape(cmd: &mut Command) {
     }
 }
 
+/// Enforce an offline child without a user namespace: remapping the caller's
+/// UID would invalidate the production checks on root-owned state parents.
+/// The supervisor closes inherited descriptors, and this filter only permits
+/// new Unix sockets. It survives exec and is inherited by all descendants.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+pub(crate) fn deny_ip_network(cmd: &mut Command) {
+    const fn instruction(code: u16, jt: u8, jf: u8, k: u32) -> libc::sock_filter {
+        libc::sock_filter { code, jt, jf, k }
+    }
+    #[cfg(target_arch = "x86_64")]
+    const ARCH: u32 = 0xc000003e;
+    #[cfg(target_arch = "aarch64")]
+    const ARCH: u32 = 0xc00000b7;
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    const ARCH: u32 = 0;
+
+    // Unsupported ABIs fail closed. SAFETY: the post-fork closure uses only
+    // stack storage and prctl syscalls; the kernel copies the filter
+    // synchronously. No allocation or lock occurs.
+    unsafe {
+        cmd.pre_exec(|| {
+            let mut filter = [
+                instruction(0x20, 0, 0, 4), // seccomp_data.arch
+                instruction(0x15, 1, 0, ARCH),
+                instruction(0x06, 0, 0, 0x80000000), // kill on a different ABI
+                instruction(0x20, 0, 0, 0),          // seccomp_data.nr
+                instruction(0x35, 0, 1, 0x40000000), // x32 ABI bit
+                instruction(0x06, 0, 0, 0x80000000),
+                // io_uring can create sockets without a socket syscall.
+                instruction(0x15, 0, 1, libc::SYS_io_uring_setup as u32),
+                instruction(0x06, 0, 0, 0x00050000 | libc::EPERM as u32),
+                instruction(0x15, 0, 1, libc::SYS_io_uring_enter as u32),
+                instruction(0x06, 0, 0, 0x00050000 | libc::EPERM as u32),
+                instruction(0x15, 0, 1, libc::SYS_io_uring_register as u32),
+                instruction(0x06, 0, 0, 0x00050000 | libc::EPERM as u32),
+                instruction(0x15, 2, 0, libc::SYS_socket as u32),
+                instruction(0x15, 1, 0, libc::SYS_socketpair as u32),
+                instruction(0x06, 0, 0, 0x7fff0000), // other syscalls allowed
+                instruction(0x20, 0, 0, 16),         // socket family: args[0]
+                instruction(0x15, 1, 0, libc::AF_UNIX as u32),
+                instruction(0x06, 0, 0, 0x00050000 | libc::EPERM as u32),
+                instruction(0x06, 0, 0, 0x7fff0000),
+            ];
+            let program = libc::sock_fprog {
+                len: filter.len() as u16,
+                filter: filter.as_mut_ptr(),
+            };
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                || libc::prctl(libc::PR_SET_SECCOMP, 2, &program) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Run before every spawn: mark every open descriptor above 2 close-on-exec.
 pub(crate) fn before_spawn() {
     mark_inherited_descriptors_cloexec();

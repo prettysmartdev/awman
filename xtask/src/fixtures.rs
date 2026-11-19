@@ -88,6 +88,9 @@ fn wanted(m: &Manifest, tier: Option<&str>, store: &Path) -> Vec<Wanted> {
         m.tiers
             .get(t)
             .is_some_and(|tier| tier.guarantees.iter().any(|g| g == "previous-release"))
+            || m.suites.values().any(|suite| {
+                suite.tier == t && suite.requires.iter().any(|cap| cap == "previous-release")
+            })
             || t == "artifact"
     });
     if previous_needed {

@@ -48,6 +48,15 @@ Rules that never change:
 
 ## Prerequisites
 
+The published `awman-linux-amd64` asset is a GNU x86_64 executable built on
+Ubuntu 22.04, with glibc 2.35 as its maximum required symbol version. The build
+step inspects the exact candidate with `readelf`, fails on newer or unknown
+glibc requirements, and records `abi.json` beside the candidate digest. The
+artifact and reproducibility jobs use the same baseline runner. Native Linux
+acceptance packets built on newer developer distributions record their host
+ABI separately; they do not establish distribution compatibility. The musl
+build smoke remains separate and does not include the builtin runtime.
+
 - A clean checkout, normally on `main`, in sync with `origin/main`, with a `gh`
   login (`gh auth login`) that can dispatch workflows and, when the Mac is managed
   as a runner, administer repository runners.

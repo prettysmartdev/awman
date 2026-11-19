@@ -9,6 +9,7 @@
 use std::process::ExitCode;
 
 mod abandon;
+mod abi;
 mod candidate;
 mod operator;
 mod promote;

@@ -50,9 +50,13 @@ pub(super) fn build(base: &Path, out: &Path) -> Result<()> {
     let mut config: Value =
         serde_json::from_slice(get(images[0]["Config"].as_str().context("config path")?)?)?;
     ensure!(
-        config["os"] == "linux" && config["architecture"] == "arm64",
-        "native fixture requires linux/arm64 base"
+        config["os"] == "linux"
+            && ["arm64", "amd64"]
+                .iter()
+                .any(|arch| config["architecture"] == *arch),
+        "native fixture requires linux/arm64 or linux/amd64 base"
     );
+    let architecture = config["architecture"].as_str().unwrap().to_string();
     let mut layers = vec![];
     for name in images[0]["Layers"].as_array().context("layers")? {
         layers.push(get(name.as_str().context("layer path")?)?.clone());
@@ -175,7 +179,7 @@ pub(super) fn build(base: &Path, out: &Path) -> Result<()> {
         &mut oci,
         "index.json",
         &serde_json::to_vec(
-            &json!({"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":format!("sha256:{hash}"),"size":manifest.len(),"platform":{"os":"linux","architecture":"arm64"},"annotations":{"org.opencontainers.image.ref.name":tag}}]}),
+            &json!({"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":format!("sha256:{hash}"),"size":manifest.len(),"platform":{"os":"linux","architecture":architecture},"annotations":{"org.opencontainers.image.ref.name":tag}}]}),
         )?,
         0o644,
         0,
@@ -189,14 +193,14 @@ pub(super) fn build(base: &Path, out: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn base(path: &Path, valid: bool) {
+    fn base(path: &Path, valid: bool, architecture: &str) {
         let layer = Builder::new(Vec::new()).into_inner().unwrap();
         let hash = if valid {
             sha256(&layer)
         } else {
             "0".repeat(64)
         };
-        let config = json!({"os":"linux","architecture":"arm64","rootfs":{"type":"layers","diff_ids":[format!("sha256:{hash}")]},"config":{}});
+        let config = json!({"os":"linux","architecture":architecture,"rootfs":{"type":"layers","diff_ids":[format!("sha256:{hash}")]},"config":{}});
         let mut tar = Builder::new(Vec::new());
         append(
             &mut tar,
@@ -221,7 +225,7 @@ mod tests {
     fn repeatable_image_contains_digest_verified_identity_and_whiteout_layers() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("base.tar");
-        base(&input, true);
+        base(&input, true, "arm64");
         let first = dir.path().join("first");
         let second = dir.path().join("second");
         build(&input, &first).unwrap();
@@ -277,12 +281,37 @@ mod tests {
     fn corrupt_base_cannot_create_a_fixture() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("base.tar");
-        base(&input, false);
+        base(&input, false, "arm64");
         let out = dir.path().join("out");
         assert!(build(&input, &out)
             .unwrap_err()
             .to_string()
             .contains("wrong digest"));
         assert!(!out.exists());
+    }
+
+    #[test]
+    fn amd64_fixture_retains_its_platform_and_unsupported_bases_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("base.tar");
+        base(&input, true, "amd64");
+        let out = dir.path().join("amd64");
+        build(&input, &out).unwrap();
+        for entry in Archive::new(fs::File::open(out.join("fixture-oci.tar")).unwrap())
+            .entries()
+            .unwrap()
+        {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap() == Path::new("index.json") {
+                let mut text = String::new();
+                entry.read_to_string(&mut text).unwrap();
+                let index: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(index["manifests"][0]["platform"]["architecture"], "amd64");
+                base(&input, true, "386");
+                assert!(build(&input, &dir.path().join("unsupported")).is_err());
+                return;
+            }
+        }
+        panic!("fixture OCI index missing");
     }
 }

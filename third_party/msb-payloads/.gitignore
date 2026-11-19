@@ -2,6 +2,7 @@
 */kernel.meta
 */agentd
 */extract-kernel
+*/provenance.generated.txt
 */*.tar.gz
 */*.dylib
 */*.so*

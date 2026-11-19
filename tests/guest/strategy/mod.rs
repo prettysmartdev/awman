@@ -3,13 +3,28 @@ use awman::engine::agent::definition::{SettingsMount, SystemPromptMode};
 use awman::engine::agent::first_party::first_party;
 fn probe(agent: &str) -> String {
     let matrix = first_party(agent).unwrap();
-    let mut script = String::from(
-        r#"#!/bin/sh
-set -eu
+    let mut script = String::from("#!/bin/sh\nset -eu\n");
+    if let Some(version) = &matrix.cli_version {
+        script.push_str(&format!(
+            "if [ \"${{1:-}}\" = --version ]; then echo '{}.0.0'; exit 0; fi\n",
+            version.required_major,
+        ));
+    }
+    script.push_str(
+        r#"
 test "$(id -u)" = 1234
 test "$HOME" != /root
-IFS= read -r prompt
-test "$prompt" = 'matrix task with spaces'
+"#,
+    );
+    if matrix.headless_prompt_in_argv {
+        script.push_str(
+            "prompt_count=0\nfor argument do if [ \"$argument\" = 'matrix task with spaces' ]; then prompt_count=$((prompt_count + 1)); fi; done\ntest \"$prompt_count\" = 1\n",
+        );
+    } else {
+        script.push_str("IFS= read -r prompt\ntest \"$prompt\" = 'matrix task with spaces'\n");
+    }
+    script.push_str(
+        r#"
 test "$AWMAN_MATRIX_ENV" = 'literal value with spaces'
 test "$(cat /matrix/ro/sentinel)" = read-only
 if echo forbidden > /matrix/ro/forbidden 2>/dev/null; then exit 71; fi
@@ -96,10 +111,23 @@ printf workflow-write > /awman/context/workflow/writeback
 fn run(id: &'static str, agent: &str, skill: &str) {
     use awman::data::fs::auth_paths::AuthPathResolver;
     let s = support::sandbox(id);
-    let archive = support::fixture(&s);
+    let mut archive = support::fixture(&s);
     support::watch(&s);
     let descriptor = first_party(agent).unwrap();
-    let repo = support::session::prepare(&s, &archive, agent, &probe(agent));
+    let script = probe(agent);
+    if let Some(version) = &descriptor.cli_version {
+        // Version gates probe the image without overlays. Put the synthetic
+        // executable in a derived image so probe and launch use the same bytes.
+        // The registered base fixture is still digest-verified before reuse.
+        let image = awman_test_support::fixtures::OciImage::read_archive(&archive).with_files(&[(
+            &format!("usr/local/bin/{}", version.binary),
+            script.as_bytes(),
+            0o755,
+        )]);
+        archive = image.write_archive(&s.work().join("strategy-image.tar"));
+        s.note("synthetic_strategy_image_manifest", &image.manifest.digest);
+    }
+    let repo = support::session::prepare(&s, &archive, agent, &script);
     let ro = s.root().join("ro");
     let rw = s.root().join("rw");
     for dir in [&ro, &rw, &s.awman_home().join("skills/matrix")] {
@@ -159,6 +187,9 @@ fn run(id: &'static str, agent: &str, skill: &str) {
         descriptor.interactive_entrypoint[0]
     )
     .into();
+    if descriptor.cli_version.is_some() {
+        config["overlays"].as_array_mut().unwrap().remove(0);
+    }
     for overlay in [
         format!("dir({}:/matrix/ro:ro)", ro.display()),
         format!("dir({}:~/matrix-rw:rw)", rw.display()),

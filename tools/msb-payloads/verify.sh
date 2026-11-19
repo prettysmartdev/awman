@@ -17,7 +17,9 @@ dest="$root/third_party/msb-payloads/$target"
 kernel="$dest/kernel.bin"
 agent="$root/third_party/msb-payloads/$arch/agentd"
 meta="$dest/kernel.meta"
-provenance="$dest/provenance.txt"
+provenance="$dest/provenance.generated.txt"
+# Existing caches can still use the historical checked-in extraction receipt.
+if [ ! -f "$provenance" ]; then provenance="$dest/provenance.txt"; fi
 for f in "$kernel" "$agent" "$meta" "$provenance"; do [ -f "$f" ] || fail "missing $f"; done
 hash_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 kernel_hash=$(hash_file "$kernel")
