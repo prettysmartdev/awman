@@ -816,12 +816,27 @@ pub async fn reconcile_repository(
 
 fn snapshot_io(error: &EngineError) -> bool {
     match error {
-        EngineError::Io { source, .. } => !matches!(
-            source.raw_os_error(),
-            Some(libc::ELOOP | libc::ENOTDIR | libc::EINVAL)
-        ),
+        EngineError::Io { source, .. } => !is_unsafe_path_error(source),
         _ => false,
     }
+}
+
+/// A refused path (symlink, non-directory, invalid name) rather than real I/O.
+#[cfg(unix)]
+fn is_unsafe_path_error(source: &std::io::Error) -> bool {
+    matches!(
+        source.raw_os_error(),
+        Some(libc::ELOOP | libc::ENOTDIR | libc::EINVAL)
+    )
+}
+
+/// Windows has no `ELOOP`; match the portable kinds for the other two.
+#[cfg(not(unix))]
+fn is_unsafe_path_error(source: &std::io::Error) -> bool {
+    matches!(
+        source.kind(),
+        std::io::ErrorKind::NotADirectory | std::io::ErrorKind::InvalidInput
+    )
 }
 
 /// Reopen the recorded runtime when the user's current default changed.
