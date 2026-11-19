@@ -144,12 +144,29 @@ fn select<'m>(m: &'m Manifest, o: &Options, build: &str) -> Result<Vec<(&'m str,
             "unknown tier {tier}"
         );
         let before = chosen.len();
+        let native = if tier == "guest" {
+            let b = &m.builds[build];
+            ensure!(
+                b.features == "builtin",
+                "guest tests require a builtin build; omit --build to select this native host"
+            );
+            Some(crate::native_validation::suites_for_target(
+                m,
+                b.target
+                    .as_deref()
+                    .unwrap_or(&m.platforms[&b.platform].triple),
+            )?)
+        } else {
+            None
+        };
         for (id, s) in &m.suites {
             // A tier selection runs test suites only. Lints and other command
             // suites run through `cargo xtask lint` or an explicit --suite.
             if &s.tier == tier
                 && s.kind == "nextest"
-                && suite_runs_on_build(m, id, build)
+                && native
+                    .as_ref()
+                    .map_or_else(|| suite_runs_on_build(m, id, build), |ids| ids.contains(id))
                 && !chosen.iter().any(|(c, _)| c == id)
             {
                 chosen.push((id.as_str(), s));
@@ -215,6 +232,20 @@ fn host_build(m: &Manifest) -> Result<String> {
         return Ok(id.clone());
     }
     bail!("no default test build in ci/gates.toml for host {host}; pass --build")
+}
+
+fn requested_build(m: &Manifest, o: &Options) -> Result<String> {
+    if let Some(build) = &o.build {
+        return Ok(build.clone());
+    }
+    if o.tiers.iter().any(|tier| tier == "guest")
+        || o.suites
+            .iter()
+            .any(|id| m.suites.get(id).is_some_and(|suite| suite.tier == "guest"))
+    {
+        return crate::native_validation::guest_host_build();
+    }
+    host_build(m)
 }
 
 fn host_triple() -> Result<String> {
@@ -402,10 +433,7 @@ fn install_runner(root: &Path) -> Result<ExitCode> {
 
 fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
     let m = crate::manifest::load(root)?;
-    let build_id = match &o.build {
-        Some(b) => b.clone(),
-        None => host_build(&m)?,
-    };
+    let build_id = requested_build(&m, o)?;
     let build = m
         .builds
         .get(&build_id)
@@ -773,7 +801,7 @@ fn package_of(path: &str) -> Option<&'static str> {
 fn list(root: &Path, o: &Options) -> Result<ExitCode> {
     let m = crate::manifest::load(root)?;
     require_nextest(root, &m)?;
-    let build = o.build.clone().map_or_else(|| host_build(&m), Ok)?;
+    let build = requested_build(&m, o)?;
     let features = m.features[&m.builds[&build].features].cargo_args.clone();
     let mut c = Command::new("cargo");
     c.current_dir(root)
@@ -968,6 +996,39 @@ mod tests {
             .iter()
             .any(|(id, _)| *id == "component-parity-daemon"));
         assert!(!chosen.iter().any(|(id, _)| *id == "unit-awman-builtin"));
+    }
+    #[test]
+    fn guest_tier_uses_native_contracts_and_requires_a_builtin_build() {
+        let mut m = crate::manifest::load(&crate::gates::root()).unwrap();
+        let o = Options {
+            tiers: vec!["guest".into()],
+            ..Options::default()
+        };
+        let ids = |manifest: &Manifest, build: &str| {
+            select(manifest, &o, build)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id.to_string())
+                .collect::<Vec<_>>()
+        };
+        m.previous_release.remove("x86_64-unknown-linux-gnu");
+        let linux = ids(&m, "linux-x64-native-builtin");
+        assert!(linux.iter().any(|id| id == "guest-boot"));
+        assert!(linux.iter().any(|id| id == "guest-linux-replacement"));
+        assert!(!linux
+            .iter()
+            .any(|id| id == "guest-upgrade" || id == "guest-linux-published-upgrade"));
+        let mac = ids(&m, "macos-arm64-ci-guest-builtin");
+        assert!(mac.iter().any(|id| id == "guest-upgrade"));
+        assert!(!mac.iter().any(|id| id.starts_with("guest-linux-")));
+        assert!(select(&m, &o, "linux-x64-default").is_err());
+        m.previous_release.insert(
+            "x86_64-unknown-linux-gnu".into(),
+            m.previous_release["aarch64-apple-darwin"].clone(),
+        );
+        assert!(ids(&m, "linux-x64-native-builtin")
+            .iter()
+            .any(|id| id == "guest-linux-published-upgrade"));
     }
     #[test]
     fn a_clean_changed_checkout_runs_the_selected_suites() {

@@ -155,10 +155,17 @@ pub(super) fn run(r: &mut Run, m: &Manifest) -> Result<()> {
     r.packet.fixture_sha256 = sha256_file(&fixture)?;
     fs::create_dir_all(r.out.join("fixtures"))?;
     fs::copy(&fixture, r.out.join("fixtures/guest-oci-base.tar"))?;
+    let docker_fixture = store.join("guest-docker-base.tar");
+    fs::copy(built.join("fixture-docker.tar"), &docker_fixture)?;
+    r.packet.docker_fixture_sha256 = sha256_file(&docker_fixture)?;
+    fs::copy(
+        &docker_fixture,
+        r.out.join("fixtures/guest-docker-base.tar"),
+    )?;
     fs::write(
         r.out.join("fixture-provenance.json"),
         serde_json::to_vec_pretty(
-            &serde_json::json!({"base_image": image, "base_archive_sha256": base_hash, "guest_archive_sha256": r.packet.fixture_sha256, "recipe_commit": r.packet.commit}),
+            &serde_json::json!({"base_image": image, "base_archive_sha256": base_hash, "guest_archive_sha256": r.packet.fixture_sha256, "docker_archive_sha256": r.packet.docker_fixture_sha256, "recipe_commit": r.packet.commit}),
         )?,
     )?;
     if let Some(previous) = m.previous_release.get(r.platform.target) {
@@ -191,11 +198,16 @@ pub(super) fn run(r: &mut Run, m: &Manifest) -> Result<()> {
     // The run-local pin is explicit evidence, not a silent edit to repository policy.
     let mut config: toml::Value =
         toml::from_str(&fs::read_to_string(r.root.join("ci/gates.toml"))?)?;
-    let fixture_config = config["fixtures"]["guest-oci-base"]
-        .as_table_mut()
-        .context("fixture table")?;
-    fixture_config.remove("pending");
-    fixture_config.insert("sha256".into(), r.packet.fixture_sha256.clone().into());
+    for (id, hash) in [
+        ("guest-oci-base", &r.packet.fixture_sha256),
+        ("guest-docker-base", &r.packet.docker_fixture_sha256),
+    ] {
+        let fixture_config = config["fixtures"][id]
+            .as_table_mut()
+            .context("fixture table")?;
+        fixture_config.remove("pending");
+        fixture_config.insert("sha256".into(), hash.clone().into());
+    }
     let config_path = r.out.join("run-config.toml");
     fs::write(&config_path, toml::to_string_pretty(&config)?)?;
     r.env.insert(

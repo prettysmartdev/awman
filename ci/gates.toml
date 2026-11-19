@@ -110,8 +110,8 @@ allowed_capabilities = ["docker", "local-registry", "git-transports", "apple-con
 
 [tiers.guest]
 budget_seconds = 300
-guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "hypervisor", "builtin-payload", "guest-fixtures", "previous-release"]
-allowed_capabilities = ["docker", "apple-containers"]
+guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "hypervisor", "builtin-payload", "guest-fixtures"]
+allowed_capabilities = ["docker", "apple-containers", "previous-release"]
 
 [tiers.artifact]
 budget_seconds = 300
@@ -639,9 +639,9 @@ kind = "nextest"
 package = "awman-cli"
 target = "test:guest"
 contracts = ["guest-upgrade"]
-requires = []
+requires = ["previous-release"]
 paths = ["src/engine/**", "tests/guest/**"]
-filter = "test(/^upgrade::/) - test(=upgrade::linux_published_previous_state_upgrades_and_boots)"
+filter = "test(=upgrade::previous_release_state_upgrades_and_boots)"
 group = "vm"
 
 [suites.guest-builder]
@@ -694,7 +694,7 @@ target = "test:artifact"
 contracts = ["artifact-signed-boot"]
 requires = ["hypervisor", "guest-fixtures", "previous-release", "offline"]
 paths = ["src/**", "tests/artifact/**"]
-filter = "test(/^signed_boot::/) - test(=signed_boot::linux_published_previous_state_upgrades_offline)"
+filter = "test(=signed_boot::signed_artifact_runs_an_offline_session) | test(=signed_boot::signed_artifact_upgrades_previous_state_offline)"
 group = "vm"
 
 [suites.artifact-upgrade-policy]
@@ -1055,6 +1055,12 @@ tiers = ["guest", "artifact"]
 build = "guest-oci-base"
 pending = "P7: slice-guest-and-artifact-tiers publishes immutable archive and digest"
 
+[fixtures.guest-docker-base]
+file = "guest-docker-base.tar"
+tiers = ["guest", "artifact"]
+build = "guest-docker-base"
+pending = "P7: slice-guest-and-artifact-tiers publishes immutable archive and digest"
+
 [fixtures.msb-payload-aarch64-apple-darwin]
 verified_record = "third_party/msb-payloads/aarch64-apple-darwin"
 tiers = ["guest"]
@@ -1312,3 +1318,25 @@ contracts = ["linux-private-memory-isolation"]
 requires = []
 paths = ["crates/awman-host-shims/src/kernel.rs", "tools/msb-payloads/check-private-memory.sh"]
 command = ["bash", "tools/msb-payloads/check-private-memory.sh"]
+
+[suites.guest-linux-replacement]
+tier = "guest"
+kind = "nextest"
+package = "awman-cli"
+target = "test:guest"
+contracts = ["guest-linux-replacement"]
+requires = []
+paths = ["src/engine/**", "tests/guest/upgrade/**"]
+filter = "test(=upgrade::cached_state_survives_atomic_executable_replacement)"
+group = "vm"
+
+[suites.artifact-linux-boot]
+tier = "artifact"
+kind = "nextest"
+package = "awman-cli"
+target = "test:artifact"
+contracts = ["artifact-linux-boot"]
+requires = ["hypervisor", "guest-fixtures", "offline"]
+paths = ["src/**", "tests/artifact/signed_boot/**"]
+filter = "test(=signed_boot::linux_artifact_runs_an_offline_session) | test(=signed_boot::exact_linux_candidate_replacement_preserves_cached_state_offline)"
+group = "vm"

@@ -81,6 +81,7 @@ struct Packet {
     suites: Vec<String>,
     artifact_sha256: String,
     fixture_sha256: String,
+    docker_fixture_sha256: String,
     files: BTreeMap<String, String>,
 }
 #[derive(Serialize, Deserialize)]
@@ -160,6 +161,12 @@ fn suites(m: &Manifest, platform: Platform) -> Vec<String> {
     m.suites
         .iter()
         .filter(|(id, s)| {
+            if ["guest-linux-replacement", "artifact-linux-boot"].contains(&id.as_str()) {
+                return !platform.apple();
+            }
+            if ["guest-upgrade", "artifact-signed-boot"].contains(&id.as_str()) {
+                return platform.apple();
+            }
             if [
                 "guest-linux-published-upgrade",
                 "artifact-linux-published-upgrade",
@@ -185,6 +192,14 @@ fn suites(m: &Manifest, platform: Platform) -> Vec<String> {
         })
         .map(|(id, _)| id.clone())
         .collect()
+}
+
+pub(crate) fn guest_host_build() -> Result<String> {
+    Ok(Platform::host()?.build.into())
+}
+
+pub(crate) fn suites_for_target(m: &Manifest, target: &str) -> Result<Vec<String>> {
+    Ok(suites(m, Platform::for_target(target)?))
 }
 fn source_hashes(root: &Path) -> Result<BTreeMap<String, String>> {
     [

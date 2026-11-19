@@ -41,7 +41,7 @@ Generated from `ci/gates.toml` (schema 1).
 | artifact | 300 | tempdir, loopback, subprocess, release-artifact |
 | boundary | 120 | tempdir, loopback, subprocess, awman-binary, fake-cli, local-git |
 | component | 20 | tempdir, loopback, subprocess, awman-binary, fake-cli, local-git |
-| guest | 300 | tempdir, loopback, subprocess, awman-binary, hypervisor, builtin-payload, guest-fixtures, previous-release |
+| guest | 300 | tempdir, loopback, subprocess, awman-binary, hypervisor, builtin-payload, guest-fixtures |
 | soak | suite-specific | tempdir, loopback, subprocess, awman-binary |
 | unit | 1 | tempdir |
 
@@ -117,6 +117,10 @@ and reproduce tests. Locally:
   with the concrete prerequisite recorded; it is never a passing boot test. The
   upgrade scenario needs the pinned previous release (`previous-release`);
   nobody builds an older awman by hand.
+- `make test-guest` selects the host's builtin build and native suites. Linux
+  runs cached executable-replacement coverage and adds published-predecessor
+  upgrade coverage when its target has a reviewed previous-release pin. An
+  explicit default-feature build is refused for the guest tier.
 - SQLite and native dependencies are exercised by persisted-state component contracts, the guest tier and `artifact-deps-scan`. Use `make test-artifact ARTIFACT=...` for a prepared candidate. Runtime execution must work offline with a minimal executable search path and cannot depend on build caches or tools scripts.
 - The builtin driver uses the vendored `build_lazy_isolated()` entry point on
   pinned `microsandbox 0.7.8`. It starts from independent defaults and

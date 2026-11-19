@@ -18,9 +18,14 @@ fn run(id: &'static str, apple: bool) {
         )
     };
     // This is an immutable, prebuilt fixture; loading it never builds or pulls.
+    let load_archive = if apple {
+        archive.clone()
+    } else {
+        s.fixture("guest-docker-base")
+    };
     s.command(&cli)
         .args(["image", "load", "--input"])
-        .arg(&archive)
+        .arg(&load_archive)
         .run()
         .assert_success();
     support::watch(&s);
@@ -32,7 +37,7 @@ fn run(id: &'static str, apple: bool) {
     );
     std::fs::write(
         repo.join("Dockerfile.dev"),
-        "FROM awman-test/guest:fixture\nRUN printf 'v1\\n' > /etc/builder-marker\n",
+        "FROM awman-test/guest:fixture\nUSER root\nRUN printf 'v1\\n' > /etc/builder-marker\nUSER probe\n",
     )
     .unwrap();
     let mut global: serde_json::Value =
@@ -55,15 +60,21 @@ fn run(id: &'static str, apple: bool) {
         std::fs::write(
             repo.join("Dockerfile.dev"),
             format!(
-                "FROM awman-test/guest:fixture\nRUN printf '{version}\\n' > /etc/builder-marker\n"
+                "FROM awman-test/guest:fixture\nUSER root\nRUN printf '{version}\\n' > /etc/builder-marker\nUSER probe\n"
             ),
         )
         .unwrap();
         let ready = support::awman(&s)
             .current_dir(&repo)
-            .env("AWMAN_TEST_BUILTIN", "1")
-            .args(["--build", "ready", "--json"])
-            .run();
+            .env("AWMAN_TEST_BUILTIN", "1");
+        // The first absent image exercises the enabled builder's automatic
+        // preparation path. The second revision explicitly forces a rebuild.
+        let ready = if version == "v1" {
+            ready.args(["ready", "--json"])
+        } else {
+            ready.args(["--build", "ready", "--json"])
+        }
+        .run();
         ready.assert_success();
         let result: serde_json::Value = serde_json::from_slice(&ready.stdout).unwrap();
         assert_eq!(result["ready"], true, "{result}");
@@ -71,6 +82,19 @@ fn run(id: &'static str, apple: bool) {
         out.assert_success();
         assert!(out.stdout_text().contains("BUILDER_UID=1234"), "{out:?}");
         assert!(out.stdout_text().lines().any(|l| l == version), "{out:?}");
+    }
+    // Remove this project’s source images before cached execution. Any new
+    // source acquisition now fails; the imported guest must remain usable.
+    let stem = repo.file_name().unwrap().to_string_lossy();
+    for tag in [
+        format!("awman-{stem}-claude:latest"),
+        format!("awman-{stem}:latest"),
+    ] {
+        s.command(&cli)
+            .args(["image", "rm"])
+            .arg(tag)
+            .run()
+            .assert_success();
     }
     // Switch PATH to private traps, preserving source endpoint identity. Cached
     // launch must succeed without invoking any builder or rebuilding a fixture.
@@ -85,18 +109,6 @@ fn run(id: &'static str, apple: bool) {
         docker.calls().is_empty() && container.calls().is_empty(),
         "cached execution reached builder"
     );
-    // Remove only images owned by this unique project, never stop a shared service.
-    let stem = repo.file_name().unwrap().to_string_lossy();
-    for tag in [
-        format!("awman-{stem}-claude:latest"),
-        format!("awman-{stem}:latest"),
-    ] {
-        s.command(&cli)
-            .args(["image", "rm"])
-            .arg(tag)
-            .run()
-            .assert_success();
-    }
 }
 #[test]
 fn docker_build_import_rebuild_then_cached_execution() {

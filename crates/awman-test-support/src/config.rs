@@ -237,8 +237,8 @@ guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "
 allowed_capabilities = ["docker", "local-registry", "git-transports", "apple-containers", "docker-sbx", "guest-fixtures"]
 [tiers.guest]
 budget_seconds = 300
-guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "hypervisor", "builtin-payload", "guest-fixtures", "previous-release"]
-allowed_capabilities = ["docker", "apple-containers"]
+guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "hypervisor", "builtin-payload", "guest-fixtures"]
+allowed_capabilities = ["docker", "apple-containers", "previous-release"]
 [tiers.artifact]
 budget_seconds = 300
 guarantees = ["tempdir", "loopback", "subprocess", "release-artifact"]

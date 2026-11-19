@@ -30,3 +30,7 @@ Filing notes:
   ZIP holds a `git diff` against upstream's default branch, plus a `PR.md` with the
   title, exact base revision, description and validation status. These are not submission-ready until the outstanding upstream tests and maintainer decisions in each bundle are resolved. Fill in `#<issue-NN-number>` once the issues
   are filed. `../upstream-libkrun-docs.md` is the earlier 0.1.41-era draft of PR 05.
+
+Proposal 03 must ship with proposal 04 or equivalent exact-name binding behavior
+before it can retire awman’s complete strict-SNI boundary. Filing order is not
+a statement that either proposal independently replaces the whole network patch.

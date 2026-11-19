@@ -206,7 +206,6 @@ pub fn validate(m: &Manifest, today: NaiveDate) -> Result<()> {
                 "hypervisor",
                 "builtin-payload",
                 "guest-fixtures",
-                "previous-release",
             ][..],
         ),
         (
@@ -224,6 +223,20 @@ pub fn validate(m: &Manifest, today: NaiveDate) -> Result<()> {
                 "capability {cap} removed from tier {tier}"
             );
         }
+    }
+    for id in [
+        "guest-upgrade",
+        "guest-linux-published-upgrade",
+        "artifact-signed-boot",
+        "artifact-linux-published-upgrade",
+    ] {
+        ensure!(
+            m.suites[id]
+                .requires
+                .iter()
+                .any(|cap| cap == "previous-release"),
+            "published upgrade suite {id} must require previous-release"
+        );
     }
     for (id, p) in &m.platforms {
         ensure!(

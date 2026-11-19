@@ -61,8 +61,9 @@ fn published_upgrade(id: &'static str) {
 }
 
 /// Linux has no published builtin predecessor yet. Prove the install/update
-/// boundary with independently copied executables and cached state, without
-/// claiming that this exercises a historical protocol migration.
+/// boundary while an actual guest is running from the replaced inode, then
+/// boot from cached state with the new executable. This is not a historical
+/// protocol migration.
 #[test]
 #[cfg(target_os = "linux")]
 fn cached_state_survives_atomic_executable_replacement() {
@@ -75,18 +76,60 @@ fn cached_state_survives_atomic_executable_replacement() {
         &s,
         &local,
         "claude",
-        "#!/bin/sh\nIFS= read -r prompt\necho REPLACEMENT_GUEST_UID=$(id -u)\necho $prompt\n",
+        "#!/bin/sh\nset -eu\nIFS= read -r prompt\necho REPLACEMENT_GUEST_UID=$(id -u)\nif [ \"$prompt\" = before-replace ]; then echo ready > /replacement/ready; while [ ! -f /replacement/release ]; do sleep 0.05; done; fi\necho $prompt\n",
     );
+    let barriers = repo.join(".replacement");
+    std::fs::create_dir(&barriers).unwrap();
+    let config_path = repo.join(".awman/config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["overlays"]
+        .as_array_mut()
+        .unwrap()
+        .push(format!("dir({}:/replacement:rw)", barriers.display()).into());
+    std::fs::write(config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     let installed = s.root().join("installed-awman");
     std::fs::copy(support::awman_exe(), &installed).unwrap();
     s.register_exe("installed-awman", &installed);
     support::session::ready(&s, &installed, &repo);
-    let before = support::session::exec(&s, &installed, &repo, "claude", "before-replace");
-    before.assert_success();
-    assert!(before.stdout_text().contains("REPLACEMENT_GUEST_UID=1234"));
+    let mut running = s
+        .command(&installed)
+        .current_dir(&repo)
+        .env("AWMAN_TEST_BUILTIN", "1")
+        .args([
+            "exec",
+            "prompt",
+            "-n",
+            "--agent",
+            "claude",
+            "before-replace",
+        ])
+        .ready(awman_test_support::Ready::FileExists(
+            barriers.join("ready"),
+        ))
+        .spawn();
     let replacement = s.root().join("replacement-awman");
     std::fs::copy(support::awman_exe(), &replacement).unwrap();
     std::fs::rename(replacement, &installed).unwrap();
+    let running_executable = std::fs::read_link(format!("/proc/{}/exe", running.pid())).unwrap();
+    assert!(
+        running_executable.to_string_lossy().ends_with(" (deleted)"),
+        "the running CLI still has its original inode on disk: {}",
+        running_executable.display()
+    );
+    std::fs::write(barriers.join("release"), b"continue").unwrap();
+    assert_eq!(
+        running.wait(std::time::Duration::from_secs(60)),
+        awman_test_support::Exit::Code(0),
+        "{}",
+        running.stderr_so_far()
+    );
+    let completed = running.stdout_so_far();
+    assert!(
+        completed.contains("REPLACEMENT_GUEST_UID=1234"),
+        "{completed}"
+    );
+    assert!(completed.contains("before-replace"), "{completed}");
     std::fs::remove_file(local).unwrap();
     let after = support::session::exec(&s, &installed, &repo, "claude", "after-replace");
     after.assert_success();

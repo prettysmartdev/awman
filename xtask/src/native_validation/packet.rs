@@ -134,6 +134,10 @@ pub(super) fn verify(root: &Path, out: &Path, m: &Manifest) -> Result<()> {
         "fixture digest mismatch"
     );
     ensure!(
+        sha256_file(&out.join("fixtures/guest-docker-base.tar"))? == p.docker_fixture_sha256,
+        "Docker fixture digest mismatch"
+    );
+    ensure!(
         !p.steps.is_empty() && p.steps.iter().all(|s| s.exit == 0),
         "a command failed"
     );
@@ -209,15 +213,20 @@ pub(super) fn verify(root: &Path, out: &Path, m: &Manifest) -> Result<()> {
     }
     let mut original: toml::Value =
         toml::from_str(&fs::read_to_string(root.join("ci/gates.toml"))?)?;
-    let fixture = original["fixtures"]["guest-oci-base"]
-        .as_table_mut()
-        .context("fixture table")?;
-    fixture.remove("pending");
-    fixture.insert("sha256".into(), p.fixture_sha256.clone().into());
+    for (id, hash) in [
+        ("guest-oci-base", &p.fixture_sha256),
+        ("guest-docker-base", &p.docker_fixture_sha256),
+    ] {
+        let fixture = original["fixtures"][id]
+            .as_table_mut()
+            .context("fixture table")?;
+        fixture.remove("pending");
+        fixture.insert("sha256".into(), hash.clone().into());
+    }
     let config: toml::Value = toml::from_str(&fs::read_to_string(out.join("run-config.toml"))?)?;
     ensure!(
         config == original,
-        "run configuration changed more than the prepared fixture pin"
+        "run configuration changed more than the prepared fixture pins"
     );
     check_results(out, &p, m)
 }
@@ -236,14 +245,15 @@ mod tests {
             let platform = Platform::for_target(target).unwrap();
             assert!(m.builds.contains_key(platform.build));
             let ids = suites(&m, platform);
-            for required in [
-                "guest-boot",
-                "guest-upgrade",
-                "guest-builder",
-                "guest-import",
-                "artifact-signed-boot",
-            ] {
+            for required in ["guest-boot", "guest-builder", "guest-import"] {
                 assert!(ids.iter().any(|id| id == required), "{target}: {required}");
+            }
+            for (mac, linux) in [
+                ("guest-upgrade", "guest-linux-replacement"),
+                ("artifact-signed-boot", "artifact-linux-boot"),
+            ] {
+                assert_eq!(ids.iter().any(|id| id == mac), platform.apple());
+                assert_eq!(ids.iter().any(|id| id == linux), !platform.apple());
             }
             assert_eq!(
                 ids.iter().any(|id| id == "boundary-apple"),

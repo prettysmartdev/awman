@@ -35,7 +35,7 @@ Generated from `ci/gates.toml` (schema 1).
 | artifact | 300 | tempdir, loopback, subprocess, release-artifact |
 | boundary | 120 | tempdir, loopback, subprocess, awman-binary, fake-cli, local-git |
 | component | 20 | tempdir, loopback, subprocess, awman-binary, fake-cli, local-git |
-| guest | 300 | tempdir, loopback, subprocess, awman-binary, hypervisor, builtin-payload, guest-fixtures, previous-release |
+| guest | 300 | tempdir, loopback, subprocess, awman-binary, hypervisor, builtin-payload, guest-fixtures |
 | soak | suite-specific | tempdir, loopback, subprocess, awman-binary |
 | unit | 1 | tempdir |
 

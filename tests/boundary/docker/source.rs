@@ -153,8 +153,18 @@ fn tls_and_mutual_tls_engine_sources_verify_certificates_and_client_identity() {
                 "mTLS accepted no client certificate"
             );
         }
+        if let ImageSourceSpec::DockerStore { tls, .. } = &mut request.source {
+            *tls = Some(endpoint.tls.clone());
+        }
         drop(imported);
         drop(endpoint);
+        // Keep source identity unchanged while its transport is genuinely down.
+        // Normal IfMissing acquisition must use the verified local cache.
+        request.policy = AcquirePolicy::IfMissing;
+        let cached = acquirer
+            .acquire(&request, &mut |_| {})
+            .expect("cached Engine image remains usable after source shutdown");
+        assert_eq!(cached.identity.config_digest.as_str(), expected);
     }
     sandbox.finish();
 }

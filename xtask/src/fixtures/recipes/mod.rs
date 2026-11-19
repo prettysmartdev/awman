@@ -91,14 +91,21 @@ fn published(opts: &BTreeMap<String, String>) -> Result<()> {
     );
     Ok(())
 }
-fn guest(opts: &BTreeMap<String, String>) -> Result<()> {
+fn guest(recipe: &str, opts: &BTreeMap<String, String>) -> Result<()> {
     let base = PathBuf::from(value(opts, "--base")?);
     verify(&base, value(opts, "--sha256")?)?;
     let out = PathBuf::from(value(opts, "--out")?);
     guest_image::build(&base, &out)?;
-    let archive = out.join("fixture-oci.tar");
+    let archive = out.join(if recipe == "guest-docker-base" {
+        "fixture-docker.tar"
+    } else {
+        "fixture-oci.tar"
+    });
     let hash = crate::evidence::digest::sha256_file(&archive)?;
-    println!("fixture guest-oci-base: {} sha256={hash}; publish these immutable bytes then commit the pin",archive.display());
+    println!(
+        "fixture {recipe}: {} sha256={hash}; publish these immutable bytes then commit the pin",
+        archive.display()
+    );
     Ok(())
 }
 fn history(opts: &BTreeMap<String, String>) -> Result<()> {
@@ -167,7 +174,7 @@ pub fn run(recipe: &str, args: &[String]) -> Result<ExitCode> {
     let opts = options(args)?;
     match recipe {
         "previous-published" => published(&opts)?,
-        "guest-oci-base" => guest(&opts)?,
+        "guest-oci-base" | "guest-docker-base" => guest(recipe, &opts)?,
         "previous-from-history" => history(&opts)?,
         _ => bail!("unknown fixture recipe {recipe}"),
     }

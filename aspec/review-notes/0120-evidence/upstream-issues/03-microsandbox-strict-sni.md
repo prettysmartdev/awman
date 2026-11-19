@@ -107,3 +107,8 @@ DNS cache. That changes existing behaviour, so it's raised separately in
   design?
 - Should it be a separate flag, as proposed, or a mode, for example
   `strict = "inspect" | "sni"`?
+
+Exact-name DNS binding for suffix rules depends on proposal 04 (or equivalent).
+Current upstream allows sibling-name bindings; accepting strict-SNI alone does
+not establish the downstream exact-name guarantee. Review and test that policy
+change before deleting the corresponding downstream network patch.
