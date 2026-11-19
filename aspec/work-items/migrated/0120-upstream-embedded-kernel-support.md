@@ -56,6 +56,12 @@ and macOS guest acceptance and the full upstream suite remain outstanding.
 Linux native evidence belongs to WI 0124, and does not validate new upstream
 0.7.16 sources. Linux ARM64 remains gated; the current release scope is x86_64.
 
+WI 0124's [native acceptance record](../../review-notes/0124-evidence/notes.md)
+now validates the carried 0.7.8 runtime on Linux x86_64, including private-memory
+boot, private locks under umask `0002`, source/builder journeys and the exact
+optimized artifact. This earns no acceptance for the newer upstream source;
+published equivalents of proposals 06 and 07 still require replacement testing.
+
 Distribution policy (2026-09-29, from
 [WI 0123](completed/0123-builtin-native-verification-and-release-closure.md);
 supersedes the 2026-09-28 "no signing" policy): the Apple Silicon artifact is

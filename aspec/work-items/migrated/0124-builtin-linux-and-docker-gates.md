@@ -2,7 +2,7 @@
 
 Title: Enable and validate the builtin runtime on Linux x86_64 KVM
 Issue: https://github.com/prettysmartdev/awman/issues/47
-Status: In progress; [PR #75](https://github.com/prettysmartdev/awman/pull/75) targets `nextgen`.
+Status: Implemented; native acceptance recorded below. [PR #75](https://github.com/prettysmartdev/awman/pull/75) targets `nextgen` and tracks latest-head CI and review readiness.
 
 ## Summary
 
@@ -100,16 +100,24 @@ acceptance; ARM64 host-only compilation earns none.
 - [x] Exact pinned libkrun memory tests: independent sibling mappings, immutable
   backing, sparse/private fresh memory; five tests, no skipped cases.
 - [x] Registered registry boundary suite: ten real-registry tests covering the
-  transport/auth/proxy/retry/failure matrix above. Full native rerun remains required.
+  transport/auth/proxy/retry/failure matrix above, included in the native packet.
 - [x] Manifest/tooling checks and release ABI parser/policy tests.
-- [ ] Full native guest suites: boot, exec, import, network, upgrade/replacement,
+- [x] Full native guest suites: boot, exec, import, network, upgrade/replacement,
   builder and strategy.
-- [ ] Native Docker source, runtime conformance and shipped-template suites.
-- [ ] Exact optimized/LTO/stripped artifact: offline boot, dependency/ABI scan,
+- [x] Native Docker source, runtime conformance and shipped-template suites.
+- [x] Exact optimized/LTO/stripped artifact: offline boot, dependency/ABI scan,
   protocol policy, entrypoints, smoke, measurements and executable replacement.
-- [ ] Real `make install` on the Linux host and installed runtime diagnostic.
-- [ ] Independently verify and retain native packet; update evidence register.
-- [ ] Final `nextgen` PR CI green and ready for review/merge.
+- [x] Real `make install` on the Linux host and installed runtime diagnostic.
+- [x] Independently verify and retain native packet; update evidence register.
+
+[Native acceptance](../../review-notes/0124-evidence/notes.md) records exact commit
+`50cb794ed6a613fefbe114caf8648e0a00db346e`, all 19 suites and 86 passing JUnit
+cases, five additional mapping tests, installation and independent verification.
+The packet archive SHA-256 is
+`2f49431756528d8226e4769de5d3a6a1d89919a38d4b7f52842e9e6b49abcbfe`.
+The Debian candidate requires glibc 2.39; Ubuntu 22.04 release builds enforce
+their separate 2.35 ceiling. Latest-head hosted CI and review readiness are
+tracked by the PR's required checks, rather than predeclared by this record.
 
 Source revisions and full packets must accompany final acceptance; intermediate
 passes do not certify a later implementation. No ARM64, Windows or Docker

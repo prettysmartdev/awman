@@ -432,7 +432,7 @@ In every mode: inbound connections are refused (awman never publishes a guest po
 
 **CAs.** By default the guest trusts only the image's own CA bundle. Set `trustHostCas: true` (global only) to also install the host's trusted root CAs in the guest at boot — useful behind a corporate TLS-inspecting proxy. awman never installs an interception CA of its own.
 
-> These rules are tested in real guests on Apple Silicon: allowlist and denied-egress enforcement (DNS, direct IP, DNS-over-HTTPS, proxy bypass), `hostPorts` access, `none` mode, and isolation between VMs running at the same time with different policies. IPv6 denial is verified only on hosts that have IPv6 connectivity.
+> Real-guest checks on Apple Silicon cover allowlist and denied-egress enforcement (DNS, direct IP, DNS-over-HTTPS, proxy bypass), `hostPorts` access, `none` mode, and concurrent VMs with different policies. Linux x86_64 KVM checks also prove authorized and denied host-port access in concurrent VMs and that `none` leaves no active egress interface or route. IPv6 denial is verified only on hosts that have IPv6 connectivity.
 
 ### Session lifecycle
 
