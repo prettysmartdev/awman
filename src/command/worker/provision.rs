@@ -63,6 +63,14 @@ pub(super) async fn agents_for_lease(
                 .unwrap_or_else(|| session.configured_agent().to_string()),
         );
     }
+    // Resolve every requested agent before creating a lease image builder or
+    // building the project image. A stale former-built-in name must fail here
+    // even when a matching Dockerfile or agent image remains on disk.
+    for name in &names {
+        let agent = AgentName::new(name.as_str()).map_err(|e| invalid(e.to_string()))?;
+        crate::engine::agent::AgentRegistry::resolve_for_session(session, &agent)
+            .map_err(|e| invalid(e.to_string()))?;
+    }
     let builder = if super::images::supported(engines.runtime.as_ref()) {
         Some(
             super::images::LeaseImageBuilder::new(

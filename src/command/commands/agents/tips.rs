@@ -19,11 +19,11 @@ pub const TIPS: &[&str] = &[
     "`awman ready --json` prints a machine-readable readiness report for scripts and CI.",
     "Run `awman` from any subdirectory of a Git repo — it locates the root automatically.",
     "Run `awman` with no arguments to open the TUI; add a subcommand to run it once and exit.",
-    "Built-in agents: Claude, Codex, Opencode, Gemini, Copilot, Cline and Antigravity.",
+    "Built-in agents: Claude, Codex, OpenCode (1.x), OpenCode 2 (opencode-v2), Cursor, Copilot, Cline and Antigravity.",
     // ── Agent sessions ───────────────────────────────────────────────────────
     "`awman chat` opens an interactive chat session with your configured agent.",
     "`awman chat --plan` starts the agent in read-only plan mode.",
-    "`awman chat --agent gemini --model <model>` overrides the agent and model for one session.",
+    "`awman chat --agent codex --model <model>` overrides the agent and model for one session.",
     "`awman exec prompt \"<text>\"` sends a one-shot prompt to the agent.",
     "`awman exec prompt --work-item github:42` uses a GitHub issue as the prompt.",
     "`--yolo` enables fully autonomous mode; `--auto` enables auto permission mode.",

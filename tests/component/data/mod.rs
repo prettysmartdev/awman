@@ -2,6 +2,7 @@
 //!
 //! Owner: workflow step `slice-layer0-data`.
 
+mod agent_catalogue;
 mod config;
 mod config_properties;
 mod persistence;

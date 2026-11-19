@@ -230,6 +230,7 @@ impl World {
                     json: false,
                     allow_docker: false,
                     yolo: false,
+                    yolo_authorized: false,
                     auto: false,
                     agent: None,
                     model: None,
@@ -453,6 +454,7 @@ async fn creation_and_edit_sessions_connect_agent_status_before_waiting() {
             let subcommand = match kind {
                 "new spec" => NewSubcommand::Spec(NewSpecFlags {
                     yolo: true,
+                    yolo_authorized: true,
                     input: awman::command::commands::new::NewInput {
                         title: Some("Status spec".into()),
                         summary: Some("Status summary".into()),
@@ -1148,6 +1150,7 @@ impl Remote {
                     json: false,
                     allow_docker: false,
                     yolo: false,
+                    yolo_authorized: false,
                     auto: false,
                     agent: None,
                     model: None,

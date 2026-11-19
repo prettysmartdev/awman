@@ -52,6 +52,7 @@ pub(super) async fn run(
         NewSession {
             headless: f.non_interactive,
             yolo: f.yolo,
+            yolo_authorized: f.yolo_authorized,
             summary,
         },
         frontend,

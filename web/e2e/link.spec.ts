@@ -286,9 +286,14 @@ test.describe('reload-safe reauthorization (WI 0160)', () => {
     await daemon.stop();
     await expect(page.getByText(COPY.stopped)).toBeVisible({ timeout: 20_000 });
     await daemon.start();
+    // Let this document observe the new generation before reloading. Its
+    // automatic probe removes the old key, so a later document has no saved
+    // authorization from which to infer a restart notice.
+    await expect(page.getByText(COPY.restarted)).toBeVisible({ timeout: 20_000 });
+    await expect.poll(() => savedCredentials(page)).toEqual([]);
+    expect(await resumeHint(page)).toBeNull();
     await page.reload();
     await allowLocal(page);
-    await expect(page.getByText(COPY.restarted)).toBeVisible({ timeout: 20_000 });
     await expect(page.getByRole('button', { name: 'Connect browser', exact: true })).toBeVisible();
     await expect.poll(() => savedCredentials(page)).toEqual([]);
     expect(await resumeHint(page)).toBeNull();

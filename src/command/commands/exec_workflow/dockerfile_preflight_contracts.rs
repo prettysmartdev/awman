@@ -38,6 +38,7 @@ fn flags() -> ExecWorkflowCommandFlags {
         allow_docker: false,
         worktree: false,
         yolo: false,
+        yolo_authorized: false,
         auto: false,
         agent: Some("claude".into()),
         model: None,

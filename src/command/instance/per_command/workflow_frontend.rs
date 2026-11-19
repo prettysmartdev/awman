@@ -725,4 +725,44 @@ mod control_board_contracts {
         assert_eq!(board.failure_lines, ["Exit code: 1", "Ran for 12s"]);
         assert!(!board.can_dismiss);
     }
+
+    #[test]
+    fn stream_failure_recovery_survives_the_daemon_dialog_wire() {
+        let available = AvailableActions {
+            can_restart_current_step: true,
+            can_pause: true,
+            can_abort: true,
+            step_failure: Some(StepFailureContext {
+                step_name: "build".into(),
+                exit_code: -1,
+                detail_lines: vec![
+                    "Exit status unavailable".into(),
+                    "Reason: guest exec channel closed".into(),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let request = DialogRequest::WorkflowControlBoard(control_board_state_with(
+            "build",
+            &available,
+            &PlainPresentation,
+        ));
+        let decoded: DialogRequest =
+            serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        assert_eq!(decoded, request);
+        let DialogRequest::WorkflowControlBoard(board) = decoded else {
+            unreachable!()
+        };
+        assert!(board.can_restart);
+        assert!(!board.can_dismiss);
+        assert!(!board.can_finish);
+        assert_eq!(board.failure_lines[0], "Exit status unavailable");
+        let response = DialogResponse::Char('^');
+        let decoded = serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        assert_eq!(
+            wcb_response_to_action(decoded, &available),
+            NextAction::RestartCurrentStep
+        );
+    }
 }

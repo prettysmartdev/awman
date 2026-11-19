@@ -2,6 +2,14 @@
 
 awman supports four agent runtimes. The runtime controls how agent processes are isolated from your host machine. All four use the same `awman` commands, the same workflow files, and the same agent names — the runtime is a configuration choice, not a different tool.
 
+Preparation output follows the same rules on every runtime: reusing a ready
+image is quiet, and progress describes work that is needed. Docker and Apple
+Containers show build progress only when building. Builtin shows a short
+`Preparing <image> (<source>)` status, which may reuse cached content. Docker
+Sandboxes shows `Preparing <agent> kit (sbx)` while creating and validating its
+kit. Warnings and failures remain visible, and `ready` finishes with a readiness
+summary. Build output is printed without a `running` suffix on every line.
+
 ---
 
 ## Choosing a runtime
@@ -220,6 +228,12 @@ awman ready
 
 The image is imported into awman's private store. Docker is used only as a *source* at this step (awman talks to the Engine API directly and never runs the `docker` CLI). Agents never run in Docker under this runtime, and after import Docker does not need to be running.
 
+Readiness checks stay quiet when an installed image can be reused. If preparation
+is needed, you see a short status such as
+`Preparing awman-myproject-claude:latest (apple-local)`. Preparation may reuse
+cached content; it does not necessarily download or import the image again.
+Warnings and failures still include the details needed to act on them.
+
 There is no default source. In an interactive CLI or TUI session, `awman ready` offers to configure one when the requested builtin image has no usable source. In headless or other non-interactive flows, it does not guess a registry or daemon: readiness fails with a message naming the missing config fields (see [Interactive image-source setup](#interactive-image-source-setup)).
 
 **`awman init` and `builtin`.** `awman init` builds images through the configured runtime, so with `runtime.kind` set to `builtin` its build step fails (`image building; build externally and import with ready is not supported on the builtin runtime`) and the agent audit is skipped. Run `awman init` before selecting `builtin` (or with `docker` or `apple` temporarily selected), then switch the runtime and run `awman ready` after building externally.
@@ -310,7 +324,7 @@ With `{ "type": "apple-local" }`, `awman ready` asks the Apple Containers servic
 - With an enabled local builtin builder, chat and prompt launches check source input hashes, the installed image's recorded source and any pending build receipt. A current image from the same source is reused without exporting, acquiring or importing it again, and without import progress messages. Missing or stale source images are built and imported as needed. Other sources keep their check-only behavior for installed images; run `awman ready` if their recorded source differs or provenance is missing.
 - With a configured source, `ready` checks the acquisition cache using the source kind, resolved endpoint or archive path, reference, and platform. Changing any of these selects that source's cache entry or acquires it. A replaced archive is revalidated; a cached archive remains usable after its source is removed. With no source configured, an installed image is reused.
 - With the builder disabled (the default), `awman ready --build` and `--no-cache` **re-acquire** the image from its source; they do not build. `--refresh` (the Dockerfile audit) is unchanged. With the builder enabled, `--build` schedules the usual builds, and `--no-cache` applies to any build that runs and still re-acquires the image from its source.
-- `awman ready --build` also imports the image of **every other agent** that has a `.awman/Dockerfile.<agent>` (one **Import agent image: \<agent\>** row each), so `chat --agent`, workflow steps, and other agents can run without a separate import. Plain `awman ready` imports only the default agent and lists any other agents whose images are missing.
+- `awman ready --build` also prepares the image of **every other agent** that has a `.awman/Dockerfile.<agent>`, with one preparation status per image, so `chat --agent`, workflow steps, and other agents can run without a separate import. Plain `awman ready` prepares only the default agent and lists any other agents whose images are missing.
 - Other agents use their own `runtime.builtin.images` entry when there is one, otherwise `runtime.builtin.imageSource`. A `runtime.builtin.imageSource` that names a single image — an `archive`, or any source with an explicit `reference` — holds only one agent's image, so for other agents `ready` skips it with a warning instead of importing the wrong image. Give each of those agents its own `runtime.builtin.images` entry (for example one archive per agent). Workflow preflight and squad apply the same rule: a step running another agent fails with that warning's text rather than importing the default agent's image under its tag.
 - When the summary reports agent images that are still missing, its closing hint says what to do for each one: `run "ready --build" to import <agents>.` (or `build <agents>` / `build and import <agents>`, depending on what each image's source allows), and ``configure an image source for <agents> (`runtime.builtin.imageSource` or a `runtime.builtin.images` entry), then run "ready --build".`` for an agent with no usable source. A digest-pinned local reference or colliding build output instead asks you to configure a writable, distinct reference in `runtime.builtin.images` before running `ready --build`. A failed image gets its own hint, for example `fix the <agent> image build, then run "awman ready --build" again.` or `the <agent> image was built but not imported; run "awman ready" again to retry the import.`
 - If the `--refresh` audit changes `Dockerfile.dev` and this session cannot rebuild the default image, `ready` warns: ``Dockerfile changed: rebuild the image in its source store (or enable `runtime.builtin.builder.enabled` with a `docker-local` or `apple-local` source), then run `awman ready --build` to re-import it``, or, with no source configured, to rebuild it externally and configure `runtime.builtin.imageSource`.
@@ -582,9 +596,11 @@ awman ready
 
 No credentials are registered at ready time — all secret registration happens at agent launch, scoped to the launched sandbox. See [Credentials](#credentials) below.
 
-No images are built and nothing is pushed to a registry. `awman ready` for sbx is fast: kit emission and credential registration are text-file writes and short subprocess calls.
+No images are built and nothing is pushed to a registry. `awman ready` for sbx writes kit files and runs short validation commands.
 
-Every `sbx` command awman runs is announced in the status log before it executes. You can see exactly what awman is doing on your behalf.
+Successful readiness probes (`sbx version`, `sbx ls`, and `sbx kit validate`)
+stay quiet. Warnings and failures retain their diagnostics; commands that change
+sandboxes, such as removal with `--no-cache`, are still announced.
 
 ### Kits — what they are and where they live
 
@@ -605,7 +621,9 @@ Kits are generated by awman and stored globally, not per-repo:
 
 You do not edit these files by hand. Re-run `awman ready` to regenerate them (e.g., after upgrading awman or changing agent config). Use `awman ready --no-cache` to force a clean rebuild: awman removes any existing sandboxes for the affected agents and re-emits fresh kits. The next `awman chat` invocation pays the install cost again.
 
-**Kit kinds:** Docker ships built-in sandbox templates for five agents (`claude`, `codex`, `gemini`, `copilot`, `opencode`). awman extends these as `kind: mixin` kits, which reuse Docker's published base and add awman-specific install and startup steps on top. For agents without a Docker built-in (`antigravity`, `cline`), awman emits `kind: agent` kits that build on a generic shell base image.
+**Kit kinds:** Docker ships built-in sandbox templates for some agents (`claude`, `codex`, `copilot`). awman extends these as `kind: mixin` kits, which reuse Docker's published base and add awman-specific install and startup steps on top. For agents without a Docker built-in (`opencode`, `opencode-v2`, `cursor`, `antigravity`, `cline`), awman bundles `kind: agent` kits that build on a generic shell base image. Cursor and OpenCode 2 are currently refused at readiness and launch because sandbox state and credentials are shared between executions.
+
+**Upgrading `opencode`:** earlier awman versions emitted `opencode` as a `mixin` kit. If `awman ready` finds that kit changed kind and sandboxes named `awman-*-opencode` exist, it warns and names them; run `awman ready --agent opencode --no-cache` to remove them and re-create them from the new kit. Launch under sbx checks OpenCode 1.x inside the sandbox and refuses a mismatched major or a failed version probe.
 
 ### Persistent sandbox lifecycle
 
@@ -664,7 +682,6 @@ Each agent accepts a specific allowlist of auth variables (matching the [Docker 
 |---|---|---|
 | `claude` | `ANTHROPIC_API_KEY` | `anthropic` |
 | `codex` | `OPENAI_API_KEY` | `openai` |
-| `gemini` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | `google` |
 | `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` | `github` |
 | `opencode` | `ANTHROPIC_API_KEY` | `anthropic` |
 
@@ -672,7 +689,8 @@ Rules:
 
 - An `env(VAR)` overlay for a credential-class variable **not** on the agent's allowlist is dropped with a warning (it is never written anywhere workspace-readable).
 - Launching with no supported auth overlay does not warn blindly. awman first probes for a pre-existing sbx secret that already covers the agent's provider — it runs `sbx secret ls --service <service>` (the well-known service name, e.g. `anthropic` for `claude`) and `sbx secret ls -g` (the global store). If a matching secret is found (from a previous launch, a manual `sbx secret set`, or a global key), awman prints an informational note that the existing credential will authenticate the agent and launches normally. Only when no pre-existing secret is found does it warn that auth must be configured manually (`sbx secret set <sandbox> <service>` — sandbox-scoped secrets apply immediately, even to a running sandbox) or via the agent's own login flow inside the sandbox — and the launch still proceeds either way.
-- Custom-kit agents (`antigravity`, `cline`) do not participate in launch-time auto-auth yet; register their credentials manually with `sbx secret set`.
+- `cursor` and `opencode-v2` are refused on this runtime until per-execution state and credential isolation is available. Use `docker`, `apple` or `builtin`.
+- Other custom-kit agents (`antigravity`, `cline`) do not participate in launch-time auto-auth yet; register their credentials manually with `sbx secret set`.
 - Non-credential `env(VAR)` overlays (e.g. `LOG_LEVEL`) are unaffected — they reach the agent through `session.json` as before.
 
 Credentials are piped to `sbx secret set` via stdin — they never appear in process listings, and they are masked in all awman output.
@@ -687,8 +705,8 @@ How awman delivers a seeded prompt (e.g., from `awman exec prompt --agent claude
 
 | Kit kind | Prompt delivery |
 |---|---|
-| `kind: mixin` (`claude`, `codex`, `gemini`, `copilot`, `opencode`) | Written into the agent's stdin at launch (typed ahead for interactive sessions, piped for `--headless`) |
-| `kind: agent` (`antigravity`, `cline`) | Appended as a positional argument at launch |
+| `kind: mixin` (`claude`, `codex`, `copilot`) | Written into the agent's stdin at launch (typed ahead for interactive sessions, piped for `--headless`) |
+| `kind: agent` (`opencode`, `antigravity`, `cline`) | Appended as a positional argument at launch |
 
 Mixin kits launch their agent through Docker's built-in sandbox template, so awman cannot put the prompt on the command line — stdin injection is the single delivery path. The prompt is also recorded in `session.json` and staged by the startup script at `~/.awman/seeded-prompt.txt` inside the VM for reference, but that copy is informational, not a second delivery.
 
@@ -705,15 +723,16 @@ No prompt is delivered twice: mixin kits use stdin; `kind: agent` kits use posit
 
 ### Supported agents
 
-All seven built-in agents are supported under `sbx`:
+Six built-in agents are supported under `sbx`; two require a container runtime:
 
 | Agent | Kit kind | Notes |
 |---|---|---|
 | `claude` | mixin | Extends `docker/sandbox-templates:claude-code-docker` |
 | `codex` | mixin | Extends `docker/sandbox-templates:codex-docker` |
-| `gemini` | mixin | Extends `docker/sandbox-templates:gemini-docker` |
 | `copilot` | mixin | Extends `docker/sandbox-templates:copilot-docker` |
-| `opencode` | mixin | Extends `docker/sandbox-templates:opencode-docker` |
+| `opencode` | agent | OpenCode 1.x installed on the `shell-docker` base |
+| `opencode-v2` | unavailable | Requires per-execution state and credential isolation |
+| `cursor` | unavailable | Requires per-execution state and credential isolation |
 | `antigravity` | agent | Full install on `shell-docker` base |
 | `cline` | agent | Full install on `shell-docker` base |
 
@@ -735,14 +754,14 @@ All seven built-in agents are supported under `sbx`:
 
 **Mixin launch flags:** mixin kits launch the agent through Docker's built-in template, whose launch command takes no CLI flags from awman. Anything with a native config-file equivalent is delivered through `session.json` (see [Session config](#session-config-and-seeded-prompts)); the rest is warned about at launch instead of silently dropped:
 
-| Option | claude | codex / gemini / opencode | copilot |
+| Option | claude | codex | copilot |
 |---|---|---|---|
 | `--model` | applied (settings file) | applied (settings/config file) | **not deliverable** — warned; use the `/model` slash command in-session |
 | `--plan` / `--auto` / `--yolo` | applied (`permissions.defaultMode`) | **not deliverable** — warned | **not deliverable** — warned |
 | `--headless` | **not deliverable** — warned; the prompt is still piped to the agent's interactive entrypoint | same | same |
 | `agents.flags` / `--agent-flag` | **not deliverable** — warned | **not deliverable** — warned | **not deliverable** — warned |
 
-`kind: agent` kits (`antigravity`, `cline`) are unaffected: awman owns their entrypoint and passes mode flags, `--model`, `agents.flags`, and any non-interactive flag as launch arguments, exactly like the container runtimes.
+`kind: agent` kits (`opencode`, `antigravity`, `cline`) are unaffected: awman owns their entrypoint and passes mode flags, `--model`, `agents.flags`, and any non-interactive flag as launch arguments, exactly like the container runtimes.
 
 **Port mappings:** if a workflow binds a port inside the sandbox, that port mapping is lost when the sandbox stops. Port-based workflows must keep the sandbox running continuously.
 

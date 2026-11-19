@@ -138,7 +138,7 @@ All steps support the same fields:
 | `name` | string | yes | Unique step identifier within the workflow |
 | `prompt` | string | yes | Prompt template sent to the agent |
 | `depends_on` | array of strings | no | Names of steps that must complete before this one runs |
-| `agent` | string | no | Run this step with a specific agent instead of the default. Valid values: `claude`, `codex`, `opencode`, `gemini`, `antigravity`, `copilot`, `cline`, or a [custom agent](15-custom-agents.md) name |
+| `agent` | string | no | Run this step with a specific agent instead of the default. Valid values: `claude`, `codex`, `opencode`, `opencode-v2`, `cursor`, `antigravity`, `copilot`, `cline`, or a [custom agent](15-custom-agents.md) name |
 | `model` | string | no | Run this step with a specific model. Overrides any `--model` flag |
 | `overlays` | array of strings | no | Overlays applied to this step only — see [Workflow step overlays](08-overlays.md#workflow-step-overlays) |
 | `abort_on_failure` | bool | no | When `true`, a failure here stops the whole workflow (and kills any running parallel peers) instead of prompting. Defaults to `false` |
@@ -958,6 +958,13 @@ and omit the output path. CLI and TUI workflow runs do not mount `/awman/output`
 
 ## Running a workflow
 
+Large step prompts, including expanded work item contents, are delivered intact.
+On Docker, Apple Containers and builtin, when a prompt is too large to pass as
+a command-line argument, awman mounts it as a temporary read-only file and tells
+the agent to read and follow the entire file. The agent may show that file read
+as its first action. Its normal file-reading permissions still apply. Agents
+that receive prompts through stdin or ACP keep those delivery methods.
+
 ### In the TUI
 
 ```
@@ -1234,6 +1241,16 @@ If an agent step's container exits unexpectedly, awman does **not** end the work
 
 There is no "Enter to finish workflow" on a failure board — finishing a run on a failed step is never what you want, so **Ctrl+C** is the deliberate way out. The container's recent output is also saved to a log file; see [Container failure logs](#container-failure-logs).
 
+The same recovery applies when the builtin runtime loses an execution stream
+before receiving the agent's exit status, including in the TUI with the daemon
+backend. The board shows **Exit status unavailable** and the stream failure
+reason. This can happen when the guest execution channel closes, the guest
+reports an execution failure, or the output receiver falls behind and loses
+events. Press **↑** to retry the step in a fresh container using the existing
+workflow worktree. Awman confirms that the old execution has stopped before
+offering recovery; if stopping it fails, the error ends the run. Steps configured
+with `abort_on_failure` keep their abort behavior.
+
 An arrow the board does not offer does nothing. On the *first* step there is no previous step to go back to, and on the *last* one there is nothing to skip ahead to; those arrows are shown greyed out with the reason, and pressing them leaves the board where it is.
 
 In command mode the same choices are printed as a menu on stderr (`[r]` restart, `[b]` back, `[n]` next, `[p]` pause, `[a]` abort), and only the ones that apply are listed.
@@ -1274,7 +1291,7 @@ Running: plan     ┃  ● implement    ✓ review    ⚠️ docs
 When a step declares its own `agent` and/or `model`, the box shows the resolved **`agent/model`** on its top border (for example `claude/opus-4-8`) so you can see at a glance which agent and model will run each step:
 
 ```
- ╭claude/opus-4-8──╮   ╭gemini───────────╮
+ ╭claude/opus-4-8──╮   ╭codex────────────╮
  │ ● implement     │ → │ ○ review        │
  ╰─────────────────╯   ╰─────────────────╯
 ```

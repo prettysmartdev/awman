@@ -267,6 +267,7 @@ impl Command for ChatCommand {
             let mut run_opts = AgentRunOptions {
                 command_secrets: self.engines.command_secrets(),
                 yolo: self.flags.yolo.then_some(YoloMode::Enabled),
+                yolo_authorized: self.flags.yolo_authorized,
                 auto: self.flags.auto.then_some(AutoMode::Enabled),
                 plan: self.flags.plan.then_some(PlanMode::Enabled),
                 allow_docker: self.flags.allow_docker,
@@ -331,6 +332,10 @@ impl Command for ChatCommand {
                     return Err(CommandError::from(e));
                 }
             };
+
+            for note in LaunchPolicy::launch_notices(&agent, &run_opts) {
+                frontend.write_message(note);
+            }
 
             // 7. Build the agent instance.
             let instance = match self.engines.runtime.build(resolved) {

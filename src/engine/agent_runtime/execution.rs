@@ -276,7 +276,9 @@ pub(crate) fn with_program_status_frontend(
     frontend: Box<dyn AgentFrontend>,
     config: crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig,
 ) -> Box<dyn AgentFrontend> {
+    let redaction = frontend.output_redaction();
     Box::new(ProgramStatusFrontend {
+        redaction,
         frontend,
         config,
         terminal: None,
@@ -284,6 +286,7 @@ pub(crate) fn with_program_status_frontend(
 }
 
 struct ProgramStatusFrontend {
+    redaction: crate::engine::auth::redaction::RedactionSet,
     frontend: Box<dyn AgentFrontend>,
     config: crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig,
     terminal: Option<crate::engine::agent_runtime::execution::TerminalLaunch>,
@@ -300,6 +303,9 @@ impl crate::data::message::UserMessageSink for ProgramStatusFrontend {
 
 #[async_trait::async_trait]
 impl AgentFrontend for ProgramStatusFrontend {
+    fn output_redaction(&self) -> crate::engine::auth::redaction::RedactionSet {
+        self.redaction.clone()
+    }
     fn terminal_launch(&self) -> Option<crate::engine::agent_runtime::execution::TerminalLaunch> {
         let mut launch = self
             .terminal
@@ -778,14 +784,48 @@ impl AgentInstance for TerminalInstance {
         source.container = Some(self.instance.handle_preview().name);
         launch.owner.source = Some(source);
         let retained_launch = launch.clone();
+        let redaction = frontend.output_redaction();
         let mut execution = self
             .instance
             .run_with_frontend(Box::new(ProgramStatusFrontend {
                 frontend,
                 config,
                 terminal: Some(launch),
+                redaction,
             }))?;
         execution.terminal = Some(retained_launch);
         Ok(execution)
+    }
+}
+
+pub(crate) fn with_output_redaction(
+    instance: Box<dyn AgentInstance>,
+    redaction: crate::engine::auth::redaction::RedactionSet,
+) -> Box<dyn AgentInstance> {
+    Box::new(RedactedInstance {
+        instance,
+        redaction,
+    })
+}
+struct RedactedInstance {
+    instance: Box<dyn AgentInstance>,
+    redaction: crate::engine::auth::redaction::RedactionSet,
+}
+impl AgentInstance for RedactedInstance {
+    fn handle_preview(&self) -> AgentHandlePreview {
+        self.instance.handle_preview()
+    }
+    fn run_with_frontend(
+        self: Box<Self>,
+        frontend: Box<dyn AgentFrontend>,
+    ) -> Result<AgentExecution, EngineError> {
+        let config = frontend.program_status_config();
+        self.instance
+            .run_with_frontend(Box::new(ProgramStatusFrontend {
+                frontend,
+                config,
+                terminal: None,
+                redaction: self.redaction,
+            }))
     }
 }

@@ -979,6 +979,7 @@ mod dynamic_flag_tests {
             allow_docker: false,
             worktree: true,
             yolo: true,
+            yolo_authorized: true,
             auto: false,
             agent: None,
             model: None,

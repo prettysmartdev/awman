@@ -1,0 +1,45 @@
+# awman-generated Docker Sandbox kit — agent: cursor (kind: agent)
+# Rendered by DSbxKitEmitter at awman ready; edit this template to customize installation.
+# awman version: {{AWMAN_VERSION}}
+schemaVersion: "1"
+kind: agent
+name: awman-cursor
+displayName: awman (Cursor)
+description: awman-managed Cursor sandbox
+agent:
+  image: docker/sandbox-templates:shell-docker
+  entrypoint:
+    run:
+      - /home/agent/.local/bin/cursor-agent
+  persistence: persistent
+network:
+  allowedDomains:
+    - cursor.com
+    - downloads.cursor.com
+    - api2.cursor.sh
+# Cursor has no verified Docker Sandbox credential service; no login state is installed.
+agentContext: |
+  This sandbox is orchestrated by awman {{AWMAN_VERSION}} using the
+  Docker Sandboxes (experimental) runtime. Per-launch configuration is read
+  from ${WORKDIR}/.awman/session.json by the startup script.
+commands:
+  install:
+    - command: |
+        set -euo pipefail
+        case "$(uname -m)" in
+          x86_64|amd64|aarch64|arm64) ;;
+          *) echo "awman: cursor-agent has no Linux package for architecture '$(uname -m)' (supported: x86_64, aarch64)" >&2; exit 1 ;;
+        esac
+        CA_LDD="$(ldd --version 2>&1 || true)"
+        case "$CA_LDD" in
+          *musl*) echo "awman: cursor-agent requires glibc; this base image uses musl" >&2; exit 1 ;;
+        esac
+        runuser -u agent -- env -i HOME=/home/agent PATH=/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin bash -eo pipefail -c '
+        curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 600 https://cursor.com/install | bash
+        cursor-agent --version
+        cursor-agent --help >/dev/null
+        '
+      description: Install the current Cursor CLI
+  startup:
+    - command: ["bash", "/home/agent/.awman/apply-session-config.sh"]
+      description: Apply awman per-launch session config

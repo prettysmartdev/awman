@@ -72,13 +72,18 @@ impl ReadyEngine {
             let status = match definition {
                 Err(error) => StepStatus::Failed(format!("{agent_name}: {error}")),
                 Ok(def) if def.ping_argv.is_none() => {
-                    let path = match &def.origin {
-                        crate::engine::agent::AgentOrigin::Custom { path, .. } => {
-                            path.display().to_string()
-                        }
-                        _ => def.name.clone(),
-                    };
-                    skipped = Some(format!("no [ping] command in {path}; host check skipped"));
+                    skipped = Some(match &def.origin {
+                        crate::engine::agent::AgentOrigin::Custom { path, .. } => format!(
+                            "no [ping] command in {}; host check skipped",
+                            path.display()
+                        ),
+                        // A host binary could be another major (or start a
+                        // shared service); the image is probed instead.
+                        crate::engine::agent::AgentOrigin::FirstParty => format!(
+                            "{agent_name}: readiness is checked inside the agent image; \
+                             host check skipped"
+                        ),
+                    });
                     StepStatus::Skipped
                 }
                 Ok(def) => {
@@ -445,8 +450,6 @@ impl ReadyEngine {
                     self.options.build || !self.runtime.image_exists(&tag).unwrap_or(false);
                 if !needs_build {
                     self.summary.base_image = StepStatus::Done;
-                    frontend
-                        .report_step_status(&ReadyStep::BuildBaseImage.into(), StepStatus::Done);
                     ReadyPhase::BuildingAgentImage
                 } else {
                     frontend
@@ -522,8 +525,7 @@ impl ReadyEngine {
                     || !self.runtime.image_exists(&tag).unwrap_or(false);
                 if !needs_build {
                     self.summary.agent_image = StepStatus::Done;
-                    frontend
-                        .report_step_status(&ReadyStep::BuildAgentImage.into(), StepStatus::Done);
+                    self.verify_agent_cli(frontend, &tag);
                     return Ok({
                         self.phase = ReadyPhase::CheckingNonDefaultAgents;
                         self.phase.clone()
@@ -549,6 +551,7 @@ impl ReadyEngine {
                             &ReadyStep::BuildAgentImage.into(),
                             StepStatus::Done,
                         );
+                        self.verify_agent_cli(frontend, &tag);
                     }
                     Err(e) => {
                         let message = crate::engine::agent::custom_build_failure(
@@ -1036,6 +1039,51 @@ impl ReadyEngine {
         Ok(next)
     }
 
+    /// WI 0157: once the default agent's image is built or imported, execute
+    /// its major-specific CLI **inside the image** and report the version that runs.
+    /// A wrong major (or no binary) fails ready; a probe that could not run is
+    /// a warning, never `Done`. Agents without a major requirement
+    /// keep the plain `Done`.
+    pub(super) fn verify_agent_cli(&mut self, frontend: &mut dyn ReadyFrontend, tag: &str) {
+        use crate::data::message::{MessageLevel, UserMessage};
+        use crate::engine::container::agent_version::{mismatch_message, CliVersionStatus};
+        if self.summary.agent_image != StepStatus::Done {
+            return;
+        }
+        let Some(def) = self.definition.as_ref() else {
+            return;
+        };
+        let Some(requirement) = def.cli_version.clone() else {
+            return;
+        };
+        let display = def.display_name.clone();
+        let agent = def.name.clone();
+        let status = match self.runtime.probe_agent_cli_version(tag, &requirement) {
+            CliVersionStatus::Compatible { version } => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Info,
+                    text: format!("{display} CLI {version} verified inside {tag}"),
+                });
+                StepStatus::Done
+            }
+            CliVersionStatus::Mismatch { found, expected } => {
+                StepStatus::Failed(mismatch_message(&display, &agent, tag, &found, &expected))
+            }
+            CliVersionStatus::Unknown { reason } => StepStatus::Warn(format!(
+                "could not verify the {} version inside {tag}: {reason}",
+                requirement.binary
+            )),
+        };
+        if let StepStatus::Warn(text) | StepStatus::Failed(text) = &status {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: text.clone(),
+            });
+        }
+        self.summary.agent_image = status.clone();
+        frontend.report_step_status(&ReadyStep::BuildAgentImage.into(), status);
+    }
+
     /// `ImportingAgentImage`: import the default agent's image and record the
     /// outcome in the summary.
     pub(super) async fn import_default_agent_image(
@@ -1048,6 +1096,8 @@ impl ReadyEngine {
             Ok(_) => {
                 self.summary.agent_image = StepStatus::Done;
                 self.summary.image_source = Some(StepStatus::Done);
+                let tag = crate::data::image_tags::agent_image_tag(git_root, &agent);
+                self.verify_agent_cli(frontend, &tag);
             }
             Err(msg) => self.record_import_failure(msg),
         }
@@ -1147,14 +1197,18 @@ impl ReadyEngine {
             if self.cancel.check().is_err() {
                 return;
             }
-            let step: SetupStep = ReadyStep::ImportAgentImageFor(agent.clone()).into();
-            frontend.report_step_status(&step, StepStatus::Running);
-
             let status = match self.prepare_agent_image(frontend, git_root, agent).await {
                 Ok(status) => status,
                 Err(msg) => StepStatus::Failed(msg),
             };
-            frontend.report_step_status(&step, status);
+            // The preparer owns progress. Keep early refusals visible without
+            // wrapping successful preparation in a second import row.
+            if matches!(status, StepStatus::Failed(_) | StepStatus::Warn(_)) {
+                frontend.report_step_status(
+                    &ReadyStep::ImportAgentImageFor(agent.clone()).into(),
+                    status,
+                );
+            }
         }
     }
 

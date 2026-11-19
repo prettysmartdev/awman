@@ -431,19 +431,6 @@ impl Command for ReadyCommand {
         outcome.json_requested = self.flags.json;
         outcome.refresh_requested = self.flags.refresh;
 
-        // Structured log only: the summary already showed every failure once,
-        // so the user never sees a second, unformatted copy of an error.
-        tracing::debug!(
-            runtime = %outcome.runtime,
-            dockerfile = ?outcome.dockerfile,
-            base_image = ?outcome.base_image,
-            agent_image = ?outcome.agent_image,
-            image_source = ?outcome.image_source,
-            local_agent = ?outcome.local_agent,
-            ready = outcome.ready,
-            "ready: complete"
-        );
-
         Ok(outcome)
     }
 }

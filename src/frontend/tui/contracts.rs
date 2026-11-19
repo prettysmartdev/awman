@@ -553,3 +553,48 @@ async fn board_activity_belongs_to_its_step_instead_of_the_focused_peer() {
         Some("build")
     );
 }
+
+/// WI 0157: a TUI command naming the retired built-in `gemini` shows the
+/// migration note and never starts a container. The same refusal on the CLI,
+/// daemon and API paths is proven in `tests/component/{parity,command}`.
+#[test]
+fn retired_gemini_selection_shows_the_migration_note_without_a_container() {
+    let s = TestSandbox::for_test(TestCase::component(
+        "frontend::tui::contracts::retired_gemini_selection_shows_the_migration_note_without_a_container",
+    ));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(retired_gemini_selection_journey(&s));
+    // Tab cancellation cannot interrupt an in-flight synchronous Git poll.
+    // Join it before removing the working directory, including on Windows.
+    drop(runtime);
+    s.finish();
+}
+
+async fn retired_gemini_selection_journey(s: &TestSandbox) {
+    let mut app = app(s);
+    for ch in "exec prompt --agent gemini hello".chars() {
+        press(&mut app, KeyCode::Char(ch), KeyModifiers::NONE);
+    }
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    let note = "'gemini' is no longer a built-in agent";
+    // The command runs on the runtime's worker threads; the tick adopts
+    // its messages into the tab.
+    awman_test_support::wait_for(
+        "the TUI to show the retired-gemini migration note",
+        std::time::Duration::from_secs(15),
+        || {
+            app.tick_all_tabs();
+            let text = app.active_tab().output_lines.join("\n");
+            (text.contains(note) || draw(&mut app, 200, 60).contains(note)).then_some(())
+        },
+    );
+    assert!(
+        app.active_tab().focused_slot().is_none(),
+        "a container slot was started for a refused agent"
+    );
+    drop(app);
+}

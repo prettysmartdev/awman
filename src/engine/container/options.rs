@@ -214,6 +214,13 @@ pub enum ContainerOption {
         env_var: Option<String>,
         guard: MountGuard,
     },
+    /// A read-only file inside a private temporary directory owned by `guard`.
+    /// Retained until confirmed guest exit, like system prompt files.
+    TemporaryFileMount {
+        host_path: PathBuf,
+        container_path: PathBuf,
+        guard: MountGuard,
+    },
     EnvPassthrough(EnvVar),
     /// Per-launch value, kept out of argv and redacted in Debug.
     EnvOverride {
@@ -300,7 +307,7 @@ pub enum ContainerOption {
         guard: PromptFileGuard,
     },
     /// System prompt delivered via an env var pointing to a mounted file
-    /// (e.g. `GEMINI_SYSTEM_MD=<container_path>`).
+    /// (a custom agent's `[system_prompt] env`, e.g. `AGENT_SYSTEM_MD=<container_path>`).
     SystemPromptEnvFile {
         env_var: String,
         host_path: PathBuf,
@@ -512,10 +519,15 @@ fn covered_credential_services(
         .collect()
 }
 
+/// Credential names only, allowing native Docker reattach to recover the
+/// same output protection from the container environment without persisting values.
+pub(crate) const OUTPUT_SECRET_ENV_LABEL: &str = "awman.output-secret-env";
+
 /// Resolved option bag — all options merged into a single struct that the
 /// backend consumes. Conflicting options are detected here.
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedContainerOptions {
+    pub output_redaction: crate::engine::auth::redaction::RedactionSet,
     pub host_env: Option<crate::data::config::env::EnvSnapshot>,
     pub agent_identity: Option<(String, Option<String>)>,
     pub program_status: crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig,
@@ -528,6 +540,8 @@ pub struct ResolvedContainerOptions {
     /// Set by the Apple backend before handing options to the shared launcher.
     pub tmpfs_bare_paths: bool,
     pub env_passthrough: Vec<EnvVar>,
+    /// Values selected for this execution; opaque, never serialized or placed in argv.
+    pub resolved_env_grants: Option<Vec<(String, crate::engine::auth::credential::SecretString)>>,
     pub env_overrides: Vec<(String, crate::engine::auth::credential::SecretString)>,
     pub env_literal: Vec<EnvLiteral>,
     pub seeded_prompt: Option<String>,
@@ -803,6 +817,7 @@ impl ResolvedContainerOptions {
             &r.env_literal,
             &lookup,
         )?;
+        r.register_output_secrets();
         r.validate()?;
         // Render through the existing shared argv tail on every container
         // backend. ACP and interactive launches never receive structured flags.
@@ -815,6 +830,9 @@ impl ResolvedContainerOptions {
                     "--verbose".into(),
                 ],
                 AgentOutputFormat::CodexJson => vec!["--json".into()],
+                AgentOutputFormat::CursorStreamJson => {
+                    vec!["--output-format".into(), "stream-json".into()]
+                }
             });
         } else {
             r.agent_output_format = AgentOutputFormat::Text;
@@ -833,6 +851,18 @@ impl ResolvedContainerOptions {
             ContainerOption::Overlay(v) => self.overlays.push(v),
             ContainerOption::Tmpfs(v) => self.tmpfs.push(v),
             ContainerOption::ReadOnlyWorkspace(v) => self.read_only_workspace |= v,
+            ContainerOption::TemporaryFileMount {
+                host_path,
+                container_path,
+                guard,
+            } => {
+                self.overlays.push(OverlaySpec {
+                    host_path,
+                    container_path,
+                    permission: OverlayPermission::ReadOnly,
+                });
+                self.prompt_files.push(guard);
+            }
             ContainerOption::TemporaryDirectoryMount {
                 container_path,
                 env_var,
@@ -921,6 +951,60 @@ impl ResolvedContainerOptions {
             }
         }
         Ok(())
+    }
+
+    /// Freeze grants before launch so later daemon environment updates cannot
+    /// replace the value whose output protection was registered.
+    pub(crate) fn register_output_secrets(&mut self) {
+        if self.resolved_env_grants.is_none() {
+            self.resolved_env_grants = Some(
+                self.env_passthrough
+                    .iter()
+                    .filter_map(|var| {
+                        self.host_env
+                            .as_ref()
+                            .map_or_else(
+                                || crate::data::config::env::host_var(&var.0),
+                                |env| env.host_payload(&var.0),
+                            )
+                            .map(|value| {
+                                (
+                                    var.0.clone(),
+                                    crate::engine::auth::credential::SecretString::new(value),
+                                )
+                            })
+                    })
+                    .collect(),
+            );
+        }
+        for (_, value) in self
+            .resolved_env_grants
+            .iter()
+            .flatten()
+            .chain(self.env_overrides.iter())
+        {
+            self.output_redaction.add(value.clone());
+        }
+        let mut names: Vec<_> = self
+            .resolved_env_grants
+            .iter()
+            .flatten()
+            .map(|(key, _)| key.clone())
+            .chain(self.env_overrides.iter().map(|(key, _)| key.clone()))
+            .chain(self.agent_credentials.iter().map(|(key, _)| key.clone()))
+            .collect();
+        names.sort();
+        names.dedup();
+        self.labels
+            .retain(|(key, _)| key != OUTPUT_SECRET_ENV_LABEL);
+        if !names.is_empty() {
+            self.labels
+                .push((OUTPUT_SECRET_ENV_LABEL.into(), names.join(",")));
+        }
+        for (_, value) in &self.agent_credentials {
+            self.output_redaction
+                .add(crate::engine::auth::credential::SecretString::new(value));
+        }
     }
 
     pub(crate) fn validate_caller_env(&self) -> Result<(), ResolveError> {

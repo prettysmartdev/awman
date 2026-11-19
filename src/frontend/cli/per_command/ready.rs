@@ -52,18 +52,10 @@ impl ReadyFrontend for CliFrontend {
         )
     }
 
-    fn report_phase(&mut self, phase: &ReadyPhase) {
-        // The shared `ReadyPhase` Display text, as the TUI and API report it
-        // (WI 0126 F3). Progress goes to stderr; with --json it is
-        // suppressed so stdout and stderr stay machine-clean.
-        if self.is_json_mode() {
-            return;
-        }
-        use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
-        self.messages.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: format!("ready: {phase}"),
-        });
+    fn report_phase(&mut self, _phase: &ReadyPhase) {
+        // Steps report actual work and the final summary reports readiness.
+        // Phase transitions would duplicate those and announce work even when
+        // a phase only checks an already-ready image (as with init).
     }
 
     fn report_summary(&mut self, summary: &ReadySummary) {

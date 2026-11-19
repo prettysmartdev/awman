@@ -34,6 +34,8 @@ pub mod first_party;
 pub mod frontend;
 pub mod image_freshness;
 pub mod registry;
+mod seeded_prompt;
+pub mod session_seed;
 
 pub use definition::*;
 pub use frontend::AgentImageFrontend;
@@ -199,6 +201,8 @@ pub enum AutoMode {
 pub struct AgentRunOptions {
     /// Caller values are used only for explicit env overlay names.
     pub command_secrets: Option<Arc<crate::data::secret::CommandSecrets>>,
+    /// Explicit caller authorization, independent of unattended defaults.
+    pub yolo_authorized: bool,
     pub yolo: Option<crate::engine::container::options::YoloMode>,
     pub auto: Option<crate::engine::container::options::AutoMode>,
     pub plan: Option<crate::engine::container::options::PlanMode>,
@@ -260,6 +264,96 @@ impl AgentRunOptions {
             })
             .collect()
     }
+}
+
+/// The container options that decide an agent's argv for one launch:
+/// entrypoint (with the headless form, `headless_only_flags`,
+/// `headless_text_flags` or the interactive model fallback), PTY/ACP
+/// selection, structured output, permission modes, tool lists, seeded prompt
+/// and model. Pure (no session, no I/O), so the per-agent argv tables are
+/// pinned by unit tests against exactly what `build_options` emits. Callers
+/// run [`AgentDefinition::validate_run`] first.
+pub(crate) fn launch_argv_options(
+    def: &AgentDefinition,
+    run: &AgentRunOptions,
+) -> Result<Vec<ContainerOption>, EngineError> {
+    let acp = matches!(run.launch_mode, LaunchMode::Acp);
+    let entrypoint = if acp {
+        def.entrypoint_for_acp()?
+    } else {
+        def.entrypoint_for_run(run)
+    };
+    let mut options = vec![
+        ContainerOption::Entrypoint(entrypoint),
+        ContainerOption::Interactive(!run.non_interactive),
+    ];
+    // Select the persistent piped-stdio (`-i`, no PTY) container path when
+    // launching over ACP. Emitted only when actually ACP so ordinary stdio
+    // launches keep today's PTY/one-shot-piped behaviour untouched.
+    if acp {
+        options.push(ContainerOption::Acp(true));
+    }
+    // Exactly one of `headless_text_flags` (in the entrypoint) and the
+    // structured format's flags (rendered at resolve) is ever applied.
+    if def.uses_structured_output(run) {
+        options.push(ContainerOption::AgentOutputFormat(def.output_format));
+    }
+
+    // Mode flags.
+    if let Some(y) = run.yolo {
+        options.push(ContainerOption::Yolo(y));
+    }
+    if let Some(a) = run.auto {
+        options.push(ContainerOption::Auto(a));
+    }
+    if let Some(p) = run.plan {
+        options.push(ContainerOption::Plan(p));
+    }
+
+    // Tool allow/deny lists.
+    if !run.allowed_tools.is_empty() {
+        options.push(ContainerOption::AllowedTools(run.allowed_tools.clone()));
+        if let Some(flag) = &def.allowed_tools_flag {
+            options.push(ContainerOption::AllowedToolsFlag(flag.to_string()));
+        }
+    }
+    if !run.disallowed_tools.is_empty() {
+        options.push(ContainerOption::DisallowedTools(
+            run.disallowed_tools.clone(),
+        ));
+        if let Some(flag) = &def.disallowed_tools_flag {
+            options.push(ContainerOption::DisallowedToolsFlag(flag.to_string()));
+        }
+    }
+
+    // Resolve per-agent mode flags into literal argv strings.
+    let mode_flags = def.mode_flags(run);
+    if !mode_flags.is_empty() {
+        options.push(ContainerOption::AgentModeFlags(mode_flags));
+    }
+
+    // Initial prompt. In interactive mode most agents receive it as a
+    // trailing positional arg; agents whose bare positional means something
+    // else (opencode: a project dir) declare a delivery flag in their definition.
+    // Headless delivery follows each CLI's prompt contract: some expect
+    // an argv operand, while the others read stdin.
+    if let Some(prompt) = run.initial_prompt.as_ref() {
+        options.push(ContainerOption::SeededPrompt(prompt.clone()));
+        if def.headless_prompt_in_argv {
+            options.push(ContainerOption::HeadlessPromptInArgv(true));
+        }
+        if let InteractiveSeedDelivery::Flag(flag) = &def.interactive_seed_delivery {
+            options.push(ContainerOption::InteractiveSeedFlag(flag.to_string()));
+        }
+    }
+
+    // Model flag. With an interactive model fallback the subcommand is part
+    // of the entrypoint, so the flag lands after it.
+    if let Some(model) = run.model.as_deref() {
+        let flag = def.model_flag_for(model)?;
+        options.push(ContainerOption::Model { flag });
+    }
+    Ok(options)
 }
 
 fn resolve_agent_flags(session: &Session, agent: &AgentName, run: &AgentRunOptions) -> Vec<String> {
@@ -520,11 +614,15 @@ impl AgentEngine {
         frontend: &mut dyn AgentImageFrontend,
         image_exists: impl Fn(&str) -> bool,
     ) -> Result<(), EngineError> {
-        if session
+        if let Some(tag) = session
             .lease_images()
-            .is_some_and(|images| images.agents.contains_key(agent.as_str()))
+            .and_then(|images| images.agents.get(agent.as_str()))
         {
-            return Ok(());
+            // Lease images are content-keyed and already provisioned, but the
+            // CLI inside still has to be the pinned major (same rule as the
+            // build and import paths below).
+            let def = self.resolve_definition(session, agent)?;
+            return self.check_agent_cli(&def, tag);
         }
         if session.lease_images().is_some() {
             return Err(EngineError::Config(format!("agent '{agent}' was not provisioned for this lease; include it in the workflow agent pool")));
@@ -592,7 +690,7 @@ impl AgentEngine {
                 (_, StepStatus::Warn(reason)) => Err(EngineError::Other(format!(
                     "cannot import image for agent '{agent}' ({tag}): {reason}"
                 ))),
-                _ => Ok(()),
+                _ => self.check_agent_cli(&def, &tag),
             };
         }
 
@@ -683,7 +781,27 @@ impl AgentEngine {
             }
         }
 
-        Ok(())
+        self.check_agent_cli(&def, &agent_tag)
+    }
+
+    /// WI 0157: refuse to launch an image whose CLI reports the wrong
+    /// major (or none). Probes the same binary the launch executes
+    /// (`cli_version.binary == interactive_entrypoint[0]`) inside the image,
+    /// once per image identity. Probe failures block only these major-specific adapters.
+    fn check_agent_cli(&self, def: &AgentDefinition, tag: &str) -> Result<(), EngineError> {
+        use crate::engine::container::agent_version::{mismatch_message, CliVersionStatus};
+        let Some(requirement) = def.cli_version.as_ref() else {
+            return Ok(());
+        };
+        match self.runtime.probe_agent_cli_version(tag, requirement) {
+            CliVersionStatus::Mismatch { found, expected } => Err(EngineError::Config(
+                mismatch_message(&def.display_name, &def.name, tag, &found, &expected),
+            )),
+            CliVersionStatus::Unknown { reason } => Err(EngineError::Config(format!(
+                "cannot verify {} inside {tag}: {reason}; run 'awman ready --build' before launching", def.name
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// This session's builtin launch settings (default vCPUs and memory,
@@ -814,6 +932,7 @@ impl AgentEngine {
             .cloned()
             .or_else(|| run.image_tag_override.clone())
             .unwrap_or_else(|| session.agent_image_tag(agent.as_str()));
+        self.check_agent_cli(&def, &image_tag)?;
         let image = ImageRef::new(image_tag.clone());
         // ACP launches use the agent's ACP entrypoint (e.g. `cline --acp`) and
         // select the persistent piped-stdio container path instead of a PTY, so
@@ -822,20 +941,12 @@ impl AgentEngine {
         // definition lacks an `acp_entrypoint`, so `entrypoint_for_acp` cannot fail
         // here in practice — the `?` is defence-in-depth.
         let acp = matches!(run.launch_mode, LaunchMode::Acp);
-        let entrypoint = if acp {
-            def.entrypoint_for_acp()?
-        } else {
-            def.entrypoint_for(run.non_interactive)
-        };
-
         let mut options = vec![
             ContainerOption::AgentIdentity {
                 agent: agent.as_str().to_owned(),
                 model: run.model.clone(),
             },
             ContainerOption::Image(image),
-            ContainerOption::Entrypoint(entrypoint),
-            ContainerOption::Interactive(!run.non_interactive),
             ContainerOption::AllowDocker(run.allow_docker),
             ContainerOption::Label {
                 key: "awman.session".into(),
@@ -845,18 +956,6 @@ impl AgentEngine {
         if let Some(launch) = builtin_launch {
             options.push(ContainerOption::BuiltinLaunch(launch));
         }
-
-        // Select the persistent piped-stdio (`-i`, no PTY) container path when
-        // launching over ACP. Emitted only when actually ACP so ordinary stdio
-        // launches keep today's PTY/one-shot-piped behaviour untouched.
-        if acp {
-            options.push(ContainerOption::Acp(true));
-        }
-        if run.structured_output && run.non_interactive && !acp && def.output_format.is_structured()
-        {
-            options.push(ContainerOption::AgentOutputFormat(def.output_format));
-        }
-
         options.push(ContainerOption::ProgramStatus(
             crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig {
                 enabled: session.effective_config().program_status_enabled(),
@@ -864,44 +963,17 @@ impl AgentEngine {
             },
         ));
 
-        // Mode flags.
-        if let Some(y) = run.yolo {
-            options.push(ContainerOption::Yolo(y));
-        }
-        if let Some(a) = run.auto {
-            options.push(ContainerOption::Auto(a));
-        }
-        if let Some(p) = run.plan {
-            options.push(ContainerOption::Plan(p));
-        }
-
-        // Tool allow/deny lists.
-        if !run.allowed_tools.is_empty() {
-            options.push(ContainerOption::AllowedTools(run.allowed_tools.clone()));
-            if let Some(flag) = &def.allowed_tools_flag {
-                options.push(ContainerOption::AllowedToolsFlag(flag.to_string()));
-            }
-        }
-        if !run.disallowed_tools.is_empty() {
-            options.push(ContainerOption::DisallowedTools(
-                run.disallowed_tools.clone(),
-            ));
-            if let Some(flag) = &def.disallowed_tools_flag {
-                options.push(ContainerOption::DisallowedToolsFlag(flag.to_string()));
-            }
-        }
-
-        // Resolve per-agent mode flags into literal argv strings.
-        let mode_flags = def.mode_flags(run);
-        if !mode_flags.is_empty() {
-            options.push(ContainerOption::AgentModeFlags(mode_flags));
-        }
+        // Entrypoint, modes, tools, seed and model: the agent's argv contract,
+        // pure and shared with the argv unit tests.
+        options.extend(launch_argv_options(&def, run)?);
+        seeded_prompt::stage_large_argv_prompt(session.env(), &def, run, &mut options)?;
 
         // User-configured extra agent args (`agentFlags` / `--agent-flag`). One
         // that the entrypoint already carries for this launch (codex
-        // `--no-daemon` on an interactive launch) is dropped, not doubled; the
-        // command layer warns about it (`LaunchPolicy::warn_config`). An ACP
-        // entrypoint carries none of them.
+        // `--no-daemon` on an interactive launch, cursor `--trust` on a
+        // headless one) is dropped, not doubled; the command layer warns
+        // about it (`LaunchPolicy::warn_config`). An ACP entrypoint carries
+        // none of them.
         let mut agent_flags = resolve_agent_flags(session, agent, run);
         if !acp {
             let managed = def.entrypoint_managed_flags(run.non_interactive);
@@ -909,27 +981,6 @@ impl AgentEngine {
         }
         if !agent_flags.is_empty() {
             options.push(ContainerOption::AgentFlags(agent_flags));
-        }
-
-        // Initial prompt. In interactive mode most agents receive it as a
-        // trailing positional arg; agents whose bare positional means something
-        // else (opencode: a project dir) declare a delivery flag in their definition.
-        // Headless delivery follows each CLI's prompt contract: some expect
-        // an argv operand, while the others read stdin.
-        if let Some(prompt) = run.initial_prompt.as_ref() {
-            options.push(ContainerOption::SeededPrompt(prompt.clone()));
-            if def.headless_prompt_in_argv {
-                options.push(ContainerOption::HeadlessPromptInArgv(true));
-            }
-            if let InteractiveSeedDelivery::Flag(flag) = &def.interactive_seed_delivery {
-                options.push(ContainerOption::InteractiveSeedFlag(flag.to_string()));
-            }
-        }
-
-        // Model flag.
-        if let Some(model) = run.model.as_deref() {
-            let flag = def.model_flag_for(model)?;
-            options.push(ContainerOption::Model { flag });
         }
 
         // Env passthrough.
@@ -1019,6 +1070,20 @@ impl AgentEngine {
                 .prefix("awman-session-storage-")
                 .tempdir_in(session.env().temp_dir())
                 .map_err(|e| EngineError::Other(format!("create session storage: {e}")))?;
+            // One-way private copy of host state (opencode-v2's config). Never
+            // copied back; the host files are never written.
+            if let Some(seed) = &storage.seed_from_home {
+                session_seed::seed_with_data_home(
+                    session.env().home_dir().as_deref(),
+                    crate::data::fs::data_paths::data_home(session.env())
+                        .ok()
+                        .as_deref(),
+                    seed,
+                    dir.path(),
+                    session_seed::SEED_MAX_ENTRIES,
+                    session_seed::SEED_MAX_BYTES,
+                )?;
+            }
             options.push(ContainerOption::TemporaryDirectoryMount {
                 container_path: guest_path.clone(),
                 env_var: storage.env_var.clone(),
@@ -1236,6 +1301,12 @@ impl AgentEngine {
                 },
             ),
         ];
+
+        // An agent whose credential cannot reach a sandbox says so up front
+        // instead of failing mysteriously inside the VM (cursor).
+        if let Some(note) = &def.sandbox_auth_note {
+            options.push(SandboxOption::UnsupportedNote(note.clone()));
+        }
 
         // Seeded prompt — recorded in session.json exactly once. For `kind: agent`
         // kits the dsbx launcher appends it positionally; for `kind: mixin` kits
@@ -1701,6 +1772,29 @@ mod workspace_access_tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn only_opencode_major_probes_gate_launch() {
+        let sandbox = TestSandbox::for_test(TestCase::component(
+            "engine::agent::workspace_access_tests::only_opencode_major_probes_gate_launch",
+        ));
+        let session = session(&sandbox);
+        let runtime = Arc::new(image_freshness::test_runtime::BuildRuntime::default());
+        let engine = AgentEngine::new(
+            Arc::new(OverlayEngine::new(&session).unwrap()),
+            runtime.clone(),
+        );
+        for agent in ["opencode", "opencode-v2"] {
+            let def = first_party::first_party(agent).unwrap();
+            assert!(engine.check_agent_cli(&def, "fixture").is_err());
+        }
+        let def = first_party::first_party("cursor").unwrap();
+        engine.check_agent_cli(&def, "fixture").unwrap();
+        *runtime.cli_version_line.lock().unwrap() = Some("2025.01.01-aaaaaaa".into());
+        engine.check_agent_cli(&def, "fixture").unwrap();
+        *runtime.cli_version_line.lock().unwrap() = Some("2026.11.17-f532c45".into());
+        engine.check_agent_cli(&def, "fixture").unwrap();
     }
 
     #[test]

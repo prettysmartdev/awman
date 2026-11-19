@@ -196,8 +196,9 @@ pub struct SimpleAdvance {
 /// frontend renders the same copy.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StepFailureContext {
-    /// The step whose container exited non-zero.
+    /// The step whose execution failed.
     pub step_name: String,
+    /// -1 when the execution stream failed without a process exit status.
     pub exit_code: i32,
     pub signal: Option<i32>,
     /// Human-readable detail lines (exit code, signal, run duration). Rendered

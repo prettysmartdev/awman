@@ -1039,7 +1039,19 @@ async fn a_restart_mid_lease_releases_credentials_lost_and_reruns_nothing() {
     assert_eq!(release["result"]["failure"]["code"], "credentials_lost");
     assert_eq!(release["result"]["failure"]["stage"], "preflight");
     assert!(mock.result_for("restarted").is_none());
-    let recovered = host.leases().get(&id).unwrap().unwrap();
+    // The server acknowledgement precedes the worker's local state write.
+    // Observe both boundaries instead of racing the local persistence step.
+    let recovered = wait_for_async(
+        "the recovered release is persisted locally",
+        Duration::from_secs(20),
+        || async {
+            host.leases()
+                .get(&id)
+                .unwrap()
+                .filter(|lease| lease.state == LeaseState::Released)
+        },
+    )
+    .await;
     assert_eq!(recovered.state, LeaseState::Released);
     // Nothing re-ran after the restart.
     assert_eq!(host.runs().len(), runs);

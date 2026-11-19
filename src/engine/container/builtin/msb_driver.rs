@@ -861,7 +861,8 @@ async fn pump(
                     Some(M::Stderr(data))=>(ExecEvent::Stderr(data.to_vec()),false),
                     Some(M::Exited{code})=>(ExecEvent::Exited(code),true),
                     Some(M::StdinError(_))=>continue,
-                    Some(M::Failed(_))|None=>(ExecEvent::Failed,true),
+                    Some(M::Failed(reason))=>(ExecEvent::Failed(format!("guest exec failed: {}", reason.message)),true),
+                    None=>(ExecEvent::Failed("guest exec channel closed".into()),true),
                 };
                 let _=events.send(event);
                 if finished {break;}

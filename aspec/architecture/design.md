@@ -19,6 +19,10 @@ Unit tests, integration tests, and end-to-end tests are combined to achieve maxi
 ### Principle 3: Layered Architecture
 Strict unidirectional dependencies between layers prevent cross-cutting concerns and ensure that lower layers never depend on higher layers.
 
+### Agent version ownership
+
+Users select agent binary versions through agent Dockerfiles and installation templates. Agent definitions, readiness checks and launch admission must never require an exact binary version or reject an upgrade for differing from a bundled default. The sole version distinction is OpenCode 1.x versus 2.x, whose breaking interfaces have separate adapters; those adapters check only the major inside the image. Other agents have no version admission policy. Bundled artifact choices are installation defaults, not compatibility requirements.
+
 ## Four-Layer Architecture
 
 ```
@@ -163,6 +167,15 @@ compiled into the executable; writable disks, image caches, databases, sockets,
 and logs remain runtime state on disk.
 
 ### Runtime backend operations
+
+Container-tier agent launches keep initial prompts of at most 64 KiB in their
+normal delivery channel. Larger prompts that would be argv operands are staged
+verbatim in a private temporary file, mounted read-only, and replaced with a
+short instruction to read and follow the entire file as the user's task. This
+applies equally to interactive and argv-based headless agents on Docker, Apple
+and builtin; stdin and ACP delivery stay unchanged. Prompt mounts follow the
+existing confirmed-exit lifetime guards, including failed launches and retries.
+No prompt content is truncated, shell-expanded or promoted to a system prompt.
 
 The engine owns a backend contract expressed as operations, not as a required
 CLI binary. It selects a backend, checks availability, creates/attaches/stops

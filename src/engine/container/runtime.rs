@@ -108,6 +108,9 @@ pub struct ContainerRuntime {
     env: crate::data::config::env::EnvSnapshot,
     backend: Arc<dyn ContainerBackend>,
     phase_tools_cache: std::sync::Mutex<crate::data::fs::phase_tools_cache::PhaseToolsCache>,
+    /// In-image agent CLI version results by (image id, requirement), so a launch
+    /// probes each image identity once (WI 0157).
+    agent_version_cache: super::agent_version::AgentVersionCache,
 }
 
 // Endpoint buckets prevent a daemon's first Docker from becoming every
@@ -170,6 +173,7 @@ impl ContainerRuntime {
         Self {
             backend: Arc::new(DockerBackend::new(env.clone())),
             phase_tools_cache: new_phase_tools_cache(&env),
+            agent_version_cache: Default::default(),
             env,
         }
     }
@@ -185,6 +189,7 @@ impl ContainerRuntime {
         Self {
             backend: Arc::new(AppleBackend::new(env.clone())),
             phase_tools_cache: new_phase_tools_cache(&env),
+            agent_version_cache: Default::default(),
             env,
         }
     }
@@ -212,6 +217,7 @@ impl ContainerRuntime {
         Ok(Self {
             backend,
             phase_tools_cache: new_phase_tools_cache(&env),
+            agent_version_cache: Default::default(),
             env,
         })
     }
@@ -250,10 +256,13 @@ impl ContainerRuntime {
     /// Build a fully-configured `AgentInstance` from pre-resolved options.
     pub fn build(
         &self,
-        options: ResolvedContainerOptions,
+        mut options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
         options.validate_caller_env()?;
-        self.backend.build(options)
+        options.register_output_secrets();
+        let redaction = options.output_redaction.clone();
+        let instance = self.backend.build(options)?;
+        Ok(crate::engine::agent_runtime::execution::with_output_redaction(instance, redaction))
     }
 
     pub fn list_running(&self, session: &Session) -> Result<Vec<AgentHandle>, EngineError> {
@@ -560,6 +569,19 @@ impl AgentRuntimeEngine for ContainerRuntime {
 
     fn image_home_dir(&self, tag: &str) -> Result<Option<String>, EngineError> {
         Ok(ContainerRuntime::image_home_dir(self, tag))
+    }
+
+    fn probe_agent_cli_version(
+        &self,
+        tag: &str,
+        requirement: &crate::engine::agent::definition::CliMajorRequirement,
+    ) -> crate::engine::container::agent_version::CliVersionStatus {
+        crate::engine::container::agent_version::probe_cli_version_cached(
+            self,
+            &self.agent_version_cache,
+            tag,
+            requirement,
+        )
     }
 
     fn build_image(

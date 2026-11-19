@@ -286,6 +286,7 @@ pub(crate) async fn create_new_spec(
     let credentials = resolve_credentials(engines, &session, &agent, LABEL, frontend)?;
     let mut run_opts = AgentRunOptions {
         non_interactive,
+        yolo_authorized: flags.yolo_authorized,
         yolo: flags
             .yolo
             .then_some(crate::engine::container::options::YoloMode::Enabled),

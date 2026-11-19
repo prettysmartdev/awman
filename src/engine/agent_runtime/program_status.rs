@@ -517,24 +517,41 @@ impl ReportedGate {
 /// receives only the fixed query reply, and is never invoked for piped I/O.
 pub struct ProgramStatusStream {
     scanner: Osc7501Scanner,
+    redaction: Option<crate::engine::auth::redaction::RedactionStream>,
     tracker: SharedProgramStatusTracker,
     config: ProgramStatusBridgeConfig,
 }
 
 impl ProgramStatusStream {
     pub fn finish(&mut self) -> Vec<u8> {
-        self.scanner.finish()
+        let mut bytes = self
+            .redaction
+            .as_mut()
+            .map(|r| r.finish())
+            .unwrap_or_default();
+        let forward = self.scanner.feed(&bytes).forward.into_owned();
+        bytes = forward;
+        bytes.extend(self.scanner.finish());
+        bytes
+    }
+    pub fn with_redaction(mut self, set: crate::engine::auth::redaction::RedactionSet) -> Self {
+        if !set.is_empty() {
+            self.redaction = Some(crate::engine::auth::redaction::RedactionStream::new(set));
+        }
+        self
     }
     pub fn new(tracker: SharedProgramStatusTracker, config: ProgramStatusBridgeConfig) -> Self {
         Self {
             scanner: Osc7501Scanner::new(),
+            redaction: None,
             tracker,
             config,
         }
     }
 
     pub fn feed<'a>(&mut self, chunk: &'a [u8], mut reply: impl FnMut(&[u8])) -> Cow<'a, [u8]> {
-        let result = self.scanner.feed(chunk);
+        let redacted = self.redaction.as_mut().map(|r| r.feed(chunk));
+        let result = self.scanner.feed(redacted.as_deref().unwrap_or(chunk));
         if self.config.enabled {
             for event in &result.events {
                 if matches!(event, ScanEvent::Osc(ParsedOsc7501::Query))
@@ -547,7 +564,14 @@ impl ProgramStatusStream {
                 }
             }
         }
-        result.forward
+        if redacted.is_some() {
+            Cow::Owned(result.forward.into_owned())
+        } else {
+            match result.forward {
+                Cow::Borrowed(_) => Cow::Borrowed(chunk),
+                Cow::Owned(b) => Cow::Owned(b),
+            }
+        }
     }
 }
 
@@ -597,5 +621,34 @@ impl Default for ProgramStatusBridgeConfig {
             enabled: true,
             answer_queries: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod output_redaction_tests {
+    use super::*;
+    #[test]
+    fn output_redaction_precedes_tail_terminal_and_status_with_split_chunks() {
+        let set = crate::engine::auth::redaction::RedactionSet::new();
+        set.add(crate::engine::auth::credential::SecretString::new(
+            "canary-api-key",
+        ));
+        let tracker = ProgramStatusTracker::shared();
+        let mut stream = ProgramStatusStream::new(tracker, Default::default()).with_redaction(set);
+        let mut output = Vec::new();
+        for chunk in [
+            b"diagnostic canary-".as_slice(),
+            b"api-key\n",
+            b"{\"result\":\"canary-api-key\"}",
+            b" partial canary-",
+            b"api-key",
+        ] {
+            output.extend_from_slice(&stream.feed(chunk, |_| {}));
+        }
+        output.extend(stream.finish());
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "diagnostic ***\n{\"result\":\"***\"} partial ***"
+        );
     }
 }

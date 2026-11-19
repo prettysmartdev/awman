@@ -43,6 +43,7 @@ pub enum ParsedFlag {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedArgs {
     flags: BTreeMap<String, ParsedFlag>,
+    implicit_flags: BTreeSet<String>,
     /// Positional arguments, keyed by their catalogue name. Stored as a vector
     /// so a greedy trailing argument keeps every token; single-valued
     /// positionals hold a one-element vector.
@@ -67,10 +68,15 @@ impl ParsedArgs {
                 .into_iter()
                 .collect(),
             path_arguments: BTreeSet::new(),
+            implicit_flags: BTreeSet::new(),
         }
     }
 
     /// Whether the invocation set `flag`, whatever its type.
+    pub fn flag_is_explicit(&self, flag: &str) -> bool {
+        self.flags.contains_key(flag) && !self.implicit_flags.contains(flag)
+    }
+
     pub fn has_flag(&self, flag: &str) -> bool {
         self.flags.contains_key(flag)
     }
@@ -150,6 +156,9 @@ impl ParsedArgs {
     pub fn to_argv(&self, spec: &CommandSpec) -> Vec<String> {
         let mut argv = Vec::new();
         for (name, value) in &self.flags {
+            if self.implicit_flags.contains(name) {
+                continue;
+            }
             match value {
                 ParsedFlag::Bool(true) => argv.push(format!("--{name}")),
                 ParsedFlag::Bool(false) => argv.push(format!("--{name}=false")),
@@ -269,6 +278,7 @@ fn apply_frontend_defaults(parsed: &mut ParsedArgs, spec: &CommandSpec, frontend
             continue;
         };
         if entry.forced {
+            parsed.implicit_flags.insert(entry.flag.to_string());
             parsed.flags.insert(entry.flag.to_string(), value);
             continue;
         }
@@ -294,6 +304,7 @@ fn apply_frontend_defaults(parsed: &mut ParsedArgs, spec: &CommandSpec, frontend
         if conflict_present {
             continue;
         }
+        parsed.implicit_flags.insert(entry.flag.to_string());
         parsed.flags.insert(entry.flag.to_string(), value);
     }
 }
@@ -538,6 +549,7 @@ pub(crate) fn parse_against_spec(
     }
 
     Ok(ParsedArgs {
+        implicit_flags: BTreeSet::new(),
         flags,
         arguments,
         path_arguments,
@@ -703,5 +715,34 @@ fn replaced_or_unknown_flag(
         command: path.iter().map(|segment| (*segment).to_string()).collect(),
         flag: replaced.name.to_string(),
         reason: (replaced.message)(value.as_deref()),
+    }
+}
+
+#[cfg(test)]
+mod permission_provenance_tests {
+    use super::*;
+    #[test]
+    fn api_and_worker_defaults_never_become_explicit_yolo_on_relay() {
+        let catalogue = CommandCatalogue::get();
+        let spec = catalogue.lookup_with_aliases(&["exec", "prompt"]).unwrap();
+        for profile in [FrontendKind::WORKER_LOCAL, FrontendKind::SQUAD_LOCAL] {
+            for opt in [None, Some("--yolo"), Some("--yolo=false")] {
+                let mut args = vec!["--agent".into(), "cursor".into()];
+                if let Some(opt) = opt {
+                    args.push(opt.into());
+                }
+                args.push("review".into());
+                let parsed = catalogue
+                    .parse_raw_args_with_profile(&["exec", "prompt"], &args, profile)
+                    .unwrap();
+                assert_eq!(parsed.flag_is_explicit("yolo"), opt.is_some());
+                assert_eq!(parsed.flag_bool("yolo"), Some(opt != Some("--yolo=false")));
+                let forwarded = parsed.to_argv(spec);
+                assert_eq!(
+                    forwarded.iter().any(|a| a.starts_with("--yolo")),
+                    opt.is_some()
+                );
+            }
+        }
     }
 }

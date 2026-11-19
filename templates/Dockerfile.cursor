@@ -1,0 +1,59 @@
+FROM {{AWMAN_BASE_IMAGE}}
+
+# Force root for installation: a base image may have switched to a non-root
+# user, and apt/cp/install need write access to /usr/local, /etc, /root.
+USER root
+
+# Reset env vars so installer behavior does not depend on what the base set:
+#   - HOME drives where installers and tools write user-scoped files.
+#   - DEBIAN_FRONTEND avoids interactive apt prompts.
+#   - PATH prepends the agent baseline to whatever the base image set,
+#     so installer-resolved binaries cannot be shadowed by the base while
+#     useful base PATH additions (e.g. /usr/local/cargo/bin from
+#     Dockerfile.dev) stay visible inside the agent container.
+ENV HOME=/root \
+    DEBIAN_FRONTEND=noninteractive \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+WORKDIR /root
+
+# Strict shell for every RUN: -e fails fast, -o pipefail catches errors in
+# `curl | bash` pipelines so a partial download cannot silently succeed.
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+
+# Override any inherited ENTRYPOINT/CMD so `docker run image <command> ...`
+# behaves predictably regardless of how the base evolves.
+ENTRYPOINT []
+CMD ["/bin/bash"]
+
+LABEL awman.agent="cursor"
+
+# ── Supported platform ────────────────────────────────────────────────────────
+RUN case "$(uname -m)" in \
+      x86_64|amd64|aarch64|arm64) ;; \
+      *) echo "awman: cursor-agent has no Linux package for architecture '$(uname -m)' (supported: x86_64, aarch64)" >&2; exit 1 ;; \
+    esac; \
+    CA_LDD="$(ldd --version 2>&1 || true)"; \
+    case "$CA_LDD" in \
+      *musl*) echo "awman: cursor-agent requires glibc; this base image uses musl" >&2; exit 1 ;; \
+    esac
+
+# ── awman user + workspace (idempotent against a base that already created it) ─
+# Outer braces keep the && chain associated with the user-creation block,
+# avoiding the `A || B && C && D` precedence trap that would otherwise skip
+# `mkdir`/`chown` whenever the user already exists.
+RUN { id -u awman >/dev/null 2>&1 \
+       || useradd -m -s /bin/bash -d /home/awman awman 2>/dev/null \
+       || useradd -s /bin/bash -d /home/awman awman ; } \
+    && mkdir -p /workspace /home/awman \
+    && chown -R awman:awman /workspace /home/awman
+
+USER awman
+ENV HOME=/home/awman \
+    PATH=/home/awman/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
+WORKDIR /workspace
+
+# Install the current upstream CLI as the runtime user. This Dockerfile owns
+# version selection; awman does not restrict upgrades or suppress self-updates.
+RUN curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 600 https://cursor.com/install | bash \
+    && cursor-agent --version \
+    && cursor-agent --help >/dev/null

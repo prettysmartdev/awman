@@ -42,6 +42,23 @@ divergent body is used, including a forged header. Remove the header line to tak
 ownership, or delete the file to regenerate it. These files are image build inputs
 and need review independently when their contents differ from the approved recipe.
 
+Session configuration copies obey the same real-location boundary as settings
+mounts, including the actual awman data home and relocated protected aliases.
+Copy traversal and file reads use held directory descriptors and no-follow opens;
+links and unsafe entries fail the launch rather than silently dropping policy.
+An absent config starts empty. Platforms without secure traversal refuse an
+existing config. Copies are bounded and private, and never written back.
+
+Built-in OpenCode 2 and Cursor require explicit caller authorization for yolo;
+frontend defaults and implied dynamic/squad automation are not authorization.
+They are refused on Docker Sandboxes until per-execution state and credential
+scope isolation exists. Pinned-agent launches refuse failed version probes on
+every launch path. Cursor requires its exact tested build and its version probe
+also disables updates; OpenCode may use another version of the required major.
+Resolved env grants and secret overrides are registered before runtime output is
+published. Streaming redaction precedes terminal replay, status parsing, logs and
+failure tails, and protects secrets spanning byte chunks.
+
 ## Guidance:
 
 - **Trusted work item providers** — `workItems.source` may be repository

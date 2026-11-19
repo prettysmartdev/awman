@@ -45,7 +45,7 @@ Available via: CLI, TUI, API
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
-| `--agent` | string | `claude` | — | — | CLI, TUI, API | Code agent to install in the Dockerfile.dev container: claude, codex, opencode, gemini, copilot, cline, antigravity, or the name of a custom agent defined in .awman/agents/ or ~/.awman/agents/. |
+| `--agent` | string | `claude` | — | — | CLI, TUI, API | Code agent to install in the Dockerfile.dev container: claude, codex, opencode, opencode-v2, cursor, copilot, cline, antigravity, or the name of a custom agent defined in .awman/agents/ or ~/.awman/agents/. |
 | `--aspec` | bool | false | — | — | CLI, TUI, API | Download aspec templates to the current project. |
 
 ---

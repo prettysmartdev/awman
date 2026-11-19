@@ -337,11 +337,11 @@ $ docker run --rm -it \
     -v /path/to/repo:/workspace \
     -w /workspace \
     -v /tmp/awman-claude-dir-a1b2c3/.claude:/home/awman/.claude \
-    -e GEMINI_API_KEY \
+    -e ANTHROPIC_API_KEY \
     awman-myapp-claude:latest claude "Implement work item 0001..."
 ```
 
-With the Apple Containers runtime, the same commands are shown with `container` instead of `docker`. With the Docker Sandboxes runtime, every `sbx` invocation is announced — `sbx create`, `sbx run`, `sbx exec`, `sbx stop`, `sbx rm`, `sbx secret set`, `sbx kit validate` — without sensitive values:
+With the Apple Containers runtime, the same commands are shown with `container` instead of `docker`. With Docker Sandboxes, commands that manage or run sandboxes are announced — `sbx create`, `sbx run`, `sbx exec`, `sbx stop`, `sbx rm`, `sbx secret set` — without sensitive values. Successful readiness probes (`version`, `ls`, `kit validate`) stay quiet; warnings and failed commands retain their diagnostics:
 
 ```
 Running: sbx create --kit ~/.awman/kits/claude --name awman-ab12-claude claude /home/user/myproject

@@ -898,6 +898,7 @@ fn insert_or_merge(map: &mut HashMap<String, OverlaySpec>, key: String, spec: Ov
 // split by what is being staged. All private: `OverlayEngine` is declared in
 // this file, so the module's public surface is unchanged.
 mod agent_settings;
+pub(crate) use agent_settings::overlaps_protected_root as seed_overlaps_protected_root;
 mod claude;
 mod credential_file;
 pub mod prerequisite_grants;

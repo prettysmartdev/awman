@@ -379,16 +379,22 @@ awman writes the file for you when you answer the agent and model questions duri
 ### Set the default agent
 
 ```sh
-awman config set agents.default gemini --global   # for all projects
+awman config set agents.default cursor --global   # for all projects
 awman config set agents.default codex             # for this repo only
 ```
 
-Valid agents: `claude`, `codex`, `gemini`, `opencode`, `cline`, `copilot`, `antigravity`, or the name of a [custom agent](15-custom-agents.md). Custom definitions are TOML files:
+Valid agents: `claude`, `codex`, `opencode`, `opencode-v2`, `cursor`, `cline`, `copilot`, `antigravity`, or the name of a [custom agent](15-custom-agents.md). Custom definitions are TOML files:
 
 | Path | Scope |
 |---|---|
 | `<git_root>/.awman/agents/<name>.toml` | This repo (wins over a global definition of the same name) |
 | `<AWMAN_HOME>/agents/<name>.toml` | Every repo |
+
+Agent versions are selected by your agent Dockerfiles, not an awman version allowlist. Upgrade or pin a build in `.awman/Dockerfile.<agent>` and rebuild with `awman ready --build`. Only the OpenCode major is checked for adapter compatibility.
+
+`opencode` selects OpenCode 1.x and `opencode-v2` selects OpenCode 2.x; they are independent agents (see [OpenCode 1.x and 2.x](03-agent-sessions.md#opencode-1x-and-2x)). `cursor` needs `CURSOR_API_KEY` delivered through `env()` (see [Cursor authentication](03-agent-sessions.md#cursor-authentication)).
+
+`gemini` is no longer a built-in agent. If `agents.default` is `"gemini"` and no custom agent named `gemini` exists, awman refuses to run and names the two ways forward: the built-in `antigravity` agent, or a [custom Gemini agent](15-custom-agents.md#example-gemini-cli). It does not change your setting for you. See [Gemini is no longer built in](03-agent-sessions.md#gemini-is-no-longer-built-in) for the scope of Google's consumer-account deprecation.
 
 A repo-scope write accepts custom agents defined in the repo or globally; a `--global` write accepts only globally defined ones. Anything else is rejected at write time with the list of valid agents.
 

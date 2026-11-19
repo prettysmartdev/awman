@@ -280,10 +280,16 @@ impl ContainerBackend for DockerBackend {
     }
 
     fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
-        Ok(Box::new(AttachInstance {
-            cli: self.cli(),
-            handle: handle.clone(),
-        }))
+        let redaction = attach_output_redaction(self.cli(), &handle.id)?;
+        Ok(
+            crate::engine::agent_runtime::execution::with_output_redaction(
+                Box::new(AttachInstance {
+                    cli: self.cli(),
+                    handle: handle.clone(),
+                }),
+                redaction,
+            ),
+        )
     }
 
     fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError> {
@@ -457,6 +463,7 @@ pub(super) fn attach_bridge_config(
     stuck_timeout: std::time::Duration,
 ) -> crate::engine::container::io_bridge::BridgeConfig {
     crate::engine::container::io_bridge::BridgeConfig {
+        output_redaction: Default::default(),
         grace_timeout,
         stuck_timeout,
         container_start_delay: std::time::Duration::ZERO,
@@ -487,6 +494,61 @@ pub(super) fn kill_local_exec(pid: Option<u32>) {
             let _ = pid; // best-effort no-op; the container is never touched
         }
     }
+}
+
+fn attach_output_redaction(
+    cli: ContainerCli,
+    id: &str,
+) -> Result<crate::engine::auth::redaction::RedactionSet, EngineError> {
+    let set = crate::engine::auth::redaction::RedactionSet::new();
+    let label = format!(
+        "{{{{index .Config.Labels \"{}\"}}}}",
+        super::options::OUTPUT_SECRET_ENV_LABEL
+    );
+    let output = crate::engine::host_cli::checked_output(
+        cli.command().args(["inspect", "--format", &label, id]),
+        cli.bin,
+    )?;
+    if !output.status.success() {
+        return Err(EngineError::Container(
+            "cannot inspect output protection for attach".into(),
+        ));
+    }
+    let names = String::from_utf8_lossy(&output.stdout);
+    let names = names.trim();
+    // Older containers have no grant-name label.
+    if names.is_empty() || names == "<no value>" {
+        return Ok(set);
+    }
+    if !names.split(',').all(is_env_var_name) {
+        return Err(EngineError::Container(
+            "invalid output protection metadata for attach".into(),
+        ));
+    }
+    let output = crate::engine::host_cli::checked_output(
+        cli.command()
+            .args(["inspect", "--format", "{{json .Config.Env}}", id]),
+        cli.bin,
+    )?;
+    if !output.status.success() {
+        return Err(EngineError::Container(
+            "cannot recover output protection for attach".into(),
+        ));
+    }
+    let env: Vec<String> = serde_json::from_slice(&output.stdout)
+        .map_err(|_| EngineError::Container("cannot decode output protection for attach".into()))?;
+    for name in names.split(',') {
+        let value = env
+            .iter()
+            .filter_map(|entry| entry.split_once('='))
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value)
+            .ok_or_else(|| {
+                EngineError::Container("missing output protection value for attach".into())
+            })?;
+        set.add(crate::engine::auth::credential::SecretString::new(value));
+    }
+    Ok(set)
 }
 
 /// Configured-but-not-running attach handle. `run_with_frontend` opens a
@@ -524,6 +586,7 @@ impl AgentInstance for AttachInstance {
         let io = frontend.take_io();
         let mut bridge_cfg = attach_bridge_config(grace_timeout, stuck_timeout);
         bridge_cfg.program_status = frontend.program_status_config();
+        bridge_cfg.output_redaction = frontend.output_redaction();
 
         // `docker attach` reconnects to the container's primary process (the
         // agent launched by `docker run -it`), rather than creating a sibling
@@ -780,21 +843,29 @@ impl ExecutionBackend for AttachExecution {
 /// changing it would silently alter CLI/TUI behaviour for a variable that is
 /// deliberately set to the empty string.
 fn resolve_env_passthrough_raw(options: &ResolvedContainerOptions) -> Vec<(String, String)> {
-    let mut values: Vec<_> = options
-        .env_passthrough
-        .iter()
-        .filter(|envvar| is_env_var_name(&envvar.0))
-        .filter_map(|envvar| {
-            options
-                .host_env
-                .as_ref()
-                .map_or_else(
-                    || crate::data::config::env::host_var(&envvar.0),
-                    |env| env.host_payload(&envvar.0),
-                )
-                .map(|value| (envvar.0.clone(), value))
-        })
-        .collect();
+    let mut values: Vec<_> = if let Some(grants) = &options.resolved_env_grants {
+        grants
+            .iter()
+            .filter(|(key, _)| is_env_var_name(key))
+            .map(|(key, value)| (key.clone(), value.expose().to_string()))
+            .collect()
+    } else {
+        options
+            .env_passthrough
+            .iter()
+            .filter(|envvar| is_env_var_name(&envvar.0))
+            .filter_map(|envvar| {
+                options
+                    .host_env
+                    .as_ref()
+                    .map_or_else(
+                        || crate::data::config::env::host_var(&envvar.0),
+                        |env| env.host_payload(&envvar.0),
+                    )
+                    .map(|value| (envvar.0.clone(), value))
+            })
+            .collect()
+    };
     for (key, value) in &options.env_overrides {
         if crate::data::config::workflows::valid_env_name(key) {
             values.retain(|(name, _)| name != key);

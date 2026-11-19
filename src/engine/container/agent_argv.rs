@@ -151,3 +151,7 @@ impl PathRendering {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "agent_argv_adapter_tests.rs"]
+mod adapter_tests;

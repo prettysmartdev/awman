@@ -35,6 +35,11 @@ pub enum ImageRetryClass {
 
 #[derive(Debug, Error)]
 pub enum EngineError {
+    /// The exec transport ended without a trustworthy process exit status.
+    /// Only a confirmed stop permits workflow recovery in a fresh container.
+    #[error("builtin exec stream closed or failed before reporting exit status: {reason}")]
+    ExecutionStreamFailed { reason: String, stopped: bool },
+
     #[error(transparent)]
     Data(#[from] DataError),
 
@@ -151,6 +156,15 @@ pub enum EngineError {
 
     #[error("plan mode is not supported by agent {agent}")]
     PlanModeUnsupported { agent: String },
+
+    /// A permission mode (or mode combination) this agent cannot honour;
+    /// refused before anything is prepared.
+    #[error("{reason}")]
+    AgentModeUnsupported {
+        agent: String,
+        mode: &'static str,
+        reason: String,
+    },
 
     #[error(
         "agent image build requires the project base image first ({tag}); run `awman ready --build`"

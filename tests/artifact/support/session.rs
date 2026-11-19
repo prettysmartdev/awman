@@ -28,8 +28,12 @@ pub fn prepare(s: &TestSandbox, archive: &Path, agent: &str, body: &str) -> Path
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&synthetic, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+    // The executable the definition launches (`agy`, `cursor-agent`, and
+    // `opencode` for both OpenCode majors).
     let name = match agent {
         "antigravity" => "agy",
+        "cursor" => "cursor-agent",
+        "opencode-v2" => "opencode",
         other => other,
     };
     std::fs::write(

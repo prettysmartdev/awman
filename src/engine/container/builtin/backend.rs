@@ -226,7 +226,7 @@ impl BuiltinBackend {
         std::thread::spawn(move || {
             let mut events = session.events;
             while let Ok(event) = events.blocking_recv() {
-                let terminal = matches!(event, ExecEvent::Exited(_) | ExecEvent::Failed);
+                let terminal = matches!(event, ExecEvent::Exited(_) | ExecEvent::Failed(_));
                 if tx.send(event).is_err() || terminal {
                     break;
                 }
@@ -363,12 +363,20 @@ impl BuiltinBackend {
                 .unwrap_or(config.argv),
         );
         let mut env = Vec::new();
-        for key in options.env_passthrough {
-            if let Some(value) = options.host_env.as_ref().map_or_else(
-                || crate::data::config::env::host_var(&key.0),
-                |env| env.get(&key.0).map(str::to_owned),
-            ) {
-                env.push((key.0, value));
+        if let Some(grants) = options.resolved_env_grants {
+            env.extend(
+                grants
+                    .into_iter()
+                    .map(|(key, value)| (key, value.expose().to_string())),
+            );
+        } else {
+            for key in options.env_passthrough {
+                if let Some(value) = options.host_env.as_ref().map_or_else(
+                    || crate::data::config::env::host_var(&key.0),
+                    |env| env.get(&key.0).map(str::to_owned),
+                ) {
+                    env.push((key.0, value));
+                }
             }
         }
         for (key, value) in options.env_overrides {
@@ -1047,7 +1055,7 @@ impl ContainerBackend for BuiltinBackend {
         std::thread::spawn(move || {
             let mut events = session.events;
             while let Ok(event) = events.blocking_recv() {
-                let terminal = matches!(event, ExecEvent::Exited(_) | ExecEvent::Failed);
+                let terminal = matches!(event, ExecEvent::Exited(_) | ExecEvent::Failed(_));
                 if tx.send(event).is_err() || terminal {
                     break;
                 }

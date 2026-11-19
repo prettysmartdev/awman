@@ -96,6 +96,12 @@ fn require_agent(opts: &ResolvedSandboxOptions) -> Result<String, EngineError> {
             "sandbox launch requires an agent id".into(),
         ));
     }
+    if let Some(def) = first_party(&opts.agent_id) {
+        def.validate_run(
+            &Default::default(),
+            crate::engine::agent::definition::RunParadigm::Sandbox,
+        )?;
+    }
     Ok(opts.agent_id.clone())
 }
 
@@ -345,6 +351,16 @@ pub(in crate::engine::sandbox) fn run_interactive(
         }
     }
 
+    // 5b. WI 0157: the binary the kit launches must be the pinned major.
+    //     Probe errors and a wrong major both refuse launch; a stale sandbox
+    //     cannot bypass version verification when its exec fails.
+    if let Some(requirement) = first_party(&agent).and_then(|d| d.cli_version) {
+        let mut argv = vec!["exec".to_string(), name.clone(), requirement.binary.clone()];
+        argv.push("--version".into());
+        let out = SbxCommand::new(argv).in_env(&snapshot).run_quiet()?;
+        verify_sandbox_version(&name, &requirement, &out)?;
+    }
+
     // 6. The launch argv is always the positional-run form — the kit and
     //    workspace are baked into the sandbox at creation.
     let argv = run_argv(&name, &agent, &options);
@@ -392,6 +408,25 @@ pub(in crate::engine::sandbox) fn run_interactive(
 /// apply script can only stage the prompt, not deliver it — so stdin
 /// injection is their single delivery path (PTY type-ahead when interactive,
 /// piped stdin otherwise).
+fn verify_sandbox_version(
+    name: &str,
+    requirement: &crate::engine::agent::definition::CliMajorRequirement,
+    out: &super::spawn::SbxOutput,
+) -> Result<(), EngineError> {
+    use crate::engine::container::agent_version::{classify_cli_version, CliVersionStatus};
+    if !out.success() {
+        return Err(EngineError::Sandbox(format!(
+            "cannot verify CLI inside sandbox '{name}'; run 'awman ready --no-cache'"
+        )));
+    }
+    if let CliVersionStatus::Mismatch { found, expected } =
+        classify_cli_version(requirement, out.stdout.lines().next().unwrap_or_default())
+    {
+        return Err(EngineError::Sandbox(format!("sandbox '{name}' does not run the expected {expected} (found {found}); run 'awman ready --no-cache'")));
+    }
+    Ok(())
+}
+
 fn stdin_seed(agent: &str, options: &ResolvedSandboxOptions) -> Option<String> {
     match kit_kind_for(agent) {
         SbxKitKind::Agent => None,
@@ -474,14 +509,16 @@ fn agent_args_for(
     if !matches!(def.sbx_kit_kind, SbxKitKind::Agent) {
         return Vec::new();
     }
-    let mut args = Vec::new();
-    if options.interactive {
-        args.extend(def.interactive_only_flags.iter().cloned());
-    } else {
-        if let Some(flag) = &def.non_interactive_flag {
-            args.push(flag.clone());
-        }
-    }
+    // The kit's `agent.entrypoint.run` is `interactive_entrypoint`; the rest
+    // of the launch shape (headless form, `headless_only_flags`, the
+    // interactive model fallback subcommand) comes from the same definition
+    // method the container builders use. Structured output is never
+    // delivered under sbx, so the text flags always apply.
+    let shape = def.launch_shape(!options.interactive, options.model.is_some(), false);
+    let mut args: Vec<String> = shape
+        .into_iter()
+        .skip(def.interactive_entrypoint.len())
+        .collect();
     args.extend(options.mode_flags.iter().cloned());
     if let Some(model) = &options.model {
         match model {
@@ -836,5 +873,105 @@ impl ExecutionBackend for DSbxExecution {
                 .run_quiet();
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod adapter_tail_tests {
+    //! WI 0157: the sbx tail after the kit entrypoint matches the container
+    //! argv for the version-specific adapters.
+    use super::*;
+    use crate::engine::container::options::ModelFlagForm;
+    use crate::engine::sandbox::options::SandboxOption;
+
+    fn tail(
+        agent: &str,
+        interactive: bool,
+        model: Option<&str>,
+        mode: &[&str],
+        seed: Option<&str>,
+    ) -> Vec<String> {
+        let mut options = vec![SandboxOption::Interactive(interactive)];
+        if let Some(m) = model {
+            options.push(SandboxOption::Model {
+                flag: ModelFlagForm::Argument(m.into()),
+            });
+        }
+        if !mode.is_empty() {
+            options.push(SandboxOption::AgentModeFlags(
+                mode.iter().map(|s| s.to_string()).collect(),
+            ));
+        }
+        if let Some(s) = seed {
+            options.push(SandboxOption::SeededPrompt(s.into()));
+        }
+        agent_args(agent, &ResolvedSandboxOptions::resolve(options))
+    }
+
+    fn s(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn sandbox_version_failure_cannot_bypass_the_pin() {
+        let requirement = first_party("opencode").unwrap().cli_version.unwrap();
+        for (exit_code, stdout) in [(1, "1.19.6"), (0, ""), (0, "2.3.2")] {
+            let out = super::super::spawn::SbxOutput {
+                stdout: stdout.into(),
+                stderr: String::new(),
+                exit_code,
+            };
+            assert!(verify_sandbox_version("fixture", &requirement, &out).is_err());
+        }
+        let opts = ResolvedSandboxOptions::resolve([SandboxOption::AgentId("cursor".into())]);
+        assert!(require_agent(&opts).is_err());
+    }
+    #[test]
+    fn opencode_v1_is_an_agent_kit_with_its_headless_subcommand() {
+        assert_eq!(kit_kind_for("opencode"), SbxKitKind::Agent);
+        assert_eq!(
+            tail("opencode", false, None, &[], Some("hi")),
+            s(&["run", "hi"])
+        );
+        assert_eq!(
+            tail("opencode", true, Some("a/b"), &["--auto"], Some("hi")),
+            s(&["--auto", "--model", "a/b", "--prompt", "hi"])
+        );
+    }
+
+    #[test]
+    fn opencode_v2_tail_follows_the_standalone_kit_entrypoint() {
+        assert_eq!(kit_kind_for("opencode-v2"), SbxKitKind::Agent);
+        assert_eq!(
+            tail("opencode-v2", true, None, &[], None),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            tail("opencode-v2", true, Some("a/b"), &[], Some("hi")),
+            s(&["mini", "--model", "a/b", "--prompt", "hi"])
+        );
+        assert_eq!(
+            tail("opencode-v2", false, Some("a/b"), &["--auto"], Some("hi")),
+            s(&["run", "--auto", "--model", "a/b", "hi"])
+        );
+    }
+
+    #[test]
+    fn cursor_headless_tail_always_uses_text_output_under_sbx() {
+        assert_eq!(kit_kind_for("cursor"), SbxKitKind::Agent);
+        assert_eq!(
+            tail("cursor", false, Some("m"), &[], Some("hi")),
+            s(&[
+                "--print",
+                "--trust",
+                "--output-format",
+                "text",
+                "--model",
+                "m",
+                "hi"
+            ])
+        );
+        assert_eq!(tail("cursor", true, None, &[], Some("hi")), s(&["hi"]));
+        assert!(!tail("cursor", false, None, &[], Some("hi")).contains(&"--force".to_string()));
     }
 }

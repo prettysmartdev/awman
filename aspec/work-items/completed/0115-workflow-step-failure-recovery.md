@@ -98,6 +98,17 @@ ride out transient agent/container failures without a human in the loop.
   single failure-recovery surface, and leaving a dead engine→frontend contract
   behind would invite divergence.
 
+Execution-stream failures participate in the same main-step recovery policy
+as non-zero exits, for sequential and parallel workflows and daemon-backed
+interactive clients. The runtime preserves a redacted failure reason and a
+typed confirmation that the old execution has stopped. Recovery is allowed
+only with that confirmation; unrelated engine errors and unconfirmed stops
+remain fatal. Persist these failures with the existing unknown-status sentinel
+`-1` and the reason, without fabricating an `AgentExitInfo`. The failure board
+says "Exit status unavailable" and offers the usual restart/back/skip/pause/abort
+actions. Authentication recovery must not treat stream loss as an agent exit.
+Existing `abort_on_failure`, cancellation and unattended retry limits apply.
+
 ### 2. Workflow resume — one flow for both modes
 
 Resume is a single code path. `WorkflowResumePrompt` (built by the command
