@@ -2,6 +2,12 @@
 
 The manifest test system is the only supported path. See [replacement-ledger.md](replacement-ledger.md) for coverage decisions and evidence. Native Apple Silicon acceptance remains open until the maintainer's packet is independently reviewed.
 
+The Linux x86_64 builtin PR build and release jobs run on Ubuntu 22.04 to
+preserve the published GNU executable's glibc 2.35 baseline. Default-feature
+Linux PR suites remain on Ubuntu 24.04, and the musl static smoke remains
+separate. Candidate creation rejects any newer or unrecognized glibc symbol
+requirement before publishing its build record.
+
 Platform: GitHub Actions
 
 What CI runs is defined once, in `ci/gates.toml` (the **gate manifest**). The CI

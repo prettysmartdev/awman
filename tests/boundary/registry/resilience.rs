@@ -138,8 +138,8 @@ fn bearer_token_expiring_between_manifest_and_blob_is_renewed() {
 #[test]
 fn transient_server_errors_and_mid_blob_disconnect_retry_the_same_source() {
     for (fault, id) in [
-        (Fault::Unavailable(2), "registry::resilience::transient_server_errors_and_mid_blob_disconnect_retry_the_same_source::server"),
-        (Fault::DisconnectBlob, "registry::resilience::transient_server_errors_and_mid_blob_disconnect_retry_the_same_source::disconnect"),
+        (Fault::Unavailable(2), "registry::resilience::transient_server_errors_and_mid_blob_disconnect_retry_the_same_source"),
+        (Fault::DisconnectBlob, "registry::resilience::transient_server_errors_and_mid_blob_disconnect_retry_the_same_source"),
     ] {
         let (s, registry, image) = prepare(id);
         let endpoint = Endpoint::start(&s, registry, fault);
@@ -155,14 +155,26 @@ fn transient_server_errors_and_mid_blob_disconnect_retry_the_same_source() {
 #[test]
 fn retry_exhaustion_and_bad_digest_never_publish_partial_images() {
     for (fault, expected, id) in [
-        (Fault::Unavailable(usize::MAX), 3, "registry::resilience::retry_exhaustion_and_bad_digest_never_publish_partial_images::server"),
-        (Fault::CorruptBlob, 2, "registry::resilience::retry_exhaustion_and_bad_digest_never_publish_partial_images::digest"),
+        (
+            Fault::Unavailable(usize::MAX),
+            3,
+            "registry::resilience::retry_exhaustion_and_bad_digest_never_publish_partial_images",
+        ),
+        (
+            Fault::CorruptBlob,
+            2,
+            "registry::resilience::retry_exhaustion_and_bad_digest_never_publish_partial_images",
+        ),
     ] {
         let (s, registry, _) = prepare(id);
         let endpoint = Endpoint::start(&s, registry, fault);
         let (acquirer, request) = pull(&s, &endpoint, Duration::from_secs(10));
         no_cached_success(&acquirer, &request);
-        assert_eq!(endpoint.requests.load(Ordering::SeqCst), expected, "wrong retry classification");
+        assert_eq!(
+            endpoint.requests.load(Ordering::SeqCst),
+            expected,
+            "wrong retry classification"
+        );
         drop(endpoint);
         s.finish();
     }
@@ -206,6 +218,11 @@ fn cancellation_interrupts_a_stalled_blob_without_publishing_success() {
             awman::engine::error::EngineError::ImageAcquisitionCancelled
         ));
     });
+    let references = s.root().join("fault-cache/oci-cache/refs");
+    assert!(
+        !references.exists() || std::fs::read_dir(references).unwrap().next().is_none(),
+        "cancelled transfer published a cache reference"
+    );
     drop(endpoint);
     s.finish();
 }

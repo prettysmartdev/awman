@@ -88,6 +88,11 @@ That's it — you have an isolated agent working in your repo.
 
 Release assets: `awman-linux-amd64`, `awman-linux-arm64`, `awman-macos-arm64`, `awman-windows-amd64.exe`, plus `SHA256SUMS` (see [Runtimes](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions) to verify downloads). Intel Macs are not supported.
 
+The Linux x86_64 download requires glibc 2.35 or newer, such as Ubuntu 22.04
+or Debian 12. Its builtin runtime also needs read/write access to `/dev/kvm`.
+Alpine Linux and other musl distributions require a source build using another
+runtime.
+
 The **experimental builtin microVM runtime** (macOS on Apple Silicon and Linux x86_64 with KVM in this release) is compiled into awman itself, so installing awman is the only install step for it: no Docker, `container`, or `sbx` is required to run agents. The `awman-macos-arm64` release binary includes it and is ad-hoc signed with the hypervisor entitlement it needs; see [The macOS binary, Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions) if macOS refuses to open a downloaded copy. Enable it explicitly in your global config with `awman config set runtime.kind builtin`, then follow [Getting an agent image](11-runtimes.md#getting-an-agent-image). By default `awman ready` imports an image you built elsewhere. To build and import in one command instead, point the image source at a local store and enable the builder:
 
 ```json

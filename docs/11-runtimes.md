@@ -132,7 +132,7 @@ awman ready --build --no-cache   # rebuild from scratch
 | Host | Status |
 |---|---|
 | macOS on Apple Silicon | Supported (experimental). Included in the `awman-macos-arm64` release and in source builds (`make build`). |
-| Linux x86_64 (GNU/glibc) | Supported (experimental) with KVM. Included in `awman-linux-amd64` and source builds (`make build`). |
+| Linux x86_64 (GNU/glibc) | Supported (experimental) with KVM. Included in `awman-linux-amd64` (glibc 2.35 or newer) and source builds (`make build`). |
 | Linux arm64, Linux musl, Windows | Builtin runtime unavailable. Other supported runtimes remain available. |
 
 The runtime is present only in awman builds compiled with it. The `awman-macos-arm64` and GNU/glibc `awman-linux-amd64` release assets include it. Linux arm64, musl and Windows builds do not. A build without it reports `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature`.

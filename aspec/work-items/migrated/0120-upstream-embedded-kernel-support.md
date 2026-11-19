@@ -2,8 +2,52 @@
 
 > Testing policy update (WI144): test commands, harness paths and test counts in this historical record are superseded by [the current testing contract](/aspec/devops/testing.md). Use manifest suites and `make validate-native` for native acceptance. Removed test sources and raw evidence bundles are available only in Git history; they must not be restored as test patterns.
 
-Title: Replace the vendored embedded-kernel patch with upstream libkrun support
-Issue: n/a
+Title: Retire downstream Microsandbox patches through published upstream APIs
+Issue: https://github.com/prettysmartdev/awman/issues/46
+
+## Current reconciliation (2026-11-19)
+
+This section supersedes the historical upstream snapshot and patch counts
+below. The Linux enablement work is tracked in issue #47 on `nextgen`.
+No upstream fork, branch, commit, issue or PR was created or submitted.
+
+Upstream source was fetched directly and inspected at:
+
+| Repository | Default-branch revision | Workspace version |
+|---|---|---|
+| Microsandbox | `abff71505fc46416b3d704ee2787f8e55ae66efa` | `0.7.16`, pins `msb_krun =0.1.46` |
+| libkrun | `35cf9e345365b9500e3ef1c9823c3edcfb35a52b` | `0.1.46` |
+
+These are inspected source revisions, not a claim that awman adopted or
+validated those releases. Awman remains pinned to Microsandbox `0.7.8` and
+published `msb_krun 0.1.41`; a dependency migration requires separate protocol,
+catalog, payload and native acceptance. Current upstream also changed storage
+protection and context APIs, so a version bump is not a mechanical patch deletion.
+
+The current patch inventory is six crates: SQLx plus SDK, filesystem, network,
+types, and the newly carried Microsandbox runtime patch. There is still no
+libkrun fork. Exact archive/diff digests and removal conditions are maintained
+in `third_party/README.md` and each `PATCH.md`.
+
+| Saved proposal | Current finding and required next step |
+|---|---|
+| 01 isolated construction | Upstream renamed the backend to `LocalContext`; the proposal now targets `LocalContextBuilder::build_isolated`. The pinned awman SDK still needs `build_lazy_isolated`. Preserve refusal of ambient runtime overrides and hostile user/managed config tests. |
+| 02 per-architecture embedded Agentd | `MSB_EMBED_ARTIFACTS_ROOT` remains absent. Rebase around upstream's new Agentd storage-capability validation; retain validation and fail-closed missing-architecture behavior. |
+| 03 strict visible SNI | `strict_sni` remains absent. Reconcile the new DNS-forwarder/proxy APIs and context paths; require positive TLS and denied-before-connect tests plus protocol capability negotiation. |
+| 04 suffix DNS binding | Upstream still explicitly allows sibling DNS bindings. This proposal intentionally tightens behavior and requires a maintainer decision; do not call it an accepted fix. |
+| 05 kernel allocation documentation | Heap alignment guidance remains useful. The example must also explain that an idempotent process-owned kernel buffer is not proof of independent writable guest memory. |
+| 06 fresh x86_64 private-memory boot | New proposal: call existing `Vm::set_private_memory_boot(true)` for fresh Linux x86_64 guests before entry, leaving restore memory ownership intact. This retires the new runtime patch only after a published equivalent passes mapping-isolation, concurrent guest and final-artifact tests. |
+
+The `host.builtin.internal` alias rename remains awman-specific. Removing the
+network fork completely also needs a configurable upstream alias (or an
+explicitly reviewed compatibility change); merging SNI proposals alone is
+insufficient. SQLx compatibility remains an independent removal gate.
+
+Saved proposal bundles are in `aspec/review-notes/0120-evidence/upstream-prs/`.
+Their base, application checks and outstanding upstream tests are explicit in
+each `PR.md`; they are local drafts, not upstream acceptance evidence.
+Linux native evidence belongs to WI 0124, and does not validate new upstream
+0.7.16 sources. Linux ARM64 remains gated; the current release scope is x86_64.
 
 Distribution policy (2026-09-29, from
 [WI 0123](completed/0123-builtin-native-verification-and-release-closure.md);

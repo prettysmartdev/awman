@@ -14,11 +14,14 @@ fn size_startup_and_rss_are_recorded_without_thresholds() {
         starts.push(start.elapsed().as_micros() as u64);
     }
     let mut rss: Option<u64> = None;
+    let sample_command = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "__awman-builtin-kernel-check"
+    } else {
+        "--version"
+    };
     #[cfg(target_os = "linux")]
     {
-        let mut child = support::run_artifact(&s, &a)
-            .arg("__awman-builtin-kernel-check")
-            .spawn();
+        let mut child = support::run_artifact(&s, &a).arg(sample_command).spawn();
         while child.try_exit().is_none() {
             if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", child.pid())) {
                 for line in status.lines().filter(|l| l.starts_with("VmHWM:")) {
@@ -42,6 +45,6 @@ fn size_startup_and_rss_are_recorded_without_thresholds() {
     };
     let record = serde_json::json!({"schema":1,"artifact_sha256":a.sha256,"target_os":std::env::consts::OS,"target_arch":std::env::consts::ARCH,
         "size_bytes":std::fs::metadata(&a.exe).unwrap().len(),"startup_us":starts,"startup_method":"supervised offline --version wall time, includes wrapper",
-        "rss_bytes":rss,"rss_method":"Linux /proc VmHWM during exact kernel-check","blocking":false,"warning":warning});
+        "rss_bytes":rss,"rss_method":format!("Linux /proc VmHWM during exact {sample_command}"),"blocking":false,"warning":warning});
     support::record(&format!("measurements-{}.json", a.sha256), &record);
 }
