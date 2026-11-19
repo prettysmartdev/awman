@@ -19,7 +19,7 @@ summary. Build output is printed without a `running` suffix on every line.
 | `docker` (default) | Linux, macOS, Windows | Linux container (shared kernel) | Docker daemon |
 | `apple` | macOS 26+ only | Lightweight VM per container | macOS 26 Tahoe |
 | `sbx` | macOS arm64; Windows x86_64 (experimental) | MicroVM per session | `sbx` CLI + Docker account |
-| `builtin` | macOS on Apple Silicon and Linux x86_64 with KVM (experimental) | MicroVM per session, embedded in awman | The `awman-macos-arm64` release binary (or a signed source build). No Docker, `container`, or `sbx` needed to *run* agents |
+| `builtin` | macOS on Apple Silicon and Linux x86_64 with KVM (experimental) | MicroVM per session, embedded in awman | The `awman-macos-arm64` or `awman-linux-amd64` release binary, or a supported source build. No Docker, `container`, or `sbx` needed to *run* agents |
 
 Set the runtime in your global config (`runtime.kind` is a global-only key):
 
@@ -208,9 +208,9 @@ macOS only lets a program start a virtual machine when its code signature carrie
 
 ### Building from source
 
-Run `make payloads` once (it fetches and checksum-verifies the embedded kernel and guest agent for your host), then `make install`. On Apple Silicon, `make build`/`make install` require a verified payload, include the builtin runtime, and **ad-hoc sign the binary with the hypervisor entitlement automatically** (`tools/macos-sign.sh`). `make install` builds and signs as your user, uses `sudo` only if copying to the install directory requires it, and verifies the installed signature. On other hosts they build the existing runtimes only.
+Run `make install`. On Linux x86_64 GNU and Apple Silicon, `make build`/`make install` fetch and checksum-verify the embedded kernel and guest agent automatically and include the builtin runtime. Apple Silicon builds are also **ad-hoc signed with the hypervisor entitlement automatically** (`tools/macos-sign.sh`). `make install` builds as your user, uses `sudo` only if the install directory requires it, and atomically replaces the installed executable. On macOS it verifies the installed signature. Other hosts build the existing runtimes only.
 
-If you copy, strip or otherwise change the binary afterwards, sign it again:
+On macOS, if you copy, strip or otherwise change the binary afterwards, sign it again:
 
 ```sh
 make sign-macos BIN=/usr/local/bin/awman
@@ -503,12 +503,13 @@ For a newer catalog, use the newer awman. Otherwise quit any awman still using t
 | Message | Cause and fix |
 |---|---|
 | `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature` | This awman build lacks the runtime. Use an asset that includes it or build from source (see above), or select another runtime. |
-| `the experimental builtin runtime is only available on macOS on Apple Silicon …` | This release supports the builtin runtime only on Apple Silicon Macs. Use `docker`, `apple` or `sbx`. |
-| `runtime.kind: expected one of docker, apple, sbx, builtin` | The value is not one of the four runtime names (an earlier spelling such as `builtin` counts). Run `awman config set runtime.kind builtin`. |
-| `embedded worker startup failed; verify KVM access or the macOS com.apple.security.hypervisor entitlement …` | The binary lacks the hypervisor entitlement: it was built from source without signing, or modified after signing. Run `make sign-macos BIN=$(command -v awman)`, or reinstall the release binary. |
+| `the experimental builtin runtime is only available on macOS on Apple Silicon …` | This release supports Apple Silicon Macs and Linux x86_64 with KVM. On other hosts, select a supported runtime such as `docker`. |
+| `runtime.kind: expected one of docker, apple, sbx, builtin` | The value is not one of the four runtime names (an earlier spelling such as `builtin-experimental` counts). Run `awman config set runtime.kind builtin`. |
+| `embedded worker startup failed; verify KVM access or the macOS com.apple.security.hypervisor entitlement …` | On Linux, check read/write access to `/dev/kvm` and virtualization support. On macOS, the binary may lack its entitlement or have been modified after signing: run `make sign-macos BIN=$(command -v awman)` or reinstall it. |
 | `"awman-macos-arm64" cannot be opened because the developer cannot be verified` | The file is quarantined (downloaded with a browser). Verify its checksum, then `xattr -d com.apple.quarantine <file>` — see [The macOS binary, Gatekeeper and permissions](#the-macos-binary-gatekeeper-and-permissions). |
 | `builtin image <tag> has no absolute effective HOME` | The image sets no `HOME` and its user has no absolute home in `/etc/passwd`. Add `ENV HOME=/path` to the Dockerfile. |
 | `the builtin runtime refuses to start while <variable> is set …` | An environment override would replace the builtin runtime. Unset the variable named in the error and retry. |
+| `builtin state directory requires private ownership (0700) and trusted parents` | The state directory must be owned by you with mode `0700`; its parent directories must not be writable by other users. New awman directories are created privately. For an existing personal `~/.awman`, check its ownership and use `chmod 700 ~/.awman` if it is writable by your group. Choose a private state location instead of changing a deliberately shared directory. |
 | `no image source is configured for '<tag>'` | In an interactive CLI or TUI run, choose a source in the `ready` setup prompt. In non-interactive runs, set `runtime.builtin.imageSource` for the default source or `runtime.builtin.images.<tag>` for that image, then run `awman ready` (see [Interactive image-source setup](#interactive-image-source-setup)). If building is wanted, also set `runtime.builtin.builder.enabled` to `true`; source selection alone only imports. |
 | ``builtin image <image> is not imported; run `awman ready` to import it``, or ``image '<tag>' is not in the builtin image cache (…); run `awman ready` to import it`` | Run `awman ready`. |
 | ``a builtin sandbox for agent '<name>' already exists; stop or remove it (`awman clean`) or choose another name`` | A session with that name is still present; stop it, run `awman clean`, or pick another name. |

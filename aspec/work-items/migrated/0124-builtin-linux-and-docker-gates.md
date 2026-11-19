@@ -42,6 +42,10 @@ releases.
 - `make build` fetches missing checksum-pinned payload inputs. `make install`
   builds as the invoking user and atomically replaces the destination, including
   a currently executing inode; escalate only the final installation if needed.
+- Create new data/config directories with private permissions even under a
+  group-writable Linux umask. Keep existing unsafe-directory refusal intact.
+  Test fixture roots must also be private at creation; guest cleanup audits the
+  owned catalog without trying to host a builtin worker in a test executable.
 - Support explicit archive, OCI registry and Docker Engine sources. Validate
   Docker Unix/TLS/mTLS transport, Docker-save and OCI archives, authenticated
   private-CA registries, HTTP/CONNECT proxies, proxy authentication/NO_PROXY,

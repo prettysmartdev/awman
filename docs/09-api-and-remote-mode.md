@@ -537,9 +537,9 @@ An agent that needs full-screen terminal control (e.g. an interactive editor) re
 
 ### Headless runs on the builtin runtime
 
-Headless, CI, and API-server runs work the same way described by `<data>/daemon/server.json`runtime.kind = "builtin"`` (macOS on Apple Silicon and Linux x86_64 with KVM), with these differences:
+Headless, CI, and API-server runs support `runtime.kind = "builtin"` on macOS on Apple Silicon and Linux x86_64 with KVM, with these differences:
 
-- The host must be an Apple Silicon Mac running the signed `awman-macos-arm64` binary (a macOS CI runner or VM must itself expose Hypervisor.framework). No Docker daemon is needed to run agents, but images must be available: run `awman ready` (with a configured `runtime.builtin.imageSource`) as a setup step. Unless `runtime.builtin.builder.enabled` is set with a local source, a launch whose image is missing fails with build-and-import instructions; workflow preflight and squad never build.
+- The host must expose its hypervisor: Hypervisor.framework on Apple Silicon, or read/write access to `/dev/kvm` on Linux x86_64. Use the corresponding `awman-macos-arm64` or `awman-linux-amd64` binary. No Docker daemon is needed to run agents, but images must be available: run `awman ready` (with a configured `runtime.builtin.imageSource`) as a setup step. Unless `runtime.builtin.builder.enabled` is set with a local source, a launch whose image is missing fails with build-and-import instructions; workflow preflight and squad never build.
 - Each session's microVM lives and dies with the awman process that launched it. Under `awman daemon start`, that is the daemon; stopping the server stops the VMs it launched.
 - `awman ready --json` includes an `image_source` entry when images were imported.
 

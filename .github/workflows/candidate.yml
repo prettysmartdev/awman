@@ -493,6 +493,12 @@ jobs:
           cargo run --locked --quiet --manifest-path controller/Cargo.toml --target-dir "$XTASK_TARGET" -p xtask -- \
             release candidate fetch --preflight preflight/preflight.json --asset "$ASSET" \
             --record record/candidate-record.json --in in --out artifact
+      - name: Prepare the verified builtin payload for the artifact harness
+        if: ${{ matrix.target.builtin }}
+        working-directory: candidate
+        run: |
+          bash tools/msb-payloads/fetch.sh "${{ matrix.target.target }}"
+          bash tools/msb-payloads/verify.sh "${{ matrix.target.target }}"
       - name: Artifact tier on the exact bytes
         working-directory: candidate
         env:
@@ -666,6 +672,12 @@ jobs:
         with:
           name: release-preflight
           path: preflight
+      - name: Prepare the verified builtin payload for the audit build
+        if: ${{ matrix.target.builtin && !matrix.target.self_hosted }}
+        working-directory: candidate
+        run: |
+          bash tools/msb-payloads/fetch.sh "${{ matrix.target.target }}"
+          bash tools/msb-payloads/verify.sh "${{ matrix.target.target }}"
       - name: Audit build
         if: ${{ !matrix.target.self_hosted }}
         env:

@@ -111,7 +111,7 @@ allowed_capabilities = ["docker", "local-registry", "git-transports", "apple-con
 [tiers.guest]
 budget_seconds = 300
 guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "hypervisor", "builtin-payload", "guest-fixtures"]
-allowed_capabilities = ["docker", "apple-containers", "previous-release"]
+allowed_capabilities = ["docker", "apple-containers", "previous-release", "local-registry", "offline"]
 
 [tiers.artifact]
 budget_seconds = 300

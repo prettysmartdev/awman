@@ -59,7 +59,7 @@ and reproduce tests. Locally:
 | `make test-unit` / `make test-component` | one tier | pinned nextest |
 | `make test-boundary AWMAN_TEST_HOST_RESOURCES=…` | the `boundary` tier against the real engines and services you name | the named resources |
 | `make test-guest` | fetches the pinned guest fixtures, then the `guest` tier | Apple Silicon or KVM, verified payload (`make payloads`), Docker or Apple Containers for the fixtures |
-| `make test-artifact ARTIFACT=/abs/path/awman` | the `artifact` tier against a release executable | the executable |
+| `make test-artifact ARTIFACT=/abs/path/awman` | this host's declared release artifact contracts | the executable and offline isolation; macOS also needs HVF and guest fixtures |
 | `make gates` | `cargo xtask gates check`: manifest, generated files, Makefile contract and these documents | none |
 | `make architecture-lint` | the layering lint and `cargo xtask lint hygiene` | none |
 
@@ -153,6 +153,10 @@ inside guests. The runner needs curl, tar, network access during preparation,
 and enough disk for debug/test and release artifacts. Offline acceptance uses
 an unprivileged user/network namespace, so the host must allow those namespaces.
 On Debian, add the user to `kvm` and `docker` groups and log in again first.
+
+`make test-artifact ARTIFACT=...` runs the same six Linux artifact contracts as
+hosted release verification. Use `make linux-prerelease` for KVM boot, image
+sources, builders and upgrade acceptance against the native executable.
 
 The target uses the manifest native-validation runner, prepares private fixtures
 and an owned loopback registry, runs the registered guest, Docker/registry

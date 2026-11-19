@@ -41,19 +41,13 @@ impl std::ops::DerefMut for ArtifactSandbox {
 pub fn sandbox(id: &'static str) -> ArtifactSandbox {
     let mut sandbox = TestSandbox::for_test(TestCase::artifact(id));
     sandbox.register_exe("fake-cli", fake_cli_exe());
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("awa-").rand_bytes(8);
-    let state = if cfg!(target_os = "macos") {
-        builder.tempdir_in(
-            awman_test_support::runtime_env::get()
-                .tmproot
-                .clone()
-                .unwrap_or_else(std::env::temp_dir),
-        )
-    } else {
-        builder.tempdir()
-    }
-    .expect("BLOCKED[tempdir]: private artifact state");
+    let state = awman_test_support::sandbox::private_tempdir(
+        "awa-",
+        &awman_test_support::runtime_env::get()
+            .tmproot
+            .clone()
+            .unwrap_or_else(|| awman_test_support::runtime_env::get().system_temp.clone()),
+    );
     std::fs::write(
         sandbox.root().join("vm-state-path"),
         state.path().join("s").to_str().unwrap(),

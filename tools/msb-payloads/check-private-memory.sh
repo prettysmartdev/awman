@@ -6,7 +6,8 @@ root=$(cd "$(dirname "$0")/../.." && pwd -P)
 work=${1:-$root/target/private-memory/$(date -u +%Y%m%dT%H%M%SZ)-$$}
 case "$work" in /*) ;; *) echo 'absolute private work directory required' >&2; exit 2 ;; esac
 [ ! -e "$work" ] || { echo "private-memory work directory already exists: $work" >&2; exit 2; }
-mkdir -m 700 -p "$work"
+umask 077
+mkdir -p "$work"
 version=0.1.41
 expected=400ebdfc24faad502a5f0ef7e1e91625873dfb54cf4ed7aa8b3ad6944f46c0bf
 locked_field() {

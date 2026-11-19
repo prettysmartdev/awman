@@ -144,18 +144,32 @@ fn select<'m>(m: &'m Manifest, o: &Options, build: &str) -> Result<Vec<(&'m str,
             "unknown tier {tier}"
         );
         let before = chosen.len();
-        let native = if tier == "guest" {
+        let applicable = if tier == "guest" || tier == "artifact" {
             let b = &m.builds[build];
-            ensure!(
-                b.features == "builtin",
-                "guest tests require a builtin build; omit --build to select this native host"
-            );
-            Some(crate::native_validation::suites_for_target(
-                m,
-                b.target
-                    .as_deref()
-                    .unwrap_or(&m.platforms[&b.platform].triple),
-            )?)
+            if tier == "guest" {
+                ensure!(
+                    b.features == "builtin",
+                    "guest tests require a builtin build; omit --build to select this native host"
+                );
+                Some(crate::native_validation::suites_for_target(
+                    m,
+                    b.target
+                        .as_deref()
+                        .unwrap_or(&m.platforms[&b.platform].triple),
+                )?)
+            } else {
+                // Hosted release verification runs the declared artifact cells.
+                // Linux KVM boot/upgrade contracts are selected explicitly by
+                // native-validation on a host with the required resources.
+                Some(
+                    m.gates
+                        .values()
+                        .flat_map(|gate| &gate.cells)
+                        .filter(|cell| cell.builds.iter().any(|id| id == build))
+                        .flat_map(|cell| cell.suites.iter().cloned())
+                        .collect::<Vec<_>>(),
+                )
+            }
         } else {
             None
         };
@@ -164,7 +178,7 @@ fn select<'m>(m: &'m Manifest, o: &Options, build: &str) -> Result<Vec<(&'m str,
             // suites run through `cargo xtask lint` or an explicit --suite.
             if &s.tier == tier
                 && s.kind == "nextest"
-                && native
+                && applicable
                     .as_ref()
                     .map_or_else(|| suite_runs_on_build(m, id, build), |ids| ids.contains(id))
                 && !chosen.iter().any(|(c, _)| c == id)
@@ -245,7 +259,31 @@ fn requested_build(m: &Manifest, o: &Options) -> Result<String> {
     {
         return crate::native_validation::guest_host_build();
     }
+    if o.tiers.iter().any(|tier| tier == "artifact")
+        || o.suites.iter().any(|id| {
+            m.suites
+                .get(id)
+                .is_some_and(|suite| suite.tier == "artifact")
+        })
+    {
+        return artifact_build(m, &host_triple()?);
+    }
     host_build(m)
+}
+
+fn artifact_build(m: &Manifest, target: &str) -> Result<String> {
+    m.builds
+        .iter()
+        .find(|(_, build)| {
+            build.kind == "release"
+                && build
+                    .target
+                    .as_deref()
+                    .unwrap_or(&m.platforms[&build.platform].triple)
+                    == target
+        })
+        .map(|(id, _)| id.clone())
+        .with_context(|| format!("no release build for artifact host {target}; pass --build"))
 }
 
 fn host_triple() -> Result<String> {
@@ -1029,6 +1067,59 @@ mod tests {
         assert!(ids(&m, "linux-x64-native-builtin")
             .iter()
             .any(|id| id == "guest-linux-published-upgrade"));
+    }
+    #[test]
+    fn artifact_tier_selects_release_cells_while_native_upgrades_follow_predecessor_pins() {
+        use std::collections::BTreeSet;
+        let mut m = crate::manifest::load(&crate::gates::root()).unwrap();
+        let o = Options {
+            tiers: vec!["artifact".into()],
+            ..Options::default()
+        };
+        let ids = |manifest: &Manifest, target: &str| {
+            let build = artifact_build(manifest, target).unwrap();
+            select(manifest, &o, &build)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id.to_string())
+                .collect::<BTreeSet<_>>()
+        };
+        let common = BTreeSet::from([
+            "artifact-entrypoints".to_string(),
+            "artifact-deps-scan".into(),
+            "artifact-upgrade-policy".into(),
+            "artifact-smoke".into(),
+            "artifact-switches".into(),
+            "artifact-measure".into(),
+        ]);
+        let linux_target = "x86_64-unknown-linux-gnu";
+        m.previous_release.remove(linux_target);
+        let linux_build = artifact_build(&m, linux_target).unwrap();
+        assert_eq!(m.builds[&linux_build].features, "builtin");
+        assert_eq!(ids(&m, linux_target), common);
+        let native = crate::native_validation::suites_for_target(&m, linux_target).unwrap();
+        assert!(native.iter().any(|id| id == "artifact-linux-boot"));
+        assert!(!native
+            .iter()
+            .any(|id| id == "artifact-linux-published-upgrade"));
+        for target in ["aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
+            assert_eq!(ids(&m, target), common, "{target}");
+        }
+        let mut apple = common.clone();
+        apple.insert("artifact-signed-boot".into());
+        assert_eq!(ids(&m, "aarch64-apple-darwin"), apple);
+        m.previous_release.insert(
+            linux_target.into(),
+            m.previous_release["aarch64-apple-darwin"].clone(),
+        );
+        assert_eq!(ids(&m, linux_target), common);
+        assert!(
+            crate::native_validation::suites_for_target(&m, linux_target)
+                .unwrap()
+                .iter()
+                .any(|id| id == "artifact-linux-published-upgrade")
+        );
+        assert!(artifact_build(&m, "unsupported-target").is_err());
     }
     #[test]
     fn a_clean_changed_checkout_runs_the_selected_suites() {
