@@ -118,19 +118,10 @@ fn registry_ready_boot_and_offline_cache_survive_source_deletion() {
         missing.body
     );
 
-    s.require::<Offline>();
-    let probe = s
-        .command("/usr/bin/unshare")
-        .args(["--user", "--map-root-user", "--net", "--", "/bin/true"])
-        .run();
-    assert!(
-        probe.exit.success(),
-        "BLOCKED[offline]: network namespace unavailable: {probe:?}"
-    );
+    let isolation = s.require::<Offline>();
     let offline = || {
-        s.command("/usr/bin/unshare")
-            .args(["--user", "--map-root-user", "--net", "--"])
-            .arg(support::awman_exe())
+        s.command(support::awman_exe())
+            .offline(&isolation)
             .current_dir(&repo)
             .env("AWMAN_TEST_BUILTIN", "1")
     };

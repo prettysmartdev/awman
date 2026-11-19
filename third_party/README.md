@@ -9,7 +9,7 @@ All sources come from immutable published crates. Their `PATCH.md` files record 
 | `microsandbox-0.7.8` | Isolated local backend builder (`build_lazy_isolated`) that ignores installed Microsandbox config | Pinned upstream isolated builder plus hostile-config and native coexistence checks |
 | `microsandbox-network-0.7.8` | Explicit visible-SNI enforcement without interception; exact DNS binding for suffix rules; guest host alias `host.builtin.internal` | Equivalent pinned upstream option plus SDK-boundary and native guest network tests |
 | `microsandbox-types-0.7.8` | Preserve `strict_sni` through local/cloud NetworkSpec conversions | Remove with network patch after configuration roundtrip and native tests |
-| `microsandbox-runtime-0.7.8` | Request private kernel memory for Linux x86_64 fresh boots | Equivalent upstream runner plus native concurrent boot and optimized artifact acceptance |
+| `microsandbox-runtime-0.7.8` | Private kernel memory for Linux x86_64 fresh boots and owner-only Unix lifecycle locks | Equivalent upstream runner plus native concurrent boot and optimized artifact acceptance with umask `0002` |
 
 There is no `msb_krun` patch. WI 0120 removed the vendored `msb_krun-0.1.39` tree: awman depends on the published `msb_krun =0.1.41` (libkrun `b35c7e118d7a1e48c8fad103b258e64ff5c49147`) with its upstream `static-krunfw` feature and supplies the `krunfw_get_kernel` callback itself (`crates/awman-host-shims/src/kernel.rs`). Six crate patches remain: SQLx, four Microsandbox trees rebased from 0.7.2 onto published 0.7.8, and the Linux x86_64 runner patch against published 0.7.8.
 
@@ -23,7 +23,7 @@ Microsandbox trees are published `0.7.8` crates from upstream revision `7b7b9dc8
 | `microsandbox-filesystem-0.7.8` | `e890749fd6c87b7966865a4f7a0add888926adce222fdd4525eb64e047fee30b` | `b87c1e5f67fe0b9b3044bc43ff332601233280012bd35ea4145b6b75b9feab61` |
 | `microsandbox-network-0.7.8` | `9bfc80d59e60d46b44d19c60e3e9abe5c1b3b41c92cad739f661b752376902c2` | `5dbe1bbd4ee65adb2a518ded77e6737c87225dab1d4ad76a39b8c4538c17a665` |
 | `microsandbox-types-0.7.8` | `74af7e859dcfb714bf612e7e27ad682aaedc946be419ace40e661d7e6ae74ba6` | `f0db5e8555259e07288a97a45a4d3dcb66a561a98cd4c1229bbd26b0f4b0fa41` |
-| `microsandbox-runtime-0.7.8` | `b9748ae73d3b183f52f13bf1c41fe216268978ff24fbd8a3a628f14cf8cc874e` | `c0026a1efc4f5710f53a1222024bfd166f22474c2a27ea65c0acadaeb05b6003` |
+| `microsandbox-runtime-0.7.8` | `b9748ae73d3b183f52f13bf1c41fe216268978ff24fbd8a3a628f14cf8cc874e` | `ad1a9ff8973c5029b85d35ad715652d1605cc88d9e8b2eeddf70d77c8e77caa9` |
 | `sqlx-sqlite-0.9.0` (unchanged) | n/a | `22a7e9a2e4f9dbf588a514e5305dfd6f21377107bb7600c348660606d664031f` |
 
 The Apache-2.0 `LICENSE` in each Microsandbox tree has SHA-256 `a276ca3381fefb9cde42fccae847856085c76027557d62eee83f057eb6c53433`. See [network provenance and boundary](microsandbox-network-0.7.8/PATCH.md), [types provenance](microsandbox-types-0.7.8/PATCH.md), [SDK builder provenance](microsandbox-0.7.8/PATCH.md) and [filesystem provenance](microsandbox-filesystem-0.7.8/PATCH.md).

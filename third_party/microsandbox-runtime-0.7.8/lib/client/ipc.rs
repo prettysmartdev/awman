@@ -491,6 +491,9 @@ fn acquire_lifecycle_guard_unix(
         .truncate(false)
         .read(true)
         .write(true)
+        // Worker inheritance requires an owner-writable-only lifecycle lock,
+        // independently of a developer's group-writable umask.
+        .mode(0o600)
         .open(&path)?;
     let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
     if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
@@ -866,6 +869,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let run_dir = temp.path().join("run");
         let owner = acquire_lifecycle_guard(&run_dir, "worker").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                owner.file.metadata().unwrap().permissions().mode() & 0o077,
+                0,
+                "lifecycle locks must be private regardless of the process umask"
+            );
+        }
 
         assert!(
             try_acquire_lifecycle_guard(&run_dir, "worker")

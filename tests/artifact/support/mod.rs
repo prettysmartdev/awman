@@ -110,20 +110,11 @@ pub fn run_artifact(s: &TestSandbox, a: &ReleaseArtifact) -> OwnedCommand {
     run_exact(s, &a.exe)
 }
 pub fn run_exact(s: &TestSandbox, exe: &Path) -> OwnedCommand {
-    s.require::<Offline>();
+    let _offline = s.require::<Offline>();
     #[cfg(target_os = "linux")]
     {
-        let probe = s
-            .command("/usr/bin/unshare")
-            .args(["--user", "--map-root-user", "--net", "--", "/bin/true"])
-            .run();
-        assert!(
-            probe.exit.success(),
-            "BLOCKED[offline]: network namespace unavailable: {probe:?}"
-        );
-        s.command("/usr/bin/unshare")
-            .args(["--user", "--map-root-user", "--net", "--"])
-            .arg(exe)
+        s.command(exe)
+            .offline(&_offline)
             .label("offline exact artifact")
     }
     #[cfg(target_os = "macos")]

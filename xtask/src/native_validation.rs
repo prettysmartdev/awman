@@ -151,6 +151,22 @@ impl Run {
             args,
         )
     }
+    fn suite(&mut self, id: &str) -> Result<String> {
+        let dir = self.out.join(id);
+        self.xtask(
+            &format!("run-{id}"),
+            &[
+                "test",
+                "run",
+                "--suite",
+                id,
+                "--build",
+                self.platform.build,
+                "--evidence-dir",
+                dir.to_str().unwrap(),
+            ],
+        )
+    }
 }
 fn git(root: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git").args(args).current_dir(root).output()?;
@@ -186,6 +202,7 @@ fn suites(m: &Manifest, platform: Platform) -> Vec<String> {
                             "boundary-registry",
                             "boundary-conformance",
                             "boundary-templates",
+                            "boundary-offline",
                         ]
                         .contains(&id.as_str())
                     })
@@ -246,8 +263,11 @@ fn execute(r: &mut Run, m: &Manifest) -> Result<()> {
             ],
         )?;
         r.command("os-version", "uname", &["-a"])?;
-        r.command("offline-isolation", "unshare", &["--user", "--map-root-user", "--net", "--", "/bin/true"])
-            .context("Linux offline validation requires unprivileged user and network namespaces (unshare --user --map-root-user --net)")?;
+        let umask = r.command("host-umask", "sh", &["-c", "umask"])?;
+        ensure!(
+            u32::from_str_radix(umask.trim(), 8) == Ok(0o002),
+            "Linux native acceptance requires umask 0002; use make linux-prerelease"
+        );
     }
     r.command("rust-version", "rustc", &["-vV"])?;
     prepare::run(r, m)?;
@@ -319,6 +339,22 @@ fn execute(r: &mut Run, m: &Manifest) -> Result<()> {
             )?;
         }
     }
+    if !platform.apple() {
+        r.suite("boundary-offline")
+        .context("Linux offline acceptance requires kernel seccomp filters: the registered probe must deny IP sockets, preserve Unix IPC and UID, and enforce the restriction in descendants; see boundary-offline evidence")?;
+    }
+    // Resolve native boot/source failures before spending time on the optimized
+    // executable. Artifact suites still run against the exact immutable candidate.
+    let mut failures = Vec::new();
+    for id in &suites(m, platform) {
+        if m.suites[id].tier == "artifact" || id == "boundary-offline" {
+            continue;
+        }
+        if let Err(e) = r.suite(id) {
+            failures.push(format!("{id}: {e:#}"));
+        }
+    }
+    ensure!(failures.is_empty(), "{}", failures.join("\n"));
     r.command(
         "build-artifact",
         "cargo",
@@ -351,22 +387,11 @@ fn execute(r: &mut Run, m: &Manifest) -> Result<()> {
         "AWMAN_TEST_ARTIFACT_SHA256".into(),
         r.packet.artifact_sha256.clone(),
     );
-    let mut failures = Vec::new();
     for id in &suites(m, platform) {
-        let dir = r.out.join(id);
-        if let Err(e) = r.xtask(
-            &format!("run-{id}"),
-            &[
-                "test",
-                "run",
-                "--suite",
-                id,
-                "--build",
-                platform.build,
-                "--evidence-dir",
-                dir.to_str().unwrap(),
-            ],
-        ) {
+        if m.suites[id].tier != "artifact" {
+            continue;
+        }
+        if let Err(e) = r.suite(id) {
             failures.push(format!("{id}: {e:#}"));
         }
     }

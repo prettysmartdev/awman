@@ -152,8 +152,9 @@ apple-silicon-prerelease:
 	@cargo xtask release validate
 
 # Local Linux KVM acceptance and portable evidence for the current commit.
+# Exercise a common developer umask without changing the invoking shell.
 linux-prerelease:
-	CARGO_TARGET_DIR=target/native-validation-tools cargo xtask native-validation run --platform linux
+	umask 0002; CARGO_TARGET_DIR=target/native-validation-tools cargo xtask native-validation run --platform linux
 
 # Release VERSION. A managed Apple Silicon runner verifies the manifest fixtures
 # in its private runner directory, registers for the candidate job, and

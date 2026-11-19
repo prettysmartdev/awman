@@ -151,7 +151,12 @@ with read/write `/dev/kvm` access and a running Docker Engine on a local Unix
 socket. Docker supplies image-source and builder evidence; agents execute only
 inside guests. The runner needs curl, tar, network access during preparation,
 and enough disk for debug/test and release artifacts. Offline acceptance uses
-an unprivileged user/network namespace, so the host must allow those namespaces.
+kernel seccomp filters to deny IP sockets while preserving Unix IPC and the
+invoking user's identity. A registered prerequisite test proves enforcement
+before the release build; unavailable seccomp support blocks acceptance.
+The make target sets `umask 0002` only in its recipe subprocess, and the packet
+records it, so acceptance exercises private state under permissive defaults
+without changing the developer's shell profile.
 On Debian, add the user to `kvm` and `docker` groups and log in again first.
 
 `make test-artifact ARTIFACT=...` runs the same six Linux artifact contracts as

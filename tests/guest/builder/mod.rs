@@ -50,12 +50,7 @@ fn run(id: &'static str, apple: bool) {
         serde_json::to_vec(&global).unwrap(),
     )
     .unwrap();
-    // A descriptor ping stand-in only accepts the fixed readiness invocation;
-    // it can never execute a user task on the host.
-    let fake_exe = support::fake_cli_exe();
-    s.register_exe("fake-cli", fake_exe);
-    let ping = s.install_fake(fake_exe, "claude");
-    ping.on(&["--model", "haiku", "--print"]).stdout("hello\n");
+    // session::prepare already installed the private descriptor readiness ping.
     for version in ["v1", "v2"] {
         std::fs::write(
             repo.join("Dockerfile.dev"),
@@ -98,6 +93,7 @@ fn run(id: &'static str, apple: bool) {
     }
     // Switch PATH to private traps, preserving source endpoint identity. Cached
     // launch must succeed without invoking any builder or rebuilding a fixture.
+    let fake_exe = support::fake_cli_exe();
     let docker = s.install_fake(fake_exe, "docker");
     docker.on(&[]).exit(91);
     let container = s.install_fake(fake_exe, "container");

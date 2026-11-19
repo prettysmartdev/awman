@@ -577,7 +577,8 @@ impl Capability for ReleaseArtifact {
     }
 }
 
-/// No route beyond loopback (enforced by the job's session wrapper).
+/// Deny IP traffic while preserving Unix IPC (enforced by the session wrapper
+/// or Linux `OwnedCommand::offline`).
 #[derive(Debug, Clone)]
 pub struct Offline;
 impl Capability for Offline {

@@ -337,6 +337,7 @@ pub fn validate(m: &Manifest, today: NaiveDate) -> Result<()> {
                 "boundary-registry",
                 "boundary-git",
                 "boundary-conformance",
+                "boundary-offline",
                 "boundary-templates",
                 "web",
             ]
@@ -353,6 +354,10 @@ pub fn validate(m: &Manifest, today: NaiveDate) -> Result<()> {
             || (id.starts_with("unit-") && !id.ends_with("-builtin"))
         {
             for build in policy::HOSTED_BUILDS {
+                // Descriptor ownership/mode checks are a Unix-only contract.
+                if *id == "unit-host-shims" && *build == "windows-x64-default" {
+                    continue;
+                }
                 ensure!(
                     pr.iter().any(|c| c.suite == *id && c.build == *build),
                     "required suite {id} missing hosted build {build}"

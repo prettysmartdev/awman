@@ -106,7 +106,7 @@ guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "
 [tiers.boundary]
 budget_seconds = 120
 guarantees = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git"]
-allowed_capabilities = ["docker", "local-registry", "git-transports", "apple-containers", "docker-sbx", "guest-fixtures"]
+allowed_capabilities = ["docker", "local-registry", "git-transports", "apple-containers", "docker-sbx", "guest-fixtures", "offline"]
 
 [tiers.guest]
 budget_seconds = 300
@@ -134,7 +134,7 @@ trust = "hosted"
 runs_on = ["ubuntu-24.04"]
 triple = "x86_64-unknown-linux-gnu"
 image = "20261101.360"
-provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "docker", "local-registry", "git-transports", "release-artifact", "public-network"]
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "docker", "local-registry", "git-transports", "release-artifact", "public-network", "offline"]
 
 [platforms.linux-arm64]
 toolchain = "1.94.0"
@@ -317,6 +317,17 @@ contracts = ["unit-test-support"]
 requires = []
 paths = []
 always = true
+
+[suites.unit-host-shims]
+tier = "unit"
+kind = "nextest"
+package = "awman-host-shims"
+target = "lib"
+contracts = ["unit-host-shims"]
+requires = []
+paths = []
+always = true
+filter = "test(/^worker::tests::/)"
 
 [suites.unit-xtask]
 tier = "component"
@@ -841,6 +852,17 @@ target = "test:component"
 contracts = ["component-test-support"]
 requires = []
 paths = ["crates/awman-test-support/**"]
+filter = "not test(=ports::offline_commands_deny_ip_preserve_unix_identity_and_inherit)"
+
+[suites.boundary-offline]
+tier = "boundary"
+kind = "nextest"
+package = "awman-test-support"
+target = "test:component"
+contracts = ["linux-offline-isolation"]
+requires = ["offline"]
+paths = ["crates/awman-test-support/**", "tests/guest/**", "tests/artifact/**"]
+filter = "test(=ports::offline_commands_deny_ip_preserve_unix_identity_and_inherit)"
 
 [suites.lint-fmt]
 tier = "unit"
@@ -941,12 +963,16 @@ suites = ["component-core-internals", "component-command-models", "unit-awman", 
 builds = ["linux-x64-default", "macos-arm64-default", "windows-x64-default"]
 
 [[gates.pr.cells]]
-suites = ["boundary-docker", "boundary-registry", "boundary-git", "boundary-conformance", "boundary-templates"]
+suites = ["boundary-docker", "boundary-registry", "boundary-git", "boundary-conformance", "boundary-templates", "boundary-offline"]
 builds = ["linux-x64-default"]
 
 [[gates.pr.cells]]
 suites = ["unit-awman-builtin"]
 builds = ["linux-x64-builtin", "linux-arm64-builtin"]
+
+[[gates.pr.cells]]
+suites = ["unit-host-shims"]
+builds = ["linux-x64-default", "macos-arm64-default"]
 
 [[gates.pr.cells]]
 suites = ["lint-fmt", "lint-clippy", "lint-architecture", "lint-hygiene", "lint-shell", "lint-workflows", "lint-deny", "lint-notice", "doctests", "web"]

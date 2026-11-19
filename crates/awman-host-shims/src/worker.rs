@@ -218,14 +218,34 @@ fn descriptor_role(fd: i32, role: FdRole) -> bool {
         FdRole::Config => kind == libc::S_IFREG && stat.st_nlink == 0 && access != libc::O_WRONLY,
         FdRole::PipeRead => kind == libc::S_IFIFO && access == libc::O_RDONLY,
         FdRole::PipeWrite => kind == libc::S_IFIFO && access == libc::O_WRONLY,
-        // The SDK opens the lifecycle lock with the process umask (0644 by
-        // default). Only this user may be able to write it; read bits grant
-        // nothing, since `flock` needs no write access.
+        // The patched SDK creates lifecycle locks as 0600. Accept legacy 0644
+        // locks too, but never group/other-writable inherited files.
         FdRole::Lock => {
             kind == libc::S_IFREG
                 && stat.st_nlink == 1
                 && stat.st_mode & 0o022 == 0
                 && access == libc::O_RDWR
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
+
+    #[test]
+    fn lifecycle_descriptor_refuses_group_or_other_writers() {
+        let lock = tempfile::NamedTempFile::new().unwrap();
+        for (mode, accepted) in [(0o600, true), (0o644, true), (0o664, false), (0o666, false)] {
+            lock.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(mode))
+                .unwrap();
+            assert_eq!(
+                descriptor_role(lock.as_raw_fd(), FdRole::Lock),
+                accepted,
+                "lifecycle lock mode {mode:o}"
+            );
         }
     }
 }

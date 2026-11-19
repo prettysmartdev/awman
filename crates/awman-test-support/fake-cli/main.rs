@@ -46,6 +46,8 @@
 //! - `--fake-protocol`: print the protocol version (`1`).
 //! - `--fake-sleep`: sleep forever (used by `spawn-child`).
 //! - `--fake-list-fds`: print every open descriptor number above 2 (Unix).
+//! - `--fake-offline-probe`: verify IP denial, Unix IPC and unchanged UID,
+//!   including an exec'd child (Linux).
 
 // A helper executable, not test code: it records its own environment,
 // polls for the release file and starts its grandchild directly.
@@ -250,6 +252,11 @@ fn main() {
             list_fds();
             return;
         }
+        #[cfg(target_os = "linux")]
+        Some("--fake-offline-probe") => {
+            offline_probe(&args);
+            return;
+        }
         _ => {}
     }
     let exe = std::env::current_exe().unwrap_or_else(|e| fail(&format!("fake: current_exe: {e}")));
@@ -327,4 +334,49 @@ fn main() {
     let _ = stderr.flush();
     let _ = std::fs::write(call.join("done"), format!("{effective_exit}\n"));
     std::process::exit(effective_exit);
+}
+
+#[cfg(target_os = "linux")]
+fn offline_probe(args: &[String]) {
+    use std::net::{TcpStream, UdpSocket};
+    use std::os::unix::net::UnixStream;
+    let denied = |result: std::io::Result<()>, name: &str| {
+        let error = result.expect_err("offline process created an IP socket");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{name}: {error}"
+        );
+        println!("{name}-denied");
+    };
+    denied(TcpStream::connect(&args[1]).map(|_| ()), "ipv4-tcp");
+    denied(TcpStream::connect("[::1]:9").map(|_| ()), "ipv6-tcp");
+    denied(UdpSocket::bind("127.0.0.1:0").map(|_| ()), "ipv4-udp");
+    denied(UdpSocket::bind("[::1]:0").map(|_| ()), "ipv6-udp");
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let uid = status
+        .lines()
+        .find(|line| line.starts_with("Uid:"))
+        .unwrap()
+        .split_whitespace()
+        .nth(2)
+        .unwrap();
+    assert_eq!(uid, args[3], "offline enforcement changed effective UID");
+    println!("uid-preserved");
+    UnixStream::pair().unwrap();
+    let mut unix = UnixStream::connect(&args[2]).unwrap();
+    unix.write_all(b"offline-unix-works").unwrap();
+    drop(unix);
+    if args.len() == 4 {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(args)
+            .arg("child")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "offline descendant failed: {child:?}"
+        );
+        std::io::stdout().write_all(&child.stdout).unwrap();
+    }
 }

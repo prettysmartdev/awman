@@ -14,6 +14,7 @@ Reconciled on 2026-11-19 against Microsandbox `abff71505fc46416b3d704ee2787f8e55
 | [04-microsandbox-suffix-sni-binding.md](04-microsandbox-suffix-sni-binding.md) | `superradcompany/microsandbox` | `third_party/microsandbox-network-0.7.8/` (policy tightening) | Behaviour change; asks a question |
 | [06-microsandbox-private-memory-boot.md](06-microsandbox-private-memory-boot.md) | `superradcompany/microsandbox` | `third_party/microsandbox-runtime-0.7.8/` | Fresh x86_64 per-VM memory |
 | [05-libkrun-static-krunfw-macos-alignment.md](05-libkrun-static-krunfw-macos-alignment.md) | `superradcompany/libkrun` | None; documentation only | Docs |
+| [07-microsandbox-private-lifecycle-lock.md](07-microsandbox-private-lifecycle-lock.md) | `superradcompany/microsandbox` | `third_party/microsandbox-runtime-0.7.8/` (lock creation) | Private Unix descriptor permissions |
 
 Filing notes:
 
@@ -26,7 +27,7 @@ Filing notes:
 - The `host.microsandbox.internal` → `host.builtin.internal` alias rename in the
   network patch is awman-specific, so no issue is drafted for it. If upstream ever
   makes the alias configurable, that rename can go too.
-- Saved proposals for all six live in [`../upstream-prs/`](../upstream-prs/). Each
+- Saved proposals for all seven live in [`../upstream-prs/`](../upstream-prs/). Each
   ZIP holds a `git diff` against upstream's default branch, plus a `PR.md` with the
   title, exact base revision, description and validation status. These are not submission-ready until the outstanding upstream tests and maintainer decisions in each bundle are resolved. Fill in `#<issue-NN-number>` once the issues
   are filed. `../upstream-libkrun-docs.md` is the earlier 0.1.41-era draft of PR 05.

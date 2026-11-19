@@ -34,7 +34,8 @@ releases.
 - Verify native x86_64 kernel/Agentd payload hashes. Use libkrun's existing
   private-memory boot mode for fresh x86_64 VMs, so the process-owned embedded
   kernel allocation is never shared writable guest RAM. Preserve independent
-  checkpoint-restore ownership.
+  checkpoint-restore ownership. Create inherited Unix lifecycle locks as `0600`
+  regardless of umask, while retaining strict worker descriptor validation.
 - Build release assets on Ubuntu 22.04 and reject glibc requirements newer than
   2.35. Embed the VM, kernel, guest agent, SQLite and other runtime dependencies;
   only the documented operating-system C ABI and unwinder remain dynamic.
@@ -57,7 +58,7 @@ releases.
   Imported images run without the source daemon or builder. Shipped Dockerfile
   templates and Docker runtime regression contracts remain required boundaries.
 - `make linux-prerelease` uses the existing native-validation runner. Preflight
-  architecture, KVM, Docker Unix socket and offline user/network namespaces;
+  architecture, KVM, Docker Unix socket, umask 0002 and enforced offline seccomp;
   prepare private, independently hashed OCI/Docker fixtures and an owned loopback
   registry; enumerate registered tests independently of their results; validate
   the exact candidate and archive a packet with source/artifact/input digests.
@@ -94,8 +95,8 @@ acceptance; ARM64 host-only compilation earns none.
 
 ## Test considerations and evidence
 
-- [x] Host preflight: native x86_64, ordinary-user KVM access, Docker and offline
-  namespaces; native payload extraction and kernel accessor diagnostic.
+- [x] Host preflight: native x86_64, ordinary-user KVM access and Docker;
+  native payload extraction and kernel accessor diagnostic.
 - [x] Exact pinned libkrun memory tests: independent sibling mappings, immutable
   backing, sparse/private fresh memory; five tests, no skipped cases.
 - [x] Registered registry boundary suite: ten real-registry tests covering the

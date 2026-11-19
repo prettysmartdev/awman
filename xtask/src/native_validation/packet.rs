@@ -183,7 +183,8 @@ pub(super) fn verify(root: &Path, out: &Path, m: &Manifest) -> Result<()> {
             "registry-ready",
             "remove-registry",
             "run-boundary-private-memory",
-            "offline-isolation",
+            "host-umask",
+            "run-boundary-offline",
         ]);
     }
     for name in required {
@@ -202,6 +203,13 @@ pub(super) fn verify(root: &Path, out: &Path, m: &Manifest) -> Result<()> {
         ensure!(
             fs::read_to_string(out.join(format!("{name}.stdout")))?.trim() == value,
             "invalid native host evidence"
+        );
+    }
+    if !platform.apple() {
+        ensure!(
+            u32::from_str_radix(fs::read_to_string(out.join("host-umask.stdout"))?.trim(), 8)
+                == Ok(0o002),
+            "Linux acceptance did not exercise umask 0002"
         );
     }
     for id in &p.suites {
