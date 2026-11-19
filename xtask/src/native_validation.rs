@@ -201,65 +201,6 @@ fn remove_cargo_package_metadata(command: &mut Command, names: impl IntoIterator
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::ffi::OsStr;
-
-    #[test]
-    /// hygiene-allow(H2): Inspects child environment directives without starting a process.
-    fn native_children_drop_parent_package_metadata_but_keep_build_settings() {
-        let metadata = [
-            "CARGO_MANIFEST_DIR",
-            "CARGO_MANIFEST_PATH",
-            "CARGO_MANIFEST_LINKS",
-            "CARGO_PKG_NAME",
-            "CARGO_PKG_VERSION",
-            "CARGO_PKG_VERSION_MAJOR",
-            "CARGO_PKG_VERSION_MINOR",
-            "CARGO_PKG_VERSION_PATCH",
-            "CARGO_PKG_VERSION_PRE",
-            "CARGO_PKG_AUTHORS",
-            "CARGO_PKG_DESCRIPTION",
-        ];
-        let settings = [
-            ("PATH", "/pinned-tools:/usr/bin"),
-            ("CARGO_TARGET_DIR", "/private/build"),
-            ("CARGO_HOME", "/tools/cargo"),
-            ("RUSTUP_HOME", "/tools/rustup"),
-            ("RUSTUP_TOOLCHAIN", "1.94.0"),
-            ("CARGO_BUILD_TARGET", "x86_64-unknown-linux-gnu"),
-            ("CARGO_BUILD_JOBS", "2"),
-            ("CARGO_MAKEFLAGS", "--jobserver-auth=8,9"),
-            ("CARGO_PROFILE_RELEASE_LTO", "thin"),
-            ("RUSTFLAGS", "-C debuginfo=0"),
-            ("CARGO_ENCODED_RUSTFLAGS", "-C\u{1f}debuginfo=0"),
-        ];
-        let mut command = Command::new("cargo");
-        command.envs(metadata.iter().map(|name| (name, "parent-xtask-value")));
-        command.envs(settings);
-        remove_cargo_package_metadata(
-            &mut command,
-            metadata
-                .iter()
-                .copied()
-                .chain(settings.iter().map(|(name, _)| *name))
-                .map(OsString::from),
-        );
-        let environment: BTreeMap<_, _> = command.get_envs().collect();
-        for name in metadata {
-            // None is an explicit removal, preventing inherited parent values.
-            assert_eq!(environment[OsStr::new(name)], None, "{name}");
-        }
-        for (name, value) in settings {
-            assert_eq!(
-                environment[OsStr::new(name)],
-                Some(OsStr::new(value)),
-                "{name}"
-            );
-        }
-    }
-}
 fn git(root: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git").args(args).current_dir(root).output()?;
     ensure!(out.status.success(), "git {} failed", args.join(" "));
@@ -618,5 +559,65 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
         _ => anyhow::bail!(
             "usage: cargo xtask native-validation run [--platform linux] | verify <extracted-evidence-directory>"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    /// hygiene-allow(H2): Inspects child environment directives without starting a process.
+    fn native_children_drop_parent_package_metadata_but_keep_build_settings() {
+        let metadata = [
+            "CARGO_MANIFEST_DIR",
+            "CARGO_MANIFEST_PATH",
+            "CARGO_MANIFEST_LINKS",
+            "CARGO_PKG_NAME",
+            "CARGO_PKG_VERSION",
+            "CARGO_PKG_VERSION_MAJOR",
+            "CARGO_PKG_VERSION_MINOR",
+            "CARGO_PKG_VERSION_PATCH",
+            "CARGO_PKG_VERSION_PRE",
+            "CARGO_PKG_AUTHORS",
+            "CARGO_PKG_DESCRIPTION",
+        ];
+        let settings = [
+            ("PATH", "/pinned-tools:/usr/bin"),
+            ("CARGO_TARGET_DIR", "/private/build"),
+            ("CARGO_HOME", "/tools/cargo"),
+            ("RUSTUP_HOME", "/tools/rustup"),
+            ("RUSTUP_TOOLCHAIN", "1.94.0"),
+            ("CARGO_BUILD_TARGET", "x86_64-unknown-linux-gnu"),
+            ("CARGO_BUILD_JOBS", "2"),
+            ("CARGO_MAKEFLAGS", "--jobserver-auth=8,9"),
+            ("CARGO_PROFILE_RELEASE_LTO", "thin"),
+            ("RUSTFLAGS", "-C debuginfo=0"),
+            ("CARGO_ENCODED_RUSTFLAGS", "-C\u{1f}debuginfo=0"),
+        ];
+        let mut command = Command::new("cargo");
+        command.envs(metadata.iter().map(|name| (name, "parent-xtask-value")));
+        command.envs(settings);
+        remove_cargo_package_metadata(
+            &mut command,
+            metadata
+                .iter()
+                .copied()
+                .chain(settings.iter().map(|(name, _)| *name))
+                .map(OsString::from),
+        );
+        let environment: BTreeMap<_, _> = command.get_envs().collect();
+        for name in metadata {
+            // None is an explicit removal, preventing inherited parent values.
+            assert_eq!(environment[OsStr::new(name)], None, "{name}");
+        }
+        for (name, value) in settings {
+            assert_eq!(
+                environment[OsStr::new(name)],
+                Some(OsStr::new(value)),
+                "{name}"
+            );
+        }
     }
 }
