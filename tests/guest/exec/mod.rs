@@ -51,18 +51,51 @@ fn credential_refresh_reaches_multiple_consumers() {
 fn vcpu_and_memory_limits_reach_the_guest() {
     let s = support::sandbox("exec::vcpu_and_memory_limits_reach_the_guest");
     support::scenario(&s, "limits");
-    for (file, cpu, min, max) in [
-        ("limits-default", 1, 256 * 1024, 512 * 1024),
-        ("limits", 2, 384 * 1024, 768 * 1024),
-    ] {
+    // msb_krun_arch 0.1.41's x86 bundled-kernel layout below the MMIO
+    // gap adds low RAM and the kernel extent before the requested RAM region.
+    // Private-memory boot changes ownership, not this address-space layout.
+    let boot_overhead_kib = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        let manifest: toml::Value = toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../third_party/msb-payloads/manifest.toml"
+        )))
+        .unwrap();
+        let kernel = &manifest["targets"]["x86_64-unknown-linux-gnu"];
+        let end =
+            kernel["guest_address"].as_integer().unwrap() + kernel["size"].as_integer().unwrap();
+        u64::try_from(end).unwrap().div_ceil(1024)
+    } else {
+        0
+    };
+    let mut totals = Vec::new();
+    for (file, cpu, requested_mib) in [("limits-default", 1, 512), ("limits", 2, 768)] {
         let text = std::fs::read_to_string(s.work().join(format!("{file}.stdout"))).unwrap();
         let values: Vec<u64> = text
             .lines()
             .map(|v| v.trim().parse().expect("guest resource value"))
             .collect();
-        assert_eq!(values[0], cpu);
-        assert!(values[1] > min && values[1] <= max, "{text}");
+        assert_eq!(values.len(), 2, "{file}: {text}");
+        assert_eq!(values[0], cpu, "{file}: {text}");
+        let requested_kib = requested_mib * 1024;
+        // MemTotal excludes Linux's reserved pages. Bound those reservations
+        // as well as the exact pin-derived architectural addition.
+        assert!(
+            values[1] > requested_kib - 128 * 1024
+                && values[1] <= requested_kib + boot_overhead_kib,
+            "{file}: requested={requested_kib} KiB, boot overhead={boot_overhead_kib} KiB, guest={text}"
+        );
+        totals.push(values[1]);
     }
+    // The per-launch override must change actual RAM by the requested 256 MiB.
+    // Allow 16 MiB for changed page tables, kernel reservations and the second
+    // vCPU; an ignored override or an oversized allocation still fails.
+    let growth = totals[1]
+        .checked_sub(totals[0])
+        .expect("guest RAM must grow");
+    assert!(
+        growth.abs_diff(256 * 1024) <= 16 * 1024,
+        "512/768 MiB guest totals={totals:?} KiB, growth={growth} KiB"
+    );
 }
 #[test]
 fn pty_resize_is_observed_in_the_guest() {

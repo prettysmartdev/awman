@@ -41,7 +41,7 @@ Generated from `ci/gates.toml` (schema 1).
 | artifact | 300 | tempdir, loopback, subprocess, release-artifact |
 | boundary | 120 | tempdir, loopback, subprocess, awman-binary, fake-cli, local-git |
 | component | 20 | tempdir, loopback, subprocess, awman-binary, fake-cli, local-git |
-| guest | 300 | tempdir, loopback, subprocess, awman-binary, hypervisor, builtin-payload, guest-fixtures, previous-release |
+| guest | 300 | tempdir, loopback, subprocess, awman-binary, hypervisor, builtin-payload, guest-fixtures |
 | soak | suite-specific | tempdir, loopback, subprocess, awman-binary |
 | unit | 1 | tempdir |
 
@@ -59,7 +59,7 @@ and reproduce tests. Locally:
 | `make test-unit` / `make test-component` | one tier | pinned nextest |
 | `make test-boundary AWMAN_TEST_HOST_RESOURCES=…` | the `boundary` tier against the real engines and services you name | the named resources |
 | `make test-guest` | fetches the pinned guest fixtures, then the `guest` tier | Apple Silicon or KVM, verified payload (`make payloads`), Docker or Apple Containers for the fixtures |
-| `make test-artifact ARTIFACT=/abs/path/awman` | the `artifact` tier against a release executable | the executable |
+| `make test-artifact ARTIFACT=/abs/path/awman` | this host's declared release artifact contracts | the executable and offline isolation; macOS also needs HVF and guest fixtures |
 | `make gates` | `cargo xtask gates check`: manifest, generated files, Makefile contract and these documents | none |
 | `make architecture-lint` | the layering lint and `cargo xtask lint hygiene` | none |
 
@@ -117,6 +117,10 @@ and reproduce tests. Locally:
   with the concrete prerequisite recorded; it is never a passing boot test. The
   upgrade scenario needs the pinned previous release (`previous-release`);
   nobody builds an older awman by hand.
+- `make test-guest` selects the host's builtin build and native suites. Linux
+  runs cached executable-replacement coverage and adds published-predecessor
+  upgrade coverage when its target has a reviewed previous-release pin. An
+  explicit default-feature build is refused for the guest tier.
 - SQLite and native dependencies are exercised by persisted-state component contracts, the guest tier and `artifact-deps-scan`. Use `make test-artifact ARTIFACT=...` for a prepared candidate. Runtime execution must work offline with a minimal executable search path and cannot depend on build caches or tools scripts.
 - The builtin driver uses the vendored `build_lazy_isolated()` entry point on
   pinned `microsandbox 0.7.8`. It starts from independent defaults and
@@ -130,6 +134,46 @@ and reproduce tests. Locally:
   release builds but not after `strip` or under fat LTO, so artifact scans must
   not require the symbol name. `make payloads` fetches and checksum-verifies the
   host's payload (`tools/msb-payloads/fetch.sh`); `make payloads-verify` verifies bytes against the reviewed payload record. A new payload status requires reviewed native evidence; the command does not automatically promote a record.
+
+### Linux builtin development and prerelease acceptance
+
+Linux x86_64 GNU builds include the experimental builtin runtime. Install the
+pinned Rust toolchain, a C/C++ compiler, pkg-config, Clang/libclang and CMake.
+On Debian/Ubuntu: `sudo apt-get install build-essential pkg-config clang libclang-dev cmake`.
+`make build` fetches and verifies missing pinned kernel and guest-agent build
+inputs; it does not install a separate runtime. `make install` builds as the
+invoking user, then atomically installs to `/usr/local/bin`; use
+`INSTALL_PATH=/your/bin` for a user-owned location. Restart long-running awman
+daemons after upgrading the executable.
+
+Run `make linux-prerelease` from a clean, committed checkout on Linux x86_64
+with read/write `/dev/kvm` access and a running Docker Engine on a local Unix
+socket. Docker supplies image-source and builder evidence; agents execute only
+inside guests. The runner needs curl, tar, network access during preparation,
+and enough disk for debug/test and release artifacts. Offline acceptance uses
+kernel seccomp filters to deny IP sockets while preserving Unix IPC and the
+invoking user's identity. A registered prerequisite test proves enforcement
+before the release build; unavailable seccomp support blocks acceptance.
+The make target sets `umask 0002` only in its recipe subprocess, and the packet
+records it, so acceptance exercises private state under permissive defaults
+without changing the developer's shell profile.
+On Debian, add the user to `kvm` and `docker` groups and log in again first.
+
+`make test-artifact ARTIFACT=...` runs the same six Linux artifact contracts as
+hosted release verification. Use `make linux-prerelease` for KVM boot, image
+sources, builders and upgrade acceptance against the native executable.
+
+The target uses the manifest native-validation runner, prepares private fixtures
+and an owned loopback registry, runs the registered guest, Docker/registry
+boundary and artifact suites, and removes its registry even on failure.
+Evidence is written under `target/native-validation/` and archived as a tarball.
+Verify an extracted packet with
+`cargo xtask native-validation verify /path/to/evidence`.
+Missing prerequisites fail the run; they never count as passing skips.
+
+The first Linux release proves atomic executable replacement and cached restart.
+It does not claim migration from a previous Linux builtin release, because none
+exists. Linux ARM64 remains unavailable pending independent native acceptance.
 
 ### Pinned tooling
 

@@ -70,16 +70,13 @@ fn sandbox_case(case: TestCase) -> GuestSandbox {
     ] {
         s.register_exe(name, exe);
     }
-    let vm_state = tempfile::Builder::new()
-        .prefix("awg-")
-        .rand_bytes(8)
-        .tempdir_in(
-            awman_test_support::runtime_env::get()
-                .tmproot
-                .clone()
-                .unwrap_or_else(|| awman_test_support::runtime_env::get().system_temp.clone()),
-        )
-        .expect("BLOCKED[tempdir]: private VM root");
+    let vm_state = awman_test_support::sandbox::private_tempdir(
+        "awg-",
+        &awman_test_support::runtime_env::get()
+            .tmproot
+            .clone()
+            .unwrap_or_else(|| awman_test_support::runtime_env::get().system_temp.clone()),
+    );
     std::fs::write(
         s.root().join("vm-state-path"),
         vm_state.path().join("s").to_str().unwrap(),
@@ -154,52 +151,25 @@ pub fn scenario(s: &TestSandbox, scenario: &str) -> String {
 #[cfg(awman_builtin)]
 pub fn watch(s: &TestSandbox) {
     let root = state(s);
-    s.on_finish(
-        "guest VMs and images",
-        Box::new(move || {
-            if !root.exists() {
-                return Vec::new();
-            }
-            let rt = match awman::engine::container::ContainerRuntime::builtin(
-                awman::engine::container::runtime::BuiltinRuntimeSettings {
-                    state_dir: root.clone(),
-                    ambient_overrides: Vec::new(),
-                    test_isolation: false,
-                },
-            ) {
-                Ok(rt) => rt,
-                Err(e) => return vec![Leak::new("vm", format!("cannot audit owner state: {e}"))],
-            };
-            let mut leaks = Vec::new();
-            match rt.list_running_all() {
-                Ok(vms) => {
-                    for vm in vms {
-                        leaks.push(Leak::new("vm", &vm.id));
-                        let _ = rt.stop(&vm);
-                    }
-                }
-                Err(e) => leaks.push(Leak::new("vm", format!("cannot enumerate: {e}"))),
-            }
-            if let Ok(vms) = rt.list_stopped() {
-                for vm in vms {
-                    if let Err(e) = rt.remove_container(&vm.id) {
-                        leaks.push(Leak::new("vm", e.to_string()));
-                    }
-                }
-            }
-            match rt.list_dangling_images() {
-                Ok(images) => {
-                    for image in images {
-                        if let Err(e) = rt.remove_image(&image.id) {
-                            leaks.push(Leak::new("image", e.to_string()));
-                        }
-                    }
-                }
-                Err(e) => leaks.push(Leak::new("image", format!("cannot enumerate: {e}"))),
-            }
-            leaks
-        }),
-    );
+    s.on_finish("guest private VM catalog", Box::new(move || {
+        let catalog = root.join("db/msb.db");
+        if !catalog.exists() {
+            return Vec::new();
+        }
+        // Inspect persisted ownership without trying to instantiate an embedded
+        // worker from this test executable. Child processes are supervised by s.
+        let audit = || -> rusqlite::Result<i64> {
+            let connection = rusqlite::Connection::open_with_flags(&catalog,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            connection.query_row(
+                "SELECT COUNT(*) FROM sandbox WHERE status IN ('Starting','Running','Draining','Paused')",
+                [], |row| row.get(0))
+        };
+        match audit() {
+            Ok(0) => Vec::new(),
+            result => vec![Leak::new("vm", format!("private catalog retains active VM state: {result:?}"))],
+        }
+    }));
 }
 #[cfg(not(awman_builtin))]
 pub fn watch(_: &TestSandbox) {

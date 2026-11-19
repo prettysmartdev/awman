@@ -12,10 +12,7 @@ fn version_and_provider_info_work_without_path_or_network() {
     assert!(out.stdout_text().starts_with("awman "), "{out:?}");
     #[cfg(not(any(
         all(target_os = "macos", target_arch = "aarch64"),
-        all(
-            target_os = "linux",
-            any(target_arch = "aarch64", target_arch = "x86_64")
-        )
+        all(target_os = "linux", target_arch = "x86_64")
     )))]
     {
         let refused = support::run_artifact(&s, &a)
@@ -25,10 +22,7 @@ fn version_and_provider_info_work_without_path_or_network() {
     }
     #[cfg(any(
         all(target_os = "macos", target_arch = "aarch64"),
-        all(
-            target_os = "linux",
-            any(target_arch = "aarch64", target_arch = "x86_64")
-        )
+        all(target_os = "linux", target_arch = "x86_64")
     ))]
     {
         let info = support::info(&s, &a);

@@ -37,6 +37,95 @@ fn tracked_child_addresses_are_checked_too() {
     assert!(text.contains("still accepts connections"), "{text}");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reused_address_is_not_a_leaked_listener() {
+    let sandbox = sandbox("ports::a_reused_address_is_not_a_leaked_listener");
+    let original = sandbox.ports().tcp_listener();
+    let addr = original.local_addr().unwrap();
+    // Also exercise registration of a child-reported address.
+    sandbox.ports().track(addr);
+    drop(original);
+    // hygiene-allow(H4): intentionally reuse the closed endpoint to model another concurrent test; this test owns and drops the replacement listener.
+    #[allow(clippy::disallowed_methods)]
+    let replacement = std::net::TcpListener::bind(addr).unwrap();
+    TcpStream::connect(addr).unwrap();
+    sandbox.finish();
+    drop(replacement);
+}
+
+#[test]
+fn a_cloned_listener_remains_owned_after_the_original_is_dropped() {
+    let (_parent, sandbox) =
+        leaky_sandbox("ports::a_cloned_listener_remains_owned_after_the_original_is_dropped");
+    let listener = sandbox.ports().tcp_listener();
+    let survivor = listener.try_clone().unwrap();
+    drop(listener);
+    let text = expect_panic(|| sandbox.finish());
+    assert!(text.contains("still accepts connections"), "{text}");
+    drop(survivor);
+}
+
+/// Registered as boundary-offline, excluded from the ordinary component suite:
+/// kernel enforcement is an explicit host capability, not a passing skip.
+#[cfg(target_os = "linux")]
+#[test]
+fn offline_commands_deny_ip_preserve_unix_identity_and_inherit() {
+    use awman_test_support::capability::Offline;
+    use awman_test_support::{TestCase, TestSandbox};
+    use std::io::Read;
+    use std::os::unix::{fs::MetadataExt, net::UnixListener};
+
+    let mut sandbox = TestSandbox::for_test(TestCase::boundary(
+        "ports::offline_commands_deny_ip_preserve_unix_identity_and_inherit",
+    ));
+    sandbox.register_exe("fake-cli", fake_cli_exe());
+    let offline = sandbox.require::<Offline>();
+    let tcp = sandbox.ports().tcp_listener();
+    let addr = tcp.local_addr().unwrap();
+    TcpStream::connect(addr).unwrap(); // The endpoint really is reachable.
+    let socket = sandbox.ports().unix_socket("offline.sock");
+    let unix = UnixListener::bind(&socket).unwrap();
+    unix.set_nonblocking(true).unwrap();
+    let uid = std::fs::metadata(sandbox.root()).unwrap().uid();
+    let output = sandbox
+        .command(fake_cli_exe())
+        .offline(&offline)
+        .arg("--fake-offline-probe")
+        .arg(addr.to_string())
+        .arg(&socket)
+        .arg(uid.to_string())
+        .run();
+    output.assert_success();
+    for proof in [
+        "ipv4-tcp-denied",
+        "ipv6-tcp-denied",
+        "ipv4-udp-denied",
+        "ipv6-udp-denied",
+        "uid-preserved",
+    ] {
+        assert_eq!(
+            output
+                .stdout_text()
+                .lines()
+                .filter(|line| *line == proof)
+                .count(),
+            2,
+            "{output:?}"
+        );
+    }
+    for _ in 0..2 {
+        let (mut stream, _) = unix.accept().unwrap();
+        let mut received = String::new();
+        stream.read_to_string(&mut received).unwrap();
+        assert_eq!(received, "offline-unix-works");
+    }
+    drop(unix);
+    std::fs::remove_file(socket).unwrap();
+    drop(tcp);
+    sandbox.finish();
+}
+
 #[test]
 fn tcp_readiness_waits_for_accepting() {
     let sandbox = sandbox("ports::tcp_readiness_waits_for_accepting");

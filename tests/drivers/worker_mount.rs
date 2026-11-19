@@ -24,6 +24,9 @@ pub async fn run(runtime: Arc<dyn AgentRuntimeEngine>, selected: &str, image: &s
         let command = awman::data::ids::CommandId::new().to_string();
         paths.prepare_command_dir(&session, &command).unwrap();
         let writer = CommandStateWriter::new(paths.clone(), &session, &command);
+        // The command entrypoint prepares this directory before runtime build;
+        // this driver exercises the runtime directly and must do the same.
+        awman::data::fs::command_outputs::prepare_output_dir(&writer.output_dir(), true).unwrap();
         let owned =
             CommandOwnedRuntime::new(runtime.clone(), &command).with_output_writer(writer.clone());
         let script = if read_only {

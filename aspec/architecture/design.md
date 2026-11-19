@@ -4,7 +4,9 @@
 
 awman follows a **four-layer architecture** that separates data, business logic, command dispatch, and presentation. This design ensures functional parity across four frontend adapters (CLI, TUI, API, squad) while maintaining code health and enabling future frontend implementations.
 
-Pattern: single statically-linked binary
+Pattern: one executable with application/runtime dependencies statically linked
+or embedded; only the platform system ABI may remain dynamic, as specified in
+[`aspec/foundation.md`](../foundation.md) and checked by the release pipeline.
 
 For the complete architectural specification, see [`aspec/architecture/2026-grand-architecture.md`](./2026-grand-architecture.md).
 
@@ -151,7 +153,7 @@ Output to user
 
 ## Execution Isolation
 
-All agent code execution occurs inside an isolated container or microVM managed by the `ContainerRuntime` (Layer 1). The host is never directly exposed to untrusted code. The builtin backend uses a Linux microVM; selecting it does not run agent code on the host. It is released as `builtin-experimental` for macOS on Apple Silicon only (`RELEASED_TARGETS` in `engine::container::builtin`); the engine still compiles and unit-tests for Linux KVM, which WI 0124 enables.
+All agent code execution occurs inside an isolated container or microVM managed by the `ContainerRuntime` (Layer 1). The host is never directly exposed to untrusted code. The builtin backend uses a Linux microVM; selecting it does not run agent code on the host. It is selected with `runtime.kind: "builtin"` and released experimentally for macOS on Apple Silicon and Linux x86_64 GNU with KVM (`RELEASED_TARGETS` in `engine::container::builtin`). Linux ARM64 remains gated on separate native acceptance. Linux x86_64 uses private-memory boot so the process-owned kernel callback allocation cannot become shared writable guest RAM.
 
 - **Mount scope validation**: Git root, current working directory, or abort
 - **Auth isolation**: API keys stored in secure hashing, env vars injected at container startup only

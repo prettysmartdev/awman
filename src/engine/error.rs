@@ -447,7 +447,8 @@ pub enum EngineError {
     /// The host is not a released builtin target.
     #[error(
         "the builtin runtime is unavailable: the experimental builtin runtime is only \
-         available on macOS on Apple Silicon (macos/aarch64) in this release; this host is \
+         available on macOS on Apple Silicon (macos/aarch64) and Linux x86_64 with KVM \
+         in this release; this host is \
          {os}/{arch}. Choose another runtime (docker, apple-containers or \
          docker-sbx-experimental)"
     )]

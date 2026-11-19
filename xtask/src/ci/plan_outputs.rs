@@ -189,6 +189,18 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("git-transports")));
+        assert!(entries.iter().any(|e| {
+            e["suites"]
+                .as_str()
+                .unwrap()
+                .split(',')
+                .any(|id| id == "boundary-offline")
+                && e["host_resources"]
+                    .as_str()
+                    .unwrap()
+                    .split(',')
+                    .any(|id| id == "offline")
+        }));
         let unit_entries = output["shards"]["test-unit-linux-x64"].as_array().unwrap();
         assert!(unit_entries.iter().all(|e| {
             e["suites"]

@@ -92,7 +92,7 @@ pub fn probe_cli_version(
     requirement: &CliMajorRequirement,
 ) -> CliVersionStatus {
     let process_env = runtime.env();
-    if process_env.test_isolation() && !process_env.test_docker() {
+    if !super::runtime::probe_isolation_permits(runtime.runtime_name(), process_env) {
         return CliVersionStatus::Unknown {
             reason: "test isolation".into(),
         };
@@ -132,7 +132,7 @@ pub fn probe_cli_version_cached(
     requirement: &CliMajorRequirement,
 ) -> CliVersionStatus {
     let process_env = runtime.env();
-    if process_env.test_isolation() && !process_env.test_docker() {
+    if !super::runtime::probe_isolation_permits(runtime.runtime_name(), process_env) {
         return CliVersionStatus::Unknown {
             reason: "test isolation".into(),
         };
@@ -173,6 +173,41 @@ pub fn mismatch_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_probes_require_the_selected_runtime_grant() {
+        use crate::data::config::env::EnvSnapshot;
+        use crate::engine::container::runtime::probe_isolation_permits;
+        let runtimes = [
+            ("docker", "AWMAN_TEST_DOCKER"),
+            ("apple-containers", "AWMAN_TEST_APPLE_CONTAINER"),
+            ("builtin", "AWMAN_TEST_BUILTIN"),
+        ];
+        for (selected, _) in runtimes {
+            for (_, granted) in runtimes {
+                let env = EnvSnapshot::from_full_env(
+                    [
+                        ("AWMAN_TEST_ISOLATION".into(), "1".into()),
+                        (granted.into(), "1".into()),
+                    ]
+                    .into(),
+                );
+                assert_eq!(
+                    probe_isolation_permits(selected, &env),
+                    runtimes
+                        .iter()
+                        .any(|(name, flag)| *name == selected && *flag == granted)
+                );
+            }
+            let isolated =
+                EnvSnapshot::from_full_env([("AWMAN_TEST_ISOLATION".into(), "1".into())].into());
+            assert!(!probe_isolation_permits(selected, &isolated));
+            assert!(probe_isolation_permits(
+                selected,
+                &EnvSnapshot::from_full_env(Default::default())
+            ));
+        }
+    }
 
     fn requirement(major: u64) -> CliMajorRequirement {
         CliMajorRequirement {

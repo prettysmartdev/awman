@@ -478,7 +478,7 @@ Or per-invocation: `awman chat --overlay "env(ANTHROPIC_API_KEY)"`. See [Overlay
 awman config set runtime.kind docker     # default
 awman config set runtime.kind apple      # macOS only (Apple Containers)
 awman config set runtime.kind sbx        # experimental (Docker Sandboxes)
-awman config set runtime.kind builtin    # experimental; Apple Silicon only
+awman config set runtime.kind builtin    # experimental; Apple Silicon or Linux x86_64 with KVM
 ```
 
 See [Runtimes](#runtimes) below. The `builtin` runtime also has its own `runtime.builtin.*` settings (VM size, image sources); see [Builtin runtime settings](#builtin-runtime-settings).
@@ -638,7 +638,7 @@ Precedence is per key: a repository value overrides the matching global value, w
 | `docker` (default) | Linux, macOS, Windows | Standard Docker; ephemeral containers torn down when the session ends |
 | `apple` | macOS 26+ only | Native `container` CLI; same user experience as Docker. On Linux/Windows this value is an error, not a silent fallback. `--allow-docker` is not supported under this runtime |
 | `sbx` | macOS arm64, Windows x86_64 (experimental) | Docker Sandboxes (persistent microVMs per session; hypervisor-grade isolation). Requires the `sbx` CLI and a Docker account. Linux is blocked by an upstream virtiofs bug. See [Runtimes](11-runtimes.md) |
-| `builtin` | macOS on Apple Silicon only (experimental) | MicroVM per session embedded in the awman binary; needs no Docker, `container`, or `sbx` to run agents. Included in the `awman-macos-arm64` release, which is ad-hoc signed (see [Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions)). Must be set explicitly in the global config. `awman ready` imports images from a configured source (and, with `runtime.builtin.builder.enabled`, can build them first in a local Docker or Apple Containers store). See [Runtimes](11-runtimes.md#builtin-microvm-experimental) |
+| `builtin` | macOS on Apple Silicon and Linux x86_64 with KVM (experimental) | MicroVM per session embedded in the awman binary; needs no Docker, `container`, or `sbx` to run agents. Included in `awman-linux-amd64` and `awman-macos-arm64`; the macOS binary is ad-hoc signed (see [Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions)). Must be set explicitly in the global config. `awman ready` imports images from a configured source (and, with `runtime.builtin.builder.enabled`, can build them first in a local Docker or Apple Containers store). See [Runtimes](11-runtimes.md#builtin-microvm-experimental) |
 
 `sbx` and `builtin` are experimental; the value itself never says so. An unrecognized value (e.g. a typo, or one of the old spellings) is a fatal error — awman never falls back to a different isolation model than the one you configured. CLI commands print the invalid value and the list of valid values, then exit; the TUI shows the same message in a startup modal (Enter quits). `runtime.kind` is global scope: fix it in the global file and relaunch.
 

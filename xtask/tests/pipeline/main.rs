@@ -753,6 +753,19 @@ fn candidate_validates_promotes_and_verifies_the_same_bytes() {
     o.succeeded();
     assert_eq!(o.outputs["decision"], "new");
     assert_eq!(o.outputs["candidate"], "1");
+    let targets: Vec<Value> = serde_json::from_str(&o.outputs["targets"]).unwrap();
+    let linux = targets
+        .iter()
+        .find(|target| target["asset"] == "awman-linux-amd64")
+        .unwrap();
+    assert_eq!(
+        linux["builtin"], true,
+        "Linux release must fetch its payload"
+    );
+    assert_eq!(
+        linux["sign"], false,
+        "Linux payload fetch is independent of macOS signing"
+    );
     w.build_all(100, "a");
     w.assemble(100).succeeded();
     let rel = draft(&w.store, "production", 1).unwrap();

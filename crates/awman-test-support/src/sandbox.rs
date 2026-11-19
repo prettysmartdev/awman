@@ -11,7 +11,6 @@ use crate::tier::{TestCase, Tier};
 use crate::Leak;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -99,7 +98,7 @@ pub(crate) struct Shared {
     allowed: Mutex<BTreeSet<PathBuf>>,
     fakes: Mutex<BTreeSet<PathBuf>>,
     pub exes: Mutex<BTreeMap<String, PathBuf>>,
-    pub tcp: Mutex<Vec<SocketAddr>>,
+    pub tcp: Mutex<Vec<net::TrackedTcp>>,
     pub sockets: Mutex<Vec<PathBuf>>,
     pub(crate) probes: Mutex<Vec<(String, LeakProbe)>>,
     granted: Mutex<Vec<(&'static str, capability::Reprobe)>>,
@@ -369,15 +368,7 @@ impl TestSandbox {
         if let Err(e) = std::fs::create_dir_all(&parent) {
             panic!("BLOCKED[tempdir]: cannot create {}: {e}", parent.display());
         }
-        let root_dir = tempfile::Builder::new()
-            .prefix("awman-test-")
-            .tempdir_in(&parent)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "BLOCKED[tempdir]: cannot create a sandbox in {}: {e}",
-                    parent.display()
-                )
-            });
+        let root_dir = private_tempdir("awman-test-", &parent);
         let root = root_dir.path().to_path_buf();
         let home = root.join("home");
         let dirs = [
@@ -394,7 +385,12 @@ impl TestSandbox {
             root.join("no-hooks"),
         ];
         for dir in &dirs {
-            std::fs::create_dir_all(dir)
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder
+                .create(dir)
                 .unwrap_or_else(|e| panic!("BLOCKED[tempdir]: {}: {e}", dir.display()));
         }
         let (sock_dir, sock_short) = make_sock_dir(&root);
@@ -802,32 +798,30 @@ fn make_sock_dir(root: &Path) -> (PathBuf, Option<tempfile::TempDir>) {
         .tmproot
         .clone()
         .unwrap_or_else(|| crate::runtime_env::get().system_temp.clone());
-    let short = tempfile::Builder::new()
-        .prefix("aw-")
-        .rand_bytes(8)
-        .tempdir_in(&parent)
-        .unwrap_or_else(|e| {
-            panic!(
-                "BLOCKED[tempdir]: cannot create a short socket dir in {}: {e}",
-                parent.display()
-            )
-        });
+    let short = private_tempdir("aw-", &parent);
     assert!(short.path().as_os_str().len() + 25 <= crate::net::MAX_SOCKET_PATH,
         "BLOCKED[tempdir]: configured socket root {} is too long; grant a shorter private AWMAN_TEST_TMPROOT", parent.display());
-    make_private(short.path());
     check_private_dir(short.path());
     (short.path().to_path_buf(), Some(short))
 }
 
-#[cfg(unix)]
-fn make_private(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        .unwrap_or_else(|e| panic!("BLOCKED[tempdir]: chmod {}: {e}", dir.display()));
+/// Create an owned temporary directory with owner-only permissions at creation
+/// time, independent of the caller's umask. Used for sandbox and short VM roots.
+pub fn private_tempdir(prefix: &str, parent: &Path) -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix).rand_bytes(8);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir_in(parent).unwrap_or_else(|e| {
+        panic!(
+            "BLOCKED[tempdir]: cannot create a private directory in {}: {e}",
+            parent.display()
+        )
+    })
 }
-
-#[cfg(not(unix))]
-fn make_private(_dir: &Path) {}
 
 #[cfg(unix)]
 fn check_private_dir(dir: &Path) {
@@ -922,6 +916,25 @@ mod tests {
         assert_eq!(sandbox.tier(), Tier::Unit);
         sandbox.finish();
         assert!(!root.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sandbox_and_vm_temp_roots_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let sandbox = TestSandbox::new();
+        let vm = private_tempdir("vm-", sandbox.root());
+        for path in [
+            sandbox.root().to_path_buf(),
+            sandbox.home(),
+            sandbox.awman_home(),
+            vm.path().to_path_buf(),
+        ] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
     }
 
     #[test]

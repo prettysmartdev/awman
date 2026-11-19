@@ -17,16 +17,16 @@ agent = "agentd-aarch64"
 agent_sha256 = "1bfc94d1e3974082010cdc16bf9df86f9654d52ac284efe4b439fbc678f426f3"
 
 [targets."x86_64-unknown-linux-gnu"]
-status = "unverified"
+status = "verified"
 architecture = "x86_64"
 kernel_alignment = 4096
 archive = "microsandbox-linux-x86_64.tar.gz"
 archive_sha256 = "86f9f72dc3e639c7175bc07909b4b63ce412517c1ef8a2e1921171af5682fded"
 firmware = "libkrunfw.so.5.6.1"
-kernel_sha256 = ""
-size = 0
-guest_address = 0
-entry_address = 0
+kernel_sha256 = "c09aba16346d3a72f0aa1728d444ce09a7d82f296716d2955ffe0012e2fc8864"
+size = 21561344
+guest_address = 16777216
+entry_address = 16777507
 agent = "agentd-x86_64"
 agent_sha256 = "1a911b6cb85e306100b102ab4bac2702acfcdaf929ea7ee3ea473486b05ac349"
 

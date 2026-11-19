@@ -3,9 +3,10 @@
 //! A vCPU count is a whole number of virtual CPUs the guest sees, not a share
 //! of host CPU time: the runtime has no fractional quota, so fractional,
 //! non-finite and out-of-range requests are refused rather than rounded.
-//! Guest memory is a hard ceiling enforced by the VMM: exceeding it triggers
-//! the guest kernel's OOM killer inside the VM, never host memory pressure
-//! beyond the configured size.
+//! Memory is the requested RAM allocation passed to the VMM. Guest-visible RAM
+//! also depends on the platform's boot layout and kernel reservations; host
+//! usage additionally includes VMM, kernel and device overhead. The guest's OOM
+//! killer handles guest allocation exhaustion, but this is not a host-RSS limit.
 use crate::data::config::builtin_runtime::MIN_MEMORY_MIB;
 use crate::engine::container::options::{CpuLimit, MemoryLimit};
 use crate::engine::error::EngineError;

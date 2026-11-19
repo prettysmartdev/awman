@@ -206,7 +206,6 @@ pub fn validate(m: &Manifest, today: NaiveDate) -> Result<()> {
                 "hypervisor",
                 "builtin-payload",
                 "guest-fixtures",
-                "previous-release",
             ][..],
         ),
         (
@@ -224,6 +223,20 @@ pub fn validate(m: &Manifest, today: NaiveDate) -> Result<()> {
                 "capability {cap} removed from tier {tier}"
             );
         }
+    }
+    for id in [
+        "guest-upgrade",
+        "guest-linux-published-upgrade",
+        "artifact-signed-boot",
+        "artifact-linux-published-upgrade",
+    ] {
+        ensure!(
+            m.suites[id]
+                .requires
+                .iter()
+                .any(|cap| cap == "previous-release"),
+            "published upgrade suite {id} must require previous-release"
+        );
     }
     for (id, p) in &m.platforms {
         ensure!(
@@ -324,6 +337,7 @@ pub fn validate(m: &Manifest, today: NaiveDate) -> Result<()> {
                 "boundary-registry",
                 "boundary-git",
                 "boundary-conformance",
+                "boundary-offline",
                 "boundary-templates",
                 "web",
             ]
@@ -340,6 +354,10 @@ pub fn validate(m: &Manifest, today: NaiveDate) -> Result<()> {
             || (id.starts_with("unit-") && !id.ends_with("-builtin"))
         {
             for build in policy::HOSTED_BUILDS {
+                // Descriptor ownership/mode checks are a Unix-only contract.
+                if *id == "unit-host-shims" && *build == "windows-x64-default" {
+                    continue;
+                }
                 ensure!(
                     pr.iter().any(|c| c.suite == *id && c.build == *build),
                     "required suite {id} missing hosted build {build}"

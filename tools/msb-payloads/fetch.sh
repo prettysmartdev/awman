@@ -11,6 +11,12 @@ esac
 if [ "$(uname -s)" != "$os" ] || [ "$(uname -m | sed 's/^arm64$/aarch64/')" != "$arch" ]; then
     echo "native $target host required to extract firmware" >&2; exit 2
 fi
+# Preserve build-input mtimes when every cached byte and its provenance still
+# match the reviewed manifest. Re-extraction would force otherwise warm builds.
+if bash "$root/tools/msb-payloads/verify.sh" "$target" >/dev/null 2>&1; then
+    printf 'PASS verified cached payload %s (unchanged)\n' "$target"
+    exit 0
+fi
 manifest="$root/third_party/msb-payloads/manifest.toml"
 version=$(awk -F'"' '/^version =/ {print $2; exit}' "$manifest")
 field() { awk -v section="[targets.\"$target\"]" -v key="$1" '$0 == section {inside=1;next} /^\[/ {inside=0} inside && $1 == key {gsub(/"/, "", $3); print $3; exit}' "$manifest"; }
@@ -48,7 +54,10 @@ actual_agent_hash=$agent_hash
 actual_kernel_hash=$(hash_file "$dest/kernel.bin")
 source_revision=$(awk -F'"' '/^microsandbox_revision =/ {print $2; exit}' "$manifest")
 libkrun_revision=$(awk -F'"' '/^libkrun_revision =/ {print $2; exit}' "$manifest")
-cat > "$dest/provenance.txt" <<EOF
+# Keep this machine's extraction receipt out of tracked source. Compiler/host
+# details vary between developer and release machines; the manifest pins bytes.
+provenance="$dest/provenance.generated.txt"
+cat > "$provenance" <<EOF
 target=$target
 architecture=$arch
 host_os=$(uname -s)
@@ -64,12 +73,11 @@ kernel_sha256=$actual_kernel_hash
 agent=$agent
 agent_sha256=$actual_agent_hash
 EOF
-cat "$dest/provenance.txt"
+cat "$provenance"
 cat "$dest/kernel.meta"
 if [ "$(field status)" != verified ]; then
-    # Exit 4 (not 3) so `make payloads-verify` can tell "recorded, awaiting
-    # verification" apart from a download or hash failure.
-    echo "Payload evidence was recorded. Run \`make payloads-verify\` on this native host to run the required gates and mark the payload verified." >&2
+    # Exit 4 distinguishes recorded, awaiting native review from a hash failure.
+    echo "Payload evidence was recorded. A maintainer must review the native guest/artifact acceptance packet before updating the manifest; make payloads-verify does not promote records." >&2
     exit 4
 fi
 bash "$root/tools/msb-payloads/verify.sh" "$target"

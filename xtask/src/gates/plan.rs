@@ -253,6 +253,7 @@ pub fn create(m: &Manifest, gate: &str, request: Request, today: NaiveDate) -> R
                         "apple-containers",
                         "docker-sbx",
                         "hypervisor",
+                        "offline",
                     ]
                     .contains(&c.as_str())
                 })

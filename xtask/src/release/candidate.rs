@@ -312,7 +312,9 @@ fn preflight(f: &Flags) -> Step {
         .iter()
         .map(|t| {
             serde_json::json!({"asset": t.asset, "target": t.triple, "build": t.build,
-                "runs_on": t.runs_on, "sign": t.sign, "self_hosted": t.runs_on.iter().any(|l| l == "self-hosted")})
+                "runs_on": t.runs_on, "sign": t.sign,
+                "builtin": m.builds[&t.build].features == "builtin",
+                "self_hosted": t.runs_on.iter().any(|l| l == "self-hosted")})
         })
         .collect();
     outputs(&[
@@ -400,6 +402,7 @@ fn build(f: &Flags) -> Step {
             && bin.exists()
             && digest::sha256_file(&bin)? == prev.unsigned_sha256
         {
+            super::abi::verify(&t.triple, &bin, &out)?;
             println!("{asset}: already built for input {input_digest}; not rebuilding");
             return Ok(Ok(()));
         }
@@ -447,6 +450,7 @@ fn build(f: &Flags) -> Step {
         .join(exe_name(&t.triple));
     // A copy, never a hardlink to a mutable build output.
     std::fs::copy(&built, &bin).with_context(|| format!("copying {}", built.display()))?;
+    super::abi::verify(&t.triple, &bin, &out)?;
     ops::read_only(&bin)?;
     let rec = BuildRecord {
         asset: asset.into(),

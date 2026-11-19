@@ -22,7 +22,7 @@ Generated from `ci/gates.toml` (schema 1).
 | artifact | 300 | tempdir, loopback, subprocess, release-artifact |
 | boundary | 120 | tempdir, loopback, subprocess, awman-binary, fake-cli, local-git |
 | component | 20 | tempdir, loopback, subprocess, awman-binary, fake-cli, local-git |
-| guest | 300 | tempdir, loopback, subprocess, awman-binary, hypervisor, builtin-payload, guest-fixtures, previous-release |
+| guest | 300 | tempdir, loopback, subprocess, awman-binary, hypervisor, builtin-payload, guest-fixtures |
 | soak | suite-specific | tempdir, loopback, subprocess, awman-binary |
 | unit | 1 | tempdir |
 
@@ -68,12 +68,18 @@ implemented as probes in `crates/awman-test-support/src/capability.rs`.
 | `docker-sbx` | the Docker sandbox CLI | `docker-sbx` |
 | `hypervisor` | Hypervisor.framework or KVM | `hypervisor` |
 | `builtin-payload` | the verified builtin payload | `builtin-payload=<dir>` |
-| `guest-fixtures` | the pinned guest OCI archive | `AWMAN_TEST_FIXTURES` |
+| `guest-fixtures` | pinned guest OCI and Docker-save archives | `AWMAN_TEST_FIXTURES` |
 | `previous-release` | the pinned previous release executable | `AWMAN_TEST_FIXTURES` |
 | `release-artifact` | a release executable with a known digest | `AWMAN_TEST_ARTIFACT` and `AWMAN_TEST_ARTIFACT_SHA256` |
 | `offline` | enforced offline network | `offline` |
 | `public-network` | public registry access | `public-network` |
 | `registry-credentials` | private registry credentials | `registry-credentials=<file>` |
+
+`previous-release` is required by published-predecessor upgrade suites, rather
+than every guest test. The first Linux builtin release runs separate cached
+executable-replacement and offline artifact suites. Once a reviewed Linux
+predecessor pin exists, native validation additionally requires the published
+upgrade suites; missing or invalid predecessor bytes then block the run.
 
 `sandbox.require::<Capability>()` returns a `Granted<C>` or panics:
 
@@ -165,6 +171,9 @@ tests, never run on the host.
 At the end of a test every owned process, port, socket and directory is checked.
 A survivor, an address still accepting connections, or a socket file left in
 `sock_dir` is reported as a `LEAK` and fails the test.
+On Linux, when procfs is available, TCP ownership includes the original socket
+inode: an unrelated test reusing a closed address is not a surviving resource.
+Without that identity evidence the checker conservatively probes the address.
 
 Release database handles and other file owners before calling `finish()`. For
 ordinary scoped tests, declare the sandbox first and let its checked `Drop` run
@@ -440,13 +449,13 @@ command explicitly grants the test runner access to those named local runtimes
 and the hypervisor. It never runs an agent on the host.
 
 The target installs the pinned test runner, fetches and verifies the builtin
-payload and published previous executable, prepares a digest-recorded guest
-fixture, compiles the native suites, captures their expected tests, signs the
+payload and published previous executable, prepares digest-recorded OCI and
+Docker-save guest fixtures, compiles the native suites, captures their expected tests, signs the
 guest executables and release candidate, and runs the guest and artifact tiers
 plus the declared native boundaries. The signed candidate is copied into the
 packet and must retain the same digest throughout execution. The offline artifact
 tests enforce their own network denial. Image preparation is a separate online
-phase; a locally prepared fixture pin is recorded in `run-config.toml` and does
+phase; both locally prepared fixture pins are recorded in `run-config.toml` and do
 not change the repository's fixture policy.
 
 Successful and failed runs both print a `target/native-validation/*.tar.gz`

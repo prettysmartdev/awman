@@ -27,6 +27,8 @@ pub struct RealRegistryWorld<'a> {
     upstream: SocketAddr,
     proxy: RefCell<CountingProxy>,
     states: Cell<usize>,
+    #[cfg(unix)]
+    tls: Option<crate::docker::tls::Endpoint>,
 }
 
 impl<'a> RealRegistryWorld<'a> {
@@ -37,7 +39,26 @@ impl<'a> RealRegistryWorld<'a> {
             upstream,
             proxy: RefCell::new(proxy),
             states: Cell::new(0),
+            #[cfg(unix)]
+            tls: None,
         }
+    }
+
+    #[cfg(unix)]
+    pub fn with_tls(mut self) -> Self {
+        use base64::Engine as _;
+        let authorization = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD
+                .encode("awman-test-user:test-secret-registry-password")
+        );
+        let address = self.proxy.borrow().addr();
+        self.tls = Some(crate::docker::tls::Endpoint::start_tcp(
+            self.sandbox,
+            address,
+            Some(authorization),
+        ));
+        self
     }
 
     fn call(&self, method: &str, target: &str, headers: &[(&str, &str)], body: &[u8]) -> Reply {
@@ -102,10 +123,25 @@ impl RegistryWorld for RealRegistryWorld<'_> {
     }
 
     fn registry(&self) -> String {
+        #[cfg(unix)]
+        if let Some(tls) = &self.tls {
+            return tls.host.strip_prefix("tcp://").unwrap().to_string();
+        }
         self.proxy.borrow().addr().to_string()
     }
 
     fn host_config(&self) -> RegistryHostConfig {
+        #[cfg(unix)]
+        if let Some(tls) = &self.tls {
+            return RegistryHostConfig {
+                insecure: false,
+                ca_cert: Some(tls.tls.ca.clone()),
+                auth: Some(awman::data::config::image_source::RegistryAuthSource::Env {
+                    username_var: "AWMAN_REGISTRY_TEST_USER".into(),
+                    password_var: "AWMAN_REGISTRY_TEST_PASSWORD".into(),
+                }),
+            };
+        }
         RegistryHostConfig {
             insecure: true,
             ca_cert: None,

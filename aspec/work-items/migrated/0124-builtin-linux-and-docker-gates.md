@@ -1,148 +1,139 @@
 # Work Item: Task
 
-Title: Optional future work: builtin runtime on Linux KVM, Docker Engine sources and registry edge cases
-Issue: n/a
+Title: Enable and validate the builtin runtime on Linux x86_64 KVM
+Issue: https://github.com/prettysmartdev/awman/issues/47
+Status: Implemented; native acceptance recorded below. [PR #75](https://github.com/prettysmartdev/awman/pull/75) targets `nextgen` and tracks latest-head CI and review readiness.
 
-Status: Open, **optional future work** for a later release. Nothing here
-blocks WI 0123, and WI 0119/0121 are resolved without it.
-Parent: [WI 0121](completed/0121-complete-builtin-runtime-and-native-verification.md)
-Split from: [WI 0123](completed/0123-builtin-native-verification-and-release-closure.md)
-(the macOS Apple Silicon `builtin-experimental` release)
+## Summary
 
-## Summary:
+Enable the experimental builtin runtime in Linux x86_64 GNU builds and release
+assets, with real KVM acceptance and a repeatable `make linux-prerelease` target.
+Repair the Linux developer installation path and source/test portability defects.
+The user confirmed x86_64-only scope on 2026-11-19; Linux ARM64 remains gated.
 
-- WI 0123 ships `builtin-experimental` on Apple Silicon macOS only and closes
-  the builtin-runtime work stream, resolving WI 0119 and WI 0121. The criteria
-  it could not cover are recorded there as **Deferred (WI 0124, optional)**.
-- This item collects that deferred work: Linux KVM support, Docker Engine
-  sources, and registry edge cases beyond WI 0123's normal-case validation.
-  Pick up any package independently, in any later release.
-- Start from the [evidence register](../review-notes/0121-evidence-register.md),
-  WI 0121 sections A–J, WI 0120's patch inventory, and the macOS evidence and
-  fixes from [WI 0122](completed/0122-native-apple-image-store-bridge.md) and
-  WI 0123. The WI 0122 fixes (lock mode, bind-source ancestors, `only_lo`
-  semantics) are platform-neutral and must be re-validated on Linux.
+This replaces the old optional WI 0124 plan. WI 0144's manifest suites and
+`awman-test-support` are the only supported test path. Historical native scripts,
+old harness names and passing skips are not current acceptance evidence.
 
-## User Stories
+## User stories
 
-### User Story 1:
-As a: user on Linux
+As a Linux developer, I want the installed binary to include its microVM runtime
+and import supported image sources, so running agents needs neither a separate
+runtime installation nor a Docker daemon after image acquisition.
 
-I want to:
-Use the builtin runtime (`runtime.kind: "builtin"`, 0139) on Linux arm64 or x86_64 with KVM, and import
-images from Docker Engine and authenticated registries.
+As an awman contributor, I want a clean checkout to build and install normally,
+and one prerelease command that captures verifiable native evidence for future
+releases.
 
-So I can:
-Run agents in the embedded microVM runtime without the Docker daemon at run
-time.
+## Implementation details
 
-### User Story 2:
-As a: maintainer
+- Include builtin support in GNU/Linux x86_64 source builds and the normal
+  `awman-linux-amd64` release. Keep ARM64, Windows and musl builds on their
+  existing backends. Linux runtime startup requires usable `/dev/kvm` and
+  never falls back to host execution.
+- Verify native x86_64 kernel/Agentd payload hashes. Use libkrun's existing
+  private-memory boot mode for fresh x86_64 VMs, so the process-owned embedded
+  kernel allocation is never shared writable guest RAM. Preserve independent
+  checkpoint-restore ownership. Create inherited Unix lifecycle locks as `0600`
+  regardless of umask, while retaining strict worker descriptor validation.
+- Build release assets on Ubuntu 22.04 and reject glibc requirements newer than
+  2.35. Embed the VM, kernel, guest agent, SQLite and other runtime dependencies;
+  only the documented operating-system C ABI and unwinder remain dynamic.
+  Keep musl static build regression coverage. Use Thin LTO and stripped symbols.
+- `make build` fetches missing checksum-pinned payload inputs. `make install`
+  builds as the invoking user and atomically replaces the destination, including
+  a currently executing inode; escalate only the final installation if needed.
+- Create new data/config directories with private permissions even under a
+  group-writable Linux umask. Keep existing unsafe-directory refusal intact.
+  Test fixture roots must also be private at creation; guest cleanup audits the
+  owned catalog without trying to host a builtin worker in a test executable.
+- Support explicit archive, OCI registry and Docker Engine sources. Validate
+  Docker Unix/TLS/mTLS transport, Docker-save and OCI archives, authenticated
+  private-CA registries, HTTP/CONNECT proxies, proxy authentication/NO_PROXY,
+  bearer renewal, retries, disconnects, digest failures, deadlines and cancellation.
+  Late failures must publish neither a successful import nor a usable cache entry.
+  Apple Containers remains a macOS-only source with explicit refusal on Linux.
+- Validate Docker builder preparation, import, rebuild and cached guest execution.
+  Keep source identity fixed and never select an unrelated source or runtime.
+  Imported images run without the source daemon or builder. Shipped Dockerfile
+  templates and Docker runtime regression contracts remain required boundaries.
+- `make linux-prerelease` uses the existing native-validation runner. Preflight
+  architecture, KVM, Docker Unix socket, umask 0002 and enforced offline seccomp;
+  prepare private, independently hashed OCI/Docker fixtures and an owned loopback
+  registry; enumerate registered tests independently of their results; validate
+  the exact candidate and archive a packet with source/artifact/input digests.
+  Cleanup owned services on failure. Missing infrastructure fails the run.
+- The first Linux builtin release has no published predecessor. Prove cached
+  state across executable replacement without claiming a cross-release upgrade.
+  Once `previous_release.x86_64-unknown-linux-gnu` is pinned, the runner must
+  automatically require the genuine old/new guest and offline artifact tests.
+- Keep issue #46, all carried patch provenance/removal conditions, and saved
+  upstream proposals current. No upstream issue or PR is submitted in this work.
 
-I want to:
-Extend the experimental runtime beyond Apple Silicon and harden image sources
-beyond the normal cases, with native Linux and real-service evidence.
+### Coordinated assignments
 
-So I can:
-Offer the runtime on more platforms and sources in later releases.
+The build/runtime coordinator owns release assets, installation and kernel memory
+integration; the native-validation coordinator owns manifest/packet/CI contracts;
+the Docker/source coordinator owns real-service and failure-boundary tests.
+Record native architecture, KVM access, source revision and artifact identity
+before accepting evidence. Only the supplied x86_64 machine earns Linux native
+acceptance; ARM64 host-only compilation earns none.
 
-## Implementation Details:
+## Edge cases
 
-### Required agent assignments and preflight
+- Unavailable/denied KVM, wrong architecture, missing or corrupted payloads.
+- Concurrent guests, repeated boot after failure, private mounts, permissions,
+  resource limits, network isolation, owner exit and process cleanup.
+- Atomic installation while an executable is in use; cached restart; an old
+  process resolving a deleted executable must require a restart explicitly.
+- Minimal PATH and enforced-offline execution; no extracted host helpers or
+  ambient Microsandbox configuration/runtime discovery.
+- Source credential failure or cancellation after partial bytes; no secret
+  diagnostics, stale success reports, fallback source or partial cache reuse.
+- A format accepted by the builtin importer is not necessarily accepted by
+  Docker's image loader; fixture formats and their hashes must remain explicit.
 
-These are capability-based assignments awaiting dispatch, not claims that an
-agent has run:
+## Test considerations and evidence
 
-| Assignment | Required access before accepting the task |
-|---|---|
-| Git/build coordinator | Accessible awman object database, authoritative WI 0119 base and reviewed head, history for genuine old/new builds; clean checkout/export capability |
-| Linux ARM64 agent | Native ARM64 with usable `/dev/kvm`; disposable Docker Unix/TLS/mTLS and registry/proxy/CA services; strace; enough disk/RAM for bounded feature/release builds |
-| Linux x86_64 agent | Native x86_64 with usable `/dev/kvm` and the same service/trace/build capabilities |
-| Docker service agent (any host) | Disposable Docker Engine (Unix, TCP+TLS, mTLS) and authenticated private-CA registry/proxy/keychain services |
+- [x] Host preflight: native x86_64, ordinary-user KVM access and Docker;
+  native payload extraction and kernel accessor diagnostic.
+- [x] Exact pinned libkrun memory tests: independent sibling mappings, immutable
+  backing, sparse/private fresh memory; five tests, no skipped cases.
+- [x] Registered registry boundary suite: ten real-registry tests covering the
+  transport/auth/proxy/retry/failure matrix above, included in the native packet.
+- [x] Manifest/tooling checks and release ABI parser/policy tests.
+- [x] Full native guest suites: boot, exec, import, network, upgrade/replacement,
+  builder and strategy.
+- [x] Native Docker source, runtime conformance and shipped-template suites.
+- [x] Exact optimized/LTO/stripped artifact: offline boot, dependency/ABI scan,
+  protocol policy, entrypoints, smoke, measurements and executable replacement.
+- [x] Real `make install` on the Linux host and installed runtime diagnostic.
+- [x] Independently verify and retain native packet; update evidence register.
 
-Each agent first records native architecture, KVM access, service/fixture
-availability, Git identity and artifact paths. Fail missing prerequisites
-explicitly and reassign; never count skips as success. Use disposable
-secrets, redact evidence, and never dump ambient credentials.
+[Native acceptance](../../review-notes/0124-evidence/notes.md) records exact commit
+`50cb794ed6a613fefbe114caf8648e0a00db346e`, all 19 suites and 86 passing JUnit
+cases, five additional mapping tests, installation and independent verification.
+The packet archive SHA-256 is
+`2f49431756528d8226e4769de5d3a6a1d89919a38d4b7f52842e9e6b49abcbfe`.
+The Debian candidate requires glibc 2.39; Ubuntu 22.04 release builds enforce
+their separate 2.35 ceiling. Latest-head hosted CI and review readiness are
+tracked by the PR's required checks, rather than predeclared by this record.
 
-### Work packages
+Source revisions and full packets must accompany final acceptance; intermediate
+passes do not certify a later implementation. No ARM64, Windows or Docker
+Sandboxes native pass is claimed by this x86_64 work.
 
-1. **Payloads:** verify the `x86_64-unknown-linux-gnu` payload natively (it is
-   still `unverified`); re-verify `aarch64-unknown-linux-gnu` from a clean
-   checkout. Build with the pinned Linux payload (0.1.41 uses pure Rust `caps`; no libcap-ng input).
-2. **Enable Linux:** lift WI 0123's platform gate for Linux arm64/x86_64 only
-   after packages 3–8 pass on that architecture. Add the `builtin-runtime`
-   feature to the matching Linux release assets and update the docs WI 0123
-   marked "Apple Silicon only".
-3. **Clean build and boot (D-03/D-11 Linux):** `tools/native-builtin-ci.sh`
-   for both Linux targets; actual awman boots through the current provider.
-4. **Native scenarios on Linux (D-04/D-05/D-06/D-07/D-08/D-09/D-12):** repeat
-   WI 0123 section C packages 2–5, 7 and 8 on both architectures, including
-   the x86_64 writable kernel copy, Linux deleted-executable upgrade cases, and
-   SQLite old/new catalog checks.
-5. **Docker Engine source (D-01/D-02):** real Unix/TLS/mTLS Docker suites;
-   credential failure/expiry/disconnect/retry/deadline/cancel; late-failure
-   report suppression; source shutdown with cached guest boot.
-6. **Registry edge cases (D-02):** WI 0123 validates the normal cases against
-   real public registries. This package covers the rest:
-   - private-CA registries (`store_registry_real_ca_proxy_auth_roundtrip`) and
-     `insecure` registries;
-   - HTTPS/HTTP proxies with observed `CONNECT`, proxy credentials and
-     `NO_PROXY`;
-   - Bearer token expiry mid-pull and re-authentication;
-   - disconnects mid-blob, stalled responses, deadlines and cancellation;
-   - 5xx storms, retry exhaustion, final (non-retried) auth/TLS/digest errors;
-   - late-failure report suppression.
-7. **Corpus (D-15):** the full required format × shipped-template corpus from
-   Docker and registry sources (Apple exports were covered in WI 0122/0123).
-8. **Docker backend regressions (D-11/D-15):** existing `docker` runtime
-   regressions with the builtin runtime present.
-9. **Linux release artifacts (D-13/D-14):** optimized/LTO/stripped artifacts
-   boot; trace executable/firmware access and helper/provider retention;
-   minimal PATH and enforced-offline cached execution; ABI, measurements,
-   notices, corresponding source and relink/source-offer materials.
-10. **Docker-dependent leftovers from WI 0123:** the live
-    `docker-sbx-experimental` regression (needs a signed-in Docker account,
-    `sbx login`); `docker save` and buildx OCI exports in the real template
-    corpus (`tests/oci_import/corpus/build-corpus.sh` with Docker; WI 0123
-    shipped an Apple-only corpus mode); a native Windows run of the
-    existing-backend refusal checks (CI builds it).
-11. **Record-keeping:** as each package lands, update the evidence register
-    rows WI 0123 marked Deferred to PASS, with linked evidence.
+## Codebase integration
 
-## Edge Case Considerations:
-
-- The same behaviour as WI 0121: no ambient runtime discovery, host agent
-  execution, helper fallback, secret leakage or unlisted parity exception.
-- Linux `/tmp` and similar paths are not symlinks, but bind-source ancestor
-  canonicalization (WI 0122) must not change Linux behaviour; test it.
-- The embedded kernel's inert `dummy0` also appears on Linux; the WI 0122
-  `only_lo` probe semantics apply.
-
-## Test Considerations:
-
-- [ ] x86_64 payload verified; arm64 re-verified from a clean checkout.
-- [ ] D-01/D-02: Docker Engine sources work through real Unix/TLS/mTLS
-  services with auth/failure/retry; cached execution needs no source.
-- [ ] D-03/D-11: clean-checkout builds boot on Linux arm64 and x86_64 KVM.
-- [ ] D-04/D-05/D-06/D-07/D-08/D-09/D-10/D-12 on both Linux architectures.
-- [ ] D-13/D-14: Linux release artifacts boot and pass native scans; materials
-  and measurements recorded.
-- [ ] D-15: full format × template corpus and Docker backend regressions.
-- [ ] Linux enabled for `runtime.kind: "builtin"` (0139 drops the `-experimental` value suffix; maturity is stated in docs and `awman config show`); docs updated.
-- [ ] Registry edge cases (package 6) pass against disposable services.
-- [ ] Register rows updated from Deferred to PASS as packages land. Each
-  package can be completed and released on its own.
-
-## Codebase Integration:
-
-- Follow the conventions and suites established in WI 0121–0123.
-- Update WI 0120's inventory and the evidence register with every Linux fix.
+Follow `aspec/architecture/design.md`, `aspec/architecture/security.md`,
+`aspec/devops/testing.md` and `ci/gates.toml`. No pre-WI144 harness or fallback
+workflow is restored. Keep unsafe code in the host-shims boundary. Maintain
+published-crate archive hashes, minimal diffs and independent removal gates.
 
 ## Documentation
 
-When Linux is enabled, update the platform statements WI 0123 added
-(`README.md`, `docs/00-getting-started.md`, `docs/07-configuration.md`,
-`docs/11-runtimes.md` and the others listed there) to describe Linux support
-and its KVM requirements. User-facing docs only; implementation detail stays
-here and in code comments.
+Update current runtime, configuration, getting-started and isolation guides with
+Linux availability, glibc/KVM requirements, image sources and Docker builder use.
+Document contributor prerequisites and prerelease packet review in `aspec/devops/`.
+Implementation and upstream patch notes stay in this work item and `third_party/`,
+not in a work-item-specific user guide. Historical release notes remain historical.

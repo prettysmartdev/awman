@@ -19,7 +19,7 @@ summary. Build output is printed without a `running` suffix on every line.
 | `docker` (default) | Linux, macOS, Windows | Linux container (shared kernel) | Docker daemon |
 | `apple` | macOS 26+ only | Lightweight VM per container | macOS 26 Tahoe |
 | `sbx` | macOS arm64; Windows x86_64 (experimental) | MicroVM per session | `sbx` CLI + Docker account |
-| `builtin` | macOS on Apple Silicon only (experimental) | MicroVM per session, embedded in awman | The `awman-macos-arm64` release binary (or a signed source build). No Docker, `container`, or `sbx` needed to *run* agents |
+| `builtin` | macOS on Apple Silicon and Linux x86_64 with KVM (experimental) | MicroVM per session, embedded in awman | The `awman-macos-arm64` or `awman-linux-amd64` release binary, or a supported source build. No Docker, `container`, or `sbx` needed to *run* agents |
 
 Set the runtime in your global config (`runtime.kind` is a global-only key):
 
@@ -27,7 +27,7 @@ Set the runtime in your global config (`runtime.kind` is a global-only key):
 awman config set runtime.kind docker                   # default
 awman config set runtime.kind apple         # macOS 26+ only
 awman config set runtime.kind sbx  # experimental
-awman config set runtime.kind builtin     # experimental, Apple Silicon only; see below
+awman config set runtime.kind builtin     # experimental, Apple Silicon or Linux x86_64 with KVM; see below
 ```
 
 You can switch runtimes at any time — each keeps its own separate state and does not interfere with the others. See [Switching runtimes](#switching-runtimes).
@@ -125,16 +125,17 @@ awman ready --build --no-cache   # rebuild from scratch
 
 **Isolation model:** a hardware-virtualized VM with its own kernel per session. The hypervisor, device emulation, and shared-filesystem implementations form part of the security boundary. The configured project, settings, and overlay mounts grant access to host files. There is no host Docker socket bridge.
 
-> **Experimental, macOS on Apple Silicon only.** This runtime is released as an experimental preview, like `sbx`: behaviour and configuration may still change. In this release it runs only on Macs with Apple Silicon. Its guest behaviour (sessions, PTY and ACP, workflows, squad, the API, resource limits, networking, image import) is tested on real Apple Silicon hardware; see [Parity limits](#parity-limits-versus-docker-and-apple-containers) for what differs from the other runtimes.
+> **Experimental, macOS on Apple Silicon and Linux x86_64 with KVM.** This runtime is released as an experimental preview, like `sbx`: behaviour and configuration may still change. Linux requires a GNU/glibc x86_64 build and read/write access to `/dev/kvm`; see [Parity limits](#parity-limits-versus-docker-and-apple-containers) for what differs from the other runtimes.
 
 ### Where it is available
 
 | Host | Status |
 |---|---|
 | macOS on Apple Silicon | Supported (experimental). Included in the `awman-macos-arm64` release and in source builds (`make build`). |
-| Linux (x86_64 or arm64), Windows | Not available in this release. Selecting it reports `the experimental builtin runtime is only available on macOS on Apple Silicon (macos/aarch64) in this release; this host is <os>/<arch>`. |
+| Linux x86_64 (GNU/glibc) | Supported (experimental) with KVM. Included in `awman-linux-amd64` (glibc 2.35 or newer) and source builds (`make build`). |
+| Linux arm64, Linux musl, Windows | Builtin runtime unavailable. Other supported runtimes remain available. |
 
-The runtime is present only in awman builds compiled with it. The `awman-macos-arm64` release asset includes it; the Linux and Windows assets do not. A build without it reports `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature`.
+The runtime is present only in awman builds compiled with it. The `awman-macos-arm64` and GNU/glibc `awman-linux-amd64` release assets include it. Linux arm64, musl and Windows builds do not. A build without it reports `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature`.
 
 ### Enabling it
 
@@ -151,7 +152,29 @@ or edit the global config file (`~/.awman/config.json`) directly:
 { "runtime": { "kind": "builtin" } }
 ```
 
-The value is exact: the earlier spelling `builtin` is refused, and the error names `builtin`. `awman config set` refuses unknown runtime values, and if the file already holds one, `awman config …` still works so you can fix it; every command that would run an agent refuses to start until you do.
+The value is `builtin`; the earlier `builtin-experimental` spelling is no longer accepted. `awman config set` refuses unknown runtime values, and if the file already holds one, `awman config …` still works so you can fix it; every command that would run an agent refuses to start until you do.
+
+### Linux KVM access
+
+The builtin runtime needs hardware virtualization exposed as `/dev/kvm`. On a
+Debian or Ubuntu host, grant your account access and log out and back in:
+
+```sh
+sudo usermod -aG kvm "$USER"
+# After logging in again:
+test -r /dev/kvm && test -w /dev/kvm
+awman config set runtime.kind builtin
+```
+
+A cloud VM also needs nested virtualization from its provider. If `/dev/kvm`
+is missing or inaccessible, awman reports the prerequisite and refuses to start
+a guest. Running awman as root is unnecessary.
+
+For image preparation, choose an archive, registry, or Docker Engine source.
+To build project images locally, install Docker, allow your account to use its
+Unix socket, and enable `runtime.builtin.builder.enabled`. Docker prepares
+and exports the image; cached agent execution uses KVM and needs no Docker
+service. Apple Containers sources are available only on macOS.
 
 ### The macOS binary, Gatekeeper and permissions
 
@@ -185,9 +208,9 @@ macOS only lets a program start a virtual machine when its code signature carrie
 
 ### Building from source
 
-Run `make payloads` once (it fetches and checksum-verifies the embedded kernel and guest agent for your host), then `make install`. On Apple Silicon, `make build`/`make install` require a verified payload, include the builtin runtime, and **ad-hoc sign the binary with the hypervisor entitlement automatically** (`tools/macos-sign.sh`). `make install` builds and signs as your user, uses `sudo` only if copying to the install directory requires it, and verifies the installed signature. On other hosts they build the existing runtimes only.
+Run `make install`. On Linux x86_64 GNU and Apple Silicon, `make build`/`make install` fetch and checksum-verify the embedded kernel and guest agent automatically and include the builtin runtime. Apple Silicon builds are also **ad-hoc signed with the hypervisor entitlement automatically** (`tools/macos-sign.sh`). `make install` builds as your user, uses `sudo` only if the install directory requires it, and atomically replaces the installed executable. On macOS it verifies the installed signature. Other hosts build the existing runtimes only.
 
-If you copy, strip or otherwise change the binary afterwards, sign it again:
+On macOS, if you copy, strip or otherwise change the binary afterwards, sign it again:
 
 ```sh
 make sign-macos BIN=/usr/local/bin/awman
@@ -362,7 +385,7 @@ Importing enforces safety limits: a total archive of up to 32 GiB, up to 8 GiB p
 |---|---|---|
 | `runtime.builtin.stateDir` | `<AWMAN_HOME>/builtin` | Private builtin runtime state root for imported images, VM/session state, catalog and control sockets. The directory is process-wide: every builtin session in the awman process uses it, and a repo `runtime.builtin.stateDir` that resolves to a different directory is rejected at launch with an error naming both paths. Must be an absolute path without `..`, owned by you with mode `0700`, and contain no symlinks. Keep it short: control sockets live below it and paths are limited to about 100 bytes (`socket path … is longer than the … limit; configure a shorter builtin state directory`). `AWMAN_BUILTIN_STATE_DIR` overrides config for the process. |
 | `runtime.builtin.vcpus` | `2` | Whole vCPUs per session VM, 1–255. Fractional values are rejected, never rounded. |
-| `runtime.builtin.memory` | `4GiB` | Guest memory, 128MiB or more. |
+| `runtime.builtin.memory` | `4GiB` | Requested guest RAM, 128MiB or more. Allow additional host memory for VM overhead. |
 | `runtime.builtin.rootDisk` | `30GiB` | Writable root disk per session VM, 256MiB or more: the space the agent has for everything outside its mounts (`/`, its home directory, installed packages). The disk file is sparse, so it only uses host space as the agent writes. |
 | `runtime.builtin.mountQuota` | `30GiB` | How much the agent may add to each host mount, the workspace included, beyond what it already held; 1 or more. Writes past it fail with "no space left on device" in the guest. This keeps an agent from filling your disk through a mount. |
 | `runtime.builtin.builder.enabled` | `false` | Let `ready`, and a launch whose agent image is missing, build in a `docker-local` or `apple-local` source store before importing. See [Building from a local image source](#building-from-a-local-image-source). |
@@ -409,7 +432,7 @@ In every mode: inbound connections are refused (awman never publishes a guest po
 
 **CAs.** By default the guest trusts only the image's own CA bundle. Set `trustHostCas: true` (global only) to also install the host's trusted root CAs in the guest at boot — useful behind a corporate TLS-inspecting proxy. awman never installs an interception CA of its own.
 
-> These rules are tested in real guests on Apple Silicon: allowlist and denied-egress enforcement (DNS, direct IP, DNS-over-HTTPS, proxy bypass), `hostPorts` access, `none` mode, and isolation between VMs running at the same time with different policies. IPv6 denial is verified only on hosts that have IPv6 connectivity.
+> Real-guest checks on Apple Silicon cover allowlist and denied-egress enforcement (DNS, direct IP, DNS-over-HTTPS, proxy bypass), `hostPorts` access, `none` mode, and concurrent VMs with different policies. Linux x86_64 KVM checks also prove authorized and denied host-port access in concurrent VMs and that `none` leaves no active egress interface or route. IPv6 denial is verified only on hosts that have IPv6 connectivity.
 
 ### Session lifecycle
 
@@ -465,7 +488,7 @@ For a newer catalog, use the newer awman. Otherwise quit any awman still using t
 |---|---|---|
 | Image creation | `ready` builds from Dockerfiles | `ready` imports from a configured source; with `runtime.builtin.builder.enabled` it can first build in a local Docker or Apple Containers store |
 | Fractional CPU | Supported | Rejected (`cannot honour …`): whole vCPUs only |
-| Resource limit enforcement | Container-level limits | VM allocation: the guest sees exactly the configured vCPUs and memory, and memory exhaustion is handled by the guest's own OOM killer without affecting the host or other VMs |
+| Resource limit enforcement | Container-level limits | Whole vCPUs and a requested RAM allocation per VM. Guest-visible memory depends on the platform boot layout and excludes kernel reservations. Guest allocation exhaustion uses the guest's OOM killer; budget host memory for VM overhead and concurrent sessions too. |
 | `--allow-docker` | Mounts the host Docker socket (Docker only) | **Rejected.** No socket is ever mounted and there is no host daemon bridge |
 | Reattach after the launching awman exits | Docker: yes. Apple: no | No |
 | Host `localhost` / MCP services | Per the container network | Inside the VM, `127.0.0.1` is the VM itself; a host loopback service is reachable only if its port is listed in `runtime.builtin.network.hostPorts` (see [Network](#network)) |
@@ -480,16 +503,17 @@ For a newer catalog, use the newer awman. Otherwise quit any awman still using t
 | Message | Cause and fix |
 |---|---|
 | `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature` | This awman build lacks the runtime. Use an asset that includes it or build from source (see above), or select another runtime. |
-| `the experimental builtin runtime is only available on macOS on Apple Silicon …` | This release supports the builtin runtime only on Apple Silicon Macs. Use `docker`, `apple` or `sbx`. |
-| `runtime.kind: expected one of docker, apple, sbx, builtin` | The value is not one of the four runtime names (an earlier spelling such as `builtin` counts). Run `awman config set runtime.kind builtin`. |
-| `embedded worker startup failed; verify KVM access or the macOS com.apple.security.hypervisor entitlement …` | The binary lacks the hypervisor entitlement: it was built from source without signing, or modified after signing. Run `make sign-macos BIN=$(command -v awman)`, or reinstall the release binary. |
+| `the experimental builtin runtime is only available on macOS on Apple Silicon …` | This release supports Apple Silicon Macs and Linux x86_64 with KVM. On other hosts, select a supported runtime such as `docker`. |
+| `runtime.kind: expected one of docker, apple, sbx, builtin` | The value is not one of the four runtime names (an earlier spelling such as `builtin-experimental` counts). Run `awman config set runtime.kind builtin`. |
+| `embedded worker startup failed; verify KVM access or the macOS com.apple.security.hypervisor entitlement …` | On Linux, check read/write access to `/dev/kvm` and virtualization support. On macOS, the binary may lack its entitlement or have been modified after signing: run `make sign-macos BIN=$(command -v awman)` or reinstall it. |
 | `"awman-macos-arm64" cannot be opened because the developer cannot be verified` | The file is quarantined (downloaded with a browser). Verify its checksum, then `xattr -d com.apple.quarantine <file>` — see [The macOS binary, Gatekeeper and permissions](#the-macos-binary-gatekeeper-and-permissions). |
 | `builtin image <tag> has no absolute effective HOME` | The image sets no `HOME` and its user has no absolute home in `/etc/passwd`. Add `ENV HOME=/path` to the Dockerfile. |
 | `the builtin runtime refuses to start while <variable> is set …` | An environment override would replace the builtin runtime. Unset the variable named in the error and retry. |
+| `builtin state directory requires private ownership (0700) and trusted parents` | The state directory must be owned by you with mode `0700`; its parent directories must not be writable by other users. New awman directories are created privately. For an existing personal `~/.awman`, check its ownership and use `chmod 700 ~/.awman` if it is writable by your group. Choose a private state location instead of changing a deliberately shared directory. |
 | `no image source is configured for '<tag>'` | In an interactive CLI or TUI run, choose a source in the `ready` setup prompt. In non-interactive runs, set `runtime.builtin.imageSource` for the default source or `runtime.builtin.images.<tag>` for that image, then run `awman ready` (see [Interactive image-source setup](#interactive-image-source-setup)). If building is wanted, also set `runtime.builtin.builder.enabled` to `true`; source selection alone only imports. |
 | ``builtin image <image> is not imported; run `awman ready` to import it``, or ``image '<tag>' is not in the builtin image cache (…); run `awman ready` to import it`` | Run `awman ready`. |
 | ``a builtin sandbox for agent '<name>' already exists; stop or remove it (`awman clean`) or choose another name`` | A session with that name is still present; stop it, run `awman clean`, or pick another name. |
-| `the <builder> image builder is unavailable: <detail>` | `runtime.builtin.builder.enabled` selected Docker or Apple Containers for this image's source, but it cannot be used (CLI missing, daemon or service stopped). Start it, or disable the builder to import only. This is a build failure; awman does not fall back to an older image. |
+| `the <builder> image builder is unavailable: <detail>` | `runtime.builtin.builder.enabled` selected Docker or Apple Containers for this image's source, but it cannot be used (CLI missing, daemon or service stopped). Start it to prepare updated images. A session can continue with an installed image and a stale-image warning; explicit `ready --build` fails. Disable the builder to launch installed images without source freshness probes. |
 | ``the Docker builder `default` for <endpoint> uses the `<driver>` driver, which does not store images in that Engine …`` | Switch the endpoint's buildx `default` builder to the `docker` driver (`docker buildx use default`), or uninstall buildx to use the legacy builder. |
 | ``<tag>: the build succeeded but the import failed; run `awman ready` again to retry the import`` | The image built, but importing it into the builtin runtime failed (see the import row for why). Fix that and run `awman ready`; it imports the build without rebuilding. |
 | `<tag>: <builder> is unreachable; using the installed image (…)` | The source store could not be inspected, so the installed image was kept. Start the builder to check for and build changes. |

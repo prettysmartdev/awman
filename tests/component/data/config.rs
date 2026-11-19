@@ -325,3 +325,44 @@ fn unified_home_roots_every_store_and_removed_overrides_are_inert() {
         Path::new("/xd/awman/squad")
     );
 }
+
+/// The first global config/data write must leave a home that the builtin
+/// state boundary can trust even on systems whose normal umask is 0002.
+#[test]
+#[cfg(unix)]
+fn newly_created_config_and_data_homes_are_private_without_chmodding_existing_dirs() {
+    use awman::data::{
+        builtin_state::BuiltinState,
+        fs::{config_file::write_config_file_atomically, data_paths::DataPaths},
+    };
+    use std::os::unix::fs::PermissionsExt;
+    let s = crate::support::sandbox("data::config::newly_created_config_and_data_homes_are_private_without_chmodding_existing_dirs");
+    let config_home = s.home().join("fresh-config-home");
+    write_config_file_atomically(&config_home.join("config.json"), "{}").unwrap();
+    let data_home = s.home().join("fresh-data-home");
+    DataPaths::at_root(data_home.join("data"))
+        .ensure_root()
+        .unwrap();
+    for path in [&config_home, &data_home, &data_home.join("data")] {
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        BuiltinState::resolve(&path.join("builtin"), |_| Ok(())).unwrap();
+    }
+    std::fs::set_permissions(&config_home, std::fs::Permissions::from_mode(0o775)).unwrap();
+    write_config_file_atomically(&config_home.join("config.json"), "{\"updated\":true}").unwrap();
+    DataPaths::at_root(&config_home).ensure_root().unwrap();
+    assert_eq!(
+        std::fs::metadata(&config_home)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o775
+    );
+    assert!(
+        BuiltinState::resolve(&config_home.join("refused"), |_| Ok(())).is_err(),
+        "existing group-writable ancestors must still be refused"
+    );
+}

@@ -310,6 +310,90 @@ jobs:
             target
           key: ${{ steps.cache-key.outputs.key }}
 
+  build-linux-x64-builtin:
+    name: Build linux-x64-builtin
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.builds), 'linux-x64-builtin') }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    outputs:
+      archive_sha256: ${{ steps.digests.outputs.archive_sha256 }}
+      expected_sha256: ${{ steps.digests.outputs.expected_sha256 }}
+      binary_sha256: ${{ steps.digests.outputs.binary_sha256 }}
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
+        with:
+          toolchain: "1.94.0"
+      - name: Compute the cache key
+        id: cache-key
+        run: echo "key=$(cargo xtask ci cache-key --build linux-x64-builtin)" >> "$GITHUB_OUTPUT"
+      - name: Restore the cargo and build cache (exact key, no fallback)
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cache-key.outputs.key }}
+      - name: Prepare the verified builtin payload
+        run: bash tools/msb-payloads/fetch.sh x86_64-unknown-linux-gnu
+      - name: Install the pinned test runner
+        run: cargo xtask test install-runner
+      - name: Build the nextest archive and the debug binary
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            # Nextest recompiles xtask; Windows cannot replace a running exe.
+            cp target/debug/xtask.exe target/xtask-archive.exe
+            target/xtask-archive.exe test archive --build linux-x64-builtin --out archive
+          else
+            cargo xtask test archive --build linux-x64-builtin --out archive
+          fi
+      - name: Record digests
+        id: digests
+        run: |
+          cp "target/debug/awman$(if [ "$RUNNER_OS" = Windows ]; then echo .exe; fi)" archive/awman-debug-linux-x64-builtin
+          cargo xtask ci digest record --out archive/digests.json \
+            archive=archive/test-archive-linux-x64-builtin.tar.zst \
+            expected=archive/expected-tests-linux-x64-builtin.json \
+            binary=archive/awman-debug-linux-x64-builtin >> "$GITHUB_OUTPUT"
+      - name: Upload the archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-archive-${{ needs.plan.outputs.gate }}-${{ inputs.mode }}-linux-x64-builtin
+          path: archive
+          if-no-files-found: error
+          retention-days: 7
+      - name: Record cache statistics
+        if: ${{ always() }}
+        env:
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+          CACHE_KEY: ${{ steps.cache-key.outputs.key }}
+        run: cargo xtask ci cache-stats --build linux-x64-builtin --key "$CACHE_KEY" --hit "${CACHE_HIT:-false}" --out cache-stats
+      - name: Upload cache statistics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: evidence-${{ needs.plan.outputs.gate }}-${{ inputs.mode }}-cache-linux-x64-builtin
+          path: cache-stats
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Save the cache (main pushes only)
+        if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.cache-key.outputs.key }}
+
   build-linux-x64-default:
     name: Build linux-x64-default
     needs: plan
@@ -861,6 +945,80 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: failure-${{ env.GATE }}-${{ inputs.mode }}-builtin-hermetic-linux-arm64-m${{ strategy.job-index }}
+          path: evidence/**/records
+          if-no-files-found: ignore
+          retention-days: 30
+
+  builtin-hermetic-linux-x64-release:
+    name: Test component on linux-x64-release
+    needs: [plan, build-linux-x64-builtin]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-linux-x64-builtin.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'builtin-hermetic-linux-x64-release') }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards)['builtin-hermetic-linux-x64-release'] || fromJSON('[{"i":1,"n":1,"suites":""}]') }}
+    env:
+      GATE: ${{ needs.plan.outputs.gate }}
+      AWMAN_TEST_LEASE: ${{ strategy.job-index }}
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
+        with:
+          toolchain: "1.94.0"
+      - name: Allocate this job attempt
+        run: cargo xtask ci sweep --init
+      - name: Download the test archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: test-archive-${{ needs.plan.outputs.gate }}-${{ inputs.mode }}-linux-x64-builtin
+          path: archive
+      - name: Verify the archive against the build job's recorded digests
+        env:
+          ARCHIVE_SHA256: ${{ needs.build-linux-x64-builtin.outputs.archive_sha256 }}
+          EXPECTED_SHA256: ${{ needs.build-linux-x64-builtin.outputs.expected_sha256 }}
+          BINARY_SHA256: ${{ needs.build-linux-x64-builtin.outputs.binary_sha256 }}
+        run: |
+          cargo xtask ci digest verify --file archive/digests.json \
+            --expect "archive=$ARCHIVE_SHA256" \
+            --expect "expected=$EXPECTED_SHA256" \
+            --expect "binary=$BINARY_SHA256"
+      - name: Install the pinned test runner
+        run: cargo xtask test install-runner
+      - name: Fetch content-addressed fixtures
+        run: cargo xtask fixtures fetch --tier component
+      - name: Run the suites from the archive
+        env:
+          SUITES: ${{ matrix.shard.suites }}
+          SHARD_I: ${{ matrix.shard.i }}
+          SHARD_N: ${{ matrix.shard.n }}
+          AWMAN_TEST_HOST_RESOURCES: ${{ matrix.shard.host_resources }}
+        run: |
+          bash tools/ci-test-home.sh cargo xtask test run --suite "$SUITES" --build linux-x64-builtin \
+            --archive archive/test-archive-linux-x64-builtin.tar.zst \
+            --shard "$SHARD_I/$SHARD_N" --evidence-dir evidence
+      - name: Leak sweep (processes, containers, VMs, temp roots of this run)
+        if: ${{ always() }}
+        run: cargo xtask ci sweep
+      - name: Upload evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: evidence-${{ env.GATE }}-${{ inputs.mode }}-builtin-hermetic-linux-x64-release-m${{ strategy.job-index }}
+          path: evidence
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Upload failure records
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: failure-${{ env.GATE }}-${{ inputs.mode }}-builtin-hermetic-linux-x64-release-m${{ strategy.job-index }}
           path: evidence/**/records
           if-no-files-found: ignore
           retention-days: 30
@@ -1905,7 +2063,7 @@ jobs:
 
   gate:
     name: gate
-    needs: [plan, lint, build-linux-arm64-builtin, build-linux-x64-default, static-musl, build-macos-arm64-ci-guest-builtin, build-macos-arm64-default, build-windows-x64-default, boundary-linux-docker, builtin-hermetic-linux-arm64, test-boundary-macos-arm64-ci-guest, test-boundary-macos-arm64-sbx, test-component-linux-x64, test-component-macos-arm64, test-component-macos-arm64-ci-guest, test-component-windows-x64, test-guest-macos-arm64-ci-guest, test-soak-linux-x64, test-soak-linux-x64-private-registry, test-soak-macos-arm64-ci-guest, test-unit-linux-x64, test-unit-macos-arm64, test-unit-windows-x64, web, hardware-blocked]
+    needs: [plan, lint, build-linux-arm64-builtin, build-linux-x64-builtin, build-linux-x64-default, static-musl, build-macos-arm64-ci-guest-builtin, build-macos-arm64-default, build-windows-x64-default, boundary-linux-docker, builtin-hermetic-linux-arm64, builtin-hermetic-linux-x64-release, test-boundary-macos-arm64-ci-guest, test-boundary-macos-arm64-sbx, test-component-linux-x64, test-component-macos-arm64, test-component-macos-arm64-ci-guest, test-component-windows-x64, test-guest-macos-arm64-ci-guest, test-soak-linux-x64, test-soak-linux-x64-private-registry, test-soak-macos-arm64-ci-guest, test-unit-linux-x64, test-unit-macos-arm64, test-unit-windows-x64, web, hardware-blocked]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
