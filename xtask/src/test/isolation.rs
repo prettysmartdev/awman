@@ -351,13 +351,15 @@ mod tests {
         let run = Run::for_home(home.path().to_owned()).unwrap();
         let mut command = Command::new("/bin/sh");
         command
-            .args(["-c", "printf 'ready\\n'; exec /bin/sleep 60"])
+            .args(["-c", "printf 'ready\\n'; IFS= read -r release"])
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped());
         run.apply(&mut command);
         let mut leaked = command.spawn().unwrap();
         // spawn() can return before exec has installed the private environment.
-        // Exercise the scanner only after this deliberately leaked child proves
-        // it has entered that environment; no scheduler-delay assumption.
+        // Keep this shell blocked on its owned stdin after readiness. A second
+        // exec (e.g. sleep) can momentarily expose an empty /proc/<pid>/environ
+        // while the sweep reads it, even though the first exec was synchronized.
         let mut ready = [0u8; 6];
         std::io::Read::read_exact(&mut leaked.stdout.take().unwrap(), &mut ready).unwrap();
         assert_eq!(&ready, b"ready\n");

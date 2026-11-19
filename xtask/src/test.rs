@@ -308,6 +308,40 @@ fn target_flags(target: &str) -> Result<Vec<String>> {
     })
 }
 
+/// Build cells cover the workspace, but an individual suite selects one package.
+/// Infrastructure crates have no runtime features, and guest drivers belong to
+/// the CLI alone. Preserve all other manifest arguments so unknown flags/features
+/// still fail in Cargo instead of being silently discarded.
+pub(crate) fn package_features(features: &[String], package: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut input = features.iter();
+    while let Some(arg) = input.next() {
+        if arg != "--features" {
+            args.push(arg.clone());
+            continue;
+        }
+        let Some(values) = input.next() else {
+            args.push(arg.clone());
+            break;
+        };
+        let enabled = values
+            .split(',')
+            .filter(|feature| match *feature {
+                "guest-drivers" => package == "awman-cli",
+                "builtin-runtime" => {
+                    !["awman-test-support", "awman-wsp", "xtask"].contains(&package)
+                }
+                _ => true,
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        if !enabled.is_empty() {
+            args.extend([arg.clone(), enabled]);
+        }
+    }
+    args
+}
+
 /// The nextest filterset of one suite, scoped to its package and binary.
 fn suite_filter(s: &Suite) -> Result<String> {
     let package = s
@@ -509,6 +543,7 @@ fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
     let mut failed = Vec::new();
     let mut records = Vec::new();
     for inv in invocations(&chosen)? {
+        let features = package_features(&features, &inv.package);
         let mut command = match o.runner {
             Runner::Nextest => nextest_command(root, &inv, &features, o)?,
             Runner::Libtest => libtest_command(&inv, &chosen, &features)?,
@@ -933,6 +968,7 @@ fn update_golden(root: &Path, o: &Options) -> Result<ExitCode> {
     require_nextest(root, &m)?;
     let mut code = 0;
     for inv in invocations(&chosen)? {
+        let features = package_features(&features, &inv.package);
         let mut c = nextest_command(root, &inv, &features, &o2)?;
         c.env("PATH", tool_path(root))
             .env("INSTA_UPDATE", "always")
@@ -946,6 +982,24 @@ fn update_golden(root: &Path, o: &Options) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_features_follow_the_selected_package() {
+        let m = crate::manifest::load(&crate::gates::root()).unwrap();
+        let builtin = &m.features["builtin"].cargo_args;
+        assert_eq!(package_features(builtin, "awman-cli"), *builtin);
+        for package in ["awman", "awman-host-shims"] {
+            assert_eq!(
+                package_features(builtin, package),
+                ["--features", "builtin-runtime"]
+            );
+        }
+        for package in ["awman-test-support", "awman-wsp", "xtask"] {
+            assert!(package_features(builtin, package).is_empty());
+        }
+        let unknown = ["--no-default-features", "--features", "future-feature"].map(String::from);
+        assert_eq!(package_features(&unknown, "xtask"), unknown);
+    }
 
     #[test]
     fn target_flags_follow_manifest_target_ids() {

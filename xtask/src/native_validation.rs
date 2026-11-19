@@ -303,6 +303,8 @@ fn execute(r: &mut Run, m: &Manifest) -> Result<()> {
             ensure!(target == "lib", "unsupported native target {target}");
             args.push("--lib");
         }
+        let features =
+            crate::test::package_features(features, s.package.as_deref().context("suite package")?);
         args.extend(features.iter().map(String::as_str));
         if let Some(filter) = &s.filter {
             args.extend(["-E", filter]);
