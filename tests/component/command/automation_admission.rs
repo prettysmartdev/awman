@@ -102,6 +102,15 @@ struct Rig {
     _sandbox: awman_test_support::TestSandbox,
 }
 
+/// The controller is process-wide: forget this execution and its held
+/// leases so nothing outlives the sandbox's database.
+impl Drop for Rig {
+    fn drop(&mut self) {
+        self.owned.clone().abandon();
+        global().release_leases(&self.command);
+    }
+}
+
 impl Rig {
     fn new(name: &'static str, options: Options) -> Self {
         let sandbox = crate::support::sandbox(name);

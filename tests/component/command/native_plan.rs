@@ -854,11 +854,13 @@ async fn an_overlay_replacing_checked_opencode_config_is_refused() {
     )
     .await;
     let launch = f.last();
+    // Overlay sources are canonicalized (`\\?\` on Windows).
+    let canonical = payload.canonicalize().unwrap();
     assert!(
         launch
             .mounts
             .iter()
-            .any(|(guest, _, host)| guest == "/workspace/opencode.json" && host == &payload),
+            .any(|(guest, _, host)| guest == "/workspace/opencode.json" && host == &canonical),
         "{:?}",
         launch.mounts
     );

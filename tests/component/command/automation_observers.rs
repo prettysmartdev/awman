@@ -62,9 +62,22 @@ struct Host {
     store: AutomationStore,
     command: CommandId,
     events: Arc<Mutex<Vec<EventPayload>>>,
+    /// Executions started on the process-wide controller, abandoned on drop.
+    started: Mutex<Vec<OwnedExecution>>,
     // Last: fields drop in order, and Windows cannot remove the tempdir
     // while the store above still holds its database open.
     sandbox: awman_test_support::TestSandbox,
+}
+
+/// The controller is process-wide: forget this host's executions and held
+/// leases so nothing outlives the sandbox's database.
+impl Drop for Host {
+    fn drop(&mut self) {
+        for owned in self.started.lock().unwrap().drain(..) {
+            owned.abandon();
+        }
+        global().release_leases(&self.command);
+    }
 }
 
 impl Host {
@@ -93,6 +106,7 @@ impl Host {
             sandbox,
             command,
             events: Arc::new(Mutex::new(Vec::new())),
+            started: Mutex::new(Vec::new()),
         }
     }
 
@@ -140,6 +154,7 @@ fn interactive(host: &Host, execution: &ExecutionId) -> OwnedExecution {
         .unwrap();
     owned.launching();
     owned.running();
+    host.started.lock().unwrap().push(owned.clone());
     owned
 }
 

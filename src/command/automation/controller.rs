@@ -993,8 +993,15 @@ fn spawn_writer_pump(
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
     };
+    // Weak: the cell owns the queue's sender, so a strong reference here
+    // would keep the cell (and its store and lease) alive forever.
+    let weak = Arc::downgrade(&cell);
+    drop(cell);
     runtime.spawn(async move {
         while let Some(write) = queue.recv().await {
+            let Some(cell) = weak.upgrade() else {
+                return;
+            };
             let mut state = cell.state.lock().unwrap_or_else(|p| p.into_inner());
             write_locked(&cell, &mut state, write, &engine);
         }
@@ -1572,14 +1579,19 @@ impl OwnedExecution {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let cell = self.cell.clone();
-        let controller = self.controller.clone();
+        // Weak: the timers never extend the execution's lifetime past its
+        // owners, so an execution nobody holds releases its store at once.
+        let weak = Arc::downgrade(&self.cell);
+        let cancelled = self.cell.timers.clone();
         runtime.spawn(async move {
             loop {
                 tokio::select! {
-                    _ = cell.timers.cancelled() => return,
+                    _ = cancelled.cancelled() => return,
                     _ = tokio::time::sleep(Duration::from_millis(50)) => {}
                 }
+                let Some(cell) = weak.upgrade() else {
+                    return;
+                };
                 let mut state = cell.state.lock().unwrap_or_else(|p| p.into_inner());
                 if state.finished {
                     return;
@@ -1597,7 +1609,6 @@ impl OwnedExecution {
                     }
                 }
                 drop(state);
-                let _ = &controller;
             }
         });
     }
