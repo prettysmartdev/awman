@@ -18,17 +18,9 @@ use crate::data::session::{GitRootResolver, Session, SessionOpenOptions};
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
 
-/// A fatal startup failure selected for frontend presentation. The inert
-/// engine bundle only allows the frontend to open its quit-only modal.
+/// A fatal startup failure selected for frontend presentation.
 pub struct RuntimeStartupFailure {
     pub error: crate::command::error::CommandError,
-}
-impl RuntimeStartupFailure {
-    pub(crate) fn new(error: EngineError) -> Self {
-        Self {
-            error: error.into(),
-        }
-    }
 }
 
 /// The command-aware startup coordinator for one binary invocation.
@@ -79,33 +71,40 @@ impl Startup {
 
         let opts = SessionOpenOptions {
             env: Some(env),
-            overrides,
+            overrides: overrides.clone(),
             ..Default::default()
         };
         // Outside a Git repo the directory is not a repository: config scope
         // and `--repo` must not treat it as one.
-        let session = if in_repo {
+        let mut session = if in_repo {
             Session::open_at_git_root(working_dir, git_root, opts)
         } else {
             Session::open_at_directory_root(git_root, opts)
         }
         .context("failed to open session")?;
-        // Detect after opening the session so repo builtin settings participate
-        // in the same effective configuration used by command execution.
-        let (detected, fatal_runtime_error) = Engines::detect_effective(
-            CommandCatalogue::get(),
-            &session.effective_config(),
-            &path_refs,
-        )
-        .map_err(|error| match error {
-            EngineError::UnknownRuntime { .. } => anyhow::Error::new(error),
-            other => anyhow::Error::new(other).context("failed to detect agent runtime"),
-        })?;
+        // A one-shot process has one known invocation repository. Bind its
+        // allowed repo settings before constructing any process resource.
+        // Multi-session TUI startup continues to bind global/env/startup only.
+        let process_config = if self.command_path.is_empty() {
+            Engines::resolve_process_config(session.env().clone(), overrides.clone())?
+        } else {
+            session.effective_config()
+        };
+        // Runtime and monitor use only the already resolved process config.
+        // The session retains repository settings for each individual launch.
+        let (detected, fatal_runtime_error) =
+            Engines::detect_effective(CommandCatalogue::get(), &process_config, &path_refs)
+                .map_err(|error| match error {
+                    EngineError::UnknownRuntime { .. } => anyhow::Error::new(error),
+                    other => anyhow::Error::new(other).context("failed to detect agent runtime"),
+                })?;
         // Opening the runtime may have upgraded the builtin state directory in
         // place; its notice is presented by the frontend that runs next.
         let notices = detected.take_notices();
-        let engines =
-            Engines::from_detected(detected, &session).context("failed to construct engines")?;
+        let engines = Engines::from_detected_with_config(detected, &session, &process_config)
+            .context("failed to construct engines")?;
+        engines.inherit_process_settings(&mut session)?;
+        engines.validate_process_config(&session.effective_config())?;
 
         Ok(StartupOutcome::new(
             session,

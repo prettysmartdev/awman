@@ -615,7 +615,7 @@ mod execute;
 mod factory;
 
 mod merge_fix_prompt;
-mod phase_container;
+pub(crate) mod phase_container;
 mod prepare;
 mod prerequisites;
 mod shared_frontend;

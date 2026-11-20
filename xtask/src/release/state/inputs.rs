@@ -92,12 +92,12 @@ impl CandidateInputs {
     pub fn pending_pins(&self) -> Vec<String> {
         let mut out = Vec::new();
         for (k, v) in &self.fixtures {
-            if v.is_none() {
+            if !v.as_deref().is_some_and(digest::is_sha256) {
                 out.push(format!("fixture {k} has no published digest"));
             }
         }
         for (k, v) in &self.previous_release {
-            if v.is_none() {
+            if !v.as_deref().is_some_and(digest::is_sha256) {
                 out.push(format!(
                     "previous release for {k} has no authenticated digest"
                 ));
@@ -251,13 +251,32 @@ pub fn compute(src: &Path, m: &Manifest, version: &str, commit: &str) -> Result<
     let fixtures = m
         .fixtures
         .iter()
-        .filter(|(_, f)| f.verified_record.is_none())
-        .map(|(k, f)| (k.clone(), f.sha256.clone()))
+        .map(|(k, f)| {
+            let pin = if crate::manifest::validate::fixture_pin_error(m, k, f).is_some() {
+                None
+            } else if let Some(record) = &f.verified_record {
+                file_digest(src, &format!("{record}/provenance.txt"))
+                    .ok()
+                    .flatten()
+            } else {
+                f.sha256.clone()
+            };
+            (k.clone(), pin)
+        })
         .collect();
     let previous_release = m
         .previous_release
         .iter()
-        .map(|(k, p)| (k.clone(), p.sha256.clone()))
+        .map(|(k, p)| {
+            (
+                k.clone(),
+                if p.pending.is_some() {
+                    None
+                } else {
+                    p.sha256.clone()
+                },
+            )
+        })
         .collect();
     let targets = targets(m)?;
     let toolchain = targets

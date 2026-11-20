@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 
 /// Deadline for the one-shot ACP handshake requests (`initialize`,
 /// `session/new`). These must complete quickly; a peer that answers
@@ -15,12 +15,15 @@ use tokio::sync::{mpsc, Mutex};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 use crate::data::message::UserMessageSink;
-use crate::engine::acp::client::{AcpClient, AcpTransport, IncomingRequest};
+use crate::engine::acp::budget::AcpQueueStats;
+use crate::engine::acp::client::{
+    AcpCancelHandle, AcpClient, AcpIncoming, AcpTransport, AcpUpdates, IncomingRequest,
+};
 use crate::engine::acp::frontend::AcpFrontend;
 use crate::engine::acp::protocol::{
     ContentBlock, InitializeRequest, InitializeResponse, JsonRpcId, NewSessionRequest,
     NewSessionResponse, PermissionDecision, PermissionRequest, PromptRequest, PromptResponse,
-    SessionUpdate, SetSessionModeRequest,
+    SetSessionModeRequest,
 };
 use crate::engine::agent_runtime::execution::{AgentExecution, AgentExitInfo};
 use crate::engine::error::EngineError;
@@ -49,9 +52,10 @@ pub struct AcpSession {
     execution: AgentExecution,
     client: Arc<AcpClient>,
     session_id: Mutex<Option<String>>,
-    permissions_rx: mpsc::UnboundedReceiver<IncomingRequest>,
+    permissions_rx: AcpIncoming,
     pending_permissions: Mutex<HashSet<JsonRpcId>>,
-    updates_rx: mpsc::UnboundedReceiver<SessionUpdate>,
+    updates_rx: AcpUpdates,
+    cancel: AcpCancelHandle,
     permissions: PermissionPolicy,
     /// The starting mode `initialize` was asked to establish, if any.
     requested_mode: Option<String>,
@@ -82,6 +86,7 @@ impl AcpSession {
     ) -> Self {
         let permissions_rx = client.take_incoming();
         let updates_rx = client.take_updates();
+        let cancel = client.cancel_handle();
         Self {
             execution,
             client: Arc::new(client),
@@ -89,6 +94,7 @@ impl AcpSession {
             permissions_rx,
             pending_permissions: Mutex::new(HashSet::new()),
             updates_rx,
+            cancel,
             permissions,
             requested_mode: None,
             current_mode: None,
@@ -239,8 +245,12 @@ impl AcpSession {
     /// any error path once the container has launched, so the `docker run`
     /// child is never leaked (an errored `initialize`/`prompt` otherwise drops
     /// the still-running execution without waiting on it).
+    ///
+    /// Never waits for stdin space: an agent that stopped reading cannot hold
+    /// up teardown.
     pub async fn shutdown(&mut self) -> Result<AgentExitInfo, EngineError> {
-        let _ = self.cancel().await;
+        let _ = self.cancel_now().await;
+        self.cancel.cancel();
         let _ = self.execution.cancel();
         self.execution.wait().await
     }
@@ -270,7 +280,27 @@ impl AcpSession {
     /// requests cancelled, as required by ACP's cancellation semantics.
     pub async fn cancel(&mut self) -> Result<(), EngineError> {
         if let Some(session_id) = self.session_id.lock().await.clone() {
-            self.client.notify(
+            self.client
+                .notify(
+                    "session/cancel",
+                    serde_json::json!({"sessionId": session_id}),
+                )
+                .await?;
+        }
+        let ids: Vec<_> = self.pending_permissions.lock().await.drain().collect();
+        for id in ids {
+            self.client
+                .respond_permission(id, PermissionDecision::Cancelled)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// [`cancel`](Self::cancel) for teardown: sends only what fits in the
+    /// stdin budget right now.
+    async fn cancel_now(&mut self) -> Result<(), EngineError> {
+        if let Some(session_id) = self.session_id.lock().await.clone() {
+            self.client.notify_now(
                 "session/cancel",
                 serde_json::json!({"sessionId": session_id}),
             )?;
@@ -278,7 +308,7 @@ impl AcpSession {
         let ids: Vec<_> = self.pending_permissions.lock().await.drain().collect();
         for id in ids {
             self.client
-                .respond_permission(id, PermissionDecision::Cancelled)?;
+                .respond_now(id, PermissionDecision::Cancelled.as_result())?;
         }
         Ok(())
     }
@@ -290,7 +320,19 @@ impl AcpSession {
         decision: PermissionDecision,
     ) -> Result<(), EngineError> {
         self.pending_permissions.lock().await.remove(&request_id);
-        self.client.respond_permission(request_id, decision)
+        self.client.respond_permission(request_id, decision).await
+    }
+
+    /// A handle that cancels this session's transport from another task:
+    /// reader tasks stop, queued data is freed and pending requests fail.
+    /// A driver blocked in [`drive`](Self::drive) then returns.
+    pub fn cancel_handle(&self) -> AcpCancelHandle {
+        self.cancel.clone()
+    }
+
+    /// Occupancy and high-water marks of every ACP queue.
+    pub fn queue_stats(&self) -> AcpQueueStats {
+        self.cancel.stats()
     }
 
     pub fn execution(&self) -> &AgentExecution {
@@ -298,6 +340,19 @@ impl AcpSession {
     }
     pub async fn wait(&mut self) -> Result<AgentExitInfo, EngineError> {
         self.execution.wait().await
+    }
+
+    /// Reap the execution after the transport ended. An overflow is the
+    /// session's result; otherwise the agent's exit info is.
+    async fn finish_transport(&mut self) -> Result<AgentExitInfo, EngineError> {
+        let _ = self.cancel_now().await;
+        self.cancel.cancel();
+        let _ = self.execution.cancel();
+        let exit = self.execution.wait().await;
+        match self.client.failure() {
+            Some(overflow) => Err(overflow),
+            None => exit,
+        }
     }
 
     /// Drive a complete interactive conversation through the portable
@@ -319,6 +374,13 @@ impl AcpSession {
     /// inside the same driver loop also services `session/request_permission`
     /// during that turn, avoiding the permission-before-prompt-response
     /// circular wait.
+    ///
+    /// Control (permission requests) is polled before bulk updates, and the
+    /// driver never waits on one without draining the other, so a saturated
+    /// update queue cannot hold back a permission reply or the turn result.
+    /// While the frontend is inside a synchronous call the reader applies
+    /// backpressure; cancellation through [`cancel_handle`](Self::cancel_handle)
+    /// still stops the transport at once.
     pub async fn drive_with_initial_prompt(
         &mut self,
         frontend: &mut dyn AcpFrontend,
@@ -331,16 +393,15 @@ impl AcpSession {
                 Some(prompt) => prompt,
                 None => match frontend.next_prompt() {
                     Some(prompt) => prompt,
-                    None => {
-                        self.cancel().await?;
-                        // `None` means the whole awman session ends, so also use
-                        // the normal execution cancellation path instead of
-                        // waiting indefinitely for a cooperative agent to exit.
-                        self.execution.cancel()?;
-                        return self.execution.wait().await;
-                    }
+                    // `None` means the whole awman session ends, so also use
+                    // the normal execution cancellation path instead of
+                    // waiting indefinitely for a cooperative agent to exit.
+                    None => return self.finish_transport().await,
                 },
             };
+            if self.cancel.is_cancelled() {
+                return self.finish_transport().await;
+            }
             let client = self.client.clone();
             let session_id =
                 self.session_id.lock().await.clone().ok_or_else(|| {
@@ -360,44 +421,54 @@ impl AcpSession {
             });
             loop {
                 tokio::select! {
+                    biased;
+                    request = self.permissions_rx.recv() => match request {
+                        Some(IncomingRequest::Permission(request)) => {
+                            if let Err(e) = self.handle_permission(frontend, request).await {
+                                // The reply could not be sent: the transport
+                                // closed or was cancelled. Reap, and report an
+                                // overflow if that is what closed it.
+                                drop(turn);
+                                let closed = self.cancel.is_cancelled();
+                                let ended = self.finish_transport().await;
+                                return if closed { ended } else { Err(e) };
+                            }
+                        }
+                        // Control closed => the connection ended or was
+                        // cancelled. Render what the turn already queued, then
+                        // reap — cancel covers a peer that closes stdout but
+                        // keeps its process alive.
+                        None => {
+                            while let Some(update) = self.updates_rx.try_recv() {
+                                frontend.render_update(update);
+                            }
+                            drop(turn);
+                            return self.finish_transport().await;
+                        }
+                    },
                     result = &mut turn => {
                         // The reader enqueues a turn's `session/update`s before
                         // the prompt response that ends the turn, so anything
                         // still queued here belongs to this turn — drain and
                         // render it before finishing (otherwise the tail of a
                         // turn, or the whole of a fast headless turn, is lost).
-                        while let Ok(update) = self.updates_rx.try_recv() {
+                        while let Some(update) = self.updates_rx.try_recv() {
                             frontend.render_update(update);
                         }
                         if let Err(e) = result {
                             // The turn RPC failed (typically the agent dropped
                             // the connection mid-turn). Reap the child so it is
                             // never leaked, then surface the error.
-                            let _ = self.execution.cancel();
-                            let _ = self.execution.wait().await;
-                            return Err(e);
+                            let _ = self.finish_transport().await;
+                            return Err(self.client.failure().unwrap_or(e));
                         }
                         break;
                     }
                     update = self.updates_rx.recv() => match update {
                         Some(update) => frontend.render_update(update),
-                        // Update channel closed => the ACP reader task ended
-                        // because stdout closed: the connection dropped. Cancel
-                        // and reap the execution and return its AgentExitInfo
-                        // (the edge case requires a done/error transition, not a
-                        // hang) — cancel covers a peer that closes stdout but
-                        // keeps its process alive.
                         None => {
-                            let _ = self.execution.cancel();
-                            return self.execution.wait().await;
-                        }
-                    },
-                    request = self.permissions_rx.recv() => match request {
-                        Some(IncomingRequest::Permission(request)) => self.handle_permission(frontend, request).await?,
-                        // Incoming channel closed => connection dropped; reap.
-                        None => {
-                            let _ = self.execution.cancel();
-                            return self.execution.wait().await;
+                            drop(turn);
+                            return self.finish_transport().await;
                         }
                     },
                 }
@@ -435,6 +506,7 @@ mod start_mode_tests {
     //! JSON-RPC over the real transport.
     use super::*;
     use crate::data::message::{UserMessage, UserMessageSink};
+    use crate::engine::acp::protocol::SessionUpdate;
     use crate::engine::agent_runtime::execution::{CancelHandle, ExecutionBackend};
     use crate::engine::agent_runtime::frontend::AgentFrontend;
     use serde_json::{json, Value};

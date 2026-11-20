@@ -44,7 +44,7 @@ and `cursor` do not offer ACP and refuse it before launch. Other agents use the
 standard stdio launch mode.
 
 ACP is available with the Docker and Apple Containers runtimes. The
-`docker-sbx-experimental` runtime does not currently support ACP. The `builtin-experimental` runtime carries ACP over its own binary-clean stream: frames reach the agent byte-for-byte, and closing the client's stdin ends the agent's input as it does on Docker.
+`sbx` runtime does not currently support ACP. The `builtin` runtime carries ACP over its own binary-clean stream: frames reach the agent byte-for-byte, and closing the client's stdin ends the agent's input as it does on Docker.
 
 The interactive ACP experience currently ships in the **CLI**. See
 [ACP in the TUI](#acp-in-the-tui) and [Workflows](#workflows-and-unsupported-agents)
@@ -228,7 +228,7 @@ Per-agent translation and expected `<NAME>` format:
 | `opencode-v2` | `--model <NAME>` | `provider/model`, as for `opencode`. Interactive sessions with `--model` use OpenCode 2.x's minimal interface (`opencode mini`); see [OpenCode 1.x and 2.x](#opencode-1x-and-2x) |
 | `cursor` | `--model <NAME>` | model name as listed by `cursor-agent models` |
 | `cline` | `--model <NAME>` | model ID for the selected provider; use `--agent-flag --provider` to select a provider for one run |
-| `copilot` | `--model <NAME>` | bare model ID; cannot be applied under the `docker-sbx-experimental` runtime (use the `/model` slash command there) |
+| `copilot` | `--model <NAME>` | bare model ID; cannot be applied under the `sbx` runtime (use the `/model` slash command there) |
 
 For agents that support multiple providers (`opencode`, for example), the `provider/model` slash form lets you target a specific provider when more than one is configured. awman passes the value through verbatim — the agent does the routing.
 
@@ -236,7 +236,7 @@ An agent with no model flag (a custom agent whose definition declares none) refu
 
 `--model` can be combined freely with `--agent`, `--yolo`, `--auto`, and all other flags. When used with `exec workflow`, the flag value acts as the default model for every workflow step that does not define its own `model` field. See [Per-step model overrides](05-workflows.md#per-step-model-overrides).
 
-Under the `docker-sbx-experimental` runtime, the flag is delivered through the sandbox's per-launch session config (built-in template agents) or as launch arguments (custom-kit agents) rather than directly on the command line; the supported agents and modes are the same, except copilot, which cannot receive a model override there. See [Runtimes](11-runtimes.md#known-limitations).
+Under the `sbx` runtime, the flag is delivered through the sandbox's per-launch session config (built-in template agents) or as launch arguments (custom-kit agents) rather than directly on the command line; the supported agents and modes are the same, except copilot, which cannot receive a model override there. See [Runtimes](11-runtimes.md#known-limitations).
 
 ### `--headless` / `-n`
 
@@ -255,7 +255,7 @@ Run the agent in print/batch mode — no interactivity required. The agent execu
 
 Useful for CI pipelines, scripting, or when you want the output captured rather than live.
 
-Under the `docker-sbx-experimental` runtime, agents that launch through Docker's built-in sandbox templates (`claude`, `codex`, `copilot`) cannot have their non-interactive flag enabled — awman warns at launch and pipes the prompt to the interactive entrypoint instead. See [Runtimes](11-runtimes.md#known-limitations).
+Under the `sbx` runtime, agents that launch through Docker's built-in sandbox templates (`claude`, `codex`, `copilot`) cannot have their non-interactive flag enabled — awman warns at launch and pipes the prompt to the interactive entrypoint instead. See [Runtimes](11-runtimes.md#known-limitations).
 
 ### `--interactive`
 
@@ -426,7 +426,7 @@ Every agent-launching command (`chat`, `exec prompt`, `exec workflow`, and their
 
 When both `--yolo` and `--auto` are passed, `--yolo` wins. `--plan` together with an explicit `--yolo` or `--auto` is refused (`plan and yolo modes are mutually exclusive`).
 
-Not every agent implements every level. `--plan` on a custom agent with no native plan delivery is refused before launch, so a plan request never silently runs at the agent's default level. For `--auto` and `--yolo`, awman simply omits the flag where an agent has no equivalent — the session still launches, but at the agent's own default permission level rather than the one you asked for. **Under the container runtimes this is silent**, so check the tables below before relying on a mode. (Under `docker-sbx-experimental` the unsupported combinations are warned about at launch — see [Runtimes](11-runtimes.md#known-limitations).)
+Not every agent implements every level. `--plan` on a custom agent with no native plan delivery is refused before launch, so a plan request never silently runs at the agent's default level. For `--auto` and `--yolo`, awman simply omits the flag where an agent has no equivalent — the session still launches, but at the agent's own default permission level rather than the one you asked for. **Under the container runtimes this is silent**, so check the tables below before relying on a mode. (Under `sbx` the unsupported combinations are warned about at launch — see [Runtimes](11-runtimes.md#known-limitations).)
 
 ### `--plan`
 
@@ -970,7 +970,7 @@ Your original files are never modified. The copies are created in a temporary di
 
 Or per command: `awman chat --agent cursor --overlay "env(CURSOR_API_KEY)"`. awman reads the value from your host shell and injects it into the container; it is masked (`***`) in agent output, terminal replay and failure logs, and never appears in the launch arguments. awman does not mount a host `~/.cursor/` directory and does not run `cursor-agent login` for you.
 
-Cursor is refused on `docker-sbx-experimental`: that runtime reuses state and credential scopes between executions. Use `docker`, `apple` or `builtin` with `env(CURSOR_API_KEY)`.
+Cursor is refused on `sbx`: that runtime reuses state and credential scopes between executions. Use `docker`, `apple` or `builtin` with `env(CURSOR_API_KEY)`.
 
 ---
 
@@ -995,7 +995,7 @@ OpenCode readiness now checks the image only and skips the former host authentic
 
 OpenCode 2 and Cursor require an explicit `--yolo` to authorize their broad approval modes. API and worker defaults, dynamic mode and squad leaders do not grant this authorization. A launch with only an implied yolo mode is refused; dynamic workflows using these agents need an explicit `--yolo`. Squad evaluation leaders and their workflows currently cannot use these agents with their automatic yolo mode.
 
-OpenCode 2 is refused on `docker-sbx-experimental` until per-execution state and credential isolation is available. Its host config copy refuses symlinks (including intermediate directories), hard links, protected paths and special files, so policy files are never silently omitted. Make linked policy files regular files before launching. On platforms without secure descriptor-relative copying, an existing host config is refused; a missing config starts empty.
+OpenCode 2 is refused on `sbx` until per-execution state and credential isolation is available. Its host config copy refuses symlinks (including intermediate directories), hard links, protected paths and special files, so policy files are never silently omitted. Make linked policy files regular files before launching. On platforms without secure descriptor-relative copying, an existing host config is refused; a missing config starts empty.
 
 If an image holds the wrong major version, `awman ready` and launch refuse it, for example: `does not contain OpenCode 2: expected opencode 2.x, found 1.19.6. Update .awman/Dockerfile.opencode-v2 to install opencode 2.x and run 'awman ready --build'.`
 
@@ -1334,8 +1334,8 @@ awman agents profile delete review --agent claude --yes
 
 Only one execution can write a profile at a time. A crashed or unfinished execution
 leaves it `closing` until awman confirms the container is gone and the snapshot is
-safe. `profile close` retries that cleanup; if sanitizing fails, the previous
-consistent snapshot is kept. A live execution must be cancelled through its own
+safe. `profile close` retries that cleanup against the runtime recorded for the profile; if sanitizing fails, the previous
+consistent snapshot is kept. If awman cannot confirm that the container is gone or who owns it (for example the recorded runtime is currently unavailable), the profile stays `closing` and its private run data is preserved: make that runtime available again and rerun `profile close`. `profile list`, `close` and `delete` print their result in the terminal; in the TUI it appears in the status log (a failed close as an error), and through the API it is the command's `data` (the same JSON as `--json`) with a failed command status. A failed close exits non-zero. A live execution must be cancelled through its own
 command controls. Only an `inactive` profile can be deleted, and deletion removes its
 history. awman keeps the current and previous snapshot with no time-based expiry.
 `profile list` shows state and counts, never conversation IDs, transcript text or
@@ -1397,6 +1397,19 @@ until `agents.automation.startupTimeout`.
   completion was verified, whether output was fully collected and whether cleanup
   finished. The weakest tier observed is the one reported. See
   [API & Remote Mode](09-api-and-remote-mode.md#automation-turns-and-terminals).
+- **Completion is verified only after it is durably recorded.** A task is reported complete
+  with verified completion only after its result is recorded and its lifecycle events are
+  durably written. If recording fails, awman stops the run, cancels the agent, releases
+  what it owned, publishes no completion and returns a storage error and a non-zero exit;
+  nothing is retried or resent. If the result is recorded but its events could not be
+  published ("completion recorded, not yet published"), the daemon publishes them from the
+  recorded result when it reconciles (restart the daemon if it does not); never resubmit the
+  task to repair publication. A result over 8 MiB is reported as `result_too_large` with no
+  final message and no verified completion. After a restart, committed answers stay available;
+  interrupted work that was never acknowledged is `delivery_unknown`, and acknowledged but
+  unsettled work is `execution_lost`. Continuing requires a new execution (with
+  `--agent-session`), never an automatic replay. Profile export and cleanup are confirmed
+  separately: an unconfirmed or abandoned cleanup is not upgraded to success on restart.
 - **Timeouts.** `agents.automation.startupTimeout` (default `120s`),
   `cancelTimeout` (`10s`) and `outputDrainTimeout` (`5s`, at most the cancel
   timeout) are set through [configuration](07-configuration.md#automation-timeouts)

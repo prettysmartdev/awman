@@ -3,6 +3,7 @@
 //!   fetch [--tier <id>] [--store <dir>]   place every pinned fixture the tier needs
 //!   verify [--store <dir>]                check every placed fixture against its pin
 //!   build <recipe> …                      explicit preparation recipes (fixtures/recipes)
+//!   verify-build --base B --sha256 SHA --out DIR  independently reproduce both guest archives
 //!   publish-plan                          JSON list of fixtures to build and publish (Fixtures workflow)
 //!
 //! The store layout is the one `awman-test-support` reads: `<store>/<file or id>`
@@ -22,7 +23,7 @@ use crate::manifest::Manifest;
 pub fn run(args: &[String]) -> Result<ExitCode> {
     let Some((cmd, rest)) = args.split_first() else {
         eprintln!(
-            "usage: cargo xtask fixtures fetch [--tier T] | verify | build <recipe> | publish-plan"
+            "usage: cargo xtask fixtures fetch [--tier T] | verify | build <recipe> | verify-build --base B --sha256 SHA --out DIR | publish-plan"
         );
         return Ok(ExitCode::from(2));
     };
@@ -36,6 +37,7 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
         }
         "fetch" => fetch(&root, flag(rest, "--tier").as_deref(), &store(&root, rest)),
         "verify" => verify(&root, &store(&root, rest)),
+        "verify-build" => recipes::verify_guest(rest),
         "publish-plan" => publish_plan(&root),
         other => bail!("unknown fixtures command {other}"),
     }
@@ -113,11 +115,22 @@ fn wanted(m: &Manifest, tier: Option<&str>, store: &Path) -> Vec<Wanted> {
 fn fetch(root: &Path, tier: Option<&str>, store: &Path) -> Result<ExitCode> {
     let m = crate::manifest::load(root)?;
     let mut blocked = Vec::new();
+    for (id, f) in &m.fixtures {
+        if tier.is_some_and(|tier| !f.tiers.is_empty() && !f.tiers.iter().any(|t| t == tier)) {
+            continue;
+        }
+        if let Some(error) = crate::manifest::validate::fixture_pin_error(&m, id, f) {
+            blocked.push(format!("BLOCKED[fixture:{id}]: {error}"));
+        }
+    }
+    if !blocked.is_empty() {
+        return report(blocked);
+    }
     for w in wanted(&m, tier, store) {
         let Some(digest) = w
             .sha256
             .as_deref()
-            .filter(|d| crate::evidence::digest::is_sha256(d))
+            .filter(|d| w.pending.is_none() && crate::evidence::digest::is_sha256(d))
         else {
             blocked.push(format!(
                 "BLOCKED[fixture:{}]: no published SHA-256 ({})",
@@ -151,6 +164,10 @@ fn download_verified(url: &str, digest: &str, path: &Path) -> Result<()> {
     let partial = path.with_extension("partial");
     let status = Command::new("curl")
         .args([
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
             "--fail",
             "--location",
             "--silent",
@@ -176,6 +193,14 @@ fn download_verified(url: &str, digest: &str, path: &Path) -> Result<()> {
 fn verify(root: &Path, store: &Path) -> Result<ExitCode> {
     let m = crate::manifest::load(root)?;
     let mut problems = Vec::new();
+    for (id, f) in &m.fixtures {
+        if let Some(error) = crate::manifest::validate::fixture_pin_error(&m, id, f) {
+            problems.push(format!("BLOCKED[fixture:{id}]: {error}"));
+        }
+    }
+    if !problems.is_empty() {
+        return report(problems);
+    }
     for w in wanted(&m, None, store) {
         match w
             .sha256

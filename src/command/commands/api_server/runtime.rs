@@ -20,7 +20,7 @@ use crate::data::command_status::CommandStatus;
 use crate::data::fs::api_db::{CommandRecord, LabelOwner, SqliteSessionStore};
 use crate::data::fs::api_labels::Labels;
 use crate::data::fs::api_paths::ApiPaths;
-use crate::data::session::{Session, SessionOpenOptions, SessionType, StaticGitRootResolver};
+use crate::data::session::SessionType;
 use crate::data::session_manager::SessionManager;
 use crate::data::session_setup_event::{SessionSetupError, SessionSetupStatus};
 use crate::data::session_status::SessionStatus;
@@ -177,7 +177,7 @@ pub struct WorkerServices {
     /// worker that claimed each one.
     pub command_cancels: Arc<TokenRegistry>,
     /// Tokens of in-progress session setups, keyed by session id; registered
-    /// by the route that spawns the setup.
+    /// by the Layer 2 session lifecycle service.
     pub setup_cancels: Arc<TokenRegistry>,
 }
 
@@ -207,22 +207,11 @@ impl WorkerServices {
         // two daemons would open different files and API-mode data would appear to
         // vanish after squad migrated it.
         let data_paths = paths.data_paths();
-        let migration = if core.is_none() {
-            Some(
-                data_paths
-                    .migrate_legacy_db(paths.root())
-                    .map_err(CommandError::Data)?,
-            )
-        } else {
-            None
-        };
-        tracing::info!(migration = ?migration, "api database migration outcome");
-
-        let db_path = paths.db_path();
-        tracing::info!(db = %db_path.display(), "Opening session store");
         let store = match core {
             Some(core) => core.session_store().clone(),
-            None => Arc::new(SqliteSessionStore::open_at(&db_path).map_err(CommandError::Data)?),
+            None => data_paths
+                .open_session_store(paths.root())
+                .map_err(CommandError::Data)?,
         };
         // The WI 0135 lifecycle tables (cancel markers, `/v1/worker/runs` linkage)
         // must exist before any recovery below reads them.
@@ -275,15 +264,22 @@ impl WorkerServices {
                     }
                     continue;
                 }
-                let resolver = StaticGitRootResolver::new(&workdir_path);
-                match Session::open_or_workdir_fallback(
-                    workdir_path,
-                    &resolver,
-                    SessionOpenOptions {
-                        env: Some(config.env.clone()),
-                        ..Default::default()
-                    },
-                ) {
+                // The saved authority is an upper bound that the current
+                // allowlist must still grant; without one nothing is inferred
+                // and the restored session cannot launch.
+                let policy = crate::command::session_create::SessionCreatePolicy::new(
+                    config.workdirs.clone(),
+                    paths.session_dir(&rec.id),
+                )
+                .with_workdir_roots(config.workdir_roots.clone());
+                let opened = crate::command::session_setup::restore_session(
+                    &store,
+                    &rec,
+                    &policy,
+                    &config.env,
+                    engines.git_engine.as_ref(),
+                );
+                match opened {
                     Ok(mut session) => {
                         crate::command::context::session_binding::apply(
                             &mut session,

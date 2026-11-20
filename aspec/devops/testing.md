@@ -421,6 +421,9 @@ expires = "2026-12-31"
 
 `ci/acceptance-matrix.toml` records important behavior anchors with named tests and gates. Platform, feature, runtime and complete suite selection come from `ci/gates.toml`; do not duplicate that Cartesian product by hand or demand one test per catalogue permutation. `cargo xtask matrix check` rejects missing behavior slices and nonexistent named tests. `covered` means executable coverage exists, not that it passed on a platform. Only actual run evidence establishes execution, and the native item remains open until its packet is reviewed.
 
+The manifest runner accepts `--test-threads N` (a positive integer) to limit
+nextest parallelism without changing suite deadlines, retries or selection.
+
 ## Execution and evidence
 
 Every selected suite must contain tests. The runner captures compiled inventory, executes with zero retries, clears stale JUnit, and records source hashes and actual results. Missing tests, required skips and changed inputs fail validation. Component contracts in private library modules are selected explicitly by the manifest; placement alone never grants unit-tier privileges.

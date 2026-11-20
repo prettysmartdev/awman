@@ -11,6 +11,7 @@ pub mod client;
 pub mod events;
 pub mod http_core;
 pub mod local;
+pub mod sse;
 pub mod terminal_client;
 // WI 0142: `awman.frontend.v1` WebSocket transport (filled by engine-feature-layer1).
 pub mod frontend_client;
@@ -20,8 +21,11 @@ pub use client::{
     RemoteResponse, SessionSetupStatusResponse, StartCommandRequest, StartRunRequest,
     StartRunResponse, StartSessionRequest, StartSessionResponse,
 };
-pub use events::ExecutionEventSink;
+pub use events::{
+    run_cancellable, ExecutionEventSink, FollowEnd, FollowReport, ReconnectNotice, ReconnectPolicy,
+};
 pub use http_core::{HttpClientOptions, HttpCore, HttpResponse};
 pub use local::{LocalClient, LocalEndpoint};
+pub use sse::{SseDecoder, MAX_SSE_FRAME_BYTES};
 
 pub mod work_server_link;

@@ -76,12 +76,13 @@ async fn same_agent_authorities_notify_matching_leases_and_never_rewrite_managed
     .unwrap();
     let binding_a = CredentialBinding::to_file(resolver.clone(), &a);
     let binding_b = CredentialBinding::to_file(resolver.clone(), &b);
-    let monitor = CredentialRefreshMonitor::with_binding(
+    let monitor = CredentialRefreshMonitor::with_binding_in(
         MonitorConfig {
             tick_interval: Duration::from_secs(60),
             ..Default::default()
         },
         binding_a.clone(),
+        &crate::support::env_snapshot(&sandbox),
     );
     let received = Arc::new(Mutex::new(Vec::<String>::new()));
     let delivery = RefreshableCredentialDelivery {
@@ -259,12 +260,13 @@ async fn legacy_file_refresh_registers_new_tokens_with_the_launch_redactor() {
     let path = root.join(".credentials.json");
     std::fs::write(&path, b"old credential").unwrap();
     let binding = CredentialBinding::to_file(AuthPathResolver::at_home(sandbox.home()), &source);
-    let monitor = CredentialRefreshMonitor::with_binding(
+    let monitor = CredentialRefreshMonitor::with_binding_in(
         MonitorConfig {
             tick_interval: Duration::from_secs(60),
             ..Default::default()
         },
         binding.clone(),
+        &crate::support::env_snapshot(&sandbox),
     );
     let delivery = RefreshableCredentialDelivery {
         agent: AgentName::new("claude").unwrap(),
@@ -457,7 +459,11 @@ fn managed_windows_enrollment_refuses_the_legacy_locking_exception() {
         AuthPathResolver::at_home(sandbox.home()),
         sandbox.tmp().join("source"),
     );
-    let monitor = CredentialRefreshMonitor::with_binding(MonitorConfig::default(), binding.clone());
+    let monitor = CredentialRefreshMonitor::with_binding_in(
+        MonitorConfig::default(),
+        binding.clone(),
+        &crate::support::env_snapshot(&sandbox),
+    );
     let delivery = RefreshableCredentialDelivery {
         agent: AgentName::new("claude").unwrap(),
         spec_agent: "claude",
@@ -474,5 +480,126 @@ fn managed_windows_enrollment_refuses_the_legacy_locking_exception() {
         SourceSink(std::sync::Arc::new(|_| panic!("unlocked managed callback"))),
     );
     assert!(matches!(result, Err("safe_authority_lock_unavailable")));
+    sandbox.finish();
+}
+
+/// The workflow's pre-step and post-exit paths both call refresh_now; the
+/// background loop reaches the same pinger only while a lease is live.
+#[cfg(unix)]
+#[tokio::test]
+async fn synchronous_refresh_and_live_tick_use_only_installed_snapshot_programs() {
+    use awman::data::{fs::AuthPathResolver, session::AgentName};
+    use awman::engine::{
+        auth::{
+            credential::{CredentialBinding, CredentialFingerprint},
+            RefreshableCredentialDelivery,
+        },
+        credential_refresh::{CredentialRefreshMonitor, MonitorConfig, RefreshOutcome},
+    };
+    use std::time::Duration;
+    let sandbox = crate::support::sandbox(
+        "engine::credential_refresh::synchronous_refresh_and_live_tick_use_only_installed_snapshot_programs",
+    );
+    let fake = sandbox.install_fake(crate::support::fake_cli_exe(), "claude");
+    fake.on(&[]).stdout("hello\n");
+    let local = sandbox.work().join("bin");
+    std::fs::create_dir_all(&local).unwrap();
+    awman_test_support::exe::install_as(fake.exe(), &local, "claude");
+    let source = sandbox.tmp().join("host-credential.json");
+    let original = r#"{"claudeAiOauth":{"accessToken":"owned-test-secret","expiresAt":1}}"#;
+    std::fs::write(&source, original).unwrap();
+    let binding = CredentialBinding::to_file(AuthPathResolver::at_home(sandbox.home()), &source);
+    let mut entries = sandbox.env().clone();
+    entries.set(
+        "PATH",
+        std::env::join_paths([&local, &sandbox.bin()]).unwrap(),
+    );
+    let elsewhere = sandbox.tmp().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let env = awman::data::config::env::EnvSnapshot::from_instance_env(
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string_lossy().into(), v.to_string_lossy().into()))
+            .collect(),
+        elsewhere,
+        vec![],
+    );
+    let monitor = CredentialRefreshMonitor::with_binding_in(
+        MonitorConfig {
+            tick_interval: Duration::from_secs(60),
+            ..Default::default()
+        },
+        binding,
+        &env,
+    );
+    let agent = AgentName::new("claude").unwrap();
+    assert!(matches!(
+        monitor.refresh_now(&agent, Duration::from_secs(3)).await,
+        RefreshOutcome::Stale { .. }
+    ));
+    assert!(
+        fake.calls().is_empty(),
+        "no host ping without a registered checkout"
+    );
+    monitor.add_checkout_roots([sandbox.work(), sandbox.tmp().join("retired-checkout")]);
+    assert_eq!(monitor.live_lease_count(), 0);
+    assert!(fake.calls().is_empty());
+    // The two existing synchronous workflow callers use this exact boundary.
+    // A successful executable exit without rotation is truthfully stale.
+    for expected_calls in 1..=2 {
+        let outcome = monitor.refresh_now(&agent, Duration::from_secs(3)).await;
+        assert!(
+            matches!(outcome, RefreshOutcome::Stale { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(fake.calls().len(), expected_calls);
+    }
+    // A new monitor has no previous backoff and starts a real tick when its
+    // first lease is registered. It uses the same explicit snapshot.
+    drop(monitor);
+    let binding = CredentialBinding::to_file(AuthPathResolver::at_home(sandbox.home()), &source);
+    let monitor = CredentialRefreshMonitor::with_binding_in(
+        MonitorConfig {
+            tick_interval: Duration::from_secs(60),
+            ..Default::default()
+        },
+        binding,
+        &env,
+    );
+    monitor.add_checkout_roots([sandbox.work(), sandbox.tmp().join("retired-checkout")]);
+    let staged = sandbox.tmp().join("staged.json");
+    std::fs::write(&staged, original).unwrap();
+    let delivery = RefreshableCredentialDelivery {
+        agent,
+        spec_agent: "claude",
+        credential_env_key: "CLAUDE_CODE_OAUTH_TOKEN",
+        staged_path: staged,
+        staged_root: sandbox.tmp(),
+        initial_fingerprint: CredentialFingerprint::zeroed(),
+    };
+    let lease = monitor.register(&delivery, "owned-fake-container");
+    awman_test_support::wait::wait_for_async(
+        "periodic host ping and status",
+        Duration::from_secs(3),
+        || async {
+            (fake.calls().len() == 3
+                && monitor
+                    .status()
+                    .iter()
+                    .any(|s| matches!(s.last_outcome, Some(RefreshOutcome::Stale { .. }))))
+            .then_some(())
+        },
+    )
+    .await;
+    drop(lease);
+    assert_eq!(monitor.live_lease_count(), 0);
+    drop(monitor);
+    assert_eq!(std::fs::read_to_string(source).unwrap(), original);
+    for call in fake.calls() {
+        assert_eq!(call.argv.len(), 4);
+        assert!(awman::engine::ready::GREETINGS.contains(&call.argv[3].as_str()));
+        assert_eq!(call.env["HOME"], sandbox.home().to_string_lossy());
+        assert!(!call.cwd.starts_with(sandbox.work()));
+    }
     sandbox.finish();
 }

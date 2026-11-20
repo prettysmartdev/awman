@@ -20,6 +20,160 @@ use engine::Engine;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+#[test]
+fn concurrent_fixture_cleanup_preserves_peer_and_preexisting_resources() {
+    let mut sandbox = support::sandbox(
+        "docker::concurrent_fixture_cleanup_preserves_peer_and_preexisting_resources",
+    );
+    let engine = Engine::grant(&mut sandbox);
+    let base = engine.base_image();
+
+    // A name reservation is not ownership of an existing unlabelled resource.
+    let unlabelled = engine::Cleanup::new(&engine);
+    let unlabelled_name = engine.unique_name("awman-boundary-unlabelled");
+    unlabelled.container(&unlabelled_name);
+    engine.run_ok(&[
+        "run",
+        "-d",
+        "--name",
+        &unlabelled_name,
+        &base,
+        "sleep",
+        "3600",
+    ]);
+    unlabelled.created_container(&unlabelled_name);
+    let foreign_reservation = engine::Cleanup::new(&engine);
+    foreign_reservation.container(&unlabelled_name);
+    drop(foreign_reservation);
+    assert!(engine.container_exists(&unlabelled_name));
+    drop(unlabelled);
+    assert!(!engine.container_exists(&unlabelled_name));
+
+    let failed_setup = engine::Cleanup::new(&engine);
+    let failed_image = engine.unique_tag("awman-boundary-project-failed-setup");
+    let failed_container = engine.unique_name("awman-boundary-project-failed-setup");
+    let (failed_dockerfile, failed_context) =
+        engine.write_context("failed-setup", &format!("FROM {base}\n"));
+    failed_setup.build_image(&failed_image, &failed_dockerfile, &failed_context);
+    failed_setup.container(&failed_container);
+    let failed_owner = failed_setup.owner_label();
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        engine
+            .command()
+            .args([
+                "run",
+                "-d",
+                "--label",
+                &failed_owner,
+                "--name",
+                &failed_container,
+                &failed_image,
+                "sleep",
+                "3600",
+            ])
+            .run()
+            .assert_success();
+        panic!("injected setup assertion before daemon ID registration");
+    }));
+    assert!(failure.is_err());
+    drop(failed_setup);
+    assert!(!engine.container_exists(&failed_container));
+    assert!(!engine.has_image(&failed_image));
+
+    let outsider = engine::Cleanup::new(&engine);
+    let existing_image = engine.unique_tag("awman-boundary-project-preexisting");
+    let existing_container = engine.unique_name("awman-boundary-project-preexisting");
+    outsider.image(&existing_image);
+    engine.run_ok(&["tag", &base, &existing_image]);
+    outsider.created_image(&existing_image);
+    let (dockerfile, context) =
+        engine.write_context("world", &format!("FROM {base}\nENV AWMAN_TEST_WORLD=1\n"));
+    outsider.container(&existing_container);
+    engine
+        .command()
+        .args([
+            "run",
+            "-d",
+            "--label",
+            &outsider.owner_label(),
+            "--name",
+            &existing_container,
+            &existing_image,
+            "sleep",
+            "3600",
+        ])
+        .run()
+        .assert_success();
+
+    let first = engine::Cleanup::new(&engine);
+    let first_image = engine.unique_tag("awman-boundary-project-world");
+    let first_container = engine.unique_name("awman-boundary-project-world");
+    first.build_image(&first_image, &dockerfile, &context);
+    first.container(&first_container);
+    engine
+        .command()
+        .args([
+            "run",
+            "-d",
+            "--label",
+            &first.owner_label(),
+            "--name",
+            &first_container,
+            &first_image,
+            "sleep",
+            "3600",
+        ])
+        .run()
+        .assert_success();
+    first.created_container(&first_container);
+
+    let second = engine::Cleanup::new(&engine);
+    let second_image = engine.unique_tag("awman-boundary-project-world");
+    let second_container = engine.unique_name("awman-boundary-project-world");
+    second.build_image(&second_image, &dockerfile, &context);
+    second.container(&second_container);
+    engine
+        .command()
+        .args([
+            "run",
+            "-d",
+            "--label",
+            &second.owner_label(),
+            "--name",
+            &second_container,
+            &second_image,
+            "sleep",
+            "3600",
+        ])
+        .run()
+        .assert_success();
+    second.created_container(&second_container);
+
+    drop(first);
+    assert!(!engine.container_exists(&first_container));
+    assert!(!engine.has_image(&first_image));
+    assert!(engine.container_exists(&second_container));
+    assert!(engine.has_image(&second_image));
+    assert!(engine.container_exists(&existing_container));
+    assert!(engine.has_image(&existing_image));
+    assert!(
+        engine.has_image(&base),
+        "the shared base image remains tagged"
+    );
+
+    drop(second);
+    assert!(!engine.container_exists(&second_container));
+    assert!(!engine.has_image(&second_image));
+    assert!(engine.container_exists(&existing_container));
+    assert!(engine.has_image(&existing_image));
+    assert!(
+        engine.has_image(&base),
+        "peer cleanup kept the shared base tag"
+    );
+    drop(outsider);
+    sandbox.finish();
+}
+
 /// The runtime reaches the granted engine, names itself `docker`, reports
 /// an unknown image as absent and lists running awman containers without
 /// error. (Replaces the legacy `docker_runtime_*`, `docker_image_exists_*`
@@ -58,6 +212,9 @@ fn an_overlay_is_mounted_read_only_at_the_requested_path() {
     std::fs::write(host_dir.join("marker.txt"), b"overlay-ok\n").expect("marker file");
 
     let runtime = ContainerRuntime::docker_in(engine.snapshot());
+    let name = engine.unique_name("awman-boundary-overlay");
+    let cleanup = engine::Cleanup::new(&engine);
+    cleanup.container(&name);
     let env = HashMap::new();
     let overlays = [OverlaySpec {
         host_path: host_dir,
@@ -67,8 +224,9 @@ fn an_overlay_is_mounted_read_only_at_the_requested_path() {
     let workdir = engine.sandbox.work();
     let container = runtime
         .launch_background(&BackgroundLaunchRequest {
+            labels: &[("awman.test.owner".into(), cleanup.owner_token().into())],
             secret_env: &[],
-            name: Some("awman-boundary-overlay"),
+            name: Some(&name),
             image: &base,
             workdir: &workdir,
             env: &env,
@@ -76,8 +234,7 @@ fn an_overlay_is_mounted_read_only_at_the_requested_path() {
             builtin_launch: None,
         })
         .expect("a background container starts with an overlay");
-    let cleanup = engine::Cleanup::new(&engine);
-    cleanup.container("awman-boundary-overlay");
+    cleanup.created_container(&name);
 
     let read = container.exec("cat /mnt/overlay-test/marker.txt", None);
     let write = container.exec("touch /mnt/overlay-test/new 2>/dev/null; echo $?", None);
@@ -91,7 +248,7 @@ fn an_overlay_is_mounted_read_only_at_the_requested_path() {
         "0",
         "a read-only overlay accepted a write"
     );
-    assert!(!engine.container_exists("awman-boundary-overlay"));
+    assert!(!engine.container_exists(&name));
     drop(cleanup);
     sandbox.finish();
 }
@@ -107,6 +264,9 @@ fn secret_values_with_equals_and_newline_arrive_byte_for_byte() {
     let engine = Engine::grant(&mut sandbox);
     let base = engine.base_image();
     let runtime = ContainerRuntime::docker_in(engine.snapshot());
+    let name = engine.unique_name("awman-boundary-secrets");
+    let cleanup = engine::Cleanup::new(&engine);
+    cleanup.container(&name);
     let secrets = vec![
         (
             "BOUNDARY_PLAIN".to_string(),
@@ -128,8 +288,9 @@ fn secret_values_with_equals_and_newline_arrive_byte_for_byte() {
     let workdir = engine.sandbox.work();
     let container = runtime
         .launch_background(&BackgroundLaunchRequest {
+            labels: &[("awman.test.owner".into(), cleanup.owner_token().into())],
             secret_env: &secrets,
-            name: Some("awman-boundary-secrets"),
+            name: Some(&name),
             image: &base,
             workdir: &workdir,
             env: &env,
@@ -137,8 +298,7 @@ fn secret_values_with_equals_and_newline_arrive_byte_for_byte() {
             builtin_launch: None,
         })
         .expect("a background container starts with secrets");
-    let cleanup = engine::Cleanup::new(&engine);
-    cleanup.container("awman-boundary-secrets");
+    cleanup.created_container(&name);
 
     let seen = container.exec(
         "printf '%s|%s|%s' \"$BOUNDARY_PLAIN\" \"$BOUNDARY_EQUALS\" \"$BOUNDARY_NEWLINE\"",
@@ -262,11 +422,14 @@ fn teardown_git_uses_the_private_credential_cache_only_for_the_session_host() {
     let runtime = ContainerRuntime::docker_in(engine.snapshot());
     let env = HashMap::from([("GIT_TERMINAL_PROMPT".to_string(), "0".to_string())]);
     let workdir = engine.sandbox.work();
-    let name = "awman-boundary-git-socket";
+    let name = engine.unique_name("awman-boundary-git-socket");
+    let cleanup = engine::Cleanup::new(&engine);
+    cleanup.container(&name);
     let container = runtime
         .launch_background(&BackgroundLaunchRequest {
+            labels: &[("awman.test.owner".into(), cleanup.owner_token().into())],
             secret_env: &[],
-            name: Some(name),
+            name: Some(&name),
             image: &image,
             workdir: &workdir,
             env: &env,
@@ -274,8 +437,7 @@ fn teardown_git_uses_the_private_credential_cache_only_for_the_session_host() {
             builtin_launch: None,
         })
         .expect("a background container starts without host socket mounts");
-    let cleanup = engine::Cleanup::new(&engine);
-    cleanup.container(name);
+    cleanup.created_container(&name);
     container
         .seed_git_credentials(&listener.cache_seed())
         .unwrap();
@@ -297,7 +459,7 @@ fn teardown_git_uses_the_private_credential_cache_only_for_the_session_host() {
     let session = fill("protocol=https\\nhost=git.example\\npath=team/repo.git\\n\\n");
     let other_host = fill("protocol=https\\nhost=evil.example\\npath=team/repo.git\\n\\n");
     let other_repo = fill("protocol=https\\nhost=git.example\\npath=team/other.git\\n\\n");
-    let environment = engine.run_ok(&["inspect", "--format", "{{json .Config.Env}}", name]);
+    let environment = engine.run_ok(&["inspect", "--format", "{{json .Config.Env}}", &name]);
     container.kill().expect("the container is removed");
     assert!(
         session.contains(&format!("password={token}")) && session.contains("exit=0"),
@@ -336,5 +498,50 @@ fn a_read_only_workspace_rejects_writes_while_scratch_output_context_and_home_st
         root: &engine.sandbox.root().join("read-only-proof"),
         builtin: false,
     });
+    sandbox.finish();
+}
+
+/// Docker can create a named container and then return an error before
+/// yielding its ID. The pre-registered ownership label still identifies it.
+#[test]
+fn failed_background_creation_is_cleaned_without_a_returned_id() {
+    use awman::engine::container::background::BackgroundLaunchRequest;
+    let mut sandbox =
+        support::sandbox("docker::failed_background_creation_is_cleaned_without_a_returned_id");
+    let engine = Engine::grant(&mut sandbox);
+    let image = engine.unique_name("awman-boundary-no-sleep");
+    let images = engine::Cleanup::new(&engine);
+    let (file, context) =
+        engine.write_context("no-sleep", "FROM scratch\nLABEL fixture=no-sleep\n");
+    images.build_image(&image, &file, &context);
+    let name = engine.unique_name("awman-boundary-partial-create");
+    {
+        let cleanup = engine::Cleanup::new(&engine);
+        cleanup.container(&name);
+        let labels = [("awman.test.owner".into(), cleanup.owner_token().into())];
+        let env = HashMap::new();
+        let result = ContainerRuntime::docker_in(engine.snapshot()).launch_background(
+            &BackgroundLaunchRequest {
+                labels: &labels,
+                secret_env: &[],
+                name: Some(&name),
+                image: &image,
+                workdir: &engine.sandbox.work(),
+                env: &env,
+                overlays: &[],
+                builtin_launch: None,
+            },
+        );
+        assert!(result.is_err(), "scratch image has no sleep executable");
+        assert!(
+            engine.container_exists(&name),
+            "Docker created the labelled entry before the start failed"
+        );
+    }
+    assert!(
+        !engine.container_exists(&name),
+        "the owned failed create was removed"
+    );
+    drop(images);
     sandbox.finish();
 }

@@ -21,13 +21,6 @@ use crate::engine::container::background::BackgroundLaunchRequest;
 use crate::engine::container::{BuildRequest, ContainerRuntime};
 use crate::engine::error::EngineError;
 
-/// Images the suite asks the world for. Real worlds build or tag these from
-/// a minimal base; their names never collide with a user's images.
-pub const PRESENT_IMAGE: &str = "awman-conformance/present:1";
-/// An image tag the world guarantees is absent.
-pub const ABSENT_IMAGE: &str = "awman-conformance/absent:1";
-/// The tag the build checks build.
-pub const BUILT_IMAGE: &str = "awman-conformance/built:1";
 /// `HOME` declared in the present image's config.
 pub const PRESENT_HOME: &str = "/home/conformance";
 /// The command a background exec check runs, and what it must report.
@@ -51,15 +44,23 @@ pub const BUILD_MARKER: &str = "awman-conformance-build-step";
 pub trait ContainerWorld: Waiter {
     /// Name of the implementation, e.g. `docker CLI (fake)`.
     fn subject(&self) -> String;
+    fn present_image(&self) -> &str;
+    fn absent_image(&self) -> &str;
+    fn built_image(&self) -> &str;
+    fn resource_name(&self, purpose: &str) -> String;
+    fn owner_labels(&self) -> Vec<(String, String)>;
+    /// Register before a production create, so even a failed launch is cleaned by label.
+    fn track_container(&self, name: &str);
+    fn build_labels(&self) -> Vec<(String, String)>;
     /// Environment under which `docker` resolves to the CLI under test.
     fn env(&self) -> EnvSnapshot;
     /// Environment under which no container CLI can be found.
     fn env_without_cli(&self) -> EnvSnapshot;
-    /// Make [`PRESENT_IMAGE`] exist with `HOME=`[`PRESENT_HOME`]; return its id.
+    /// Make the present image exist with `HOME=`[`PRESENT_HOME`]; return its id.
     fn given_present_image(&self) -> String;
-    /// Make sure [`ABSENT_IMAGE`] and [`BUILT_IMAGE`] do not exist.
+    /// Make sure the absent and build image references do not exist.
     fn given_absent_images(&self);
-    /// A build context whose Dockerfile builds [`BUILT_IMAGE`] from the
+    /// A build context whose Dockerfile builds the build image from the
     /// present image and prints [`BUILD_MARKER`]; `failing` makes the build
     /// fail with a non-zero exit after printing the marker.
     fn given_build_context(&self, failing: bool) -> (PathBuf, PathBuf);
@@ -105,7 +106,7 @@ pub fn container_runtime(world: &dyn ContainerWorld) -> Report {
     world.given_absent_images();
     report.check(
         "image_presence_identity_and_home_are_read_from_the_store",
-        check_images(&runtime, &present_id),
+        check_images(world, &runtime, &present_id),
     );
     report.check("a_build_streams_output_and_creates_the_image", {
         check_build(world, &runtime, false)
@@ -124,7 +125,7 @@ pub fn container_runtime(world: &dyn ContainerWorld) -> Report {
         check_background_cleanup(world, &runtime)
     });
     report.check("starting_from_a_missing_image_is_image_not_found", {
-        check_missing_image(&runtime)
+        check_missing_image(world, &runtime)
     });
     report.check("listing_returns_awman_containers_only", {
         check_listing(world, &runtime)
@@ -133,27 +134,32 @@ pub fn container_runtime(world: &dyn ContainerWorld) -> Report {
     report
 }
 
-fn check_images(runtime: &ContainerRuntime, present_id: &str) -> Result<(), String> {
-    ensure(runtime.image_exists(PRESENT_IMAGE), || {
-        format!("{PRESENT_IMAGE} reported absent")
+fn check_images(
+    world: &dyn ContainerWorld,
+    runtime: &ContainerRuntime,
+    present_id: &str,
+) -> Result<(), String> {
+    ensure(runtime.image_exists(world.present_image()), || {
+        format!("{} reported absent", world.present_image())
     })?;
-    ensure(!runtime.image_exists(ABSENT_IMAGE), || {
-        format!("{ABSENT_IMAGE} reported present")
+    ensure(!runtime.image_exists(world.absent_image()), || {
+        format!("{} reported present", world.absent_image())
     })?;
-    let id = runtime.image_id(PRESENT_IMAGE);
+    let id = runtime.image_id(world.present_image());
     ensure(id.as_deref() == Some(present_id), || {
         format!("image id {id:?}, world says {present_id:?}")
     })?;
-    ensure(runtime.image_id(ABSENT_IMAGE).is_none(), || {
+    ensure(runtime.image_id(world.absent_image()).is_none(), || {
         "an absent image has an id".to_string()
     })?;
-    let home = runtime.image_home_dir(PRESENT_IMAGE);
+    let home = runtime.image_home_dir(world.present_image());
     ensure(home.as_deref() == Some(PRESENT_HOME), || {
         format!("image HOME {home:?}, expected {PRESENT_HOME}")
     })?;
-    ensure(runtime.image_home_dir(ABSENT_IMAGE).is_none(), || {
-        "an absent image has a HOME".to_string()
-    })
+    ensure(
+        runtime.image_home_dir(world.absent_image()).is_none(),
+        || "an absent image has a HOME".to_string(),
+    )
 }
 
 fn check_build(
@@ -163,23 +169,24 @@ fn check_build(
 ) -> Result<(), String> {
     world.given_absent_images();
     let (dockerfile, context) = world.given_build_context(failing);
-    let request = BuildRequest::runtime(BUILT_IMAGE, &dockerfile, &context, true);
+    let mut request = BuildRequest::runtime(world.built_image(), &dockerfile, &context, true);
+    request.labels = world.build_labels().into_iter().collect();
     let mut lines = Vec::new();
     let result = runtime.build_image(&request, &mut |line| lines.push(line.to_string()));
     ensure(lines.iter().any(|l| l.contains(BUILD_MARKER)), || {
         format!("build output never showed {BUILD_MARKER:?}: {lines:?}")
     })?;
     match (failing, result) {
-        (false, Ok(())) => ensure(runtime.image_exists(BUILT_IMAGE), || {
-            format!("{BUILT_IMAGE} absent after a successful build")
+        (false, Ok(())) => ensure(runtime.image_exists(world.built_image()), || {
+            format!("{} absent after a successful build", world.built_image())
         }),
         (false, Err(e)) => Err(format!("build failed: {e}")),
         (true, Err(EngineError::ImageBuildExitNonzero { tag, exit_code, .. })) => {
-            ensure(tag == BUILT_IMAGE && exit_code != 0, || {
+            ensure(tag == world.built_image() && exit_code != 0, || {
                 format!("failure names tag {tag:?} exit {exit_code}")
             })?;
-            ensure(!runtime.image_exists(BUILT_IMAGE), || {
-                format!("{BUILT_IMAGE} present after a failed build")
+            ensure(!runtime.image_exists(world.built_image()), || {
+                format!("{} present after a failed build", world.built_image())
             })
         }
         (true, other) => Err(format!("expected ImageBuildExitNonzero, got {other:?}")),
@@ -187,15 +194,18 @@ fn check_build(
 }
 
 fn launch<'a>(
+    world: &'a dyn ContainerWorld,
+    labels: &'a [(String, String)],
     workdir: &'a std::path::Path,
     env: &'a HashMap<String, String>,
     secrets: &'a [(String, SecretString)],
     name: &'a str,
 ) -> BackgroundLaunchRequest<'a> {
     BackgroundLaunchRequest {
+        labels,
         secret_env: secrets,
         name: Some(name),
-        image: PRESENT_IMAGE,
+        image: world.present_image(),
         workdir,
         env,
         overlays: &[],
@@ -211,9 +221,12 @@ fn check_background_exec(
     world: &dyn ContainerWorld,
     runtime: &ContainerRuntime,
 ) -> Result<(), String> {
+    let labels = world.owner_labels();
     let dir = workdir(world);
     let env = HashMap::new();
-    let request = launch(&dir, &env, &[], "awman-conformance-exec");
+    let name_exec = world.resource_name("exec");
+    world.track_container(&name_exec);
+    let request = launch(world, &labels, &dir, &env, &[], &name_exec);
     let container = runtime
         .launch_background(&request)
         .map_err(|e| format!("start: {e}"))?;
@@ -240,10 +253,13 @@ fn check_background_env(
     world: &dyn ContainerWorld,
     runtime: &ContainerRuntime,
 ) -> Result<(), String> {
+    let labels = world.owner_labels();
     let dir = workdir(world);
     let env = HashMap::from([(ENV_NAME.to_string(), ENV_VALUE.to_string())]);
     let secrets = vec![(SECRET_NAME.to_string(), SecretString::new(SECRET_VALUE))];
-    let request = launch(&dir, &env, &secrets, "awman-conformance-env");
+    let name_env = world.resource_name("env");
+    world.track_container(&name_env);
+    let request = launch(world, &labels, &dir, &env, &secrets, &name_env);
     let container = runtime
         .launch_background(&request)
         .map_err(|e| format!("start: {e}"))?;
@@ -273,18 +289,23 @@ fn check_background_cleanup(
     world: &dyn ContainerWorld,
     runtime: &ContainerRuntime,
 ) -> Result<(), String> {
+    let labels = world.owner_labels();
     let dir = workdir(world);
     let env = HashMap::new();
+    let name_kill = world.resource_name("kill");
+    world.track_container(&name_kill);
     let killed = runtime
-        .launch_background(&launch(&dir, &env, &[], "awman-conformance-kill"))
+        .launch_background(&launch(world, &labels, &dir, &env, &[], &name_kill))
         .map_err(|e| format!("start: {e}"))?;
     let killed_id = killed.container_id().to_string();
     ensure(world.container_exists(&killed_id), || {
         format!("{killed_id} not visible after start")
     })?;
     killed.kill().map_err(|e| format!("kill: {e}"))?;
+    let name_drop = world.resource_name("drop");
+    world.track_container(&name_drop);
     let dropped = runtime
-        .launch_background(&launch(&dir, &env, &[], "awman-conformance-drop"))
+        .launch_background(&launch(world, &labels, &dir, &env, &[], &name_drop))
         .map_err(|e| format!("start: {e}"))?;
     let dropped_id = dropped.container_id().to_string();
     drop(dropped);
@@ -297,14 +318,22 @@ fn check_background_cleanup(
     Ok(())
 }
 
-fn check_missing_image(runtime: &ContainerRuntime) -> Result<(), String> {
-    let dir = PathBuf::from("/");
+fn check_missing_image(
+    world: &dyn ContainerWorld,
+    runtime: &ContainerRuntime,
+) -> Result<(), String> {
+    let labels = world.owner_labels();
+    let dir = workdir(world);
     let env = HashMap::new();
-    let mut request = launch(&dir, &env, &[], "awman-conformance-missing");
-    request.image = ABSENT_IMAGE;
+    let name_missing = world.resource_name("missing");
+    world.track_container(&name_missing);
+    let mut request = launch(world, &labels, &dir, &env, &[], &name_missing);
+    request.image = world.absent_image();
     match runtime.launch_background(&request) {
         Err(EngineError::ContainerImageNotFound { image }) => {
-            ensure(image == ABSENT_IMAGE, || format!("error names {image:?}"))
+            ensure(image == world.absent_image(), || {
+                format!("error names {image:?}")
+            })
         }
         Err(other) => Err(format!("expected ContainerImageNotFound, got {other}")),
         Ok(container) => {
@@ -317,13 +346,16 @@ fn check_missing_image(runtime: &ContainerRuntime) -> Result<(), String> {
 
 fn check_listing(world: &dyn ContainerWorld, runtime: &ContainerRuntime) -> Result<(), String> {
     let foreign = world.given_foreign_container();
+    let labels = world.owner_labels();
     let dir = workdir(world);
     let env = HashMap::new();
+    let name_listed = world.resource_name("listed");
+    world.track_container(&name_listed);
     let ours = runtime
-        .launch_background(&launch(&dir, &env, &[], "awman-conformance-listed"))
+        .launch_background(&launch(world, &labels, &dir, &env, &[], &name_listed))
         .map_err(|e| format!("start: {e}"))?;
     let listed = runtime.list_running_all();
-    let ours_name = "awman-conformance-listed".to_string();
+    let ours_name = name_listed;
     ours.kill().map_err(|e| format!("kill: {e}"))?;
     let listed = listed.map_err(|e| format!("list: {e}"))?;
     ensure(listed.iter().any(|h| h.name == ours_name), || {

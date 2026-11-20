@@ -102,6 +102,10 @@ pub struct ApiDispatchFrontend {
     parsed: Arc<Result<ParsedArgs, CommandError>>,
     event_bus: EventBusSender,
     state_writer: Option<CommandStateWriter>,
+    /// The daemon's shared session store, injected by the API frontend
+    /// factory. Automation hosting uses it; this frontend never opens a
+    /// database by path.
+    shared_store: Option<Arc<crate::data::fs::api_db::SqliteSessionStore>>,
     line_buffer_stdout: String,
     line_buffer_stderr: String,
     /// Main step names in definition order (`WorkflowState.steps`), from the
@@ -220,6 +224,7 @@ impl ApiDispatchFrontend {
             parsed: Arc::new(parsed),
             event_bus,
             state_writer: None,
+            shared_store: None,
             line_buffer_stdout: String::new(),
             line_buffer_stderr: String::new(),
             step_order: Vec::new(),
@@ -265,6 +270,16 @@ impl ApiDispatchFrontend {
     /// Mirror workflow snapshots into the command directory for API polling.
     pub fn with_state_writer(mut self, writer: CommandStateWriter) -> Self {
         self.state_writer = Some(writer);
+        self
+    }
+
+    /// Bind the daemon's shared session store (the same `Arc` the queue
+    /// worker and core hold) for automation hosting.
+    pub fn with_shared_store(
+        mut self,
+        store: Arc<crate::data::fs::api_db::SqliteSessionStore>,
+    ) -> Self {
+        self.shared_store = Some(store);
         self
     }
 
@@ -1799,6 +1814,12 @@ impl AgentsCommandFrontend for ApiDispatchFrontend {
             self.emit_agents_json(overview);
         }
     }
+    fn show_profile_result(
+        &mut self,
+        outcome: &crate::command::commands::agents::profile::ProfileOutcome,
+    ) {
+        self.emit_agents_json(&outcome.project().data);
+    }
     fn show_list(&mut self, outcome: &crate::command::commands::agents::AgentsListOutcome) {
         self.emit_agents_json(&outcome.agents);
     }
@@ -1893,28 +1914,52 @@ fn emit_agent_policy(
 impl crate::command::commands::agent_setup::AgentLaunchFrontend for ApiDispatchFrontend {
     fn set_pty_active(&mut self, _active: bool) {}
 
-    fn automation_host(&self) -> Option<crate::command::automation::AutomationHost> {
-        let writer = self.state_writer.as_ref()?;
+    /// A frontend without a command state writer is not running a queued
+    /// daemon command (an embedded foreground projection or a probe) and
+    /// hosts in the foreground. A queued command is hosted by the shared
+    /// store the factory injected; if that store, its automation tables or
+    /// the command identity cannot be bound, the launch fails: it never
+    /// opens another database or turns into a foreground run with
+    /// different session/command records.
+    fn automation_host(
+        &self,
+    ) -> Result<crate::command::automation::launch::AutomationHosting, CommandError> {
+        use crate::command::automation::launch::AutomationHosting;
+        let Some(writer) = self.state_writer.as_ref() else {
+            return Ok(AutomationHosting::Foreground);
+        };
+        let shared = self.shared_store.as_ref().ok_or_else(|| {
+            CommandError::Other(format!(
+                "automation for command {} cannot start: the daemon's shared store was not bound \
+                 to this API command",
+                writer.command_id()
+            ))
+        })?;
+        let command_id = crate::data::ids::CommandId::parse(writer.command_id()).map_err(|e| {
+            CommandError::Other(format!(
+                "automation for command {} cannot start: invalid command id ({e})",
+                writer.command_id()
+            ))
+        })?;
+        let store = crate::data::automation_store::AutomationStore::open(Arc::clone(shared))?;
         writer.record_automation();
-        let db =
-            crate::data::fs::api_db::SqliteSessionStore::open_at(&writer.paths().db_path()).ok()?;
-        let store =
-            crate::data::automation_store::AutomationStore::open(std::sync::Arc::new(db)).ok()?;
-        let command_id = crate::data::ids::CommandId::parse(writer.command_id()).ok()?;
         let bus = self.event_bus.clone();
-        Some(crate::command::automation::AutomationHost {
+        let host = crate::command::automation::AutomationHost {
             store,
             command_id,
             attempt: self.event_bus.attempt(),
             owner_key: crate::command::automation::controller::local_owner_key(
                 &writer.paths().db_path(),
             ),
-            events: Some(std::sync::Arc::new(move |payload| bus.emit(payload))),
+            events: Some(bus.lifecycle_publisher()),
             finished: Some({
                 let writer = writer.clone();
-                std::sync::Arc::new(move |result| writer.record_automation_result(result))
+                std::sync::Arc::new(move |result, message| {
+                    writer.record_automation_result(result, message)
+                })
             }),
-        })
+        };
+        Ok(AutomationHosting::Shared(host))
     }
 
     /// WI 0141: a single-agent command's OSC 7501 reports become
@@ -2130,5 +2175,140 @@ mod source_choice_contracts {
             ImageSourceAnswer::Unavailable
         );
         assert!(events.try_recv().is_err(), "no event may be emitted");
+    }
+}
+
+#[cfg(test)]
+mod phase_capture_tests {
+    use crate::command::commands::exec_workflow::{phase_container::*, SharedWorkflowFrontend};
+    use crate::engine::agent_runtime::background::AgentExec;
+    use crate::engine::agent_runtime::execution::AgentInstance;
+    use crate::engine::agent_runtime::execution::{
+        AgentExecution, AgentExitInfo, AgentHandlePreview, CancelHandle, ExecutionBackend,
+    };
+    use crate::engine::auth::{credential::SecretString, redaction::RedactionSet};
+    use crate::engine::container::ContainerRuntime;
+    use crate::engine::error::EngineError;
+    use crate::engine::workflow::PhaseStepRef;
+    use awman_test_support::{TestCase, TestSandbox};
+    use std::sync::Arc;
+
+    struct Exited;
+    impl ExecutionBackend for Exited {
+        fn wait_blocking(self: Box<Self>) -> Result<AgentExitInfo, EngineError> {
+            Ok(AgentExitInfo {
+                exit_code: 37,
+                signal: None,
+                started_at: chrono::Utc::now(),
+                ended_at: chrono::Utc::now(),
+            })
+        }
+        fn cancel(&self) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn cancel_handle(&self) -> CancelHandle {
+            CancelHandle::new(|| Ok(()))
+        }
+    }
+    struct Instance {
+        tail: Arc<crate::engine::agent_runtime::OutputTail>,
+        redaction: RedactionSet,
+    }
+    impl AgentInstance for Instance {
+        fn handle_preview(&self) -> AgentHandlePreview {
+            unreachable!()
+        }
+        fn output_redaction(&self) -> RedactionSet {
+            self.redaction.clone()
+        }
+        fn run_with_frontend(
+            self: Box<Self>,
+            _: Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend>,
+        ) -> Result<AgentExecution, EngineError> {
+            let (tx, _) = tokio::sync::broadcast::channel(4);
+            Ok(AgentExecution::new(
+                crate::data::session::AgentHandle {
+                    id: "phase".into(),
+                    name: "phase".into(),
+                    image_tag: "fixture".into(),
+                    started_at: chrono::Utc::now(),
+                },
+                Box::new(Exited),
+                Arc::new(tx),
+                Some(self.tail),
+            ))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failing_interactive_phase_keeps_a_complete_private_redacted_transcript_above_one_mib()
+    {
+        let s = TestSandbox::for_test(TestCase::component(
+            "exec_workflow::phase_container::complete_transcript",
+        ));
+        let env = crate::data::config::env::EnvSnapshot::with_overrides([
+            ("HOME", s.home().to_str().unwrap()),
+            ("AWMAN_HOME", s.awman_home().to_str().unwrap()),
+        ]);
+        let tail =
+            Arc::new(crate::engine::agent_runtime::OutputTail::spooled(&s.awman_home()).unwrap());
+        let expected = format!(
+            "BEGIN-full-transcript\n{}END-full-transcript\n",
+            "phase-secret ordinary output\n".repeat(70000)
+        );
+        tail.push_bytes(expected.as_bytes());
+        tail.finish_capture();
+        let redaction = RedactionSet::new();
+        redaction.add(SecretString::new("phase-secret"));
+        let bus = crate::command::commands::api_server::event_bus::EventBus::new(64);
+        let frontend = SharedWorkflowFrontend::new(Box::new(
+            crate::frontend::api::command_frontend::ApiDispatchFrontend::new(
+                "exec workflow",
+                &[],
+                bus.sender(),
+            ),
+        ));
+        let phase = InteractivePhaseContainer::new(
+            Arc::new(ContainerRuntime::docker_in(env.clone())),
+            frontend,
+            &PhaseStepRef {
+                kind: crate::data::workflow_state::PhaseKind::Setup,
+                index: 0,
+                description: "large failed phase".into(),
+            },
+            "fixture",
+            PhaseContainerWorkspace {
+                workdir: s.work(),
+                host_env: env,
+                env: Default::default(),
+                overlays: vec![],
+                builtin_launch: None,
+            },
+        );
+        let (output, path) = tokio::task::spawn_blocking(move || {
+            let output = phase
+                .run_instance(Box::new(Instance { tail, redaction }))
+                .unwrap();
+            (
+                output,
+                phase.failure_transcript().expect("full failure artifact"),
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(output.exit_code, 37);
+        assert!(output.stdout.len() < 1024 * 1024);
+        assert!(output.stdout.contains(&path.display().to_string()));
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes, expected.replace("phase-secret", "***").as_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        s.finish();
     }
 }

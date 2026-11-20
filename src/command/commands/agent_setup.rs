@@ -132,11 +132,16 @@ pub trait AgentLaunchFrontend:
     /// says so there, which is visible in review; a silent default is not.
     fn set_pty_active(&mut self, active: bool);
 
-    /// The durable host of an automation execution when this frontend runs
-    /// a daemon-hosted command (WI 0070). `None` means a foreground run,
-    /// which records itself in the same data-home database.
-    fn automation_host(&self) -> Option<crate::command::automation::AutomationHost> {
-        None
+    /// Where an automation execution launched through this frontend is
+    /// hosted (WI 0070). Frontends that run commands in the invoking
+    /// process keep the default, an intentional foreground run that records
+    /// itself in the shared data-home store. A daemon-hosted frontend
+    /// returns its command's shared host, or an error when that host cannot
+    /// be bound; a storage failure is never reported as `Foreground`.
+    fn automation_host(
+        &self,
+    ) -> Result<crate::command::automation::launch::AutomationHosting, CommandError> {
+        Ok(crate::command::automation::launch::AutomationHosting::Foreground)
     }
 
     /// Wait for a relayed command's stdout and stderr readers before releasing

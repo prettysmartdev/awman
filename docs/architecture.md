@@ -70,7 +70,7 @@ Reusable runtime mechanics. Engines do real I/O against Docker, git and the file
 
 | Module | Owns |
 |---|---|
-| `agent_runtime` | The cross-runtime contract: `AgentRuntimeEngine`, `AgentExecution`, `AgentFrontend`, runtime capabilities, and `detect_effective`, which selects the runtime from config (`docker`, `apple-containers`, `builtin-experimental`, `docker-sbx-experimental`). `conformance` checks every runtime against the contract. |
+| `agent_runtime` | The cross-runtime contract: `AgentRuntimeEngine`, `AgentExecution`, `AgentFrontend`, runtime capabilities, and `detect_effective`, which selects the runtime from config (`docker`, `apple`, `sbx`, `builtin`). `conformance` checks every runtime against the contract. |
 | `container` | `ContainerRuntime`, the container tier. Backends (`docker.rs`, `apple.rs`, `builtin/`) are private to the module behind the `ContainerBackend` trait; `host_cli_backend.rs` is shared by the CLI-driven ones. |
 | `container/builtin` | The embedded microVM backend: driver, exec bridge, image catalog, networking, resource limits, state paths. |
 | `sandbox` | `SandboxRuntime`, the sandbox tier (Docker Sandboxes). |

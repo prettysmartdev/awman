@@ -163,7 +163,7 @@ pub trait SandboxDriver: Send + Sync {
     fn list(&self) -> Result<Vec<SandboxSummary>, EngineError>;
     fn exec(&self, id: &str, request: ExecRequest) -> Result<ExecSession, EngineError>;
     fn stop_owned(&self, id: &str, owner: &str, grace: Duration) -> Result<(), EngineError> {
-        self.finish_owned(id, owner, grace, true)
+        self.finish_owned(id, owner, grace, false)
     }
     fn finish_owned(
         &self,
@@ -172,7 +172,17 @@ pub trait SandboxDriver: Send + Sync {
         grace: Duration,
         remove: bool,
     ) -> Result<(), EngineError>;
-    fn remove_stopped(&self, id: &str) -> Result<(), EngineError>;
+    fn remove_stopped_checked(
+        &self,
+        _handle: &AgentHandle,
+        _owner: &str,
+        _execution: &str,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::NotImplemented(
+            "identity-checked sandbox removal",
+        ))
+    }
+    fn remove_stopped(&self, id: &str, owner: &str) -> Result<(), EngineError>;
     fn stats(&self, id: &str) -> Result<AgentStats, EngineError>;
     fn image_config(&self, tag: &str) -> Result<Option<SandboxImageConfig>, EngineError>;
     fn import_archive(&self, path: PathBuf, tag: String) -> Result<(), EngineError>;

@@ -62,6 +62,7 @@ struct Host {
     store: AutomationStore,
     command: CommandId,
     events: Arc<Mutex<Vec<EventPayload>>>,
+    publisher: awman::command::commands::api_server::event_bus::LifecyclePublisher,
     /// Executions started on the process-wide controller, abandoned on drop.
     started: Mutex<Vec<OwnedExecution>>,
     // Last: fields drop in order, and Windows cannot remove the tempdir
@@ -100,24 +101,31 @@ impl Host {
             false,
         )
         .unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let publisher = recording_publisher(
+            &awman::data::fs::api_paths::ApiPaths::from_root(sandbox.root().join("api")),
+            session.as_str(),
+            command.as_str(),
+            events.clone(),
+        );
         Self {
+            publisher,
             store: AutomationStore::open(db.clone()).unwrap(),
             db,
             sandbox,
             command,
-            events: Arc::new(Mutex::new(Vec::new())),
+            events,
             started: Mutex::new(Vec::new()),
         }
     }
 
     fn host(&self) -> AutomationHost {
-        let sink = self.events.clone();
         AutomationHost {
             store: self.store.clone(),
             command_id: self.command.clone(),
             attempt: 1,
             owner_key: "uid:test:fixture".into(),
-            events: Some(Arc::new(move |p| sink.lock().unwrap().push(p))),
+            events: Some(self.publisher.clone()),
             finished: None,
         }
     }
@@ -368,7 +376,7 @@ async fn a_symlinked_or_foreign_record_file_is_never_followed_or_trusted() {
     }
 }
 
-fn headless(host: &Host) -> HeadlessRun {
+fn reserved_headless(host: &Host) -> HeadlessRun {
     let execution = ExecutionId::new();
     let mut snapshot = fixture_snapshot();
     snapshot.execution_id = execution;
@@ -378,7 +386,7 @@ fn headless(host: &Host) -> HeadlessRun {
     snapshot.native_session_id = None;
     snapshot.status_support = StatusSupport::None;
     snapshot.status_source = awman::data::automation::StatusSource::None;
-    let mut run = HeadlessRun::reserve(
+    HeadlessRun::reserve(
         host.host(),
         snapshot,
         binding(),
@@ -387,9 +395,13 @@ fn headless(host: &Host) -> HeadlessRun {
         &timeouts(),
         "Review the diff",
     )
-    .unwrap();
-    run.launching();
-    run.running();
+    .unwrap()
+}
+
+fn headless(host: &Host) -> HeadlessRun {
+    let mut run = reserved_headless(host);
+    run.launching().unwrap();
+    run.running().unwrap();
     run
 }
 
@@ -581,7 +593,13 @@ async fn a_finalized_command_never_gains_another_execution() {
         attempt: 1,
         status: awman::data::command_status::CommandStatus::Done,
         exit_code: 0,
-        result_json: "{}".into(),
+        result_json: host
+            .db
+            .get_command(host.command.as_str())
+            .unwrap()
+            .unwrap()
+            .result
+            .unwrap(),
         finished_at: chrono::Utc::now().to_rfc3339(),
     };
     assert!(host
@@ -706,12 +724,26 @@ async fn recovery_respects_live_owners_finalizes_ended_commands_and_reaches_turn
     let execution = ExecutionId::new();
     let owned = interactive(&host, &execution);
     store_history(&host, &execution, 200);
-    owned.finish(ExitFacts {
-        exit_code: Some(0),
-        wait_error: None,
-        output_status: OutputStatus::Complete,
-        cleanup_status: CleanupStatus::Complete,
-    });
+    // The store owns this synthetic history; the intentionally stale live
+    // controller may not overwrite its revision or claim it committed it.
+    host.store
+        .finish_execution(
+            &execution,
+            &CommandAutomationResult {
+                execution_id: execution.clone(),
+                native_session_id: None,
+                last_turn_id: None,
+                native_start_mode: owned.snapshot().native_start_mode,
+                workspace_access: owned.snapshot().workspace_access,
+                status_support: StatusSupport::Full,
+                completion_verified: true,
+                output_status: OutputStatus::Complete,
+                cleanup_status: CleanupStatus::Complete,
+            },
+            None,
+        )
+        .unwrap();
+    owned.abandon();
     let turns = |store: &AutomationStore| {
         let mut all = Vec::new();
         let mut cursor = None;
@@ -865,4 +897,455 @@ async fn launch_secrets_split_across_channel_reads_never_reach_state_or_identity
         output_status: OutputStatus::Complete,
         cleanup_status: CleanupStatus::Complete,
     });
+}
+
+/// Records the actual ordered file writer's inputs; lifecycle policy remains in
+/// the production bus, controller and store.
+pub(crate) fn recording_publisher(
+    paths: &awman::data::fs::api_paths::ApiPaths,
+    session: &str,
+    command: &str,
+    events: Arc<Mutex<Vec<EventPayload>>>,
+) -> awman::command::commands::api_server::event_bus::LifecyclePublisher {
+    use awman::data::fs::api_command_log::{EventLog, OrderedCommandLog};
+    struct Recording {
+        log: OrderedCommandLog,
+        events: Arc<Mutex<Vec<EventPayload>>>,
+    }
+    impl EventLog for Recording {
+        fn append(
+            &mut self,
+            event: &awman::data::execution_event::ExecutionEvent,
+        ) -> std::io::Result<()> {
+            self.log.append(event)?;
+            self.events.lock().unwrap().push(event.payload.clone());
+            Ok(())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.log.flush()
+        }
+    }
+    let bus = awman::command::commands::api_server::event_bus::EventBus::new(128);
+    bus.set_log_writer(Ok(Box::new(Recording {
+        log: OrderedCommandLog::open(paths, session, command).unwrap(),
+        events,
+    })));
+    bus.sender().lifecycle_publisher()
+}
+
+#[tokio::test]
+async fn completion_write_faults_return_storage_error_without_publishing_success() {
+    let faults = [
+        "CREATE TRIGGER fault BEFORE UPDATE OF snapshot_json ON agent_executions BEGIN SELECT RAISE(ABORT,'identity write'); END;",
+        "CREATE TRIGGER fault BEFORE UPDATE OF delivery_phase ON agent_turns WHEN NEW.delivery_phase='acknowledged' BEGIN SELECT RAISE(ABORT,'delivery write'); END;",
+        "CREATE TRIGGER fault BEFORE UPDATE OF started_at ON agent_turns BEGIN SELECT RAISE(ABORT,'observation write'); END;",
+        "CREATE TRIGGER fault BEFORE UPDATE OF result_json ON agent_turns BEGIN SELECT RAISE(ABORT,'turn write'); END;",
+        "CREATE TRIGGER fault BEFORE UPDATE OF launch_phase ON agent_executions WHEN NEW.launch_phase='ended' BEGIN SELECT RAISE(ABORT,'finish write'); END;",
+        "CREATE TRIGGER fault BEFORE UPDATE OF result ON commands BEGIN SELECT RAISE(ABORT,'command projection'); END;",
+        "CREATE TABLE commit_fault(id TEXT REFERENCES commands(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fault AFTER UPDATE OF result ON commands BEGIN INSERT INTO commit_fault VALUES('missing-command'); END;",
+        "UPDATE agent_executions SET revision=revision+1,snapshot_json=json_set(snapshot_json,'$.revision',revision+1)",
+    ];
+    for fault in faults {
+        let host = Host::new("command::automation_observers::completion_write_faults_return_storage_error_without_publishing_success");
+        let run = headless(&host);
+        host.db
+            .with_conn(|c| {
+                c.execute_batch(fault)?;
+                Ok(())
+            })
+            .unwrap();
+        let finished = run.finish_observed(
+            &observed(true, Some(Ok(Some("answer".into())))),
+            Ok(0),
+            false,
+        );
+        assert_eq!(
+            finished.failure.as_ref().unwrap().code,
+            "storage_error",
+            "{fault}"
+        );
+        assert!(!finished.automation.completion_verified);
+        assert!(finished.final_message.is_none());
+        assert!(matches!(
+            awman::command::automation::launch::into_command_result(&finished),
+            Err(awman::command::error::CommandError::Data(_))
+        ));
+        assert!(!host.event_names().contains(&"agent_turn_completed"));
+        let execution = host
+            .store
+            .current_execution(&host.command)
+            .unwrap()
+            .unwrap();
+        assert_ne!(execution.launch_phase, LaunchPhase::Ended);
+        assert!(execution.final_assurance.is_none());
+        assert!(!host.store.lease_held(&execution.execution_id).unwrap());
+        assert!(host
+            .store
+            .list_turns(&host.command, None, None)
+            .unwrap()
+            .items[0]
+            .result
+            .is_none());
+        // Remove the owned fault and repair the stale revision for recovery.
+        host.db.with_conn(|c| { c.execute_batch("DROP TRIGGER IF EXISTS fault; UPDATE agent_executions SET revision=json_extract(snapshot_json,'$.revision')")?; Ok(()) }).unwrap();
+        let reopened = AutomationStore::open(Arc::new(
+            SqliteSessionStore::open(&host.sandbox.root().join("api")).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            ExecutionController::recover(&reopened).unwrap(),
+            vec![host.command.clone()]
+        );
+        let turns = reopened
+            .list_turns(&host.command, None, None)
+            .unwrap()
+            .items;
+        assert_eq!(turns.len(), 1);
+        assert!(!turns[0].result.as_ref().unwrap().completion_verified);
+    }
+}
+
+#[tokio::test]
+async fn oversized_native_answer_is_a_small_durable_failure() {
+    let host = Host::new(
+        "command::automation_observers::oversized_native_answer_is_a_small_durable_failure",
+    );
+    let finished = headless(&host).finish_observed(
+        &observed(true, Some(Ok(Some("x".repeat(8 * 1024 * 1024))))),
+        Ok(0),
+        false,
+    );
+    assert_eq!(finished.failure.as_ref().unwrap().code, "result_too_large");
+    assert!(!finished.automation.completion_verified);
+    assert!(finished.final_message.is_none());
+    let turn = host
+        .store
+        .list_turns(&host.command, None, None)
+        .unwrap()
+        .items
+        .remove(0);
+    let result = turn.result.unwrap();
+    assert_eq!(result.status, TurnStatus::Failed);
+    assert_eq!(result.failure.as_ref().unwrap().code, "result_too_large");
+    assert!(serde_json::to_vec(&result).unwrap().len() < 4096);
+    assert!(host
+        .store
+        .current_execution(&host.command)
+        .unwrap()
+        .unwrap()
+        .pending_events
+        .is_none());
+    assert!(host.events.lock().unwrap().iter().all(|e| !matches!(e,EventPayload::AgentTurnCompleted { result,.. } if result.completion_verified)));
+}
+
+#[tokio::test]
+async fn publication_faults_and_crashes_replay_the_committed_batch_once() {
+    use awman::command::commands::api_server::event_bus::EventBus;
+    use awman::data::execution_event::ExecutionEvent;
+    use awman::data::fs::api_command_log::{CommandLogWriter, EventLog, OrderedCommandLog};
+    use awman::data::fs::api_paths::ApiPaths;
+    #[derive(Clone, Copy, Debug)]
+    enum Fault {
+        Append,
+        Flush,
+        CrashBeforeAppend,
+        CrashAfterAppend,
+        CrashAfterFlush,
+        Clear,
+    }
+    struct FaultLog {
+        inner: OrderedCommandLog,
+        fault: Fault,
+        terminal: bool,
+        store: AutomationStore,
+        command: CommandId,
+    }
+    impl EventLog for FaultLog {
+        fn append(&mut self, event: &ExecutionEvent) -> std::io::Result<()> {
+            if matches!(event.payload, EventPayload::AgentTurnCompleted { .. }) {
+                self.terminal = true;
+                let record = self
+                    .store
+                    .current_execution(&self.command)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(record.launch_phase, LaunchPhase::Ended);
+                assert!(record.final_assurance.unwrap().completion_verified);
+                assert!(record.pending_events.is_some());
+                match self.fault {
+                    Fault::Append => return Err(std::io::Error::other("injected append failure")),
+                    Fault::CrashBeforeAppend => panic!("crash after DB commit before log append"),
+                    _ => {}
+                }
+            }
+            self.inner.append(event)?;
+            if self.terminal && matches!(self.fault, Fault::CrashAfterAppend) {
+                panic!("crash during batch append");
+            }
+            Ok(())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.terminal && matches!(self.fault, Fault::Flush) {
+                return Err(std::io::Error::other("injected flush failure"));
+            }
+            self.inner.flush()?;
+            if self.terminal && matches!(self.fault, Fault::CrashAfterFlush) {
+                panic!("crash after flush before fanout");
+            }
+            Ok(())
+        }
+    }
+    for fault in [
+        Fault::Append,
+        Fault::Flush,
+        Fault::CrashBeforeAppend,
+        Fault::CrashAfterAppend,
+        Fault::CrashAfterFlush,
+        Fault::Clear,
+    ] {
+        let mut host=Host::new("command::automation_observers::publication_faults_and_crashes_replay_the_committed_batch_once");
+        let command = host.db.get_command(host.command.as_str()).unwrap().unwrap();
+        let paths = ApiPaths::from_root(host.sandbox.root().join("api"));
+        let bus = EventBus::new(128);
+        bus.set_log_writer(Ok(Box::new(FaultLog {
+            inner: OrderedCommandLog::open(&paths, &command.session_id, &command.id).unwrap(),
+            fault,
+            terminal: false,
+            store: host.store.clone(),
+            command: host.command.clone(),
+        })));
+        host.publisher = bus.sender().lifecycle_publisher();
+        let mut receiver = bus.subscribe();
+        let run = headless(&host);
+        if matches!(fault, Fault::Clear) {
+            host.db.with_conn(|c| { c.execute_batch("CREATE TRIGGER fault BEFORE UPDATE OF pending_events_json ON agent_executions WHEN NEW.pending_events_json IS NULL BEGIN SELECT RAISE(ABORT,'clear failure'); END;")?; Ok(()) }).unwrap();
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run.finish_observed(
+                &observed(true, Some(Ok(Some("durable answer".into())))),
+                Ok(0),
+                false,
+            )
+        }));
+        match fault {
+            Fault::CrashBeforeAppend | Fault::CrashAfterAppend | Fault::CrashAfterFlush => {
+                assert!(outcome.is_err())
+            }
+            _ => {
+                let finished = outcome.unwrap();
+                assert_eq!(finished.failure.unwrap().code, "storage_error");
+                assert!(!finished.automation.completion_verified);
+            }
+        }
+        let mut completions = 0;
+        while let Ok(event) = receiver.try_recv() {
+            completions += usize::from(matches!(
+                event.payload,
+                EventPayload::AgentTurnCompleted { .. }
+            ));
+        }
+        assert_eq!(
+            completions,
+            usize::from(matches!(fault, Fault::Clear)),
+            "{fault:?}"
+        );
+        let committed = host
+            .store
+            .current_execution(&host.command)
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.launch_phase, LaunchPhase::Ended);
+        assert!(
+            committed
+                .final_assurance
+                .as_ref()
+                .unwrap()
+                .completion_verified
+        );
+        assert!(committed.pending_events.is_some());
+        assert!(!host.store.lease_held(&committed.execution_id).unwrap());
+        let row = host.db.get_command(host.command.as_str()).unwrap().unwrap();
+        let result: awman::data::fs::api_db::CommandResult =
+            serde_json::from_str(row.result.as_ref().unwrap()).unwrap();
+        assert_eq!(result.automation, committed.final_assurance);
+        assert_eq!(result.final_message.as_deref(), Some("durable answer"));
+        host.db
+            .with_conn(|c| {
+                c.execute_batch("DROP TRIGGER IF EXISTS fault")?;
+                Ok(())
+            })
+            .unwrap();
+        // Close the bus/file to model process loss, then reopen the real store.
+        drop(bus);
+        host.publisher = EventBus::new(16).sender().lifecycle_publisher();
+        let reopened = AutomationStore::open(Arc::new(
+            SqliteSessionStore::open(&host.sandbox.root().join("api")).unwrap(),
+        ))
+        .unwrap();
+        CommandLogWriter::recover_lifecycle(&paths, &row, &reopened).unwrap();
+        CommandLogWriter::recover_lifecycle(&paths, &row, &reopened).unwrap();
+        assert!(reopened
+            .read_execution(&committed.execution_id)
+            .unwrap()
+            .pending_events
+            .is_none());
+        let events = paths.read_command_events(&command.session_id, &command.id);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.payload, EventPayload::AgentTurnCompleted { .. }))
+                .count(),
+            1,
+            "{fault:?}"
+        );
+        assert_eq!(
+            reopened
+                .list_turns(&host.command, None, None)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        assert_eq!(
+            ExecutionController::recover(&reopened).unwrap(),
+            vec![host.command.clone()]
+        );
+    }
+}
+
+#[tokio::test]
+async fn foreground_finish_writes_and_missing_rows_cannot_silently_succeed() {
+    use awman::command::automation::launch::ForegroundRecord;
+    use awman::data::fs::DataPaths;
+    use awman::data::session::{Session, SessionOpenOptions};
+    for fault in ["CREATE TRIGGER fault BEFORE UPDATE OF status ON commands BEGIN SELECT RAISE(ABORT,'command finish'); END;", "CREATE TRIGGER fault BEFORE UPDATE OF status ON sessions BEGIN SELECT RAISE(ABORT,'session finish'); END;", "UPDATE commands SET status='error'"] {
+        let sandbox=crate::support::sandbox("command::automation_observers::foreground_finish_writes_and_missing_rows_cannot_silently_succeed");
+        let env=crate::support::env_snapshot(&sandbox);
+        let session=Session::open_at_directory_root(sandbox.work().to_path_buf(),SessionOpenOptions{env:Some(env.clone()),..Default::default()}).unwrap();
+        let (record,host)=ForegroundRecord::create(&session,"exec prompt").unwrap();
+        let db=SqliteSessionStore::open_at(&DataPaths::from_env(&env).unwrap().db_path()).unwrap();
+        let mut snapshot=fixture_snapshot();
+        snapshot.execution_id=ExecutionId::new();
+        snapshot.state=AutomationState::Starting;
+        snapshot.revision=0;
+        snapshot.active_turn_id=None;
+        snapshot.native_session_id=None;
+        snapshot.status_support=StatusSupport::None;
+        snapshot.status_source=awman::data::automation::StatusSource::None;
+        let run=HeadlessRun::reserve(host.clone(),snapshot,binding(),"fixture".into(),None,&timeouts(),"once").unwrap();
+        let finished=run.finish_observed(&observed(true,Some(Ok(None))),Ok(0),false);
+        assert!(finished.failure.is_none());
+        db.with_conn(|c|{c.execute_batch(fault)?;Ok(())}).unwrap();
+        assert!(record.finish(&finished,0).is_err(),"{fault}");
+        assert_eq!(host.store.list_turns(&host.command_id,None,None).unwrap().items.len(),1);
+        global().release_leases(&host.command_id);
+    }
+}
+
+#[tokio::test]
+async fn launch_phase_write_failures_are_fallible_and_never_claim_completion() {
+    for phase in ["launching", "running"] {
+        let host=Host::new("command::automation_observers::launch_phase_write_failures_are_fallible_and_never_claim_completion");
+        let mut run = reserved_headless(&host);
+        if phase == "running" {
+            run.launching().unwrap();
+        }
+        host.db.with_conn(|c| { c.execute_batch(&format!("CREATE TRIGGER fault BEFORE UPDATE OF launch_phase ON agent_executions WHEN NEW.launch_phase='{phase}' BEGIN SELECT RAISE(ABORT,'phase write'); END;"))?; Ok(()) }).unwrap();
+        let result = if phase == "running" {
+            run.running()
+        } else {
+            run.launching()
+        };
+        assert!(matches!(
+            result,
+            Err(awman::command::error::CommandError::Data(_))
+        ));
+        drop(run);
+        let execution = host
+            .store
+            .current_execution(&host.command)
+            .unwrap()
+            .unwrap();
+        assert!(!host.store.lease_held(&execution.execution_id).unwrap());
+        assert!(execution.final_assurance.is_none());
+        assert!(!host.event_names().contains(&"agent_turn_completed"));
+        host.db
+            .with_conn(|c| {
+                c.execute_batch("DROP TRIGGER fault")?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            ExecutionController::recover(&host.store).unwrap(),
+            vec![host.command.clone()]
+        );
+        assert_eq!(
+            host.store
+                .list_turns(&host.command, None, None)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn bus_secrets_are_redacted_before_the_immutable_native_answer_commit() {
+    let host = Host::new("command::automation_observers::bus_secrets_are_redacted_before_the_immutable_native_answer_commit");
+    host.publisher
+        .redaction()
+        .add(awman::data::secret::SecretString::new("bus-only-secret"));
+    let mut snapshot = fixture_snapshot();
+    snapshot.execution_id = ExecutionId::new();
+    snapshot.revision = 0;
+    snapshot.active_turn_id = None;
+    snapshot.native_session_id = None;
+    snapshot.state = AutomationState::Starting;
+    let id = snapshot.execution_id.clone();
+    let mut run = HeadlessRun::reserve(
+        host.host(),
+        snapshot,
+        binding(),
+        "fixture".into(),
+        None,
+        &timeouts(),
+        "task",
+    )
+    .unwrap();
+    run.launching().unwrap();
+    run.running().unwrap();
+    let finished = run.finish_observed(
+        &HeadlessObservation {
+            identity: Some(NativeSessionId::parse("native-1").unwrap()),
+            outcome: Some(Ok(Some("answer bus-only-secret".into()))),
+            protocol_error: None,
+        },
+        Ok(0),
+        false,
+    );
+    assert_eq!(finished.final_message.as_deref(), Some("answer ***"));
+    let page = host.store.list_turns(&host.command, None, None).unwrap();
+    assert_eq!(
+        page.items[0]
+            .result
+            .as_ref()
+            .unwrap()
+            .final_message
+            .as_deref(),
+        Some("answer ***")
+    );
+    assert!(
+        host.store
+            .read_execution(&id)
+            .unwrap()
+            .final_assurance
+            .unwrap()
+            .completion_verified
+    );
+    let command = host.db.get_command(host.command.as_str()).unwrap().unwrap();
+    let saved: awman::data::fs::api_db::CommandResult =
+        serde_json::from_str(command.result.as_deref().unwrap()).unwrap();
+    assert_eq!(saved.final_message.as_deref(), Some("answer ***"));
+    global().release_leases(&host.command);
 }

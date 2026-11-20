@@ -90,6 +90,35 @@ pub fn prepare_channel(
         .map_err(|e| CommandError::Other(format!("create the automation channel: {e}")))
 }
 
+/// Where an automation execution is hosted, as the launching frontend
+/// declares it.
+#[derive(Debug)]
+pub enum AutomationHosting {
+    /// An intentional foreground invocation (CLI, TUI): the run records
+    /// itself through [`ForegroundRecord`] in the shared data-home store.
+    Foreground,
+    /// A daemon/API command: the run uses the command's existing records in
+    /// the daemon's shared store.
+    Shared(AutomationHost),
+}
+
+/// Resolve the frontend's hosting answer into the host the run uses. A
+/// hosting failure is returned before anything is written; only an explicit
+/// `Foreground` creates foreground records.
+fn host_for(
+    hosting: Result<AutomationHosting, CommandError>,
+    session: &Session,
+    command: &[&str],
+) -> Result<(Option<ForegroundRecord>, AutomationHost), CommandError> {
+    match hosting? {
+        AutomationHosting::Shared(host) => Ok((None, host)),
+        AutomationHosting::Foreground => {
+            let (record, host) = ForegroundRecord::create(session, &command.join(" "))?;
+            Ok((Some(record), host))
+        }
+    }
+}
+
 /// A foreground run records itself in the data-home database: a local
 /// session row and a running command row, so the same durable execution,
 /// turn and dedup records exist without a daemon.
@@ -105,9 +134,13 @@ impl ForegroundRecord {
         session: &Session,
         subcommand: &str,
     ) -> Result<(Self, AutomationHost), CommandError> {
+        // The same migration-aware opener the daemon core uses: a legacy
+        // database is relocated (or a conflict refused) before any row is
+        // written, and no second database is ever created beside it.
         let paths = crate::data::fs::DataPaths::from_env(session.env())?;
+        let legacy = crate::data::fs::ApiPaths::from_env(session.env())?;
         let db_path = paths.db_path();
-        let db = Arc::new(SqliteSessionStore::open_at(&db_path)?);
+        let db = paths.open_session_store(legacy.root())?;
         let session_id = crate::data::ids::WorkerSessionId::new();
         let command_id = crate::data::ids::CommandId::new();
         db.insert_session(
@@ -147,31 +180,62 @@ impl ForegroundRecord {
         &self,
         finished: &FinishedExecution,
         exit_code: i32,
-    ) -> crate::data::fs::api_db::CommandResult {
+    ) -> Result<crate::data::fs::api_db::CommandResult, CommandError> {
         let result = crate::data::fs::api_db::CommandResult {
             automation: Some(finished.automation.clone()),
+            error: finished.failure.as_ref().map(|f| f.message.clone()),
+            failure: finished
+                .failure
+                .as_ref()
+                .map(|f| crate::data::fs::api_db::CommandFailure {
+                    stage: "step".into(),
+                    code: f.code.clone(),
+                    message: f.message.clone(),
+                    step: None,
+                }),
+            outcome: Some(if finished.cancelled {
+                crate::data::execution_event::CommandStatusKind::Cancelled
+            } else if finished.failure.is_some() {
+                crate::data::execution_event::CommandStatusKind::Error
+            } else {
+                crate::data::execution_event::CommandStatusKind::Done
+            }),
+            outputs: Some(Default::default()),
             exit_code: Some(exit_code),
             final_message: finished.final_message.clone(),
             ..Default::default()
         };
         let completion = CommandCompletion {
             attempt: 1,
-            status: if finished.failure.is_none() {
+            status: if finished.cancelled {
+                CommandStatus::Cancelled
+            } else if finished.failure.is_none() {
                 CommandStatus::Done
             } else {
                 CommandStatus::Error
             },
             exit_code,
-            result_json: serde_json::to_string(&result).unwrap_or_default(),
+            result_json: serde_json::to_string(&result)
+                .map_err(|e| CommandError::Other(e.to_string()))?,
             finished_at: chrono::Utc::now().to_rfc3339(),
         };
-        let _ = self
+        if !self
             .db
-            .finalize_running_command(&self.command_id, &completion);
-        let _ = self
+            .finalize_running_command(&self.command_id, &completion)?
+        {
+            return Err(CommandError::Data(crate::data::error::DataError::Other(
+                "command completion compare-and-set failed".into(),
+            )));
+        }
+        if !self
             .db
-            .close_session(&self.session_id, &chrono::Utc::now().to_rfc3339());
-        result
+            .close_session(&self.session_id, &chrono::Utc::now().to_rfc3339())?
+        {
+            return Err(CommandError::Data(crate::data::error::DataError::Other(
+                "foreground session completion compare-and-set failed".into(),
+            )));
+        }
+        Ok(result)
     }
 }
 
@@ -195,7 +259,11 @@ pub struct StartRequest<'a> {
     pub mode: AutomationMode,
     pub requested_native: Option<crate::data::settings_profile::NativeSessionId>,
     pub runtime: String,
-    pub host: Option<AutomationHost>,
+    /// The frontend's answer from `AgentLaunchFrontend::automation_host`.
+    /// An error (a daemon command whose shared store could not be bound)
+    /// aborts the start before any record is written; it never becomes a
+    /// foreground run.
+    pub host: Result<AutomationHosting, CommandError>,
     pub initial_task: Option<String>,
     /// Interactive (PTY) launch; headless uses the strict one-shot policy.
     pub interactive: bool,
@@ -218,14 +286,7 @@ pub fn start(request: StartRequest<'_>) -> Result<AutomationRun, CommandError> {
     let config = request.session.effective_config();
     let timeouts = config.automation_timeouts()?;
     let osc_enabled = config.program_status_enabled() && request.interactive;
-    let (foreground, host) = match request.host {
-        Some(host) => (None, host),
-        None => {
-            let (record, host) =
-                ForegroundRecord::create(request.session, &request.command.join(" "))?;
-            (Some(record), host)
-        }
-    };
+    let (foreground, host) = host_for(request.host, request.session, request.command)?;
     let capabilities = adapter.declarations(request.definition, &request.runtime, osc_enabled);
     let snapshot = AutomationSnapshot {
         execution_id: request.profile.execution_id().clone(),
@@ -244,6 +305,7 @@ pub fn start(request: StartRequest<'_>) -> Result<AutomationRun, CommandError> {
         status_reason: None,
         capabilities,
     };
+    let completion_host = host.clone();
     let owned = global()
         .start(ControllerLaunch {
             host,
@@ -263,12 +325,16 @@ pub fn start(request: StartRequest<'_>) -> Result<AutomationRun, CommandError> {
             initial_task: request.initial_task,
         })
         .map_err(CommandError::Other)?;
+    if let Err(error) = bind_profile_completion(request.profile, completion_host, foreground) {
+        owned.clone().abandon();
+        return Err(error);
+    }
     Ok(AutomationRun {
         owned,
         osc_enabled,
         channel: request.channel,
         drain: timeouts.output_drain.to_duration(),
-        foreground,
+        foreground: None,
     })
 }
 
@@ -291,7 +357,7 @@ impl AutomationRun {
         // The terminal's exit follows the stored command result: the daemon's
         // queue worker publishes it (command_finalized); a foreground run
         // stores its own record first.
-        let finished = self.owned.finish_deferred(ExitFacts {
+        let mut finished = self.owned.finish_deferred(ExitFacts {
             exit_code,
             wait_error,
             output_status: output,
@@ -303,11 +369,16 @@ impl AutomationRun {
             } else {
                 exit_code.unwrap_or(0)
             };
-            let result = record.finish(&finished, code);
-            // Close result (if any), the one logical exit, lease release.
-            self.owned
-                .controller()
-                .command_finalized(&record.command, &result);
+            match record.finish(&finished, code) {
+                Ok(result) => self
+                    .owned
+                    .controller()
+                    .command_finalized(&record.command, &result),
+                Err(error) => {
+                    finished.storage_failed(&error.to_string());
+                    self.owned.clone().abandon();
+                }
+            }
         }
         finished
     }
@@ -316,6 +387,15 @@ impl AutomationRun {
 /// Map a finished execution's primary failure to the command error the
 /// existing CLI exit classes and API envelope report.
 pub fn into_command_result(finished: &FinishedExecution) -> Result<(), CommandError> {
+    if let Some(f) = finished
+        .failure
+        .as_ref()
+        .filter(|f| f.code == "storage_error")
+    {
+        return Err(CommandError::Data(crate::data::error::DataError::Other(
+            f.message.clone(),
+        )));
+    }
     if finished.cancelled {
         return Err(CommandError::Aborted);
     }
@@ -374,7 +454,14 @@ pub async fn run_interactive(
         run.osc_enabled,
     );
     run.owned.launching();
-    let execution = match instance.run_with_frontend(wrapped) {
+    let launch = if run.owned.stop_requested().is_cancelled() {
+        Err(crate::engine::error::EngineError::Other(
+            "automation launch persistence failed".into(),
+        ))
+    } else {
+        instance.run_with_frontend(wrapped)
+    };
+    let execution = match launch {
         Ok(execution) => execution,
         Err(e) => {
             let exit = Err(e);
@@ -506,14 +593,7 @@ impl HeadlessRun {
             ))
         })?;
         let timeouts = request.session.effective_config().automation_timeouts()?;
-        let (foreground, host) = match request.host {
-            Some(host) => (None, host),
-            None => {
-                let (record, host) =
-                    ForegroundRecord::create(request.session, &request.command.join(" "))?;
-                (Some(record), host)
-            }
-        };
+        let (foreground, host) = host_for(request.host, request.session, request.command)?;
         let execution_id = request.profile.execution_id().clone();
         let snapshot = AutomationSnapshot {
             execution_id: execution_id.clone(),
@@ -532,7 +612,8 @@ impl HeadlessRun {
             status_reason: Some("headless one-shot: native identity and outcome pending".into()),
             capabilities: adapter.declarations(request.definition, &request.runtime, false),
         };
-        let mut run = Self::reserve(
+        let completion_host = host.clone();
+        let run = Self::reserve(
             host,
             snapshot,
             request.profile.execution_binding(),
@@ -541,7 +622,7 @@ impl HeadlessRun {
             &timeouts,
             task,
         )?;
-        run.foreground = foreground;
+        bind_profile_completion(request.profile, completion_host, foreground)?;
         Ok(run)
     }
 
@@ -560,6 +641,9 @@ impl HeadlessRun {
         use crate::data::automation_store::{operation_digest, Operation, Reservation};
         let execution_id = snapshot.execution_id.clone();
         let other = |e: crate::data::error::DataError| CommandError::Other(e.to_string());
+        if let Some(events) = &host.events {
+            events.ensure_available()?;
+        }
         let lease = host.store.acquire_lease(&execution_id).map_err(other)?;
         super::controller::reserve_execution_record(
             &host,
@@ -630,29 +714,31 @@ impl HeadlessRun {
 
     fn emit(&self, payload: crate::data::execution_event::EventPayload) {
         if let Some(events) = &self.host.events {
-            events(payload);
+            events.emit(payload);
         }
     }
 
     /// The provider launch operation begins: the task is in its argv/stdin
     /// from here on, so a crash can no longer prove it was not delivered.
-    pub fn launching(&mut self) {
+    pub fn launching(&mut self) -> Result<(), CommandError> {
         use crate::data::automation_records::DeliveryPhase;
         // The one absolute startup deadline starts at the launch operation.
         self.startup_deadline =
             Some(tokio::time::Instant::now() + self.timeouts.startup.to_duration());
         let store = &self.host.store;
-        let _ = store.mark_launching(&self.snapshot.execution_id);
-        let _ = store.mark_delivery(
+        store.mark_launching(&self.snapshot.execution_id)?;
+        store.mark_delivery(
             &self.turn.turn_id,
             DeliveryPhase::WriteStarted,
             &self.snapshot.execution_id,
-        );
+        )?;
+        Ok(())
     }
 
     /// The provider process is running.
-    pub fn running(&self) {
-        let _ = self.host.store.mark_running(&self.snapshot.execution_id);
+    pub fn running(&self) -> Result<(), CommandError> {
+        self.host.store.mark_running(&self.snapshot.execution_id)?;
+        Ok(())
     }
 
     /// The saved cancellation budget (agents.automation.cancelTimeout).
@@ -761,33 +847,29 @@ impl HeadlessRun {
         use crate::data::execution_event::EventPayload;
         let store = self.host.store.clone();
         let execution_id = self.snapshot.execution_id.clone();
-        // Native identity: the execution's root conversation, recorded once
-        // (never another conversation's identity).
-        if let Some(id) = &observed.identity {
-            let mut next = self.snapshot.clone();
-            next.revision += 1;
-            next.native_session_id = Some(id.clone());
-            next.state = AutomationState::Working;
-            next.status_support = StatusSupport::Full;
-            next.status_source = StatusSource::Native;
-            next.status_reason = None;
-            if store
-                .transition_execution(self.snapshot.revision, &next, None)
-                .is_ok()
-            {
+        let observed_write = (|| -> Result<(), crate::data::error::DataError> {
+            if let Some(id) = &observed.identity {
+                let mut next = self.snapshot.clone();
+                next.revision += 1;
+                next.native_session_id = Some(id.clone());
+                next.state = AutomationState::Working;
+                next.status_support = StatusSupport::Full;
+                next.status_source = StatusSource::Native;
+                next.status_reason = None;
+                store.transition_execution(self.snapshot.revision, &next, None)?;
                 self.snapshot = next;
-                let _ = store.mark_delivery(
+                store.mark_delivery(
                     &self.turn.turn_id,
                     DeliveryPhase::Acknowledged,
                     &execution_id,
-                );
-                let _ = store.observe_turn(
+                )?;
+                store.observe_turn(
                     &self.turn.turn_id,
                     &execution_id,
                     Some(id),
                     None,
                     Some(chrono::Utc::now()),
-                );
+                )?;
                 self.emit(EventPayload::AgentIdentity {
                     execution_id: execution_id.clone(),
                     native_session_id: id.clone(),
@@ -802,9 +884,22 @@ impl HeadlessRun {
                     status_source: StatusSource::Native,
                 });
             }
-        }
+            Ok(())
+        })();
         let exit_code = exit.as_ref().ok().copied();
         let (mut result, mut failure) = headless_result(observed, exit, StatusSupport::Full);
+        if let Some(events) = &self.host.events {
+            let redaction = events.redaction();
+            result.final_message = result
+                .final_message
+                .map(|message| redaction.redact(&message));
+            if let Some(failure) = &mut result.failure {
+                failure.message = redaction.redact(&failure.message);
+            }
+            if let Some(failure) = &mut failure {
+                failure.message = redaction.redact(&failure.message);
+            }
+        }
         if cancelled && result.completion_source != CompletionSource::Native {
             result.status = TurnStatus::Cancelled;
             result.completion_source = CompletionSource::None;
@@ -824,24 +919,13 @@ impl HeadlessRun {
                 failure = Some(stop);
             }
         }
-        let mut stopping = self.snapshot.clone();
-        stopping.revision += 1;
-        stopping.active_turn_id = None;
-        stopping.state = AutomationState::Stopping;
-        let _ = store.complete_turn(&self.turn.turn_id, &result, &stopping, None);
-        self.emit(EventPayload::AgentTurnCompleted {
-            request_id: self.turn.request_id,
-            execution_id: execution_id.clone(),
-            turn_id: self.turn.turn_id.clone(),
-            result: result.clone(),
-        });
-        let mut ended = stopping.clone();
+        if !super::results::bound_turn_result(&mut result) {
+            failure = result.failure.clone();
+        }
+        let mut ended = self.snapshot.clone();
         ended.revision += 1;
+        ended.active_turn_id = None;
         ended.state = AutomationState::Ended;
-        let _ = store.transition_execution(stopping.revision, &ended, None);
-        self.emit(EventPayload::AgentState {
-            snapshot: Box::new(ended.clone()),
-        });
         let automation = CommandAutomationResult {
             execution_id: execution_id.clone(),
             native_session_id: ended.native_session_id.clone(),
@@ -860,11 +944,13 @@ impl HeadlessRun {
                 "the agent was not confirmed stopped before the cancellation deadline",
             ));
         }
-        let _ = store.finish_execution(&execution_id, &automation, failure.as_ref());
-        if let Some(sink) = &self.host.finished {
-            sink(&automation);
+        if cancelled && failure.is_none() {
+            failure = Some(super::admission::failure(
+                super::admission::codes::CANCELLED,
+                "cancelled",
+            ));
         }
-        let finished = FinishedExecution {
+        let mut finished = FinishedExecution {
             automation,
             failure,
             // The shared strict result carries the confirmed answer.
@@ -873,6 +959,56 @@ impl HeadlessRun {
                 .flatten(),
             cancelled,
         };
+        let committed = observed_write.and_then(|()| {
+            let projection = self
+                .host
+                .events
+                .as_ref()
+                .map(|events| {
+                    events.reserve(vec![
+                        EventPayload::AgentTurnCompleted {
+                            request_id: self.turn.request_id,
+                            execution_id: execution_id.clone(),
+                            turn_id: self.turn.turn_id.clone(),
+                            result: result.clone(),
+                        },
+                        EventPayload::AgentState {
+                            snapshot: Box::new(ended.clone()),
+                        },
+                    ])
+                })
+                .transpose()?;
+            store.complete_execution(
+                &self.turn.turn_id,
+                &result,
+                &ended,
+                &finished.automation,
+                finished.failure.as_ref(),
+                projection.as_ref(),
+            )?;
+            finished.failure = store.read_execution(&execution_id)?.end_failure;
+            finished.cancelled |= finished
+                .failure
+                .as_ref()
+                .is_some_and(|f| f.code == super::admission::codes::CANCELLED);
+            if let (Some(events), Some(projection)) = (&self.host.events, projection) {
+                events.publish(&projection)?;
+                store.clear_pending_events(&execution_id, projection.cursor)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = committed {
+            if let Some(events) = &self.host.events {
+                events.abort(&error.to_string());
+            }
+            finished.storage_failed(&error.to_string());
+            // The lease drops with this run. Recovery owns any committed batch;
+            // never replace it with this transient publication/storage failure.
+            return finished;
+        }
+        if let Some(sink) = &self.host.finished {
+            sink(&finished.automation, finished.final_message.as_deref());
+        }
         if let Some(record) = &self.foreground {
             let code = match exit_code {
                 Some(c) if finished.failure.is_some() && c != 0 => c,
@@ -880,7 +1016,11 @@ impl HeadlessRun {
                 Some(c) => c,
                 None => 1,
             };
-            record.finish(&finished, if cancelled { 130 } else { code });
+            if let Err(error) =
+                record.finish(&finished, if finished.cancelled { 130 } else { code })
+            {
+                finished.storage_failed(&error.to_string());
+            }
             // The command result is stored: the execution is no longer live.
             drop(self.lease.take());
         } else {
@@ -947,4 +1087,56 @@ pub fn cleanup_unconfirmed(
             final_message: finished.final_message.clone(),
         },
     }
+}
+
+/// The profile owner resolves this journal only after export and writer cleanup.
+/// A crash leaves pending cleanup, which recovery must downgrade, never bless.
+fn bind_profile_completion(
+    profile: &ProfileSession,
+    host: AutomationHost,
+    foreground: Option<ForegroundRecord>,
+) -> Result<(), CommandError> {
+    let id = profile.execution_id().clone();
+    let cleanup_store = host.store.clone();
+    let cleanup_id = id.clone();
+    profile.on_cleanup(move |confirmed| {
+        if !confirmed && host.store.read_execution(&id)?.final_assurance.is_none() {
+            host.store
+                .fail_uncommitted_storage(&id, "profile owner ended before execution completion")?;
+        }
+        host.store.finish_profile_cleanup(&id, confirmed)?;
+        if let Some(record) = foreground {
+            let e = host.store.read_execution(&id)?;
+            if let Some(automation) = e.final_assurance {
+                let row = record
+                    .db
+                    .get_command(&record.command_id)?
+                    .ok_or_else(|| CommandError::Other("missing foreground command".into()))?;
+                let committed: crate::data::fs::api_db::CommandResult =
+                    serde_json::from_str(row.result.as_deref().unwrap_or("{}"))
+                        .map_err(|e| CommandError::Other(e.to_string()))?;
+                let finished = FinishedExecution {
+                    automation,
+                    final_message: committed.final_message,
+                    cancelled: e
+                        .end_failure
+                        .as_ref()
+                        .is_some_and(|f| f.code == "cancelled"),
+                    failure: e.end_failure,
+                };
+                let code = if finished.cancelled {
+                    130
+                } else if finished.failure.is_some() {
+                    1
+                } else {
+                    0
+                };
+                let result = record.finish(&finished, code)?;
+                global().command_finalized(&record.command, &result);
+            }
+        }
+        Ok(())
+    });
+    cleanup_store.begin_profile_cleanup(&cleanup_id)?;
+    Ok(())
 }

@@ -522,6 +522,150 @@ fn prepare_native_plan(
     Ok(())
 }
 
+/// The session's granted mount authority, or the refusal for a session that
+/// must be revalidated first.
+fn launch_authority(
+    session: &Session,
+) -> Result<&crate::data::mount_authority::MountAuthority, EngineError> {
+    match session.mount_authority() {
+        crate::data::session::SessionMountAuthority::Granted(authority) => Ok(authority),
+        crate::data::session::SessionMountAuthority::RevalidationRequired { reason } => {
+            Err(EngineError::MountAuthorityRevalidationRequired {
+                reason: reason.clone(),
+            })
+        }
+    }
+}
+
+fn outside_authority(
+    authority: &crate::data::mount_authority::MountAuthority,
+    path: &Path,
+    error: crate::data::mount_authority::MountAuthorityError,
+) -> EngineError {
+    EngineError::MountOutsideAuthority {
+        path: path.to_path_buf(),
+        authority_root: authority.root().to_path_buf(),
+        reason: error.to_string(),
+    }
+}
+
+/// The host directory mounted at `/workspace` must be the session's
+/// authorized root, resolved again now: a directory replaced by a symlink
+/// after admission, or a root that moved, refuses the launch.
+fn check_workspace_authority(session: &Session, host_path: &Path) -> Result<(), EngineError> {
+    let authority = launch_authority(session)?;
+    authority
+        .check_workspace(host_path)
+        .map_err(|e| outside_authority(authority, host_path, e))
+}
+
+/// Every final host mount that is Git metadata must be inside the authorized
+/// root or one of its verified Git directories. Runs on the complete option
+/// list, so user overlays and worktree Git mounts are judged alike.
+fn check_git_mounts<'a>(
+    session: &Session,
+    overlays: impl IntoIterator<Item = (&'a Path, &'a Path)>,
+) -> Result<(), EngineError> {
+    let authority = launch_authority(session)?;
+    for (host, guest) in overlays {
+        authority
+            .check_git_mount(host, guest)
+            .map_err(|e| outside_authority(authority, host, e))?;
+    }
+    Ok(())
+}
+
+fn container_overlays(options: &[ContainerOption]) -> impl Iterator<Item = (&Path, &Path)> + Clone {
+    options.iter().filter_map(|option| match option {
+        ContainerOption::Overlay(spec) => {
+            Some((spec.host_path.as_path(), spec.container_path.as_path()))
+        }
+        _ => None,
+    })
+}
+
+/// The on-disk identity of every authority-checked mount source of one
+/// launch, taken before its first check. The launch is checked again, and
+/// each identity compared, at the last point before the options go to the
+/// runtime, so a workspace or Git directory swapped (by a link, a rename or
+/// a replacement) while the rest of the launch is prepared is refused rather
+/// than mounted. Path-based bind mounts leave the interval between that last
+/// check and the runtime's own mount call; nothing in the engine runs in it.
+#[derive(Debug, Default)]
+struct LaunchMountPins {
+    sources: Vec<(
+        std::path::PathBuf,
+        Option<crate::data::mount_authority::SourceIdentity>,
+    )>,
+}
+
+impl LaunchMountPins {
+    fn pin(&mut self, session: &Session, host: &Path) -> Result<(), EngineError> {
+        if self.sources.iter().any(|(path, _)| path == host) {
+            return Ok(());
+        }
+        let authority = launch_authority(session)?;
+        let identity = crate::data::mount_authority::SourceIdentity::of(host).or_else(|e| {
+            // A local invocation over a path that does not exist (an
+            // in-memory fixture) has nothing to pin; policy grants fail
+            // closed like their authority check.
+            if authority.is_policy_granted() {
+                Err(outside_authority(authority, host, e))
+            } else {
+                Ok(None)
+            }
+        })?;
+        self.sources.push((host.to_path_buf(), identity));
+        Ok(())
+    }
+
+    /// Pin the declared Git mounts among `overlays` (the workspace is pinned
+    /// separately before its own check).
+    fn pin_git_mounts<'a>(
+        &mut self,
+        session: &Session,
+        overlays: impl IntoIterator<Item = (&'a Path, &'a Path)>,
+    ) -> Result<(), EngineError> {
+        let authority = launch_authority(session)?;
+        for (host, guest) in overlays {
+            if authority.declares_git_mount(host, guest) {
+                self.pin(session, host)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The final check: the workspace and Git mounts of the options about to
+    /// be handed to the runtime pass the authority again, and every pinned
+    /// source is still the same object.
+    fn verify<'a>(
+        &self,
+        session: &Session,
+        overlays: impl IntoIterator<Item = (&'a Path, &'a Path)> + Clone,
+    ) -> Result<(), EngineError> {
+        let authority = launch_authority(session)?;
+        for (host, guest) in overlays.clone() {
+            if guest == Path::new(crate::data::workspace::WORKSPACE_GUEST_PATH) {
+                check_workspace_authority(session, host)?;
+            }
+        }
+        check_git_mounts(session, overlays)?;
+        for (path, pinned) in &self.sources {
+            let Some(pinned) = pinned else { continue };
+            let now = crate::data::mount_authority::SourceIdentity::of(path)
+                .map_err(|e| outside_authority(authority, path, e))?;
+            if now.as_ref() != Some(pinned) {
+                return Err(EngineError::MountOutsideAuthority {
+                    path: path.clone(),
+                    authority_root: authority.root().to_path_buf(),
+                    reason: "the mount source was replaced while the launch was prepared".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Lexical host path, resolved through symlinks when it exists, so two
 /// spellings of one directory compare equal.
 fn comparable_host_path(path: &Path) -> std::path::PathBuf {
@@ -868,6 +1012,7 @@ impl AgentEngine {
             session.git_root(),
             WorkspaceAccess::from_read_only(self.read_only_workspace),
         );
+        check_workspace_authority(session, &spec.host_path)?;
         let permission = if spec.access.is_read_only() {
             if !self.runtime.capabilities().read_only_workspace() {
                 return Err(read_only_unsupported(self.runtime.display_name()));
@@ -1234,6 +1379,22 @@ impl AgentEngine {
         run: &AgentRunOptions,
         credentials: &AgentCredentials,
     ) -> Result<Vec<ContainerOption>, EngineError> {
+        let mut pins = LaunchMountPins::default();
+        let options = self.build_container_options(session, agent, run, credentials, &mut pins)?;
+        pins.verify(session, container_overlays(&options))?;
+        Ok(options)
+    }
+
+    /// The container option list, with the identity of every
+    /// authority-checked source recorded in `pins` before its check.
+    fn build_container_options(
+        &self,
+        session: &Session,
+        agent: &AgentName,
+        run: &AgentRunOptions,
+        credentials: &AgentCredentials,
+        pins: &mut LaunchMountPins,
+    ) -> Result<Vec<ContainerOption>, EngineError> {
         if session
             .lease_images()
             .is_some_and(|images| !images.agents.contains_key(agent.as_str()))
@@ -1363,6 +1524,7 @@ impl AgentEngine {
         }
 
         // Mount the project source into the container's working directory.
+        pins.pin(session, session.git_root())?;
         options.extend(self.workspace_mounts(session)?);
 
         // Overlays — agent settings + user-supplied dirs + skills.
@@ -1623,6 +1785,8 @@ impl AgentEngine {
             "/workspace",
         )));
 
+        pins.pin_git_mounts(session, container_overlays(&options))?;
+        check_git_mounts(session, container_overlays(&options))?;
         if self.read_only_workspace || self.lease_workspace_scope.is_some() {
             validate_workspace_mounts(
                 &mut options,
@@ -1676,6 +1840,8 @@ impl AgentEngine {
                     "command secrets require a container runtime".into(),
                 ));
             }
+            let mut pins = LaunchMountPins::default();
+            pins.pin(session, session.git_root())?;
             let mut options = self.build_sandbox_options(session, agent, run)?;
             if !credentials.env_vars.is_empty() {
                 options.push(SandboxOption::AgentCredentials {
@@ -1685,10 +1851,18 @@ impl AgentEngine {
             let mut resolved =
                 crate::engine::sandbox::options::ResolvedSandboxOptions::resolve(options);
             resolved.host_env = Some(session.env().clone());
+            pins.verify(
+                session,
+                [(
+                    session.git_root(),
+                    Path::new(crate::data::workspace::WORKSPACE_GUEST_PATH),
+                )],
+            )?;
             Ok(ResolvedAgentOptions::Sandbox(Box::new(resolved)))
         } else {
+            let mut pins = LaunchMountPins::default();
             let mut options =
-                self.build_options_with_credentials(session, agent, run, credentials)?;
+                self.build_container_options(session, agent, run, credentials, &mut pins)?;
             if matches!(&credentials.delivery, CredentialDelivery::Env)
                 && !credentials.env_vars.is_empty()
             {
@@ -1699,12 +1873,25 @@ impl AgentEngine {
             if let Some(channel) = &run.automation_channel {
                 options.extend(channel.container_options());
             }
-            Ok(ResolvedAgentOptions::Container(Box::new(
+            let mut resolved =
                 crate::engine::container::options::ResolvedContainerOptions::resolve_in(
                     options,
                     session.env(),
-                )?,
-            )))
+                )?;
+            // Last engine step before the runtime: the mounts it will create
+            // are checked against the authority and their pinned identities.
+            pins.verify(
+                session,
+                resolved
+                    .overlays
+                    .iter()
+                    .map(|o| (o.host_path.as_path(), o.container_path.as_path())),
+            )?;
+            resolved.mount_guard = Some(crate::data::mount_authority::MountSourceGuard {
+                authority: launch_authority(session)?.clone(),
+                sources: pins.sources,
+            });
+            Ok(ResolvedAgentOptions::Container(Box::new(resolved)))
         }
     }
 
@@ -1735,6 +1922,7 @@ impl AgentEngine {
         let yolo_run = with_yolo_disallowed_tools(session, &def, run, RunParadigm::Sandbox)?;
         let run: &AgentRunOptions = &yolo_run;
         def.validate_run(run, RunParadigm::Sandbox)?;
+        check_workspace_authority(session, session.git_root())?;
 
         let mut options = vec![
             SandboxOption::AgentId(agent.as_str().to_string()),

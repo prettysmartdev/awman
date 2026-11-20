@@ -15,6 +15,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+mod readiness;
+mod source_defects;
+
 const VERSION: &str = "v0.14.0";
 const C1: &str = "1111111111111111111111111111111111111111";
 const C2: &str = "2222222222222222222222222222222222222222";
@@ -136,6 +139,10 @@ impl World {
             "<plist>hypervisor</plist>\n",
         );
         w.write_src("tools/macos-sign.sh", "#!/usr/bin/env bash\n");
+        w.write_src(
+            "third_party/msb-payloads/aarch64-apple-darwin/provenance.txt",
+            "owned-test-payload-provenance",
+        );
         w.write_src(
             "third_party/msb-payloads/manifest.toml",
             "status = \"verified\"\n",

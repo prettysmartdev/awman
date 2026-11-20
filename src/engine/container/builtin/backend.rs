@@ -273,8 +273,12 @@ impl BuiltinBackend {
         }
         Ok(summary)
     }
-    fn plan(&self, options: ResolvedContainerOptions) -> Result<LaunchPlan, EngineError> {
+    pub(super) fn plan(
+        &self,
+        options: ResolvedContainerOptions,
+    ) -> Result<LaunchPlan, EngineError> {
         options.validate_read_only_workspace()?;
+        let output_tail = super::super::process::output_tail_for(&options)?;
         if options.allow_docker {
             return Err(unsupported("Docker socket bridge"));
         }
@@ -416,12 +420,15 @@ impl BuiltinBackend {
             ..Default::default()
         };
         Ok(LaunchPlan {
+            mount_guard: options.mount_guard,
             image_lease,
             spec,
             command,
             name,
             remove_on_exit: options.remove_on_exit,
             persistent_stdin: options.acp || options.interactive,
+            startup_grace: options.startup_grace,
+            output_tail,
             seeded_prompt: if options.acp || options.interactive || options.headless_prompt_in_argv
             {
                 None
@@ -673,7 +680,11 @@ impl ContainerBackend for BuiltinBackend {
         // handle generation (creation time + name) protect against stopping a
         // replacement that reused the name; the launch-scoped owner token is
         // only required for automatic cleanup paths (cancel, finish, stuck).
-        let current = self.driver.get(&handle.id)?;
+        let current = match self.driver.get(&handle.id) {
+            Ok(current) => current,
+            Err(EngineError::AgentNotFound { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         naming::check_protocol(&current.labels)?;
         if current.handle.started_at != handle.started_at || current.handle.name != handle.name {
             return Err(EngineError::BuiltinAgentReplaced {
@@ -687,9 +698,38 @@ impl ContainerBackend for BuiltinBackend {
         self.driver
             .stop_owned(&handle.id, owner, Duration::from_secs(2))
     }
+    fn remove_agent_checked(
+        &self,
+        handle: &AgentHandle,
+        execution: &str,
+    ) -> Result<(), EngineError> {
+        let current = match self.driver.get(&handle.id) {
+            Ok(current) => current,
+            Err(EngineError::AgentNotFound { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        naming::check_protocol(&current.labels)?;
+        let owner = current
+            .labels
+            .get(naming::LABEL_OWNER)
+            .ok_or_else(|| EngineError::Other("builtin sandbox has no owner label".into()))?;
+        self.driver
+            .remove_stopped_checked(handle, owner, execution)?;
+        let _ = std::fs::remove_file(self.paths.attach(&handle.id, owner));
+        Ok(())
+    }
     fn remove_agent(&self, id: &str) -> Result<(), EngineError> {
-        let current = self.driver.get(id)?;
-        self.driver.remove_stopped(id)?;
+        let current = match self.driver.get(id) {
+            Ok(current) => current,
+            Err(EngineError::AgentNotFound { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        naming::check_protocol(&current.labels)?;
+        let owner = current
+            .labels
+            .get(naming::LABEL_OWNER)
+            .ok_or_else(|| EngineError::Other("builtin sandbox has no owner label".into()))?;
+        self.driver.remove_stopped(id, owner)?;
         if let Some(owner) = current.labels.get(naming::LABEL_OWNER) {
             let _ = std::fs::remove_file(self.paths.attach(id, owner));
         }
@@ -739,7 +779,9 @@ impl ContainerBackend for BuiltinBackend {
             network: network::compile(&offline),
         })?;
         let output = self.collect_probe(&id, &config, request);
-        let _ = self.driver.stop_owned(&id, &owner, Duration::from_secs(2));
+        let _ = self
+            .driver
+            .finish_owned(&id, &owner, Duration::from_secs(2), true);
         output
     }
     fn image_exists(&self, tag: &str) -> Result<bool, EngineError> {
@@ -973,7 +1015,7 @@ impl ContainerBackend for BuiltinBackend {
                     memory_mib: launch.memory_mib,
                     network_mode: launch.network.mode.as_str(),
                 },
-                &[],
+                request.labels,
             )?,
             mounts: mounted,
             tmpfs: Vec::new(),
@@ -1107,10 +1149,11 @@ impl ContainerBackend for BuiltinBackend {
     }
     fn stop_and_remove(&self, id: &str) -> Result<(), EngineError> {
         let current = self.owned(id)?;
-        self.driver.stop_owned(
+        self.driver.finish_owned(
             id,
             &current.labels[naming::LABEL_OWNER],
             Duration::from_secs(2),
+            true,
         )?;
         if let Ok(mut env) = self.background_env.lock() {
             env.remove(id);
@@ -1194,7 +1237,7 @@ mod workspace_access_tests {
         fn finish_owned(&self, _: &str, _: &str, _: Duration, _: bool) -> Result<(), EngineError> {
             panic!("unexpected guest cleanup")
         }
-        fn remove_stopped(&self, _: &str) -> Result<(), EngineError> {
+        fn remove_stopped(&self, _: &str, _: &str) -> Result<(), EngineError> {
             panic!("unexpected guest cleanup")
         }
         fn stats(&self, _: &str) -> Result<crate::engine::agent_runtime::AgentStats, EngineError> {

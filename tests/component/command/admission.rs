@@ -79,6 +79,102 @@ async fn setup_and_closed_sessions_refuse_command_admission() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn automation_flag_projection_matches_accepted_modes_and_replay() {
+    let s = crate::support::sandbox(
+        "command::admission::automation_flag_projection_matches_accepted_modes_and_replay",
+    );
+    let f = AdmissionFixture::new(&s);
+    let admission = f.admission.clone().with_request_context(
+        awman::data::daemon_state::CommandRequestContext {
+            profile_owner: true,
+            ..Default::default()
+        },
+    );
+    let session = f
+        .admission
+        .admit_session(f.local(&s), None, false, None)
+        .await
+        .unwrap();
+    f.store
+        .update_setup_status(&session.session_id, SessionSetupStatus::Ready)
+        .unwrap();
+
+    for (args, expected) in [
+        (vec!["go"], serde_json::Value::Null),
+        (vec!["--automation", "go"], serde_json::json!("auto")),
+        (vec!["--automation=auto", "go"], serde_json::json!("auto")),
+        (
+            vec![
+                "--settings-profile=review",
+                "--automation=require_full",
+                "go",
+            ],
+            serde_json::json!("require_full"),
+        ),
+    ] {
+        let mut submission = prompt("unused");
+        submission.args = args.iter().map(|arg| (*arg).to_string()).collect();
+        let command = admission
+            .admit_command(&session.session_id, submission, None)
+            .await
+            .unwrap();
+        assert_eq!(command.flags_applied["automation"], expected);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&command.response_body).unwrap()
+                ["flags_applied"]["automation"],
+            expected
+        );
+    }
+
+    let mut replay_submission = prompt("unused");
+    replay_submission.args = [
+        "--settings-profile=review",
+        "--automation=require_full",
+        "go",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let journal = f.journal("automation-replay");
+    assert_eq!(
+        journal.begin("same request").unwrap(),
+        IdempotencyBegin::Fresh
+    );
+    let admitted = admission
+        .admit_command(&session.session_id, replay_submission, Some(&journal))
+        .await
+        .unwrap();
+    drop(journal);
+    let retry = f.journal("automation-replay");
+    assert_eq!(
+        retry.begin("same request").unwrap(),
+        IdempotencyBegin::Replay {
+            status: 202,
+            body: admitted.response_body.clone(),
+        }
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&admitted.response_body).unwrap()
+            ["flags_applied"]["automation"],
+        "require_full"
+    );
+
+    for args in [
+        vec!["--automation=unsupported", "go"],
+        vec!["--automation", "--automation=require_full", "go"],
+    ] {
+        let mut submission = prompt("unused");
+        submission.args = args.into_iter().map(str::to_string).collect();
+        assert!(matches!(
+            admission
+                .admit_command(&session.session_id, submission, None)
+                .await,
+            Err(AdmissionError::CommandValidation(_))
+        ));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn accepted_session_replays_after_dropped_response_without_duplication() {
     let s = crate::support::sandbox(
         "command::admission::accepted_session_replays_after_dropped_response_without_duplication",
@@ -344,4 +440,29 @@ async fn removed_issue_flag_is_refused_with_the_replacement_in_api_args() {
         }
         other => panic!("expected the replacement error, got {:?}", other.err()),
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_list_does_not_project_an_unsupported_automation_flag() {
+    let s = crate::support::sandbox(
+        "command::admission::agents_list_does_not_project_an_unsupported_automation_flag",
+    );
+    let f = AdmissionFixture::new(&s);
+    let session = f
+        .admission
+        .admit_session(f.local(&s), None, false, None)
+        .await
+        .unwrap();
+    f.store
+        .update_setup_status(&session.session_id, SessionSetupStatus::Ready)
+        .unwrap();
+    let mut submission = prompt("unused");
+    submission.subcommand = "agents list".into();
+    submission.args.clear();
+    let command = f
+        .admission
+        .admit_command(&session.session_id, submission, None)
+        .await
+        .unwrap();
+    assert_eq!(command.flags_applied, serde_json::json!({}));
 }

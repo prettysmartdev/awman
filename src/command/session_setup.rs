@@ -183,6 +183,36 @@ impl SessionSetup {
         let _ = self.store.update_setup_status(&self.session_id, status);
     }
 
+    /// The authority this session is opened with: the plan's, for a local
+    /// session; for a remote session, awman's clone inside this session's
+    /// own directory and nothing else.
+    fn mount_authority(
+        &self,
+    ) -> Result<crate::data::mount_authority::MountAuthority, crate::data::error::DataError> {
+        let refused = |reason: String| crate::data::error::DataError::InvalidPath {
+            path: self.plan.resolved_workdir.clone(),
+            reason,
+        };
+        match (self.plan.kind, &self.plan.mount_authority) {
+            (SessionKind::Local, Some(authority)) => Ok(authority.clone()),
+            (SessionKind::Local, None) => Err(refused(
+                "the session plan carries no mount authority".into(),
+            )),
+            (SessionKind::Remote, _) => {
+                let clone = self
+                    .plan
+                    .cloned_path
+                    .as_deref()
+                    .unwrap_or(&self.plan.resolved_workdir);
+                crate::data::mount_authority::MountAuthority::remote_clone(
+                    clone,
+                    &self.paths.session_dir(&self.session_id),
+                )
+                .map_err(|e| refused(e.to_string()))
+            }
+        }
+    }
+
     /// Write the final snapshot to `setup_state.json` and let the frontend
     /// retire its per-session machinery.
     async fn finish(&self, presenter: &mut dyn SessionSetupPresenter) {
@@ -654,11 +684,31 @@ impl SessionSetup {
             "Opening session"
         );
 
-        let session = match self.sessions.open_or_create_with_key(
-            Some(self.session_id.clone()),
-            self.plan.resolved_workdir.clone(),
-            SessionOpenOptions::default(),
-        ) {
+        // The session may mount only what admission authorized. A remote
+        // session's authority is derived from awman's own clone, which exists
+        // only now. Opening fails if the root the session would resolve is
+        // anything else (an enclosing checkout, a path replaced since
+        // admission): never a silent widening to a parent.
+        let opened = self.mount_authority().and_then(|authority| {
+            self.sessions
+                .open_or_create_with_key(
+                    Some(self.session_id.clone()),
+                    self.plan.resolved_workdir.clone(),
+                    SessionOpenOptions {
+                        mount_authority: Some(authority.clone()),
+                        ..Default::default()
+                    },
+                )
+                .map(|session| (session, authority))
+        });
+        // Persisted with the row so a restart can revalidate it; a session
+        // whose authority is not durable is not set up.
+        let opened = opened.and_then(|(session, authority)| {
+            self.store
+                .set_mount_authority(&self.session_id, &authority)
+                .map(|()| session)
+        });
+        let session = match opened {
             Ok(session) => session,
             Err(e) => {
                 tracing::error!(
@@ -859,4 +909,70 @@ impl SessionSetup {
 
         self.finish(presenter).await;
     }
+}
+
+/// Reopen a persisted API session after a restart, holding it to its saved
+/// mount authority.
+///
+/// The saved authority is an upper bound: the current `policy` must still
+/// grant the saved workdir at the same canonical path
+/// ([`revalidate_restored_authority`](crate::command::session_create::revalidate_restored_authority)).
+/// A row with no saved authority (written before authorities were recorded),
+/// one the policy no longer grants, or one whose path changed is still
+/// restored, so status and close keep working, but with its authority
+/// withdrawn: every launch is refused with
+/// `mount_authority_revalidation_required`. Nothing is inferred from the
+/// workdir or from Git discovery. The session is rooted at its saved workdir
+/// exactly; restore never walks up to an enclosing checkout.
+pub fn restore_session(
+    store: &SqliteSessionStore,
+    record: &crate::data::fs::api_db::SessionRecord,
+    policy: &crate::command::session_create::SessionCreatePolicy,
+    env: &crate::data::config::env::EnvSnapshot,
+    git: &dyn crate::data::session::GitRootResolver,
+) -> Result<crate::data::session::Session, crate::data::error::DataError> {
+    use crate::data::session::{Session, SessionMountAuthority, StaticGitRootResolver};
+    let workdir = std::path::PathBuf::from(&record.workdir);
+    let kind = if record.session_type == SessionKind::Remote.as_str() {
+        SessionKind::Remote
+    } else {
+        SessionKind::Local
+    };
+    let saved = store.mount_authority(&record.id).unwrap_or_else(|error| {
+        tracing::error!(session_id = %record.id, %error, "Failed to read saved mount authority");
+        None
+    });
+    let authority = crate::command::session_create::revalidate_restored_authority(
+        policy,
+        kind,
+        &workdir,
+        saved.as_deref(),
+        git,
+    );
+    let resolver = StaticGitRootResolver::new(&workdir);
+    let open = |mount_authority| {
+        Session::open_or_workdir_fallback(
+            workdir.clone(),
+            &resolver,
+            SessionOpenOptions {
+                env: Some(env.clone()),
+                mount_authority,
+                ..Default::default()
+            },
+        )
+    };
+    let withdrawn = |reason: String| {
+        open(None).map(|mut session| {
+            session.require_mount_revalidation(reason);
+            session
+        })
+    };
+    let session = match authority {
+        Ok(authority) => open(Some(authority)).or_else(|error| withdrawn(error.to_string())),
+        Err(reason) => withdrawn(reason),
+    }?;
+    if let SessionMountAuthority::RevalidationRequired { reason } = session.mount_authority() {
+        tracing::warn!(session_id = %record.id, workdir = %record.workdir, %reason, "Restored session needs its mount authority revalidated; launches are refused");
+    }
+    Ok(session)
 }

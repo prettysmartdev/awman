@@ -10,7 +10,7 @@ import { harness, request } from './helpers';
 afterEach(() => { cleanup(); sessionStorage.clear(); });
 function show() {
   const h = harness(); h.s.tabs = [h.s.tabs[0]!]; h.s.tabs[0]!.workflow = null; h.store.applySnapshot(h.s);
-  render(<Workspace client={h.client} connection={h.connection} launchContext="lc_default" squadAvailable reconnect={vi.fn()} />);
+  render(<Workspace client={h.client} connection={h.connection} launchContext="lc_default" listenerName="loopback" squadAvailable reconnect={vi.fn()} />);
   return h;
 }
 it('resizes with the active touch and stops when that touch is canceled', () => {

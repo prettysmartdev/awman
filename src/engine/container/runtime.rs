@@ -434,6 +434,15 @@ impl ContainerRuntime {
         self.build(ResolvedContainerOptions::resolve(spec.options())?)
     }
 
+    /// Build a phase with its session environment (including private spool home).
+    pub fn build_phase_step_in(
+        &self,
+        spec: &PhaseStepContainerSpec<'_>,
+        env: &crate::data::config::env::EnvSnapshot,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        self.build(ResolvedContainerOptions::resolve_in(spec.options(), env)?)
+    }
+
     /// Start a background container for setup/teardown execution.
     ///
     /// Delegates to the backend's `start_background`. The returned
@@ -561,6 +570,14 @@ impl AgentRuntimeEngine for ContainerRuntime {
 
     fn reattach_after_owner_exit(&self) -> bool {
         self.backend.reattach_after_owner_exit()
+    }
+
+    fn remove_agent_checked(
+        &self,
+        handle: &AgentHandle,
+        execution: &str,
+    ) -> Result<(), EngineError> {
+        self.backend.remove_agent_checked(handle, execution)
     }
 
     fn remove_agent(&self, id: &str) -> Result<(), EngineError> {

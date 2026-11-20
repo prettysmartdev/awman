@@ -15,7 +15,6 @@
 use crate::docker::engine::Engine;
 use crate::support;
 use awman::data::templates::{agent_dockerfile_for, pinned_cli_version, project_dockerfile_dev};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 /// Every `templates/Dockerfile.<name>`, each with a build test below.
@@ -45,18 +44,14 @@ fn build_on_project_base(
     template: &str,
 ) {
     let engine = Engine::grant(sandbox);
-    // Build/version scenarios may run concurrently for the same agent.
-    let mut hash = std::collections::hash_map::DefaultHasher::new();
-    engine.sandbox.root().hash(&mut hash);
-    let id = hash.finish();
-    let base_tag = format!("awman-boundary-{agent}-{id:x}-base:latest");
-    let tag = format!("awman-boundary-{agent}-{id:x}:latest");
+    let id = engine.run_id();
+    let base_tag = format!("awman-boundary-{agent}-{id}-base:latest");
+    let tag = format!("awman-boundary-{agent}-{id}:latest");
     let cleanup = crate::docker::engine::Cleanup::new(&engine);
-    cleanup.image(&tag).image(&base_tag);
 
     let (dockerfile, context) =
         engine.write_context(&format!("{agent}-base"), project_dockerfile_dev());
-    engine.build(&base_tag, &dockerfile, &context);
+    cleanup.build_image(&base_tag, &dockerfile, &context);
 
     let rendered = template
         .replace("{{AWMAN_BASE_IMAGE}}", &base_tag)
@@ -66,7 +61,7 @@ fn build_on_project_base(
         "the {agent} template still has an unresolved placeholder after substitution"
     );
     let (dockerfile, context) = engine.write_context(agent, &rendered);
-    engine.build(&tag, &dockerfile, &context);
+    cleanup.build_image(&tag, &dockerfile, &context);
     assert!(
         engine.has_image(&tag),
         "{tag} is absent after a successful build"
@@ -78,7 +73,8 @@ fn build_on_project_base(
             engine.run_ok(&["image", "inspect", "--format", "{{.Architecture}}", &tag]);
         assert!(matches!(architecture.as_str(), "amd64" | "arm64"));
         engine.sandbox.note("image_architecture", &architecture);
-        let name = format!("awman-version-{agent}-{id:x}");
+        let name = format!("awman-version-{agent}-{id}");
+        let owner_label = cleanup.owner_label();
         cleanup.container(&name);
         let binary = if agent == "cursor" {
             "/home/awman/.local/bin/cursor-agent"
@@ -90,6 +86,8 @@ fn build_on_project_base(
             "--rm",
             "--name",
             &name,
+            "--label",
+            &owner_label,
             "--network",
             "none",
             "--entrypoint",
@@ -170,12 +168,11 @@ fn shipped_templates_equal_the_files_under_templates() {
 fn the_project_template_builds() {
     let mut sandbox = support::sandbox("templates::the_project_template_builds");
     let engine = Engine::grant(&mut sandbox);
-    let tag = "awman-boundary-project:latest";
+    let tag = engine.unique_tag("awman-boundary-project");
     let cleanup = crate::docker::engine::Cleanup::new(&engine);
-    cleanup.image(tag);
     let (dockerfile, context) = engine.write_context("project", project_dockerfile_dev());
-    engine.build(tag, &dockerfile, &context);
-    assert!(engine.has_image(tag));
+    cleanup.build_image(&tag, &dockerfile, &context);
+    assert!(engine.has_image(&tag));
     drop(cleanup);
     sandbox.finish();
 }

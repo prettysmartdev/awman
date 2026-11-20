@@ -256,7 +256,9 @@ pub(crate) const CREDENTIAL_REFRESH_WAIT: Duration = Duration::from_secs(30);
 pub(crate) fn refresh_credential_blocking(
     monitor: Arc<crate::engine::credential_refresh::CredentialRefreshMonitor>,
     agent: crate::data::session::AgentName,
+    checkout_roots: Vec<PathBuf>,
 ) -> RefreshOutcome {
+    monitor.add_checkout_roots(checkout_roots);
     std::thread::scope(|scope| {
         scope
             .spawn(move || {
@@ -498,7 +500,15 @@ impl CommandLayerFactory {
                 .unwrap_or(false);
             if near_expiry {
                 if let Some(monitor) = self.engines.credential_monitor.clone() {
-                    let outcome = refresh_credential_blocking(monitor, runtime.step_agent.clone());
+                    let outcome = refresh_credential_blocking(
+                        monitor,
+                        runtime.step_agent.clone(),
+                        vec![
+                            session.working_dir().to_path_buf(),
+                            session.git_root().to_path_buf(),
+                            session.definition_root().to_path_buf(),
+                        ],
+                    );
                     if let Some(warning) = refresh_warning(&outcome) {
                         self.shared.lock().unwrap().write_message(UserMessage {
                             level: MessageLevel::Warning,
@@ -722,7 +732,8 @@ impl AgentExecutionFactory for CommandLayerFactory {
         let Some(monitor) = self.engines.credential_monitor.clone() else {
             return Ok(false);
         };
-        let outcome = refresh_credential_blocking(monitor, agent.clone());
+        let outcome =
+            refresh_credential_blocking(monitor, agent.clone(), vec![self.image_git_root.clone()]);
         if let Some(warning) = refresh_warning(&outcome) {
             self.shared.lock().unwrap().write_message(UserMessage {
                 level: MessageLevel::Warning,

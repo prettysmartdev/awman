@@ -16,7 +16,7 @@
 name: Release candidate
 run-name: >-
   Release ${{ inputs.version }} (${{ inputs.commit }})${{ inputs.dry_run && ' [rehearsal]' || '' }}${{
-  (contains(inputs.operator_record, '"record_only":true') || contains(inputs.operator_record, '"record_only": true')) && ' [journal]' || '' }}
+  toJSON(fromJSON(inputs.operator_record || '{}').record_only) == 'true' && ' [journal]' || '' }}
 
 on:
   workflow_dispatch:
@@ -73,12 +73,15 @@ on:
 permissions:
   contents: read
 
-# One candidate workflow per version and mode at a time; never cancelled.
-# Operator journals (record-only dispatches) never queue behind a candidate.
+# One active candidate per repository/version/mode; keep active runs running.
+# Operator journals (record-only dispatches) have independent admission.
+# Actions may replace pending runs; this is mutual exclusion, not a durable queue.
+# Preflight reads live allocation state after admission; assembly checks it again.
 concurrency:
   group: >-
-    candidate-${{ github.repository }}-${{ inputs.version }}-${{ inputs.dry_run }}-${{ github.run_id }}${{
-    (contains(inputs.operator_record, '"record_only":true') || contains(inputs.operator_record, '"record_only": true')) && format('-journal-{0}', github.run_id) || '' }}
+    ${{ toJSON(fromJSON(inputs.operator_record || '{}').record_only) == 'true' &&
+    format('candidate-journal-{0}-{1}', github.repository, github.run_id) ||
+    format('candidate-{0}-{1}-{2}', github.repository, inputs.version, inputs.dry_run) }}
   cancel-in-progress: false
 
 env:

@@ -28,6 +28,7 @@ use crate::engine::container::options::ResolvedContainerOptions;
 /// no leases, which is the same behaviour the absent global produced and is
 /// also how the `authRefresh.enabled: false` kill switch is implemented.
 pub trait CredentialLeaseFactory: Send + Sync {
+    fn add_checkout_roots(&self, _roots: Vec<std::path::PathBuf>) {}
     fn register_lease(
         &self,
         delivery: &RefreshableCredentialDelivery,
@@ -74,6 +75,9 @@ impl std::fmt::Debug for LeaseFactoryHandle {
 /// The monitor registers through `Arc<Self>` (it hands a clone to the tick
 /// thread), so the factory impl lives on the handle rather than on the value.
 impl CredentialLeaseFactory for Arc<CredentialRefreshMonitor> {
+    fn add_checkout_roots(&self, roots: Vec<std::path::PathBuf>) {
+        CredentialRefreshMonitor::add_checkout_roots(self, roots);
+    }
     fn register_redacted_lease(
         &self,
         delivery: &RefreshableCredentialDelivery,
@@ -105,6 +109,15 @@ pub(crate) fn register_container_leases(
     options: &ResolvedContainerOptions,
     container: &str,
 ) -> Vec<CredentialLease> {
+    if let Some(factory) = &options.lease_factory {
+        let roots = options
+            .working_dir
+            .iter()
+            .cloned()
+            .chain(options.agent_add_dirs.iter().map(|(_, p)| p.clone()))
+            .collect();
+        factory.0.add_checkout_roots(roots);
+    }
     if options.refreshable_credentials.is_empty() {
         return Vec::new();
     }

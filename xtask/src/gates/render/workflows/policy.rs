@@ -30,6 +30,9 @@ fn allowed_write(path: &str, job: &str, scope: &str) -> bool {
             "id-token" | "attestations"
         ) | ("promote.yml", "verify-inputs" | "receipt", "contents")
             | ("fixtures.yml", "publish", "contents")
+            // Protected-main fixture preparation attests the exact archives and
+            // reproduction record; only publication gets a contents write token.
+            | ("fixtures.yml", "build", "id-token" | "attestations")
             | ("nightly.yml", "flake-hunt", "issues")
             | (
                 "nightly.yml",

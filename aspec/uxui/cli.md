@@ -405,53 +405,69 @@ accepts the pull-worker interaction setting, but no pull worker runs currently.
 
 ## Runtime and image-source configuration
 
-User-facing labels and explanations call the embedded backend the "builtin runtime"
-or `builtin-experimental`. Dependency names belong in internal implementation
-details and the attribution at the bottom of the runtimes documentation. The
+User-facing labels and explanations call the embedded backend the "builtin
+runtime". Dependency names belong in internal implementation details and the attribution at the bottom of the runtimes documentation. The
 guest hostname for explicitly allowed host ports is `host.builtin.internal`.
 
-The `runtime` setting selects `docker`, `apple-containers`,
-`docker-sbx-experimental`, or `builtin-experimental` (released for macOS on
-Apple Silicon only; any other host refuses it before doing any work); an unset
-value keeps the existing Docker default. The unreleased spelling `builtin` is
-an unknown runtime whose error names `builtin-experimental`. `config set`
-rejects unknown runtime values, and commands that need no runtime keep
-working with an invalid stored value so it can be repaired. The builtin block is stored in global or repository config and
-repo values merge over global values. Its supported keys are `stateDir`,
-`vcpus` (default 2), `memoryMib` (default 4096, minimum 128), `rootDiskMib`
-(writable root disk, default 30720, minimum 256), `mountQuotaMib` (MiB the
-guest may add to each host mount, default 30720, minimum 1), `imageSource`,
-per-image `images`, per-host `registries`, and `network` (guest network
-policy: `mode` `public`/`allowlist`/`none`, default `public`; `allow`;
-`hostPorts`; global-only `nameservers`/`trustHostCas`). A repo `network`
-block may only narrow the global one — a stricter mode, a subset of the
-global `allow` list, a subset of the global `hostPorts` — never widen it, since
-repo config ships with the checkout and may be untrusted. Network, `vcpus`,
-`memoryMib`, `rootDiskMib` and `mountQuotaMib` are resolved per session at every launch, so a repo's values
-apply wherever an agent for that repo runs (CLI, a TUI tab, an API session, a
-squad task, or a workflow worktree). A workflow worktree is cut from a commit, so
-its session takes the invoking checkout's repo `builtin` block and default
-`agent`, not the committed ones, and every session gets the global config the
-invoking process loaded (honouring `AWMAN_CONFIG_HOME`). An invalid or widening
-repo block fails that repo's launches only: runtime detection resolves only the
-process-wide settings, and runtimes other than builtin never read the block.
-The state directory is resolved in this order: the
-`AWMAN_BUILTIN_STATE_DIR` environment variable, then `builtin.stateDir` (repo
-over global), then `<data home>/builtin`. It is effectively process-wide: a
-repo `builtin.stateDir` that resolves to a different directory than the
-process's is rejected for that launch with an error naming both paths, while a
-value equal to the process's is accepted. Keep the directory path short, since
-control sockets live beneath it. For example:
+`runtime.kind` selects `docker` (default), `apple`, `sbx`, or `builtin`.
+`sbx` and `builtin` are experimental. The builtin microVM is an experimental
+preview on macOS Apple Silicon and Linux x86_64 GNU builds with read/write
+`/dev/kvm` access; Linux ARM64 remains gated. Unsupported hosts fail explicitly
+without substituting another runtime. Unknown values are rejected, never
+silently mapped to Docker. Configuration uses the nested `runtime` object:
 
 ```json
 {
-  "runtime": "builtin-experimental",
-  "builtin": {
-    "vcpus": 2,
-    "memoryMib": 4096,
-    "imageSource": { "type": "registry", "registry": "ghcr.io" },
-    "images": {
-      "awman-agent:latest": { "type": "archive", "path": "/images/agent.oci.tar" }
+  "runtime": {
+    "kind": "builtin",
+    "builtin": {
+      "imageSource": { "type": "registry", "registry": "ghcr.io" }
+    }
+  }
+}
+```
+
+`runtime.kind` and `runtime.builtin.stateDir` are process-scoped. The process
+resolves them at startup; a command-local override that differs from the
+running process is refused and requires restarting with the requested value.
+`runtime.builtin.stateDir` resolves from `AWMAN_RUNTIME_BUILTIN_STATE_DIR`,
+then global config, then `<data home>/builtin`; a repository value may repeat
+that path but cannot change it. Other builtin settings, including `network`,
+`vcpus`, `memory`, `rootDisk`, `mountQuota`, image sources, images,
+registries and `builder.enabled`, are session-scoped and resolve from each
+session's effective config. Repository values override global values by key;
+a repository network policy may narrow but never widen the global policy.
+Workflow worktree sessions retain the invoking session's repo settings.
+
+Image building is opt-in with `runtime.builtin.builder.enabled` (default
+false). The builder can build only through the local Docker Engine selected by
+`docker-local` (Unix socket) or the Apple Containers store selected by
+`apple-local`, and imports from that same source. Registry, archive, remote
+Docker and unconfigured sources do not select a builder. `ready` and API
+session setup may build when their policy permits; workflow preflight, dynamic
+workflow and squad evaluation use import-only policy and do not build. `awman
+init` uses the configured runtime's build operation and does not build through
+the builtin runtime; initialize with Docker or Apple Containers, then select
+builtin.
+
+The builtin block supports `stateDir`, `vcpus` (default 2), `memory` (default
+`4GiB`, minimum `128MiB`), `rootDisk` (default `30GiB`, minimum `256MiB`),
+`mountQuota` (default `30GiB`, minimum `1MiB`), `imageSource`, per-image `images`,
+per-host `registries`, `builder.enabled`, and `network` (`public`, `allowlist`,
+or `none`; optional `allow` and `hostPorts`; global-only `nameservers` and
+`trustHostCas`).
+
+```json
+{
+  "runtime": {
+    "kind": "builtin",
+    "builtin": {
+      "vcpus": 2,
+      "memory": "4GiB",
+      "imageSource": { "type": "registry", "registry": "ghcr.io" },
+      "images": {
+        "awman-agent:latest": { "type": "archive", "path": "/images/agent.oci.tar" }
+      }
     }
   }
 }
@@ -466,17 +482,17 @@ select a local or remote Engine endpoint and TLS files. Apple-local acquisition
 image helper: it refuses service releases outside the pinned list, never runs
 the `container` CLI or reads the private store, and validates the export like
 any other archive. Off macOS, or without the bridge, it is reported blocked.
-`builtin.builder.enabled` defaults to false. When enabled, `ready` may build
+`runtime.builtin.builder.enabled` defaults to false. When enabled, `ready` may build
 only through the local Docker Engine or Apple Containers store selected by
 that image's resolved source, then imports from that same source. Registry,
 archive, remote Docker, and unconfigured sources do not select a builder.
 Incompatible requested builds warn and retain normal source import behavior.
-API session setup, `chat`, `exec prompt`, workflow preflight (static and dynamic)
-and squad image checks may build missing or stale source images through the
-same explicitly enabled compatible local builder, then import them. The
-workflow prerequisite review reports this pending preparation using the same
-input hashes, including generated recipes and project-image dependencies.
-With the builder disabled a launch never acquires.
+API session setup may build a missing compatible-source image. `chat`,
+`exec prompt`, workflow preflight (static and dynamic) and squad evaluation
+only import from the selected source and never build. The workflow prerequisite
+review reports pending preparation using the same input hashes, including
+generated recipes and project-image dependencies. With the builder disabled a
+launch never acquires.
 These checks re-acquire an image that is present but was imported from a different
 source than the one now resolved, so an image they accept is the one `ready`
 would have accepted. Like `ready`, they refuse to import a default source that

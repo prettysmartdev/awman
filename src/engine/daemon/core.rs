@@ -45,9 +45,9 @@ pub struct Core {
 impl Core {
     pub fn open(deps: CoreDeps) -> Result<Arc<Self>, EngineError> {
         deps.daemon_paths.ensure_root()?;
+        // The one migration-aware opener shared with foreground producers.
         let legacy = crate::data::fs::api_paths::ApiPaths::from_env(&deps.env)?;
-        deps.data_paths.migrate_legacy_db(legacy.root())?;
-        let session_store = Arc::new(SqliteSessionStore::open_at(&deps.data_paths.db_path())?);
+        let session_store = deps.data_paths.open_session_store(legacy.root())?;
         Self::with_session_store(deps, session_store)
     }
     /// Assemble a core around an existing store. Embedded callers can share

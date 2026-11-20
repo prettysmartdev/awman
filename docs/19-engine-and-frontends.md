@@ -52,6 +52,14 @@ awman daemon api dialogs.list id=ins_…
 
 `awman daemon api --list` shows every action with its route, including `dialogs.answer` (answer a pending dialog by ID) and `ui.request` (ask an instance to open or close a tab or change focus). Engine routes are served on the local listener only. See [API & Remote Mode](09-api-and-remote-mode.md#engine-routes).
 
+## Commands, disconnects and process settings
+
+Work the engine admits belongs to the engine, not to the terminal or browser that asked for it. Closing or losing a frontend, or a client dropping an API request, does not cancel a command or session setup that was already admitted; it keeps running and you can reconnect and look at it. To stop work, cancel it explicitly: a cancel that arrives before the command has started is honoured, and a cancelled one-shot run closes only after its cleanup finishes. When the daemon shuts down it waits for setup cancellation, cleanup and finalization first.
+
+The runtime (`runtime.kind`), the builtin state directory and the credential-refresh settings are fixed when the TUI or daemon starts. A `--set` for one of them in the command box, or in an API command's `args`, that differs from the running value is refused before anything is created (`process_scoped_setting`, HTTP 409 over the API), with the `--set` to restart with; see [Settings fixed for an awman process](07-configuration.md#settings-fixed-for-an-awman-process). Everything else you `--set` applies to that command only.
+
+`awman agents profile list`, `close` and `delete` show their result in the TUI status log (a failed close as an error), and API clients receive the same JSON as `--json` in the command's `data`, with a failed command status when a close fails.
+
 ## Upgrading awman
 
 The TUI and the daemon must be the same awman build to share an instance. If you start a newer awman while an older daemon is running:

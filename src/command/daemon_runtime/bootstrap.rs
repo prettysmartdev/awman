@@ -22,7 +22,7 @@ use crate::command::{
     error::CommandError,
 };
 use crate::data::{
-    config::{env::EnvSnapshot, ConfigLayers, EffectiveConfig, FlagConfig},
+    config::{env::EnvSnapshot, EffectiveConfig},
     daemon_state::{EnabledBy, FeatureName},
     fs::{prerequisite_grants::PrerequisiteGrantStore, DataPaths},
 };
@@ -52,20 +52,19 @@ impl DaemonRuntime {
     pub async fn bootstrap<F: ApiCommandFrontendFactory + 'static>(
         b: DaemonBootstrap<F>,
     ) -> Result<(Arc<Self>, DaemonClaim), CommandError> {
-        let engines = Engines::for_env(b.env.clone())?;
-        let config = EffectiveConfig::resolve(
-            ConfigLayers {
-                global: (*engines.global_config).clone(),
-                set: b.set.clone(),
-                env: crate::data::config::effective::env_overrides(
-                    &b.env,
-                    &[&engines.global_config],
-                )?,
-                ..Default::default()
-            },
-            FlagConfig::default(),
-            b.env.clone(),
-        )?;
+        Self::bootstrap_with_engine_factory(b, Engines::for_process_config).await
+    }
+
+    /// Construct once from effective startup config. The injected factory is
+    /// also used by embedded hosts; it must honor the configured backend.
+    pub async fn bootstrap_with_engine_factory<F: ApiCommandFrontendFactory + 'static>(
+        b: DaemonBootstrap<F>,
+        factory: impl FnOnce(&EffectiveConfig) -> Result<Engines, crate::engine::error::EngineError>,
+    ) -> Result<(Arc<Self>, DaemonClaim), CommandError> {
+        let config = Engines::resolve_process_config(b.env.clone(), b.set.clone())?;
+        let engines = factory(&config)?;
+        Engines::check_runtime_identity(&engines.process_binding(), engines.runtime.as_ref())?;
+        engines.validate_process_config(&config)?;
         let settings = config.daemon();
         if !settings.squad.enabled && !settings.worker.enabled && !settings.engine.enabled {
             return Err(CommandError::DaemonNoFeatures);
@@ -114,7 +113,7 @@ impl DaemonRuntime {
             max_concurrent_jobs: settings.max_concurrent_jobs,
             terminal_hub: b.terminal_hub,
         })?;
-        let engines = Engines::from_core(&core, Arc::new(config.config().clone()));
+        let engines = Engines::from_core(&core, built.global_config.clone());
         let keys = ApiKeyStore::open(core.daemon_paths().api_keys_file())?;
         let browser = crate::command::daemon_api::browser::BrowserAuth::open(
             core.daemon_paths().browser_grants_file(),
@@ -157,6 +156,7 @@ impl DaemonRuntime {
             workdirs: recovered.workdirs.clone(),
             workdir_roots: recovered.workdir_roots.clone(),
             started_at: core.started_at(),
+            setup_stopping: std::sync::atomic::AtomicBool::new(false),
             task_handles: tokio::sync::Mutex::new(Vec::new()),
             engines: engines.clone(),
             sessions: recovered.sessions.clone(),

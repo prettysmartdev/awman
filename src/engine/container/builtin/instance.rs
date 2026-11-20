@@ -10,11 +10,14 @@ use crate::engine::{
 };
 use std::sync::Arc;
 pub struct LaunchPlan {
+    pub mount_guard: Option<crate::data::mount_authority::MountSourceGuard>,
     pub spec: SandboxSpec,
     pub command: ExecRequest,
     pub name: String,
     pub remove_on_exit: bool,
     pub persistent_stdin: bool,
+    pub startup_grace: Option<std::time::Duration>,
+    pub output_tail: Arc<crate::engine::agent_runtime::output_tail::OutputTail>,
     pub seeded_prompt: Option<String>,
     pub leases: Vec<crate::engine::credential_refresh::CredentialLease>,
     pub prompt_files: Vec<crate::engine::container::options::PromptFileGuard>,
@@ -62,6 +65,15 @@ impl Instance {
             owner: self.owner.clone(),
             armed: true,
         };
+        if let Some(guard) = &self.plan.mount_guard {
+            guard
+                .verify()
+                .map_err(|error| EngineError::MountOutsideAuthority {
+                    path: guard.authority.root().to_path_buf(),
+                    authority_root: guard.authority.root().to_path_buf(),
+                    reason: error.to_string(),
+                })?;
+        }
         self.driver.create(self.plan.spec)?;
         let mut request = self.plan.command;
         if let Some(notice) = self.plan.terminal_env_notice.clone() {
@@ -95,6 +107,8 @@ impl Instance {
                 prompt_files: self.plan.prompt_files,
                 io,
                 cancel_grace: self.cancel_grace,
+                startup_grace: self.plan.startup_grace,
+                output_tail: self.plan.output_tail,
             })
             .run(frontend)?;
         launch_cleanup.armed = false;
@@ -111,9 +125,12 @@ struct LaunchCleanup {
 impl Drop for LaunchCleanup {
     fn drop(&mut self) {
         if self.armed {
-            let _ =
-                self.driver
-                    .stop_owned(&self.id, &self.owner, std::time::Duration::from_secs(2));
+            let _ = self.driver.finish_owned(
+                &self.id,
+                &self.owner,
+                std::time::Duration::from_secs(2),
+                true,
+            );
         }
     }
 }

@@ -19,6 +19,7 @@ pub mod program_status_projection;
 pub mod prompts;
 pub mod session_create;
 pub mod session_git_transport;
+pub mod session_lifecycle;
 pub mod session_setup;
 pub mod startup;
 pub mod stats_sampler;

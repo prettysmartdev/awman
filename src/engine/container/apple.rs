@@ -110,7 +110,7 @@ fn extract_apple_started_at(row: &serde_json::Value) -> chrono::DateTime<chrono:
         .and_then(|v| v.as_str())
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.with_timezone(&chrono::Utc))
-        .unwrap_or_else(chrono::Utc::now)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
 }
 
 /// Check whether the row represents a running container.
@@ -119,9 +119,28 @@ fn extract_apple_started_at(row: &serde_json::Value) -> chrono::DateTime<chrono:
 /// If absent (Docker-style output from `ps`), assume running.
 fn is_apple_running(row: &serde_json::Value) -> bool {
     match row.get("status").and_then(|v| v.as_str()) {
-        Some(s) => s == "running",
+        // Paused, stopping and unknown states cannot prove shutdown. Keep
+        // them visible to lifecycle reconciliation until terminal is known.
+        Some(s) => !matches!(s, "stopped" | "exited" | "dead"),
         None => true,
     }
+}
+
+fn validate_apple_listing(stdout: &str) -> Result<(), EngineError> {
+    if let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(stdout) {
+        if rows.iter().all(serde_json::Value::is_object) {
+            return Ok(());
+        }
+    } else if !stdout.trim().is_empty()
+        && stdout.lines().all(|line| {
+            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|row| row.is_object())
+        })
+    {
+        return Ok(());
+    }
+    Err(EngineError::Container(
+        "container list returned invalid state; shutdown is unconfirmed".into(),
+    ))
 }
 
 /// Check whether the row's name matches awman container patterns.
@@ -135,6 +154,14 @@ fn is_awman_container(name: &str) -> bool {
 /// has no server-side name filter, so name-prefix discovery is done here,
 /// client-side.
 fn parse_apple_list_output(stdout: &str, name_prefix: Option<&str>) -> Vec<AgentHandle> {
+    parse_apple_list_state(stdout, name_prefix, false)
+}
+
+fn parse_apple_list_state(
+    stdout: &str,
+    name_prefix: Option<&str>,
+    stopped: bool,
+) -> Vec<AgentHandle> {
     let arr: Result<Vec<serde_json::Value>, _> = serde_json::from_str(stdout);
     let rows: Vec<serde_json::Value> = match arr {
         Ok(v) => v,
@@ -145,7 +172,15 @@ fn parse_apple_list_output(stdout: &str, name_prefix: Option<&str>) -> Vec<Agent
     };
     let mut handles = Vec::new();
     for row in rows {
-        if !is_apple_running(&row) {
+        let terminal = matches!(
+            row.get("status").and_then(|v| v.as_str()),
+            Some("stopped" | "exited" | "dead")
+        );
+        if if stopped {
+            !terminal
+        } else {
+            !is_apple_running(&row)
+        } {
             continue;
         }
         let name = extract_apple_name(&row);
@@ -263,12 +298,16 @@ impl ContainerBackend for AppleBackend {
         let output = crate::engine::host_cli::checked_output(
             self.cli()
                 .command()
-                .args(["list", "--format", "json"])
+                .args(["list", "--all", "--format", "json"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null()),
             "container",
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() {
+            return Err(EngineError::Container("container list --all failed".into()));
+        }
+        validate_apple_listing(&stdout)?;
         Ok(parse_apple_list_output(&stdout, None))
     }
 
@@ -459,8 +498,21 @@ impl ContainerBackend for AppleBackend {
     }
 
     fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
-        // Apple's CLI cannot enumerate stopped containers by awman ownership.
-        Ok(Vec::new())
+        let output = crate::engine::host_cli::checked_output(
+            self.cli()
+                .command()
+                .args(["list", "--all", "--format", "json"]),
+            "container",
+        )?;
+        if !output.status.success() {
+            return Err(EngineError::Container("container list --all failed".into()));
+        }
+        validate_apple_listing(&String::from_utf8_lossy(&output.stdout))?;
+        Ok(parse_apple_list_state(
+            &String::from_utf8_lossy(&output.stdout),
+            None,
+            true,
+        ))
     }
 
     fn list_dangling_images(&self) -> Result<Vec<ContainerImageInfo>, EngineError> {
@@ -514,15 +566,7 @@ impl ContainerBackend for AppleBackend {
         &self,
         request: &background::BackgroundLaunchRequest<'_>,
     ) -> Result<String, EngineError> {
-        background::default_start_background(
-            self.cli(),
-            request.name,
-            request.image,
-            request.workdir,
-            request.env,
-            request.overlays,
-            request.secret_env,
-        )
+        background::default_start_background(self.cli(), request)
     }
 
     fn exec_in_background(
@@ -753,5 +797,21 @@ mod workspace_access_tests {
         )));
         options.tmpfs.clear();
         assert!(backend.build(options).is_err());
+    }
+}
+
+#[cfg(test)]
+mod missing_timestamp_tests {
+    #[test]
+    fn a_stopped_row_without_timestamp_has_stable_identity() {
+        let row = serde_json::json!({"name":"awman-stopped", "status":"stopped"});
+        assert_eq!(
+            super::extract_apple_started_at(&row),
+            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
+        );
+        assert_eq!(
+            super::extract_apple_started_at(&row),
+            super::extract_apple_started_at(&row)
+        );
     }
 }

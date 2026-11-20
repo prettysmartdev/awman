@@ -226,7 +226,7 @@ fn durable_reservation_dedup_completion_and_turn_pagination() {
             [],
             |r| r.get(0),
         )?;
-        assert_eq!(count, 6);
+        assert_eq!(count, 7);
         let raw: String = c.query_row(
             "SELECT operation_digest FROM agent_request_dedup LIMIT 1",
             [],
@@ -555,11 +555,16 @@ fn retention_keeps_live_execution_and_prunes_its_records_only_after_cleanup() {
     store
         .finish_execution(&record.execution_id, &assurance, None)
         .unwrap();
-    let result = CommandResult {
-        exit_code: Some(0),
-        automation: Some(assurance),
-        ..Default::default()
-    };
+    let mut result: CommandResult = serde_json::from_str(
+        db.get_command(record.command_id.as_str())
+            .unwrap()
+            .unwrap()
+            .result
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    result.exit_code = Some(0);
     store
         .finalize_command(
             &record.command_id,
@@ -731,4 +736,337 @@ fn direct_turn_lookup_liveness_leases_and_unfinalized_ended_executions() {
     let listed = store.list_unfinalized_ended().unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].execution_id, record.execution_id);
+}
+
+#[test]
+fn terminal_commit_is_atomic_and_cancellation_is_serialized_with_it() {
+    use awman::data::automation::{CleanupStatus, OutputStatus, StatusSupport};
+    for cancel_before in [false, true] {
+        let sandbox=crate::support::sandbox("data::automation_store::terminal_commit_is_atomic_and_cancellation_is_serialized_with_it");
+        let (db, store, record) = setup(&sandbox.root().join("db"));
+        let lifecycle =
+            awman::data::api_lifecycle_store::CommandLifecycleStore::open(db.clone()).unwrap();
+        let reserved = reservation(&record, 1);
+        let turn = reserved.turn.turn_id.clone();
+        let request = reserved.turn.request_id;
+        let digest = reserved.digest.clone();
+        let mut ended = reserved.snapshot.clone();
+        store.reserve_turn(reserved, record.revision).unwrap();
+        ended.revision += 1;
+        ended.state = AutomationState::Ended;
+        ended.active_turn_id = None;
+        let result: TurnResult =
+            serde_json::from_value(fixture()["automation_examples"]["turn_result"].clone())
+                .unwrap();
+        let assurance = CommandAutomationResult {
+            execution_id: record.execution_id.clone(),
+            native_session_id: None,
+            last_turn_id: Some(turn.clone()),
+            native_start_mode: record.native_start_mode,
+            workspace_access: record.workspace_access,
+            status_support: StatusSupport::Full,
+            completion_verified: result.completion_verified,
+            output_status: OutputStatus::Complete,
+            cleanup_status: CleanupStatus::Complete,
+        };
+        let event = ExecutionEvent {
+            timestamp: Utc::now(),
+            attempt: 1,
+            sequence: 7,
+            source: None,
+            payload: EventPayload::AgentState {
+                snapshot: Box::new(ended.clone()),
+            },
+        };
+        let projection = LifecycleProjection {
+            cursor: event.cursor(),
+            events: vec![event],
+        };
+        if cancel_before {
+            lifecycle
+                .request_cancel(&record.command_id, &Utc::now().to_rfc3339())
+                .unwrap();
+        }
+        // A failure at the last DB write rolls the earlier turn and execution
+        // writes back, including the pending publication reservation.
+        db.with_conn(|c| { c.execute_batch("CREATE TRIGGER fault BEFORE UPDATE OF result ON commands BEGIN SELECT RAISE(ABORT,'projection failed'); END;")?; Ok(()) }).unwrap();
+        assert!(store
+            .complete_execution(&turn, &result, &ended, &assurance, None, Some(&projection))
+            .is_err());
+        let unchanged = store.read_execution(&record.execution_id).unwrap();
+        assert_eq!(unchanged.active_turn_id, Some(turn.clone()));
+        assert!(unchanged.pending_events.is_none());
+        assert!(unchanged.final_assurance.is_none());
+        assert!(store
+            .read_turn(&record.execution_id, &turn)
+            .unwrap()
+            .unwrap()
+            .result
+            .is_none());
+        db.with_conn(|c| {
+            c.execute_batch("DROP TRIGGER fault")?;
+            Ok(())
+        })
+        .unwrap();
+        store
+            .complete_execution(&turn, &result, &ended, &assurance, None, Some(&projection))
+            .unwrap();
+        if !cancel_before {
+            lifecycle
+                .request_cancel(&record.command_id, &Utc::now().to_rfc3339())
+                .unwrap();
+        }
+        let saved = store.read_execution(&record.execution_id).unwrap();
+        assert_eq!(saved.launch_phase, LaunchPhase::Ended);
+        assert!(store
+            .lookup_request(&record.owner_key, &record.execution_id, request, &digest)
+            .is_err());
+        assert_eq!(
+            saved.end_failure.as_ref().map(|f| f.code.as_str()),
+            cancel_before.then_some("cancelled")
+        );
+        let command = db.get_command(record.command_id.as_str()).unwrap().unwrap();
+        let projected: CommandResult =
+            serde_json::from_str(command.result.as_ref().unwrap()).unwrap();
+        assert_eq!(projected.automation, Some(assurance));
+        let completion = CommandCompletion {
+            attempt: 1,
+            status: CommandStatus::Done,
+            exit_code: 0,
+            finished_at: Utc::now().to_rfc3339(),
+            result_json: command.result.unwrap(),
+        };
+        assert!(store
+            .finalize_command(&record.command_id, &completion)
+            .is_err());
+        assert!(!db
+            .finalize_running_command(record.command_id.as_str(), &completion)
+            .unwrap());
+        store
+            .clear_pending_events(&record.execution_id, projection.cursor)
+            .unwrap();
+        assert!(matches!(
+            store
+                .lookup_request(&record.owner_key, &record.execution_id, request, &digest)
+                .unwrap(),
+            RequestLookup::Replay {
+                result: Some(_),
+                ..
+            }
+        ));
+        let mut contradictory = completion.clone();
+        contradictory.result_json = "{}".into();
+        assert!(store
+            .finalize_command(&record.command_id, &contradictory)
+            .is_err());
+        assert!(db
+            .finalize_running_command(record.command_id.as_str(), &contradictory)
+            .is_err());
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE commands SET result=NULL WHERE id=?",
+                [record.command_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(store
+            .finalize_command(&record.command_id, &completion)
+            .is_err());
+        assert!(db
+            .finalize_running_command(record.command_id.as_str(), &completion)
+            .is_err());
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE commands SET result=? WHERE id=?",
+                rusqlite::params![completion.result_json, record.command_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(store
+            .finalize_command(&record.command_id, &completion)
+            .unwrap());
+    }
+}
+
+#[test]
+fn stale_and_oversized_terminal_commits_leave_every_projection_unchanged() {
+    use awman::data::automation::{CleanupStatus, OutputStatus, StatusSupport};
+    let sandbox=crate::support::sandbox("data::automation_store::stale_and_oversized_terminal_commits_leave_every_projection_unchanged");
+    let (db, store, record) = setup(&sandbox.root().join("db"));
+    let r = reservation(&record, 1);
+    let turn = r.turn.turn_id.clone();
+    let mut ended = r.snapshot.clone();
+    store.reserve_turn(r, record.revision).unwrap();
+    ended.state = AutomationState::Ended;
+    ended.active_turn_id = None;
+    let mut result: TurnResult =
+        serde_json::from_value(fixture()["automation_examples"]["turn_result"].clone()).unwrap();
+    let assurance = CommandAutomationResult {
+        execution_id: record.execution_id.clone(),
+        native_session_id: None,
+        last_turn_id: Some(turn.clone()),
+        native_start_mode: record.native_start_mode,
+        workspace_access: record.workspace_access,
+        status_support: StatusSupport::Full,
+        completion_verified: true,
+        output_status: OutputStatus::Complete,
+        cleanup_status: CleanupStatus::Complete,
+    };
+    assert!(store
+        .complete_execution(&turn, &result, &ended, &assurance, None, None)
+        .unwrap_err()
+        .to_string()
+        .contains("stale_revision"));
+    ended.revision += 1;
+    result.final_message = Some("x".repeat(MAX_TURN_RESULT_BYTES));
+    assert!(store
+        .complete_execution(&turn, &result, &ended, &assurance, None, None)
+        .unwrap_err()
+        .to_string()
+        .contains("bound"));
+    assert!(store
+        .read_turn(&record.execution_id, &turn)
+        .unwrap()
+        .unwrap()
+        .result
+        .is_none());
+    assert!(store
+        .read_execution(&record.execution_id)
+        .unwrap()
+        .final_assurance
+        .is_none());
+    assert!(db
+        .get_command(record.command_id.as_str())
+        .unwrap()
+        .unwrap()
+        .result
+        .is_none());
+}
+
+#[test]
+fn post_profile_cleanup_is_durable_and_never_upgraded_by_reopen() {
+    use awman::data::automation::{CleanupStatus, OutputStatus, StatusSupport};
+    let s = crate::support::sandbox(
+        "data::automation_store::post_profile_cleanup_is_durable_and_never_upgraded_by_reopen",
+    );
+    let (db, store, record) = setup(&s.tmp().join("cleanup-db"));
+    store.begin_profile_cleanup(&record.execution_id).unwrap();
+    let r = reservation(&record, 1);
+    let turn = r.turn.turn_id.clone();
+    let mut ended = r.snapshot.clone();
+    store.reserve_turn(r, record.revision).unwrap();
+    ended.revision += 1;
+    ended.state = AutomationState::Ended;
+    ended.active_turn_id = None;
+    let result: TurnResult =
+        serde_json::from_value(fixture()["automation_examples"]["turn_result"].clone()).unwrap();
+    let assurance = CommandAutomationResult {
+        execution_id: record.execution_id.clone(),
+        native_session_id: None,
+        last_turn_id: Some(turn.clone()),
+        native_start_mode: record.native_start_mode,
+        workspace_access: record.workspace_access,
+        status_support: StatusSupport::Full,
+        completion_verified: true,
+        output_status: OutputStatus::Complete,
+        cleanup_status: CleanupStatus::Complete,
+    };
+    store
+        .complete_execution(&turn, &result, &ended, &assurance, None, None)
+        .unwrap();
+    store
+        .finish_profile_cleanup(&record.execution_id, false)
+        .unwrap();
+    // A late contradictory successful retry cannot erase the durable failure.
+    store
+        .finish_profile_cleanup(&record.execution_id, true)
+        .unwrap();
+    let e = store.read_execution(&record.execution_id).unwrap();
+    assert_eq!(
+        e.final_assurance.unwrap().cleanup_status,
+        CleanupStatus::Pending
+    );
+    assert_eq!(e.end_failure.unwrap().code, "cleanup_timeout");
+    let command = db.get_command(record.command_id.as_str()).unwrap().unwrap();
+    let saved: CommandResult = serde_json::from_str(command.result.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        saved.final_message, None,
+        "chat's command contract omits final_message"
+    );
+    assert_eq!(
+        saved.automation.as_ref().unwrap().cleanup_status,
+        CleanupStatus::Pending
+    );
+    db.complete_command(
+        record.command_id.as_str(),
+        CommandStatus::Error,
+        Some(1),
+        command.result.as_deref(),
+    )
+    .unwrap();
+    let reopened = AutomationStore::open(db).unwrap();
+    assert_eq!(
+        reopened
+            .read_execution(&record.execution_id)
+            .unwrap()
+            .final_assurance
+            .unwrap()
+            .cleanup_status,
+        CleanupStatus::Pending
+    );
+}
+
+#[test]
+fn old_ended_command_without_result_is_repaired_only_on_store_open() {
+    use awman::data::automation::{CleanupStatus, OutputStatus, StatusSupport};
+    let s = crate::support::sandbox(
+        "data::automation_store::old_ended_command_without_result_is_repaired_only_on_store_open",
+    );
+    let (db, store, record) = setup(&s.tmp().join("legacy-db"));
+    let r = reservation(&record, 1);
+    let turn = r.turn.turn_id.clone();
+    let mut ended = r.snapshot.clone();
+    store.reserve_turn(r, record.revision).unwrap();
+    ended.revision += 1;
+    ended.state = AutomationState::Ended;
+    ended.active_turn_id = None;
+    let result: TurnResult =
+        serde_json::from_value(fixture()["automation_examples"]["turn_result"].clone()).unwrap();
+    let assurance = CommandAutomationResult {
+        execution_id: record.execution_id.clone(),
+        native_session_id: None,
+        last_turn_id: Some(turn.clone()),
+        native_start_mode: record.native_start_mode,
+        workspace_access: record.workspace_access,
+        status_support: StatusSupport::Full,
+        completion_verified: true,
+        output_status: OutputStatus::Complete,
+        cleanup_status: CleanupStatus::Complete,
+    };
+    store
+        .complete_execution(&turn, &result, &ended, &assurance, None, None)
+        .unwrap();
+    db.with_conn(|c| {
+        c.execute(
+            "UPDATE commands SET result=NULL WHERE id=?",
+            [record.command_id.as_str()],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let reopened = AutomationStore::open(db.clone()).unwrap();
+    let command = db.get_command(record.command_id.as_str()).unwrap().unwrap();
+    let saved: CommandResult = serde_json::from_str(command.result.as_deref().unwrap()).unwrap();
+    assert_eq!(saved.automation, Some(assurance));
+    assert_eq!(saved.final_message, None);
+    assert_eq!(reopened.list_unfinalized_ended().unwrap().len(), 1);
+    db.complete_command(
+        record.command_id.as_str(),
+        CommandStatus::Done,
+        Some(0),
+        command.result.as_deref(),
+    )
+    .unwrap();
 }

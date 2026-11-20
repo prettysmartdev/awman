@@ -40,7 +40,39 @@ pub use git_process::spawn as spawn_git;
 mod metadata;
 #[cfg(windows)]
 pub use metadata::publish as publish_git_metadata;
+/// Install the native filesystem providers: Git metadata publication and the
+/// owner-only private-file boundary (see [`install_private_files`]). The binary
+/// and the component test support call this once at startup.
 #[cfg(windows)]
 pub fn install_metadata_publisher() {
     awman::data::fs::git_metadata::GitMetadataCopy::install_windows_publisher(metadata::publish);
+    install_private_files();
+}
+
+#[cfg(windows)]
+mod private_fs;
+/// Rename an open private file within its own directory, replacing the
+/// target entry (never writing through it), with POSIX semantics where
+/// supported. The file needs DELETE access.
+#[cfg(windows)]
+pub use metadata::publish_replacing as publish_private_file;
+#[cfg(windows)]
+pub use private_fs::{
+    create_dir as private_create_dir, create_file as private_create_file,
+    final_path as private_final_path, verify as private_verify,
+};
+
+/// Install the native Windows boundary used by `awman::data::fs::private_files`.
+/// Without it every private store on Windows is refused before anything is written.
+#[cfg(windows)]
+pub fn install_private_files() {
+    awman::data::fs::private_files::install_windows_native(
+        awman::data::fs::private_files::WindowsNative {
+            create_dir: private_fs::create_dir,
+            create_file: private_fs::create_file,
+            verify: private_fs::verify,
+            final_path: private_fs::final_path,
+            rename: metadata::publish_replacing,
+        },
+    );
 }

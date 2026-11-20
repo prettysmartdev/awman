@@ -407,7 +407,7 @@ Workflow [setup and teardown](05-workflows.md#container-execution-model) steps g
   ctrl-m minimize  ·  ctrl-\ detach  ·  scroll ↕ history
 ```
 
-The title bar shows the agent, `(containerized)` — or `(sandboxed)` under `docker-sbx-experimental` — the workflow step when one is running, and on the right the container name, live CPU usage, memory, and total runtime. Stats are polled from the container runtime every 3 seconds.
+The title bar shows the agent, `(containerized)` — or `(sandboxed)` under the `sbx` runtime — the workflow step when one is running, and on the right the container name, live CPU usage, memory, and total runtime. Stats are polled from the container runtime every 3 seconds.
 
 ### Keyboard and mouse
 

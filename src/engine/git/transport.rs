@@ -45,6 +45,42 @@ fn spawn_contained(
     }
 }
 
+/// Reaping Git's leader does not wait for its killed helpers to exit. Keep
+/// cancellation inside the transport boundary until the whole group is quiet.
+#[cfg(target_os = "linux")]
+fn wait_for_killed_group(pgid: u32) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let mut live = false;
+        for entry in std::fs::read_dir("/proc")?.flatten() {
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let Some((_, fields)) = stat.rsplit_once(") ") else {
+                continue;
+            };
+            let mut fields = fields.split_whitespace();
+            let state = fields.next();
+            let _parent = fields.next();
+            let group = fields.next().and_then(|s| s.parse::<u32>().ok());
+            if group == Some(pgid) && !matches!(state, Some("Z" | "X")) {
+                live = true;
+                break;
+            }
+        }
+        if !live {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "killed Git process group did not exit",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// A helper installation contains paths/handles only, never a secret in argv or env.
 pub trait CredentialHelper: Send + Sync + std::fmt::Debug {
     fn git_config_args(&self) -> Vec<String>;
@@ -285,6 +321,8 @@ impl HostGitTransport {
                 let _ = child.kill();
                 drop(job.take());
                 let status = child.wait().map_err(io)?;
+                #[cfg(target_os = "linux")]
+                wait_for_killed_group(child.id()).map_err(io)?;
                 stopped?;
                 timed_out = true;
                 break status;
@@ -383,6 +421,8 @@ impl TransportGuard {
                 let _ = child.kill();
                 drop(job.take());
                 let _ = child.wait();
+                #[cfg(target_os = "linux")]
+                wait_for_killed_group(child.id()).map_err(io)?;
                 self.check()?;
                 return Err(EngineError::GitLocalTimeout);
             }

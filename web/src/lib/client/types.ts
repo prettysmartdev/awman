@@ -1394,6 +1394,7 @@ export interface NetworkListenerRecord {
   tls: TlsStatus | null;
   error: string | null;
   features: FeatureName[];
+  configured_features?: FeatureName[];
   api_keys: number;
   browser_links: boolean;
   allowed_origins: string[];

@@ -858,8 +858,8 @@ are written to the tab's status log, so a failed attach explains itself
 rather than silently returning to the task grid.
 
 Attach has the same semantics on every supported runtime. On **docker**, it is a
-native `docker attach` to the agent's TTY. On **apple-containers** and
-**builtin-experimental**, which have no attach verb, the awman process that launched the agent (the squad daemon, for squad tasks)
+native `docker attach` to the agent's TTY. On **apple** and
+**builtin**, which have no attach verb, the awman process that launched the agent (the squad daemon, for squad tasks)
 serves the agent's live terminal on a local, user-private socket, and attach
 connects to that. Either way you reach the real agent TUI, several clients
 can attach at once, and detaching never stops the container.
@@ -917,14 +917,14 @@ guardrails to every run rather than leaving them optional:
 - **Credentials are only ever injected at container startup**, the same as
   any other agent container, and are never written into a task's
   persistent directory where they'd survive across runs.
-- **A sandbox runtime (`docker-sbx-experimental`) is refused entirely.**
+- **A sandbox runtime (`runtime.kind` `sbx`) is refused entirely.**
   squad's task-directory mounts, its evaluation-agent handshake, and
   workflow setup/teardown steps all depend on a real container runtime.
   Every squad command — including daemon lifecycle commands such as `start`,
   `stop`, and `logs`, task commands, and the TUI — fails with a clear error
   naming the configured runtime rather than degrading silently.
-  Use `docker`, `apple-containers` or `builtin-experimental` (below) instead.
-- **The experimental builtin runtime (`builtin-experimental`, Apple Silicon) works with squad, with limits.** Squad discovers and attaches to its agents by name and label as on the other runtimes, and its tasks need imported images. With `runtime.builtin.builder.enabled` and a compatible local source, squad automatically builds missing source images and imports them, using the same preparation policy as workflow prerequisites. Installed images are not rebuilt; use `awman ready --build` to refresh them. Raw build output goes to squad's per-build log, while lifecycle messages and failure diagnostics stay in the daemon log. Like Apple Containers, a builtin session can be reattached only while the awman process that launched it (the squad daemon, for squad tasks) is still running; if the daemon exits, the agent VMs it launched stop with it. On macOS the squad daemon runs in the background under launchd, so macOS may ask for folder access again after every awman upgrade if a task's workspace is under `~/Desktop`, `~/Documents` or another protected folder; see [The macOS binary, Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
+  Use `docker`, `apple` or `builtin` (below) instead.
+- **The experimental builtin runtime (`runtime.kind` `builtin`; Apple Silicon, or Linux x86_64 with KVM) works with squad, with limits.** Squad discovers and attaches to its agents by name and label as on the other runtimes, and its tasks need imported images. Squad evaluates images by importing them from the configured source; it does not build on its own. Prepare them first with `awman ready` (with `runtime.builtin.builder.enabled` and a local `docker-local` or `apple-local` source, `ready` builds then imports; `awman ready --build` forces a refresh). Registry, archive and remote Docker sources are import-only. Like Apple Containers, a builtin session can be reattached only while the awman process that launched it (the squad daemon, for squad tasks) is still running; if the daemon exits, the agent VMs it launched stop with it. On macOS the squad daemon runs in the background under launchd, so macOS may ask for folder access again after every awman upgrade if a task's workspace is under `~/Desktop`, `~/Documents` or another protected folder; see [The macOS binary, Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
 
 ---
 
@@ -996,6 +996,10 @@ Daemon output is available with `awman daemon logs` and
 Task and run records remain in the shared database under
 `~/.awman/data/awman.db`. Squad task output and workspace files remain under
 `~/.awman/squad/`; the daemon log is under `~/.awman/daemon/`.
+
+### When a listener does not serve squad
+
+If the squad view reports that squad is not available through the listener you are connected to (for example the web app's loopback listener), awman looks at the current status of that listener and, when it can, shows the exact change to make while keeping the features the listener already serves, so squad is added to the list rather than replacing it. If awman cannot read that listener's current features (the status is unavailable or out of date), it does not guess a replacement: it tells you to inspect `awman status` and `awman config show`, then edit `daemon.network.listeners.<name>.features` yourself so that it lists every feature you want, including `squad`. Changing a listener's features ends its browser grants (see [Web App](20-webapp.md)).
 
 ## Authenticating network clients
 

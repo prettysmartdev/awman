@@ -35,6 +35,7 @@ impl ApiCommandFrontendFactory for ApiFrontendFactory {
         event_bus: crate::command::commands::api_server::event_bus::EventBusSender,
         state_writer: CommandStateWriter,
         interaction: crate::command::interaction::InteractionDecision,
+        shared_store: &std::sync::Arc<crate::data::fs::api_db::SqliteSessionStore>,
     ) -> Self::Frontend {
         let args: Vec<String> = serde_json::from_str(&command.args).unwrap_or_default();
         command_frontend::ApiDispatchFrontend::for_frontend(
@@ -52,6 +53,7 @@ impl ApiCommandFrontendFactory for ApiFrontendFactory {
         )
         .with_interaction(interaction)
         .with_state_writer(state_writer)
+        .with_shared_store(std::sync::Arc::clone(shared_store))
         .deferring_done()
     }
 }

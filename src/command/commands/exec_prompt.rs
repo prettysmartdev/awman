@@ -744,7 +744,7 @@ impl Command for ExecPromptCommand {
                         },
                         &final_prompt,
                     )?;
-                    run.launching();
+                    run.launching()?;
                     headless_run = Some(run);
                 }
                 if headless_run.is_some() {
@@ -754,11 +754,17 @@ impl Command for ExecPromptCommand {
                 let mut execution = match instance.run_with_frontend(container_frontend) {
                     Ok(e) => e,
                     Err(e) => {
+                        let mut storage_error = None;
                         if let Some(run) = headless_run.take() {
                             // The spawn failed: the reserved turn ends failed
                             // (never replayed), the execution ends.
                             let failed = Err(crate::engine::error::EngineError::Other(e.to_string()));
-                            run.finish(&native_stream, &failed, false).await;
+                            let finished = run.finish(&native_stream, &failed, false).await;
+                            if let Err(error @ CommandError::Data(_)) =
+                                crate::command::automation::launch::into_command_result(&finished)
+                            {
+                                storage_error = Some(error);
+                            }
                         }
                         frontend.set_pty_active(false);
                         frontend.replay_queued();
@@ -766,12 +772,10 @@ impl Command for ExecPromptCommand {
                             level: MessageLevel::Error,
                             text: format!("exec prompt: agent launch failed: {e}"),
                         });
-                        return Err(CommandError::from(e));
+                        return Err(storage_error.unwrap_or_else(|| CommandError::from(e)));
                     }
                 };
-                if let Some(run) = &headless_run {
-                    run.running();
-                }
+                let running_error = headless_run.as_ref().and_then(|run| run.running().err());
                 frontend.set_stuck_sender(execution.stuck_sender());
                 // Raced against an external cancel, the way a workflow step's
                 // wait is: the execution moves into a wait task, and a cancel
@@ -801,17 +805,19 @@ impl Command for ExecPromptCommand {
                 enum Interrupt {
                     Cancel,
                     Startup,
+                    Storage,
                 }
-                let first = tokio::select! {
+                let first = if running_error.is_some() { Err(Interrupt::Storage) } else { tokio::select! {
                     biased;
                     result = &mut wait_rx => Ok(result.unwrap_or_else(|_| dropped())),
                     _ = async {tokio::select! {_=self.cancel.cancelled()=>{},_=native_stream.mismatch.cancelled()=>{}}} => Err(Interrupt::Cancel),
                     _ = startup_expiry => Err(Interrupt::Startup),
-                };
+                } };
                 let exit = match first {
                     Ok(result) => result,
                     Err(why) => {
                         let text = match why {
+                            Interrupt::Storage => "exec prompt: storage failed; stopping the agent".to_string(),
                             Interrupt::Cancel => {
                                 cancelled = true;
                                 "exec prompt: cancelled; stopping the agent".to_string()
@@ -875,6 +881,7 @@ impl Command for ExecPromptCommand {
                 frontend.set_pty_active(false);
                 frontend.wait_output_drained().await;
                 frontend.replay_queued();
+                if let Some(error) = running_error { return Err(error); }
                 exit
             };
 

@@ -217,3 +217,199 @@ async fn api_chat_is_an_owner_local_interactive_automation_terminal_only() {
     server.shutdown().await;
     sandbox.finish();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_publishes_committed_automation_once_and_never_requeues_input() {
+    use awman::command::automation::{
+        controller::AutomationHost, launch::HeadlessRun, results::HeadlessObservation,
+    };
+    use awman::command::commands::api_server::event_bus::EventBus;
+    use awman::data::automation::{AutomationState, StatusSource, StatusSupport};
+    use awman::data::automation_records::{AutomationSnapshot, ExecutionProfileBinding};
+    use awman::data::automation_store::AutomationStore;
+    use awman::data::execution_event::{EventPayload, ExecutionEvent};
+    use awman::data::fs::api_command_log::{EventLog, OrderedCommandLog};
+    use awman::data::fs::api_db::CommandResult;
+    use awman::data::ids::ExecutionId;
+    use awman::data::settings_profile::{NativeSessionId, SettingsProfileName};
+    struct FlushFault {
+        log: OrderedCommandLog,
+        terminal: bool,
+    }
+    impl EventLog for FlushFault {
+        fn append(&mut self, event: &ExecutionEvent) -> std::io::Result<()> {
+            self.terminal |= matches!(event.payload, EventPayload::AgentTurnCompleted { .. });
+            self.log.append(event)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.terminal {
+                Err(std::io::Error::other("completion flush failed"))
+            } else {
+                self.log.flush()
+            }
+        }
+    }
+    let sandbox=support::sandbox("daemon::automation_routes::restart_publishes_committed_automation_once_and_never_requeues_input");
+    let server = Api::with_config(&sandbox, worker_config()).await;
+    let api = server.api.worker.as_ref().unwrap();
+    let db = api.store.clone();
+    let paths = api.paths.clone();
+    // Stop the fixture before reserving the interrupted execution: an orderly
+    // StopMode::Now shutdown cancels running commands, unlike process loss.
+    // The production controller then leaves its committed state in this same
+    // store for the next daemon lifetime to recover.
+    server.shutdown().await;
+    let session = WorkerSessionId::new();
+    let command = CommandId::new();
+    db.insert_session(
+        session.as_str(),
+        sandbox.work().to_str().unwrap(),
+        &chrono::Utc::now().to_rfc3339(),
+    )
+    .unwrap();
+    db.insert_running_lease_command(
+        command.as_str(),
+        session.as_str(),
+        "exec prompt",
+        "[]",
+        false,
+    )
+    .unwrap();
+    let store = AutomationStore::open(db.clone()).unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../web/test/lib/fixtures/terminal-frames.json"
+    ))
+    .unwrap();
+    let mut snapshot: AutomationSnapshot =
+        serde_json::from_value(fixture["automation_examples"]["snapshot"].clone()).unwrap();
+    snapshot.execution_id = ExecutionId::new();
+    snapshot.state = AutomationState::Starting;
+    snapshot.revision = 0;
+    snapshot.active_turn_id = None;
+    snapshot.native_session_id = None;
+    snapshot.status_support = StatusSupport::None;
+    snapshot.status_source = StatusSource::None;
+    let binding = ExecutionProfileBinding {
+        repository_key: "123456789abcdef0".into(),
+        root_sha256: "123456789abcdef0".repeat(4),
+        provider: snapshot.provider.clone(),
+        name: SettingsProfileName::parse("fixture").unwrap(),
+    };
+    let bus = EventBus::new(16);
+    bus.set_log_writer(Ok(Box::new(FlushFault {
+        log: OrderedCommandLog::open(&paths, session.as_str(), command.as_str()).unwrap(),
+        terminal: false,
+    })));
+    let mut run = HeadlessRun::reserve(
+        AutomationHost {
+            store: store.clone(),
+            command_id: command.clone(),
+            attempt: 1,
+            owner_key: "uid:test:restart".into(),
+            events: Some(bus.sender().lifecycle_publisher()),
+            finished: None,
+        },
+        snapshot,
+        binding,
+        "fixture".into(),
+        None,
+        &Default::default(),
+        "deliver once",
+    )
+    .unwrap();
+    run.launching().unwrap();
+    run.running().unwrap();
+    let finished = run.finish_observed(
+        &HeadlessObservation {
+            identity: Some(NativeSessionId::parse("session-1").unwrap()),
+            outcome: Some(Ok(Some("committed answer".into()))),
+            protocol_error: None,
+        },
+        Ok(0),
+        false,
+    );
+    assert_eq!(finished.failure.unwrap().code, "storage_error");
+    assert!(!finished.automation.completion_verified);
+    assert!(store
+        .current_execution(&command)
+        .unwrap()
+        .unwrap()
+        .pending_events
+        .is_some());
+    drop(bus);
+    drop(store);
+    // This fixture seeds only command/execution state, not the session's
+    // launch authority and environment. Keep restart focused on publication
+    // recovery rather than trying to restore that incomplete session.
+    db.close_session_force(session.as_str(), &chrono::Utc::now().to_rfc3339())
+        .unwrap();
+    // A lost final command CAS must stop startup before generic stale-command
+    // recovery can requeue it. Its already repaired lifecycle batch survives.
+    db.with_conn(|c| {
+        c.execute_batch("CREATE TRIGGER fault BEFORE UPDATE OF status ON commands WHEN NEW.status='done' BEGIN SELECT RAISE(IGNORE); END;")?;
+        Ok(())
+    }).unwrap();
+    let restart = awman::command::daemon_runtime::DaemonRuntime::bootstrap(
+        awman::command::daemon_runtime::DaemonBootstrap {
+            env: support::env_snapshot(&sandbox),
+            set: Default::default(),
+            squad_run_frontends: awman::frontend::squad::unattended::UnattendedFrontends::shared(),
+            push_frontend_factory: awman::frontend::api::ApiFrontendFactory,
+            terminal_hub: std::sync::Arc::new(awman::engine::daemon::core::TerminalHub::new(
+                Default::default(),
+            )),
+            engine_presentation: std::sync::Arc::new(
+                awman::command::instance::frontend::PlainPresentation,
+            ),
+        },
+    )
+    .await;
+    let error = match restart {
+        Err(error) => error,
+        Ok(_) => panic!("startup must reject a lost completion CAS"),
+    };
+    assert!(matches!(error, CommandError::Data(_)), "{error}");
+    assert!(error.to_string().contains("compare-and-swap"), "{error}");
+    assert_eq!(
+        db.get_command(command.as_str()).unwrap().unwrap().status,
+        awman::data::command_status::CommandStatus::Running
+    );
+    db.with_conn(|c| {
+        c.execute_batch("DROP TRIGGER fault")?;
+        Ok(())
+    })
+    .unwrap();
+    for _ in 0..2 {
+        let restarted = Api::restart_with_config(&sandbox, worker_config()).await;
+        let api = restarted.api.worker.as_ref().unwrap();
+        let row = api.store.get_command(command.as_str()).unwrap().unwrap();
+        assert_eq!(row.status, awman::data::command_status::CommandStatus::Done);
+        assert_eq!(row.attempt, 1);
+        let result: CommandResult = serde_json::from_str(row.result.as_ref().unwrap()).unwrap();
+        assert!(result.automation.unwrap().completion_verified);
+        assert_eq!(result.final_message.as_deref(), Some("committed answer"));
+        let turns = worker::commands_turns(api, &command, &Default::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(turns.items.len(), 1);
+        assert!(turns.items[0].result.as_ref().unwrap().completion_verified);
+        let events = paths.read_command_events(session.as_str(), command.as_str());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.payload, EventPayload::AgentTurnCompleted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e.payload, EventPayload::Done))
+                .count(),
+            1
+        );
+        assert!(events.windows(2).all(|w| w[0].cursor() < w[1].cursor()));
+        restarted.shutdown().await;
+    }
+    sandbox.finish();
+}

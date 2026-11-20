@@ -80,13 +80,38 @@ pub fn require_frontend(
         _ => Err(CommandError::ProfileOwnerRequired),
     }
 }
+type CleanupCallback = Box<dyn FnOnce(bool) -> Result<(), CommandError> + Send>;
+struct CleanupCompletion(Option<CleanupCallback>);
+impl CleanupCompletion {
+    fn finish(mut self, confirmed: bool) -> Result<(), CommandError> {
+        self.0.take().expect("profile cleanup callback")(confirmed)
+    }
+}
+impl Drop for CleanupCompletion {
+    fn drop(&mut self) {
+        if let Some(callback) = self.0.take() {
+            if let Err(error) = callback(false) {
+                tracing::error!(%error, "abandoned profile completion requires recovery");
+            }
+        }
+    }
+}
 pub struct ProfileSession {
+    completion: std::sync::Mutex<Option<CleanupCompletion>>,
     lease: ProfileLease,
     manifest: ProfileManifest,
     spec: ProfileStateSpec,
     redaction: Option<crate::engine::auth::redaction::RedactionSet>,
 }
 impl ProfileSession {
+    pub(crate) fn on_cleanup(
+        &self,
+        callback: impl FnOnce(bool) -> Result<(), CommandError> + Send + 'static,
+    ) {
+        *self.completion.lock().expect("profile completion lock") =
+            Some(CleanupCompletion(Some(Box::new(callback))));
+    }
+
     /// Retain the launch's shared old/new values through every publication.
     pub fn bind_redaction(
         &mut self,
@@ -170,6 +195,26 @@ impl ProfileSession {
     /// }
     /// ```
     pub async fn leave(
+        mut self,
+        runtime: Arc<dyn AgentRuntimeEngine>,
+        turn: TurnStateAtExit,
+    ) -> Result<ProfileManifest, CommandError> {
+        let completion = self
+            .completion
+            .get_mut()
+            .expect("profile completion lock")
+            .take();
+        let result = self.leave_inner(runtime, turn).await;
+        if let Some(completion) = completion {
+            let confirmed = result.as_ref().is_ok_and(|m| {
+                m.state.admits_writer()
+                    && m.history_unavailable.as_deref() != Some("output_incomplete")
+            });
+            completion.finish(confirmed)?;
+        }
+        result
+    }
+    async fn leave_inner(
         mut self,
         runtime: Arc<dyn AgentRuntimeEngine>,
         turn: TurnStateAtExit,
@@ -400,6 +445,7 @@ pub fn enter_sync(
         manifest,
         spec: spec.clone(),
         redaction: None,
+        completion: std::sync::Mutex::new(None),
     }))
 }
 fn unsupported(agent: &AgentName, reason: &str) -> CommandError {
@@ -515,28 +561,72 @@ async fn reconcile_inner(
         for handle in &resources {
             let label = runtime.resource_label(handle, EXECUTION_LABEL)?;
             if label.as_deref() == Some(owner_probe.execution_id.as_str()) {
+                if found.is_some() {
+                    return Ok(false);
+                }
                 found = Some(*handle);
-                break;
             }
             if handle.name == owner_probe.resource_name && label.is_none() {
                 same_name_without_label = true;
             }
         }
         if let Some(handle) = found {
+            let mut stop_error = None;
             if running.iter().any(|h| h.id == handle.id) {
                 if mode == ReconcileMode::VerifyOnly {
                     return Ok(false);
                 }
-                runtime.stop(handle)?;
+                stop_error = runtime.stop(handle).err();
             }
-            runtime.remove_agent(&handle.id)?;
-            if runtime
-                .list_running_all()?
+            // Stopping can race automatic cleanup or name reuse. Re-resolve
+            // both generation and execution ownership before deleting anything.
+            let running_now = runtime.list_running_all()?;
+            let stopped_now = runtime.list_stopped()?;
+            if let Some(current) = running_now
                 .iter()
-                .chain(runtime.list_stopped()?.iter())
-                .any(|h| h.id == handle.id)
+                .chain(stopped_now.iter())
+                .find(|h| h.id == handle.id)
             {
-                return Ok(false);
+                if current.started_at != handle.started_at || current.name != handle.name {
+                    return Ok(false);
+                }
+                if runtime.resource_label(current, EXECUTION_LABEL)?.as_deref()
+                    != Some(owner_probe.execution_id.as_str())
+                {
+                    return Ok(false);
+                }
+                if let Some(error) = stop_error {
+                    return Err(error);
+                }
+                if running_now.iter().any(|h| h.id == current.id) {
+                    return Ok(false);
+                }
+                let removed =
+                    runtime.remove_agent_checked(current, owner_probe.execution_id.as_str());
+                // An already absent instance is success only when a fresh
+                // enumeration proves that the owned execution has gone.
+                let remaining_running = runtime.list_running_all()?;
+                let remaining_stopped = runtime.list_stopped()?;
+                for remaining in remaining_running.iter().chain(remaining_stopped.iter()) {
+                    let label = runtime.resource_label(remaining, EXECUTION_LABEL)?;
+                    if label.as_deref() == Some(owner_probe.execution_id.as_str())
+                        || (remaining.name == owner_probe.resource_name && label.is_none())
+                    {
+                        removed?;
+                        return Ok(false);
+                    }
+                }
+            } else {
+                // Absence of the old id alone is insufficient if ownership
+                // moved to another resource while stop was in progress.
+                for remaining in running_now.iter().chain(stopped_now.iter()) {
+                    let label = runtime.resource_label(remaining, EXECUTION_LABEL)?;
+                    if label.as_deref() == Some(owner_probe.execution_id.as_str())
+                        || (remaining.name == owner_probe.resource_name && label.is_none())
+                    {
+                        return Ok(false);
+                    }
+                }
             }
         }
         if same_name_without_label {

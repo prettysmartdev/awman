@@ -439,7 +439,10 @@ impl WorkflowEngine {
             // wording a failure (including one with nothing on stderr, as an
             // interactive run's never has) is the frontend's job (F-45).
             self.set_phase_step_failed(kind, idx, &result.stderr);
-            return PhaseStepOutcome::exited(result.exit_code, result.stdout, result.stderr);
+            let mut outcome =
+                PhaseStepOutcome::exited(result.exit_code, result.stdout, result.stderr);
+            outcome.full_transcript = container.failure_transcript();
+            return outcome;
         }
 
         PhaseStepOutcome {
@@ -635,6 +638,7 @@ impl WorkflowEngine {
                     step_name: &desc,
                     stdout: &last.stdout,
                     stderr: &last.stderr,
+                    full_transcript: last.full_transcript.as_deref(),
                 }),
             );
 
@@ -1140,12 +1144,47 @@ impl WorkflowEngine {
         let sanitized = sanitize_step_name_for_filename(failure.step_name);
         let filename = format!("{}-failure-{sanitized}.txt", failure.kind.label());
         let file_path = host_dir.join(&filename);
-        let contents = self.redaction.redact(&format_phase_failure_file(
-            failure.step_name,
-            failure.stdout,
-            failure.stderr,
-        ));
-        if let Err(e) = std::fs::write(&file_path, contents) {
+        let write_result = (|| -> Result<(), crate::data::error::DataError> {
+            // Every retry replaces this entry atomically; never follow an agent-planted link.
+            let staging = host_dir.join(format!(".failure-{}.tmp", uuid::Uuid::new_v4()));
+            let mut output = crate::data::fs::private_files::create_private_file_new(&staging)?;
+            let result = (|| -> std::io::Result<()> {
+                use std::io::Write;
+                if let Some(path) = failure.full_transcript {
+                    writeln!(
+                        output,
+                        "# {} — complete phase transcript\n",
+                        failure.step_name
+                    )?;
+                    let input = crate::data::fs::private_files::open_private_file(path)
+                        .map_err(std::io::Error::other)?;
+                    let mut reader = crate::engine::auth::redaction::RedactedReader::new(
+                        input,
+                        self.redaction.clone(),
+                    );
+                    std::io::copy(&mut reader, &mut output)?;
+                } else {
+                    output.write_all(
+                        self.redaction
+                            .redact(&format_phase_failure_file(
+                                failure.step_name,
+                                failure.stdout,
+                                failure.stderr,
+                            ))
+                            .as_bytes(),
+                    )?;
+                }
+                output.sync_all()
+            })();
+            if let Err(error) = result {
+                let _ = std::fs::remove_file(&staging);
+                return Err(crate::data::error::DataError::io(&staging, error));
+            }
+            std::fs::rename(&staging, &file_path)
+                .map_err(|e| crate::data::error::DataError::io(&file_path, e))?;
+            Ok(())
+        })();
+        if let Err(e) = write_result {
             self.msg_warning(format!(
                 "on_failure: could not write failure output to {}, launching agent without it: {e}",
                 file_path.display()

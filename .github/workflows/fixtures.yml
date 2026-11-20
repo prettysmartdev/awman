@@ -17,7 +17,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: fixtures-${{ github.run_id }}
+  group: fixtures-${{ github.repository }}-${{ inputs.tag }}
   cancel-in-progress: false
 jobs:
   build:
@@ -25,6 +25,10 @@ jobs:
     environment: fixtures
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,10 +48,17 @@ jobs:
           curl --fail --location --proto '=https' --proto-redir '=https' --output base.tar "$BASE_URL"
           mkdir -p out
           cargo xtask fixtures build guest-oci-base --base base.tar --sha256 "$BASE_SHA256" --out built
-          cp built/fixture-oci.tar out/guest-oci-base.tar
-          cp built/fixture-docker.tar out/guest-docker-base.tar
-          (cd out && sha256sum guest-oci-base.tar guest-docker-base.tar > SHA256SUMS)
+          cargo xtask fixtures verify-build --base base.tar --sha256 "$BASE_SHA256" --out built
+          cp built/fixture-oci.tar built/fixture-docker.tar built/provenance.json out/
+          (cd out && sha256sum fixture-oci.tar fixture-docker.tar provenance.json > SHA256SUMS)
           cp fixture-plan.json out/
+      - name: Attest the exact fixture archives and reproduction record
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            out/fixture-oci.tar
+            out/fixture-docker.tar
+            out/provenance.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fixture-${{ github.run_id }}
@@ -78,6 +89,10 @@ jobs:
           (cd out && sha256sum -c SHA256SUMS)
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo 'Refusing to replace an existing fixture release' >&2
+            exit 1
+          fi
+          if gh api "repos/$GH_REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo 'Refusing an existing remote fixture tag' >&2
             exit 1
           fi
           gh release create "$TAG" --target "$COMMIT" --title "$TAG" --notes-file out/SHA256SUMS out/*

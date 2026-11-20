@@ -72,7 +72,9 @@ pub trait AgentsCommandFrontend: AgentLaunchFrontend + Send + Sync {
 
     /// One-shot results, for frontends that do not render outcomes
     /// themselves (the TUI). The CLI renders from the outcome on stdout.
-    fn show_profile_result(&mut self, _outcome: &profile::ProfileOutcome) {}
+    /// Profile results have no default: every admitted frontend must present
+    /// the shared [`profile::ProfileResultProjection`].
+    fn show_profile_result(&mut self, outcome: &profile::ProfileOutcome);
     fn show_list(&mut self, _outcome: &AgentsListOutcome) {}
     fn show_detail(&mut self, _outcome: &AgentsDetailOutcome) {}
     fn show_kill_result(&mut self, _outcome: &AgentsKillOutcome) {}

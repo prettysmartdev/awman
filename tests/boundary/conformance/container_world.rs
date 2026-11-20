@@ -7,22 +7,21 @@
 
 use super::argv_watch::ArgvWatcher;
 use super::waiter::PollWaiter;
-use crate::docker::engine::Engine;
+use crate::docker::engine::{Cleanup, Engine};
 use awman::data::config::env::EnvSnapshot;
-use awman::engine::conformance::container::{
-    ContainerWorld, ABSENT_IMAGE, BUILD_MARKER, BUILT_IMAGE, PRESENT_HOME, PRESENT_IMAGE,
-};
+use awman::engine::conformance::container::{ContainerWorld, BUILD_MARKER, PRESENT_HOME};
 use awman::engine::conformance::Waiter;
 use awman_test_support::EnvMap;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Name of the container the world keeps running and awman does not own.
-const FOREIGN_CONTAINER: &str = "boundary-foreign-conformance";
-
 pub struct RealDockerWorld<'e, 'a> {
     engine: &'e Engine<'a>,
+    cleanup: Cleanup<'e, 'a>,
+    present: String,
+    absent: String,
+    built: String,
     watcher: ArgvWatcher,
     contexts: RefCell<usize>,
 }
@@ -31,6 +30,10 @@ impl<'e, 'a> RealDockerWorld<'e, 'a> {
     pub fn new(engine: &'e Engine<'a>) -> RealDockerWorld<'e, 'a> {
         RealDockerWorld {
             engine,
+            cleanup: Cleanup::new(engine),
+            present: engine.unique_name("awman-conformance-present"),
+            absent: engine.unique_name("awman-conformance-absent"),
+            built: engine.unique_name("awman-conformance-built"),
             watcher: ArgvWatcher::start(engine.sandbox),
             contexts: RefCell::new(0),
         }
@@ -44,6 +47,29 @@ impl Waiter for RealDockerWorld<'_, '_> {
 }
 
 impl ContainerWorld for RealDockerWorld<'_, '_> {
+    fn present_image(&self) -> &str {
+        &self.present
+    }
+    fn absent_image(&self) -> &str {
+        &self.absent
+    }
+    fn built_image(&self) -> &str {
+        &self.built
+    }
+    fn resource_name(&self, purpose: &str) -> String {
+        self.engine
+            .unique_name(&format!("awman-conformance-{purpose}"))
+    }
+    fn owner_labels(&self) -> Vec<(String, String)> {
+        vec![("awman.test.owner".into(), self.cleanup.owner_token().into())]
+    }
+    fn build_labels(&self) -> Vec<(String, String)> {
+        self.cleanup.image(&self.built);
+        self.owner_labels()
+    }
+    fn track_container(&self, name: &str) {
+        self.cleanup.container(name);
+    }
     fn subject(&self) -> String {
         format!("docker CLI (real engine {})", self.engine.docker.host)
     }
@@ -76,14 +102,26 @@ impl ContainerWorld for RealDockerWorld<'_, '_> {
             "present",
             &format!("FROM {base}\nENV HOME={PRESENT_HOME}\n"),
         );
-        self.engine.build(PRESENT_IMAGE, &dockerfile, &context);
+        self.cleanup
+            .build_image(&self.present, &dockerfile, &context);
         self.engine
-            .run_ok(&["image", "inspect", "--format", "{{.Id}}", PRESENT_IMAGE])
+            .run_ok(&["image", "inspect", "--format", "{{.Id}}", &self.present])
     }
 
     fn given_absent_images(&self) {
-        for image in [ABSENT_IMAGE, BUILT_IMAGE] {
-            self.engine.remove_image(image);
+        for image in [&self.absent, &self.built] {
+            if self.engine.has_image(image) {
+                let expected = self.cleanup.owner_label();
+                let actual = self.engine.run_ok(&[
+                    "image",
+                    "inspect",
+                    "--format",
+                    "{{index .Config.Labels \"awman.test.owner\"}}",
+                    image,
+                ]);
+                assert_eq!(format!("awman.test.owner={actual}"), expected);
+                self.engine.remove_image(image);
+            }
         }
     }
 
@@ -96,22 +134,26 @@ impl ContainerWorld for RealDockerWorld<'_, '_> {
         let tail = if failing { "RUN false\n" } else { "" };
         self.engine.write_context(
             &format!("build-{n}"),
-            &format!("FROM {PRESENT_IMAGE}\nRUN echo {BUILD_MARKER}\n{tail}"),
+            &format!("FROM {}\nRUN echo {BUILD_MARKER}\n{tail}", self.present),
         )
     }
 
     fn given_foreign_container(&self) -> String {
-        self.engine.remove_container(FOREIGN_CONTAINER);
+        let name = self.engine.unique_name("boundary-foreign-conformance");
+        self.cleanup.container(&name);
         self.engine.run_ok(&[
             "run",
             "-d",
             "--name",
-            FOREIGN_CONTAINER,
-            PRESENT_IMAGE,
+            &name,
+            "--label",
+            &self.cleanup.owner_label(),
+            &self.present,
             "sleep",
             "3600",
         ]);
-        FOREIGN_CONTAINER.to_string()
+        self.cleanup.created_container(&name);
+        name
     }
 
     fn container_exists(&self, id_or_name: &str) -> bool {
@@ -124,14 +166,5 @@ impl ContainerWorld for RealDockerWorld<'_, '_> {
 
     fn cleanup(&self) {
         self.watcher.stop();
-        self.engine.remove_container(FOREIGN_CONTAINER);
-        for name in self.engine.container_names() {
-            if name.starts_with("awman-conformance-") {
-                self.engine.remove_container(&name);
-            }
-        }
-        for image in [PRESENT_IMAGE, BUILT_IMAGE, ABSENT_IMAGE] {
-            self.engine.remove_image(image);
-        }
     }
 }

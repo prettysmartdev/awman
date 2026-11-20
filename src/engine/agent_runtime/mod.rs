@@ -242,6 +242,18 @@ pub trait AgentRuntimeEngine: Send + Sync {
 
     /// Remove a stopped agent by id or name (`awman clean`). Returns an error
     /// when the runtime refuses, so callers can count per-item failures.
+    /// Remove only the observed stopped generation with its execution owner.
+    /// Backends without an atomic identity boundary refuse rather than delete by name.
+    fn remove_agent_checked(
+        &self,
+        _handle: &AgentHandle,
+        _execution: &str,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::NotImplemented(
+            "identity-checked agent removal",
+        ))
+    }
+
     fn remove_agent(&self, _id: &str) -> Result<(), EngineError> {
         Err(EngineError::UnsupportedOnRuntime {
             runtime: self.runtime_name(),

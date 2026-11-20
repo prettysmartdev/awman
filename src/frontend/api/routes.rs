@@ -20,14 +20,9 @@ use crate::command::commands::api_server::admission::{
     IdempotentResult, SessionSubmission,
 };
 use crate::command::commands::api_server::command_log_stream::CommandLogUpdate;
-use crate::command::commands::api_server::event_bus::EventBus;
-use crate::command::commands::api_server::session_setup::{
-    log_session_setup, SessionSetupBus, SessionSetupBusSender, SetupReadyFrontend, TracingSetupSink,
-};
+use crate::command::commands::api_server::session_setup::BusSessionSetupPresenter;
 use crate::command::commands::api_server::{CancelOutcome, CloseOutcome, SetupReadiness};
-use crate::command::session_create::{SessionCreatePlan, SessionCreateRequest};
-use crate::command::session_setup::{SessionSetup, SessionSetupPresenter};
-use crate::data::api_lifecycle_store::RunRecord;
+use crate::command::session_create::SessionCreateRequest;
 use crate::data::command_status::CommandStatus;
 use crate::data::execution_event::{EventCursor, ExecutionEvent};
 use crate::data::fs::api_db::SessionCommandAdmission;
@@ -36,10 +31,7 @@ use crate::data::fs::api_db::{CommandListFilter, CommandRecord, LabelOwner};
 use crate::data::fs::api_labels::{LabelSelector, Labels};
 
 use crate::data::session_setup_event::SessionSetupStatus;
-use crate::data::session_setup_event::SetupEventPayload;
 use crate::data::session_status::SessionStatus;
-use crate::engine::git::GitFrontend;
-use crate::engine::ready::frontend::ReadyFrontend;
 
 // ─── Auth mode ───────────────────────────────────────────────────────────────
 
@@ -312,6 +304,14 @@ fn admission_error(error: AdmissionError, session_id: &str) -> Response {
         AdmissionError::SessionCreation(e) => ApiError::session_creation(&e).into_response(),
         AdmissionError::CommandValidation(e) => ApiError::command_validation(&e).into_response(),
         AdmissionError::CommandAdmission(e) => ApiError::command_admission(&e).into_response(),
+        AdmissionError::MountAuthorityRevalidationRequired { reason } => ApiError {
+            status: StatusCode::CONFLICT,
+            code: "mount_authority_revalidation_required",
+            message: format!(
+                "Session workdir authorization could not be revalidated ({reason}); close it and create a new session"
+            ),
+        }
+        .into_response(),
         AdmissionError::Unavailable { command, available } => ApiError::invalid_request(
             "command not available via API",
         )
@@ -2034,9 +2034,6 @@ async fn create_submission(
     close_on_finish: bool,
     journal: Option<&IdempotentAdmission>,
 ) -> Response {
-    if let Err(error) = Labels::new(body.labels.clone().into_inner()) {
-        return bad_request(error.to_string());
-    }
     let submission = SessionSubmission {
         request: SessionCreateRequest {
             context_key: body.context_key,
@@ -2051,59 +2048,23 @@ async fn create_submission(
         },
         labels: body.labels,
     };
-    let result = match command {
-        Some(command) => {
-            worker::runs_create(
-                state,
-                context,
-                submission,
-                command.into(),
-                close_on_finish,
-                journal,
-            )
-            .await
-        }
-        None => {
-            worker::sessions_create(state, context, submission, None, close_on_finish, journal)
-                .await
-        }
-    };
+    let verbose_setup = state.verbose_setup();
+    let result = worker::sessions_create_presented(
+        state,
+        context,
+        submission,
+        command.map(Into::into),
+        close_on_finish,
+        journal,
+        move |id, bus| Box::new(BusSessionSetupPresenter::new(id, bus, verbose_setup)),
+    )
+    .await;
     let admitted = match result {
         Ok(admitted) => admitted,
         Err(error) => return admission_error(error, ""),
     };
-    let crate::command::commands::api_server::admission::AdmittedSession {
-        session_id,
-        plan,
-        run,
-        response_body,
-    } = admitted;
-
-    let setup_bus = Arc::new(SessionSetupBus::new(256));
-
-    tracing::info!(
-        session_id = %session_id,
-        session_type = %plan.kind,
-        workdir = %plan.resolved_workdir.display(),
-        "Session created (setup starting)"
-    );
-
-    // Register before spawning/responding so cancellation can never miss setup.
-    let token = state.setup_cancels.register(&session_id);
-    let state_clone = Arc::clone(state);
-    let sid = session_id.clone();
-    let run_for_setup = run.clone();
-    // There is no await between durable admission and spawning its owner.
-    // Bus contention belongs to that task, so dropping the HTTP future cannot
-    // strand admitted work or serialize validation behind a presentation lock.
-    tokio::spawn(async move {
-        state_clone
-            .setup_buses
-            .lock()
-            .await
-            .insert(sid.clone(), Arc::clone(&setup_bus));
-        run_session_setup(state_clone, sid, plan, setup_bus, token, run_for_setup).await;
-    });
+    let run = admitted.run;
+    let response_body = admitted.response_body;
     if run.is_none() {
         (
             StatusCode::CREATED,
@@ -2113,138 +2074,6 @@ async fn create_submission(
             .into_response()
     } else {
         accepted_json(response_body)
-    }
-}
-
-/// Drive the Layer 2 [`SessionSetup`] orchestrator with an
-/// [`ApiSessionSetupPresenter`]. Every setup *behaviour* — clone/branch
-/// sequencing, the remote-clone failure-cleanup rule, the status column, the
-/// `setup_state.json` snapshot and every `SessionSetupState` transition — is
-/// Layer 2's or Layer 0's (WI 0114 F-41). This frontend supplies the bus the
-/// events are broadcast on, the log they are mirrored to, and the ready
-/// frontend, and nothing else.
-async fn run_session_setup(
-    state: Arc<AppState>,
-    session_id: String,
-    plan: SessionCreatePlan,
-    setup_bus: Arc<SessionSetupBus>,
-    token: tokio_util::sync::CancellationToken,
-    run: Option<RunRecord>,
-) {
-    let setup = SessionSetup::new(
-        session_id.clone(),
-        plan,
-        state.engines.clone(),
-        Arc::clone(&state.sessions),
-        Arc::clone(&setup_bus.current_state),
-        Arc::clone(&state.store),
-        state.paths.clone(),
-    )
-    .with_cancellation(token.clone());
-    let mut presenter = ApiSessionSetupPresenter {
-        bus_sender: setup_bus.sender(),
-        setup_bus,
-        state: Arc::clone(&state),
-        session_id: session_id.clone(),
-        verbose_setup: state
-            .live_config
-            .read()
-            .expect("worker config lock")
-            .as_ref()
-            .map(|c| c.daemon().verbose_setup)
-            .unwrap_or_else(|| {
-                crate::data::config::daemon::DaemonSettings::from_merged(
-                    &state
-                        .engines
-                        .global_config
-                        .daemon
-                        .clone()
-                        .unwrap_or_default(),
-                )
-                .verbose_setup
-            }),
-    };
-    // Lists can expose the queued row before this task is spawned (or even
-    // before run linkage/token registration). Carry that early cancel into
-    // Track A's setup-abort path as well.
-    if let Some(run) = &run {
-        if let Err(error) = state.lifecycle().reconcile_setup_cancel(run, &token) {
-            tracing::error!(%error, session_id, command_id = %run.command_id, "Failed to read early setup cancellation");
-        }
-    }
-    setup.run(&mut presenter).await;
-    // Once cleanup is complete, cancellation may close a terminal run itself.
-    // Unregister before checking its row so neither path can miss the close.
-    state.setup_cancels.unregister(&session_id);
-    if let Some(run) = run {
-        if let Err(error) = state
-            .lifecycle()
-            .finish_run_setup(&state.lifecycle_store, &run)
-            .await
-        {
-            tracing::error!(%error, "Failed to reconcile run after setup");
-        }
-    }
-}
-
-/// API-frontend implementation of the Layer 2 [`SessionSetupPresenter`]: the
-/// session-setup broadcast bus, the session-tagged log, and the ready-checks
-/// frontend. It persists nothing and decides nothing.
-struct ApiSessionSetupPresenter {
-    state: Arc<AppState>,
-    session_id: String,
-    setup_bus: Arc<SessionSetupBus>,
-    bus_sender: SessionSetupBusSender,
-    /// Whether per-session setup lines are logged at `info` or `debug`.
-    /// Read once from the Layer 0 snapshot when the presenter is built; Layer
-    /// 0 owns `AWMAN_API_VERBOSE_SETUP` and nothing above it reads the
-    /// environment directly (F-37).
-    verbose_setup: bool,
-}
-
-#[async_trait::async_trait]
-impl SessionSetupPresenter for ApiSessionSetupPresenter {
-    fn log(&mut self, line: &str) {
-        log_session_setup(&self.session_id, self.verbose_setup, line);
-    }
-
-    fn emit(&mut self, event: SetupEventPayload) {
-        self.bus_sender.emit(event);
-    }
-
-    fn ready_frontend(&mut self) -> Box<dyn ReadyFrontend> {
-        // A throwaway EventBus satisfies the ready frontend's container sink; its
-        // events are mirrored to the tracing log and the session-setup bus.
-        let event_bus = EventBus::new(4096);
-        Box::new(SetupReadyFrontend::new(
-            &self.session_id,
-            self.setup_bus.sender(),
-            event_bus.sender(),
-            self.verbose_setup,
-        ))
-    }
-
-    fn git_log_sink(&mut self) -> Box<dyn GitFrontend + Send> {
-        Box::new(TracingSetupSink::new(&self.session_id, self.verbose_setup))
-    }
-
-    async fn finished(&mut self) {
-        tokio::spawn(cleanup_setup_bus(
-            Arc::downgrade(&self.state),
-            self.session_id.clone(),
-        ));
-    }
-}
-
-/// Retain the setup bus for 60 seconds after the run reaches a terminal state,
-/// so a client that polls or subscribes just after completion still sees the
-/// final events, then drop it.
-async fn cleanup_setup_bus(state: std::sync::Weak<AppState>, session_id: String) {
-    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-    // Retaining presentation history must not keep the daemon's database or
-    // session credentials alive after shutdown.
-    if let Some(state) = state.upgrade() {
-        state.setup_buses.lock().await.remove(&session_id);
     }
 }
 
@@ -2605,6 +2434,7 @@ async fn handle_stream_command_logs(
                 }),
                 update = events.next_update() => match update {
                     None => return,
+                    Some(CommandLogUpdate::RecoveryRequired) => Event::default().event("operation_error").data(r#"{"code":"storage_error","message":"Command storage requires recovery; repair storage and restart the daemon. Do not resubmit the task."}"#),
                     Some(CommandLogUpdate::Waiting(value)) => {
                         waiting = value;
                         keepalive.reset();

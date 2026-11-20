@@ -18,7 +18,7 @@ function mount(patch: (tab: TabSnapshot) => TabSnapshot = t => t, setup?: (h: Re
   const tab = patch({ ...original, workflow: null, execution_phase: { phase: 'idle' }, slots: [], yolo: null });
   h.s.tabs = [tab]; h.s.pending_dialogs = []; h.store.applySnapshot(h.s); setup?.(h);
   const reconnect = vi.fn();
-  render(<Workspace client={h.client} connection={h.connection} launchContext="lc_default" squadAvailable reconnect={reconnect} />);
+  render(<Workspace client={h.client} connection={h.connection} launchContext="lc_default" listenerName="loopback" squadAvailable reconnect={reconnect} />);
   return { ...h, tab, reconnect };
 }
 const running = (t: TabSnapshot): TabSnapshot => ({ ...t, execution_phase: { phase: 'running', command: 'ready' } });
@@ -201,7 +201,7 @@ describe('M2, M3, M5, L1, L2, L5', () => {
     const h = harness(); const base = snapshot().tabs[0]!;
     h.s.tabs = [0, 1, 2].map(i => ({ ...base, tab_id: `tab_${i}`, label: { ...base.label, text: `Tab ${i}` }, workflow: null, execution_phase: { phase: 'idle' }, slots: [], yolo: null }));
     h.s.pending_dialogs = []; h.store.applySnapshot(h.s);
-    render(<Workspace client={h.client} connection={h.connection} launchContext="lc_default" squadAvailable reconnect={vi.fn()} />);
+    render(<Workspace client={h.client} connection={h.connection} launchContext="lc_default" listenerName="loopback" squadAvailable reconnect={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: 'All tabs (3)' }));
     const list = screen.getByRole('dialog', { name: 'Workspace tabs' });
     for (const i of [0, 1, 2]) expect(within(list).getByRole('button', { name: new RegExp(`^Tab ${i}`) })).toBeTruthy();

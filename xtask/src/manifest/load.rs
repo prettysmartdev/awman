@@ -3,7 +3,10 @@ use anyhow::{Context, Result};
 use std::path::Path;
 
 pub fn load(root: &Path) -> Result<Manifest> {
-    parse(&std::fs::read(root.join("ci/gates.toml")).context("reading ci/gates.toml")?)
+    let mut manifest =
+        parse(&std::fs::read(root.join("ci/gates.toml")).context("reading ci/gates.toml")?)?;
+    manifest.root = root.to_path_buf();
+    Ok(manifest)
 }
 pub fn parse(bytes: &[u8]) -> Result<Manifest> {
     let mut manifest: Manifest = toml::from_str(std::str::from_utf8(bytes)?)

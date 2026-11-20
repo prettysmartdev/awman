@@ -139,6 +139,16 @@ const HEAD: &str = r####"  plan:
       - name: Report
         if: ${{ always() }}
         run: cat seeded-defects.md >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Retain baseline, per-patch JUnit and compiler diagnostics
+        if: ${{ always() }}
+        uses: @@UPLOAD@@
+        with:
+          name: seeded-defects-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            seeded-defects.md
+            seeded-defects.evidence/
+          if-no-files-found: error
+          retention-days: 30
 
   mutation:
     name: Mutation testing (Layer 0 and Layer 2, sampled)

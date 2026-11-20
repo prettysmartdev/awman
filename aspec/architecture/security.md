@@ -11,9 +11,15 @@ Review-only `UntrustedAgent` data cannot be passed to these sinks. Engines never
 prompt or grant approval implicitly.
 
 Custom agent definitions never cause host execution except through their optional
-`[ping]`, run by `HostAgentPinger` only during a full `awman ready` (never `--prepare-only`) and only after the
-definition is approved for its current hash. The approval prompt shows the exact host
-command and its resolved path; without `[ping]`, `ready` skips the host check.
+`[ping]`, run by `HostAgentPinger` only during a full `awman ready` (never
+`--prepare-only`) and only after approval for the exact definition hash and
+canonical resolved executable path. Approval also binds a missing-program
+sentinel; changes to PATH resolution or a symlink target require approval
+again. `ResolvedAgent` pins the approved canonical program for execution, so
+the path cannot change between review and spawn. Existing approvals that bind
+only the definition hash must be renewed before a custom ping. The approval
+prompt shows the exact host command and resolved path; without `[ping]`,
+`ready` skips the host check. Non-ping approvals are unchanged.
 
 Custom host pings are argv-only, append one fixed greeting, run in a fresh private
 scratch directory and time out after 10 seconds during `ready`, with the child
@@ -72,7 +78,7 @@ failure tails, and protects secrets spanning byte chunks.
   15-second total timeout. Responses are limited to 2 MiB and work item
   bodies to 1 MiB. Do not include credentials in provider URLs.
 
-- Never directly execute any code assistant on the developer host machine. Every single code agent action should be executed by running a Docker image that has the agent tool installed and passing an entrypoing command to direct the agentic tool.
+- Never directly execute any code assistant on the developer host machine. Every single code agent action should be executed by running a Docker image that has the agent tool installed and passing an entrypoing command to direct the agentic tool. The one exception below is a confirmed, permanent product decision (WI 0078, audit A02): it is to be preserved and hardened, not removed, and `AGENTS.md` states the same rule.
   - **Sole exception — the `ready` local-agent check** (`HostAgentPinger::ping`
     in `src/engine/ready/host_agent.rs`, originally the
     `ReadyPhase::CheckingLocalAgent` arm): the configured agent's binary IS
@@ -91,6 +97,14 @@ failure tails, and protects secrets spanning byte chunks.
     **Preparation-only operations are excluded.** `awman ready --prepare-only` selects `PreparationPolicy::ImagesOnly`, which never reaches `CheckingLocalAgent`, never constructs a ping, never registers credential refresh and never runs an agent audit (`--refresh` is rejected with it). It keeps definition trust, image inspection/build/import and registry authentication, and its summary reports authentication as `not_checked`. Only an explicit `--prepare-only` selects it; ordinary `ready` and daemon session setup keep the full checks, and no code infers preparation-only intent.
 
     Every trigger runs the identical, unchanged ping: the prompt is hardcoded (from the `GREETINGS` table), there is no user input, no repo content, the process runs in a dedicated empty directory outside the repository (never the repo working directory), and the cheapest available model is pinned. Triggers (c) and (d) route through the same monitor/ping path as (a) and (b) — a single type, `HostAgentPinger`, now handles all four; they widen *when* the ping runs, never *what* it does. No other code path may execute an agent on the host. Any new host-side agent invocation beyond this check is a security violation.
+
+    **Executable selection (first-party pings).** A scratch working directory does not constrain which program runs, so first-party pings resolve their executable through a dedicated installed-program resolver, never the general host-CLI lookup:
+    - PATH entries that are empty, relative, or not absolute after snapshot resolution are skipped; they are never resolved against the invoking checkout or cwd.
+    - Each remaining candidate is canonicalized (symlinks resolved). A candidate whose canonical path lies inside the session's canonical Git root or working directory, or inside any linked worktree of that repository, is refused; so is a symlink alias outside the checkout that resolves into it. Lookup continues with later PATH entries; only a validated installed candidate may execute.
+    - The canonical path chosen by the resolver is the path that is spawned (argv-only, cleared environment plus the snapshot's spawn environment). There is no fallback to an unchecked name, relative path or `cwd`-joined path.
+    - A missing program and a refused program are distinct, truthful results (`not installed` / `refused: resolves inside the checkout`); neither is reported as authenticated, and neither blocks container work.
+    - Custom-definition `[ping]` commands keep their own trust rule (approval of the exact definition hash and resolved path, above). First-party lookup never inherits a custom approval, and the resolver does not widen or bypass custom trust.
+    - The fixed greeting, absence of task/repository content, empty private cwd, bounded timeouts, kill-on-drop cleanup, the four triggers and the `--prepare-only` exclusion are unchanged. Tests use owned fake executables and private environment snapshots; no test runs a real host provider agent.
 
     Do not conflate `HostAgentPinger` with `engine::daemon::DaemonSupervisor`,
     which is the only type permitted to spawn the *daemon* binary
@@ -125,6 +139,11 @@ failure tails, and protects secrets spanning byte chunks.
     reach beyond its filesystem mount: a socket, not a directory, and
     off by default. `docker.rs`'s `allow_docker` argv builder is the only
     place this mount is constructed.
+- **Mount authority (WI 0078, A01).** Admission produces a typed Layer 0 `MountAuthority { root, git_dirs, source }` and the launch may never exceed it. `root` is the canonical directory the caller is authorized to mount at `/workspace`; `git_dirs` lists the canonical auxiliary Git directories (a linked worktree's main `.git`) that were verified for it; `source` is one of `LocalInvocation` (CLI/TUI: the cwd, or the Git root the user confirmed), `ExactWorkdir`, `WorkdirRootChild`, `RemoteClone` (awman-owned clone under the API root) or `VerifiedWorktree`.
+  - An exact `workDirs` entry authorizes exactly that directory. If the requested directory is not its own Git root (it lies inside an enclosing checkout, or its `.git` is a pointer file or symlink), admission refuses with HTTP 403 and rule `exact_workdir_not_git_root`, naming the enclosing root the operator would have to allowlist explicitly. A directory with no enclosing repository keeps working as a non-Git workdir. The parent is never mounted, and an interactive confirmation never widens an API caller's allowlist; noninteractive callers fail closed.
+  - `SessionCreatePlan` carries the authority into `SessionSetup`; a session opened with an explicit authority must resolve its mount root to `authority.root` or setup fails. The authority is persisted with the session row (`sessions.mount_authority`, versioned JSON).
+  - Restore re-evaluates the current allowlist: a saved authority is an upper bound, not a grant. A session whose authority is absent (rows written before this contract), no longer granted, or no longer canonicalizes to the same path is not launchable: commands are refused with `mount_authority_revalidation_required`; nothing is inferred from the saved workdir or from Git discovery. `RemoteClone` authorities are re-derived only from the awman-owned clone path under the API root.
+  - Immediately before every runtime create (first launch, retry and recovery alike) the engine canonicalizes the final workspace mount and every auxiliary Git mount again: the workspace host path must equal `authority.root` and each Git mount must be listed in `git_dirs` (or lie inside `authority.root`). Any difference, including a symlink or directory replaced after admission and a root derived from writable `core.worktree`, refuses the launch with `EngineError::MountOutsideAuthority` before any container or VM exists. Code that re-roots a session (worktrees, lease workspaces) derives a new authority through a named, verifying constructor; it never edits the root in place.
 
 Builtin image-import validation applies to the selected image. Before invoking
 Microsandbox's load-all archive API, awman projects the archive to exactly that

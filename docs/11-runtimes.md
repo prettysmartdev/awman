@@ -133,7 +133,8 @@ awman ready --build --no-cache   # rebuild from scratch
 |---|---|
 | macOS on Apple Silicon | Supported (experimental). Included in the `awman-macos-arm64` release and in source builds (`make build`). |
 | Linux x86_64 (GNU/glibc) | Supported (experimental) with KVM. Included in `awman-linux-amd64` (glibc 2.35 or newer) and source builds (`make build`). |
-| Linux arm64, Linux musl, Windows | Builtin runtime unavailable. Other supported runtimes remain available. |
+| Linux arm64 | Not supported yet (gated until native acceptance). Builds do not include the runtime. Other supported runtimes remain available. |
+| Linux musl, Windows | Builtin runtime unavailable. Other supported runtimes remain available. |
 
 The runtime is present only in awman builds compiled with it. The `awman-macos-arm64` and GNU/glibc `awman-linux-amd64` release assets include it. Linux arm64, musl and Windows builds do not. A build without it reports `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature`.
 
@@ -152,7 +153,9 @@ or edit the global config file (`~/.awman/config.json`) directly:
 { "runtime": { "kind": "builtin" } }
 ```
 
-The value is `builtin`; the earlier `builtin-experimental` spelling is no longer accepted. `awman config set` refuses unknown runtime values, and if the file already holds one, `awman config …` still works so you can fix it; every command that would run an agent refuses to start until you do.
+The value is `builtin`; the earlier `builtin-experimental` spelling is no longer accepted. `awman config set` refuses unknown runtime values. If the file already holds one, every command that would run an agent refuses to start (awman never falls back to Docker). Edit a malformed file directly; for a valid file naming a runtime this host cannot use, repair it with a startup override, for example `awman --set runtime.kind=docker config set runtime.kind docker`.
+
+`runtime.kind` and `runtime.builtin.stateDir` are fixed for a running awman process: a TUI or API command that asks for a different value is refused with `process_scoped_setting` (HTTP 409) and tells you to restart with the value you want. VM size, network and image-source settings stay per session. See [Settings fixed for an awman process](07-configuration.md#settings-fixed-for-an-awman-process).
 
 ### Linux KVM access
 
@@ -440,6 +443,7 @@ In every mode: inbound connections are refused (awman never publishes a guest po
 - Ctrl-C in the launching session sends the agent an interrupt and gives it 10 seconds to exit before the VM is killed. In `awman attach`, Ctrl-C detaches only that client.
 - **The awman process that launched a session must keep running.** If it exits, the session's VM stops. Detaching and reattaching works while that process is alive: another client, including a newer compatible awman process, can attach to the same live session and see the same output; detaching only ends that one client's connection, and the guest keeps running. Reattaching after the launching process has exited is not supported. Checkpoint restore is not supported.
 - **A client is never left believing it saw the whole session when it didn't.** If a client reading attached output falls too far behind the live stream, awman ends that connection with an explicit failure — never a later clean exit that would make missed output look like it was delivered. Reconnect (or restart the agent) after seeing this. An attach starts at the current output; it does not replay what was written before the connection was accepted.
+- An explicit stop of a builtin session keeps an inspectable stopped instance (repeating the stop, or stopping one that is already gone, is safe); removing it (`awman clean`, or an explicit remove) deletes it and its disk. Awman refuses to act on an instance that was replaced by another with the same name.
 - `awman agents status` lists builtin sessions. Workflows and squad find their sessions by name, as they do on Docker.
 - `awman agents detail <id>` includes the builtin VM's configured vCPUs, memory in MiB, and network mode.
 - Live CPU and memory figures (the TUI's container title bar and minimized bars, and `awman agents status`) are measured from the VM itself: CPU is the guest's vCPU time over wall time on the same per-core scale as `docker stats` (100% is one fully busy vCPU, so a 2-vCPU VM tops out at 200%), and memory is what the guest is using. The runtime publishes a new sample once a second, so a one-shot `awman agents status` may take about a second per running session to report CPU.

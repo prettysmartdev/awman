@@ -22,13 +22,16 @@ function TaskConfirm({ client, action, task, confirm, dismiss, busy }: { client:
   return <Modal title={action === 'delete' ? 'Delete task' : prompt?.title ?? 'Loading prompt…'}><p className="prose">{action === 'delete' ? `Delete task "${task.name}"?` : prompt?.body}</p>{error && <p role="alert">{error}</p>}{action === 'delete' ? <div className="actions"><button className="secondary danger" disabled={busy} onClick={confirm}>Delete</button><button className="secondary" onClick={dismiss}>Cancel</button></div> : prompt && <PromptButtons prompt={prompt} disabled={busy} choose={choose} />}</Modal>;
 }
 
-export function Squad({ client, available, readOnly, submit, detach, enabled = true, onInterrupt, onAttachmentChange }: { client: DaemonClient; available: boolean; readOnly: boolean; submit: (args: string[]) => void; detach: () => void; enabled?: boolean; onInterrupt?: () => void; onAttachmentChange?: (attached: boolean) => void }) {
+function shellQuote(value: string): string { return `'${value.replaceAll("'", "'\\''")}'`; }
+
+export function Squad({ client, listenerName, available, readOnly, submit, detach, enabled = true, onInterrupt, onAttachmentChange }: { client: DaemonClient; listenerName?: string | null; available: boolean; readOnly: boolean; submit: (args: string[]) => void; detach: () => void; enabled?: boolean; onInterrupt?: () => void; onAttachmentChange?: (attached: boolean) => void }) {
   const [tasks, setTasks] = useState<SquadTask[]>([]); const [selected, setSelected] = useState(0);
   const [detail, setDetail] = useState<SquadTask | null>(null); const [runs, setRuns] = useState<SquadRun[] | null>(null);
   const [error, setError] = useState(''); const [unavailable, setUnavailable] = useState(!available);
   const [action, setAction] = useState<TaskAction | null>(null); const [target, setTarget] = useState<SquadTask | null>(null);
   const [busy, setBusy] = useState(false);
   const [columns, setColumns] = useState(1);
+  const [recovery, setRecovery] = useState<{ features: string[] } | null | 'loading'>('loading');
   useEffect(() => {
     if (typeof matchMedia !== 'function') return; const media = matchMedia('(min-width: 768px)');
     const update = () => setColumns(media.matches ? 2 : 1); update(); media.addEventListener('change', update); return () => media.removeEventListener('change', update);
@@ -49,6 +52,17 @@ export function Squad({ client, available, readOnly, submit, detach, enabled = t
     document.addEventListener('visibilitychange', visibility);
     return () => { live = false; clearInterval(timer); document.removeEventListener('visibilitychange', visibility); };
   }, [available, client]);
+  useEffect(() => {
+    if (available) return;
+    let live = true;
+    setRecovery('loading');
+    if (!listenerName) { setRecovery(null); return; }
+    void client.status().then(status => {
+      const listener = status.listeners.network[listenerName];
+      if (live) setRecovery(listener?.name === listenerName && listener.configured_features ? { features: listener.configured_features } : null);
+    }).catch(() => { if (live) setRecovery(null); });
+    return () => { live = false; };
+  }, [available, client, listenerName]);
   useEffect(() => {
     if (!attachOwner) return;
     let live = true; let checking = false;
@@ -100,7 +114,14 @@ export function Squad({ client, available, readOnly, submit, detach, enabled = t
     const actions: Record<string, TaskAction> = { 'squad.pause': 'pause', 'squad.trigger': 'trigger', 'squad.cancel': 'cancel', 'squad.delete': 'delete' };
     const next = actions[a]; if (next) { request(next); return; } return false;
   }, enabled);
-  if (unavailable) return <section className="panel"><h2>Squad unavailable</h2><p>Enable squad on this listener and in the daemon, then reopen the squad tab.</p><div className="stack">{['awman config set daemon.network.listeners.loopback.features engine,squad', 'awman config set daemon.features.squad.enabled true'].map(command => <div className="squad-command" key={command}><pre>{command}</pre><button className="secondary" aria-label={"Copy " + command} onClick={() => void copyText(command).catch(() => setError('Copy failed.'))}>Copy</button></div>)}</div>{error && <p role="alert">{error}</p>}</section>;
+  if (unavailable) {
+    const features = recovery && recovery !== 'loading' ? [...new Set([...recovery.features, 'engine', 'squad'])].sort() : null;
+    const listenerCommand = features && listenerName
+      ? `awman config set ${shellQuote(`daemon.network.listeners.${listenerName}.features`)} ${shellQuote(features.join(','))}`
+      : null;
+    const commands = listenerCommand ? [listenerCommand, 'awman config set daemon.features.squad.enabled true'] : [];
+    return <section className="panel"><h2>Squad unavailable</h2><p>Enable Squad on the connected listener and in the daemon, then reopen the Squad tab.</p>{recovery === 'loading' && <p role="status">Checking current listener configuration…</p>}{!listenerCommand && <p>Inspect the current listener and feature configuration with <code>awman status</code> and <code>awman config show</code>. Reconnect to refresh listener details before changing configuration.</p>}<div className="stack">{commands.map(command => <div className="squad-command" key={command}><pre>{command}</pre><button className="secondary" aria-label={"Copy " + command} onClick={() => void copyText(command).catch(() => setError('Copy failed.'))}>Copy</button></div>)}</div>{error && <p role="alert">{error}</p>}</section>;
+  }
   return <section className="panel squad" data-key-context="squadList"><header><h2>Squad</h2><button className={task ? 'secondary' : ''} disabled={readOnly || busy} onClick={() => void catalogueCommand('new_squad_task')}>New task</button></header><p className="hint">The command box is inactive in the squad tab. Use task controls.</p>{error && <p role="alert">{error}</p>}
 
     <VirtualList label="Squad tasks" activeIndex={Math.floor(selected / columns)} rowHeight={132} items={Array.from({ length: Math.ceil(tasks.length / columns) }, (_, row) => tasks.slice(row * columns, (row + 1) * columns))} render={(row, rowIndex) => <div className="squad-card-row">{row.map((t, col) => <button className="secondary squad-card" key={t.id} aria-pressed={selected === rowIndex * columns + col} onClick={() => { setSelected(rowIndex * columns + col); void client.squad.task(t.id).then(setDetail).catch(e => setError(errorText(e))); }}><strong>{t.name}</strong><span>{t.status} · {t.last_run_status ?? 'No runs'}</span><span className="hint">Every {Math.max(1, Math.round(t.interval_ms / 60000))} minutes</span>{t.unmet_env.length ? ` · Missing ${t.unmet_env.join(', ')}` : ''}</button>)}</div>} />

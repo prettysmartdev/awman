@@ -21,6 +21,9 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(awman_builtin)]
+mod deadline;
+
 #[cfg(not(awman_builtin))]
 fn main() -> std::process::ExitCode {
     if awman_host_shims::dispatch_worker(std::env::vars_os(), std::env::args_os()) {
@@ -346,22 +349,24 @@ mod driver {
 
         // Removal on exit is asynchronous in the worker; give it a bounded
         // moment before counting what is still running.
-        let mut leftover = 0;
-        for _ in 0..50 {
-            leftover = runtimes
-                .iter()
-                .map(|r| {
-                    r.list_running_all()
-                        .expect("BLOCKED[hypervisor]: lost VM enumeration")
-                        .len()
-                })
-                .max()
-                .unwrap_or(0);
-            if leftover == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+        let leftover = crate::deadline::until(
+            Duration::from_secs(10),
+            || {
+                let leftover = runtimes
+                    .iter()
+                    .map(|r| {
+                        r.list_running_all()
+                            .expect("BLOCKED[hypervisor]: lost VM enumeration")
+                            .len()
+                    })
+                    .max()
+                    .unwrap_or(0);
+                (leftover == 0).then_some(leftover)
+            },
+            || "VM cleanup deadline: running guests remain".into(),
+        )
+        .await
+        .expect("guest cleanup");
         println!("LEFTOVER\t{leftover}");
         println!("DONE");
         ExitCode::SUCCESS

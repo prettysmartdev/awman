@@ -538,7 +538,7 @@ impl WorkflowEngine {
         }
         self.auth_retries_used.insert(step_name.to_string());
         self.msg_warning(format!(
-            "Step '{step_name}' failed authentication; refreshed credentials and retrying once"
+            "Step '{step_name}' failed authentication; retrying once after a credential refresh attempt"
         ));
         Ok(true)
     }

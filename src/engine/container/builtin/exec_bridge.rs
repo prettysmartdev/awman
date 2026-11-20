@@ -16,7 +16,7 @@ use crate::{
                 AgentExecution, AgentExitInfo, AgentHandlePreview, AgentInstance, CancelHandle,
                 ExecutionBackend, FrontendWaitGuard,
             },
-            frontend::{AgentFrontend, AgentIo, AgentStatus},
+            frontend::{send_bounded, send_lossy, AgentFrontend, AgentIo, AgentStatus},
             output_tail::OutputTail,
         },
         container::io_bridge::{OutputActivity, StuckConfig, StuckDetector},
@@ -83,6 +83,8 @@ pub struct ExecBridgeOptions {
     /// How long an interrupted agent gets to exit before it is killed and its
     /// sandbox stopped. Production launches use [`DEFAULT_CANCEL_GRACE`].
     pub cancel_grace: Duration,
+    pub startup_grace: Option<Duration>,
+    pub output_tail: Arc<OutputTail>,
 }
 pub struct ExecBridge(ExecBridgeOptions);
 
@@ -252,7 +254,10 @@ impl ExecBridge {
             prompt_files,
             mut io,
             cancel_grace,
+            startup_grace,
+            output_tail: tail,
         } = self.0;
+        tail.set_warning_sink(io.stderr.clone());
         if let Some(prompt) = seeded_prompt {
             // Same bytes as the Docker path: the prompt plus a terminating newline.
             io.stdin_tx
@@ -292,6 +297,15 @@ impl ExecBridge {
             _ => None,
         };
         let redaction = frontend.output_redaction();
+        // ACP: this event loop cannot wait, so stdout that overruns the
+        // transport budget fails the session explicitly and stderr drops
+        // (counted) at ingress; neither channel grows beyond its budget.
+        let acp_gates = frontend.acp_io_gates();
+        let acp_stdout = acp_gates.as_ref().map(|gates| gates.stdout.clone());
+        let acp_stderr = acp_gates.as_ref().map(|gates| gates.stderr.clone());
+        for gate in acp_stdout.iter().chain(acp_stderr.iter()) {
+            gate.attach();
+        }
         let server = if let Some(path) = attach_path {
             Some(AttachServer::bind(
                 &path,
@@ -328,7 +342,6 @@ impl ExecBridge {
             }
         });
         let resize_abort = resize_task.abort_handle();
-        let tail = Arc::new(OutputTail::with_default_capacity());
         let output_activity = OutputActivity::new();
         let program_status = ProgramStatusTracker::shared();
         let cleanup_claimed = Arc::new(AtomicBool::new(false));
@@ -352,7 +365,7 @@ impl ExecBridge {
         let stuck = StuckDetector::spawn(
             StuckConfig {
                 startup_timing: frontend.startup_timing(),
-                grace_timeout: frontend.grace_timeout(),
+                grace_timeout: startup_grace.unwrap_or_else(|| frontend.grace_timeout()),
                 stuck_timeout: frontend.stuck_timeout(),
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: cancel_grace,
@@ -376,7 +389,8 @@ impl ExecBridge {
         let mut prompt_files = ObservedPromptFiles(prompt_files);
         let mut stdout_status = ProgramStatusStream::new(program_status.clone(), status_config)
             .with_redaction(redaction.clone());
-        let mut stderr_status = ProgramStatusStream::new(program_status.clone(), status_config);
+        let mut stderr_status = ProgramStatusStream::new(program_status.clone(), status_config)
+            .with_redaction(redaction.clone());
         let query_control = control.clone();
         let event_task = tokio::spawn(async move {
             let mut events = session.events;
@@ -385,6 +399,7 @@ impl ExecBridge {
                     biased;
                     _ = released.notified(), if sinks.is_some() => {
                         sinks = None;
+                        output_tail.close_capture();
                         continue;
                     }
                     event = events.recv() => event,
@@ -400,7 +415,7 @@ impl ExecBridge {
                             terminal.push_output(&bytes);
                         }
                         if let Some((stdout, _)) = &sinks {
-                            let _ = stdout.send(bytes.into_owned());
+                            let _ = send_bounded(acp_stdout.as_ref(), stdout, bytes.into_owned());
                         }
                     }
                     Ok(ExecEvent::Stderr(bytes)) => {
@@ -413,7 +428,7 @@ impl ExecBridge {
                             terminal.push_output(&bytes);
                         }
                         if let Some((_, stderr)) = &sinks {
-                            let _ = stderr.send(bytes.into_owned());
+                            let _ = send_lossy(acp_stderr.as_ref(), stderr, bytes.into_owned());
                         }
                     }
                     Ok(ExecEvent::Exited(code)) => {
@@ -467,9 +482,14 @@ impl ExecBridge {
                     terminal.push_output(&bytes);
                 }
                 if let Some((stdout, stderr)) = &sinks {
-                    let _ = if is_stderr { stderr } else { stdout }.send(bytes);
+                    let _ = if is_stderr {
+                        send_lossy(acp_stderr.as_ref(), stderr, bytes)
+                    } else {
+                        send_bounded(acp_stdout.as_ref(), stdout, bytes)
+                    };
                 }
             }
+            output_tail.close_capture();
             if let Some((_, terminal)) = &terminal {
                 terminal.exit(outcome.as_ref().map_or(-1, |info| info.exit_code));
             }
@@ -731,6 +751,8 @@ impl AgentInstance for AttachInstance {
                 prompt_files: Vec::new(),
                 io,
                 cancel_grace: DEFAULT_CANCEL_GRACE,
+                startup_grace: None,
+                output_tail: Arc::new(OutputTail::with_default_capacity()),
             })
             .run(frontend)
         }

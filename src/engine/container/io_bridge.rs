@@ -134,6 +134,11 @@ pub(crate) struct BridgeConfig {
     /// attach clients see exactly what the launching frontend sees. `None`
     /// keeps the existing behaviour.
     pub output_broadcast: Option<Arc<tokio::sync::broadcast::Sender<Vec<u8>>>>,
+    /// ACP transport budgets (`AgentFrontend::acp_io_gates`). When set, the
+    /// piped stdout reader acquires before forwarding (it stops reading the
+    /// child while the transport is full) and the stdin writer releases after
+    /// each write. `None` everywhere else.
+    pub acp_gates: Option<crate::engine::agent_runtime::frontend::AcpIoGates>,
 }
 
 /// Bundle returned by `bridge_pty` / `bridge_piped` containing the artifacts
@@ -536,6 +541,9 @@ pub(crate) fn bridge_piped(
 ) -> BridgeResult {
     let output = OutputActivity::new();
     let program_status = ProgramStatusTracker::shared();
+    // A short-lived stdout reader may finish before stderr is registered.
+    // Keep capture open until both registrations are complete.
+    let _capture_registration = config.output_tail.writer();
 
     // stdout reader thread.
     //
@@ -545,6 +553,10 @@ pub(crate) fn bridge_piped(
     // the container actually produces.
     if let Some(child_stdout) = child.stdout.take() {
         let stdout_tx = io.stdout;
+        let stdout_gate = config.acp_gates.as_ref().map(|gates| gates.stdout.clone());
+        if let Some(gate) = &stdout_gate {
+            gate.attach();
+        }
         let act = output.clone();
         // A writer handle, so a caller can wait for this thread to finish.
         let tail = config.output_tail.writer();
@@ -574,7 +586,13 @@ pub(crate) fn bridge_piped(
                                 let _ = tx.send(bytes.to_vec());
                             }
                         }
-                        if sink_open && stdout_tx.send(bytes.to_vec()).is_err() {
+                        if sink_open
+                            && !crate::engine::agent_runtime::frontend::send_gated(
+                                stdout_gate.as_ref(),
+                                &stdout_tx,
+                                bytes.to_vec(),
+                            )
+                        {
                             sink_open = false;
                         }
                     }
@@ -585,8 +603,12 @@ pub(crate) fn bridge_piped(
             if let Some(tx) = &broadcast {
                 let _ = tx.send(bytes.clone());
             }
-            if !bytes.is_empty() {
-                let _ = stdout_tx.send(bytes);
+            if sink_open && !bytes.is_empty() {
+                crate::engine::agent_runtime::frontend::send_gated(
+                    stdout_gate.as_ref(),
+                    &stdout_tx,
+                    bytes,
+                );
             }
         });
     }
@@ -595,6 +617,11 @@ pub(crate) fn bridge_piped(
     // Feeds the same tail as stdout so the buffer holds combined output.
     if let Some(child_stderr) = child.stderr.take() {
         let stderr_tx = io.stderr;
+        // ACP: bounded at ingress; a full budget drops (and counts) newest.
+        let stderr_gate = config.acp_gates.as_ref().map(|gates| gates.stderr.clone());
+        if let Some(gate) = &stderr_gate {
+            gate.attach();
+        }
         let act = output.clone();
         // A writer handle, so a caller can wait for this thread to finish.
         let tail = config.output_tail.writer();
@@ -624,7 +651,13 @@ pub(crate) fn bridge_piped(
                                 let _ = tx.send(bytes.to_vec());
                             }
                         }
-                        if sink_open && stderr_tx.send(bytes.to_vec()).is_err() {
+                        if sink_open
+                            && !crate::engine::agent_runtime::frontend::send_lossy(
+                                stderr_gate.as_ref(),
+                                &stderr_tx,
+                                bytes.to_vec(),
+                            )
+                        {
                             sink_open = false;
                         }
                     }
@@ -636,7 +669,11 @@ pub(crate) fn bridge_piped(
                 let _ = tx.send(bytes.clone());
             }
             if !bytes.is_empty() {
-                let _ = stderr_tx.send(bytes);
+                crate::engine::agent_runtime::frontend::send_lossy(
+                    stderr_gate.as_ref(),
+                    &stderr_tx,
+                    bytes,
+                );
             }
         });
     }
@@ -645,6 +682,10 @@ pub(crate) fn bridge_piped(
     let stdin_tx = io.stdin_tx;
     if let Some(child_stdin) = child.stdin.take() {
         let mut stdin_rx = io.stdin_rx;
+        let stdin_gate = config.acp_gates.as_ref().map(|gates| gates.stdin.clone());
+        if let Some(gate) = &stdin_gate {
+            gate.attach();
+        }
         tokio::spawn(async move {
             use std::io::Write;
             let mut writer = child_stdin;
@@ -655,6 +696,13 @@ pub(crate) fn bridge_piped(
                 if writer.flush().is_err() {
                     break;
                 }
+                if let Some(gate) = &stdin_gate {
+                    gate.release(bytes.len());
+                }
+            }
+            // The child stopped reading: senders fail instead of waiting.
+            if let Some(gate) = &stdin_gate {
+                gate.close();
             }
         });
     }

@@ -22,6 +22,9 @@
 //! repo may only narrow) and workflow prerequisites (repo and task files may
 //! narrow, never grant).
 
+#[path = "process_binding.rs"]
+pub mod process_binding;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -240,6 +243,25 @@ pub struct AuthRefreshSettings {
     pub enabled: bool,
     pub threshold: Duration,
     pub tick: Duration,
+}
+
+impl AuthRefreshSettings {
+    pub fn from_config(config: &ConfigFile) -> Self {
+        let refresh = config
+            .agents
+            .as_ref()
+            .and_then(|a| a.auth.as_ref())
+            .and_then(|a| a.refresh.as_ref());
+        Self {
+            enabled: refresh.and_then(|r| r.enabled).unwrap_or(true),
+            threshold: refresh
+                .and_then(|r| r.threshold.as_ref())
+                .map_or(Duration::from_secs(20 * 60), |d| d.to_duration()),
+            tick: refresh
+                .and_then(|r| r.tick.as_ref())
+                .map_or(Duration::from_secs(60), |d| d.to_duration()),
+        }
+    }
 }
 
 /// The merged view of every config source, plus the invocation's flags and
@@ -512,20 +534,7 @@ impl EffectiveConfig {
     /// `agents.auth.refresh.*`. `enabled: false` restores env-variable
     /// credential delivery.
     pub fn auth_refresh(&self) -> AuthRefreshSettings {
-        let refresh = self
-            .agents()
-            .auth
-            .and_then(|a| a.refresh)
-            .unwrap_or_default();
-        AuthRefreshSettings {
-            enabled: refresh.enabled.unwrap_or(true),
-            threshold: refresh
-                .threshold
-                .map_or(Duration::from_secs(20 * 60), |d| d.to_duration()),
-            tick: refresh
-                .tick
-                .map_or(Duration::from_secs(60), |d| d.to_duration()),
-        }
+        AuthRefreshSettings::from_config(&self.merged)
     }
 
     /// `--remote-session` > `AWMAN_REMOTE_SESSION`.

@@ -109,7 +109,9 @@ The **experimental builtin microVM runtime** (macOS on Apple Silicon and Linux x
 }
 ```
 
-Then `awman ready` builds the Dockerfiles in that Docker Engine (`apple-local` uses Apple Containers) and imports the result; agents still run only in the builtin microVM. See [Building from a local image source](11-runtimes.md#building-from-a-local-image-source). `awman init` still builds images with the configured runtime, so under `builtin-experimental` its image-build step fails and the agent audit is skipped: run `awman init` while `runtime` is `docker` or `apple-containers`, then switch.
+Then `awman ready` builds the Dockerfiles in that local Docker Engine (`apple-local` uses Apple Containers) and imports the result; agents still run only in the builtin microVM. Only a Unix-socket `docker-local` source or `apple-local` can build; registry, archive and remote Docker sources are import-only, and awman never picks a build target you did not configure. See [Building from a local image source](11-runtimes.md#building-from-a-local-image-source). `awman init` does not use the builtin image builder: with `runtime.kind` set to `builtin` its image-build step fails and the agent audit is skipped. Run `awman init` while `runtime.kind` is `docker` or `apple`, then switch to `builtin`.
+
+Builtin is an experimental preview on macOS Apple Silicon and Linux x86_64 (GNU/glibc) with KVM. Linux ARM64 is not supported yet: builds for it do not include the runtime, so use another runtime there.
 
 ### `awman init`
 

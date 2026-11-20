@@ -1764,8 +1764,15 @@ pub fn validate_value(key: &ConfigKey, value: &Value) -> Result<(), KeyError> {
         ValueKind::Enum(values) => {
             let s = value.as_str().unwrap_or_default();
             if !values.contains(&s) {
+                let hint = if key.path == "runtime.kind" {
+                    super::runtime::RuntimeSelection::hint_for(s)
+                        .map(|hint| format!("; {hint}"))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 return Err(invalid(format!(
-                    "expected one of {}, got {shown}",
+                    "expected one of {}, got {shown}{hint}",
                     values.join(", ")
                 )));
             }

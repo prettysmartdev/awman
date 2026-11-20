@@ -20,8 +20,15 @@
 #![deny(unsafe_code)]
 
 #[cfg(awman_builtin)]
+mod deadline;
+
+#[cfg(awman_builtin)]
 #[path = "worker_mount.rs"]
 mod worker_mount_probe;
+
+#[cfg(awman_builtin)]
+#[path = "../guest/support/phase_runtime.rs"]
+mod phase_runtime;
 
 #[cfg(not(awman_builtin))]
 fn main() -> std::process::ExitCode {
@@ -57,6 +64,23 @@ mod driver {
     use awman::engine::container::ContainerRuntime;
 
     type Res<T> = Result<T, String>;
+
+    fn wait_for_sync<T>(
+        limit: Duration,
+        mut condition: impl FnMut() -> Option<T>,
+    ) -> Result<T, String> {
+        let started = Instant::now();
+        loop {
+            if let Some(value) = condition() {
+                return Ok(value);
+            }
+            let remaining = limit.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err("guest readiness deadline expired".into());
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(20)));
+        }
+    }
 
     /// The scenario's per-launch settings, set once in `run`.
     static LAUNCH: std::sync::OnceLock<BuiltinLaunchSettings> = std::sync::OnceLock::new();
@@ -223,6 +247,42 @@ mod driver {
         Ok(seen)
     }
 
+    async fn resize_until_size(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        stdin: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        expected: &str,
+        limit: Duration,
+    ) -> Res<String> {
+        let seen = std::cell::RefCell::new(String::new());
+        let queries = std::cell::Cell::new(0);
+        let mut last_query: Option<Instant> = None;
+        crate::deadline::until(
+            limit,
+            || {
+                if last_query.is_none_or(|last| last.elapsed() >= Duration::from_millis(100)) {
+                    if stdin.send(b"query\n".to_vec()).is_ok() {
+                        queries.set(queries.get() + 1);
+                    }
+                    last_query = Some(Instant::now());
+                }
+                while let Ok(chunk) = rx.try_recv() {
+                    seen.borrow_mut().push_str(&String::from_utf8_lossy(&chunk));
+                }
+                seen.borrow()
+                    .contains(expected)
+                    .then(|| seen.borrow().clone())
+            },
+            || {
+                format!(
+                    "guest PTY resize deadline: expected={expected:?}; observed={:?}; queries={}",
+                    seen.borrow(),
+                    queries.get()
+                )
+            },
+        )
+        .await
+    }
+
     fn overlay(host: &Path, guest: &str, rw: bool) -> OverlaySpec {
         OverlaySpec {
             host_path: host.to_path_buf(),
@@ -324,17 +384,15 @@ mod driver {
             tree.single_ro.clone(),
         );
         std::thread::spawn(move || {
-            for _ in 0..1200 {
-                if ready.exists() {
-                    let next = claude.join(".credentials.next");
-                    std::fs::write(&next, "access-token-v2").unwrap();
-                    std::fs::rename(&next, claude.join(".credentials.json")).unwrap();
-                    let next = single.with_extension("next");
-                    std::fs::write(&next, "file-ro-v2").unwrap();
-                    std::fs::rename(&next, &single).unwrap();
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(100));
+            wait_for_sync(Duration::from_secs(120), || ready.exists().then_some(()))
+                .expect("guest refresh readiness");
+            {
+                let next = claude.join(".credentials.next");
+                std::fs::write(&next, "access-token-v2").unwrap();
+                std::fs::rename(&next, claude.join(".credentials.json")).unwrap();
+                let next = single.with_extension("next");
+                std::fs::write(&next, "file-ro-v2").unwrap();
+                std::fs::rename(&next, &single).unwrap();
             }
         })
     }
@@ -397,7 +455,16 @@ mod driver {
             }
         }
         let runtime = std::sync::Arc::new(runtime);
-        let result = if args.scenario == "worker-mount" {
+        let result = if args.scenario.starts_with("phase-") {
+            crate::phase_runtime::run(
+                &runtime,
+                &args.scenario,
+                &args.tag,
+                &args.work,
+                LAUNCH.get().unwrap(),
+            )
+            .await
+        } else if args.scenario == "worker-mount" {
             crate::worker_mount_probe::run(runtime.clone(), "builtin", &args.tag).await;
             Ok(())
         } else {
@@ -521,7 +588,7 @@ mod driver {
             // replaces the file atomically and both must observe it.
             "refresh-multi" => {
                 let tree = tree(&a.work.join("tree"), &a.scripts);
-                let script = "for i in $(seq 1 100); do \
+                let script = "[ \"$(cat /agent-home/.claude/.credentials.json)\" = access-token-v1 ] || exit 2; echo READY-v1; for i in $(seq 1 1000); do \
                     [ \"$(cat /agent-home/.claude/.credentials.json)\" = access-token-v2 ] && { echo seen-v2; exit 0; }; \
                     sleep 0.1; done; echo never-saw-v2; exit 1";
                 let mut launched = Vec::new();
@@ -531,7 +598,9 @@ mod driver {
                     o.entrypoint = sh(script);
                     launched.push(launch(runtime, o, None)?);
                 }
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                for (_, peer) in &mut launched {
+                    read_until(&mut peer.stdout, "READY-v1", Duration::from_secs(60)).await?;
+                }
                 let next = tree.claude.join(".credentials.next");
                 std::fs::write(&next, "access-token-v2").unwrap();
                 std::fs::rename(&next, tree.claude.join(".credentials.json")).unwrap();
@@ -607,19 +676,27 @@ mod driver {
             "pty-resize" => {
                 let mut o = options(tag, &name("pty"));
                 o.interactive = true;
-                o.entrypoint = sh("stty size; read line; stty size");
+                o.entrypoint = sh("stty size; while IFS= read -r line; do [ \"$line\" = exit ] && exit 0; stty size; done");
                 let (exec, mut peer) = launch(runtime, o, Some((80, 24)))?;
                 let first = read_until(&mut peer.stdout, "24 80", Duration::from_secs(60)).await?;
+                let resize_started = Instant::now();
                 peer.resize
                     .as_ref()
                     .ok_or("no resize channel")?
                     .send((100, 30))
                     .map_err(|e| e.to_string())?;
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                let rest = resize_until_size(
+                    &mut peer.stdout,
+                    &peer.stdin,
+                    "30 100",
+                    Duration::from_secs(60),
+                )
+                .await?;
                 peer.stdin
-                    .send(b"go\n".to_vec())
+                    .send(b"exit\n".to_vec())
                     .map_err(|e| e.to_string())?;
-                let rest = read_until(&mut peer.stdout, "30 100", Duration::from_secs(60)).await?;
+                println!("PTY_RESIZE_RUN\t{}", a.work.display());
+                println!("PTY_RESIZE_MS\t{}", resize_started.elapsed().as_millis());
                 println!("PTY_SIZES\t{}", (first + &rest).replace(['\r', '\n'], " "));
                 let outcome = finish(exec, peer).await?;
                 println!("EXIT\t{}", outcome.exit);

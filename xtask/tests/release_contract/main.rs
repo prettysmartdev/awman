@@ -2,6 +2,7 @@
 //! scratch Git objects, fake transports, FakeCli tools and controlling PTYs.
 #![cfg(unix)]
 mod runner;
+mod workflows;
 use awman_test_support::{fakes::FakeCli, Exit, PtyChild, TestCase, TestSandbox};
 use std::{
     fs,

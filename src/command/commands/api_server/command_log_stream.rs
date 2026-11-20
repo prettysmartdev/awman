@@ -13,6 +13,8 @@ use super::event_bus::EventBus;
 /// Delivery facts needed by adapters that preserve resumable cursors and
 /// progress notices. Transient events deliberately have no resumable cursor.
 pub enum CommandLogUpdate {
+    /// Unnumbered terminal transport failure; the durable command needs recovery.
+    RecoveryRequired,
     QueueStatus(crate::data::daemon_state::CommandQueueStatus),
     Event {
         event: Box<ExecutionEvent>,
@@ -107,6 +109,10 @@ impl CommandLogStream {
             if !cursor.replay(&events, &tx).await {
                 return;
             }
+            if recovery_required(&state, &command_id).await {
+                let _ = tx.send(CommandLogUpdate::RecoveryRequired).await;
+                return;
+            }
             if command.status.is_terminal() {
                 finish_terminal_log(
                     &state,
@@ -189,6 +195,9 @@ impl CommandLogStream {
                     tokio::select! {
                         _ = tx.closed() => return,
                         _ = status_poll.tick() => {
+                            if recovery_required(&state, &command_id).await {
+                                let _ = tx.send(CommandLogUpdate::RecoveryRequired).await; return;
+                            }
                             let Some(row) = command_log_row(&state, &command_id).await else {
                                 return;
                             };
@@ -606,5 +615,72 @@ async fn wait_for_worker(
                 }
             }
         }
+    }
+}
+
+async fn recovery_required(state: &CommandLogSource, command: &str) -> bool {
+    state
+        .event_buses
+        .lock()
+        .await
+        .get(command)
+        .is_some_and(|bus| bus.recovery_required())
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+    #[tokio::test]
+    async fn permanent_storage_failure_is_unnumbered_and_never_fabricates_done() {
+        let s = awman_test_support::TestSandbox::for_test(awman_test_support::TestCase::component(
+            "command_log_stream::permanent_storage_failure",
+        ));
+        let db = Arc::new(SqliteSessionStore::open_in_memory().unwrap());
+        let sid = crate::data::ids::WorkerSessionId::new();
+        let cid = crate::data::ids::CommandId::new();
+        db.insert_session(
+            sid.as_str(),
+            s.work().to_str().unwrap(),
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .unwrap();
+        db.insert_running_lease_command(cid.as_str(), sid.as_str(), "chat", "[]", false)
+            .unwrap();
+        let bus = Arc::new(EventBus::new(64));
+        let sequence = bus.next_sequence();
+        bus.sender().require_recovery();
+        let buses = Arc::new(tokio::sync::Mutex::new(HashMap::from([(
+            cid.as_str().to_string(),
+            bus.clone(),
+        )])));
+        let mut stream = CommandLogStream::open(
+            db.clone(),
+            ApiPaths::from_root(s.tmp().join("api")),
+            buses,
+            db.get_command(cid.as_str()).unwrap().unwrap(),
+            None,
+            None,
+            Duration::from_millis(5),
+        )
+        .await;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(1), stream.next_update())
+                .await
+                .unwrap()
+            {
+                Some(CommandLogUpdate::RecoveryRequired) => break,
+                Some(CommandLogUpdate::Restart(_)) => {}
+                _ => panic!("unexpected progress or fabricated completion"),
+            }
+        }
+        assert!(stream.next_update().await.is_none());
+        assert_eq!(bus.next_sequence(), sequence);
+        assert!(!db
+            .get_command(cid.as_str())
+            .unwrap()
+            .unwrap()
+            .status
+            .is_terminal());
+        s.finish();
     }
 }

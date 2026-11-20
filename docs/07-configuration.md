@@ -133,6 +133,26 @@ the new limit. `workServers.<name>.maxConcurrentJobs` also reloads live and limi
 new leases from that server. Environment and startup `--set` overrides still
 take precedence over file edits.
 
+### Settings fixed for an awman process
+
+A few settings choose machinery that a running awman process builds once, so they bind to the process rather than to each command:
+
+- `runtime.kind` (which runtime runs agents),
+- `runtime.builtin.stateDir` (only when the runtime is `builtin`; also `AWMAN_RUNTIME_BUILTIN_STATE_DIR`), and
+- `agents.auth.refresh.enabled`, `.threshold` and `.tick`.
+
+The TUI, the daemon and the squad daemon resolve these once at startup, from the global file, environment variables and any startup `--set`, with the normal precedence. Everything else in the reference table (builtin `network`, `vcpus`, `memory`, `rootDisk`, `mountQuota`, image sources and `builder.enabled`, agent choice, flags, workflow and automation settings) is resolved per session and keeps working per command.
+
+A one-shot CLI command (`awman chat`, `awman exec …`) is its own process, so it honours these settings from your global file, environment, repository and `--set` for that run. A command submitted to a process that is already running cannot change them. A `--set` in the TUI command box or in an API command's `args` that differs from what the process is running, or a repository value for `stateDir` or the refresh settings that differs from it, is refused before anything is created (over the API: HTTP 409, code `process_scoped_setting`):
+
+```text
+`runtime.kind` is fixed for this awman process (running with docker; requested builtin). Restart the daemon or TUI with `--set runtime.kind=builtin`, or change the global config and restart.
+```
+
+A request that names the value the process already uses is accepted (equivalent durations such as `60s` and `1m` count as equal). A repository config file cannot hold `runtime.kind` at all; it is global-only. `awman config set` can still write a process-scoped key for the next start, but a reload does not apply it (`restart the daemon to apply`).
+
+An invalid or unavailable runtime is never replaced by Docker. If the global file is malformed, edit it directly. If it is valid but names a runtime this host cannot use, give the repair command a valid startup override, for example `awman --set runtime.kind=docker config set runtime.kind docker`.
+
 ---
 
 ## Work item sources
@@ -691,7 +711,7 @@ Precedence is per key: a repository value overrides the matching global value, w
 | `sbx` | macOS arm64, Windows x86_64 (experimental) | Docker Sandboxes (persistent microVMs per session; hypervisor-grade isolation). Requires the `sbx` CLI and a Docker account. Linux is blocked by an upstream virtiofs bug. See [Runtimes](11-runtimes.md) |
 | `builtin` | macOS on Apple Silicon and Linux x86_64 with KVM (experimental) | MicroVM per session embedded in the awman binary; needs no Docker, `container`, or `sbx` to run agents. Included in `awman-linux-amd64` and `awman-macos-arm64`; the macOS binary is ad-hoc signed (see [Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions)). Must be set explicitly in the global config. `awman ready` imports images from a configured source (and, with `runtime.builtin.builder.enabled`, can build them first in a local Docker or Apple Containers store). See [Runtimes](11-runtimes.md#builtin-microvm-experimental) |
 
-`sbx` and `builtin` are experimental; the value itself never says so. An unrecognized value (e.g. a typo, or one of the old spellings) is a fatal error — awman never falls back to a different isolation model than the one you configured. CLI commands print the invalid value and the list of valid values, then exit; the TUI shows the same message in a startup modal (Enter quits). `runtime.kind` is global scope: fix it in the global file and relaunch.
+`sbx` and `builtin` are experimental; the value itself never says so. An unrecognized value (e.g. a typo, or one of the old spellings) is a fatal error — awman never falls back to a different isolation model than the one you configured. CLI commands print the invalid value and the list of valid values, then exit; the TUI shows the same message in a startup modal (Enter quits). `runtime.kind` is global scope and fixed for each awman process (see [Settings fixed for an awman process](#settings-fixed-for-an-awman-process)): fix it in the global file and relaunch. Builtin is an experimental preview on macOS Apple Silicon and Linux x86_64 GNU/KVM; Linux ARM64 is not supported yet.
 
 `awman ready` validates the configured runtime before any other check and reports which one is active. For full details on platform support, setup, credential registration, and the persistent-sandbox lifecycle see [Runtimes](11-runtimes.md).
 

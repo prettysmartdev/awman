@@ -495,29 +495,76 @@ fn tool_pins(m: &Manifest) -> Vec<String> {
     errors
 }
 
+/// One validator for preflight, fetch and verify. Repository payload records
+/// are the only exception to downloadable archive pins, and are authenticated
+/// inputs themselves rather than an arbitrary bypass string.
+pub fn fixture_pin_error(m: &Manifest, id: &str, f: &Fixture) -> Option<String> {
+    if let Some(record) = &f.verified_record {
+        let path = std::path::Path::new(record);
+        let components: Vec<_> = path.components().collect();
+        let valid_path = id.strip_prefix("msb-payload-").is_some_and(|triple| {
+            matches!(
+                triple,
+                "aarch64-apple-darwin" | "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu"
+            ) && record == &format!("third_party/msb-payloads/{triple}")
+        }) && components.len() == 3
+            && record.starts_with("third_party/msb-payloads/")
+            && components
+                .iter()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !valid_path
+            || f.pending.is_some()
+            || f.sha256.is_some()
+            || f.build.is_some()
+            || f.file.is_some()
+            || f.source.is_some()
+        {
+            return Some("invalid or ambiguous verified_record".into());
+        }
+        if !m.root.as_os_str().is_empty() && !m.root.join(path).join("provenance.txt").is_file() {
+            return Some("missing verified payload provenance record".into());
+        }
+        return None;
+    }
+    if f.pending.is_some()
+        || !f
+            .sha256
+            .as_deref()
+            .is_some_and(crate::evidence::digest::is_sha256)
+    {
+        return Some("missing published digest or pin still pending".into());
+    }
+    if f.build.is_none()
+        && !f.source.as_deref().is_some_and(|s| {
+            s.starts_with("https://") && s.len() > 8 && !s.chars().any(char::is_whitespace)
+        })
+    {
+        return Some("downloadable fixture requires an HTTPS source".into());
+    }
+    if f.source
+        .as_deref()
+        .is_some_and(|s| !s.starts_with("https://"))
+    {
+        return Some("fixture source must use HTTPS".into());
+    }
+    None
+}
 fn fixture_pins(m: &Manifest) -> Vec<String> {
     let mut errors = Vec::new();
     for (id, f) in &m.fixtures {
-        if f.verified_record.is_none()
-            && !f
-                .sha256
-                .as_ref()
-                .is_some_and(|d| crate::evidence::digest::is_sha256(d))
-        {
-            errors.push(format!(
-                "fixture {id}: missing published digest ({})",
-                f.pending.as_deref().unwrap_or("not pinned")
-            ));
+        if let Some(error) = fixture_pin_error(m, id, f) {
+            errors.push(format!("fixture {id}: {error}"));
         }
     }
     for (id, p) in &m.previous_release {
-        if !p
-            .sha256
-            .as_ref()
-            .is_some_and(|d| crate::evidence::digest::is_sha256(d))
+        if p.pending.is_some()
+            || !p
+                .sha256
+                .as_deref()
+                .is_some_and(crate::evidence::digest::is_sha256)
         {
             errors.push(format!(
-                "previous release {id}: missing authenticated asset digest"
+                "previous release {id}: missing authenticated asset digest or still pending"
             ));
         }
     }

@@ -370,6 +370,9 @@ impl AgentFrontend for ProgramStatusFrontend {
     fn take_io(&mut self) -> crate::engine::agent_runtime::frontend::AgentIo {
         self.frontend.take_io()
     }
+    fn acp_io_gates(&self) -> Option<crate::engine::agent_runtime::frontend::AcpIoGates> {
+        self.frontend.acp_io_gates()
+    }
     fn set_agent_output_format(
         &mut self,
         format: crate::data::agent_output_format::AgentOutputFormat,

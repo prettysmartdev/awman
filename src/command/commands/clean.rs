@@ -299,9 +299,8 @@ impl CleanCommand {
         if !paths.db_path().exists() {
             return Ok(None);
         }
-        let db = std::sync::Arc::new(crate::data::fs::api_db::SqliteSessionStore::open_at(
-            &paths.db_path(),
-        )?);
+        let db = paths
+            .open_session_store(crate::data::fs::ApiPaths::from_env(self.session.env())?.root())?;
         // Older installs may not yet have the lease side table.
         crate::data::worker::lease_store::LeaseStore::open(db.clone())?;
         Ok(Some(

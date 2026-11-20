@@ -24,11 +24,15 @@ use crate::engine::error::EngineError;
 
 /// A resolved definition, shared by everything one launch prepares.
 #[derive(Debug, Clone)]
-pub struct ResolvedAgent(Arc<AgentDefinition>);
+pub struct ResolvedAgent(Arc<AgentDefinition>, Option<PathBuf>);
 
 impl ResolvedAgent {
     pub fn definition(&self) -> Arc<AgentDefinition> {
         self.0.clone()
+    }
+
+    pub(crate) fn approved_ping_program(&self) -> Option<&Path> {
+        self.1.as_deref()
     }
 }
 
@@ -124,7 +128,10 @@ impl AgentRegistry {
     ) -> Result<ResolvedAgent, EngineError> {
         let def = Self::load_untrusted(env, name, git_root)?;
         let def = def.definition();
-        if Self::trust_status(env, def, git_root)? == TrustStatus::Pending {
+        let ping_program = custom_ping_program(env, def);
+        if Self::trust_status_with_ping(env, def, git_root, ping_program.as_deref())?
+            == TrustStatus::Pending
+        {
             if let AgentOrigin::Custom { path, sha256, .. } = &def.origin {
                 return Err(EngineError::AgentDefinitionUntrusted {
                     name: def.name.clone(),
@@ -133,7 +140,7 @@ impl AgentRegistry {
                 });
             }
         }
-        Ok(ResolvedAgent(Arc::new(def.clone())))
+        Ok(ResolvedAgent(Arc::new(def.clone()), ping_program))
     }
 
     /// Resolve using the invoker's definition root, including in worktree sessions.
@@ -242,6 +249,16 @@ impl AgentRegistry {
         def: &AgentDefinition,
         git_root: Option<&Path>,
     ) -> Result<TrustStatus, EngineError> {
+        let ping_program = custom_ping_program(env, def);
+        Self::trust_status_with_ping(env, def, git_root, ping_program.as_deref())
+    }
+
+    fn trust_status_with_ping(
+        env: &EnvSnapshot,
+        def: &AgentDefinition,
+        git_root: Option<&Path>,
+        ping_program: Option<&Path>,
+    ) -> Result<TrustStatus, EngineError> {
         if !def.is_custom() {
             return Ok(TrustStatus::FirstParty);
         }
@@ -255,7 +272,8 @@ impl AgentRegistry {
         let AgentOrigin::Custom { sha256, .. } = &def.origin else {
             unreachable!()
         };
-        Ok(if store.is_trusted(&trust_key(def, git_root)?, sha256) {
+        let approval = ping_approval_hash(def, sha256, ping_program);
+        Ok(if store.is_trusted(&trust_key(def, git_root)?, &approval) {
             TrustStatus::Approved
         } else {
             TrustStatus::Pending
@@ -278,7 +296,9 @@ impl AgentRegistry {
         if let Some(warning) = &store.load_warning {
             tracing::warn!("{warning}");
         }
-        store.approve(trust_key(def, git_root)?, &def.name, sha256)?;
+        let ping_program = custom_ping_program(env, def);
+        let approval = ping_approval_hash(def, sha256, ping_program.as_deref());
+        store.approve(trust_key(def, git_root)?, &def.name, &approval)?;
         Ok(())
     }
 
@@ -313,6 +333,43 @@ impl AgentRegistry {
             notes,
         }
     }
+}
+
+// Custom pings retain their own approval boundary. A PATH/symlink change
+// requires approval again, and a missing program cannot become runnable under
+// an approval recorded while it was missing. Never use first-party exclusions
+// to grant or infer custom trust.
+fn custom_ping_program(env: &EnvSnapshot, def: &AgentDefinition) -> Option<PathBuf> {
+    if !def.is_custom() {
+        return None;
+    }
+    let name = def.ping_argv.as_ref()?.first()?;
+    crate::engine::host_cli::find_program(env, name, env.path_dirs())?
+        .canonicalize()
+        .ok()
+}
+
+fn ping_approval_hash(def: &AgentDefinition, hash: &str, program: Option<&Path>) -> String {
+    if def.ping_argv.is_none() {
+        return hash.to_owned();
+    }
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"awman-custom-ping-path-v1\0");
+    digest.update(hash.as_bytes());
+    digest.update(b"\0");
+    match program {
+        Some(path) => {
+            digest.update(b"resolved\0");
+            digest.update(path.as_os_str().as_encoded_bytes());
+        }
+        None => digest.update(b"not-installed"),
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn trust_key(def: &AgentDefinition, git_root: Option<&Path>) -> Result<TrustKey, EngineError> {

@@ -12,7 +12,7 @@ use awman::command::{
     error::CommandError,
 };
 use awman::data::{
-    fs::{ApiPaths, AuthPathResolver},
+    fs::AuthPathResolver,
     preparation::{AuthenticationCheck, PreparationPolicy},
     session::{AgentHandle, Session, SessionOpenOptions},
     step_status::StepStatus,
@@ -129,26 +129,24 @@ fn fixture(name: &'static str, images_present: bool) -> Fixture {
         .global(json!({"agents": {"auth":{"refresh":{"enabled":false}}}}))
         .write(&sandbox, Some(repo.path()));
     let marker = sandbox.root().join("host-agent-ran");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::create_dir_all(sandbox.bin()).unwrap();
-        let script = sandbox.bin().join("claude");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\necho ran >> '{}'\necho hello\n",
-                marker.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    let fake = sandbox.install_fake(support::fake_cli_exe(), "claude");
+    fake.on(&[]).touch(&marker).stdout("hello\n");
+    let mut entries = sandbox.env().clone();
+    // No ambient executable search, including for the deliberately missing codex.
+    entries.set("PATH", sandbox.bin());
+    let env = awman::data::config::env::EnvSnapshot::from_instance_env(
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string_lossy().into(), v.to_string_lossy().into()))
+            .collect(),
+        repo.path().to_path_buf(),
+        vec![],
+    );
     let session = Session::open_at_git_root(
         repo.path().to_path_buf(),
         repo.path().to_path_buf(),
         SessionOpenOptions {
-            env: Some(support::env_snapshot(&sandbox)),
+            env: Some(env),
             ..Default::default()
         },
     )
@@ -175,10 +173,7 @@ fn fixture(name: &'static str, images_present: bool) -> Fixture {
         sandbox_runtime: None,
         git_engine: Arc::new(GitEngine::with_env(env.clone())),
         overlay_engine: overlay.clone(),
-        auth_engine: Arc::new(AuthEngine::with_paths(
-            auth,
-            ApiPaths::from_env(&env).unwrap(),
-        )),
+        auth_engine: Arc::new(AuthEngine::new(&session).unwrap()),
         agent_engine: Arc::new(AgentEngine::new(overlay, runtime.clone())),
         workflow_state_store: Arc::new(WorkflowStateStore::new(&session)),
         credential_monitor: None,
@@ -362,4 +357,256 @@ async fn prepare_only_without_build_keeps_discovered_images_optional() {
     std::fs::write(f.session.git_root().join(".awman/Dockerfile.other"), "x\n").unwrap();
     let outcome = run(&f, flags(true, false)).await.unwrap();
     assert!(outcome.images_ready, "{outcome:?}");
+}
+
+#[tokio::test]
+async fn full_ready_reports_checkout_refusal_without_claiming_authentication() {
+    let mut f = fixture(
+        "command::prepare_only::full_ready_reports_checkout_refusal_without_claiming_authentication",
+        true,
+    );
+    let bin = f.session.git_root().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    awman_test_support::exe::install_as(
+        &f.sandbox.bin().join(if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        }),
+        &bin,
+        "claude",
+    );
+    let mut env = f.sandbox.env().clone();
+    env.set("PATH", &bin);
+    f.session = Session::open_at_git_root(
+        f.session.working_dir().to_path_buf(),
+        f.session.git_root().to_path_buf(),
+        SessionOpenOptions {
+            // Deliberately leave invocation cwd elsewhere: ready must carry
+            // the session root independently of the process snapshot cwd.
+            env: Some(awman::data::config::env::EnvSnapshot::from_instance_env(
+                env.iter()
+                    .map(|(k, v)| (k.to_string_lossy().into(), v.to_string_lossy().into()))
+                    .collect(),
+                f.sandbox.work(),
+                vec![],
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let outcome = run(&f, flags(false, false)).await.unwrap();
+    assert!(
+        matches!(&outcome.local_agent, StepStatus::Failed(message) if message.contains("refused: resolves inside the checkout")),
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.authentication, AuthenticationCheck::Failed);
+    assert!(!f.marker.exists());
+    f.sandbox.finish();
+}
+
+#[tokio::test]
+async fn prepare_only_never_registers_refresh_even_with_an_available_monitor() {
+    use awman::engine::{
+        auth::credential::CredentialBinding,
+        credential_refresh::{CredentialRefreshMonitor, MonitorConfig},
+    };
+    let mut f = fixture(
+        "command::prepare_only::prepare_only_never_registers_refresh_even_with_an_available_monitor",
+        true,
+    );
+    ConfigTree::new()
+        .global(json!({"agents":{"auth":{"refresh":{"enabled":true}}}}))
+        .write(&f.sandbox, Some(f.session.git_root()));
+    f.session = Session::open_at_git_root(
+        f.session.working_dir().to_path_buf(),
+        f.session.git_root().to_path_buf(),
+        SessionOpenOptions {
+            env: Some(f.session.env().clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let binding = CredentialBinding::to_file(
+        AuthPathResolver::at_home(f.sandbox.home()),
+        f.sandbox.tmp().join("no-credential-read-expected"),
+    );
+    let monitor = CredentialRefreshMonitor::with_binding_in(
+        MonitorConfig::default(),
+        binding,
+        f.session.env(),
+    );
+    f.engines.credential_monitor = Some(monitor.clone());
+    let outcome = run(&f, flags(true, false)).await.unwrap();
+    assert_eq!(outcome.authentication, AuthenticationCheck::NotChecked);
+    assert!(!f.marker.exists());
+    assert_eq!(monitor.live_lease_count(), 0);
+    assert!(
+        monitor.status().is_empty(),
+        "no refresh authority may be enrolled"
+    );
+    drop(f);
+    drop(monitor);
+}
+
+/// Exercise the actual workflow factory at both authorized synchronous
+/// triggers. Agent execution is an owned fake Docker CLI, never a host agent.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn workflow_pre_step_and_post_exit_recovery_keep_the_sanctioned_ping() {
+    use awman::command::dispatch::Dispatch;
+    use awman::engine::{
+        auth::credential::CredentialBinding,
+        credential_refresh::{CredentialRefreshMonitor, MonitorConfig},
+    };
+    use std::time::Duration;
+    let s = support::sandbox(
+        "command::prepare_only::workflow_pre_step_and_post_exit_recovery_keep_the_sanctioned_ping",
+    );
+    let repo = RepoBuilder::new(&s, "workflow-ping")
+        .file("Dockerfile.dev", "FROM scratch\n")
+        .file(".awman/Dockerfile.claude", "FROM scratch\n")
+        .file(
+            "workflow.toml",
+            "[[steps]]\nname = 'owned-step'\nprompt = 'private task must stay in the container'\n",
+        )
+        .init();
+    ConfigTree::new()
+        .global(json!({"runtime":{"kind":"docker"},"agents":{"auth":{"mode":"keychain","refresh":{"enabled":true}}}}))
+        .write(&s, Some(repo.path()));
+    let source = s.home().join(".claude/.credentials.json");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(
+        &source,
+        r#"{"claudeAiOauth":{"accessToken":"owned-workflow-secret","expiresAt":1}}"#,
+    )
+    .unwrap();
+    let ping = s.install_fake(support::fake_cli_exe(), "claude");
+    ping.on(&[]).stdout("hello\n");
+    let docker = s.install_fake(support::fake_cli_exe(), "docker");
+    awman_test_support::fakes::docker_cli_baseline(&docker);
+    docker.on(&[]);
+    docker.on(&["image", "inspect"]);
+    docker
+        .on(&["image", "inspect", "--format", "{{.Id}}"])
+        .stdout("sha256:owned\n");
+    docker
+        .on(&[
+            "image",
+            "inspect",
+            "--format",
+            "{{range .Config.Env}}{{println .}}{{end}}",
+        ])
+        .stdout("HOME=/home/awman\n");
+    docker.on(&["run"]).stderr("401 Unauthorized\n").exit(1);
+    let mut entries = s.env().clone();
+    // General CLI isolation recognizes owned fakes beneath its private temp
+    // root. Include bin as well as tmp without opting into a real daemon.
+    entries.set("TMPDIR", s.root());
+    let env = awman::data::config::env::EnvSnapshot::from_instance_env(
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string_lossy().into(), v.to_string_lossy().into()))
+            .collect(),
+        repo.path().to_path_buf(),
+        vec![],
+    );
+    assert_eq!(
+        awman::engine::host_cli::program_in(&env, "docker"),
+        docker.exe()
+    );
+    let session = Session::open_at_git_root(
+        repo.path().to_path_buf(),
+        repo.path().to_path_buf(),
+        SessionOpenOptions {
+            env: Some(env.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut engines = Engines::for_env(env.clone()).unwrap();
+    let monitor = CredentialRefreshMonitor::with_binding_in(
+        MonitorConfig {
+            tick_interval: Duration::from_secs(3600),
+            ..Default::default()
+        },
+        CredentialBinding::to_file(AuthPathResolver::at_home(s.home()), &source),
+        &env,
+    );
+    engines.credential_monitor = Some(monitor.clone());
+    // Keep the independent periodic trigger out of this synchronous-trigger
+    // test. The monitor's real lease/tick journey is covered in engine tests.
+    engines.agent_engine = Arc::new(AgentEngine::new(
+        engines.overlay_engine.clone(),
+        engines.runtime.clone(),
+    ));
+    let args = vec![
+        "--headless".into(),
+        "--auto".into(),
+        "--yolo=false".into(),
+        "--agent".into(),
+        "claude".into(),
+        repo.path().join("workflow.toml").display().to_string(),
+    ];
+    let bus = EventBus::new(1024);
+    let mut events = bus.subscribe_log();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let frontend = ApiDispatchFrontend::new("exec workflow", &args, bus.sender());
+    let dispatch = Dispatch::new(
+        frontend,
+        Arc::new(tokio::sync::RwLock::new(session)),
+        engines,
+    )
+    .with_cancellation(cancel.clone());
+    // After the auth retry also fails, the API starts its ordinary failure
+    // countdown. Observe that boundary to prove the auth retry guard stopped
+    // another immediate recovery, then cancel instead of waiting for an
+    // unrelated automatic workflow retry.
+    let observe = async {
+        awman_test_support::wait::wait_for_async(
+            "ordinary failure countdown after the single auth recovery",
+            Duration::from_secs(8),
+            || {
+                std::future::ready({
+                    std::iter::from_fn(|| events.try_recv().ok()).any(|event| matches!(
+                    event.payload,
+                    awman::data::execution_event::EventPayload::StatusMessage { phase, message }
+                        if phase == "yolo_countdown" && message.contains("retrying after failure")
+                )).then_some(())
+                })
+            },
+        )
+        .await;
+        cancel.cancel();
+    };
+    // Keep the production command's large debug future off the test stack
+    // before combining it with the independent event observer.
+    let run = Box::pin(dispatch.run_command(&["exec", "workflow"]));
+    let (result, ()) = tokio::join!(tokio::time::timeout(Duration::from_secs(12), run), observe,);
+    let result = result.expect("workflow cancellation must finish inside the component deadline");
+    let runs: Vec<_> = docker
+        .calls()
+        .into_iter()
+        .filter(|c| c.argv.first().is_some_and(|a| a == "run"))
+        .collect();
+    assert_eq!(
+        runs.len(),
+        2,
+        "one initial run and one auth retry; result={result:?}"
+    );
+    assert_eq!(
+        ping.calls().len(),
+        3,
+        "pre-step, post-exit recovery, retry pre-step; result={result:?}"
+    );
+    assert_eq!(monitor.live_lease_count(), 0);
+    for call in ping.calls() {
+        assert_eq!(&call.argv[..3], ["--model", "haiku", "--print"]);
+        assert!(awman::engine::ready::GREETINGS.contains(&call.argv[3].as_str()));
+        assert_eq!(call.argv.len(), 4, "no task content in ping argv");
+        assert!(!call.cwd.starts_with(repo.path()));
+        assert_eq!(call.env["HOME"], s.home().to_string_lossy());
+    }
+    drop(monitor);
+    s.finish();
 }

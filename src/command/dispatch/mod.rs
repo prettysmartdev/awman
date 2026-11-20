@@ -513,7 +513,10 @@ impl<F: CommandFrontend> Dispatch<F> {
             .try_read()
             .map_err(|_| CommandError::Other("session is write-locked".into()))?
             .clone();
+        self.engines.inherit_process_settings(&mut session)?;
         self.apply_set_overrides(&canonical, &mut session)?;
+        self.engines
+            .validate_process_config(&session.effective_config())?;
         let ctx = BuildContext {
             remote_target: self.frontend.flag_string(&canonical, "remote")?,
             set_args: crate::data::config::overrides::forwardable_set_args(
