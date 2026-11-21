@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
+    #[serde(skip)]
+    pub root: std::path::PathBuf,
     pub schema: u32,
     pub tools: BTreeMap<String, Tool>,
     pub capabilities: BTreeMap<String, Capability>,

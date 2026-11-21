@@ -191,7 +191,7 @@ impl QueuedCommandResult {
                     outcome.automation_final_message().map(str::to_owned)
                 }
                 Err(CommandError::AutomationFailed { final_message, .. }) => final_message.clone(),
-                Err(_) if contributions.automation => None,
+                Err(_) if contributions.automation => contributions.automation_final_message,
                 _ => contributions.final_message,
             },
             data: contributions.data,
@@ -453,6 +453,54 @@ impl QueuedCommandResult {
         command: &CommandRecord,
         sender: &super::event_bus::EventBusSender,
     ) {
+        // Never write a competing sidecar for an unfinished automation commit
+        // or its pending log batch. Recovery derives that command from SQLite.
+        let ready = store.with_conn(|c| {
+            crate::data::automation_store::validate_command_result(c, &command.id, Some(&self.result_json))?;
+            let pending: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM agent_executions WHERE command_id=? AND (launch_phase!='ended' OR pending_events_json IS NOT NULL))", [&command.id], |r| r.get(0))?;
+            if pending { return Err(crate::data::error::DataError::Other("automation completion awaits recovery".into())); }
+            Ok(())
+        });
+        if let Err(error) = ready {
+            tracing::error!(%error, command_id = %command.id, "Command completion refused; recovery required");
+            sender.lifecycle_publisher().abort(&error.to_string());
+            if let Ok(id) = crate::data::ids::CommandId::parse(&command.id) {
+                crate::command::automation::controller::global().release_leases(&id);
+                let automation = crate::data::automation_store::AutomationStore::from_store(store);
+                let recovered = (|| -> Result<(), crate::data::error::DataError> {
+                    if let Some(execution) = automation.current_execution(&id)? {
+                        automation.fail_uncommitted_storage(
+                            &execution.execution_id,
+                            &error.to_string(),
+                        )?;
+                    }
+                    recover_automation_executions(store, paths)?;
+                    Ok(())
+                })();
+                match recovered {
+                    Ok(())
+                        if store
+                            .get_command(&command.id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|c| c.status.is_terminal()) =>
+                    {
+                        sender.recovered_terminal(
+                            paths.read_command_events(&command.session_id, &command.id),
+                        );
+                    }
+                    Ok(()) => {
+                        sender.require_recovery();
+                        tracing::error!(command_id = %command.id, "automation recovery remains pending")
+                    }
+                    Err(error) => {
+                        sender.require_recovery();
+                        tracing::error!(%error, command_id = %command.id, "automation storage requires recovery")
+                    }
+                }
+            }
+            return;
+        }
         // Durable before the row: from here on a restart finalizes this
         // attempt rather than running its side effects again.
         if let Err(error) = paths.write_command_completion(
@@ -460,39 +508,57 @@ impl QueuedCommandResult {
             &command.id,
             &self.sidecar(command.attempt),
         ) {
-            tracing::error!(%error, session_id = %command.session_id, command_id = %command.id, "Failed to write completion sidecar; a failed row write would requeue this command");
+            tracing::error!(%error, session_id = %command.session_id, command_id = %command.id, "Failed to write completion sidecar");
+            sender.lifecycle_publisher().abort(&error.to_string());
+            if let Ok(id) = crate::data::ids::CommandId::parse(&command.id) {
+                crate::command::automation::controller::global().release_leases(&id);
+            }
+            sender.require_recovery();
+            return;
         }
         let persisted = self.persist_with_retry(store, command).await;
         if let Err(error) = &persisted {
             tracing::error!(%error, session_id = %command.session_id, command_id = %command.id, attempt = command.attempt, "Failed to store command completion; startup recovery will finalize the row from its sidecar");
         }
-        let stored = persisted.is_ok().then(|| {
-            store.get_command(&command.id).unwrap_or_else(|error| {
-                tracing::error!(%error, session_id = %command.session_id, command_id = %command.id, "Failed to read back command completion");
-                None
-            })
-        });
-        let row = stored.flatten().unwrap_or_else(|| {
-            let mut row = command.clone();
-            row.status = self.status;
-            row.exit_code = Some(self.exit_code);
-            row.result = Some(self.result_json.clone());
-            row
-        });
-        // WI 0070: a controller-owned terminal publishes its close result and
-        // one logical exit after the result is stored and before the command's
-        // terminal event.
+        if let Err(error) = persisted {
+            sender.lifecycle_publisher().abort(&error.to_string());
+            if let Ok(id) = crate::data::ids::CommandId::parse(&command.id) {
+                crate::command::automation::controller::global().release_leases(&id);
+            }
+            sender.require_recovery();
+            return;
+        }
+        let row = match store.get_command(&command.id) {
+            Ok(Some(row)) => row,
+            _ => {
+                sender
+                    .lifecycle_publisher()
+                    .abort("cannot read committed command");
+                if let Ok(id) = crate::data::ids::CommandId::parse(&command.id) {
+                    crate::command::automation::controller::global().release_leases(&id);
+                }
+                sender.require_recovery();
+                return;
+            }
+        };
+        if let Err(error) = sender.try_finish(terminal_payload(&row)) {
+            tracing::error!(%error, "command recorded, terminal publication pending recovery");
+            if let Ok(id) = crate::data::ids::CommandId::parse(&command.id) {
+                crate::command::automation::controller::global().release_leases(&id);
+            }
+            sender.require_recovery();
+            return;
+        }
+        // Terminal clients receive their close result and logical exit only
+        // after the command result and its terminal log flush are acknowledged.
         if let (Ok(id), Some(result)) = (
             crate::data::ids::CommandId::parse(&command.id),
             row.result.as_deref().and_then(read_command_result),
         ) {
             crate::command::automation::controller::global().command_finalized(&id, &result);
         }
-        sender.finish(terminal_payload(&row));
-        if persisted.is_ok() {
-            if let Err(error) = paths.remove_command_completion(&command.session_id, &command.id) {
-                tracing::warn!(%error, session_id = %command.session_id, command_id = %command.id, "Failed to remove completion sidecar");
-            }
+        if let Err(error) = paths.remove_command_completion(&command.session_id, &command.id) {
+            tracing::warn!(%error, session_id = %command.session_id, command_id = %command.id, "Failed to remove completion sidecar");
         }
     }
 }
@@ -511,26 +577,59 @@ pub(crate) fn recover_automation_executions(
 ) -> Result<Vec<String>, crate::data::error::DataError> {
     use crate::data::command_status::{CommandCompletion, CommandStatus};
     let automation = crate::data::automation_store::AutomationStore::from_store(store);
+    for execution in automation.list_recoverable()? {
+        if execution.pending_events.is_none() || automation.lease_held(&execution.execution_id)? {
+            continue;
+        }
+        let _authority = automation.acquire_lease(&execution.execution_id)?;
+        let command = store
+            .get_command(execution.command_id.as_str())?
+            .ok_or_else(|| {
+                crate::data::error::DataError::Other("missing command for pending lifecycle".into())
+            })?;
+        CommandLogWriter::recover_lifecycle(paths, &command, &automation)?;
+    }
     let commands = crate::command::automation::ExecutionController::recover(&automation)
         .map_err(crate::data::error::DataError::Other)?;
     let mut finalized = Vec::new();
     for id in commands {
-        let Some(command) = store.get_command(id.as_str())? else {
-            continue;
-        };
+        let command = store.get_command(id.as_str())?.ok_or_else(|| {
+            crate::data::error::DataError::Other("missing command for recovered execution".into())
+        })?;
         if command.status != CommandStatus::Running {
             continue;
         }
+        if let Some(execution) = automation.current_execution(&id)? {
+            if automation.profile_cleanup_pending(&execution.execution_id)? {
+                automation.finish_profile_cleanup(&execution.execution_id, false)?;
+            }
+        }
         let execution = automation.current_execution(&id)?;
-        let assurance = execution.as_ref().and_then(|e| e.final_assurance.clone());
+        let assurance = Some(
+            execution
+                .as_ref()
+                .and_then(|e| e.final_assurance.clone())
+                .ok_or_else(|| {
+                    crate::data::error::DataError::Other(
+                        "missing frozen assurance for recovered execution".into(),
+                    )
+                })?,
+        );
         let end_failure = execution.as_ref().and_then(|e| e.end_failure.clone());
         let lost_message = "awman stopped while this execution was running; it was finalized without replay (use an explicit native resume to continue)";
         let cancelled = end_failure
             .as_ref()
-            .is_some_and(|f| f.code == crate::command::automation::admission::codes::CANCELLED);
+            .is_some_and(|f| f.code == crate::command::automation::admission::codes::CANCELLED)
+            || store.with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM command_cancellations WHERE command_id=?)",
+                    [id.as_str()],
+                    |r| r.get::<_, bool>(0),
+                )?)
+            })?;
         // The last turn's confirmed answer, from the durable rows only.
         let final_message = match &execution {
-            Some(e) if end_failure.is_none() => {
+            Some(e) if command.subcommand == "exec prompt" => {
                 let mut cursor = None;
                 let mut turns = Vec::new();
                 loop {
@@ -547,13 +646,13 @@ pub(crate) fn recover_automation_executions(
             _ => None,
         };
         let (status, kind, exit_code, failure_record) = match &end_failure {
-            None => (CommandStatus::Done, CommandStatusKind::Done, 0, None),
-            Some(_) if cancelled => (
+            _ if cancelled => (
                 CommandStatus::Cancelled,
                 CommandStatusKind::Aborted,
                 130,
                 None,
             ),
+            None => (CommandStatus::Done, CommandStatusKind::Done, 0, None),
             Some(f) => (
                 CommandStatus::Error,
                 CommandStatusKind::Error,
@@ -564,7 +663,7 @@ pub(crate) fn recover_automation_executions(
                         .iter()
                         .copied()
                         .find(|known| *known == f.code)
-                        .unwrap_or(crate::data::agent_failure::EXECUTION_LOST),
+                        .unwrap_or(f.code.as_str()),
                     if f.code == crate::data::agent_failure::EXECUTION_LOST {
                         lost_message
                     } else {
@@ -581,6 +680,9 @@ pub(crate) fn recover_automation_executions(
             failure: failure_record,
             automation: assurance,
             final_message,
+            outputs: Some(crate::data::fs::command_outputs::summarize_output_dir(
+                &paths.command_output_dir(&command.session_id, &command.id),
+            )),
             ..CommandResult::default()
         };
         let completion = CommandCompletion {
@@ -593,6 +695,10 @@ pub(crate) fn recover_automation_executions(
         if store.finalize_running_command(id.as_str(), &completion)? {
             finalize_unowned_command(store, paths, id.as_str())?;
             finalized.push(id.as_str().to_owned());
+        } else {
+            return Err(crate::data::error::DataError::Other(
+                "recovered automation command finalization lost its compare-and-swap".into(),
+            ));
         }
     }
     Ok(finalized)
@@ -842,12 +948,16 @@ pub trait ApiCommandFrontendFactory: Send + Sync {
     /// `interaction` is the run's resolved interaction (WI 0141): the frontend
     /// sets `AgentIo::initial_size = interaction.pty_size` and reports
     /// `headless` from it, and decides nothing else about it.
+    ///
+    /// `shared_store` is the daemon's one session store (the worker's own
+    /// `Arc`); the frontend hosts automation on it and opens no database.
     fn frontend_for(
         &self,
         cmd: &CommandRecord,
         event_bus: super::event_bus::EventBusSender,
         state_writer: CommandStateWriter,
         interaction: crate::command::interaction::InteractionDecision,
+        shared_store: &Arc<SqliteSessionStore>,
     ) -> Self::Frontend;
 }
 
@@ -958,9 +1068,13 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             let bus = EventBus::for_attempt(4096, cmd.attempt);
             let writer = CommandStateWriter::new(self.paths.clone(), &cmd.session_id, id.as_str());
             let interaction = self.interaction_for(&cmd);
-            let frontend =
-                self.frontend_factory
-                    .frontend_for(&cmd, bus.sender(), writer, interaction);
+            let frontend = self.frontend_factory.frontend_for(
+                &cmd,
+                bus.sender(),
+                writer,
+                interaction,
+                &self.store,
+            );
             let mut engines = self.engines.clone();
             engines.runtime = Arc::new(super::owned_runtime::CommandOwnedRuntime::new(
                 Arc::clone(&engines.runtime),
@@ -1335,36 +1449,16 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             .ephemeral_secrets
             .register_session_redaction(&session_id, &event_bus.redaction());
 
-        // Spawn logfile writer task. The two log files are owned by a Layer 0
-        // writer so this frontend performs no filesystem calls of its own.
-        let log_writer = {
-            let mut log_rx = event_bus.subscribe_log();
-            let paths = self.paths.clone();
-            let session_id_for_log = session_id.clone();
-            let command_id_for_log = command_id.clone();
-            tokio::spawn(async move {
-                let mut writer = match CommandLogWriter::open_append(
-                    &paths,
-                    &session_id_for_log,
-                    &command_id_for_log,
-                )
-                .await
-                {
-                    Ok(w) => w,
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to create command log files");
-                        return;
-                    }
-                };
-                while let Some(event) = log_rx.recv().await {
-                    writer.write_event(&event).await;
-                    if matches!(event.payload, EventPayload::Done) {
-                        writer.flush().await;
-                        break;
-                    }
-                }
-            })
-        };
+        // The bus owns ordered writes and acknowledges stable log flushes before
+        // publishing lifecycle completions. No second writer may append here.
+        event_bus.set_log_writer(
+            crate::data::fs::api_command_log::OrderedCommandLog::open(
+                &self.paths,
+                &session_id,
+                &command_id,
+            )
+            .map(|w| Box::new(w) as Box<dyn crate::data::fs::api_command_log::EventLog>),
+        );
 
         // Spawn server-side tracing task — emits structured tracing records
         // for workflow step + phase transitions and the engine-reported
@@ -1408,6 +1502,7 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
             event_bus.sender(),
             state_writer.clone(),
             interaction,
+            &self.store,
         );
 
         // Look up the Session.
@@ -1438,7 +1533,6 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 completion
                     .publish(&self.store, &self.paths, &cmd, &event_bus.sender())
                     .await;
-                let _ = log_writer.await;
                 self.cleanup_event_bus(&command_id).await;
                 self.post_execution_check(&session_id, &command_id).await;
                 return;
@@ -1503,7 +1597,6 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 completion
                     .publish(&self.store, &self.paths, &cmd, &event_bus.sender())
                     .await;
-                let _ = log_writer.await;
                 self.cleanup_event_bus(&command_id).await;
                 self.post_execution_check(&session_id, &command_id).await;
                 return;
@@ -1557,7 +1650,6 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 completion
                     .publish(&self.store, &self.paths, &cmd, &event_bus.sender())
                     .await;
-                let _ = log_writer.await;
                 self.cleanup_event_bus(&command_id).await;
                 self.post_execution_check(&session_id, &command_id).await;
                 return;
@@ -1860,7 +1952,6 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
                 &event_bus.sender(),
             )
             .await;
-        let _ = log_writer.await;
         self.cleanup_event_bus(&command_id).await;
         self.post_execution_check(&session_id, &command_id).await;
     }
@@ -1950,6 +2041,16 @@ impl<F: ApiCommandFrontendFactory> QueueWorker<F> {
         self.engines
             .ephemeral_secrets
             .remove(&crate::data::ids::CommandId::parse(command_id).expect("persisted command id"));
+        // Preserve transport health for late subscribers until explicit recovery/restart.
+        if self
+            .event_buses
+            .lock()
+            .await
+            .get(command_id)
+            .is_some_and(|bus| bus.recovery_required())
+        {
+            return;
+        }
         let buses = Arc::clone(&self.event_buses);
         let cmd_id = command_id.to_string();
         tokio::spawn(async move {
@@ -2015,6 +2116,11 @@ fn catalogue_json(outcome: &CommandOutcome) -> Option<serde_json::Value> {
         CommandOutcome::Init(outcome) => serde_json::to_value(outcome).ok(),
         CommandOutcome::Ready(outcome) if outcome.json_requested => Some(outcome.to_legacy_json()),
         CommandOutcome::Squad(outcome) => serde_json::to_value(outcome).ok(),
+        // Same typed projection the frontend records; this is the fallback
+        // so a profile result is never absent from command data.
+        CommandOutcome::Agents(crate::command::commands::agents::AgentsOutcome::Profile(
+            outcome,
+        )) => Some(outcome.project().data),
         _ => None,
     }
 }
@@ -2354,6 +2460,16 @@ mod command_secrets_tests {
         completion
             .publish(&store, &paths, &command, &bus.sender())
             .await;
+        assert!(
+            bus.recovery_required(),
+            "permanent persistence failure reaches the transport health surface"
+        );
+        assert!(!store
+            .get_command(cid.as_str())
+            .unwrap()
+            .unwrap()
+            .status
+            .is_terminal());
         let sidecar = paths
             .read_command_completion(sid.as_str(), cid.as_str())
             .unwrap()
@@ -2383,6 +2499,210 @@ mod command_secrets_tests {
             paths.command_log_path(sid.as_str(), cid.as_str()),
         ] {
             assert!(!std::fs::read_to_string(path).unwrap().contains(secret));
+        }
+    }
+}
+
+#[cfg(test)]
+mod automation_completion_tests {
+    use super::*;
+    use crate::command::automation::{
+        controller::AutomationHost, launch::HeadlessRun, results::HeadlessObservation,
+    };
+    use crate::data::automation::{AutomationState, CleanupStatus, StatusSource, StatusSupport};
+    use crate::data::automation_records::{AutomationSnapshot, ExecutionProfileBinding};
+    use crate::data::automation_store::AutomationStore;
+    use crate::data::fs::api_command_log::OrderedCommandLog;
+    use crate::data::ids::{CommandId, ExecutionId, WorkerSessionId};
+    use crate::data::settings_profile::{NativeSessionId, SettingsProfileName};
+
+    struct FlushOnce {
+        log: OrderedCommandLog,
+        armed: bool,
+        completion: bool,
+    }
+    impl crate::data::fs::api_command_log::EventLog for FlushOnce {
+        fn append(
+            &mut self,
+            event: &crate::data::execution_event::ExecutionEvent,
+        ) -> std::io::Result<()> {
+            self.completion |= matches!(event.payload, EventPayload::AgentTurnCompleted { .. });
+            self.log.append(event)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.armed && self.completion {
+                self.armed = false;
+                Err(std::io::Error::other("injected completion flush failure"))
+            } else {
+                self.log.flush()
+            }
+        }
+    }
+    #[tokio::test]
+    async fn verified_chat_and_failed_cleanup_finalize_through_worker_without_restart() {
+        for (cleanup_fails, storage_fault) in [
+            (false, "none"),
+            (true, "none"),
+            (false, "flush"),
+            (false, "commit"),
+        ] {
+            let s = awman_test_support::TestSandbox::for_test(awman_test_support::TestCase::component("queue_worker::verified_chat_and_failed_cleanup_finalize_through_worker_without_restart"));
+            let db = Arc::new(SqliteSessionStore::open(&s.tmp().join("db")).unwrap());
+            CommandLifecycleStore::open(db.clone()).unwrap();
+            let sid = WorkerSessionId::new();
+            let cid = CommandId::new();
+            db.insert_session(
+                sid.as_str(),
+                s.work().to_str().unwrap(),
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .unwrap();
+            db.insert_running_lease_command(cid.as_str(), sid.as_str(), "chat", "[]", false)
+                .unwrap();
+            let store = AutomationStore::open(db.clone()).unwrap();
+            let paths = ApiPaths::from_root(s.tmp().join("api"));
+            let bus = EventBus::new(64);
+            bus.set_log_writer(Ok(Box::new(FlushOnce {
+                log: OrderedCommandLog::open(&paths, sid.as_str(), cid.as_str()).unwrap(),
+                armed: storage_fault == "flush",
+                completion: false,
+            })));
+            let mut received = bus.subscribe_ordered();
+            let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/web/test/lib/fixtures/terminal-frames.json"
+            )))
+            .unwrap();
+            let mut snapshot: AutomationSnapshot =
+                serde_json::from_value(fixture["automation_examples"]["snapshot"].clone()).unwrap();
+            snapshot.execution_id = ExecutionId::new();
+            snapshot.state = AutomationState::Starting;
+            snapshot.revision = 0;
+            snapshot.active_turn_id = None;
+            snapshot.native_session_id = None;
+            snapshot.status_support = StatusSupport::None;
+            snapshot.status_source = StatusSource::None;
+            let eid = snapshot.execution_id.clone();
+            let profile_binding = ExecutionProfileBinding {
+                repository_key: "123456789abcdef0".into(),
+                root_sha256: "123456789abcdef0".repeat(4),
+                provider: snapshot.provider.clone(),
+                name: SettingsProfileName::parse("fixture").unwrap(),
+            };
+            let mut run = HeadlessRun::reserve(
+                AutomationHost {
+                    store: store.clone(),
+                    command_id: cid.clone(),
+                    attempt: 1,
+                    owner_key: "uid:fixture".into(),
+                    events: Some(bus.sender().lifecycle_publisher()),
+                    finished: None,
+                },
+                snapshot,
+                profile_binding,
+                "fixture".into(),
+                None,
+                &Default::default(),
+                "one turn",
+            )
+            .unwrap();
+            store.begin_profile_cleanup(&eid).unwrap();
+            run.launching().unwrap();
+            run.running().unwrap();
+            if storage_fault == "commit" {
+                db.with_conn(|c| { c.execute_batch("CREATE TRIGGER fail_result BEFORE UPDATE OF result ON commands BEGIN SELECT RAISE(ABORT,'completion write failed'); END;")?; Ok(()) }).unwrap();
+            }
+            let finished = run.finish_observed(
+                &HeadlessObservation {
+                    identity: Some(NativeSessionId::parse("session-1").unwrap()),
+                    outcome: Some(Ok(Some("verified answer".into()))),
+                    protocol_error: None,
+                },
+                Ok(0),
+                false,
+            );
+            if storage_fault == "commit" {
+                db.with_conn(|c| {
+                    c.execute_batch("DROP TRIGGER fail_result")?;
+                    Ok(())
+                })
+                .unwrap();
+            }
+            assert_eq!(
+                finished.automation.completion_verified,
+                storage_fault == "none"
+            );
+            store.finish_profile_cleanup(&eid, !cleanup_fails).unwrap();
+            let outcome = if storage_fault != "none" {
+                Err(crate::command::error::CommandError::Data(
+                    crate::data::error::DataError::Other("storage_error".into()),
+                ))
+            } else if cleanup_fails {
+                Err(crate::command::automation::launch::cleanup_unconfirmed(
+                    &finished,
+                    None,
+                    "export failed",
+                ))
+            } else {
+                Ok(CommandOutcome::Chat(
+                    crate::command::commands::chat::ChatOutcome {
+                        automation: Some(finished.automation.clone()),
+                        automation_final_message: finished.final_message.clone(),
+                        agent: None,
+                        exit_code: Some(0),
+                    },
+                ))
+            };
+            let mut completion =
+                QueuedCommandResult::new(&outcome, &Ok(PushBackOutcome::NotConfigured));
+            completion = completion.map_result(|r| {
+                finish_result_fields(r, &outcome, &["chat"], None, &s.tmp().join("output"))
+            });
+            let command = db.get_command(cid.as_str()).unwrap().unwrap();
+            completion
+                .publish(&db, &paths, &command, &bus.sender())
+                .await;
+            let saved = db.get_command(cid.as_str()).unwrap().unwrap();
+            assert_eq!(
+                saved.status,
+                if cleanup_fails || storage_fault == "commit" {
+                    CommandStatus::Error
+                } else {
+                    CommandStatus::Done
+                },
+                "storage fault: {storage_fault}; cleanup failed: {cleanup_fails}"
+            );
+            let result: CommandResult =
+                serde_json::from_str(saved.result.as_deref().unwrap()).unwrap();
+            assert_eq!(result.final_message, None);
+            assert_eq!(
+                result.automation.unwrap().cleanup_status,
+                if cleanup_fails || storage_fault == "commit" {
+                    CleanupStatus::Pending
+                } else {
+                    CleanupStatus::Complete
+                }
+            );
+            let events: Vec<_> = std::iter::from_fn(|| received.try_recv().ok()).collect();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| matches!(e.payload, EventPayload::Done))
+                    .count(),
+                1
+            );
+            assert!(matches!(
+                events[events.len() - 2].payload,
+                EventPayload::CommandStatus { .. }
+            ));
+            assert!(recover_automation_executions(&db, &paths)
+                .unwrap()
+                .is_empty());
+            drop(received);
+            drop(bus);
+            drop(store);
+            drop(db);
+            s.finish();
         }
     }
 }

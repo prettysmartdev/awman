@@ -260,6 +260,24 @@ pub fn headless_result(
     }
 }
 
+/// Bound the encoded record before reserving publication. An oversized native
+/// answer becomes a small, durable failure; it never retains a verified answer.
+pub fn bound_turn_result(result: &mut crate::data::automation_records::TurnResult) -> bool {
+    if serde_json::to_vec(result)
+        .is_ok_and(|v| v.len() <= crate::data::automation_store::MAX_TURN_RESULT_BYTES)
+    {
+        return true;
+    }
+    result.status = crate::data::automation::TurnStatus::Failed;
+    result.completion_verified = false;
+    result.final_message = None;
+    result.failure = Some(super::admission::failure(
+        "result_too_large",
+        "the encoded turn result exceeds the 8 MiB storage limit",
+    ));
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -64,7 +64,10 @@ pub use process::{Exit, Output, OwnedChild, OwnedCommand, Ready, Stdin};
 pub use pty::{PtyChild, PtyCommand};
 pub use sandbox::TestSandbox;
 pub use tier::{TestCase, Tier};
-pub use wait::{wait_for, wait_for_async, wait_for_with};
+pub use wait::{
+    wait_for, wait_for_async, wait_for_async_with, wait_for_with, wait_for_with_budget,
+    DeadlineBudget,
+};
 
 /// The text of a caught panic (`&str` or `String` payload).
 #[cfg(test)]

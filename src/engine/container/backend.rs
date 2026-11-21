@@ -152,6 +152,18 @@ pub(super) trait ContainerBackend: Send + Sync {
     /// Remove a stopped agent by id or name. Errors when the runtime refuses
     /// (e.g. it transitioned back to running), so `awman clean` can count
     /// per-item failures.
+    /// Remove only the observed stopped generation with its execution owner.
+    /// Backends without an atomic identity boundary refuse rather than delete by name.
+    fn remove_agent_checked(
+        &self,
+        _handle: &AgentHandle,
+        _execution: &str,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::NotImplemented(
+            "identity-checked agent removal",
+        ))
+    }
+
     fn remove_agent(&self, id: &str) -> Result<(), EngineError>;
 
     // ─── Image store ────────────────────────────────────────────────────────

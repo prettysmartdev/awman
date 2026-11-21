@@ -453,5 +453,13 @@ pub(super) fn cli_remove(
 /// Explicit user stop: keep immutable identity and propagate failures.
 /// Removal remains the command's separate best-effort operation.
 pub(super) fn cli_stop_checked(cli: ContainerCli, id: &str) -> Result<(), EngineError> {
-    crate::engine::host_cli::checked_output(cli.command().args(["stop", id]), cli.bin).map(|_| ())
+    let output =
+        crate::engine::host_cli::checked_output(cli.command().args(["stop", id]), cli.bin)?;
+    if !output.status.success() {
+        return Err(EngineError::Container(format!(
+            "{} stop {id} failed",
+            cli.bin
+        )));
+    }
+    Ok(())
 }

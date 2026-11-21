@@ -43,9 +43,8 @@ pub fn dispose_token(
     // Foreground workers can outlive a disabled or absent daemon worker.
     // Their durable leases use the same database and need the same drain.
     if paths.db_path().exists() {
-        let store = std::sync::Arc::new(crate::data::fs::api_db::SqliteSessionStore::open_at(
-            &paths.db_path(),
-        )?);
+        let store =
+            paths.open_session_store(crate::data::fs::ApiPaths::from_env(session.env())?.root())?;
         let leases = crate::data::worker::lease_store::LeaseStore::open(store)?
             .active_for_server(name)?
             .len();

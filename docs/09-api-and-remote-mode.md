@@ -1458,7 +1458,7 @@ not redacted and must not be used to store or display secrets.
 
 The command begins executing as soon as a worker claims it from the queue. **At most one command per session runs at any given time** — commands within a session are processed sequentially in FIFO order. If a command is already running, subsequent commands are queued and wait their turn (they do not block the API request).
 
-**`flags_applied`** reports the API's flag defaults for the submitted command. It lists only flags the command accepts, so it is `{}` for commands such as `agents list`:
+**`flags_applied`** reports the API's flag defaults for the submitted command. It lists only flags the command accepts, so it is `{}` for commands that take none, such as `agents list`. For `chat` and `exec prompt` it also reports `automation`, always present: `"auto"`, `"require_full"`, or `null` when automation was not requested. Replaying an idempotent request returns the same body:
 
 | Flag | Behavior |
 |------|----------|
@@ -1549,9 +1549,9 @@ fields are omitted when they do not apply:
 | `git` | Checkout summary: branch and base/head SHAs when known, dirty flag, and changed-file details |
 | `worktree_path` | Retained worktree path, when applicable |
 | `pull_request` | `{ "url": "…" }` for a PR opened by a successful `create_pull_request` teardown step |
-| `final_message` | The final agent message for `exec prompt` when the selected agent provides structured output |
+| `final_message` | The final agent message for `exec prompt` when the selected agent provides structured output. A `chat` command result omits it; verified answers stay available in the turn records |
 | `outputs` | `{ "files", "bytes" }` summary of files under `/awman/output` |
-| `data` | JSON data for commands with a JSON result |
+| `data` | JSON data for commands with a JSON result. `agents profile list`, `close` and `delete` return the same JSON here as `--json` prints; a profile `close` that fails makes the command `failed` |
 | `error` | Legacy error text; ordinary failures use `failure.message`, while setup and cancellation retain their legacy markers |
 | `cancelled_at` | Time an accepted cancellation was recorded |
 | `pushed` | Push result for sessions configured with `push: true`; may be `null` when no push occurred |
@@ -2054,7 +2054,9 @@ Match on `code`, not on the `error` text. Existing messages are preserved for co
 | `code` | HTTP status | Meaning |
 |--------|-------------|---------|
 | `unauthorized` | 401 | The `Authorization` header is missing or the key is wrong |
-| `forbidden_workdir` | 403 | The session `workdir` is not allowed by the [working directory allowlist](#working-directory-allowlist) |
+| `forbidden_workdir` | 403 | The session `workdir` is not allowed by the [working directory allowlist](#working-directory-allowlist). An exact entry that is a subdirectory of a checkout, a linked worktree or has a `.git` file or symlink is refused (rule `exact_workdir_not_git_root`) and the message names the enclosing repository to allow instead |
+| `mount_authority_revalidation_required` | 409 | A restored session whose workdir is no longer authorized (or was created by an older awman) cannot launch commands; close it and create a new session |
+| `process_scoped_setting` | 409 | A command asked for a process-wide setting (`runtime.kind`, `runtime.builtin.stateDir`, credential-refresh settings) that differs from what this daemon is running. Restart the daemon with `--set <key>=<value>` or change the global config and restart; see [Settings fixed for an awman process](07-configuration.md#settings-fixed-for-an-awman-process) |
 | `invalid_request` | 400 | The request is malformed or fails validation: bad JSON, an invalid query value, an invalid label selector or `Idempotency-Key`, no session named, or a body `session_id` that disagrees with the `x-awman-session` header |
 | `forbidden` | 403 | The requested operation is forbidden, including credential widening |
 | `not_found` | 404 | An unknown route or missing admission resource |
@@ -2211,7 +2213,7 @@ Response (HTTP 202):
 
 Track the run with `GET /v1/worker/commands/<command_id>` and `GET /v1/worker/commands/<command_id>/events`.
 
-**`close_on_finish`** (default `false`). When `true`, the session is closed as soon as the command reaches a terminal state — `done`, `error` or `cancelled` — and a remote session's clone is deleted. This also applies when setup fails or the run is cancelled before the command starts. Logs and command records are kept. With `false`, the session stays open for further commands.
+**`close_on_finish`** (default `false`). When `true`, the session is closed as soon as the command reaches a terminal state — `done`, `error` or `cancelled` — and a remote session's clone is deleted. This also applies when setup fails or the run is cancelled before the command starts. Logs and command records are kept. With `false`, the session stays open for further commands. Once a session or run is admitted, the client disconnecting does not cancel it; the work continues and can be tracked by command ID. Cancel explicitly to stop it: a cancel that arrives before the command starts is honoured, and a cancelled one-shot run is closed only after its cleanup finishes. On daemon shutdown, awman waits for setup cancellation, cleanup and finalization before exiting.
 
 **Setup failure.** If session setup fails (a clone error, a merge conflict, a failing ready step), the queued command never runs. It becomes `error` with exit code 1 and a structured failure:
 
@@ -2753,8 +2755,9 @@ Command cmd_e5f6a7b8…: workflow (session abc123) via https://127.0.0.1:9876 [d
 ```
 
 - A command that already finished is replayed in full, then the final line is printed.
-- If the connection drops, awman reconnects once after 2 seconds.
-- **Ctrl-C** stops following; the command keeps running on the server.
+- If the stream ends before the command finishes (a dropped connection, or a proxy closing an idle one), awman reconnects up to 5 times, after 2, 4, 8, 16 and 30 seconds, and resumes after the last event it printed (`Last-Event-ID`): no output is repeated and the command is never resubmitted. Each attempt prints a warning, and an attempt that delivers new output resets the count.
+- If every reconnect fails, awman prints `Follow incomplete: …` with the status command to check the job, and exits non-zero (the remote's exit code if known, else 1) even if the job later finishes. Events it cannot decode are skipped and reported once at the end (`N events could not be decoded`); a single event larger than 16 MiB stops the follow with `remote protocol error` and is not retried.
+- **Ctrl-C** detaches immediately, even when the job is silent. It sends no cancel request: the command keeps running on the server and its status is reported as unknown. Check it with the status command awman prints when the follow ends.
 - With `--follow`, awman exits with the remote command's result: `0` when it finished `done`, the command's own exit code when that is non-zero, and `1` when it failed or was cancelled without one, or when following stopped before it finished (Ctrl-C, a lost connection). Without `--follow`, a successful submit exits `0`.
 
 ---

@@ -30,6 +30,8 @@ pub struct BackgroundExecRequest<'a> {
 /// An idle setup/teardown container with per-session builtin settings.
 #[derive(Clone, Copy)]
 pub struct BackgroundLaunchRequest<'a> {
+    /// Caller-owned labels applied atomically at creation, including fixture ownership.
+    pub labels: &'a [(String, String)],
     pub secret_env: &'a [(String, crate::engine::auth::credential::SecretString)],
     /// Explicit ownership name, when the caller needs restart discovery.
     pub name: Option<&'a str>,
@@ -190,17 +192,30 @@ impl AgentExec for BackgroundContainer {
 
 pub(super) fn default_start_background(
     cli: ContainerCli,
-    name: Option<&str>,
-    image: &str,
-    workdir: &Path,
-    env: &HashMap<String, String>,
-    overlays: &[OverlaySpec],
-    secret_env: &[(String, crate::engine::auth::credential::SecretString)],
+    request: &BackgroundLaunchRequest<'_>,
 ) -> Result<String, EngineError> {
+    let BackgroundLaunchRequest {
+        name,
+        image,
+        workdir,
+        env,
+        overlays,
+        secret_env,
+        labels,
+        ..
+    } = *request;
     let name = name
         .map(str::to_owned)
         .unwrap_or_else(crate::engine::container::naming::generate_container_name);
     let mut args = build_start_background_argv(&name, image, workdir, env, overlays);
+    for (key, value) in labels {
+        if key == "awman" {
+            return Err(EngineError::Config(
+                "reserved background label: awman".into(),
+            ));
+        }
+        args.splice(2..2, ["--label".into(), format!("{key}={value}")]);
+    }
     // Insert names before the image; values exist only in the CLI child env.
     for (key, _) in secret_env {
         args.splice(args.len() - 2..args.len() - 2, ["-e".into(), key.clone()]);

@@ -88,6 +88,7 @@ struct Rig {
     /// terminals (and their store) for replay, past the sandbox.
     controller: Arc<ExecutionController>,
     store: AutomationStore,
+    db: Arc<SqliteSessionStore>,
     command: CommandId,
     hub: Arc<TerminalHub>,
     ops: Arc<TerminalOperations>,
@@ -119,9 +120,14 @@ impl Rig {
         .unwrap();
         db.insert_running_lease_command(command.as_str(), session.as_str(), "chat", "[]", false)
             .unwrap();
-        let store = AutomationStore::open(db).unwrap();
+        let store = AutomationStore::open(db.clone()).unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
-        let sink = events.clone();
+        let publisher = super::automation_observers::recording_publisher(
+            &awman::data::fs::api_paths::ApiPaths::from_root(sandbox.root().join("api")),
+            session.as_str(),
+            command.as_str(),
+            events.clone(),
+        );
         let execution = ExecutionId::new();
         let controller = Arc::new(ExecutionController::default());
         let owned = controller
@@ -131,7 +137,7 @@ impl Rig {
                     command_id: command.clone(),
                     attempt: 1,
                     owner_key: "uid:test:fixture".into(),
-                    events: Some(Arc::new(move |p| sink.lock().unwrap().push(p))),
+                    events: Some(publisher),
                     finished: None,
                 },
                 execution_id: execution.clone(),
@@ -198,6 +204,7 @@ impl Rig {
             controller,
             _sandbox: sandbox,
             store,
+            db,
             command,
             hub,
             ops,
@@ -1274,4 +1281,74 @@ async fn credential_uncertainty_revokes_fresh_readiness_after_next_request_stagi
     );
     drop(enrollment);
     rig.finish();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delivery_persistence_fault_stops_input_and_releases_control_without_success() {
+    let mut rig=Rig::new("command::automation_admission::delivery_persistence_fault_stops_input_and_releases_control_without_success",Options::default());
+    let mut session = rig.session();
+    session
+        .handle_client_frame(TerminalClientFrame::TakeControl)
+        .unwrap();
+    rig.native(
+        "facility",
+        serde_json::json!({"payload":{"full_lifecycle":true}}),
+    );
+    rig.native("ready", serde_json::json!({}));
+    rig.db.with_conn(|c| { c.execute_batch("CREATE TRIGGER fault BEFORE UPDATE OF delivery_phase ON agent_turns WHEN NEW.delivery_phase='write_started' BEGIN SELECT RAISE(ABORT,'delivery marker'); END;")?; Ok(()) }).unwrap();
+    rig.submit(
+        &mut session,
+        uuid::Uuid::new_v4(),
+        rig.state().revision,
+        "must not be delivered",
+    );
+    awman_test_support::wait::wait_for(
+        "storage failure cancels the execution",
+        Duration::from_secs(2),
+        || rig.owned.stop_requested().is_cancelled().then_some(()),
+    );
+    assert!(rig.written().is_empty());
+    let finished = rig.finish();
+    assert_eq!(finished.failure.unwrap().code, "storage_error");
+    assert!(!finished.automation.completion_verified);
+    assert!(rig.turns()[0].result.is_none());
+    assert!(!rig
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e, EventPayload::AgentTurnCompleted { .. })));
+    assert!(!rig.store.lease_held(rig.owned.execution_id()).unwrap());
+    rig.db
+        .with_conn(|c| {
+            c.execute_batch("DROP TRIGGER fault")?;
+            Ok(())
+        })
+        .unwrap();
+    ExecutionController::recover(&rig.store).unwrap();
+    let turns = rig.turns();
+    assert_eq!(turns.len(), 1);
+    assert!(!turns[0].result.as_ref().unwrap().completion_verified);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_input_is_refused_when_its_state_write_fails() {
+    let mut rig = Rig::new(
+        "command::automation_admission::raw_input_is_refused_when_its_state_write_fails",
+        Options::default(),
+    );
+    rig.osc_state("state=idle");
+    assert_eq!(rig.state().state, AutomationState::Ready);
+    rig.db.with_conn(|c| {
+        c.execute_batch("CREATE TRIGGER fault BEFORE UPDATE OF snapshot_json ON agent_executions BEGIN SELECT RAISE(ABORT,'state write'); END;")?;
+        Ok(())
+    }).unwrap();
+    assert!(!rig.hub.admit_raw_input(rig.terminal.as_ref().unwrap()));
+    assert_eq!(rig.owned.manual_input().unwrap_err().code, "storage_error");
+    assert!(rig.owned.stop_requested().is_cancelled());
+    assert!(rig.written().is_empty());
+    let finished = rig.finish();
+    assert_eq!(finished.failure.unwrap().code, "storage_error");
+    assert!(!finished.automation.completion_verified);
+    assert!(!rig.store.lease_held(rig.owned.execution_id()).unwrap());
 }

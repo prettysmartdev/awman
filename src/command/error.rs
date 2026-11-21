@@ -13,6 +13,12 @@ use crate::engine::error::EngineError;
 
 #[derive(Debug, Error)]
 pub enum CommandError {
+    #[error("`{key}` is fixed for this awman process (running with {bound}; requested {requested}). Restart the daemon or TUI with `--set {key}={requested}`, or change the global config and restart.")]
+    ProcessScopedSetting {
+        key: String,
+        bound: String,
+        requested: String,
+    },
     #[error("settings profile busy: {0}; run 'awman agents profile close <NAME> --agent <agent>' after cancelling its command")]
     SettingsProfileBusy(String),
     #[error("native session not found in this profile")]
@@ -536,7 +542,8 @@ impl CommandError {
         CommandError::DaemonHttpStatus { status: 404, .. } => 4,
 
         // Exit 2 — invalid usage / parse / flag conflict
-        CommandError::UnknownCommand { .. }
+        CommandError::ProcessScopedSetting { .. }
+        | CommandError::UnknownCommand { .. }
         | CommandError::UnknownFlag { .. }
         | CommandError::MissingRequiredFlag { .. }
         | CommandError::MissingRequiredArgument { .. }
@@ -628,6 +635,7 @@ impl CommandError {
         match self {
             CommandError::SettingsProfileBusy(_)
             | CommandError::Data(DataError::ProfileLockBusy) => 409,
+            CommandError::ProcessScopedSetting { .. } => 409,
             CommandError::NativeSessionNotFound => 404,
             CommandError::NativeCapabilityUnavailable(_) => 409,
             CommandError::ProfileOwnerRequired => 403,
@@ -730,6 +738,7 @@ impl CommandError {
             | CommandError::Engine(EngineError::AgentDefinitionUntrusted { .. })
             | CommandError::WorktreeExists { .. }
             | CommandError::UnknownCommand { .. }
+            | CommandError::ProcessScopedSetting { .. }
             | CommandError::NotAvailableForFrontend { .. }
             | CommandError::UnknownFlag { .. }
             | CommandError::MissingRequiredFlag { .. }
@@ -839,6 +848,7 @@ impl CommandError {
                 outcome_codes::INTERNAL
             }
 
+            CommandError::ProcessScopedSetting { .. } => "process_scoped_setting",
             CommandError::RuntimeWaitFailed(_) => crate::data::agent_failure::RUNTIME_WAIT_FAILED,
             CommandError::InvalidRequest(_) => "invalid_request",
             CommandError::NativeCapabilityUnavailable(_) => {

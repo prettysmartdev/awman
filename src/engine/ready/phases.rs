@@ -103,6 +103,9 @@ impl ReadyEngine {
                         LocalAgentPingResult::NotInstalled => {
                             StepStatus::Failed(format!("{agent_name}: not installed"))
                         }
+                        LocalAgentPingResult::RefusedInsideCheckout => StepStatus::Failed(format!(
+                            "{agent_name}: refused: resolves inside the checkout"
+                        )),
                         LocalAgentPingResult::CouldNotRun => {
                             StepStatus::Failed(format!("{agent_name}: could not run"))
                         }

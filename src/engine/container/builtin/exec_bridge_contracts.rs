@@ -38,7 +38,7 @@ impl SandboxDriver for Driver {
             Err(EngineError::Other("stop failed".into()))
         }
     }
-    fn remove_stopped(&self, _: &str) -> Result<(), EngineError> {
+    fn remove_stopped(&self, _: &str, _: &str) -> Result<(), EngineError> {
         unreachable!()
     }
     fn stats(&self, _: &str) -> Result<AgentStats, EngineError> {
@@ -136,6 +136,8 @@ async fn failed_execution(stop_succeeds: bool, failure: Failure) -> EngineError 
             initial_size: None,
         },
         cancel_grace: DEFAULT_CANCEL_GRACE,
+        startup_grace: None,
+        output_tail: Arc::new(OutputTail::with_default_capacity()),
     })
     .run(Box::new(Frontend(redaction)))
     .unwrap();
@@ -191,4 +193,238 @@ async fn closed_channel_reports_unknown_exit_after_cleanup() {
     assert!(error
         .to_string()
         .contains("exec event channel: channel closed"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn resolved_phase_options_preserve_quiet_start_and_ordered_redacted_failure_output() {
+    use std::io::Read;
+    struct PhaseFrontend;
+    impl UserMessageSink for PhaseFrontend {
+        fn write_message(&mut self, _: UserMessage) {}
+        fn replay_queued(&mut self) {}
+    }
+    impl AgentFrontend for PhaseFrontend {
+        fn report_status(&mut self, _: AgentStatus) {}
+        fn report_progress(&mut self, _: AgentProgress) {}
+        fn take_io(&mut self) -> AgentIo {
+            unreachable!()
+        }
+        fn grace_timeout(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn output_redaction(&self) -> RedactionSet {
+            let set = RedactionSet::new();
+            set.add(SecretString::new("phase-secret"));
+            set
+        }
+    }
+    let s = TestSandbox::new();
+    let driver = Arc::new(Driver {
+        stop_succeeds: true,
+        stopped: AtomicBool::new(false),
+    });
+    let (broadcast, events) = tokio::sync::broadcast::channel(1024);
+    let (stdout, _) = tokio::sync::mpsc::unbounded_channel();
+    let (stderr, _) = tokio::sync::mpsc::unbounded_channel();
+    let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+    let tail = Arc::new(OutputTail::spooled(&s.awman_home()).unwrap());
+    let mut execution = ExecBridge::new(ExecBridgeOptions {
+        handle: AgentHandle {
+            id: "step".into(),
+            name: "step".into(),
+            image_tag: "fixture".into(),
+            started_at: chrono::Utc::now(),
+        },
+        session: ExecSession {
+            events,
+            broadcast: broadcast.clone(),
+            control: Arc::new(ControlSink),
+        },
+        cleanup: Some(CleanupTarget {
+            driver: driver.clone(),
+            owner: "launch-owner".into(),
+            remove_on_exit: true,
+        }),
+        attach_path: None,
+        persistent_stdin: true,
+        seeded_prompt: None,
+        leases: vec![],
+        prompt_files: vec![],
+        io: AgentIo {
+            stdout,
+            stderr,
+            stdin_tx,
+            stdin_rx,
+            resize: None,
+            initial_size: None,
+        },
+        cancel_grace: Duration::ZERO,
+        startup_grace: Some(Duration::MAX),
+        output_tail: tail.clone(),
+    })
+    .run(Box::new(PhaseFrontend))
+    .unwrap();
+    let mut startup_events = execution.subscribe_stuck();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        startup_events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    assert!(!driver.stopped.load(Ordering::Acquire));
+    // Alternate the streams in one event sequence. Finish each line with
+    // nonsecret trailing bytes so redaction never needs a cross-event hold.
+    for n in 0..250 {
+        let bytes =
+            format!("line-{n:03}: phase-secret trailing-padding-xxxxxxxxxxxxxxxx\n").into_bytes();
+        assert!(broadcast
+            .send(if n % 2 == 0 {
+                ExecEvent::Stdout(bytes)
+            } else {
+                ExecEvent::Stderr(bytes)
+            })
+            .is_ok());
+    }
+    assert!(broadcast.send(ExecEvent::Exited(37)).is_ok());
+    assert_eq!(execution.wait().await.unwrap().exit_code, 37);
+    let mut transcript = String::new();
+    tail.transcript_reader()
+        .unwrap()
+        .read_to_string(&mut transcript)
+        .unwrap();
+    assert!(!transcript.contains("phase-secret"));
+    let lines = transcript.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 250);
+    for (n, line) in lines.iter().enumerate() {
+        assert!(line.starts_with(&format!("line-{n:03}: ")), "{line}");
+    }
+    assert_eq!(tail.snapshot().len(), 100);
+    assert!(driver.stopped.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn quiet_phase_deadline_cancels_with_startup_grace_disabled() {
+    struct ExitOnInterrupt(tokio::sync::broadcast::Sender<ExecEvent>);
+    impl ExecControl for ExitOnInterrupt {
+        fn send(&self, command: Control) -> Result<(), EngineError> {
+            if matches!(command, Control::Interrupt) {
+                let _ = self.0.send(ExecEvent::Exited(130));
+            }
+            Ok(())
+        }
+    }
+    let s = TestSandbox::new();
+    let driver = Arc::new(Driver {
+        stop_succeeds: true,
+        stopped: AtomicBool::new(false),
+    });
+    let (broadcast, events) = tokio::sync::broadcast::channel(16);
+    let (stdout, _) = tokio::sync::mpsc::unbounded_channel();
+    let (stderr, _) = tokio::sync::mpsc::unbounded_channel();
+    let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut execution = ExecBridge::new(ExecBridgeOptions {
+        handle: AgentHandle {
+            id: "step".into(),
+            name: "step".into(),
+            image_tag: "fixture".into(),
+            started_at: chrono::Utc::now(),
+        },
+        session: ExecSession {
+            events,
+            broadcast: broadcast.clone(),
+            control: Arc::new(ExitOnInterrupt(broadcast)),
+        },
+        cleanup: Some(CleanupTarget {
+            driver: driver.clone(),
+            owner: "launch-owner".into(),
+            remove_on_exit: true,
+        }),
+        attach_path: None,
+        persistent_stdin: true,
+        seeded_prompt: None,
+        leases: vec![],
+        prompt_files: vec![],
+        io: AgentIo {
+            stdout,
+            stderr,
+            stdin_tx,
+            stdin_rx,
+            resize: None,
+            initial_size: None,
+        },
+        cancel_grace: Duration::ZERO,
+        startup_grace: Some(Duration::MAX),
+        output_tail: Arc::new(OutputTail::spooled(&s.awman_home()).unwrap()),
+    })
+    .run(Box::new(Frontend(RedactionSet::new())))
+    .unwrap();
+    // An overall deadline owns cancellation independently of the first-byte
+    // detector. Dropping wait must still interrupt this entirely quiet phase.
+    assert!(tokio::time::timeout(Duration::ZERO, execution.wait())
+        .await
+        .is_err());
+    awman_test_support::wait_for_async(
+        "quiet phase cancellation cleanup",
+        Duration::from_millis(500),
+        || async { driver.stopped.load(Ordering::Acquire).then_some(()) },
+    )
+    .await;
+    assert!(driver.stopped.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn dropped_wait_releases_warning_sender_before_guest_shutdown() {
+    let s = TestSandbox::for_test(TestCase::component("engine::container::builtin::exec_bridge::contracts::dropped_wait_releases_warning_sender_before_guest_shutdown"));
+    let (broadcast, events) = tokio::sync::broadcast::channel(16);
+    let (stdout, mut out) = tokio::sync::mpsc::unbounded_channel();
+    let (stderr, mut err) = tokio::sync::mpsc::unbounded_channel();
+    let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+    let tail = Arc::new(OutputTail::spooled(&s.awman_home()).unwrap());
+    let mut execution = ExecBridge::new(ExecBridgeOptions {
+        handle: AgentHandle {
+            id: "step".into(),
+            name: "step".into(),
+            image_tag: "fixture".into(),
+            started_at: chrono::Utc::now(),
+        },
+        session: ExecSession {
+            events,
+            broadcast: broadcast.clone(),
+            control: Arc::new(ControlSink),
+        },
+        cleanup: None,
+        attach_path: None,
+        persistent_stdin: true,
+        seeded_prompt: None,
+        leases: vec![],
+        prompt_files: vec![],
+        io: AgentIo {
+            stdout,
+            stderr,
+            stdin_tx,
+            stdin_rx,
+            resize: None,
+            initial_size: None,
+        },
+        cancel_grace: Duration::from_secs(10),
+        startup_grace: Some(Duration::MAX),
+        output_tail: tail.clone(),
+    })
+    .run(Box::new(Frontend(RedactionSet::new())))
+    .unwrap();
+    assert!(tokio::time::timeout(Duration::ZERO, execution.wait())
+        .await
+        .is_err());
+    tokio::time::timeout(Duration::from_millis(200), async {
+        assert!(out.recv().await.is_none());
+        assert!(err.recv().await.is_none());
+    })
+    .await
+    .expect("both drains close while guest and transcript are retained");
+    assert!(broadcast.send(ExecEvent::Exited(0)).is_ok());
+    drop(execution);
+    drop(tail);
+    drop(broadcast);
+    s.finish();
 }

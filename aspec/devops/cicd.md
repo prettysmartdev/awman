@@ -123,9 +123,11 @@ reported as passed because it was skipped.
 - `flake-hunt`: every tier five times with recorded shuffle seeds under CPU
   contention; any intermittent failure opens a `flaky-test` issue with its
   failure record.
-- `seeded-defects`: applies known defects from `ci/seeded-defects/` and the
-  pipeline faults (missing target, renamed job, skipped hardware) and asserts
-  the right cell turns red. The patch directory is not yet populated, and the job fails closed while it is empty.
+- `seeded-defects`: runs known defects from `ci/seeded-defects/` against an
+  isolated clean-HEAD baseline and patched checkout. Fresh JUnit output detects
+  product failures; each run retains `seeded-defects.evidence`. Compiler
+  failures, stale inputs, surviving defects, pipeline faults and blocked
+  infrastructure are non-passing outcomes, never detected defects.
 - `mutation`: `cargo-mutants` on `src/data` and `src/command`, sampled.
 - `coverage`: `cargo-llvm-cov` per layer; diagnostic.
 - `repro-build`: a clean-room unsigned build compared with the latest

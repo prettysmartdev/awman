@@ -253,7 +253,13 @@ fn fixture(s: &TestSandbox, name: &str, global: Value, workflow: &str, container
         agent_engine: Arc::new(AgentEngine::new(overlay, runtime.clone())),
         workflow_state_store: Arc::new(WorkflowStateStore::new(&session)),
         credential_monitor: None,
-        global_config: Arc::new(Default::default()),
+        global_config: Arc::new(
+            awman::data::config::effective::process_binding::ProcessBinding::from_config(
+                &session.effective_config(),
+            )
+            .unwrap()
+            .snapshot(&session.effective_config()),
+        ),
         ephemeral_secrets: Arc::new(Default::default()),
         lease_workflow_review: Some(Arc::new(
             awman::command::worker::policy::LeaseWorkflowReview::foreground(),

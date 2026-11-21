@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 mod credentials;
 
+pub const MAX_TURN_RESULT_BYTES: usize = 8 * 1024 * 1024;
+
 type Result<T> = std::result::Result<T, DataError>;
 fn invalid(message: &str) -> DataError {
     DataError::Other(message.into())
@@ -62,6 +64,12 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     if !has_exposed {
         // Previous versions could deliver while still pending: preserve uncertainty.
         conn.execute_batch("BEGIN IMMEDIATE; ALTER TABLE agent_credential_updates ADD COLUMN exposed INTEGER NOT NULL DEFAULT 0 CHECK(exposed IN (0,1)); UPDATE agent_credential_updates SET exposed=1 WHERE status IN ('pending','applying','restarting'); COMMIT;")?;
+    }
+    {
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS agent_profile_cleanup (execution_id TEXT PRIMARY KEY REFERENCES agent_executions(execution_id) ON DELETE CASCADE, outcome TEXT NOT NULL CHECK(outcome IN ('pending','complete','failed')))")?;
+    }
+    {
+        conn.execute_batch("UPDATE commands SET result=json_object('automation',json((SELECT final_assurance_json FROM agent_executions WHERE execution_id=commands.active_execution_id)), 'final_message', CASE WHEN subcommand='exec prompt' THEN (SELECT json_extract(result_json,'$.final_message') FROM agent_turns WHERE execution_id=commands.active_execution_id AND json_extract(result_json,'$.status')='completed' AND json_extract(result_json,'$.completion_verified')=1 ORDER BY ordinal DESC LIMIT 1) ELSE NULL END) WHERE result IS NULL AND status='running' AND EXISTS(SELECT 1 FROM agent_executions WHERE execution_id=commands.active_execution_id AND launch_phase='ended' AND final_assurance_json IS NOT NULL)")?;
     }
     Ok(())
 }
@@ -468,6 +476,139 @@ params![
     expected as i64,
 ])?)
 }
+fn commit_turn(
+    c: &Connection,
+    turn: &TurnId,
+    result: &TurnResult,
+    snapshot: &AutomationSnapshot,
+    projection: Option<&LifecycleProjection>,
+) -> Result<()> {
+    let encoded = json(result)?;
+    if encoded.len() > MAX_TURN_RESULT_BYTES {
+        return Err(invalid("turn result exceeds bound"));
+    }
+    let _: TurnResult = decode(&encoded)?;
+    let t: TurnRecord = read_record(c, "agent_turns", TURN_COLUMNS, "turn_id=?", &[turn])?
+        .ok_or_else(|| invalid("turn not found"))?;
+    let e = execution(c, &t.execution_id)?;
+    if let Some(old) = t.result {
+        return if old == *result && e.snapshot.as_ref() == Some(snapshot) && projection.is_none() {
+            Ok(())
+        } else {
+            Err(invalid("immutable turn result"))
+        };
+    }
+    if snapshot.execution_id != t.execution_id
+        || e.active_turn_id.as_ref() != Some(turn)
+        || snapshot.active_turn_id.is_some()
+        || (t.native_turn_id.is_some() && t.native_turn_id != result.native_turn_id)
+    {
+        return Err(invalid("invalid turn completion"));
+    }
+    let now = Utc::now().to_rfc3339();
+    cas(c.execute(
+"UPDATE agent_turns SET result_json=?1,completed_at=?2,delivery_phase='terminal',native_turn_id=COALESCE(native_turn_id,?3) WHERE turn_id=?4 AND result_json IS NULL",
+params![
+    encoded,
+    now,
+    result.native_turn_id,
+    turn,
+])?)?;
+    let frame = TerminalFrame::TurnResult {
+        request_id: t.request_id,
+        execution_id: t.execution_id.clone(),
+        turn_id: t.turn_id,
+        result: result.clone(),
+    };
+    cas(c.execute(
+"UPDATE agent_request_dedup SET result_json=?,completed_at=? WHERE owner_key=? AND execution_id=? AND request_id=? AND result_json IS NULL",
+params![
+    json(&frame)?,
+    now,
+    e.owner_key,
+    t.execution_id,
+    t.request_id.to_string(),
+])?)?;
+    transition(c, e.revision, snapshot, projection)
+}
+fn finish_record(
+    c: &Connection,
+    id: &ExecutionId,
+    assurance: &CommandAutomationResult,
+    failure: Option<&AutomationFailure>,
+    allow_pending: bool,
+) -> Result<()> {
+    let e = execution(c, id)?;
+    if assurance.execution_id != *id
+        || assurance.native_session_id != e.native_session_id
+        || e.active_turn_id.is_some()
+        || (!allow_pending && e.pending_events.is_some())
+        || e.snapshot
+            .as_ref()
+            .is_some_and(|s| s.state != crate::data::automation::AutomationState::Ended)
+    {
+        return Err(invalid("execution not drained"));
+    }
+    if e.launch_phase == LaunchPhase::Ended {
+        return if e.final_assurance.as_ref() == Some(assurance) && e.end_failure.as_ref() == failure
+        {
+            Ok(())
+        } else {
+            Err(invalid("immutable execution result"))
+        };
+    }
+    // Serialize cancellation with the completion transaction. Native turn facts
+    // stay immutable; the command/execution records the accepted cancellation.
+    let has_cancellations: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='command_cancellations')", [], |r| r.get(0))?;
+    let cancelled = has_cancellations
+        && c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM command_cancellations WHERE command_id=?)",
+            [&e.command_id],
+            |r| r.get::<_, bool>(0),
+        )?;
+    let cancellation = AutomationFailure {
+        code: "cancelled".into(),
+        message: "cancelled".into(),
+    };
+    let failure = if cancelled {
+        Some(&cancellation)
+    } else {
+        failure
+    };
+    cas(c.execute(
+"UPDATE agent_executions SET launch_phase='ended',ended_at=?,final_assurance_json=?,end_failure_json=? WHERE execution_id=? AND launch_phase!='ended'",
+params![
+    Utc::now().to_rfc3339(),
+    json(assurance)?,
+    failure.map(json).transpose()?,
+    id,
+])?)?;
+    let mut command: CommandResult = c
+        .query_row(
+            "SELECT result FROM commands WHERE id=? AND status='running' AND attempt=?",
+            params![e.command_id, e.attempt],
+            |r| r.get::<_, Option<String>>(0),
+        )?
+        .map(|v| decode(&v))
+        .transpose()?
+        .unwrap_or_default();
+    command.automation = Some(assurance.clone());
+    let subcommand: String = c.query_row(
+        "SELECT subcommand FROM commands WHERE id=?",
+        [&e.command_id],
+        |r| r.get(0),
+    )?;
+    command.final_message = if subcommand == "exec prompt" {
+        c.query_row("SELECT CASE WHEN json_extract(result_json,'$.status')='completed' AND json_extract(result_json,'$.completion_verified')=1 THEN json_extract(result_json,'$.final_message') ELSE NULL END FROM agent_turns WHERE execution_id=? AND result_json IS NOT NULL ORDER BY ordinal DESC LIMIT 1", [id], |r| r.get::<_, Option<String>>(0)).optional()?.flatten()
+    } else {
+        None
+    };
+    cas(c.execute(
+        "UPDATE commands SET result=? WHERE id=? AND status='running' AND attempt=?",
+        params![json(&command)?, e.command_id, e.attempt],
+    )?)
+}
+
 impl AutomationStore {
     pub fn open(store: Arc<SqliteSessionStore>) -> Result<Self> {
         let conn = store.shared_connection();
@@ -482,6 +623,115 @@ impl AutomationStore {
             conn: store.shared_connection(),
         }
     }
+    /// A stopped owner may durably record a storage failure if no completion
+    /// transaction committed. A pending/frozen completion belongs to replay.
+    pub fn fail_uncommitted_storage(&self, id: &ExecutionId, detail: &str) -> Result<()> {
+        use crate::data::automation::*;
+        let e = self.read_execution(id)?;
+        if e.launch_phase == LaunchPhase::Ended || e.pending_events.is_some() {
+            return Ok(());
+        }
+        let mut snapshot = e
+            .snapshot
+            .clone()
+            .ok_or_else(|| invalid("missing automation snapshot"))?;
+        snapshot.revision += 1;
+        snapshot.state = AutomationState::Ended;
+        snapshot.active_turn_id = None;
+        let failure = AutomationFailure {
+            code: "storage_error".into(),
+            message: format!("automation storage failed: {detail}"),
+        };
+        let assurance = CommandAutomationResult {
+            execution_id: id.clone(),
+            native_session_id: e.native_session_id.clone(),
+            last_turn_id: e.active_turn_id.clone(),
+            native_start_mode: e.native_start_mode,
+            workspace_access: e.workspace_access,
+            status_support: snapshot.status_support,
+            completion_verified: false,
+            output_status: OutputStatus::Incomplete,
+            cleanup_status: CleanupStatus::Pending,
+        };
+        if let Some(turn) = &e.active_turn_id {
+            let result = TurnResult {
+                status: TurnStatus::Failed,
+                status_support: snapshot.status_support,
+                readiness_source: if snapshot.status_source == StatusSource::Native {
+                    ReadinessSource::Native
+                } else {
+                    ReadinessSource::Osc7501
+                },
+                completion_source: CompletionSource::None,
+                completion_verified: false,
+                native_turn_id: None,
+                final_message: None,
+                output_status: OutputStatus::Incomplete,
+                failure: Some(failure.clone()),
+            };
+            self.complete_execution(turn, &result, &snapshot, &assurance, Some(&failure), None)
+        } else {
+            self.transaction(|c| {
+                transition(c, e.revision, &snapshot, None)?;
+                finish_record(c, id, &assurance, Some(&failure), false)
+            })
+        }
+    }
+
+    /// Profile export is a separate durable outcome from the native turn.
+    pub fn begin_profile_cleanup(&self, id: &ExecutionId) -> Result<()> {
+        self.conn
+            .lock()
+            .map_err(|_| invalid("database lock poisoned"))?
+            .execute(
+                "INSERT INTO agent_profile_cleanup(execution_id,outcome) VALUES (?,'pending')",
+                [id],
+            )?;
+        Ok(())
+    }
+    pub fn profile_cleanup_pending(&self, id: &ExecutionId) -> Result<bool> {
+        Ok(self.conn.lock().map_err(|_| invalid("database lock poisoned"))?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_profile_cleanup WHERE execution_id=? AND outcome='pending')", [id], |r| r.get(0))?)
+    }
+    /// Only this explicit post-execution transition may downgrade cleanup.
+    /// Turn results and verified native completion remain immutable.
+    pub fn finish_profile_cleanup(&self, id: &ExecutionId, confirmed: bool) -> Result<()> {
+        let mut c = self
+            .conn
+            .lock()
+            .map_err(|_| invalid("database lock poisoned"))?;
+        let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE agent_profile_cleanup SET outcome=? WHERE execution_id=? AND outcome='pending'",
+            params![if confirmed { "complete" } else { "failed" }, id],
+        )?;
+        if changed != 0 && !confirmed {
+            let e = execution(&tx, id)?;
+            if let Some(mut assurance) = e.final_assurance {
+                assurance.cleanup_status = crate::data::automation::CleanupStatus::Pending;
+                let failure = e.end_failure.unwrap_or(AutomationFailure {
+                    code: "cleanup_timeout".into(),
+                    message: "settings-profile cleanup was not confirmed".into(),
+                });
+                tx.execute("UPDATE agent_executions SET final_assurance_json=?,end_failure_json=? WHERE execution_id=?", params![json(&assurance)?, json(&failure)?, id])?;
+                let mut result: CommandResult = tx
+                    .query_row(
+                        "SELECT result FROM commands WHERE id=?",
+                        [&e.command_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .map(|v| decode(&v))??;
+                result.automation = Some(assurance);
+                tx.execute(
+                    "UPDATE commands SET result=? WHERE id=? AND status='running'",
+                    params![json(&result)?, e.command_id],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Profile-only identity observation. Automation identities transition with their snapshot.
     pub fn observe_execution_identity(
         &self,
@@ -545,9 +795,9 @@ return Err(invalid("stale command attempt"));
                 return Err(invalid("the command is no longer running"));
             }
             if let Some(previous)=previous {
- if execution(conn,
-&ExecutionId::parse(&previous).map_err(|_|invalid("invalid execution pointer"))?)?.launch_phase!=LaunchPhase::Ended {
-return Err(invalid("previous execution is active"));
+ let previous = execution(conn, &ExecutionId::parse(&previous).map_err(|_|invalid("invalid execution pointer"))?)?;
+ if previous.launch_phase!=LaunchPhase::Ended || previous.pending_events.is_some() {
+return Err(invalid("previous execution is active or publication pending"));
 }
 }
             let last:i64=conn.query_row("SELECT COALESCE(MAX(execution_ordinal),0) FROM agent_executions WHERE command_id=?",
@@ -562,7 +812,7 @@ EXEC_COLUMNS,
 &record,
 &[])?;
             cas(conn.execute(
-"UPDATE commands SET active_execution_id=? WHERE id=? AND attempt=?",
+"UPDATE commands SET active_execution_id=?,result=CASE WHEN result IS NULL THEN NULL ELSE json_remove(result,'$.automation','$.final_message') END WHERE id=? AND attempt=?",
 params![
     record.execution_id,
     record.command_id,
@@ -826,63 +1076,23 @@ params![
         snapshot: &AutomationSnapshot,
         projection: Option<&LifecycleProjection>,
     ) -> Result<()> {
-        let encoded = json(result)?;
-        if encoded.len() > 8 * 1024 * 1024 {
-            return Err(invalid("turn result exceeds bound"));
-        }
-        // Deserialize too: validates opaque native identity even for Rust producers.
-        let _: TurnResult = decode(&encoded)?;
+        self.transaction(|c| commit_turn(c, turn, result, snapshot, projection))
+    }
+    /// One commit owns the turn, ended execution, command projection and recovery batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_execution(
+        &self,
+        turn: &TurnId,
+        result: &TurnResult,
+        snapshot: &AutomationSnapshot,
+        assurance: &CommandAutomationResult,
+        failure: Option<&AutomationFailure>,
+        projection: Option<&LifecycleProjection>,
+    ) -> Result<()> {
         self.transaction(|c| {
-            let t:TurnRecord=read_record(c,
-"agent_turns",
-TURN_COLUMNS,
-"turn_id=?",
-&[turn])?.ok_or_else(||invalid("turn not found"))?;
-            if let Some(old)=t.result {
-return if old==*result {
-Ok(())
-}
- else {
-Err(invalid("immutable turn result"))
-}
-;
-}
-            let e=execution(c,
-&t.execution_id)?;
-            if snapshot.execution_id!=t.execution_id || e.active_turn_id.as_ref()!=Some(turn) || snapshot.active_turn_id.is_some() || (t.native_turn_id.is_some() && t.native_turn_id!=result.native_turn_id) {
-return Err(invalid("invalid turn completion"));
-}
-            let now=Utc::now().to_rfc3339();
-            cas(c.execute(
-"UPDATE agent_turns SET result_json=?1,completed_at=?2,delivery_phase='terminal',native_turn_id=COALESCE(native_turn_id,?3) WHERE turn_id=?4 AND result_json IS NULL",
-params![
-    encoded,
-    now,
-    result.native_turn_id,
-    turn,
-])?)?;
-            let frame=TerminalFrame::TurnResult{
-request_id:t.request_id,
-execution_id:t.execution_id.clone(),
-turn_id:t.turn_id,
-result:result.clone()
-}
-;
-            cas(c.execute(
-"UPDATE agent_request_dedup SET result_json=?,completed_at=? WHERE owner_key=? AND execution_id=? AND request_id=? AND result_json IS NULL",
-params![
-    json(&frame)?,
-    now,
-    e.owner_key,
-    t.execution_id,
-    t.request_id.to_string(),
-])?)?;
-            transition(c,
-e.revision,
-snapshot,
-projection)
-}
-)
+            commit_turn(c, turn, result, snapshot, projection)?;
+            finish_record(c, &snapshot.execution_id, assurance, failure, true)
+        })
     }
     pub fn reserve_close(
         &self,
@@ -969,31 +1179,24 @@ params![
         assurance: &CommandAutomationResult,
         failure: Option<&AutomationFailure>,
     ) -> Result<()> {
+        self.transaction(|c| finish_record(c, id, assurance, failure, false))
+    }
+    /// Freeze the terminal snapshot and command assurance in the same transaction.
+    pub fn finish_execution_at(
+        &self,
+        snapshot: &AutomationSnapshot,
+        assurance: &CommandAutomationResult,
+        failure: Option<&AutomationFailure>,
+        projection: Option<&LifecycleProjection>,
+    ) -> Result<()> {
         self.transaction(|c| {
-            let e=execution(c,
-id)?;
-            if assurance.execution_id!=*id || assurance.native_session_id!=e.native_session_id || e.active_turn_id.is_some() || e.pending_events.is_some() || e.snapshot.as_ref().is_some_and(|s|s.state!=crate::data::automation::AutomationState::Ended) {
-return Err(invalid("execution not drained"));
-}
-            if e.launch_phase==LaunchPhase::Ended {
-return if e.final_assurance.as_ref()==Some(assurance) && e.end_failure.as_ref()==failure {
-Ok(())
-}
- else {
-Err(invalid("immutable execution result"))
-}
-;
-}
-            cas(c.execute(
-"UPDATE agent_executions SET launch_phase='ended',ended_at=?,final_assurance_json=?,end_failure_json=? WHERE execution_id=? AND launch_phase!='ended'",
-params![
-    Utc::now().to_rfc3339(),
-    json(assurance)?,
-    failure.map(json).transpose()?,
-    id,
-])?)
-}
-)
+            let expected = snapshot
+                .revision
+                .checked_sub(1)
+                .ok_or_else(|| invalid("stale_revision"))?;
+            transition(c, expected, snapshot, projection)?;
+            finish_record(c, &snapshot.execution_id, assurance, failure, true)
+        })
     }
     /// Uses the established command completion CAS; no second result owner.
     pub fn finalize_command(
@@ -1009,6 +1212,7 @@ params![
             if pending {
 return Err(invalid("execution not finalized"));
 }
+            validate_command_result(c, command.as_str(), Some(&completion.result_json))?;
             Ok(c.execute(
 "UPDATE commands SET status=?,exit_code=?,finished_at=?,result=? WHERE id=? AND status='running' AND attempt=?",
 params![
@@ -1131,10 +1335,22 @@ r.get(2)?))).optional()?;
     match row {
         None => Ok(RequestLookup::Missing),
         Some((saved, _, _)) if saved.as_deref() != Some(digest) => Ok(RequestLookup::Conflict),
-        Some((_, response, result)) => Ok(RequestLookup::Replay {
-            response: decode(&response)?,
-            result: result.map(|s| decode(&s)).transpose()?,
-        }),
+        Some((_, response, result)) => {
+            if result.is_some() {
+                let pending: bool = c.query_row(
+                    "SELECT pending_events_json IS NOT NULL FROM agent_executions WHERE execution_id=?",
+                    [id],
+                    |r| r.get(0),
+                )?;
+                if pending {
+                    return Err(invalid("completion recorded, not yet published"));
+                }
+            }
+            Ok(RequestLookup::Replay {
+                response: decode(&response)?,
+                result: result.map(|s| decode(&s)).transpose()?,
+            })
+        }
     }
 }
 fn insert_dedup(
@@ -1184,11 +1400,19 @@ fn lease_io(path: &std::path::Path, error: std::io::Error) -> DataError {
 impl AutomationStore {
     /// `<db dir>/automation-leases/<execution>.lock`; `None` for an
     /// in-memory database (one process by construction).
-    fn lease_path(&self, id: &ExecutionId) -> Option<std::path::PathBuf> {
-        let conn = self.conn.lock().ok()?;
-        let db = conn.path().filter(|p| !p.is_empty())?;
-        let dir = std::path::Path::new(db).parent()?.join("automation-leases");
-        Some(dir.join(format!("{}.lock", id.as_str())))
+    fn lease_path(&self, id: &ExecutionId) -> Result<Option<std::path::PathBuf>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| invalid("database lock poisoned"))?;
+        let Some(db) = conn.path().filter(|p| !p.is_empty()) else {
+            return Ok(None);
+        };
+        let dir = std::path::Path::new(db)
+            .parent()
+            .ok_or_else(|| invalid("database has no parent"))?
+            .join("automation-leases");
+        Ok(Some(dir.join(format!("{}.lock", id.as_str()))))
     }
 
     fn open_lease(path: &std::path::Path, create: bool) -> std::io::Result<std::fs::File> {
@@ -1206,7 +1430,7 @@ impl AutomationStore {
 
     /// Take this execution's lease (exclusive, non-blocking).
     pub fn acquire_lease(&self, id: &ExecutionId) -> Result<Option<ExecutionLease>> {
-        let Some(path) = self.lease_path(id) else {
+        let Some(path) = self.lease_path(id)? else {
             return Ok(None);
         };
         if let Some(dir) = path.parent() {
@@ -1228,7 +1452,7 @@ impl AutomationStore {
     /// Whether a live process (this one included, through another handle)
     /// holds this execution's lease now.
     pub fn lease_held(&self, id: &ExecutionId) -> Result<bool> {
-        let Some(path) = self.lease_path(id) else {
+        let Some(path) = self.lease_path(id)? else {
             return Ok(false);
         };
         let file = match Self::open_lease(&path, false) {
@@ -1298,4 +1522,31 @@ impl AutomationStore {
         let page = self.list_turns(&command, Some(&cursor), Some(1))?;
         Ok(page.items.into_iter().find(|t| &t.turn_id == turn))
     }
+}
+
+/// Final command writers may add metadata, but cannot replace a committed
+/// automation projection with a transient publication failure or stale result.
+pub(crate) fn validate_command_result(
+    c: &Connection,
+    id: &str,
+    result: Option<&str>,
+) -> Result<()> {
+    let cleanup_pending: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM agent_profile_cleanup p JOIN agent_executions e ON e.execution_id=p.execution_id WHERE e.command_id=? AND p.outcome='pending')", [id], |r| r.get(0))?;
+    if cleanup_pending {
+        return Err(invalid("settings-profile cleanup awaits confirmation"));
+    }
+    let saved: Option<Option<String>> = c.query_row("SELECT c.result FROM commands c JOIN agent_executions e ON e.execution_id=c.active_execution_id WHERE c.id=? AND e.final_assurance_json IS NOT NULL", [id], |r| r.get(0)).optional()?;
+    if let Some(saved) = saved {
+        let saved = saved.ok_or_else(|| invalid("missing committed command automation result"))?;
+        let saved: CommandResult = decode(&saved)?;
+        let proposed: CommandResult =
+            decode(result.ok_or_else(|| invalid("missing command automation result"))?)?;
+        if saved.automation != proposed.automation || saved.final_message != proposed.final_message
+        {
+            return Err(invalid(
+                "command result conflicts with committed automation completion",
+            ));
+        }
+    }
+    Ok(())
 }

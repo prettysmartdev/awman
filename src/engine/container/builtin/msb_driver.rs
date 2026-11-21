@@ -476,7 +476,12 @@ impl SandboxDriver for MsbDriver {
                     .sandboxes()
                     .get(backend.clone(), &id)
                     .await
-                    .map_err(|_| failure("lookup"))?,
+                    .map_err(|error| match error {
+                        microsandbox::MicrosandboxError::SandboxNotFound(_) => {
+                            EngineError::AgentNotFound { id: id.clone() }
+                        }
+                        _ => failure("lookup"),
+                    })?,
             )
         })
     }
@@ -511,11 +516,13 @@ impl SandboxDriver for MsbDriver {
         let backend = self.backend();
         let id = id.to_string();
         self.call(async move {
-            let handle = backend
-                .sandboxes()
-                .get(backend.clone(), &id)
-                .await
-                .map_err(|_| failure("lookup"))?;
+            let handle = match backend.sandboxes().get(backend.clone(), &id).await {
+                Ok(handle) => handle,
+                Err(microsandbox::MicrosandboxError::SandboxNotFound(_)) => {
+                    return Err(EngineError::AgentNotFound { id })
+                }
+                Err(_) => return Err(failure("lookup")),
+            };
             naming::check_protocol(&summary(&handle)?.labels)?;
             let sandbox = handle.connect().await.map_err(|_| failure("connect"))?;
             let (program, args) = request
@@ -571,11 +578,11 @@ impl SandboxDriver for MsbDriver {
         let owner = owner.to_string();
         let active = self.active.clone();
         self.call(async move {
-            let handle = backend
-                .sandboxes()
-                .get(backend.clone(), &id)
-                .await
-                .map_err(|_| failure("lookup"))?;
+            let handle = match backend.sandboxes().get(backend.clone(), &id).await {
+                Ok(handle) => handle,
+                Err(microsandbox::MicrosandboxError::SandboxNotFound(_)) => return Ok(()),
+                Err(_) => return Err(failure("lookup")),
+            };
             let info = summary(&handle)?;
             naming::check_owner(&info.labels, &owner)?;
             if !info.stopped
@@ -590,8 +597,13 @@ impl SandboxDriver for MsbDriver {
                 // then stop and kill both fail although the goal is met.
                 // Only a sandbox that is still running is a failure.
                 let still_running = match backend.sandboxes().get(backend.clone(), &id).await {
-                    Ok(current) => !summary(&current)?.stopped,
-                    Err(_) => false, // already removed
+                    Ok(current) => {
+                        let current = summary(&current)?;
+                        naming::check_owner(&current.labels, &owner)?;
+                        !current.stopped
+                    }
+                    Err(microsandbox::MicrosandboxError::SandboxNotFound(_)) => false,
+                    Err(_) => return Err(failure("lookup after stop")),
                 };
                 if still_running {
                     return Err(failure("stop"));
@@ -603,26 +615,69 @@ impl SandboxDriver for MsbDriver {
                 .remove(&id);
             if remove && handle.remove().await.is_err() {
                 // Concurrent cleanup may already have removed it.
-                if backend.sandboxes().get(backend.clone(), &id).await.is_ok() {
-                    return Err(failure("remove"));
+                match backend.sandboxes().get(backend.clone(), &id).await {
+                    Err(microsandbox::MicrosandboxError::SandboxNotFound(_)) => {}
+                    _ => return Err(failure("remove")),
                 }
             }
             Ok(())
         })
     }
-    fn remove_stopped(&self, id: &str) -> Result<(), EngineError> {
+    fn remove_stopped_checked(
+        &self,
+        observed: &crate::data::session::AgentHandle,
+        owner: &str,
+        execution: &str,
+    ) -> Result<(), EngineError> {
+        let backend = self.backend();
+        let observed = observed.clone();
+        let owner = owner.to_string();
+        let execution = execution.to_string();
+        self.call(async move {
+            let handle = match backend.sandboxes().get(backend.clone(), &observed.id).await {
+                Ok(handle) => handle,
+                Err(microsandbox::MicrosandboxError::SandboxNotFound(_)) => return Ok(()),
+                Err(_) => return Err(failure("lookup")),
+            };
+            let info = summary(&handle)?;
+            naming::check_owner(&info.labels, &owner)?;
+            if info.handle.started_at != observed.started_at
+                || info.handle.name != observed.name
+                || info
+                    .labels
+                    .get("awman.profile-execution")
+                    .map(String::as_str)
+                    != Some(execution.as_str())
+                || !info.stopped
+            {
+                return Err(failure("remove: sandbox generation or execution changed"));
+            }
+            // SDK removal uses the identity on this very handle, never a fresh name lookup.
+            match handle.remove().await {
+                Ok(()) | Err(microsandbox::MicrosandboxError::SandboxNotFound(_)) => Ok(()),
+                Err(_) => Err(failure("remove")),
+            }
+        })
+    }
+    fn remove_stopped(&self, id: &str, owner: &str) -> Result<(), EngineError> {
         let backend = self.backend();
         let id = id.to_string();
+        let owner = owner.to_string();
         self.call(async move {
-            let handle = backend
-                .sandboxes()
-                .get(backend.clone(), &id)
-                .await
-                .map_err(|_| failure("lookup"))?;
-            if !summary(&handle)?.stopped {
+            let handle = match backend.sandboxes().get(backend.clone(), &id).await {
+                Ok(handle) => handle,
+                Err(microsandbox::MicrosandboxError::SandboxNotFound(_)) => return Ok(()),
+                Err(_) => return Err(failure("lookup")),
+            };
+            let info = summary(&handle)?;
+            naming::check_owner(&info.labels, &owner)?;
+            if !info.stopped {
                 return Err(failure("remove: sandbox is not stopped"));
             }
-            handle.remove().await.map_err(|_| failure("remove"))
+            match handle.remove().await {
+                Ok(()) | Err(microsandbox::MicrosandboxError::SandboxNotFound(_)) => Ok(()),
+                Err(_) => Err(failure("remove")),
+            }
         })
     }
     fn stats(&self, id: &str) -> Result<AgentStats, EngineError> {

@@ -270,7 +270,10 @@ hardware cells have no override path. Restore the hardware or fix the product.
 
 ### Two operators start candidates for the same version
 
-Candidate runs for one version are serialised and never cancelled. If two
+Candidate dispatches are mutually excluded by repository, version and
+`dry_run`; only strict-boolean `record_only` runs use run-specific journals.
+GitHub Actions may replace pending runs in a concurrency group and does not
+guarantee FIFO order, so a queued run is not a durable release request. If two
 dispatches still allocate the same number, the second assembly ends `BLOCKED:
 candidate N … was allocated concurrently by another run; nothing was published`.
 Re-run `make release` on the commit you want: it allocates the next number and
@@ -370,9 +373,11 @@ tip change during verification requires a retry.
 
 Native acceptance remains open as recorded in WI144. Publication still requires the service-authenticated candidate gate, approved environment and immutable fixture pins; a local packet does not bypass them.
 
-The Fixtures dispatch is available on main under the `fixtures` environment. It
-accepts a reviewed HTTPS arm64 Docker-save archive and its SHA-256, builds the
-offline fixture using `fixtures build guest-oci-base`, and publishes a new
-`fixtures-*` release without replacing an existing tag. Before production guest validation, a maintainer verifies the public fixture and previous-release assets, commits all
-digests, and runs the native guest/artifact checks. Merely running the fixture
-builder does not establish that its guest boots.
+Fixture preparation writes `provenance.json` with base, archive, recipe and
+contract digests. `cargo xtask fixtures verify-build --base B --sha256 SHA
+--out DIR` reproduces both fixture archives. The Fixtures workflow attests and
+publishes `fixture-oci.tar`, `fixture-docker.tar` and `provenance.json`.
+Maintainers verify the public bytes and attestations before committing pins;
+global manifest guest pins remain pending until publication. Native guest
+qualification is separate, and a local build does not establish that a guest
+boots.

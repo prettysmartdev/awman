@@ -48,6 +48,24 @@ use crate::engine::container::options::{
     ContainerName, ImageRef, PromptFileGuard, ResolvedContainerOptions,
 };
 use crate::engine::credential_refresh::CredentialLease;
+
+pub(super) fn output_tail_for(
+    options: &ResolvedContainerOptions,
+) -> Result<Arc<crate::engine::agent_runtime::output_tail::OutputTail>, EngineError> {
+    use crate::engine::agent_runtime::output_tail::OutputTail;
+    if !options.full_transcript {
+        return Ok(Arc::new(OutputTail::with_default_capacity()));
+    }
+    let env = options.host_env.as_ref().ok_or_else(|| {
+        EngineError::Config(
+            "full transcript capture requires the launch environment snapshot".into(),
+        )
+    })?;
+    let home = crate::data::fs::data_paths::data_home(env)?;
+    OutputTail::spooled(&home)
+        .map(Arc::new)
+        .map_err(|e| EngineError::io(home.join("spool/transcripts"), e))
+}
 use crate::engine::error::EngineError;
 
 /// The `Arc<Mutex<…>>` the I/O bridge hands back for a PTY-bridged run.
@@ -191,6 +209,7 @@ pub(super) fn bridge_config_for(
             crate::engine::agent_runtime::output_tail::OutputTail::with_default_capacity(),
         ),
         output_broadcast: None,
+        acp_gates: None,
         terminal: None,
         program_status: Default::default(),
     }
@@ -296,10 +315,13 @@ impl AgentInstance for ContainerInstance {
         bridge_cfg.output_redaction = self.options.output_redaction.clone();
         bridge_cfg.terminal = frontend.terminal_launch();
         bridge_cfg.startup_timing = frontend.startup_timing();
-        if self.options.full_transcript {
-            bridge_cfg.output_tail =
-                Arc::new(crate::engine::agent_runtime::output_tail::OutputTail::unbounded());
+        if self.options.acp {
+            // Bound the ACP transport: the stdout reader stops reading while
+            // the client is full, and stdin space returns as the child reads.
+            bridge_cfg.acp_gates = frontend.acp_io_gates();
         }
+        bridge_cfg.output_tail = output_tail_for(&self.options)?;
+        bridge_cfg.output_tail.set_warning_sink(io.stderr.clone());
         let req = SpawnRequest {
             io,
             argv,
@@ -462,6 +484,7 @@ pub(super) fn spawn_pty_bridged(
 
     assert_leases_before_spawn(&instance.options, &leases);
 
+    verify_mount_sources(&instance.options)?;
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -552,6 +575,7 @@ pub(super) fn spawn_piped(
     let prompt_files = std::mem::take(&mut instance.options.prompt_files);
     assert_leases_before_spawn(&instance.options, &leases);
 
+    verify_mount_sources(&instance.options)?;
     let mut child = spawn_child(cli.clone(), &mut cmd)?;
 
     // Write seeded prompt into stdin channel before the writer task starts.
@@ -633,6 +657,7 @@ pub(super) fn spawn_piped_interactive(
     let leases = std::mem::take(&mut instance.leases);
     let prompt_files = std::mem::take(&mut instance.options.prompt_files);
     assert_leases_before_spawn(&instance.options, &leases);
+    verify_mount_sources(&instance.options)?;
 
     let mut child = spawn_child(cli.clone(), &mut cmd)?;
 
@@ -831,5 +856,62 @@ impl ExecutionBackend for ContainerExecution {
         // Docker containers are explicitly reattachable after their owner
         // exits. A dropped, never-awaited execution must not remove one.
         false
+    }
+}
+
+pub(super) fn verify_mount_sources(options: &ResolvedContainerOptions) -> Result<(), EngineError> {
+    if let Some(guard) = &options.mount_guard {
+        guard
+            .verify()
+            .map_err(|error| EngineError::MountOutsideAuthority {
+                path: guard.authority.root().to_path_buf(),
+                authority_root: guard.authority.root().to_path_buf(),
+                reason: error.to_string(),
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod transcript_environment_tests {
+    use super::*;
+    #[test]
+    fn full_transcript_requires_and_uses_explicit_private_environment() {
+        let s = awman_test_support::TestSandbox::for_test(awman_test_support::TestCase::component(
+            "container::full_transcript_requires_and_uses_explicit_private_environment",
+        ));
+        let mut options = ResolvedContainerOptions {
+            full_transcript: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            output_tail_for(&options),
+            Err(EngineError::Config(_))
+        ));
+        options.host_env = Some(crate::data::config::env::EnvSnapshot::from_instance_env(
+            s.env()
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect(),
+            s.work(),
+            vec![],
+        ));
+        let tail = output_tail_for(&options).unwrap();
+        tail.push_bytes(b"private transcript\n");
+        assert!(s.awman_home().join("spool/transcripts").is_dir());
+        use std::io::Read as _;
+        let mut output = String::new();
+        tail.transcript_reader()
+            .unwrap()
+            .read_to_string(&mut output)
+            .unwrap();
+        assert_eq!(output, "private transcript\n");
+        drop(tail);
+        s.finish();
     }
 }

@@ -25,7 +25,8 @@ pub struct WorkerApi {
     pub workdirs: Vec<PathBuf>,
     pub workdir_roots: Vec<PathBuf>,
     pub started_at: Instant,
-    pub task_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    pub setup_stopping: std::sync::atomic::AtomicBool,
+    pub task_handles: tokio::sync::Mutex<Vec<crate::command::session_lifecycle::SessionSetupTask>>,
     pub engines: crate::command::dispatch::Engines,
     pub sessions: Arc<SessionManager>,
     pub event_buses: Arc<tokio::sync::Mutex<HashMap<String, Arc<EventBus>>>>,
@@ -33,6 +34,25 @@ pub struct WorkerApi {
 }
 
 impl WorkerApi {
+    pub fn verbose_setup(&self) -> bool {
+        self.live_config
+            .read()
+            .expect("worker config lock")
+            .as_ref()
+            .map(|config| config.daemon().verbose_setup)
+            .unwrap_or_else(|| {
+                crate::data::config::daemon::DaemonSettings::from_merged(
+                    &self
+                        .engines
+                        .global_config
+                        .daemon
+                        .clone()
+                        .unwrap_or_default(),
+                )
+                .verbose_setup
+            })
+    }
+
     pub fn push_enabled(&self) -> bool {
         self.live_config
             .read()
@@ -56,7 +76,19 @@ impl WorkerApi {
         let live = self.live_config.read().expect("worker config lock").clone();
         let mut engines = self.engines.clone();
         let (workdirs, roots) = if let Some(config) = live {
-            engines.global_config = Arc::new(config.config().clone());
+            let mut snapshot = config.config().clone();
+            // The effective file view may omit the builtin directory when it
+            // was defaulted at startup. Keep the resolved process baseline;
+            // admission must compare repository values with that exact binding.
+            if let Some(dir) = self.engines.process_binding().builtin_state_dir {
+                snapshot
+                    .runtime
+                    .get_or_insert_with(Default::default)
+                    .builtin
+                    .get_or_insert_with(Default::default)
+                    .state_dir = Some(dir);
+            }
+            engines.global_config = Arc::new(snapshot);
             (
                 config
                     .worker_push_work_dirs()
@@ -140,7 +172,7 @@ pub fn sessions_queue(
     api.lifecycle().queue_view(id.as_str())
 }
 pub async fn sessions_create(
-    api: &WorkerApi,
+    api: &Arc<WorkerApi>,
     context: crate::data::daemon_state::CommandRequestContext,
     request: crate::command::commands::api_server::admission::SessionSubmission,
     command: Option<crate::command::commands::api_server::admission::CommandSubmission>,
@@ -150,18 +182,58 @@ pub async fn sessions_create(
     crate::command::commands::api_server::admission::AdmittedSession,
     crate::command::commands::api_server::admission::AdmissionError,
 > {
-    if !api.push_enabled() {
-        return Err(
-            crate::command::commands::api_server::admission::AdmissionError::FeatureDisabled,
-        );
-    }
-    api.admission()
-        .with_request_context(context)
-        .admit_session(request, command, close_on_finish, journal)
-        .await
+    let verbose_setup = api.verbose_setup();
+    sessions_create_presented(
+        api,
+        context,
+        request,
+        command,
+        close_on_finish,
+        journal,
+        move |id, bus| {
+            Box::new(
+                crate::command::commands::api_server::session_setup::BusSessionSetupPresenter::new(
+                    id,
+                    bus,
+                    verbose_setup,
+                ),
+            )
+        },
+    )
+    .await
+}
+
+/// Supply presentation without taking ownership of scheduling or finalization.
+pub async fn sessions_create_presented(
+    api: &Arc<WorkerApi>,
+    context: crate::data::daemon_state::CommandRequestContext,
+    request: crate::command::commands::api_server::admission::SessionSubmission,
+    command: Option<crate::command::commands::api_server::admission::CommandSubmission>,
+    close_on_finish: bool,
+    journal: Option<&crate::command::commands::api_server::admission::IdempotentAdmission>,
+    present: impl FnOnce(
+            &str,
+            Arc<SessionSetupBus>,
+        ) -> Box<dyn crate::command::session_setup::SessionSetupPresenter>
+        + Send
+        + 'static,
+) -> Result<
+    crate::command::commands::api_server::admission::AdmittedSession,
+    crate::command::commands::api_server::admission::AdmissionError,
+> {
+    crate::command::session_lifecycle::SessionLifecycle::create(
+        api,
+        context,
+        request,
+        command,
+        close_on_finish,
+        journal,
+        present,
+    )
+    .await
 }
 pub async fn runs_create(
-    api: &WorkerApi,
+    api: &Arc<WorkerApi>,
     context: crate::data::daemon_state::CommandRequestContext,
     session: crate::command::commands::api_server::admission::SessionSubmission,
     command: crate::command::commands::api_server::admission::CommandSubmission,

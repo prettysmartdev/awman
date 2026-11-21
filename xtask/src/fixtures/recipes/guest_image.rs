@@ -187,6 +187,44 @@ pub(super) fn build(base: &Path, out: &Path) -> Result<()> {
     fs::create_dir_all(out)?;
     fs::write(out.join("fixture-docker.tar"), docker.into_inner()?)?;
     fs::write(out.join("fixture-oci.tar"), oci.into_inner()?)?;
+    let provenance = json!({
+        "schema": 1,
+        "recipe": "guest-contract-v1",
+        "recipe_sha256": sha256(include_bytes!("guest_image.rs")),
+        "image_contract_sha256": sha256(include_bytes!("../../../../tests/guest/support/image-contract.sh")),
+        "base_archive_sha256": crate::evidence::digest::sha256_file(base)?,
+        "platform": {"os": "linux", "architecture": architecture},
+        "archives": {
+            "fixture-docker.tar": crate::evidence::digest::sha256_file(&out.join("fixture-docker.tar"))?,
+            "fixture-oci.tar": crate::evidence::digest::sha256_file(&out.join("fixture-oci.tar"))?
+        }
+    });
+    fs::write(
+        out.join("provenance.json"),
+        serde_json::to_vec_pretty(&provenance)?,
+    )?;
+    Ok(())
+}
+
+/// Rebuild from independently pinned base bytes and the reviewed recipe. A
+/// sidecar cannot authenticate itself: compare its entire record and both
+/// archive digests with this independent reproduction.
+pub(super) fn verify(base: &Path, out: &Path) -> Result<()> {
+    let rebuilt = tempfile::tempdir()?;
+    build(base, rebuilt.path())?;
+    let expected: Value =
+        serde_json::from_slice(&fs::read(rebuilt.path().join("provenance.json"))?)?;
+    let actual: Value = serde_json::from_slice(&fs::read(out.join("provenance.json"))?)?;
+    ensure!(
+        actual == expected,
+        "fixture provenance differs from the reviewed recipe/base"
+    );
+    for name in ["fixture-docker.tar", "fixture-oci.tar"] {
+        ensure!(
+            crate::evidence::digest::sha256_file(&out.join(name))? == expected["archives"][name],
+            "fixture archive {name} differs from its reproduced digest"
+        );
+    }
     Ok(())
 }
 

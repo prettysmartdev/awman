@@ -22,7 +22,7 @@ const lastFrame = (send: ReturnType<typeof vi.fn>) => send.mock.calls.at(-1)?.[0
 describe('matrix rows', () => {
   it('repo.new_tab_cancel: the Cancel button closes the dialog and sends nothing', async () => {
     const h = harness(); h.s.tabs = [{ ...h.s.tabs[0]!, workflow: null }]; h.store.applySnapshot(h.s);
-    render(<Workspace client={h.client} connection={h.connection} launchContext="lc_default" squadAvailable={true} reconnect={vi.fn()} />);
+    render(<Workspace client={h.client} connection={h.connection} launchContext="lc_default" listenerName="loopback" squadAvailable={true} reconnect={vi.fn()} />);
     fireEvent.click(screen.getAllByRole('button', { name: 'New tab' })[0]!);
     await screen.findByRole('option', { name: /Project/ });
     const before = h.send.mock.calls.length;
@@ -33,7 +33,7 @@ describe('matrix rows', () => {
 
   it('exec.status_log_toggle: the Status log control reveals and hides the status messages', () => {
     const h = harness(); h.s.tabs = [{ ...h.s.tabs[0]!, workflow: null, status_log: [{ level: 'warning', text: 'container restarted' }] }]; h.store.applySnapshot(h.s);
-    render(<Workspace client={h.client} connection={h.connection} launchContext="lc_default" squadAvailable={true} reconnect={vi.fn()} />);
+    render(<Workspace client={h.client} connection={h.connection} launchContext="lc_default" listenerName="loopback" squadAvailable={true} reconnect={vi.fn()} />);
     const toggle = screen.getByRole('button', { name: 'Status log' });
     expect(screen.queryByText('container restarted')).toBeNull();
     fireEvent.click(toggle);
@@ -94,7 +94,7 @@ describe('matrix rows', () => {
 
   it('tabs.stuck_yellow: a stuck delta marks the tab and its slot', () => {
     const h = harness(); const tab = { ...snapshot().tabs[0]!, workflow: null }; h.s.tabs = [tab]; h.store.applySnapshot(h.s);
-    render(<Workspace client={h.client} connection={h.connection} launchContext="lc_default" squadAvailable={true} reconnect={vi.fn()} />);
+    render(<Workspace client={h.client} connection={h.connection} launchContext="lc_default" listenerName="loopback" squadAvailable={true} reconnect={vi.fn()} />);
     expect(screen.getByRole('tab').textContent).not.toContain('⚠');
     act(() => h.store.applyDelta({ delta: 'stuck', value: { tab_id: tab.tab_id, stuck: true } }));
     expect(screen.getByRole('tab').textContent).toContain('⚠');

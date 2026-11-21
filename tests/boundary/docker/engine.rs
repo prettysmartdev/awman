@@ -12,6 +12,7 @@ use awman::data::config::env::EnvSnapshot;
 use awman_test_support::capability::Docker;
 use awman_test_support::{Granted, Output, OwnedCommand, TestSandbox};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::support;
 
@@ -21,6 +22,7 @@ pub const BUILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(9
 
 /// Base image used when the run names none.
 pub const DEFAULT_BASE_IMAGE: &str = "busybox:1.36.1";
+static RESOURCE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// The Docker Engine granted to one test.
 pub struct Engine<'a> {
@@ -68,6 +70,31 @@ impl<'a> Engine<'a> {
         support::env_snapshot(self.sandbox)
     }
 
+    /// A per-sandbox suffix suitable for Docker names, tags and ownership labels.
+    pub fn run_id(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        std::process::id().hash(&mut hash);
+        self.sandbox.root().hash(&mut hash);
+        format!("{:016x}", hash.finish())
+    }
+
+    pub fn unique_name(&self, prefix: &str) -> String {
+        format!(
+            "{prefix}-{}-{:x}",
+            self.run_id(),
+            RESOURCE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    pub fn unique_tag(&self, prefix: &str) -> String {
+        format!(
+            "{prefix}:{}-{:x}",
+            self.run_id(),
+            RESOURCE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
     /// Whether the engine has `image`.
     pub fn has_image(&self, image: &str) -> bool {
         self.run(&["image", "inspect", "--format", "{{.Id}}", image])
@@ -89,7 +116,16 @@ impl<'a> Engine<'a> {
 
     /// Remove an image; absent is fine.
     pub fn remove_image(&self, image: &str) {
-        let _ = self.run(&["rmi", "-f", image]);
+        let _ = self.run(&["rmi", image]);
+    }
+
+    fn resource_owner(&self, kind: &str, reference: &str) -> Option<String> {
+        let format = "{{.Id}} {{index .Config.Labels \"awman.test.owner\"}}";
+        let result = self.run(&[kind, "inspect", "--format", format, reference]);
+        result
+            .exit
+            .success()
+            .then(|| result.stdout_text().trim().to_string())
     }
 
     /// The reference every test image is built from, present in the engine.
@@ -125,13 +161,54 @@ impl<'a> Engine<'a> {
             .unwrap_or_else(|e| panic!("BLOCKED[tempdir]: {}: {e}", file.display()));
         (file, context)
     }
+}
 
-    /// `docker build -t <tag> -f <dockerfile> <context>`; the output of a
-    /// failed build is in the panic message.
-    pub fn build(&self, tag: &str, dockerfile: &Path, context: &Path) {
+/// Removes the named containers and images when dropped, including when the
+/// test panics, so a failing boundary test leaves the engine as it found it.
+pub struct Cleanup<'e, 'a> {
+    engine: &'e Engine<'a>,
+    owner: String,
+    containers: std::cell::RefCell<Vec<(String, Option<String>)>>,
+    images: std::cell::RefCell<Vec<(String, Option<String>)>>,
+}
+
+impl<'e, 'a> Cleanup<'e, 'a> {
+    pub fn new(engine: &'e Engine<'a>) -> Cleanup<'e, 'a> {
+        Cleanup {
+            engine,
+            owner: format!(
+                "{}-{:x}",
+                engine.run_id(),
+                RESOURCE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ),
+            containers: Default::default(),
+            images: Default::default(),
+        }
+    }
+
+    pub fn owner_token(&self) -> &str {
+        &self.owner
+    }
+
+    pub fn owner_label(&self) -> String {
+        format!("awman.test.owner={}", self.owner)
+    }
+
+    /// Build with this fixture world's ownership label and register the tag
+    /// before Docker can create it, so drop cleanup also covers failed setup.
+    pub fn build_image(&self, tag: &str, dockerfile: &Path, context: &Path) {
+        self.image(tag);
         let out = self
+            .engine
             .command()
-            .args(["build", "--tag", tag, "--file"])
+            .args([
+                "build",
+                "--label",
+                &self.owner_label(),
+                "--tag",
+                tag,
+                "--file",
+            ])
             .arg(dockerfile)
             .arg(context)
             .deadline(BUILD_DEADLINE)
@@ -139,41 +216,35 @@ impl<'a> Engine<'a> {
         out.assert_success();
     }
 
-    /// Every container name currently known to the engine.
-    pub fn container_names(&self) -> Vec<String> {
-        self.run_ok(&["ps", "-a", "--format", "{{.Names}}"])
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
-}
-
-/// Removes the named containers and images when dropped, including when the
-/// test panics, so a failing boundary test leaves the engine as it found it.
-pub struct Cleanup<'e, 'a> {
-    engine: &'e Engine<'a>,
-    containers: std::cell::RefCell<Vec<String>>,
-    images: std::cell::RefCell<Vec<String>>,
-}
-
-impl<'e, 'a> Cleanup<'e, 'a> {
-    pub fn new(engine: &'e Engine<'a>) -> Cleanup<'e, 'a> {
-        Cleanup {
-            engine,
-            containers: Default::default(),
-            images: Default::default(),
-        }
-    }
-
     /// Remove this container when the guard drops.
     pub fn container(&self, name: &str) -> &Self {
-        self.containers.borrow_mut().push(name.to_string());
+        self.containers.borrow_mut().push((name.to_string(), None));
+        self
+    }
+
+    /// Record the daemon ID after a successful create, closing the setup gap.
+    pub fn created_container(&self, name: &str) -> &Self {
+        let id = self
+            .engine
+            .resource_owner("container", name)
+            .and_then(|details| details.split_whitespace().next().map(str::to_string));
+        self.containers.borrow_mut().push((name.to_string(), id));
         self
     }
 
     /// Remove this image when the guard drops.
     pub fn image(&self, reference: &str) -> &Self {
-        self.images.borrow_mut().push(reference.to_string());
+        self.images.borrow_mut().push((reference.to_string(), None));
+        self
+    }
+
+    /// Record the image content ID after this world creates or tags it.
+    pub fn created_image(&self, reference: &str) -> &Self {
+        let id = self
+            .engine
+            .resource_owner("image", reference)
+            .and_then(|details| details.split_whitespace().next().map(str::to_string));
+        self.images.borrow_mut().push((reference.to_string(), id));
         self
     }
 }
@@ -181,10 +252,28 @@ impl<'e, 'a> Cleanup<'e, 'a> {
 impl Drop for Cleanup<'_, '_> {
     fn drop(&mut self) {
         for name in self.containers.borrow().iter() {
-            self.engine.remove_container(name);
+            let details = self.engine.resource_owner("container", &name.0);
+            let Some(details) = details else { continue };
+            let mut fields = details.split_whitespace();
+            let Some(id) = fields.next() else { continue };
+            let owner = fields.next().unwrap_or("");
+            let recorded = name.1.as_deref() == Some(id);
+            if recorded || owner == self.owner {
+                self.engine.remove_container(id);
+            }
         }
         for image in self.images.borrow().iter() {
-            self.engine.remove_image(image);
+            let details = self.engine.resource_owner("image", &image.0);
+            let Some(details) = details else { continue };
+            let mut fields = details.split_whitespace();
+            let Some(id) = fields.next() else { continue };
+            let owner = fields.next().unwrap_or("");
+            let recorded = image.1.as_deref() == Some(id);
+            if recorded || owner == self.owner {
+                // Removing the unique tag drops only this reference. Never
+                // force-remove a content ID shared by another image tag.
+                self.engine.remove_image(&image.0);
+            }
         }
     }
 }

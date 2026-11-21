@@ -19,6 +19,7 @@ use std::sync::Arc;
 mod contracts;
 pub mod frontend;
 pub mod host_agent;
+pub(crate) mod installed_program;
 mod phases;
 
 pub use crate::data::ready_phase::{ReadyFailure, ReadyPhase};
@@ -142,7 +143,12 @@ impl ReadyEngine {
                 false => ReadyImageAction::Build,
             };
         let cancel = preparer.cancel_token();
-        let host_env = session.env().clone();
+        let host_agent =
+            HostAgentPinger::with_env(session.env().clone()).with_checkout_roots(vec![
+                session.git_root().to_path_buf(),
+                session.working_dir().to_path_buf(),
+                session.definition_root().to_path_buf(),
+            ]);
         Self {
             session,
             git_engine,
@@ -153,7 +159,7 @@ impl ReadyEngine {
             phase: ReadyPhase::Preflight,
             summary,
             pre_audit_dockerfile_hash: None,
-            host_agent: Arc::new(HostAgentPinger::with_env(host_env)),
+            host_agent: Arc::new(host_agent),
             definition: None,
             preparer,
             image_policy,

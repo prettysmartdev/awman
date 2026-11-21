@@ -74,10 +74,30 @@ impl WorkflowLogPaths {
         container_name: &str,
         contents: &str,
     ) -> Result<PathBuf, DataError> {
+        self.write_container_log_from_reader(
+            workflow_id,
+            step_name,
+            container_name,
+            &mut contents.as_bytes(),
+        )
+    }
+    /// Stream a complete transcript to a private file with bounded memory.
+    pub fn write_container_log_from_reader(
+        &self,
+        workflow_id: uuid::Uuid,
+        step_name: &str,
+        container_name: &str,
+        reader: &mut dyn std::io::Read,
+    ) -> Result<PathBuf, DataError> {
         let dir = self.logs_dir();
-        std::fs::create_dir_all(&dir).map_err(|e| DataError::io(&dir, e))?;
+        super::private_files::create_private_dir(&dir)?;
         let path = self.container_log_path(workflow_id, step_name, container_name);
-        std::fs::write(&path, contents).map_err(|e| DataError::io(&path, e))?;
+        let mut file = super::private_files::create_private_file_new(&path)?;
+        let result = std::io::copy(reader, &mut file).and_then(|_| file.sync_all());
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&path);
+            return Err(DataError::io(&path, error));
+        }
         Ok(path)
     }
 }

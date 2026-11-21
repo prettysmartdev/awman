@@ -323,7 +323,8 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         }
         // Session-creation validation errors (surfaced by multi-session
         // frontends); their Display text is already user-appropriate.
-        CommandError::SessionInvalidType { .. }
+        CommandError::ProcessScopedSetting { .. }
+        | CommandError::SessionInvalidType { .. }
         | CommandError::ApiWorkdirRootInvalid { .. }
         | CommandError::WorktreeExists { .. }
         | CommandError::SessionWorkdirRequired

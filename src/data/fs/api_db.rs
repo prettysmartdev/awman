@@ -539,10 +539,54 @@ impl SqliteSessionStore {
         Self::open_at(&root.join(crate::data::fs::api_paths::API_DB_FILENAME))
     }
 
-    /// Open (or create) the database at an exact file path. This is the
-    /// env-scoped entry point used after the database moved out of the API
-    /// daemon directory into `DataPaths`.
+    /// Open (or create) the database at an exact file path, with no legacy
+    /// migration. Foreground and daemon producers open the shared store
+    /// through `DataPaths::open_session_store` instead.
+    ///
+    /// When the directory holds a store migration lock, the open waits for
+    /// it (up to `MIGRATION_LOCK_WAIT`) and holds it while the file is opened
+    /// and its schema migrated, so a direct open can never create or write a
+    /// destination database in the middle of a legacy migration.
     pub fn open_at(db_file: &Path) -> Result<Self, DataError> {
+        Self::open_at_with_lock_wait(db_file, crate::data::fs::data_paths::MIGRATION_LOCK_WAIT)
+    }
+
+    /// [`Self::open_at`] with an explicit wait for a held migration lock.
+    /// A lock still held after `wait` refuses the open; nothing is created.
+    pub fn open_at_with_lock_wait(
+        db_file: &Path,
+        wait: std::time::Duration,
+    ) -> Result<Self, DataError> {
+        use crate::data::fs::private_files::{self, LockMode};
+        let parent = db_file.parent().unwrap_or(Path::new("."));
+        let lock = parent.join(crate::data::fs::data_paths::MIGRATION_LOCK_FILENAME);
+        let _held = if db_file.file_name()
+            == Some(std::ffi::OsStr::new(
+                crate::data::fs::api_paths::API_DB_FILENAME,
+            ))
+            && lock.symlink_metadata().is_ok()
+        {
+            Some(
+                private_files::lock_private_timeout(&lock, LockMode::Exclusive, wait, || Ok(()))?
+                    .ok_or_else(|| {
+                    DataError::Other(format!(
+                        "the awman database {} is being migrated by another awman process \
+                             (lock {} still held after {}s); retry when it finishes",
+                        db_file.display(),
+                        lock.display(),
+                        wait.as_secs()
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
+        Self::open_at_unlocked(db_file)
+    }
+
+    /// Open without taking the migration lock: only for the migration-aware
+    /// opener, which already holds it.
+    pub(crate) fn open_at_unlocked(db_file: &Path) -> Result<Self, DataError> {
         let parent = db_file.parent().ok_or_else(|| {
             DataError::Other(format!(
                 "database path has no parent: {}",
@@ -557,6 +601,16 @@ impl SqliteSessionStore {
             conn: std::sync::Arc::new(Mutex::new(conn)),
         })
     }
+    /// A private in-memory database (embedded callers and tests). It is
+    /// shared by handing out the `Arc`, never by opening it again.
+    pub fn open_in_memory() -> Result<Self, DataError> {
+        let conn = Connection::open_in_memory()?;
+        Self::migrate(&conn)?;
+        Ok(Self {
+            conn: std::sync::Arc::new(Mutex::new(conn)),
+        })
+    }
+
     pub(crate) fn shared_connection(&self) -> std::sync::Arc<Mutex<Connection>> {
         self.conn.clone()
     }
@@ -615,6 +669,9 @@ impl SqliteSessionStore {
         // WI 0145: kind marker of an in-memory session credential (no value).
         Self::add_column_if_missing(conn, "sessions", "git_auth_kind", "TEXT")?;
         Self::add_column_if_missing(conn, "sessions", "context_key", "TEXT")?;
+        // WI 0078: the session's versioned mount authority JSON; NULL on rows
+        // written before it existed, which restore refuses to infer.
+        Self::add_column_if_missing(conn, "sessions", "mount_authority", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "worker_id", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "queued_at", "TEXT")?;
         Self::add_column_if_missing(conn, "commands", "result", "TEXT")?;
@@ -1586,6 +1643,7 @@ impl SqliteSessionStore {
     ) -> Result<(), DataError> {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.lock();
+        crate::data::automation_store::validate_command_result(&conn, id, result_json)?;
         let changed = conn.execute(
             "UPDATE commands SET status = ?1, exit_code = ?2, finished_at = COALESCE(finished_at, ?3), result = ?4
              WHERE id = ?5 AND (active_execution_id IS NULL OR (status = 'running' AND NOT EXISTS (SELECT 1 FROM agent_executions WHERE command_id=commands.id AND (launch_phase!='ended' OR pending_events_json IS NOT NULL))))",
@@ -1615,6 +1673,11 @@ impl SqliteSessionStore {
         completion: &CommandCompletion,
     ) -> Result<bool, DataError> {
         let conn = self.lock();
+        crate::data::automation_store::validate_command_result(
+            &conn,
+            id,
+            Some(&completion.result_json),
+        )?;
         let changed = conn.execute(
             "UPDATE commands SET status = ?1, exit_code = ?2, finished_at = ?3, result = ?4
              WHERE id = ?5 AND status = 'running' AND attempt = ?6 AND NOT EXISTS (SELECT 1 FROM agent_executions WHERE command_id=commands.id AND (launch_phase!='ended' OR pending_events_json IS NOT NULL))",
@@ -1971,5 +2034,39 @@ impl SqliteSessionStore {
             params![key.map(|k| k.as_str()), id],
         )?;
         Ok(())
+    }
+}
+
+// Mount authority (WI 0078): the versioned JSON a session's launches are held
+// to. Kept out of `SessionRecord` so restore is the only reader.
+impl SqliteSessionStore {
+    /// Record the authority setup opened the session with.
+    pub fn set_mount_authority(
+        &self,
+        id: &str,
+        authority: &crate::data::mount_authority::MountAuthority,
+    ) -> Result<(), DataError> {
+        let changed = self.conn.lock().unwrap().execute(
+            "UPDATE sessions SET mount_authority=?1 WHERE id=?2",
+            params![authority.to_persisted(), id],
+        )?;
+        if changed == 0 {
+            return Err(DataError::Other(format!("session {id} not found")));
+        }
+        Ok(())
+    }
+
+    /// The saved authority JSON; `None` for rows written before it existed
+    /// (or whose setup never opened the session).
+    pub fn mount_authority(&self, id: &str) -> Result<Option<String>, DataError> {
+        let conn = self.conn.lock().unwrap();
+        let value: Option<Option<String>> = conn
+            .query_row(
+                "SELECT mount_authority FROM sessions WHERE id=?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.flatten())
     }
 }

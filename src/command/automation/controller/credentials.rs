@@ -578,7 +578,7 @@ impl ExecutionController {
         state.active = None;
         drop(state);
         if let Some(events) = &binding.host.events {
-            events(EventPayload::AgentCredentialsChanged {
+            events.emit(EventPayload::AgentCredentialsChanged {
                 request_id: op.request_id,
                 execution_id: fence.execution_id.clone(),
                 credential_generation: op.credential_generation,

@@ -300,6 +300,13 @@ for the protocol.
   until cleanup is confirmed; `awman agents profile close NAME --agent AGENT` retries it
   once the container is gone. Use the saved native conversation with
   `--agent-session` to continue in a new execution.
+- **Completion and storage failures.** A turn counts as complete only after its result is
+  recorded and its lifecycle events are durably written. If recording fails, the command ends
+  with a storage error, further task input stops and nothing is retried or resent. If the
+  result is recorded but its events could not be published, the command reports
+  "completion recorded, not yet published": restart the daemon and it publishes them once from
+  the recorded result. Do not resubmit the task to repair publication. A result larger than
+  8 MiB is reported as `result_too_large` with no final message and is not a verified success.
 - **Timeouts.** `agents.automation.startupTimeout`, `cancelTimeout` and
   `outputDrainTimeout` ([Configuration](07-configuration.md#automation-timeouts)) are read
   when each launch starts; changing them never affects a running execution. They are
@@ -314,6 +321,33 @@ for the protocol.
 - **Windows.** The refresh coordination that prevents two awman processes from refreshing
   one credential at once is not available on Windows, where each process serializes its own
   refreshes and logs that limitation.
+
+## Runtime and process settings
+
+The daemon resolves its runtime (`runtime.kind`), the builtin state directory and the
+credential-refresh settings once, at startup, from the global config, `AWMAN_*` variables and
+any `--set` on `awman daemon start`; the startup `--set` values are what the daemon actually
+uses, so check them rather than only the file. Commands submitted to a running daemon cannot
+change them: a command whose `--set` (in API `args`) or repository config asks for a different
+value is refused with HTTP 409 `process_scoped_setting`. Restart the daemon with the value you
+want, or change the global config and restart. A value equal to the running one is accepted.
+See [Settings fixed for an awman process](07-configuration.md#settings-fixed-for-an-awman-process).
+A runtime that cannot start is an explicit startup failure, never a silent switch to Docker.
+
+## Storage
+
+The daemon and foreground automation runs share one database, `~/.awman/data/awman.db`. On
+first use after an upgrade from a layout that kept it in `~/.awman/api/`, awman moves it,
+verifies the copy and leaves the original as `awman.db.pre-migration` (see
+[Cleaning up](13-cleaning-up.md)). An interrupted move resumes on the next start. If a
+database exists in both places, awman changes nothing and refuses to start with a message
+naming both files: stop every awman process, back up both databases (with their `-wal` and
+`-shm` files), move the one you do not want to another directory (do not delete it), and
+start again. awman never merges them. Another awman process that is migrating makes a new
+one wait up to 30 seconds, then fail with a retry message. If the daemon cannot open its
+database, commands fail with a storage error rather than running as a separate foreground run.
+Do not edit `awman.db.migration.json` or `.awman.db.migrating-*` in the data directory; they
+are the migration's in-progress state.
 
 ## Configuration reference
 

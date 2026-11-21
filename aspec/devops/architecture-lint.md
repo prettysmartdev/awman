@@ -73,4 +73,4 @@ make pre-push            # fmt-check + clippy + test + architecture-lint
 
 ## CI integration
 
-Wired into `.github/workflows/test.yml` as the first step of the `fast` job, before clippy and tests, so layering violations fail fast.
+Wired into `.github/workflows/ci.yml` as the first step of the `fast` job, before clippy and tests, so layering violations fail fast.

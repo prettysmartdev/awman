@@ -255,6 +255,9 @@ fn preflight(f: &Flags) -> Step {
     let resolution = if dry_run {
         Resolution::New { candidate: 1 }
     } else {
+        // Workflow concurrency admission precedes this read. Never reuse a
+        // candidate number computed by an operator before admission. Assembly
+        // also checks for collisions because other writers can bypass Actions.
         let existing = super::state::existing(hub.as_ref(), &version)?;
         let max = super::state::recorded(hub.as_ref(), &version, &namespace)?
             .into_iter()

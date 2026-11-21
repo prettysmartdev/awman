@@ -135,6 +135,7 @@ fn docker_and_apple_deliver_git_cache_credentials_only_on_private_stdin() {
         };
         let container = runtime
             .launch_background(&BackgroundLaunchRequest {
+                labels: &[],
                 secret_env: &[],
                 name: Some("private-cache-fixture"),
                 image: "fixture:local",

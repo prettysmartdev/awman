@@ -52,9 +52,9 @@ fn repo_config_save_refuses_a_symlinked_leaf_without_touching_its_target() {
 }
 
 #[test]
-fn interrupted_database_migration_recovers_from_legacy_source_and_preserves_backup() {
+fn an_unjournaled_destination_beside_a_legacy_store_is_preserved_as_a_conflict() {
     let sandbox = support::sandbox(
-        "data::persistence::interrupted_database_migration_recovers_from_legacy_source_and_preserves_backup",
+        "data::persistence::an_unjournaled_destination_beside_a_legacy_store_is_preserved_as_a_conflict",
     );
     let legacy = sandbox.tmp().join("legacy-api");
     std::fs::create_dir_all(&legacy).unwrap();
@@ -66,14 +66,20 @@ fn interrupted_database_migration_recovers_from_legacy_source_and_preserves_back
     )
     .unwrap();
     paths.ensure_root().unwrap();
-    std::fs::write(paths.db_path(), b"partial target").unwrap();
+    std::fs::write(paths.db_path(), b"bytes nobody can attribute").unwrap();
 
+    // Without a journal proving it was staged by a migration, the
+    // destination is never assumed to be a partial copy and removed.
     assert!(matches!(
-        paths.migrate_legacy_db(&legacy).unwrap(),
-        MigrationOutcome::RecoveredFromInterrupted { .. }
+        paths.migrate_legacy_db(&legacy),
+        Err(awman::data::error::DataError::StoreMigrationConflict { .. })
     ));
     assert_eq!(
         std::fs::read(paths.db_path()).unwrap(),
+        b"bytes nobody can attribute"
+    );
+    assert_eq!(
+        std::fs::read(legacy.join(DB_FILENAME)).unwrap(),
         b"authoritative legacy bytes"
     );
     assert_eq!(

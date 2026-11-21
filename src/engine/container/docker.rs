@@ -352,6 +352,29 @@ impl ContainerBackend for DockerBackend {
         host_cli_backend::cli_stop_checked(self.cli(), &handle.id)
     }
 
+    fn remove_agent_checked(
+        &self,
+        handle: &AgentHandle,
+        execution: &str,
+    ) -> Result<(), EngineError> {
+        // Docker's full content-independent container ID cannot resolve a name replacement.
+        if handle.id.len() != 64 || !handle.id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(EngineError::Container(
+                "identity-checked removal requires a full container ID".into(),
+            ));
+        }
+        if self
+            .resource_label(handle, "awman.profile-execution")?
+            .as_deref()
+            != Some(execution)
+        {
+            return Err(EngineError::Container(
+                "container execution owner changed".into(),
+            ));
+        }
+        self.remove_agent(&handle.id)
+    }
+
     fn remove_agent(&self, id: &str) -> Result<(), EngineError> {
         host_cli_backend::cli_remove(self.cli(), "rm", id)
     }
@@ -402,15 +425,7 @@ impl ContainerBackend for DockerBackend {
         &self,
         request: &background::BackgroundLaunchRequest<'_>,
     ) -> Result<String, EngineError> {
-        background::default_start_background(
-            self.cli(),
-            request.name,
-            request.image,
-            request.workdir,
-            request.env,
-            request.overlays,
-            request.secret_env,
-        )
+        background::default_start_background(self.cli(), request)
     }
 
     fn exec_in_background(
@@ -495,6 +510,7 @@ pub(super) fn attach_bridge_config(
             crate::engine::agent_runtime::output_tail::OutputTail::with_default_capacity(),
         ),
         output_broadcast: None,
+        acp_gates: None,
         terminal: None,
         program_status: Default::default(),
     }

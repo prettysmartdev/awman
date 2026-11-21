@@ -440,6 +440,30 @@ pub struct Session {
     created_at: SystemTime,
     last_active_at: SystemTime,
     created_at_instant: Instant,
+    /// The boundary every launch of this session may mount.
+    mount_authority: SessionMountAuthority,
+}
+
+/// A session's mount boundary, or why it has none.
+///
+/// A session restored from persistence without a saved authority, or whose
+/// saved authority the current policy no longer grants, is not launchable:
+/// nothing is inferred from its workdir or from Git discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionMountAuthority {
+    Granted(crate::data::mount_authority::MountAuthority),
+    RevalidationRequired { reason: String },
+}
+
+impl SessionMountAuthority {
+    /// The authority of a session re-rooted at a verified worktree checkout.
+    /// A session that needs revalidation stays that way.
+    fn rerooted_at(&self, worktree: &Path) -> Self {
+        match self {
+            Self::Granted(authority) => Self::Granted(authority.verified_worktree(worktree)),
+            other => other.clone(),
+        }
+    }
 }
 
 /// The agent a session runs when no flag or config names one.
@@ -453,6 +477,10 @@ pub struct SessionOpenOptions {
     pub available_agents: Option<Vec<AgentName>>,
     /// `--set key=value` overrides, already resolved against the key table.
     pub overrides: ConfigOverrides,
+    /// The boundary admission granted. When set, the root this open resolves
+    /// must canonicalize to `authority.root()` or the open fails. When unset,
+    /// the session records a local-invocation authority for its own root.
+    pub mount_authority: Option<crate::data::mount_authority::MountAuthority>,
 }
 
 impl Session {
@@ -569,6 +597,7 @@ impl Session {
                 env: Some(invoker.env.clone()),
                 available_agents: Some(invoker.available_agents.clone()),
                 overrides: invoker.config.layers().set.clone(),
+                mount_authority: None,
             },
         )?;
         // The invoker's repo `runtime.builtin` block and `agents.default`, and
@@ -611,6 +640,7 @@ impl Session {
         session.lease_images = invoker.lease_images.clone();
         session.repo_context = invoker.repo_context.clone();
         session.default_agent = invoker.default_agent.clone();
+        session.mount_authority = invoker.mount_authority.rerooted_at(session.git_root());
         Ok(session)
     }
 
@@ -634,6 +664,7 @@ impl Session {
             session_type: SessionType::Local {
                 workdir: working_dir,
             },
+            mount_authority: invoker.mount_authority.rerooted_at(&git_root),
             git_root,
             definition_root: invoker.definition_root.clone(),
             is_git_repo: true,
@@ -659,6 +690,27 @@ impl Session {
         is_git_repo: bool,
     ) -> Result<Self, DataError> {
         let env = opts.env.unwrap_or_else(EnvSnapshot::empty);
+        // Checked before any repository file is read from the root.
+        let mount_authority = match opts.mount_authority {
+            Some(authority) => {
+                let resolved = std::fs::canonicalize(&git_root)
+                    .map_err(|source| DataError::io(&git_root, source))?;
+                if resolved != authority.root() {
+                    return Err(DataError::InvalidPath {
+                        path: git_root,
+                        reason: format!(
+                            "the session would mount {}, which is not its authorized workdir {}",
+                            resolved.display(),
+                            authority.root().display()
+                        ),
+                    });
+                }
+                SessionMountAuthority::Granted(authority)
+            }
+            None => SessionMountAuthority::Granted(
+                crate::data::mount_authority::MountAuthority::local_invocation(&git_root),
+            ),
+        };
         let layers = ConfigLayers::load(&env, Some(&git_root), opts.overrides.clone())?;
         let config = EffectiveConfig::resolve(layers, opts.flags.clone(), env.clone())?;
 
@@ -675,6 +727,7 @@ impl Session {
         let now = SystemTime::now();
 
         Ok(Self {
+            mount_authority,
             id: SessionId::new(),
             inline_work_item: None,
             staged_work_item: None,
@@ -756,6 +809,28 @@ impl Session {
 
     pub fn git_root(&self) -> &Path {
         &self.git_root
+    }
+
+    /// The boundary every launch of this session may mount, or why the
+    /// session must be revalidated before it can launch.
+    pub fn mount_authority(&self) -> &SessionMountAuthority {
+        &self.mount_authority
+    }
+
+    /// The granted authority, if any.
+    pub fn granted_mount_authority(&self) -> Option<&crate::data::mount_authority::MountAuthority> {
+        match &self.mount_authority {
+            SessionMountAuthority::Granted(authority) => Some(authority),
+            SessionMountAuthority::RevalidationRequired { .. } => None,
+        }
+    }
+
+    /// Withdraw this session's authority: it may not launch until it is
+    /// revalidated (a restored session the current policy no longer grants).
+    pub fn require_mount_revalidation(&mut self, reason: impl Into<String>) {
+        self.mount_authority = SessionMountAuthority::RevalidationRequired {
+            reason: reason.into(),
+        };
     }
 
     /// Repository whose agent definitions and approvals govern this session.

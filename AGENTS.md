@@ -49,8 +49,15 @@ make validate-native # Apple Silicon acceptance and evidence packet
 
 ## Security Constraints (non-negotiable)
 
-- **Never execute any agent/code assistant directly on the host machine**
-- All agentic operations run inside Docker containers (built from `Dockerfile.dev`)
+- **Never execute any agent/code assistant directly on the host machine**, with one
+  accepted exception: the `HostAgentPinger` readiness/credential-refresh ping defined in
+  `aspec/architecture/security.md`. It is the only type allowed to spawn an agent binary
+  on the host, only for its listed triggers, with a fixed greeting, no task or repository
+  content, an empty private working directory, and a first-party executable resolved from
+  an installed location outside the checkout. Do not add triggers, a second host-agent
+  mechanism, or a fallback to an unvalidated program name; do not remove the exception.
+- All agent work (tasks, prompts, repository access) runs inside containers or microVMs
+  (images built from `Dockerfile.dev`); the ping above never carries any of it
 - Only mount the current directory or Git repo root to containers — never parent directories
 - If a parent directory is the Git root, prompt the user to confirm the mount scope
 

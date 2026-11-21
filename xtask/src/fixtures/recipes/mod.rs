@@ -108,6 +108,18 @@ fn guest(recipe: &str, opts: &BTreeMap<String, String>) -> Result<()> {
     );
     Ok(())
 }
+
+/// Verify publication outputs against a separately reviewed base pin. This
+/// proves reproducibility; the maintainer also authenticates Actions provenance
+/// before committing the public archive pins.
+pub fn verify_guest(args: &[String]) -> Result<ExitCode> {
+    let opts = options(args)?;
+    let base = PathBuf::from(value(&opts, "--base")?);
+    verify(&base, value(&opts, "--sha256")?)?;
+    guest_image::verify(&base, Path::new(value(&opts, "--out")?))?;
+    println!("both fixture archives and provenance match the reviewed base and recipe");
+    Ok(ExitCode::SUCCESS)
+}
 fn history(opts: &BTreeMap<String, String>) -> Result<()> {
     let hash = value(opts, "--sha256")?;
     digest(hash)?;

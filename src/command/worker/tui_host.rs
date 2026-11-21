@@ -297,11 +297,15 @@ impl Host {
         let paths =
             crate::data::fs::DataPaths::from_env(session.env()).map_err(|e| e.to_string())?;
         if paths.db_path().exists() {
-            if let Ok(db) = SqliteSessionStore::open_at(&paths.db_path()) {
+            if let Ok(db) = paths.open_session_store(
+                crate::data::fs::ApiPaths::from_env(session.env())
+                    .map_err(|e| e.to_string())?
+                    .root(),
+            ) {
                 let _ = super::images::schedule_cleanup(
                     engines.runtime.clone(),
                     session.env().clone(),
-                    Arc::new(db),
+                    db,
                     super::images::budgets(&settings),
                 )
                 .await;
@@ -964,8 +968,13 @@ impl Host {
         let paths =
             crate::data::fs::DataPaths::from_env(self.session.env()).map_err(|e| e.to_string())?;
         let links = LinkStore::new(&paths);
-        let store =
-            Arc::new(SqliteSessionStore::open_at(&paths.db_path()).map_err(|e| e.to_string())?);
+        let store = paths
+            .open_session_store(
+                crate::data::fs::ApiPaths::from_env(self.session.env())
+                    .map_err(|e| e.to_string())?
+                    .root(),
+            )
+            .map_err(|e| e.to_string())?;
         let leases = LeaseStore::open(store).map_err(|e| e.to_string())?;
         for name in links.retired().map_err(|e| e.to_string())? {
             if !self.settings.work_servers.contains_key(&name)
@@ -1175,8 +1184,13 @@ impl ManualRun {
             let owner = crate::data::worker::paths::try_lease_owner(paths.root(), &record.id)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| "lease already owned".to_string())?;
-            let store =
-                Arc::new(SqliteSessionStore::open_at(&paths.db_path()).map_err(|e| e.to_string())?);
+            let store = paths
+                .open_session_store(
+                    crate::data::fs::ApiPaths::from_env(invoker.env())
+                        .map_err(|e| e.to_string())?
+                        .root(),
+                )
+                .map_err(|e| e.to_string())?;
             let leases = LeaseStore::open(store.clone()).map_err(|e| e.to_string())?;
             leases.insert(&record).map_err(|e| e.to_string())?;
             let active = Arc::new(Active {
@@ -1453,13 +1467,17 @@ impl ManualRun {
                     });
                     let _ = leases.update(&record);
                     active.done.cancel();
-                    if let Ok(db) = crate::data::fs::DataPaths::from_env(invoker.env())
-                        .and_then(|p| SqliteSessionStore::open_at(&p.db_path()))
+                    if let Ok(db) =
+                        crate::data::fs::DataPaths::from_env(invoker.env()).and_then(|p| {
+                            p.open_session_store(
+                                crate::data::fs::ApiPaths::from_env(invoker.env())?.root(),
+                            )
+                        })
                     {
                         let _ = super::images::schedule_cleanup(
                             engines.runtime.clone(),
                             invoker.env().clone(),
-                            Arc::new(db),
+                            db,
                             super::images::budgets(&invoker.effective_config().daemon().worker),
                         )
                         .await;

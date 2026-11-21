@@ -120,6 +120,12 @@ pub enum EngineError {
     #[error("ACP protocol error: {0}")]
     Acp(String),
 
+    /// An ACP queue that must not wait (control traffic, pending requests,
+    /// or an unbounded runtime stream) exceeded its budget. The session is
+    /// cancelled; nothing was silently dropped.
+    #[error("ACP {queue} queue exceeded its budget; the session was cancelled")]
+    AcpOverflow { queue: &'static str },
+
     #[error(
         "runtime {runtime} was given {got}-paradigm options; \
          this indicates a Layer 2 dispatch bug"
@@ -299,6 +305,11 @@ pub enum EngineError {
     #[error("remote transport error: {0}")]
     RemoteTransport(String),
 
+    /// The remote's stream violated the protocol in a way reconnecting would
+    /// only repeat (an SSE frame over the size limit).
+    #[error("remote protocol error: {0}")]
+    RemoteProtocol(String),
+
     // ── Builtin runtime and image acquisition (WI 0119) ───────────────────
     //
     // The image-source fields are named `source_kind`, not `source`: thiserror
@@ -328,6 +339,28 @@ pub enum EngineError {
         process.display()
     )]
     BuiltinStateDirMismatch { process: PathBuf, session: PathBuf },
+
+    /// A final workspace or Git mount does not fit the session's authorized
+    /// mount boundary. Refused before any container or VM exists.
+    #[error(
+        "refusing to launch: the mount {} is outside this session's authorized workdir {} \
+         ({reason}). Create a new session for the directory you intend to mount.",
+        path.display(),
+        authority_root.display()
+    )]
+    MountOutsideAuthority {
+        path: PathBuf,
+        authority_root: PathBuf,
+        reason: String,
+    },
+
+    /// A restored session whose mount authority is missing or no longer
+    /// granted by the current policy. Code: `mount_authority_revalidation_required`.
+    #[error(
+        "mount_authority_revalidation_required: this session's workdir authorization could not \
+         be revalidated ({reason}); close it and create a new session"
+    )]
+    MountAuthorityRevalidationRequired { reason: String },
 
     /// A launch carries an allowed- or disallowed-tools list but the agent
     /// declares no flag to deliver it. Every runtime refuses the launch:

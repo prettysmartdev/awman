@@ -10,6 +10,31 @@ use std::time::{Duration, Instant};
 const FIRST_DELAY: Duration = Duration::from_millis(5);
 const MAX_DELAY: Duration = Duration::from_millis(100);
 
+/// One monotonic budget shared by readiness, diagnostics, and cleanup work.
+#[derive(Clone, Debug)]
+pub struct DeadlineBudget {
+    deadline: Instant,
+}
+
+impl DeadlineBudget {
+    /// Start a budget that expires after `limit`.
+    pub fn new(limit: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + limit,
+        }
+    }
+
+    /// Time left in this budget, or zero after expiry.
+    pub fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    /// Whether this budget has expired.
+    pub fn is_expired(&self) -> bool {
+        self.remaining().is_zero()
+    }
+}
+
 /// Poll `probe` (5 ms backing off to 100 ms) until it returns `Some`.
 /// On expiry, panic with `what` and the elapsed time.
 ///
@@ -55,6 +80,16 @@ pub fn wait_for_with<T>(
     }
 }
 
+/// Wait using the time remaining in a shared budget.
+pub fn wait_for_with_budget<T>(
+    what: &str,
+    budget: &DeadlineBudget,
+    probe: impl FnMut() -> Option<T>,
+    diagnostics: impl Fn() -> String,
+) -> T {
+    wait_for_with(what, budget.remaining(), probe, diagnostics)
+}
+
 /// Async variant for tokio tests: polls `probe()` with the same backoff using
 /// `tokio::time::sleep` (real time; never use it under paused time).
 pub async fn wait_for_async<T, F, Fut>(what: &str, limit: Duration, mut probe: F) -> T
@@ -73,6 +108,42 @@ where
             panic!("timed out after {elapsed:.1?} (limit {limit:?}) waiting for {what}");
         }
         // The one sanctioned async real-time delay: polling backoff.
+        #[allow(clippy::disallowed_methods)]
+        tokio::time::sleep(delay.min(limit - elapsed)).await;
+        delay = (delay * 2).min(MAX_DELAY);
+    }
+}
+
+/// Async variant of [`wait_for_with`] that includes caller diagnostics on expiry.
+pub async fn wait_for_async_with<T, F, Fut>(
+    what: &str,
+    limit: Duration,
+    mut probe: F,
+    diagnostics: impl Fn() -> String,
+) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<T>>,
+{
+    let started = Instant::now();
+    let mut delay = FIRST_DELAY;
+    loop {
+        if let Some(value) = probe().await {
+            return value;
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= limit {
+            let details = diagnostics();
+            panic!(
+                "timed out after {elapsed:.1?} (limit {limit:?}) waiting for {what}{}{}",
+                if details.is_empty() {
+                    ""
+                } else {
+                    "\n--- diagnostics ---\n"
+                },
+                details
+            );
+        }
         #[allow(clippy::disallowed_methods)]
         tokio::time::sleep(delay.min(limit - elapsed)).await;
         delay = (delay * 2).min(MAX_DELAY);
@@ -139,6 +210,26 @@ mod tests {
     }
 
     #[test]
+    fn budget_wait_reports_diagnostics_with_remaining_time() {
+        let budget = DeadlineBudget::new(Duration::from_millis(20));
+        let err = std::panic::catch_unwind(|| {
+            wait_for_with_budget(
+                "readiness",
+                &budget,
+                || None::<()>,
+                || "guest never acknowledged resize".to_string(),
+            )
+        })
+        .unwrap_err();
+        let message = crate::panic_text(&err);
+        assert!(message.contains("waiting for readiness"), "{message}");
+        assert!(
+            message.contains("guest never acknowledged resize"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn async_variant_waits_and_expires() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -164,5 +255,25 @@ mod tests {
         })
         .unwrap_err();
         assert!(crate::panic_text(&err).contains("never"));
+    }
+
+    #[test]
+    fn async_diagnostic_variant_includes_state_on_expiry() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let err = std::panic::catch_unwind(move || {
+            rt.block_on(wait_for_async_with(
+                "guest resize",
+                Duration::from_millis(10),
+                || async { None::<()> },
+                || "last PTY size: 24 80".to_string(),
+            ))
+        })
+        .unwrap_err();
+        let message = crate::panic_text(&err);
+        assert!(message.contains("waiting for guest resize"), "{message}");
+        assert!(message.contains("last PTY size: 24 80"), "{message}");
     }
 }

@@ -436,7 +436,15 @@ impl WorkflowEngine {
         tail: &OutputTail,
         exit_code: i32,
     ) {
-        let contents = self.redaction.redact(&tail.snapshot_text());
+        let reader = match tail.transcript_reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                self.msg_warning(format!("could not read container transcript: {error}"));
+                return;
+            }
+        };
+        let mut contents =
+            crate::engine::auth::redaction::RedactedReader::new(reader, self.redaction.clone());
         let paths = match crate::data::fs::WorkflowLogPaths::from_env(self.session.env()) {
             Ok(p) => p,
             Err(e) => {
@@ -448,11 +456,11 @@ impl WorkflowEngine {
                 return;
             }
         };
-        match paths.write_container_log(
+        match paths.write_container_log_from_reader(
             self.state.invocation_id,
             step_name,
             container_name,
-            &contents,
+            &mut contents,
         ) {
             Ok(path) => self.msg_error(format!(
                 "Step '{step_name}' container '{container_name}' exited with code {exit_code}. \
@@ -1144,6 +1152,7 @@ struct PhaseStepOutcome {
     /// Names of the CI jobs a failed `poll_ci` saw fail, for the fix commit
     /// message. Empty for every other step.
     ci_failed_jobs: Vec<String>,
+    full_transcript: Option<std::path::PathBuf>,
 }
 
 /// Exit code reported for a phase step that failed without one of its own
@@ -1158,6 +1167,7 @@ impl PhaseStepOutcome {
             stdout: String::new(),
             stderr: String::new(),
             ci_failed_jobs: Vec::new(),
+            full_transcript: None,
         }
     }
 
@@ -1168,6 +1178,7 @@ impl PhaseStepOutcome {
             stdout,
             stderr,
             ci_failed_jobs: Vec::new(),
+            full_transcript: None,
         }
     }
 
@@ -1178,6 +1189,7 @@ impl PhaseStepOutcome {
             stdout,
             stderr,
             ci_failed_jobs: Vec::new(),
+            full_transcript: None,
         }
     }
 
@@ -1197,6 +1209,7 @@ struct PhaseFailureContext<'a> {
     step_name: &'a str,
     stdout: &'a str,
     stderr: &'a str,
+    full_transcript: Option<&'a std::path::Path>,
 }
 
 /// Resolved artifacts after successfully writing the phase-failure file.

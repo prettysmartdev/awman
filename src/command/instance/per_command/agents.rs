@@ -10,6 +10,7 @@
 
 use tokio_util::sync::CancellationToken;
 
+use crate::command::commands::agents::profile::{ProfileLineLevel, ProfileOutcome};
 use crate::command::commands::agents::{
     AgentsCommandFrontend, AgentsDetailOutcome, AgentsKillOutcome, AgentsListOutcome,
     AgentsOverview, AgentsTuiContext, KillChoice, LIST_COLUMNS,
@@ -47,6 +48,19 @@ impl AgentsCommandFrontend for InstanceCommandFrontend {
             if let Some(data) = dash.as_mut() {
                 data.watching = false;
             }
+        }
+    }
+
+    fn show_profile_result(&mut self, outcome: &ProfileOutcome) {
+        for (level, text) in outcome.project().lines {
+            self.write_message(UserMessage {
+                level: match level {
+                    ProfileLineLevel::Info => MessageLevel::Info,
+                    ProfileLineLevel::Success => MessageLevel::Success,
+                    ProfileLineLevel::Error => MessageLevel::Error,
+                },
+                text,
+            });
         }
     }
 

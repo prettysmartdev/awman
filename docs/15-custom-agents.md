@@ -187,7 +187,7 @@ awman reports every problem it finds in one pass. The file is capped at 64 KiB a
 | `schema` | Must be `1` |
 | `display_name`, `description`, `homepage` | No control characters; at most 256, 4096 and 2048 bytes |
 | argv tokens (`run.command`, mode and tool flags, `acp.command`) | Non-empty, no NUL or newline characters, at most 1024 bytes. `run.command[0]` is a bare name or an absolute path |
-| `ping.command` | Non-empty argv, at most 16 tokens. `command[0]` is a bare binary name (looked up on your host `PATH`) or an absolute path; relative paths like `./pi` are rejected |
+| `ping.command` | Non-empty argv, at most 16 tokens. `command[0]` is a bare binary name (looked up on your host `PATH`) or an absolute path; relative paths like `./pi` are rejected. A program that resolves inside the repository, working directory or a linked worktree is not run |
 | `system_prompt` | Each delivery requires exactly the keys shown above |
 | `run.env` keys | POSIX environment names; `HOME`, `PATH`, `USER`, `AWMAN_*` and `LD_*` are rejected |
 | `auth.env` | POSIX environment names; `AWMAN_*` and `SSH_AUTH_SOCK` are rejected |
@@ -197,7 +197,7 @@ awman reports every problem it finds in one pass. The file is capped at 64 KiB a
 | `image.apt` | Each entry matches `^[a-z0-9][a-z0-9+.-]*$` |
 | `image.dockerfile` | A relative path inside the TOML's own directory (no `..`, no symlink escaping it); exclusive with `install`, `apt` and `needs_node` |
 | `[image]` | Needs either `install` or `dockerfile` |
-| `[sandbox]` | Rejected: `custom agents do not support Docker Sandboxes yet; remove [sandbox] and use docker, apple or builtin-experimental` |
+| `[sandbox]` | Rejected: `custom agents do not support Docker Sandboxes yet; remove [sandbox] and use runtime.kind docker, apple or builtin` |
 | `[run].output_format` | One of `text`, `claude_stream_json` or `codex_json` (default `text`) |
 
 ---
@@ -292,7 +292,7 @@ An unknown agent name exits with status 4 and lists the known agents; a definiti
 
 ### The trust store
 
-Approvals are stored per definition in `~/.awman/trusted-agents.json`, keyed by the repository and the **content hash** of the TOML plus any Dockerfile it references. Change either file and the hash changes, so awman asks again.
+Approvals are stored per definition in `~/.awman/trusted-agents.json`, keyed by the repository and the **content hash** of the TOML plus any Dockerfile it references. Change either file and the hash changes, so awman asks again. For a definition with `[ping]` the approval also binds the resolved, canonical path of the host program, so the check is asked again if either the definition or the program it resolves to changes. Approvals recorded by an earlier awman that covered only the definition need to be renewed once.
 
 - **Repo definitions** always need approval, because anyone who can commit to a repository can change them.
 - **Global definitions** (`~/.awman/agents/`) are your own files and need no approval — unless they declare `[ping]`, in which case they are reviewed like a repo definition.
@@ -326,6 +326,8 @@ command = ["pi", "-p"]
       (pi resolves to /usr/local/bin/pi on your PATH)
   ```
 
+- **Where `command[0]` can come from:** a bare name is looked up only through absolute entries of your `PATH`; the approved, canonical path is the one that runs. A program that resolves inside the repository, the working directory or a linked worktree of it (including through a symbolic link) is never run, and `ready` reports it as refused rather than authenticated. A missing program is reported as not installed. Neither blocks container work.
+- **Private working directory:** the check runs from an empty private directory and receives no task or repository content.
 - **Without `[ping]`,** `awman ready` skips the host check for that agent and says so; the review reads ``no host command: `awman ready` will skip the host check``.
 - Global definitions with `[ping]` are reviewed and approved just like repo ones.
 

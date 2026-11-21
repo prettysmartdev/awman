@@ -15,3 +15,5 @@ pub(crate) mod automation_store;
 pub(crate) mod credential_updates;
 
 mod agent_profiles;
+mod private_files;
+mod store_migration;

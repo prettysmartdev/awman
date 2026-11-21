@@ -17,7 +17,7 @@ function mount(tabPatch: (tab: TabSnapshot) => TabSnapshot = t => t) {
   const h = harness(); const original = snapshot().tabs[0]!;
   const tab = tabPatch({ ...original, workflow: { steps: [], current_step: 'implement', max_concurrent: 2, reported: {} } as unknown as TabSnapshot['workflow'], execution_phase: { phase: 'running', command: 'exec workflow' }, slots: [], yolo: null });
   h.s.tabs = [tab]; h.s.pending_dialogs = []; h.store.applySnapshot(h.s);
-  render(<Workspace client={h.client} connection={h.connection} launchContext="lc_default" squadAvailable={true} reconnect={vi.fn()} />);
+  render(<Workspace client={h.client} connection={h.connection} launchContext="lc_default" listenerName="loopback" squadAvailable={true} reconnect={vi.fn()} />);
   return { ...h, tab };
 }
 const answers = (send: ReturnType<typeof vi.fn>) => send.mock.calls.filter(([f]) => f.type === 'dialog_response');

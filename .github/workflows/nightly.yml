@@ -146,6 +146,16 @@ jobs:
       - name: Report
         if: ${{ always() }}
         run: cat seeded-defects.md >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Retain baseline, per-patch JUnit and compiler diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: seeded-defects-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            seeded-defects.md
+            seeded-defects.evidence/
+          if-no-files-found: error
+          retention-days: 30
 
   mutation:
     name: Mutation testing (Layer 0 and Layer 2, sampled)

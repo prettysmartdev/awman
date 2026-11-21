@@ -29,6 +29,96 @@ pub enum ProfileOutcome {
         failure: Option<ProfileCloseFailure>,
     },
 }
+/// How a presentation level shows one projected line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileLineLevel {
+    Info,
+    Success,
+    Error,
+}
+
+/// The one typed projection of a profile result. CLI JSON, API command data
+/// and TUI messages all derive from it, so a list, a close or a typed close
+/// failure cannot be shown by one frontend and vanish in another.
+#[derive(Debug, Clone)]
+pub struct ProfileResultProjection {
+    /// The JSON value emitted by every frontend that declares JSON output.
+    pub data: serde_json::Value,
+    /// Human lines for presenters that do not render JSON (the TUI).
+    pub lines: Vec<(ProfileLineLevel, String)>,
+    /// Typed close failure; its presence makes the command exit non-zero.
+    pub failure: Option<ProfileCloseFailure>,
+}
+
+fn state_label(state: &ProfileState) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{state:?}").to_lowercase())
+}
+
+impl ProfileOutcome {
+    pub fn project(&self) -> ProfileResultProjection {
+        let data = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        let mut lines = Vec::new();
+        let mut failure = None;
+        match self {
+            ProfileOutcome::List { profiles } => {
+                if profiles.is_empty() {
+                    lines.push((ProfileLineLevel::Info, "No settings profiles.".to_string()));
+                }
+                for p in profiles {
+                    lines.push((
+                        ProfileLineLevel::Info,
+                        format!(
+                            "{}/{}  {}  generation {}",
+                            p.agent,
+                            p.name,
+                            state_label(&p.state),
+                            p.current_generation
+                        ),
+                    ));
+                }
+            }
+            ProfileOutcome::Delete { agent, name, .. } => lines.push((
+                ProfileLineLevel::Success,
+                format!("Deleted profile {agent}/{name}."),
+            )),
+            ProfileOutcome::Close {
+                agent,
+                name,
+                state,
+                snapshot,
+                failure: close_failure,
+                ..
+            } => match close_failure {
+                None => lines.push((
+                    ProfileLineLevel::Success,
+                    format!(
+                        "Closed profile {agent}/{name} ({}; snapshot {snapshot}).",
+                        state_label(state)
+                    ),
+                )),
+                Some(f) => {
+                    lines.push((
+                        ProfileLineLevel::Error,
+                        format!(
+                            "Profile {agent}/{name} close failed [{}]: {}",
+                            f.code, f.message
+                        ),
+                    ));
+                    failure = Some(f.clone());
+                }
+            },
+        }
+        ProfileResultProjection {
+            data,
+            lines,
+            failure,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProfileCloseFailure {
     pub code: String,

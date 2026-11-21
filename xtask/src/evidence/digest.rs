@@ -9,7 +9,9 @@ pub fn sha256(bytes: &[u8]) -> String {
         .collect()
 }
 pub fn is_sha256(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 pub fn sha256_file(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)?;

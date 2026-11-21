@@ -1,0 +1,14 @@
+# defect: Invert base layer digest verification so valid archives are refused and corrupt layers are accepted
+# expect-red: unit-xtask
+diff --git a/xtask/src/fixtures/recipes/guest_image.rs b/xtask/src/fixtures/recipes/guest_image.rs
+--- a/xtask/src/fixtures/recipes/guest_image.rs
++++ b/xtask/src/fixtures/recipes/guest_image.rs
+@@ -70,7 +70,7 @@
+     );
+     for (bytes, id) in layers.iter().zip(ids) {
+         ensure!(
+-            *id == format!("sha256:{}", sha256(bytes)),
++            *id != format!("sha256:{}", sha256(bytes)),
+             "base layer is compressed or has the wrong digest"
+         );
+     }

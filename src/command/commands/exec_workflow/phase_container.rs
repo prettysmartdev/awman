@@ -40,6 +40,7 @@ const TRANSCRIPT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) struct PhaseContainerWorkspace {
     pub workdir: PathBuf,
+    pub host_env: crate::data::config::env::EnvSnapshot,
     pub env: HashMap<String, String>,
     pub overlays: Vec<OverlaySpec>,
     pub builtin_launch: Option<crate::data::config::builtin_launch::BuiltinLaunchSettings>,
@@ -80,6 +81,7 @@ impl PhaseContainerFactory<'_> {
                     self.image,
                     PhaseContainerWorkspace {
                         workdir: self.workdir.to_path_buf(),
+                        host_env: self.session.env().clone(),
                         env: env.env.clone(),
                         overlays: overlays.to_vec(),
                         builtin_launch: launch,
@@ -91,6 +93,7 @@ impl PhaseContainerFactory<'_> {
                     .map(|prefix| format!("{prefix}phase-{}", uuid::Uuid::new_v4().simple()));
                 let background = self.runtime.start_background(
                     &crate::engine::container::background::BackgroundLaunchRequest {
+                        labels: &[],
                         secret_env: &secret_env,
                         name: name.as_deref(),
                         image: self.image,
@@ -123,6 +126,9 @@ struct TransportPhaseContainer {
     setup: bool,
 }
 impl AgentExec for TransportPhaseContainer {
+    fn failure_transcript(&self) -> Option<PathBuf> {
+        self.inner.failure_transcript()
+    }
     fn exec(
         &self,
         command: &str,
@@ -158,6 +164,7 @@ pub(crate) struct InteractivePhaseContainer {
     step: PhaseStepRef,
     image: String,
     workspace: PhaseContainerWorkspace,
+    failure_transcript: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl InteractivePhaseContainer {
@@ -174,6 +181,7 @@ impl InteractivePhaseContainer {
             step: step.clone(),
             image: image.to_string(),
             workspace,
+            failure_transcript: Default::default(),
         }
     }
 
@@ -182,15 +190,18 @@ impl InteractivePhaseContainer {
         command: &str,
         step_env: Option<&HashMap<String, String>>,
     ) -> Result<ExecOutput, EngineError> {
-        let instance = self.runtime.build_phase_step(&PhaseStepContainerSpec {
-            builtin_launch: self.workspace.builtin_launch.as_ref(),
-            image: &self.image,
-            workdir: &self.workspace.workdir,
-            overlays: &self.workspace.overlays,
-            env: &self.workspace.env,
-            command,
-            step_env,
-        })?;
+        let instance = self.runtime.build_phase_step_in(
+            &PhaseStepContainerSpec {
+                builtin_launch: self.workspace.builtin_launch.as_ref(),
+                image: &self.image,
+                workdir: &self.workspace.workdir,
+                overlays: &self.workspace.overlays,
+                env: &self.workspace.env,
+                command,
+                step_env,
+            },
+            &self.workspace.host_env,
+        )?;
         self.run_instance(instance)
     }
 
@@ -198,6 +209,9 @@ impl InteractivePhaseContainer {
         &self,
         instance: Box<dyn AgentInstance>,
     ) -> Result<ExecOutput, EngineError> {
+        *self.failure_transcript.lock().unwrap() = None;
+        let redaction = instance.output_redaction();
+        redaction.absorb(&self.frontend.lock().unwrap().output_redaction());
         self.frontend
             .lock()
             .unwrap()
@@ -223,7 +237,47 @@ impl InteractivePhaseContainer {
         let stdout = match transcript {
             Some(tail) => {
                 tail.wait_for_writers(TRANSCRIPT_FLUSH_TIMEOUT);
-                tail.plain_text()
+                if exit.exit_code != 0 {
+                    let saved = (|| -> Result<PathBuf, EngineError> {
+                        let mut reader = crate::engine::auth::redaction::RedactedReader::new(
+                            tail.transcript_reader().map_err(|e| {
+                                EngineError::Other(format!("read phase transcript: {e}"))
+                            })?,
+                            redaction.clone(),
+                        );
+                        let paths =
+                            crate::data::fs::WorkflowLogPaths::from_env(&self.workspace.host_env)?;
+                        Ok(paths.write_container_log_from_reader(
+                            uuid::Uuid::new_v4(),
+                            &self.step.description,
+                            "phase",
+                            &mut reader,
+                        )?)
+                    })();
+                    let excerpt = redaction.redact(&tail.plain_text());
+                    match saved {
+                        Ok(path) => {
+                            *self.failure_transcript.lock().unwrap() = Some(path.clone());
+                            format!(
+                                "{excerpt}\n[awman: full transcript saved to {}]\n",
+                                path.display()
+                            )
+                        }
+                        Err(error) => {
+                            self.frontend.lock().unwrap().write_message(
+                                crate::data::message::UserMessage {
+                                    level: crate::data::message::MessageLevel::Warning,
+                                    text: format!(
+                                        "could not retain the full phase transcript: {error}"
+                                    ),
+                                },
+                            );
+                            format!("[awman: full transcript could not be saved: {error}; bounded excerpt follows]\n{excerpt}")
+                        }
+                    }
+                } else {
+                    tail.plain_text()
+                }
             }
             None => String::new(),
         };
@@ -243,6 +297,9 @@ impl InteractivePhaseContainer {
 }
 
 impl AgentExec for InteractivePhaseContainer {
+    fn failure_transcript(&self) -> Option<PathBuf> {
+        self.failure_transcript.lock().unwrap().clone()
+    }
     fn exec(
         &self,
         command: &str,

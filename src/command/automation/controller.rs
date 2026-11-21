@@ -46,7 +46,7 @@ use crate::engine::terminal_hub::{InputGrant, TerminalHub};
 
 /// Where an execution's lifecycle events go: the command's existing event
 /// stream (the daemon's bus, or nothing for a foreground run).
-pub type EventSink = Arc<dyn Fn(EventPayload) + Send + Sync>;
+pub use crate::command::commands::api_server::event_bus::LifecyclePublisher;
 
 /// The durable host an execution is recorded in: the shared API database
 /// with an existing command row (daemon-hosted or a foreground record).
@@ -57,14 +57,14 @@ pub struct AutomationHost {
     pub attempt: u32,
     /// Trusted UID/SID + data-home binding of the local owner.
     pub owner_key: String,
-    pub events: Option<EventSink>,
+    pub events: Option<LifecyclePublisher>,
     /// Receives the frozen assurance when the execution finishes, so the
     /// command result keeps it on every outcome (cancellation included).
     pub finished: Option<FinishedSink>,
 }
 
 /// See [`AutomationHost::finished`].
-pub type FinishedSink = Arc<dyn Fn(&CommandAutomationResult) + Send + Sync>;
+pub type FinishedSink = Arc<dyn Fn(&CommandAutomationResult, Option<&str>) + Send + Sync>;
 
 impl std::fmt::Debug for AutomationHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -117,6 +117,14 @@ pub struct FinishedExecution {
     pub failure: Option<AutomationFailure>,
     pub final_message: Option<String>,
     pub cancelled: bool,
+}
+
+impl FinishedExecution {
+    pub fn storage_failed(&mut self, error: &str) {
+        self.automation.completion_verified = false;
+        self.final_message = None;
+        self.failure = Some(super::admission::failure("storage_error", error));
+    }
 }
 
 /// One accepted guarded write, waiting for the writer pump. The pump
@@ -236,6 +244,9 @@ impl ExecutionController {
     /// Reserve the execution durably and register its cell. The returned
     /// handle owns the execution until [`OwnedExecution::finish`].
     pub fn start(self: &Arc<Self>, launch: ControllerLaunch) -> Result<OwnedExecution, String> {
+        if let Some(events) = &launch.host.events {
+            events.ensure_available().map_err(store_error)?;
+        }
         let ControllerLaunch {
             host,
             execution_id,
@@ -499,7 +510,13 @@ impl ExecutionController {
     pub fn recover(store: &AutomationStore) -> Result<Vec<CommandId>, String> {
         store.recover_credential_updates().map_err(store_error)?;
         let live = |id: &ExecutionId| -> Result<bool, String> {
-            Ok(global().cell(id).is_some() || store.lease_held(id).map_err(store_error)?)
+            Ok(global().cell(id).is_some_and(|cell| {
+                !cell
+                    .state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .finished
+            }) || store.lease_held(id).map_err(store_error)?)
         };
         let mut commands = Vec::new();
         for record in store.list_recoverable().map_err(store_error)? {
@@ -507,12 +524,24 @@ impl ExecutionController {
                 continue;
             }
             // Recovery authority: one recoverer per execution.
-            let Ok(_authority) = store.acquire_lease(&record.execution_id) else {
-                continue;
+            let _authority = match store.acquire_lease(&record.execution_id) {
+                Ok(lease) => lease,
+                Err(_)
+                    if store
+                        .lease_held(&record.execution_id)
+                        .map_err(store_error)? =>
+                {
+                    continue
+                }
+                Err(error) => return Err(store_error(error)),
             };
-            let Some(mut snapshot) = record.snapshot.clone() else {
+            if record.automation_mode.is_none() {
                 continue;
-            };
+            }
+            let mut snapshot = record
+                .snapshot
+                .clone()
+                .ok_or_else(|| "missing required automation snapshot".to_owned())?;
             let lost = super::admission::failure(
                 codes::EXECUTION_LOST,
                 "awman stopped while this execution was running; it was not resumed or replayed",
@@ -526,7 +555,10 @@ impl ExecutionController {
                 let found = store
                     .read_turn(&record.execution_id, turn)
                     .map_err(store_error)?;
-                if let Some(t) = found.filter(|t| t.result.is_none()) {
+                {
+                    let t = found
+                        .filter(|t| t.result.is_none())
+                        .ok_or_else(|| "missing required unsettled turn".to_owned())?;
                     let result = crate::data::automation_records::TurnResult {
                         status: if acknowledged {
                             crate::data::automation::TurnStatus::Failed
@@ -705,8 +737,7 @@ fn replay_lookup(
             frames.extend(result);
             Ok(Some(OperationReply::Replay(frames)))
         }
-        // An unknown execution for this owner is not a recorded request.
-        Err(_) => Ok(None),
+        Err(error) => Err(Refusal::new("storage_error", error.to_string())),
     }
 }
 
@@ -894,6 +925,7 @@ fn submit_locked(
         Ok(frame) => frame,
         Err(e) => {
             state.admission.abandon_reservation(&turn_id, before);
+            persistence_failed(cell, state, &e.to_string());
             return Err(Refusal::new(
                 codes::AGENT_NOT_READY,
                 format!("the turn could not be reserved: {e}"),
@@ -954,15 +986,13 @@ fn write_locked(
         DeliveryPhase::WriteStarted,
         &cell.execution_id,
     ) {
-        let f = super::admission::failure(
-            codes::EXECUTION_LOST,
-            &format!("the delivery marker could not be committed: {e}"),
-        );
-        let effects = state.admission.write_not_started(&write.turn_id, f);
-        apply_effects(cell, state, effects);
+        persistence_failed(cell, state, &e.to_string());
         return;
     }
     apply_effects(cell, state, effects);
+    if state.persist_failed {
+        return;
+    }
     let ok = engine.send(write.bytes).is_ok();
     if ok {
         if let Err(e) = state.host.store.mark_delivery(
@@ -1015,9 +1045,13 @@ fn persistence_failed(cell: &Arc<Cell>, state: &mut CellState, error: &str) {
         tracing::error!(execution = %cell.execution_id.as_str(), %error, "automation state could not be committed; stopping the execution");
     }
     state.persist_failed = true;
-    if state.stop_failure.is_none() {
+    state.writer = None;
+    if let Some(events) = &state.host.events {
+        events.abort(error);
+    }
+    {
         state.stop_failure = Some(super::admission::failure(
-            codes::EXECUTION_LOST,
+            "storage_error",
             &format!("the execution's durable state could not be committed: {error}"),
         ));
     }
@@ -1045,6 +1079,7 @@ fn close_locked(
             .store
             .reserve_close(&state.host.owner_key, &request, digest, &snapshot, None)
     {
+        persistence_failed(cell, state, &e.to_string());
         return Err(Refusal::new(
             codes::AGENT_NOT_READY,
             format!("the close could not be reserved: {e}"),
@@ -1069,7 +1104,7 @@ fn emit(state: &CellState, payload: EventPayload) {
         return;
     }
     if let Some(events) = &state.host.events {
-        events(payload);
+        events.emit(payload);
     }
 }
 
@@ -1119,9 +1154,21 @@ fn redact_effect(redaction: &RedactionSet, effect: Effect) -> Effect {
 /// stops input and the execution (fail closed). Returns whether the initial
 /// task is now deliverable.
 fn apply_effects(cell: &Arc<Cell>, state: &mut CellState, effects: Vec<Effect>) -> bool {
+    if state.persist_failed {
+        return false;
+    }
     let effects: Vec<Effect> = effects
         .into_iter()
-        .map(|e| redact_effect(&state.redaction, e))
+        .map(|e| {
+            let mut e = redact_effect(&state.redaction, e);
+            if let Some(events) = &state.host.events {
+                e = redact_effect(&events.redaction(), e);
+            }
+            if let Effect::TurnCompleted { result, .. } = &mut e {
+                let _ = results::bound_turn_result(result);
+            }
+            e
+        })
         .collect();
     let mut deliver_initial = false;
     let state_changed = effects.contains(&Effect::State);
@@ -1154,14 +1201,17 @@ fn apply_effects(cell: &Arc<Cell>, state: &mut CellState, effects: Vec<Effect>) 
             release_bootstrap(state);
             if let Err(e) = committed {
                 persistence_failed(cell, state, &e.to_string());
-                continue;
+                return false;
             }
             let request_id = state
                 .turns
                 .iter()
                 .find(|t| &t.turn_id == turn_id)
-                .map(|t| t.request_id)
-                .unwrap_or_default();
+                .map(|t| t.request_id);
+            let Some(request_id) = request_id else {
+                persistence_failed(cell, state, "missing required turn for observation");
+                return false;
+            };
             emit(
                 state,
                 EventPayload::AgentTurnStarted {
@@ -1183,20 +1233,57 @@ fn apply_effects(cell: &Arc<Cell>, state: &mut CellState, effects: Vec<Effect>) 
     // Whether the turn result committed (and may therefore be published).
     let mut completion_committed = false;
     if let Some((turn_id, result)) = &completion {
-        // The turn result and its state transition are one transaction.
-        match state
-            .host
-            .store
-            .complete_turn(turn_id, result, &snapshot, None)
-        {
-            Ok(_) => {
-                completion_committed = true;
-                if let Some(t) = state.turns.iter_mut().find(|t| &t.turn_id == turn_id) {
-                    t.result = Some(result.clone());
-                    t.completed_at = Some(chrono::Utc::now());
-                }
+        let committed = (|| -> Result<(), crate::data::error::DataError> {
+            let request_id = state
+                .turns
+                .iter()
+                .find(|t| &t.turn_id == turn_id)
+                .ok_or_else(|| {
+                    crate::data::error::DataError::Other("missing required turn".into())
+                })?
+                .request_id;
+            let projection = state
+                .host
+                .events
+                .as_ref()
+                .map(|events| {
+                    events.reserve(vec![
+                        EventPayload::AgentTurnCompleted {
+                            request_id,
+                            execution_id: cell.execution_id.clone(),
+                            turn_id: turn_id.clone(),
+                            result: result.clone(),
+                        },
+                        EventPayload::AgentState {
+                            snapshot: Box::new(snapshot.clone()),
+                        },
+                    ])
+                })
+                .transpose()?;
+            state
+                .host
+                .store
+                .complete_turn(turn_id, result, &snapshot, projection.as_ref())?;
+            if let (Some(events), Some(projection)) = (&state.host.events, projection) {
+                events.publish(&projection)?;
+                state
+                    .host
+                    .store
+                    .clear_pending_events(&cell.execution_id, projection.cursor)?;
             }
-            // Never report a completion that is not durable.
+            Ok(())
+        })();
+        match committed {
+            Ok(()) => {
+                completion_committed = true;
+                let t = state
+                    .turns
+                    .iter_mut()
+                    .find(|t| &t.turn_id == turn_id)
+                    .expect("validated turn");
+                t.result = Some(result.clone());
+                t.completed_at = Some(chrono::Utc::now());
+            }
             Err(e) => persistence_failed(cell, state, &e.to_string()),
         }
         if state
@@ -1207,7 +1294,7 @@ fn apply_effects(cell: &Arc<Cell>, state: &mut CellState, effects: Vec<Effect>) 
             state.ack_deadline = None;
         }
         release_bootstrap(state);
-    } else if state_changed {
+    } else if state_changed && snapshot.state != crate::data::automation::AutomationState::Ended {
         let committed = state
             .host
             .store
@@ -1218,16 +1305,26 @@ fn apply_effects(cell: &Arc<Cell>, state: &mut CellState, effects: Vec<Effect>) 
                         .host
                         .store
                         .transition_execution(current.revision, &snapshot, None)
-                } else {
+                } else if current.snapshot.as_ref() == Some(&snapshot) {
                     Ok(())
+                } else {
+                    Err(crate::data::error::DataError::Other(
+                        "stale_revision".into(),
+                    ))
                 }
             });
         if let Err(e) = committed {
             persistence_failed(cell, state, &e.to_string());
         }
     }
-    if state_changed {
-        publish_state(state);
+    if state_changed && snapshot.state != crate::data::automation::AutomationState::Ended {
+        if completion_committed {
+            if let Some((id, hub)) = terminal(state) {
+                let _ = hub.update_automation(&id, snapshot.clone());
+            }
+        } else {
+            publish_state(state);
+        }
     }
     for effect in effects {
         match effect {
@@ -1252,16 +1349,7 @@ fn apply_effects(cell: &Arc<Cell>, state: &mut CellState, effects: Vec<Effect>) 
                     .iter()
                     .find(|t| t.turn_id == turn_id)
                     .map(|t| t.request_id)
-                    .unwrap_or_default();
-                emit(
-                    state,
-                    EventPayload::AgentTurnCompleted {
-                        request_id,
-                        execution_id: cell.execution_id.clone(),
-                        turn_id: turn_id.clone(),
-                        result: result.clone(),
-                    },
-                );
+                    .expect("completion transaction validated required turn");
                 if let Some((id, hub)) = terminal(state) {
                     let _ = hub.publish_automation_frame(
                         &id,
@@ -1405,7 +1493,11 @@ impl TerminalAutomation for ExecutionController {
         match state.admission.manual_input() {
             Ok(effects) => {
                 apply_effects(&cell, &mut state, effects);
-                action()
+                if state.persist_failed {
+                    Err(TerminalRefusal::InputNotAllowed)
+                } else {
+                    action()
+                }
             }
             Err(_) => Err(TerminalRefusal::InputNotAllowed),
         }
@@ -1469,11 +1561,10 @@ impl OwnedExecution {
 
     /// The provider process is running.
     pub fn running(&self) {
-        let _ = self
-            .state()
-            .host
-            .store
-            .mark_running(&self.cell.execution_id);
+        let mut state = self.state();
+        if let Err(error) = state.host.store.mark_running(&self.cell.execution_id) {
+            persistence_failed(&self.cell, &mut state, &error.to_string());
+        }
     }
 
     /// Bind the engine-side input writer (the agent's stdin channel). Guarded
@@ -1532,7 +1623,16 @@ impl OwnedExecution {
         let mut state = self.state();
         state.terminal = Some((id.clone(), Arc::downgrade(hub)));
         if state.initial_task.is_some() {
-            state.bootstrap = hub.take_control(id).ok();
+            match hub.take_control(id) {
+                Ok(grant) => state.bootstrap = Some(grant),
+                Err(error) => {
+                    state.stop_failure = Some(super::admission::failure(
+                        codes::AGENT_NOT_READY,
+                        &format!("cannot acquire initial input control: {error}"),
+                    ));
+                    self.cell.stop.cancel();
+                }
+            }
         }
         self.controller
             .terminals
@@ -1551,6 +1651,12 @@ impl OwnedExecution {
         let mut state = self.state();
         let effects = state.admission.manual_input()?;
         apply_effects(&self.cell, &mut state, effects);
+        if state.persist_failed {
+            return Err(Refusal::new(
+                "storage_error",
+                "automation persistence failed",
+            ));
+        }
         Ok(())
     }
 
@@ -1633,7 +1739,11 @@ impl OwnedExecution {
         let code = exit.exit_code;
         let finished = self.finish_deferred(exit);
         if !self.closed_by_request() {
-            self.publish_exit(code.unwrap_or(1));
+            self.publish_exit(if finished.failure.is_some() {
+                1
+            } else {
+                code.unwrap_or(1)
+            });
         }
         finished
     }
@@ -1684,19 +1794,60 @@ impl OwnedExecution {
         if state.persist_failed {
             // Nothing uncommitted is reported as a verified result.
             automation.completion_verified = false;
-            failure = failure.or_else(|| state.stop_failure.clone());
+            failure = state.stop_failure.clone();
         }
-        if let Err(e) = state.host.store.finish_execution(
-            &self.cell.execution_id,
-            &automation,
-            failure.as_ref(),
-        ) {
+        if state.cancelled && failure.is_none() {
+            failure = Some(super::admission::failure(codes::CANCELLED, "cancelled"));
+        }
+        let saved = if state.persist_failed {
+            Err(crate::data::error::DataError::Other(
+                "automation persistence already failed".into(),
+            ))
+        } else {
+            (|| -> Result<(), crate::data::error::DataError> {
+                let projection = state
+                    .host
+                    .events
+                    .as_ref()
+                    .map(|events| {
+                        events.reserve(vec![EventPayload::AgentState {
+                            snapshot: Box::new(snapshot.clone()),
+                        }])
+                    })
+                    .transpose()?;
+                state.host.store.finish_execution_at(
+                    &snapshot,
+                    &automation,
+                    failure.as_ref(),
+                    projection.as_ref(),
+                )?;
+                failure = state
+                    .host
+                    .store
+                    .read_execution(&self.cell.execution_id)?
+                    .end_failure;
+                state.cancelled |= failure.as_ref().is_some_and(|f| f.code == codes::CANCELLED);
+                if let (Some(events), Some(projection)) = (&state.host.events, projection) {
+                    events.publish(&projection)?;
+                    state
+                        .host
+                        .store
+                        .clear_pending_events(&self.cell.execution_id, projection.cursor)?;
+                }
+                Ok(())
+            })()
+        };
+        if let Err(e) = saved {
             persistence_failed(&self.cell, &mut state, &e.to_string());
             automation.completion_verified = false;
-            failure = failure.or_else(|| state.stop_failure.clone());
-        }
-        if let Some(sink) = &state.host.finished {
-            sink(&automation);
+            failure = state.stop_failure.clone();
+        } else {
+            if let Some((id, hub)) = terminal(&state) {
+                let _ = hub.update_automation(&id, snapshot);
+            }
+            if let Some(sink) = &state.host.finished {
+                sink(&automation, results::final_message(&turns).as_deref());
+            }
         }
         state.finished = true;
         // The last turn's confirmed answer travels with every outcome
@@ -1707,10 +1858,20 @@ impl OwnedExecution {
             results::final_message(&turns)
         };
         let cancelled = state.cancelled;
+        let persist_failed = state.persist_failed;
         let lease = state.lease.take();
+        let lease = if persist_failed {
+            drop(lease);
+            None
+        } else {
+            lease
+        };
         let command = state.host.command_id.clone();
         drop(state);
         self.controller.hold_lease(&command, lease);
+        if persist_failed {
+            self.controller.forget(&self.cell.execution_id);
+        }
         FinishedExecution {
             automation,
             failure,
@@ -1738,9 +1899,13 @@ impl OwnedExecution {
     /// can finalize the execution. Nothing is published or replayed.
     pub fn abandon(self) {
         self.cell.timers.cancel();
+        self.cell.stop.cancel();
         let mut state = self.state();
+        release_bootstrap(&mut state);
+        state.writer = None;
         state.finished = true;
         state.lease = None;
+        self.controller.release_leases(&state.host.command_id);
         drop(state);
         self.controller
             .cells
@@ -1787,7 +1952,7 @@ impl crate::engine::terminal_hub::RawInputGate for ExecutionController {
         match state.admission.manual_input() {
             Ok(effects) => {
                 apply_effects(&cell, &mut state, effects);
-                true
+                !state.persist_failed
             }
             Err(_) => false,
         }

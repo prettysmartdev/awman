@@ -33,6 +33,7 @@ pub mod issue;
 pub mod jsonc;
 pub mod merge_fix_prompt;
 pub mod message;
+pub mod mount_authority;
 pub mod network;
 pub mod oci_cache;
 pub mod oci_identity;

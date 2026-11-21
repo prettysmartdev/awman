@@ -116,6 +116,7 @@ pub struct CredentialRefreshMonitor {
     /// (F-38). The tick loop's refresh is authorized trigger (b) in
     /// `security.md`.
     host_agent: HostAgentPinger,
+    checkout_roots: Mutex<Vec<std::path::PathBuf>>,
 }
 
 impl CredentialRefreshMonitor {
@@ -141,15 +142,21 @@ impl CredentialRefreshMonitor {
         )
     }
 
-    /// Construct a monitor bound to an explicit credential source, so the tick
-    /// loop never reads a developer's real credential nor spawns a real host
-    /// ping (F3) — on any platform.
+    /// Construct a monitor bound to an explicit credential source, using the
+    /// process environment for host pings. Tests must use `with_binding_in`
+    /// with a private snapshot and owned fake executables as well as a private
+    /// credential file, on every platform.
     pub fn with_binding(config: MonitorConfig, binding: CredentialBinding) -> Arc<Self> {
         let root = binding
             .resolver()
             .home()
             .join(".cache/awman-credential-authorities");
-        Self::with_lock_root(config, binding, root)
+        Self::with_lock_root(
+            config,
+            binding,
+            root,
+            &crate::engine::host_cli::process_env(),
+        )
     }
     pub fn with_binding_in(
         config: MonitorConfig,
@@ -157,12 +164,13 @@ impl CredentialRefreshMonitor {
         env: &crate::data::config::env::EnvSnapshot,
     ) -> Arc<Self> {
         let root = super::authority::lock_root(env, binding.resolver().home());
-        Self::with_lock_root(config, binding, root)
+        Self::with_lock_root(config, binding, root, env)
     }
     fn with_lock_root(
         config: MonitorConfig,
         binding: CredentialBinding,
         lock_root: std::path::PathBuf,
+        env: &crate::data::config::env::EnvSnapshot,
     ) -> Arc<Self> {
         Arc::new(Self {
             lock_root,
@@ -175,8 +183,18 @@ impl CredentialRefreshMonitor {
             delivered: Mutex::new(HashMap::new()),
             refresh_gate: tokio::sync::Mutex::new(()),
             thread_started: std::sync::Once::new(),
-            host_agent: HostAgentPinger::new(),
+            host_agent: HostAgentPinger::with_env(env.clone()),
+            checkout_roots: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Retain session exclusions for the monitor lifetime: forgetting a live
+    /// checkout would be unsafe, retaining a retired one is conservative.
+    pub fn add_checkout_roots(&self, roots: impl IntoIterator<Item = std::path::PathBuf>) {
+        self.checkout_roots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend(roots);
     }
 
     /// Register a live credentialed container. Called from the container
@@ -421,7 +439,23 @@ impl CredentialRefreshMonitor {
         // its last-known-good file — loudly, never silently.
         let mut stale_remediation: Option<String> = None;
         let snapshot = if near_expiry {
-            match self.host_agent.refresh_credential(spec, binding).await {
+            let roots = self
+                .checkout_roots
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            let outcome = if roots.is_empty() {
+                HostRefreshOutcome::PingFailed {
+                    result: crate::engine::ready::LocalAgentPingResult::CouldNotRun,
+                }
+            } else {
+                self.host_agent
+                    .clone()
+                    .with_checkout_roots(roots)
+                    .refresh_credential(spec, binding)
+                    .await
+            };
+            match outcome {
                 HostRefreshOutcome::Advanced { .. } => match (spec.read)(&source) {
                     Ok(fresh) => fresh,
                     Err(reason) => {

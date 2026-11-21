@@ -41,6 +41,8 @@ pub const STARTUP_TIMEOUT: &str = "startup_timeout";
 pub const DELIVERY_UNKNOWN: &str = "delivery_unknown";
 /// The provider reported the turn as failed.
 pub const AGENT_TURN_FAILED: &str = "agent_turn_failed";
+/// A serialized native result exceeds the durable result limit.
+pub const RESULT_TOO_LARGE: &str = "result_too_large";
 /// Malformed, missing or contradictory required native records.
 pub const AGENT_PROTOCOL_ERROR: &str = "agent_protocol_error";
 /// Waiting on the runtime for the agent's exit failed.
@@ -67,6 +69,7 @@ pub const ALL: &[&str] = &[
     STARTUP_TIMEOUT,
     DELIVERY_UNKNOWN,
     AGENT_TURN_FAILED,
+    RESULT_TOO_LARGE,
     AGENT_PROTOCOL_ERROR,
     RUNTIME_WAIT_FAILED,
     CREDENTIAL_UPDATE_FAILED,
@@ -111,7 +114,7 @@ mod tests {
                 "{code}"
             );
         }
-        assert_eq!(ALL.len(), 17);
+        assert_eq!(ALL.len(), 18);
         // Reused, not redefined.
         assert!(!seen.contains(crate::data::fs::api_db::failure_codes::CREDENTIALS_LOST));
         for reused in [

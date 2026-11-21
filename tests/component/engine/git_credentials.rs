@@ -15,7 +15,7 @@ use awman::engine::git::GitEngine;
 use awman_test_support::capability::{LocalGit, Loopback};
 use awman_test_support::fakes::{FakeGitHttp, GitHttpFault};
 use awman_test_support::fixtures::RepoBuilder;
-use awman_test_support::{wait_for, Stdin, TestSandbox};
+use awman_test_support::{wait_for_with_budget, DeadlineBudget, Stdin, TestSandbox};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -215,6 +215,10 @@ fn session_credential_clone_fetch_ls_remote_and_push_leave_no_secret_in_argv_env
 #[cfg(target_os = "linux")]
 #[test]
 fn running_git_and_helper_processes_carry_no_secret_in_argv_or_environment() {
+    // Leave four seconds of the 20-second component tier budget for panic
+    // diagnostics, cancellation, worker join and sandbox teardown.
+    let readiness = DeadlineBudget::new(Duration::from_secs(16));
+    let teardown = DeadlineBudget::new(Duration::from_secs(19));
     let s = sandbox("engine::git_credentials::running_git_and_helper_processes_carry_no_secret_in_argv_or_environment");
     let seed = RepoBuilder::new(&s, "seed").file("a", "a").init();
     seed.bare_remote("origin");
@@ -258,9 +262,20 @@ fn running_git_and_helper_processes_carry_no_secret_in_argv_or_environment() {
             )
         })
     };
-    wait_for("the authenticated request", Duration::from_secs(30), || {
-        held.load(Ordering::SeqCst).then_some(())
-    });
+    let worker = CloneWorker::new(cancel.clone(), worker, teardown);
+    wait_for_with_budget(
+        "the authenticated request",
+        &readiness,
+        || held.load(Ordering::SeqCst).then_some(()),
+        || {
+            format!(
+                "authenticated request observed: {}; HTTP requests: {}; clone path exists: {}",
+                held.load(Ordering::SeqCst),
+                http.requests().iter().flatten().count(),
+                clone.exists(),
+            )
+        },
+    );
     let mut saw_session_git = false;
     for entry in std::fs::read_dir("/proc").unwrap().flatten() {
         let pid = entry.path();
@@ -285,6 +300,132 @@ fn running_git_and_helper_processes_carry_no_secret_in_argv_or_environment() {
     cancel.cancel();
     let result = worker.join().unwrap();
     assert!(result.is_err());
+}
+
+struct CloneWorker<T = Result<(), EngineError>> {
+    cancel: CancellationToken,
+    join: Option<std::thread::JoinHandle<T>>,
+    deadline: DeadlineBudget,
+}
+
+impl<T> CloneWorker<T> {
+    fn new(
+        cancel: CancellationToken,
+        join: std::thread::JoinHandle<T>,
+        deadline: DeadlineBudget,
+    ) -> Self {
+        Self {
+            cancel,
+            join: Some(join),
+            deadline,
+        }
+    }
+
+    fn join(mut self) -> std::thread::Result<T> {
+        let join = self.join.as_ref().expect("worker handle is present");
+        wait_for_with_budget(
+            "clone worker cancellation and join",
+            &self.deadline,
+            || join.is_finished().then_some(()),
+            || "clone worker did not stop after cancellation".into(),
+        );
+        self.join.take().expect("worker handle is present").join()
+    }
+}
+
+impl<T> Drop for CloneWorker<T> {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(join) = self.join.take() {
+            // Never block the whole test in a destructor on a regressed clone.
+            // Keep the deadline diagnostic even while unwinding another failure.
+            let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                wait_for_with_budget(
+                    "clone worker teardown",
+                    &self.deadline,
+                    || join.is_finished().then_some(()),
+                    || "cancelled clone still running".into(),
+                );
+            }));
+            if stopped.is_ok() {
+                let _ = join.join();
+            }
+        }
+    }
+}
+
+#[test]
+fn missing_authenticated_readiness_reports_diagnostics_and_joins_worker() {
+    let s = sandbox("engine::git_credentials::missing_authenticated_readiness_reports_diagnostics_and_joins_worker");
+    let seed = RepoBuilder::new(&s, "seed").file("a", "a").init();
+    seed.bare_remote("origin");
+    let held = Arc::new(AtomicBool::new(false));
+    let http = FakeGitHttp::builder(&s, &s.root().join("remotes"))
+        .basic_auth("alice", TOKEN)
+        .fault({
+            let held = held.clone();
+            move |request| {
+                (request.method == "POST").then(|| {
+                    held.store(true, Ordering::SeqCst);
+                    GitHttpFault::StallBeforeResponse
+                })
+            }
+        })
+        .start();
+    let url = http.url("origin.git");
+    let sockets = server(&s);
+    let transport = HostGitTransport::user(CredentialSource::Helper(Arc::new(
+        sockets.ticket(spec(TOKEN), CredentialScope::for_http_url(&url).unwrap()),
+    )));
+    let g = engine_with_stale_global_helper(&s);
+    let cancel = CancellationToken::new();
+    let worker_cancel = cancel.clone();
+    let clone = s.work().join("clone");
+    let join = std::thread::spawn(move || {
+        g.clone_with_transport(
+            &url,
+            None,
+            &clone,
+            &transport,
+            &mut RecordingMessageSink::new(),
+            &guard(&worker_cancel),
+        )
+    });
+    let worker = CloneWorker::new(cancel, join, DeadlineBudget::new(Duration::from_secs(4)));
+    wait_for_with_budget(
+        "real authenticated clone is held",
+        &DeadlineBudget::new(Duration::from_secs(2)),
+        || held.load(Ordering::SeqCst).then_some(()),
+        || "HTTP POST not observed".into(),
+    );
+    let budget = DeadlineBudget::new(Duration::from_millis(50));
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for_with_budget(
+            "forced missing readiness",
+            &budget,
+            || None::<()>,
+            || {
+                format!(
+                    "forced fixture: authenticated={}; request count={}",
+                    held.load(Ordering::SeqCst),
+                    http.requests().iter().flatten().count()
+                )
+            },
+        )
+    }))
+    .expect_err("forced missing readiness must time out");
+    let message = failure
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| failure.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    assert!(message.contains("authenticated=true"), "{message}");
+    drop(worker);
+    assert_eq!(
+        sockets.live_tickets(),
+        0,
+        "real clone and helper joined before teardown"
+    );
 }
 
 fn ask_helper(s: &TestSandbox, socket: &Path, nonce: &str, request: &str) -> String {

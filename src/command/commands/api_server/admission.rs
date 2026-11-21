@@ -78,6 +78,9 @@ pub enum AdmissionError {
     },
     Session(SessionCommandAdmission),
     Setup(SetupReadiness),
+    MountAuthorityRevalidationRequired {
+        reason: String,
+    },
     Storage {
         what: &'static str,
         source: DataError,
@@ -280,6 +283,14 @@ impl ApiAdmission {
         );
         let catalogue = CommandCatalogue::get();
         let path: Vec<&str> = command.subcommand.split_whitespace().collect();
+        self.engines
+            .validate_process_set_args(
+                &catalogue
+                    .parse_raw_args(&path, &command.args)
+                    .map(|parsed| parsed.flag_strings("set"))
+                    .unwrap_or_default(),
+            )
+            .map_err(AdmissionError::CommandValidation)?;
         let spec = catalogue.lookup_with_aliases(&path);
         let supports_headless = spec.is_some_and(|s| s.find_flag("headless").is_some());
         let supports_interactive = spec.is_some_and(|s| s.find_flag("interactive").is_some());
@@ -364,6 +375,29 @@ impl ApiAdmission {
         close_on_finish: bool,
         journal: Option<&IdempotentAdmission>,
     ) -> Result<AdmittedSession, AdmissionError> {
+        self.admit_session_owned(submission, command, close_on_finish, journal, || {
+            std::future::ready(Ok(()))
+        })
+        .await
+        .map(|(admitted, ())| admitted)
+    }
+
+    /// Reserve lifecycle ownership after async validation, before durable
+    /// admission. Successful admission and handing off its owner cannot yield.
+    pub(crate) async fn admit_session_owned<
+        G,
+        F: std::future::Future<Output = Result<G, AdmissionError>>,
+    >(
+        &self,
+        submission: SessionSubmission,
+        command: Option<CommandSubmission>,
+        close_on_finish: bool,
+        journal: Option<&IdempotentAdmission>,
+        reserve: impl FnOnce() -> F,
+    ) -> Result<(AdmittedSession, G), AdmissionError> {
+        Labels::new(submission.labels.clone().into_inner()).map_err(|e| {
+            AdmissionError::SessionCreation(CommandError::InvalidRequest(e.to_string()))
+        })?;
         let command = command.map(|c| self.resolve_interaction(c)).transpose()?;
         let session_id = crate::data::ids::WorkerSessionId::new().to_string();
         let created_at = crate::data::wire::format_timestamp(chrono::Utc::now());
@@ -377,6 +411,21 @@ impl ApiAdmission {
             .request
             .validate(&policy, self.engines.git_engine.as_ref())
             .map_err(AdmissionError::SessionCreation)?;
+        // Refuse known repository conflicts before allocating durable state.
+        // Remote repository config is unavailable until setup clones it.
+        if let Some(authority) = &plan.mount_authority {
+            use crate::data::config::{ConfigLayers, ConfigOverrides, EffectiveConfig, FlagConfig};
+            let env = self.engines.git_engine.env().clone();
+            let mut layers =
+                ConfigLayers::load(&env, Some(authority.root()), ConfigOverrides::default())
+                    .map_err(|e| AdmissionError::SessionCreation(e.into()))?;
+            layers.global = (*self.engines.global_config).clone();
+            let config = EffectiveConfig::resolve(layers, FlagConfig::default(), env)
+                .map_err(|e| AdmissionError::SessionCreation(e.into()))?;
+            self.engines
+                .validate_process_config(&config)
+                .map_err(AdmissionError::SessionCreation)?;
+        }
         // WI 0145: the caller's credential (scope = this repository) is held
         // in memory only; the merge-ref advertisement already uses it.
         let git_credential = match (&submission.request.git_auth, plan.repo_url.as_deref()) {
@@ -407,6 +456,7 @@ impl ApiAdmission {
             self.validate_profile_owner(command, &parsed)?;
         }
 
+        let owner = reserve().await?;
         // Create session storage directories (Layer 0).
         if let Err(e) = self.paths.prepare_session_dirs(&session_id) {
             tracing::error!(error = %e, "Failed to create session directory");
@@ -480,9 +530,14 @@ impl ApiAdmission {
             tracing::error!(error = %e, "Failed to insert session");
             return Err(storage("Failed to create session", e));
         }
-        self.store
+        if let Err(error) = self
+            .store
             .set_context_key(&session_id, plan.context_key.as_ref())
-            .map_err(|e| storage("Failed to store context key", e))?;
+        {
+            drop(owner);
+            self.compensate_session(&session_id, journal).await;
+            return Err(storage("Failed to store context key", error));
+        }
         if let Some(credential) = &git_credential {
             self.engines.ephemeral_secrets.insert_session_git_auth(
                 &session_id,
@@ -507,6 +562,7 @@ impl ApiAdmission {
                 },
             ) {
                 tracing::error!(error = %e, "Failed to record remote session fields");
+                drop(owner);
                 self.compensate_session(&session_id, journal).await;
                 return Err(storage("Failed to create session", e));
             }
@@ -517,6 +573,7 @@ impl ApiAdmission {
                 .set_labels(LabelOwner::Session, &session_id, &submission.labels)
         {
             tracing::error!(%error, "Failed to store session labels");
+            drop(owner);
             self.compensate_session(&session_id, journal).await;
             return Err(storage("Failed to store session labels", error));
         }
@@ -533,11 +590,13 @@ impl ApiAdmission {
             };
             if let Err(error) = self.lifecycle_store.record_run(&run) {
                 tracing::error!(%error, "Failed to record run");
+                drop(owner);
                 self.compensate_session(&session_id, journal).await;
                 return Err(storage("Failed to record run", error));
             }
             if let Err(error) = self.enqueue_command(run.command_id.as_str(), &session_id, &command)
             {
+                drop(owner);
                 self.compensate_session(&session_id, journal).await;
                 return Err(error);
             }
@@ -553,16 +612,20 @@ impl ApiAdmission {
                 None => IdempotencyResource::Session(&session_id),
             };
             if let Err(error) = journal.record(&response_body, resource) {
+                drop(owner);
                 self.compensate_session(&session_id, Some(journal)).await;
                 return Err(error);
             }
         }
-        Ok(AdmittedSession {
-            session_id,
-            plan,
-            run,
-            response_body,
-        })
+        Ok((
+            AdmittedSession {
+                session_id,
+                plan,
+                run,
+                response_body,
+            },
+            owner,
+        ))
     }
 
     async fn compensate_session(&self, session_id: &str, journal: Option<&IdempotentAdmission>) {
@@ -618,6 +681,15 @@ impl ApiAdmission {
             SessionCommandAdmission::Accepted => {}
             other => return Err(AdmissionError::Session(other)),
         }
+        if let Some(session) = self.sessions.get_by_key(session_id) {
+            if let crate::data::session::SessionMountAuthority::RevalidationRequired { reason } =
+                session.read().await.mount_authority()
+            {
+                return Err(AdmissionError::MountAuthorityRevalidationRequired {
+                    reason: reason.clone(),
+                });
+            }
+        }
         // WI 0145: a session whose in-memory Git credential was lost (daemon
         // restart) cannot publish; refuse before anything is queued.
         if let Some(session) = self
@@ -652,6 +724,12 @@ impl ApiAdmission {
             if let Some(value) = parsed.flag_string(flag) {
                 flags_applied[key] = serde_json::json!(value);
             }
+        }
+        if matches!(submission.subcommand.as_str(), "chat" | "exec prompt") {
+            flags_applied[crate::data::automation::AUTOMATION_FLAG] = parsed
+                .automation_mode()
+                .map(|mode| serde_json::json!(mode.as_str()))
+                .unwrap_or(serde_json::Value::Null);
         }
         if flags_applied.get("headless").is_some() {
             flags_applied["headless"] = serde_json::json!(

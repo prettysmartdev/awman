@@ -29,7 +29,7 @@ usage: cargo xtask <command> [args]
   gates check|render|plan      validate, render and plan from ci/gates.toml
   evidence emit|aggregate|...  write and aggregate evidence.json
   test run|archive|list|...    run manifest suites with the pinned runner
-  fixtures fetch|verify|build  content-addressed test fixtures
+  fixtures fetch|verify|build|verify-build  content-addressed test fixtures
   lint hygiene|shell|pins|...  repository lints that are not clippy
   matrix render|check          acceptance matrix
   native-validation run|verify local Apple Silicon or Linux KVM evidence packet

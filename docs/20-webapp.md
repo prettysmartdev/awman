@@ -103,7 +103,7 @@ stage in the middle, and the command box at the bottom.
 - **Squad.** The **Squad** button opens the squad view, or returns to it when
   it is already open. A dot on the button shows squad health. Squad tasks have
   a menu for Edit, Pause/Resume and History; Cancel run and Delete are kept
-  apart at the bottom of it.
+  apart at the bottom of it. If the listener does not serve squad, the view points you to the current listener status and your configuration rather than replacing its feature list; see [Squad: When a listener does not serve squad](12-squad.md#when-a-listener-does-not-serve-squad).
 - **Queue.** The **Queue** button shows a badge when work items are waiting and
   opens the queue beside the workspace (see [Work queue](#work-queue)).
 - **Actions.** The **Actions** button opens the command menu: a searchable list
@@ -162,7 +162,7 @@ your workspace**.
 
 Things to know about a reload:
 
-- Reconnecting does not resend anything. A command that was running keeps
+- Reconnecting does not resend anything, and closing or reloading the tab never cancels admitted work. A command that was running keeps
   running; commands you typed and dialog answers are not repeated. Check the
   current status before repeating an action.
 - The reload must finish within 60 seconds for the workspace to be resumed.

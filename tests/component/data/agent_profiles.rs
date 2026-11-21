@@ -87,7 +87,9 @@ fn layout_private_publication_and_retention() {
 }
 #[test]
 fn lease_contention_and_reopen_preserves_durable_state() {
-    let s = TestSandbox::new();
+    let s = crate::support::sandbox(
+        "data::agent_profiles::lease_contention_and_reopen_preserves_durable_state",
+    );
     let (layout, m) = fixture(&s);
     let lease = layout.try_lock(Duration::ZERO).unwrap().unwrap();
     lease.write_manifest(&m).unwrap();
@@ -129,7 +131,9 @@ fn orphan_generation_never_becomes_current_and_next_publication_recovers() {
 }
 #[test]
 fn identity_schema_links_and_portable_names_fail_closed() {
-    let s = TestSandbox::new();
+    let s = crate::support::sandbox(
+        "data::agent_profiles::identity_schema_links_and_portable_names_fail_closed",
+    );
     let (layout, mut m) = fixture(&s);
     let lease = layout.try_lock(Duration::ZERO).unwrap().unwrap();
     m.provider = "codex".into();

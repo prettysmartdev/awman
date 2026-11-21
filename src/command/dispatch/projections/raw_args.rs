@@ -127,6 +127,15 @@ impl ParsedArgs {
         self.flag_string(flag)
     }
 
+    /// The accepted automation mode, projected from the catalogue-validated
+    /// enum value. A bare `--automation` is already normalized to `auto` by
+    /// its `OptionalEnum` declaration; absent remains `None`.
+    pub fn automation_mode(&self) -> Option<crate::data::automation::AutomationMode> {
+        self.flag_enum(crate::data::automation::AUTOMATION_FLAG)
+            .as_deref()
+            .and_then(crate::data::automation::AutomationMode::parse)
+    }
+
     pub fn flag_u16(&self, flag: &str) -> Option<u16> {
         match self.flags.get(flag) {
             Some(ParsedFlag::U16(n)) => Some(*n),

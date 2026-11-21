@@ -338,8 +338,8 @@ pub enum ContainerOption {
     /// `grace_timeout`: that default suits an agent, but a shell command may
     /// legitimately print nothing for a long time.
     StartupGrace(std::time::Duration),
-    /// Keep the container's whole output in its `OutputTail` instead of the
-    /// last `DEFAULT_OUTPUT_TAIL_LINES` lines.
+    /// Keep the whole post-redaction output in a private disk spool, alongside
+    /// the bounded diagnostic tail. Full consumers use a transcript reader.
     FullTranscript,
     /// The session's builtin launch settings (default vCPUs and memory,
     /// network policy), resolved by `AgentEngine` from the session's
@@ -535,6 +535,7 @@ pub(crate) const OUTPUT_SECRET_ENV_LABEL: &str = "awman.output-secret-env";
 /// backend consumes. Conflicting options are detected here.
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedContainerOptions {
+    pub mount_guard: Option<crate::data::mount_authority::MountSourceGuard>,
     pub output_redaction: crate::engine::auth::redaction::RedactionSet,
     pub host_env: Option<crate::data::config::env::EnvSnapshot>,
     pub agent_identity: Option<(String, Option<String>)>,
@@ -945,6 +946,7 @@ impl ResolvedContainerOptions {
         env: Option<crate::data::config::env::EnvSnapshot>,
     ) -> Result<Self, ResolveError> {
         let mut r = Self {
+            mount_guard: None,
             host_env: env,
             yolo: YoloMode::Disabled,
             auto: AutoMode::Disabled,

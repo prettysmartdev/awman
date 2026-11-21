@@ -21,6 +21,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::command::error::CommandError;
+use crate::data::mount_authority::MountAuthority;
 use crate::data::session::{GitRootResolver, SessionKind};
 
 /// URL schemes accepted for `remote` session repository URLs. Bare paths and
@@ -95,16 +96,26 @@ impl SessionCreatePolicy {
         self
     }
 
-    fn validate_workdir(
+    /// Check `requested` (already canonical) against the allowlist and return
+    /// the mount authority it is granted. The authority is the only directory
+    /// a session admitted for `requested` may ever mount at `/workspace`.
+    pub fn validate_workdir(
         &self,
         requested: &Path,
         git: &dyn GitRootResolver,
-    ) -> Result<(), CommandError> {
+    ) -> Result<MountAuthority, CommandError> {
         if self.workdirs.iter().any(|path| {
             path.canonicalize()
                 .is_ok_and(|resolved| resolved == requested)
         }) {
-            return Ok(());
+            return match exact_workdir_problem(requested, git) {
+                None => MountAuthority::exact_workdir(requested).map_err(|_| {
+                    CommandError::SessionWorkdirUnresolvable {
+                        path: requested.display().to_string(),
+                    }
+                }),
+                Some(rule) => Err(self.refuse(requested, rule)),
+            };
         }
 
         let roots: Vec<PathBuf> = self
@@ -138,8 +149,21 @@ impl SessionCreatePolicy {
                 // is_dir on symlink_metadata also rejects symlinked .git
                 // directories, which could pull a mount outside the child.
                 WorkdirRefusal::GitDirNotDirectory { root: root.clone() }
+            } else if let Some(problem) =
+                crate::data::mount_authority::git_metadata_problem(requested)
+            {
+                // core.worktree (or an include that could set it) makes Git
+                // operate on a directory other than the one mounted.
+                WorkdirRefusal::GitConfigRedirects {
+                    root: root.clone(),
+                    problem,
+                }
             } else {
-                return Ok(());
+                return MountAuthority::workdir_root_child(requested).map_err(|_| {
+                    CommandError::SessionWorkdirUnresolvable {
+                        path: requested.display().to_string(),
+                    }
+                });
             }
         } else if let Some(root) = roots
             .iter()
@@ -149,9 +173,12 @@ impl SessionCreatePolicy {
         } else {
             WorkdirRefusal::NotListed
         };
+        Err(self.refuse(requested, rule))
+    }
 
+    fn refuse(&self, requested: &Path, rule: WorkdirRefusal) -> CommandError {
         tracing::warn!(workdir = %requested.display(), rule = ?rule, "API workdir refused");
-        Err(CommandError::SessionWorkdirNotAllowed {
+        CommandError::SessionWorkdirNotAllowed {
             requested: requested.display().to_string(),
             rule,
             allowed: self
@@ -164,7 +191,54 @@ impl SessionCreatePolicy {
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect(),
-        })
+        }
+    }
+}
+
+/// Why an exact allowlisted directory cannot be mounted as its own session
+/// root, or `None` when it can: it is a self-contained Git root (a real
+/// `.git` directory whose config keeps the work tree here), or a plain
+/// directory with no enclosing repository at all.
+///
+/// Both Git's answer and the nearest `.git` marker are consulted: setup's
+/// directory resolver stops at the nearest marker, so either one naming a
+/// different directory would widen the mount to it.
+fn exact_workdir_problem(requested: &Path, git: &dyn GitRootResolver) -> Option<WorkdirRefusal> {
+    let refuse = |enclosing: Option<PathBuf>, problem: String| {
+        Some(WorkdirRefusal::ExactWorkdirNotGitRoot(Box::new(
+            ExactWorkdirConflict { enclosing, problem },
+        )))
+    };
+    if let Some(problem) = crate::data::mount_authority::git_metadata_problem(requested) {
+        // A pointer file or symlink names Git metadata outside the entry.
+        let enclosing = git
+            .resolve(requested)
+            .ok()
+            .map(|root| root.canonicalize().unwrap_or(root))
+            .filter(|root| root != requested);
+        return refuse(enclosing, problem.to_string());
+    }
+    if requested.join(".git").is_dir() {
+        return None;
+    }
+    if let Some(marker) = requested
+        .ancestors()
+        .skip(1)
+        .find(|p| std::fs::symlink_metadata(p.join(".git")).is_ok())
+    {
+        return refuse(Some(marker.to_path_buf()), String::new());
+    }
+    match git.resolve(requested) {
+        Err(crate::data::error::DataError::GitRootNotFound { .. }) => None,
+        Ok(root) => {
+            let root = root.canonicalize().unwrap_or(root);
+            if root == requested {
+                None
+            } else {
+                refuse(Some(root), String::new())
+            }
+        }
+        Err(error) => refuse(None, format!("Git discovery failed: {error}")),
     }
 }
 
@@ -182,6 +256,41 @@ pub enum WorkdirRefusal {
     },
     /// A direct child with a pointer file, symlink or missing `.git` directory.
     GitDirNotDirectory { root: PathBuf },
+    /// A direct child whose Git config sets `core.worktree` (or includes
+    /// files that could), so Git would operate on another directory.
+    GitConfigRedirects {
+        root: PathBuf,
+        problem: crate::data::mount_authority::GitMetadataProblem,
+    },
+    /// An exact entry that is not its own Git root: it lies inside an
+    /// enclosing checkout, or its Git metadata points elsewhere. Mounting it
+    /// would require the enclosing root, which the entry does not authorize.
+    /// Boxed: keeps `CommandError` small.
+    ExactWorkdirNotGitRoot(Box<ExactWorkdirConflict>),
+}
+
+/// Detail of [`WorkdirRefusal::ExactWorkdirNotGitRoot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactWorkdirConflict {
+    /// The repository root the directory belongs to, when known.
+    pub enclosing: Option<PathBuf>,
+    /// What is wrong with its Git metadata; empty when the enclosing root
+    /// alone is the reason.
+    pub problem: String,
+}
+
+impl WorkdirRefusal {
+    /// Stable rule name, for logs and API clients.
+    pub fn rule(&self) -> &'static str {
+        match self {
+            Self::NotListed => "not_listed",
+            Self::NotDirectChild { .. } => "not_direct_child",
+            Self::NotOwnGitRoot { .. } => "not_own_git_root",
+            Self::GitDirNotDirectory { .. } => "git_dir_not_directory",
+            Self::GitConfigRedirects { .. } => "git_config_redirects",
+            Self::ExactWorkdirNotGitRoot(_) => "exact_workdir_not_git_root",
+        }
+    }
 }
 
 impl fmt::Display for WorkdirRefusal {
@@ -199,6 +308,26 @@ impl fmt::Display for WorkdirRefusal {
             Self::GitDirNotDirectory { .. } => f.write_str(
                 "its .git is not a real directory (linked worktrees and symlinked .git directories are not allowed)",
             ),
+            Self::GitConfigRedirects { problem, .. } => write!(
+                f,
+                "it is a direct child of an allowlisted root but {problem}"
+            ),
+            Self::ExactWorkdirNotGitRoot(conflict) => {
+                let ExactWorkdirConflict { enclosing, problem } = conflict.as_ref();
+                f.write_str("exact_workdir_not_git_root: it is allowlisted exactly but is not its own Git root")?;
+                if !problem.is_empty() {
+                    write!(f, " ({problem})")?;
+                }
+                match enclosing {
+                    Some(root) => write!(
+                        f,
+                        "; its repository root is '{}'. A session for it would have to mount that whole checkout, which this entry does not authorize. Add '{}' to workDirs explicitly to allow it, or use a directory that is its own repository",
+                        root.display(),
+                        root.display()
+                    ),
+                    None => f.write_str("; use a directory that is its own repository with a real .git directory, or one outside any repository"),
+                }
+            }
         }
     }
 }
@@ -224,6 +353,10 @@ pub struct SessionCreatePlan {
     pub merge_refs: Vec<String>,
     /// Push the session branch after a successful command; `false` for local.
     pub push: bool,
+    /// The boundary a local session may mount, granted by the allowlist.
+    /// `None` for a remote session until setup has created awman's own clone,
+    /// whose authority is then derived from the clone path alone.
+    pub mount_authority: Option<MountAuthority>,
 }
 
 impl SessionCreatePlan {
@@ -334,15 +467,17 @@ impl SessionCreateRequest {
                         path: workdir_in.to_string(),
                     }
                 })?;
-                policy
-                    .validate_workdir(&requested, git)
-                    .map_err(|mut error| {
-                        if let CommandError::SessionWorkdirNotAllowed { requested, .. } = &mut error
-                        {
-                            *requested = workdir_in.to_string();
-                        }
-                        error
-                    })?;
+                let mount_authority =
+                    policy
+                        .validate_workdir(&requested, git)
+                        .map_err(|mut error| {
+                            if let CommandError::SessionWorkdirNotAllowed { requested, .. } =
+                                &mut error
+                            {
+                                *requested = workdir_in.to_string();
+                            }
+                            error
+                        })?;
                 Ok(SessionCreatePlan {
                     context_key,
                     kind,
@@ -353,6 +488,7 @@ impl SessionCreateRequest {
                     base_ref: None,
                     merge_refs: Vec::new(),
                     push: false,
+                    mount_authority: Some(mount_authority),
                 })
             }
             SessionKind::Remote => {
@@ -455,6 +591,7 @@ impl SessionCreateRequest {
                     base_ref,
                     merge_refs,
                     push: self.push,
+                    mount_authority: None,
                 })
             }
         }
@@ -541,4 +678,47 @@ fn branch_name_problem(name: &str) -> Option<String> {
         return Some("give the bare branch name; 'origin/' is implied".to_string());
     }
     None
+}
+
+/// Revalidate the saved mount authority of a session restored after a
+/// restart. The saved authority is an upper bound, not a grant: the current
+/// policy must still grant the saved workdir, it must still resolve to the
+/// same canonical directory, and the result must not exceed what was saved.
+/// A missing or unreadable authority is never inferred from the workdir or
+/// from Git discovery. Remote clones are re-derived only from the
+/// awman-owned clone path under `policy.clone_base_dir`.
+///
+/// Returns the reason the session must be revalidated on refusal.
+pub fn revalidate_restored_authority(
+    policy: &SessionCreatePolicy,
+    kind: SessionKind,
+    workdir: &Path,
+    saved: Option<&str>,
+    git: &dyn GitRootResolver,
+) -> Result<MountAuthority, String> {
+    let saved = saved.ok_or_else(|| {
+        "the session was created before mount authorities were recorded".to_string()
+    })?;
+    let saved = MountAuthority::from_persisted(saved).map_err(|e| e.to_string())?;
+    let current = match kind {
+        SessionKind::Remote => MountAuthority::remote_clone(workdir, &policy.clone_base_dir)
+            .map_err(|e| e.to_string())?,
+        SessionKind::Local => {
+            let requested = std::fs::canonicalize(workdir)
+                .map_err(|e| format!("cannot resolve {}: {e}", workdir.display()))?;
+            policy
+                .validate_workdir(&requested, git)
+                .map_err(|e| e.to_string())?
+        }
+    };
+    if !saved.is_within(&current) {
+        return Err(format!(
+            "the saved authorization ({} at {}) no longer matches what the current allowlist grants ({} at {})",
+            saved.source().as_str(),
+            saved.root().display(),
+            current.source().as_str(),
+            current.root().display()
+        ));
+    }
+    Ok(current)
 }

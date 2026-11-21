@@ -13,7 +13,7 @@ mod container_world;
 mod process_world;
 mod waiter;
 
-use crate::docker::engine::{Cleanup, Engine};
+use crate::docker::engine::Engine;
 use crate::support;
 use awman::engine::conformance::{container, process};
 use awman_test_support::capability::Subprocess;
@@ -28,10 +28,6 @@ use awman_test_support::conformance::{docker_cli, DockerCliUnderTest};
 fn real_docker_cli_conforms() {
     let mut sandbox = support::sandbox("conformance::real_docker_cli_conforms");
     let engine = Engine::grant(&mut sandbox);
-    let cleanup = Cleanup::new(&engine);
-    cleanup
-        .image(container::PRESENT_IMAGE)
-        .image(container::BUILT_IMAGE);
 
     docker_cli(&DockerCliUnderTest {
         sandbox: engine.sandbox,
@@ -47,7 +43,7 @@ fn real_docker_cli_conforms() {
         "a real engine declares every container check applicable: {:?}",
         report.not_applicable
     );
-    drop(cleanup);
+    drop(world);
     sandbox.finish();
 }
 

@@ -105,6 +105,11 @@ pub struct RemoteExecOutcome {
     /// Whether the client followed the command (`--follow`). Only a followed
     /// command's result decides the client's exit code.
     pub followed: bool,
+    /// The follow ended before the server's `done` event: reconnects were
+    /// exhausted or the stream broke the protocol. Exits non-zero even when
+    /// the status lookup afterwards reports `done`, since output was lost.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub follow_incomplete: bool,
 }
 
 impl RemoteExecOutcome {
@@ -112,13 +117,15 @@ impl RemoteExecOutcome {
     /// submitted, which succeeded: 0. With `--follow` it is the remote
     /// command's own non-zero exit code, else 0 only for a command that
     /// finished `done`; a failed or cancelled command, or one still running
-    /// because following stopped early, exits 1.
+    /// because following stopped early, exits 1. An incomplete follow exits
+    /// non-zero even if the command later reports `done`.
     pub fn client_exit_code(&self) -> i32 {
         if !self.followed {
             return 0;
         }
         match (self.exit_code, self.status.as_deref()) {
             (Some(code), _) if code != 0 => i32::try_from(code).unwrap_or(1),
+            _ if self.follow_incomplete => 1,
             (_, Some("done")) => 0,
             _ => 1,
         }
@@ -216,10 +223,16 @@ pub trait RemoteCommandFrontend: UserMessageSink + Send + Sync {
     }
 }
 
+/// A one-shot signal that stops a `--follow` locally (detaches). Production
+/// listens for Ctrl-C; an embedder or test may supply its own.
+pub type FollowInterrupt = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
 pub struct RemoteCommand {
     sub: RemoteSubcommand,
     engines: Engines,
     session: crate::data::session::Session,
+    /// Replaces the Ctrl-C listener of `--follow`; `None` listens for Ctrl-C.
+    follow_interrupt: Option<FollowInterrupt>,
 }
 
 impl RemoteCommand {
@@ -232,7 +245,14 @@ impl RemoteCommand {
             sub,
             engines,
             session,
+            follow_interrupt: None,
         }
+    }
+
+    /// Detach a `--follow` when `interrupt` completes instead of on Ctrl-C.
+    pub fn with_follow_interrupt(mut self, interrupt: FollowInterrupt) -> Self {
+        self.follow_interrupt = Some(interrupt);
+        self
     }
 
     /// Construct from the catalogue-resolved input (WI 0113 F-10). The four
@@ -357,10 +377,24 @@ impl Command for RemoteCommand {
         let addr = resolve_addr(&session, self.sub.remote_addr_flag()).ok();
         let result = match self.sub {
             RemoteSubcommand::ExecWorkflow(f) => {
-                run_remote_exec_workflow(&session, &self.engines, f, &mut *frontend).await
+                run_remote_exec_workflow(
+                    &session,
+                    &self.engines,
+                    f,
+                    self.follow_interrupt,
+                    &mut *frontend,
+                )
+                .await
             }
             RemoteSubcommand::ExecPrompt(f) => {
-                run_remote_exec_prompt(&session, &self.engines, f, &mut *frontend).await
+                run_remote_exec_prompt(
+                    &session,
+                    &self.engines,
+                    f,
+                    self.follow_interrupt,
+                    &mut *frontend,
+                )
+                .await
             }
             RemoteSubcommand::SessionStart(f) => {
                 run_session_start(&session, &self.engines, f, &mut *frontend).await
@@ -426,10 +460,12 @@ async fn run_remote_exec(
     session: &crate::data::session::Session,
     engines: &Engines,
     params: RemoteExecParams<'_>,
+    interrupt: Option<FollowInterrupt>,
     frontend: &mut dyn UserMessageSink,
 ) -> Result<RemoteExecOutcome, CommandError> {
     use crate::command::commands::remote_client::{ExecJobResponse, ExecutionEventSink};
     use crate::data::execution_event::{CommandStatusKind, EventPayload};
+    use crate::engine::remote::{FollowEnd, ReconnectNotice};
 
     let subcommand_name = params.subcommand_name;
     let target = session
@@ -454,6 +490,10 @@ async fn run_remote_exec(
 
     let mut follow_exit_code: Option<i32> = None;
     let mut follow_result: Option<crate::data::fs::api_db::CommandResult> = None;
+    let mut follow_incomplete = false;
+    // The user detached: return at once with what the follow observed. A
+    // fresh status lookup here could wait for the full request timeout.
+    let mut detached = false;
 
     if params.follow {
         frontend.write_message(UserMessage {
@@ -467,7 +507,6 @@ async fn run_remote_exec(
             sink: &'a mut dyn UserMessageSink,
             exit_code: &'a mut Option<i32>,
             result: &'a mut Option<crate::data::fs::api_db::CommandResult>,
-            interrupted: std::sync::Arc<std::sync::atomic::AtomicBool>,
             /// Step names seen in `source` (WI 0137 §5). Once a second step
             /// appears (a parallel group, or later steps), output lines are
             /// prefixed with the step that wrote them.
@@ -492,10 +531,24 @@ async fn run_remote_exec(
             }
         }
         impl ExecutionEventSink for FollowSink<'_> {
+            fn on_reconnecting(&mut self, notice: &ReconnectNotice) {
+                let resume = notice
+                    .resume_from
+                    .map(|cursor| format!(", resuming after event {cursor}"))
+                    .unwrap_or_default();
+                self.sink.write_message(UserMessage {
+                    level: MessageLevel::Warning,
+                    text: format!(
+                        "Event stream interrupted ({}); reconnecting in {}s (attempt {}/{}{resume})...",
+                        notice.reason,
+                        notice.delay.as_secs(),
+                        notice.attempt,
+                        notice.max_attempts,
+                    ),
+                });
+            }
+
             fn on_event(&mut self, event: crate::data::execution_event::ExecutionEvent) -> bool {
-                if self.interrupted.load(std::sync::atomic::Ordering::Relaxed) {
-                    return true;
-                }
                 let prefix = self.step_prefix(&event);
                 match event.payload {
                     EventPayload::AgentCredentialsChanged { .. } | EventPayload::AgentExecutionReplaced { .. } | EventPayload::AgentState { .. } | EventPayload::AgentIdentity { .. } | EventPayload::AgentTurnStarted { .. } | EventPayload::AgentTurnCompleted { .. } => {},
@@ -648,67 +701,86 @@ async fn run_remote_exec(
             }
         }
 
-        // Ctrl-C handler: flip a flag the sink checks on every event.
-        let interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let interrupted_clone = interrupted.clone();
-        let ctrlc_task = tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            interrupted_clone.store(true, std::sync::atomic::Ordering::Relaxed);
-        });
-
+        let cancel = tokio_util::sync::CancellationToken::new();
         let mut sink = FollowSink {
             sink: frontend,
             exit_code: &mut follow_exit_code,
             result: &mut follow_result,
-            interrupted: interrupted.clone(),
             steps_seen: std::collections::HashSet::new(),
         };
 
-        // Try once; on disconnect, retry once after 2s.
-        let mut last_err: Option<CommandError> = None;
-        for attempt in 0..2 {
-            let result = client
-                .stream_job_logs(&session_id, &command_id, &mut sink)
-                .await;
-            match result {
-                Ok(()) => {
-                    last_err = None;
-                    break;
-                }
-                Err(e) => {
-                    last_err = Some(CommandError::from(e));
-                    if attempt == 0 && !interrupted.load(std::sync::atomic::Ordering::Relaxed) {
-                        sink.sink.write_message(UserMessage {
-                            level: MessageLevel::Warning,
-                            text: "SSE connection dropped; retrying in 2 seconds...".into(),
-                        });
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    } else {
-                        break;
-                    }
-                }
+        // Ctrl-C cancels the follow locally. The listener is a future joined
+        // with the follow, not a task, so it is dropped when the follow ends;
+        // nothing is sent to the server and the command keeps running there.
+        let ctrl_c = async move {
+            if let Some(interrupt) = interrupt {
+                interrupt.await;
+            } else if tokio::signal::ctrl_c().await.is_err() {
+                // No signal support: never fire.
+                std::future::pending::<()>().await;
             }
-        }
+        };
+        let policy = crate::engine::remote::ReconnectPolicy::default();
+        let report = crate::engine::remote::run_cancellable(
+            &cancel,
+            ctrl_c,
+            client.follow_job_events(&command_id, &mut sink, &cancel, &policy),
+        )
+        .await;
 
-        ctrlc_task.abort();
-
-        if interrupted.load(std::sync::atomic::Ordering::Relaxed) {
+        let status_hint = format!(
+            "awman remote exec {subcommand_name} --session {session_id} --job {command_id} status"
+        );
+        if report.malformed > 0 {
+            let first = report
+                .first_malformed
+                .as_deref()
+                .unwrap_or("unknown reason");
             sink.sink.write_message(UserMessage {
                 level: MessageLevel::Warning,
                 text: format!(
-                    "Follow interrupted. Job is still running server-side. \
-                     Check status with: awman remote exec {subcommand_name} --session {session_id} --job {command_id} status"
+                    "{} events could not be decoded and were skipped (first: {first})",
+                    report.malformed
                 ),
             });
-        } else if let Some(e) = last_err {
-            sink.sink.write_message(UserMessage {
-                level: MessageLevel::Error,
-                text: format!(
-                    "Connection to server lost. The job may still be running. \
-                     Check status with: awman remote exec {subcommand_name} --session {session_id} --job {command_id} status \
-                     (last error: {e})"
-                ),
-            });
+        }
+        match report.end {
+            FollowEnd::Done => {}
+            FollowEnd::Detached => {
+                detached = true;
+                sink.sink.write_message(UserMessage {
+                    level: MessageLevel::Warning,
+                    text: format!(
+                        "Follow interrupted. Job is still running server-side. \
+                         Check status with: {status_hint}"
+                    ),
+                });
+            }
+            FollowEnd::Incomplete {
+                reconnects,
+                last_error,
+            } => {
+                follow_incomplete = true;
+                sink.sink.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!(
+                        "Follow incomplete: the event stream ended before the command finished \
+                         and {reconnects} reconnect attempts failed. The job may still be running. \
+                         Check status with: {status_hint} (last error: {last_error})"
+                    ),
+                });
+            }
+            FollowEnd::Failed(e) => {
+                follow_incomplete = true;
+                sink.sink.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!(
+                        "Follow stopped: {}. The job may still be running. \
+                         Check status with: {status_hint}",
+                        CommandError::from(e)
+                    ),
+                });
+            }
         }
     }
 
@@ -722,6 +794,8 @@ async fn run_remote_exec(
             .to_string()
         });
         (status, result.exit_code.or(follow_exit_code).map(i64::from))
+    } else if detached {
+        (None, follow_exit_code.map(i64::from))
     } else {
         match client.get_command(&command_id).await {
             Ok(r) => (
@@ -742,6 +816,7 @@ async fn run_remote_exec(
         status,
         exit_code,
         followed: params.follow,
+        follow_incomplete,
     })
 }
 
@@ -749,6 +824,7 @@ async fn run_remote_exec_workflow(
     session: &crate::data::session::Session,
     engines: &Engines,
     flags: RemoteExecWorkflowFlags,
+    interrupt: Option<FollowInterrupt>,
     frontend: &mut dyn UserMessageSink,
 ) -> Result<RemoteOutcome, CommandError> {
     use crate::command::commands::remote_client::ExecArg;
@@ -767,6 +843,7 @@ async fn run_remote_exec_workflow(
             session_flag: flags.session.as_deref(),
             follow: flags.follow,
         },
+        interrupt,
         frontend,
     )
     .await?;
@@ -778,6 +855,7 @@ async fn run_remote_exec_prompt(
     session: &crate::data::session::Session,
     engines: &Engines,
     flags: RemoteExecPromptFlags,
+    interrupt: Option<FollowInterrupt>,
     frontend: &mut dyn UserMessageSink,
 ) -> Result<RemoteOutcome, CommandError> {
     use crate::command::commands::remote_client::ExecArg;
@@ -792,6 +870,7 @@ async fn run_remote_exec_prompt(
             session_flag: flags.session.as_deref(),
             follow: flags.follow,
         },
+        interrupt,
         frontend,
     )
     .await?;

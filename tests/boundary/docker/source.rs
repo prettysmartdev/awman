@@ -22,19 +22,11 @@ fn engine_export_and_docker_save_preserve_identity_and_cached_content() {
     );
     let engine = Engine::grant(&mut sandbox);
     let base = engine.base_image();
-    let tag = format!(
-        "awman-boundary-source-{}:latest",
-        engine
-            .sandbox
-            .root()
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_lowercase()
-    );
+    let tag = engine.unique_tag("awman-boundary-source");
     let cleanup = Cleanup::new(&engine);
-    cleanup.image(&tag);
-    engine.run_ok(&["tag", &base, &tag]);
+    let (dockerfile, context) =
+        engine.write_context("source", &format!("FROM {base}\nENV AWMAN_TEST_SOURCE=1\n"));
+    cleanup.build_image(&tag, &dockerfile, &context);
     let expected = engine.run_ok(&["image", "inspect", "--format", "{{.Id}}", &tag]);
     let state = engine.sandbox.root().join("source-cache");
     let acquirer = CachingAcquirer::new(

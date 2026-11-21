@@ -98,6 +98,12 @@ impl<F: ApiCommandFrontendFactory + 'static> DaemonFeature for WorkerFeature<F> 
         FeatureName::Worker
     }
     async fn start(&self, core: &Core) -> Result<FeatureTask, EngineError> {
+        {
+            let _tasks = self.shared.task_handles.lock().await;
+            self.shared
+                .setup_stopping
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         self.pull_handle(core)?;
         let pull = self.pull.get().expect("pull initialized").clone();
         let stop = CancellationToken::new();
@@ -267,6 +273,13 @@ impl<F: ApiCommandFrontendFactory + 'static> DaemonFeature for WorkerFeature<F> 
         if let Some(pull) = self.pull.get() {
             pull.cancel_for_shutdown();
         }
+        let setup_tasks = {
+            let mut tasks = self.shared.task_handles.lock().await;
+            self.shared
+                .setup_stopping
+                .store(true, std::sync::atomic::Ordering::Release);
+            std::mem::take(&mut *tasks)
+        };
         self.shared.setup_cancels.cancel_all();
         if let Err(e) = self.shared.cancel_all() {
             tracing::error!(%e,"failed to cancel worker jobs");
@@ -285,14 +298,16 @@ impl<F: ApiCommandFrontendFactory + 'static> DaemonFeature for WorkerFeature<F> 
         if let Some(pull) = self.pull.get() {
             pull.stop_now().await;
         }
-        let setup_tasks = std::mem::take(&mut *self.shared.task_handles.lock().await);
+
         for task in &setup_tasks {
             task.abort();
         }
         // Aborting schedules destruction; it does not release SQLite/files
         // synchronously. Join setup tasks before reporting shutdown complete.
         for task in setup_tasks {
-            let _ = task.await;
+            if let Err(error) = task.await {
+                tracing::error!(%error, "session setup task failed while stopping");
+            }
         }
         if let Some(task) = self.pool_abort.lock().unwrap().take() {
             task.abort();

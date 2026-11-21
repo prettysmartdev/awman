@@ -21,8 +21,8 @@
 //! `auth.env` from a custom definition is applied to the host process.
 //! The process runs in a dedicated empty 0700 directory OUTSIDE the
 //! repository — never the repo cwd — so a real code assistant launched this
-//! way cannot discover repository instructions or content, and a
-//! repo-planted `./claude` cannot be picked up via a relative lookup
+//! way cannot discover repository instructions or content. First-party
+//! executable selection separately excludes canonical checkout locations
 //! (INV-8, BLOCKING-2).
 
 use crate::engine::agent::{AgentDefinition, ResolvedAgent};
@@ -102,6 +102,8 @@ pub enum LocalAgentPingResult {
     /// authenticated.
     Error,
     NotInstalled,
+    /// An executable was found, but its canonical location is checkout-controlled.
+    RefusedInsideCheckout,
     CouldNotRun,
     TimedOut,
 }
@@ -136,13 +138,13 @@ const HOST_REFRESH_REMEDIATION: &str = "run `claude` on the host / check login";
 
 /// The one type permitted to execute an agent binary on the host.
 ///
-/// Stateless today, and deliberately so: it exists to make the sanctioned
-/// exception a named capability that a type must hold rather than a free
-/// function any module can reach for. `ReadyEngine` holds one;
+/// The environment and checkout exclusions travel with this named capability.
+/// `ReadyEngine` holds one;
 /// `CredentialRefreshMonitor` holds one. A new holder is a security review.
 #[derive(Debug, Clone, Default)]
 pub struct HostAgentPinger {
     env: Option<crate::data::config::env::EnvSnapshot>,
+    checkout_roots: Vec<std::path::PathBuf>,
 }
 
 impl HostAgentPinger {
@@ -150,7 +152,25 @@ impl HostAgentPinger {
         Self::with_env(crate::engine::host_cli::process_env())
     }
     pub fn with_env(env: crate::data::config::env::EnvSnapshot) -> Self {
-        Self { env: Some(env) }
+        Self {
+            env: Some(env.clone()),
+            checkout_roots: if env.cwd()
+                != env
+                    .home_dir()
+                    .as_deref()
+                    .unwrap_or(std::path::Path::new("/"))
+                && env.cwd().parent().is_some()
+            {
+                vec![env.cwd().to_path_buf()]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    pub fn with_checkout_roots(mut self, roots: Vec<std::path::PathBuf>) -> Self {
+        self.checkout_roots = roots;
+        self
     }
 
     /// Build the fixed `(command, argv)` for the sanctioned host ping. Pure
@@ -221,9 +241,32 @@ impl HostAgentPinger {
             .env
             .clone()
             .unwrap_or_else(crate::engine::host_cli::process_env);
-        let mut command =
-            tokio::process::Command::new(crate::engine::host_cli::program_in(&snapshot, &cmd));
-        command.env_clear().envs(snapshot.spawn_env());
+        let program = if def.is_custom() {
+            // Custom approval is separate from installed first-party selection.
+            // The registry pins the approved canonical path.
+            let Some(program) = def.approved_ping_program() else {
+                return LocalAgentPingResult::NotInstalled;
+            };
+            program.to_path_buf()
+        } else {
+            use super::installed_program::{resolve, ResolveError};
+            match resolve(&snapshot, &cmd, &self.checkout_roots) {
+                Ok(program) => program,
+                Err(ResolveError::NotInstalled) => return LocalAgentPingResult::NotInstalled,
+                Err(ResolveError::InsideCheckout) => {
+                    return LocalAgentPingResult::RefusedInsideCheckout;
+                }
+                Err(ResolveError::CouldNotValidate) => return LocalAgentPingResult::CouldNotRun,
+            }
+        };
+        let Ok(path) = super::installed_program::child_path(&snapshot, &self.checkout_roots) else {
+            return LocalAgentPingResult::CouldNotRun;
+        };
+        let mut command = tokio::process::Command::new(program);
+        command
+            .env_clear()
+            .envs(snapshot.spawn_env())
+            .env("PATH", path);
         command
             .args(&args)
             .current_dir(scratch.path())

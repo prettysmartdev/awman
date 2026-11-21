@@ -1,12 +1,13 @@
 //! [`Engines`] — the one owner of the Layer 1 graph a command runs against:
-//! how a session-backed host and a daemon assemble it, and which runtime each
-//! gets when the configured one is unknown or unavailable.
+//! how a session-backed host and a daemon bind runtime and monitor settings.
 
 use std::sync::Arc;
 
 use crate::command::dispatch::catalogue::CommandCatalogue;
+use crate::command::error::CommandError;
 use crate::command::startup::RuntimeStartupFailure;
-use crate::data::config::{ConfigFile, EffectiveConfig};
+use crate::data::config::effective::process_binding::ProcessBinding;
+use crate::data::config::{ConfigFile, ConfigLayers, ConfigOverrides, EffectiveConfig, FlagConfig};
 use crate::data::fs::{ApiPaths, AuthPathResolver};
 use crate::data::session::Session;
 use crate::engine::agent::AgentEngine;
@@ -36,11 +37,21 @@ pub fn credential_refresh_monitor(
         return None;
     }
     Some(
-        crate::engine::credential_refresh::CredentialRefreshMonitor::new(
+        crate::engine::credential_refresh::CredentialRefreshMonitor::with_binding_in(
             crate::engine::credential_refresh::MonitorConfig {
                 refresh_threshold: settings.threshold,
                 tick_interval: settings.tick,
             },
+            crate::engine::auth::credential::CredentialBinding::platform_default(
+                AuthPathResolver::at_home(
+                    config
+                        .env()
+                        .home_dir()
+                        .or_else(dirs::home_dir)
+                        .unwrap_or_else(std::env::temp_dir),
+                ),
+            ),
+            config.env(),
         ),
     )
 }
@@ -94,7 +105,8 @@ pub struct Engines {
     pub credential_monitor:
         Option<Arc<crate::engine::credential_refresh::CredentialRefreshMonitor>>,
 
-    /// The global config this bundle was assembled from.
+    /// The immutable process config snapshot this bundle was assembled from,
+    /// including resolved startup overrides and process-scoped defaults.
     ///
     /// A **daemon's** single config source. Daemons have no `Session`, so
     /// before WI 0114 F-31 the daemon-side code that needed a global setting
@@ -105,7 +117,8 @@ pub struct Engines {
     ///
     /// A **session-backed** host reads `session.effective_config()` instead:
     /// that already merged this in, under the repo config, the environment
-    /// and the flags. This field is for the code that has no session.
+    /// and the flags. Dispatch also uses the process fields here to inherit
+    /// the bound defaults and to refuse incompatible local overrides.
     pub global_config: Arc<ConfigFile>,
 }
 
@@ -130,48 +143,57 @@ impl Engines {
     }
 
     pub fn for_env(env: crate::data::config::env::EnvSnapshot) -> Result<Self, EngineError> {
-        let auth_paths = AuthPathResolver::at_home(
-            env.home_dir()
-                .or_else(dirs::home_dir)
-                .ok_or(crate::data::error::DataError::HomeNotFound)?,
-        );
-        let api_paths = ApiPaths::from_env(&env)?;
-        // The daemon's one config read (F-31). A malformed file fails the
-        // start with a message naming the file and the offending key, rather
-        // than being defaulted away and leaving the daemon quietly running on
-        // settings the user did not write.
-        let global = ConfigFile::load(
-            &crate::data::config::file::global_config_path(&env)?,
-            crate::data::config::FileKind::Global,
-        )?;
-        // Env and `--set` overrides of a daemon arrive through its argv and
-        // environment; the env layer hook resolves the latter.
-        let daemon_config = EffectiveConfig::resolve(
-            crate::data::config::ConfigLayers {
-                env: crate::data::config::effective::env_overrides(&env, &[&global])?,
-                global: global.clone(),
-                ..Default::default()
-            },
-            Default::default(),
+        let config = Self::resolve_process_config(env, ConfigOverrides::default())?;
+        Self::for_process_config(&config)
+    }
+
+    /// Resolve once, before constructing any runtime or credential monitor.
+    pub fn resolve_process_config(
+        env: crate::data::config::env::EnvSnapshot,
+        set: ConfigOverrides,
+    ) -> Result<EffectiveConfig, EngineError> {
+        Ok(EffectiveConfig::resolve(
+            ConfigLayers::load(&env, None, set)?,
+            FlagConfig::default(),
             env,
-        )?;
-        // Only the runtime's process-wide parts (for builtin: the state
-        // directory and the ambient-override check) come from the global
-        // config. Every launch resolves its own builtin settings (network,
-        // vCPUs, memory) from the task's session through
-        // `AgentEngine::builtin_launch_settings`, so a task inherits its
-        // repo's narrowing.
-        let detected = agent_runtime::detect_effective(&daemon_config)?;
+        )?)
+    }
+
+    pub fn for_process_config(config: &EffectiveConfig) -> Result<Self, EngineError> {
+        let detected = agent_runtime::detect_effective(config)?;
         for notice in detected.take_notices() {
             tracing::info!("{notice}");
         }
-        let runtime = detected.engine();
-        let container_runtime = detected.container_runtime();
-        let sandbox_runtime = detected.sandbox_runtime();
+        Self::with_process_runtime(
+            config,
+            detected.engine(),
+            detected.container_runtime(),
+            detected.sandbox_runtime(),
+        )
+    }
+
+    /// Assemble a process graph around an explicitly supplied backend. Embedded
+    /// hosts can inject their runtime; its actual identity must match config.
+    pub fn with_process_runtime(
+        config: &EffectiveConfig,
+        runtime: Arc<dyn AgentRuntimeEngine>,
+        container_runtime: Option<Arc<ContainerRuntime>>,
+        sandbox_runtime: Option<Arc<SandboxRuntime>>,
+    ) -> Result<Self, EngineError> {
+        let binding = ProcessBinding::from_config(config)?;
+        Self::check_runtime_identity(&binding, runtime.as_ref())?;
+        let auth_paths = AuthPathResolver::at_home(
+            config
+                .env()
+                .home_dir()
+                .or_else(dirs::home_dir)
+                .ok_or(crate::data::error::DataError::HomeNotFound)?,
+        );
+        let api_paths = ApiPaths::from_env(config.env())?;
         let overlay_engine = Arc::new(OverlayEngine::with_auth_resolver(auth_paths.clone()));
         // A daemon has no `Session`, so its credential-refresh settings come
         // from the global config it just loaded plus the process env.
-        let credential_monitor = credential_refresh_monitor(&daemon_config);
+        let credential_monitor = credential_refresh_monitor(config);
         // The *detected* runtime, not a fresh Docker handle: `AgentEngine`
         // branches on `runtime.capabilities()` to decide which paradigm's
         // options to resolve (F-40b), so handing it a Docker handle under a
@@ -189,7 +211,7 @@ impl Engines {
             runtime,
             container_runtime,
             sandbox_runtime,
-            git_engine: Arc::new(GitEngine::with_env(daemon_config.env().clone())),
+            git_engine: Arc::new(GitEngine::with_env(config.env().clone())),
             overlay_engine,
             auth_engine: Arc::new(AuthEngine::with_paths(auth_paths, api_paths)),
             agent_engine,
@@ -197,7 +219,18 @@ impl Engines {
                 workflow_root,
             )),
             credential_monitor,
-            global_config: Arc::new(global),
+            global_config: Arc::new({
+                let mut snapshot = config.config().clone();
+                if let Some(dir) = &binding.builtin_state_dir {
+                    snapshot
+                        .runtime
+                        .get_or_insert_with(Default::default)
+                        .builtin
+                        .get_or_insert_with(Default::default)
+                        .state_dir = Some(dir.clone());
+                }
+                snapshot
+            }),
         })
     }
 
@@ -233,7 +266,17 @@ impl Engines {
         detected: DetectedRuntime,
         session: &Session,
     ) -> Result<Self, EngineError> {
+        Self::from_detected_with_config(detected, session, &session.effective_config())
+    }
+
+    pub(crate) fn from_detected_with_config(
+        detected: DetectedRuntime,
+        session: &Session,
+        config: &EffectiveConfig,
+    ) -> Result<Self, EngineError> {
+        let binding = ProcessBinding::from_config(config)?;
         let runtime = detected.engine();
+        Self::check_runtime_identity(&binding, runtime.as_ref())?;
         let container_runtime = detected.container_runtime();
         let sandbox_runtime = detected.sandbox_runtime();
         let overlay_engine = Arc::new(OverlayEngine::new(session)?);
@@ -248,7 +291,7 @@ impl Engines {
         // A disabled `authRefresh` leaves the monitor unbuilt, making lease
         // registration a no-op and preserving legacy env-var delivery — the
         // same kill switch the uninstalled process-global used to be.
-        let credential_monitor = credential_refresh_monitor(&session.effective_config());
+        let credential_monitor = credential_refresh_monitor(config);
         let agent_engine = Arc::new(
             AgentEngine::new(overlay_engine.clone(), runtime.clone())
                 .with_lease_factory(lease_factory_for(credential_monitor.as_ref())),
@@ -270,7 +313,7 @@ impl Engines {
             credential_monitor,
             // The session already merged the global config; taking it from
             // there rather than re-loading is the whole point of F-31.
-            global_config: Arc::new(session.effective_config().layers().global.clone()),
+            global_config: Arc::new(binding.snapshot(config)),
         })
     }
 
@@ -315,30 +358,8 @@ impl Engines {
             .unwrap_or_default()
     }
 
-    /// Agent-runtime detection with the documented CLI/TUI fallback policy,
-    /// lifted out of `main.rs` (WI-0098 Finding B) so Layer 4 stays pure
-    /// wiring. Picks the runtime named by `config`, applying three rules:
-    ///
-    /// * **Valid runtime** → `Ok((runtime, None))`.
-    /// * **Unknown `runtime:` string** — a fatal configuration error, never a
-    ///   silent Docker fallback, for every command that `requires_runtime`.
-    ///   For such a CLI invocation the [`EngineError::UnknownRuntime`] is
-    ///   returned so the caller can print it and exit. Commands that need no
-    ///   runtime (`awman config …`) get a warning and inert default engines,
-    ///   so the setting can be repaired. For the bare-TUI invocation
-    ///   (`command_path` empty) inert default (Docker) engines are still
-    ///   constructed — the TUI boots only far enough to show a fatal modal —
-    ///   and the error text is returned as the second tuple field for that
-    ///   modal.
-    /// * **Runtime unavailable on this host** (e.g. `apple-containers` on
-    ///   Linux) → fatal only when the command `requires_runtime`; otherwise a
-    ///   warning is printed to stderr and detection falls back to the default
-    ///   Docker runtime, keeping `awman config` reachable to fix the setting.
-    ///
-    /// Returns the detected runtime handles paired with the optional TUI
-    /// fatal-modal message (`Some` only on the unknown-runtime TUI path).
-    /// `main` combines the returned [`DetectedRuntime`] with the
-    /// session-derived engines to assemble the full [`Engines`] bundle.
+    /// Detect exactly the configured backend. Invalid or unsupported runtimes
+    /// fail explicitly for every frontend; no substitute engines are created.
     pub fn detect(
         catalogue: &CommandCatalogue,
         config: &ConfigFile,
@@ -361,55 +382,124 @@ impl Engines {
     }
 
     fn detect_result(
-        catalogue: &CommandCatalogue,
+        _catalogue: &CommandCatalogue,
         result: Result<DetectedRuntime, EngineError>,
-        command_path: &[&str],
+        _command_path: &[&str],
     ) -> Result<(DetectedRuntime, Option<RuntimeStartupFailure>), EngineError> {
-        match result {
-            Ok(detected) => Ok((detected, None)),
-            Err(e @ EngineError::UnknownRuntime { .. }) => {
-                // Invalid `runtime:` is fatal for anything that would run an
-                // agent. CLI invocations bubble the error up to be printed and
-                // exited on; the bare-TUI invocation constructs inert default
-                // engines (never exercised — the modal's only action is quit)
-                // and returns the message for the startup modal. Commands that
-                // need no runtime (`awman config …`) warn and continue, so the
-                // setting stays fixable from the CLI.
-                if !command_path.is_empty() {
-                    if catalogue.requires_runtime(command_path) {
-                        return Err(e);
+        result.map(|detected| (detected, None))
+    }
+
+    /// The immutable process values are retained in the engine bundle's config
+    /// snapshot. Reading the typed binding does not resolve config a second time.
+    pub fn process_binding(&self) -> ProcessBinding {
+        ProcessBinding::from_snapshot(&self.global_config)
+    }
+
+    pub(crate) fn check_runtime_identity(
+        binding: &ProcessBinding,
+        runtime: &dyn AgentRuntimeEngine,
+    ) -> Result<(), EngineError> {
+        use crate::data::config::runtime::RuntimeKind;
+        let actual = match runtime.runtime_name() {
+            "docker" => Some(RuntimeKind::Docker),
+            "apple-containers" => Some(RuntimeKind::AppleContainers),
+            "docker-sbx-experimental" => Some(RuntimeKind::DockerSbxExperimental),
+            "builtin" => Some(RuntimeKind::BuiltinExperimental),
+            _ => None,
+        };
+        if actual != Some(binding.runtime_kind) {
+            return Err(EngineError::Other(format!(
+                "runtime construction disagrees with runtime.kind: configured {}; constructed {}",
+                binding.runtime_kind,
+                runtime.runtime_name()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Sessions opened later inherit the process baseline. Explicit repo/task
+    /// and invocation values remain visible so conflicts can be refused after
+    /// the command's --set layer has been applied.
+    pub fn inherit_process_settings(&self, session: &mut Session) -> Result<(), CommandError> {
+        use crate::data::config::Layer;
+        let config = session.effective_config();
+        let snapshot = self.global_config.to_value();
+        let mut inherited = Vec::new();
+        for key in ProcessBinding::KEYS {
+            let source = config.source_of(key);
+            let env_name = crate::data::config::fields::CONFIG_KEYS
+                .iter()
+                .find(|entry| entry.path == *key)
+                .expect("process key")
+                .env_name(&[]);
+            // Startup argv remains authoritative over the same global/env
+            // baseline. A different client's explicit environment must survive
+            // inheritance so validation refuses a conflicting backend.
+            let inherit = source == Layer::Default
+                || source == Layer::Global
+                || (source == Layer::Env
+                    && config.env().get(&env_name) == self.git_engine.env().get(&env_name));
+            if inherit {
+                let pointer = format!("/{}", key.replace('.', "/"));
+                if let Some(value) = snapshot.pointer(&pointer) {
+                    if config.value().pointer(&pointer) != Some(value) {
+                        if source == Layer::Global {
+                            tracing::warn!(key, "using the bound process setting; global changes require restarting awman");
+                        }
+                        inherited.push(((*key).to_string(), value.clone()));
                     }
-                    eprintln!(
-                        "warning: {e}; continuing without it so `awman config` can update the \
-                         setting"
-                    );
-                    let fallback = agent_runtime::detect(&ConfigFile::default())?;
-                    return Ok((fallback, None));
                 }
-                let fallback = agent_runtime::detect(&ConfigFile::default())?;
-                Ok((fallback, Some(RuntimeStartupFailure::new(e))))
-            }
-            Err(e) => {
-                if command_path.is_empty() {
-                    let inert = agent_runtime::detect(&ConfigFile::default())?;
-                    return Ok((inert, Some(RuntimeStartupFailure::new(e))));
-                }
-                // A configured runtime this host can't construct must not lock
-                // the user out of `awman config` — the documented way to switch
-                // the runtime back. The catalogue decides which commands need a
-                // runtime; for the rest, warn and continue on the default
-                // Docker runtime, which config commands never touch.
-                if catalogue.requires_runtime(command_path) {
-                    return Err(e);
-                }
-                eprintln!(
-                    "warning: configured runtime is unavailable on this host ({e}); \
-                     continuing with the default Docker runtime so `awman config` \
-                     can update the setting"
-                );
-                let fallback = agent_runtime::detect(&ConfigFile::default())?;
-                Ok((fallback, None))
             }
         }
+        session.add_overrides(ConfigOverrides::new(inherited))?;
+        Ok(())
+    }
+
+    pub fn validate_process_config(&self, config: &EffectiveConfig) -> Result<(), CommandError> {
+        let bound = self.process_binding();
+        let requested = ProcessBinding::from_config(config)?;
+        if let Some(difference) = bound.difference(&requested) {
+            // Preserve the established repository state-directory refusal.
+            if difference.key == "runtime.builtin.stateDir"
+                && config.source_of(&difference.key) == crate::data::config::Layer::Repo
+            {
+                return Err(EngineError::BuiltinStateDirMismatch {
+                    process: bound.builtin_state_dir.unwrap(),
+                    session: requested.builtin_state_dir.unwrap(),
+                }
+                .into());
+            }
+            return Err(CommandError::ProcessScopedSetting {
+                key: difference.key,
+                bound: difference.bound,
+                requested: difference.requested,
+            });
+        }
+        Ok(())
+    }
+
+    /// Pre-allocation admission for API argv. Start from the bound process
+    /// snapshot, then add command-local values with normal --set precedence.
+    pub fn validate_process_set_args(&self, set: &[String]) -> Result<(), CommandError> {
+        let mut overrides = ConfigOverrides::parse_set_args(set)
+            .map_err(|e| CommandError::InvalidRequest(e.to_string()))?;
+        // Admission has no repository/task config yet. Only resolve the
+        // process keys here: session settings may depend on those later layers.
+        overrides
+            .0
+            .retain(|(key, _)| ProcessBinding::KEYS.contains(&key.as_str()));
+        if overrides.is_empty() {
+            return Ok(());
+        }
+        let config = EffectiveConfig::resolve(
+            ConfigLayers {
+                global: (*self.global_config).clone(),
+                set: overrides,
+                ..Default::default()
+            },
+            FlagConfig::default(),
+            self.git_engine.env().clone(),
+        )?;
+        self.validate_process_config(&config)
     }
 }

@@ -68,6 +68,8 @@ pub struct ResultContributions {
     /// The frozen execution assurance, recorded when the execution
     /// finishes, so a cancelled or otherwise failed command still reports it.
     pub automation_result: Option<crate::data::automation_records::CommandAutomationResult>,
+    /// The durable native answer, kept on cancellation as well as success.
+    pub automation_final_message: Option<String>,
 }
 
 impl CommandStateWriter {
@@ -153,17 +155,22 @@ impl CommandStateWriter {
 
     /// Record that this command runs an automation execution.
     pub fn record_automation(&self) {
-        self.contributions().automation = true;
+        let mut contributions = self.contributions();
+        contributions.automation = true;
+        contributions.automation_result = None;
+        contributions.automation_final_message = None;
     }
 
     /// Record the frozen automation assurance of the finished execution.
     pub fn record_automation_result(
         &self,
         result: &crate::data::automation_records::CommandAutomationResult,
+        final_message: Option<&str>,
     ) {
         let mut contributions = self.contributions();
         contributions.automation = true;
         contributions.automation_result = Some(result.clone());
+        contributions.automation_final_message = final_message.map(str::to_owned);
     }
 
     /// Record the pull request a teardown step opened (WI 0137 §1).
@@ -336,9 +343,12 @@ impl CommandLogWriter {
                 sequence += 1;
             }
             events.flush()?;
-            output.flush()
+            output.flush()?;
+            events.sync_data()?;
+            output.sync_data()
         };
-        append().map_err(|source| DataError::Io { path, source })
+        append().map_err(|source| DataError::Io { path, source })?;
+        sync_command_directories(paths, &command.session_id, &command.id)
     }
 
     /// Open both log files for `command_id` under `session_id` for appending,
@@ -376,7 +386,9 @@ impl CommandLogWriter {
     }
     pub async fn try_flush(&mut self) -> std::io::Result<()> {
         self.events_file.flush().await?;
-        self.output_file.flush().await
+        self.output_file.flush().await?;
+        self.events_file.sync_data().await?;
+        self.output_file.sync_data().await
     }
     /// Repair only the owning execution's reserved projection, before opening publication.
     /// Exact cursor/content matches replay harmlessly; conflicting or later final records fail.
@@ -430,7 +442,10 @@ impl CommandLogWriter {
                     );
                 if let Some(expected) = batch.iter().find(|event| event.cursor() == saved.cursor())
                 {
-                    if serde_json::to_value(&saved).ok() != serde_json::to_value(expected).ok() {
+                    if serde_json::to_value(&saved).map_err(|e| DataError::Other(e.to_string()))?
+                        != serde_json::to_value(expected)
+                            .map_err(|e| DataError::Other(e.to_string()))?
+                    {
                         return Err(DataError::Other("conflicting lifecycle cursor".into()));
                     }
                     found.insert(saved.cursor());
@@ -466,6 +481,7 @@ impl CommandLogWriter {
             file.flush()
                 .and_then(|_| file.sync_data())
                 .map_err(|e| DataError::io(&path, e))?;
+            sync_command_directories(paths, &command.session_id, &command.id)?;
             store.clear_pending_events(
                 &execution.execution_id,
                 execution
@@ -540,4 +556,88 @@ impl CommandStateWriter {
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
+}
+
+/// The event bus's ordered persistence seam. A flush acknowledges stable storage,
+/// not merely enqueueing a write. Implementations must keep append errors sticky.
+pub trait EventLog: Send {
+    fn append(&mut self, event: &ExecutionEvent) -> std::io::Result<()>;
+    fn flush(&mut self) -> std::io::Result<()>;
+}
+
+/// Synchronous writer for the synchronous lifecycle transaction/publication path.
+/// The bus owns it under its publication lock, so progress cannot overtake a batch.
+pub struct OrderedCommandLog {
+    events: std::io::BufWriter<std::fs::File>,
+    output: std::io::BufWriter<std::fs::File>,
+}
+impl OrderedCommandLog {
+    pub fn open(paths: &ApiPaths, session: &str, command: &str) -> Result<Self, DataError> {
+        use std::io::{Read, Seek, Write};
+        fn open(path: &Path) -> Result<std::io::BufWriter<std::fs::File>, DataError> {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| DataError::io(path, e))?;
+            if file.metadata().map_err(|e| DataError::io(path, e))?.len() > 0 {
+                file.seek(SeekFrom::End(-1))
+                    .map_err(|e| DataError::io(path, e))?;
+                let mut byte = [0];
+                file.read_exact(&mut byte)
+                    .map_err(|e| DataError::io(path, e))?;
+                if byte[0] != b'\n' {
+                    file.write_all(b"\n").map_err(|e| DataError::io(path, e))?;
+                }
+            }
+            Ok(std::io::BufWriter::new(file))
+        }
+        paths.prepare_command_dir(session, command)?;
+        let writer = Self {
+            events: open(&paths.command_events_log_path(session, command))?,
+            output: open(&paths.command_log_path(session, command))?,
+        };
+        sync_command_directories(paths, session, command)?;
+        Ok(writer)
+    }
+}
+impl EventLog for OrderedCommandLog {
+    fn append(&mut self, event: &ExecutionEvent) -> std::io::Result<()> {
+        use std::io::Write;
+        serde_json::to_writer(&mut self.events, event)?;
+        self.events.write_all(b"\n")?;
+        if let Some(text) = event.payload.to_plain_text() {
+            writeln!(self.output, "{text}")?;
+        }
+        Ok(())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        self.events.flush()?;
+        self.output.flush()?;
+        self.events.get_ref().sync_data()?;
+        self.output.get_ref().sync_data()
+    }
+}
+
+/// File sync acknowledges contents; Unix also requires syncing newly created
+/// directory entries before the pending projection can be retired.
+fn sync_command_directories(
+    paths: &ApiPaths,
+    session: &str,
+    command: &str,
+) -> Result<(), DataError> {
+    #[cfg(unix)]
+    for directory in paths.command_dir(session, command).ancestors() {
+        std::fs::File::open(directory)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| DataError::io(directory, e))?;
+        if directory == paths.root() {
+            break;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (paths, session, command);
+    Ok(())
 }

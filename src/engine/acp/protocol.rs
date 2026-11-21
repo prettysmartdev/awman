@@ -234,6 +234,14 @@ pub struct WriteTextFileRequest {
 /// bound).
 pub const MAX_ACP_LINE_BYTES: usize = 8 * 1024 * 1024;
 
+/// One decoded line and the number of wire bytes it occupied (without its
+/// newline). Queues charge decoded items by this length.
+#[derive(Debug)]
+pub struct Frame {
+    pub bytes: usize,
+    pub value: Result<Value, String>,
+}
+
 /// Incremental newline-delimited JSON framing. A bad line is returned to the
 /// caller and never poisons later frames. The buffered length is capped at
 /// [`MAX_ACP_LINE_BYTES`]; an over-long line is discarded (with a warning) and
@@ -241,12 +249,23 @@ pub const MAX_ACP_LINE_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Debug, Default)]
 pub struct LineFramer {
     pending: Vec<u8>,
+    /// Prefix of `pending` already known to hold no newline, so each push
+    /// scans only new bytes (a maximum-size line stays linear).
+    scanned: usize,
     /// True while dropping the tail of an over-long line until the next `\n`.
     discarding: bool,
 }
 
 impl LineFramer {
     pub fn push(&mut self, bytes: &[u8]) -> Vec<Result<Value, String>> {
+        self.push_sized(bytes)
+            .into_iter()
+            .map(|frame| frame.value)
+            .collect()
+    }
+
+    /// Like [`push`](Self::push), also reporting each line's wire length.
+    pub fn push_sized(&mut self, bytes: &[u8]) -> Vec<Frame> {
         let mut frames = Vec::new();
         let mut rest = bytes;
 
@@ -263,17 +282,39 @@ impl LineFramer {
         }
 
         self.pending.extend_from_slice(rest);
-        while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = self.pending.drain(..=end).collect();
-            let line = &line[..line.len() - 1];
+        let mut start = 0;
+        let mut from = self.scanned;
+        while let Some(offset) = self.pending[from..].iter().position(|b| *b == b'\n') {
+            let end = from + offset;
+            let line = &self.pending[start..end];
+            start = end + 1;
+            from = start;
             if line.iter().all(|b| b.is_ascii_whitespace()) {
                 continue;
             }
-            match std::str::from_utf8(line) {
-                Ok(text) => frames.push(serde_json::from_str(text).map_err(|e| e.to_string())),
-                Err(e) => frames.push(Err(format!("invalid UTF-8 ACP line: {e}"))),
+            // A completed line is held to the same cap as an unterminated
+            // one, before any decoding, however the bytes were partitioned.
+            if line.len() > MAX_ACP_LINE_BYTES {
+                frames.push(Frame {
+                    bytes: 0,
+                    value: Err(format!(
+                        "ACP line exceeded {MAX_ACP_LINE_BYTES}-byte cap ({} bytes); discarded",
+                        line.len()
+                    )),
+                });
+                continue;
             }
+            let value = match std::str::from_utf8(line) {
+                Ok(text) => serde_json::from_str(text).map_err(|e| e.to_string()),
+                Err(e) => Err(format!("invalid UTF-8 ACP line: {e}")),
+            };
+            frames.push(Frame {
+                bytes: line.len(),
+                value,
+            });
         }
+        self.pending.drain(..start);
+        self.scanned = self.pending.len();
 
         // Cap the unterminated remainder. A peer that never emits `\n` (or emits
         // a pathologically long line) must not grow `pending` without bound.
@@ -281,15 +322,24 @@ impl LineFramer {
         // next newline realigns framing instead of prepending the dropped bytes.
         if self.pending.len() > MAX_ACP_LINE_BYTES {
             let buffered = self.pending.len();
-            self.pending.clear();
+            self.pending = Vec::new();
+            self.scanned = 0;
             self.discarding = true;
-            frames.push(Err(format!(
-                "ACP line exceeded {MAX_ACP_LINE_BYTES}-byte cap ({buffered} bytes buffered with \
-                 no newline); discarding until next newline"
-            )));
+            frames.push(Frame {
+                bytes: 0,
+                value: Err(format!(
+                    "ACP line exceeded {MAX_ACP_LINE_BYTES}-byte cap ({buffered} bytes buffered \
+                     with no newline); discarding until next newline"
+                )),
+            });
         }
 
         frames
+    }
+
+    /// Bytes currently buffered for an unterminated line.
+    pub fn buffered(&self) -> usize {
+        self.pending.len()
     }
 }
 
@@ -364,5 +414,78 @@ pub fn summarize_update(update: &SessionUpdate) -> String {
                 sanitize_terminal_text(current_mode_id)
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod framer_cap_tests {
+    use super::*;
+
+    /// A valid JSON line of exactly `len` bytes (without the newline).
+    fn line_of(len: usize) -> Vec<u8> {
+        let overhead = br#"{"jsonrpc":"2.0","method":"x","params":""}"#.len();
+        let mut line = br#"{"jsonrpc":"2.0","method":"x","params":""#.to_vec();
+        line.extend(std::iter::repeat_n(b'a', len - overhead));
+        line.extend_from_slice(br#""}"#);
+        assert_eq!(line.len(), len);
+        line
+    }
+
+    fn ok_sizes(frames: &[Frame]) -> Vec<usize> {
+        frames
+            .iter()
+            .filter(|f| f.value.is_ok())
+            .map(|f| f.bytes)
+            .collect()
+    }
+
+    #[test]
+    fn a_completed_line_over_the_cap_is_refused_however_it_is_partitioned() {
+        let over = line_of(MAX_ACP_LINE_BYTES + 130);
+        let ok = line_of(64);
+        // One push: the whole oversize line plus its newline, then a valid line.
+        let mut framer = LineFramer::default();
+        let mut bytes = over.clone();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&ok);
+        bytes.push(b'\n');
+        let frames = framer.push_sized(&bytes);
+        assert_eq!(ok_sizes(&frames), vec![64], "oversize line must not decode");
+        assert!(frames.iter().any(|f| f.value.is_err()));
+        // Split exactly at the cap: the remainder check sees MAX bytes (legal),
+        // then the final bytes and the newline complete an oversize line.
+        let mut framer = LineFramer::default();
+        assert!(framer.push_sized(&over[..MAX_ACP_LINE_BYTES]).is_empty());
+        let mut tail = over[MAX_ACP_LINE_BYTES..].to_vec();
+        tail.push(b'\n');
+        let frames = framer.push_sized(&tail);
+        assert!(
+            ok_sizes(&frames).is_empty(),
+            "split oversize line must not decode"
+        );
+        assert_eq!(frames.len(), 1);
+        assert_eq!(framer.buffered(), 0);
+        // Framing continues normally afterwards.
+        let mut next = ok.clone();
+        next.push(b'\n');
+        assert_eq!(ok_sizes(&framer.push_sized(&next)), vec![64]);
+    }
+
+    #[test]
+    fn a_line_of_exactly_the_cap_is_accepted_with_the_newline_in_any_push() {
+        let max = line_of(MAX_ACP_LINE_BYTES);
+        let mut framer = LineFramer::default();
+        let mut bytes = max.clone();
+        bytes.push(b'\n');
+        assert_eq!(
+            ok_sizes(&framer.push_sized(&bytes)),
+            vec![MAX_ACP_LINE_BYTES]
+        );
+        let mut framer = LineFramer::default();
+        assert!(framer.push_sized(&max).is_empty());
+        assert_eq!(
+            ok_sizes(&framer.push_sized(b"\n")),
+            vec![MAX_ACP_LINE_BYTES]
+        );
     }
 }

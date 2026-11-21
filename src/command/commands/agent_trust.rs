@@ -38,21 +38,19 @@ pub struct HostCommandReview {
     /// Shell-quoted argv plus the literal `'<greeting>'` placeholder.
     pub rendered: String,
     /// Where `argv[0]` resolves on the host `PATH` right now. `None` for a
-    /// bare name that is not found; always `None` for an absolute path,
-    /// which needs no lookup.
+    /// program that is not found. Absolute paths are canonicalized too.
     pub resolved_binary: Option<PathBuf>,
     /// `true` when `argv[0]` is a bare name (looked up on `PATH`).
     pub bare_name: bool,
 }
 
 impl HostCommandReview {
-    pub fn from_argv(argv: &[String]) -> Self {
+    pub fn from_argv(env: &crate::data::config::env::EnvSnapshot, argv: &[String]) -> Self {
         let bare_name = argv.first().is_some_and(|bin| is_bare_host_binary(bin));
-        let resolved_binary = if bare_name {
-            which::which(&argv[0]).ok()
-        } else {
-            None
-        };
+        let resolved_binary = argv.first().and_then(|bin| {
+            crate::engine::host_cli::find_program(env, bin, env.path_dirs())
+                .and_then(|path| path.canonicalize().ok())
+        });
         let mut rendered = shell_words::join(argv.iter().map(|t| escape_controls(t)));
         rendered.push_str(" '<greeting>'");
         Self {
@@ -69,6 +67,11 @@ impl HostCommandReview {
             "⚠ `awman ready` will run this command ON YOUR HOST (not in a container):\n",
         );
         out.push_str(&format!("    {}\n", self.rendered));
+        if !self.bare_name {
+            if let Some(path) = &self.resolved_binary {
+                out.push_str(&format!("    (canonical executable: {})\n", path.display()));
+            }
+        }
         if self.bare_name {
             match &self.resolved_binary {
                 Some(path) => out.push_str(&format!(
@@ -119,7 +122,10 @@ pub struct AgentTrustReview {
 impl AgentTrustReview {
     /// Build the review for a custom definition. A first-party definition
     /// never needs one; it yields an empty, path-less review.
-    pub fn from_definition(def: &AgentDefinition) -> Self {
+    pub fn from_definition(
+        env: &crate::data::config::env::EnvSnapshot,
+        def: &AgentDefinition,
+    ) -> Self {
         let (scope, path, sha256) = match &def.origin {
             AgentOrigin::Custom {
                 scope,
@@ -155,7 +161,10 @@ impl AgentTrustReview {
             path,
             sha256,
             homepage: def.homepage.clone(),
-            host_command: def.ping_argv.as_deref().map(HostCommandReview::from_argv),
+            host_command: def
+                .ping_argv
+                .as_deref()
+                .map(|argv| HostCommandReview::from_argv(env, argv)),
             install_steps,
             dockerfile,
             host_dir,
@@ -298,7 +307,7 @@ pub fn ensure_agent_trusted(
         TrustStatus::Approved => return Ok(TrustOutcome::AlreadyApproved),
         TrustStatus::Pending => {}
     }
-    let mut review = AgentTrustReview::from_definition(def);
+    let mut review = AgentTrustReview::from_definition(env, def);
     let paths = crate::data::RepoDockerfilePaths::new(session.git_root());
     review
         .notices

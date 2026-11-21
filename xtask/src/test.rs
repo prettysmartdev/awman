@@ -59,6 +59,7 @@ struct Options {
     runner: Runner,
     changed: bool,
     shuffle_seed: Option<u64>,
+    test_threads: Option<usize>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +90,11 @@ impl Options {
                 "--evidence-dir" => o.evidence_dir = Some(value()?.into()),
                 "--out" => o.out = Some(value()?.into()),
                 "--shuffle-seed" => o.shuffle_seed = Some(value()?.parse()?),
+                "--test-threads" => {
+                    let threads: usize = value()?.parse()?;
+                    ensure!(threads > 0, "--test-threads must be positive");
+                    o.test_threads = Some(threads);
+                }
                 "--runner" => {
                     o.runner = match value()?.as_str() {
                         "nextest" => Runner::Nextest,
@@ -575,7 +581,7 @@ fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
                     skip_value = false;
                     continue;
                 }
-                if arg == "--no-tests" {
+                if arg == "--no-tests" || arg == "--test-threads" {
                     skip_value = true;
                     continue;
                 }
@@ -723,6 +729,9 @@ fn nextest_command(
             }
             c.args(features);
         }
+    }
+    if let Some(threads) = o.test_threads {
+        c.args(["--test-threads", &threads.to_string()]);
     }
     if let Some(shard) = &o.shard {
         c.args(["--partition", &format!("count:{shard}")]);
@@ -1064,6 +1073,7 @@ mod tests {
         assert!(o.changed);
         assert_eq!(o.shard.as_deref(), Some("1/3"));
         assert!(Options::parse(&["--bogus".to_string()]).is_err());
+        assert!(Options::parse(&["--test-threads".into(), "0".into()]).is_err());
     }
 
     #[test]
@@ -1242,11 +1252,19 @@ mod tests {
         assert_eq!(invocations.len(), 2);
         for invocation in invocations {
             assert_eq!(invocation.suites.len(), 1);
-            let command =
-                nextest_command(&crate::gates::root(), &invocation, &[], &Options::default())
-                    .unwrap();
+            let command = nextest_command(
+                &crate::gates::root(),
+                &invocation,
+                &[],
+                &Options {
+                    test_threads: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             let args: Vec<_> = command.get_args().map(|a| a.to_string_lossy()).collect();
             assert!(args.windows(2).any(|a| a == ["--no-tests", "fail"]));
+            assert!(args.windows(2).any(|a| a == ["--test-threads", "1"]));
         }
     }
 }

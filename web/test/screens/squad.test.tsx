@@ -7,7 +7,34 @@ import { harness } from './helpers';
 afterEach(cleanup);
 function taskAction(name: string) { fireEvent.click(screen.getByRole('button', { name: 'Task actions' })); fireEvent.click(screen.getByRole('menuitem', { name })); }
 async function show() { const h = harness(); const submit = vi.fn(); render(<Squad client={h.client} available={true} readOnly={false} submit={submit} detach={vi.fn()} />); await screen.findByRole('button', { name: /Daily.*active/ }); return { ...h, submit }; }
-it('shows unavailable recipes for missing listener features', () => { const h = harness(); render(<Squad client={h.client} available={false} readOnly={false} submit={vi.fn()} detach={vi.fn()} />); expect(screen.getByText('awman config set daemon.network.listeners.loopback.features engine,squad')).toBeTruthy(); expect(screen.getByText('awman config set daemon.features.squad.enabled true')).toBeTruthy(); expect(h.api.squad.tasks).not.toHaveBeenCalled(); });
+it('uses the connected non-loopback listener and preserves its existing worker feature', async () => {
+  const h = harness();
+  h.api.status.mockResolvedValueOnce({ listeners: { network: { 'trusted-remote': { name: 'trusted-remote', features: [], configured_features: ['worker'] } } } } as never);
+  render(<Squad client={h.client} listenerName="trusted-remote" available={false} readOnly={false} submit={vi.fn()} detach={vi.fn()} />);
+  expect(await screen.findByText("awman config set 'daemon.network.listeners.trusted-remote.features' 'engine,squad,worker'")).toBeTruthy();
+  expect(screen.getByText('awman config set daemon.features.squad.enabled true')).toBeTruthy();
+  expect(h.api.status).toHaveBeenCalledTimes(1);
+  expect(h.api.squad.tasks).not.toHaveBeenCalled();
+});
+it('gives inspection instructions when listener identity or current metadata is missing', async () => {
+  const h = harness();
+  render(<Squad client={h.client} available={false} readOnly={false} submit={vi.fn()} detach={vi.fn()} />);
+  expect(await screen.findByText(/Inspect the current listener and feature configuration/)).toBeTruthy();
+  expect(screen.queryByText(/daemon\.network\.listeners\./)).toBeNull();
+  expect(h.api.status).not.toHaveBeenCalled();
+  cleanup();
+  const stale = harness();
+  stale.api.status.mockRejectedValueOnce(new Error('status unavailable'));
+  render(<Squad client={stale.client} listenerName="old-listener" available={false} readOnly={false} submit={vi.fn()} detach={vi.fn()} />);
+  expect(await screen.findByText(/Inspect the current listener and feature configuration/)).toBeTruthy();
+  expect(screen.queryByText(/daemon\.network\.listeners\./)).toBeNull();
+});
+it('uses the updated feature set from current status and safely quotes listener names', async () => {
+  const h = harness();
+  h.api.status.mockResolvedValueOnce({ listeners: { network: { "edge-prod": { name: "edge-prod", features: ['engine'], configured_features: ['worker', 'engine'] } } } } as never);
+  render(<Squad client={h.client} listenerName="edge-prod" available={false} readOnly={false} submit={vi.fn()} detach={vi.fn()} />);
+  expect(await screen.findByText("awman config set 'daemon.network.listeners.edge-prod.features' 'engine,squad,worker'")).toBeTruthy();
+});
 it('renders cards, details, history and inactive command reminder', async () => { const h = await show(); expect(screen.getByText(/command box is inactive/)).toBeTruthy(); taskAction('Details'); await screen.findByRole('heading', { name: 'Task details' }); expect(h.api.squad.task).toHaveBeenCalledWith(h.task.id); fireEvent.click(screen.getByRole('button', { name: 'Close details' })); taskAction('History'); await screen.findByRole('dialog', { name: 'Run history' }); expect(h.api.squad.runs).toHaveBeenCalledWith(h.task.id); });
 it.each([['Pause', 'patch'], ['Trigger', 'trigger'], ['Cancel run', 'cancelRun']] as const)('requires engine prompt before %s', async (label, method) => { const h = await show(); taskAction(label); await screen.findByText('Engine wording for squad_task_confirm'); expect(h.api.squad[method]).not.toHaveBeenCalled(); fireEvent.click(screen.getByRole('button', { name: 'Confirm task action' })); await waitFor(() => expect(h.api.squad[method]).toHaveBeenCalledTimes(1)); });
 it('new and edit actions use the engine interview; attach uses argv with no shell interpolation', async () => { const h = await show(); fireEvent.click(screen.getByRole('button', { name: 'New task' })); await waitFor(() => expect(h.submit).toHaveBeenCalledWith(['squad', 'add', '--interview'])); taskAction('Edit'); await waitFor(() => expect(h.submit).toHaveBeenCalledWith(['squad', 'edit', h.task.name, '--interview'])); taskAction('Attach'); await waitFor(() => expect(h.api.terminals).toHaveBeenCalledWith(h.task.id)); expect(h.submit).toHaveBeenCalledWith(['squad', 'attach', h.task.name]); });
@@ -48,4 +75,12 @@ it('keeps task context and reading actions visible when mutations become read on
   await screen.findByRole('button', { name: /Daily.*active/ }); fireEvent.click(screen.getByRole('button', { name: 'Task actions' }));
   expect((screen.getByRole('menuitem', { name: /Delete task/ }) as HTMLButtonElement).disabled).toBe(true);
   expect((screen.getByRole('menuitem', { name: 'History' }) as HTMLButtonElement).disabled).toBe(false);
+});
+it('does not replace configured features using the effective feature list', async () => {
+  const h = harness();
+  h.api.status.mockResolvedValueOnce({ listeners: { network: { edge: { name: 'edge', features: ['engine'] } } } } as never);
+  render(<Squad client={h.client} listenerName="edge" available={false} readOnly={false} submit={vi.fn()} detach={vi.fn()} />);
+  await waitFor(() => expect(h.api.status).toHaveBeenCalledTimes(1));
+  await screen.findByText(/Inspect the current listener and feature configuration/);
+  expect(screen.queryByText(/awman config set/)).toBeNull();
 });

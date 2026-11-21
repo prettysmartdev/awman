@@ -9,11 +9,7 @@
 //!
 //! Under the data home: `data/awman.db`, `data/repos/<hash>/state.json`,
 //! `api/`, `squad/`, `attach/`, `builtin/`, and the other data dirs.
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
-
-use sha2::{Digest, Sha256};
 
 use crate::data::config::env::{Env, EnvSnapshot};
 use crate::data::error::DataError;
@@ -70,8 +66,12 @@ pub const DATA_SUBDIR: &str = "data";
 /// `api_paths::API_DB_FILENAME`.
 pub const DB_FILENAME: &str = "awman.db";
 
-const MIGRATION_LOCK_FILENAME: &str = ".migrating";
-const STALE_MIGRATION_LOCK_AGE: Duration = Duration::from_secs(60);
+mod migration;
+pub use migration::{
+    MigrationFault, MigrationFileRecord, MigrationJournal, MigrationPhase, MigrationStep,
+    StoreOpenOptions, MIGRATION_JOURNAL_FILENAME, MIGRATION_JOURNAL_SCHEMA,
+    MIGRATION_LOCK_FILENAME, MIGRATION_LOCK_WAIT, MIGRATION_STAGING_PREFIX,
+};
 
 /// Result of relocating the legacy API-owned database into the shared data
 /// directory. Presentation layers decide whether and how to report it.
@@ -84,6 +84,8 @@ pub enum MigrationOutcome {
         sidecars: Vec<PathBuf>,
         backup_kept: bool,
     },
+    /// A journaled migration interrupted earlier was completed, or redone
+    /// from the untouched legacy files.
     RecoveredFromInterrupted {
         copied_bytes: u64,
     },
@@ -163,208 +165,4 @@ impl DataPaths {
             .create(&self.root)
             .map_err(|e| DataError::io(&self.root, e))
     }
-
-    /// Relocate the database from a pre-squad API root, preserving SQLite's WAL
-    /// sidecars. The original is renamed only after all copies verify, making
-    /// an interrupted migration safely resumable.
-    pub fn migrate_legacy_db(&self, legacy_root: &Path) -> Result<MigrationOutcome, DataError> {
-        self.ensure_root()?;
-        let _lock = MigrationLock::acquire(&self.root)?;
-
-        let legacy = legacy_root.join(DB_FILENAME);
-        let target = self.db_path();
-        let target_sidecars = sidecars_for(&target);
-        let legacy_sidecars = sidecars_for(&legacy);
-
-        let recovered = match (legacy.exists(), target.exists()) {
-            (false, false) => return Ok(MigrationOutcome::FreshInstall),
-            (false, true) => return Ok(MigrationOutcome::AlreadyMigrated),
-            (true, true) => {
-                // The legacy source still has its name, so any target was
-                // written before verification/rename and cannot be trusted.
-                remove_targets(&target, &target_sidecars)?;
-                true
-            }
-            (true, false) => false,
-        };
-
-        let copied_bytes = match copy_and_verify(&legacy, &target, &legacy_sidecars) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                // Copy/verification failure must leave recognisable legacy
-                // files intact. Only the untrusted destination is removed.
-                let _ = remove_targets(&target, &target_sidecars);
-                return Err(error);
-            }
-        };
-        let (sidecars, backup_kept) = rename_legacy_aside(&legacy, &legacy_sidecars)?;
-        if recovered {
-            return Ok(MigrationOutcome::RecoveredFromInterrupted { copied_bytes });
-        }
-        Ok(MigrationOutcome::Migrated {
-            copied_bytes,
-            sidecars,
-            backup_kept,
-        })
-    }
-}
-
-/// A best-effort process lock for a short filesystem migration. It uses the
-/// same `O_CREAT | O_EXCL` idiom as daemon pidfile claims and cleans itself up
-/// on every return path.
-struct MigrationLock {
-    path: PathBuf,
-}
-
-impl MigrationLock {
-    fn acquire(root: &Path) -> Result<Self, DataError> {
-        let path = root.join(MIGRATION_LOCK_FILENAME);
-        for attempt in 0..2 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    file.write_all(std::process::id().to_string().as_bytes())
-                        .map_err(|e| DataError::io(&path, e))?;
-                    return Ok(Self { path });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|metadata| metadata.modified())
-                        .ok()
-                        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                        .is_some_and(|age| age > STALE_MIGRATION_LOCK_AGE);
-                    if stale {
-                        match std::fs::remove_file(&path) {
-                            Ok(()) => continue,
-                            Err(remove_error)
-                                if remove_error.kind() == std::io::ErrorKind::NotFound =>
-                            {
-                                continue;
-                            }
-                            Err(remove_error) => return Err(DataError::io(&path, remove_error)),
-                        }
-                    }
-                    return Err(DataError::Other(format!(
-                        "database migration is already in progress ({})",
-                        path.display()
-                    )));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    return Err(DataError::Other(format!(
-                        "database migration is already in progress ({})",
-                        path.display()
-                    )));
-                }
-                Err(error) => return Err(DataError::io(&path, error)),
-            }
-        }
-        unreachable!("migration lock retries are bounded")
-    }
-}
-
-impl Drop for MigrationLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-fn sidecars_for(db_path: &Path) -> [PathBuf; 2] {
-    [
-        path_with_suffix(db_path, "-wal"),
-        path_with_suffix(db_path, "-shm"),
-    ]
-}
-
-fn remove_targets(target: &Path, sidecars: &[PathBuf; 2]) -> Result<(), DataError> {
-    for path in std::iter::once(target).chain(sidecars.iter().map(PathBuf::as_path)) {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(DataError::io(path, error)),
-        }
-    }
-    Ok(())
-}
-
-fn copy_and_verify(
-    legacy: &Path,
-    target: &Path,
-    legacy_sidecars: &[PathBuf; 2],
-) -> Result<u64, DataError> {
-    let mut copied_bytes = copy_and_verify_one(legacy, target)?;
-    for (source, destination) in legacy_sidecars.iter().zip(sidecars_for(target)) {
-        if source.exists() {
-            copied_bytes += copy_and_verify_one(source, &destination)?;
-        }
-    }
-    Ok(copied_bytes)
-}
-
-fn copy_and_verify_one(source: &Path, destination: &Path) -> Result<u64, DataError> {
-    let copied = std::fs::copy(source, destination).map_err(|e| DataError::io(destination, e))?;
-    let source_len = std::fs::metadata(source)
-        .map_err(|e| DataError::io(source, e))?
-        .len();
-    let destination_len = std::fs::metadata(destination)
-        .map_err(|e| DataError::io(destination, e))?
-        .len();
-    if copied != source_len
-        || destination_len != source_len
-        || sha256(source)? != sha256(destination)?
-    {
-        return Err(DataError::Other(format!(
-            "database migration verification failed for {}",
-            source.display()
-        )));
-    }
-    Ok(source_len)
-}
-
-fn sha256(path: &Path) -> Result<[u8; 32], DataError> {
-    let bytes = std::fs::read(path).map_err(|e| DataError::io(path, e))?;
-    Ok(Sha256::digest(bytes).into())
-}
-
-fn pre_migration_path(path: &Path) -> PathBuf {
-    path_with_suffix(path, ".pre-migration")
-}
-
-fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = path.as_os_str().to_os_string();
-    value.push(suffix);
-    PathBuf::from(value)
-}
-
-fn rename_legacy_aside(
-    legacy: &Path,
-    legacy_sidecars: &[PathBuf; 2],
-) -> Result<(Vec<PathBuf>, bool), DataError> {
-    let mut sidecars = Vec::new();
-    let mut backup_kept = true;
-    for source in std::iter::once(legacy).chain(legacy_sidecars.iter().map(PathBuf::as_path)) {
-        if !source.exists() {
-            continue;
-        }
-        let backup = pre_migration_path(source);
-        if backup.exists() {
-            // An older backup is more conservative to retain. The verified
-            // target is now authoritative, so remove only this old-name copy.
-            std::fs::remove_file(source).map_err(|e| DataError::io(source, e))?;
-            // `backup_kept` describes the *database* backup specifically: a
-            // stale sidecar backup must not make the outcome claim this run's
-            // main backup was discarded.
-            if source == legacy {
-                backup_kept = false;
-            }
-        } else {
-            std::fs::rename(source, &backup).map_err(|e| DataError::io(source, e))?;
-        }
-        if source != legacy {
-            sidecars.push(backup);
-        }
-    }
-    Ok((sidecars, backup_kept))
 }

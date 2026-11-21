@@ -163,3 +163,19 @@ fn failed_guest_workload_allows_repeated_kernel_boot() {
         assert!(text.contains(&format!("round-{round}")), "{text}");
     }
 }
+
+#[test]
+fn quiet_phase_keeps_full_ordered_failure_transcript_and_cancels() {
+    let s = support::sandbox("exec::quiet_phase_keeps_full_ordered_failure_transcript_and_cancels");
+    let out = support::scenario(&s, "phase-quiet-transcript");
+    assert!(out.contains("PHASE_EXIT\t37"), "{out}");
+    assert!(out.contains("TRANSCRIPT_LINES\t20000"), "{out}");
+    assert!(out.contains("QUIET_CANCELLED\ttrue"), "{out}");
+}
+
+#[test]
+fn stopped_builtin_instance_is_inspectable_until_owned_removal() {
+    let s = support::sandbox("exec::stopped_builtin_instance_is_inspectable_until_owned_removal");
+    let out = support::scenario(&s, "phase-stop-remove");
+    assert!(out.contains("STOP_GET_REMOVE\ttrue"), "{out}");
+}

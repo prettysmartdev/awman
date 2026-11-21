@@ -27,6 +27,9 @@ struct Resources {
     unavailable: bool,
     stops: usize,
     removes: usize,
+    stop_uncertain: bool,
+    disappear_on_stop: bool,
+    replace_on_stop: bool,
 }
 pub(super) struct Runtime {
     caps: Capabilities,
@@ -88,7 +91,38 @@ impl AgentRuntimeEngine for Runtime {
     fn stop(&self, _: &AgentHandle) -> Result<(), EngineError> {
         let mut r = self.resources.lock().unwrap();
         r.stops += 1;
+        if r.stop_uncertain {
+            return Err(EngineError::Other("shutdown uncertain".into()));
+        }
+        if r.disappear_on_stop {
+            r.handle = None;
+        }
+        if r.replace_on_stop {
+            let handle = r.handle.as_mut().unwrap();
+            handle.started_at += chrono::Duration::seconds(1);
+            r.label = Some("replacement-execution".into());
+        }
         r.running = false;
+        Ok(())
+    }
+    fn remove_agent_checked(
+        &self,
+        handle: &AgentHandle,
+        execution: &str,
+    ) -> Result<(), EngineError> {
+        let mut r = self.resources.lock().unwrap();
+        let Some(current) = r.handle.as_ref() else {
+            return Ok(());
+        };
+        if r.running
+            || current.started_at != handle.started_at
+            || current.name != handle.name
+            || r.label.as_deref() != Some(execution)
+        {
+            return Err(EngineError::Other("generation or owner changed".into()));
+        }
+        r.removes += 1;
+        r.handle = None;
         Ok(())
     }
     fn remove_agent(&self, _: &str) -> Result<(), EngineError> {
@@ -891,7 +925,9 @@ async fn profile_api_admission_requires_authenticated_local_owner() {
             fs::api_labels::Labels,
         },
     };
-    let s = TestSandbox::new();
+    let s = crate::support::sandbox(
+        "command::settings_profiles::profile_api_admission_requires_authenticated_local_owner",
+    );
     let fixture = super::support::AdmissionFixture::new(&s);
     let command = || CommandSubmission {
         secrets: None,
@@ -1382,4 +1418,347 @@ async fn intermediate_publication_without_retained_redaction_is_withheld() {
         awman::data::fs::agent_profiles::PublicationStatus::RetainedPrevious
     ));
     s.finish();
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn orphan_close_rechecks_shutdown_absence_and_same_name_generation() {
+    let s = crate::support::sandbox("command::settings_profiles::orphan_close_rechecks_shutdown_absence_and_same_name_generation");
+    let session = session(&s);
+    for (name, absent, replaced, uncertain) in [
+        ("absent", true, false, false),
+        ("replaced", false, true, false),
+        ("uncertain", false, false, true),
+    ] {
+        let runtime = Runtime::new();
+        let p = start(&session, name, runtime.clone()).await;
+        let execution_id = p.execution_id().clone();
+        {
+            let mut r = runtime.resources.lock().unwrap();
+            r.handle = Some(AgentHandle {
+                id: "owned-resource".into(),
+                name: format!("awman-profile-{}", execution_id.as_str()),
+                image_tag: "test".into(),
+                started_at: chrono::Utc::now(),
+            });
+            r.label = Some(execution_id.to_string());
+            r.running = true;
+            r.disappear_on_stop = absent;
+            r.replace_on_stop = replaced;
+            r.stop_uncertain = uncertain;
+        }
+        let run = p.run_state().run_dir;
+        drop(p);
+        let lease = layout(&session, name)
+            .try_lock(Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        let before = lease.read_manifest().unwrap().unwrap();
+        let generation_before_close = before.current_generation;
+        let spec = first_party("claude").unwrap().profile_state.unwrap();
+        let after = reconcile(
+            &lease,
+            before,
+            ReconcileMode::StopOwned,
+            runtime.clone(),
+            &spec,
+            TurnStateAtExit::Unknown,
+        )
+        .await
+        .unwrap();
+        assert_eq!(runtime.resources.lock().unwrap().removes, 0);
+        if absent {
+            assert_eq!(after.state, ProfileState::Inactive);
+            assert!(!run.exists());
+        } else {
+            assert_eq!(after.state, ProfileState::Closing);
+            assert!(run.exists());
+            assert_eq!(after.current_generation, generation_before_close);
+        }
+    }
+}
+
+async fn profile_outcome(
+    session: &Session,
+    engines: &awman::command::dispatch::Engines,
+    owner: bool,
+    action: &str,
+    args: &[&str],
+) -> (
+    Result<awman::command::dispatch::CommandOutcome, CommandError>,
+    Vec<String>,
+) {
+    use awman::{
+        command::{commands::api_server::event_bus::EventBus, dispatch::Dispatch},
+        data::execution_event::EventPayload,
+        frontend::api::command_frontend::ApiDispatchFrontend,
+    };
+    let path = ["agents", "profile", action];
+    let args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let bus = EventBus::new(128);
+    let mut rx = bus.subscribe();
+    let frontend = ApiDispatchFrontend::new(&path.join(" "), &args, bus.sender());
+    let outcome = Dispatch::new(
+        frontend,
+        Arc::new(tokio::sync::RwLock::new(session.clone())),
+        engines.clone(),
+    )
+    .with_profile_owner(owner)
+    .run_command(&path)
+    .await;
+    let mut lines = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let EventPayload::StdoutLine(line) = event.payload {
+            lines.push(line);
+        }
+    }
+    (outcome, lines)
+}
+
+#[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
+async fn profile_results_project_identically_to_cli_api_and_tui() {
+    use awman::command::commands::agents::{profile::ProfileLineLevel, AgentsOutcome};
+    use awman::command::dispatch::CommandOutcome;
+    let s = TestSandbox::new();
+    let session = session(&s);
+    let runtime = Runtime::new();
+    let engines = engines(&s, &session, runtime.clone());
+    let p = start(&session, "review", runtime.clone()).await;
+    p.leave(runtime.clone(), TurnStateAtExit::Unknown)
+        .await
+        .unwrap();
+
+    // List: the API stdout event carries the exact projected JSON data.
+    let (list, api_lines) = profile_outcome(&session, &engines, true, "list", &[]).await;
+    let list = list.unwrap();
+    let CommandOutcome::Agents(AgentsOutcome::Profile(list)) = &list else {
+        panic!("list must be a profile outcome");
+    };
+    let projection = list.project();
+    assert_eq!(api_lines.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&api_lines[0]).unwrap(),
+        projection.data
+    );
+    assert!(projection.data[0].is_null() && projection.data.get("profiles").is_some());
+    assert!(projection
+        .lines
+        .iter()
+        .any(|(l, t)| *l == ProfileLineLevel::Info && t.contains("claude/review")));
+
+    // Successful close.
+    let (close, api_lines) = profile_outcome(
+        &session,
+        &engines,
+        true,
+        "close",
+        &["review", "--agent", "claude"],
+    )
+    .await;
+    let close = close.unwrap();
+    assert_eq!(close.exit_code(), 0);
+    let CommandOutcome::Agents(AgentsOutcome::Profile(out)) = &close else {
+        panic!("close must be a profile outcome");
+    };
+    let projection = out.project();
+    assert!(projection.failure.is_none());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&api_lines[0]).unwrap(),
+        projection.data
+    );
+    assert!(projection
+        .lines
+        .iter()
+        .any(|(l, _)| *l == ProfileLineLevel::Success));
+}
+
+#[tokio::test]
+#[cfg(unix)] // settings profiles are unix-only
+async fn typed_profile_close_failure_is_visible_with_failure_status() {
+    use awman::command::commands::agents::{profile::ProfileLineLevel, AgentsOutcome};
+    use awman::command::dispatch::CommandOutcome;
+    let s = TestSandbox::new();
+    let session = session(&s);
+    let runtime = Runtime::new();
+    let engines = engines(&s, &session, runtime.clone());
+    let p = start(&session, "review", runtime.clone()).await;
+    let id = p.execution_id().clone();
+    runtime.resources.lock().unwrap().handle = Some(AgentHandle {
+        id: "backend-id".into(),
+        name: "runtime-renamed-resource".into(),
+        image_tag: "test".into(),
+        started_at: chrono::Utc::now(),
+    });
+    runtime.resources.lock().unwrap().label = Some(id.as_str().into());
+    runtime.resources.lock().unwrap().running = true;
+    runtime.resources.lock().unwrap().unavailable = true;
+    drop(p);
+    let (close, api_lines) = profile_outcome(
+        &session,
+        &engines,
+        true,
+        "close",
+        &["review", "--agent", "claude"],
+    )
+    .await;
+    let close = close.unwrap();
+    assert_eq!(
+        close.exit_code(),
+        1,
+        "typed close failure is a failed command"
+    );
+    let CommandOutcome::Agents(AgentsOutcome::Profile(out)) = &close else {
+        panic!("close must be a profile outcome");
+    };
+    let projection = out.project();
+    let failure = projection.failure.expect("typed failure projected");
+    assert!(!failure.code.is_empty());
+    assert!(projection
+        .lines
+        .iter()
+        .any(|(l, t)| *l == ProfileLineLevel::Error && t.contains(&failure.code)));
+    let emitted: serde_json::Value = serde_json::from_str(&api_lines[0]).unwrap();
+    assert_eq!(emitted, projection.data);
+    assert_eq!(emitted["failure"]["code"], failure.code.as_str());
+}
+
+#[tokio::test]
+async fn profile_commands_refuse_origins_without_owner_authority() {
+    let s = TestSandbox::new();
+    let session = session(&s);
+    let engines = engines(&s, &session, Runtime::new());
+    let (refused, lines) = profile_outcome(&session, &engines, false, "list", &[]).await;
+    assert!(matches!(refused, Err(CommandError::ProfileOwnerRequired)));
+    assert!(lines.is_empty(), "a refused origin emits no profile data");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn automation_command_finalization_waits_for_profile_export_and_records_failure() {
+    use awman::command::automation::{
+        launch::{AutomationHosting, HeadlessRun, StartRequest},
+        results::HeadlessObservation,
+    };
+    use awman::data::{
+        automation::{AutomationMode, CleanupStatus},
+        automation_store::AutomationStore,
+        command_status::CommandStatus,
+    };
+    for fail_export in [false, true] {
+        let s = crate::support::sandbox("command::settings_profiles::automation_command_finalization_waits_for_profile_export_and_records_failure");
+        let session = session(&s);
+        let runtime = Runtime::new();
+        let profile = start(&session, "cleanup", runtime.clone()).await;
+        let execution = profile.execution_id().clone();
+        let definition = first_party("claude").unwrap();
+        let policy = Default::default();
+        let mut run = HeadlessRun::start(
+            StartRequest {
+                command: &["exec", "prompt"],
+                session: &session,
+                definition: &definition,
+                profile: &profile,
+                policy: &policy,
+                mode: AutomationMode::Auto,
+                requested_native: None,
+                runtime: "profile-test".into(),
+                host: Ok(AutomationHosting::Foreground),
+                initial_task: None,
+                interactive: false,
+                channel: None,
+            },
+            "one verified task",
+        )
+        .unwrap();
+        run.launching().unwrap();
+        run.running().unwrap();
+        let finished = run.finish_observed(
+            &HeadlessObservation {
+                identity: Some(NativeSessionId::parse("native-1").unwrap()),
+                outcome: Some(Ok(Some("verified answer".into()))),
+                protocol_error: None,
+            },
+            Ok(0),
+            false,
+        );
+        assert!(finished.failure.is_none(), "{finished:?}");
+        let paths = DataPaths::from_env(session.env()).unwrap();
+        let legacy = awman::data::fs::ApiPaths::from_env(session.env()).unwrap();
+        let db = paths.open_session_store(legacy.root()).unwrap();
+        let store = AutomationStore::open(db.clone()).unwrap();
+        let record = store.read_execution(&execution).unwrap();
+        assert!(store.profile_cleanup_pending(&execution).unwrap());
+        assert_eq!(
+            db.get_command(record.command_id.as_str())
+                .unwrap()
+                .unwrap()
+                .status,
+            CommandStatus::Running
+        );
+        runtime.resources.lock().unwrap().unavailable = fail_export;
+        let cleanup = profile.leave(runtime, TurnStateAtExit::Complete).await;
+        if fail_export {
+            assert_eq!(cleanup.unwrap().state, ProfileState::Closing);
+        } else {
+            assert!(cleanup.unwrap().state.admits_writer());
+        }
+        let saved = db.get_command(record.command_id.as_str()).unwrap().unwrap();
+        assert_eq!(
+            saved.status,
+            if fail_export {
+                CommandStatus::Error
+            } else {
+                CommandStatus::Done
+            }
+        );
+        let result: awman::data::fs::api_db::CommandResult =
+            serde_json::from_str(saved.result.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            result.automation.unwrap().cleanup_status,
+            if fail_export {
+                CleanupStatus::Pending
+            } else {
+                CleanupStatus::Complete
+            }
+        );
+        assert!(!store.profile_cleanup_pending(&execution).unwrap());
+        assert_eq!(
+            AutomationStore::open(db.clone())
+                .unwrap()
+                .read_execution(&execution)
+                .unwrap()
+                .end_failure
+                .is_some(),
+            fail_export
+        );
+        drop(store);
+        drop(db);
+        drop(session);
+        s.finish();
+    }
+}
+
+#[test]
+fn checked_removal_refuses_a_stopped_same_name_replacement() {
+    let runtime = Runtime::new();
+    let observed = AgentHandle {
+        id: "same-name".into(),
+        name: "same-name".into(),
+        image_tag: "fixture".into(),
+        started_at: chrono::Utc::now(),
+    };
+    {
+        let mut r = runtime.resources.lock().unwrap();
+        let mut replacement = observed.clone();
+        replacement.started_at += chrono::Duration::seconds(1);
+        r.handle = Some(replacement);
+        r.label = Some("replacement-execution".into());
+    }
+    assert!(runtime
+        .remove_agent_checked(&observed, "original-execution")
+        .is_err());
+    let r = runtime.resources.lock().unwrap();
+    assert!(r.handle.is_some());
+    assert_eq!(r.removes, 0);
 }
