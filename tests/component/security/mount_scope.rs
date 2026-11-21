@@ -207,8 +207,19 @@ mod authority {
     use awman::frontend::api::command_frontend::ApiDispatchFrontend;
     use awman_test_support::fixtures::{ConfigTree, RepoBuilder};
     use awman_test_support::TestSandbox;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink as symlink_dir;
+    #[cfg(windows)]
+    use std::os::windows::fs::symlink_dir;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+
+    fn remove_dir_link(path: &Path) {
+        #[cfg(unix)]
+        std::fs::remove_file(path).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_dir(path).unwrap();
+    }
 
     /// Every (host, guest) mount of every launch the runtime was asked for.
     #[derive(Default)]
@@ -743,14 +754,14 @@ mod authority {
             let (root, foreign, moved) = (root.clone(), foreign.clone(), moved.clone());
             *w.runtime.during_preparation.lock().unwrap() = Some(Box::new(move || {
                 std::fs::rename(&root, &moved).unwrap();
-                std::os::unix::fs::symlink(&foreign, &root).unwrap();
+                symlink_dir(&foreign, &root).unwrap();
             }));
         }
         refused_with(launch(&w, managed(&w, &id).await, vec![]).await, |e| {
             matches!(e, EngineError::MountOutsideAuthority { .. })
         });
         assert!(w.launches().is_empty(), "{:?}", w.launches());
-        std::fs::remove_file(&root).unwrap();
+        remove_dir_link(&root);
         std::fs::rename(&moved, &root).unwrap();
 
         // A different directory renamed into place: the path still resolves
@@ -816,11 +827,11 @@ mod authority {
         for target in [&plain, &foreign_git] {
             // Redirected before the launch.
             std::fs::rename(&nested_git, &saved).unwrap();
-            std::os::unix::fs::symlink(target, &nested_git).unwrap();
+            symlink_dir(target, &nested_git).unwrap();
             refused_with(launch(&w, managed(&w, &id).await, overlay()).await, |e| {
                 matches!(e, EngineError::MountOutsideAuthority { .. })
             });
-            std::fs::remove_file(&nested_git).unwrap();
+            remove_dir_link(&nested_git);
             std::fs::rename(&saved, &nested_git).unwrap();
 
             // Redirected while the launch is prepared.
@@ -829,13 +840,13 @@ mod authority {
                     (nested_git.clone(), saved.clone(), target.to_path_buf());
                 *w.runtime.during_preparation.lock().unwrap() = Some(Box::new(move || {
                     std::fs::rename(&nested_git, &saved).unwrap();
-                    std::os::unix::fs::symlink(&target, &nested_git).unwrap();
+                    symlink_dir(&target, &nested_git).unwrap();
                 }));
             }
             refused_with(launch(&w, managed(&w, &id).await, overlay()).await, |e| {
                 matches!(e, EngineError::MountOutsideAuthority { .. })
             });
-            std::fs::remove_file(&nested_git).unwrap();
+            remove_dir_link(&nested_git);
             std::fs::rename(&saved, &nested_git).unwrap();
         }
         assert_eq!(
