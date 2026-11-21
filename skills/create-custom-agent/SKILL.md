@@ -49,4 +49,4 @@ Check the definition against the validation table in [`reference.md`](reference.
 
 ## 6. Hand off
 
-Tell the user to run `awman ready --agent <name>` on the host. That step reviews and approves the definition and builds the image. They can then run `awman chat --agent <name>`. They can move the file to `~/.awman/agents/` to use it in every repository. Do not claim the image was built or tested.
+Tell the user to run `awman ready --agent <name>` on the host. That step reviews and approves the definition and builds the image. They can then run `awman chat --agent <name>`. They can move the file to `~/.awman/agents/` to use it in every repository. Do not claim the image was built or tested. To revise a definition later, they can use `awman edit agent <name>`, which does not approve it; it must be approved again with `awman ready --agent <name>`.

@@ -1,5 +1,7 @@
 # WI 0121 evidence register (sections J.1 and J.3)
 
+> Testing policy update (WI144): test commands, harness paths and test counts in this historical record are superseded by [the current testing contract](/aspec/devops/testing.md). Use manifest suites and `make validate-native` for native acceptance. Removed test sources and raw evidence bundles are available only in Git history; they must not be restored as test patterns.
+
 **Scope amendment (2026-09-28):** the user removed all signing and notarization
 requirements. This includes release credentials and explicit ad-hoc signing
 steps. Earlier reports/logs retain their historical wording; those requirements
@@ -520,3 +522,21 @@ verified, and the Apple Silicon boot, signed-artifact and strict-fixture gates
 passed. The x86_64 provider still refuses its direct-mapping consumer until WI 0124
 integrates private-memory boot and isolation coverage. Linux KVM gates remain
 deferred to WI 0124.
+
+## WI 0124 Linux x86_64 acceptance (2026-11-19)
+
+This supersedes the earlier x86_64 refusal/deferred status in this register.
+The builtin runtime now uses private-memory boot and private lifecycle locks;
+Linux ARM64 remains gated. [Full evidence](0124-evidence/notes.md) records commit
+`50cb794ed6a613fefbe114caf8648e0a00db346e`, 19 native suites with 86 passing
+JUnit cases, five additional published-libkrun mapping tests, actual normal-user
+installation, and independent verification of all inventory/results/file digests.
+
+Packet `20261119T172839Z-159092.tar.gz` SHA-256:
+`2f49431756528d8226e4769de5d3a6a1d89919a38d4b7f52842e9e6b49abcbfe`.
+Candidate/installed binary SHA-256:
+`f927569ed069ffc073f4e1a7dafb9317caf419ce8219323e4b02117bd1c85386`.
+The candidate's observed glibc requirement is 2.39 on Debian; Ubuntu 22.04
+release artifacts have a separate enforced 2.35 ceiling. No historical Linux
+builtin release upgrade or newer-upstream native pass is claimed. Saved
+upstream proposals remain unsubmitted; see WI 0120's current reconciliation.

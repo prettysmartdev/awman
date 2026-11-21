@@ -29,6 +29,9 @@ pub(crate) fn print_report(report: &WorkflowPrerequisiteReport) {
 }
 
 impl WorkflowPrerequisiteFrontend for CliFrontend {
+    fn ask_prerequisite_image(&mut self, prompt: &Prompt<bool>) -> Result<bool, CommandError> {
+        self.pick_from_prompt(prompt)
+    }
     /// `--json` prints nothing here: the outcome carries the report. Only a
     /// report that questions follow asks Continue/Abort, after saying what
     /// continuing leads to; a check-only or headless report is just printed.
@@ -141,7 +144,7 @@ impl WorkflowPrerequisiteFrontend for CliFrontend {
     }
 
     /// Never approved without a person: `--yes`, `--json` and
-    /// `--non-interactive` all decline.
+    /// `--headless` all decline.
     fn confirm_prerequisite_host_command(
         &mut self,
         _review: &HostSecretCommandReview,
@@ -151,62 +154,5 @@ impl WorkflowPrerequisiteFrontend for CliFrontend {
             return Ok(TrustDecision::Decline);
         }
         self.pick_from_prompt(prompt)
-    }
-}
-
-#[cfg(test)]
-mod wi0149_tests {
-    use super::*;
-    use crate::data::workflow_prerequisites::*;
-    #[test]
-    fn wi0149_cli_prerequisite_defaults_are_the_command_prompts_defaults() {
-        let matches = crate::command::dispatch::catalogue::CommandCatalogue::get()
-            .build_clap_command()
-            .try_get_matches_from(["awman", "exec", "workflow", "wf.toml", "--non-interactive"])
-            .unwrap();
-        let mut cli = CliFrontend::new(matches);
-        let check = PrerequisiteCheck {
-            prerequisite: WorkflowPrerequisite::GitIdentity,
-            status: PrerequisiteStatus::Missing,
-            explanation: "fixture".into(),
-            needed_by: vec![],
-            remediations: vec![],
-        };
-        assert!(!cli.can_ask_prerequisites());
-        let p = crate::command::prompts::prerequisite_identity(&check);
-        assert_eq!(
-            cli.ask_prerequisite_identity(&p).unwrap(),
-            p.default_on_dismiss.unwrap()
-        );
-        let p = crate::command::prompts::prerequisite_identity_persist("git config --local");
-        assert_eq!(
-            cli.ask_prerequisite_identity_persist(&p).unwrap(),
-            p.default_on_dismiss.unwrap()
-        );
-        let p = crate::command::prompts::prerequisite_ssh(&check, "github.com:org/repo");
-        assert_eq!(
-            cli.ask_prerequisite_ssh(&p).unwrap(),
-            p.default_on_dismiss.unwrap()
-        );
-        let p = crate::command::prompts::prerequisite_token_consent(&check, "GH_TOKEN");
-        assert_eq!(
-            cli.ask_prerequisite_token_consent(&p).unwrap(),
-            p.default_on_dismiss.unwrap()
-        );
-        let p = crate::command::prompts::prerequisite_token_source(&check);
-        assert_eq!(
-            cli.ask_prerequisite_token_source(&p).unwrap(),
-            p.default_on_dismiss.unwrap()
-        );
-        let p = crate::command::prompts::prerequisite_missing_tool(&check);
-        assert_eq!(
-            cli.ask_prerequisite_tool(&p).unwrap(),
-            p.default_on_dismiss.unwrap()
-        );
-        let p = crate::command::prompts::prerequisite_gap(&check);
-        assert_eq!(
-            cli.ask_prerequisite_gap(&p).unwrap(),
-            p.default_on_dismiss.unwrap()
-        );
     }
 }

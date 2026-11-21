@@ -8,8 +8,6 @@ use crate::data::error::DataError;
 use crate::engine::error::{run_checked, EngineError};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::time::Duration;
 
 pub const SOCKET_PATH_LIMIT: usize = 103;
 
@@ -63,13 +61,6 @@ impl BuiltinPaths {
         super::blocking::BlockingOperation::run(move || state.lock().map_err(state_error))
     }
 
-    /// Serialises image imports, which can take minutes, without blocking
-    /// catalog readers such as `awman agents status`.
-    #[cfg(test)]
-    pub fn import_lock(&self) -> Result<File, EngineError> {
-        self.state().import_lock().map_err(state_error)
-    }
-
     pub fn import_lock_cancellable(
         &self,
         cancel: &crate::engine::oci::CancelToken,
@@ -94,13 +85,6 @@ impl BuiltinPaths {
     pub fn image_lease(&self, image: &str, exclusive: bool) -> Result<File, EngineError> {
         self.state()
             .image_lease(image, exclusive)
-            .map_err(state_error)
-    }
-
-    #[cfg(test)]
-    fn lock_named(&self, name: &str, wait: Duration) -> Result<File, EngineError> {
-        self.state()
-            .lock_controlled(name, wait, false, || Ok(()))
             .map_err(state_error)
     }
 
@@ -136,86 +120,3 @@ impl BuiltinPaths {
         Ok(())
     }
 }
-
-#[cfg(test)]
-fn check_socket_budget(home: &Path) -> Result<(), EngineError> {
-    BuiltinPaths {
-        home: home.to_path_buf(),
-    }
-    .check_socket_budget()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Instant;
-
-    #[test]
-    fn import_lock_wait_observes_cancellation() {
-        let temp = tempfile::tempdir_in("/tmp").unwrap();
-        let paths = BuiltinPaths::resolve(&temp.path().join("s")).unwrap();
-        let held = paths.import_lock().unwrap();
-        let token = crate::engine::oci::CancelToken::new();
-        let signal = token.clone();
-        let canceller = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            signal.cancel();
-        });
-        let start = Instant::now();
-        let err = paths.import_lock_cancellable(&token).unwrap_err();
-        canceller.join().unwrap();
-        assert!(crate::engine::oci::retry::is_cancelled(&err));
-        assert!(start.elapsed() < Duration::from_secs(2));
-        drop(held);
-        assert!(paths.import_lock().is_ok());
-    }
-
-    #[test]
-    fn full_socket_budget_counts_utf8_bytes() {
-        assert!(check_socket_budget(Path::new("/short")).is_ok());
-        assert!(check_socket_budget(Path::new(&format!("/{}", "é".repeat(35)))).is_err());
-    }
-    #[test]
-    fn socket_budget_includes_the_longest_sdk_compatibility_endpoint() {
-        let suffix = "/run/agent/00000000000000000000000000000000.control.sock";
-        let root = format!("/{}", "a".repeat(SOCKET_PATH_LIMIT - suffix.len() - 1));
-        assert!(check_socket_budget(Path::new(&root)).is_ok());
-        assert!(check_socket_budget(Path::new(&(root + "a"))).is_err());
-        let paths = BuiltinPaths {
-            home: "/private".into(),
-        };
-        assert_ne!(
-            paths.attach("same-name", "old-owner"),
-            paths.attach("same-name", "new-owner")
-        );
-        assert_eq!(
-            paths.attach("../escape", "owner").parent().unwrap(),
-            Path::new("/private/attach")
-        );
-    }
-
-    #[test]
-    fn busy_lock_times_out_with_a_clear_error() {
-        let temp = tempfile::tempdir_in("/tmp").unwrap();
-        let paths =
-            BuiltinPaths::resolve(&temp.path().canonicalize().unwrap().join("state")).unwrap();
-        let _held = paths.lock().unwrap();
-        assert!(matches!(
-            paths.lock_named("awman.lock", Duration::from_millis(100)),
-            Err(EngineError::BuiltinRuntimeUnavailable { reason }) if reason.contains("busy")
-        ));
-        // The import lock is independent of the catalog lock.
-        assert!(paths.import_lock().is_ok());
-    }
-
-    #[test]
-    fn a_hostile_state_root_maps_to_a_config_error() {
-        assert!(matches!(
-            BuiltinPaths::resolve(Path::new("relative")),
-            Err(EngineError::Config(_))
-        ));
-    }
-}
-
-#[cfg(test)]
-mod hardening_tests;

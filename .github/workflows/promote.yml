@@ -1,0 +1,359 @@
+# Release promote: same-bytes promotion of a validated candidate, then
+# post-publish verification from the public URL (design 12.1, 16.3-16.5;
+# WI 0144 sections 5.1, 5.5, 6.5).
+#
+# This workflow compiles, tests and signs NOTHING. Every decision is made by
+# the controller binary that candidate.yml built from its protected revision
+# and attested; it is downloaded, its attestation verified, then run. The
+# final tag and publication use the dedicated release GitHub App identity
+# (the `v*` tag ruleset allowlists that App, not GitHub Actions), held only by
+# the `publish` job, which re-verifies everything inside the publication lock
+# immediately before each irreversible call. Tag and publish are idempotent:
+# an interrupted promotion is resumed by running this workflow again.
+name: Release promote
+run-name: Promote ${{ inputs.version }} candidate ${{ inputs.candidate }}${{ inputs.dry_run && ' [rehearsal]' || '' }}
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+      commit:
+        type: string
+        required: true
+      candidate:
+        type: string
+        required: true
+      dry_run:
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version (vX.Y.Z)
+        type: string
+        required: true
+      commit:
+        description: Candidate commit (full SHA)
+        type: string
+        required: true
+      candidate:
+        description: Candidate number being promoted
+        type: string
+        required: true
+      dry_run:
+        description: Verify everything, create no tag, publish nothing
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  VERSION: ${{ inputs.version }}
+  COMMIT: ${{ inputs.commit }}
+  CANDIDATE: ${{ inputs.candidate }}
+  DRY_RUN: ${{ inputs.dry_run }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Re-download every asset, SHA-256 against release-state.json and
+  # SHA256SUMS, verify attestations, every required gate ID passed for this
+  # commit and manifest version, evidence unexpired, commit still an ancestor
+  # of main, no expired quarantine/override, notes/entitlement/manifest equal
+  # to main's.
+  verify-inputs:
+    name: Verify the candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+      attestations: read
+    outputs:
+      targets: ${{ steps.verify.outputs.targets }}
+      published: ${{ steps.verify.outputs.published }}
+      source_run: ${{ steps.verify.outputs.source_run }}
+      validation_run: ${{ steps.verify.outputs.validation_run }}
+      nextest_url: ${{ steps.verify.outputs.nextest_url }}
+      nextest_sha256: ${{ steps.verify.outputs.nextest_sha256 }}
+    steps:
+      - &main
+        name: Check out main (current release policy; never built or run)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: main
+          persist-credentials: false
+      - &controller
+        name: Download the attested controller of the candidate run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$DRY_RUN" = true ]; then record="candidate-record-rehearsal-$VERSION-c$CANDIDATE"; else record="candidate-record-$VERSION-c$CANDIDATE"; fi
+          run_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$record&per_page=100" \
+            --jq '[.artifacts[] | select(.workflow_run.head_branch == "main" and (.expired | not))] | max_by(.id) | .workflow_run.id')
+          [ -n "$run_id" ] && [ "$run_id" != null ] || { echo "FAILED: no retained record $record; the candidate was abandoned or expired"; exit 1; }
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n release-controller -D controller-bin
+          gh attestation verify controller-bin/xtask --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/candidate.yml" --source-ref refs/heads/main
+          chmod +x controller-bin/xtask
+          if [ "$DRY_RUN" = true ]; then
+            echo "NAMESPACE_ARGS=--dry-run --namespace rehearsal/$run_id" >> "$GITHUB_ENV"
+          else
+            echo "NAMESPACE_ARGS=--namespace production" >> "$GITHUB_ENV"
+          fi
+      - name: Verify inputs
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # shellcheck disable=SC2086 # NAMESPACE_ARGS is two or three words by construction
+          controller-bin/xtask release promote verify-inputs --version "$VERSION" --commit "$COMMIT" \
+            --candidate "$CANDIDATE" $NAMESPACE_ARGS --main-checkout main --out verify
+
+  # The only job holding the publication identity and lock. Rechecks every
+  # input inside the lock, creates the annotated tag at the candidate commit
+  # if absent (fails if present elsewhere), freezes release-state.json and
+  # publishes the draft. A rehearsal never reaches this job.
+  publish:
+    name: Tag and publish
+    needs: verify-inputs
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
+    concurrency:
+      group: publish-${{ github.repository }}-${{ inputs.version }}
+      cancel-in-progress: false
+    steps:
+      - name: Promotion identity is configured
+        env:
+          CLIENT_ID: ${{ vars.AWMAN_RELEASE_APP_CLIENT_ID }}
+          HAS_KEY: ${{ secrets.AWMAN_RELEASE_APP_PRIVATE_KEY != '' }}
+        run: |
+          [ -n "$CLIENT_ID" ] && [ "$HAS_KEY" = true ] || {
+            echo "BLOCKED: the release GitHub App (vars.AWMAN_RELEASE_APP_CLIENT_ID, secrets.AWMAN_RELEASE_APP_PRIVATE_KEY) is not configured (pending-cutover P6); nothing was tagged or published"
+            exit 1
+          }
+      - name: Mint the short-lived promotion token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.AWMAN_RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AWMAN_RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+      -
+        name: Check out main (current release policy; never built or run)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: main
+          persist-credentials: false
+      -
+        name: Download the attested controller of the candidate run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$DRY_RUN" = true ]; then record="candidate-record-rehearsal-$VERSION-c$CANDIDATE"; else record="candidate-record-$VERSION-c$CANDIDATE"; fi
+          run_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$record&per_page=100" \
+            --jq '[.artifacts[] | select(.workflow_run.head_branch == "main" and (.expired | not))] | max_by(.id) | .workflow_run.id')
+          [ -n "$run_id" ] && [ "$run_id" != null ] || { echo "FAILED: no retained record $record; the candidate was abandoned or expired"; exit 1; }
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n release-controller -D controller-bin
+          gh attestation verify controller-bin/xtask --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/candidate.yml" --source-ref refs/heads/main
+          chmod +x controller-bin/xtask
+          if [ "$DRY_RUN" = true ]; then
+            echo "NAMESPACE_ARGS=--dry-run --namespace rehearsal/$run_id" >> "$GITHUB_ENV"
+          else
+            echo "NAMESPACE_ARGS=--namespace production" >> "$GITHUB_ENV"
+          fi
+      - name: Create the annotated tag at the candidate commit
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          # shellcheck disable=SC2086
+          controller-bin/xtask release promote tag --version "$VERSION" --commit "$COMMIT" \
+            --candidate "$CANDIDATE" $NAMESPACE_ARGS --main-checkout main --out promote
+      - name: Publish the draft (same bytes; no asset is uploaded or changed)
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          # shellcheck disable=SC2086
+          controller-bin/xtask release promote publish --version "$VERSION" --commit "$COMMIT" \
+            --candidate "$CANDIDATE" $NAMESPACE_ARGS --main-checkout main --out promote
+
+  # Post-publish verification on every target's native OS (macOS on the
+  # release Mac): download from the public URL without credentials, check
+  # SHA256SUMS and the attestation, smoke the binary, and boot the published
+  # Mac binary with the prebuilt artifact harness. Never modifies the release.
+  # A rehearsal verifies the candidate run's bytes instead.
+  verify:
+    name: Verify ${{ matrix.target.asset }}
+    needs: [verify-inputs, publish]
+    if: ${{ github.ref == 'refs/heads/main' && always() && needs.verify-inputs.result == 'success' && (needs.publish.result == 'success' || inputs.dry_run) }}
+    runs-on: ${{ matrix.target.runs_on }}
+    timeout-minutes: 45
+    environment: release
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.verify-inputs.outputs.targets) }}
+    env:
+      ASSET: ${{ matrix.target.asset }}
+      WANT: ${{ matrix.target.sha256 }}
+      SOURCE_RUN: ${{ needs.verify-inputs.outputs.source_run }}
+      VALIDATION_RUN: ${{ needs.verify-inputs.outputs.validation_run }}
+    steps:
+      - name: Check out the candidate commit (workspace map for the prebuilt harness)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit }}
+          path: candidate
+          persist-credentials: false
+          clean: true
+      - name: Download the published bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p pub
+          if [ "$DRY_RUN" = true ]; then
+            gh run download "$SOURCE_RUN" --repo "$GITHUB_REPOSITORY" -n "candidate-$ASSET" -D in
+            cp "in/$ASSET" "pub/$ASSET"
+            gh run download "$SOURCE_RUN" --repo "$GITHUB_REPOSITORY" -n "candidate-record-rehearsal-$VERSION-c$CANDIDATE" -D record
+            cp record/SHA256SUMS pub/SHA256SUMS
+          else
+            base="https://github.com/$GITHUB_REPOSITORY/releases/download/$VERSION"
+            curl --fail --silent --show-error --location --retry 3 -o "pub/$ASSET" "$base/$ASSET"
+            curl --fail --silent --show-error --location --retry 3 -o pub/SHA256SUMS "$base/SHA256SUMS"
+          fi
+      - name: SHA256SUMS
+        id: sums
+        run: |
+          if command -v sha256sum > /dev/null; then got=$(sha256sum "pub/$ASSET" | cut -d' ' -f1); else got=$(shasum -a 256 "pub/$ASSET" | cut -d' ' -f1); fi
+          echo "sha256=$got" >> "$GITHUB_OUTPUT"
+          grep -qxF "$got  $ASSET" pub/SHA256SUMS || { echo "FAILED: $ASSET is not listed with $got in SHA256SUMS"; exit 1; }
+          [ "$got" = "$WANT" ] || { echo "FAILED: published $ASSET is $got, validated bytes are $WANT"; exit 1; }
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+      - name: Attestation
+        id: attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "pub/$ASSET" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/candidate.yml" --source-ref refs/heads/main
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+      - name: Smoke
+        id: smoke
+        run: |
+          chmod +x "pub/$ASSET"
+          home=$(mktemp -d)
+          out=$(HOME="$home" USERPROFILE="$home" "pub/$ASSET" --version)
+          echo "$out"
+          case "$out" in *"${VERSION#v}"*) ;; *) echo "FAILED: $ASSET --version does not report ${VERSION#v}"; exit 1 ;; esac
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+      - name: Boot the published Mac binary (prebuilt harness, exact bytes, offline)
+        id: boot
+        if: ${{ runner.os == 'macOS' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The manifest's pinned [tools.nextest] archive, from verify-inputs.
+          NEXTEST_URL: ${{ needs.verify-inputs.outputs.nextest_url }}
+          NEXTEST_SHA256: ${{ needs.verify-inputs.outputs.nextest_sha256 }}
+        run: |
+          test "$(sysctl -n kern.hv_support)" = 1 || { echo "BLOCKED: no Hypervisor.framework on this runner; a hosted Mac is a VM and cannot boot a guest"; exit 1; }
+          gh run download "$VALIDATION_RUN" --repo "$GITHUB_REPOSITORY" -n "verify-harness-$ASSET" -D harness
+          curl --fail --silent --show-error --location -o nextest.tar.gz "$NEXTEST_URL"
+          [ "$(shasum -a 256 nextest.tar.gz | cut -d' ' -f1)" = "$NEXTEST_SHA256" ] || { echo "FAILED: nextest archive digest mismatch"; exit 1; }
+          mkdir -p nextest && tar -xzf nextest.tar.gz -C nextest
+          archive=$(find harness -name '*.tar.zst' | head -1)
+          [ -n "$archive" ] || { echo "BLOCKED: verify harness archive missing from run $VALIDATION_RUN"; exit 1; }
+          AWMAN_TEST_TIER=artifact AWMAN_TEST_HOST_RESOURCES=offline,hypervisor \
+          AWMAN_TEST_ARTIFACT="$PWD/pub/$ASSET" AWMAN_TEST_ARTIFACT_SHA256="$WANT" \
+          AWMAN_TEST_EVIDENCE_DIR="$PWD/boot-evidence" \
+            nextest/cargo-nextest nextest run --archive-file "$archive" --workspace-remap candidate \
+            --no-default-filter -E 'package(=awman-cli) & binary(=artifact) & test(/^signed_boot::/)'
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+      - name: Result
+        if: ${{ always() }}
+        env:
+          GOT: ${{ steps.sums.outputs.sha256 }}
+          SUMS: ${{ steps.sums.outputs.ok == 'true' }}
+          ATT: ${{ steps.attestation.outputs.ok == 'true' }}
+          SMOKE: ${{ steps.smoke.outputs.ok == 'true' }}
+          BOOT: ${{ runner.os == 'macOS' && (steps.boot.outputs.ok == 'true' && 'true' || 'false') || 'null' }}
+        run: |
+          mkdir -p result
+          printf '{"asset":"%s","sha256":"%s","sums_ok":%s,"attestation_ok":%s,"smoke_ok":%s,"boot_ok":%s}\n' \
+            "$ASSET" "${GOT:-}" "$SUMS" "$ATT" "$SMOKE" "$BOOT" > "result/verified-$ASSET.json"
+          cat "result/verified-$ASSET.json"
+      - if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verified-${{ matrix.target.asset }}
+          path: result/
+          retention-days: 90
+          overwrite: true
+
+  # The authenticated receipt state::query derives `verified` from: re-checks
+  # the public bytes on the controller and requires every target's result.
+  receipt:
+    name: Verification receipt
+    needs: [verify-inputs, verify]
+    if: ${{ github.ref == 'refs/heads/main' && always() && needs.verify-inputs.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+      attestations: read
+    steps:
+      -
+        name: Download the attested controller of the candidate run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$DRY_RUN" = true ]; then record="candidate-record-rehearsal-$VERSION-c$CANDIDATE"; else record="candidate-record-$VERSION-c$CANDIDATE"; fi
+          run_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$record&per_page=100" \
+            --jq '[.artifacts[] | select(.workflow_run.head_branch == "main" and (.expired | not))] | max_by(.id) | .workflow_run.id')
+          [ -n "$run_id" ] && [ "$run_id" != null ] || { echo "FAILED: no retained record $record; the candidate was abandoned or expired"; exit 1; }
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n release-controller -D controller-bin
+          gh attestation verify controller-bin/xtask --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/candidate.yml" --source-ref refs/heads/main
+          chmod +x controller-bin/xtask
+          if [ "$DRY_RUN" = true ]; then
+            echo "NAMESPACE_ARGS=--dry-run --namespace rehearsal/$run_id" >> "$GITHUB_ENV"
+          else
+            echo "NAMESPACE_ARGS=--namespace production" >> "$GITHUB_ENV"
+          fi
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: verified-*
+          path: results
+      - name: Receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # shellcheck disable=SC2086
+          controller-bin/xtask release verify public --version "$VERSION" --candidate "$CANDIDATE" \
+            $NAMESPACE_ARGS --results results --out receipt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.dry_run && 'rehearsal-verified-' || 'release-verified-' }}${{ inputs.version }}
+          path: receipt/receipt.json
+          retention-days: 90
+          overwrite: true

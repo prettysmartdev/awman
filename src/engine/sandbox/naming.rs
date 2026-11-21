@@ -34,34 +34,3 @@ pub fn worktree_hash(workspace: &std::path::Path) -> String {
     }
     format!("{:08x}", hash & 0xffff_ffff)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generate_sandbox_name_is_deterministic() {
-        let a = generate_sandbox_name("abc123", "claude");
-        let b = generate_sandbox_name("abc123", "claude");
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn generate_sandbox_name_format() {
-        let name = generate_sandbox_name("deadbeef", "gemini");
-        assert_eq!(name, "awman-deadbeef-gemini");
-        assert!(name.starts_with("awman-"), "name must start with awman-");
-    }
-
-    #[test]
-    fn generate_sandbox_name_different_inputs_differ() {
-        let a = generate_sandbox_name("hash1", "claude");
-        let b = generate_sandbox_name("hash2", "claude");
-        let c = generate_sandbox_name("hash1", "gemini");
-        assert_ne!(
-            a, b,
-            "different worktree hashes must produce different names"
-        );
-        assert_ne!(a, c, "different agents must produce different names");
-    }
-}

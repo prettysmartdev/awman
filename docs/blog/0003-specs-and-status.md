@@ -11,12 +11,12 @@ The `amux specs` subcommands added in v0.3 consolidate and expand its spec autho
 ```sh
 amux specs new               # same as before
 amux specs new --interview   # new: agent helps you complete the spec based on a short description
-amux specs amend 0025        # new: agent helps you update spec to match how it was implemented
+amux edit spec 0025 --amend  # new: agent helps you update spec to match how it was implemented
 ```
 
 `--interview` is the one I've been wanting for a while. When you need to create a new work item, amux will run your agent based on a short description, and expand it into a first draft of the spec — what problem you're solving, what it should do in edge cases, what the constraints are. It fills in the spec Markdown so you can refine it. The result is a much more complete work item without having to write it from scratch. I've found it's particularly useful when I know roughly what I want but haven't thought through the details yet — the agent surface things I would have left blank or forgotten. The first draft isn't always exactly what you want, but editing a good starting point is much faster than starting from scratch.
 
-`specs amend` is at the other end of the workflow - it runs your agent against a completed work item after the implementation is verified and tested. It reads the spec and the current state of the codebase and updates the spec to accurately reflect what was built. Not every work item warrants this, but for anything that will have ongoing maintenance or gets referenced in future specs, keeping them accurate is worth the two minutes it takes. This is especially useful when you need to go back-and-forth with your agent after initial implementation to iron out small bugs or edge cases.
+`edit spec --amend` is at the other end of the workflow - it runs your agent against a completed work item after the implementation is verified and tested. It reads the spec and the current state of the codebase and updates the spec to accurately reflect what was built. Not every work item warrants this, but for anything that will have ongoing maintenance or gets referenced in future specs, keeping them accurate is worth the two minutes it takes. This is especially useful when you need to go back-and-forth with your agent after initial implementation to iron out small bugs or edge cases.
 
 ## `amux status`
 

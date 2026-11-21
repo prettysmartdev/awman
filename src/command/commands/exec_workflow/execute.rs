@@ -22,17 +22,55 @@ impl Command for ExecWorkflowCommand {
         }
         // Early flag validation (Layer 2) — runs before any IO for both the
         // dynamic and non-dynamic paths. Surfaces an error message and aborts.
-        if let Err(e) = validate_dynamic_flags(&self.flags) {
+        if let Err(e) =
+            validate_dynamic_flags(&self.flags, self.session.inline_work_item().is_some())
+        {
             frontend.write_message(UserMessage {
                 level: MessageLevel::Error,
                 text: format!("exec workflow: {e}"),
             });
             return Err(e);
         }
+        // Read-only workspace (WI 0152), command level: refused with
+        // --dynamic or on a runtime that cannot enforce it, before any IO.
+        // The per-step field is checked once the workflow file is loaded.
+        let command_access = crate::command::commands::workspace_access::effective_access(
+            self.workspace_access,
+            &self.engines.agent_engine,
+        );
+        if let Err(e) = crate::command::commands::workspace_access::check_workflow_flags(
+            self.workspace_access,
+            self.flags.dynamic,
+        )
+        .and_then(|()| {
+            crate::command::commands::workspace_access::preflight_workspace_access(
+                command_access,
+                self.flags.allow_docker,
+                self.engines.runtime.as_ref(),
+            )
+        }) {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: {e}"),
+            });
+            return Err(e);
+        }
+        if self.workspace_access.is_read_only() {
+            frontend.report_workspace_access(self.workspace_access, None);
+        }
+
+        // Resolve against the invoking checkout before prerequisites, worktree
+        // preparation, setup, or any agent launch. Fail closed on every error.
+        let work_item = crate::command::work_item::WorkItemResolver::new(
+            self.session.clone(),
+            Arc::clone(&self.engines.git_engine),
+        )
+        .resolve(self.flags.work_item.as_deref(), &mut *frontend)
+        .await?;
 
         // Dynamic mode: a leader agent designs the workflow, then it executes.
         if self.flags.dynamic {
-            return self.run_dynamic(frontend).await;
+            return self.run_dynamic(frontend, work_item).await;
         }
         let mut frontend = SharedWorkflowFrontend::new(frontend);
 
@@ -76,7 +114,7 @@ impl Command for ExecWorkflowCommand {
             });
             return Err(err);
         }
-        let mut workflow = match Workflow::load(&workflow_path) {
+        let workflow = match Workflow::load(&workflow_path) {
             Ok(w) => w,
             Err(e) => {
                 let err = CommandError::Other(format!("loading workflow: {e}"));
@@ -87,6 +125,28 @@ impl Command for ExecWorkflowCommand {
                 return Err(err);
             }
         };
+
+        if !self.profile_owner
+            && (self.settings_profile.is_some()
+                || workflow.steps.iter().any(|s| s.settings_profile.is_some()))
+        {
+            return Err(CommandError::ProfileOwnerRequired);
+        }
+        // Read-only workspace (WI 0152), workflow level: one read-only step
+        // on a runtime that cannot honour it fails here, before prerequisites,
+        // the worktree or setup — not midway through the run.
+        if let Err(e) = crate::command::commands::workspace_access::preflight_workflow_access(
+            &workflow,
+            command_access,
+            self.flags.allow_docker,
+            self.engines.runtime.as_ref(),
+        ) {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: {e}"),
+            });
+            return Err(e);
+        }
 
         // Custom agent definitions are reviewed once per distinct agent
         // before anything resolves them (the preflight below included).
@@ -100,14 +160,50 @@ impl Command for ExecWorkflowCommand {
             return Err(e);
         }
 
-        // Workflow prerequisites (WI 0149): what the teardown steps need is
-        // checked, asked about and granted now, before the worktree, the
-        // image or any container exists. `--check-prerequisites` ends here.
-        let prerequisite_needs =
-            crate::data::workflow_prerequisites::WorkflowPrerequisites::from_workflow(&workflow);
+        // ACP compatibility is a workflow-wide pre-flight check.  Do it
+        // before mount scope, worktree preparation, image setup, overlays, or
+        // the workflow engine so `fallback: error` cannot leave partial work.
+        let launch_modes = match frontend.with(|frontend| {
+            validate_workflow_acp_preflight(&workflow, &self.session, &self.flags, frontend)
+        }) {
+            Ok(modes) => modes,
+            Err(e) => return Err(CommandError::from(e)),
+        };
+
+        // Native plan (WI 0070) is workflow-wide too: every agent step must
+        // deliver --plan on its own route, checked before step 1. Independent
+        // of the read-only mount preflight above.
+        if let Err(e) = native_mode_steps(&workflow, &self.session, &self.flags, &launch_modes)
+            .and_then(|steps| {
+                crate::command::commands::workspace_access::preflight_workflow_native_mode(
+                    &steps,
+                    self.flags.plan,
+                    &self.session,
+                    if self.engines.runtime.capabilities().kit_declarative {
+                        crate::engine::agent::definition::RunParadigm::Sandbox
+                    } else {
+                        crate::engine::agent::definition::RunParadigm::Container
+                    },
+                )
+            })
+        {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: {e}"),
+            });
+            return Err(e);
+        }
+
+        // Collect the complete workflow scope before any worktree or agent starts.
+        let preflight =
+            crate::command::commands::workflow_prerequisites::WorkflowPreflightPlan::for_workflow(
+                &workflow,
+                &self.session,
+                &self.flags,
+            )?;
         let prerequisites = match self
             .start_prerequisites(
-                &prerequisite_needs,
+                &preflight,
                 crate::engine::workflow::workflow_name_for(&workflow),
                 &frontend,
             )
@@ -117,7 +213,7 @@ impl Command for ExecWorkflowCommand {
             PrerequisiteStart::CheckOnly(outcome) => return Ok(outcome),
         };
 
-        // Track whether the gemini deprecation warning has already been emitted
+        // Track whether the vendor deprecation warning has already been emitted
         // so we never fire it twice (early CLI check + post-load TOML scan).
         let mut deprecation_warned = false;
         if let Some(agent) = self.flags.agent.as_deref() {
@@ -126,10 +222,7 @@ impl Command for ExecWorkflowCommand {
         }
 
         // Emit deprecation warnings for legacy config fields.
-        frontend.with(|frontend| {
-            LaunchPolicy::for_session(&self.session)
-                .warn_config(&self.engines.config_notices, frontend)
-        });
+        frontend.with(|frontend| LaunchPolicy::for_session(&self.session).warn_config(frontend));
 
         if self.flags.yolo && self.flags.worktree {
             frontend.write_message(UserMessage {
@@ -158,16 +251,6 @@ impl Command for ExecWorkflowCommand {
         frontend.with(|frontend| warn_context_workflow_in_phase(&workflow, frontend));
         let _ = deprecation_warned;
 
-        // ACP compatibility is a workflow-wide pre-flight check.  Do it
-        // before mount scope, worktree preparation, image setup, overlays, or
-        // the workflow engine so `fallback: error` cannot leave partial work.
-        let launch_modes = match frontend.with(|frontend| {
-            validate_workflow_acp_preflight(&workflow, &self.session, &self.flags, frontend)
-        }) {
-            Ok(modes) => modes,
-            Err(e) => return Err(CommandError::from(e)),
-        };
-
         // 2. Resolve mount scope — confirm with the user when cwd differs from git root.
         let cwd = self.session.working_dir().to_path_buf();
         let git_root_for_scope = self.session.git_root().to_path_buf();
@@ -184,111 +267,16 @@ impl Command for ExecWorkflowCommand {
             }
         };
 
-        // 3. Load work item context from --work-item or --issue.
-        // `_issue_temp_file` keeps the temp file alive for the duration of
-        // this function — its Drop impl deletes the file regardless of how
-        // the function exits (success, error, panic).
-        let issue_title_slug: Option<String>;
-        let _issue_temp_file: Option<IssueTempFile>;
-        let issue_overlay: Option<TypedOverlay>;
-
-        let work_item_context = if let Some(ref issue_ref) = self.flags.issue_source.issue {
-            // --issue: fetch issue and construct work item context from it.
-            let router = crate::engine::issue::router::IssueSourceRouter::new(
-                std::sync::Arc::clone(&self.engines.git_engine),
-                self.session.env(),
-            );
-            match frontend.with(|frontend| {
-                router.fetch_issue_with_progress(issue_ref, &git_root_for_scope, frontend)
-            }) {
-                Ok((issue, source)) => {
-                    let work_items_dir = self
-                        .session
-                        .repo_config()
-                        .work_items_dir_or_default(&git_root_for_scope);
-                    let build = match issue_source_overlay(
-                        source,
-                        &issue,
-                        &git_root_for_scope,
-                        &work_items_dir,
-                    ) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            frontend.write_message(UserMessage {
-                                level: MessageLevel::Error,
-                                text: format!(
-                                    "exec workflow: failed to write issue temp file: {e}"
-                                ),
-                            });
-                            return Err(CommandError::Other(format!(
-                                "writing issue temp file: {e}"
-                            )));
-                        }
-                    };
-
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Info,
-                        text: format!(
-                            "exec workflow: fetched issue '{}' ({})",
-                            issue.title, issue.source_id
-                        ),
-                    });
-
-                    issue_overlay = Some(build.overlay);
-                    issue_title_slug = Some(build.slug);
-                    let number = build.number;
-                    let content = build.content;
-                    _issue_temp_file = Some(build.temp_file);
-                    Some(WorkItemContext { number, content })
-                }
-                Err(e) => {
-                    frontend.write_message(UserMessage {
-                        level: MessageLevel::Error,
-                        text: format!("exec workflow: failed to fetch issue: {e}"),
-                    });
-                    return Err(CommandError::Other(e.to_string()));
-                }
-            }
-        } else if let Some(wi_str) = &self.flags.work_item {
-            issue_title_slug = None;
-            _issue_temp_file = None;
-            issue_overlay = None;
-            match parse_work_item_number(wi_str) {
-                Some(number) => {
-                    let path = find_work_item_file(&self.session, &git_root_for_scope, number);
-                    match path.and_then(|p| std::fs::read_to_string(&p).ok()) {
-                        Some(content) => Some(WorkItemContext { number, content }),
-                        None => {
-                            frontend.write_message(crate::data::message::UserMessage {
-                                level: crate::data::message::MessageLevel::Warning,
-                                text: format!(
-                                    "work item file for {:04} not found; \
-                                     {{{{work_item_*}}}} placeholders will be empty",
-                                    number
-                                ),
-                            });
-                            None
-                        }
-                    }
-                }
-                None => {
-                    frontend.write_message(crate::data::message::UserMessage {
-                        level: crate::data::message::MessageLevel::Warning,
-                        text: format!(
-                            "could not parse work item number from {:?}; \
-                             {{{{work_item_*}}}} placeholders will be empty",
-                            wi_str
-                        ),
-                    });
-                    None
-                }
-            }
-        } else {
-            issue_title_slug = None;
-            _issue_temp_file = None;
-            issue_overlay = None;
-            None
-        };
+        // Keep private remote input alive through steps, teardown and cancellation.
+        // Local input continues to use the file in the mounted checkout.
+        let prepared_input = work_item
+            .as_ref()
+            .map(|item| crate::command::work_item::prepare_work_item_input(item, &self.session))
+            .transpose()?;
+        let work_item_context = prepared_input.as_ref().map(|input| input.context.clone());
+        let work_item_overlay = prepared_input
+            .as_ref()
+            .and_then(|input| input.overlay.clone());
         // 4. Worktree prepare (if --worktree is set).
         // When a worktree is used, capture its path so the session below is
         // rooted at the worktree checkout rather than the main repo.
@@ -308,18 +296,7 @@ impl Command for ExecWorkflowCommand {
         let worktree_lifecycle = if self.flags.worktree && !self.session.session_type().is_remote()
         {
             let git_root = self.session.git_root().to_path_buf();
-            // `--issue` names the worktree after the issue slug, `--work-item`
-            // after the number, otherwise the workflow filename. The choice is
-            // `WorktreeLifecycle::name_for`'s; this opens it once (F-51).
-            let worktree_name = WorktreeLifecycle::name_for(
-                issue_title_slug.as_deref(),
-                self.flags
-                    .work_item
-                    .is_some()
-                    .then(|| work_item_context.as_ref().map(|ctx| ctx.number))
-                    .flatten(),
-                &workflow_path,
-            );
+            let worktree_name = WorktreeLifecycle::name_for(work_item.as_ref(), &workflow_path);
             let lifecycle = match WorktreeLifecycle::open(
                 Arc::clone(&self.engines.git_engine),
                 git_root,
@@ -354,7 +331,7 @@ impl Command for ExecWorkflowCommand {
                         &store,
                         &workflow,
                         &workflow_name,
-                        work_item_context.as_ref().map(|c| c.number),
+                        work_item_context.as_ref(),
                         Some(lifecycle.worktree_path()),
                         frontend,
                     )
@@ -442,36 +419,15 @@ impl Command for ExecWorkflowCommand {
                     }
                 }
             }
-            if let Some(overlay) = issue_overlay {
-                all.push(overlay);
-            }
             all
         };
 
-        // 6. Every agent the steps launch needs its image. Ask about each
-        //    one that is missing (set up / fall back to the default agent /
-        //    abort) now, before any setup step or agent container starts.
-        //    Images are tagged by the invoking repo, not the worktree.
-        if let Err(e) = ensure_static_workflow_agent_images(
-            &mut workflow,
-            &self.engines,
-            &self.session,
-            &self.flags,
-            &mut frontend,
-        )
-        .await
-        {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Error,
-                text: format!("exec workflow: {e}"),
-            });
-            return Err(e);
-        }
-
         let prepared = PreparedRun {
+            invocation_id: None,
             workflow,
             workflow_path,
             work_item_context,
+            work_item_overlay,
             cli_typed,
             mount_path,
             worktree_path,
@@ -480,7 +436,6 @@ impl Command for ExecWorkflowCommand {
             git_root_for_scope,
             cwd,
             original_session: self.session,
-            issue_temp_file: _issue_temp_file,
             launch_modes,
             skip_state_resume_prompt: state_resume_settled,
             prerequisites,
@@ -496,6 +451,9 @@ impl Command for ExecWorkflowCommand {
             self.managed_session.as_ref(),
             &self.cancel,
             self.output_dir.as_deref(),
+            self.workspace_access,
+            self.settings_profile.as_ref(),
+            self.profile_owner,
         )
         .await
     }
@@ -517,36 +475,45 @@ pub(crate) fn existing_worktree_choice(
     }
 }
 
-#[cfg(test)]
-mod existing_worktree_choice_tests {
-    use super::existing_worktree_choice;
-    use crate::command::commands::worktree_lifecycle::{
-        ExistingWorktreeChoice as C, ExistingWorktreeDecision as D,
-    };
-
-    #[test]
-    fn explicit_choice_overrides_accepted_dynamic_resume() {
-        use crate::command::headless::HeadlessDefaults;
-
-        for decision in [D::Resume, D::Recreate, D::Fail] {
-            assert_eq!(
-                existing_worktree_choice(Some(decision), true),
-                C::Explicit(decision)
-            );
-        }
-        assert_eq!(existing_worktree_choice(None, true), C::ResumeAccepted);
-        assert_eq!(existing_worktree_choice(None, false), C::Ask);
-
-        // ResumeAccepted is resolved by the host: API fails even for saved
-        // dynamic state, while unattended squad and piped CLI keep resuming.
-        assert_eq!(HeadlessDefaults::api().existing_worktree(), D::Fail);
-        assert_eq!(
-            HeadlessDefaults::squad(
-                crate::command::commands::mount_scope::MountScopeDecision::MountGitRoot
-            )
-            .existing_worktree(),
-            D::Resume
-        );
-        assert_eq!(HeadlessDefaults::cli().existing_worktree(), D::Resume);
+/// Each agent step's route for the `--plan` preflight (WI 0070), resolved
+/// the way the step will launch: agent step > workflow > config, model step
+/// > workflow > config, launch mode from the ACP preflight.
+fn native_mode_steps(
+    workflow: &crate::data::workflow_definition::Workflow,
+    session: &Session,
+    flags: &ExecWorkflowCommandFlags,
+    launch_modes: &std::collections::HashMap<String, crate::data::config::agents::LaunchMode>,
+) -> Result<Vec<crate::command::commands::workspace_access::NativeModeStep>, CommandError> {
+    if !flags.plan {
+        return Ok(Vec::new());
     }
+    let config = workflow_effective_config(session, flags)?;
+    let default_agent = config.agent();
+    let default_model = config.model();
+    workflow
+        .steps
+        .iter()
+        .map(|step| {
+            let name = step
+                .agent
+                .as_deref()
+                .or(workflow.agent.as_deref())
+                .or(default_agent.as_deref())
+                .ok_or_else(|| {
+                    CommandError::Other(format!(
+                        "workflow step '{}' resolves to no agent",
+                        step.name
+                    ))
+                })?;
+            Ok(crate::command::commands::workspace_access::NativeModeStep {
+                step: step.name.clone(),
+                agent: crate::data::session::AgentName::new(name)?,
+                launch_mode: launch_modes.get(&step.name).copied().unwrap_or_default(),
+                non_interactive: flags.non_interactive,
+                model_requested: step.model.is_some()
+                    || workflow.model.is_some()
+                    || default_model.is_some(),
+            })
+        })
+        .collect()
 }

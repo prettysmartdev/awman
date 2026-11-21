@@ -1,5 +1,7 @@
 # awman 0.12: tackle more with your personal squad of agents
 
+> Migration reference: commands and routes below describe this historical release. Removed server commands now produce migration errors; they are retained here to identify upgrade changes. Use [the unified daemon](../16-daemon.md) and [current worker routes](../09-api-and-remote-mode.md) for current instructions.
+
 Much of my day building software isn't the work I'd describe if you asked me what I do. It's the triage, the dependency and pipeline management, the PR that went red on a merge conflict, the issue that needs a rough plan before anyone can pick it up. Each thing takes only a few minutes, but together they eat up significant chunks of my day. Even with the multiplicative effort of parallel agents, the thing I actually wanted to build often gets pushed down the stack while I ensure the "glue work" gets done. 
 
 Agents have taken on huge amounts of complex software development for a while now, but every one of them requires that I kick things off with a prompt or a spec (which interrupts some other line of thinking and forces a context switch). My goal with awman v0.12 was to drastically reduce the amount of time I need to spend thinking about procedural glue work throughout my day.

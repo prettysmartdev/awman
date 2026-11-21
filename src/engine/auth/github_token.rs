@@ -80,7 +80,7 @@ pub trait TokenProbeSource: Send + Sync {
     fn gh_on_path(&self) -> Option<PathBuf>;
     fn host_gh_status(&self, host: &str) -> GhAuthStatus;
     fn verify(&self, token: &SecretString, host: &str) -> TokenVerification;
-    /// Optional value access for verification and non-interactive refresh.
+    /// Optional value access for verification and headless refresh.
     /// Defaults let name-only probe fakes remain valid without reading the host env.
     fn env_token(&self, _var: &str) -> Option<SecretString> {
         None
@@ -160,8 +160,15 @@ impl GitHubTokenResolver {
 
     /// `which("gh")`; under test isolation only a fake inside the temp dir counts.
     pub fn gh_on_path(&self) -> Option<PathBuf> {
-        let found = which::which("gh").ok().filter(|p| p.is_absolute())?;
-        if test_isolation_active() && !inside_temp_dir(&found) {
+        let snapshot = self
+            .env
+            .clone()
+            .unwrap_or_else(crate::engine::host_cli::process_env);
+        let found = crate::engine::host_cli::program_in(&snapshot, "gh");
+        if !found.is_file() {
+            return None;
+        }
+        if test_isolation_active() && !inside_temp_dir_in(&snapshot, &found) {
             return None;
         }
         Some(found)
@@ -235,7 +242,13 @@ impl GitHubTokenResolver {
         command.stdin = HostStdin::Tty;
         command.timeout = HOST_SECRET_TIMEOUT_MAX;
         command.expect_secret = false;
-        HostSecretCommand::new(command)?.outside_repository(self.repository_root.as_deref())
+        HostSecretCommand::new_in(
+            command,
+            self.env
+                .clone()
+                .unwrap_or_else(crate::engine::host_cli::process_env),
+        )?
+        .outside_repository(self.repository_root.as_deref())
     }
 
     /// The configured `acquire` argv. Approval of a repo-scoped command is
@@ -248,14 +261,19 @@ impl GitHubTokenResolver {
     ) -> Result<HostSecretCommand, HostSecretCommandError> {
         let program = acquire.argv.first().cloned().unwrap_or_default();
         let ellipsis = if acquire.argv.len() > 1 { " …" } else { "" };
-        HostSecretCommand::new(HostSecretCommandOptions {
-            argv: acquire.argv.clone(),
-            label: format!("configured token command ({program}{ellipsis})"),
-            timeout: Duration::from_secs(acquire.timeout_secs),
-            stdin,
-            refused_binaries: refused_binaries.to_vec(),
-            expect_secret: true,
-        })?
+        HostSecretCommand::new_in(
+            HostSecretCommandOptions {
+                argv: acquire.argv.clone(),
+                label: format!("configured token command ({program}{ellipsis})"),
+                timeout: Duration::from_secs(acquire.timeout_secs),
+                stdin,
+                refused_binaries: refused_binaries.to_vec(),
+                expect_secret: true,
+            },
+            self.env
+                .clone()
+                .unwrap_or_else(crate::engine::host_cli::process_env),
+        )?
         .outside_repository(self.repository_root.as_deref())
     }
 
@@ -329,7 +347,13 @@ impl GitHubTokenResolver {
         options.stdin = stdin;
         options.timeout = timeout;
         options.expect_secret = expect_secret;
-        HostSecretCommand::new(options)?.outside_repository(self.repository_root.as_deref())
+        HostSecretCommand::new_in(
+            options,
+            self.env
+                .clone()
+                .unwrap_or_else(crate::engine::host_cli::process_env),
+        )?
+        .outside_repository(self.repository_root.as_deref())
     }
 }
 
@@ -396,9 +420,9 @@ pub(crate) fn valid_host(host: &str) -> bool {
             .is_none_or(|p| !p.is_empty() && p.len() <= 5 && p.chars().all(|c| c.is_ascii_digit()))
 }
 
-fn inside_temp_dir(path: &Path) -> bool {
+fn inside_temp_dir_in(snapshot: &EnvSnapshot, path: &Path) -> bool {
     let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    canonical(path).starts_with(canonical(&std::env::temp_dir()))
+    canonical(path).starts_with(canonical(&snapshot.temp_dir()))
 }
 
 fn verify_url(host: &str) -> String {
@@ -479,121 +503,3 @@ fn verify_blocking(url: &str, token: &SecretString, timeout: Duration) -> TokenV
         Err(_) => unknown("GitHub API response did not parse".into()),
     }
 }
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    fn resolver(env: &[(&str, &str)], vars: &[&str]) -> GitHubTokenResolver {
-        GitHubTokenResolver::new(GitHubTokenResolverOptions {
-            env_vars: vars.iter().map(|s| s.to_string()).collect(),
-            ..Default::default()
-        })
-        .with_env_snapshot(EnvSnapshot::with_overrides(env.iter().copied()))
-    }
-
-    #[test]
-    fn env_lookup_follows_configured_order_and_skips_empty() {
-        let r = resolver(
-            &[
-                ("GH_TOKEN", " "),
-                ("GITHUB_TOKEN", "ghp_x1"),
-                ("OTHER", "o"),
-            ],
-            &["GH_TOKEN", "GITHUB_TOKEN", "OTHER"],
-        );
-        assert_eq!(r.env_token_name().as_deref(), Some("GITHUB_TOKEN"));
-        assert_eq!(r.env_token("GITHUB_TOKEN").unwrap().expose(), "ghp_x1");
-        assert!(r.env_token("GH_TOKEN").is_none());
-        assert_eq!(
-            TokenProbeSource::env_token_name(&r, &["OTHER".into()]).as_deref(),
-            Some("OTHER")
-        );
-        assert!(!format!("{r:?}").contains("ghp_x1"));
-    }
-
-    #[test]
-    fn verification_is_disabled_under_test_isolation() {
-        let r = resolver(&[], &[]);
-        assert_eq!(
-            r.verify(&SecretString::new("ghp_whatever")),
-            TokenVerification::Unknown {
-                reason: "test isolation".into()
-            }
-        );
-        assert_eq!(verify_url("github.com"), "https://api.github.com/user");
-        assert_eq!(
-            verify_url("ghe.example.com"),
-            "https://ghe.example.com/api/v3/user"
-        );
-    }
-
-    #[test]
-    fn hosts_are_validated() {
-        assert!(valid_host("github.com"));
-        assert!(valid_host("ghe.example.com:8443"));
-        for bad in ["", "-x", "a/b", "a@b", "a b", "evil.com/x?", "h:", "h:abc"] {
-            assert!(!valid_host(bad), "{bad}");
-        }
-    }
-
-    #[test]
-    fn acquire_and_gh_commands_use_fixed_argv() {
-        let dir = tempfile::tempdir().unwrap();
-        let op = dir.path().join("op");
-        std::fs::write(&op, "#!/bin/sh\necho tok_from_op\n").unwrap();
-        std::fs::set_permissions(&op, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let policy = AcquirePolicy {
-            argv: vec![op.to_string_lossy().into(), "read".into()],
-            timeout_secs: 5,
-            refresh: Default::default(),
-            scope: crate::data::workflow_prerequisites::AcquireScope::Global,
-            sha256: String::new(),
-        };
-        let r = resolver(&[], &[]);
-        let cmd = r.acquire_command(&policy, HostStdin::Null, &[]).unwrap();
-        assert_eq!(cmd.review().timeout_secs, 5);
-        assert_eq!(cmd.run().unwrap().secret.unwrap().expose(), "tok_from_op");
-
-        let path = dir.path().join("gh");
-        let options = r
-            .gh_options(&path, &["auth", "token", "--hostname"])
-            .unwrap();
-        assert_eq!(
-            options.argv[1..],
-            ["auth", "token", "--hostname", "github.com"].map(String::from)
-        );
-    }
-}
-
-#[cfg(all(test, unix))]
-mod custom_gh_review_tests {
-    use super::*;
-    #[test]
-    fn builtin_gh_uses_the_complete_custom_agent_refusal_set() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
-        let dir = tempfile::tempdir().unwrap();
-        let agent = dir.path().join("custom-agent-program");
-        std::fs::write(&agent, "#!/bin/sh\necho fake_token\n").unwrap();
-        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let gh = dir.path().join("gh");
-        symlink(&agent, &gh).unwrap();
-        let resolver = GitHubTokenResolver::new(Default::default())
-            .with_refused_binaries(vec![agent.display().to_string()]);
-        assert!(resolver
-            .gh_command(
-                &gh,
-                &["auth", "status", "--hostname"],
-                "fixture",
-                HostStdin::Null,
-                Duration::from_secs(1),
-                false
-            )
-            .is_err());
-    }
-}
-
-#[cfg(all(test, unix))]
-#[path = "github_token_tests.rs"]
-mod coverage_tests;

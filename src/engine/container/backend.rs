@@ -35,6 +35,14 @@ pub(super) struct ProbeRequest<'a> {
 /// What every container backend must support. The concrete type is hidden
 /// behind `Arc<dyn ContainerBackend>` and never escapes this module.
 pub(super) trait ContainerBackend: Send + Sync {
+    fn inspect_image(
+        &self,
+        tag: &str,
+    ) -> Result<Option<super::runtime::ImageMetadata>, EngineError>;
+    fn list_images_by_repo(
+        &self,
+        repo: &crate::data::image_inputs::RepoKey,
+    ) -> Result<Vec<super::runtime::ImageMetadata>, EngineError>;
     // ─── Identity ───────────────────────────────────────────────────────────
 
     /// Static name used by `ContainerRuntime::runtime_name`.
@@ -131,11 +139,31 @@ pub(super) trait ContainerBackend: Send + Sync {
     }
 
     /// Explicitly stop the resolved agent; propagate failures. Removal is separate.
+    /// Read an execution label from a runtime-owned resource, never its name alone.
+    fn resource_label(
+        &self,
+        _handle: &AgentHandle,
+        _key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        Err(EngineError::NotImplemented("resource label inspection"))
+    }
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError>;
 
     /// Remove a stopped agent by id or name. Errors when the runtime refuses
     /// (e.g. it transitioned back to running), so `awman clean` can count
     /// per-item failures.
+    /// Remove only the observed stopped generation with its execution owner.
+    /// Backends without an atomic identity boundary refuse rather than delete by name.
+    fn remove_agent_checked(
+        &self,
+        _handle: &AgentHandle,
+        _execution: &str,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::NotImplemented(
+            "identity-checked agent removal",
+        ))
+    }
+
     fn remove_agent(&self, id: &str) -> Result<(), EngineError>;
 
     // ─── Image store ────────────────────────────────────────────────────────
@@ -187,6 +215,16 @@ pub(super) trait ContainerBackend: Send + Sync {
     ) -> Result<ImportedImage, EngineError> {
         cancel.check()?;
         self.import_image(request, sink)
+    }
+
+    fn import_image_cancellable_in(
+        &self,
+        request: &ImageImportRequest,
+        _env: &crate::data::config::env::EnvSnapshot,
+        sink: &mut dyn UserMessageSink,
+        cancel: &crate::engine::oci::CancelToken,
+    ) -> Result<ImportedImage, EngineError> {
+        self.import_image_cancellable(request, sink, cancel)
     }
 
     /// List dangling awman images eligible for cleanup.

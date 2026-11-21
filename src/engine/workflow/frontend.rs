@@ -63,6 +63,16 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     /// a clock can ignore it.
     fn yolo_countdown_started(&mut self, _step_name: &str, _kind: CountdownKind) {}
 
+    /// Active-tab suppression input (WI 0141): whether the user is
+    /// interacting with `step_name`'s agent right now (typing or scrolling
+    /// on its tab), so an `AgentDone` countdown should not start yet. The
+    /// engine keeps handling exits, reports and cancellation meanwhile and
+    /// starts the full countdown once this turns false. Must not block.
+    /// Defaults to `false`.
+    fn user_interacting_with(&self, _step_name: &str) -> bool {
+        false
+    }
+
     /// Engine tells frontend: yolo countdown finished (expired, cancelled,
     /// or step recovered). Frontend dismisses dialog / resets tab style.
     fn yolo_countdown_finished(&mut self, _step_name: &str) {}
@@ -136,6 +146,19 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     /// when the engine killed it without waiting for the real code.
     fn report_container_exited(&mut self, _exit_code: i32) {}
 
+    /// The step's agent reported a new OSC 7501 status (WI 0141): a change of
+    /// state or kind, already deduplicated and debounced. `None` means the
+    /// agent cleared its records. Fire-and-forget; the engine has already
+    /// decided what the report does (countdown, board, pause), so frontends
+    /// only render it — the TUI overview's `blocked: permission`, a CLI
+    /// status line. `msg` is untrusted agent text: plain text, truncated.
+    fn report_agent_status(
+        &mut self,
+        _step_name: &str,
+        _status: Option<&crate::data::program_status::EffectiveStatus>,
+    ) {
+    }
+
     // === Capabilities ===
 
     /// Whether a human is on the other side of this frontend and can be asked
@@ -144,7 +167,7 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     /// `true` puts the engine on the interactive recovery path: it opens the
     /// Workflow Control Board with the failure attached and waits for a
     /// restart / back / next / abort decision. `false` — the squad daemon, the
-    /// API server, a `--non-interactive` CLI run — puts it on the unattended
+    /// API server, a `--headless` CLI run — puts it on the unattended
     /// path: one yolo countdown, one automatic retry, then the workflow fails
     /// (WI-0115 §3).
     ///
@@ -278,6 +301,14 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
 
     /// Per-step yolo countdown updates.
     fn parallel_step_yolo_countdown_started(&mut self, _step_name: &str) {}
+    /// A per-step countdown started, with what its expiry will do (a silence
+    /// advance, an `AgentDone` advance, or an `AgentBlocked` / `AgentError`
+    /// step failure). The engine always calls this one; the default forwards
+    /// to [`Self::parallel_step_yolo_countdown_started`], so a frontend that
+    /// does not label countdowns needs no change.
+    fn parallel_step_countdown_started(&mut self, step_name: &str, _kind: CountdownKind) {
+        self.parallel_step_yolo_countdown_started(step_name);
+    }
     fn parallel_step_yolo_countdown_tick(
         &mut self,
         _step_name: &str,
@@ -386,6 +417,10 @@ impl<F: WorkflowFrontend + ?Sized> WorkflowFrontend for std::sync::Arc<std::sync
         self.lock().unwrap().yolo_countdown_started(step_name, kind);
     }
 
+    fn user_interacting_with(&self, step_name: &str) -> bool {
+        self.lock().unwrap().user_interacting_with(step_name)
+    }
+
     fn yolo_countdown_finished(&mut self, step_name: &str) {
         self.lock().unwrap().yolo_countdown_finished(step_name);
     }
@@ -433,6 +468,14 @@ impl<F: WorkflowFrontend + ?Sized> WorkflowFrontend for std::sync::Arc<std::sync
 
     fn report_container_exited(&mut self, exit_code: i32) {
         self.lock().unwrap().report_container_exited(exit_code);
+    }
+
+    fn report_agent_status(
+        &mut self,
+        step_name: &str,
+        status: Option<&crate::data::program_status::EffectiveStatus>,
+    ) {
+        self.lock().unwrap().report_agent_status(step_name, status);
     }
 
     fn report_ci_poll(&mut self, event: &crate::data::ci_poll_event::CiPollEvent) {
@@ -550,6 +593,12 @@ impl<F: WorkflowFrontend + ?Sized> WorkflowFrontend for std::sync::Arc<std::sync
             .parallel_step_yolo_countdown_started(step_name);
     }
 
+    fn parallel_step_countdown_started(&mut self, step_name: &str, kind: CountdownKind) {
+        self.lock()
+            .unwrap()
+            .parallel_step_countdown_started(step_name, kind);
+    }
+
     fn parallel_step_yolo_countdown_tick(
         &mut self,
         step_name: &str,
@@ -565,117 +614,5 @@ impl<F: WorkflowFrontend + ?Sized> WorkflowFrontend for std::sync::Arc<std::sync
         self.lock()
             .unwrap()
             .parallel_step_yolo_countdown_finished(step_name);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::ci_poll_event::CiPollEvent;
-    use crate::data::message::{MessageLevel, RecordingMessageSink, UserMessage};
-
-    /// A frontend that implements only the required methods, so
-    /// `report_ci_poll` and `attach_engine` run their defaults.
-    #[derive(Default)]
-    struct DefaultOnlyFrontend(RecordingMessageSink);
-
-    impl UserMessageSink for DefaultOnlyFrontend {
-        fn write_message(&mut self, message: UserMessage) {
-            self.0.write_message(message);
-        }
-        fn replay_queued(&mut self) {}
-    }
-
-    impl WorkflowFrontend for DefaultOnlyFrontend {
-        fn show_workflow_control_board(
-            &mut self,
-            _state: &WorkflowState,
-            _available: &AvailableActions,
-        ) -> Result<NextAction, EngineError> {
-            unreachable!("not exercised")
-        }
-        fn yolo_countdown_tick(
-            &mut self,
-            _step_name: &str,
-            _remaining: Duration,
-            _total: Duration,
-        ) -> Result<YoloTickOutcome, EngineError> {
-            Ok(YoloTickOutcome::Continue)
-        }
-        fn report_step_status(&mut self, _step: &WorkflowStep, _status: WorkflowStepStatus) {}
-        fn report_workflow_completed(&mut self, _outcome: &WorkflowOutcome) {}
-        fn confirm_resume(&mut self, _mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
-            Ok(false)
-        }
-    }
-
-    /// F-45's contract: the default `report_ci_poll` writes the identical line
-    /// the workflow engine used to compose from `(PollMessage, String)`, at
-    /// the same level — so a frontend that has not opted in shows exactly the
-    /// same output.
-    #[test]
-    fn the_default_report_ci_poll_writes_the_pre_f45_narration() {
-        let cases: &[(CiPollEvent, &str, MessageLevel)] = &[
-            (
-                CiPollEvent::Attempt { attempt: 1, of: 5 },
-                "Polling CI (attempt 1/5)...",
-                MessageLevel::Info,
-            ),
-            (CiPollEvent::Passed, "CI passed", MessageLevel::Info),
-            (
-                CiPollEvent::StillRunning,
-                "CI still running",
-                MessageLevel::Info,
-            ),
-            (
-                CiPollEvent::NoRunYet,
-                "No CI run found yet (may not have been created); will retry",
-                MessageLevel::Info,
-            ),
-            (
-                CiPollEvent::Failed {
-                    detail: "unit-tests".into(),
-                },
-                "CI failed: unit-tests",
-                MessageLevel::Warning,
-            ),
-        ];
-        for (event, text, level) in cases {
-            let mut fe = DefaultOnlyFrontend::default();
-            fe.report_ci_poll(event);
-            let messages = fe.0.all();
-            assert_eq!(messages.len(), 1, "one line per event, for {event:?}");
-            assert_eq!(&messages[0].text, text);
-            assert_eq!(&messages[0].level, level);
-        }
-    }
-
-    /// `attach_engine`'s default is a no-op that writes nothing, exactly as
-    /// the four `set_*` defaults it replaced did.
-    #[test]
-    fn the_default_attach_engine_writes_nothing() {
-        let mut fe = DefaultOnlyFrontend::default();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<EngineRequest>();
-        fe.attach_engine(EngineHandles::requests(tx));
-        let (sender, _rx) = broadcast::channel::<StuckEvent>(4);
-        fe.attach_engine(EngineHandles::step_stuck("a", Arc::new(sender)));
-        assert!(fe.0.all().is_empty());
-    }
-
-    /// The constructors label the handover correctly: only the per-step ones
-    /// carry a step name, which is what tells a frontend whether the channels
-    /// are the tab's or one parallel container's.
-    #[test]
-    fn only_the_per_step_constructors_name_a_step() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<EngineRequest>();
-        assert!(EngineHandles::requests(tx).step.is_none());
-
-        let (sender, _rx) = broadcast::channel::<StuckEvent>(4);
-        assert!(EngineHandles::stuck(Arc::new(sender)).step.is_none());
-
-        let (sender, _rx) = broadcast::channel::<StuckEvent>(4);
-        let handles = EngineHandles::step_stuck("build", Arc::new(sender));
-        assert_eq!(handles.step.as_deref(), Some("build"));
-        assert!(handles.stuck.is_some() && handles.requests.is_none());
     }
 }

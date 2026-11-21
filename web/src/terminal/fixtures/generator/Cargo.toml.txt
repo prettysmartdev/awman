@@ -1,0 +1,8 @@
+[package]
+name = "fixgen"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+vt100 = { package = "vt100-ctt", version = "=0.17.1", default-features = false }
+base64 = "0.22"
+serde_json = "1"

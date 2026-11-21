@@ -124,6 +124,11 @@ pub enum SetupStep {
     Agent(AgentSetupStep),
     Ready(ReadyStep),
     Init(InitStep),
+    /// Acquisition may reuse cached content; it is not necessarily an import.
+    PrepareImage {
+        tag: String,
+        source: crate::data::config::image_source::ImageSourceKind,
+    },
     /// One line of runtime build output, forwarded as a transient step label.
     ///
     /// The engines stream an image build's stdout through the same method,
@@ -139,6 +144,7 @@ impl fmt::Display for SetupStep {
             Self::Agent(step) => step.fmt(f),
             Self::Ready(step) => step.fmt(f),
             Self::Init(step) => step.fmt(f),
+            Self::PrepareImage { tag, source } => write!(f, "Preparing {tag} ({source})"),
             Self::Output(line) => f.write_str(line),
         }
     }
@@ -166,81 +172,5 @@ impl SetupStep {
     /// A line of build output, reported as a transient step.
     pub fn output(line: impl Into<String>) -> Self {
         Self::Output(line.into())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// F-45 is behaviour-preserving: every `Display` must reproduce the exact
-    /// string the engines passed as a `&str` key before the change, because
-    /// two frontends index their own state by it and the API's setup event
-    /// stream carries it on the wire.
-    #[test]
-    fn display_reproduces_the_pre_f45_step_keys() {
-        let cases: &[(SetupStep, &str)] = &[
-            (
-                AgentSetupStep::DownloadingDockerfile.into(),
-                "Downloading Dockerfile",
-            ),
-            (AgentSetupStep::BuildingImage.into(), "Building image"),
-            (ReadyStep::ApplyAgentKit.into(), "Apply agent kit"),
-            (
-                ReadyStep::CheckDockerfile(PathBuf::from("/repo/Dockerfile.dev")).into(),
-                "Check /repo/Dockerfile.dev",
-            ),
-            (
-                ReadyStep::CreateDockerfile(PathBuf::from("/repo/Dockerfile.dev")).into(),
-                "Create /repo/Dockerfile.dev",
-            ),
-            (
-                ReadyStep::DownloadAgentDockerfile.into(),
-                "Download agent Dockerfile",
-            ),
-            (ReadyStep::BuildBaseImage.into(), "Build base image"),
-            (ReadyStep::BuildAgentImage.into(), "Build agent image"),
-            (
-                ReadyStep::BuildAgentImageFor("codex".into()).into(),
-                "Build agent image: codex",
-            ),
-            (
-                ReadyStep::ImportAgentImageFor("codex".into()).into(),
-                "Import agent image: codex",
-            ),
-            (ReadyStep::OtherAgents.into(), "Other agents"),
-            (ReadyStep::MissingImages.into(), "Missing images"),
-            (ReadyStep::CheckLocalAgent.into(), "Check local agent"),
-            (
-                ReadyStep::RebuildingAfterAudit.into(),
-                "Rebuilding after audit",
-            ),
-            (InitStep::BuildImage.into(), "Build image"),
-            (InitStep::BuildBaseImage.into(), "Build base image"),
-            (InitStep::BuildAgentImage.into(), "Build agent image"),
-            (
-                InitStep::RebuildingAfterAudit.into(),
-                "Rebuilding after audit",
-            ),
-            (
-                SetupStep::output("#5 [2/7] RUN apt-get update"),
-                "#5 [2/7] RUN apt-get update",
-            ),
-        ];
-        for (step, want) in cases {
-            assert_eq!(&step.to_string(), want, "Display for {step:?}");
-        }
-    }
-
-    /// `ReadyStep::BuildAgentImage` and `BuildAgentImageFor` render
-    /// differently, which matters: the ready flow reports the default agent's
-    /// build and each non-default agent's build as separate steps, and a
-    /// frontend that keys on the label must keep telling them apart.
-    #[test]
-    fn the_default_and_named_agent_image_steps_do_not_collide() {
-        assert_ne!(
-            ReadyStep::BuildAgentImage.to_string(),
-            ReadyStep::BuildAgentImageFor("claude".into()).to_string()
-        );
     }
 }

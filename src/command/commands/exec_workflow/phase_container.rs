@@ -40,6 +40,7 @@ const TRANSCRIPT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) struct PhaseContainerWorkspace {
     pub workdir: PathBuf,
+    pub host_env: crate::data::config::env::EnvSnapshot,
     pub env: HashMap<String, String>,
     pub overlays: Vec<OverlaySpec>,
     pub builtin_launch: Option<crate::data::config::builtin_launch::BuiltinLaunchSettings>,
@@ -57,45 +58,56 @@ pub(crate) struct PhaseContainerFactory<'a> {
     pub workdir: &'a std::path::Path,
     pub interactive: bool,
     pub secret_env: &'a [(String, crate::engine::auth::credential::SecretString)],
+    pub git_cache_seed: Option<&'a crate::data::secret::SecretString>,
     pub transport: Option<&'a Arc<crate::engine::git::remote_push::RemotePushGit>>,
 }
 impl PhaseContainerFactory<'_> {
     pub fn build(
         &self,
         step: &PhaseStepRef,
-        env: &HashMap<String, String>,
+        env: &super::prepare::PhaseEnvironment,
         overlays: &[OverlaySpec],
     ) -> Result<Box<dyn AgentExec>, EngineError> {
         let launch = self.agent_engine.builtin_launch_settings(self.session)?;
-        let container: Box<dyn AgentExec> = if self.interactive && self.secret_env.is_empty() {
-            Box::new(InteractivePhaseContainer::new(
-                self.runtime.clone(),
-                self.frontend.clone(),
-                step,
-                self.image,
-                PhaseContainerWorkspace {
-                    workdir: self.workdir.to_path_buf(),
-                    env: env.clone(),
-                    overlays: overlays.to_vec(),
-                    builtin_launch: launch,
-                },
-            ))
-        } else {
-            let name = self
-                .name_prefix
-                .map(|prefix| format!("{prefix}phase-{}", uuid::Uuid::new_v4().simple()));
-            Box::new(self.runtime.start_background(
-                &crate::engine::container::background::BackgroundLaunchRequest {
-                    secret_env: self.secret_env,
-                    name: name.as_deref(),
-                    image: self.image,
-                    workdir: self.workdir,
-                    env,
-                    overlays,
-                    builtin_launch: launch.as_ref(),
-                },
-            )?)
-        };
+        let mut secret_env = self.secret_env.to_vec();
+        // Caller overrides come last, including names also supplied by grants.
+        secret_env.extend(env.secret_env.iter().cloned());
+        let container: Box<dyn AgentExec> =
+            if self.interactive && secret_env.is_empty() && self.git_cache_seed.is_none() {
+                Box::new(InteractivePhaseContainer::new(
+                    self.runtime.clone(),
+                    self.frontend.clone(),
+                    step,
+                    self.image,
+                    PhaseContainerWorkspace {
+                        workdir: self.workdir.to_path_buf(),
+                        host_env: self.session.env().clone(),
+                        env: env.env.clone(),
+                        overlays: overlays.to_vec(),
+                        builtin_launch: launch,
+                    },
+                ))
+            } else {
+                let name = self
+                    .name_prefix
+                    .map(|prefix| format!("{prefix}phase-{}", uuid::Uuid::new_v4().simple()));
+                let background = self.runtime.start_background(
+                    &crate::engine::container::background::BackgroundLaunchRequest {
+                        labels: &[],
+                        secret_env: &secret_env,
+                        name: name.as_deref(),
+                        image: self.image,
+                        workdir: self.workdir,
+                        env,
+                        overlays,
+                        builtin_launch: launch.as_ref(),
+                    },
+                )?;
+                if let Some(seed) = self.git_cache_seed {
+                    background.seed_git_credentials(seed)?;
+                }
+                Box::new(background)
+            };
         if let Some(transport) = self.transport {
             Ok(Box::new(TransportPhaseContainer {
                 inner: container,
@@ -114,6 +126,9 @@ struct TransportPhaseContainer {
     setup: bool,
 }
 impl AgentExec for TransportPhaseContainer {
+    fn failure_transcript(&self) -> Option<PathBuf> {
+        self.inner.failure_transcript()
+    }
     fn exec(
         &self,
         command: &str,
@@ -149,6 +164,7 @@ pub(crate) struct InteractivePhaseContainer {
     step: PhaseStepRef,
     image: String,
     workspace: PhaseContainerWorkspace,
+    failure_transcript: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl InteractivePhaseContainer {
@@ -165,6 +181,7 @@ impl InteractivePhaseContainer {
             step: step.clone(),
             image: image.to_string(),
             workspace,
+            failure_transcript: Default::default(),
         }
     }
 
@@ -173,15 +190,18 @@ impl InteractivePhaseContainer {
         command: &str,
         step_env: Option<&HashMap<String, String>>,
     ) -> Result<ExecOutput, EngineError> {
-        let instance = self.runtime.build_phase_step(&PhaseStepContainerSpec {
-            builtin_launch: self.workspace.builtin_launch.as_ref(),
-            image: &self.image,
-            workdir: &self.workspace.workdir,
-            overlays: &self.workspace.overlays,
-            env: &self.workspace.env,
-            command,
-            step_env,
-        })?;
+        let instance = self.runtime.build_phase_step_in(
+            &PhaseStepContainerSpec {
+                builtin_launch: self.workspace.builtin_launch.as_ref(),
+                image: &self.image,
+                workdir: &self.workspace.workdir,
+                overlays: &self.workspace.overlays,
+                env: &self.workspace.env,
+                command,
+                step_env,
+            },
+            &self.workspace.host_env,
+        )?;
         self.run_instance(instance)
     }
 
@@ -189,6 +209,9 @@ impl InteractivePhaseContainer {
         &self,
         instance: Box<dyn AgentInstance>,
     ) -> Result<ExecOutput, EngineError> {
+        *self.failure_transcript.lock().unwrap() = None;
+        let redaction = instance.output_redaction();
+        redaction.absorb(&self.frontend.lock().unwrap().output_redaction());
         self.frontend
             .lock()
             .unwrap()
@@ -214,7 +237,47 @@ impl InteractivePhaseContainer {
         let stdout = match transcript {
             Some(tail) => {
                 tail.wait_for_writers(TRANSCRIPT_FLUSH_TIMEOUT);
-                tail.plain_text()
+                if exit.exit_code != 0 {
+                    let saved = (|| -> Result<PathBuf, EngineError> {
+                        let mut reader = crate::engine::auth::redaction::RedactedReader::new(
+                            tail.transcript_reader().map_err(|e| {
+                                EngineError::Other(format!("read phase transcript: {e}"))
+                            })?,
+                            redaction.clone(),
+                        );
+                        let paths =
+                            crate::data::fs::WorkflowLogPaths::from_env(&self.workspace.host_env)?;
+                        Ok(paths.write_container_log_from_reader(
+                            uuid::Uuid::new_v4(),
+                            &self.step.description,
+                            "phase",
+                            &mut reader,
+                        )?)
+                    })();
+                    let excerpt = redaction.redact(&tail.plain_text());
+                    match saved {
+                        Ok(path) => {
+                            *self.failure_transcript.lock().unwrap() = Some(path.clone());
+                            format!(
+                                "{excerpt}\n[awman: full transcript saved to {}]\n",
+                                path.display()
+                            )
+                        }
+                        Err(error) => {
+                            self.frontend.lock().unwrap().write_message(
+                                crate::data::message::UserMessage {
+                                    level: crate::data::message::MessageLevel::Warning,
+                                    text: format!(
+                                        "could not retain the full phase transcript: {error}"
+                                    ),
+                                },
+                            );
+                            format!("[awman: full transcript could not be saved: {error}; bounded excerpt follows]\n{excerpt}")
+                        }
+                    }
+                } else {
+                    tail.plain_text()
+                }
             }
             None => String::new(),
         };
@@ -234,6 +297,9 @@ impl InteractivePhaseContainer {
 }
 
 impl AgentExec for InteractivePhaseContainer {
+    fn failure_transcript(&self) -> Option<PathBuf> {
+        self.failure_transcript.lock().unwrap().clone()
+    }
     fn exec(
         &self,
         command: &str,

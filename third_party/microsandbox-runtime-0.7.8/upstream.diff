@@ -1,0 +1,44 @@
+--- a/lib/client/ipc.rs
++++ b/lib/client/ipc.rs
+@@ -491,6 +491,9 @@
+         .truncate(false)
+         .read(true)
+         .write(true)
++        // Worker inheritance requires an owner-writable-only lifecycle lock,
++        // independently of a developer's group-writable umask.
++        .mode(0o600)
+         .open(&path)?;
+     let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+     if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+@@ -866,6 +869,15 @@
+         let temp = tempfile::tempdir().unwrap();
+         let run_dir = temp.path().join("run");
+         let owner = acquire_lifecycle_guard(&run_dir, "worker").unwrap();
++        #[cfg(unix)]
++        {
++            use std::os::unix::fs::PermissionsExt;
++            assert_eq!(
++                owner.file.metadata().unwrap().permissions().mode() & 0o077,
++                0,
++                "lifecycle locks must be private regardless of the process umask"
++            );
++        }
+
+         assert!(
+             try_acquire_lifecycle_guard(&run_dir, "worker")
+--- a/lib/runner/vm.rs
++++ b/lib/runner/vm.rs
+@@ -2726,6 +2726,13 @@
+     let mut vm = builder
+         .build()
+         .map_err(|e| RuntimeError::Custom(format!("build VM: {e}")))?;
++    // The embedded x86 kernel callback is process-owned and idempotent. Copy
++    // it into this VM's private RAM rather than mapping that shared allocation
++    // writable. Restores supply their own independently owned memory below.
++    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
++    if config.vm.checkpoint_restore.is_none() {
++        vm.set_private_memory_boot(true);
++    }
+     let restored_agent = if let Some(restore) = &config.vm.checkpoint_restore {
+         let prepared = prepared_restore.expect("restore was admitted before device construction");
+         // Local branches and durable restores both retain exact immutable disk bindings.

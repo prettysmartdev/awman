@@ -5,8 +5,19 @@
 //! this user and closed to everyone else, and a record is replaced by
 //! writing a private sibling, syncing it, and renaming it into place. A file
 //! that breaks these rules is refused, never adopted.
+//!
+//! On Unix "private" means owned by the effective user with no group/other
+//! mode bits. On Windows it means owned by this user (or the token's default
+//! owner) with a DACL that grants no other account except LocalSystem and
+//! Administrators, checked on the opened handle; new objects get an explicit
+//! protected owner-only DACL instead of inheriting the parent's, and links,
+//! junctions and other reparse points are refused on the path and its
+//! ancestors (see `windows.rs`). An existing ACL is never changed.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(not(windows))]
+use std::fs::OpenOptions;
+#[cfg(not(windows))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,6 +26,11 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use crate::data::error::DataError;
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::{install_windows_native, WindowsNative};
 
 /// How long a lock waiter sleeps between attempts.
 const LOCK_POLL: Duration = Duration::from_millis(50);
@@ -36,6 +52,14 @@ fn refused(path: &Path, why: &str) -> DataError {
 /// Create `dir` (and missing parents) and require it to be a real directory,
 /// owned by this user and closed to others.
 pub fn create_private_dir(dir: &Path) -> Result<(), DataError> {
+    #[cfg(windows)]
+    return windows::create_private_dir(dir);
+    #[cfg(not(windows))]
+    create_private_dir_portable(dir)
+}
+
+#[cfg(not(windows))]
+fn create_private_dir_portable(dir: &Path) -> Result<(), DataError> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -64,30 +88,52 @@ pub fn create_private_dir(dir: &Path) -> Result<(), DataError> {
 /// Create `dir`, which must not already exist, readable only by this user.
 /// The parent must exist.
 pub fn create_private_dir_new(dir: &Path) -> Result<(), DataError> {
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(dir).map_err(|e| io_err(dir, e))
+    #[cfg(windows)]
+    return windows::create_private_dir_new(dir);
+    #[cfg(not(windows))]
+    {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(dir).map_err(|e| io_err(dir, e))
+    }
 }
 
 /// Create `path`, which must not already exist, readable and writable only by
 /// this user. Exclusive creation means a staging name can never be
 /// pre-planted (or be a symlink that is followed).
 pub fn create_private_file_new(path: &Path) -> Result<File, DataError> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
+    #[cfg(windows)]
+    return windows::create_private_file_new(path);
+    #[cfg(not(windows))]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(path).map_err(|e| io_err(path, e))
     }
-    options.open(path).map_err(|e| io_err(path, e))
 }
 
 /// Open `path` without following a symlink, creating it owner-only when
 /// `create` is set, and check it is a private regular file. `Ok(None)` when
 /// it is absent and `create` is not set.
 fn open_private(path: &Path, create: bool, write: bool) -> Result<Option<File>, DataError> {
+    #[cfg(windows)]
+    return windows::open_private(path, create, write);
+    #[cfg(not(windows))]
+    open_private_portable(path, create, write)
+}
+
+#[cfg(not(windows))]
+fn open_private_portable(
+    path: &Path,
+    create: bool,
+    write: bool,
+) -> Result<Option<File>, DataError> {
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -104,12 +150,17 @@ fn open_private(path: &Path, create: bool, write: bool) -> Result<Option<File>, 
     let file = match options.open(path) {
         Ok(file) => file,
         Err(e) if !create && e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
+        // `O_NOFOLLOW` reports a symlink as `ELOOP`; anything else (a
+        // read-only directory, a missing parent) is an ordinary I/O error,
+        // not a symlink to remove.
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
             return Err(refused(
                 path,
                 &format!("cannot be opened safely (symlinks are refused): {e}"),
             ));
         }
+        Err(e) => return Err(io_err(path, e)),
     };
     let meta = file.metadata().map_err(|e| io_err(path, e))?;
     if !meta.is_file() {
@@ -129,6 +180,11 @@ fn open_private(path: &Path, create: bool, write: bool) -> Result<Option<File>, 
         }
     }
     Ok(Some(file))
+}
+
+/// Open an existing owner-only regular file without following links.
+pub fn open_private_file(path: &Path) -> Result<File, DataError> {
+    open_private(path, false, false)?.ok_or_else(|| refused(path, "private file is absent"))
 }
 
 /// Open the private lock or lease file at `path` (read-write), creating it
@@ -242,24 +298,29 @@ pub fn write_private_json_atomic<T: Serialize>(
             .unwrap_or("record"),
         uuid::Uuid::new_v4().simple()
     ));
-    let result = (|| {
-        let mut file = open_private(&tmp, true, true)?
-            .ok_or_else(|| DataError::Other(format!("{} vanished", tmp.display())))?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|e| io_err(&tmp, e))?;
-        check()?;
-        std::fs::rename(&tmp, path).map_err(|e| io_err(path, e))
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    #[cfg(windows)]
+    return windows::write_atomic(path, &tmp, &bytes, &mut check);
+    #[cfg(not(windows))]
+    {
+        let result = (|| {
+            let mut file = open_private(&tmp, true, true)?
+                .ok_or_else(|| DataError::Other(format!("{} vanished", tmp.display())))?;
+            file.write_all(&bytes)
+                .and_then(|_| file.sync_all())
+                .map_err(|e| io_err(&tmp, e))?;
+            check()?;
+            std::fs::rename(&tmp, path).map_err(|e| io_err(path, e))
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result?;
+        #[cfg(unix)]
+        if let Ok(d) = File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
     }
-    result?;
-    #[cfg(unix)]
-    if let Ok(d) = File::open(dir) {
-        let _ = d.sync_all();
-    }
-    Ok(())
 }
 
 /// Read a small JSON record where anything unusable is a miss, not an error:
@@ -272,24 +333,35 @@ pub fn read_private_json_or_miss<T: DeserializeOwned>(
     max_bytes: u64,
 ) -> Result<Option<T>, DataError> {
     use std::io::Read;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = match options.open(path) {
-        Ok(file) => file,
+    #[cfg(windows)]
+    let file = match windows::open_or_miss(path) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Ok(None),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        // ELOOP: a symlink in place of a record.
-        #[cfg(unix)]
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(None),
         Err(e) => return Err(io_err(path, e)),
     };
-    if !file.metadata().is_ok_and(|m| m.is_file()) {
-        return Ok(None);
-    }
+    #[cfg(not(windows))]
+    let file = {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = match options.open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            // ELOOP: a symlink in place of a record.
+            #[cfg(unix)]
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(None),
+            Err(e) => return Err(io_err(path, e)),
+        };
+        if !file.metadata().is_ok_and(|m| m.is_file()) {
+            return Ok(None);
+        }
+        file
+    };
     let mut bytes = Vec::new();
     file.take(max_bytes + 1)
         .read_to_end(&mut bytes)
@@ -327,60 +399,6 @@ pub fn remove_private_file(path: &Path) -> Result<(), DataError> {
     }
 }
 
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::{symlink, PermissionsExt};
-
-    #[test]
-    fn create_private_file_new_is_exclusive_and_owner_only() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("stage");
-        drop(create_private_file_new(&path).unwrap());
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert!(matches!(
-            create_private_file_new(&path),
-            Err(DataError::Io { .. })
-        ));
-        let link = root.path().join("link");
-        symlink(root.path().join("elsewhere"), &link).unwrap();
-        assert!(create_private_file_new(&link).is_err());
-        assert!(!root.path().join("elsewhere").exists());
-    }
-
-    #[test]
-    fn private_records_refuse_symlinks_and_public_permissions() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let record = root.path().join("record.json");
-        write_private_json_atomic(&record, &serde_json::json!({"ok": true}), || Ok(())).unwrap();
-        assert_eq!(
-            read_private_json::<serde_json::Value>(&record).unwrap(),
-            Some(serde_json::json!({"ok": true}))
-        );
-        let link = root.path().join("link.json");
-        symlink(&record, &link).unwrap();
-        assert!(read_private_json::<serde_json::Value>(&link).is_err());
-        assert!(lock_private_exclusive(&link, || Ok(())).is_err());
-        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_private_json::<serde_json::Value>(&record).is_err());
-    }
-
-    #[test]
-    fn private_directory_refuses_a_symlink() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let real = root.path().join("real");
-        create_private_dir(&real).unwrap();
-        let link = root.path().join("link");
-        symlink(&real, &link).unwrap();
-        assert!(create_private_dir(&link).is_err());
-    }
-}
-
 /// A bounded approval read validates ownership, links and permissions on the
 /// opened descriptor. Cache readers deliberately retain their separate policy.
 pub fn read_private_approval_json<T: DeserializeOwned>(
@@ -407,7 +425,3 @@ pub fn read_private_approval_json<T: DeserializeOwned>(
     }
     Ok(serde_json::from_slice(&bytes).ok())
 }
-
-#[cfg(all(test, unix))]
-#[path = "private_files_coverage_tests.rs"]
-mod coverage_tests;

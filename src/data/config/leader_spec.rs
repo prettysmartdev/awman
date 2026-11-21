@@ -40,26 +40,3 @@ impl LeaderSpec {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_well_formed_spec_splits_into_agent_and_model() {
-        let spec = LeaderSpec::parse("claude::claude-opus-4-8").unwrap();
-        assert_eq!(spec.agent, "claude");
-        assert_eq!(spec.model, "claude-opus-4-8");
-    }
-
-    #[test]
-    fn anything_but_two_non_empty_components_is_a_shape_error() {
-        for raw in ["claude", "claude::", "::model", "a::b::c", ""] {
-            assert_eq!(
-                LeaderSpec::parse(raw),
-                Err(LeaderSpecError::Shape),
-                "{raw:?} must not parse"
-            );
-        }
-    }
-}

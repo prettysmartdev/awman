@@ -12,7 +12,19 @@ use super::*;
 /// - Width is derived from each tab's natural content width, capped against
 ///   the budget (¼/½/¾/1/n for n=1/2/3/n tabs)
 pub(super) fn render_tab_bar(app: &App, area: Rect, frame: &mut Frame) {
-    let n = app.tabs.len();
+    // While a host presenter manages tabs (WI 0142) the bar stays collapsed
+    // to the active tab, drawn as if it were the only one.
+    let shown: Vec<(usize, &tabs::Tab)> = if app.remote_view.tab_bar_collapsed() {
+        app.tabs
+            .iter()
+            .enumerate()
+            .skip(app.active_tab)
+            .take(1)
+            .collect()
+    } else {
+        app.tabs.iter().enumerate().collect()
+    };
+    let n = shown.len();
     if n == 0 || area.width == 0 {
         return;
     }
@@ -20,11 +32,9 @@ pub(super) fn render_tab_bar(app: &App, area: Rect, frame: &mut Frame) {
     // First pass: compute the maximum natural content width across all tabs.
     // We pass `u16::MAX` as the cell width to `tab_subcommand_label` so it
     // doesn't truncate while measuring.
-    let max_natural_content: u16 = app
-        .tabs
+    let max_natural_content: u16 = shown
         .iter()
-        .enumerate()
-        .map(|(i, tab)| {
+        .map(|&(i, tab)| {
             let is_active = i == app.active_tab;
             // Measure with the untruncated project name so a wide terminal
             // lets long names claim more width; `compute_tab_bar_width`
@@ -48,8 +58,8 @@ pub(super) fn render_tab_bar(app: &App, area: Rect, frame: &mut Frame) {
         return;
     }
 
-    for (i, tab) in app.tabs.iter().enumerate() {
-        let x = area.x + (i as u16) * tab_width;
+    for (position, &(i, tab)) in shown.iter().enumerate() {
+        let x = area.x + (position as u16) * tab_width;
         // Stop drawing when the next cell would overflow — old awman did the
         // same; there is no overflow indicator.
         if x + tab_width > area.x + area.width {

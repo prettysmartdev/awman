@@ -43,6 +43,9 @@ pub enum ParsedFlag {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedArgs {
     flags: BTreeMap<String, ParsedFlag>,
+    /// A `--` before the first positional makes the complete tail literal.
+    literal_tail: bool,
+    implicit_flags: BTreeSet<String>,
     /// Positional arguments, keyed by their catalogue name. Stored as a vector
     /// so a greedy trailing argument keeps every token; single-valued
     /// positionals hold a one-element vector.
@@ -67,10 +70,20 @@ impl ParsedArgs {
                 .into_iter()
                 .collect(),
             path_arguments: BTreeSet::new(),
+            implicit_flags: BTreeSet::new(),
+            literal_tail: false,
         }
     }
 
+    pub fn literal_tail(&self) -> bool {
+        self.literal_tail
+    }
+
     /// Whether the invocation set `flag`, whatever its type.
+    pub fn flag_is_explicit(&self, flag: &str) -> bool {
+        self.flags.contains_key(flag) && !self.implicit_flags.contains(flag)
+    }
+
     pub fn has_flag(&self, flag: &str) -> bool {
         self.flags.contains_key(flag)
     }
@@ -114,6 +127,15 @@ impl ParsedArgs {
         self.flag_string(flag)
     }
 
+    /// The accepted automation mode, projected from the catalogue-validated
+    /// enum value. A bare `--automation` is already normalized to `auto` by
+    /// its `OptionalEnum` declaration; absent remains `None`.
+    pub fn automation_mode(&self) -> Option<crate::data::automation::AutomationMode> {
+        self.flag_enum(crate::data::automation::AUTOMATION_FLAG)
+            .as_deref()
+            .and_then(crate::data::automation::AutomationMode::parse)
+    }
+
     pub fn flag_u16(&self, flag: &str) -> Option<u16> {
         match self.flags.get(flag) {
             Some(ParsedFlag::U16(n)) => Some(*n),
@@ -138,6 +160,52 @@ impl ParsedArgs {
     pub fn arguments(&self, name: &str) -> Vec<String> {
         self.arguments.get(name).cloned().unwrap_or_default()
     }
+
+    /// The argv tokens (after the command path) that
+    /// [`CommandCatalogue::parse_raw_args`] parses back into `self` for
+    /// `spec`. A presenter whose engine runs elsewhere sends these
+    /// (`SubmitInput::Argv`), so the engine re-parses through the same
+    /// catalogue parser instead of trusting a parse it did not make (D3).
+    ///
+    /// Flags use the inline `--name=value` form, so a value starting with `-`
+    /// stays a value. A literal trailing positional retains its `--` marker;
+    /// ordinary greedy tails keep their original validation on relay.
+    pub fn to_argv(&self, spec: &CommandSpec) -> Vec<String> {
+        let mut argv = Vec::new();
+        for (name, value) in &self.flags {
+            if self.implicit_flags.contains(name) {
+                continue;
+            }
+            match value {
+                ParsedFlag::Bool(true) => argv.push(format!("--{name}")),
+                ParsedFlag::Bool(false) => argv.push(format!("--{name}=false")),
+                ParsedFlag::Str(text) => argv.push(format!("--{name}={text}")),
+                ParsedFlag::Strings(items) => {
+                    argv.extend(items.iter().map(|item| format!("--{name}={item}")))
+                }
+                ParsedFlag::Path(path) => argv.push(format!("--{name}={}", path.display())),
+                ParsedFlag::U16(n) => argv.push(format!("--{name}={n}")),
+                ParsedFlag::Usize(n) => argv.push(format!("--{name}={n}")),
+            }
+        }
+        let positionals: Vec<String> = spec
+            .arguments
+            .iter()
+            .flat_map(|argument| self.arguments(argument.name))
+            .collect();
+        if !positionals.is_empty() {
+            if self.literal_tail
+                || !spec
+                    .arguments
+                    .iter()
+                    .any(|a| matches!(a.kind, ArgumentKind::TrailingVarArgs))
+            {
+                argv.push("--".into());
+            }
+            argv.extend(positionals);
+        }
+        argv
+    }
 }
 
 // ─── Per-frontend flag-default policy (Finding D) ────────────────────────────
@@ -155,9 +223,16 @@ pub(crate) struct FrontendFlagDefault {
 
 /// API-profile flag defaults.
 ///
-/// `non-interactive` is FORCED: HTTP workers have no TTY, and on Apple's
-/// `container` CLI a PTY request with piped stdin fails with `ENOTTY`, so this
-/// is a technical requirement, not a preference.
+/// `headless` is an overridable DEFAULT (WI 0141): it is
+/// `daemon.features.worker.push.interaction`'s own default, `headless`.
+/// It is no longer forced. Interaction is a per-feature setting resolved in
+/// Layer 2 (`command::interaction::resolve_interaction`); push admission
+/// always writes the resolved choice into the stored args as an explicit
+/// `--headless` or `--interactive`, so this default only fills in for a
+/// caller that parses daemon args without going through admission. An
+/// explicit `--interactive` suppresses it (the two flags conflict). Whether
+/// the agent then gets a PTY is decided by the `InteractionDecision` handed
+/// to the frontend, not by sniffing args.
 ///
 /// `yolo` is an overridable DEFAULT: it stays `true` for backward compatibility
 /// (every historical API caller ran with auto-approval), but a request payload
@@ -166,9 +241,9 @@ pub(crate) struct FrontendFlagDefault {
 /// the API frontend. See work item 0097, Finding D.
 const API_FLAG_DEFAULTS: &[FrontendFlagDefault] = &[
     FrontendFlagDefault {
-        flag: "non-interactive",
+        flag: "headless",
         value: FlagDefault::Bool(true),
-        forced: true,
+        forced: false,
     },
     FrontendFlagDefault {
         flag: "yolo",
@@ -184,13 +259,16 @@ const API_FLAG_DEFAULTS: &[FrontendFlagDefault] = &[
 /// body — the literal F-50 found in `api/routes.rs`.
 pub(crate) fn frontend_flag_defaults(frontend: FrontendKind) -> &'static [FrontendFlagDefault] {
     match frontend {
+        // An engine instance serves a person at a local frontend: no
+        // unattended profile (parity with the TUI).
+        FrontendKind::Daemon { .. } if frontend.is_engine_local() => &[],
         // The squad daemon runs unattended for the same reasons the API
         // server does, and applies the same profile.
-        FrontendKind::Api | FrontendKind::SquadDaemon => API_FLAG_DEFAULTS,
+        FrontendKind::Daemon { .. } => API_FLAG_DEFAULTS,
         // CLI and TUI resolve flag defaults through clap / the command layer;
         // no profile overrides apply, guaranteeing this mechanism cannot alter
         // their behavior.
-        FrontendKind::Cli | FrontendKind::Tui => &[],
+        FrontendKind::Cli | FrontendKind::Tui | FrontendKind::Relayed { .. } => &[],
     }
 }
 
@@ -224,6 +302,7 @@ fn apply_frontend_defaults(parsed: &mut ParsedArgs, spec: &CommandSpec, frontend
             continue;
         };
         if entry.forced {
+            parsed.implicit_flags.insert(entry.flag.to_string());
             parsed.flags.insert(entry.flag.to_string(), value);
             continue;
         }
@@ -235,13 +314,21 @@ fn apply_frontend_defaults(parsed: &mut ParsedArgs, spec: &CommandSpec, frontend
         if parsed.flags.contains_key(entry.flag) {
             continue;
         }
+        // Conflicts are symmetric but may be declared on one side only
+        // (`--interactive` declares its conflict with the shared
+        // `--headless` spec), so check both directions.
         let conflict_present = flag_spec
             .conflicts_with
             .iter()
-            .any(|other| flag_is_active(&parsed.flags, other));
+            .any(|other| flag_is_active(&parsed.flags, other))
+            || spec.flags.iter().any(|other| {
+                other.conflicts_with.contains(&entry.flag)
+                    && flag_is_active(&parsed.flags, other.long)
+            });
         if conflict_present {
             continue;
         }
+        parsed.implicit_flags.insert(entry.flag.to_string());
         parsed.flags.insert(entry.flag.to_string(), value);
     }
 }
@@ -290,16 +377,19 @@ impl CommandCatalogue {
             }
             let allowed = match flag.frontends {
                 FrontendVisibility::All => true,
-                FrontendVisibility::CliOnly => frontend == FrontendKind::Cli,
-                FrontendVisibility::TuiOnly => frontend == FrontendKind::Tui,
+                // A relayed frontend sees the flags of the frontend relaying it.
+                FrontendVisibility::CliOnly => frontend.presenting() == Some(FrontendKind::Cli),
+                FrontendVisibility::TuiOnly => {
+                    frontend.presenting() == Some(FrontendKind::Tui) || frontend.is_engine_local()
+                }
                 FrontendVisibility::CliAndTui => {
-                    matches!(frontend, FrontendKind::Cli | FrontendKind::Tui)
+                    frontend.presenting().is_some() || frontend.is_engine_local()
                 }
                 FrontendVisibility::Hidden => false,
             };
             // A forced technical setting is applied even without an argv
             // token, and the client cannot override its value. Accepting its
-            // spelling (e.g. a daemon's non-interactive mode) grants nothing.
+            // spelling (e.g. a daemon's headless mode) grants nothing.
             let forced_by_profile = frontend_flag_defaults(frontend)
                 .iter()
                 .any(|entry| entry.flag == flag.long && entry.forced);
@@ -319,7 +409,7 @@ impl CommandCatalogue {
     /// `(flag name, value)` pairs — the profile's own account of itself.
     ///
     /// A frontend that reports its profile to a client reads it here rather
-    /// than restating it: `api/routes.rs` used to answer `POST /v1/commands`
+    /// than restating it: `api/routes.rs` used to answer `POST /v1/worker/commands`
     /// with a hand-written `{"yolo": true, "non_interactive": true}` that no
     /// test tied to `API_FLAG_DEFAULTS` (WI 0114 F-50). Flags the command
     /// does not declare are left out, so the report matches what was applied.
@@ -339,7 +429,7 @@ impl CommandCatalogue {
     }
 }
 
-fn parse_against_spec(
+pub(crate) fn parse_against_spec(
     spec: &CommandSpec,
     path: &[&str],
     args: &[String],
@@ -358,7 +448,12 @@ fn parse_against_spec(
     let fixed_arg_count = spec
         .arguments
         .iter()
-        .filter(|a| !matches!(a.kind, ArgumentKind::TrailingVarArgs))
+        .filter(|a| {
+            !matches!(
+                a.kind,
+                ArgumentKind::TrailingVarArgs | ArgumentKind::VarArgs
+            )
+        })
         .count();
 
     let mut greedy = false;
@@ -369,6 +464,9 @@ fn parse_against_spec(
         let arg = cursor.peek().expect("not done").clone();
 
         if greedy || after_double_dash {
+            if greedy && !after_double_dash {
+                refuse_misplaced_flags(spec, path, std::slice::from_ref(&arg))?;
+            }
             positionals.push(arg);
             cursor.advance();
             continue;
@@ -385,22 +483,34 @@ fn parse_against_spec(
                 Some((n, v)) => (n, Some(v.to_string())),
                 None => (rest, None),
             };
-            let flag_spec = spec
+            let Some(flag_spec) = spec
                 .find_flag(name)
-                .ok_or_else(|| CommandError::unknown_flag(path, name))?;
+                .or_else(|| CommandCatalogue::get().find_global_flag(name))
+            else {
+                return Err(replaced_or_unknown_flag(
+                    path,
+                    name,
+                    inline,
+                    cursor.next_token(),
+                ));
+            };
             cursor.apply_flag(flag_spec, inline, &mut flags)?;
-        } else if let Some(short) = arg.strip_prefix('-') {
-            // Only single-character short flags are supported (clap parity).
-            if short.chars().count() != 1 {
-                return Err(CommandError::unknown_flag(path, arg.clone()));
+        } else if arg != "-" && arg.starts_with('-') {
+            let shorts = arg[1..].to_string();
+            let mut chars = shorts.char_indices().peekable();
+            while let Some((offset, ch)) = chars.next() {
+                let flag_spec = applicable_flags(spec)
+                    .find(|f| f.short == Some(ch))
+                    .ok_or_else(|| CommandError::unknown_flag(path, format!("-{ch}")))?;
+                if matches!(flag_spec.kind, FlagKind::Bool) && chars.peek().is_some() {
+                    flags.insert(flag_spec.long.into(), ParsedFlag::Bool(true));
+                    continue;
+                }
+                let rest = &shorts[offset + ch.len_utf8()..];
+                let inline = (!rest.is_empty()).then(|| rest.trim_start_matches('=').to_string());
+                cursor.apply_flag(flag_spec, inline, &mut flags)?;
+                break;
             }
-            let ch = short.chars().next().unwrap();
-            let flag_spec = spec
-                .flags
-                .iter()
-                .find(|f| f.short == Some(ch))
-                .ok_or_else(|| CommandError::unknown_flag(path, format!("-{ch}")))?;
-            cursor.apply_flag(flag_spec, None, &mut flags)?;
         } else {
             positionals.push(arg);
             // Begin greedy capture once we have started filling a trailing
@@ -432,13 +542,24 @@ fn parse_against_spec(
         }
     }
 
+    // A declared flag whose behavior is not wired yet is refused here, so
+    // the TUI command box and API admission reject it before anything is
+    // queued or launched (WI 0070). Prompt tokens were never parsed as flags.
+    CommandCatalogue::get().refuse_pending_flags(
+        path,
+        flags
+            .keys()
+            .map(String::as_str)
+            .filter(|name| flag_is_active(&flags, name)),
+    )?;
+
     // Map collected positionals onto the declared arguments in order.
     let mut arguments: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut path_arguments: BTreeSet<String> = BTreeSet::new();
     let mut pos_idx = 0;
     for arg_spec in spec.arguments {
         match arg_spec.kind {
-            ArgumentKind::TrailingVarArgs => {
+            ArgumentKind::TrailingVarArgs | ArgumentKind::VarArgs => {
                 let collected: Vec<String> = positionals[pos_idx..].to_vec();
                 if !collected.is_empty() {
                     arguments.insert(arg_spec.name.to_string(), collected);
@@ -470,10 +591,131 @@ fn parse_against_spec(
     }
 
     Ok(ParsedArgs {
+        implicit_flags: BTreeSet::new(),
+        literal_tail: after_double_dash && trailing,
         flags,
         arguments,
         path_arguments,
     })
+}
+
+/// Applicable command options plus inherited global options, from the catalogue.
+fn applicable_flags(spec: &CommandSpec) -> impl Iterator<Item = &FlagSpec> {
+    let catalogue = CommandCatalogue::get();
+    spec.flags.iter().chain(catalogue.global_flags())
+}
+
+/// Check whole argv tokens only. Prose containing option spellings is never scanned.
+pub(crate) fn refuse_misplaced_flags(
+    spec: &CommandSpec,
+    path: &[&str],
+    tokens: &[String],
+) -> Result<(), CommandError> {
+    for token in tokens {
+        let known = if matches!(token.as_str(), "-h" | "--help" | "-V" | "--version") {
+            true
+        } else if let Some(long) = token.strip_prefix("--") {
+            let name = long.split_once('=').map_or(long, |(name, _)| name);
+            applicable_flags(spec).any(|flag| flag.long == name)
+        } else if let Some(shorts) = token.strip_prefix('-') {
+            let mut recognized = false;
+            for (offset, ch) in shorts.char_indices() {
+                let Some(flag) = applicable_flags(spec).find(|flag| flag.short == Some(ch)) else {
+                    recognized = false;
+                    break;
+                };
+                recognized = true;
+                // A value-taking short option owns the rest of its token.
+                if !matches!(flag.kind, FlagKind::Bool) {
+                    break;
+                }
+                if shorts[offset + ch.len_utf8()..].starts_with('=') {
+                    break;
+                }
+            }
+            recognized
+        } else {
+            false
+        };
+        if known {
+            return Err(CommandError::InvalidArgumentValue {
+                command: path.iter().map(|s| (*s).to_string()).collect(),
+                argument: "prompt".into(),
+                reason: format!("`{token}` appears after prompt text. Move awman flags before the prompt, or put `--` before the first prompt token to make the entire prompt literal."),
+            });
+        }
+    }
+    Ok(())
+}
+
+impl CommandCatalogue {
+    /// Recover a trailing positional's token boundaries and literal delimiter from
+    /// CLI argv. Path and prefix options use the same catalogue cursor.
+    pub fn parse_cli_tail(&self, argv: &[String]) -> Result<Option<ParsedArgs>, CommandError> {
+        let mut spec = self.root();
+        let mut path = Vec::new();
+        let mut cursor = RawArgCursor::new(argv.get(1..).unwrap_or_default(), &[]);
+        let mut prefix = BTreeMap::new();
+        while let Some(token) = cursor.peek() {
+            if spec
+                .arguments
+                .iter()
+                .any(|a| matches!(a.kind, ArgumentKind::TrailingVarArgs))
+            {
+                return self
+                    .parse_raw_args(&path, &cursor.args[cursor.i..])
+                    .map(Some);
+            }
+            if let Some(sub) = spec.find_subcommand(token) {
+                path.push(sub.name);
+                spec = sub;
+                cursor.advance();
+            } else if let Some(long) = token.strip_prefix("--") {
+                let (name, inline) = long
+                    .split_once('=')
+                    .map_or((long, None), |(n, v)| (n, Some(v.to_string())));
+                let Some(flag) = applicable_flags(spec).find(|f| f.long == name) else {
+                    return Ok(None);
+                };
+                cursor.apply_flag(flag, inline, &mut prefix)?;
+            } else if let Some(short) = token.strip_prefix('-') {
+                let Some(_) = short.char_indices().next() else {
+                    return Ok(None);
+                };
+                let mut chars = short.char_indices().peekable();
+                while let Some((offset, ch)) = chars.next() {
+                    let Some(flag) = applicable_flags(spec).find(|f| f.short == Some(ch)) else {
+                        return Ok(None);
+                    };
+                    let rest_offset = offset + ch.len_utf8();
+                    let rest = &short[rest_offset..];
+                    if matches!(flag.kind, FlagKind::Bool)
+                        && chars.peek().is_some()
+                        && !rest.starts_with('=')
+                    {
+                        prefix.insert(flag.long.to_string(), ParsedFlag::Bool(true));
+                        continue;
+                    }
+                    {
+                        let inline = (!rest.is_empty())
+                            .then(|| rest.strip_prefix('=').unwrap_or(rest).to_string());
+                        cursor.apply_flag(flag, inline, &mut prefix)?;
+                        break;
+                    }
+                }
+            } else {
+                return Ok(None);
+            }
+        }
+        if spec
+            .arguments
+            .iter()
+            .any(|a| matches!(a.kind, ArgumentKind::TrailingVarArgs))
+        {
+            return self.parse_raw_args(&path, &[]).map(Some);
+        }
+        Ok(None)
+    }
 }
 
 /// A position in an argument vector, and the command path errors are
@@ -496,6 +738,11 @@ impl<'a> RawArgCursor<'a> {
 
     fn peek(&self) -> Option<&'a String> {
         self.args.get(self.i)
+    }
+
+    /// The token after the current one.
+    fn next_token(&self) -> Option<&'a String> {
+        self.args.get(self.i + 1)
     }
 
     fn advance(&mut self) {
@@ -542,7 +789,26 @@ impl<'a> RawArgCursor<'a> {
                 flags.insert(key, ParsedFlag::Str(val));
                 Ok(())
             }
-            FlagKind::VecString => {
+            FlagKind::OptionalEnum { .. } => {
+                // `=`-only: a bare flag takes its missing-value default and
+                // the next token is never consumed as the value.
+                let earlier = match flags.get(&key) {
+                    Some(ParsedFlag::Str(value)) => Some(value.clone()),
+                    _ => None,
+                };
+                let occurrences = earlier
+                    .as_deref()
+                    .map(Some)
+                    .into_iter()
+                    .chain(std::iter::once(inline.as_deref()));
+                let value = flag_spec
+                    .resolve_optional_enum(path, occurrences)?
+                    .expect("at least one occurrence");
+                flags.insert(key, ParsedFlag::Str(value));
+                self.advance();
+                Ok(())
+            }
+            FlagKind::VecString | FlagKind::AgentArg => {
                 let val = self.read_value(inline, flag_spec.long)?;
                 match flags.get_mut(&key) {
                     Some(ParsedFlag::Strings(items)) => items.push(val),
@@ -596,7 +862,7 @@ impl<'a> RawArgCursor<'a> {
             return Ok(v);
         }
         match self.args.get(self.i + 1) {
-            Some(v) if !v.starts_with('-') => {
+            Some(v) if !v.starts_with('-') || self.hyphen_value_allowed(flag, v)? => {
                 let v = v.clone();
                 self.advance();
                 self.advance();
@@ -609,497 +875,250 @@ impl<'a> RawArgCursor<'a> {
             }),
         }
     }
+
+    fn hyphen_value_allowed(&self, flag_name: &str, value: &str) -> Result<bool, CommandError> {
+        let spec = CommandCatalogue::get()
+            .lookup(self.path)
+            .ok_or_else(|| CommandError::unknown_command(self.path))?;
+        let Some(flag) = applicable_flags(spec).find(|flag| flag.long == flag_name) else {
+            return Ok(false);
+        };
+        if !flag.allows_hyphen_value() {
+            return Ok(false);
+        }
+        let collides = value == "--"
+            || value == "-h"
+            || value == "--help"
+            || value == "-V"
+            || value == "--version"
+            || if let Some(long) = value.strip_prefix("--") {
+                let name = long.split_once('=').map_or(long, |(name, _)| name);
+                applicable_flags(spec).any(|known| known.long == name)
+            } else if let Some(shorts) = value.strip_prefix('-') {
+                let mut chars = shorts.chars();
+                chars.next().is_some_and(|first| {
+                    applicable_flags(spec).any(|known| known.short == Some(first))
+                })
+            } else {
+                false
+            };
+        if collides {
+            return Err(CommandError::InvalidArgumentValue {
+                command: self.path.iter().map(|s| (*s).to_string()).collect(),
+                argument: "prompt".into(),
+                reason: format!("`{value}` is an awman option or delimiter; use `--{flag_name}={value}` to pass it literally to the agent"),
+            });
+        }
+        Ok(true)
+    }
+}
+
+/// The error for an undeclared long flag: a [replaced flag]'s migration
+/// message when it is one, otherwise [`CommandError::UnknownFlag`]. The value
+/// is the inline `--flag=value`, or the next token unless it is a flag.
+///
+/// [replaced flag]: crate::command::dispatch::catalogue::ReplacedFlagSpec
+fn replaced_or_unknown_flag(
+    path: &[&str],
+    name: &str,
+    inline: Option<String>,
+    next: Option<&String>,
+) -> CommandError {
+    let Some(replaced) = CommandCatalogue::get().replaced_flag(name) else {
+        return CommandError::unknown_flag(path, name);
+    };
+    let value = inline.or_else(|| next.filter(|token| !token.starts_with('-')).cloned());
+    CommandError::InvalidFlagValue {
+        command: path.iter().map(|segment| (*segment).to_string()).collect(),
+        flag: replaced.name.to_string(),
+        reason: (replaced.message)(value.as_deref()),
+    }
 }
 
 #[cfg(test)]
-mod tests {
+mod permission_provenance_tests {
     use super::*;
-
-    fn cat() -> &'static CommandCatalogue {
-        CommandCatalogue::get()
-    }
-
-    fn argv(parts: &[&str]) -> Vec<String> {
-        parts.iter().map(|s| s.to_string()).collect()
-    }
-
     #[test]
-    fn exec_prompt_joins_trailing_positionals() {
-        let p = cat()
-            .parse_raw_args(&["exec", "prompt"], &argv(&["hello", "brave", "world"]))
-            .unwrap();
-        assert_eq!(p.argument("prompt").as_deref(), Some("hello brave world"));
-        assert_eq!(p.arguments("prompt"), vec!["hello", "brave", "world"]);
-    }
-
-    #[test]
-    fn exec_workflow_path_positional_reachable_via_flag_path_and_argument() {
-        let p = cat()
-            .parse_raw_args(&["exec", "workflow"], &argv(&["build.toml"]))
-            .unwrap();
-        assert_eq!(p.argument("workflow").as_deref(), Some("build.toml"));
-        assert_eq!(p.flag_path("workflow"), Some(PathBuf::from("build.toml")));
-    }
-
-    /// The API / TUI command box parse `--agent-flag=<value>` exactly as clap
-    /// does, hyphen-leading values included.
-    #[test]
-    fn agent_flag_inline_values_may_start_with_a_hyphen() {
-        let p = cat()
-            .parse_raw_args(
-                &["chat"],
-                &argv(&["--agent-flag=--no-daemon", "--agent-flag=-v"]),
-            )
-            .unwrap();
-        assert_eq!(p.flag_strings("agent-flag"), vec!["--no-daemon", "-v"]);
-    }
-
-    /// Clap rejects positionals a command never declared; the raw-args
-    /// projection must agree (WI-0097 parity) rather than silently dropping
-    /// them. `exec workflow` declares exactly one positional.
-    #[test]
-    fn extra_positional_beyond_declared_arguments_is_rejected() {
-        let err = cat()
-            .parse_raw_args(&["exec", "workflow"], &argv(&["build.toml", "stray"]))
-            .expect_err("an undeclared extra positional must be a usage error");
-        match err {
-            CommandError::UnexpectedArgument { command, argument } => {
-                assert_eq!(command, vec!["exec", "workflow"]);
-                assert_eq!(argument, "stray", "the error must name the stray token");
+    fn api_and_worker_defaults_never_become_explicit_yolo_on_relay() {
+        let catalogue = CommandCatalogue::get();
+        let spec = catalogue.lookup_with_aliases(&["exec", "prompt"]).unwrap();
+        for profile in [FrontendKind::WORKER_LOCAL, FrontendKind::SQUAD_LOCAL] {
+            for opt in [None, Some("--yolo"), Some("--yolo=false")] {
+                let mut args = vec!["--agent".into(), "cursor".into()];
+                if let Some(opt) = opt {
+                    args.push(opt.into());
+                }
+                args.push("review".into());
+                let parsed = catalogue
+                    .parse_raw_args_with_profile(&["exec", "prompt"], &args, profile)
+                    .unwrap();
+                assert_eq!(parsed.flag_is_explicit("yolo"), opt.is_some());
+                assert_eq!(parsed.flag_bool("yolo"), Some(opt != Some("--yolo=false")));
+                let forwarded = parsed.to_argv(spec);
+                assert_eq!(
+                    forwarded.iter().any(|a| a.starts_with("--yolo")),
+                    opt.is_some()
+                );
             }
-            other => panic!("expected UnexpectedArgument, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod misplaced_flag_tests {
+    use super::*;
+    const PATH: &[&str] = &["exec", "prompt"];
+    fn args(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|s| (*s).into()).collect()
+    }
+    fn parse(tokens: &[&str]) -> Result<ParsedArgs, CommandError> {
+        CommandCatalogue::get().parse_raw_args(PATH, &args(tokens))
+    }
+
+    #[test]
+    fn catalogue_options_aliases_inline_values_and_clusters_are_refused() {
+        for token in [
+            "--agent",
+            "--model=m",
+            "--headless",
+            "--work-item=70",
+            "--branch=b",
+            "--remote=host",
+            "--set=agents.stuckTimeout=60s",
+            "-n",
+            "-nn",
+            "-noenv(X)",
+            "-w70",
+        ] {
+            let error = parse(&["review", token]).unwrap_err();
+            assert_eq!(
+                (error.exit_code(), error.http_status(), error.code()),
+                (2, 400, "invalid_request"),
+                "{token}: {error}"
+            );
+            assert!(error.to_string().contains("before the prompt"));
+            assert!(error.to_string().contains("`--`"));
         }
     }
 
-    /// `new skill` declares no positional at all, so a stray skill name next to
-    /// `--pull` must be rejected before any git work can start (WI-0103).
     #[test]
-    fn new_skill_rejects_a_positional_name_alongside_pull() {
-        let err = cat()
-            .parse_raw_args(
-                &["new", "skill"],
-                &argv(&["--pull", "owner/library", "accidental-name"]),
-            )
-            .expect_err("new skill takes no positional argument");
-        assert!(
-            matches!(
-                &err,
-                CommandError::UnexpectedArgument { argument, .. } if argument == "accidental-name"
-            ),
-            "expected UnexpectedArgument naming the stray name, got {err:?}"
+    fn literal_marker_round_trips_and_a_late_delimiter_does_not_disable_the_guard() {
+        let spec = CommandCatalogue::get().lookup(PATH).unwrap();
+        for tokens in [
+            &["--", "--model"][..],
+            &["--", "review", "--", "--model=m"][..],
+            &["review", "--", "unknown-option"][..],
+        ] {
+            let parsed = parse(tokens).unwrap();
+            assert_eq!(parsed.literal_tail(), tokens[0] == "--");
+            assert_eq!(
+                parse(
+                    &parsed
+                        .to_argv(spec)
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                )
+                .unwrap(),
+                parsed
+            );
+        }
+        assert!(parse(&["review", "--", "--model=m"]).is_err());
+    }
+
+    #[test]
+    fn prose_unknown_words_and_hyphenated_agent_flag_values_keep_their_tokens() {
+        let parsed = parse(&[
+            "--agent-flag",
+            "--effort",
+            "--agent-flag=unsupported",
+            "Explain --model and --headless",
+            "--unknown",
+            "-xyz",
+            "-",
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.flag_strings("agent-flag"),
+            ["--effort", "unsupported"]
         );
+        assert_eq!(
+            parsed.arguments("prompt"),
+            ["Explain --model and --headless", "--unknown", "-xyz", "-"]
+        );
+        let clustered = parse(&["-n", "-oenv(TEST)", "review"]).unwrap();
+        assert_eq!(clustered.flag_bool("headless"), Some(true));
+        assert_eq!(clustered.flag_strings("overlay"), ["env(TEST)"]);
     }
 
     #[test]
-    fn flag_equals_and_space_forms_are_equivalent() {
-        let a = cat()
-            .parse_raw_args(&["exec", "prompt"], &argv(&["--agent", "claude"]))
-            .unwrap();
-        let b = cat()
-            .parse_raw_args(&["exec", "prompt"], &argv(&["--agent=claude"]))
-            .unwrap();
-        assert_eq!(a.flag_string("agent").as_deref(), Some("claude"));
-        assert_eq!(b.flag_string("agent").as_deref(), Some("claude"));
+    fn agent_flag_does_not_consume_awman_options_or_delimiter() {
+        for value in ["--headless", "--model", "--", "-n", "--help", "-V"] {
+            let error = parse(&["--agent-flag", value, "task"]).unwrap_err();
+            assert!(error.to_string().contains("use `--agent-flag="), "{error}");
+        }
+        let parsed = parse(&["--agent-flag=--headless", "task"]).unwrap();
+        assert_eq!(parsed.flag_strings("agent-flag"), ["--headless"]);
     }
 
     #[test]
-    fn bool_flag_is_set_true_by_presence() {
-        let p = cat()
-            .parse_raw_args(&["exec", "prompt"], &argv(&["--plan"]))
-            .unwrap();
-        assert_eq!(p.flag_bool("plan"), Some(true));
-    }
-
-    #[test]
-    fn repeated_vec_flag_accumulates() {
-        let p = cat()
-            .parse_raw_args(
-                &["exec", "prompt"],
-                &argv(&["--overlay", "/a", "--overlay", "/b"]),
-            )
-            .unwrap();
-        assert_eq!(p.flag_strings("overlay"), vec!["/a", "/b"]);
-    }
-
-    #[test]
-    fn double_dash_forces_positionals() {
-        let p = cat()
-            .parse_raw_args(&["exec", "prompt"], &argv(&["--", "--not-a-flag"]))
-            .unwrap();
-        assert_eq!(p.argument("prompt").as_deref(), Some("--not-a-flag"));
-    }
-
-    #[test]
-    fn unknown_flag_is_structured_error() {
-        let err = cat()
-            .parse_raw_args(&["exec", "prompt"], &argv(&["--bogus"]))
-            .unwrap_err();
-        assert!(matches!(err, CommandError::UnknownFlag { .. }));
-    }
-
-    #[test]
-    fn u16_type_mismatch_is_structured_error() {
-        let err = cat()
-            .parse_raw_args(&["api", "start"], &argv(&["--port", "not-a-number"]))
-            .unwrap_err();
-        assert!(matches!(err, CommandError::InvalidFlagValue { .. }));
-    }
-
-    #[test]
-    fn u16_flag_coerces_value() {
-        let p = cat()
-            .parse_raw_args(&["api", "start"], &argv(&["--port", "9876"]))
-            .unwrap();
-        assert_eq!(p.flag_u16("port"), Some(9876));
-    }
-
-    #[test]
-    fn bad_enum_value_is_structured_error() {
-        let err = cat()
-            .parse_raw_args(
-                &["remote", "session", "start"],
-                &argv(&["--type", "banana"]),
-            )
-            .unwrap_err();
-        assert!(matches!(err, CommandError::InvalidFlagValue { .. }));
-    }
-
-    #[test]
-    fn api_profile_forces_non_interactive_and_defaults_yolo() {
-        let p = cat()
-            .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&["hi"]), FrontendKind::Api)
-            .unwrap();
-        assert_eq!(p.flag_bool("non-interactive"), Some(true));
-        assert_eq!(p.flag_bool("yolo"), Some(true));
-    }
-
-    #[test]
-    fn api_profile_yolo_default_is_overridable_by_plan() {
-        // A request that opts into --plan (mutually exclusive with yolo in the
-        // catalogue) must genuinely override the overridable yolo default: the
-        // fills-when-absent default is suppressed because a conflicting flag is
-        // present, so yolo stays unset and dispatch sees a coherent request.
-        // non-interactive stays forced regardless.
-        let p = cat()
-            .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&["--plan"]), FrontendKind::Api)
-            .unwrap();
-        assert_eq!(p.flag_bool("plan"), Some(true));
-        assert_eq!(p.flag_bool("non-interactive"), Some(true));
-        // yolo default suppressed by the conflicting --plan (real override).
-        assert_eq!(p.flag_bool("yolo"), None);
-    }
-
-    #[test]
-    fn cli_and_tui_profiles_apply_no_overrides() {
-        let p = cat()
-            .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&["hi"]), FrontendKind::Cli)
-            .unwrap();
-        // No profile override: non-interactive/yolo are absent unless supplied.
-        assert_eq!(p.flag_bool("non-interactive"), None);
-        assert_eq!(p.flag_bool("yolo"), None);
-    }
-
-    #[test]
-    fn unknown_command_path_is_structured_error() {
-        let err = cat().parse_raw_args(&["nope"], &argv(&[])).unwrap_err();
-        assert!(matches!(err, CommandError::UnknownCommand { .. }));
-    }
-
-    #[test]
-    fn config_set_maps_two_positionals() {
-        let p = cat()
-            .parse_raw_args(&["config", "set"], &argv(&["agent", "claude"]))
-            .unwrap();
-        assert_eq!(p.argument("field").as_deref(), Some("agent"));
-        assert_eq!(p.argument("value").as_deref(), Some("claude"));
-    }
-
-    #[test]
-    fn only_parse_stage_errors_can_be_replayed() {
-        let error = cat().parse_raw_args(&["nope"], &argv(&[])).unwrap_err();
-        let replay = error.clone_parse_stage().expect("a parse error replays");
-        assert_eq!(replay.to_string(), error.to_string());
-        assert!(CommandError::Aborted.clone_parse_stage().is_none());
-    }
-
-    #[test]
-    fn explicit_yolo_value_is_kept_under_api_profile() {
-        // yolo is an overridable default, so if the request already set it the
-        // profile must not clobber it.
-        let p = cat()
-            .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&["--yolo"]), FrontendKind::Api)
-            .unwrap();
-        assert_eq!(p.flag_bool("yolo"), Some(true));
-    }
-}
-
-/// Parsing cases every frontend that dispatches from [`ParsedArgs`] must read
-/// back identically. The API and TUI frontends' own tests run this table, so
-/// the only allowed differences are the profile rows declared here.
-#[cfg(test)]
-pub(crate) mod shared_cases {
-    use super::*;
-    use crate::command::dispatch::CommandFrontend;
-
-    pub(crate) enum Read {
-        /// Compared the way `resolved::read_flag` reads it: absent is false.
-        Bool(&'static str, bool),
-        Str(&'static str, &'static str),
-        Strs(&'static str, &'static [&'static str]),
-        Path(&'static str, &'static str),
-        U16(&'static str, u16),
-        Usize(&'static str, usize),
-        Arg(&'static str, &'static str),
-        Args(&'static str, &'static [&'static str]),
-    }
-
-    pub(crate) struct Case {
-        pub name: &'static str,
-        /// The command as typed, possibly through an alias.
-        pub path: &'static [&'static str],
-        pub canonical: &'static [&'static str],
-        pub args: &'static [&'static str],
-        pub reads: &'static [Read],
-        /// Reads that differ by caller profile.
-        pub tui_reads: &'static [Read],
-        pub api_reads: &'static [Read],
-    }
-
-    const PROMPT: &[&str] = &["exec", "prompt"];
-    const WORKFLOW: &[&str] = &["exec", "workflow"];
-
-    pub(crate) const CASES: &[Case] = &[
-        Case {
-            name: "omitted flags: false for the TUI, API profile defaults and forces",
-            path: PROMPT,
-            canonical: PROMPT,
-            args: &["hi"],
-            reads: &[Read::Bool("plan", false)],
-            tui_reads: &[
-                Read::Bool("yolo", false),
-                Read::Bool("non-interactive", false),
-            ],
-            api_reads: &[
-                Read::Bool("yolo", true),
-                Read::Bool("non-interactive", true),
-            ],
-        },
-        Case {
-            name: "explicit false beats a default but not a forced flag",
-            path: PROMPT,
-            canonical: PROMPT,
-            args: &["--yolo=false", "--non-interactive=false", "hi"],
-            reads: &[Read::Bool("yolo", false)],
-            tui_reads: &[Read::Bool("non-interactive", false)],
-            api_reads: &[Read::Bool("non-interactive", true)],
-        },
-        Case {
-            name: "a conflicting flag suppresses the API's yolo default",
-            path: PROMPT,
-            canonical: PROMPT,
-            args: &["--plan", "hi"],
-            reads: &[Read::Bool("plan", true), Read::Bool("yolo", false)],
-            tui_reads: &[],
-            api_reads: &[],
-        },
-        Case {
-            name: "an explicitly false flag does not suppress another flag's default",
-            path: PROMPT,
-            canonical: PROMPT,
-            args: &["--plan=false", "hi"],
-            reads: &[Read::Bool("plan", false)],
-            tui_reads: &[Read::Bool("yolo", false)],
-            api_reads: &[Read::Bool("yolo", true)],
-        },
-        Case {
-            name: "an explicitly false flag keeps its own value beside a false conflict",
-            path: PROMPT,
-            canonical: PROMPT,
-            args: &["--plan=false", "--yolo=false", "hi"],
-            reads: &[Read::Bool("plan", false), Read::Bool("yolo", false)],
-            tui_reads: &[],
-            api_reads: &[],
-        },
-        Case {
-            name: "a false --plan does not conflict with --yolo",
-            path: PROMPT,
-            canonical: PROMPT,
-            args: &["--plan=false", "--yolo", "hi"],
-            reads: &[Read::Bool("plan", false), Read::Bool("yolo", true)],
-            tui_reads: &[],
-            api_reads: &[],
-        },
-        Case {
-            name: "a false --yolo does not conflict with --plan",
-            path: PROMPT,
-            canonical: PROMPT,
-            args: &["--yolo=false", "--plan", "hi"],
-            reads: &[Read::Bool("plan", true), Read::Bool("yolo", false)],
-            tui_reads: &[],
-            api_reads: &[],
-        },
-        Case {
-            name: "a command alias and a short flag resolve to canonical names",
-            path: &["exec", "wf"],
-            canonical: WORKFLOW,
-            args: &["a.toml", "-n"],
-            reads: &[
-                Read::Bool("non-interactive", true),
-                Read::Arg("workflow", "a.toml"),
-            ],
-            tui_reads: &[],
-            api_reads: &[],
-        },
-        Case {
-            name: "numeric flags at their bounds arrive typed",
-            path: WORKFLOW,
-            canonical: WORKFLOW,
-            args: &["a.toml", "--max-concurrent", "1"],
-            reads: &[Read::Usize("max-concurrent", 1)],
-            tui_reads: &[],
-            api_reads: &[],
-        },
-        Case {
-            name: "the largest port arrives typed",
-            path: &["api", "start"],
-            canonical: &["api", "start"],
-            args: &["--port=65535"],
-            reads: &[Read::U16("port", 65535)],
-            tui_reads: &[],
-            api_reads: &[],
-        },
-        Case {
-            name: "a path positional reads as both a path and an argument",
-            path: WORKFLOW,
-            canonical: WORKFLOW,
-            args: &["dir with space/a.toml"],
-            reads: &[
-                Read::Path("workflow", "dir with space/a.toml"),
-                Read::Arg("workflow", "dir with space/a.toml"),
-            ],
-            tui_reads: &[],
-            api_reads: &[],
-        },
-        Case {
-            name: "trailing arguments keep hyphen-leading tokens",
-            path: PROMPT,
-            canonical: PROMPT,
-            args: &["hello", "--not-a-flag", "-x"],
-            reads: &[
-                Read::Arg("prompt", "hello --not-a-flag -x"),
-                Read::Args("prompt", &["hello", "--not-a-flag", "-x"]),
-            ],
-            tui_reads: &[],
-            api_reads: &[],
-        },
-        Case {
-            name: "a double dash makes the rest positional",
-            path: PROMPT,
-            canonical: PROMPT,
-            args: &["--", "--plan"],
-            reads: &[Read::Bool("plan", false), Read::Arg("prompt", "--plan")],
-            tui_reads: &[],
-            api_reads: &[],
-        },
-        Case {
-            name: "repeated flags accumulate in order",
-            path: PROMPT,
-            canonical: PROMPT,
-            args: &["--overlay", "/b", "--overlay=/a"],
-            reads: &[Read::Strs("overlay", &["/b", "/a"])],
-            tui_reads: &[],
-            api_reads: &[],
-        },
-        Case {
-            name: "hyphen-leading agent args pass through their inline form",
-            path: &["chat"],
-            canonical: &["chat"],
-            args: &[
-                "--agent",
-                "claude",
-                "--agent-flag=--no-daemon",
-                "--agent-flag=-v",
-            ],
-            reads: &[
-                Read::Str("agent", "claude"),
-                Read::Strs("agent-flag", &["--no-daemon", "-v"]),
-            ],
-            tui_reads: &[],
-            api_reads: &[],
-        },
-    ];
-
-    /// Rejected input and the classification it must keep in every frontend.
-    pub(crate) const ERROR_CASES: &[(&[&str], &[&str], &str)] = &[
-        (PROMPT, &["--bogus"], "UnknownFlag"),
-        (PROMPT, &["-ab"], "UnknownFlag"),
-        (&["nope"], &[], "UnknownCommand"),
-        (WORKFLOW, &["a.toml", "stray"], "UnexpectedArgument"),
-        (&["api", "start"], &["--port=65536"], "InvalidFlagValue"),
-        (&["api", "start"], &["--port=abc"], "InvalidFlagValue"),
-        (WORKFLOW, &["--max-concurrent=0"], "InvalidFlagValue"),
-        (&["chat"], &["--launch-mode=banana"], "InvalidFlagValue"),
-        (&["chat"], &["--agent-flag", "-v"], "InvalidFlagValue"),
-        (PROMPT, &["--plan", "--yolo"], "InvalidFlagValue"),
-    ];
-
-    pub(crate) fn classification(error: &CommandError) -> &'static str {
-        match error {
-            CommandError::UnknownCommand { .. } => "UnknownCommand",
-            CommandError::UnknownFlag { .. } => "UnknownFlag",
-            CommandError::InvalidFlagValue { .. } => "InvalidFlagValue",
-            CommandError::UnexpectedArgument { .. } => "UnexpectedArgument",
-            other => panic!("not a parse-stage classification: {other:?}"),
+    fn help_and_version_after_prompt_text_are_misplaced_flags() {
+        for token in ["-h", "--help", "-V", "--version"] {
+            let error = parse(&["task", token]).unwrap_err();
+            assert!(
+                error.to_string().contains("appears after prompt text"),
+                "{error}"
+            );
         }
     }
 
-    /// Assert `reads` against any frontend, through the dispatch accessors.
-    pub(crate) fn assert_reads<F: CommandFrontend>(frontend: &F, case: &Case, reads: &[Read]) {
-        let path = case.canonical;
-        let name = case.name;
-        for read in reads {
-            match *read {
-                Read::Bool(flag, want) => assert_eq!(
-                    frontend.flag_bool(path, flag).unwrap().unwrap_or(false),
-                    want,
-                    "{name}: --{flag}"
-                ),
-                Read::Str(flag, want) => assert_eq!(
-                    frontend.flag_string(path, flag).unwrap().as_deref(),
-                    Some(want),
-                    "{name}: --{flag}"
-                ),
-                Read::Strs(flag, want) => assert_eq!(
-                    frontend.flag_strings(path, flag).unwrap(),
-                    want,
-                    "{name}: --{flag}"
-                ),
-                Read::Path(flag, want) => assert_eq!(
-                    frontend.flag_path(path, flag).unwrap(),
-                    Some(PathBuf::from(want)),
-                    "{name}: --{flag}"
-                ),
-                Read::U16(flag, want) => assert_eq!(
-                    frontend.flag_u16(path, flag).unwrap(),
-                    Some(want),
-                    "{name}: --{flag}"
-                ),
-                Read::Usize(flag, want) => assert_eq!(
-                    frontend.flag_usize(path, flag).unwrap(),
-                    Some(want),
-                    "{name}: --{flag}"
-                ),
-                Read::Arg(arg, want) => assert_eq!(
-                    frontend.argument(path, arg).unwrap().as_deref(),
-                    Some(want),
-                    "{name}: {arg}"
-                ),
-                Read::Args(arg, want) => assert_eq!(
-                    frontend.arguments(path, arg).unwrap(),
-                    want,
-                    "{name}: {arg}"
-                ),
-            }
+    #[test]
+    fn cli_tail_rejects_awman_flag_as_separate_agent_flag_value() {
+        let argv = args(&[
+            "awman",
+            "exec",
+            "prompt",
+            "--agent-flag",
+            "--headless",
+            "task",
+        ]);
+        let error = CommandCatalogue::get().parse_cli_tail(&argv).unwrap_err();
+        assert!(error.to_string().contains("use `--agent-flag="));
+    }
+
+    #[test]
+    fn cli_tail_keeps_clusters_before_the_prompt_in_the_shared_raw_parser() {
+        let argv = args(&["awman", "exec", "prompt", "-nn", "task"]);
+        let parsed = CommandCatalogue::get()
+            .parse_cli_tail(&argv)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.flag_bool("headless"), Some(true));
+        assert_eq!(parsed.arguments("prompt"), ["task"]);
+    }
+
+    #[test]
+    fn cli_prefix_options_and_literal_tail_use_the_shared_parser() {
+        for prefix in [
+            &["awman"][..],
+            &["awman", "--set", "agents.stuckTimeout=60s"][..],
+        ] {
+            let mut argv = args(prefix);
+            argv.extend(args(&[
+                "exec",
+                "prompt",
+                "--agent-flag",
+                "--effort",
+                "--",
+                "--model",
+            ]));
+            let parsed = CommandCatalogue::get()
+                .parse_cli_tail(&argv)
+                .unwrap()
+                .unwrap();
+            assert!(parsed.literal_tail());
+            assert_eq!(parsed.arguments("prompt"), ["--model"]);
+            assert_eq!(parsed.flag_strings("agent-flag"), ["--effort"]);
         }
     }
 }

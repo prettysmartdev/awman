@@ -1,0 +1,449 @@
+{
+  "health_basic": {
+    "status": "ok"
+  },
+  "health_browser": {
+    "status": "ok",
+    "build": "0.42.0",
+    "protocols": {
+      "api": 1,
+      "frontend": 1,
+      "terminal": 1,
+      "browser": 1
+    },
+    "capabilities": [
+      "daemon_features",
+      "network_listener",
+      "named_listeners",
+      "api_keys",
+      "health",
+      "terminal",
+      "interactive",
+      "engine_instances",
+      "frontend_protocol",
+      "browser_links",
+      "browser_tickets",
+      "launch_contexts",
+      "engine_catalogue",
+      "web_frontend"
+    ],
+    "listener": {
+      "name": "loopback",
+      "transport": "loopback_http",
+      "features": [
+        "engine"
+      ]
+    },
+    "engine": {
+      "state": "on"
+    },
+    "browser_links": true
+  },
+  "health_browser_engine_off": {
+    "status": "ok",
+    "build": "0.41.0",
+    "protocols": {
+      "api": 1,
+      "frontend": 1,
+      "terminal": 1
+    },
+    "capabilities": [
+      "daemon_features",
+      "named_listeners",
+      "terminal",
+      "engine_instances",
+      "frontend_protocol"
+    ],
+    "listener": {
+      "name": "loopback",
+      "transport": "loopback_http",
+      "features": [
+        "engine"
+      ]
+    },
+    "engine": {
+      "state": "off"
+    },
+    "browser_links": false
+  },
+  "link_created": {
+    "id": "blk_00112233445566778899aabbccddeeff",
+    "code": "web-K7PM-3Q9X",
+    "polling_secret": "q2V0Zl9zZWNyZXRfZXhhbXBsZV9wb2xsaW5nX3NlY3I",
+    "interval_ms": 2000,
+    "expires_at": "2026-11-09T09:20:02.000Z",
+    "listener": "loopback",
+    "origin": "https://awman.prettysmart.dev",
+    "scope": "engine"
+  },
+  "link_poll_pending": {
+    "status": "pending",
+    "retry_after_ms": 2000
+  },
+  "link_poll_approved": {
+    "status": "approved",
+    "grant": {
+      "id": "brw_ffeeddccbbaa99887766554433221100",
+      "token": "awb_dG9rZW5fZXhhbXBsZV9ub3RfcmVhbF90b2tlbl9hYmM",
+      "scope": "engine",
+      "origin": "https://awman.prettysmart.dev",
+      "listener": "loopback",
+      "expires_at": "2026-11-09T21:15:40.000Z"
+    }
+  },
+  "link_poll_denied": {
+    "status": "denied"
+  },
+  "link_poll_gone": {
+    "error": "link expired or unknown",
+    "code": "link_gone"
+  },
+  "ticket_request_frontend": {
+    "route": "frontend",
+    "instance_id": "ins_5f0c2a9e7b1d4c3e8a6f9b2d1c0e4a7b"
+  },
+  "ticket_request_terminal": {
+    "route": "terminal",
+    "terminal_id": "term_4e5f60718293a4b5c6d7e8f901a2b3c4"
+  },
+  "ticket": {
+    "ticket": "awt_dGlja2V0X2V4YW1wbGVfbm90X3JlYWxfdGlja2V0X3h5",
+    "expires_in_ms": 30000
+  },
+  "status": {
+    "status": "ok",
+    "version": "0.42.0",
+    "protocol": {
+      "api": 1,
+      "frontend": 1
+    },
+    "capabilities": [
+      "daemon_features",
+      "named_listeners",
+      "terminal",
+      "engine_instances",
+      "frontend_protocol"
+    ],
+    "features": {
+      "engine": {
+        "enabled_by": "config",
+        "oldest_queued_age_ms": null,
+        "restarts": 0,
+        "last_error": null,
+        "since_at": "2026-11-09T08:00:00.123456Z",
+        "idle_timeout_ms": 1800000,
+        "idle_ms": 0,
+        "name": "engine",
+        "state": "on",
+        "running": 1,
+        "queued": 0,
+        "detail": {
+          "instances": 1,
+          "frontends": 2
+        }
+      },
+      "squad": {
+        "enabled_by": null,
+        "oldest_queued_age_ms": null,
+        "restarts": 0,
+        "last_error": null,
+        "since_at": "2026-11-09T08:00:00.123456Z",
+        "name": "squad",
+        "state": "off",
+        "running": 0,
+        "queued": 0
+      },
+      "worker": {
+        "enabled_by": null,
+        "reason": "not configured",
+        "oldest_queued_age_ms": null,
+        "restarts": 0,
+        "last_error": null,
+        "since_at": "2026-11-09T08:00:00.123456Z",
+        "name": "worker",
+        "state": "off",
+        "max_concurrent_jobs": 2,
+        "running": 0,
+        "queued": 0
+      }
+    },
+    "max_concurrent_jobs": 4,
+    "pid": 41234,
+    "uptime_ms": 4502113,
+    "listeners": {
+      "local": {
+        "transport": "unix_socket",
+        "address": "/Users/me/.awman/daemon/awman.sock"
+      },
+      "network": {
+        "loopback": {
+          "name": "loopback",
+          "enabled": true,
+          "listen": "127.0.0.1:9877",
+          "bound": "127.0.0.1:9877",
+          "transport": "loopback_http",
+          "tls": null,
+          "error": null,
+          "features": [
+            "engine"
+          ],
+          "api_keys": 0,
+          "browser_links": true,
+          "allowed_origins": [
+            "https://awman.prettysmart.dev",
+            "http://localhost:3000"
+          ],
+          "browser_grants": 1
+        }
+      }
+    },
+    "agents": [
+      "claude",
+      "codex",
+      "gemini"
+    ]
+  },
+  "launch_contexts": {
+    "items": [
+      {
+        "id": "lc_0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+        "label": "awman",
+        "root": "/Users/me/src/awman",
+        "is_default": true,
+        "env_state": "live",
+        "refreshed_at": "2026-11-09T09:00:00Z"
+      },
+      {
+        "id": "lc_f9e8d7c6b5a4039281706f5e4d3c2b1a",
+        "label": "notes",
+        "root": "/Users/me/notes",
+        "is_default": false,
+        "env_state": "stale",
+        "refreshed_at": "2026-11-01T12:00:00Z"
+      }
+    ],
+    "default_id": "lc_0a1b2c3d4e5f60718293a4b5c6d7e8f9",
+    "next_cursor": null
+  },
+  "launch_contexts_empty": {
+    "items": [],
+    "default_id": null,
+    "next_cursor": null
+  },
+  "catalogue": {
+    "etag": "5d41402abc4b2a76b9719d911017c592ae0f8a6b6b2fbc1c5c3d1a1f6a3c6f0e",
+    "commands": [
+      {
+        "path": [
+          "exec"
+        ],
+        "help": "Run a workflow or prompt",
+        "long_help": null,
+        "aliases": [],
+        "flags": [],
+        "arguments": [],
+        "subcommands": [
+          {
+            "path": [
+              "exec",
+              "workflow"
+            ],
+            "help": "Run a workflow",
+            "long_help": "Runs a multi-step workflow in containers.",
+            "aliases": [
+              "wf"
+            ],
+            "flags": [
+              {
+                "long": "yolo",
+                "short": "y",
+                "help": "Advance without asking",
+                "kind": "bool",
+                "default": null
+              },
+              {
+                "long": "agent",
+                "short": null,
+                "help": "Agent to use",
+                "kind": "value",
+                "default": "claude",
+                "values": [
+                  "claude",
+                  "codex",
+                  "gemini"
+                ]
+              }
+            ],
+            "arguments": [
+              {
+                "name": "workflow",
+                "help": "Workflow name",
+                "required": true
+              }
+            ],
+            "subcommands": []
+          }
+        ]
+      }
+    ],
+    "actions": {
+      "show_config": [
+        "config",
+        "show"
+      ],
+      "new_squad_task": [
+        "squad",
+        "new"
+      ]
+    }
+  },
+  "prompt_squad_task_confirm": {
+    "title": "Pause task nightly-review?",
+    "body": "It will not run until resumed.",
+    "choices": [
+      {
+        "key": "y",
+        "label": "Pause",
+        "value": "confirm"
+      },
+      {
+        "key": "n",
+        "label": "Keep running",
+        "value": "dismiss"
+      }
+    ],
+    "default_on_dismiss": "dismiss"
+  },
+  "instance_create_request": {
+    "annotations": {
+      "web/origin": "https://awman.prettysmart.dev"
+    }
+  },
+  "instance_created": {
+    "id": "ins_5f0c2a9e7b1d4c3e8a6f9b2d1c0e4a7b"
+  },
+  "instances_list": {
+    "items": [
+      {
+        "id": "ins_5f0c2a9e7b1d4c3e8a6f9b2d1c0e4a7b",
+        "primary_frontend_kind": "web",
+        "annotations": {
+          "web/origin": "https://awman.prettysmart.dev"
+        },
+        "tab_count": 2,
+        "running_jobs": 1,
+        "created_at": "2026-11-09T09:15:02.481233Z"
+      }
+    ],
+    "next_cursor": null
+  },
+  "terminals_list": {
+    "items": [
+      {
+        "id": "term_4e5f60718293a4b5c6d7e8f901a2b3c4",
+        "owner_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "feature": "engine",
+        "source": {
+          "phase": "main",
+          "step_name": "implement",
+          "step_index": 1,
+          "container": "awman-claude-7d0f5e2c",
+          "step_attempt": 1
+        },
+        "agent": "claude",
+        "model": "opus",
+        "attempt": 1,
+        "cols": 120,
+        "rows": 36,
+        "state": "open",
+        "created_at": "2026-11-09T09:16:10.002Z",
+        "allow_remote_input": true
+      },
+      {
+        "id": "term_8a9b0c1d2e3f405162738495a6b7c8d9",
+        "owner_id": "run_0123456789abcdef0123456789abcdef",
+        "feature": "squad",
+        "agent": "codex",
+        "attempt": 1,
+        "cols": 80,
+        "rows": 24,
+        "state": "exited",
+        "exit_code": 0,
+        "created_at": "2026-11-09T07:00:00.000Z",
+        "allow_remote_input": false
+      }
+    ],
+    "next_cursor": null
+  },
+  "squad_tasks": {
+    "items": [
+      {
+        "prerequisites": null,
+        "id": "task_0123456789abcdef0123456789abcdef",
+        "name": "nightly-review",
+        "description": "Review open PRs",
+        "repo_scope": "/Users/me/src/awman",
+        "mount_scope": "gitroot",
+        "overlays": [],
+        "interval_ms": 3600000,
+        "status": "active",
+        "agent": "claude",
+        "model": null,
+        "backoff_until": null,
+        "created_at": "2026-11-01T10:00:00.000Z",
+        "updated_at": "2026-11-08T10:00:00.000Z",
+        "last_run_at": "2026-11-09T07:00:00.000Z",
+        "trigger_requested_at": null,
+        "last_run_status": "workflow_executed",
+        "unmet_env": []
+      }
+    ],
+    "next_cursor": null
+  },
+  "squad_runs": {
+    "items": [
+      {
+        "id": "run_0123456789abcdef0123456789abcdef",
+        "task_id": "task_0123456789abcdef0123456789abcdef",
+        "status": "workflow_executed",
+        "workflow_path": "/Users/me/.awman/squad/tasks/nightly-review/runs/1/workflow.yaml",
+        "workflow_state_path": null,
+        "session_id": "ses_aabbccddeeff00112233445566778899",
+        "started_at": "2026-11-09T07:00:00.000Z",
+        "finished_at": "2026-11-09T07:04:12.000Z",
+        "error": null,
+        "reason": "two PRs need review",
+        "unmet_env": []
+      }
+    ],
+    "next_cursor": null
+  },
+  "squad_task_patch": {
+    "paused": true
+  },
+  "squad_run_created": {
+    "id": "run_fedcba9876543210fedcba9876543210"
+  },
+  "squad_run_canceled": {
+    "id": "run_fedcba9876543210fedcba9876543210",
+    "status": "canceling"
+  },
+  "dialog_answer_outcome": {
+    "outcome": "already_answered",
+    "by": {
+      "by": "api"
+    }
+  },
+  "frontend_socket_refusal": {
+    "code": "primary_exists",
+    "error": "instance already has a primary frontend"
+  },
+  "error": {
+    "error": "browser grant is invalid or expired",
+    "code": "browser_grant_invalid"
+  },
+  "error_rate_limited": {
+    "error": "too many link requests",
+    "code": "rate_limited"
+  }
+}

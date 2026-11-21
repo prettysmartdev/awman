@@ -1,5 +1,7 @@
 # WI 0123 evidence: `builtin-experimental` on Apple Silicon
 
+> Testing policy update (WI144): test commands, harness paths and test counts in this historical record are superseded by [the current testing contract](/aspec/devops/testing.md). Use manifest suites and `make validate-native` for native acceptance. Removed test sources and raw evidence bundles are available only in Git history; they must not be restored as test patterns.
+
 Final sweep recorded 2026-09-29 on Apple Silicon (macOS 26.6.2, arm64,
 `kern.hv_support=1`, Apple Containers 0.12.0). Every log under
 [`final/`](final/) starts with the SHA-256 of the WI 0123 code patch against

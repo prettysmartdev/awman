@@ -8,12 +8,12 @@ use std::sync::Arc;
 
 use crate::command::dispatch::catalogue::SessionWorktreeTarget;
 use crate::command::error::CommandError;
+use crate::data::checkout_paths::{
+    branch_worktree_dir_name, pull_request_worktree_dir_name, WorktreePaths,
+};
 use crate::data::fs::remote_slug::RemoteSlug;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::Session;
-use crate::data::worktree_paths::{
-    branch_worktree_dir_name, pull_request_worktree_dir_name, WorktreePaths,
-};
 use crate::engine::git::pull_request::{
     match_pull_request_remote, parse_pull_request_input, PullRequestClient, PullRequestState,
 };
@@ -409,15 +409,11 @@ impl Resolver<'_> {
             self.announce_reuse(&worktree);
             self.refresh_reused(&worktree, &how)?;
             return Ok(worktree);
-        }
-        #[cfg(test)]
-        race_hooks::run(self.root, RaceStage::AfterLookup);
+        };
         let path = match self.available_path(directory_name) {
             Ok(path) => path,
             Err(error) => return self.reuse_after_collision(branch, error, &how),
         };
-        #[cfg(test)]
-        race_hooks::run(self.root, RaceStage::AfterPathCheck);
         let local = self.git.local_branch_exists(self.root, branch)?;
         let added = match (on_remote, local) {
             (true, false) => {
@@ -506,7 +502,7 @@ impl Resolver<'_> {
         {
             return self.resolve_branch(&info.head_ref_name, Some(&remote), &name, false);
         }
-        let branch = format!("pr/{}", pr.number);
+        let branch = crate::data::checkout_paths::pull_request_branch_name(pr.number);
         self.git.validate_branch_name(self.root, &branch)?;
         if info.is_cross_repository {
             self.warn(format!("Fork PR #{} uses local branch '{branch}' without tracking the fork branch. Pushing to origin will not update the PR; configure the fork's remote explicitly.", pr.number));
@@ -604,24 +600,27 @@ impl Resolver<'_> {
 
     fn missing_name(&self, name: &str) -> CommandError {
         let detail = (|| -> Result<String, CommandError> {
-            let paths = WorktreePaths::from_home()?;
-            let directories = [
-                paths.named(self.root, name),
-                paths.legacy_named(self.root, name),
-            ]
-            .into_iter()
-            .filter_map(|path| path.parent().map(Path::to_path_buf))
-            .collect::<Vec<_>>();
+            let paths = WorktreePaths::from_env(self.git.env())?;
+            let directories = [paths.named(self.root, name)]
+                .into_iter()
+                .filter_map(|path| path.parent().map(Path::to_path_buf))
+                .collect::<Vec<_>>();
+            let canonical_directories = directories
+                .iter()
+                .filter_map(|dir| dir.canonicalize().ok())
+                .collect::<Vec<_>>();
             let available = self
                 .git
                 .list_worktree_entries(self.root)?
                 .into_iter()
                 .filter(|entry: &WorktreeEntry| {
                     !entry.prunable
-                        && entry
-                            .path
-                            .parent()
-                            .is_some_and(|p| directories.iter().any(|dir| p == dir))
+                        && entry.path.parent().is_some_and(|parent| {
+                            directories.iter().any(|dir| parent == dir)
+                                || parent.canonicalize().is_ok_and(|canonical| {
+                                    canonical_directories.contains(&canonical)
+                                })
+                        })
                 })
                 .filter(|entry| {
                     self.git
@@ -669,47 +668,6 @@ pub(crate) fn concurrent_add_failure(error: &crate::engine::error::EngineError) 
         || detail.contains("checked out at")
 }
 
-/// Test seam: run a callback (standing in for a concurrent launch) at a fixed
-/// point of the branch flow, for one repository only.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum RaceStage {
-    /// After the first checked-out lookup found nothing.
-    AfterLookup,
-    /// After the default path was found vacant.
-    AfterPathCheck,
-}
-
-#[cfg(test)]
-pub(crate) mod race_hooks {
-    use super::RaceStage;
-    use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
-
-    type Hook = Box<dyn FnOnce() + Send>;
-    static HOOKS: Mutex<Option<HashMap<(PathBuf, RaceStage), Hook>>> = Mutex::new(None);
-
-    /// Register `hook` to run once when the resolver for `root` reaches `stage`.
-    pub(crate) fn set(root: &Path, stage: RaceStage, hook: impl FnOnce() + Send + 'static) {
-        let mut hooks = HOOKS.lock().unwrap();
-        hooks
-            .get_or_insert_with(HashMap::new)
-            .insert((root.to_path_buf(), stage), Box::new(hook));
-    }
-
-    pub(super) fn run(root: &Path, stage: RaceStage) {
-        let hook = HOOKS
-            .lock()
-            .unwrap()
-            .as_mut()
-            .and_then(|hooks| hooks.remove(&(root.to_path_buf(), stage)));
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
-}
-
 fn canonicalize(path: &Path) -> Result<PathBuf, CommandError> {
     path.canonicalize().map_err(|e| {
         CommandError::Other(format!(
@@ -749,7 +707,9 @@ pub(crate) fn parse_existing_worktree_input(
 pub(crate) fn worktree_name_candidates(name: &str) -> Vec<String> {
     let mut candidates = vec![name.to_string()];
     if !name.is_empty() && name.bytes().all(|c| c.is_ascii_digit()) && name.len() < 4 {
-        candidates.push(format!("{name:0>4}"));
+        candidates.push(crate::data::checkout_paths::work_item_dir_name(
+            name.parse().expect("at most three ASCII digits"),
+        ));
     }
     candidates
 }

@@ -19,14 +19,6 @@ pub struct LaunchLabels<'a> {
     pub network_mode: &'a str,
 }
 
-/// Launch sizing for sandboxes created by tests that do not care about it.
-#[cfg(test)]
-pub const TEST_LAUNCH: LaunchLabels<'static> = LaunchLabels {
-    vcpus: 1,
-    memory_mib: 256,
-    network_mode: "public",
-};
-
 pub fn sandbox_name_for(name: &str) -> String {
     format!("aw{}", &crate::data::fs::hash::sha256_hex(name)[..14])
 }
@@ -91,36 +83,3 @@ pub fn check_owner(labels: &BTreeMap<String, String>, owner: &str) -> Result<(),
     }
     Ok(())
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn names_are_fixed_and_labels_cannot_spoof_ownership() {
-        let name = sandbox_name_for(&"é/../".repeat(80));
-        assert_eq!(name.len(), 16);
-        assert!(name.chars().all(|c| c.is_ascii_alphanumeric()));
-        assert!(labels(
-            "name",
-            "owner",
-            TEST_LAUNCH,
-            &[(LABEL_OWNER.into(), "other".into())]
-        )
-        .is_err());
-        assert!(check_protocol(&BTreeMap::new()).is_err());
-    }
-    #[test]
-    fn reused_pid_does_not_authorize_a_new_owner() {
-        let labels = labels("agent", "original-token", TEST_LAUNCH, &[]).unwrap();
-        assert!(check_owner(&labels, "original-token").is_ok());
-        assert!(check_owner(&labels, "another-token").is_err());
-        let mut old = labels;
-        old.insert(LABEL_PROTOCOL.into(), "old-runtime".into());
-        assert!(matches!(
-            check_owner(&old, "original-token"),
-            Err(EngineError::WorkerProtocolMismatch { .. })
-        ));
-    }
-}
-
-#[cfg(test)]
-mod hardening_tests;

@@ -17,6 +17,7 @@ use crate::engine::container::options::{
 /// variant and a single branch in `ResolvedSandboxOptions::ingest`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SandboxOption {
+    ProgramStatus(crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig),
     /// Kit selector — which agent kit/template the sandbox boots.
     AgentId(String),
     EntrypointOverride(Entrypoint),
@@ -89,6 +90,8 @@ pub enum SandboxOption {
 /// sandbox backend consumes.
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedSandboxOptions {
+    pub host_env: Option<crate::data::config::env::EnvSnapshot>,
+    pub program_status: crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig,
     /// Kit selector.
     pub agent_id: String,
     pub entrypoint_override: Option<Entrypoint>,
@@ -163,6 +166,7 @@ impl ResolvedSandboxOptions {
 
     fn ingest(&mut self, opt: SandboxOption) {
         match opt {
+            SandboxOption::ProgramStatus(config) => self.program_status = config,
             SandboxOption::AgentId(v) => self.agent_id = v,
             SandboxOption::EntrypointOverride(v) => self.entrypoint_override = Some(v),
             SandboxOption::WorkspaceDir(v) => self.workspace_dir = v,
@@ -205,40 +209,6 @@ impl ResolvedSandboxOptions {
             SandboxOption::PermissionMode(v) => self.permission_mode = Some(v),
             SandboxOption::KeepAfterExit => self.keep_after_exit = true,
             SandboxOption::UnsupportedNote(v) => self.unsupported_notes.push(v),
-        }
-    }
-}
-
-#[cfg(test)]
-mod restriction_tests {
-    use super::*;
-    use crate::engine::agent_runtime::{AgentRuntimeEngine, ResolvedAgentOptions};
-    use crate::engine::error::EngineError;
-    use crate::engine::sandbox::SandboxRuntime;
-
-    #[test]
-    fn direct_sandbox_options_cannot_bypass_tool_validation() {
-        for agent in crate::engine::agent::first_party::FIRST_PARTY_AGENTS {
-            for allowed in [true, false] {
-                let options = ResolvedSandboxOptions::resolve([
-                    SandboxOption::AgentId((*agent).into()),
-                    if allowed {
-                        SandboxOption::AllowedTools(vec!["Read".into()])
-                    } else {
-                        SandboxOption::DisallowedTools(vec!["Bash".into()])
-                    },
-                ]);
-                let result = SandboxRuntime::for_tests()
-                    .build(ResolvedAgentOptions::Sandbox(Box::new(options)));
-                if *agent == "claude" {
-                    assert!(result.is_ok());
-                } else {
-                    assert!(
-                        matches!(result, Err(EngineError::ToolRestrictionFlagMissing { .. })),
-                        "{agent}"
-                    );
-                }
-            }
         }
     }
 }

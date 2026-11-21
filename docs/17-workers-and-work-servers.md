@@ -1,0 +1,600 @@
+# Workers and work servers
+
+The daemon's **worker** feature handles two kinds of work. Push clients submit
+sessions and commands to the daemon API. Pull workers connect to linked work
+servers, register their capabilities, and claim queued items. Both use shared
+daemon execution capacity. The API and remote client are the push interface;
+work-server links and queue claims are the pull interface. See [API and Remote
+Mode](09-api-and-remote-mode.md) and [The daemon](16-daemon.md).
+
+## Link a work server
+
+Link with device approval:
+
+```sh
+awman link https://work.example.com --name team --label pool=laptops
+```
+
+awman displays the verification URI and code, opens the URI when possible,
+then waits up to ten minutes for approval. A work server can instead issue a
+token directly. Pass it as `--token TOKEN`, or use `--token -` to read it from
+stdin:
+
+```sh
+awman link https://work.example.com --name team --token - < token.txt
+```
+
+Avoid a literal token argument because command arguments may be visible to
+other local processes. `--name` is optional; without it, awman normalizes the
+URL host to a lowercase config name. Names contain lowercase letters, digits,
+`_`, and `-`, start with a letter or digit, and are at most 63 characters.
+Repeat `--label key=value` to configure worker labels. The URL must use HTTPS;
+HTTP is accepted for loopback testing only.
+
+Refresh tokens are stored in owner-only state, outside configuration. To review
+or change a link:
+
+```sh
+awman config get workServers
+awman config set workServers.team.labels.pool build-boxes
+awman config set workServers.team.enabled false
+awman config unset workServers.team
+```
+
+Removing a server stops new claims. Active leases finish before the stored
+token is removed; cleanup survives daemon restarts.
+If a running daemon cannot confirm its active leases, unset reports deferred
+cleanup and retains the token until the daemon retires the server.
+
+If the server revokes a link, the worker stops claiming from it, cancels its
+running leases, and `awman daemon status` shows the server as `revoked`. To link again, remove the entry with
+`awman config unset workServers.<name>` and run `awman link` once more.
+
+## Work server settings
+
+`workServers` is a global map. Every entry requires a `url`; omitted optional
+values use these defaults:
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `workServers.<name>.url` | required | Work server base URL. |
+| `workServers.<name>.enabled` | `true` | Whether awman registers and uses this server. |
+| `workServers.<name>.claim` | `auto` | Whether the daemon claims eligible items automatically or waits for a person to pick. |
+| `workServers.<name>.maxConcurrentJobs` | `1` | Maximum simultaneous leases from this server. |
+| `workServers.<name>.interaction` | inherited | Optional `interactive` or `headless` mode for this server's jobs. |
+| `workServers.<name>.labels` | `{}` | Owner-configured labels reported by this worker. |
+| `workServers.<name>.imageBudget` | `{ "maxImages": 20 }` | Most images built for leases that the worker keeps; see [Lease images](#lease-images-and-the-image-budget). |
+| `workServers.<name>.allowEnv` | `[]` | Worker environment variable names that leases from this server may request with `env(NAME)`. |
+| `workServers.<name>.allowSkills` | `[]` | Installed skill names outside awman's builtin library that leases from this server may request with `skill(name)`. |
+
+The per-server limit and the daemon's shared worker capacity both apply. A
+server cannot run more than `maxConcurrentJobs` (a positive integer), and
+pushed jobs and pulled leases compete for the daemon worker's available slots.
+See [Configuration](07-configuration.md#work-server-links)
+for config layering and [The daemon](16-daemon.md#worker-push-and-pull) for
+worker capacity and interaction settings.
+
+`allowEnv` entries are exact environment variable names matching
+`^[A-Z_][A-Z0-9_]*$`. A lease may request `env(NAME)` when it supplies that
+name in `exec.secrets`, or when the name is in `allowEnv` and is set in the
+worker daemon's environment. A supplied secret takes precedence over a worker
+environment value with the same name. Secret values without a matching
+`env(NAME)` request are accepted but never injected.
+
+`allowSkills` entries name installed skills. Skills in awman's builtin skill
+library are allowed without this list; other installed skills must be listed.
+An allowed library name also allows its named child skills. Hand-authored
+skills take precedence over a same-named builtin library skill and do not
+inherit the builtin library's trust. Workers report eligible installed skills
+with labels of the form `awman/skill.<name>=true` (slashes in a skill name are
+written as dots in the label key), for example
+`awman/skill.awman.create-custom-agent=true`. If a skill is installed after
+the worker registered, restart or re-register the worker before relying on
+its skill label.
+
+`auto` long-polls for eligible items while capacity is available. The claim
+holds an execution slot while it waits, so a claimed item starts at once; the
+slot is handed to a pushed job as soon as one is waiting for it. `manual`
+registers and lists eligible items but waits for a person to choose one through
+the queue picker. Changing a server to disabled or manual stops new automatic
+claims; accepted leases continue. Settings are live while the daemon runs.
+
+## Lease images and the image budget
+
+On Docker and Apple Containers, a pulled lease builds its project and agent images under names derived from their content rather than from the checkout folder: a repository key (from the origin URL, so every clone of one repository shares it) plus the inputs hash described in [Runtimes](11-runtimes.md#keeping-images-fresh-docker-and-apple-containers). A later lease for the same repository with the same Dockerfiles and copied files finds the images already built and reuses them; changing the project Dockerfile or a copied file produces new images. Leases that start together share one build. A repository with no project Dockerfile uses awman's default base image, which is shared across repositories.
+
+Project recipes with unresolved COPY/ADD sources (including globs and `COPY .`) build separately for each lease. Agent recipes that copy files from the build context also build separately for each lease. This prevents one checkout from reusing another checkout's untracked inputs. Agent bases are pinned to the prepared project image ID; multi-stage recipes, untagged project references and `ARG` defaults are supported. Ambiguous awman project bases or unsupported FROM variables fail with a configuration error.
+
+A lease can launch only agents provisioned from its workflow or configured dynamic agent pool. Include any delegated agent in that pool. Lease Dockerfiles must be regular files inside the checkout; symlinks and paths outside it are refused.
+
+A worker that does this reports the `lease_image_reuse` capability. Runtimes that import images (builtin) keep their previous behaviour and do not report it.
+
+Reused images accumulate, so each work server has an `imageBudget` limiting what the worker keeps:
+
+```json
+{
+  "workServers": {
+    "team": {
+      "url": "https://work.example.com",
+      "imageBudget": { "maxImages": 10, "maxBytes": "20GiB" }
+    }
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `maxImages` | Most lease-built images to keep (integer, at least 1). |
+| `maxBytes` | Most total reported image size to keep, as a size such as `"20GiB"`. Shared layers count in each image’s reported size, so this is a conservative cache budget rather than a measurement of disk space freed. |
+
+Without `imageBudget` the limit is `maxImages: 20` and no byte limit. Once you set `imageBudget`, a key you leave out is unlimited (setting only `maxBytes` puts no limit on the count). The settings are live.
+
+Cleanup runs when the worker starts and recovers, after an image is provisioned, and when a lease ends. Stopping the worker waits for image cleanup from recovery and finished leases to complete. Cleanup follows these rules:
+
+- Only images the worker built itself are removed. An image that already existed when a lease needed it is reused but never removed.
+- The least recently used images go first, and the budget is re-checked after each removal.
+- Images an active lease uses are never removed. If active leases alone exceed the budget, awman keeps those images and warns once.
+- An image whose tag now points at a different image is left alone.
+- A failed removal never changes a lease's result; the image stays recorded and a later cleanup tries again.
+
+`awman clean` also lists unused lease images; see [Cleaning up](13-cleaning-up.md).
+
+## Labels and affinity
+
+Worker labels are merged from three sources:
+
+1. **Reported facts** generated by awman: `awman/os`, `awman/arch`,
+   `awman/version`, `awman/runtime`, `awman/host`, the allowed
+   `awman/interaction.interactive` and `awman/interaction.headless` modes, and
+   `awman/agent.<name>` for each agent the worker can run. The daemon reports
+   every built-in agent, because a pulled run prepares and builds the agent's
+   image in its own clone, plus any other agent with a built image. An agent
+   whose name is not a valid label key (for example, one containing `_`) is
+   not reported.
+2. **Owner-configured labels** from `workServers.<name>.labels` or repeatable
+   `--label key=value` at link time.
+3. **Server-assigned labels** returned by the work server during registration.
+
+The `awman/` prefix is reserved for facts reported by awman. Owner config and
+reported facts cannot set server-owned labels; server-assigned labels are
+separate. Plain label keys such as `pool` use lowercase letters, digits, and
+hyphens. Dots may appear in a namespace such as `team.example/region`.
+Underscores and bare dotted keys such as `infact.kind` are invalid for new
+labels.
+
+A work item can request worker labels with an affinity object. Every entry in
+`required` must match for the worker to be eligible. Entries in `preferred`
+add their weight to the item's preference score when all matches in that
+group pass; weights range from 1 to 100. Supported operators are `In`,
+`NotIn`, `Exists`, and `DoesNotExist`. `In` and `NotIn` require non-empty
+`values`; `Exists` and `DoesNotExist` require no values. `NotIn` also matches
+when the label key is absent.
+
+```json
+{
+  "required": [{ "key": "pool", "op": "In", "values": ["build-boxes"] }],
+  "preferred": [{ "weight": 25, "match": [{ "key": "region", "op": "In", "values": ["eu"] }] }]
+}
+```
+
+The worker checks required affinity before and after claiming an item. A stale
+queue row may become ineligible if labels or policy change before the claim.
+A pick made while the worker has no free slot fails with `worker_busy`
+instead; the item stays in the queue and can be picked again later.
+
+With several linked servers, `awman queue` lists what the reachable ones offer.
+It fails only when you name a server with `--server` and that server cannot be
+listed, or when no server can.
+
+## Queue and picking work
+
+List eligible items or pick one from a terminal:
+
+```sh
+awman queue
+awman queue --server team
+awman queue --json
+awman queue pick
+awman queue pick ITEM_ID --server team
+awman queue pick ITEM_ID --json
+```
+
+`--server` filters to one linked server. `--json` prints an `items` JSON
+envelope for `queue`, or the completed `CommandResult` for `queue pick`, and
+disables prompts. Without an item ID, `queue pick` opens an interactive picker
+when stdin is a terminal; use the arrow keys, `/` to filter, and Enter to
+select. JSON mode or non-interactive stdin requires an item ID. The list
+contains summary metadata and, when supplied by the server, a Markdown body
+preview and source URL. The claim remains authoritative for executable work.
+The CLI runs the picked item in the foreground and waits for completion,
+including publication of the result. It reuses the daemon's registration when
+pull is enabled. Otherwise a manual worker lives for the foreground command;
+it never automatically claims additional items.
+
+The TUI has a work queue panel opened with **Ctrl+Q** when
+`tui.worker.enabled=true`. The panel shows eligible items, lets you view the
+the Markdown body preview, and runs a picked item in its own tab. The engine instance
+owns the worker and its prepared lease, including when a frontend connects
+through the daemon. A
+terminal using XON/XOFF flow control may consume Ctrl+Q before awman receives
+it. See [Using the TUI](02-using-the-tui.md#work-queue-panel).
+
+### Using the current checkout
+
+When the invoking checkout's origin matches the work item's repository,
+foreground CLI and TUI runs offer a worktree in that checkout or a fresh clone.
+The worktree uses the lease branch and keeps the private inline body and Git
+credentials outside the checkout. JSON mode selects a fresh clone without
+prompting. Automatic daemon jobs always use isolated lease workspaces.
+
+## Running pulled work
+
+The daemon rechecks required affinity, interaction policy, runtime support,
+and capacity before it runs a lease. Supported work includes prompt items,
+inline TOML workflows, and dynamic workflows when `exec.yolo=true`, or with `exec.yolo=false` when the run is interactive. Lease
+workflows require empty setup and teardown phases. Output publication follows
+the item's `push.enabled` and `push.branch` settings. Lease-supplied overlays,
+conflicting workflow selectors, zero timeouts, and output limits above 32 MiB
+are rejected as ineligible. Reviewed worker configuration can supply
+overlays within the lease workspace. Directory expressions cannot expose host
+paths outside that workspace; command-authored output and verified Git metadata
+mounts are separate. Mounts exposing clone ancestors, worker-private files, or sibling
+leases are refused. Read-only workspaces make each workspace alias read-only
+and provide writable scratch storage.
+
+The work item body is stored in an owner-only file outside the clone and
+mounted read-only at `/awman/work-item.md`. Git credentials use a private
+helper file and are not persisted with the lease. Repository URLs must use
+HTTPS, loopback HTTP, or SSH without a password. URL userinfo on HTTP, query
+strings, and fragments are refused. SSH usernames such as `git@host` are
+supported. Credential objects containing secrets require an HTTP repository
+URL; SSH uses the worker's configured authentication. Already-expired initial
+credentials are rejected before cloning. Lease Git operations ignore ambient
+Git configuration, repository-selection variables, tracing, and
+SSH-command overrides. SSH uses batch mode and may use the owner's SSH agent
+and normal SSH configuration.
+
+Heartbeats extend the lease expiry confirmed by the server. A lease operation
+failure, expiry, lease loss, or revoked link stops the run and its in-flight
+Git work and prevents stale result reporting. A server cancellation reports a
+partial cancelled result. Credential refresh refusal stops publication. Lease
+push-back retries only failures where no remote response was received; any
+HTTP response, including 429 and 5xx, ends that attempt. Before a retry, awman
+checks the remote branch so it can recognize a commit accepted before the
+connection failed, without publishing it twice. Retry progress is included as
+`push_retry` events with the attempt, operation, delay and sanitized remote;
+the event does not include Git output or credentials. Cancellation, expiry,
+credential refusal and remote rejection stop retrying. Git cannot undo a
+commit the remote accepted just before cancellation, but awman fences later
+work and reporting.
+
+The default daemon stop waits for running pulled work to finish. `awman daemon
+stop --now` releases shutdown before cancelling remaining worker commands.
+Disabling the worker or pull setting stops new work and lets accepted leases
+drain. A daemon restart stops abandoned commands and releases still-live
+leases without executing them again. See [The daemon](16-daemon.md#start-stop-status-and-logs).
+
+## Work Server Protocol v1 reference
+
+Work servers implement WSP v1 under the configured base URL. Requests use
+HTTPS; loopback HTTP is allowed for local testing. The client follows no HTTP
+redirects. Every HTTP request carries `x-wsp-version: 1`. Device link and
+refresh-token exchange calls are unauthenticated; other calls carry
+`Authorization: Bearer <access_token>`. Every lease-scoped HTTP request and
+terminal handshake also carries
+`x-wsp-epoch: <claim-time epoch>`; validate it against the current lease so an
+old worker cannot act on a later claim that reuses an ID.
+
+Work items are generic: a server may add fields of its own to a lease, work
+item, `repo` or `push` object, and the worker ignores them. What the worker
+must act on is strict: an unknown `exec`, `credentials`, `outputs` or `affinity`
+field causes an `ineligible` release using the original claim ID and epoch, so
+a requirement the worker does not know is never skipped. Servers must negotiate
+such extensions before assigning work that requires them.
+
+### Calls
+
+| Method and path | Request | Success |
+|---|---|---|
+| `POST /v1/link` | No body; version header | `200` `LinkStart`: `user_code`, `verification_uri`, `link_id`, `interval_ms`. |
+| `POST /v1/link/{link_id}/token` | No body; version header | `202` or `204` while pending, optionally with `interval_ms`; `200` `LinkToken` with `refresh_token` when approved. |
+| `POST /v1/token` | `TokenRequest`: `refresh_token` | `200` `AccessToken`: `access_token`, optional `expires_at`. |
+| `POST /v1/workers/register` | `RegisterRequest`: `name`, `labels`, `capacity`, `features` | `200` `RegisterResponse`: `worker_id`, `server_labels`, `heartbeat_ms`, `poll_ms`. Defaults for the last two are 15000 and 1000. |
+| `GET /v1/queue?limit=N&cursor=...` | Opaque cursor; limit clamped to 1–500 | `List<QueueItem>`: `items`, `next_cursor`. |
+| `POST /v1/claims?wait_ms=N` | `ClaimRequest`: optional `item_id`; wait capped at 30000 ms | `201` `ClaimResponse` containing `lease`, or `204` when empty. |
+| `POST /v1/leases/{id}/heartbeat` | `HeartbeatRequest` | `200` `HeartbeatResponse`. |
+| `POST /v1/leases/{id}/events` | `EventBatch`: `events` | `2xx`, optionally `EventsResponse` `{ "accepted": N }`; an empty success body is also accepted. |
+| `POST /v1/leases/{id}/credentials` | No body | `200` `Credentials`. |
+| `POST /v1/leases/{id}/result` | `LeaseResult<CommandResult>` | Successful response ends the lease. |
+| `POST /v1/leases/{id}/release` | `ReleaseRequest`: `reason`, optional `message` and `result` | Successful response releases the lease. |
+| `GET /v1/leases/{id}/terminal` | WebSocket handshake, `awman.terminal.v1` subprotocol | A multiplexed terminal stream when granted by the lease. |
+
+The `features` array in registration contains capabilities this worker can
+currently use. WSP v1 capability names recognized by awman are `terminal`,
+`interactive`, `prompt`, `workflow_dynamic`, `workflow_file`, `outputs`,
+`outputs_mount_state`, `workflow_state_events`, `lease_credentials`,
+`lease_inline_work_item`, `lease_read_only`, `lease_git_auth_failure`,
+`lease_push_retry`, `lease_secrets`, `lease_skills`, `lease_prerequisites`,
+`lease_workflows_dynamic`, `lease_context`, and `lease_workflow_context`. The
+four `lease_*` features are registered only by daemon pull workers that can
+honor them on the current runtime; `lease_skills` also requires host skill
+mount support. A worker refuses an item that requests an unsupported feature.
+The daemon API separately advertises `worker_pull` when pull is active.
+
+Each `QueueItem` has `id`, `title`, `kind`, `labels`, integer `priority`,
+`enqueued_at`, and `assigned_to_me`, with optional `summary`, `body`, and
+`source: {url}`. Its `kind` is `workflow` or `prompt`. A server may include
+`body` as a Markdown preview, which the picker shows before a claim; a row never
+carries repository credentials. In a
+claim request, omit `item_id` to claim any eligible item; include it to request
+that specific item.
+
+`LinkStart` is polled at the server-provided interval, which may be adjusted by
+pending responses. Denial uses `access_denied`; pending may use
+`authorization_pending`. The refresh token is exchanged for an access token
+before authenticated calls. On one `401`, awman obtains a fresh access token
+and retries once. A refused refresh indicates a revoked link.
+
+### Lease, WorkItem, and Result shapes
+
+The WSP `Lease` is the server-side lease, distinct from awman's local
+`lease_…` record:
+
+```json
+{
+  "id": "opaque-server-lease-id",
+  "epoch": 4,
+  "expires_at": "2026-11-09T12:00:00Z",
+  "item": { "id": "item-1", "title": "Example", "kind": "prompt", "body": "...", "repo": {}, "exec": {} },
+  "terminal": false,
+  "remote_input": false
+}
+```
+
+`terminal` and `remote_input` default to `false`. A `WorkItem` requires
+`id`, `title`, `kind` (`workflow` or `prompt`), `body`, `repo`, and `exec`.
+Optional fields are `summary`, `source: {url}`, `push`, and `outputs`; it also
+has `labels`, integer `priority`, and `affinity`. `repo` has `url`,
+`base_ref`, `branch`, optional `merge_refs`, and optional `credentials`.
+`push` has `enabled` and an optional `branch`, which defaults to `repo.branch`;
+`outputs` has integer `max_bytes`, 1048576 when omitted.
+Credential `kind` is `bearer`, `basic`, or `none`, with optional `token`,
+`username`, and `expires_at`. `exec` has `dynamic`, optional `leader`,
+`workflow_toml`, `agent`, and `model`, plus `read_only`, `overlays`, optional
+`interaction` (`interactive` or `headless`), `yolo`, and optional `timeout_ms`.
+`leader` uses `agent::model` syntax.
+
+The `exec` object may also include `secrets`, `prerequisites`, and
+`workflows_dynamic`. These additions are optional:
+
+```json
+{
+  "exec": {
+    "dynamic": true,
+    "overlays": ["env(DEPLOY_TOKEN)", "skill(awman/create-custom-agent)"],
+    "secrets": { "DEPLOY_TOKEN": "<secret value>" },
+    "prerequisites": {
+      "git_identity": { "name": "Build Bot", "email": "build@example.com" },
+      "ssh": "allow",
+      "github_token": "deny"
+    },
+    "workflows_dynamic": {
+      "default_leader": "claude::sonnet",
+      "agents_to_models": { "codex": ["gpt-5-codex"] },
+      "guidance": ["Keep the patch focused."]
+    }
+  }
+}
+```
+
+Rust servers must use the explicit secret-bearing adapter for claim responses:
+
+```rust
+let response = serde_json::json!({
+    "lease": awman_wsp::secret::server_wire::lease(&lease)
+});
+// Return `response` as the HTTP 201 JSON body.
+```
+
+Ordinary `Serialize` on `Exec`, `WorkItem`, `Lease`, or `ClaimResponse`
+intentionally omits secret values. The adapter's returned JSON contains plaintext
+secrets: send it only over the authenticated claim response and never log or
+persist it.
+
+`secrets` maps names to values and follows the command-secret limits:
+ at most
+32 entries, names matching `^[A-Z_][A-Z0-9_]*$` and at most 128 bytes, and
+non-empty values of at most 8192 bytes without NUL. Duplicate names and repeated
+`secrets` fields are refused. Runtime-control, loader, interpreter, proxy, and terminal
+variables (for example `DOCKER_HOST`, `DOCKER_CONFIG`, `PATH`, `LD_PRELOAD`,
+`HTTPS_PROXY`, and `TERM`) cannot be requested through lease environment
+overlays, even when allowlisted or supplied as per-item secrets. This keeps the
+host runtime client's configuration worker-owned. Ordinary token values use
+the shared command-secret delivery path: name-only runtime arguments, with the
+value in the runtime child process's environment. Values are held in memory;
+
+lease records retain secret names only. A worker restart cannot resume a lease
+whose secret values were lost.
+The complete claim response must fit within 8 MiB.
+
+For leases, `exec.overlays` may request only `env(NAME)` and named
+`skill(name)` overlays. Other kinds are refused. `context` is supplied through
+the WorkItem's `context` field instead. Environment overlays must meet the
+`allowEnv` or per-item secret rule above. Requested skills must be installed
+and either in the builtin library or allowed by `allowSkills`. Overlays in
+server-supplied `workflow_toml` and generated or resumed dynamic workflows are\nreviewed by the same env and skill rules before their steps launch.
+
+`prerequisites` is valid only for workflow items. It may contain
+`git_identity: {name, email}`, `ssh: "allow"|"deny"`, and
+`github_token: "allow"|"deny"`. An `allow` choice can select only credentials
+already named by the worker's prerequisite policy; widening beyond that policy
+is refused. A fixed `git_identity` applies to the worker's commit of leftover
+changes before lease publication. Main agent containers retain their own Git
+identity; commits they create themselves are not rewritten or assigned this
+identity. `workflows_dynamic` uses the snake_case fields shown above, is
+
+valid only for dynamic workflow items (`dynamic: true`), and is applied as the
+lease's workflow configuration layer.
+
+An unsupported feature or invalid lease request is released with reason
+`ineligible`. A prerequisite policy widening refusal is also released with
+reason `ineligible`; its release message starts with
+`prerequisite_widening_refused`. If the worker restarts after receiving
+`exec.secrets`, it releases that lease with reason `error` and failure code
+`credentials_lost`; it never reruns the lease without those values.
+
+Secret redaction covers posted lease events, the result's `final_message` and
+`failure.message`, and release messages. It does not redact values written to
+`/awman/output`, context or workflow-note attachments, or bytes sent through a terminal. A `remote_input` lease can
+show a secret value typed by a person or echoed by a program; those terminal
+bytes are outside the redaction guarantee. Do not use output files or
+terminals to return secret material.
+
+When access to a work server is refused, the link endpoint responds with HTTP
+403 and code `access_denied`.
+
+`HeartbeatRequest` has `state` (`preparing`, `running`, `awaiting_input`, or
+`pushing`) and optional `step` and arbitrary JSON `progress`.
+`HeartbeatResponse` has `expires_at`, `cancel`, and optional `cancel_reason`.
+`EventBatch.events` contains event objects with integer `attempt` and
+`sequence`, `emitted_at`, optional `source`, and a `payload` object. The
+payload uses a snake_case `type` and may have a `data` value. Send events in
+order. The `(attempt, sequence)` pair is the idempotency key for deduplication.
+
+`LeaseResult<R>` is `{ "result": R, "outputs"?: { ... },
+"outputs_mounted": bool, "duration_ms": integer }`. In awman's worker,
+`R` is the command result JSON, passed through without a WSP-specific rewrite.
+`outputs` holds the files that fit within the item's `outputs.max_bytes`; a file
+that does not fit in the remaining budget is left out.
+`ReleaseRequest<R>` uses reason `user_declined`, `ineligible`, `shutdown`, or
+`error`, and may include a human-readable `message` and partial `result`.
+Credentials contain secrets and must be protected in storage, logs, and
+responses.
+
+### Context memory and workflow notes
+
+Two optional exchanges let a server keep notes for a repository across runs and
+collect what a workflow wrote. Each is advertised by its own worker feature,
+and a server that offers an item needing one to a worker without it gets an
+`ineligible` release.
+
+**Repository context (`lease_context`).** A `WorkItem` may carry `context`:
+`{ "files": [{ "path", "content_base64" }], "max_bytes" }`. `path` is relative
+with `/` separators (no `..`, `.`, empty segments, leading `/`, backslash,
+colon or control characters), and `content_base64` is standard padded base64.
+`max_bytes` defaults to 1048576 and is capped at 16 MiB; it limits each file
+and the total of the staged files, and at most 1,000 files are accepted. The
+`context` object is decoded strictly, so an unknown field fails the lease.
+The worker writes the files to a fresh per-lease directory, mounts it as the
+item's `context(repo)`, and deletes it when the lease ends. It is never
+written to the worker's own repo context, and an overlay key does not change
+that.
+
+When the run ends, the worker compares the directory with what it staged and
+returns `context_changes` on `LeaseResult` (or on `ReleaseRequest` for a
+`shutdown` release): a list `{ "items": [...], "next_cursor": null }`. Each item
+has `path` and `change` (`added`, `modified` or `deleted`); added and modified
+items also carry `size_bytes`, `sha256` and `content_base64` (decoded content
+within the same `max_bytes` cap). Deletions carry nothing else. Symbolic links
+and non-regular files an agent leaves behind are not reported. Invalid file
+names or case-insensitive collisions fail collection with `context_invalid`;
+a resulting tree over the file-count or decoded-byte cap fails with
+`context_too_large`, including when unchanged files contribute to the total. The server applies the changes to its stored
+memory only when the lease epoch is current; a report from a lost lease is
+refused with `lease_lost` and changes nothing. A server should treat a change
+set as all-or-nothing and refuse one with invalid paths, bad base64, or a
+size that does not match.
+
+Failures use the `{ "error", "code" }` shape. A request with an invalid path,
+encoding, duplicate (including names that differ only in case), a file/directory
+clash, or an existing staging directory fails the lease before any work with
+`context_invalid`. Content over the cap fails it with `context_too_large`
+(HTTP 413). If the agent leaves more than `max_bytes` behind, the worker
+returns the changes as metadata only (no `content_base64`), fails the result
+with stage `context` and code `context_too_large`, and does not push the
+branch; a server must not apply metadata-only changes. An agent failure or
+cancellation that happened first is kept as the result. Foreground (picked)
+leases do not support `lease_context`, so an item carrying `context` is
+refused as `ineligible` there. Windows workers also omit `lease_context` from
+registration and refuse context-bearing leases as `ineligible`: their context
+API is read-only, and safe snapshot staging is not supported. Workflow-note
+attachments remain available through the separate `lease_workflow_context`
+capability.
+
+**Workflow notes (`lease_workflow_context`).** A `WorkItem` may carry
+`workflow_context`: `{ "max_bytes" }` (default 1048576, capped by the worker at 16 MiB). It asks the worker to
+return the files the workflow steps wrote to `/awman/context/workflow`.
+`LeaseResult` then carries `workflow_context`:
+
+```json
+{
+  "items": [
+    { "path": "plan.md", "size_bytes": 1204, "sha256": "…",
+      "modified_at": "2026-11-09T12:00:00Z", "content_base64": "…" }
+  ],
+  "next_cursor": null,
+  "truncated": false
+}
+```
+
+Every safe regular file is listed with `path`, `size_bytes`, `sha256` and
+`modified_at`. `content_base64` is included while the total inlined content
+fits within `max_bytes`; a file that does not fit is still listed, without
+content, and `truncated` is `true`. Agent-written names outside the portable
+context path rules are omitted and also set `truncated: true`. Artifact
+collection runs outside the async executor with a 30-second listing deadline
+and a 256 MiB hashing budget. If the notes cannot be read (or a rerun
+replaced them while they were read), the attachment has no items and
+`truncated` is `true`, with `collection_error: "unavailable"` to distinguish
+incomplete metadata from omitted content. This optional field is absent after
+a successful enumeration, including when only the inline byte cap was reached.
+Collection failures never change the command outcome. A command with
+no workflow notes returns an empty list with `truncated: false`. A result from
+a lost lease carries no attachment. A worker without `lease_workflow_context`
+releases an item that has `workflow_context` as `ineligible`.
+
+### Fencing, heartbeats, events, and terminals
+
+Treat lease IDs as opaque. A new claim increments `epoch`; the worker pins the
+epoch it received and includes it on every heartbeat, event, credential,
+result, release, and terminal request. Reject stale IDs or epochs with
+`409 lease_lost`, including when an ID has been reused. A lost lease must not
+change state, accept a result, or accept terminal input. `409 taken` indicates
+another worker won the claim race. `409 ineligible` indicates the item no
+longer meets the worker's policy or affinity.
+
+Heartbeats report current state and allow the server to extend `expires_at` or
+request cancellation. A worker must stop if a heartbeat requests cancellation
+or a lease request reports loss. Events can be retried; deduplicate by
+`(attempt, sequence)`. Store them once even when the worker resends a batch.
+
+The optional terminal endpoint is a WebSocket using subprotocol
+`awman.terminal.v1`. The handshake uses bearer authorization, version, and
+epoch headers. Text frames are JSON objects with a `terminal_id` and tagged
+`type`. Supported frame types are `snapshot` (`has_output`, `cols`, `rows`,
+`screen`), `output` (`bytes`), `resize` (`cols`, `rows`), `exit` (`code`),
+`lagged`, `error` (`code`, `error`), `input` (`bytes`), `take_control`, and
+`detached` (`reason`). Frames multiplex terminals by `terminal_id`. A server
+may send `input`, resize, or take-control frames only when the lease grants a
+terminal; awman accepts remote input only when the lease grants `remote_input`
+and `daemon.terminal.remoteInput` is currently enabled.
+
+Foreground CLI and engine-instance runs keep their terminal hub in the executing
+process. The daemon retains the WSP connection and credentials. The owner-only
+`POST /v1/worker/leases/{id}/terminal` route accepts an array of multiplexed
+terminal frames and returns `{items, next_cursor: null}` with pending input.
+Queues are bounded, and final terminal output drains before reporting the result.
+The daemon checks its live remote-input policy on every incoming control frame.
+Foreground owners poll their local lease resource while connected; after 30 seconds
+without an owner poll, the daemon cancels and releases the lease, stopping any
+remaining command containers after the completion grace period.
+
+### Wire conventions and errors
+
+Use JSON request and response bodies, snake_case field names, RFC 3339 UTC
+timestamps in `_at` fields, and integer milliseconds in `_ms` fields. Lists
+use `{ "items": [...], "next_cursor": ... }`; cursors are opaque. Errors use
+`{ "error": "...", "code": "..." }`. Common codes include `unauthorized`,
+`expired`, `taken`, `ineligible`, `lease_lost`, `not_found`,
+`invalid_event`, `context_invalid`, and `context_too_large` (HTTP 413). Keep error codes stable. Do not return secrets in errors or
+logs.

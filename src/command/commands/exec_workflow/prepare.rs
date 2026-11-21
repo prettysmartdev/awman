@@ -13,12 +13,49 @@ use crate::data::config::effective::EffectiveConfig;
 use crate::data::session::AgentName;
 use crate::engine::workflow::{PhaseStepRef, RemediationAgentSpec};
 
+pub(crate) fn notify_dynamic_unavailable(
+    item: &WorkItemContext,
+    reason: &str,
+    frontend: &mut dyn ExecWorkflowCommandFrontend,
+) -> Result<(), CommandError> {
+    let identity = item
+        .number
+        .map(|n| format!("{n:04}"))
+        .unwrap_or_else(|| item.key.clone());
+    frontend.notify_dynamic_workflow_resume_unavailable(&identity, reason)
+}
+
+/// Report content drift without redesigning the saved workflow.
+pub(crate) fn report_work_item_drift(
+    current: &WorkItemContext,
+    saved: &crate::data::workflow_state::WorkflowState,
+    sink: &mut dyn UserMessageSink,
+) {
+    let text = match saved.work_item_content_hash.as_deref() {
+        Some(hash) if hash != current.content_hash => Some(format!(
+            "Work item {} changed since the saved workflow was designed; resuming the saved workflow.",
+            current.key,
+        )),
+        None => Some(format!(
+            "The saved workflow for work item {} has no content hash; change detection is unavailable.",
+            current.key,
+        )),
+        _ => None,
+    };
+    if let Some(text) = text {
+        sink.write_message(UserMessage {
+            level: MessageLevel::Warning,
+            text,
+        });
+    }
+}
+
 /// Emit the deprecation warning for `agent`, if its vendor has deprecated it.
 ///
 /// The wording is the one per-agent table's
 /// (`AgentDefinition::deprecation_note`, reached through
 /// `LaunchPolicy::deprecation_warning`). This used to be a third hand-written
-/// copy of the gemini text, alongside `chat`'s and `exec prompt`'s (F-32).
+/// copy of the vendor deprecation text, alongside `chat`'s and `exec prompt`'s (F-32).
 pub(crate) fn workflow_resume_start_points(
     dag: &crate::data::workflow_dag::WorkflowDag,
     state: &crate::data::workflow_state::WorkflowState,
@@ -93,13 +130,13 @@ pub(crate) fn offer_state_resume(
     store: &crate::data::workflow_state_store::WorkflowStateStore,
     workflow: &Workflow,
     workflow_name: &str,
-    work_item: Option<u32>,
+    work_item: Option<&WorkItemContext>,
     worktree_path: Option<&Path>,
     frontend: &mut dyn ExecWorkflowCommandFrontend,
 ) -> Result<StateResumeOutcome, CommandError> {
     let proceed = StateResumeOutcome::Proceed { resumed: false };
     let drop_state = |frontend: &mut dyn ExecWorkflowCommandFrontend| {
-        if let Err(e) = store.delete(work_item, workflow_name) {
+        if let Err(e) = store.delete_for_key(work_item.map(|wi| wi.key.as_str()), workflow_name) {
             frontend.write_message(UserMessage {
                 level: MessageLevel::Warning,
                 text: format!("exec workflow: failed to delete workflow state file: {e}"),
@@ -107,7 +144,7 @@ pub(crate) fn offer_state_resume(
         }
     };
 
-    let mut saved = match store.load(work_item, workflow_name) {
+    let mut saved = match store.load_for_key(work_item.map(|wi| wi.key.as_str()), workflow_name) {
         Ok(Some(saved)) => saved,
         Ok(None) => return Ok(proceed),
         Err(e) => {
@@ -120,6 +157,17 @@ pub(crate) fn offer_state_resume(
             return Ok(proceed);
         }
     };
+
+    if let Some(current) = work_item {
+        current.validate_saved_identity(&saved)?;
+    } else if saved.work_item_source_id.is_some()
+        || saved.work_item_key.is_some()
+        || saved.work_item.is_some()
+    {
+        return Err(CommandError::Other(
+            "saved workflow belongs to a different work item; refusing to resume".into(),
+        ));
+    }
 
     let dag = match crate::data::workflow_dag::WorkflowDag::build(&workflow.steps) {
         Ok(dag) => dag,
@@ -155,15 +203,19 @@ pub(crate) fn offer_state_resume(
 
     let prompt = WorkflowResumePrompt::new(
         workflow_name.to_string(),
-        work_item,
+        work_item.and_then(|wi| wi.number),
         worktree_path.map(|p| p.to_path_buf()),
         false,
         completed_step_count(&saved),
         saved.step_states.len(),
         start_points,
-    );
+    )
+    .with_work_item_key(work_item.map(|wi| wi.key.clone()));
     match frontend.ask_workflow_resume(&prompt)? {
         WorkflowResumeDecision::ResumeFrom(start) => {
+            if let Some(current) = work_item {
+                report_work_item_drift(current, &saved, frontend);
+            }
             // Rewind before the engine loads the file, so a run that ended on
             // a failure or an abort — every step terminal — is runnable again.
             saved.rewind_to(&dag, &start);
@@ -193,9 +245,13 @@ pub(crate) fn offer_state_resume(
 /// (WI-0092 §10) — neither path recursively re-enters
 /// `ExecWorkflowCommand::run_with_frontend`.
 pub(crate) struct PreparedRun {
+    /// A fresh dynamic run's identity, allocated before its leader launched.
+    /// `None` lets the engine create or resume the ordinary persisted run.
+    pub(crate) invocation_id: Option<uuid::Uuid>,
     pub(crate) workflow: Workflow,
     pub(crate) workflow_path: PathBuf,
     pub(crate) work_item_context: Option<WorkItemContext>,
+    pub(crate) work_item_overlay: Option<TypedOverlay>,
     pub(crate) cli_typed: Vec<TypedOverlay>,
     pub(crate) mount_path: PathBuf,
     pub(crate) worktree_path: Option<PathBuf>,
@@ -206,10 +262,7 @@ pub(crate) struct PreparedRun {
     /// The pre-worktree session. `execute_prepared` re-roots it at the worktree
     /// when `worktree_path` is set.
     pub(crate) original_session: Session,
-    /// Kept alive for the duration of the run; its Drop removes the issue temp
-    /// file. `None` for non-issue invocations.
-    pub(crate) issue_temp_file: Option<IssueTempFile>,
-    pub(crate) launch_modes: HashMap<String, crate::data::config::repo::LaunchMode>,
+    pub(crate) launch_modes: HashMap<String, crate::data::config::agents::LaunchMode>,
     /// Skip the persisted-state resume prompt below. Set only by the dynamic
     /// resume path, which has already asked the user a strictly better version
     /// of the same question (WI-0115 §2).
@@ -229,14 +282,58 @@ pub(crate) async fn execute_prepared_with_outputs(
     flags: &ExecWorkflowCommandFlags,
     engines: &Engines,
     prepared: PreparedRun,
-    frontend: SharedWorkflowFrontend,
+    mut frontend: SharedWorkflowFrontend,
     squad_identity: Option<&crate::engine::squad::launcher::SquadContainerIdentity>,
     task_workspace: Option<&Path>,
     workflow_state_root: Option<&Path>,
     managed_session: Option<&Arc<tokio::sync::RwLock<Session>>>,
     cancel: &tokio_util::sync::CancellationToken,
     output_dir: Option<&Path>,
+    workspace_access: crate::data::workspace::WorkspaceAccess,
+    settings_profile: Option<&crate::data::settings_profile::SettingsProfileName>,
+    profile_owner: bool,
 ) -> Result<ExecWorkflowOutcome, CommandError> {
+    if !profile_owner
+        && (settings_profile.is_some()
+            || prepared
+                .workflow
+                .steps
+                .iter()
+                .any(|s| s.settings_profile.is_some()))
+    {
+        return Err(CommandError::ProfileOwnerRequired);
+    }
+    if engines.agent_engine.is_lease_workspace() {
+        crate::command::worker::policy::validate_workflow(&prepared.workflow)
+            .map_err(CommandError::Other)?;
+        // Freshly generated and saved/resumed definitions both enter here,
+        // before any generated step or factory can resolve its overlays.
+        let review = engines.lease_workflow_review.as_ref().ok_or_else(|| {
+            CommandError::Other("lease workflow overlay review is unavailable".into())
+        })?;
+        review
+            .review(&prepared.workflow, prepared.original_session.env())
+            .map_err(CommandError::Other)?;
+    }
+    // Read-only workspace (WI 0152): the last check before outputs, setup or
+    // any step. The plain path already ran it after loading the file; this is
+    // the only check a generated (dynamic) workflow's read-only steps get.
+    let workspace_access = crate::command::commands::workspace_access::effective_access(
+        workspace_access,
+        &engines.agent_engine,
+    );
+    if let Err(e) = crate::command::commands::workspace_access::preflight_workflow_access(
+        &prepared.workflow,
+        workspace_access,
+        flags.allow_docker,
+        engines.runtime.as_ref(),
+    ) {
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Error,
+            text: format!("exec workflow: {e}"),
+        });
+        return Err(e);
+    }
     if let Some(dir) = output_dir {
         crate::data::fs::command_outputs::prepare_output_dir(dir, false).map_err(|e| {
             CommandError::Other(format!(
@@ -246,9 +343,11 @@ pub(crate) async fn execute_prepared_with_outputs(
         })?;
     }
     let PreparedRun {
+        invocation_id,
         mut workflow,
         workflow_path,
         work_item_context,
+        work_item_overlay,
         cli_typed,
         mount_path,
         worktree_path,
@@ -257,11 +356,12 @@ pub(crate) async fn execute_prepared_with_outputs(
         git_root_for_scope,
         cwd,
         original_session,
-        issue_temp_file: _issue_temp_file,
         launch_modes,
         skip_state_resume_prompt,
         prerequisites,
     } = prepared;
+    let mut phase_cli_typed = cli_typed.clone();
+    phase_cli_typed.extend(work_item_overlay.clone());
     let mut prerequisites = prerequisites;
     // The pre-teardown re-check probes the checkout the steps really mount.
     prerequisites.flow.set_worktree(worktree_path.clone());
@@ -304,7 +404,7 @@ pub(crate) async fn execute_prepared_with_outputs(
                 &store,
                 &workflow,
                 &workflow_name,
-                work_item_context.as_ref().map(|c| c.number),
+                work_item_context.as_ref(),
                 worktree_path.as_deref(),
                 frontend,
             )
@@ -371,6 +471,7 @@ pub(crate) async fn execute_prepared_with_outputs(
         original_session
     };
     session.set_flags(workflow_flag_config(flags));
+    session.add_overrides(workflow_flag_overrides(flags))?;
 
     // 9. Run the engine with three-phase coordination.
     let yolo = flags.yolo;
@@ -427,11 +528,14 @@ pub(crate) async fn execute_prepared_with_outputs(
     let (engine_result, step_counts, mut engine) = {
         let proxy = shared.clone();
         let factory = CommandLayerFactory {
+            settings_profile: settings_profile.cloned(),
+            profiles: Default::default(),
             shared: shared.clone(),
             engines: engines.clone(),
             flags: Arc::clone(&flags_arc),
             cli_typed_overlays: cli_typed.clone(),
             work_item_context,
+            work_item_overlay,
             image_git_root: git_root_for_scope.clone(),
             workflow_overlays: workflow_overlays_for_factory,
             squad_identity: squad_identity.cloned(),
@@ -439,30 +543,33 @@ pub(crate) async fn execute_prepared_with_outputs(
             launch_modes: Arc::new(launch_modes),
             agent_flags: workflow_agent_flags,
             output_dir: output_dir.map(Path::to_path_buf),
+            workspace_access,
         };
         let cleanup_workflow = workflow.clone();
-        let cleanup_work_item = engine_work_item_context
-            .as_ref()
-            .map(|wi| (wi.number, wi.content.clone()));
-        let mut engine = match WorkflowEngine::resume(
-            &session,
-            crate::engine::workflow::WorkflowSpec::new(workflow)
-                .with_work_item_context(engine_work_item_context)
-                .with_state_root(workflow_state_root.map(Path::to_path_buf))
-                // poll_ci runs on the host with the granted token, never the
-                // ambient GITHUB_TOKEN.
-                .with_ci_token(
-                    prerequisites
-                        .remote("origin")
-                        .and_then(|remote| prerequisites.grants.token_for_remote(&remote)),
-                ),
-            crate::engine::workflow::WorkflowEngineDeps {
-                frontend: proxy.into_workflow_frontend(),
-                agent_factory: Box::new(factory),
-            },
-        )
-        .await
-        {
+        let cleanup_work_item_context = engine_work_item_context.clone();
+        let spec = crate::engine::workflow::WorkflowSpec::new(workflow)
+            .with_invocation_id(invocation_id)
+            .with_work_item_context(engine_work_item_context)
+            .with_state_root(workflow_state_root.map(Path::to_path_buf))
+            // poll_ci runs on the host with the granted token, never the
+            // ambient GITHUB_TOKEN.
+            .with_ci_token(
+                prerequisites
+                    .remote("origin")
+                    .and_then(|remote| prerequisites.grants.token_for_remote(&remote)),
+            );
+        let deps = crate::engine::workflow::WorkflowEngineDeps {
+            frontend: proxy.into_workflow_frontend(),
+            agent_factory: Box::new(factory),
+        };
+        // A new leader has already committed this command to a fresh run.
+        // Never adopt stale state (and its scratch) after planning completes.
+        let initialized = if invocation_id.is_some() {
+            WorkflowEngine::new(&session, spec, deps)
+        } else {
+            WorkflowEngine::resume(&session, spec, deps).await
+        };
+        let mut engine = match initialized {
             Ok(eng) => eng,
             Err(e) => {
                 let err = CommandError::from(e);
@@ -480,6 +587,7 @@ pub(crate) async fn execute_prepared_with_outputs(
             engine = engine.mirror_into_session(Arc::clone(session));
         }
         engine.set_yolo(yolo);
+        engine.set_non_interactive(flags.non_interactive);
         engine.set_ci_destination(prerequisites.remote("origin").map(|r| r.redacted));
         engine.set_ci_host_binaries(prerequisites.flow.options().custom_agent_binaries.clone());
         engine.set_cancellation(cancel.clone());
@@ -507,7 +615,7 @@ pub(crate) async fn execute_prepared_with_outputs(
         // setup/teardown shell step runs as a foreground, PTY-attached
         // container they can watch and type into, like an agent step.
         // Everything else — the API server, the squad daemon, a
-        // `--non-interactive` CLI — keeps the headless background container.
+        // `--headless` CLI — keeps the headless background container.
         // A squad-generated workflow is always headless, whichever frontend
         // is driving it.
         let interactive_phase_steps = prerequisites.redaction.is_empty()
@@ -517,7 +625,8 @@ pub(crate) async fn execute_prepared_with_outputs(
         shared.lock().unwrap().record_cancel_cleanup(
             &crate::data::workflow_cleanup::WorkflowCleanup {
                 workflow: cleanup_workflow,
-                work_item: cleanup_work_item,
+                work_item: None,
+                work_item_context: cleanup_work_item_context,
                 workdir: session.working_dir().to_path_buf(),
                 mount_path: mount_path.clone(),
                 state_root: workflow_state_root.map(Path::to_path_buf),
@@ -526,7 +635,7 @@ pub(crate) async fn execute_prepared_with_outputs(
                     &git_root_for_scope,
                     engines.runtime.capabilities().image_acquisition,
                 ),
-                cli_overlays: cli_typed.clone(),
+                cli_overlays: phase_cli_typed.clone(),
                 worktree_git_mount: worktree_git_mount
                     .as_ref()
                     .map(|m| (m.host_path.clone(), m.container_path.clone(), m.permission)),
@@ -551,7 +660,7 @@ pub(crate) async fn execute_prepared_with_outputs(
             let mut resolved = resolve_phase_overlays(
                 engines,
                 &session,
-                &cli_typed,
+                &phase_cli_typed,
                 &setup_entry_overlays,
                 worktree_git_mount.as_ref(),
                 &base_image,
@@ -623,6 +732,10 @@ pub(crate) async fn execute_prepared_with_outputs(
                                 .iter()
                                 .find(|(i, _)| *i == idx)
                                 .and_then(|(_, g)| g.transport.as_ref()),
+                            git_cache_seed: _setup_grants
+                                .iter()
+                                .find(|(i, _)| *i == idx)
+                                .and_then(|(_, g)| g.git_cache_seed.as_ref()),
                         }
                         .build(step, env, overlays)
                     };
@@ -676,6 +789,17 @@ pub(crate) async fn execute_prepared_with_outputs(
         } else {
             engine.run_to_completion().await
         };
+        if profile_owner {
+            if let Err(error) =
+                crate::command::commands::launch_policy::settings_profile::reconcile_repository(
+                    &session,
+                    engines.runtime.clone(),
+                )
+                .await
+            {
+                tracing::warn!(%error,"workflow profile cleanup remains pending");
+            }
+        }
         // A runtime wait error may race the token too. Reconcile before
         // deciding which teardown policy to apply, rather than after cleanup.
         let result =
@@ -754,7 +878,7 @@ pub(crate) async fn execute_prepared_with_outputs(
                 let mut resolved = resolve_phase_overlays(
                     engines,
                     &session,
-                    &cli_typed,
+                    &phase_cli_typed,
                     &teardown_entry_overlays,
                     worktree_git_mount.as_ref(),
                     &base_image,
@@ -810,6 +934,10 @@ pub(crate) async fn execute_prepared_with_outputs(
                                 .iter()
                                 .find(|(i, _)| *i == idx)
                                 .and_then(|(_, g)| g.transport.as_ref()),
+                            git_cache_seed: _teardown_grants
+                                .iter()
+                                .find(|(i, _)| *i == idx)
+                                .and_then(|(_, g)| g.git_cache_seed.as_ref()),
                         }
                         .build(step, env, overlays)
                     };
@@ -972,10 +1100,6 @@ pub(crate) async fn execute_prepared_with_outputs(
         return Err(err);
     }
 
-    // `_issue_temp_file`'s Drop impl removes the temp file when this
-    // function returns — covers both this success path and every early
-    // error return above.
-
     Ok(ExecWorkflowOutcome {
         prerequisites: None,
         workflow: workflow_path.display().to_string(),
@@ -1093,6 +1217,10 @@ async fn run_merge_fix_agent(
         }
     };
     session.set_flags(workflow_flag_config(flags));
+    if let Err(e) = session.add_overrides(workflow_flag_overrides(flags)) {
+        warn(format!("merge-fix: {e}"));
+        return false;
+    }
 
     let prompt = match merge_fix_prompt(&session.effective_config(), failure, work_item) {
         Ok(prompt) => prompt,
@@ -1158,22 +1286,54 @@ async fn run_merge_fix_agent(
     }
 }
 
+/// Settings the workflow flags still carry that are config keys now
+/// (`agents.launchMode`, `workflows.maxConcurrentSteps`), as `--set`-layer
+/// overrides.
+pub(crate) fn workflow_flag_overrides(
+    flags: &ExecWorkflowCommandFlags,
+) -> crate::data::config::ConfigOverrides {
+    let mut pairs = Vec::new();
+    if let Some(mode) = flags.launch_mode {
+        pairs.push((
+            "agents.launchMode".to_string(),
+            serde_json::to_value(mode).expect("launch mode serializes"),
+        ));
+    }
+    if let Some(n) = flags.max_concurrent {
+        pairs.push((
+            "workflows.maxConcurrentSteps".to_string(),
+            serde_json::Value::from(n),
+        ));
+    }
+    crate::data::config::ConfigOverrides::new(pairs)
+}
+
+/// The invoking session's effective config with the workflow flags applied.
+pub(crate) fn workflow_effective_config(
+    session: &Session,
+    flags: &ExecWorkflowCommandFlags,
+) -> Result<crate::data::config::EffectiveConfig, crate::data::error::DataError> {
+    let current = session.effective_config();
+    let mut layers = current.layers().clone();
+    layers.set.0.extend(workflow_flag_overrides(flags).0);
+    crate::data::config::EffectiveConfig::resolve(
+        layers,
+        workflow_flag_config(flags),
+        current.env().clone(),
+    )
+}
+
 pub(crate) fn workflow_flag_config(
     flags: &ExecWorkflowCommandFlags,
 ) -> crate::data::config::FlagConfig {
     crate::data::config::FlagConfig {
         agent: flags.agent.clone(),
         model: flags.model.clone(),
-        launch_mode: flags.launch_mode,
         yolo: Some(flags.yolo),
         auto: Some(flags.auto),
-        non_interactive: Some(flags.non_interactive),
+        headless: Some(flags.non_interactive),
         overlays_raw: (!flags.overlay.is_empty()).then_some(flags.overlay.clone()),
-        work_item: flags
-            .work_item
-            .as_deref()
-            .and_then(|raw| raw.parse::<u32>().ok()),
-        max_concurrent_agents: flags.max_concurrent,
+        work_item: flags.work_item.clone(),
         leader: flags.leader.clone(),
         ..Default::default()
     }
@@ -1285,8 +1445,7 @@ pub(crate) fn finalize_policy(
 /// the workflow engine uses (`step.agent` > `workflow.agent` > session
 /// default), in first-seen order.
 ///
-/// Was `workflow_resolves_to_gemini`, which answered one hard-coded question
-/// about one agent name (F-32). The caller now asks the per-agent table
+/// Was a one-agent hard-coded question (F-32). The caller now asks the per-agent table
 /// whether each one carries a deprecation note.
 pub(crate) fn workflow_agents(workflow: &Workflow, session: &Session) -> Vec<String> {
     let workflow_default = workflow.agent.as_deref();
@@ -1344,6 +1503,42 @@ pub(crate) fn resolve_phase_image(
 /// One call per entry — that's the whole point post-WI-0082: each step's
 /// container sees only the entry's own overlays plus the standing sources,
 /// not the union of all phase entries' overlays.
+#[derive(Default)]
+pub(crate) struct PhaseEnvironment {
+    pub(super) env: std::collections::HashMap<String, String>,
+    pub(super) secret_env: Vec<(String, crate::data::secret::SecretString)>,
+}
+
+impl std::ops::Deref for PhaseEnvironment {
+    type Target = std::collections::HashMap<String, String>;
+    fn deref(&self) -> &Self::Target {
+        &self.env
+    }
+}
+impl std::ops::DerefMut for PhaseEnvironment {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.env
+    }
+}
+
+impl PhaseEnvironment {
+    fn resolve(
+        names: &[String],
+        secrets: Option<&crate::data::secret::CommandSecrets>,
+        host: impl Fn(&str) -> Option<String>,
+    ) -> Self {
+        let mut env = Self::default();
+        for name in names {
+            if let Some(value) = secrets.and_then(|s| s.get(name)) {
+                env.secret_env.push((name.clone(), value.clone()));
+            } else if let Some(value) = host(name) {
+                env.env.insert(name.clone(), value);
+            }
+        }
+        env
+    }
+}
+
 pub(crate) fn collect_single_entry_overlays(
     engines: &Engines,
     session: &Session,
@@ -1353,7 +1548,7 @@ pub(crate) fn collect_single_entry_overlays(
 ) -> Result<
     (
         Vec<crate::engine::container::options::OverlaySpec>,
-        std::collections::HashMap<String, String>,
+        PhaseEnvironment,
     ),
     CommandError,
 > {
@@ -1368,8 +1563,8 @@ pub(crate) fn collect_single_entry_overlays(
     // rebuilt yet, in which case mounting at the Dockerfile-derived path
     // silently breaks credential passthrough.
     let dockerfile_path = session
-        .repo_config()
-        .dockerfile_path_or_default(session.git_root());
+        .effective_config()
+        .dockerfile_path(session.git_root());
     // detect_home_from_dockerfile silently returns None when the file is
     // missing — surface that as a warning so a misconfigured `dockerfile`
     // key doesn't cause overlays to fall back to a default container home
@@ -1409,12 +1604,12 @@ pub(crate) fn collect_single_entry_overlays(
             ))
         })?;
 
-    let mut env = std::collections::HashMap::new();
-    for var_name in &collected.env_passthrough {
-        if let Some(val) = crate::data::config::env::host_var(var_name) {
-            env.insert(var_name.clone(), val);
-        }
-    }
+    let command_secrets = engines.command_secrets();
+    let env = PhaseEnvironment::resolve(
+        &collected.env_passthrough,
+        command_secrets.as_deref(),
+        crate::data::config::env::host_var,
+    );
 
     Ok((overlay_specs, env))
 }
@@ -1435,7 +1630,7 @@ pub(crate) fn collect_single_entry_overlays(
 pub(crate) type PhaseOverlayResult = Result<
     (
         Vec<crate::engine::container::options::OverlaySpec>,
-        std::collections::HashMap<String, String>,
+        PhaseEnvironment,
     ),
     CommandError,
 >;
@@ -1471,9 +1666,39 @@ pub(crate) fn resolve_phase_overlays(
 pub(crate) async fn finish_cancelled_cleanup(
     engines: &Engines,
     original_session: &Session,
-    cleanup: crate::data::workflow_cleanup::WorkflowCleanup,
+    mut cleanup: crate::data::workflow_cleanup::WorkflowCleanup,
     frontend: SharedWorkflowFrontend,
 ) -> Result<(), CommandError> {
+    // Private execution input is recreated after a restart, since the
+    // original temp file was owned by the cancelled invocation.
+    let recovery_input = cleanup
+        .work_item_context
+        .as_ref()
+        .filter(|context| context.key.starts_with("remote-"))
+        .map(|context| {
+            let item = crate::command::work_item::ResolvedWorkItem {
+                origin: crate::command::work_item::WorkItemOrigin::Remote {
+                    source_id: context.source_id.clone(),
+                    provider: "recovery".into(),
+                },
+                number: context.number,
+                key: context.key.clone(),
+                title: context.title.clone(),
+                slug: None,
+                content: context.content.clone(),
+                issue: None,
+            };
+            crate::command::work_item::prepare_work_item_input(&item, original_session)
+        })
+        .transpose()?;
+    if let Some(input) = &recovery_input {
+        cleanup.cli_overlays.retain(|overlay| {
+            !matches!(overlay,
+            TypedOverlay::Directory(directory)
+                if directory.container == input.container_path.to_string_lossy())
+        });
+        cleanup.cli_overlays.extend(input.overlay.clone());
+    }
     let session = Session::open_worktree_for(
         cleanup.workdir.clone(),
         cleanup.workdir.clone(),
@@ -1500,11 +1725,11 @@ pub(crate) async fn finish_cancelled_cleanup(
     let mut engine = WorkflowEngine::resume(
         &session,
         crate::engine::workflow::WorkflowSpec::new(cleanup.workflow)
-            .with_work_item_context(
+            .with_work_item_context(cleanup.work_item_context.or_else(|| {
                 cleanup
                     .work_item
-                    .map(|(number, content)| WorkItemContext { number, content }),
-            )
+                    .map(|(number, content)| WorkItemContext::from_legacy(number, content))
+            }))
             .with_state_root(cleanup.state_root),
         crate::engine::workflow::WorkflowEngineDeps {
             frontend: frontend.clone().into_workflow_frontend(),
@@ -1548,6 +1773,7 @@ pub(crate) async fn finish_cancelled_cleanup(
                     interactive: false,
                     secret_env: &[],
                     transport: None,
+                    git_cache_seed: None,
                 }
                 .build(step, env, overlays)
             })
@@ -1579,31 +1805,30 @@ impl crate::engine::workflow::factory::AgentExecutionFactory for CleanupOnlyFact
 }
 
 #[cfg(test)]
-mod compat_tests {
+mod command_secrets_tests {
     use super::*;
+    use crate::data::secret::{CommandSecrets, SecretString};
 
     #[test]
-    fn import_setup_uses_runnable_agent_image_while_build_keeps_project_image() {
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let session = Session::for_tests_isolated(root.path(), home.path());
-        let project = crate::data::image_tags::project_image_tag(root.path());
-        let agent = crate::data::image_tags::agent_image_tag(root.path(), "claude");
-        assert_eq!(
-            resolve_phase_image(
-                &session,
-                root.path(),
-                crate::engine::agent_runtime::ImageAcquisition::Build
+    fn phase_env_uses_requested_caller_values_before_host_without_literal_secrets() {
+        let secrets = CommandSecrets::new([
+            ("TOKEN".into(), SecretString::new("test-secret-phase")),
+            (
+                "PRIVATE".into(),
+                SecretString::new("test-secret-unrequested"),
             ),
-            project
+        ])
+        .unwrap();
+        let env = PhaseEnvironment::resolve(
+            &["TOKEN".into(), "HOST_ONLY".into()],
+            Some(&secrets),
+            |_| Some("host-value".into()),
         );
-        assert_eq!(
-            resolve_phase_image(
-                &session,
-                root.path(),
-                crate::engine::agent_runtime::ImageAcquisition::Import
-            ),
-            agent
-        );
+        assert_eq!(env.secret_env.len(), 1);
+        assert_eq!(env.secret_env[0].0, "TOKEN");
+        assert_eq!(env.secret_env[0].1.expose(), "test-secret-phase");
+        assert!(!env.env.contains_key("TOKEN"));
+        assert!(!env.env.contains_key("PRIVATE"));
+        assert_eq!(env.env["HOST_ONLY"], "host-value");
     }
 }

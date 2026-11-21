@@ -16,6 +16,7 @@ pub const FIRST_ATTEMPT: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionEvent {
+    #[serde(alias = "emitted_at")]
     pub timestamp: DateTime<Utc>,
     /// Which execution of the command produced this event (1-based). Lines
     /// written before WI 0136 have no field and read back as attempt 1.
@@ -36,6 +37,19 @@ fn first_attempt() -> u32 {
 }
 
 impl ExecutionEvent {
+    /// Shared SSE/WSP projection. Stored logs retain their legacy shape.
+    pub fn public_value(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).expect("execution events serialize");
+        let object = value.as_object_mut().expect("event object");
+        object.remove("timestamp");
+        object.insert(
+            "emitted_at".into(),
+            crate::data::wire::format_timestamp(self.timestamp).into(),
+        );
+        object.get_mut("payload").expect("payload")["type"] = self.payload.sse_event_type().into();
+        value
+    }
+
     /// This event's position in the command's stream.
     pub fn cursor(&self) -> EventCursor {
         EventCursor::new(self.attempt, self.sequence)
@@ -95,6 +109,10 @@ impl std::fmt::Display for EventSourcePhase {
 /// same way without each variant defining its own copy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventSource {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<crate::data::ids::ExecutionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<crate::data::ids::TurnId>,
     pub phase: EventSourcePhase,
     /// Absent for the leader and for shell setup/teardown output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -117,6 +135,8 @@ impl EventSource {
     /// A source with only its phase set.
     pub fn phase(phase: EventSourcePhase) -> Self {
         Self {
+            execution_id: None,
+            turn_id: None,
             phase,
             step_name: None,
             step_index: None,
@@ -129,6 +149,8 @@ impl EventSource {
     /// with the builder methods once known.
     pub fn step(phase: EventSourcePhase, step_name: impl Into<String>, step_index: usize) -> Self {
         Self {
+            execution_id: None,
+            turn_id: None,
             phase,
             step_name: Some(step_name.into()),
             step_index: Some(step_index),
@@ -183,7 +205,7 @@ pub const STEP_ACTIVITY_SUMMARY_MAX_CHARS: usize = 200;
 /// SSE `id:` of every persisted frame and the value of `Last-Event-ID` /
 /// `?after=`. Ordering is lexicographic (attempt first), which is the order
 /// events are appended to `events.log`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EventCursor {
     pub attempt: u32,
     pub sequence: u64,
@@ -321,7 +343,7 @@ pub enum CommandStatusKind {
     Aborted,
     /// Ended with an error; `error` carries the reason.
     Error,
-    /// Stopped by an external cancel request (`POST /v1/commands/{id}/cancel`).
+    /// Stopped by an external cancel request (`POST /v1/worker/commands/{id}/cancel`).
     Cancelled,
 }
 
@@ -373,28 +395,73 @@ impl std::fmt::Display for PhaseStatusKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum EventPayload {
+    #[serde(alias = "agent_credentials_changed")]
+    AgentCredentialsChanged {
+        request_id: uuid::Uuid,
+        execution_id: crate::data::ids::ExecutionId,
+        credential_generation: u64,
+        refresh_owner: crate::data::credential_update::RefreshOwner,
+    },
+    #[serde(alias = "agent_execution_replaced")]
+    AgentExecutionReplaced {
+        request_id: uuid::Uuid,
+        previous_execution_id: crate::data::ids::ExecutionId,
+        execution_id: crate::data::ids::ExecutionId,
+        credential_generation: u64,
+    },
+    #[serde(alias = "agent_state")]
+    AgentState {
+        snapshot: Box<crate::data::automation_records::AutomationSnapshot>,
+    },
+    #[serde(alias = "agent_identity")]
+    AgentIdentity {
+        execution_id: crate::data::ids::ExecutionId,
+        native_session_id: crate::data::settings_profile::NativeSessionId,
+    },
+    #[serde(alias = "agent_turn_started")]
+    AgentTurnStarted {
+        request_id: uuid::Uuid,
+        execution_id: crate::data::ids::ExecutionId,
+        turn_id: crate::data::ids::TurnId,
+        native_session_id: Option<crate::data::settings_profile::NativeSessionId>,
+        #[serde(deserialize_with = "crate::data::automation_records::native_turn_id")]
+        native_turn_id: Option<String>,
+        status_support: crate::data::automation::StatusSupport,
+        status_source: crate::data::automation::StatusSource,
+    },
+    #[serde(alias = "agent_turn_completed")]
+    AgentTurnCompleted {
+        request_id: uuid::Uuid,
+        execution_id: crate::data::ids::ExecutionId,
+        turn_id: crate::data::ids::TurnId,
+        result: crate::data::automation_records::TurnResult,
+    },
+    #[serde(alias = "workflow_prerequisites")]
     WorkflowPrerequisites {
         phase: PrerequisitePhase,
         report: WorkflowPrerequisiteReport,
     },
+    #[serde(alias = "stdout_line")]
     StdoutLine(String),
+    #[serde(alias = "stderr_line")]
     StderrLine(String),
-    StatusMessage {
-        phase: String,
-        message: String,
-    },
+    #[serde(alias = "status_message")]
+    StatusMessage { phase: String, message: String },
+    #[serde(alias = "workflow_step_transition")]
     WorkflowStepTransition {
         step_name: String,
         step_index: usize,
         from_status: StepStatusKind,
         to_status: StepStatusKind,
     },
+    #[serde(alias = "workflow_phase_transition")]
     WorkflowPhaseTransition {
         phase: String,
         step_desc: String,
         status: PhaseStatusKind,
     },
     /// One container in a parallel group (WI-0096) has started running.
+    #[serde(alias = "workflow_parallel_step_launched")]
     WorkflowParallelStepLaunched {
         step_name: String,
         step_index: usize,
@@ -402,16 +469,32 @@ pub enum EventPayload {
         model: Option<String>,
     },
     /// One container in a parallel group (WI-0096) has exited.
+    #[serde(alias = "workflow_parallel_step_exited")]
     WorkflowParallelStepExited {
         step_name: String,
         step_index: usize,
         exit_code: i32,
     },
     /// A parallel group (WI-0096) has fully drained; all its steps completed.
+    #[serde(alias = "workflow_parallel_group_finished")]
     WorkflowParallelGroupFinished,
     /// A structured-output agent did something (WI 0137 §4). `summary` is one
     /// line of at most [`STEP_ACTIVITY_SUMMARY_MAX_CHARS`] characters. The
     /// step it belongs to is the envelope's `source`.
+    /// A push (WI 0145) got no remote response and will be retried after
+    /// `delay_ms`. `attempt` is the attempt about to be made (the first retry
+    /// is 2); `operation` is `push` or the `ls-remote` head check; `remote` is
+    /// the sanitized remote identifier. Never carries Git output or
+    /// credentials. Attributed to the push phase by the envelope's `source`.
+    #[serde(alias = "push_retry")]
+    PushRetry {
+        attempt: u8,
+        max_attempts: u8,
+        operation: String,
+        delay_ms: u64,
+        remote: String,
+    },
+    #[serde(alias = "step_activity")]
     StepActivity {
         kind: StepActivityKind,
         summary: String,
@@ -419,8 +502,9 @@ pub enum EventPayload {
     /// How the command ended. Emitted exactly once per command by the queue
     /// worker, after the terminal row is written and before `Done`
     /// (WI 0137 §2). `result` is the same object `GET
-    /// /v1/commands/{id}/status` returns; `status`, `exit_code` and `error`
+    /// /v1/worker/commands/{id}` returns; `status`, `exit_code` and `error`
     /// are kept for clients that predate it.
+    #[serde(alias = "command_status")]
     CommandStatus {
         status: CommandStatusKind,
         exit_code: Option<i32>,
@@ -428,12 +512,117 @@ pub enum EventPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<Box<CommandResult>>,
     },
+    /// The agent's effective OSC 7501 status changed (WI 0141). Values use
+    /// the spec spellings; the step it belongs to is the envelope's `source`.
+    #[serde(alias = "program_status")]
+    ProgramStatus {
+        state: crate::data::program_status::ProgramState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<crate::data::program_status::BlockedKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        msg: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app: Option<String>,
+    },
+    /// A PTY-bridged container registered a hub terminal (WI 0141). Step,
+    /// phase, container and attempt come from the envelope's `source`.
+    #[serde(alias = "terminal_opened")]
+    TerminalOpened {
+        terminal_id: crate::data::ids::TerminalId,
+        agent: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        cols: u16,
+        rows: u16,
+    },
+    /// The terminal's PTY exited (WI 0141).
+    #[serde(alias = "terminal_closed")]
+    TerminalClosed {
+        terminal_id: crate::data::ids::TerminalId,
+        exit_code: i32,
+    },
+    /// The input grant on a terminal was taken or released (WI 0141).
+    /// `holder` is the client's `x-awman-actor`, or `local`. Keystrokes are
+    /// never logged.
+    #[serde(alias = "terminal_control")]
+    TerminalControl {
+        terminal_id: crate::data::ids::TerminalId,
+        holder: String,
+        #[serde(
+            default,
+            skip_serializing_if = "crate::data::annotations::Annotations::is_empty"
+        )]
+        annotations: crate::data::terminal::Annotations,
+    },
+    /// A local attach subscription ended (WI 0141); published by the engine
+    /// to host presenters (0142, 0157).
+    #[serde(alias = "terminal_viewer_detached")]
+    TerminalViewerDetached {
+        terminal_id: crate::data::ids::TerminalId,
+        reason: crate::data::terminal::DetachReason,
+        #[serde(
+            default,
+            skip_serializing_if = "crate::data::annotations::Annotations::is_empty"
+        )]
+        annotations: crate::data::terminal::Annotations,
+    },
+    /// The complete `GET /v1/worker/commands/{id}/workflow` snapshot,
+    /// published every time `workflow.state.json` is persisted (WI 0143),
+    /// including the initial and final snapshots. Same ordered log as push
+    /// SSE and WSP event delivery.
+    #[serde(rename = "workflow_state")]
+    #[serde(alias = "workflow_state")]
+    WorkflowState(serde_json::Value),
+    /// A stale image could not be rebuilt, so the session runs on the
+    /// previous image (WI 0163). A warning, not a failure: the session that
+    /// repairs a broken `Dockerfile.dev` must still be able to run.
+    #[serde(alias = "image_stale")]
+    ImageStale(ImageStaleWarning),
+    #[serde(alias = "done")]
     Done,
+}
+
+/// Which image a rebuild was for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StaleImageKind {
+    Project,
+    Agent,
+}
+
+/// Payload of the `image_stale` event: a rebuild of a stale image failed and
+/// the previous image is kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageStaleWarning {
+    /// The failed build, named as the build step reports it (e.g. `build
+    /// project image awman-x:latest`).
+    pub build: String,
+    /// The tag the session keeps running on.
+    pub image: String,
+    pub kind: StaleImageKind,
+    /// The agent, for an agent image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The inputs hash of the working tree the rebuild was for.
+    pub expected_inputs: String,
+    /// The kept image's `dev.awman.inputs` label; `None` when unlabeled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_inputs: Option<String>,
+    /// Why the build failed. Callers pass a redacted, single-line message.
+    pub reason: String,
 }
 
 impl EventPayload {
     pub fn sse_event_type(&self) -> &'static str {
         match self {
+            EventPayload::AgentCredentialsChanged { .. } => "agent_credentials_changed",
+            EventPayload::AgentExecutionReplaced { .. } => "agent_execution_replaced",
+            EventPayload::AgentState { .. } => "agent_state",
+            EventPayload::AgentIdentity { .. } => "agent_identity",
+            EventPayload::AgentTurnStarted { .. } => "agent_turn_started",
+            EventPayload::AgentTurnCompleted { .. } => "agent_turn_completed",
             EventPayload::WorkflowPrerequisites { .. } => "workflow_prerequisites",
             EventPayload::StdoutLine(_) => "stdout_line",
             EventPayload::StderrLine(_) => "stderr_line",
@@ -444,13 +633,27 @@ impl EventPayload {
             EventPayload::WorkflowParallelStepExited { .. } => "workflow_parallel_step_exited",
             EventPayload::WorkflowParallelGroupFinished => "workflow_parallel_group_finished",
             EventPayload::StepActivity { .. } => "step_activity",
+            EventPayload::PushRetry { .. } => "push_retry",
             EventPayload::CommandStatus { .. } => "command_status",
+            EventPayload::ProgramStatus { .. } => "program_status",
+            EventPayload::TerminalOpened { .. } => "terminal_opened",
+            EventPayload::TerminalClosed { .. } => "terminal_closed",
+            EventPayload::TerminalControl { .. } => "terminal_control",
+            EventPayload::TerminalViewerDetached { .. } => "terminal_viewer_detached",
+            EventPayload::WorkflowState(_) => "workflow_state",
+            EventPayload::ImageStale(_) => "image_stale",
             EventPayload::Done => "done",
         }
     }
 
     pub fn to_plain_text(&self) -> Option<String> {
         match self {
+            EventPayload::AgentCredentialsChanged { .. }
+            | EventPayload::AgentExecutionReplaced { .. }
+            | EventPayload::AgentState { .. }
+            | EventPayload::AgentIdentity { .. }
+            | EventPayload::AgentTurnStarted { .. }
+            | EventPayload::AgentTurnCompleted { .. } => None,
             EventPayload::WorkflowPrerequisites { report, .. } => {
                 Some(format!("[prerequisites] {}", report.summary_line()))
             }
@@ -489,6 +692,15 @@ impl EventPayload {
             EventPayload::WorkflowParallelGroupFinished => {
                 Some("[parallel] group finished".to_string())
             }
+            EventPayload::PushRetry {
+                attempt,
+                max_attempts,
+                operation,
+                delay_ms,
+                remote,
+            } => Some(format!(
+                "push retry {attempt}/{max_attempts} in {delay_ms} ms ({operation} to {remote})"
+            )),
             // The activity feed is additive: `output.log` stays the agent's
             // output lines only, exactly as before WI 0137.
             EventPayload::StepActivity { .. } => None,
@@ -501,370 +713,114 @@ impl EventPayload {
                     Some(format!("[status] {status}"))
                 }
             }
+            // Status and terminal lifecycle are structured signals, not agent
+            // output: `output.log` stays the agent's own lines (WI 0141).
+            EventPayload::ProgramStatus { .. }
+            | EventPayload::TerminalOpened { .. }
+            | EventPayload::TerminalClosed { .. }
+            | EventPayload::TerminalControl { .. }
+            | EventPayload::TerminalViewerDetached { .. } => None,
+            // A structured snapshot, not a log line.
+            EventPayload::WorkflowState(_) => None,
+            EventPayload::ImageStale(w) => Some(format!(
+                "[image] warning: {} failed; still using {} ({})",
+                w.build, w.image, w.reason
+            )),
             EventPayload::Done => None,
         }
     }
 }
 
 #[cfg(test)]
-mod phase_log_tests {
+mod image_stale_tests {
     use super::*;
+
     #[test]
-    fn additive_phase_events_remain_structured_without_duplicate_text() {
-        let phase = EventPayload::WorkflowPhaseTransition {
-            phase: "setup".into(),
-            step_desc: "prepare".into(),
-            status: PhaseStatusKind::Running,
+    fn image_stale_warning_streams_as_image_stale_and_round_trips() {
+        let warning = ImageStaleWarning {
+            build: "build project image awman-x:latest".into(),
+            image: "awman-x:latest".into(),
+            kind: StaleImageKind::Project,
+            agent: None,
+            expected_inputs: "ab".into(),
+            installed_inputs: None,
+            reason: "exit 1".into(),
         };
-        assert_eq!(phase.to_plain_text(), None);
-        assert_eq!(phase.sse_event_type(), "workflow_phase_transition");
-        assert_eq!(
-            EventPayload::StatusMessage {
-                phase: "setup".into(),
-                message: "started: prepare".into()
-            }
-            .to_plain_text(),
-            Some("[setup] started: prepare".into())
-        );
-    }
-}
-
-#[cfg(test)]
-mod cursor_tests {
-    use super::*;
-
-    fn event(attempt: u32, sequence: u64, payload: EventPayload) -> ExecutionEvent {
-        ExecutionEvent {
+        let event = ExecutionEvent {
             timestamp: Utc::now(),
-            attempt,
-            sequence,
+            attempt: FIRST_ATTEMPT,
+            sequence: 0,
             source: None,
-            payload,
-        }
-    }
-
-    fn line(n: &str) -> EventPayload {
-        EventPayload::StdoutLine(n.into())
-    }
-
-    #[test]
-    fn source_is_omitted_when_absent_and_round_trips_when_present() {
-        let bare = serde_json::to_value(event(1, 0, line("x"))).unwrap();
-        assert!(bare.get("source").is_none());
-
-        let mut attributed = event(1, 1, line("y"));
-        attributed.source = Some(
-            EventSource::step(EventSourcePhase::Main, "tests", 2)
-                .with_container("awman-1")
-                .with_step_attempt(1),
-        );
-        let json = serde_json::to_value(&attributed).unwrap();
-        assert_eq!(json["source"]["phase"], "main");
-        assert_eq!(json["source"]["step_name"], "tests");
-        assert_eq!(json["source"]["step_index"], 2);
-        assert_eq!(json["source"]["container"], "awman-1");
-        assert_eq!(json["source"]["step_attempt"], 1);
-        let back: ExecutionEvent = serde_json::from_value(json).unwrap();
-        assert_eq!(back.source, attributed.source);
-
-        let leader = serde_json::to_value(EventSource::phase(EventSourcePhase::Leader)).unwrap();
-        assert_eq!(leader, serde_json::json!({"phase": "leader"}));
-    }
-
-    #[test]
-    fn step_filter_keeps_matching_steps_and_terminal_events() {
-        let mut tests = event(1, 0, line("a"));
-        tests.source = Some(EventSource::step(EventSourcePhase::Main, "tests", 0));
-        let mut docs = event(1, 1, line("b"));
-        docs.source = Some(EventSource::step(EventSourcePhase::Main, "docs", 1));
-        let unattributed = event(1, 2, line("c"));
-        let status = event(
-            1,
-            3,
-            EventPayload::CommandStatus {
-                status: CommandStatusKind::Done,
-                exit_code: Some(0),
-                error: None,
-                result: None,
-            },
-        );
-        let done = event(1, 4, EventPayload::Done);
-        assert!(tests.matches_step_filter("tests"));
-        assert!(!docs.matches_step_filter("tests"));
-        assert!(!unattributed.matches_step_filter("tests"));
-        assert!(status.matches_step_filter("tests"));
-        assert!(done.matches_step_filter("tests"));
-    }
-
-    #[test]
-    fn step_activity_is_typed_and_absent_from_plain_text() {
-        let payload = EventPayload::StepActivity {
-            kind: StepActivityKind::ToolUse,
-            summary: "Read src/main.rs".into(),
+            payload: EventPayload::ImageStale(warning.clone()),
         };
-        assert_eq!(payload.sse_event_type(), "step_activity");
-        assert_eq!(payload.to_plain_text(), None);
-        let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["type"], "StepActivity");
-        assert_eq!(json["data"]["kind"], "tool_use");
-    }
-
-    #[test]
-    fn command_status_result_is_omitted_when_absent_and_legacy_lines_parse() {
-        let without = serde_json::to_value(EventPayload::CommandStatus {
-            status: CommandStatusKind::Error,
-            exit_code: Some(1),
-            error: Some("boom".into()),
-            result: None,
-        })
-        .unwrap();
-        assert!(without["data"].get("result").is_none());
-        let legacy =
-            r#"{"type":"CommandStatus","data":{"status":"done","exit_code":0,"error":null}}"#;
-        let parsed: EventPayload = serde_json::from_str(legacy).unwrap();
-        assert!(matches!(
-            parsed,
-            EventPayload::CommandStatus { result: None, .. }
-        ));
-        let with = EventPayload::CommandStatus {
-            status: CommandStatusKind::Done,
-            exit_code: Some(0),
-            error: None,
-            result: Some(Box::new(CommandResult {
-                exit_code: Some(0),
-                ..CommandResult::default()
-            })),
-        };
-        let json = serde_json::to_value(&with).unwrap();
-        assert_eq!(json["data"]["result"]["exit_code"], 0);
-    }
-
-    #[test]
-    fn cursor_parses_attempt_and_sequence() {
-        assert_eq!(EventCursor::parse("1:0"), Some(EventCursor::new(1, 0)));
-        assert_eq!(
-            EventCursor::parse("12:345"),
-            Some(EventCursor::new(12, 345))
-        );
-        assert_eq!(EventCursor::parse("007:0009"), Some(EventCursor::new(7, 9)));
-        // Attempt 0 is syntactically valid; `ReplayFrom` treats it as unknown.
-        assert_eq!(EventCursor::parse("0:5"), Some(EventCursor::new(0, 5)));
-        assert_eq!(
-            EventCursor::parse("4294967295:18446744073709551615"),
-            Some(EventCursor::new(u32::MAX, u64::MAX))
-        );
-    }
-
-    #[test]
-    fn cursor_rejects_malformed_input() {
-        for bad in [
-            "",
-            ":",
-            "1",
-            "1:",
-            ":1",
-            "1:2:3",
-            "a:b",
-            "1:b",
-            "a:1",
-            "-1:2",
-            "1:-2",
-            "+1:2",
-            "1:+2",
-            " 1:2",
-            "1:2 ",
-            "1: 2",
-            "1 :2",
-            "1;2",
-            "1.0:2",
-            "0x1:2",
-            "١:٢",
-            "1:2\n",
-            "4294967296:0",
-            "1:18446744073709551616",
-        ] {
-            assert_eq!(EventCursor::parse(bad), None, "{bad:?} must be rejected");
-        }
-    }
-
-    #[test]
-    fn cursor_display_round_trips_through_parse() {
-        for cursor in [
-            EventCursor::new(1, 0),
-            EventCursor::new(3, 41),
-            EventCursor::new(u32::MAX, u64::MAX),
-        ] {
-            assert_eq!(EventCursor::parse(&cursor.to_string()), Some(cursor));
-        }
-        assert_eq!(EventCursor::new(2, 7).to_string(), "2:7");
-    }
-
-    #[test]
-    fn cursor_orders_by_attempt_then_sequence() {
-        assert!(EventCursor::new(1, 999) < EventCursor::new(2, 0));
-        assert!(EventCursor::new(2, 3) < EventCursor::new(2, 4));
-        // Numeric, not lexicographic: 10 > 9.
-        assert!(EventCursor::new(1, 9) < EventCursor::new(1, 10));
-        assert!(EventCursor::new(9, 0) < EventCursor::new(10, 0));
-    }
-
-    #[test]
-    fn event_cursor_reflects_attempt_and_sequence() {
-        assert_eq!(event(3, 8, EventPayload::Done).cursor().to_string(), "3:8");
-    }
-
-    #[test]
-    fn serialized_event_includes_attempt() {
-        let json = serde_json::to_value(event(2, 5, line("x"))).unwrap();
-        assert_eq!(json["attempt"], 2);
-        assert_eq!(json["sequence"], 5);
-    }
-
-    #[test]
-    fn legacy_line_without_attempt_deserializes_as_first_attempt() {
-        let legacy = r#"{"timestamp":"2026-01-01T00:00:00Z","sequence":4,"payload":{"type":"StdoutLine","data":"hi"}}"#;
-        let parsed: ExecutionEvent = serde_json::from_str(legacy).unwrap();
-        assert_eq!(parsed.attempt, FIRST_ATTEMPT);
-        assert_eq!(parsed.attempt, 1);
-        assert_eq!(parsed.cursor(), EventCursor::new(1, 4));
-    }
-
-    #[test]
-    fn parse_event_log_reads_mixed_legacy_and_new_lines_and_skips_damage() {
-        let legacy = r#"{"timestamp":"2026-01-01T00:00:00Z","sequence":0,"payload":{"type":"StdoutLine","data":"old"}}"#;
-        let new = serde_json::to_string(&event(2, 0, line("new"))).unwrap();
-        let raw = format!("{legacy}\n\n{{\"torn\":\n{new}\nnot json\n");
-        let events = parse_event_log(&raw);
-        let cursors: Vec<_> = events.iter().map(|e| e.cursor().to_string()).collect();
-        assert_eq!(cursors, ["1:0", "2:0"]);
-    }
-
-    #[test]
-    fn kept_attempts_lists_each_attempt_once() {
-        let events = vec![
-            event(1, 0, line("a")),
-            event(1, 1, line("b")),
-            event(3, 0, line("c")),
-        ];
-        assert_eq!(
-            kept_attempts(&events).into_iter().collect::<Vec<_>>(),
-            [1, 3]
-        );
-        assert!(kept_attempts(&[]).is_empty());
-    }
-
-    fn two_attempts() -> Vec<ExecutionEvent> {
-        vec![
-            event(1, 0, line("a1")),
-            event(1, 1, line("a2")),
-            event(2, 0, line("b1")),
-            event(2, 1, line("b2")),
-        ]
-    }
-
-    #[test]
-    fn resolve_without_a_cursor_replays_everything() {
-        let events = two_attempts();
-        let from = ReplayFrom::resolve(&events, 2, None);
-        assert_eq!(from, ReplayFrom::Beginning);
-        assert!(events.iter().all(|e| from.includes(e)));
-    }
-
-    #[test]
-    fn resolve_with_a_kept_attempt_resumes_strictly_after_the_cursor() {
-        let events = two_attempts();
-        for (cursor, expected) in [
-            (EventCursor::new(1, 0), vec!["1:1", "2:0", "2:1"]),
-            (EventCursor::new(1, 1), vec!["2:0", "2:1"]),
-            (EventCursor::new(2, 0), vec!["2:1"]),
-            (EventCursor::new(2, 1), vec![]),
-            // Ahead of the head of a kept attempt: nothing replays, no fallback.
-            (EventCursor::new(2, 99), vec![]),
-        ] {
-            let from = ReplayFrom::resolve(&events, 2, Some(cursor));
-            assert_eq!(from, ReplayFrom::After(cursor));
-            let got: Vec<_> = events
-                .iter()
-                .filter(|e| from.includes(e))
-                .map(|e| e.cursor().to_string())
-                .collect();
-            assert_eq!(got, expected, "after {cursor}");
-        }
-    }
-
-    #[test]
-    fn resolve_with_an_attempt_that_is_not_kept_restarts_the_current_attempt() {
-        let events = vec![event(2, 0, line("b1")), event(2, 1, line("b2"))];
-        for cursor in [
-            EventCursor::new(1, 5),  // purged / not in the log
-            EventCursor::new(0, 0),  // attempt 0 never exists
-            EventCursor::new(3, 0),  // newer than the row's attempt
-            EventCursor::new(40, 1), // far newer
-        ] {
-            let from = ReplayFrom::resolve(&events, 2, Some(cursor));
-            assert_eq!(from, ReplayFrom::StartOfAttempt(2), "{cursor}");
-            assert!(events.iter().all(|e| from.includes(e)));
-            assert!(!from.includes(&event(1, 0, line("older"))));
-        }
-    }
-
-    #[test]
-    fn resolve_with_an_empty_log_restarts_the_current_attempt() {
-        let from = ReplayFrom::resolve(&[], 3, Some(EventCursor::new(1, 0)));
-        assert_eq!(from, ReplayFrom::StartOfAttempt(3));
+        let public = event.public_value();
+        assert_eq!(public["payload"]["type"], "image_stale");
+        assert_eq!(public["payload"]["data"]["kind"], "project");
+        assert!(public["payload"]["data"].get("agent").is_none());
+        let stored = serde_json::to_string(&event).unwrap();
+        let back: ExecutionEvent = serde_json::from_str(&stored).unwrap();
+        assert!(matches!(back.payload, EventPayload::ImageStale(w) if w == warning));
+        let snake = r#"{"type":"image_stale","data":{"build":"b","image":"i","kind":"agent","agent":"claude","expected_inputs":"e","reason":"r"}}"#;
+        let parsed: EventPayload = serde_json::from_str(snake).unwrap();
+        assert!(parsed.to_plain_text().unwrap().contains("still using i"));
     }
 }
 
 #[cfg(test)]
-mod prerequisite_event_tests {
+mod automation_event_tests {
     use super::*;
-    use crate::data::workflow_prerequisites::*;
-
-    fn payload() -> EventPayload {
-        EventPayload::WorkflowPrerequisites {
-            phase: PrerequisitePhase::BeforeTeardown,
-            report: WorkflowPrerequisiteReport {
-                phase: PrerequisitePhase::BeforeTeardown,
-                origin: PrerequisiteOrigin::AssumedAll,
-                checks: vec![PrerequisiteCheck {
-                    prerequisite: WorkflowPrerequisite::GitHubToken {
-                        host: "github.com".into(),
-                    },
-                    status: PrerequisiteStatus::Missing,
-                    explanation: "no granted GitHub token is available".into(),
-                    needed_by: vec![],
-                    remediations: vec![Remediation::PasteToken, Remediation::Continue],
-                }],
-                advisories: vec![],
-                notes: vec![],
+    #[test]
+    fn lifecycle_events_keep_sources_and_do_not_become_pty_text() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../web/test/lib/fixtures/terminal-frames.json"
+        ))
+        .unwrap();
+        let snapshot: crate::data::automation_records::AutomationSnapshot =
+            serde_json::from_value(fixture["automation_examples"]["snapshot"].clone()).unwrap();
+        let result =
+            serde_json::from_value(fixture["automation_examples"]["turn_result"].clone()).unwrap();
+        let turn = crate::data::ids::TurnId::new();
+        let request_id = uuid::Uuid::new_v4();
+        let payloads = [
+            EventPayload::AgentState {
+                snapshot: Box::new(snapshot.clone()),
             },
+            EventPayload::AgentIdentity {
+                execution_id: snapshot.execution_id.clone(),
+                native_session_id: crate::data::settings_profile::NativeSessionId::parse("session")
+                    .unwrap(),
+            },
+            EventPayload::AgentTurnStarted {
+                request_id,
+                execution_id: snapshot.execution_id.clone(),
+                turn_id: turn.clone(),
+                native_session_id: None,
+                native_turn_id: None,
+                status_support: snapshot.status_support,
+                status_source: snapshot.status_source,
+            },
+            EventPayload::AgentTurnCompleted {
+                request_id,
+                execution_id: snapshot.execution_id.clone(),
+                turn_id: turn.clone(),
+                result,
+            },
+        ];
+        for (sequence, payload) in payloads.into_iter().enumerate() {
+            assert!(payload.to_plain_text().is_none());
+            assert!(payload.sse_event_type().starts_with("agent_"));
+            let mut source = EventSource::phase(EventSourcePhase::Main);
+            source.execution_id = Some(snapshot.execution_id.clone());
+            source.turn_id = Some(turn.clone());
+            let event = ExecutionEvent {
+                timestamp: Utc::now(),
+                attempt: 1,
+                sequence: sequence as u64,
+                source: Some(source.clone()),
+                payload,
+            };
+            let decoded: ExecutionEvent = serde_json::from_value(event.public_value()).unwrap();
+            assert_eq!(decoded.source, Some(source));
         }
-    }
-
-    #[test]
-    fn workflow_prerequisites_sse_type_and_plain_text() {
-        let event = payload();
-        assert_eq!(event.sse_event_type(), "workflow_prerequisites");
-        assert_eq!(
-            event.to_plain_text().unwrap(),
-            "[prerequisites] 1 of 1 workflow prerequisites need your attention"
-        );
-    }
-
-    #[test]
-    fn payload_json_is_tagged_and_secret_free() {
-        let json = serde_json::to_value(payload()).unwrap();
-        assert_eq!(json["type"], "WorkflowPrerequisites");
-        assert_eq!(json["data"]["phase"], "before_teardown");
-        assert_eq!(json["data"]["report"]["checks"][0]["status"], "missing");
-        assert_eq!(
-            json["data"]["report"]["checks"][0]["remediations"][0]["type"],
-            "paste_token"
-        );
-        let text = json.to_string();
-        // Remediations name choices; no field exists that could carry a value.
-        assert!(!text.contains("ghp_"));
-        let back: EventPayload = serde_json::from_value(json).unwrap();
-        assert_eq!(back.sse_event_type(), "workflow_prerequisites");
     }
 }

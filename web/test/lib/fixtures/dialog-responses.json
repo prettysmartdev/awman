@@ -1,0 +1,41 @@
+[
+  {
+    "kind": "interrupted"
+  },
+  {
+    "kind": "yes"
+  },
+  {
+    "kind": "no"
+  },
+  {
+    "kind": "cancel"
+  },
+  {
+    "kind": "text",
+    "value": "wi-0159"
+  },
+  {
+    "kind": "secret",
+    "value": "ghp_example_not_a_real_token"
+  },
+  {
+    "kind": "index",
+    "value": 1
+  },
+  {
+    "kind": "char",
+    "value": "a"
+  },
+  {
+    "kind": "dismissed"
+  },
+  {
+    "kind": "config_edit",
+    "value": {
+      "field": "agent",
+      "value": "codex",
+      "global": false
+    }
+  }
+]

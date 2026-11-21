@@ -32,6 +32,21 @@ pub struct WorkflowRuntimeContext {
 /// Trait implemented by Layer 2: produce a fresh `AgentExecution` for a
 /// step, or inject a prompt into an already-running container.
 pub trait AgentExecutionFactory: Send + Sync {
+    /// Command-owned settings scopes must agree before another workflow step
+    /// can inherit an already-running execution.
+    fn settings_scope_matches(&self, _current: &WorkflowStep, _next: &WorkflowStep) -> bool {
+        true
+    }
+
+    /// The runtime wait and its output readers have ended. The command layer
+    /// can now reconcile any private state owned by this execution.
+    fn execution_finished(
+        &self,
+        _handle: AgentHandle,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+
     fn execution_for_step(
         &self,
         step: &WorkflowStep,

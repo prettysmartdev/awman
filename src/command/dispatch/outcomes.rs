@@ -6,25 +6,52 @@
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind", content = "payload")]
 pub enum CommandOutcome {
+    /// A completed command whose typed result lives in another engine.
+    /// Presenters retain its exit code even when they render from feed deltas.
+    Relayed(crate::data::frontend_protocol::CommandResultWire),
+    Attach(crate::command::commands::attach::AttachOutcome),
     Init(crate::command::commands::init::InitOutcome),
     Ready(crate::command::commands::ready::ReadyOutcome),
     Chat(crate::command::commands::chat::ChatOutcome),
     Agents(crate::command::commands::agents::AgentsOutcome),
     Config(crate::command::commands::config::ConfigOutcome),
+    WorkerLink(crate::command::commands::worker::WorkerLinkOutcome),
+    Queue(crate::data::wire::List<crate::command::daemon_api::worker_pull::QueueRow>),
+    QueuePick(crate::data::fs::api_db::CommandResult),
     ExecPrompt(crate::command::commands::exec_prompt::ExecPromptOutcome),
     ExecWorkflow(crate::command::commands::exec_workflow::ExecWorkflowOutcome),
-    ApiServer(crate::command::commands::api_server::ApiServerOutcome),
+    DaemonApi(crate::command::commands::daemon::api::DaemonApiOutcome),
+    Daemon(crate::command::commands::daemon::lifecycle::DaemonOutcome),
     Squad(crate::command::commands::squad::commands::SquadOutcome),
     SquadAttach(crate::command::commands::squad::attach::SquadAttachOutcome),
     Remote(crate::command::commands::remote::RemoteOutcome),
     New(crate::command::commands::new::NewOutcome),
-    Specs(crate::command::commands::specs::SpecsOutcome),
+    Edit(crate::command::commands::edit::EditOutcome),
     Clean(crate::command::commands::clean::CleanOutcome),
     /// Trivial wrapper used by no-op leaf commands during the refactor.
+    Link(String),
     Empty,
 }
 
 impl CommandOutcome {
+    /// The same final assurance travels through CLI, relay and command storage.
+    pub fn automation(&self) -> Option<&crate::data::automation_records::CommandAutomationResult> {
+        match self {
+            Self::Chat(outcome) => outcome.automation.as_ref(),
+            Self::ExecPrompt(outcome) => outcome.automation.as_ref(),
+            Self::Relayed(result) => result.automation.as_ref(),
+            Self::QueuePick(result) => result.automation.as_ref(),
+            _ => None,
+        }
+    }
+    /// An interactive automation run's last confirmed answer (WI 0070).
+    pub fn automation_final_message(&self) -> Option<&str> {
+        match self {
+            Self::Chat(outcome) => outcome.automation_final_message.as_deref(),
+            Self::ExecPrompt(outcome) => outcome.automation_final_message.as_deref(),
+            _ => None,
+        }
+    }
     /// The command's process/API exit code. Successful aggregate outcomes can
     /// still carry a failure: `new skill --pull-all` continues collecting
     /// libraries after one source fails, and must be visible to both CLI and
@@ -37,9 +64,12 @@ impl CommandOutcome {
     /// showed red in the TUI.
     pub fn exit_code(&self) -> i32 {
         match self {
-            Self::Chat(outcome) => outcome.exit_code.unwrap_or(0),
+            Self::Relayed(result) => result.exit_code,
+            Self::Attach(outcome) => outcome.exit_code,
+            Self::Chat(outcome) => outcome.exit_code.unwrap_or(1),
             Self::ExecWorkflow(outcome) => outcome.exit_code.unwrap_or(0),
-            Self::ExecPrompt(outcome) => outcome.exit_code.unwrap_or(0),
+            Self::ExecPrompt(outcome) => outcome.exit_code.unwrap_or(1),
+            Self::QueuePick(outcome) => outcome.exit_code.unwrap_or(1),
             Self::SquadAttach(outcome) => outcome.exit_code,
             Self::Agents(outcome) => outcome.exit_code(),
             // `remote exec --follow` reports the remote command's result.
@@ -59,90 +89,139 @@ impl CommandOutcome {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// A failed runtime wait is never an absent, successful exit. Cancellation is
+/// synthetic only when no provider failure is already known.
+pub(crate) fn agent_exit_code(
+    exit: Result<crate::engine::agent_runtime::AgentExitInfo, crate::engine::error::EngineError>,
+    cancelled: bool,
+) -> Result<Option<i32>, crate::command::error::CommandError> {
+    match exit {
+        Err(error) => Err(crate::command::error::CommandError::RuntimeWaitFailed(
+            error.to_string(),
+        )),
+        Ok(info) if info.exit_code != 0 => Ok(Some(info.exit_code)),
+        Ok(_) if cancelled => Ok(Some(crate::data::command_status::CANCELLED_EXIT_CODE)),
+        Ok(info) => Ok(Some(info.exit_code)),
+    }
+}
 
-    #[test]
-    fn command_outcome_exit_code_covers_execution_and_partial_skill_failure() {
-        assert_eq!(
-            CommandOutcome::ExecWorkflow(
-                crate::command::commands::exec_workflow::ExecWorkflowOutcome {
-                    prerequisites: None,
-                    workflow: "workflow.toml".into(),
-                    exit_code: Some(17),
-                    worktree_used: false,
-                }
-            )
-            .exit_code(),
-            17
-        );
-        assert_eq!(
-            CommandOutcome::ExecPrompt(crate::command::commands::exec_prompt::ExecPromptOutcome {
-                agent: None,
-                exit_code: Some(3)
-            })
-            .exit_code(),
-            3
-        );
-        let partial = CommandOutcome::New(crate::command::commands::new::NewOutcome::Skill(
-            crate::command::commands::new::NewSkillOutcome {
-                interview: false,
-                global: false,
-                path: None,
-                pull: true,
-                libraries: vec![crate::command::commands::new::PullLibraryOutcome {
-                    slug: "broken".into(),
-                    dir: "broken".into(),
-                    updated: false,
-                    skills_found: Vec::new(),
-                    error: Some("unreachable".into()),
-                }],
-            },
-        ));
-        assert!(partial.is_partial_failure());
-        assert_eq!(partial.exit_code(), 1);
-        assert_eq!(CommandOutcome::Empty.exit_code(), 0);
+#[cfg(test)]
+mod wait_failure_tests {
+    use super::*;
+    use crate::engine::agent_runtime::execution::{CancelHandle, ExecutionBackend};
+    use crate::engine::agent_runtime::{AgentExecution, AgentExitInfo};
+    use crate::engine::error::EngineError;
+    use std::sync::Arc;
+
+    struct FailedWait;
+    impl ExecutionBackend for FailedWait {
+        fn wait_blocking(self: Box<Self>) -> Result<AgentExitInfo, EngineError> {
+            Err(EngineError::Container(
+                "synthetic runtime wait failure".into(),
+            ))
+        }
+        fn cancel(&self) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn cancel_handle(&self) -> CancelHandle {
+            CancelHandle::new(|| Ok(()))
+        }
+    }
+    fn info(code: i32) -> AgentExitInfo {
+        let now = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        AgentExitInfo {
+            exit_code: code,
+            signal: None,
+            started_at: now,
+            ended_at: now,
+        }
     }
 
-    /// WI 0125 (M-7): a `Ready` outcome's exit code is driven by
-    /// `ReadyOutcome::ready` (set from `ReadySummary::is_ready()` in
-    /// `From<ReadySummary>`), not by whether the engine returned `Ok` —
-    /// `run_to_completion` can return `Ok(summary)` for a summary that
-    /// recorded a failed build/import as a row rather than an `Err`. Before
-    /// this change every `Ready` outcome exited 0 regardless of
-    /// `StepStatus::Failed` anywhere in it.
     #[test]
-    fn command_outcome_exit_code_reflects_ready_image_failures() {
-        fn ready_outcome(ready: bool) -> CommandOutcome {
-            use crate::command::commands::ready::ReadyOutcome;
-            use crate::data::step_status::StepStatus;
-            CommandOutcome::Ready(ReadyOutcome {
-                runtime: "docker".into(),
-                dockerfile: StepStatus::Done,
-                base_image: StepStatus::Done,
-                agent_image: StepStatus::Done,
-                image_source: None,
-                agent_definition: None,
-                local_agent: StepStatus::Done,
-                audit: StepStatus::Skipped,
-                image_rebuild: StepStatus::Skipped,
-                agent_credentials: Vec::new(),
-                non_default_agent_images: Vec::new(),
-                image_results: Vec::new(),
-                base_image_results: Vec::new(),
-                ready,
-                json_requested: false,
-                refresh_requested: false,
-            })
-        }
-
-        assert_eq!(ready_outcome(true).exit_code(), 0);
-        assert_eq!(
-            ready_outcome(false).exit_code(),
-            1,
-            "a failed required image stage must exit non-zero on every runtime, \
-             not only builtin"
+    fn cancellation_does_not_hide_runtime_wait_failure() {
+        let result = agent_exit_code(
+            Err(EngineError::Container("wait failed during cancel".into())),
+            true,
         );
+        assert!(matches!(
+            result,
+            Err(crate::command::error::CommandError::RuntimeWaitFailed(message))
+                if message.contains("wait failed during cancel")
+        ));
+    }
+
+    #[test]
+    fn missing_chat_or_exec_exit_code_is_a_failure_projection() {
+        let chat = CommandOutcome::Chat(crate::command::commands::chat::ChatOutcome {
+            automation: None,
+            automation_final_message: None,
+            agent: None,
+            exit_code: None,
+        });
+        let exec =
+            CommandOutcome::ExecPrompt(crate::command::commands::exec_prompt::ExecPromptOutcome {
+                automation: None,
+                automation_final_message: None,
+                agent: None,
+                exit_code: None,
+            });
+        assert_eq!(chat.exit_code(), 1);
+        assert_eq!(exec.exit_code(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_wait_is_a_failed_command_result() {
+        let now = info(0).started_at;
+        let (sender, _) = tokio::sync::broadcast::channel(16);
+        let mut execution = AgentExecution::new(
+            crate::data::session::AgentHandle {
+                id: "fake".into(),
+                name: "fake".into(),
+                image_tag: "fake:latest".into(),
+                started_at: now,
+            },
+            Box::new(FailedWait),
+            Arc::new(sender),
+            None,
+        );
+        let error = agent_exit_code(execution.wait().await, false).unwrap_err();
+        assert_eq!(
+            (error.exit_code(), error.http_status(), error.code()),
+            (1, 500, crate::data::agent_failure::RUNTIME_WAIT_FAILED)
+        );
+        assert!(error.to_string().contains("synthetic runtime wait failure"));
+    }
+
+    #[test]
+    fn known_provider_failure_survives_cancellation_and_outcome_projection() {
+        for cancelled in [true, false] {
+            for code in [1, 17, 42, 130, 255] {
+                let exit_code = agent_exit_code(Ok(info(code)), cancelled).unwrap();
+                for outcome in [
+                    CommandOutcome::Chat(crate::command::commands::chat::ChatOutcome {
+                        automation: None,
+                        automation_final_message: None,
+                        agent: None,
+                        exit_code,
+                    }),
+                    CommandOutcome::ExecPrompt(
+                        crate::command::commands::exec_prompt::ExecPromptOutcome {
+                            automation: None,
+                            automation_final_message: None,
+                            agent: None,
+                            exit_code,
+                        },
+                    ),
+                ] {
+                    assert_eq!(outcome.exit_code(), code);
+                }
+            }
+        }
+        assert_eq!(agent_exit_code(Ok(info(0)), true).unwrap(), Some(130));
+        assert!(matches!(
+            agent_exit_code(Err(EngineError::Other("cancelled wait".into())), true),
+            Err(crate::command::error::CommandError::RuntimeWaitFailed(_))
+        ));
+        assert_eq!(agent_exit_code(Ok(info(0)), false).unwrap(), Some(0));
     }
 }

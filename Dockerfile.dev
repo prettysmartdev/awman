@@ -39,6 +39,32 @@ RUN rm -rf /var/lib/apt/lists/* \
         musl-tools \
         openssh-client \
         pkg-config \
+        xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# The web gate runs in setup/teardown shells too, where per-user tool installs
+# and shell profiles are not retained. Keep Node and npm on the image's PATH.
+# Use the same Node major as CI; verify the official archive for each host.
+ENV NODE_VERSION=22.23.5
+RUN case "$(dpkg --print-architecture)" in \
+        amd64) node_arch=x64; node_sha=cdeb8670a0c81f51b4dc4ac61919f9b1ad917b304bf8221eb939570663d240f8 ;; \
+        arm64) node_arch=arm64; node_sha=2babb9eb5264860d540849f4b064a6fbdebcdc323657d9d382ce23d313fd5e09 ;; \
+        *) echo 'Unsupported Node.js architecture' >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz" -o /tmp/node.tar.xz \
+    && echo "${node_sha}  /tmp/node.tar.xz" | sha256sum -c - \
+    && tar -xJf /tmp/node.tar.xz --strip-components=1 --no-same-owner -C /usr/local \
+    && rm /tmp/node.tar.xz \
+    && npm install --global --ignore-scripts --no-audit --no-fund npm@11.17.0 \
+    && node --version \
+    && npm --version
+
+# Match web/e2e/package.json. Browser binaries and their system libraries must
+# survive a fresh agent HOME, just like the compiler and Node installation.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN npm exec --yes --package=playwright@1.58.2 -- playwright install --with-deps chromium firefox \
+    && chmod -R a+rX /opt/ms-playwright \
+    && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/*
 
 # ── GitHub CLI (must run as root — writes to /etc/apt) ────────────────────────

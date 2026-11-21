@@ -264,37 +264,3 @@ fn read_dirty_commit_message(
         _ => dirty_target_commit_message(None, suggested),
     }
 }
-
-#[cfg(test)]
-mod dirty_target_tests {
-    use super::*;
-    #[test]
-    fn eof_and_read_error_abort_and_enter_accepts_default() {
-        assert_eq!(
-            read_dirty_commit_message(&mut std::io::Cursor::new(b""), "WIP"),
-            DirtyMergeTargetDecision::Abort
-        );
-        struct Broken;
-        impl std::io::Read for Broken {
-            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::other("closed"))
-            }
-        }
-        impl std::io::BufRead for Broken {
-            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-                Err(std::io::Error::other("closed"))
-            }
-            fn consume(&mut self, _: usize) {}
-        }
-        assert_eq!(
-            read_dirty_commit_message(&mut Broken, "WIP"),
-            DirtyMergeTargetDecision::Abort
-        );
-        assert_eq!(
-            read_dirty_commit_message(&mut std::io::Cursor::new(b"\n"), "WIP"),
-            DirtyMergeTargetDecision::Commit {
-                message: "WIP".into()
-            }
-        );
-    }
-}

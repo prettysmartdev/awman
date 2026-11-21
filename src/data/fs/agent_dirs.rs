@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::config::agent_definition::{is_first_party_name, validate_agent_file_stem};
 use crate::data::config::env::{Env, EnvSnapshot};
-use crate::data::config::global::GlobalConfig;
 use crate::data::error::DataError;
 
 pub const AGENTS_SUBDIR: &str = "agents";
@@ -37,7 +36,7 @@ pub struct AgentDirs {
 impl AgentDirs {
     pub fn from_env(env: &EnvSnapshot, git_root: Option<PathBuf>) -> Result<Self, DataError> {
         Ok(Self {
-            global_home: GlobalConfig::data_home_with(env)?,
+            global_home: crate::data::fs::data_paths::data_home(env)?,
             git_root,
         })
     }
@@ -77,18 +76,15 @@ impl AgentDirs {
     ///
     /// The repo directory is repo-controlled, so nothing below the git root is
     /// followed: a symlinked `.awman` or `agents` directory, or a symlink at a
-    /// destination name (dangling or not), is refused or replaced, never
-    /// written through. Without `force` publication is no-clobber: an
-    /// existing entry fails before anything is written, and a file created
-    /// concurrently is never replaced. With `force` an existing entry is
-    /// replaced in place, inside the selected directory only. The global
-    /// home itself may be a symlink (it is the user's own), its `agents`
+    /// destination name (dangling or not), is refused, never
+    /// written through. Publication is no-clobber: an existing entry fails
+    /// before anything is written, and a concurrently created file is never
+    /// replaced. The global home itself may be a symlink (it is the user's own), its `agents`
     /// subdirectory may not.
     pub fn publish(
         &self,
         scope: DefinitionScope,
         files: &[(&str, &[u8])],
-        force: bool,
     ) -> Result<Vec<PathBuf>, DataError> {
         let (base, components): (PathBuf, &[&str]) = match scope {
             DefinitionScope::Repo => (
@@ -109,7 +105,7 @@ impl AgentDirs {
                 return Err(DataError::Other(format!("invalid file name {name:?}")));
             }
         }
-        publish_files(&base, components, files, force)?;
+        publish_files(&base, components, files)?;
         Ok(files.iter().map(|(name, _)| dir.join(name)).collect())
     }
 
@@ -135,7 +131,7 @@ impl AgentDirs {
 
 fn already_exists(path: &Path) -> DataError {
     DataError::Other(format!(
-        "{} already exists; pass --force to overwrite it",
+        "{} already exists; use the agent editing command to change it",
         path.display()
     ))
 }
@@ -148,17 +144,16 @@ fn not_a_directory(path: &Path) -> DataError {
 }
 
 /// Descriptor-relative publication: every directory below `base` is opened
-/// with `O_NOFOLLOW`, and files are created, linked and renamed relative to
+/// with `O_NOFOLLOW`, and files are created and linked relative to
 /// that descriptor, so a concurrent symlink swap cannot redirect a write.
 #[cfg(unix)]
 fn publish_files(
     base: &Path,
     components: &[&str],
     files: &[(&str, &[u8])],
-    force: bool,
 ) -> Result<(), DataError> {
     use nix::errno::Errno;
-    use nix::fcntl::{openat, renameat, AtFlags, OFlag, AT_FDCWD};
+    use nix::fcntl::{openat, AtFlags, OFlag, AT_FDCWD};
     use nix::sys::stat::{fstatat, mkdirat, Mode};
     use nix::unistd::{linkat, unlinkat, UnlinkatFlags};
     use std::io::Write;
@@ -184,13 +179,11 @@ fn publish_files(
             e => io(&path, e),
         })?;
     }
-    if !force {
-        for (name, _) in files {
-            match fstatat(&dir, *name, AtFlags::AT_SYMLINK_NOFOLLOW) {
-                Ok(_) => return Err(already_exists(&path.join(name))),
-                Err(Errno::ENOENT) => {}
-                Err(e) => return Err(io(&path.join(name), e)),
-            }
+    for (name, _) in files {
+        match fstatat(&dir, *name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(_) => return Err(already_exists(&path.join(name))),
+            Err(Errno::ENOENT) => {}
+            Err(e) => return Err(io(&path.join(name), e)),
         }
     }
     let mut created: Vec<&str> = Vec::new();
@@ -215,15 +208,11 @@ fn publish_files(
                 .and_then(|()| file.sync_all())
                 .map_err(|e| DataError::io(&target, e));
             let published = written.and_then(|()| {
-                if force {
-                    renameat(&dir, tmp.as_str(), &dir, *name).map_err(|e| io(&target, e))
-                } else {
-                    // link(2) never replaces an entry, symlink or not.
-                    linkat(&dir, tmp.as_str(), &dir, *name, AtFlags::empty()).map_err(|e| match e {
-                        Errno::EEXIST => already_exists(&target),
-                        e => io(&target, e),
-                    })
-                }
+                // link(2) never replaces an entry, symlink or not.
+                linkat(&dir, tmp.as_str(), &dir, *name, AtFlags::empty()).map_err(|e| match e {
+                    Errno::EEXIST => already_exists(&target),
+                    e => io(&target, e),
+                })
             });
             let _ = unlinkat(&dir, tmp.as_str(), UnlinkatFlags::NoRemoveDir);
             published?;
@@ -231,7 +220,7 @@ fn publish_files(
         }
         Ok(())
     })();
-    if result.is_err() && !force {
+    if result.is_err() {
         for name in created {
             let _ = unlinkat(&dir, name, UnlinkatFlags::NoRemoveDir);
         }
@@ -246,7 +235,6 @@ fn publish_files(
     base: &Path,
     components: &[&str],
     files: &[(&str, &[u8])],
-    force: bool,
 ) -> Result<(), DataError> {
     use std::io::Write;
     let mut path = base.to_path_buf();
@@ -261,11 +249,9 @@ fn publish_files(
             Err(e) => return Err(DataError::io(&path, e)),
         }
     }
-    if !force {
-        for (name, _) in files {
-            if std::fs::symlink_metadata(path.join(name)).is_ok() {
-                return Err(already_exists(&path.join(name)));
-            }
+    for (name, _) in files {
+        if std::fs::symlink_metadata(path.join(name)).is_ok() {
+            return Err(already_exists(&path.join(name)));
         }
     }
     for (name, body) in files {
@@ -273,13 +259,8 @@ fn publish_files(
         let mut tmp =
             tempfile::NamedTempFile::new_in(&path).map_err(|e| DataError::io(&path, e))?;
         tmp.write_all(body).map_err(|e| DataError::io(&target, e))?;
-        if force {
-            tmp.persist(&target)
-                .map_err(|e| DataError::io(&target, e.error))?;
-        } else {
-            tmp.persist_noclobber(&target)
-                .map_err(|_| already_exists(&target))?;
-        }
+        tmp.persist_noclobber(&target)
+            .map_err(|_| already_exists(&target))?;
     }
     Ok(())
 }
@@ -416,100 +397,5 @@ fn discover_dir(dir: &Path, scope: DefinitionScope, discovery: &mut AgentDiscove
             scope,
             path,
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::config::env::AWMAN_CONFIG_HOME;
-
-    #[test]
-    fn discover_repo_before_global() {
-        let tmp = tempfile::tempdir().unwrap();
-        let global_home = tmp.path().join("global");
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, global_home.to_str().unwrap())]);
-        let dirs = AgentDirs::from_env(&env, Some(tmp.path().join("repo"))).unwrap();
-        for scope in [DefinitionScope::Global, DefinitionScope::Repo] {
-            let dir = dirs.ensure_dir(scope).unwrap();
-            std::fs::write(dir.join("pi.toml"), "not parsed at discovery").unwrap();
-        }
-        let found = dirs.discover();
-        assert_eq!(found.found.len(), 2);
-        assert!(found.skipped.is_empty());
-        assert_eq!(found.lookup("pi").unwrap().scope, DefinitionScope::Repo);
-        assert_eq!(dirs.global_dir(), global_home.join("agents"));
-    }
-
-    #[test]
-    fn discovery_orders_entries_and_reports_invalid_and_reserved_stems() {
-        let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(
-            AWMAN_CONFIG_HOME,
-            tmp.path().join("home").to_str().unwrap(),
-        )]);
-        let dirs = AgentDirs::from_env(&env, Some(tmp.path().join("repo"))).unwrap();
-        let repo = dirs.ensure_dir(DefinitionScope::Repo).unwrap();
-        let global = dirs.ensure_dir(DefinitionScope::Global).unwrap();
-        for name in ["zeta", "alpha", "claude", "Bad", "_hidden"] {
-            std::fs::write(repo.join(format!("{name}.toml")), "not parsed").unwrap();
-        }
-        std::fs::write(repo.join("ignored.TOML"), "ignored").unwrap();
-        std::fs::write(repo.join("notes.txt"), "ignored").unwrap();
-        std::fs::create_dir(repo.join("directory.toml")).unwrap();
-        std::fs::write(global.join("beta.toml"), "not parsed").unwrap();
-        let result = dirs.discover();
-        assert_eq!(
-            result
-                .found
-                .iter()
-                .map(|d| (d.scope, d.name.as_str()))
-                .collect::<Vec<_>>(),
-            vec![
-                (DefinitionScope::Repo, "alpha"),
-                (DefinitionScope::Repo, "zeta"),
-                (DefinitionScope::Global, "beta")
-            ]
-        );
-        assert_eq!(result.skipped.len(), 3);
-        assert!(result
-            .skipped
-            .iter()
-            .any(|s| s.reason.contains("first-party agent")));
-        assert!(result
-            .skipped
-            .iter()
-            .filter(|s| s.path.file_name().unwrap() == "Bad.toml"
-                || s.path.file_name().unwrap() == "_hidden.toml")
-            .all(|s| s.reason.contains("must match")));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn discovery_skips_symlink_escape_but_allows_in_directory_symlink() {
-        use std::os::unix::fs::symlink;
-        let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(
-            AWMAN_CONFIG_HOME,
-            tmp.path().join("home").to_str().unwrap(),
-        )]);
-        let dirs = AgentDirs::from_env(&env, Some(tmp.path().join("repo"))).unwrap();
-        let repo = dirs.ensure_dir(DefinitionScope::Repo).unwrap();
-        let elsewhere = tmp.path().join("outside.toml");
-        std::fs::write(&elsewhere, "not parsed").unwrap();
-        symlink(&elsewhere, repo.join("escape.toml")).unwrap();
-        std::fs::write(repo.join("inside-source.toml"), "not parsed").unwrap();
-        symlink(repo.join("inside-source.toml"), repo.join("inside.toml")).unwrap();
-        let found = dirs.discover();
-        assert_eq!(
-            found
-                .found
-                .iter()
-                .map(|d| d.name.as_str())
-                .collect::<Vec<_>>(),
-            ["inside", "inside-source"]
-        );
-        assert_eq!(found.skipped.len(), 1);
-        assert!(found.skipped[0].reason.contains("symlink points outside"));
     }
 }

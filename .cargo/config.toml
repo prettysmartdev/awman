@@ -1,2 +1,7 @@
+# `cargo xtask <command>`: the gate manifest, evidence and release tooling in
+# xtask/. Not a default workspace member and never part of the shipped binary.
+[alias]
+xtask = "run --quiet -p xtask --"
+
 [env]
 MSB_EMBED_ARTIFACTS_ROOT = { value = "third_party/msb-payloads", relative = true }

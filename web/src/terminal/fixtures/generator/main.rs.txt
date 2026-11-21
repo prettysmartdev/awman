@@ -1,0 +1,131 @@
+// Fixture generator for web/src/terminal/fixtures (design §5.5.1).
+// Uses vt100-ctt 0.17.1, the parser the daemon TerminalHub mirror uses, so the
+// `snapshot` frames are exactly `Screen::state_formatted()` as the hub sends them.
+use base64::Engine;
+use serde_json::{json, Value};
+
+enum Step { Out(Vec<u8>), Resize(u16, u16), Snapshot }
+
+struct Fx { name: &'static str, about: &'static str, cols: u16, rows: u16, scrollback: usize, steps: Vec<Step> }
+
+fn b64(b: &[u8]) -> String { base64::engine::general_purpose::STANDARD.encode(b) }
+
+fn run(fx: &Fx) -> Value {
+    let mut p = vt100::Parser::new(fx.rows, fx.cols, fx.scrollback);
+    let mut frames = vec![json!({"type":"snapshot","cols":fx.cols,"rows":fx.rows,"screen":b64(&p.screen().state_formatted()),"has_output":false})];
+    for s in &fx.steps {
+        match s {
+            Step::Out(b) => { p.process(b); frames.push(json!({"type":"output","bytes":b64(b)})); }
+            Step::Resize(c, r) => { p.screen_mut().set_size(*r, *c); frames.push(json!({"type":"resize","cols":c,"rows":r})); }
+            Step::Snapshot => { let (r, c) = p.screen().size(); frames.push(json!({"type":"snapshot","cols":c,"rows":r,"screen":b64(&p.screen().state_formatted()),"has_output":true})); }
+        }
+    }
+    let scr = p.screen();
+    let (rows, cols) = scr.size();
+    let lines: Vec<String> = scr.rows(0, cols).map(|l| l.trim_end().to_string()).collect();
+    let (cr, cc) = scr.cursor_position();
+    let mouse = match scr.mouse_protocol_mode() { vt100::MouseProtocolMode::None => "none", vt100::MouseProtocolMode::Press => "x10", vt100::MouseProtocolMode::PressRelease => "normal", vt100::MouseProtocolMode::ButtonMotion => "button", vt100::MouseProtocolMode::AnyMotion => "any" };
+    let sgr = matches!(scr.mouse_protocol_encoding(), vt100::MouseProtocolEncoding::Sgr);
+    json!({
+        "name": fx.name, "about": fx.about, "source": "vt100-ctt 0.17.1 (TerminalHub mirror parser); snapshot = Screen::state_formatted()",
+        "frames": frames,
+        "final_snapshot": {"type":"snapshot","cols":cols,"rows":rows,"screen":b64(&scr.state_formatted()),"has_output":true},
+        "expect": {"cols": cols, "rows": rows, "lines": lines, "cursor": {"row": cr, "col": cc, "visible": !scr.hide_cursor()},
+            "alt_screen": scr.alternate_screen(), "app_cursor": scr.application_cursor(), "bracketed_paste": scr.bracketed_paste(),
+            "mouse_mode": mouse, "mouse_sgr": sgr}
+    })
+}
+
+fn split_at_every(b: &[u8], n: usize) -> Vec<Step> { b.chunks(n).map(|c| Step::Out(c.to_vec())).collect() }
+
+fn main() {
+    let out_dir = std::env::args().nth(1).expect("out dir");
+    let mut fxs = Vec::new();
+
+    let s = "héllo 世界 🎉 naïve — ✓\r\n".repeat(3).into_bytes();
+    fxs.push(Fx { name: "utf8_split", about: "UTF-8 sequences split across output frames at every byte boundary (1- and 3-byte chunks)", cols: 40, rows: 6, scrollback: 100,
+        steps: { let mut v = split_at_every(&s[..s.len()/2], 1); v.extend(split_at_every(&s[s.len()/2..], 3)); v } });
+
+    let mut w = Vec::new();
+    w.extend_from_slice("\x1b[2J\x1b[H".as_bytes());
+    w.extend_from_slice("中文字符测试\r\n".as_bytes());
+    w.extend_from_slice("e\u{301} a\u{308} ok\r\n".as_bytes());
+    w.extend_from_slice("12345678中\r\n".as_bytes()); // wide char straddling col 9/10 in a 10-col line -> wraps
+    w.extend_from_slice("ｆｕｌｌｗｉｄｔｈ\r\n".as_bytes());
+    fxs.push(Fx { name: "wide_graphemes", about: "CJK, fullwidth, combining marks, wide char at the wrap boundary (split across frames)", cols: 10, rows: 8, scrollback: 100, steps: split_at_every(&w, 7) });
+    fxs.push(Fx { name: "emoji_sequences", about: "Emoji modifier, flag and ZWJ sequences. KNOWN DIVERGENCE: vt100-ctt sizes each code point, wterm/Ghostty size grapheme clusters; tests assert clusters stay intact, not exact columns", cols: 12, rows: 4, scrollback: 0, steps: split_at_every("👍🏽 🇯🇵 👨‍👩‍👧 ok".as_bytes(), 5) });
+
+    let mut a = Vec::new();
+    a.extend_from_slice(b"$ claude\r\nprimary screen line\r\n");
+    a.extend_from_slice(b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+    for frame in 0..30 {
+        a.extend_from_slice(b"\x1b[?2026h\x1b[H");
+        a.extend_from_slice(format!("\x1b[1;38;5;208m\u{256d}\u{2500} Agent \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}\x1b[0m\r\n").as_bytes());
+        a.extend_from_slice(format!("\x1b[2K\u{2502} \x1b[32m\u{280b}\x1b[0m Thinking\u{2026} step {frame:>3}\x1b[3;1H").as_bytes());
+        a.extend_from_slice(format!("\x1b[2K\u{2502} \x1b[38;2;120;200;255mtokens: {}\x1b[0m\r\n", frame * 137).as_bytes());
+        a.extend_from_slice(b"\x1b[2K\x1b[7m > \x1b[27m type here\x1b[?2026l");
+    }
+    a.extend_from_slice(b"\x1b[5;3H\x1b[?25h");
+    let mut a2 = a.clone();
+    a2.extend_from_slice(b"\x1b[?1049l");
+    fxs.push(Fx { name: "alt_screen_redraw", about: "Agent-TUI style alternate-screen redraw loop with synchronized output (2026), CUP, EL, 256/true colour; ends on the alt screen", cols: 30, rows: 6, scrollback: 100, steps: split_at_every(&a, 61) });
+    fxs.push(Fx { name: "alt_screen_exit", about: "Same redraw loop, then leaves the alternate screen (1049l): primary screen restored", cols: 30, rows: 6, scrollback: 100, steps: split_at_every(&a2, 97) });
+
+    let mut c = Vec::new();
+    c.extend_from_slice(b"\x1b[31mred\x1b[0m \x1b[1;32mbold green\x1b[0m \x1b[3;4mital-ul\x1b[0m\r\n");
+    c.extend_from_slice(b"\x1b[38;5;196m256red\x1b[48;5;21m on blue\x1b[0m \x1b[38;2;1;2;3mtc\x1b[0m \x1b[7minv\x1b[0m\r\n");
+    c.extend_from_slice(b"\x1b[91mbright\x1b[0m \x1b[2mdim\x1b[22m \x1b[9mstrike\x1b[0m\r\n");
+    fxs.push(Fx { name: "colours", about: "16/256/truecolour fg+bg, bold, dim, italic, underline, inverse, strike", cols: 40, rows: 4, scrollback: 0, steps: vec![Step::Out(c)] });
+
+    let cur = b"abc\x1b[3;5HX\x1b7\x1b[1;1HY\x1b8Z\x1b[?25l\x1b[?1h".to_vec();
+    fxs.push(Fx { name: "cursor_modes", about: "CUP, DECSC/DECRC, hidden cursor (25l), DECCKM application cursor (1h)", cols: 12, rows: 4, scrollback: 0, steps: vec![Step::Out(cur)] });
+
+    fxs.push(Fx { name: "mouse_sgr", about: "App enables button-event tracking (1002) with SGR encoding (1006)", cols: 20, rows: 4, scrollback: 0,
+        steps: vec![Step::Out(b"\x1b[?1000h\x1b[?1002h\x1b[?1006hmouse on".to_vec())] });
+    fxs.push(Fx { name: "mouse_any_x10enc", about: "Any-motion tracking (1003) with default (X10-byte) encoding", cols: 20, rows: 4, scrollback: 0,
+        steps: vec![Step::Out(b"\x1b[?1003hmove".to_vec())] });
+    fxs.push(Fx { name: "bracketed_paste", about: "App enables bracketed paste (2004)", cols: 20, rows: 4, scrollback: 0,
+        steps: vec![Step::Out(b"\x1b[?2004h> ".to_vec())] });
+
+    let mut rs = vec![Step::Out(b"\x1b[2J\x1b[Hstart\r\n".to_vec())];
+    for (i, (cc, rr)) in [(100u16, 30u16), (60, 20), (120, 40), (40, 10), (80, 24), (132, 50), (20, 5), (80, 24)].iter().enumerate() {
+        rs.push(Step::Resize(*cc, *rr));
+        rs.push(Step::Out(format!("\x1b[2J\x1b[Hsize {cc}x{rr} #{i}\r\n").into_bytes()));
+    }
+    rs.push(Step::Snapshot);
+    rs.push(Step::Out(b"after snapshot".to_vec()));
+    fxs.push(Fx { name: "resize_storm", about: "Eight resize frames with redraws, then a mid-stream snapshot (lagged/reconnect resync) and more output", cols: 80, rows: 24, scrollback: 100, steps: rs });
+
+    let mut sb = Vec::new();
+    for i in 0..10_000 { sb.extend_from_slice(format!("line {i:05} \x1b[2m{}\x1b[0m\r\n", "x".repeat(i % 50)).as_bytes()); }
+    fxs.push(Fx { name: "scrollback_10k", about: "10 000 lines of output through a 80x24 screen (bounded history)", cols: 80, rows: 24, scrollback: 10_000, steps: split_at_every(&sb, 65_536) });
+
+    let mut ti = Vec::new();
+    ti.extend_from_slice(b"\x1b]0;agent \x07title\x1b\\\x1b]2;Claude <script>alert(1)</script>\x07");
+    ti.extend_from_slice(b"\x1b]8;;https://example.com/docs\x1b\\docs\x1b]8;;\x1b\\ ");
+    ti.extend_from_slice(b"\x1b]8;;javascript:alert(1)\x1b\\bad\x1b]8;;\x1b\\ ");
+    ti.extend_from_slice(b"\x1b]52;c;aGVsbG8=\x07\x1b]7;file:///etc\x07\x1b]9;notify\x07\x1b]777;notify;a;b\x07\x1b]1337;File=:AAAA\x07");
+    ti.extend_from_slice(b"\x1bP+q544e\x1b\\\x1b_Gf=24;AAAA\x1b\\\x1bPq#0;2;0;0;0#0~~\x1b\\visible");
+    fxs.push(Fx { name: "untrusted_osc", about: "Titles with markup, OSC 8 (https and javascript:), OSC 52/7/9/777/1337, DCS/XTGETTCAP, Kitty APC, Sixel; only 'docs bad visible' is printable", cols: 40, rows: 3, scrollback: 0, steps: split_at_every(&ti, 13) });
+
+    std::fs::create_dir_all(&out_dir).unwrap();
+    for fx in &fxs {
+        let mut v = run(fx);
+        if fx.name == "scrollback_10k" {
+            let first = v["frames"][0].clone();
+            v["frames"] = json!([first]);
+            v["generated_output"] = json!("numbered_lines_10k");
+        }
+        let snap = v["final_snapshot"].clone();
+        let (c, r) = (snap["cols"].as_u64().unwrap() as u16, snap["rows"].as_u64().unwrap() as u16);
+        let mut p2 = vt100::Parser::new(r, c, 0);
+        p2.process(&base64::engine::general_purpose::STANDARD.decode(snap["screen"].as_str().unwrap()).unwrap());
+        let s2 = p2.screen();
+        let (cr, cc) = s2.cursor_position();
+        v["expect_from_snapshot"] = json!({"lines": s2.rows(0, c).map(|l| l.trim_end().to_string()).collect::<Vec<_>>(),
+            "cursor": {"row": cr, "col": cc, "visible": !s2.hide_cursor()}, "alt_screen": s2.alternate_screen(),
+            "app_cursor": s2.application_cursor(), "bracketed_paste": s2.bracketed_paste()});
+        std::fs::write(format!("{out_dir}/{}.json", fx.name), serde_json::to_string_pretty(&v).unwrap()).unwrap();
+        println!("{} lines={:?}", fx.name, v["expect"]["lines"].as_array().map(|a| a.len()));
+    }
+}

@@ -1,5 +1,7 @@
 # Network closure implementation — 2026-09-28
 
+> Testing policy update (WI144): test commands, harness paths and test counts in this historical record are superseded by [the current testing contract](/aspec/devops/testing.md). Use manifest suites and `make validate-native` for native acceptance. Removed test sources and raw evidence bundles are available only in Git history; they must not be restored as test patterns.
+
 Implemented explicit default-false strict_sni option across paired pinned
 microsandbox-network/types 0.7.2 patches. Driver opts in while retaining
 strict=true and TLS interception disabled. Flag survives actual SDK builder

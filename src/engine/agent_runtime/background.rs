@@ -19,6 +19,11 @@ pub struct ExecOutput {
 
 /// Abstraction over exec-into-running-agent. Both paradigms support exec.
 pub trait AgentExec: Send + Sync {
+    /// Full private transcript retained by a foreground phase after failure.
+    fn failure_transcript(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     fn exec(
         &self,
         command: &str,

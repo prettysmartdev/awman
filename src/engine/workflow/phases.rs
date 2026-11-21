@@ -285,6 +285,28 @@ impl WorkflowEngine {
                 continue;
             }
 
+            // A PR cannot be opened for a push that failed earlier in this
+            // teardown. In particular, gh reports an absent head branch as
+            // "No commits between", which otherwise looks like indexing lag.
+            if kind == PhaseKind::Teardown
+                && step.creates_pull_request()
+                && steps[..idx].iter().enumerate().any(|(push_idx, prior)| {
+                    prior.pushes_branch()
+                        && matches!(
+                            self.state.phase_step_states(kind)[push_idx].status,
+                            PhaseStepStatus::Failed { .. }
+                        )
+                })
+            {
+                self.msg_warning(format!(
+                    "skipping {desc}: an earlier push_branch step failed; fix the push before creating a pull request"
+                ));
+                self.state.phase_step_states_mut(kind)[idx].status = PhaseStepStatus::Skipped;
+                self.persist()?;
+                self.frontend.on_phase_step_skipped(kind, &desc);
+                continue;
+            }
+
             self.state.phase_step_states_mut(kind)[idx].status = PhaseStepStatus::Running;
             self.persist()?;
 
@@ -417,7 +439,10 @@ impl WorkflowEngine {
             // wording a failure (including one with nothing on stderr, as an
             // interactive run's never has) is the frontend's job (F-45).
             self.set_phase_step_failed(kind, idx, &result.stderr);
-            return PhaseStepOutcome::exited(result.exit_code, result.stdout, result.stderr);
+            let mut outcome =
+                PhaseStepOutcome::exited(result.exit_code, result.stdout, result.stderr);
+            outcome.full_transcript = container.failure_transcript();
+            return outcome;
         }
 
         PhaseStepOutcome {
@@ -613,6 +638,7 @@ impl WorkflowEngine {
                     step_name: &desc,
                     stdout: &last.stdout,
                     stderr: &last.stderr,
+                    full_transcript: last.full_transcript.as_deref(),
                 }),
             );
 
@@ -816,6 +842,7 @@ impl WorkflowEngine {
         spec: RemediationAgentSpec,
     ) -> Result<i32, RemediationAgentError> {
         let synthetic_step = WorkflowStep {
+            settings_profile: None,
             name: "__on_failure__".to_string(),
             depends_on: Vec::new(),
             prompt_template: spec.prompt,
@@ -823,15 +850,23 @@ impl WorkflowEngine {
             model: spec.model.clone(),
             overlays: spec.extra_overlays,
             abort_on_failure: false,
+            read_only_workspace: false,
         };
 
+        let phase = match self.state.current_phase {
+            crate::data::workflow_state::WorkflowPhase::Setup => "Setup",
+            crate::data::workflow_state::WorkflowPhase::Main => "Main",
+            crate::data::workflow_state::WorkflowPhase::Teardown => "Teardown",
+            crate::data::workflow_state::WorkflowPhase::Done => "Merge",
+        };
         let runtime = WorkflowRuntimeContext {
             step_agent: spec.agent.clone(),
             step_model: spec.model.clone(),
             git_root: session.git_root().to_path_buf(),
             session_id: session.id(),
             workflow_invocation_id: self.state.invocation_id,
-            workflow_step_info: None,
+            workflow_step_info: self
+                .build_workflow_step_info(&format!("{phase} remediation: {}", spec.label)),
             // An `on_failure` remediation runs while its phase is current; the
             // merge-fix agent runs after the workflow is done, at merge-back.
             source: EventSource::phase(match self.state.current_phase {
@@ -912,8 +947,11 @@ impl WorkflowEngine {
 
         let (wait_tx, mut wait_rx) =
             tokio::sync::oneshot::channel::<Result<AgentExitInfo, EngineError>>();
+        let factory = self.agent_factory.clone();
         tokio::spawn(async move {
-            let _ = wait_tx.send(exec.wait().await);
+            let result = exec.wait().await;
+            factory.execution_finished(exec.handle().clone()).await;
+            let _ = wait_tx.send(result);
         });
 
         loop {
@@ -936,8 +974,18 @@ impl WorkflowEngine {
                     return Ok(KILLED_EXIT_CODE);
                 }
                 Some(event) = Self::recv_stuck(&mut stuck_rx) => {
-                    if !matches!(event, StuckEvent::Stuck) {
-                        continue;
+                    match event {
+                        StuckEvent::Stuck => {}
+                        StuckEvent::Reported(status) => {
+                            if let Some(code) = self
+                                .remediation_reported(label, status, &cancel_handle, &mut wait_rx, &mut stuck_rx)
+                                .await?
+                            {
+                                return Ok(code);
+                            }
+                            continue;
+                        }
+                        StuckEvent::Unstuck | StuckEvent::StartupGraceExpired => continue,
                     }
                     self.msg_warning(format!("'{label}' appears stuck (no output)"));
                     match self
@@ -958,8 +1006,65 @@ impl WorkflowEngine {
                         MidStepYoloResult::Cancelled
                         | MidStepYoloResult::ShowControlBoard
                         | MidStepYoloResult::Recovered => continue,
+                        MidStepYoloResult::Reported(status) => {
+                            if let Some(code) = self
+                                .remediation_reported(label, status, &cancel_handle, &mut wait_rx, &mut stuck_rx)
+                                .await?
+                            {
+                                return Ok(code);
+                            }
+                        }
                     }
                 }
+            }
+        }
+    }
+
+    /// An `on_failure` agent reported its status (WI 0141; only watched under
+    /// yolo, like silence). Its exit code is ignored and the failed phase step
+    /// is retried afterwards, so every countdown's expiry just stops the agent:
+    /// `done` hands the step back sooner, and a problem the agent cannot get
+    /// past never holds the phase forever. A `blocked` agent with a user
+    /// present waits for them. Returns the exit code to finish with, or `None`
+    /// to keep waiting on the agent.
+    async fn remediation_reported(
+        &mut self,
+        label: &str,
+        status: Option<crate::data::program_status::EffectiveStatus>,
+        cancel_handle: &Option<CancelHandle>,
+        wait_rx: &mut tokio::sync::oneshot::Receiver<Result<AgentExitInfo, EngineError>>,
+        stuck_rx: &mut Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
+    ) -> Result<Option<i32>, EngineError> {
+        use crate::engine::workflow::program_status::{AgentCountdownEnd, ReportedResponse};
+        let mut status = status;
+        loop {
+            self.frontend.report_agent_status(label, status.as_ref());
+            let response = self.reported_response(status.as_ref());
+            if let Some(s) = &status {
+                self.narrate_report(label, s, response);
+            }
+            let ReportedResponse::Countdown(kind) = response else {
+                // Resume / needs-you: keep waiting. (Boards are never shown
+                // during setup/teardown, and this path only runs under yolo.)
+                return Ok(None);
+            };
+            match self
+                .drive_agent_countdown(label, kind, wait_rx, stuck_rx, None)
+                .await?
+            {
+                AgentCountdownEnd::Exited(result) => return result.map(|e| Some(e.exit_code)),
+                AgentCountdownEnd::Expired => {
+                    self.msg_info(format!("Stopping '{label}' after its reported status"));
+                    if let Some(ch) = cancel_handle {
+                        let _ = ch.cancel();
+                    }
+                    self.frontend.report_container_exited(KILLED_EXIT_CODE);
+                    return Ok(Some(KILLED_EXIT_CODE));
+                }
+                AgentCountdownEnd::Cancelled
+                | AgentCountdownEnd::ShowControlBoard
+                | AgentCountdownEnd::Resumed => return Ok(None),
+                AgentCountdownEnd::Superseded(next) => status = next,
             }
         }
     }
@@ -992,7 +1097,7 @@ impl WorkflowEngine {
     ) -> Option<PhaseFailureArtifacts> {
         use crate::data::fs::context_dirs::{validate_context_path, ContextDirResolver};
 
-        let resolver = match ContextDirResolver::from_process_env() {
+        let resolver = match ContextDirResolver::from_env(self.session.env()) {
             Ok(r) => r,
             Err(e) => {
                 self.msg_warning(format!(
@@ -1039,12 +1144,47 @@ impl WorkflowEngine {
         let sanitized = sanitize_step_name_for_filename(failure.step_name);
         let filename = format!("{}-failure-{sanitized}.txt", failure.kind.label());
         let file_path = host_dir.join(&filename);
-        let contents = self.redaction.redact(&format_phase_failure_file(
-            failure.step_name,
-            failure.stdout,
-            failure.stderr,
-        ));
-        if let Err(e) = std::fs::write(&file_path, contents) {
+        let write_result = (|| -> Result<(), crate::data::error::DataError> {
+            // Every retry replaces this entry atomically; never follow an agent-planted link.
+            let staging = host_dir.join(format!(".failure-{}.tmp", uuid::Uuid::new_v4()));
+            let mut output = crate::data::fs::private_files::create_private_file_new(&staging)?;
+            let result = (|| -> std::io::Result<()> {
+                use std::io::Write;
+                if let Some(path) = failure.full_transcript {
+                    writeln!(
+                        output,
+                        "# {} — complete phase transcript\n",
+                        failure.step_name
+                    )?;
+                    let input = crate::data::fs::private_files::open_private_file(path)
+                        .map_err(std::io::Error::other)?;
+                    let mut reader = crate::engine::auth::redaction::RedactedReader::new(
+                        input,
+                        self.redaction.clone(),
+                    );
+                    std::io::copy(&mut reader, &mut output)?;
+                } else {
+                    output.write_all(
+                        self.redaction
+                            .redact(&format_phase_failure_file(
+                                failure.step_name,
+                                failure.stdout,
+                                failure.stderr,
+                            ))
+                            .as_bytes(),
+                    )?;
+                }
+                output.sync_all()
+            })();
+            if let Err(error) = result {
+                let _ = std::fs::remove_file(&staging);
+                return Err(crate::data::error::DataError::io(&staging, error));
+            }
+            std::fs::rename(&staging, &file_path)
+                .map_err(|e| crate::data::error::DataError::io(&file_path, e))?;
+            Ok(())
+        })();
+        if let Err(e) = write_result {
             self.msg_warning(format!(
                 "on_failure: could not write failure output to {}, launching agent without it: {e}",
                 file_path.display()
@@ -1080,23 +1220,29 @@ impl WorkflowEngine {
 }
 
 /// Waits between create_pull_request attempts while GitHub catches up with a
-/// push. Tests use zero delays so the retry path stays fast.
-#[cfg(not(test))]
+/// push.
 const PR_BRANCH_NOT_INDEXED_RETRY_DELAYS: [std::time::Duration; 4] = [
     std::time::Duration::from_secs(3),
     std::time::Duration::from_secs(5),
     std::time::Duration::from_secs(10),
     std::time::Duration::from_secs(15),
 ];
-#[cfg(test)]
-const PR_BRANCH_NOT_INDEXED_RETRY_DELAYS: [std::time::Duration; 4] = [std::time::Duration::ZERO; 4];
 
-/// `gh pr create` fails with "No commits between <base> and <head>" when
-/// GitHub has not yet indexed the commits push_branch just sent. An
-/// interactive run merges stderr into stdout, so both are checked.
+/// `gh pr create` can report "No commits between" while GitHub indexes a
+/// push. The same message also accompanies invalid or absent refs, which
+/// cannot be fixed by waiting. An interactive run merges stderr into stdout.
 fn pr_branch_not_yet_indexed(outcome: &PhaseStepOutcome) -> bool {
     const MARKER: &str = "No commits between";
-    outcome.stderr.contains(MARKER) || outcome.stdout.contains(MARKER)
+    let output = format!("{}\n{}", outcome.stderr, outcome.stdout);
+    output.contains(MARKER)
+        && ![
+            "Head sha can't be blank",
+            "Base sha can't be blank",
+            "Head ref must be a branch",
+            "Base ref must be a branch",
+        ]
+        .iter()
+        .any(|invalid_ref| output.contains(invalid_ref))
 }
 
 /// gh prints the created PR URL on stdout. This parser is used only by the
@@ -1121,28 +1267,6 @@ fn parse_gh_pr_create_output(output: &str) -> Option<String> {
             && parts[3].parse::<u64>().is_ok_and(|n| n > 0))
         .then(|| line.to_string())
     })
-}
-
-#[cfg(test)]
-mod pull_request_output_tests {
-    use super::parse_gh_pr_create_output;
-    #[test]
-    fn only_standalone_success_urls_are_captured_including_enterprise_hosts() {
-        for output in [
-            "https://github.com/o/r/pull/7",
-            "created\nhttps://git.example.test/o/r/pull/9\nextra diagnostics",
-        ] {
-            assert!(parse_gh_pr_create_output(output).is_some());
-        }
-        for output in [
-            "already exists: https://github.com/o/r/pull/7",
-            "https://github.com/o/r/pull/7/",
-            "https://github.com/o/r/pull/0",
-            "https://github.com/o/r/pull/1?x=1",
-        ] {
-            assert!(parse_gh_pr_create_output(output).is_none());
-        }
-    }
 }
 
 /// What poll_ci hands its on_failure agent when CI did not end green.
@@ -1170,45 +1294,3 @@ pub(super) fn poll_ci_failure_outcome(
 const NO_CI_FAILURE_REPORT: &str =
     "poll_ci recorded no failed CI run for this commit, so there are no failed jobs or log \
      tails to show; the error below is why the poll stopped.";
-
-#[cfg(test)]
-mod poll_ci_outcome_tests {
-    use super::*;
-
-    #[test]
-    fn a_failed_ci_run_hands_over_its_redacted_report_and_jobs() {
-        let redaction = RedactionSet::new();
-        redaction.add(SecretString::new("hunter2"));
-        let outcome = poll_ci_failure_outcome(
-            "poll_ci: CI failed: CI".into(),
-            Some(poll_ci::CiFailure {
-                report: "job lint: token hunter2 rejected".into(),
-                failed_jobs: vec!["lint".into()],
-            }),
-            &redaction,
-        );
-        assert!(outcome.failed);
-        assert_eq!(
-            outcome.stdout,
-            format!("job lint: token {} rejected", RedactionSet::MARK)
-        );
-        assert_eq!(outcome.stderr, "poll_ci: CI failed: CI");
-        assert_eq!(outcome.ci_failed_jobs, vec!["lint".to_string()]);
-    }
-
-    #[test]
-    fn a_poll_error_without_a_ci_report_says_so_instead_of_an_empty_report() {
-        let outcome = poll_ci_failure_outcome(
-            "poll_ci: CI did not complete within max_retries attempts".into(),
-            None,
-            &RedactionSet::new(),
-        );
-        assert!(outcome.failed);
-        assert_eq!(outcome.stdout, NO_CI_FAILURE_REPORT);
-        assert_eq!(
-            outcome.stderr,
-            "poll_ci: CI did not complete within max_retries attempts"
-        );
-        assert!(outcome.ci_failed_jobs.is_empty());
-    }
-}

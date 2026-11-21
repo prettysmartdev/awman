@@ -1,358 +1,110 @@
-//! `ConfigCommand` — view and edit global / repo configuration.
+//! `ConfigCommand` — `awman config [show] | get | set | unset`.
+//!
+//! Every key, its type, scope, sensitivity and whether a running daemon
+//! applies it live come from the key table (`data::config::fields`). Old keys
+//! are unknown keys; the key table's moved-to hint says where they went.
+//!
+//! - `show`: one row per key in table order (map entries under their map's
+//!   header), with the global, repo and effective value, the layer the
+//!   effective value comes from, and the type; sensitive values masked. Then
+//!   a read-only `state` section naming the per-repo `state.json`.
+//! - `get`: the same row for one key.
+//! - `set` / `unset`: write one file — chosen by the key's scope unless
+//!   `--global`, `--repo` or `--task <name>` names one — print the file
+//!   written, and tell a running daemon to reload when the key is live.
 
+mod live;
+pub mod work_server_unlink;
+
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Serialize;
 
 use crate::command::commands::Command;
-use crate::command::config_notices::ConfigNotices;
 use crate::command::dispatch::BuildContext;
 use crate::command::error::CommandError;
-use crate::data::config::config_json::{apply_config_field, config_field_value};
-pub use crate::data::config::fields::ConfigRowShape;
-use crate::data::config::fields::{
-    field_spec, implicit_default, json_path, resolve_field_name, writability, ConfigFieldSpec,
-    FieldScope, ResolvedFieldName, CONFIG_FIELDS, LIST_ENTRY_HINT, MAP_ENTRY_HINT,
-};
-use crate::data::config::migrations::{
-    ConfigMigrationChange, ConfigMigrationScope, GlobalConfigMigration, RepoConfigMigration,
-};
-use crate::data::config::ResolvedDynamicWorkflows;
+use crate::data::config::config_json::{config_field_value, remove_config_field, set_config_field};
+use crate::data::config::effective::{mask, Layer};
+use crate::data::config::fields::{self, ConfigKey, KeyError, KeyScope, ValueKind, CONFIG_KEYS};
+use crate::data::config::file::{global_config_path, repo_config_path, ConfigFile, FileKind};
+use crate::data::config::state::RepoState;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
-use crate::data::prompt::Prompt;
+use crate::data::session::Session;
 
-/// Field names that were removed in WI-0082 (overlay unification). Naming any
-/// of these in `awman config get|set` returns a guidance error instead of the
-/// generic "unknown field" suggestion list.
-const REMOVED_CONFIG_FIELDS: &[(&str, &str)] = &[(
-    "envPassthrough",
-    "the 'envPassthrough' field was removed; express env passthrough as overlay entries \
-     instead (e.g. `awman config set overlays \"env(VAR_NAME)\"` or add `\"env(VAR_NAME)\"` \
-     to the `overlays` array in `.awman/config.json`). See `docs/08-overlays.md`.",
-)];
+pub use live::{DaemonReloader, LiveApply, LocalDaemons, ReloadReply, RunningDaemon};
 
-/// Shown when `config get|set` was given a legacy `dynamicWorkflows.*` name.
-const DYNAMIC_WORKFLOWS_ALIAS_NOTICE: &str = "`dynamicWorkflows.*` is now `workflows.dynamic.*`";
+pub use crate::data::config::show::{ConfigEditRequest, ConfigRowKind};
 
-use crate::data::config::repo::MOVED_LEGACY_DYNAMIC_WORKFLOWS_NOTICE;
-
-fn removed_field_message(name: &str) -> Option<&'static str> {
-    REMOVED_CONFIG_FIELDS
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, msg)| *msg)
+/// What kind of value a row holds, for rendering and editing widgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigFieldKind {
+    Bool,
+    Number,
+    Enum,
+    String,
 }
 
-/// Flat list of all valid canonical field names (for suggestions). Legacy
-/// aliases are accepted as input but never suggested.
-fn valid_field_names() -> Vec<&'static str> {
-    CONFIG_FIELDS.iter().map(|spec| spec.name).collect()
-}
-
-/// Resolve a field name against the registry: a canonical name, a member of
-/// a map or list header (`<child_prefix><member>`), or a legacy alias of
-/// either. A list member must be a bare non-negative index, which keeps the
-/// numeric-index dot-path handling narrow to list rows rather than a general
-/// array facility.
-fn resolve_config_field(name: &str) -> Option<ResolvedFieldName> {
-    let resolved = resolve_field_name(name)?;
-    let bad_index = resolved.shape == ConfigRowShape::ListEntry
-        && resolved
-            .member
-            .as_deref()
-            .is_some_and(|m| m.parse::<usize>().is_err());
-    (!bad_index).then_some(resolved)
-}
-
-/// Lexical validation for a map key. The registry's one map
-/// (`workflows.dynamic.agentsToModels`) is keyed by agent name, so the rule
-/// is `AgentName`'s, in Layer 0. This used to restate it, and so did the
-/// TUI's dialog router; three copies of one rule, free to drift (WI 0114 F-20).
-fn validate_map_entry_key(key: &str) -> Result<(), String> {
-    crate::data::session::AgentName::new(key)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
-/// Resolve a `config get|set` input, or the user-facing error for a removed
-/// or unknown name. Suggestions are computed over canonical names only.
-fn resolve_input_field(name: &str) -> Result<ResolvedFieldName, CommandError> {
-    if let Some(msg) = removed_field_message(name) {
-        return Err(CommandError::Other(msg.to_string()));
-    }
-    resolve_config_field(name).ok_or_else(|| {
-        let suggestions = field_suggestions(name, &valid_field_names());
-        CommandError::UnknownConfigField {
-            name: name.to_string(),
-            suggestions: if suggestions.is_empty() {
-                "(none)".to_string()
-            } else {
-                suggestions.join(", ")
-            },
-        }
-    })
-}
-
-/// The agents a `config set agent` write may name for its scope: a repo
-/// write accepts first-party, repo-custom and global-custom names; a global
-/// write accepts first-party and global-custom names (a repo definition is
-/// unknown in every other repo).
-fn agent_listing_for_scope(
-    session: &crate::data::session::Session,
-    global: bool,
-) -> crate::engine::agent::registry::AgentListing {
-    let root = (!global).then(|| session.definition_root());
-    crate::engine::agent::registry::AgentRegistry::list(session.env(), root)
-}
-
-fn is_agent_field(field: &str) -> bool {
-    matches!(field, "agent" | "default_agent")
-}
-
-/// Reject an `agent` value the scope's listing does not contain.
-fn check_agent_known(
-    value: &str,
-    listing: &crate::engine::agent::registry::AgentListing,
-    global: bool,
-) -> Result<(), String> {
-    if listing.contains(value) {
-        return Ok(());
-    }
-    let scope = if global { "global" } else { "repo" };
-    Err(format!(
-        "'{value}' is not a known agent for {scope} config; valid agents: {}; define one with: \
-         awman new agent {value}{}",
-        listing.names().join(", "),
-        if global { " --global" } else { "" }
-    ))
-}
-
-/// Validate and coerce a string value into the appropriate JSON type for the
-/// given field. Returns the coerced `serde_json::Value` or a user-facing error.
-///
-/// Map/list members and headers are recognised by their registry shape, not
-/// by name; a legacy alias coerces exactly like its canonical name.
-fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, String> {
-    let Some(resolved) = resolve_config_field(field) else {
-        return validate_and_coerce_scalar(field, ConfigFieldKind::String, value);
-    };
-    if resolved.shape == ConfigRowShape::Scalar && resolved.spec.read_only {
-        return Err(format!(
-            "{field} is read-only; {}",
-            resolved.spec.hint.unwrap_or("edit config JSON")
-        ));
-    }
-    if resolved.spec.comma_list {
-        let items: Vec<String> = value
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_string)
-            .collect();
-        if resolved.canonical == "workflows.prerequisites.githubToken.envVars" {
-            use crate::data::config::workflows::{
-                ConfigScope, GithubTokenConfig, PrerequisitesConfig,
-            };
-            PrerequisitesConfig {
-                github_token: Some(GithubTokenConfig {
-                    env_vars: Some(items.clone()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }
-            .validate(ConfigScope::Global)
-            .map_err(|error| error.to_string())?;
-        }
-        return Ok(serde_json::json!(items));
-    }
-    match resolved.shape {
-        ConfigRowShape::MapEntry => {
-            validate_map_entry_key(resolved.member.as_deref().unwrap_or_default())?;
-            let items: Vec<&str> = value
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
-            // A member cannot be mapped to zero models (config validation
-            // rejects empty lists), so an empty value means "remove this entry".
-            if items.is_empty() {
-                return Ok(serde_json::Value::Null);
-            }
-            Ok(serde_json::Value::Array(
-                items
-                    .iter()
-                    .map(|s| serde_json::Value::String(s.to_string()))
-                    .collect(),
-            ))
-        }
-        ConfigRowShape::ListEntry => {
-            // A list entry is a single free-form instruction (it may contain
-            // commas, markdown, etc.), so it is NOT comma-split. An empty or
-            // whitespace-only value coerces to Null, which the config layer
-            // treats as "remove this array element".
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                return Ok(serde_json::Value::Null);
-            }
-            if trimmed.chars().count() > crate::data::config::repo::GUIDANCE_MAX_ENTRY_LEN {
-                return Err(format!(
-                    "guidance entry is {} characters; the maximum is {}",
-                    trimmed.chars().count(),
-                    crate::data::config::repo::GUIDANCE_MAX_ENTRY_LEN
-                ));
-            }
-            Ok(serde_json::Value::String(trimmed.to_string()))
-        }
-        // A map or list value can't be expressed as a `config set` string;
-        // without this rejection the coerced string would fail config
-        // deserialization and the set would silently write nothing. Point
-        // users at the per-member syntax.
-        ConfigRowShape::MapHeader { child_prefix } => Err(format!(
-            "{} is a map; set one agent at a time, e.g. `awman config set {child_prefix}claude \
-             \"model-a, model-b\"`",
-            resolved.spec.name
-        )),
-        ConfigRowShape::ListHeader { child_prefix } => Err(format!(
-            "{} is a list; set one entry at a time by index, e.g. `awman config set \
-             {child_prefix}0 \"never spawn more than two agents in parallel\"`",
-            resolved.spec.name
-        )),
-        ConfigRowShape::Scalar => {
-            validate_and_coerce_scalar(&resolved.canonical, resolved.spec.kind, value)
+impl ConfigFieldKind {
+    fn of(kind: ValueKind) -> Self {
+        match kind {
+            ValueKind::Bool => Self::Bool,
+            ValueKind::Int { .. } => Self::Number,
+            ValueKind::Enum(_) => Self::Enum,
+            _ => Self::String,
         }
     }
 }
 
-/// [`validate_and_coerce`] for a single-valued field, by canonical name.
-fn validate_and_coerce_scalar(
-    field: &str,
-    kind: ConfigFieldKind,
-    value: &str,
-) -> Result<serde_json::Value, String> {
-    use crate::data::config::fields::ConfigFieldKind::{Bool, Enum, Number, String as StringKind};
-
-    match kind {
-        Bool => {
-            if field == crate::data::config::builtin_runtime::BUILDER_ENABLED_FIELD {
-                crate::data::config::builtin_runtime::BuiltinBuilderConfig::parse_enabled(value)
-                    .map(serde_json::Value::Bool)
-            } else {
-                match value.trim() {
-                    "true" => Ok(serde_json::Value::Bool(true)),
-                    "false" => Ok(serde_json::Value::Bool(false)),
-                    _ => Err(format!("{field} must be true or false, not '{value}'")),
-                }
-            }
-        }
-        Number => {
-            let n = value
-                .parse::<u64>()
-                .map_err(|_| format!("'{value}' is not a valid number"))?;
-            validate_number_with_loader(field, n)?;
-            Ok(serde_json::Value::Number(n.into()))
-        }
-        Enum => match field {
-            "runtime" => {
-                use crate::data::config::RuntimeSelection;
-                match RuntimeSelection::parse(Some(value)) {
-                    Ok(_) => Ok(serde_json::Value::String(value.trim().to_string())),
-                    Err(unknown) => Err(format!(
-                        "'{}' is not a runtime; valid values: {}{}",
-                        unknown.0,
-                        RuntimeSelection::valid_values(),
-                        RuntimeSelection::hint_for(&unknown.0)
-                            .map(|hint| format!(" ({hint})"))
-                            .unwrap_or_default()
-                    )),
-                }
-            }
-            "worktree.onDirtyMergeTarget" => value
-                .parse::<crate::data::config::OnDirtyMergeTarget>()
-                .map(|v| serde_json::to_value(v).unwrap_or(serde_json::Value::Null))
-                .map_err(|e| e.to_string()),
-            "worktree.mergeFix.onFailure" => value
-                .parse::<crate::data::config::OnMergeFailure>()
-                .map(|v| serde_json::to_value(v).unwrap_or(serde_json::Value::Null))
-                .map_err(|e| e.to_string()),
-            "agent" | "default_agent" => {
-                crate::data::session::AgentName::new(value).map_err(|e| e.to_string())?;
-                Ok(serde_json::Value::String(value.to_string()))
-            }
-            _ => Ok(serde_json::Value::String(value.to_string())),
-        },
-        StringKind => match field {
-            "workflows.dynamic.defaultLeader" => {
-                crate::data::config::repo::validate_leader_spec("workflows.dynamic", value)
-                    .map_err(|error| error.to_string())?;
-                Ok(serde_json::Value::String(value.to_string()))
-            }
-            _ => Ok(serde_json::Value::String(value.to_string())),
-        },
-    }
+/// Which file `config set` / `unset` writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigTarget {
+    /// Chosen by the key's scope: global keys → the global file; repo and
+    /// task keys → the repo file inside a Git repository, else global.
+    Auto,
+    Global,
+    Repo,
+    Task(String),
 }
 
-/// Range-check a numeric field with the same Layer 0 validator that loading
-/// (or, for `builtin.*`, every launch) applies, so the editor rejects exactly
-/// what the loader rejects, with the loader's wording. Fields whose loader has
-/// no range rule beyond the JSON type need no check here; the typed round trip
-/// in [`updated_config`] still rejects values the field's type cannot hold.
-fn validate_number_with_loader(field: &str, n: u64) -> Result<(), String> {
-    use crate::data::config::{repo, BuiltinRuntimeConfig};
-    let as_usize = || usize::try_from(n).map_err(|_| format!("'{n}' is not a valid number"));
-    match field {
-        "workflows.dynamic.maxConcurrentSteps" => {
-            repo::validate_dynamic_max_concurrent_steps("workflows.dynamic", as_usize()?)
-                .map_err(|error| error.to_string())
+impl ConfigTarget {
+    fn from_flags(ctx: &BuildContext) -> Self {
+        if ctx.flags.bool("global") {
+            Self::Global
+        } else if ctx.flags.bool("repo") {
+            Self::Repo
+        } else if let Some(task) = ctx.flags.string("task") {
+            Self::Task(task)
+        } else {
+            Self::Auto
         }
-        "maxConcurrentAgents" => repo::validate_max_concurrent_agents(Some(as_usize()?))
-            .map_err(|error| error.to_string()),
-        _ => match field.strip_prefix("builtin.") {
-            // Decode the one member into the typed block exactly as a config
-            // file would be decoded (so an out-of-range `vcpus` gets serde's
-            // `u8` error), then apply the launch-time resource checks.
-            Some(member) => {
-                let fragment: BuiltinRuntimeConfig =
-                    serde_json::from_value(serde_json::json!({ member: n }))
-                        .map_err(|error| format!("{field}: {error}"))?;
-                fragment.validate_resources()
-            }
-            None => Ok(()),
-        },
     }
-}
-
-/// Config-field names within three edits of `input`, nearest first.
-///
-/// The distance itself is [`crate::data::text::nearest`]; the threshold stays
-/// here, because how near a miss is worth offering depends on the vocabulary
-/// being searched — a config field list is short and its names are long.
-fn field_suggestions<'a>(input: &str, candidates: &[&'a str]) -> Vec<&'a str> {
-    crate::data::text::nearest(input, candidates, 3)
 }
 
 #[derive(Debug, Clone)]
-pub struct ConfigShowFlags {}
+pub struct ConfigShowFlags {
+    pub json: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct ConfigGetFlags {
     pub field: String,
+    pub json: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ConfigSetFlags {
     pub field: String,
     pub value: String,
-    pub global: bool,
+    pub target: ConfigTarget,
 }
 
-/// `config migrate` flags (WI 0150 §4).
 #[derive(Debug, Clone)]
-pub struct ConfigMigrateFlags {
-    pub yes: bool,
-    pub dry_run: bool,
-    pub global: bool,
-    pub non_interactive: bool,
+pub struct ConfigUnsetFlags {
+    pub field: String,
+    pub target: ConfigTarget,
 }
 
 #[derive(Debug, Clone)]
@@ -360,489 +112,78 @@ pub enum ConfigSubcommand {
     Show(ConfigShowFlags),
     Get(ConfigGetFlags),
     Set(ConfigSetFlags),
-    /// `config migrate` (WI 0150).
-    Migrate(ConfigMigrateFlags),
-    /// `config prerequisite-grants list|revoke` (WI 0149).
-    PrerequisiteGrants(crate::command::commands::workflow_prerequisites::PrerequisiteGrantsAction),
+    Unset(ConfigUnsetFlags),
 }
+
+/// The per-repo state `config show` prints under its own heading. It is
+/// state, not config: nothing here can be set with `config set`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigStateSection {
+    /// The `state.json` file the values come from.
+    pub path: String,
+    #[serde(rename = "autoAgentAuthAccepted")]
+    pub auto_agent_auth_accepted: Option<bool>,
+}
+
+/// `runtime.kind` maturity, stated by `config show` (never in the value).
+pub const RUNTIME_MATURITY_NOTE: &str =
+    "runtime.kind: docker and apple are stable; sbx and builtin are experimental.";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigShowOutcome {
-    pub global: serde_json::Value,
-    /// The repo config as awman reads it: a legacy `dynamicWorkflows` block
-    /// appears under `workflows.dynamic` (the file itself is untouched).
-    pub repo: serde_json::Value,
-    /// One row per known field, computed in Layer 2 so the renderer doesn't
-    /// need to know which fields exist or which are read-only.
     pub rows: Vec<ConfigFieldRow>,
+    /// `None` outside a Git repository (state is per repository).
+    pub state: Option<ConfigStateSection>,
+    /// The selected TUI backend, described with the hand-off's shared wording.
+    pub resolved_backend: String,
+    pub notes: Vec<String>,
 }
 
-/// Per-field row used by `ConfigShow` rendering.
+/// One row of `config show` / the TUI config dialog.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigFieldRow {
     pub field: String,
     pub global_value: Option<String>,
     pub repo_value: Option<String>,
+    pub task_value: Option<String>,
     pub effective_value: Option<String>,
-    /// What kind of value the field accepts. Lets the renderer (or a
-    /// programmatic consumer) format the value cell appropriately and lets
-    /// `set` validate input early.
+    /// The layer the effective value comes from.
+    pub source: Layer,
+    /// The key table's type text (`duration`, `enum stdio|acp`, …).
+    pub type_name: String,
     pub kind: ConfigFieldKind,
+    pub sensitive: bool,
     pub read_only: bool,
-    /// Whether the value may be written to the global config scope.
     pub global_writable: bool,
-    /// Whether the value may be written to the repo config scope.
     pub repo_writable: bool,
-    /// Short human-readable format hint shown while editing the value
-    /// (e.g. "true or false", "comma-separated list").
     pub value_hint: Option<String>,
-    /// What *shape* of config entry this row is, as distinct from what kind
-    /// of value it holds: registry data (WI 0150 §5).
-    ///
-    /// A frontend offering "add an entry" needs to know which row heads a map
-    /// and which heads a list, and how to name a new member of it
-    /// (`child_prefix`). Frontends branch on this, never on a field name, so
-    /// a rename touches no frontend code.
-    pub shape: ConfigRowShape,
-}
-
-/// Re-exported from Layer 0, where the config schema lives (WI 0114 F-51).
-pub use crate::data::config::fields::ConfigFieldKind;
-
-/// Map a known config field name to its `ConfigFieldKind`. Mirrors the
-/// schema in `RepoConfig` / `GlobalConfig`. Unknown fields default to
-/// `String` (callers should reject them before reaching this function).
-fn config_field_kind(name: &str) -> ConfigFieldKind {
-    field_spec(name)
-        .map(|spec| spec.kind)
-        // A map or list member is not in the table; both hold text.
-        .unwrap_or(ConfigFieldKind::String)
-}
-
-/// Whether a config field is read-only in the show/edit UI. Map and list
-/// members are inline-editable; only their header rows and awman-computed
-/// fields are read-only.
-fn is_read_only_field(name: &str) -> bool {
-    field_spec(name).is_some_and(|spec| spec.read_only)
-}
-
-/// Per-scope writability for a field, derived from its scope. Read-only
-/// fields are writable in neither scope; a member is writable wherever its
-/// header's scope allows.
-fn field_writability(name: &str) -> (bool, bool) {
-    resolve_config_field(name)
-        .map(|resolved| writability(&resolved))
-        .unwrap_or((false, false))
-}
-
-/// Human-readable format hint for a field's value, shown in the TUI config
-/// dialog while editing.
-fn config_field_hint(name: &str) -> Option<String> {
-    match resolve_config_field(name).map(|resolved| resolved.shape) {
-        Some(ConfigRowShape::MapEntry) => return Some(MAP_ENTRY_HINT.to_string()),
-        Some(ConfigRowShape::ListEntry) => return Some(LIST_ENTRY_HINT.to_string()),
-        _ => {}
-    }
-    let hint = field_spec(name)?.hint?;
-    // The two agent fields share one hint whose value set is the registry's,
-    // not the table's, so the table carries a placeholder. Custom names
-    // depend on the scope being edited, so the hint says where they live;
-    // a rejected write lists the scope's exact names.
-    let agents = format!(
-        "{}, or a custom agent defined in .awman/agents/ or ~/.awman/agents/",
-        crate::engine::agent::first_party::FIRST_PARTY_AGENTS.join(", ")
-    );
-    Some(hint.replace("{agents}", &agents))
-}
-
-/// Render a map member's model-list JSON value as a comma-separated string
-/// for a display row.
-fn render_models_value(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::Array(arr) => arr
-            .iter()
-            .filter_map(|x| x.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
-        other => other.to_string(),
-    }
-}
-
-fn mask_sensitive(field: &str, value: Option<String>) -> Option<String> {
-    if !field_spec(field).is_some_and(|spec| spec.sensitive) {
-        return value;
-    }
-    value.map(|v| {
-        let chars: Vec<char> = v.chars().collect();
-        if chars.len() > 12 {
-            format!(
-                "{}…{}",
-                chars[..4].iter().collect::<String>(),
-                chars[chars.len() - 4..].iter().collect::<String>()
-            )
-        } else {
-            "(set)".to_string()
-        }
-    })
-}
-
-/// The JSON value at a dotted path, including numeric array members.
-fn json_at<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
-    path.split('.').try_fold(root, |value, key| match value {
-        serde_json::Value::Array(items) => items.get(key.parse::<usize>().ok()?),
-        _ => value.get(key),
-    })
-}
-
-/// The JSON views `config show|get` read: the global config, and the repo
-/// config with a legacy `dynamicWorkflows` block adopted into
-/// `workflows.dynamic`, so a legacy repo's values appear under the new names
-/// and `config get` agrees for either spelling. A view: nothing is written.
-fn config_views(session: &crate::data::session::Session) -> (serde_json::Value, serde_json::Value) {
-    let global = serde_json::to_value(session.global_config()).unwrap_or(serde_json::Value::Null);
-    let mut repo = session.repo_config().clone();
-    repo.adopt_legacy_dynamic_workflows();
-    let repo = serde_json::to_value(&repo).unwrap_or(serde_json::Value::Null);
-    (global, repo)
-}
-
-/// The merged dynamic-workflow settings for the given JSON views, as a run
-/// resolves them (no flags), or the resolution error's text.
-fn resolve_dynamic_view(
-    global: &serde_json::Value,
-    repo: &serde_json::Value,
-) -> Result<ResolvedDynamicWorkflows, String> {
-    let repo: crate::data::config::repo::RepoConfig =
-        serde_json::from_value(repo.clone()).map_err(|e| e.to_string())?;
-    let global: crate::data::config::global::GlobalConfig =
-        serde_json::from_value(global.clone()).map_err(|e| e.to_string())?;
-    crate::data::config::EffectiveConfig::new(
-        crate::data::config::FlagConfig::default(),
-        Default::default(),
-        repo,
-        global,
-    )
-    .dynamic_workflows()
-    .map_err(|e| e.to_string())
-}
-
-/// One row per known field, in registry order. Map and list headers are
-/// expanded into one row per member (WI-0095, WI-0099), in both scopes
-/// (WI 0150), rather than shown as a single unreadable JSON blob.
-pub fn collect_config_rows(
-    global: &serde_json::Value,
-    repo: &serde_json::Value,
-) -> Vec<ConfigFieldRow> {
-    let dynamic = resolve_dynamic_view(global, repo);
-    let mut rows: Vec<ConfigFieldRow> = Vec::new();
-    for spec in CONFIG_FIELDS {
-        match spec.shape {
-            ConfigRowShape::MapHeader { child_prefix } => {
-                push_map_rows(&mut rows, spec, child_prefix, global, repo, &dynamic)
-            }
-            ConfigRowShape::ListHeader { child_prefix } => {
-                push_list_rows(&mut rows, spec, child_prefix, global, repo, &dynamic)
-            }
-            _ => rows.push(scalar_row(spec, global, repo)),
-        }
-    }
-    rows
-}
-
-fn scalar_row(
-    spec: &ConfigFieldSpec,
-    global: &serde_json::Value,
-    repo: &serde_json::Value,
-) -> ConfigFieldRow {
-    let name = spec.name;
-    let g = config_field_value(global, &json_path(name));
-    let r = config_field_value(repo, &json_path(name));
-    // Repo over global, as every `Both` field resolves (the two dynamic
-    // scalars included: `EffectiveConfig::dynamic_workflows` layers them the
-    // same way when no flag is given).
-    let effective = r
-        .clone()
-        .or_else(|| g.clone())
-        .or_else(|| implicit_default(name).map(str::to_string));
-    let (global_writable, repo_writable) = spec.writability();
-    ConfigFieldRow {
-        field: name.to_string(),
-        global_value: mask_sensitive(name, g),
-        repo_value: mask_sensitive(name, r),
-        effective_value: mask_sensitive(name, effective),
-        kind: config_field_kind(name),
-        read_only: is_read_only_field(name),
-        global_writable,
-        repo_writable,
-        value_hint: config_field_hint(name),
-        shape: spec.shape,
-    }
-}
-
-/// The read-only header row of a map or list. It is always present, so the
-/// section is discoverable (and Ctrl+N works) even when empty.
-fn header_row(
-    spec: &ConfigFieldSpec,
-    global_value: String,
-    repo_value: String,
-    effective_value: String,
-) -> ConfigFieldRow {
-    let (global_writable, repo_writable) = spec.writability();
-    ConfigFieldRow {
-        field: spec.name.to_string(),
-        global_value: Some(global_value),
-        repo_value: Some(repo_value),
-        effective_value: Some(effective_value),
-        kind: spec.kind,
-        read_only: true,
-        global_writable,
-        repo_writable,
-        value_hint: config_field_hint(spec.name),
-        shape: spec.shape,
-    }
-}
-
-fn member_row(
-    field: String,
-    global_value: Option<String>,
-    repo_value: Option<String>,
-    effective_value: Option<String>,
-) -> ConfigFieldRow {
-    let (global_writable, repo_writable) = field_writability(&field);
-    let value_hint = config_field_hint(&field);
-    let shape = resolve_config_field(&field)
-        .map(|resolved| resolved.shape)
-        .unwrap_or(ConfigRowShape::Scalar);
-    ConfigFieldRow {
-        field,
-        global_value,
-        repo_value,
-        effective_value,
-        kind: ConfigFieldKind::String,
-        read_only: false,
-        global_writable,
-        repo_writable,
-        value_hint,
-        shape,
-    }
-}
-
-/// The map header row, then one row per key in the union of both scopes'
-/// maps, sorted for deterministic ordering. A non-empty repo map replaces the
-/// global map (WI 0150 §2), so a member's effective value is the one from the
-/// map in effect.
-fn push_map_rows(
-    rows: &mut Vec<ConfigFieldRow>,
-    spec: &ConfigFieldSpec,
-    child_prefix: &str,
-    global: &serde_json::Value,
-    repo: &serde_json::Value,
-    dynamic: &Result<ResolvedDynamicWorkflows, String>,
-) {
-    let global_map = json_at(global, spec.name).and_then(|m| m.as_object());
-    let repo_map = json_at(repo, spec.name).and_then(|m| m.as_object());
-    let summary = |map: Option<&serde_json::Map<String, serde_json::Value>>| match map {
-        Some(m) if !m.is_empty() => {
-            let n = m.len();
-            format!("{n} agent{} mapped", if n == 1 { "" } else { "s" })
-        }
-        _ => "(none)".to_string(),
-    };
-    let repo_in_effect = match dynamic {
-        Ok(resolved) => resolved
-            .agents_to_models
-            .as_ref()
-            .is_some_and(|map| map.source != crate::data::config::DynamicWorkflowsSource::Global),
-        Err(_) => repo_map.is_some_and(|m| !m.is_empty()),
-    };
-    let effective = match dynamic {
-        Err(error) => error.clone(),
-        Ok(resolved) => match &resolved.agents_to_models {
-            None => "(none)".to_string(),
-            Some(_) if repo_in_effect => "repo map (replaces global)".to_string(),
-            Some(_) => "global map".to_string(),
-        },
-    };
-    rows.push(header_row(
-        spec,
-        summary(global_map),
-        summary(repo_map),
-        effective,
-    ));
-
-    let mut keys: Vec<&String> = global_map
-        .into_iter()
-        .chain(repo_map)
-        .flat_map(|m| m.keys())
-        .collect();
-    keys.sort();
-    keys.dedup();
-    let in_effect = if repo_in_effect { repo_map } else { global_map };
-    for key in keys {
-        let value_in = |map: Option<&serde_json::Map<String, serde_json::Value>>| {
-            map.and_then(|m| m.get(key)).map(render_models_value)
-        };
-        rows.push(member_row(
-            format!("{child_prefix}{key}"),
-            value_in(global_map),
-            value_in(repo_map),
-            value_in(in_effect),
-        ));
-    }
-}
-
-/// The list header row, then one row per index up to the longer scope's
-/// list. Lists concatenate across scopes (global first, then repo, trimmed
-/// duplicates dropped), so the header carries the combined summary and the
-/// member rows have no single effective value.
-fn push_list_rows(
-    rows: &mut Vec<ConfigFieldRow>,
-    spec: &ConfigFieldSpec,
-    child_prefix: &str,
-    global: &serde_json::Value,
-    repo: &serde_json::Value,
-    dynamic: &Result<ResolvedDynamicWorkflows, String>,
-) {
-    let global_list = json_at(global, spec.name).and_then(|l| l.as_array());
-    let repo_list = json_at(repo, spec.name).and_then(|l| l.as_array());
-    let summary = |list: Option<&Vec<serde_json::Value>>| match list {
-        Some(l) if !l.is_empty() => {
-            let n = l.len();
-            format!("{n} entr{}", if n == 1 { "y" } else { "ies" })
-        }
-        _ => "(none)".to_string(),
-    };
-    let effective = match dynamic {
-        Err(error) => error.clone(),
-        Ok(resolved) if resolved.guidance.is_empty() => "(none)".to_string(),
-        Ok(resolved) => format!(
-            "{} global + {} repo entries",
-            resolved.guidance_counts.global, resolved.guidance_counts.repo
-        ),
-    };
-    rows.push(header_row(
-        spec,
-        summary(global_list),
-        summary(repo_list),
-        effective,
-    ));
-
-    let len = |list: Option<&Vec<serde_json::Value>>| list.map_or(0, Vec::len);
-    for i in 0..len(global_list).max(len(repo_list)) {
-        let entry = |list: Option<&Vec<serde_json::Value>>| {
-            list.and_then(|l| l.get(i))
-                .and_then(|e| e.as_str())
-                .map(str::to_string)
-        };
-        rows.push(member_row(
-            format!("{child_prefix}{i}"),
-            entry(global_list),
-            entry(repo_list),
-            None,
-        ));
-    }
+    pub shape: ConfigRowKind,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigGetOutcome {
-    /// The canonical field name, even when the input was a legacy alias.
     pub field: String,
     pub global_value: Option<String>,
     pub repo_value: Option<String>,
     pub effective_value: Option<String>,
-    /// The legacy spelling the user typed, when they used one.
-    pub alias_used: Option<String>,
+    pub source: Layer,
+    pub type_name: String,
 }
 
+/// What `config set` / `unset` did.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigSetOutcome {
-    /// The canonical field name, even when the input was a legacy alias.
     pub field: String,
-    pub value: String,
+    /// The value written (masked for sensitive keys); `None` for `unset`.
+    pub value: Option<String>,
+    /// `global`, `repo` or `task`.
     pub scope: String,
-    /// The write also moved `dynamicWorkflows` → `workflows.dynamic` (repo
-    /// scope only).
-    pub moved_legacy_dynamic_workflows: bool,
-    /// The legacy spelling the user typed, when they used one.
-    pub alias_used: Option<String>,
-}
-
-/// The `config migrate` confirmation's answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MigrateChoice {
-    Move,
-    Cancel,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ConfigMigrateOutcome {
-    pub scope: ConfigMigrationScope,
-    /// The config file the migration reads and writes.
+    /// The file written.
     pub path: String,
-    /// Every step that has something to change; empty = nothing to migrate.
-    pub changes: Vec<ConfigMigrationChange>,
-    /// The path, then each change's summary and before/after JSON — the text
-    /// the prompt body and `--dry-run` show. Empty when nothing changes.
-    pub preview: String,
-    /// The file was rewritten.
-    pub applied: bool,
-    /// `--dry-run`: nothing was written.
-    pub dry_run: bool,
-    /// `--global` only: the never-read `dynamicWorkflows` key is present.
-    pub global_has_never_read_dynamic_workflows: bool,
-    /// A line the command adds after the result (WI 0150 §3.12), so frontends
-    /// print it without knowing any field name.
-    pub note: Option<String>,
+    pub live: LiveApply,
 }
 
-/// The `config migrate --global` note when the never-read key is present.
-pub const GLOBAL_NEVER_READ_DYNAMIC_WORKFLOWS_NOTE: &str = "note: `dynamicWorkflows` in \
-     ~/.awman/config.json was never read; move what you want to `workflows.dynamic`";
-
-/// A user edit returned from the config show dialog.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigEditRequest {
-    pub field: String,
-    pub value: String,
-    pub global: bool,
-}
-
-impl ConfigEditRequest {
-    /// An edit to an existing row.
-    pub fn to_field(field: impl Into<String>, value: impl Into<String>, global: bool) -> Self {
-        Self {
-            field: field.into(),
-            value: value.into(),
-            global,
-        }
-    }
-
-    /// A new member, named `member`, of the map or list whose header has
-    /// `shape`, written to the global scope when `global` (map and list
-    /// members exist in both scopes).
-    ///
-    /// The field name is built from the header's own `child_prefix`, so a
-    /// frontend adding an entry never spells a config path. `None` when the
-    /// shape heads neither a map nor a list (WI 0114 F-20).
-    pub fn new_member(
-        shape: &ConfigRowShape,
-        member: &str,
-        value: impl Into<String>,
-        global: bool,
-    ) -> Option<Self> {
-        let prefix = shape.child_prefix()?;
-        Some(Self {
-            field: format!("{prefix}{member}"),
-            value: value.into(),
-            global,
-        })
-    }
-}
-
-/// An edit that failed validation or could not be written to disk. Handed
-/// back to the frontend on the next `present_config_table` call so the UI
-/// can preserve the user's input and show the reason, instead of silently
-/// discarding the edit.
+/// An edit that failed validation or could not be written.
 #[derive(Debug, Clone)]
 pub struct ConfigEditRejection {
     pub field: String,
@@ -852,115 +193,375 @@ pub struct ConfigEditRejection {
 }
 
 pub trait ConfigCommandFrontend: UserMessageSink + Send + Sync {
-    /// Present the config table to the user and block until they either
-    /// dismiss the dialog or edit a value. Returns `Ok(None)` on dismiss,
-    /// `Ok(Some(edit))` when the user changes a field.
-    ///
-    /// `rejected` carries the previous edit when it failed validation or
-    /// could not be persisted; the frontend should surface the reason and
-    /// let the user correct the value rather than retype it.
     fn present_config_table(
         &mut self,
         rows: &[ConfigFieldRow],
         rejected: Option<&ConfigEditRejection>,
     ) -> Result<Option<ConfigEditRequest>, CommandError>;
-
-    /// Ask before `config migrate` rewrites a config file. The default
-    /// refuses: there is no human to ask, so the caller must pass `--yes`
-    /// (exit 2), as `AgentsCommandFrontend::confirm_kill` does. (The work item
-    /// calls this the `MigrateConfigFrontend` prompt; it is a method here
-    /// because the config command already owns one frontend trait.)
-    fn confirm_config_migration(
-        &mut self,
-        _prompt: &Prompt<MigrateChoice>,
-    ) -> Result<MigrateChoice, CommandError> {
-        Err(CommandError::InteractiveInputUnavailable {
-            prompt: "yes".into(),
-        })
-    }
 }
 
 pub struct ConfigCommand {
     sub: ConfigSubcommand,
-    notices: Arc<ConfigNotices>,
-    session: crate::data::session::Session,
+    session: Session,
+    reloader: Arc<dyn DaemonReloader>,
 }
 
 impl ConfigCommand {
-    pub fn new(
-        sub: ConfigSubcommand,
-        notices: Arc<ConfigNotices>,
-        session: crate::data::session::Session,
-    ) -> Self {
+    pub fn new(sub: ConfigSubcommand, session: Session) -> Self {
         Self {
             sub,
-            notices,
             session,
+            reloader: Arc::new(LocalDaemons),
         }
     }
 
-    /// Construct from the catalogue-resolved input (WI 0113 F-10). The
-    /// `config` leaves share one entry point, selected by the caller's
-    /// canonical path.
+    /// Replace how running daemons are found and asked to reload (tests).
+    pub fn with_reloader(mut self, reloader: Arc<dyn DaemonReloader>) -> Self {
+        self.reloader = reloader;
+        self
+    }
+
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
         let sub = match ctx.caller.leaf() {
-            "show" => ConfigSubcommand::Show(ConfigShowFlags {}),
+            // Bare `awman config` is `awman config show`.
+            "config" | "show" => ConfigSubcommand::Show(ConfigShowFlags {
+                json: ctx.flags.bool("json"),
+            }),
             "get" => ConfigSubcommand::Get(ConfigGetFlags {
-                field: ctx.args.require("field")?,
+                field: ctx.args.require("key")?,
+                json: ctx.flags.bool("json"),
             }),
             "set" => ConfigSubcommand::Set(ConfigSetFlags {
-                field: ctx.args.require("field")?,
+                field: ctx.args.require("key")?,
                 value: ctx.args.require("value")?,
-                global: ctx.flags.bool("global"),
+                target: ConfigTarget::from_flags(ctx),
             }),
-            "migrate" => ConfigSubcommand::Migrate(ConfigMigrateFlags {
-                yes: ctx.flags.bool("yes"),
-                dry_run: ctx.flags.bool("dry-run"),
-                global: ctx.flags.bool("global"),
-                non_interactive: ctx.flags.bool("non-interactive"),
+            "unset" => ConfigSubcommand::Unset(ConfigUnsetFlags {
+                field: ctx.args.require("key")?,
+                target: ConfigTarget::from_flags(ctx),
             }),
-            "list" => ConfigSubcommand::PrerequisiteGrants(
-                crate::command::commands::workflow_prerequisites::PrerequisiteGrantsAction::List,
-            ),
-            "revoke" => ConfigSubcommand::PrerequisiteGrants(
-                crate::command::commands::workflow_prerequisites::PrerequisiteGrantsAction::Revoke(
-                    ctx.args.require("selector")?,
-                ),
-            ),
             _ => return Err(CommandError::unknown_command(&ctx.path())),
         };
-        Ok(Self::new(
-            sub,
-            ctx.engines.config_notices.clone(),
-            ctx.session.clone(),
-        ))
+        Ok(Self::new(sub, ctx.session.clone()))
     }
 
     pub fn subcommand(&self) -> &ConfigSubcommand {
         &self.sub
     }
-
-    #[cfg(test)]
-    pub(crate) fn notices(&self) -> &Arc<ConfigNotices> {
-        &self.notices
-    }
 }
 
-/// Outcome enum used by the `Command` trait impl.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", content = "payload")]
 pub enum ConfigOutcome {
     Show(ConfigShowOutcome),
     Get(ConfigGetOutcome),
     Set(ConfigSetOutcome),
-    Migrate(ConfigMigrateOutcome),
-    PrerequisiteGrants(crate::command::commands::workflow_prerequisites::PrerequisiteGrantsOutcome),
+    Unset(ConfigSetOutcome),
 }
 
-fn info(text: &str) -> UserMessage {
-    UserMessage {
-        level: MessageLevel::Info,
-        text: text.to_string(),
+fn key_error(error: KeyError) -> CommandError {
+    CommandError::Other(error.to_string())
+}
+
+/// Display text of the value at `path` in `doc`, masked for sensitive keys.
+fn display(doc: &serde_json::Value, path: &str, key: &ConfigKey) -> Option<String> {
+    let value = config_field_value(doc, path)?;
+    Some(if key.sensitive { mask(&value) } else { value })
+}
+
+fn writability(key: &ConfigKey) -> (bool, bool) {
+    (
+        key.kind != ValueKind::Object,
+        key.kind != ValueKind::Object && key.scope >= KeyScope::Repo,
+    )
+}
+
+fn value_hint(key: &ConfigKey) -> Option<String> {
+    Some(match key.kind {
+        ValueKind::Enum(values) => values.join(" | "),
+        ValueKind::Bool => "true | false".into(),
+        ValueKind::Duration => "e.g. 30s, 15m".into(),
+        ValueKind::Size => "e.g. 512MiB, 4GiB".into(),
+        ValueKind::StringList | ValueKind::IntList => "comma-separated list".into(),
+        ValueKind::StringMap => "k=v,k2=v2".into(),
+        ValueKind::Object => "edit in the config file".into(),
+        _ => return None,
+    })
+}
+
+/// The documents a row reads values from.
+pub struct ConfigDocs<'a> {
+    pub global: &'a serde_json::Value,
+    pub repo: &'a serde_json::Value,
+    /// Already masked.
+    pub effective: &'a serde_json::Value,
+    /// Layer of the effective value at a concrete path.
+    pub source: &'a dyn Fn(&str) -> Layer,
+}
+
+fn row(
+    path: String,
+    key: &ConfigKey,
+    docs: &ConfigDocs<'_>,
+    shape: ConfigRowKind,
+) -> ConfigFieldRow {
+    let (global_writable, repo_writable) = writability(key);
+    ConfigFieldRow {
+        global_value: display(docs.global, &path, key),
+        repo_value: display(docs.repo, &path, key),
+        task_value: None,
+        // `effective` is already masked (`EffectiveConfig::masked_value`).
+        effective_value: config_field_value(docs.effective, &path),
+        source: (docs.source)(&path),
+        type_name: key.kind.describe(),
+        kind: ConfigFieldKind::of(key.kind),
+        sensitive: key.sensitive,
+        read_only: key.kind == ValueKind::Object,
+        global_writable,
+        repo_writable,
+        value_hint: value_hint(key),
+        shape,
+        field: path,
+    }
+}
+
+/// The names bound at a map path in any of `docs`.
+fn names_at(docs: &[&serde_json::Value], map_path: &str) -> Vec<String> {
+    let mut names: Vec<String> = crate::data::config::fields::builtin_member_names(map_path)
+        .iter()
+        .map(|n| (*n).to_string())
+        .collect();
+    for doc in docs {
+        let node = map_path.split('.').try_fold(*doc, |v, part| v.get(part));
+        for name in node
+            .and_then(|v| v.as_object())
+            .into_iter()
+            .flat_map(|m| m.keys())
+        {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+    }
+    names
+}
+
+/// One row per key, in key-table order. A map whose members are leaves
+/// (`agents.flags.*`) gets a header row and one row per name present in any
+/// file; a map of objects (`workServers.*.url`) gets one row per name and leaf.
+pub fn collect_config_rows(docs: &ConfigDocs<'_>) -> Vec<ConfigFieldRow> {
+    let mut rows = Vec::new();
+    for key in CONFIG_KEYS {
+        // The enclosing StringMap row displays these values. The leaf row
+        // gives `config set workServers.x.labels.pool value` a scalar type.
+        if key.path == "workServers.*.labels.*" {
+            continue;
+        }
+        let Some(star) = key.path.find('*') else {
+            rows.push(row(key.path.to_string(), key, docs, ConfigRowKind::Scalar));
+            continue;
+        };
+        let map_path = key.path[..star].trim_end_matches('.');
+        let names = names_at(&[docs.global, docs.repo, docs.effective], map_path);
+        if key.path.ends_with(".*") {
+            let prefix: &'static str = &key.path[..key.path.len() - 1];
+            let mut header = row(
+                map_path.to_string(),
+                key,
+                docs,
+                ConfigRowKind::MapHeader {
+                    child_prefix: prefix.to_owned(),
+                },
+            );
+            header.global_value = None;
+            header.repo_value = None;
+            header.effective_value = None;
+            header.kind = ConfigFieldKind::String;
+            header.read_only = true;
+            rows.push(header);
+            for name in names {
+                rows.push(row(
+                    format!("{prefix}{name}"),
+                    key,
+                    docs,
+                    ConfigRowKind::MapEntry,
+                ));
+            }
+        } else {
+            for name in names {
+                let path = key.path.replacen('*', &name, 1);
+                rows.push(row(path, key, docs, ConfigRowKind::Scalar));
+            }
+        }
+    }
+    rows
+}
+
+/// The rows of the session's merged config.
+fn session_rows(session: &Session) -> Vec<ConfigFieldRow> {
+    let config = session.effective_config();
+    let layers = config.layers();
+    let (global, repo) = (layers.global.to_value(), layers.repo.to_value());
+    let effective = config.masked_value();
+    let source = |path: &str| config.source_of(path);
+    let mut rows = collect_config_rows(&ConfigDocs {
+        global: &global,
+        repo: &repo,
+        effective: &effective,
+        source: &source,
+    });
+    if let Some(backend) = rows.iter_mut().find(|row| row.field == "tui.backend") {
+        backend.effective_value = Some(
+            match config.tui_backend() {
+                crate::data::config::tui::TuiBackend::Auto => "auto",
+                crate::data::config::tui::TuiBackend::Daemon => "daemon",
+                crate::data::config::tui::TuiBackend::Builtin => "builtin",
+            }
+            .into(),
+        );
+        backend.source = config.source_of("tui.backend");
+    }
+    rows
+}
+
+/// The `state` section: the per-repo `state.json` and what it holds.
+fn state_section(session: &Session) -> Option<ConfigStateSection> {
+    if !session.is_git_repo() {
+        return None;
+    }
+    let data = crate::data::fs::DataPaths::from_env(session.env()).ok()?;
+    let git_root = session.git_root();
+    Some(ConfigStateSection {
+        path: RepoState::path(&data, git_root).display().to_string(),
+        auto_agent_auth_accepted: RepoState::load(&data, git_root)
+            .unwrap_or_default()
+            .auto_agent_auth_accepted,
+    })
+}
+
+/// A key (or a whole named map entry, for `unset`) resolved to the row whose
+/// scope decides the file.
+fn resolve_for_edit(path: &str, allow_map_entry: bool) -> Result<&'static ConfigKey, CommandError> {
+    match fields::resolve(path) {
+        Ok(resolved) => Ok(resolved.key),
+        Err(error @ KeyError::Unknown { .. }) if allow_map_entry => {
+            // `unset workServers.foo` names a whole map entry.
+            let pattern = fields::pattern_of(path).ok_or_else(|| key_error(error.clone()))?;
+            if !pattern.ends_with('*') {
+                return Err(key_error(error));
+            }
+            let prefix = format!("{pattern}.");
+            CONFIG_KEYS
+                .iter()
+                .find(|k| k.path.starts_with(&prefix))
+                .ok_or_else(|| key_error(error))
+        }
+        Err(error) => Err(key_error(error)),
+    }
+}
+
+/// Which file a `config set` / `unset` writes, and where it is.
+fn target_file(
+    session: &Session,
+    key: &ConfigKey,
+    path: &str,
+    target: &ConfigTarget,
+) -> Result<(FileKind, PathBuf), CommandError> {
+    let kind = match target {
+        ConfigTarget::Global => FileKind::Global,
+        ConfigTarget::Repo if !session.is_git_repo() => {
+            return Err(CommandError::Other(
+                "--repo needs a Git repository; run it inside one or use --global".into(),
+            ))
+        }
+        ConfigTarget::Repo => FileKind::Repo,
+        ConfigTarget::Task(_) => FileKind::Task,
+        ConfigTarget::Auto if key.scope == KeyScope::Global || !session.is_git_repo() => {
+            FileKind::Global
+        }
+        ConfigTarget::Auto => FileKind::Repo,
+    };
+    if !kind.admits(key.scope) {
+        return Err(key_error(KeyError::Scope {
+            path: path.to_string(),
+            allowed: key.scope.allowed_files(),
+            found: kind.as_str(),
+        }));
+    }
+    let file = match (kind, target) {
+        (FileKind::Global, _) => global_config_path(session.env())?,
+        (FileKind::Task, ConfigTarget::Task(name)) => {
+            let squad = crate::data::fs::squad_paths::SquadPaths::from_env(session.env())?;
+            let file = crate::data::config::file::task_config_path(&squad, name)?;
+            if !file.parent().is_some_and(std::path::Path::exists) {
+                return Err(CommandError::Other(format!("no squad task named `{name}`")));
+            }
+            file
+        }
+        _ => repo_config_path(session.git_root()),
+    };
+    Ok((kind, file))
+}
+
+/// Validate and write (or, with `raw = None`, remove) one key. Returns the
+/// file kind and path written.
+fn write_key(
+    session: &Session,
+    path: &str,
+    raw: Option<&str>,
+    target: &ConfigTarget,
+) -> Result<(FileKind, PathBuf, &'static ConfigKey), CommandError> {
+    let key = resolve_for_edit(path, raw.is_none())?;
+    let value = match raw {
+        Some(raw) => Some(fields::parse_input(key, raw).map_err(key_error)?),
+        None => None,
+    };
+    let (kind, file) = target_file(session, key, path, target)?;
+    let mut doc = ConfigFile::load(&file, kind)?.to_value();
+    match value {
+        Some(value) if !value.is_null() => set_config_field(&mut doc, path, value),
+        // `set key null` and `unset key` both remove the key from the file.
+        _ => {
+            remove_config_field(&mut doc, path);
+        }
+    }
+    ConfigFile::from_value(doc, kind)?.save(&file, kind)?;
+    Ok((kind, file, key))
+}
+
+fn unlinked_work_server(path: &str) -> Option<&str> {
+    let mut parts = path.split('.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("workServers"), Some(name), None) if !name.is_empty() => Some(name),
+        _ => None,
+    }
+}
+
+fn reopen(session: &Session) -> Result<Session, CommandError> {
+    let opts = crate::data::session::SessionOpenOptions {
+        env: Some(session.env().clone()),
+        ..Default::default()
+    };
+    let mut reopened = if session.is_git_repo() {
+        Session::open_at_git_root(
+            session.working_dir().to_path_buf(),
+            session.git_root().to_path_buf(),
+            opts,
+        )
+    } else {
+        Session::open_at_directory_root(session.git_root().to_path_buf(), opts)
+    }
+    .map_err(CommandError::from)?;
+    // Keep this invocation's `--set` layer.
+    reopened.add_overrides(session.effective_config().layers().set.clone())?;
+    Ok(reopened)
+}
+
+fn scope_name(kind: FileKind) -> &'static str {
+    match kind {
+        FileKind::Global => "global",
+        FileKind::Repo => "repo",
+        FileKind::Task => "task",
     }
 }
 
@@ -974,45 +575,32 @@ impl Command for ConfigCommand {
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
         let session = self.session;
-        let notices = &self.notices;
+        let reloader = self.reloader;
         let outcome = match self.sub {
             ConfigSubcommand::Show(_) => {
-                notices.warn_legacy_dynamic_workflows(&session, frontend.as_mut());
                 let mut session = session;
                 let mut rejected: Option<ConfigEditRejection> = None;
                 loop {
-                    let (global, repo) = config_views(&session);
-                    let rows = collect_config_rows(&global, &repo);
-
+                    let rows = session_rows(&session);
                     match frontend.present_config_table(&rows, rejected.take().as_ref())? {
                         None => {
-                            break ConfigOutcome::Show(ConfigShowOutcome { global, repo, rows });
+                            break ConfigOutcome::Show(ConfigShowOutcome {
+                                rows,
+                                state: state_section(&session),
+                                resolved_backend: resolved_backend(&session).await,
+                                notes: vec![RUNTIME_MATURITY_NOTE.to_string()],
+                            })
                         }
                         Some(edit) => {
-                            // Any failure — validation, schema mismatch, or
-                            // disk write — is handed back to the frontend as
-                            // a rejection so the user's input is preserved
-                            // and the reason is visible in the dialog. It is
-                            // also logged for the post-dialog record.
-                            let result = validate_and_coerce(&edit.field, &edit.value)
-                                .and_then(|coerced| {
-                                    if is_agent_field(&edit.field) {
-                                        check_agent_known(
-                                            &edit.value,
-                                            &agent_listing_for_scope(&session, edit.global),
-                                            edit.global,
-                                        )?;
-                                    }
-                                    Ok(coerced)
-                                })
-                                .and_then(|coerced| {
-                                    let field = resolve_config_field(&edit.field)
-                                        .map(|resolved| resolved.canonical)
-                                        .unwrap_or_else(|| edit.field.clone());
-                                    write_config_field(&session, &field, coerced, edit.global)
-                                });
-                            match result {
-                                Err(reason) => {
+                            let target = if edit.global {
+                                ConfigTarget::Global
+                            } else {
+                                ConfigTarget::Auto
+                            };
+                            match write_key(&session, &edit.field, Some(&edit.value), &target) {
+                                Ok(_) => session = reopen(&session)?,
+                                Err(error) => {
+                                    let reason = error.to_string();
                                     frontend.write_message(UserMessage {
                                         level: MessageLevel::Warning,
                                         text: format!("Config edit not saved: {reason}"),
@@ -1023,2221 +611,126 @@ impl Command for ConfigCommand {
                                         global: edit.global,
                                         reason,
                                     });
-                                    continue;
                                 }
-                                Ok(true) => frontend
-                                    .write_message(info(MOVED_LEGACY_DYNAMIC_WORKFLOWS_NOTICE)),
-                                Ok(false) => {}
                             }
-                            session = {
-                                let wd = session.working_dir().to_path_buf();
-                                let gr = session.git_root().to_path_buf();
-                                crate::data::session::Session::open_at_git_root(
-                                    wd,
-                                    gr,
-                                    crate::data::session::SessionOpenOptions {
-                                        env: Some(session.env().clone()),
-                                        ..Default::default()
-                                    },
-                                )
-                                .map_err(CommandError::from)?
-                            };
                         }
                     }
                 }
             }
-            ConfigSubcommand::PrerequisiteGrants(action) => ConfigOutcome::PrerequisiteGrants(
-                crate::command::commands::workflow_prerequisites::run_prerequisite_grants(
-                    &session, &action,
-                )?,
-            ),
             ConfigSubcommand::Get(f) => {
-                notices.warn_legacy_dynamic_workflows(&session, frontend.as_mut());
-                let resolved = resolve_input_field(&f.field)?;
-                let alias_used = resolved.via_alias.map(|_| f.field.clone());
-                if alias_used.is_some() {
-                    frontend.write_message(info(DYNAMIC_WORKFLOWS_ALIAS_NOTICE));
-                }
-                let (global, repo) = config_views(&session);
-                let field = resolved.canonical;
-                let (global_value, repo_value, effective_value) = match resolved.shape {
-                    ConfigRowShape::Scalar => {
-                        let global_value = config_field_value(&global, &json_path(&field));
-                        let repo_value = config_field_value(&repo, &json_path(&field));
-                        let effective_value = repo_value
-                            .clone()
-                            .or_else(|| global_value.clone())
-                            .or_else(|| implicit_default(&field).map(str::to_string));
-                        (global_value, repo_value, effective_value)
-                    }
-                    // Headers and members read exactly what `config show`
-                    // displays for them, layering included.
-                    _ => collect_config_rows(&global, &repo)
-                        .into_iter()
-                        .find(|row| row.field == field)
-                        .map(|row| (row.global_value, row.repo_value, row.effective_value))
-                        .unwrap_or_default(),
-                };
+                let key = fields::resolve(&f.field).map_err(key_error)?.key;
+                let config = session.effective_config();
+                let layers = config.layers();
+                let (global, repo) = (layers.global.to_value(), layers.repo.to_value());
+                let effective = config.masked_value();
                 ConfigOutcome::Get(ConfigGetOutcome {
-                    global_value: mask_sensitive(&field, global_value),
-                    repo_value: mask_sensitive(&field, repo_value),
-                    effective_value: mask_sensitive(&field, effective_value),
-                    field,
-                    alias_used,
+                    global_value: display(&global, &f.field, key),
+                    repo_value: display(&repo, &f.field, key),
+                    effective_value: config_field_value(&effective, &f.field),
+                    source: config.source_of(&f.field),
+                    type_name: key.kind.describe(),
+                    field: f.field,
                 })
             }
             ConfigSubcommand::Set(f) => {
-                let resolved = resolve_input_field(&f.field)?;
-                let field = resolved.canonical.clone();
-                let usage = |reason: String| CommandError::InvalidFlagValue {
-                    command: vec!["config".into(), "set".into()],
-                    flag: "global".into(),
-                    reason,
-                };
-                // A legacy name is only valid where the legacy key existed.
-                if let Some(alias) = resolved.via_alias {
-                    if alias.scope == FieldScope::RepoOnly && f.global {
-                        return Err(usage(format!(
-                            "'{}' is the old repo-only name; use '{field}' with --global",
-                            f.field
-                        )));
-                    }
-                }
-                // Validate scope: enforce GlobalOnly / RepoOnly constraints.
-                match resolved.spec.scope {
-                    FieldScope::GlobalOnly if !f.global => {
-                        return Err(usage(format!(
-                            "field '{field}' can only be set in global config; add --global"
-                        )));
-                    }
-                    FieldScope::RepoOnly if f.global => {
-                        return Err(usage(format!(
-                            "field '{field}' can only be set in repo config; omit --global"
-                        )));
-                    }
-                    _ => {}
-                }
-                // Validate and coerce the value per field type.
-                let invalid = |reason| CommandError::InvalidFlagValue {
-                    command: vec!["config".into(), "set".into()],
-                    flag: f.field.clone(),
-                    reason,
-                };
-                let coerced = validate_and_coerce(&field, &f.value).map_err(invalid)?;
-                if is_agent_field(&field) {
-                    check_agent_known(
-                        &f.value,
-                        &agent_listing_for_scope(&session, f.global),
-                        f.global,
-                    )
-                    .map_err(invalid)?;
-                }
-                let alias_used = resolved.via_alias.map(|_| f.field.clone());
-                if alias_used.is_some() {
-                    frontend.write_message(info(DYNAMIC_WORKFLOWS_ALIAS_NOTICE));
-                }
-                let moved =
-                    write_config_field(&session, &field, coerced, f.global).map_err(|reason| {
-                        CommandError::Other(format!("failed to set '{field}': {reason}"))
-                    })?;
-                if moved {
-                    frontend.write_message(info(MOVED_LEGACY_DYNAMIC_WORKFLOWS_NOTICE));
-                }
+                let (kind, file, key) = write_key(&session, &f.field, Some(&f.value), &f.target)?;
+                let live = live::apply(reloader.as_ref(), &session, key, &f.field);
                 ConfigOutcome::Set(ConfigSetOutcome {
-                    value: mask_sensitive(&field, Some(f.value)).unwrap_or_default(),
-                    field,
-                    scope: if f.global {
-                        "global".into()
+                    value: Some(if key.sensitive {
+                        mask(&f.value)
                     } else {
-                        "repo".into()
-                    },
-                    moved_legacy_dynamic_workflows: moved,
-                    alias_used,
+                        f.value
+                    }),
+                    field: f.field,
+                    scope: scope_name(kind).into(),
+                    path: file.display().to_string(),
+                    live,
                 })
             }
-            ConfigSubcommand::Migrate(f) => {
-                ConfigOutcome::Migrate(run_migrate(&session, &f, frontend.as_mut())?)
+            ConfigSubcommand::Unset(f) => {
+                let (kind, file, key) = write_key(&session, &f.field, None, &f.target)?;
+                let live = live::apply(reloader.as_ref(), &session, key, &f.field);
+                if let Some(name) = unlinked_work_server(&f.field) {
+                    // The daemon has reloaded (it stopped claiming for this
+                    // server); the token goes now, or after the last lease.
+                    let disposition =
+                        work_server_unlink::dispose_token(reloader.as_ref(), &session, name)?;
+                    if let Some(text) = work_server_unlink::deferred_message(name, &disposition) {
+                        frontend.write_message(UserMessage {
+                            level: MessageLevel::Info,
+                            text,
+                        });
+                    }
+                }
+                ConfigOutcome::Unset(ConfigSetOutcome {
+                    value: None,
+                    field: f.field,
+                    scope: scope_name(kind).into(),
+                    path: file.display().to_string(),
+                    live,
+                })
             }
         };
-        frontend.replay_queued();
         Ok(outcome)
     }
 }
 
-/// A planned config migration of one scope, as Layer 0 builds it. Lets
-/// `config migrate` drive either scope through one flow, so a future move
-/// (a new `ConfigMigration` step in either scope) needs no new command code.
-trait PlannedConfigMigration {
-    fn path(&self) -> &std::path::Path;
-    fn is_empty(&self) -> bool;
-    fn changes(&self) -> &[ConfigMigrationChange];
-    fn preview(&self) -> String;
-    fn apply(self) -> Result<(), crate::data::error::DataError>;
-}
+/// Describe the backend that is available to this invocation. This is a
+/// read-only probe: config show never starts or enables a daemon.
+async fn resolved_backend(session: &Session) -> String {
+    use crate::command::engine_handoff::{self, BackendSelection, EngineEnable};
+    use crate::data::config::tui::TuiBackend;
 
-impl PlannedConfigMigration for RepoConfigMigration {
-    fn path(&self) -> &std::path::Path {
-        RepoConfigMigration::path(self)
+    let config = session.effective_config();
+    if config.tui_backend() == TuiBackend::Builtin {
+        return engine_handoff::describe(&BackendSelection::Builtin);
     }
-    fn is_empty(&self) -> bool {
-        RepoConfigMigration::is_empty(self)
-    }
-    fn changes(&self) -> &[ConfigMigrationChange] {
-        RepoConfigMigration::changes(self)
-    }
-    fn preview(&self) -> String {
-        RepoConfigMigration::preview(self)
-    }
-    fn apply(self) -> Result<(), crate::data::error::DataError> {
-        RepoConfigMigration::apply(self)
-    }
-}
-
-impl PlannedConfigMigration for GlobalConfigMigration {
-    fn path(&self) -> &std::path::Path {
-        GlobalConfigMigration::path(self)
-    }
-    fn is_empty(&self) -> bool {
-        GlobalConfigMigration::is_empty(self)
-    }
-    fn changes(&self) -> &[ConfigMigrationChange] {
-        GlobalConfigMigration::changes(self)
-    }
-    fn preview(&self) -> String {
-        GlobalConfigMigration::preview(self)
-    }
-    fn apply(self) -> Result<(), crate::data::error::DataError> {
-        GlobalConfigMigration::apply(self)
-    }
-}
-
-/// `awman config migrate` (WI 0150 §4): plan every migration step for the
-/// chosen scope, show it, ask, write.
-fn run_migrate(
-    session: &crate::data::session::Session,
-    flags: &ConfigMigrateFlags,
-    frontend: &mut dyn ConfigCommandFrontend,
-) -> Result<ConfigMigrateOutcome, CommandError> {
-    if flags.global {
-        let path = crate::data::config::global::GlobalConfig::path_with(session.env())?;
-        let plan = GlobalConfigMigration::plan(&path)?;
-        let never_read = plan.has_never_read_dynamic_workflows();
-        return run_migration_plan(
-            plan,
-            ConfigMigrationScope::Global,
-            never_read,
-            flags,
-            frontend,
-        );
-    }
-    // Only the invoking checkout's file, never a worktree copy. The plan
-    // refuses a symlinked `.awman/` or `config.json` when it reads the file
-    // and again when it writes it, consistent with `agent_dirs::publish`'s
-    // treatment of repo-controlled symlinks.
-    let plan = RepoConfigMigration::plan(session.git_root())?;
-    run_migration_plan(plan, ConfigMigrationScope::Repo, false, flags, frontend)
-}
-
-fn run_migration_plan(
-    plan: impl PlannedConfigMigration,
-    scope: ConfigMigrationScope,
-    global_has_never_read_dynamic_workflows: bool,
-    flags: &ConfigMigrateFlags,
-    frontend: &mut dyn ConfigCommandFrontend,
-) -> Result<ConfigMigrateOutcome, CommandError> {
-    let path = plan.path().to_path_buf();
-    let mut outcome = ConfigMigrateOutcome {
-        scope,
-        path: path.display().to_string(),
-        changes: plan.changes().to_vec(),
-        preview: String::new(),
-        applied: false,
-        dry_run: flags.dry_run,
-        global_has_never_read_dynamic_workflows,
-        note: global_has_never_read_dynamic_workflows
-            .then(|| GLOBAL_NEVER_READ_DYNAMIC_WORKFLOWS_NOTE.to_string()),
+    let Ok(Some(client)) = super::daemon::client::DaemonClient::discover(session.env()) else {
+        return if config.tui_backend() == TuiBackend::Daemon {
+            "backend: daemon (unavailable)".into()
+        } else {
+            engine_handoff::describe(&BackendSelection::Builtin)
+        };
     };
-    if plan.is_empty() {
-        return Ok(outcome);
-    }
-    outcome.preview = plan.preview();
-    if flags.dry_run {
-        return Ok(outcome);
-    }
-    // Refuse before asking, so the user is never asked to approve a write
-    // that cannot happen. An access check rather than the mode bits: a
-    // writable-looking file owned by someone else is not writable either.
-    if std::fs::metadata(&path).is_ok_and(|m| m.permissions().readonly())
-        || (path.is_file() && std::fs::OpenOptions::new().write(true).open(&path).is_err())
-    {
-        return Err(CommandError::Other(format!(
-            "{} is read-only; refusing to migrate it",
-            path.display()
-        )));
-    }
-    if !flags.yes {
-        // Non-interactive mode never prompts: the decision must come from
-        // `--yes` (exit 2), per aspec/uxui/cli.md.
-        if flags.non_interactive {
-            return Err(CommandError::InteractiveInputUnavailable {
-                prompt: "yes".into(),
-            });
-        }
-        let prompt = crate::command::prompts::config_migrate_confirm(&outcome.preview);
-        if frontend.confirm_config_migration(&prompt)? == MigrateChoice::Cancel {
-            return Err(CommandError::Aborted);
-        }
-    }
-    plan.apply()?;
-    outcome.applied = true;
-    Ok(outcome)
-}
-
-/// Apply a coerced field value to a config snapshot, returning the updated
-/// struct or a user-facing reason when the resulting JSON no longer fits the
-/// config schema. Shared by the interactive edit loop and `config set` so a
-/// schema mismatch is never silently dropped.
-fn updated_config<T: Serialize + serde::de::DeserializeOwned>(
-    cfg: &T,
-    field: &str,
-    coerced: serde_json::Value,
-) -> Result<T, String> {
-    let mut json =
-        serde_json::to_value(cfg).map_err(|e| format!("could not serialize config: {e}"))?;
-    let path = json_path(field);
-    apply_config_field(&mut json, &path, coerced);
-    let updated: T = serde_json::from_value(json.clone())
-        .map_err(|e| format!("'{field}' does not accept this value ({e})"))?;
-    let persisted = serde_json::to_value(&updated).map_err(|e| e.to_string())?;
-    // A numeric member may append or remove/compact the array. Verify its
-    // parent so append-at-end also checks the actual serialized element.
-    let verification_path = path
-        .rsplit_once('.')
-        .filter(|(_, member)| member.parse::<usize>().is_ok())
-        .map_or(path.as_ref(), |(parent, _)| parent);
-    if json_at(&json, verification_path).filter(|v| !v.is_null())
-        != json_at(&persisted, verification_path).filter(|v| !v.is_null())
-    {
-        return Err(format!("'{field}' cannot be stored in this config scope"));
-    }
-    Ok(updated)
-}
-
-/// Validate, apply, and persist one field edit to the chosen config scope.
-/// Returns a user-facing reason on any failure — validation, schema
-/// mismatch, or disk write — so callers can surface it instead of
-/// pretending the edit succeeded.
-///
-/// A repo write is also the automatic `dynamicWorkflows` → `workflows.dynamic`
-/// migration (WI 0150 §4): the legacy block is adopted before the edit is
-/// applied, and `Ok(true)` reports that it moved so the caller can say so.
-/// A repo config with both keys set is refused with the load error. A global
-/// write never touches the repo file, and the reverse.
-fn write_config_field(
-    session: &crate::data::session::Session,
-    field: &str,
-    coerced: serde_json::Value,
-    global: bool,
-) -> Result<bool, String> {
-    let resolved = resolve_config_field(field).ok_or_else(|| format!("unknown field '{field}'"))?;
-    let (global_writable, repo_writable) = writability(&resolved);
-    if (global && !global_writable) || (!global && !repo_writable) {
-        return Err(format!("'{field}' is not writable in this config scope"));
-    }
-    if global {
-        let cfg = updated_config(session.global_config(), field, coerced)?;
-        // The session's environment, never the process's: they differ in
-        // tests and for any session opened with overrides.
-        cfg.save_with(session.env())
-            .map_err(|e| format!("could not write global config: {e}"))?;
-        return Ok(false);
-    }
-    let mut cfg = session.repo_config().clone();
-    cfg.dynamic_workflows_block().map_err(|e| e.to_string())?;
-    let moved = cfg.adopt_legacy_dynamic_workflows();
-    let cfg = updated_config(&cfg, field, coerced)?;
-    cfg.save(session.git_root()).map_err(|e| {
-        format!(
-            "could not write {}: {e}",
-            crate::data::config::repo::RepoConfig::path(session.git_root()).display()
+    let Ok(status) = client
+        .call_as::<crate::command::daemon_api::core::StatusResponse>(
+            &super::daemon::actions::Request::get("/v1/status"),
         )
-    })?;
-    Ok(moved)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::config::config_json::{remove_config_field, set_config_field};
-
-    #[test]
-    fn api_work_dir_roots_parses_as_comma_list_like_work_dirs() {
-        for field in ["api.workDirs", "api.workDirRoots"] {
-            assert_eq!(
-                validate_and_coerce(field, " /a, /b ,,/c ").unwrap(),
-                serde_json::json!(["/a", "/b", "/c"]),
-                "{field}"
-            );
-        }
-        assert!(valid_field_names().contains(&"api.workDirRoots"));
-    }
-
-    // ── config_field_value ───────────────────────────────────────────────────
-
-    #[test]
-    fn config_field_value_returns_string_field() {
-        let json = serde_json::json!({"agent": "claude", "model": null});
-        assert_eq!(
-            config_field_value(&json, "agent"),
-            Some("claude".to_string())
-        );
-    }
-
-    #[test]
-    fn config_field_value_returns_bool_field_as_string() {
-        let json = serde_json::json!({"yolo": true});
-        assert_eq!(config_field_value(&json, "yolo"), Some("true".to_string()));
-    }
-
-    #[test]
-    fn config_field_value_returns_number_field_as_string() {
-        let json = serde_json::json!({"port": 9876u64});
-        assert_eq!(config_field_value(&json, "port"), Some("9876".to_string()));
-    }
-
-    #[test]
-    fn config_field_value_returns_none_for_missing_field() {
-        let json = serde_json::json!({"agent": "claude"});
-        assert_eq!(config_field_value(&json, "nonexistent"), None);
-    }
-
-    #[test]
-    fn config_field_value_returns_none_for_null_value() {
-        let json = serde_json::json!({"model": null});
-        assert_eq!(config_field_value(&json, "model"), None);
-    }
-
-    #[test]
-    fn config_field_value_supports_dot_notation() {
-        let json = serde_json::json!({"work_items": {"dir": "aspec/work-items"}});
-        assert_eq!(
-            config_field_value(&json, "work_items.dir"),
-            Some("aspec/work-items".to_string())
-        );
-    }
-
-    // ── set_config_field ─────────────────────────────────────────────────────
-
-    #[test]
-    fn set_config_field_inserts_string_value() {
-        let mut json = serde_json::json!({});
-        set_config_field(
-            &mut json,
-            "agent",
-            serde_json::Value::String("codex".into()),
-        );
-        assert_eq!(json["agent"], serde_json::Value::String("codex".into()));
-    }
-
-    #[test]
-    fn set_config_field_inserts_bool_value() {
-        let mut json = serde_json::json!({});
-        set_config_field(&mut json, "yolo", serde_json::Value::Bool(true));
-        assert_eq!(json["yolo"], serde_json::Value::Bool(true));
-    }
-
-    #[test]
-    fn set_config_field_inserts_number_value() {
-        let mut json = serde_json::json!({});
-        set_config_field(&mut json, "port", serde_json::json!(9876u64));
-        assert_eq!(json["port"], serde_json::json!(9876u64));
-    }
-
-    #[test]
-    fn set_config_field_overwrites_existing_value() {
-        let mut json = serde_json::json!({"agent": "claude"});
-        set_config_field(
-            &mut json,
-            "agent",
-            serde_json::Value::String("gemini".into()),
-        );
-        assert_eq!(json["agent"], serde_json::Value::String("gemini".into()));
-    }
-
-    #[test]
-    fn set_config_field_does_not_modify_non_object() {
-        // If the json is not an Object, set_config_field is a no-op.
-        let mut json = serde_json::Value::Null;
-        set_config_field(
-            &mut json,
-            "agent",
-            serde_json::Value::String("claude".into()),
-        );
-        // Should still be Null — no panic.
-        assert!(json.is_null());
-    }
-
-    #[test]
-    fn set_config_field_dot_notation_creates_nested() {
-        let mut json = serde_json::json!({});
-        set_config_field(
-            &mut json,
-            "work_items.dir",
-            serde_json::Value::String("custom/dir".into()),
-        );
-        assert_eq!(json["work_items"]["dir"], "custom/dir");
-    }
-
-    #[test]
-    fn set_config_field_dot_notation_preserves_siblings() {
-        let mut json = serde_json::json!({"work_items": {"template": "tmpl.md"}});
-        set_config_field(
-            &mut json,
-            "work_items.dir",
-            serde_json::Value::String("custom/dir".into()),
-        );
-        assert_eq!(json["work_items"]["dir"], "custom/dir");
-        assert_eq!(json["work_items"]["template"], "tmpl.md");
-    }
-
-    // ── set_config_field: dynamicWorkflows.guidance array append (WI-0099) ────
-
-    #[test]
-    fn set_config_field_guidance_appends_to_new_array() {
-        let mut json = serde_json::json!({});
-        set_config_field(
-            &mut json,
-            "dynamicWorkflows.guidance.0",
-            serde_json::Value::String("first entry".into()),
-        );
-        assert_eq!(
-            json["dynamicWorkflows"]["guidance"],
-            serde_json::json!(["first entry"]),
-            "setting index 0 on an absent array must create it: {json}"
-        );
-    }
-
-    #[test]
-    fn set_config_field_guidance_appends_at_current_length() {
-        let mut json = serde_json::json!({
-            "dynamicWorkflows": {"guidance": ["first entry"]}
-        });
-        set_config_field(
-            &mut json,
-            "dynamicWorkflows.guidance.1",
-            serde_json::Value::String("second entry".into()),
-        );
-        assert_eq!(
-            json["dynamicWorkflows"]["guidance"],
-            serde_json::json!(["first entry", "second entry"]),
-            "index == current length must append, not overwrite: {json}"
-        );
-    }
-
-    #[test]
-    fn set_config_field_guidance_overwrites_in_place_when_index_in_range() {
-        let mut json = serde_json::json!({
-            "dynamicWorkflows": {"guidance": ["a", "b"]}
-        });
-        set_config_field(
-            &mut json,
-            "dynamicWorkflows.guidance.0",
-            serde_json::Value::String("a-edited".into()),
-        );
-        assert_eq!(
-            json["dynamicWorkflows"]["guidance"],
-            serde_json::json!(["a-edited", "b"]),
-            "index < length must overwrite in place: {json}"
-        );
-    }
-
-    // ── remove_config_field: dynamicWorkflows.guidance by index (WI-0099) ─────
-
-    #[test]
-    fn remove_config_field_guidance_by_index_compacts_and_reindexes() {
-        let mut json = serde_json::json!({
-            "dynamicWorkflows": {"guidance": ["a", "b", "c"]}
-        });
-        remove_config_field(&mut json, "dynamicWorkflows.guidance.1");
-        assert_eq!(
-            json["dynamicWorkflows"]["guidance"],
-            serde_json::json!(["a", "c"]),
-            "removing index 1 must leave a compact, re-indexed array: {json}"
-        );
-    }
-
-    #[test]
-    fn remove_config_field_guidance_out_of_range_index_is_noop() {
-        let mut json = serde_json::json!({
-            "dynamicWorkflows": {"guidance": ["a"]}
-        });
-        remove_config_field(&mut json, "dynamicWorkflows.guidance.5");
-        assert_eq!(
-            json["dynamicWorkflows"]["guidance"],
-            serde_json::json!(["a"]),
-            "an out-of-range index must not modify the array: {json}"
-        );
-    }
-
-    // ── validate_and_coerce ──────────────────────────────────────────────────
-
-    #[test]
-    fn validate_and_coerce_agent_valid() {
-        let v = validate_and_coerce("agent", "claude").unwrap();
-        assert_eq!(v, serde_json::Value::String("claude".into()));
-    }
-
-    #[test]
-    fn validate_and_coerce_runtime_accepts_only_known_runtimes() {
-        assert_eq!(
-            validate_and_coerce("runtime", "builtin-experimental").unwrap(),
-            serde_json::Value::String("builtin-experimental".into())
-        );
-        let err = validate_and_coerce("runtime", "builtin").unwrap_err();
-        assert!(err.contains("builtin-experimental"), "{err}");
-        assert!(validate_and_coerce("runtime", "dokcer").is_err());
-    }
-
-    // ── validate_and_coerce: builtin.builder.enabled (WI 0125) ──────────────
-
-    #[test]
-    fn validate_and_coerce_builder_enabled_accepts_true_and_false() {
-        assert_eq!(
-            validate_and_coerce("builtin.builder.enabled", "true").unwrap(),
-            serde_json::Value::Bool(true)
-        );
-        assert_eq!(
-            validate_and_coerce("builtin.builder.enabled", "false").unwrap(),
-            serde_json::Value::Bool(false)
-        );
-        // `parse_enabled` trims surrounding whitespace.
-        assert_eq!(
-            validate_and_coerce("builtin.builder.enabled", "  true  ").unwrap(),
-            serde_json::Value::Bool(true)
-        );
-    }
-
-    /// `validate_and_coerce` routes `builtin.builder.enabled` through
-    /// `BuiltinBuilderConfig::parse_enabled` (not the generic bool/string
-    /// fallback), so the error names the field and rejects truthy spellings
-    /// a generic bool coercion might otherwise accept.
-    #[test]
-    fn validate_and_coerce_builder_enabled_rejects_non_boolean_spellings() {
-        for bad in ["yes", "1", "TRUE", ""] {
-            let err = validate_and_coerce("builtin.builder.enabled", bad).unwrap_err();
-            assert!(
-                err.contains("builtin.builder.enabled"),
-                "error for {bad:?} must name the field: {err}"
-            );
-        }
-    }
-
-    /// `config show`/`get` must show the documented default (`false`) as the
-    /// *effective* value when nothing sets it, while leaving the global and
-    /// repo cells unset so scope inheritance stays visible (review-config
-    /// finding 3).
-    #[test]
-    fn collect_config_rows_builder_enabled_effective_default_is_false_but_cells_stay_unset() {
-        let rows = collect_config_rows(&serde_json::json!({}), &serde_json::json!({}));
-        let row = rows
-            .iter()
-            .find(|r| r.field == "builtin.builder.enabled")
-            .expect("builtin.builder.enabled row must be present");
-        assert_eq!(row.effective_value.as_deref(), Some("false"));
-        assert_eq!(row.global_value, None);
-        assert_eq!(row.repo_value, None);
-    }
-
-    /// An explicit repo `false` still displays as the effective value even
-    /// when a global `true` is set — repo overrides global, not merely
-    /// "inherits unless absent".
-    #[test]
-    fn collect_config_rows_builder_enabled_repo_false_overrides_global_true() {
-        let global = serde_json::json!({"builtin": {"builder": {"enabled": true}}});
-        let repo = serde_json::json!({"builtin": {"builder": {"enabled": false}}});
-        let rows = collect_config_rows(&global, &repo);
-        let row = rows
-            .iter()
-            .find(|r| r.field == "builtin.builder.enabled")
-            .unwrap();
-        assert_eq!(row.global_value.as_deref(), Some("true"));
-        assert_eq!(row.repo_value.as_deref(), Some("false"));
-        assert_eq!(row.effective_value.as_deref(), Some("false"));
-    }
-
-    #[test]
-    fn validate_and_coerce_agent_invalid() {
-        let listing = crate::engine::agent::registry::AgentListing {
-            first_party: crate::engine::agent::first_party::FIRST_PARTY_AGENTS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            ..Default::default()
-        };
-        assert!(validate_and_coerce("agent", "notareal").is_ok());
-        let err = check_agent_known("notareal", &listing, false).unwrap_err();
-        assert!(err.contains("not a known agent"));
-        assert!(check_agent_known("claude", &listing, true).is_ok());
-        assert!(validate_and_coerce("agent", "bad name!").is_err());
-    }
-
-    #[test]
-    fn validate_and_coerce_list_field() {
-        let v = validate_and_coerce("yoloDisallowedTools", "tool1, tool2, tool3").unwrap();
-        assert_eq!(v, serde_json::json!(["tool1", "tool2", "tool3"]));
-    }
-
-    #[test]
-    fn validate_and_coerce_number_field() {
-        let v = validate_and_coerce("terminal_scrollback_lines", "5000").unwrap();
-        assert_eq!(v, serde_json::json!(5000u64));
-    }
-
-    #[test]
-    fn validate_and_coerce_number_field_invalid() {
-        let err = validate_and_coerce("terminal_scrollback_lines", "abc").unwrap_err();
-        assert!(err.contains("not a valid number"));
-    }
-
-    #[test]
-    fn string_values_are_never_inferred_as_booleans_or_numbers() {
-        for value in ["123", "true", "false"] {
-            assert_eq!(
-                validate_and_coerce("work_items.dir", value).unwrap(),
-                serde_json::Value::String(value.to_string())
-            );
-        }
-    }
-
-    #[test]
-    fn string_values_are_preserved_for_unregistered_internal_calls() {
-        assert_eq!(
-            validate_and_coerce("some_field", "true").unwrap(),
-            serde_json::Value::String("true".into())
-        );
-    }
-
-    #[test]
-    fn invalid_boolean_and_numeric_values_are_rejected() {
-        assert!(
-            validate_and_coerce("workflows.prerequisites.githubToken.verify", "yes")
-                .unwrap_err()
-                .contains("true or false")
-        );
-        assert!(validate_and_coerce("maxConcurrentAgents", "many")
-            .unwrap_err()
-            .contains("not a valid number"));
-        assert!(validate_and_coerce("builtin.vcpus", "256")
-            .unwrap_err()
-            .contains("expected u8"));
-    }
-
-    /// The editor's numeric range errors are the loader's errors, word for
-    /// word: each case loads a real config file through the global and repo
-    /// loaders (or, for `builtin.*`, the launch-time resource check the
-    /// loaded block is subject to) and compares it with `config set`'s
-    /// rejection of the same value.
-    #[test]
-    fn numeric_range_errors_match_the_config_loader() {
-        use crate::data::config::{BuiltinRuntimeConfig, GlobalConfig, RepoConfig};
-
-        let dir = tempfile::tempdir().unwrap();
-        let global_path = dir.path().join("global.json");
-        std::fs::write(&global_path, r#"{"maxConcurrentAgents":0}"#).unwrap();
-        let global_error = GlobalConfig::load_path(&global_path)
-            .unwrap_err()
-            .to_string();
-        std::fs::create_dir_all(dir.path().join(".awman")).unwrap();
-        std::fs::write(RepoConfig::path(dir.path()), r#"{"maxConcurrentAgents":0}"#).unwrap();
-        let repo_error = RepoConfig::load(dir.path()).unwrap_err().to_string();
-        let editor_error = validate_and_coerce("maxConcurrentAgents", "0").unwrap_err();
-        assert_eq!(editor_error, global_error);
-        assert_eq!(editor_error, repo_error);
-
-        for (field, member, value) in [
-            ("builtin.vcpus", "vcpus", 0u64),
-            (
-                "builtin.memoryMib",
-                "memoryMib",
-                crate::data::config::builtin_runtime::MIN_MEMORY_MIB as u64 - 1,
-            ),
-            (
-                "builtin.rootDiskMib",
-                "rootDiskMib",
-                crate::data::config::builtin_runtime::MIN_ROOT_DISK_MIB as u64 - 1,
-            ),
-            ("builtin.mountQuotaMib", "mountQuotaMib", 0),
-        ] {
-            let loaded: GlobalConfig =
-                serde_json::from_value(serde_json::json!({ "builtin": { member: value } }))
-                    .unwrap();
-            let loader_error = loaded
-                .builtin
-                .as_ref()
-                .map(BuiltinRuntimeConfig::validate_resources)
-                .unwrap()
-                .unwrap_err();
-            assert_eq!(
-                validate_and_coerce(field, &value.to_string()).unwrap_err(),
-                loader_error,
-                "{field}={value}"
-            );
-        }
-
-        // Out of the field type's range: the loader refuses the file while
-        // decoding it, and the editor reports that same decode error.
-        let decode_error = serde_json::from_value::<GlobalConfig>(
-            serde_json::json!({ "builtin": { "vcpus": 256 } }),
-        )
-        .unwrap_err()
-        .to_string();
-        let editor_error = validate_and_coerce("builtin.vcpus", "256").unwrap_err();
-        assert_eq!(editor_error, format!("builtin.vcpus: {decode_error}"));
-
-        // In-range values are accepted and stay numbers.
-        for (field, value) in [
-            ("builtin.vcpus", "255"),
-            ("builtin.mountQuotaMib", "1"),
-            ("maxConcurrentAgents", "1"),
-        ] {
-            assert_eq!(
-                validate_and_coerce(field, value).unwrap(),
-                serde_json::json!(value.parse::<u64>().unwrap())
-            );
-        }
-    }
-
-    #[test]
-    fn dynamic_config_validators_match_config_loading() {
-        let error =
-            validate_and_coerce("workflows.dynamic.defaultLeader", "claude:: ").unwrap_err();
-        assert_eq!(
-            error,
-            crate::data::config::repo::validate_leader_spec("workflows.dynamic", "claude:: ")
-                .unwrap_err()
-                .to_string()
-        );
-        let error = validate_and_coerce("workflows.dynamic.maxConcurrentSteps", "0").unwrap_err();
-        assert_eq!(
-            error,
-            crate::data::config::repo::validate_dynamic_max_concurrent_steps(
-                "workflows.dynamic",
-                0
-            )
-            .unwrap_err()
-            .to_string()
-        );
-    }
-
-    // ── validate_and_coerce: dynamicWorkflows (WI-0095) ─────────────────────
-
-    #[test]
-    fn validate_and_coerce_max_concurrent_steps_accepts_positive() {
-        let v = validate_and_coerce("workflows.dynamic.maxConcurrentSteps", "3").unwrap();
-        assert_eq!(v, serde_json::json!(3u64));
-    }
-
-    #[test]
-    fn validate_and_coerce_max_concurrent_steps_rejects_zero() {
-        let err = validate_and_coerce("workflows.dynamic.maxConcurrentSteps", "0").unwrap_err();
-        assert!(
-            err.contains("must be >= 1"),
-            "zero must be rejected with the >= 1 message, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_and_coerce_default_leader_valid_shape() {
-        let v = validate_and_coerce("workflows.dynamic.defaultLeader", "claude::claude-opus-4-8")
-            .unwrap();
-        assert_eq!(
-            v,
-            serde_json::Value::String("claude::claude-opus-4-8".into())
-        );
-    }
-
-    #[test]
-    fn validate_and_coerce_default_leader_invalid_shape() {
-        let err = validate_and_coerce("workflows.dynamic.defaultLeader", "claude").unwrap_err();
-        assert!(
-            err.contains("expected agent::model"),
-            "malformed leader must be rejected, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_and_coerce_rejects_agents_to_models_map() {
-        // The map field itself cannot be written through `config set`;
-        // without this rejection the coerced string would fail RepoConfig
-        // deserialization and the set would silently write nothing.
-        let err =
-            validate_and_coerce("workflows.dynamic.agentsToModels", "claude:foo").unwrap_err();
-        assert!(
-            err.contains("workflows.dynamic.agentsToModels.claude"),
-            "the map rejection must point at the per-agent syntax, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_and_coerce_agents_to_models_entry_parses_comma_list() {
-        let v = validate_and_coerce(
-            "workflows.dynamic.agentsToModels.claude",
-            "opus-4-8, sonnet-4-6",
-        )
-        .unwrap();
-        assert_eq!(v, serde_json::json!(["opus-4-8", "sonnet-4-6"]));
-    }
-
-    #[test]
-    fn validate_and_coerce_agents_to_models_entry_empty_value_means_remove() {
-        let v = validate_and_coerce("workflows.dynamic.agentsToModels.claude", "  ").unwrap();
-        assert!(
-            v.is_null(),
-            "an empty model list must coerce to Null (entry removal), got: {v:?}"
-        );
-    }
-
-    /// The map key *is* an agent name, so the rule and the wording are
-    /// `AgentName`'s (F-20). Asserting the same message `AgentName::new`
-    /// produces is what keeps this from becoming a fourth copy of the rule.
-    #[test]
-    fn validate_and_coerce_agents_to_models_entry_rejects_bad_agent_key() {
-        let err =
-            validate_and_coerce("workflows.dynamic.agentsToModels.bad name!", "m1").unwrap_err();
-        let from_layer_0 = crate::data::session::AgentName::new("bad name!")
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            err, from_layer_0,
-            "the rejection must be Layer 0's, verbatim"
-        );
-    }
-
-    /// The whole round trip a TUI user takes: a key the dialog accepts is one
-    /// `config set` accepts, and a key it rejects is one `config set` rejects.
-    #[test]
-    fn the_dialogs_key_rule_and_the_writers_key_rule_are_the_same_rule() {
-        for key in ["claude", "gpt-4", "my_agent", "a", &"x".repeat(64)] {
-            assert!(
-                crate::data::session::AgentName::new(key).is_ok(),
-                "{key} must be accepted"
-            );
-            assert!(
-                validate_and_coerce(&format!("workflows.dynamic.agentsToModels.{key}"), "m1")
-                    .is_ok(),
-                "{key} must be writable"
-            );
-        }
-        // An empty key never forms a field name at all — `is_valid_field_name`
-        // rejects `workflows.dynamic.agentsToModels.` before validation — so
-        // only non-empty rejections are comparable here.
-        for key in ["bad name!", "a/b", &"x".repeat(65)] {
-            assert!(
-                crate::data::session::AgentName::new(key).is_err(),
-                "{key:?} must be rejected"
-            );
-            assert!(
-                validate_and_coerce(&format!("workflows.dynamic.agentsToModels.{key}"), "m1")
-                    .is_err(),
-                "{key:?} must not be writable"
-            );
-        }
-        assert!(crate::data::session::AgentName::new("").is_err());
-        assert!(resolve_config_field("workflows.dynamic.agentsToModels.").is_none());
-    }
-
-    // ── validate_and_coerce: workflows.dynamic.guidance (WI-0099) ────────────
-
-    #[test]
-    fn validate_and_coerce_rejects_bare_guidance_field() {
-        // The bare array field can't be set as a single string; the coerced
-        // string would fail RepoConfig deserialization and silently write
-        // nothing, so it must be rejected up front pointing at the per-index
-        // syntax.
-        let err =
-            validate_and_coerce("workflows.dynamic.guidance", "some instruction").unwrap_err();
-        assert!(
-            err.contains("workflows.dynamic.guidance.0"),
-            "the list rejection must point at the per-index syntax, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_and_coerce_guidance_entry_valid() {
-        let v = validate_and_coerce(
-            "workflows.dynamic.guidance.0",
-            "never spawn more than two agents in parallel",
-        )
-        .unwrap();
-        assert_eq!(
-            v,
-            serde_json::Value::String("never spawn more than two agents in parallel".into())
-        );
-    }
-
-    #[test]
-    fn validate_and_coerce_guidance_entry_is_not_comma_split() {
-        // Unlike agentsToModels, a guidance entry is one free-form string that
-        // may itself contain commas.
-        let v =
-            validate_and_coerce("workflows.dynamic.guidance.0", "do X, then Y, then Z").unwrap();
-        assert_eq!(v, serde_json::Value::String("do X, then Y, then Z".into()));
-    }
-
-    #[test]
-    fn validate_and_coerce_guidance_entry_empty_value_means_remove() {
-        let v = validate_and_coerce("workflows.dynamic.guidance.0", "   ").unwrap();
-        assert!(
-            v.is_null(),
-            "an empty/whitespace-only guidance value must coerce to Null (entry removal), got: {v:?}"
-        );
-    }
-
-    #[test]
-    fn validate_and_coerce_guidance_entry_rejects_over_length_cap() {
-        let too_long = "a".repeat(crate::data::config::repo::GUIDANCE_MAX_ENTRY_LEN + 1);
-        let err = validate_and_coerce("workflows.dynamic.guidance.0", &too_long).unwrap_err();
-        assert!(
-            err.contains("maximum"),
-            "an over-length guidance entry must be rejected, got: {err}"
-        );
-    }
-
-    // ── map/list member field name validation / scope ───────────────────────
-
-    fn resolve_config_field_ok(name: &str) -> bool {
-        resolve_config_field(name).is_some()
-    }
-
-    fn resolve_scope(name: &str) -> Option<FieldScope> {
-        resolve_config_field(name).map(|resolved| resolved.spec.scope)
-    }
-
-    fn resolved_shape(name: &str) -> Option<ConfigRowShape> {
-        resolve_config_field(name).map(|resolved| resolved.shape)
-    }
-
-    #[test]
-    fn agents_to_models_entries_are_valid_fields_in_both_scopes() {
-        assert!(resolve_config_field_ok(
-            "workflows.dynamic.agentsToModels.claude"
-        ));
-        assert_eq!(
-            resolve_scope("workflows.dynamic.agentsToModels.claude"),
-            Some(FieldScope::Both)
-        );
-        // The bare map is a header, not a member; deeper paths are neither.
-        assert_eq!(
-            resolved_shape("workflows.dynamic.agentsToModels.claude"),
-            Some(ConfigRowShape::MapEntry)
-        );
-        assert!(resolved_shape("workflows.dynamic.agentsToModels").is_some_and(|s| s.is_header()));
-        assert!(!resolve_config_field_ok(
-            "workflows.dynamic.agentsToModels.a.b"
-        ));
-    }
-
-    #[test]
-    fn guidance_entries_are_valid_fields_in_both_scopes() {
-        assert!(resolve_config_field_ok("workflows.dynamic.guidance.0"));
-        assert!(resolve_config_field_ok("workflows.dynamic.guidance.41"));
-        assert_eq!(
-            resolve_scope("workflows.dynamic.guidance.0"),
-            Some(FieldScope::Both)
-        );
-        // The bare list is a header; non-numeric or dotted trailing segments
-        // are not per-index guidance entries.
-        assert!(resolved_shape("workflows.dynamic.guidance").is_some_and(|s| s.is_header()));
-        assert!(!resolve_config_field_ok("workflows.dynamic.guidance.abc"));
-        assert!(!resolve_config_field_ok("workflows.dynamic.guidance.0.1"));
-    }
-
-    // ── updated_config (silent-save-failure fix) ─────────────────────────────
-
-    #[test]
-    fn updated_config_applies_dynamic_workflows_fields() {
-        let cfg = crate::data::config::repo::RepoConfig::default();
-        let updated = updated_config(
-            &cfg,
-            "workflows.dynamic.defaultLeader",
-            serde_json::Value::String("claude::claude-opus-4-8".into()),
-        )
-        .expect("a valid defaultLeader must round-trip through the schema");
-        assert_eq!(
-            updated
-                .dynamic_workflows_block()
-                .unwrap()
-                .map(|(cfg, _)| cfg.clone())
-                .expect("dynamicWorkflows block must be created")
-                .default_leader
-                .as_deref(),
-            Some("claude::claude-opus-4-8")
-        );
-    }
-
-    #[test]
-    fn updated_config_reports_schema_mismatch_instead_of_dropping_edit() {
-        // `workItems` is an object in the schema; a plain string used to be
-        // silently discarded (nothing saved, no error shown). The mismatch
-        // must now surface a reason naming the field.
-        let cfg = crate::data::config::repo::RepoConfig::default();
-        let err = updated_config(&cfg, "workItems", serde_json::Value::String("oops".into()))
-            .expect_err("schema-mismatched values must be rejected, not ignored");
-        assert!(
-            err.contains("workItems"),
-            "the reason must name the field: {err}"
-        );
-    }
-
-    #[test]
-    fn builtin_builder_cli_set_round_trips_as_nested_boolean() {
-        let cfg = crate::data::config::repo::RepoConfig::default();
-        let edited = updated_config(
-            &cfg,
-            "builtin.builder.enabled",
-            validate_and_coerce("builtin.builder.enabled", "true").unwrap(),
-        )
-        .unwrap();
-        let json = serde_json::to_value(&edited).unwrap();
-        assert_eq!(json["builtin"]["builder"]["enabled"], true);
-        assert!(json.get("builtin.builder.enabled").is_none());
-        assert_eq!(
-            validate_and_coerce("builtin.builder.enabled", "false").unwrap(),
-            serde_json::json!(false)
-        );
-        assert!(validate_and_coerce("builtin.builder.enabled", "yes")
-            .unwrap_err()
-            .contains("builtin.builder.enabled"));
-    }
-
-    #[test]
-    fn work_items_fields_are_written_and_read_under_the_work_items_key() {
-        let cfg = crate::data::config::repo::RepoConfig::default();
-        let edited = updated_config(&cfg, "work_items.dir", serde_json::json!("x")).unwrap();
-        let edited =
-            updated_config(&edited, "work_items.template", serde_json::json!("t.md")).unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(
-            edited.work_items_dir(tmp.path()),
-            Some(tmp.path().join("x"))
-        );
-        let json = serde_json::to_value(&edited).unwrap();
-        assert_eq!(json["workItems"]["template"], "t.md");
-        assert!(json.get("work_items").is_none(), "{json}");
-
-        let spec = field_spec("work_items.dir").unwrap();
-        let row = scalar_row(spec, &serde_json::json!({}), &json);
-        assert_eq!(row.repo_value.as_deref(), Some("x"));
-    }
-
-    // ── remove_config_field / apply_config_field ─────────────────────────────
-
-    #[test]
-    fn apply_config_field_null_removes_nested_entry() {
-        let mut json = serde_json::json!({
-            "dynamicWorkflows": {
-                "agentsToModels": {"claude": ["a"], "codex": ["b"]}
+        .await
+    else {
+        return "backend: daemon (unavailable)".into();
+    };
+    let Some(engine) = status.features.get("engine") else {
+        return "backend: daemon (engine off)".into();
+    };
+    use crate::command::daemon_api::FeatureState;
+    if matches!(engine.state, FeatureState::Off | FeatureState::Draining) {
+        return format!(
+            "backend: daemon (engine {})",
+            match engine.state {
+                FeatureState::Off => "off",
+                FeatureState::Draining => "draining",
+                _ => unreachable!(),
             }
-        });
-        apply_config_field(
-            &mut json,
-            "dynamicWorkflows.agentsToModels.claude",
-            serde_json::Value::Null,
-        );
-        assert!(
-            json["dynamicWorkflows"]["agentsToModels"]
-                .get("claude")
-                .is_none(),
-            "Null must remove the entry: {json}"
-        );
-        assert_eq!(
-            json["dynamicWorkflows"]["agentsToModels"]["codex"],
-            serde_json::json!(["b"]),
-            "sibling entries must be preserved"
         );
     }
-
-    #[test]
-    fn remove_config_field_missing_path_is_noop() {
-        let mut json = serde_json::json!({"agent": "claude"});
-        remove_config_field(&mut json, "dynamicWorkflows.agentsToModels.claude");
-        assert_eq!(json, serde_json::json!({"agent": "claude"}));
-    }
-
-    #[test]
-    fn config_field_value_renders_string_arrays_comma_separated() {
-        // List values display in the same shape the user types them, so
-        // inline edits round-trip.
-        let json = serde_json::json!({"yoloDisallowedTools": ["rm", "curl"]});
-        assert_eq!(
-            config_field_value(&json, "yoloDisallowedTools"),
-            Some("rm, curl".to_string())
-        );
-    }
-
-    // ── collect_config_rows: dynamicWorkflows (WI-0095) ─────────────────────
-
-    #[test]
-    fn collect_config_rows_includes_dynamic_workflows_scalar_fields() {
-        let global = serde_json::json!({});
-        let repo = serde_json::json!({
-            "workflows": { "dynamic": {
-                "defaultLeader": "claude::claude-opus-4-8",
-                "maxConcurrentSteps": 3
-            }}
-        });
-        let rows = collect_config_rows(&global, &repo);
-
-        let leader_row = rows
-            .iter()
-            .find(|r| r.field == "workflows.dynamic.defaultLeader")
-            .expect("flattened workflows.dynamic.defaultLeader row must be present");
-        assert_eq!(
-            leader_row.repo_value.as_deref(),
-            Some("claude::claude-opus-4-8")
-        );
-        assert!(!leader_row.read_only, "defaultLeader stays inline-editable");
-
-        let steps_row = rows
-            .iter()
-            .find(|r| r.field == "workflows.dynamic.maxConcurrentSteps")
-            .expect("flattened workflows.dynamic.maxConcurrentSteps row must be present");
-        assert_eq!(steps_row.repo_value.as_deref(), Some("3"));
-        assert!(
-            !steps_row.read_only,
-            "maxConcurrentSteps stays inline-editable"
-        );
-    }
-
-    #[test]
-    fn collect_config_rows_expands_agents_to_models_into_per_agent_rows() {
-        let global = serde_json::json!({});
-        // The repo view `config show` reads (a legacy block is adopted into
-        // `workflows.dynamic` before rows are collected).
-        let repo = serde_json::json!({
-            "workflows": {"dynamic": {
-                "agentsToModels": {
-                    "claude": ["claude-opus-4-8", "claude-sonnet-4-6"],
-                    "codex": ["codex-mini-latest"]
-                }
-            }}
-        });
-        let rows = collect_config_rows(&global, &repo);
-
-        // The map itself appears as a read-only summary row (never a raw
-        // JSON blob), so the mapping is discoverable even when empty.
-        let summary_row = rows
-            .iter()
-            .find(|r| r.field == "workflows.dynamic.agentsToModels")
-            .expect("agentsToModels summary row must be present");
-        assert_eq!(summary_row.repo_value.as_deref(), Some("2 agents mapped"));
-        assert!(summary_row.read_only, "the summary row is not editable");
-
-        let claude_row = rows
-            .iter()
-            .find(|r| r.field == "workflows.dynamic.agentsToModels.claude")
-            .expect("per-agent row for claude must be present");
-        assert_eq!(
-            claude_row.repo_value.as_deref(),
-            Some("claude-opus-4-8, claude-sonnet-4-6")
-        );
-        assert!(
-            !claude_row.read_only,
-            "agentsToModels per-agent rows must be inline-editable"
-        );
-        assert!(
-            claude_row.global_writable && claude_row.repo_writable,
-            "per-agent rows are writable in both scopes"
-        );
-
-        let codex_row = rows
-            .iter()
-            .find(|r| r.field == "workflows.dynamic.agentsToModels.codex")
-            .expect("per-agent row for codex must be present");
-        assert_eq!(codex_row.repo_value.as_deref(), Some("codex-mini-latest"));
-    }
-
-    #[test]
-    fn collect_config_rows_shows_empty_map_summary_when_unset() {
-        let rows = collect_config_rows(&serde_json::json!({}), &serde_json::json!({}));
-        let summary_row = rows
-            .iter()
-            .find(|r| r.field == "workflows.dynamic.agentsToModels")
-            .expect("summary row must be present even with no mapping configured");
-        assert_eq!(summary_row.repo_value.as_deref(), Some("(none)"));
-    }
-
-    // ── removed_field_message ────────────────────────────────────────────────
-
-    #[test]
-    fn env_passthrough_is_recognized_as_removed_field() {
-        let msg = removed_field_message("envPassthrough")
-            .expect("envPassthrough must be flagged as a removed field");
-        assert!(
-            msg.contains("env(VAR_NAME)") || msg.contains("overlays"),
-            "removed-field message must steer users to the env() overlay form; got: {msg}"
-        );
-    }
-
-    #[test]
-    fn unknown_field_returns_no_removed_message() {
-        assert!(removed_field_message("agent").is_none());
-        assert!(removed_field_message("notARealField").is_none());
-    }
-
-    #[test]
-    fn env_passthrough_is_not_in_valid_fields() {
-        let names = valid_field_names();
-        assert!(
-            !names.contains(&"envPassthrough"),
-            "envPassthrough must be removed from VALID_CONFIG_FIELDS"
-        );
-    }
-
-    // ── field_scope ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn field_scope_global_only() {
-        assert_eq!(resolve_scope("runtime"), Some(FieldScope::GlobalOnly));
-    }
-
-    #[test]
-    fn field_scope_repo_only() {
-        assert_eq!(resolve_scope("work_items.dir"), Some(FieldScope::RepoOnly));
-    }
-
-    #[test]
-    fn field_scope_both() {
-        assert_eq!(
-            resolve_scope("terminal_scrollback_lines"),
-            Some(FieldScope::Both)
-        );
-        assert_eq!(resolve_scope("agent"), Some(FieldScope::RepoOnly));
-    }
-
-    // ── field_suggestions ─────────────────────────────────────────────────────
-
-    #[test]
-    fn field_suggestions_finds_close_match() {
-        let names = valid_field_names();
-        let result = field_suggestions("agnet", &names);
-        // "agnet" is distance 2 from "agent" (two transpositions); should appear.
-        assert!(
-            result.contains(&"agent"),
-            "suggestions must contain 'agent' for input 'agnet': {result:?}"
-        );
-    }
-
-    #[test]
-    fn field_suggestions_empty_when_no_close_match() {
-        let names = valid_field_names();
-        let result = field_suggestions("zzzzzzzzzzz", &names);
-        assert!(
-            result.is_empty(),
-            "suggestions must be empty for very distant input"
-        );
-    }
-
-    #[test]
-    fn field_suggestions_sorted_by_distance() {
-        let names = valid_field_names();
-        // "runtim" is distance 1 from "runtime" and distance 2+ from all others.
-        let result = field_suggestions("runtim", &names);
-        if result.len() >= 2 {
-            // First result must be "runtime" (closest match).
-            assert_eq!(
-                result[0], "runtime",
-                "closest match must be first: {result:?}"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod edit_loop_tests {
-    use super::*;
-    use std::sync::{Arc, Mutex};
-
-    /// Scripted frontend for the interactive `config show` edit loop: returns
-    /// the next canned response on each `present_config_table` call and
-    /// records the rejection (if any) it was shown alongside the table.
-    struct ScriptedConfigFrontend {
-        responses: Vec<Option<ConfigEditRequest>>,
-        seen_rejections: Arc<Mutex<Vec<Option<ConfigEditRejection>>>>,
-    }
-
-    impl crate::data::message::UserMessageSink for ScriptedConfigFrontend {
-        fn write_message(&mut self, _msg: crate::data::message::UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-
-    impl ConfigCommandFrontend for ScriptedConfigFrontend {
-        fn present_config_table(
-            &mut self,
-            _rows: &[ConfigFieldRow],
-            rejected: Option<&ConfigEditRejection>,
-        ) -> Result<Option<ConfigEditRequest>, CommandError> {
-            self.seen_rejections.lock().unwrap().push(rejected.cloned());
-            Ok(self.responses.remove(0))
-        }
-    }
-
-    fn open_session(git_root: &std::path::Path) -> crate::data::session::Session {
-        crate::data::session::Session::for_tests(git_root)
-    }
-
-    #[tokio::test]
-    async fn sensitive_get_set_and_show_outcomes_are_masked_without_changing_the_saved_key() {
-        for key in ["sk-secret-value-abcdefgh", "1é€€€€€€€"] {
-            let tmp = tempfile::tempdir().unwrap();
-            let home = tmp.path().join("home");
-            let session = crate::data::session::Session::for_tests_isolated(tmp.path(), &home);
-            let frontend = || {
-                Box::new(ScriptedConfigFrontend {
-                    responses: vec![None],
-                    seen_rejections: Default::default(),
-                })
-            };
-            let notices = Arc::<ConfigNotices>::default();
-            let outcome = ConfigCommand::new(
-                ConfigSubcommand::Set(ConfigSetFlags {
-                    field: "remote.defaultAPIKey".into(),
-                    value: key.into(),
-                    global: true,
-                }),
-                notices.clone(),
-                session.clone(),
-            )
-            .run_with_frontend(frontend())
-            .await
-            .unwrap();
-            let ConfigOutcome::Set(set) = outcome else {
-                panic!("expected set")
-            };
-            assert_ne!(set.value, key);
-            let saved =
-                crate::data::config::global::GlobalConfig::load_with(session.env()).unwrap();
-            assert_eq!(
-                saved.remote.as_ref().unwrap().default_api_key.as_deref(),
-                Some(key)
-            );
-            let session = crate::data::session::Session::for_tests_isolated(tmp.path(), &home);
-            let outcome = ConfigCommand::new(
-                ConfigSubcommand::Get(ConfigGetFlags {
-                    field: "remote.defaultAPIKey".into(),
-                }),
-                notices.clone(),
-                session.clone(),
-            )
-            .run_with_frontend(frontend())
-            .await
-            .unwrap();
-            let ConfigOutcome::Get(get) = outcome else {
-                panic!("expected get")
-            };
-            assert_eq!(get.global_value.as_deref(), Some(set.value.as_str()));
-            assert_eq!(get.effective_value, get.global_value);
-            let outcome =
-                ConfigCommand::new(ConfigSubcommand::Show(ConfigShowFlags {}), notices, session)
-                    .run_with_frontend(frontend())
-                    .await
-                    .unwrap();
-            let ConfigOutcome::Show(show) = outcome else {
-                panic!("expected show")
-            };
-            let row = show
-                .rows
-                .iter()
-                .find(|row| row.field == "remote.defaultAPIKey")
-                .unwrap();
-            assert_eq!(row.global_value, get.global_value);
-        }
-    }
-
-    #[tokio::test]
-    async fn show_edit_loop_preserves_rejected_input_and_persists_valid_edit() {
-        let tmp = tempfile::tempdir().unwrap();
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let frontend = ScriptedConfigFrontend {
-            responses: vec![
-                // 1: invalid leader — must come back as a rejection carrying
-                // the typed value, not silently vanish.
-                Some(ConfigEditRequest {
-                    field: "workflows.dynamic.defaultLeader".into(),
-                    value: "claude".into(),
-                    global: false,
-                }),
-                // 2: corrected value — must persist to .awman/config.json.
-                Some(ConfigEditRequest {
-                    field: "workflows.dynamic.defaultLeader".into(),
-                    value: "claude::claude-opus-4-8".into(),
-                    global: false,
-                }),
-                // 3: dismiss the dialog.
-                None,
-            ],
-            seen_rejections: seen.clone(),
-        };
-
-        let cmd = ConfigCommand::new(
-            ConfigSubcommand::Show(ConfigShowFlags {}),
-            Default::default(),
-            open_session(tmp.path()),
-        );
-        cmd.run_with_frontend(Box::new(frontend))
-            .await
-            .expect("the edit loop must not error on a rejected value");
-
-        let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 3, "the table must be presented three times");
-        assert!(seen[0].is_none(), "no rejection on first present");
-        let rej = seen[1]
-            .as_ref()
-            .expect("an invalid edit must be re-presented as a rejection");
-        assert_eq!(rej.field, "workflows.dynamic.defaultLeader");
-        assert_eq!(rej.value, "claude", "the user's input must be preserved");
-        assert!(
-            rej.reason.contains("expected agent::model"),
-            "the rejection must carry the validation reason: {}",
-            rej.reason
-        );
-        assert!(
-            seen[2].is_none(),
-            "a successful save must not carry a rejection"
-        );
-
-        let cfg = crate::data::config::repo::RepoConfig::load(tmp.path())
-            .expect("the saved repo config must load cleanly");
-        assert_eq!(
-            cfg.dynamic_workflows_block()
-                .unwrap()
-                .map(|(cfg, _)| cfg.clone())
-                .expect("dynamicWorkflows must be persisted")
-                .default_leader
-                .as_deref(),
-            Some("claude::claude-opus-4-8"),
-            "the corrected edit must be persisted to config.json"
-        );
-    }
-
-    #[tokio::test]
-    async fn tui_edit_loop_round_trips_boolean_and_numeric_looking_strings() {
-        for value in ["123", "true", "false"] {
-            let tmp = tempfile::tempdir().unwrap();
-            let frontend = ScriptedConfigFrontend {
-                responses: vec![
-                    Some(ConfigEditRequest {
-                        field: "work_items.dir".into(),
-                        value: value.into(),
-                        global: false,
-                    }),
-                    None,
-                ],
-                seen_rejections: Arc::new(Mutex::new(Vec::new())),
-            };
-            ConfigCommand::new(
-                ConfigSubcommand::Show(ConfigShowFlags {}),
-                Default::default(),
-                open_session(tmp.path()),
-            )
-            .run_with_frontend(Box::new(frontend))
-            .await
-            .expect("the TUI edit should persist a valid string");
-
-            let config: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(crate::data::config::repo::RepoConfig::path(tmp.path())).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(config["workItems"]["dir"], value);
-        }
-    }
-
-    #[tokio::test]
-    async fn set_reports_schema_mismatch_instead_of_silent_success() {
-        let tmp = tempfile::tempdir().unwrap();
-        let frontend = ScriptedConfigFrontend {
-            responses: vec![],
-            seen_rejections: Arc::new(Mutex::new(Vec::new())),
-        };
-
-        let cmd = ConfigCommand::new(
-            ConfigSubcommand::Set(ConfigSetFlags {
-                field: "workItems".into(),
-                value: "not-an-object".into(),
-                global: false,
-            }),
-            Default::default(),
-            open_session(tmp.path()),
-        );
-        let err = cmd
-            .run_with_frontend(Box::new(frontend))
-            .await
-            .expect_err("a value the schema cannot hold must fail the command");
-        assert!(
-            err.to_string().contains("workItems"),
-            "the error must name the field: {err}"
-        );
-        assert!(
-            !crate::data::config::repo::RepoConfig::path(tmp.path()).exists(),
-            "nothing must be written when the set fails"
-        );
-    }
-}
-
-#[cfg(test)]
-mod agent_scope_tests {
-    use super::*;
-    use crate::data::session::Session;
-
-    const DEF: &str =
-        "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[image]\ninstall=['x']\n";
-
-    fn fixture() -> (tempfile::TempDir, Session) {
-        let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("global");
-        std::fs::create_dir_all(home.join("agents")).unwrap();
-        std::fs::create_dir_all(root.path().join(".awman/agents")).unwrap();
-        std::fs::write(root.path().join(".awman/agents/repoonly.toml"), DEF).unwrap();
-        std::fs::write(home.join("agents/globalonly.toml"), DEF).unwrap();
-        let session = Session::for_tests_isolated(root.path(), &home);
-        (root, session)
-    }
-
-    fn accepts(session: &Session, value: &str, global: bool) -> Result<(), String> {
-        check_agent_known(value, &agent_listing_for_scope(session, global), global)
-    }
-
-    #[test]
-    fn repo_scope_accepts_first_party_repo_and_global_custom() {
-        let (_r, s) = fixture();
-        for v in ["claude", "antigravity", "repoonly", "globalonly"] {
-            assert!(accepts(&s, v, false).is_ok(), "{v}");
-        }
-    }
-
-    #[test]
-    fn global_scope_accepts_first_party_and_global_custom_only() {
-        let (_r, s) = fixture();
-        for v in ["codex", "globalonly"] {
-            assert!(accepts(&s, v, true).is_ok(), "{v}");
-        }
-        let err = accepts(&s, "repoonly", true).unwrap_err();
-        assert!(err.contains("not a known agent for global config"), "{err}");
-        assert!(err.ends_with("awman new agent repoonly --global"), "{err}");
-    }
-
-    #[test]
-    fn unknown_name_lists_valid_agents_and_the_new_agent_hint() {
-        let (_r, s) = fixture();
-        let err = accepts(&s, "nope", false).unwrap_err();
-        assert!(err.contains("not a known agent for repo config"));
-        assert!(err.contains("claude") && err.contains("repoonly") && err.contains("globalonly"));
-        assert!(err.ends_with("awman new agent nope"), "{err}");
-    }
-
-    #[test]
-    fn default_agent_field_is_checked_like_agent() {
-        assert!(is_agent_field("agent") && is_agent_field("default_agent"));
-        assert!(!is_agent_field("model"));
-        // Shape check stays in validate_and_coerce.
-        assert!(validate_and_coerce("default_agent", "pi").is_ok());
-        assert!(validate_and_coerce("default_agent", "Bad Name").is_err());
-    }
-
-    #[test]
-    fn removed_agent_values_constant_is_gone() {
-        let src = include_str!("config.rs");
-        assert!(!src.contains(concat!("VALID_AGENT", "_VALUES")));
-    }
-}
-
-#[cfg(test)]
-mod wi0150_command_tests {
-    use super::*;
-    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
-    use crate::data::message::UserMessage;
-    use crate::data::session::Session;
-
-    struct MigrationFrontend(MigrateChoice);
-    impl crate::data::message::UserMessageSink for MigrationFrontend {
-        fn write_message(&mut self, _msg: UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-    impl ConfigCommandFrontend for MigrationFrontend {
-        fn present_config_table(
-            &mut self,
-            _rows: &[ConfigFieldRow],
-            _rejected: Option<&ConfigEditRejection>,
-        ) -> Result<Option<ConfigEditRequest>, CommandError> {
-            Ok(None)
-        }
-        fn confirm_config_migration(
-            &mut self,
-            _prompt: &Prompt<MigrateChoice>,
-        ) -> Result<MigrateChoice, CommandError> {
-            Ok(self.0)
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct RecordingFrontend {
-        messages: std::sync::Arc<std::sync::Mutex<Vec<UserMessage>>>,
-    }
-    impl crate::data::message::UserMessageSink for RecordingFrontend {
-        fn write_message(&mut self, msg: UserMessage) {
-            self.messages.lock().unwrap().push(msg);
-        }
-        fn replay_queued(&mut self) {}
-    }
-    impl ConfigCommandFrontend for RecordingFrontend {
-        fn present_config_table(
-            &mut self,
-            _rows: &[ConfigFieldRow],
-            _rejected: Option<&ConfigEditRejection>,
-        ) -> Result<Option<ConfigEditRequest>, CommandError> {
-            Ok(None)
-        }
-    }
-
-    fn session(root: &std::path::Path, home: &std::path::Path) -> Session {
-        Session::for_tests_with_env(
-            root,
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, home.to_str().unwrap())]),
-        )
-    }
-    fn legacy_repo(root: &std::path::Path) -> std::path::PathBuf {
-        let path = crate::data::config::repo::RepoConfig::path(root);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &path,
-            "{\n  \"agent\": \"claude\",\n  \"dynamicWorkflows\": {\"guidance\":[\"old\"]}\n}\n",
-        )
-        .unwrap();
-        path
-    }
-    fn flags(yes: bool, dry_run: bool, global: bool, non_interactive: bool) -> ConfigMigrateFlags {
-        ConfigMigrateFlags {
-            yes,
-            dry_run,
-            global,
-            non_interactive,
-        }
-    }
-
-    /// The notices handle is the command's only tie to its host: the
-    /// once-per-repo warning follows the handle it was given, so commands
-    /// sharing one warn once and a fresh handle warns again.
-    #[tokio::test]
-    async fn config_commands_warn_once_per_notices_handle() {
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        legacy_repo(root.path());
-        let frontend = RecordingFrontend::default();
-        let shared = Arc::<ConfigNotices>::default();
-        for notices in [shared.clone(), shared, Default::default()] {
-            ConfigCommand::new(
-                ConfigSubcommand::Show(ConfigShowFlags {}),
-                notices,
-                session(root.path(), home.path()),
-            )
-            .run_with_frontend(Box::new(frontend.clone()))
-            .await
-            .unwrap();
-        }
-        let warnings = frontend
-            .messages
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|message| message.level == MessageLevel::Warning)
-            .count();
-        assert_eq!(warnings, 2);
-    }
-
-    #[test]
-    fn config_migrate_prompt_accept_applies_migration() {
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let path = legacy_repo(root.path());
-        let session = session(root.path(), home.path());
-        let result = run_migrate(
-            &session,
-            &flags(false, false, false, false),
-            &mut MigrationFrontend(MigrateChoice::Move),
-        )
-        .unwrap();
-        assert!(result.applied);
-        assert!(std::fs::read_to_string(path).unwrap().contains("workflows"));
-    }
-
-    #[test]
-    fn config_migrate_cancel_leaves_file_byte_for_byte_unchanged() {
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let path = legacy_repo(root.path());
-        let before = std::fs::read(&path).unwrap();
-        let session = session(root.path(), home.path());
-        let err = run_migrate(
-            &session,
-            &flags(false, false, false, false),
-            &mut MigrationFrontend(MigrateChoice::Cancel),
-        )
-        .unwrap_err();
-        assert_eq!(err.exit_code(), 130);
-        assert_eq!(std::fs::read(path).unwrap(), before);
-    }
-
-    #[test]
-    fn config_migrate_yes_applies_without_prompt() {
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        legacy_repo(root.path());
-        let session = session(root.path(), home.path());
-        assert!(
-            run_migrate(
-                &session,
-                &flags(true, false, false, true),
-                &mut MigrationFrontend(MigrateChoice::Cancel)
-            )
-            .unwrap()
-            .applied
-        );
-    }
-
-    #[test]
-    fn config_migrate_dry_run_previews_without_writing() {
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let path = legacy_repo(root.path());
-        let before = std::fs::read(&path).unwrap();
-        let session = session(root.path(), home.path());
-        let result = run_migrate(
-            &session,
-            &flags(false, true, false, false),
-            &mut MigrationFrontend(MigrateChoice::Move),
-        )
-        .unwrap();
-        assert!(result.dry_run && !result.applied && !result.preview.is_empty());
-        assert_eq!(std::fs::read(path).unwrap(), before);
-    }
-
-    #[test]
-    fn config_migrate_non_interactive_without_yes_exits_two() {
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        legacy_repo(root.path());
-        let session = session(root.path(), home.path());
-        let err = run_migrate(
-            &session,
-            &flags(false, false, false, true),
-            &mut MigrationFrontend(MigrateChoice::Move),
-        )
-        .unwrap_err();
-        assert_eq!(err.exit_code(), 2);
-    }
-
-    #[test]
-    fn config_migrate_nothing_to_migrate_exits_zero_and_both_keys_are_refused() {
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join(".awman")).unwrap();
-        std::fs::write(
-            root.path().join(".awman/config.json"),
-            "{\"agent\":\"claude\"}",
-        )
-        .unwrap();
-        let session = session(root.path(), home.path());
-        let result = run_migrate(
-            &session,
-            &flags(false, false, false, false),
-            &mut MigrationFrontend(MigrateChoice::Move),
-        )
-        .unwrap();
-        assert!(result.changes.is_empty() && !result.applied);
-        let path = legacy_repo(root.path());
-        let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        let mut value = value;
-        value["workflows"] = serde_json::json!({"dynamic": {}});
-        std::fs::write(
-            root.path().join(".awman/config.json"),
-            serde_json::to_vec(&value).unwrap(),
-        )
-        .unwrap();
-        let err = run_migrate(
-            &session,
-            &flags(true, false, false, false),
-            &mut MigrationFrontend(MigrateChoice::Move),
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("dynamicWorkflows")
-                && err.to_string().contains("workflows.dynamic")
-        );
-    }
-
-    #[test]
-    fn config_migrate_global_reports_nothing_to_migrate_without_rewriting() {
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let session = session(root.path(), home.path());
-        let path = crate::data::config::global::GlobalConfig::path_with(session.env()).unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "{\"dynamicWorkflows\":{}}").unwrap();
-        let before = std::fs::read(&path).unwrap();
-        let result = run_migrate(
-            &session,
-            &flags(false, false, true, false),
-            &mut MigrationFrontend(MigrateChoice::Move),
-        )
-        .unwrap();
-        assert!(result.changes.is_empty() && result.global_has_never_read_dynamic_workflows);
-        assert_eq!(
-            result.note.as_deref(),
-            Some(GLOBAL_NEVER_READ_DYNAMIC_WORKFLOWS_NOTE)
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-
-        // Absent or null: no note.
-        for raw in ["{}", "{\"dynamicWorkflows\":null}"] {
-            std::fs::write(&path, raw).unwrap();
-            let result = run_migrate(
-                &session,
-                &flags(true, false, true, false),
-                &mut MigrationFrontend(MigrateChoice::Move),
-            )
-            .unwrap();
-            assert!(result.note.is_none(), "{raw}");
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
-        }
-    }
-
-    /// `config set --global` writes the session's global file, never the one
-    /// the process environment points at (they differ here: the session has
-    /// an `AWMAN_CONFIG_HOME` override, the process does not).
-    #[tokio::test]
-    async fn config_set_global_writes_the_session_global_file_only() {
-        // Hold the config-home lock: `process_path` is derived from the process
-        // environment, which concurrent `ConfigHomeGuard` tests repoint.
-        let _env = crate::data::config::env::ProcessEnvGuard::acquire(&[]);
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let session = session(root.path(), home.path());
-        let session_path =
-            crate::data::config::global::GlobalConfig::path_with(session.env()).unwrap();
-        let process_path = crate::data::config::global::GlobalConfig::path().unwrap();
-        assert_ne!(session_path, process_path);
-        let process_before = std::fs::read(&process_path).ok();
-        ConfigCommand::new(
-            ConfigSubcommand::Set(ConfigSetFlags {
-                field: "workflows.dynamic.guidance.0".into(),
-                value: "global note".into(),
-                global: true,
-            }),
-            Default::default(),
-            session,
-        )
-        .run_with_frontend(Box::new(MigrationFrontend(MigrateChoice::Move)))
-        .await
-        .unwrap();
-        let global: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&session_path).unwrap()).unwrap();
-        assert_eq!(global["workflows"]["dynamic"]["guidance"][0], "global note");
-        assert_eq!(std::fs::read(&process_path).ok(), process_before);
-        assert!(!crate::data::config::repo::RepoConfig::path(root.path()).exists());
-    }
-
-    /// An edit that would make the file fail to load is refused and the file
-    /// is left as it was, so the command that made it can still undo it.
-    #[tokio::test]
-    async fn config_set_refuses_an_edit_that_would_make_the_scope_unloadable() {
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let global_path = crate::data::config::global::GlobalConfig::path_with(
-            session(root.path(), home.path()).env(),
-        )
-        .unwrap();
-        std::fs::create_dir_all(global_path.parent().unwrap()).unwrap();
-        let fifty: Vec<String> = (0..50).map(|i| format!("entry {i}")).collect();
-        let raw = serde_json::to_string(
-            &serde_json::json!({"workflows": {"dynamic": {"guidance": fifty}}}),
-        )
-        .unwrap();
-        std::fs::write(&global_path, &raw).unwrap();
-        let repo_path = crate::data::config::repo::RepoConfig::path(root.path());
-        std::fs::create_dir_all(repo_path.parent().unwrap()).unwrap();
-        std::fs::write(&repo_path, &raw).unwrap();
-        for global in [true, false] {
-            let session = session(root.path(), home.path());
-            let err = ConfigCommand::new(
-                ConfigSubcommand::Set(ConfigSetFlags {
-                    field: "workflows.dynamic.guidance.50".into(),
-                    value: "extra".into(),
-                    global,
-                }),
-                Default::default(),
-                session,
-            )
-            .run_with_frontend(Box::new(MigrationFrontend(MigrateChoice::Move)))
-            .await
-            .unwrap_err();
-            assert!(
-                err.to_string().contains("workflows.dynamic.guidance"),
-                "global={global}: {err}"
-            );
-        }
-        assert_eq!(std::fs::read_to_string(&global_path).unwrap(), raw);
-        assert_eq!(std::fs::read_to_string(&repo_path).unwrap(), raw);
-    }
-
-    #[tokio::test]
-    async fn config_set_preserves_string_contents_and_rejects_invalid_typed_values_before_write() {
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let repo_path = crate::data::config::repo::RepoConfig::path(root.path());
-        let global_path = crate::data::config::global::GlobalConfig::path_with(
-            session(root.path(), home.path()).env(),
-        )
-        .unwrap();
-
-        for value in ["123", "true", "false"] {
-            ConfigCommand::new(
-                ConfigSubcommand::Set(ConfigSetFlags {
-                    field: "work_items.dir".into(),
-                    value: value.into(),
-                    global: false,
-                }),
-                Default::default(),
-                session(root.path(), home.path()),
-            )
-            .run_with_frontend(Box::new(MigrationFrontend(MigrateChoice::Move)))
-            .await
-            .unwrap();
-
-            let config: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&repo_path).unwrap()).unwrap();
-            assert_eq!(config["workItems"]["dir"], value);
-        }
-
-        let before = std::fs::read(&repo_path).unwrap();
-        for (field, value, global) in [
-            ("workflows.prerequisites.githubToken.verify", "yes", true),
-            ("builtin.vcpus", "256", false),
-            (
-                "workflows.prerequisites.githubToken.envVars",
-                "lower-case",
-                false,
-            ),
-        ] {
-            let result = ConfigCommand::new(
-                ConfigSubcommand::Set(ConfigSetFlags {
-                    field: field.into(),
-                    value: value.into(),
-                    global,
-                }),
-                Default::default(),
-                session(root.path(), home.path()),
-            )
-            .run_with_frontend(Box::new(MigrationFrontend(MigrateChoice::Move)))
-            .await;
-            assert!(
-                matches!(result, Err(CommandError::InvalidFlagValue { .. })),
-                "{field}={value} must be rejected as invalid input before writing"
-            );
-            assert_eq!(std::fs::read(&repo_path).unwrap(), before);
-            assert!(
-                !global_path.exists(),
-                "{field}={value} must not create global config"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn global_guidance_payload_persists_only_in_isolated_global_config_and_alias_is_usage_error(
-    ) {
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let session = session(root.path(), home.path());
-        let updated = updated_config(
-            session.global_config(),
-            "workflows.dynamic.guidance.0",
-            serde_json::json!("global note"),
-        )
-        .unwrap();
-        updated.save_with(session.env()).unwrap();
-        let global_path =
-            crate::data::config::global::GlobalConfig::path_with(session.env()).unwrap();
-        let global: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(global_path).unwrap()).unwrap();
-        assert_eq!(global["workflows"]["dynamic"]["guidance"][0], "global note");
-        assert!(!crate::data::config::repo::RepoConfig::path(root.path()).exists());
-        let alias = resolve_input_field("dynamicWorkflows.guidance.0").unwrap();
-        assert_eq!(
-            alias.via_alias.unwrap().scope,
-            crate::data::config::fields::FieldScope::RepoOnly
-        );
-        let err = ConfigCommand::new(
-            ConfigSubcommand::Set(ConfigSetFlags {
-                field: "dynamicWorkflows.guidance.0".into(),
-                value: "x".into(),
-                global: true,
-            }),
-            Default::default(),
-            session,
-        )
-        .run_with_frontend(Box::new(MigrationFrontend(MigrateChoice::Move)))
-        .await
-        .unwrap_err();
-        assert_eq!(err.exit_code(), 2);
-        assert!(err.to_string().contains("old repo-only name"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn config_set_old_name_moves_repo_block_and_reports_move() {
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let path = legacy_repo(root.path());
-        let session = session(root.path(), home.path());
-        let frontend = RecordingFrontend::default();
-        let messages = frontend.messages.clone();
-        let result = ConfigCommand::new(
-            ConfigSubcommand::Set(ConfigSetFlags {
-                field: "dynamicWorkflows.guidance.1".into(),
-                value: "new note".into(),
-                global: false,
-            }),
-            Default::default(),
-            session,
-        )
-        .run_with_frontend(Box::new(frontend))
-        .await
-        .unwrap();
-        let ConfigOutcome::Set(outcome) = result else {
-            panic!("expected set outcome")
-        };
-        assert_eq!(outcome.field, "workflows.dynamic.guidance.1");
-        let saved: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(saved.get("dynamicWorkflows").is_none());
-        assert_eq!(saved["workflows"]["dynamic"]["guidance"][1], "new note");
-        let messages = messages.lock().unwrap();
-        assert!(
-            messages
-                .iter()
-                .any(|m| m.text.contains("dynamicWorkflows.*")
-                    && m.text.contains("workflows.dynamic.*")),
-            "{messages:?}"
-        );
-        assert!(
-            messages.iter().any(|m| m.text.contains("also moved")),
-            "{messages:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn config_migrate_refuses_symlink_and_read_only_repo_config() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let target = outside.path().join("config.json");
-        std::fs::write(&target, "{}").unwrap();
-        std::fs::create_dir_all(root.path().join(".awman")).unwrap();
-        std::os::unix::fs::symlink(&target, root.path().join(".awman/config.json")).unwrap();
-        let session = session(root.path(), home.path());
-        let err = run_migrate(
-            &session,
-            &flags(true, false, false, false),
-            &mut MigrationFrontend(MigrateChoice::Move),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("symlink"));
-        std::fs::remove_file(root.path().join(".awman/config.json")).unwrap();
-        let path = legacy_repo(root.path());
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let err = run_migrate(
-            &session,
-            &flags(true, false, false, false),
-            &mut MigrationFrontend(MigrateChoice::Move),
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("read-only"), "{err}");
-    }
-}
-
-#[cfg(test)]
-mod behavior_review_tests {
-    use super::*;
-    use crate::data::config::{global::GlobalConfig, repo::RepoConfig};
-
-    #[test]
-    fn typed_round_trip_rejects_unknown_fields_instead_of_dropping_them() {
-        for (field, value) in [
-            ("api.port", serde_json::json!(7777)),
-            ("api.background", serde_json::json!(true)),
-            ("agent", serde_json::json!("claude")),
-        ] {
-            assert!(
-                updated_config(&GlobalConfig::default(), field, value).is_err(),
-                "{field}"
-            );
-        }
-        for field in ["remote", "remote.defaultAddr", "remote.defaultAPIKey"] {
-            assert!(
-                updated_config(&RepoConfig::default(), field, serde_json::json!("secret")).is_err(),
-                "{field}"
-            );
-        }
-    }
-
-    #[test]
-    fn scope_and_object_edits_are_rejected_before_writing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let session =
-            crate::data::session::Session::for_tests_isolated(tmp.path(), &tmp.path().join("home"));
-        for (field, global) in [
-            ("agent", true),
-            ("remote.defaultAddr", false),
-            ("remote.defaultAPIKey", false),
-            ("api.port", true),
-            ("api.background", true),
-        ] {
-            assert!(
-                write_config_field(&session, field, serde_json::json!("value"), global).is_err(),
-                "{field}"
-            );
-        }
-        for field in [
-            "api",
-            "remote",
-            "workItems",
-            "workflows.prerequisites.githubToken.acquire",
-        ] {
-            assert!(validate_and_coerce(field, "{}")
-                .unwrap_err()
-                .contains("read-only"));
-        }
-        assert!(!RepoConfig::path(tmp.path()).exists());
-    }
-
-    #[test]
-    fn sensitive_values_are_unicode_safe_and_list_validation_uses_the_schema() {
-        let field = "remote.defaultAPIKey";
-        for key in ["1é€€€€€€€", "1é€€€€€€€€€€€€€€€", "sk-secret-value-abcdefgh"]
-        {
-            let masked = mask_sensitive(field, Some(key.into())).unwrap();
-            assert_ne!(masked, key);
-            assert!(!masked.contains("secret-value"));
-        }
-        assert!(
-            validate_and_coerce("workflows.prerequisites.githubToken.envVars", "lower-case")
-                .unwrap_err()
-                .contains("names must match")
-        );
-        assert_eq!(
-            validate_and_coerce("overlays", "one, two").unwrap(),
-            serde_json::json!(["one", "two"])
-        );
-    }
+    let Ok(paths) = crate::data::fs::DataPaths::from_env(session.env()) else {
+        return "backend: daemon (unavailable)".into();
+    };
+    let Ok(Some(endpoint)) = crate::engine::remote::local::discover(&paths.daemon()) else {
+        return "backend: daemon (unavailable)".into();
+    };
+    let persistent = engine.state != FeatureState::Ephemeral;
+    let selection = BackendSelection::Daemon {
+        pid: endpoint.pid,
+        endpoint,
+        enabled: if persistent {
+            EngineEnable::AlreadyOn
+        } else {
+            EngineEnable::Ephemeral
+        },
+        persistent,
+        integrations: Vec::new(),
+    };
+    engine_handoff::describe(&selection)
 }

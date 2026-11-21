@@ -5,7 +5,114 @@
 
 use super::*;
 
+/// Whether a reviewed lease skill resolves using the normal mount search order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillStatus {
+    Installed { default_library: bool },
+    Missing,
+}
+
 impl OverlayEngine {
+    /// Resolve installed skills without opening a session or materializing mounts.
+    /// Keep the search order aligned with skill_overlays_for_with_env.
+    pub fn lease_skill_status(
+        env: &crate::data::config::env::EnvSnapshot,
+        name: &str,
+    ) -> SkillStatus {
+        let resolve = || -> Option<bool> {
+            let dirs = crate::data::fs::skill_dirs::SkillDirs::from_env(env, None).ok()?;
+            let (library, skill) = match name.split_once('/') {
+                Some((library, skill)) => {
+                    validate_skill_reference_segment(library, name).ok()?;
+                    validate_skill_reference_segment(skill, name).ok()?;
+                    (library, Some(skill))
+                }
+                None => {
+                    validate_skill_reference_segment(name, name).ok()?;
+                    let plain = dirs.global_dir().join(name);
+                    if plain.exists() {
+                        return (plain.is_dir()
+                            && plain.join("SKILL.md").is_file()
+                            && skill_path_confined(&dirs.global_dir(), &plain))
+                        .then_some(false);
+                    }
+                    (name, None)
+                }
+            };
+            let library_dir = dirs.library_dir(library);
+            let meta = read_library_meta(&library_dir).ok()?;
+            let subdir = validate_library_subdir(&meta.subdir).ok()?;
+            let mount = library_dir.join(subdir);
+            let path = skill.map_or_else(|| mount.clone(), |skill| mount.join(skill));
+            if !path.is_dir()
+                || !skill_path_confined(&dirs.global_dir(), &path)
+                || skill.is_some() && !path.join("SKILL.md").is_file()
+            {
+                return None;
+            }
+            // The builtin library's identity, as used by skill library pull.
+            Some(library == "awman" && meta.owner == "prettysmartdev" && meta.repo == "awman")
+        };
+        match resolve() {
+            Some(default_library) => SkillStatus::Installed { default_library },
+            None => SkillStatus::Missing,
+        }
+    }
+
+    /// Candidates for registration; admission still reviews each named request.
+    pub fn lease_skill_names(
+        env: &crate::data::config::env::EnvSnapshot,
+        allowed: &[String],
+    ) -> Vec<String> {
+        let mut names = allowed.to_vec();
+        // A library allow entry also authorizes each installed child. Resolve
+        // candidates exactly as admission does, including plain-skill shadows.
+        let mut libraries: Vec<_> = allowed
+            .iter()
+            .filter(|name| !name.contains('/'))
+            .cloned()
+            .collect();
+        libraries.push("awman".into());
+        if let Ok(dirs) = crate::data::fs::skill_dirs::SkillDirs::from_env(env, None) {
+            for name in libraries {
+                let library = dirs.library_dir(&name);
+                if let Ok(meta) = read_library_meta(&library) {
+                    if let Ok(subdir) = validate_library_subdir(&meta.subdir) {
+                        names.push(name.clone());
+                        if let Ok(entries) = std::fs::read_dir(library.join(subdir)) {
+                            for entry in entries.flatten() {
+                                if let Some(child) = entry.file_name().to_str() {
+                                    names.push(format!("{name}/{child}"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        names.retain(|name| {
+            // Registration labels must never advertise a name admission would
+            // reject. Invalid label keys are separately omitted by HostFacts.
+            let valid = crate::data::config::work_servers::validate_allow_skill_entry(name).is_ok();
+            valid
+                && match Self::lease_skill_status(env, name) {
+                    SkillStatus::Missing => false,
+                    SkillStatus::Installed { default_library } => {
+                        default_library
+                            || allowed.iter().any(|entry| {
+                                entry == name
+                                    || name
+                                        .strip_prefix(entry)
+                                        .is_some_and(|tail| tail.starts_with('/'))
+                            })
+                    }
+                }
+        });
+        names.sort();
+        names.dedup();
+        names
+    }
+
     /// Build overlay specs for the global skills directory, mapping it to the
     /// agent's native skills/commands path inside the container (read-only).
     pub fn skill_overlays(
@@ -20,7 +127,7 @@ impl OverlayEngine {
         if !include_all && names.is_empty() {
             return Ok(vec![]);
         }
-        let definition = resolve_definition(agent, git_root);
+        let definition = resolve_definition(&self.snapshot(), agent, git_root);
         self.skill_overlays_for(
             definition.as_deref(),
             agent,
@@ -43,7 +150,7 @@ impl OverlayEngine {
         git_root: &Path,
     ) -> Result<Vec<OverlaySpec>, EngineError> {
         self.skill_overlays_for_with_env(
-            &crate::data::config::env::Env::from_process(),
+            &self.snapshot(),
             definition,
             agent,
             include_all,
@@ -195,5 +302,106 @@ impl OverlayEngine {
             }
             Ok(specs)
         }
+    }
+}
+
+fn skill_path_confined(root: &Path, path: &Path) -> bool {
+    match (root.canonicalize(), path.canonicalize()) {
+        (Ok(root), Ok(path)) => path.starts_with(root),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod lease_skill_tests {
+    use super::*;
+    use crate::data::fs::skill_library::{write_library_meta, SkillLibraryMeta};
+
+    #[test]
+    fn installed_skill_review_matches_mount_resolution_and_verifies_builtin_identity() {
+        let sandbox = awman_test_support::TestSandbox::for_test(awman_test_support::TestCase::component("engine::overlay::skills::lease_skill_tests::installed_skill_review_matches_mount_resolution_and_verifies_builtin_identity"));
+        let env = crate::data::config::env::EnvSnapshot::with_overrides([(
+            "AWMAN_HOME",
+            sandbox.root().join("data").to_string_lossy().into_owned(),
+        )]);
+        let dirs = crate::data::fs::skill_dirs::SkillDirs::from_env(&env, None).unwrap();
+        let library = dirs.library_dir("awman");
+        let skill = library.join("skills/planner");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "planner").unwrap();
+        let mut meta = SkillLibraryMeta {
+            source: "https://github.com/prettysmartdev/awman".into(),
+            owner: "prettysmartdev".into(),
+            repo: "awman".into(),
+            subdir: "skills".into(),
+            sparse: true,
+        };
+        write_library_meta(&library, &meta).unwrap();
+        assert_eq!(
+            OverlayEngine::lease_skill_status(&env, "awman/planner"),
+            SkillStatus::Installed {
+                default_library: true
+            }
+        );
+        assert_eq!(
+            OverlayEngine::lease_skill_names(&env, &[]),
+            ["awman", "awman/planner"]
+        );
+        assert_eq!(
+            OverlayEngine::lease_skill_status(&env, "awman/missing"),
+            SkillStatus::Missing
+        );
+        for name in ["awman/..", "../planner", "awman/a/b"] {
+            assert_eq!(
+                OverlayEngine::lease_skill_status(&env, name),
+                SkillStatus::Missing
+            );
+        }
+        meta.owner = "different-owner".into();
+        write_library_meta(&library, &meta).unwrap();
+        assert_eq!(
+            OverlayEngine::lease_skill_status(&env, "awman/planner"),
+            SkillStatus::Installed {
+                default_library: false
+            }
+        );
+        assert!(OverlayEngine::lease_skill_names(&env, &[]).is_empty());
+        meta.owner = "prettysmartdev".into();
+        write_library_meta(&library, &meta).unwrap();
+        let plain = dirs.global_dir().join("awman");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("SKILL.md"), "local shadow").unwrap();
+        assert_eq!(
+            OverlayEngine::lease_skill_status(&env, "awman"),
+            SkillStatus::Installed {
+                default_library: false
+            }
+        );
+        assert_eq!(
+            OverlayEngine::lease_skill_names(&env, &[]),
+            ["awman/planner"]
+        );
+        assert_eq!(
+            OverlayEngine::lease_skill_names(&env, &["awman".into()]),
+            ["awman", "awman/planner"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cannot_mark_a_skill_outside_the_library_as_installed() {
+        let sandbox = awman_test_support::TestSandbox::for_test(awman_test_support::TestCase::component("engine::overlay::skills::lease_skill_tests::a_symlink_cannot_mark_a_skill_outside_the_library_as_installed"));
+        let env = crate::data::config::env::EnvSnapshot::with_overrides([(
+            "AWMAN_HOME",
+            sandbox.root().join("data").to_string_lossy().into_owned(),
+        )]);
+        let dirs = crate::data::fs::skill_dirs::SkillDirs::from_env(&env, None).unwrap();
+        std::fs::create_dir_all(dirs.global_dir()).unwrap();
+        std::fs::write(sandbox.work().join("SKILL.md"), "outside").unwrap();
+        std::os::unix::fs::symlink(sandbox.work(), dirs.global_dir().join("escape")).unwrap();
+        assert_eq!(
+            OverlayEngine::lease_skill_status(&env, "escape"),
+            SkillStatus::Missing
+        );
     }
 }

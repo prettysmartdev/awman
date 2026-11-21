@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="16" skipped="0" failures="0" errors="0" uuid="5baea77a-644b-41a2-b416-4e17f25c4d0d" timestamp="2026-11-11T21:58:20.783+00:00" time="0.486">
+    <testsuite name="awman" tests="16" skipped="0" errors="0" failures="0">
+        <testcase name="data::clock::tests::clones_share_one_clock_state" classname="awman" timestamp="2026-11-11T21:58:20.784+00:00" time="0.024"/>
+        <testcase name="data::clock::tests::advancing_moves_both_clocks_and_wall_adjustment_is_independent" classname="awman" timestamp="2026-11-11T21:58:20.784+00:00" time="0.024"/>
+        <testcase name="engine::conformance::tests::a_report_without_checks_is_not_a_success" classname="awman" timestamp="2026-11-11T21:58:20.784+00:00" time="0.024"/>
+        <testcase name="engine::conformance::tests::one_failure_makes_the_report_fail_and_is_listed" classname="awman" timestamp="2026-11-11T21:58:20.784+00:00" time="0.025"/>
+        <testcase name="engine::issue::naming_tests::numeric_id_comes_from_the_last_url_segment" classname="awman" timestamp="2026-11-11T21:58:20.810+00:00" time="0.023"/>
+        <testcase name="engine::conformance::tests::skipped_checks_do_not_fail_a_report_with_passes" classname="awman" timestamp="2026-11-11T21:58:20.810+00:00" time="0.023"/>
+        <testcase name="engine::issue::naming_tests::github_slugs_carry_the_provider_prefix_and_the_number" classname="awman" timestamp="2026-11-11T21:58:20.810+00:00" time="0.030"/>
+        <testcase name="engine::issue::naming_tests::slugs_and_branches_are_safe_for_any_title" classname="awman" timestamp="2026-11-11T21:58:20.810+00:00" time="0.040"/>
+        <testcase name="engine::workflow::contracts::cancellation_stops_the_running_agent_and_never_launches_dependents" classname="awman" timestamp="2026-11-11T21:58:20.841+00:00" time="0.164"/>
+        <testcase name="engine::workflow::timing::tests::countdowns_are_the_documented_constants" classname="awman" timestamp="2026-11-11T21:58:21.007+00:00" time="0.019"/>
+        <testcase name="frontend::api::error::constructor_tests::every_constructor_preserves_message_status_and_code" classname="awman" timestamp="2026-11-11T21:58:21.027+00:00" time="0.016"/>
+        <testcase name="frontend::tui::contracts::command_edit_validation_and_resize_preserve_user_input" classname="awman" timestamp="2026-11-11T21:58:21.045+00:00" time="0.033"/>
+        <testcase name="frontend::tui::contracts::tab_navigation_and_dialog_dismissal_keep_sessions_distinct" classname="awman" timestamp="2026-11-11T21:58:21.079+00:00" time="0.025"/>
+        <testcase name="engine::workflow::contracts::dependency_join_waits_for_every_parallel_predecessor" classname="awman" timestamp="2026-11-11T21:58:20.841+00:00" time="0.356"/>
+        <testcase name="engine::workflow::contracts::persisted_execution_resumes_without_repeating_completed_steps" classname="awman" timestamp="2026-11-11T21:58:20.852+00:00" time="0.353"/>
+        <testcase name="engine::workflow::contracts::failure_can_be_retried_before_dependents_run" classname="awman" timestamp="2026-11-11T21:58:20.841+00:00" time="0.427"/>
+    </testsuite>
+</testsuites>

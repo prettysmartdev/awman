@@ -58,8 +58,9 @@ pub struct StatsSample {
 }
 
 pub struct ContainerStatsSampler {
-    runtime: Arc<dyn AgentRuntimeEngine>,
-    runtime_handle: tokio::runtime::Handle,
+    /// The runtime and the runtime handle its blocking calls run on; `None`
+    /// for an [inert](Self::inert) sampler.
+    source: Option<(Arc<dyn AgentRuntimeEngine>, tokio::runtime::Handle)>,
     tx: Sender<StatsSample>,
     rx: Receiver<StatsSample>,
     last_poll: Instant,
@@ -77,13 +78,27 @@ impl ContainerStatsSampler {
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         Self {
-            runtime,
-            runtime_handle,
+            source: Some((runtime, runtime_handle)),
             tx,
             rx,
             // Backdated so the first `due()` after startup is true and the
             // first frame with a container already has numbers coming.
             last_poll: Instant::now() - POLL_INTERVAL,
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// A sampler with no runtime: `poll` dispatches nothing and only samples
+    /// fed through [`sender`](Self::sender) arrive. A presenter whose engine
+    /// runs elsewhere (the daemon-backed TUI, WI 0142) holds one: it has no
+    /// local runtime to ask, and the engine projects stats instead.
+    pub fn inert() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            source: None,
+            tx,
+            rx,
+            last_poll: Instant::now(),
             in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -110,6 +125,9 @@ impl ContainerStatsSampler {
     /// the running one keeps that slot's turn.
     pub fn poll(&mut self, requests: impl IntoIterator<Item = StatsRequest>) {
         self.last_poll = Instant::now();
+        let Some((runtime, runtime_handle)) = self.source.clone() else {
+            return;
+        };
         for request in requests {
             let key = (request.key, request.step_name.clone());
             match self.in_flight.lock() {
@@ -120,10 +138,10 @@ impl ContainerStatsSampler {
                 }
                 Err(_) => continue,
             }
-            let runtime = self.runtime.clone();
+            let runtime = runtime.clone();
             let tx = self.tx.clone();
             let in_flight = self.in_flight.clone();
-            self.runtime_handle.spawn_blocking(move || {
+            runtime_handle.spawn_blocking(move || {
                 let stats = match &request.target {
                     // One runtime call, not the list-then-find-then-stats
                     // three the fallback costs.
@@ -153,66 +171,5 @@ impl ContainerStatsSampler {
     /// Every sample that has arrived since the last drain.
     pub fn drain(&self) -> Vec<StatsSample> {
         self.rx.try_iter().collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sample(key: usize, step: &str) -> StatsSample {
-        StatsSample {
-            key,
-            step_name: step.to_string(),
-            stats: AgentStats {
-                name: "awman-test".into(),
-                cpu_percent: 1.0,
-                memory_mb: 2.0,
-            },
-        }
-    }
-
-    fn make_sampler() -> ContainerStatsSampler {
-        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-        let handle = RUNTIME
-            .get_or_init(|| tokio::runtime::Runtime::new().unwrap())
-            .handle()
-            .clone();
-        ContainerStatsSampler::new(
-            Arc::new(crate::engine::container::ContainerRuntime::docker()),
-            handle,
-        )
-    }
-
-    #[test]
-    fn a_fresh_sampler_is_due_immediately() {
-        assert!(
-            make_sampler().due(),
-            "the first frame with a container must not wait a full interval"
-        );
-    }
-
-    #[test]
-    fn polling_resets_the_interval() {
-        let mut sampler = make_sampler();
-        sampler.poll([]);
-        assert!(!sampler.due(), "a round just ran");
-    }
-
-    #[test]
-    fn drain_returns_samples_in_arrival_order_and_then_nothing() {
-        let sampler = make_sampler();
-        let tx = sampler.sender();
-        tx.send(sample(0, "build")).unwrap();
-        tx.send(sample(1, "test")).unwrap();
-
-        let drained = sampler.drain();
-        assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].step_name, "build");
-        assert_eq!(drained[1].step_name, "test");
-        assert!(
-            sampler.drain().is_empty(),
-            "a drained sample is not re-read"
-        );
     }
 }

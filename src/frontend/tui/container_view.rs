@@ -19,7 +19,9 @@
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::data::program_status::ProgramState;
 use crate::frontend::tui::tabs::{
     format_duration, ContainerSlot, LastContainerSummary, Tab, TextSelection,
 };
@@ -104,6 +106,8 @@ pub fn render_container_maximized(
         None => format!(" \u{1F512} {} ({}) ", agent_name, runtime_label),
     };
     let right_title = info.map(build_stats_title_from_info).unwrap_or_default();
+    let (left_title, right_title) =
+        slot_titles_with_status(focused_slot, left_title, right_title, container_width);
 
     let mut block = Block::default()
         .title(Line::from(left_title).alignment(Alignment::Left))
@@ -116,7 +120,7 @@ pub fn render_container_maximized(
     // vt100-ctt 0.17's `set_scrollback` clamps to the buffer length; its
     // `visible_rows()` uses `saturating_sub` for the live-rows portion
     // (the panic that vt100 0.15 had on offset > screen_rows is fixed),
-    // so we can scroll the full configured `terminal_scrollback_lines`
+    // so we can scroll the full configured `tui.scrollbackLines`
     // depth without crashing. We probe by setting the requested offset
     // and reading back the clamped value, then probe the depth via
     // `set_scrollback(usize::MAX)`. Reset to live before rendering.
@@ -261,7 +265,9 @@ pub fn render_container_bars(tab: &Tab, area: Rect, frame: &mut Frame, skip_focu
 }
 
 fn render_one_minimized_bar(slot: &ContainerSlot, area: Rect, frame: &mut Frame) {
-    let (color, prefix) = if slot.stuck {
+    let stuck = slot.stuck && slot.program_status.is_none();
+    let reported_color = slot.program_status.as_ref().map(|s| s.state);
+    let (color, prefix) = if stuck {
         // Yellow + ⚠ prefix for stuck bars.
         (Color::Yellow, "\u{26a0} ")
     } else if slot.yolo_mode {
@@ -273,6 +279,10 @@ fn render_one_minimized_bar(slot: &ContainerSlot, area: Rect, frame: &mut Frame)
             Color::Yellow
         };
         (c, "")
+    } else if reported_color == Some(ProgramState::Blocked) {
+        (Color::Yellow, "")
+    } else if reported_color == Some(ProgramState::Error) {
+        (Color::Red, "")
     } else {
         (Color::Green, "")
     };
@@ -304,14 +314,13 @@ fn render_one_minimized_bar(slot: &ContainerSlot, area: Rect, frame: &mut Frame)
     } else {
         format!(" [{}]", slot.step_name)
     };
-    let content = format!(
-        "{}\u{1F512} {}{} | {}{}",
-        prefix,
-        slot.agent_name(),
-        step_segment,
-        stats_title.trim(),
-        yolo_suffix
+    let (left, right) = slot_titles_with_status(
+        slot,
+        format!("{}\u{1F512} {}{} ", prefix, slot.agent_name(), step_segment),
+        format!(" | {}{}", stats_title.trim(), yolo_suffix),
+        area.width.saturating_sub(1), // paragraph's leading space
     );
+    let content = format!("{left}{right}");
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -328,6 +337,99 @@ fn render_one_minimized_bar(slot: &ContainerSlot, area: Rect, frame: &mut Frame)
 }
 
 // ─── Internals ──────────────────────────────────────────────────────────
+
+/// The agent's reported status as one line for the window title and the
+/// minimized bar: `🔒 blocked: permission — allow rm?`, or, for a working
+/// agent that has been quiet a while, `working · silent 12m`. At most
+/// `max_chars` characters; the message is sanitised and truncated first.
+/// `None` when the agent does not report (or has cleared its status).
+pub(crate) fn slot_status_text(slot: &ContainerSlot, max_chars: usize) -> Option<String> {
+    use crate::frontend::program_status_text::{display_msg, short_label, tab_glyph};
+    let status = slot.program_status.as_ref()?;
+    let head = match slot.silent_note() {
+        Some(note) => note,
+        None => {
+            let glyph = tab_glyph(status);
+            if glyph.is_empty() {
+                short_label(status)
+            } else {
+                format!("{glyph} {}", short_label(status))
+            }
+        }
+    };
+    let head_len = head.chars().count();
+    let msg_room = max_chars.saturating_sub(head_len + 3);
+    // Not enough room for a useful slice of the message: show the state only.
+    if msg_room < 8 {
+        return Some(head);
+    }
+    match status.msg.as_deref().map(|m| display_msg(m, msg_room)) {
+        Some(msg) if !msg.is_empty() => Some(format!("{head} \u{2014} {msg}")),
+        _ => Some(head),
+    }
+}
+
+/// Put the step's reported state beside its name. Container stats use the
+/// remaining space; a narrow window drops them before hiding the state.
+pub(crate) fn slot_titles_with_status(
+    slot: &ContainerSlot,
+    left_title: String,
+    right_title: String,
+    window_width: u16,
+) -> (String, String) {
+    let Some(head) = slot_status_text(slot, 0) else {
+        return (left_title, right_title);
+    };
+    let inner_width = usize::from(window_width.saturating_sub(2));
+    // Allow for the em dash and spaces separating the name and state.
+    let min_status_width = UnicodeWidthStr::width(head.as_str()) + 3;
+    // Long agent/step names can fill the border even after dropping stats.
+    // Keep the end of the step name and reserve space for the reported state.
+    let name_budget = inner_width.saturating_sub(min_status_width);
+    let left_title = if UnicodeWidthStr::width(left_title.as_str()) > name_budget {
+        let mut width = 0;
+        let suffix: String = left_title
+            .chars()
+            .rev()
+            .take_while(|c| {
+                width += c.width().unwrap_or(0);
+                width <= name_budget.saturating_sub(2)
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!(" …{suffix}")
+    } else {
+        left_title
+    };
+    let base_width = UnicodeWidthStr::width(left_title.as_str());
+    let right_width = UnicodeWidthStr::width(right_title.as_str());
+    let right_title = if base_width + min_status_width + right_width < inner_width {
+        right_title
+    } else {
+        String::new()
+    };
+    let budget =
+        inner_width.saturating_sub(base_width + UnicodeWidthStr::width(right_title.as_str()) + 3);
+    let status = slot_status_text(slot, budget).unwrap_or(head);
+    // Message limits are in characters; a wide-character message needs a
+    // final cell-width limit before being put on the terminal border.
+    let status = if UnicodeWidthStr::width(status.as_str()) > budget {
+        let mut width = 0;
+        let prefix: String = status
+            .chars()
+            .take_while(|c| {
+                width += c.width().unwrap_or(0);
+                width <= budget.saturating_sub(1)
+            })
+            .collect();
+        format!("{prefix}…")
+    } else {
+        status
+    };
+    (format!("{left_title}\u{2014} {status} "), right_title)
+}
 
 /// Build the right-side stats title: `" {container} | {cpu} | {mem} | {dur} "`.
 /// Falls back to placeholder values until the first stats sample arrives.
@@ -461,241 +563,5 @@ fn convert_vt100_color(color: vt100::Color) -> Color {
         vt100::Color::Default => Color::Reset,
         vt100::Color::Idx(i) => Color::Indexed(i),
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cell_in_selection_inside_single_row() {
-        let sel = Some(((2, 5), (2, 10)));
-        assert!(cell_in_selection(sel, 2, 5));
-        assert!(cell_in_selection(sel, 2, 10));
-        assert!(cell_in_selection(sel, 2, 7));
-    }
-
-    #[test]
-    fn cell_in_selection_outside_single_row() {
-        let sel = Some(((2, 5), (2, 10)));
-        assert!(!cell_in_selection(sel, 2, 4));
-        assert!(!cell_in_selection(sel, 2, 11));
-        assert!(!cell_in_selection(sel, 1, 7));
-        assert!(!cell_in_selection(sel, 3, 7));
-    }
-
-    #[test]
-    fn cell_in_selection_multiple_rows() {
-        let sel = Some(((2, 5), (4, 3)));
-        // Start row: anything from start_col to end of row
-        assert!(cell_in_selection(sel, 2, 5));
-        assert!(cell_in_selection(sel, 2, 80));
-        assert!(!cell_in_selection(sel, 2, 4));
-        // Middle rows: any column
-        assert!(cell_in_selection(sel, 3, 0));
-        assert!(cell_in_selection(sel, 3, 79));
-        // End row: anything from start of row to end_col
-        assert!(cell_in_selection(sel, 4, 0));
-        assert!(cell_in_selection(sel, 4, 3));
-        assert!(!cell_in_selection(sel, 4, 4));
-    }
-
-    #[test]
-    fn cell_in_selection_none_returns_false() {
-        assert!(!cell_in_selection(None, 5, 5));
-    }
-
-    // ── WI-0096 minimized-bar rendering (E2E) ───────────────────────────────
-
-    use crate::data::session::Session;
-    use crate::frontend::tui::tabs::{ContainerSlot, ContainerSlotEvent, Tab};
-
-    fn make_test_session() -> Session {
-        let tmp = tempfile::tempdir().unwrap();
-        Session::for_tests(tmp.path())
-    }
-
-    fn render_bars_to_text(tab: &Tab, width: u16, height: u16) -> String {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                render_container_bars(tab, area, frame, true);
-            })
-            .unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let area = *buf.area();
-        (0..area.height)
-            .map(|y| {
-                (0..area.width)
-                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    fn slot(name: &str) -> ContainerSlot {
-        ContainerSlot::new(name.to_string(), "claude".to_string(), 1000)
-    }
-
-    #[test]
-    fn minimized_bars_render_only_non_focused_slots_and_swap_on_ctrl_s() {
-        let mut tab = Tab::new(make_test_session());
-        tab.container_slots.push(slot("build"));
-        tab.container_slots.push(slot("test"));
-        tab.focused_slot_idx = 0; // "build" is maximized (no bar)
-
-        // Only the non-focused slot renders a minimized status bar.
-        let text = render_bars_to_text(&tab, 60, 4);
-        assert!(
-            text.contains("[test]"),
-            "non-focused slot renders as a bar: {text}"
-        );
-        assert!(
-            !text.contains("[build]"),
-            "the focused (maximized) slot is not drawn as a bar: {text}"
-        );
-
-        // Ctrl-S swaps focus → now "build" is the minimized bar, "test" maximized.
-        tab.cycle_focused_slot();
-        let text = render_bars_to_text(&tab, 60, 4);
-        assert!(
-            text.contains("[build]"),
-            "after swap 'build' is the bar: {text}"
-        );
-        assert!(
-            !text.contains("[test]"),
-            "after swap the focused 'test' has no bar: {text}"
-        );
-    }
-
-    #[test]
-    fn minimized_bar_disappears_when_its_slot_exits() {
-        let mut tab = Tab::new(make_test_session());
-        tab.container_slots.push(slot("build"));
-        tab.container_slots.push(slot("test"));
-        tab.focused_slot_idx = 0;
-
-        let text = render_bars_to_text(&tab, 60, 4);
-        assert!(text.contains("[test]"));
-
-        // The background step exits → its slot is evicted and the bar is gone.
-        tab.shared
-            .container
-            .events
-            .lock()
-            .unwrap()
-            .push_back(ContainerSlotEvent::Exited {
-                step_name: "test".to_string(),
-            });
-        tab.drain_container_slot_events();
-
-        let text = render_bars_to_text(&tab, 60, 4);
-        assert!(
-            !text.contains("[test]"),
-            "the exited slot's bar must disappear: {text}"
-        );
-    }
-
-    #[test]
-    fn minimized_bar_is_a_bordered_strip_with_container_stats() {
-        let mut tab = Tab::new(make_test_session());
-        tab.container_slots.push(slot("build"));
-        let mut bg = slot("test");
-        if let Some(info) = bg.container_info.as_mut() {
-            info.container_name = "awman-test-77".into();
-            info.latest_stats = Some(crate::engine::agent_runtime::execution::AgentStats {
-                name: "awman-test-77".into(),
-                cpu_percent: 42.5,
-                memory_mb: 256.0,
-            });
-        }
-        tab.container_slots.push(bg);
-        tab.focused_slot_idx = 0;
-
-        // Same 3-row rounded strip as the single-container minimized bar.
-        let text = render_bars_to_text(&tab, 80, PARALLEL_BAR_HEIGHT);
-        assert!(
-            text.contains('\u{256d}') && text.contains('\u{2570}'),
-            "bar must have a rounded rect border: {text}"
-        );
-        assert!(text.contains("[test]"), "bar shows the step name: {text}");
-        assert!(
-            text.contains("awman-test-77"),
-            "bar shows the container name: {text}"
-        );
-        assert!(text.contains("42.5%"), "bar shows CPU: {text}");
-        assert!(text.contains("256MiB"), "bar shows memory: {text}");
-    }
-
-    #[test]
-    fn two_background_slots_stack_two_three_row_bars() {
-        let mut tab = Tab::new(make_test_session());
-        tab.container_slots.push(slot("build"));
-        tab.container_slots.push(slot("test-a"));
-        tab.container_slots.push(slot("test-b"));
-        tab.focused_slot_idx = 0;
-
-        let text = render_bars_to_text(&tab, 80, 2 * PARALLEL_BAR_HEIGHT);
-        assert!(text.contains("[test-a]"), "first bar rendered: {text}");
-        assert!(text.contains("[test-b]"), "second bar rendered: {text}");
-        // Each bar contributes its own top border.
-        let top_corners = text.matches('\u{256d}').count();
-        assert_eq!(top_corners, 2, "two stacked bordered bars: {text}");
-    }
-
-    #[test]
-    fn minimized_stuck_bar_shows_warning_glyph() {
-        let mut tab = Tab::new(make_test_session());
-        tab.container_slots.push(slot("build"));
-        let mut stuck = slot("test");
-        stuck.stuck = true;
-        tab.container_slots.push(stuck);
-        tab.focused_slot_idx = 0;
-
-        let text = render_bars_to_text(&tab, 60, 4);
-        assert!(
-            text.contains('\u{26a0}'),
-            "a stuck minimized bar shows the ⚠ glyph: {text}"
-        );
-    }
-
-    #[test]
-    fn minimized_yolo_bar_shows_countdown_text() {
-        let mut tab = Tab::new(make_test_session());
-        tab.container_slots.push(slot("build"));
-        let mut yoloing = slot("test");
-        yoloing.yolo_mode = true;
-        *yoloing.yolo_state.lock().unwrap() = Some(crate::frontend::tui::tabs::YoloState {
-            step_name: "test".into(),
-            remaining_secs: 7,
-        });
-        tab.container_slots.push(yoloing);
-        tab.focused_slot_idx = 0;
-
-        let text = render_bars_to_text(&tab, 80, 4);
-        assert!(
-            text.contains("Yolo in 7s"),
-            "a yoloing minimized bar shows its remaining time: {text}"
-        );
-    }
-
-    #[test]
-    fn minimized_non_yolo_bar_has_no_countdown_text() {
-        let mut tab = Tab::new(make_test_session());
-        tab.container_slots.push(slot("build"));
-        tab.container_slots.push(slot("test"));
-        tab.focused_slot_idx = 0;
-
-        let text = render_bars_to_text(&tab, 80, 4);
-        assert!(
-            !text.contains("Yolo in"),
-            "a non-yoloing minimized bar shows no countdown: {text}"
-        );
     }
 }

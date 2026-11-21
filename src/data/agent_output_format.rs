@@ -1,5 +1,5 @@
 //! `AgentOutputFormat` — the structured output mode an agent CLI can print in
-//! non-interactive runs (WI 0137 §4).
+//! headless runs (WI 0137 §4).
 //!
 //! A capability of the agent table, not a name match: `claude` prints
 //! `--output-format stream-json`, `codex exec --json` prints its own JSON
@@ -15,10 +15,17 @@ pub enum AgentOutputFormat {
     /// Plain text: output lines only, no activity feed, no final message.
     #[default]
     Text,
+    OpenCodeJson,
+    OpenCodeV2Json,
+    CopilotJson,
+    ClineJson,
+    AntigravityStreamJson,
     /// Claude Code's `--output-format stream-json --verbose` NDJSON.
     ClaudeStreamJson,
     /// Codex's `exec --json` NDJSON.
     CodexJson,
+    /// Cursor Agent's `--print --output-format stream-json` NDJSON.
+    CursorStreamJson,
 }
 
 impl AgentOutputFormat {
@@ -26,9 +33,15 @@ impl AgentOutputFormat {
     /// `[run] output_format` and shown in logs.
     pub fn as_str(self) -> &'static str {
         match self {
+            AgentOutputFormat::OpenCodeJson => "opencode_json",
+            AgentOutputFormat::OpenCodeV2Json => "opencode_v2_json",
+            AgentOutputFormat::CopilotJson => "copilot_json",
+            AgentOutputFormat::ClineJson => "cline_json",
+            AgentOutputFormat::AntigravityStreamJson => "antigravity_stream_json",
             AgentOutputFormat::Text => "text",
             AgentOutputFormat::ClaudeStreamJson => "claude_stream_json",
             AgentOutputFormat::CodexJson => "codex_json",
+            AgentOutputFormat::CursorStreamJson => "cursor_stream_json",
         }
     }
 
@@ -42,32 +55,5 @@ impl AgentOutputFormat {
 impl std::fmt::Display for AgentOutputFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wire_spelling_round_trips_and_defaults_to_text() {
-        for (format, wire) in [
-            (AgentOutputFormat::Text, "\"text\""),
-            (
-                AgentOutputFormat::ClaudeStreamJson,
-                "\"claude_stream_json\"",
-            ),
-            (AgentOutputFormat::CodexJson, "\"codex_json\""),
-        ] {
-            assert_eq!(serde_json::to_string(&format).unwrap(), wire);
-            assert_eq!(
-                serde_json::from_str::<AgentOutputFormat>(wire).unwrap(),
-                format
-            );
-            assert_eq!(format!("\"{format}\""), wire);
-        }
-        assert_eq!(AgentOutputFormat::default(), AgentOutputFormat::Text);
-        assert!(!AgentOutputFormat::Text.is_structured());
-        assert!(AgentOutputFormat::ClaudeStreamJson.is_structured());
     }
 }

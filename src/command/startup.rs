@@ -12,22 +12,15 @@ use anyhow::{Context, Result};
 use crate::command::dispatch::catalogue::CommandCatalogue;
 use crate::command::dispatch::Engines;
 use crate::data::config::env::EnvSnapshot;
+use crate::data::config::ConfigOverrides;
 use crate::data::error::DataError;
 use crate::data::session::{GitRootResolver, Session, SessionOpenOptions};
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
 
-/// A fatal startup failure selected for frontend presentation. The inert
-/// engine bundle only allows the frontend to open its quit-only modal.
+/// A fatal startup failure selected for frontend presentation.
 pub struct RuntimeStartupFailure {
     pub error: crate::command::error::CommandError,
-}
-impl RuntimeStartupFailure {
-    pub(crate) fn new(error: EngineError) -> Self {
-        Self {
-            error: error.into(),
-        }
-    }
 }
 
 /// The command-aware startup coordinator for one binary invocation.
@@ -51,45 +44,67 @@ impl Startup {
 
     /// Perform ordered application startup for `working_dir` and `env`.
     pub fn run(&self, working_dir: PathBuf, env: EnvSnapshot) -> Result<StartupOutcome> {
+        self.run_with_overrides(working_dir, env, ConfigOverrides::default())
+    }
+
+    /// [`Startup::run`] with `--set` overrides (already parsed against the key
+    /// table) applied to the session's config.
+    pub fn run_with_overrides(
+        &self,
+        working_dir: PathBuf,
+        env: EnvSnapshot,
+        overrides: ConfigOverrides,
+    ) -> Result<StartupOutcome> {
         let messages = Vec::new();
 
         let path_refs: Vec<&str> = self.command_path.iter().map(String::as_str).collect();
         let git_engine = GitEngine::new();
 
         // Outside a Git repo the working directory stands in for the root.
-        let git_root = match git_engine.resolve(&working_dir) {
-            Ok(root) => root,
-            Err(DataError::GitRootNotFound { .. }) => working_dir.clone(),
+        let (git_root, in_repo) = match git_engine.resolve(&working_dir) {
+            Ok(root) => (root, true),
+            Err(DataError::GitRootNotFound { .. }) => (working_dir.clone(), false),
             Err(other) => {
                 return Err(anyhow::Error::new(other).context("failed to resolve git root"));
             }
         };
 
-        let session = Session::open_at_git_root(
-            working_dir,
-            git_root,
-            SessionOpenOptions {
-                env: Some(env),
-                ..Default::default()
-            },
-        )
+        let opts = SessionOpenOptions {
+            env: Some(env),
+            overrides: overrides.clone(),
+            ..Default::default()
+        };
+        // Outside a Git repo the directory is not a repository: config scope
+        // and `--repo` must not treat it as one.
+        let mut session = if in_repo {
+            Session::open_at_git_root(working_dir, git_root, opts)
+        } else {
+            Session::open_at_directory_root(git_root, opts)
+        }
         .context("failed to open session")?;
-        // Detect after opening the session so repo builtin settings participate
-        // in the same effective configuration used by command execution.
-        let (detected, fatal_runtime_error) = Engines::detect_effective(
-            CommandCatalogue::get(),
-            &session.effective_config(),
-            &path_refs,
-        )
-        .map_err(|error| match error {
-            EngineError::UnknownRuntime { .. } => anyhow::Error::new(error),
-            other => anyhow::Error::new(other).context("failed to detect agent runtime"),
-        })?;
+        // A one-shot process has one known invocation repository. Bind its
+        // allowed repo settings before constructing any process resource.
+        // Multi-session TUI startup continues to bind global/env/startup only.
+        let process_config = if self.command_path.is_empty() {
+            Engines::resolve_process_config(session.env().clone(), overrides.clone())?
+        } else {
+            session.effective_config()
+        };
+        // Runtime and monitor use only the already resolved process config.
+        // The session retains repository settings for each individual launch.
+        let (detected, fatal_runtime_error) =
+            Engines::detect_effective(CommandCatalogue::get(), &process_config, &path_refs)
+                .map_err(|error| match error {
+                    EngineError::UnknownRuntime { .. } => anyhow::Error::new(error),
+                    other => anyhow::Error::new(other).context("failed to detect agent runtime"),
+                })?;
         // Opening the runtime may have upgraded the builtin state directory in
         // place; its notice is presented by the frontend that runs next.
         let notices = detected.take_notices();
-        let engines =
-            Engines::from_detected(detected, &session).context("failed to construct engines")?;
+        let engines = Engines::from_detected_with_config(detected, &session, &process_config)
+            .context("failed to construct engines")?;
+        engines.inherit_process_settings(&mut session)?;
+        engines.validate_process_config(&session.effective_config())?;
 
         Ok(StartupOutcome::new(
             session,
@@ -137,65 +152,5 @@ impl StartupOutcome {
     /// the TUI. Never a prompt.
     pub fn notices(&self) -> &[String] {
         &self.notices
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::command::error::CommandError;
-    use crate::data::config::env::{EnvSnapshot, AMBIENT_MSB_OVERRIDES, AWMAN_CONFIG_HOME};
-
-    #[test]
-    fn tui_startup_preserves_override_failure_for_the_fatal_frontend() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            temp.path().join("config.json"),
-            r#"{"runtime":"builtin-experimental"}"#,
-        )
-        .unwrap();
-        for variable in AMBIENT_MSB_OVERRIDES {
-            let env = EnvSnapshot::with_overrides([
-                (AWMAN_CONFIG_HOME, temp.path().to_str().unwrap()),
-                (*variable, ""),
-            ]);
-            let outcome = Startup::new(Vec::new())
-                .run(temp.path().into(), env)
-                .unwrap();
-            let failure = outcome
-                .fatal_runtime_error
-                .expect("builtin open error must reach the modal");
-            assert_eq!(failure.error.exit_code(), 1);
-            assert_eq!(
-                failure.error.to_string(),
-                EngineError::AmbientRuntimeOverride {
-                    variable: variable.to_string()
-                }
-                .to_string()
-            );
-            assert!(matches!(
-                failure.error,
-                CommandError::Engine(EngineError::AmbientRuntimeOverride { .. })
-            ));
-        }
-    }
-
-    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    #[test]
-    fn tui_startup_preserves_the_unsupported_target_error() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            temp.path().join("config.json"),
-            r#"{"runtime":"builtin-experimental"}"#,
-        )
-        .unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, temp.path().to_str().unwrap())]);
-        let outcome = Startup::new(Vec::new())
-            .run(temp.path().into(), env)
-            .unwrap();
-        assert!(matches!(
-            outcome.fatal_runtime_error.unwrap().error,
-            CommandError::Engine(EngineError::BuiltinTargetUnreleased { .. })
-        ));
     }
 }

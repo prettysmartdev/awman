@@ -37,12 +37,6 @@ pub struct ContainerToolProbe {
 
 impl PhaseToolSource for ContainerToolProbe {
     fn probe(&self, image: &str, tools: &[&str]) -> PhaseToolsStatus {
-        let env = crate::data::config::env::Env::from_process();
-        if env.test_isolation() && !env.test_docker() {
-            return PhaseToolsStatus::Unknown {
-                reason: "test isolation".into(),
-            };
-        }
         let Some(runtime) = &self.runtime else {
             return PhaseToolsStatus::Unknown {
                 reason: "runtime has no phase-container probe".into(),

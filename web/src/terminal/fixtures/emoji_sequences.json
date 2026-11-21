@@ -1,0 +1,89 @@
+{
+  "about": "Emoji modifier, flag and ZWJ sequences. KNOWN DIVERGENCE: vt100-ctt sizes each code point, wterm/Ghostty size grapheme clusters; tests assert clusters stay intact, not exact columns",
+  "expect": {
+    "alt_screen": false,
+    "app_cursor": false,
+    "bracketed_paste": false,
+    "cols": 12,
+    "cursor": {
+      "col": 5,
+      "row": 1,
+      "visible": true
+    },
+    "lines": [
+      "👍🏽 🇯🇵 👨‍👩‍",
+      "👧 ok",
+      "",
+      ""
+    ],
+    "mouse_mode": "none",
+    "mouse_sgr": false,
+    "rows": 4
+  },
+  "expect_from_snapshot": {
+    "alt_screen": false,
+    "app_cursor": false,
+    "bracketed_paste": false,
+    "cursor": {
+      "col": 5,
+      "row": 1,
+      "visible": true
+    },
+    "lines": [
+      "👍🏽 🇯🇵 👨‍👩‍",
+      "👧 ok",
+      "",
+      ""
+    ]
+  },
+  "final_snapshot": {
+    "cols": 12,
+    "has_output": true,
+    "rows": 4,
+    "screen": "G1s/MjVoG1ttG1tIG1tK8J+RjfCfj70g8J+Hr/Cfh7Ug8J+RqOKAjfCfkanigI3wn5GnIG9rGz4bWz8xbBtbPzIwMDRs",
+    "type": "snapshot"
+  },
+  "frames": [
+    {
+      "cols": 12,
+      "has_output": false,
+      "rows": 4,
+      "screen": "G1s/MjVoG1ttG1tIG1tKGz4bWz8xbBtbPzIwMDRs",
+      "type": "snapshot"
+    },
+    {
+      "bytes": "8J+RjfA=",
+      "type": "output"
+    },
+    {
+      "bytes": "n4+9IPA=",
+      "type": "output"
+    },
+    {
+      "bytes": "n4ev8J8=",
+      "type": "output"
+    },
+    {
+      "bytes": "h7Ug8J8=",
+      "type": "output"
+    },
+    {
+      "bytes": "kajigI0=",
+      "type": "output"
+    },
+    {
+      "bytes": "8J+RqeI=",
+      "type": "output"
+    },
+    {
+      "bytes": "gI3wn5E=",
+      "type": "output"
+    },
+    {
+      "bytes": "pyBvaw==",
+      "type": "output"
+    }
+  ],
+  "name": "emoji_sequences",
+  "source": "vt100-ctt 0.17.1 (TerminalHub mirror parser); snapshot = Screen::state_formatted()"
+}

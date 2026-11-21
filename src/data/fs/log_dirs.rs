@@ -8,7 +8,6 @@
 use std::path::PathBuf;
 
 use crate::data::config::env::{Env, EnvSnapshot};
-use crate::data::config::global::GlobalConfig;
 use crate::data::error::DataError;
 
 /// Resolves and writes per-container workflow log files under `~/.awman/logs/`.
@@ -25,7 +24,7 @@ impl WorkflowLogPaths {
 
     /// Construct from a supplied env snapshot.
     pub fn from_env(env: &EnvSnapshot) -> Result<Self, DataError> {
-        let awman_home = GlobalConfig::data_home_with(env)?;
+        let awman_home = crate::data::fs::data_paths::data_home(env)?;
         Ok(Self { awman_home })
     }
 
@@ -75,10 +74,30 @@ impl WorkflowLogPaths {
         container_name: &str,
         contents: &str,
     ) -> Result<PathBuf, DataError> {
+        self.write_container_log_from_reader(
+            workflow_id,
+            step_name,
+            container_name,
+            &mut contents.as_bytes(),
+        )
+    }
+    /// Stream a complete transcript to a private file with bounded memory.
+    pub fn write_container_log_from_reader(
+        &self,
+        workflow_id: uuid::Uuid,
+        step_name: &str,
+        container_name: &str,
+        reader: &mut dyn std::io::Read,
+    ) -> Result<PathBuf, DataError> {
         let dir = self.logs_dir();
-        std::fs::create_dir_all(&dir).map_err(|e| DataError::io(&dir, e))?;
+        super::private_files::create_private_dir(&dir)?;
         let path = self.container_log_path(workflow_id, step_name, container_name);
-        std::fs::write(&path, contents).map_err(|e| DataError::io(&path, e))?;
+        let mut file = super::private_files::create_private_file_new(&path)?;
+        let result = std::io::copy(reader, &mut file).and_then(|_| file.sync_all());
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&path);
+            return Err(DataError::io(&path, error));
+        }
         Ok(path)
     }
 }
@@ -101,65 +120,5 @@ fn sanitise(component: &str) -> String {
         "unnamed".to_string()
     } else {
         cleaned
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn uuid() -> uuid::Uuid {
-        uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()
-    }
-
-    #[test]
-    fn logs_dir_is_under_awman_home() {
-        let paths = WorkflowLogPaths::at_home("/home/user/.awman");
-        assert_eq!(paths.logs_dir(), PathBuf::from("/home/user/.awman/logs"));
-    }
-
-    #[test]
-    fn container_log_path_uses_workflow_step_container_template() {
-        let paths = WorkflowLogPaths::at_home("/home/user/.awman");
-        let path = paths.container_log_path(uuid(), "build", "awman-abc123");
-        assert_eq!(
-            path,
-            PathBuf::from(
-                "/home/user/.awman/logs/550e8400-e29b-41d4-a716-446655440000-build-awman-abc123.log"
-            )
-        );
-    }
-
-    #[test]
-    fn sanitise_replaces_path_separators_and_spaces() {
-        assert_eq!(sanitise("deploy/prod step"), "deploy-prod-step");
-        assert_eq!(sanitise("../escape"), "..-escape");
-    }
-
-    #[test]
-    fn sanitise_empty_becomes_unnamed() {
-        assert_eq!(sanitise(""), "unnamed");
-    }
-
-    #[test]
-    fn crafted_step_name_cannot_escape_logs_dir() {
-        let paths = WorkflowLogPaths::at_home("/home/user/.awman");
-        let path = paths.container_log_path(uuid(), "../../etc/passwd", "c");
-        // No path traversal survives sanitisation: the file stays directly
-        // under the logs directory.
-        assert_eq!(path.parent().unwrap(), paths.logs_dir());
-    }
-
-    #[test]
-    fn write_container_log_creates_dir_and_writes_contents() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = WorkflowLogPaths::at_home(tmp.path().join(".awman"));
-        let written = paths
-            .write_container_log(uuid(), "build", "awman-xyz", "line 1\nline 2\n")
-            .unwrap();
-        assert!(written.exists(), "log file must be created");
-        let body = std::fs::read_to_string(&written).unwrap();
-        assert_eq!(body, "line 1\nline 2\n");
-        assert!(written.starts_with(paths.logs_dir()));
     }
 }

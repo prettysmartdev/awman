@@ -10,15 +10,40 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 
-use awman::command::dispatch::catalogue::CommandCatalogue;
+use awman::command::commands::view::{
+    ViewArgs, ViewCommand, FLAG_ANNOTATION, FLAG_INSTANCE, FLAG_TAB, VIEW_COMMAND,
+};
+use awman::command::dispatch::catalogue::{CommandCatalogue, SET_FLAG};
 use awman::command::dispatch::RuntimeContext;
 use awman::command::startup::Startup;
 use awman::data::config::env::Env;
+use awman::data::config::fields::KeyError;
+use awman::data::config::overrides::ConfigOverrides;
 use awman::engine::error::EngineError;
 use awman::frontend::cli;
 use awman::frontend::tui;
 
 fn main() -> Result<ExitCode> {
+    #[cfg(windows)]
+    awman_host_shims::install_metadata_publisher();
+    #[cfg(windows)]
+    awman::engine::git::transport::install_windows_spawn(awman_host_shims::spawn_git);
+    if let Some(success) = awman::command::git_credential_helper::dispatch(
+        &Env::from_process(),
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout().lock(),
+    ) {
+        return Ok(if success {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
+    }
+    #[cfg(windows)]
+    awman::engine::remote::local::install_owner_pipe(
+        awman_host_shims::owner_pipe,
+        awman_host_shims::verify_client,
+    );
     if awman_host_shims::dispatch_worker(std::env::vars_os(), std::env::args_os()) {
         return Ok(ExitCode::SUCCESS);
     }
@@ -44,26 +69,52 @@ async fn frontend_main() -> Result<ExitCode> {
     let clap_cmd = CommandCatalogue::get().build_clap_command();
     let matches = clap_cmd.get_matches();
 
+    // `--set key=value` (global, repeatable): resolved against the key table
+    // and parsed by the key's type before anything reads config. A bad key or
+    // value is a usage error, like any other bad flag.
+    let overrides = match set_overrides(&matches) {
+        Ok(overrides) => overrides,
+        Err(error) => {
+            eprintln!("error: invalid value for '--set <KEY=VALUE>': {error}");
+            return Ok(ExitCode::from(2));
+        }
+    };
+
     init_tracing();
 
     let path = cli::command_path_from_matches(&matches);
     let launch = LaunchMode::from_matches(&matches);
     // The bare-squad TUI launch (`awman squad` from a TTY, no --json/
-    // --non-interactive) has a non-empty command path but still lands in the
+    // --headless) has a non-empty command path but still lands in the
     // TUI, not the CLI. `Engines::detect`'s unknown-runtime policy branches
     // on "is this path empty" as its CLI/TUI proxy (a fatal exit for CLI, a
-    // startup-modal message for TUI) — an unrelated launch-mode decision
+    // startup-modal message for TUI) — an unrelated frontend-choice decision
     // must not defeat that proxy, so the path used for detection reflects
     // the launch mode this invocation actually resolves to, not the raw
     // parsed subcommand path.
     let detect_path: Vec<String> = if launch.is_tui() { Vec::new() } else { path };
     let working_dir = std::env::current_dir().context("could not read current directory")?;
     let startup = Startup::new(detect_path);
-    let outcome = match startup.run(working_dir, Env::from_process()) {
+    let outcome = match startup.run_with_overrides(working_dir, Env::from_process(), overrides) {
         Ok(outcome) => outcome,
         Err(error) => match error.downcast::<EngineError>() {
             Ok(error) => return Ok(cli::render_startup_error(matches, error.into())),
-            Err(error) => return Err(error),
+            Err(error) => {
+                if error
+                    .downcast_ref::<awman::data::error::DataError>()
+                    .is_some_and(|e| {
+                        matches!(
+                            e,
+                            awman::data::error::DataError::ConfigParse { .. }
+                                | awman::data::error::DataError::Other(_)
+                        )
+                    })
+                {
+                    eprintln!("error: {error:#}");
+                    return Ok(ExitCode::from(2));
+                }
+                return Err(error);
+            }
         },
     };
     // Each frontend's `run` prints these: stderr in command mode, and the
@@ -78,12 +129,68 @@ async fn frontend_main() -> Result<ExitCode> {
         LaunchMode::Cli => None,
         LaunchMode::TuiNormal => Some(tui::InitialTab::Normal),
         LaunchMode::TuiSquad => Some(tui::InitialTab::Squad),
+        LaunchMode::TuiView => {
+            // The hidden `awman view` secondary frontend (WI 0142): Layer 2
+            // parses its flags and runs it through the TUI's entry point.
+            let args = match view_args(&matches) {
+                Ok(args) => args,
+                Err(error) => {
+                    eprintln!("awman: {error}");
+                    return Ok(ExitCode::from(2));
+                }
+            };
+            let entry = tui::ViewEntryPoint::new(ctx, messages, notices);
+            return Ok(match ViewCommand::new(args).run(&entry) {
+                Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
+                Err(error) => {
+                    eprintln!("awman: {error}");
+                    ExitCode::from(1)
+                }
+            });
+        }
     };
 
     match initial_tab {
         Some(tab) => Ok(tui::run(matches, ctx, fatal_runtime_error, tab, messages, notices).await),
         None => Ok(cli::run(matches, ctx, messages, notices).await),
     }
+}
+
+/// `awman view`'s flags, parsed by Layer 2.
+fn view_args(matches: &clap::ArgMatches) -> Result<ViewArgs, awman::command::error::CommandError> {
+    let view = matches
+        .subcommand_matches(VIEW_COMMAND)
+        .expect("TuiView is only chosen for the view subcommand");
+    let annotations: Vec<String> = view
+        .get_many::<String>(FLAG_ANNOTATION)
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default();
+    ViewArgs::from_flags(
+        view.get_one::<String>(FLAG_INSTANCE)
+            .map(String::as_str)
+            .unwrap_or_default(),
+        view.get_one::<String>(FLAG_TAB).map(String::as_str),
+        &annotations,
+    )
+}
+
+/// The global `--set` values, wherever on the command line they appeared,
+/// parsed against the key table.
+fn set_overrides(matches: &clap::ArgMatches) -> Result<ConfigOverrides, KeyError> {
+    ConfigOverrides::parse_set_args(&set_args(matches))
+}
+
+/// Raw `--set` values. clap propagates a global arg's values to every level,
+/// so the deepest subcommand's matches hold them all.
+fn set_args(matches: &clap::ArgMatches) -> Vec<String> {
+    let mut current = matches;
+    while let Some((_, sub)) = current.subcommand() {
+        current = sub;
+    }
+    current
+        .get_many::<String>(SET_FLAG)
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default()
 }
 
 /// Which frontend this invocation resolves to, and — for the TUI arms —
@@ -96,12 +203,16 @@ enum LaunchMode {
     Cli,
     TuiNormal,
     TuiSquad,
+    /// The hidden `awman view` (always a TUI, whatever stdin is).
+    TuiView,
 }
 
 impl LaunchMode {
     fn from_matches(matches: &clap::ArgMatches) -> Self {
         if matches.subcommand_name().is_none() {
             Self::TuiNormal
+        } else if matches.subcommand_name() == Some(VIEW_COMMAND) {
+            Self::TuiView
         } else if cli::is_bare_tui_invocation(matches) {
             Self::TuiSquad
         } else {
@@ -118,7 +229,7 @@ impl LaunchMode {
 ///
 /// Without this, every `tracing::info!`/`warn!`/`error!` call in the
 /// codebase (notably the API-server startup messages in `frontend::api`)
-/// is silently dropped, which made `awman api start` look like it was
+/// is silently dropped, which made `awman daemon start` look like it was
 /// hanging until Ctrl-C. We write to stderr (so stdout stays clean for
 /// `--json` callers), default to `info`-level for awman code, and honor
 /// `RUST_LOG` for overrides. ANSI colors are auto-enabled by the `fmt`
@@ -185,101 +296,3 @@ fn init_tracing() {
 // a real session). Instead we test the **routing logic** directly: the task
 // `matches.subcommand_name().is_some()` is what drives the cli-vs-tui branch.
 // These tests exercise that predicate with synthetic `ArgMatches`.
-
-#[cfg(test)]
-mod tests {
-    use awman::command::dispatch::catalogue::CommandCatalogue;
-    use awman::frontend::cli::command_path_from_matches;
-
-    /// A subcommand in argv → `subcommand_name().is_some()` → CLI branch.
-    #[test]
-    fn subcommand_present_signals_cli_branch() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        for argv in [
-            vec!["awman", "agents", "status"],
-            vec!["awman", "ready"],
-            vec!["awman", "chat"],
-            vec!["awman", "init"],
-            vec!["awman", "exec", "workflow", "wf.toml"],
-            vec!["awman", "api", "start"],
-            vec!["awman", "remote", "session", "start"],
-        ] {
-            let m = cmd
-                .clone()
-                .try_get_matches_from(&argv)
-                .unwrap_or_else(|e| panic!("failed to parse {argv:?}: {e}"));
-            assert!(
-                m.subcommand_name().is_some(),
-                "{argv:?} must have a subcommand — routes to CLI"
-            );
-            // command_path_from_matches must also return a non-empty path.
-            let path = command_path_from_matches(&m);
-            assert!(!path.is_empty(), "{argv:?} must produce a non-empty path");
-        }
-    }
-
-    /// Bare `awman` → `subcommand_name().is_none()` → TUI branch.
-    #[test]
-    fn bare_invocation_signals_tui_branch() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman"]).unwrap();
-        assert!(
-            m.subcommand_name().is_none(),
-            "bare `awman` must have no subcommand — routes to TUI"
-        );
-        let path = command_path_from_matches(&m);
-        assert!(
-            path.is_empty(),
-            "bare invocation must produce an empty path"
-        );
-    }
-
-    /// Every `LaunchMode` variant reports `is_tui()` correctly — this is the
-    /// mapping `main` uses to decide the path fed to `Engines::detect`, so a
-    /// wrong answer here would defeat the CLI/TUI unknown-runtime proxy for
-    /// whichever variant is wrong.
-    #[test]
-    fn launch_mode_is_tui_matches_each_variant() {
-        assert!(!super::LaunchMode::Cli.is_tui());
-        assert!(super::LaunchMode::TuiNormal.is_tui());
-        assert!(super::LaunchMode::TuiSquad.is_tui());
-    }
-
-    /// Regression for the bug where a bare `awman squad` TUI launch under an
-    /// unknown `runtime:` config lost its fatal modal and exited like a CLI
-    /// invocation instead. `awman squad`'s parsed command path is non-empty
-    /// (`["squad"]`) — same as any ordinary CLI subcommand — even though the
-    /// invocation can resolve to the Squad TUI. `main` must not feed that raw
-    /// path to `Engines::detect`'s CLI/TUI proxy for a `TuiSquad` launch: it
-    /// has to collapse to the same empty path a bare `awman` uses, exactly
-    /// like `LaunchMode::TuiSquad.is_tui()` (asserted above) requires.
-    #[test]
-    fn bare_squad_has_a_non_empty_path_despite_resolving_to_the_tui() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman", "squad"]).unwrap();
-        assert!(
-            m.subcommand_name().is_some(),
-            "`awman squad` has a subcommand, same as any CLI invocation"
-        );
-        let path = command_path_from_matches(&m);
-        assert_eq!(
-            path,
-            vec!["squad"],
-            "the raw parsed path must not be used directly as the CLI/TUI \
-             detection proxy for this invocation"
-        );
-    }
-
-    /// Aliases also route through the CLI branch correctly.
-    #[test]
-    fn exec_workflow_alias_wf_routes_to_cli() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "exec", "wf", "wf.toml"])
-            .unwrap();
-        assert!(m.subcommand_name().is_some());
-        let path = command_path_from_matches(&m);
-        // Clap resolves the alias to canonical `workflow`.
-        assert_eq!(path, vec!["exec", "workflow"]);
-    }
-}

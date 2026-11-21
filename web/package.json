@@ -1,0 +1,45 @@
+{
+  "name": "@awman/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "dev": "NEXT_TELEMETRY_DISABLED=1 next dev --hostname 127.0.0.1 --port 3000",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.sw.json",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "build": "NEXT_TELEMETRY_DISABLED=1 next build && node scripts/externalize-inline.mjs out && node scripts/build-sw.mjs out",
+    "audit": "node scripts/audit-output.mjs out && node scripts/audit-csp.mjs out",
+    "verify:edge": "npm --prefix edge run verify:assets",
+    "check": "npm run typecheck && npm run lint && npm run matrix && npm run test && npm run build && npm run audit && npm run verify:edge",
+    "icons": "node scripts/make-icons.mjs",
+    "matrix": "node acceptance/render-matrix.mjs --check"
+  },
+  "dependencies": {
+    "@wterm/core": "0.5.10",
+    "@wterm/ghostty": "0.5.10",
+    "next": "15.5.29",
+    "react": "19.2.9",
+    "react-dom": "19.2.9"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@testing-library/dom": "10.4.1",
+    "@testing-library/react": "16.3.0",
+    "@types/node": "22.19.15",
+    "@types/react": "19.2.2",
+    "@types/react-dom": "19.2.2",
+    "esbuild": "0.25.12",
+    "eslint": "10.14.0",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "globals": "16.5.0",
+    "jsdom": "26.1.0",
+    "parse5": "8.1.1",
+    "typescript": "5.8.3",
+    "typescript-eslint": "8.72.2",
+    "vitest": "4.1.0"
+  }
+}

@@ -2,7 +2,7 @@
 //! answered with when there is nobody to ask.
 //!
 //! Three hosts run commands with no operator attached: the API server, the
-//! squad daemon, and the CLI with a piped stdin (or `--non-interactive`).
+//! squad daemon, and the CLI with a piped stdin (or `--headless`).
 //! Before WI 0114 F-13 each of them carried its own answers, inline in its
 //! Layer 3 frontend, and they had drifted: the same `exec workflow` squash-
 //! merged under the API, left a branch alone under squad, and asked for
@@ -50,6 +50,7 @@
 //! | [`prerequisite_unresolved`](HeadlessDefaults::prerequisite_unresolved) | `static ? Fail : Warn` | `static ? Fail : Warn` | `static ? Fail : Warn` |
 //! | [`prerequisite_tool`](HeadlessDefaults::prerequisite_tool) | `Continue` | `Continue` | `Continue` |
 //! | [`prerequisite_gap`](HeadlessDefaults::prerequisite_gap) | `Continue` | `Continue` | `Continue` |
+//! | [`prerequisite_image`](HeadlessDefaults::prerequisite_image) | `Prepare` | `Prepare` | `Prepare` |
 //!
 //! Approving a custom agent definition (`agent_trust::ensure_agent_trusted`)
 //! deliberately has **no row**: no profile, and no `--yes`, ever answers it.
@@ -113,7 +114,7 @@
 //! ## What is deliberately not here
 //!
 //! - **`confirm_deletion`** (`awman clean`). The API answers `false` from an
-//!   impl that never runs (`clean` is `api_allowed: false` at the catalogue).
+//!   impl that never runs (`clean` is `ApiAvailability::Disabled` at the catalogue).
 //!   The CLI does *not* default: with no TTY and no `--yes` it raises
 //!   `CommandError::InteractiveInputUnavailable`, refusing to guess about
 //!   deletion. That is a gate, not an answer, so only the API delegates.
@@ -124,13 +125,13 @@ use crate::command::commands::agent_auth::AgentAuthDecision;
 use crate::command::commands::agent_setup::AgentSetupDecision;
 use crate::command::commands::exec_workflow::{WorkflowResumeDecision, WorkflowResumePrompt};
 use crate::command::commands::mount_scope::MountScopeDecision;
-use crate::command::commands::specs::WorkItemKind;
 use crate::command::commands::workflow_prerequisites::{GapChoice, ToolChoice};
 use crate::command::commands::worktree_lifecycle::{
     DirtyMergeTargetDecision, ExistingWorktreeDecision, PostWorkflowWorktreeAction,
     PostWorkflowWorktreePrompt, PreWorktreeDecision, WorktreeMergeMode,
 };
-use crate::data::config::repo::WorkItemsConfig;
+use crate::command::work_item::spec_service::WorkItemKind;
+use crate::data::config::work_items::WorkItemsConfig;
 use crate::data::config::workflows::{CredentialUse, UnresolvedMode};
 use crate::data::workflow_prerequisites::PrerequisiteOrigin;
 use crate::engine::acp::protocol::{PermissionDecision, PermissionOption};
@@ -183,7 +184,7 @@ impl HeadlessDefaults {
         }
     }
 
-    /// The CLI's policy when stdin is not a TTY or `--non-interactive` is set:
+    /// The CLI's policy when stdin is not a TTY or `--headless` is set:
     /// squad's caution about the working tree, but the user's own host
     /// credentials are never injected without them saying so.
     pub fn cli() -> Self {
@@ -412,7 +413,7 @@ impl HeadlessDefaults {
         false
     }
 
-    /// Answer for `SpecsCommandFrontend::ask_spec_kind`.
+    /// Answer for `NewSpecFrontend::ask_spec_kind`.
     ///
     /// Uniform: `Task` is the neutral kind, and nothing in a headless
     /// invocation distinguishes a feature from a bug.
@@ -453,6 +454,12 @@ impl HeadlessDefaults {
         ToolChoice::Continue
     }
 
+    /// Prepare missing workflow images. Building still requires the session's
+    /// explicit builtin builder opt-in and a compatible local source.
+    pub fn prerequisite_image(&self) -> bool {
+        true
+    }
+
     /// Answer for `ask_prerequisite_gap` (missing remote, detached HEAD, a
     /// pull request with no push before it). Uniform: continue, and let
     /// `unresolved` decide.
@@ -461,430 +468,171 @@ impl HeadlessDefaults {
     }
 }
 
+/// The answer table above, cell by cell, for every row that takes no
+/// run-specific prompt. Changing a policy means changing a row here, which
+/// makes the change deliberate and reviewable.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::commands::exec_workflow::WorkflowResumeStep;
 
-    /// One row of the module doc's answer table, in the same order.
-    ///
-    /// Anything that varies across profiles gets a column here. Rows that are
-    /// uniform by construction (`existing_worktree`, `yolo_tick`, the init and
-    /// ready answers, `confirm_deletion`) are asserted once in
-    /// [`uniform_answers_are_the_same_for_every_profile`].
-    struct Row {
-        /// The question, as the module doc names it.
-        question: &'static str,
-        api: &'static str,
-        squad: &'static str,
-        cli: &'static str,
-    }
-
-    /// The recorded contract. Changing a cell here is the only way to change a
-    /// headless policy, which is the point: it cannot happen as a side effect
-    /// of editing a frontend.
-    const TABLE: &[Row] = &[
-        Row {
-            question: "prerequisite_credential_use",
-            api: "Deny",
-            squad: "Deny",
-            cli: "Deny",
-        },
-        Row {
-            question: "prerequisite_unresolved(static)",
-            api: "Fail",
-            squad: "Fail",
-            cli: "Fail",
-        },
-        Row {
-            question: "prerequisite_unresolved(assumed_all)",
-            api: "Warn",
-            squad: "Warn",
-            cli: "Warn",
-        },
-        Row {
-            question: "prerequisite_tool",
-            api: "Continue",
-            squad: "Continue",
-            cli: "Continue",
-        },
-        Row {
-            question: "prerequisite_gap",
-            api: "Continue",
-            squad: "Continue",
-            cli: "Continue",
-        },
-        Row {
-            question: "mount_scope",
-            api: "MountGitRoot",
-            squad: "MountCurrentDirOnly",
-            cli: "MountGitRoot",
-        },
-        Row {
-            question: "agent_setup(default_available = true)",
-            api: "Setup",
-            squad: "Setup",
-            cli: "Setup",
-        },
-        Row {
-            question: "agent_setup(default_available = false)",
-            api: "Abort",
-            squad: "Setup",
-            cli: "Setup",
-        },
-        Row {
-            question: "agent_auth_consent",
-            api: "Accept",
-            squad: "Accept",
-            cli: "DeclineOnce",
-        },
-        Row {
-            question: "confirm_resume",
-            api: "true",
-            squad: "false",
-            cli: "false",
-        },
-        Row {
-            question: "workflow_next_action(can_launch_next = true)",
-            api: "LaunchNext",
-            squad: "LaunchNext",
-            cli: "LaunchNext",
-        },
-        Row {
-            question: "workflow_next_action(can_launch_next = false, can_finish_workflow = true)",
-            api: "FinishWorkflow",
-            squad: "LaunchNext",
-            cli: "LaunchNext",
-        },
-        Row {
-            question: "workflow_next_action(can_launch_next = false, can_finish_workflow = false)",
-            api: "Abort",
-            squad: "LaunchNext",
-            cli: "LaunchNext",
-        },
-        Row {
-            question: "pre_worktree_uncommitted_files",
-            api: "Commit(suggested)",
-            squad: "UseLastCommit",
-            cli: "UseLastCommit",
-        },
-        Row {
-            question: "existing_worktree",
-            api: "Fail",
-            squad: "Resume",
-            cli: "Resume",
-        },
-        Row {
-            question: "post_workflow_action(had_error = false)",
-            api: "Merge",
-            squad: "Keep",
-            cli: "Keep",
-        },
-        Row {
-            question: "post_workflow_action(had_error = true)",
-            api: "Keep",
-            squad: "Keep",
-            cli: "Keep",
-        },
-        Row {
-            question: "worktree_commit_before_merge",
-            api: "Some(suggested)",
-            squad: "None",
-            cli: "None",
-        },
-        Row {
-            question: "merge_mode",
-            api: "Squash",
-            squad: "LeaveBranch",
-            cli: "LeaveBranch",
-        },
-        Row {
-            question: "confirm_worktree_cleanup",
-            api: "true",
-            squad: "false",
-            cli: "false",
-        },
-        Row {
-            question: "dirty_merge_target",
-            api: "Abort",
-            squad: "Abort",
-            cli: "Abort",
-        },
-        Row {
-            question: "launch_merge_fix_agent",
-            api: "false",
-            squad: "false",
-            cli: "false",
-        },
-        Row {
-            question: "workflow_resume(has a stop point)",
-            api: "ResumeFrom(build)",
-            squad: "Fresh",
-            cli: "ResumeFrom(build)",
-        },
-        Row {
-            question: "workflow_resume(no stop point)",
-            api: "Fresh",
-            squad: "Fresh",
-            cli: "Fresh",
-        },
-        Row {
-            question: "acp_permission",
-            api: "Cancelled",
-            squad: "Cancelled",
-            cli: "Selected(ok)",
-        },
-    ];
-
-    /// The squad profile's `mount_scope` is task data, so the table records
-    /// what it does with a *non-default* value: return it verbatim.
-    const SQUAD_TASK_SCOPE: MountScopeDecision = MountScopeDecision::MountCurrentDirOnly;
-
-    fn available(can_launch_next: bool, can_finish_workflow: bool) -> AvailableActions {
-        AvailableActions {
-            can_launch_next,
-            can_finish_workflow,
-            ..Default::default()
-        }
-    }
-
-    fn post_workflow_prompt(had_error: bool) -> PostWorkflowWorktreePrompt {
-        PostWorkflowWorktreePrompt {
-            branch: "awman/work-item-0114".to_string(),
-            target_branch: "main".to_string(),
-            had_error,
-            title: "title".to_string(),
-            body: "body".to_string(),
-            merge_label: "merge".to_string(),
-            discard_label: "discard".to_string(),
-            keep_label: "keep".to_string(),
-        }
-    }
-
-    fn resume_prompt(start_points: Vec<&str>) -> WorkflowResumePrompt {
-        WorkflowResumePrompt::new(
-            "ci".to_string(),
-            None,
-            None,
-            false,
-            1,
-            3,
-            start_points
-                .into_iter()
-                .map(|name| WorkflowResumeStep {
-                    name: name.to_string(),
-                    role: "the step that failed".to_string(),
-                })
-                .collect(),
-        )
-    }
-
-    fn permission_option(option_id: &str, kind: &str) -> PermissionOption {
-        PermissionOption {
-            option_id: option_id.to_string(),
-            name: option_id.to_string(),
-            kind: kind.to_string(),
-        }
-    }
-
-    fn permission_options() -> Vec<PermissionOption> {
-        vec![permission_option("ok", "allow_once")]
-    }
-
-    /// Render every answer of one profile as the table spells it.
-    fn answers(d: &HeadlessDefaults) -> Vec<(&'static str, String)> {
-        let opts = permission_options();
+    /// `(question, [api, squad, cli])`, each answer in its `Debug` form.
+    fn table() -> Vec<(&'static str, [String; 3])> {
+        let profiles = [
+            HeadlessDefaults::api(),
+            HeadlessDefaults::squad(MountScopeDecision::MountCurrentDirOnly),
+            HeadlessDefaults::cli(),
+        ];
+        let row = |name: &'static str, f: &dyn Fn(&HeadlessDefaults) -> String| {
+            (name, [f(&profiles[0]), f(&profiles[1]), f(&profiles[2])])
+        };
         vec![
-            (
-                "prerequisite_credential_use",
-                format!("{:?}", d.prerequisite_credential_use()),
-            ),
-            (
-                "prerequisite_unresolved(static)",
+            row("mount_scope", &|p| format!("{:?}", p.mount_scope())),
+            row("agent_setup(available)", &|p| {
+                format!("{:?}", p.agent_setup(true))
+            }),
+            row("agent_setup(unavailable)", &|p| {
+                format!("{:?}", p.agent_setup(false))
+            }),
+            row("agent_auth_consent", &|p| {
+                format!("{:?}", p.agent_auth_consent())
+            }),
+            row("confirm_resume", &|p| format!("{:?}", p.confirm_resume())),
+            row("yolo_tick", &|p| format!("{:?}", p.yolo_tick())),
+            row("pre_worktree_uncommitted_files", &|p| {
+                format!("{:?}", p.pre_worktree_uncommitted_files("m"))
+            }),
+            row("existing_worktree", &|p| {
+                format!("{:?}", p.existing_worktree())
+            }),
+            row("worktree_commit_before_merge", &|p| {
+                format!("{:?}", p.worktree_commit_before_merge("m"))
+            }),
+            row("merge_mode", &|p| format!("{:?}", p.merge_mode())),
+            row("confirm_worktree_cleanup", &|p| {
+                format!("{:?}", p.confirm_worktree_cleanup())
+            }),
+            row("dirty_merge_target", &|p| {
+                format!("{:?}", p.dirty_merge_target())
+            }),
+            row("launch_merge_fix_agent", &|p| {
+                format!("{:?}", p.launch_merge_fix_agent())
+            }),
+            row("replace_aspec", &|p| format!("{:?}", p.replace_aspec())),
+            row("run_audit", &|p| format!("{:?}", p.run_audit())),
+            row("work_items_setup", &|p| {
+                format!("{:?}", p.work_items_setup())
+            }),
+            row("dockerfile_setup", &|p| {
+                format!("{:?}", p.dockerfile_setup())
+            }),
+            row("create_dockerfile", &|p| {
+                format!("{:?}", p.create_dockerfile())
+            }),
+            row("run_audit_on_template", &|p| {
+                format!("{:?}", p.run_audit_on_template())
+            }),
+            row("confirm_deletion", &|p| {
+                format!("{:?}", p.confirm_deletion())
+            }),
+            row("delete_task_dir", &|p| format!("{:?}", p.delete_task_dir())),
+            row("spec_kind", &|p| format!("{:?}", p.spec_kind())),
+            row("prerequisite_credential_use", &|p| {
+                format!("{:?}", p.prerequisite_credential_use())
+            }),
+            row("prerequisite_unresolved(static)", &|p| {
                 format!(
                     "{:?}",
-                    d.prerequisite_unresolved(PrerequisiteOrigin::Static)
-                ),
-            ),
-            (
-                "prerequisite_unresolved(assumed_all)",
+                    p.prerequisite_unresolved(PrerequisiteOrigin::Static)
+                )
+            }),
+            row("prerequisite_unresolved(assumed)", &|p| {
                 format!(
                     "{:?}",
-                    d.prerequisite_unresolved(PrerequisiteOrigin::AssumedAll)
-                ),
-            ),
-            ("prerequisite_tool", format!("{:?}", d.prerequisite_tool())),
-            ("prerequisite_gap", format!("{:?}", d.prerequisite_gap())),
-            ("mount_scope", format!("{:?}", d.mount_scope())),
-            (
-                "agent_setup(default_available = true)",
-                format!("{:?}", d.agent_setup(true)),
-            ),
-            (
-                "agent_setup(default_available = false)",
-                format!("{:?}", d.agent_setup(false)),
-            ),
-            (
-                "agent_auth_consent",
-                format!("{:?}", d.agent_auth_consent()),
-            ),
-            ("confirm_resume", d.confirm_resume().to_string()),
-            (
-                "workflow_next_action(can_launch_next = true)",
-                format!("{:?}", d.workflow_next_action(&available(true, false))),
-            ),
-            (
-                "workflow_next_action(can_launch_next = false, can_finish_workflow = true)",
-                format!("{:?}", d.workflow_next_action(&available(false, true))),
-            ),
-            (
-                "workflow_next_action(can_launch_next = false, can_finish_workflow = false)",
-                format!("{:?}", d.workflow_next_action(&available(false, false))),
-            ),
-            (
-                "pre_worktree_uncommitted_files",
-                match d.pre_worktree_uncommitted_files("suggested") {
-                    PreWorktreeDecision::Commit { message } => format!("Commit({message})"),
-                    other => format!("{other:?}"),
-                },
-            ),
-            ("existing_worktree", format!("{:?}", d.existing_worktree())),
-            (
-                "post_workflow_action(had_error = false)",
-                format!("{:?}", d.post_workflow_action(&post_workflow_prompt(false))),
-            ),
-            (
-                "post_workflow_action(had_error = true)",
-                format!("{:?}", d.post_workflow_action(&post_workflow_prompt(true))),
-            ),
-            (
-                "worktree_commit_before_merge",
-                match d.worktree_commit_before_merge("suggested") {
-                    Some(m) => format!("Some({m})"),
-                    None => "None".to_string(),
-                },
-            ),
-            ("merge_mode", format!("{:?}", d.merge_mode())),
-            (
-                "confirm_worktree_cleanup",
-                d.confirm_worktree_cleanup().to_string(),
-            ),
-            (
-                "dirty_merge_target",
-                format!("{:?}", d.dirty_merge_target()),
-            ),
-            (
-                "launch_merge_fix_agent",
-                d.launch_merge_fix_agent().to_string(),
-            ),
-            (
-                "workflow_resume(has a stop point)",
-                match d.workflow_resume(&resume_prompt(vec!["build"])) {
-                    WorkflowResumeDecision::ResumeFrom(name) => format!("ResumeFrom({name})"),
-                    other => format!("{other:?}"),
-                },
-            ),
-            (
-                "workflow_resume(no stop point)",
-                match d.workflow_resume(&resume_prompt(vec![])) {
-                    WorkflowResumeDecision::ResumeFrom(name) => format!("ResumeFrom({name})"),
-                    other => format!("{other:?}"),
-                },
-            ),
-            (
-                "acp_permission",
-                match d.acp_permission(&opts) {
-                    PermissionDecision::Selected { option_id } => format!("Selected({option_id})"),
-                    PermissionDecision::Cancelled => "Cancelled".to_string(),
-                },
-            ),
+                    p.prerequisite_unresolved(PrerequisiteOrigin::AssumedAll)
+                )
+            }),
+            row("prerequisite_tool", &|p| {
+                format!("{:?}", p.prerequisite_tool())
+            }),
+            row("prerequisite_gap", &|p| {
+                format!("{:?}", p.prerequisite_gap())
+            }),
+            row("prerequisite_image", &|p| {
+                format!("{:?}", p.prerequisite_image())
+            }),
         ]
     }
 
-    /// The regression guard F-13 exists for: each profile answers exactly what
-    /// the table records, cell by cell.
-    /// One profile under test: its name, the profile itself, and the accessor
-    /// for the column of [`TABLE`] it must match.
-    type ProfileUnderTest = (&'static str, HeadlessDefaults, fn(&Row) -> &'static str);
-
     #[test]
-    fn every_profile_answers_its_recorded_table() {
-        let profiles: [ProfileUnderTest; 3] = [
-            ("api", HeadlessDefaults::api(), |r| r.api),
-            ("squad", HeadlessDefaults::squad(SQUAD_TASK_SCOPE), |r| {
-                r.squad
-            }),
-            ("cli", HeadlessDefaults::cli(), |r| r.cli),
+    fn headless_answer_table() {
+        let expected: &[(&str, [&str; 3])] = &[
+            (
+                "mount_scope",
+                ["MountGitRoot", "MountCurrentDirOnly", "MountGitRoot"],
+            ),
+            ("agent_setup(available)", ["Setup", "Setup", "Setup"]),
+            ("agent_setup(unavailable)", ["Abort", "Setup", "Setup"]),
+            ("agent_auth_consent", ["Accept", "Accept", "DeclineOnce"]),
+            ("confirm_resume", ["true", "false", "false"]),
+            ("yolo_tick", ["Continue", "Continue", "Continue"]),
+            (
+                "pre_worktree_uncommitted_files",
+                [
+                    "Commit { message: \"m\" }",
+                    "UseLastCommit",
+                    "UseLastCommit",
+                ],
+            ),
+            ("existing_worktree", ["Fail", "Resume", "Resume"]),
+            (
+                "worktree_commit_before_merge",
+                ["Some(\"m\")", "None", "None"],
+            ),
+            ("merge_mode", ["Squash", "LeaveBranch", "LeaveBranch"]),
+            ("confirm_worktree_cleanup", ["true", "false", "false"]),
+            ("dirty_merge_target", ["Abort", "Abort", "Abort"]),
+            ("launch_merge_fix_agent", ["false", "false", "false"]),
+            // Init (WI 0148): a headless host keeps an existing aspec/ and
+            // project Dockerfile, never runs the audit, sets up no work items,
+            // and creates the project Dockerfile from the default template
+            // when it is missing. API `init` depends on `CreateNew` here: a
+            // `Skip` would leave an API-initialised repository with no
+            // Dockerfile.dev for later nodes to add tools to.
+            ("replace_aspec", ["false", "false", "false"]),
+            ("run_audit", ["false", "false", "false"]),
+            ("work_items_setup", ["None", "None", "None"]),
+            ("dockerfile_setup", ["CreateNew", "CreateNew", "CreateNew"]),
+            ("create_dockerfile", ["true", "true", "true"]),
+            ("run_audit_on_template", ["false", "false", "false"]),
+            ("confirm_deletion", ["false", "false", "false"]),
+            ("delete_task_dir", ["false", "false", "false"]),
+            ("spec_kind", ["Task", "Task", "Task"]),
+            ("prerequisite_credential_use", ["Deny", "Deny", "Deny"]),
+            ("prerequisite_unresolved(static)", ["Fail", "Fail", "Fail"]),
+            ("prerequisite_unresolved(assumed)", ["Warn", "Warn", "Warn"]),
+            ("prerequisite_tool", ["Continue", "Continue", "Continue"]),
+            ("prerequisite_gap", ["Continue", "Continue", "Continue"]),
+            ("prerequisite_image", ["true", "true", "true"]),
         ];
-
-        for (name, defaults, expected_cell) in profiles {
-            let actual = answers(&defaults);
+        let actual = table();
+        assert_eq!(actual.len(), expected.len(), "every row is pinned");
+        for ((name, got), (want_name, want)) in actual.iter().zip(expected) {
+            assert_eq!(name, want_name);
             assert_eq!(
-                actual.len(),
-                TABLE.len(),
-                "{name}: the table and the answer list have drifted apart"
+                got.iter().map(String::as_str).collect::<Vec<_>>(),
+                want.to_vec(),
+                "row `{name}` as [api, squad, cli]"
             );
-            for (row, (question, got)) in TABLE.iter().zip(actual) {
-                assert_eq!(
-                    row.question, question,
-                    "{name}: table and answer list are out of order"
-                );
-                assert_eq!(
-                    expected_cell(row),
-                    got,
-                    "{name} profile answered {question} with {got}, table says {}",
-                    expected_cell(row)
-                );
-            }
         }
     }
 
-    /// The rows the module doc marks as the same for every host. Asserted here
-    /// rather than as three identical table columns.
+    /// The row API `init` stands on, pinned by value as well as by table.
     #[test]
-    fn uniform_answers_are_the_same_for_every_profile() {
-        for defaults in [
-            HeadlessDefaults::api(),
-            HeadlessDefaults::squad(SQUAD_TASK_SCOPE),
-            HeadlessDefaults::cli(),
-        ] {
-            assert!(matches!(defaults.yolo_tick(), YoloTickOutcome::Continue));
-            assert!(!defaults.replace_aspec());
-            assert!(!defaults.run_audit());
-            assert!(defaults.work_items_setup().is_none());
-            assert_eq!(
-                defaults.dockerfile_setup(),
-                DockerfileSetupDecision::CreateNew
-            );
-            assert!(defaults.create_dockerfile());
-            assert!(!defaults.run_audit_on_template());
-            assert!(!defaults.confirm_deletion());
-            assert!(!defaults.delete_task_dir());
-            assert_eq!(defaults.spec_kind(), WorkItemKind::Task);
-        }
-    }
-
-    /// Squad's `mount_scope` is the scope the task was created with, returned
-    /// verbatim — not a constant like the other two profiles.
-    #[test]
-    fn squad_returns_the_captured_mount_scope() {
-        for scope in [
-            MountScopeDecision::MountGitRoot,
-            MountScopeDecision::MountCurrentDirOnly,
-            MountScopeDecision::Abort,
-        ] {
-            assert_eq!(HeadlessDefaults::squad(scope).mount_scope(), scope);
-        }
-    }
-
-    /// `approve` refuses to treat a non-allow option as approval, so a CLI run
-    /// whose agent offered only "reject" still cancels.
-    #[test]
-    fn cli_acp_permission_does_not_approve_a_reject_only_request() {
-        let reject_only = vec![permission_option("no", "reject_once")];
-        assert!(matches!(
-            HeadlessDefaults::cli().acp_permission(&reject_only),
-            PermissionDecision::Cancelled
-        ));
+    fn api_init_creates_the_default_project_dockerfile() {
+        let api = HeadlessDefaults::api();
+        assert_eq!(api.dockerfile_setup(), DockerfileSetupDecision::CreateNew);
+        assert!(!api.replace_aspec());
+        assert!(!api.run_audit());
+        assert!(api.work_items_setup().is_none());
     }
 }

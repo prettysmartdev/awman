@@ -10,9 +10,11 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 
-use crate::data::config::global::GlobalConfig;
+use crate::data::config::file::ConfigFile as GlobalConfig;
 use crate::data::error::DataError;
 use crate::data::fs::config_file::write_config_file_atomically;
+pub use crate::data::ids::RunId;
+use crate::data::ids::{TaskId, WorkerSessionId};
 
 /// A persisted scheduled squad task.
 ///
@@ -53,7 +55,7 @@ use crate::data::fs::config_file::write_config_file_atomically;
 pub struct Task {
     #[serde(default)]
     pub prerequisites: Option<crate::data::config::workflows::PrerequisitePolicy>,
-    pub id: String,
+    pub id: TaskId,
     pub name: String,
     pub description: String,
     /// The task's effective root. See the type-level docs.
@@ -213,33 +215,6 @@ impl Task {
     }
 }
 
-/// Typed identifier for one evaluation run.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct RunId(pub String);
-
-impl RunId {
-    pub fn new() -> Self {
-        Self(uuid::Uuid::new_v4().to_string())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Default for RunId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for RunId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -311,12 +286,12 @@ pub struct TaskUpdate {
 /// A persisted squad evaluation attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Run {
-    pub id: String,
-    pub task_id: String,
+    pub id: RunId,
+    pub task_id: TaskId,
     pub status: RunStatus,
     pub workflow_path: Option<PathBuf>,
     pub workflow_state_path: Option<PathBuf>,
-    pub session_id: Option<String>,
+    pub session_id: Option<WorkerSessionId>,
     pub started_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
@@ -339,7 +314,7 @@ pub struct Run {
 
 /// SQLite-backed task store. The squad daemon is its only constructor.
 pub struct TaskStore {
-    conn: Mutex<Connection>,
+    conn: std::sync::Arc<Mutex<Connection>>,
 }
 
 impl TaskStore {
@@ -358,8 +333,11 @@ impl TaskStore {
         let conn = Connection::open(db_file)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: std::sync::Arc::new(Mutex::new(conn)),
         })
+    }
+    pub(crate) fn from_connection(conn: std::sync::Arc<Mutex<Connection>>) -> Self {
+        Self { conn }
     }
 
     /// Create (idempotently) a task's durable workspace directory.
@@ -378,8 +356,7 @@ impl TaskStore {
 
     /// Write a task's own `config.json`.
     ///
-    /// The document is a whole [`GlobalConfig`] carrying only its `squad`
-    /// block, so the file the daemon writes and the file a user may hand-edit
+    /// The document is a whole task-scope [`crate::data::config::ConfigFile`], so the file the daemon writes and the file a user may hand-edit
     /// are the same shape, parsed by the same loader.
     pub fn write_config(path: &Path, config: &GlobalConfig) -> Result<(), DataError> {
         let body = serde_json::to_string_pretty(config)
@@ -461,6 +438,7 @@ impl TaskStore {
         // The leader verdict's free-text `reason`. `NULL` for rows written
         // before this column existed and for runs that never reached a verdict.
         Self::add_column_if_missing(conn, "squad_runs", "reason", "TEXT")?;
+        crate::data::fs::schema_version::migrate_ids(conn)?;
         Ok(())
     }
 
@@ -714,8 +692,8 @@ impl TaskStore {
 
     pub fn start_run(
         &self,
-        task_id: &str,
-        session_id: Option<&str>,
+        task_id: &TaskId,
+        session_id: Option<&WorkerSessionId>,
         started_at: DateTime<Utc>,
     ) -> Result<RunId, DataError> {
         self.start_run_with_env(task_id, session_id, started_at, &[])
@@ -729,8 +707,8 @@ impl TaskStore {
     /// actually started with.
     pub fn start_run_with_env(
         &self,
-        task_id: &str,
-        session_id: Option<&str>,
+        task_id: &TaskId,
+        session_id: Option<&WorkerSessionId>,
         started_at: DateTime<Utc>,
         unmet_env: &[String],
     ) -> Result<RunId, DataError> {
@@ -836,7 +814,14 @@ impl TaskStore {
         Ok(runs)
     }
 
-    pub fn running_run_for(&self, task_id: &str) -> Result<Option<Run>, DataError> {
+    pub fn task_name_for_run(&self, id: &RunId) -> Result<Option<String>, DataError> {
+        Ok(self.lock().query_row(
+            "SELECT t.name FROM squad_tasks t JOIN squad_runs r ON r.task_id = t.id WHERE r.id = ?1",
+            [id], |row| row.get(0),
+        ).optional()?)
+    }
+
+    pub fn running_run_for(&self, task_id: &TaskId) -> Result<Option<Run>, DataError> {
         let conn = self.lock();
         let raw = conn
             .query_row(
@@ -866,7 +851,7 @@ impl TaskStore {
 #[derive(Debug)]
 struct RawTask {
     prerequisites: Option<String>,
-    id: String,
+    id: TaskId,
     name: String,
     description: String,
     repo_scope: String,
@@ -955,12 +940,12 @@ where
 
 #[derive(Debug)]
 struct RawRun {
-    id: String,
-    task_id: String,
+    id: RunId,
+    task_id: TaskId,
     status: String,
     workflow_path: Option<String>,
     workflow_state_path: Option<String>,
-    session_id: Option<String>,
+    session_id: Option<WorkerSessionId>,
     started_at: String,
     finished_at: Option<String>,
     error: Option<String>,
@@ -1038,7 +1023,7 @@ fn decode_names(value: Option<&str>) -> Result<Vec<String>, DataError> {
 }
 
 fn timestamp(value: DateTime<Utc>) -> String {
-    value.to_rfc3339()
+    crate::data::wire::format_timestamp(value)
 }
 fn timestamp_opt(value: Option<DateTime<Utc>>) -> Option<String> {
     value.map(timestamp)
@@ -1065,337 +1050,4 @@ fn encode_prerequisites(
         .map(serde_json::to_string)
         .transpose()
         .map_err(|source| DataError::ConfigSerialize { source })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn task(name: &str, now: DateTime<Utc>) -> Task {
-        Task {
-            prerequisites: None,
-            id: uuid::Uuid::new_v4().to_string(),
-            name: name.to_string(),
-            description: "test".into(),
-            repo_scope: PathBuf::from("/repo"),
-            mount_scope: MountScope::GitRoot,
-            overlays: Vec::new(),
-            interval_secs: 60,
-            status: TaskStatus::Active,
-            agent: None,
-            model: None,
-            backoff_until: None,
-            created_at: now,
-            updated_at: now,
-            last_run_at: None,
-            trigger_requested_at: None,
-            last_run_status: None,
-            unmet_env: Vec::new(),
-        }
-    }
-
-    /// The scheduler re-reads a task's `config.json` every tick through the
-    /// ordinary global-config loader. While the daemon keeps rewriting it,
-    /// that loader must always parse a complete old or new document.
-    #[test]
-    fn the_scheduler_loader_always_reads_a_complete_task_config() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("config.json");
-        let small = GlobalConfig {
-            overlays: Some(vec!["small".into()]),
-            ..Default::default()
-        };
-        let large = GlobalConfig {
-            overlays: Some(vec!["l".repeat(64 * 1024); 4]),
-            ..Default::default()
-        };
-        TaskStore::write_config(&path, &small).unwrap();
-
-        let done = Arc::new(AtomicBool::new(false));
-        let reader = {
-            let (done, path) = (Arc::clone(&done), path.clone());
-            let (small, large) = (small.overlays.clone(), large.overlays.clone());
-            std::thread::spawn(move || {
-                let mut reads = 0usize;
-                while !done.load(Ordering::Acquire) || reads == 0 {
-                    let loaded = GlobalConfig::load_path(&path)
-                        .expect("every read parses a complete task config");
-                    assert!(
-                        loaded.overlays == small || loaded.overlays == large,
-                        "read a mixed task config"
-                    );
-                    reads += 1;
-                }
-                reads
-            })
-        };
-        for i in 0..100 {
-            TaskStore::write_config(&path, if i % 2 == 0 { &large } else { &small }).unwrap();
-        }
-        done.store(true, Ordering::Release);
-        assert!(reader.join().unwrap() > 0);
-    }
-
-    #[test]
-    fn due_query_enforces_every_admission_rule() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = TaskStore::open(&tmp.path().join("awman.db")).unwrap();
-        store.migrate().unwrap();
-        let now = DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let due = task("due", now);
-        store.create(&due).unwrap();
-        let mut paused = task("paused", now);
-        paused.status = TaskStatus::Paused;
-        store.create(&paused).unwrap();
-        let mut backoff = task("backoff", now);
-        backoff.backoff_until = Some(now + chrono::Duration::minutes(1));
-        store.create(&backoff).unwrap();
-        let mut recent = task("recent", now);
-        recent.last_run_at = Some(now - chrono::Duration::seconds(59));
-        store.create(&recent).unwrap();
-        let running = task("running", now);
-        store.create(&running).unwrap();
-        store.start_run(&running.id, None, now).unwrap();
-        assert_eq!(
-            store
-                .due_for_evaluation(now)
-                .unwrap()
-                .into_iter()
-                .map(|c| c.name)
-                .collect::<Vec<_>>(),
-            vec!["due"]
-        );
-    }
-
-    #[test]
-    fn duplicate_name_gets_clear_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = TaskStore::open(&tmp.path().join("awman.db")).unwrap();
-        store.migrate().unwrap();
-        let now = Utc::now();
-        store.create(&task("same", now)).unwrap();
-        let error = store.create(&task("same", now)).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("a task named \"same\" already exists"));
-    }
-
-    #[test]
-    fn startup_reconciles_running_rows() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = TaskStore::open(&tmp.path().join("awman.db")).unwrap();
-        store.migrate().unwrap();
-        let now = Utc::now();
-        let task = task("orphan", now);
-        store.create(&task).unwrap();
-        let run_id = store.start_run(&task.id, None, now).unwrap();
-        assert_eq!(store.reconcile_orphaned_runs(now).unwrap(), 1);
-        assert!(store.running_run_for(&task.id).unwrap().is_none());
-        assert!(!store
-            .finish_run(&run_id, RunStatus::Failed, &RunDetail::default(), now)
-            .unwrap());
-    }
-
-    #[test]
-    fn finish_run_records_the_verdict_reason_in_the_history() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = TaskStore::open(&tmp.path().join("awman.db")).unwrap();
-        store.migrate().unwrap();
-        let now = Utc::now();
-        let task = task("reasoned", now);
-        store.create(&task).unwrap();
-        let run_id = store.start_run(&task.id, None, now).unwrap();
-        let detail = RunDetail {
-            reason: Some("no new issues since the last run".into()),
-            ..Default::default()
-        };
-        assert!(store
-            .finish_run(&run_id, RunStatus::NotTriggered, &detail, now)
-            .unwrap());
-        let runs = store.runs_for("reasoned", 10).unwrap();
-        assert_eq!(
-            runs[0].reason.as_deref(),
-            Some("no new issues since the last run")
-        );
-    }
-}
-
-#[cfg(test)]
-mod prerequisite_tests {
-    use super::*;
-    use crate::data::config::flags::{PrerequisiteFlags, SshFlag};
-    use crate::data::config::workflows::PrerequisitePolicy;
-
-    fn task(name: &str, now: DateTime<Utc>) -> Task {
-        serde_json::from_value(serde_json::json!({
-            "id": format!("id-{name}"), "name": name, "description": "example",
-            "repo_scope": "/repo", "mount_scope": "gitroot", "overlays": [],
-            "interval_secs": 60, "status": "active", "agent": null, "model": null,
-            "backoff_until": null, "created_at": now, "updated_at": now, "last_run_at": null
-        }))
-        .unwrap()
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_config_publishes_atomically_and_keeps_old_config_on_failure() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("task").join("config.json");
-        TaskStore::write_config(&path, &GlobalConfig::default()).unwrap();
-        let before = std::fs::read_to_string(&path).unwrap();
-
-        let dir = path.parent().unwrap();
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let changed = GlobalConfig {
-            default_agent: Some("claude".into()),
-            ..GlobalConfig::default()
-        };
-        let result = TaskStore::write_config(&path, &changed);
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        assert!(result.is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
-        TaskStore::write_config(&path, &changed).unwrap();
-        assert_ne!(std::fs::read_to_string(&path).unwrap(), before);
-        assert_eq!(
-            std::fs::read_dir(dir).unwrap().count(),
-            1,
-            "no temp file left"
-        );
-    }
-
-    #[test]
-    fn policy_round_trips_all_task_queries_and_updates_old_tasks() {
-        let root = tempfile::tempdir().unwrap();
-        let store = TaskStore::open(&root.path().join("tasks.db")).unwrap();
-        store.migrate().unwrap();
-        store.migrate().unwrap();
-        let now = Utc::now();
-        let mut task: Task = serde_json::from_value(serde_json::json!({
-            "id": "task-id", "name": "example", "description": "example",
-            "repo_scope": "/repo", "mount_scope": "gitroot", "overlays": [],
-            "interval_secs": 60, "status": "active", "agent": null, "model": null,
-            "backoff_until": null, "created_at": now, "updated_at": now, "last_run_at": null
-        }))
-        .unwrap();
-        assert!(task.prerequisites.is_none());
-        let policy = PrerequisitePolicy::from_flags(&PrerequisiteFlags {
-            ssh: Some(SshFlag::Deny),
-            ..Default::default()
-        });
-        task.prerequisites = Some(policy.clone());
-        store.create(&task).unwrap();
-        assert_eq!(
-            store.get("example").unwrap().unwrap().prerequisites,
-            Some(policy.clone())
-        );
-        assert_eq!(store.list().unwrap()[0].prerequisites, Some(policy.clone()));
-        assert_eq!(
-            store.due_for_evaluation(now).unwrap()[0].prerequisites,
-            Some(policy)
-        );
-        let replacement = PrerequisitePolicy::default();
-        let updated = store
-            .update(
-                "example",
-                &TaskUpdate {
-                    prerequisites: Some(replacement.clone()),
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(updated.prerequisites, Some(replacement));
-    }
-
-    #[test]
-    fn prerequisites_policy_round_trips_through_sqlite() {
-        use crate::data::config::workflows::{CredentialUse, PrerequisitePolicy};
-        let tmp = tempfile::tempdir().unwrap();
-        let store = TaskStore::open(&tmp.path().join("awman.db")).unwrap();
-        store.migrate().unwrap();
-        let mut policy = PrerequisitePolicy::default();
-        policy.ssh.use_ = CredentialUse::Allow;
-        policy.ssh.key = Some("~/.ssh/id_ed25519".into());
-        policy.github_token.use_ = CredentialUse::Allow;
-        policy.github_token.env_vars = vec!["GH_TOKEN".into()];
-        let now = Utc::now();
-        let created = task("with-policy", now).with_prerequisites(Some(policy.clone()));
-        store.create(&created).unwrap();
-        let loaded = store.get("with-policy").unwrap().unwrap();
-        assert_eq!(loaded.prerequisites, Some(policy.clone()));
-        assert_eq!(store.list().unwrap()[0].prerequisites, Some(policy.clone()));
-        // Stored as decisions only: key path and env var *names*.
-        let conn = store.lock();
-        let raw: String = conn
-            .query_row(
-                "SELECT prerequisites FROM squad_tasks WHERE name = 'with-policy'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        drop(conn);
-        assert!(raw.contains("GH_TOKEN"));
-        assert!(raw.contains("~/.ssh/id_ed25519"));
-        assert!(!raw.contains("ghp_"));
-
-        // Update replaces the policy; an update without one keeps the stored policy.
-        let mut denied = policy.clone();
-        denied.ssh.use_ = CredentialUse::Deny;
-        let updated = store
-            .update(
-                "with-policy",
-                &TaskUpdate {
-                    prerequisites: Some(denied.clone()),
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(updated.prerequisites, Some(denied.clone()));
-        let kept = store
-            .update(
-                "with-policy",
-                &TaskUpdate {
-                    description: Some("changed".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(kept.prerequisites, Some(denied));
-    }
-
-    #[test]
-    fn legacy_row_reads_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = TaskStore::open(&tmp.path().join("awman.db")).unwrap();
-        store.migrate().unwrap();
-        store.create(&task("legacy", Utc::now())).unwrap();
-        // A row written before the column existed has NULL there.
-        store
-            .lock()
-            .execute("UPDATE squad_tasks SET prerequisites = NULL", [])
-            .unwrap();
-        assert!(store
-            .get("legacy")
-            .unwrap()
-            .unwrap()
-            .prerequisites
-            .is_none());
-        // Migrating again is a no-op on an existing column.
-        store.migrate().unwrap();
-        assert!(store
-            .get("legacy")
-            .unwrap()
-            .unwrap()
-            .prerequisites
-            .is_none());
-    }
 }

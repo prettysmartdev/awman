@@ -77,6 +77,22 @@ fn unsupported(operation: &'static str) -> EngineError {
         runtime: "builtin",
     }
 }
+/// The one host-terminal scrub for this backend (WI 0141 §3), applied to the
+/// merged env (passthrough, overlays, literals, credentials). Returns the
+/// kept env and the user-facing notice for dropped names, which the launch
+/// writes to the frontend (and traces here).
+fn scrubbed_launch_env(
+    env: Vec<(String, String)>,
+    host_colorterm: Option<&str>,
+) -> (Vec<(String, String)>, Option<String>) {
+    let scrubbed = crate::engine::container::host_env_denylist::scrub_run_env(env, host_colorterm);
+    let notice = scrubbed.notice();
+    if let Some(notice) = &notice {
+        tracing::warn!("{notice}");
+    }
+    (scrubbed.kept, notice)
+}
+
 fn guest_path(path: &Path) -> Result<String, EngineError> {
     path.to_str()
         .filter(|s| s.starts_with('/'))
@@ -210,7 +226,7 @@ impl BuiltinBackend {
         std::thread::spawn(move || {
             let mut events = session.events;
             while let Ok(event) = events.blocking_recv() {
-                let terminal = matches!(event, ExecEvent::Exited(_) | ExecEvent::Failed);
+                let terminal = matches!(event, ExecEvent::Exited(_) | ExecEvent::Failed(_));
                 if tx.send(event).is_err() || terminal {
                     break;
                 }
@@ -257,7 +273,12 @@ impl BuiltinBackend {
         }
         Ok(summary)
     }
-    fn plan(&self, options: ResolvedContainerOptions) -> Result<LaunchPlan, EngineError> {
+    pub(super) fn plan(
+        &self,
+        options: ResolvedContainerOptions,
+    ) -> Result<LaunchPlan, EngineError> {
+        options.validate_read_only_workspace()?;
+        let output_tail = super::super::process::output_tail_for(&options)?;
         if options.allow_docker {
             return Err(unsupported("Docker socket bridge"));
         }
@@ -324,6 +345,11 @@ impl BuiltinBackend {
                 &options.labels,
             )?,
             mounts: mounts(&overlays)?,
+            tmpfs: options
+                .tmpfs
+                .iter()
+                .map(|p| guest_path(p))
+                .collect::<Result<_, _>>()?,
             mount_owner: image_owner(user.as_deref(), &config.accounts)?,
             vcpus,
             memory_mib,
@@ -341,9 +367,20 @@ impl BuiltinBackend {
                 .unwrap_or(config.argv),
         );
         let mut env = Vec::new();
-        for key in options.env_passthrough {
-            if let Some(value) = crate::data::config::env::host_var(&key.0) {
-                env.push((key.0, value));
+        if let Some(grants) = options.resolved_env_grants {
+            env.extend(
+                grants
+                    .into_iter()
+                    .map(|(key, value)| (key, value.expose().to_string())),
+            );
+        } else {
+            for key in options.env_passthrough {
+                if let Some(value) = options.host_env.as_ref().map_or_else(
+                    || crate::data::config::env::host_var(&key.0),
+                    |env| env.get(&key.0).map(str::to_owned),
+                ) {
+                    env.push((key.0, value));
+                }
             }
         }
         for (key, value) in options.env_overrides {
@@ -355,6 +392,17 @@ impl BuiltinBackend {
         if let Some((variable, _, container_path)) = &options.system_prompt_env_file {
             env.push((variable.clone(), guest_path(container_path)?));
         }
+        let (env, terminal_env_notice) = scrubbed_launch_env(
+            env,
+            options
+                .host_env
+                .as_ref()
+                .map_or_else(
+                    || crate::data::config::env::host_var("COLORTERM"),
+                    |env| env.get("COLORTERM").map(str::to_owned),
+                )
+                .as_deref(),
+        );
         let cwd = options
             .working_dir
             .map(|p| {
@@ -372,19 +420,24 @@ impl BuiltinBackend {
             ..Default::default()
         };
         Ok(LaunchPlan {
+            mount_guard: options.mount_guard,
             image_lease,
             spec,
             command,
             name,
             remove_on_exit: options.remove_on_exit,
             persistent_stdin: options.acp || options.interactive,
-            seeded_prompt: if options.acp || options.interactive {
+            startup_grace: options.startup_grace,
+            output_tail,
+            seeded_prompt: if options.acp || options.interactive || options.headless_prompt_in_argv
+            {
                 None
             } else {
                 options.seeded_prompt
             },
             leases,
             prompt_files: options.prompt_files,
+            terminal_env_notice,
         })
     }
     fn identities_path(&self) -> std::path::PathBuf {
@@ -420,6 +473,64 @@ impl BuiltinBackend {
     }
 }
 impl ContainerBackend for BuiltinBackend {
+    fn inspect_image(
+        &self,
+        tag: &str,
+    ) -> Result<Option<super::super::runtime::ImageMetadata>, EngineError> {
+        let _lock = self.paths.lock()?;
+        let Some(config) = self.driver.image_config(tag)? else {
+            return Ok(None);
+        };
+        let record = self.identities()?.remove(tag);
+        let mut labels = config.labels;
+        if let Some(record) = &record {
+            labels.extend(record.labels.clone());
+        }
+        Ok(Some(super::super::runtime::ImageMetadata {
+            manifest_digest: record.as_ref().map(|r| r.identity.manifest_digest.clone()),
+            id: record
+                .as_ref()
+                .map(|r| r.identity.config_digest.to_string())
+                .unwrap_or(config.id),
+            tags: vec![tag.into()],
+            labels,
+            size_bytes: if config.size_bytes > 0 {
+                config.size_bytes
+            } else {
+                record.map_or(0, |r| r.size_bytes)
+            },
+        }))
+    }
+
+    fn image_id(&self, tag: &str) -> Result<Option<String>, EngineError> {
+        Ok(self.inspect_image(tag)?.map(|image| image.id))
+    }
+
+    fn list_images_by_repo(
+        &self,
+        repo: &crate::data::image_inputs::RepoKey,
+    ) -> Result<Vec<super::super::runtime::ImageMetadata>, EngineError> {
+        // Enumerate only awman-owned imports. Drop the catalog lock before
+        // inspecting each row: inspection takes its own short catalog lock.
+        let tags: Vec<_> = {
+            let _lock = self.paths.lock()?;
+            self.identities()?.into_keys().collect()
+        };
+        let mut images = Vec::new();
+        for tag in tags {
+            if let Some(image) = self.inspect_image(&tag)? {
+                if image
+                    .labels
+                    .get(crate::data::image_inputs::REPO_LABEL)
+                    .map(String::as_str)
+                    == Some(repo.as_str())
+                {
+                    images.push(image);
+                }
+            }
+        }
+        Ok(images)
+    }
     fn name(&self) -> &'static str {
         crate::engine::container::runtime::BUILTIN_RUNTIME_NAME
     }
@@ -452,6 +563,7 @@ impl ContainerBackend for BuiltinBackend {
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
         self.is_available()?;
         let format = options.agent_output_format;
+        let program_status = options.program_status;
         let plan = self.plan(options)?;
         let owner = plan
             .spec
@@ -459,16 +571,21 @@ impl ContainerBackend for BuiltinBackend {
             .get(naming::LABEL_OWNER)
             .ok_or_else(|| EngineError::Other("builtin launch plan has no owner label".into()))?
             .clone();
-        Ok(crate::engine::agent_runtime::execution::with_output_format(
-            Box::new(Instance {
-                driver: self.driver.clone(),
-                paths: self.paths.clone(),
-                owner,
-                plan,
-                cancel_grace: self.cancel_grace,
-            }),
-            format,
-        ))
+        Ok(
+            crate::engine::agent_runtime::execution::with_program_status_config(
+                crate::engine::agent_runtime::execution::with_output_format(
+                    Box::new(Instance {
+                        driver: self.driver.clone(),
+                        paths: self.paths.clone(),
+                        owner,
+                        plan,
+                        cancel_grace: self.cancel_grace,
+                    }),
+                    format,
+                ),
+                program_status,
+            ),
+        )
     }
     fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
         let summary = self.driver.get(&handle.id)?;
@@ -517,6 +634,15 @@ impl ContainerBackend for BuiltinBackend {
         // always derived from the name, so this is exact for real handles too.
         self.driver.stats(&naming::sandbox_name_for(&handle.name))
     }
+    fn resource_label(
+        &self,
+        handle: &AgentHandle,
+        key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        let summary = self.driver.get(&handle.id)?;
+        naming::check_protocol(&summary.labels)?;
+        Ok(summary.labels.get(key).cloned())
+    }
     fn inspect(&self, handle: &AgentHandle) -> Result<AgentDetail, EngineError> {
         let summary = self.driver.get(&handle.id)?;
         naming::check_protocol(&summary.labels)?;
@@ -554,7 +680,11 @@ impl ContainerBackend for BuiltinBackend {
         // handle generation (creation time + name) protect against stopping a
         // replacement that reused the name; the launch-scoped owner token is
         // only required for automatic cleanup paths (cancel, finish, stuck).
-        let current = self.driver.get(&handle.id)?;
+        let current = match self.driver.get(&handle.id) {
+            Ok(current) => current,
+            Err(EngineError::AgentNotFound { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         naming::check_protocol(&current.labels)?;
         if current.handle.started_at != handle.started_at || current.handle.name != handle.name {
             return Err(EngineError::BuiltinAgentReplaced {
@@ -568,9 +698,38 @@ impl ContainerBackend for BuiltinBackend {
         self.driver
             .stop_owned(&handle.id, owner, Duration::from_secs(2))
     }
+    fn remove_agent_checked(
+        &self,
+        handle: &AgentHandle,
+        execution: &str,
+    ) -> Result<(), EngineError> {
+        let current = match self.driver.get(&handle.id) {
+            Ok(current) => current,
+            Err(EngineError::AgentNotFound { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        naming::check_protocol(&current.labels)?;
+        let owner = current
+            .labels
+            .get(naming::LABEL_OWNER)
+            .ok_or_else(|| EngineError::Other("builtin sandbox has no owner label".into()))?;
+        self.driver
+            .remove_stopped_checked(handle, owner, execution)?;
+        let _ = std::fs::remove_file(self.paths.attach(&handle.id, owner));
+        Ok(())
+    }
     fn remove_agent(&self, id: &str) -> Result<(), EngineError> {
-        let current = self.driver.get(id)?;
-        self.driver.remove_stopped(id)?;
+        let current = match self.driver.get(id) {
+            Ok(current) => current,
+            Err(EngineError::AgentNotFound { .. }) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        naming::check_protocol(&current.labels)?;
+        let owner = current
+            .labels
+            .get(naming::LABEL_OWNER)
+            .ok_or_else(|| EngineError::Other("builtin sandbox has no owner label".into()))?;
+        self.driver.remove_stopped(id, owner)?;
         if let Some(owner) = current.labels.get(naming::LABEL_OWNER) {
             let _ = std::fs::remove_file(self.paths.attach(id, owner));
         }
@@ -611,6 +770,7 @@ impl ContainerBackend for BuiltinBackend {
                 &[],
             )?,
             mounts: Vec::new(),
+            tmpfs: Vec::new(),
             mount_owner: None,
             vcpus: 1,
             memory_mib: launch.memory_mib,
@@ -619,7 +779,9 @@ impl ContainerBackend for BuiltinBackend {
             network: network::compile(&offline),
         })?;
         let output = self.collect_probe(&id, &config, request);
-        let _ = self.driver.stop_owned(&id, &owner, Duration::from_secs(2));
+        let _ = self
+            .driver
+            .finish_owned(&id, &owner, Duration::from_secs(2), true);
         output
     }
     fn image_exists(&self, tag: &str) -> Result<bool, EngineError> {
@@ -667,6 +829,21 @@ impl ContainerBackend for BuiltinBackend {
         _sink: &mut dyn UserMessageSink,
         cancel: &crate::engine::oci::CancelToken,
     ) -> Result<ImportedImage, EngineError> {
+        self.import_image_cancellable_in(
+            request,
+            &Env::for_image_acquisition(&request.registries),
+            _sink,
+            cancel,
+        )
+    }
+
+    fn import_image_cancellable_in(
+        &self,
+        request: &ImageImportRequest,
+        env: &crate::data::config::env::EnvSnapshot,
+        _sink: &mut dyn UserMessageSink,
+        cancel: &crate::engine::oci::CancelToken,
+    ) -> Result<ImportedImage, EngineError> {
         use crate::engine::oci::ImageAcquirer;
         cancel.check()?;
         let control = crate::engine::oci::retry::OperationControl::new(
@@ -681,7 +858,7 @@ impl ContainerBackend for BuiltinBackend {
                 max_layers: 256,
                 min_free_bytes: 1024 * 1024 * 1024,
             },
-            &Env::for_image_acquisition(&request.registries),
+            env,
         )
         .with_cancel(cancel.clone())
         .with_expected_built_identity(request.expected_built_identity.clone())
@@ -717,12 +894,19 @@ impl ContainerBackend for BuiltinBackend {
             self.driver.import_archive(archive, request.tag.clone())?;
         }
         let config = self.driver.image_config(&request.tag)?.unwrap_or_default();
+        let labels = installed_labels(
+            &config.labels,
+            request,
+            &acquired.identity.manifest_digest.to_string(),
+        );
         {
             let _lock = self.paths.lock()?;
             let mut identities = self.identities()?;
             identities.insert(
                 request.tag.clone(),
                 InstalledImageIdentity {
+                    labels,
+                    size_bytes: config.size_bytes,
                     identity: acquired.identity.clone(),
                     acquisition_source: Some(request.source.clone()),
                 },
@@ -743,15 +927,43 @@ impl ContainerBackend for BuiltinBackend {
         Ok(Vec::new())
     }
     fn remove_image(&self, id: &str) -> Result<(), EngineError> {
-        let _image_lease = self.paths.image_lease(id, true)?;
-        let _lock = self.paths.lock()?;
-        let mut identities = self.identities()?;
-        if !identities.contains_key(id) {
+        // Resolve immutable IDs to owned tags, then take the same per-tag
+        // fences as launches and imports. Never use a global force/prune.
+        let tags: Vec<_> = {
+            let _lock = self.paths.lock()?;
+            self.identities()?
+                .into_iter()
+                .filter(|(tag, record)| {
+                    tag == id
+                        || record.identity.config_digest.to_string() == id
+                        || record.identity.manifest_digest.to_string() == id
+                })
+                .map(|(tag, _)| tag)
+                .collect()
+        };
+        if tags.is_empty() {
             return Err(EngineError::Other("image is not owned by awman".into()));
         }
-        self.driver.remove_image(id)?;
-        identities.remove(id);
-        self.save_identities(&identities)
+        let _image_leases = tags
+            .iter()
+            .map(|tag| self.paths.image_lease(tag, true))
+            .collect::<Result<Vec<_>, _>>()?;
+        let _lock = self.paths.lock()?;
+        let mut identities = self.identities()?;
+        for tag in tags {
+            // The tag could have been reimported before its lease was taken.
+            let matches = identities.get(&tag).is_some_and(|record| {
+                tag == id
+                    || record.identity.config_digest.to_string() == id
+                    || record.identity.manifest_digest.to_string() == id
+            });
+            if matches {
+                self.driver.remove_image(&tag)?;
+                identities.remove(&tag);
+                self.save_identities(&identities)?;
+            }
+        }
+        Ok(())
     }
     fn start_background(
         &self,
@@ -803,9 +1015,10 @@ impl ContainerBackend for BuiltinBackend {
                     memory_mib: launch.memory_mib,
                     network_mode: launch.network.mode.as_str(),
                 },
-                &[],
+                request.labels,
             )?,
             mounts: mounted,
+            tmpfs: Vec::new(),
             mount_owner: image_owner(config.user.as_deref(), &config.accounts)?,
             vcpus: launch.vcpus,
             memory_mib: launch.memory_mib,
@@ -839,6 +1052,7 @@ impl ContainerBackend for BuiltinBackend {
                 command,
                 working_dir,
                 env,
+                private_stdin: None,
             },
             &mut |_| {},
         )
@@ -877,15 +1091,22 @@ impl ContainerBackend for BuiltinBackend {
                 // Like `docker exec`, setup/teardown run as the image USER.
                 user: state.user,
                 env: vars.into_iter().collect(),
+                stdin: request.private_stdin.is_some(),
                 ..Default::default()
             },
         )?;
+        if let Some(input) = request.private_stdin {
+            session.control.send(super::driver::Control::Stdin(
+                input.expose().as_bytes().to_vec(),
+            ))?;
+            session.control.send(super::driver::Control::Eof)?;
+        }
         // Blocking receiver is isolated from the caller's Tokio context.
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut events = session.events;
             while let Ok(event) = events.blocking_recv() {
-                let terminal = matches!(event, ExecEvent::Exited(_) | ExecEvent::Failed);
+                let terminal = matches!(event, ExecEvent::Exited(_) | ExecEvent::Failed(_));
                 if tx.send(event).is_err() || terminal {
                     break;
                 }
@@ -928,10 +1149,11 @@ impl ContainerBackend for BuiltinBackend {
     }
     fn stop_and_remove(&self, id: &str) -> Result<(), EngineError> {
         let current = self.owned(id)?;
-        self.driver.stop_owned(
+        self.driver.finish_owned(
             id,
             &current.labels[naming::LABEL_OWNER],
             Duration::from_secs(2),
+            true,
         )?;
         if let Ok(mut env) = self.background_env.lock() {
             env.remove(id);
@@ -955,6 +1177,28 @@ fn lines(pending: &mut Vec<u8>, bytes: Vec<u8>, callback: &mut dyn FnMut(&str)) 
 /// The acquisition request an import makes. The registry map is the
 /// importing session's own (`ImageImportRequest.registries`), never state the
 /// backend retained from another session.
+fn installed_labels(
+    config_labels: &std::collections::BTreeMap<String, String>,
+    request: &ImageImportRequest,
+    source_digest: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let mut labels = config_labels.clone();
+    labels.extend(request.labels.clone());
+    if matches!(
+        request.source,
+        crate::data::config::image_source::ImageSourceSpec::Registry { .. }
+            | crate::data::config::image_source::ImageSourceSpec::Archive { .. }
+    ) {
+        labels.insert(
+            crate::data::image_inputs::INPUTS_LABEL.into(),
+            crate::data::image_inputs::imported_inputs_hash(source_digest)
+                .as_str()
+                .into(),
+        );
+    }
+    labels
+}
+
 fn acquire_request(request: &ImageImportRequest) -> AcquireRequest {
     AcquireRequest {
         tag: request.tag.clone(),
@@ -970,144 +1214,197 @@ fn acquire_request(request: &ImageImportRequest) -> AcquireRequest {
 }
 
 #[cfg(test)]
-mod acquire_request_tests {
+mod workspace_access_tests {
     use super::*;
-    use crate::data::config::image_source::RegistryHostConfig;
+    use awman_test_support::{TestCase, TestSandbox};
+    use std::path::PathBuf;
 
-    fn import(insecure: bool) -> ImageImportRequest {
-        let mut registries = std::collections::BTreeMap::new();
-        registries.insert(
-            "r.example".to_string(),
-            RegistryHostConfig {
-                insecure,
-                ..Default::default()
-            },
-        );
-        ImageImportRequest {
-            tag: "awman-repo-claude:latest".into(),
-            source: crate::data::config::image_source::ImageSourceSpec::Archive {
-                path: "/images/agent.tar".into(),
-            },
-            platform: crate::data::oci_identity::OciPlatform::host_linux(),
-            refresh: false,
-            expected_built_identity: None,
-            immutable_export_selector: None,
-            registries,
+    // Planning must not create or execute a VM. Only image metadata is used.
+    struct ImageOnlyDriver;
+    impl SandboxDriver for ImageOnlyDriver {
+        fn create(&self, _: SandboxSpec) -> Result<(), EngineError> {
+            panic!("unexpected VM creation")
+        }
+        fn get(&self, _: &str) -> Result<SandboxSummary, EngineError> {
+            panic!("unexpected guest access")
+        }
+        fn list(&self) -> Result<Vec<SandboxSummary>, EngineError> {
+            panic!("unexpected guest access")
+        }
+        fn exec(&self, _: &str, _: ExecRequest) -> Result<ExecSession, EngineError> {
+            panic!("unexpected guest execution")
+        }
+        fn finish_owned(&self, _: &str, _: &str, _: Duration, _: bool) -> Result<(), EngineError> {
+            panic!("unexpected guest cleanup")
+        }
+        fn remove_stopped(&self, _: &str, _: &str) -> Result<(), EngineError> {
+            panic!("unexpected guest cleanup")
+        }
+        fn stats(&self, _: &str) -> Result<crate::engine::agent_runtime::AgentStats, EngineError> {
+            panic!("unexpected guest stats")
+        }
+        fn image_config(&self, _: &str) -> Result<Option<SandboxImageConfig>, EngineError> {
+            Ok(Some(SandboxImageConfig::default()))
+        }
+        fn import_archive(&self, _: PathBuf, _: String) -> Result<(), EngineError> {
+            panic!("unexpected image import")
+        }
+        fn remove_image(&self, _: &str) -> Result<(), EngineError> {
+            Ok(())
         }
     }
 
     #[test]
-    fn registries_come_from_each_import_request() {
-        let (a, b) = (import(true), import(false));
-        assert_eq!(acquire_request(&a).registries, a.registries);
-        assert_eq!(acquire_request(&b).registries, b.registries);
-        assert_ne!(
-            acquire_request(&a).registries,
-            acquire_request(&b).registries
-        );
-    }
-}
-
-#[cfg(test)]
-mod compat_tests {
-    use super::*;
-
-    #[test]
-    fn maps_single_file_without_mounting_its_parent_and_rejects_socket() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("prompt.txt");
-        std::fs::write(&file, b"prompt").unwrap();
-        let specs = mounts(&[OverlaySpec {
-            host_path: file.clone(),
-            container_path: "/home/agent/prompt.txt".into(),
-            permission: OverlayPermission::ReadOnly,
-        }])
-        .unwrap();
-        assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].host, file);
-        assert_eq!(specs[0].guest, "/home/agent/prompt.txt");
-        assert!(specs[0].read_only);
-        let nested = mounts(&[
-            OverlaySpec {
-                host_path: file.clone(),
-                container_path: "/workspace/nested/prompt.txt".into(),
-                permission: OverlayPermission::ReadOnly,
+    fn imported_labels_keep_local_build_inputs_and_use_source_digest_for_archives_and_registries() {
+        use crate::data::{
+            config::image_source::ImageSourceSpec,
+            image_inputs::{INPUTS_LABEL, REPO_LABEL},
+        };
+        let source_labels = [
+            (INPUTS_LABEL.into(), "built-inputs".into()),
+            (REPO_LABEL.into(), "foreign-repo".into()),
+        ]
+        .into();
+        for source in [
+            ImageSourceSpec::AppleStore { reference: None },
+            ImageSourceSpec::Registry {
+                registry: None,
+                reference: None,
             },
-            OverlaySpec {
-                host_path: dir.path().into(),
-                container_path: "/workspace".into(),
-                permission: OverlayPermission::ReadWrite,
+            ImageSourceSpec::Archive {
+                path: PathBuf::from("image.tar"),
             },
-        ])
-        .unwrap();
-        assert_eq!(nested[0].guest, "/workspace");
-        assert_eq!(nested[1].guest, "/workspace/nested/prompt.txt");
-        #[cfg(unix)]
-        {
-            let socket = dir.path().join("docker.sock");
-            let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-            assert!(mounts(&[OverlaySpec {
-                host_path: socket,
-                container_path: "/var/run/docker.sock".into(),
-                permission: OverlayPermission::ReadWrite
-            }])
-            .is_err());
+        ] {
+            let local = matches!(source, ImageSourceSpec::AppleStore { .. });
+            let request = ImageImportRequest {
+                labels: [(REPO_LABEL.into(), "example.test/repo".into())].into(),
+                tag: "image:latest".into(),
+                source,
+                platform: crate::data::oci_identity::OciPlatform::host_linux(),
+                refresh: false,
+                expected_built_identity: None,
+                immutable_export_selector: None,
+                registries: Default::default(),
+            };
+            let labels = installed_labels(&source_labels, &request, "sha256:source");
+            assert_eq!(
+                labels[INPUTS_LABEL],
+                if local {
+                    "built-inputs"
+                } else {
+                    "sha256:source"
+                }
+            );
+            assert_eq!(labels[REPO_LABEL], "example.test/repo");
         }
     }
 
     #[test]
-    fn numeric_image_user_sets_guest_mount_owner() {
-        let none = ImageAccounts::default();
-        assert_eq!(
-            image_owner(Some("1001:1002"), &none).unwrap(),
-            Some((1001, 1002))
-        );
-        assert_eq!(image_owner(Some("1001"), &none).unwrap(), Some((1001, 0)));
-        assert_eq!(image_owner(None, &none).unwrap(), None);
-        assert_eq!(image_owner(Some("root"), &none).unwrap(), Some((0, 0)));
-        let accounts = ImageAccounts {
-            passwd: Some("agent:x:1001:1234::/home/agent:/bin/sh\n".into()),
-            group: None,
+    fn builtin_catalog_exposes_metadata_filters_repositories_and_removes_owned_ids() {
+        use crate::data::image_inputs::{RepoKey, INPUTS_LABEL, REPO_LABEL};
+        let s = TestSandbox::for_test(TestCase::component("engine::container::builtin::backend::workspace_access_tests::builtin_catalog_exposes_metadata_filters_repositories_and_removes_owned_ids"));
+        let root = s.root().join("builtin");
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = BuiltinBackend {
+            driver: Arc::new(ImageOnlyDriver),
+            paths: BuiltinPaths { home: root.clone() },
+            settings: BuiltinRuntimeSettings {
+                state_dir: root,
+                ambient_overrides: Vec::new(),
+                test_isolation: true,
+            },
+            owner: "test-owner".into(),
+            background_env: Mutex::new(Default::default()),
+            notices: Mutex::new(Vec::new()),
+            cancel_grace: Duration::from_secs(1),
         };
-        assert_eq!(
-            image_owner(Some("1001"), &accounts).unwrap(),
-            Some((1001, 1234))
-        );
+        let identity = crate::engine::image_prep::contracts::identity("image:latest");
+        backend
+            .save_identities(
+                &[(
+                    "image:latest".into(),
+                    InstalledImageIdentity {
+                        identity: identity.clone(),
+                        acquisition_source: None,
+                        labels: [
+                            (REPO_LABEL.into(), "example.test/repo".into()),
+                            (INPUTS_LABEL.into(), "inputs".into()),
+                        ]
+                        .into(),
+                        size_bytes: 456,
+                    },
+                )]
+                .into(),
+            )
+            .unwrap();
+        let repo = RepoKey::from_label("example.test/repo");
+        let images = backend.list_images_by_repo(&repo).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].id, identity.config_digest.to_string());
+        assert_eq!(images[0].size_bytes, 456);
+        assert_eq!(images[0].labels[INPUTS_LABEL], "inputs");
+        assert!(backend
+            .list_images_by_repo(&RepoKey::from_label("other"))
+            .unwrap()
+            .is_empty());
+        assert!(backend.remove_image("unowned").is_err());
+        backend.remove_image(&images[0].id).unwrap();
+        assert!(backend.list_images_by_repo(&repo).unwrap().is_empty());
+        s.finish();
     }
 
     #[test]
-    fn named_image_user_resolves_from_the_image_account_database() {
-        let accounts = ImageAccounts {
-            passwd: Some(
-                "root:x:0:0:root:/root:/bin/bash\nawman:x:1000:1000::/home/awman:/bin/bash\n"
-                    .into(),
-            ),
-            group: Some("root:x:0:\nawman:x:1000:\nstaff:x:50:awman\n".into()),
+    fn read_only_builtin_plan_carries_tmpfs_and_writable_output_context() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::builtin::backend::workspace_access_tests::read_only_builtin_plan_carries_tmpfs_and_writable_output_context"));
+        let root = sandbox.root().join("builtin");
+        std::fs::create_dir_all(&root).unwrap();
+        let backend = BuiltinBackend {
+            driver: Arc::new(ImageOnlyDriver),
+            paths: BuiltinPaths { home: root.clone() },
+            settings: BuiltinRuntimeSettings {
+                state_dir: root,
+                ambient_overrides: Vec::new(),
+                test_isolation: true,
+            },
+            owner: "test-owner".into(),
+            background_env: Mutex::new(Default::default()),
+            notices: Mutex::new(Vec::new()),
+            cancel_grace: Duration::from_secs(1),
         };
-        assert_eq!(
-            image_owner(Some("awman"), &accounts).unwrap(),
-            Some((1000, 1000))
-        );
-        assert_eq!(
-            image_owner(Some("awman:staff"), &accounts).unwrap(),
-            Some((1000, 50))
-        );
-        assert_eq!(
-            image_owner(Some("1000"), &accounts).unwrap(),
-            Some((1000, 1000))
-        );
-        assert!(matches!(
-            image_owner(Some("ghost"), &accounts),
-            Err(EngineError::Config(message)) if message.contains("ghost")
+        assert!(backend.capabilities().read_only_workspace());
+        let mut options =
+            crate::engine::container::options::workspace_access_tests::options(&sandbox);
+        options.builtin_launch = Some(Box::default());
+        let prompt = sandbox.root().join("prompt");
+        std::fs::write(&prompt, "Review only").unwrap();
+        options.system_prompt_env_file = Some((
+            "SYSTEM_PROMPT".into(),
+            prompt,
+            "/tmp/awman-ctx-prompt-test".into(),
         ));
-        assert!(image_owner(Some("awman:nogroup"), &accounts).is_err());
-        assert!(image_owner(Some("awman"), &ImageAccounts::default()).is_err());
+        let plan = backend.plan(options.clone()).unwrap();
+        assert_eq!(plan.spec.tmpfs, ["/tmp"]);
+        assert!(plan
+            .spec
+            .mounts
+            .iter()
+            .any(|m| m.guest == "/workspace" && m.read_only));
+        assert!(plan
+            .spec
+            .mounts
+            .iter()
+            .any(|m| m.guest == "/awman/output" && !m.read_only));
+        assert!(plan
+            .spec
+            .mounts
+            .iter()
+            .any(|m| m.guest == "/awman/context/repo" && !m.read_only));
+        assert!(plan
+            .spec
+            .mounts
+            .iter()
+            .any(|m| m.guest == "/tmp/awman-ctx-prompt-test" && m.read_only));
+        options.overlays[0].permission = OverlayPermission::ReadWrite;
+        assert!(backend.plan(options).is_err());
     }
 }
-
-#[cfg(test)]
-mod launch_settings_tests;
-#[cfg(test)]
-mod lifecycle_tests;
-#[cfg(test)]
-mod matrix_tests;

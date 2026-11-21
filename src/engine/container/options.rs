@@ -120,16 +120,20 @@ pub struct AgentSettings {
     pub overlays: Vec<OverlaySpec>,
 }
 
-/// Owns one launch's system-prompt temp file. Clones share the file and the
+/// Owns one launch's temporary mounted file or directory. Clones share it and the
 /// last one normally deletes it. The file follows this launch's options,
 /// instance and execution; an observer lost before confirmed termination can
 /// preserve the path while still releasing the descriptor.
 #[derive(Debug, Clone)]
-pub struct PromptFileGuard(Arc<PromptFile>);
+pub struct MountGuard(Arc<PromptFile>);
+
+/// Historical name retained for the system-prompt mount paths.
+pub type PromptFileGuard = MountGuard;
 
 #[derive(Debug)]
 struct PromptFile {
-    file: tempfile::NamedTempFile,
+    file: Option<tempfile::NamedTempFile>,
+    dir: Option<tempfile::TempDir>,
     preserve: std::sync::atomic::AtomicBool,
 }
 
@@ -138,21 +142,40 @@ impl Drop for PromptFile {
         // If the last observer disappears before guest termination is known,
         // leave the path readable but close the descriptor normally.
         if self.preserve.load(std::sync::atomic::Ordering::Acquire) {
-            self.file.disable_cleanup(true);
+            if let Some(file) = &mut self.file {
+                file.disable_cleanup(true);
+            }
+            if let Some(dir) = self.dir.take() {
+                std::mem::forget(dir);
+            }
         }
     }
 }
 
-impl PromptFileGuard {
+impl MountGuard {
     pub fn new(file: tempfile::NamedTempFile) -> Self {
         Self(Arc::new(PromptFile {
-            file,
+            file: Some(file),
+            dir: None,
+            preserve: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+
+    pub fn new_dir(dir: tempfile::TempDir) -> Self {
+        Self(Arc::new(PromptFile {
+            file: None,
+            dir: Some(dir),
             preserve: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
     pub fn host_path(&self) -> &Path {
-        self.0.file.path()
+        self.0
+            .file
+            .as_ref()
+            .map(|f| f.path())
+            .or_else(|| self.0.dir.as_ref().map(|d| d.path()))
+            .expect("prompt guard has a file or directory")
     }
 
     pub(super) fn preserve_for_unconfirmed_guest(&self) {
@@ -162,7 +185,7 @@ impl PromptFileGuard {
     }
 }
 
-impl PartialEq for PromptFileGuard {
+impl PartialEq for MountGuard {
     fn eq(&self, other: &Self) -> bool {
         self.host_path() == other.host_path()
     }
@@ -172,9 +195,32 @@ impl PartialEq for PromptFileGuard {
 /// variant and a single branch in `ResolvedContainerOptions::ingest`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContainerOption {
+    AgentIdentity {
+        agent: String,
+        model: Option<String>,
+    },
+    ProgramStatus(crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig),
     Image(ImageRef),
     Entrypoint(Entrypoint),
     Overlay(OverlaySpec),
+    /// Writable memory-backed guest directory (never a host bind).
+    Tmpfs(PathBuf),
+    /// Required workspace policy, carried to the backend's final launch check.
+    ReadOnlyWorkspace(bool),
+    /// A private host directory mounted read-write for this execution. The
+    /// guard follows the same confirmed-guest-exit lifecycle as prompt mounts.
+    TemporaryDirectoryMount {
+        container_path: PathBuf,
+        env_var: Option<String>,
+        guard: MountGuard,
+    },
+    /// A read-only file inside a private temporary directory owned by `guard`.
+    /// Retained until confirmed guest exit, like system prompt files.
+    TemporaryFileMount {
+        host_path: PathBuf,
+        container_path: PathBuf,
+        guard: MountGuard,
+    },
     EnvPassthrough(EnvVar),
     /// Per-launch value, kept out of argv and redacted in Debug.
     EnvOverride {
@@ -182,15 +228,24 @@ pub enum ContainerOption {
         value: crate::engine::auth::credential::SecretString,
     },
     EnvLiteral(EnvLiteral),
+    NativeResume {
+        tokens: Vec<String>,
+        position: crate::engine::agent::definition::ResumePosition,
+    },
     SeededPrompt(String),
+    HeadlessPromptInArgv(bool),
     /// Flag used to deliver the seeded prompt in *interactive* mode (e.g.
     /// opencode `--prompt <text>`). Absent means the prompt is appended as a
     /// trailing positional argv arg, which is what most agents expect. Emitted
     /// alongside `SeededPrompt` by `build_options` when the agent matrix's
     /// `interactive_seed_delivery` is `Flag`.
     InteractiveSeedFlag(String),
+    /// Flag placed directly before a headless argv prompt (copilot `-p`),
+    /// after every other agent flag, so nothing can land between the flag
+    /// and its value.
+    HeadlessPromptFlag(String),
     Interactive(bool),
-    /// Structured stdout protocol for a non-interactive stdio launch.
+    /// Structured stdout protocol for a headless stdio launch.
     AgentOutputFormat(AgentOutputFormat),
     /// Launch the agent over ACP (Agent Client Protocol) instead of raw
     /// container stdio. Selects the persistent-piped spawn path (`-i`, no PTY)
@@ -242,6 +297,9 @@ pub enum ContainerOption {
     /// appended after every awman-generated agent flag and before the seeded
     /// prompt.
     AgentFlags(Vec<String>),
+    /// Per-launch agent flags derived from awman-owned mounts. These follow
+    /// user flags so a user config cannot redirect private session storage.
+    ManagedAgentFlags(Vec<String>),
     /// The flag name to use when emitting disallowed tools (e.g. `--disallowedTools`).
     DisallowedToolsFlag(String),
     /// The flag name to use when emitting allowed tools (e.g. `--allowedTools`).
@@ -257,7 +315,7 @@ pub enum ContainerOption {
         guard: PromptFileGuard,
     },
     /// System prompt delivered via an env var pointing to a mounted file
-    /// (e.g. `GEMINI_SYSTEM_MD=<container_path>`).
+    /// (a custom agent's `[system_prompt] env`, e.g. `AGENT_SYSTEM_MD=<container_path>`).
     SystemPromptEnvFile {
         env_var: String,
         host_path: PathBuf,
@@ -280,8 +338,8 @@ pub enum ContainerOption {
     /// `grace_timeout`: that default suits an agent, but a shell command may
     /// legitimately print nothing for a long time.
     StartupGrace(std::time::Duration),
-    /// Keep the container's whole output in its `OutputTail` instead of the
-    /// last `DEFAULT_OUTPUT_TAIL_LINES` lines.
+    /// Keep the whole post-redaction output in a private disk spool, alongside
+    /// the bounded diagnostic tail. Full consumers use a transcript reader.
     FullTranscript,
     /// The session's builtin launch settings (default vCPUs and memory,
     /// network policy), resolved by `AgentEngine` from the session's
@@ -469,22 +527,41 @@ fn covered_credential_services(
         .collect()
 }
 
+/// Credential names only, allowing native Docker reattach to recover the
+/// same output protection from the container environment without persisting values.
+pub(crate) const OUTPUT_SECRET_ENV_LABEL: &str = "awman.output-secret-env";
+
 /// Resolved option bag — all options merged into a single struct that the
 /// backend consumes. Conflicting options are detected here.
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedContainerOptions {
+    pub mount_guard: Option<crate::data::mount_authority::MountSourceGuard>,
+    pub output_redaction: crate::engine::auth::redaction::RedactionSet,
+    pub host_env: Option<crate::data::config::env::EnvSnapshot>,
+    pub agent_identity: Option<(String, Option<String>)>,
+    pub program_status: crate::engine::agent_runtime::program_status::ProgramStatusBridgeConfig,
     pub image: Option<ImageRef>,
     pub entrypoint: Option<Entrypoint>,
     pub overlays: Vec<OverlaySpec>,
+    pub tmpfs: Vec<PathBuf>,
+    pub read_only_workspace: bool,
+    /// Apple accepts bare tmpfs destinations; Docker accepts mount options.
+    /// Set by the Apple backend before handing options to the shared launcher.
+    pub tmpfs_bare_paths: bool,
     pub env_passthrough: Vec<EnvVar>,
+    /// Values selected for this execution; opaque, never serialized or placed in argv.
+    pub resolved_env_grants: Option<Vec<(String, crate::engine::auth::credential::SecretString)>>,
     pub env_overrides: Vec<(String, crate::engine::auth::credential::SecretString)>,
     pub env_literal: Vec<EnvLiteral>,
     pub seeded_prompt: Option<String>,
+    pub headless_prompt_in_argv: bool,
     /// Flag used to deliver `seeded_prompt` in interactive mode. When `None`,
     /// the prompt is appended as a trailing positional argv arg. When `Some`,
     /// it is delivered as `<flag> <text>` (e.g. opencode `--prompt <text>`,
     /// since opencode treats a bare positional as a project directory).
     pub interactive_seed_flag: Option<String>,
+    /// From `ContainerOption::HeadlessPromptFlag`.
+    pub headless_prompt_flag: Option<String>,
     pub interactive: bool,
     /// The protocol actually selected by the launch builder (never inferred
     /// from the agent name or by parsing stdout).
@@ -498,6 +575,10 @@ pub struct ResolvedContainerOptions {
     pub auto: AutoMode,
     pub plan: PlanMode,
     pub working_dir: Option<PathBuf>,
+    pub native_resume: Option<(
+        Vec<String>,
+        crate::engine::agent::definition::ResumePosition,
+    )>,
     pub name: Option<ContainerName>,
     pub cpu: Option<CpuLimit>,
     pub memory: Option<MemoryLimit>,
@@ -525,14 +606,15 @@ pub struct ResolvedContainerOptions {
     pub agent_mode_flags: Vec<String>,
     /// From `ContainerOption::AgentFlags`.
     pub agent_flags: Vec<String>,
+    pub managed_agent_flags: Vec<String>,
     pub disallowed_tools_flag: Option<String>,
     pub allowed_tools_flag: Option<String>,
     pub remove_on_exit: bool,
     pub system_prompt_file: Option<(PathBuf, PathBuf, String)>,
     pub system_prompt_env_file: Option<(String, PathBuf, PathBuf)>,
     pub system_prompt_inline: Option<(String, String)>,
-    /// Keeps the files behind `system_prompt_file` / `system_prompt_env_file`
-    /// on disk. Each backend moves these into its execution at spawn.
+    /// Keeps temporary mounts (prompt files and private directories) on disk.
+    /// Each backend moves these into its execution at spawn.
     pub prompt_files: Vec<PromptFileGuard>,
     pub agent_add_dirs: Vec<(String, PathBuf)>,
     /// From `ContainerOption::StartupGrace`; `None` uses the frontend's.
@@ -544,11 +626,328 @@ pub struct ResolvedContainerOptions {
     pub builtin_launch: Option<Box<BuiltinLaunchSettings>>,
 }
 
+/// A container runtime control socket lets the agent start a sibling container
+/// with the checkout mounted writable, so no mount of one (or of a directory
+/// that exposes one) is allowed for a read-only workspace, whatever the
+/// overlay's own permission says: a `:ro` socket bind is still a usable API
+/// (Linux does not apply a read-only mount to `connect(2)` on a socket).
+///
+/// Two layers: the runtime endpoints awman can name (well-known defaults
+/// plus the host environment's `DOCKER_HOST`/`CONTAINER_HOST`, runtime
+/// directory and per-user runtime homes) protect their ancestors lexically;
+/// and every mounted directory except the workspace and its Git
+/// directories is inspected, without following links, for sockets and other
+/// special files ([`reject_special_files`]).
+fn reject_runtime_control_mounts(
+    overlays: &[OverlaySpec],
+    env: Option<&crate::data::config::env::EnvSnapshot>,
+    skip_inspection: &[PathBuf],
+) -> Result<(), crate::engine::error::EngineError> {
+    reject_runtime_control_mounts_at(overlays, &runtime_endpoints(env))?;
+    reject_special_files(overlays, skip_inspection, SPECIAL_FILE_SCAN_LIMIT)
+}
+
+/// Runtime control endpoints (sockets or the directories that hold them)
+/// whose ancestors a read-only launch may not mount.
+fn runtime_endpoints(env: Option<&crate::data::config::env::EnvSnapshot>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = [
+        "/var/run/docker.sock",
+        "/run/docker.sock",
+        "/run/user",
+        "/run/podman",
+        "/var/run/podman",
+        "/run/containerd",
+        "/var/run/containerd",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect();
+    let Some(env) = env else {
+        return paths;
+    };
+    for key in ["DOCKER_HOST", "CONTAINER_HOST"] {
+        if let Some(path) = env
+            .get(key)
+            .and_then(|value| value.trim().strip_prefix("unix://"))
+            .filter(|path| path.starts_with('/'))
+        {
+            paths.push(PathBuf::from(path));
+        }
+    }
+    if let Some(dir) = env
+        .get("XDG_RUNTIME_DIR")
+        .filter(|dir| dir.starts_with('/'))
+    {
+        paths.push(PathBuf::from(dir));
+    }
+    if let Some(home) = env.home_dir() {
+        for relative in [
+            ".docker/run",
+            ".colima",
+            ".lima",
+            ".rd",
+            ".orbstack",
+            ".local/share/containers",
+        ] {
+            paths.push(home.join(relative));
+        }
+    }
+    paths
+}
+
+/// Most directory entries [`reject_special_files`] visits under one mount
+/// source; a larger source is refused as unverifiable.
+const SPECIAL_FILE_SCAN_LIMIT: usize = 50_000;
+
+/// Refuse a mount whose source is, or contains, a socket, FIFO or device
+/// file. Directories are walked without following symlinks (a link inside
+/// the mount resolves in the guest's namespace, where no host socket is
+/// mounted). Sources at or under `skip` (the workspace and its Git
+/// directories, which awman mounts itself and the read-only check already
+/// constrains) are not walked. Fails closed when a directory cannot be read
+/// or the source holds more than `limit` entries. A socket created on the
+/// host after this check is outside it: do not mount live runtime state.
+fn reject_special_files(
+    overlays: &[OverlaySpec],
+    skip: &[PathBuf],
+    limit: usize,
+) -> Result<(), crate::engine::error::EngineError> {
+    let refuse = |source: &Path, why: String| {
+        crate::engine::error::EngineError::Config(format!(
+            "read-only workspace cannot mount '{}': {why}",
+            source.display()
+        ))
+    };
+    for overlay in overlays {
+        let source =
+            std::fs::canonicalize(&overlay.host_path).unwrap_or_else(|_| overlay.host_path.clone());
+        if skip.iter().any(|root| source.starts_with(root)) {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&source) else {
+            continue;
+        };
+        if meta.is_file() {
+            continue;
+        }
+        if !meta.is_dir() {
+            return Err(refuse(
+                &overlay.host_path,
+                "it exposes a container runtime control socket or special file".into(),
+            ));
+        }
+        let mut budget = limit;
+        let mut stack = vec![source.clone()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir).map_err(|e| {
+                refuse(
+                    &overlay.host_path,
+                    format!("awman cannot inspect {} for sockets ({e})", dir.display()),
+                )
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|e| {
+                    refuse(
+                        &overlay.host_path,
+                        format!("awman cannot inspect {} for sockets ({e})", dir.display()),
+                    )
+                })?;
+                if budget == 0 {
+                    return Err(refuse(
+                        &overlay.host_path,
+                        format!(
+                            "it holds more than {limit} entries to inspect for sockets; mount a \
+                             narrower directory"
+                        ),
+                    ));
+                }
+                budget -= 1;
+                let kind = entry.file_type().map_err(|e| {
+                    refuse(
+                        &overlay.host_path,
+                        format!("awman cannot inspect {} ({e})", entry.path().display()),
+                    )
+                })?;
+                if kind.is_dir() {
+                    stack.push(entry.path());
+                } else if !kind.is_file() && !kind.is_symlink() {
+                    return Err(refuse(
+                        &overlay.host_path,
+                        format!(
+                            "it contains {}, a socket or special file that may be a container \
+                             runtime control endpoint",
+                            entry.path().display()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_runtime_control_mounts_at(
+    overlays: &[OverlaySpec],
+    sockets: &[PathBuf],
+) -> Result<(), crate::engine::error::EngineError> {
+    let sockets: Vec<PathBuf> = sockets
+        .iter()
+        .cloned()
+        // Keep the lexical location as well as its target: resolving
+        // /var/run/docker.sock to /run/docker.sock must not unprotect /var.
+        .flat_map(|path| {
+            let resolved = std::fs::canonicalize(&path).ok();
+            std::iter::once(path).chain(resolved)
+        })
+        .collect();
+    for overlay in overlays {
+        let source =
+            std::fs::canonicalize(&overlay.host_path).unwrap_or_else(|_| overlay.host_path.clone());
+        let special = std::fs::metadata(&source)
+            .map(|m| !m.is_dir() && !m.is_file())
+            .unwrap_or(false);
+        if special
+            || sockets
+                .iter()
+                .any(|s| s.starts_with(&source) || s.starts_with(&overlay.host_path))
+        {
+            return Err(crate::engine::error::EngineError::Config(format!(
+                "read-only workspace cannot mount '{}': it exposes a container \
+                 runtime control socket or special file",
+                overlay.host_path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl ResolvedContainerOptions {
+    /// Render the provider argv with the one runtime-neutral argv builder.
+    pub fn agent_argv(&self) -> Result<Vec<String>, crate::engine::error::EngineError> {
+        Ok(super::agent_argv::AgentArgv::from_options(self)?
+            .append_to(self.entrypoint.clone().map(|e| e.0).unwrap_or_default()))
+    }
+
+    /// Final backend check. Reuse the lease overlay enforcement, but refuse
+    /// any correction here: options reaching a spawn must already be safe.
+    pub(crate) fn validate_read_only_workspace(
+        &self,
+    ) -> Result<(), crate::engine::error::EngineError> {
+        use crate::data::workspace::{SCRATCH_TMPFS_PATH, WORKSPACE_GUEST_PATH};
+        use crate::engine::error::EngineError;
+        for path in &self.tmpfs {
+            if !crate::data::workspace::is_normalized_guest_path(path) {
+                return Err(EngineError::Config(
+                    "tmpfs guest path must be absolute and normalized".into(),
+                ));
+            }
+        }
+        if !self.read_only_workspace {
+            return Ok(());
+        }
+        if self.allow_docker {
+            return Err(EngineError::Config(
+                "read-only workspace cannot expose the host Docker socket".into(),
+            ));
+        }
+        let mut overlays = self.overlays.clone();
+        if let Some(settings) = &self.agent_settings {
+            overlays.extend(settings.overlays.clone());
+        }
+        if let Some((host, guest, _)) = &self.system_prompt_file {
+            overlays.push(OverlaySpec {
+                host_path: host.clone(),
+                container_path: guest.clone(),
+                permission: OverlayPermission::ReadOnly,
+            });
+        }
+        if let Some((_, host, guest)) = &self.system_prompt_env_file {
+            overlays.push(OverlaySpec {
+                host_path: host.clone(),
+                container_path: guest.clone(),
+                permission: OverlayPermission::ReadOnly,
+            });
+        }
+        let workspaces: Vec<_> = overlays
+            .iter()
+            .filter(|o| o.container_path == Path::new(WORKSPACE_GUEST_PATH))
+            .collect();
+        if workspaces.len() != 1 || workspaces[0].permission != OverlayPermission::ReadOnly {
+            return Err(EngineError::Config(
+                "read-only workspace requires exactly one read-only /workspace mount".into(),
+            ));
+        }
+        if self
+            .tmpfs
+            .iter()
+            .filter(|p| *p == Path::new(SCRATCH_TMPFS_PATH))
+            .count()
+            != 1
+            || self.tmpfs.iter().any(|p| {
+                p.starts_with(WORKSPACE_GUEST_PATH)
+                    || Path::new(WORKSPACE_GUEST_PATH).starts_with(p)
+            })
+            || overlays
+                .iter()
+                .any(|o| Path::new(SCRATCH_TMPFS_PATH).starts_with(&o.container_path))
+        {
+            return Err(EngineError::Config(
+                "read-only workspace requires an unshadowed writable tmpfs at /tmp".into(),
+            ));
+        }
+        let workspace = workspaces[0].host_path.clone();
+        let mut skip_inspection =
+            vec![std::fs::canonicalize(&workspace).unwrap_or_else(|_| workspace.clone())];
+        skip_inspection.extend(crate::engine::worker::lease_workspace::workspace_git_dirs(
+            &workspace,
+        )?);
+        reject_runtime_control_mounts(&overlays, self.host_env.as_ref(), &skip_inspection)?;
+        let mut checked: Vec<_> = overlays
+            .iter()
+            .cloned()
+            .map(ContainerOption::Overlay)
+            .collect();
+        crate::engine::worker::lease_workspace::validate_workspace_mounts(
+            &mut checked,
+            &workspace,
+            true,
+            None,
+            None,
+            &[],
+        )?;
+        for (original, checked) in overlays.iter().zip(checked) {
+            let ContainerOption::Overlay(checked) = checked else {
+                unreachable!()
+            };
+            if original.permission != checked.permission {
+                return Err(EngineError::Config(
+                    "writable overlay exposes a read-only workspace or its Git directory".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn resolve(
         options: impl IntoIterator<Item = ContainerOption>,
     ) -> Result<Self, ResolveError> {
+        Self::resolve_with_env(options, None)
+    }
+
+    pub fn resolve_in(
+        options: impl IntoIterator<Item = ContainerOption>,
+        env: &crate::data::config::env::EnvSnapshot,
+    ) -> Result<Self, ResolveError> {
+        Self::resolve_with_env(options, Some(env.clone()))
+    }
+
+    fn resolve_with_env(
+        options: impl IntoIterator<Item = ContainerOption>,
+        env: Option<crate::data::config::env::EnvSnapshot>,
+    ) -> Result<Self, ResolveError> {
         let mut r = Self {
+            mount_guard: None,
+            host_env: env,
             yolo: YoloMode::Disabled,
             auto: AutoMode::Disabled,
             plan: PlanMode::Disabled,
@@ -562,23 +961,47 @@ impl ResolvedContainerOptions {
         // by a harness-declared env var.  Applies to ALL container runtimes.
         // Production callers pass the real host-env lookup; tests inject a
         // hermetic closure to avoid mutating process-global state.
+        let lookup = |name: &str| {
+            // A private caller override is already resolved, even if the
+            // host has no value. Only presence matters to credential dedup;
+            // do not copy the secret into this ordinary String lookup.
+            if r.env_overrides
+                .iter()
+                .any(|(key, value)| key == name && !value.expose().is_empty())
+            {
+                return Some("present".into());
+            }
+            r.host_env.as_ref().map_or_else(
+                || crate::data::config::env::host_var(name),
+                |env| env.host_payload(name),
+            )
+        };
         dedup_credentials_by_declared_env(
             &mut r.agent_credentials,
             &r.env_passthrough,
             &r.env_literal,
-            &crate::data::config::env::host_var,
+            &lookup,
         );
         dedup_refreshable_by_declared_env(
             &mut r.refreshable_credentials,
             &r.env_passthrough,
             &r.env_literal,
-            &crate::data::config::env::host_var,
+            &lookup,
         )?;
+        r.register_output_secrets();
         r.validate()?;
         // Render through the existing shared argv tail on every container
         // backend. ACP and interactive launches never receive structured flags.
         if !r.interactive && !r.acp {
             r.agent_mode_flags.extend(match r.agent_output_format {
+                AgentOutputFormat::OpenCodeJson | AgentOutputFormat::OpenCodeV2Json => {
+                    vec!["--format".into(), "json".into()]
+                }
+                AgentOutputFormat::CopilotJson => vec!["--output-format".into(), "json".into()],
+                AgentOutputFormat::ClineJson => vec!["--json".into()],
+                AgentOutputFormat::AntigravityStreamJson => {
+                    vec!["--output-format".into(), "stream-json".into()]
+                }
                 AgentOutputFormat::Text => Vec::new(),
                 AgentOutputFormat::ClaudeStreamJson => vec![
                     "--output-format".into(),
@@ -586,6 +1009,9 @@ impl ResolvedContainerOptions {
                     "--verbose".into(),
                 ],
                 AgentOutputFormat::CodexJson => vec!["--json".into()],
+                AgentOutputFormat::CursorStreamJson => {
+                    vec!["--output-format".into(), "stream-json".into()]
+                }
             });
         } else {
             r.agent_output_format = AgentOutputFormat::Text;
@@ -595,14 +1021,55 @@ impl ResolvedContainerOptions {
 
     fn ingest(&mut self, opt: ContainerOption) -> Result<(), ResolveError> {
         match opt {
+            ContainerOption::AgentIdentity { agent, model } => {
+                self.agent_identity = Some((agent, model))
+            }
+            ContainerOption::ProgramStatus(config) => self.program_status = config,
             ContainerOption::Image(v) => self.image = Some(v),
             ContainerOption::Entrypoint(v) => self.entrypoint = Some(v),
             ContainerOption::Overlay(v) => self.overlays.push(v),
+            ContainerOption::Tmpfs(v) => self.tmpfs.push(v),
+            ContainerOption::ReadOnlyWorkspace(v) => self.read_only_workspace |= v,
+            ContainerOption::TemporaryFileMount {
+                host_path,
+                container_path,
+                guard,
+            } => {
+                self.overlays.push(OverlaySpec {
+                    host_path,
+                    container_path,
+                    permission: OverlayPermission::ReadOnly,
+                });
+                self.prompt_files.push(guard);
+            }
+            ContainerOption::TemporaryDirectoryMount {
+                container_path,
+                env_var,
+                guard,
+            } => {
+                self.overlays.push(OverlaySpec {
+                    host_path: guard.host_path().to_path_buf(),
+                    container_path: container_path.clone(),
+                    permission: OverlayPermission::ReadWrite,
+                });
+                if let Some(key) = env_var {
+                    self.env_literal.push(EnvLiteral {
+                        key,
+                        value: container_path.to_string_lossy().into_owned(),
+                    });
+                }
+                self.prompt_files.push(guard);
+            }
             ContainerOption::EnvPassthrough(v) => self.env_passthrough.push(v),
             ContainerOption::EnvOverride { key, value } => self.env_overrides.push((key, value)),
             ContainerOption::EnvLiteral(v) => self.env_literal.push(v),
+            ContainerOption::NativeResume { tokens, position } => {
+                self.native_resume = Some((tokens, position))
+            }
             ContainerOption::SeededPrompt(v) => self.seeded_prompt = Some(v),
+            ContainerOption::HeadlessPromptInArgv(v) => self.headless_prompt_in_argv = v,
             ContainerOption::InteractiveSeedFlag(v) => self.interactive_seed_flag = Some(v),
+            ContainerOption::HeadlessPromptFlag(v) => self.headless_prompt_flag = Some(v),
             ContainerOption::Interactive(v) => self.interactive = v,
             ContainerOption::AgentOutputFormat(v) => self.agent_output_format = v,
             ContainerOption::Acp(v) => self.acp = v,
@@ -631,6 +1098,7 @@ impl ResolvedContainerOptions {
             ContainerOption::Label { key, value } => self.labels.push((key, value)),
             ContainerOption::AgentModeFlags(v) => self.agent_mode_flags.extend(v),
             ContainerOption::AgentFlags(v) => self.agent_flags.extend(v),
+            ContainerOption::ManagedAgentFlags(v) => self.managed_agent_flags.extend(v),
             ContainerOption::DisallowedToolsFlag(v) => self.disallowed_tools_flag = Some(v),
             ContainerOption::AllowedToolsFlag(v) => self.allowed_tools_flag = Some(v),
             ContainerOption::KeepContainer => self.remove_on_exit = false,
@@ -668,7 +1136,70 @@ impl ResolvedContainerOptions {
         Ok(())
     }
 
+    /// Freeze grants before launch so later daemon environment updates cannot
+    /// replace the value whose output protection was registered.
+    pub(crate) fn register_output_secrets(&mut self) {
+        if self.resolved_env_grants.is_none() {
+            self.resolved_env_grants = Some(
+                self.env_passthrough
+                    .iter()
+                    .filter_map(|var| {
+                        self.host_env
+                            .as_ref()
+                            .map_or_else(
+                                || crate::data::config::env::host_var(&var.0),
+                                |env| env.host_payload(&var.0),
+                            )
+                            .map(|value| {
+                                (
+                                    var.0.clone(),
+                                    crate::engine::auth::credential::SecretString::new(value),
+                                )
+                            })
+                    })
+                    .collect(),
+            );
+        }
+        for (_, value) in self
+            .resolved_env_grants
+            .iter()
+            .flatten()
+            .chain(self.env_overrides.iter())
+        {
+            self.output_redaction.add(value.clone());
+        }
+        let mut names: Vec<_> = self
+            .resolved_env_grants
+            .iter()
+            .flatten()
+            .map(|(key, _)| key.clone())
+            .chain(self.env_overrides.iter().map(|(key, _)| key.clone()))
+            .chain(self.agent_credentials.iter().map(|(key, _)| key.clone()))
+            .collect();
+        names.sort();
+        names.dedup();
+        self.labels
+            .retain(|(key, _)| key != OUTPUT_SECRET_ENV_LABEL);
+        if !names.is_empty() {
+            self.labels
+                .push((OUTPUT_SECRET_ENV_LABEL.into(), names.join(",")));
+        }
+        for (_, value) in &self.agent_credentials {
+            self.output_redaction
+                .add(crate::engine::auth::credential::SecretString::new(value));
+        }
+    }
+
+    pub(crate) fn validate_caller_env(&self) -> Result<(), ResolveError> {
+        for (name, _) in &self.env_overrides {
+            super::host_env_denylist::validate_caller_env_name(name)
+                .map_err(ResolveError::Conflict)?;
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), ResolveError> {
+        self.validate_caller_env()?;
         // Yolo + Plan are mutually exclusive — yolo grants permissions, plan
         // forbids them.
         if matches!(self.yolo, YoloMode::Enabled) && matches!(self.plan, PlanMode::Enabled) {
@@ -702,575 +1233,240 @@ impl From<ResolveError> for crate::engine::error::EngineError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod workspace_access_tests {
     use super::*;
-    use std::path::PathBuf;
+    use awman_test_support::{TestCase, TestSandbox};
 
-    // ─── WI-0126 A1: builtin launch settings ride with the options ──────────
-
-    #[test]
-    fn builtin_launch_is_absent_unless_given() {
-        let resolved =
-            ResolvedContainerOptions::resolve([ContainerOption::Image(ImageRef::new("img"))])
-                .unwrap();
-        assert_eq!(resolved.builtin_launch, None);
+    pub(crate) fn options(sandbox: &TestSandbox) -> ResolvedContainerOptions {
+        let output = sandbox.root().join("output");
+        let context = sandbox.root().join("context");
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::create_dir_all(&context).unwrap();
+        ResolvedContainerOptions {
+            image: Some(ImageRef::new("read-only-test")),
+            entrypoint: Some(Entrypoint::new(["review-agent"])),
+            read_only_workspace: true,
+            tmpfs: vec!["/tmp".into()],
+            overlays: vec![
+                OverlaySpec {
+                    host_path: sandbox.work(),
+                    container_path: "/workspace".into(),
+                    permission: OverlayPermission::ReadOnly,
+                },
+                OverlaySpec {
+                    host_path: output,
+                    container_path: "/awman/output".into(),
+                    permission: OverlayPermission::ReadWrite,
+                },
+                OverlaySpec {
+                    host_path: context,
+                    container_path: "/awman/context/repo".into(),
+                    permission: OverlayPermission::ReadWrite,
+                },
+            ],
+            host_env: Some(crate::data::config::env::EnvSnapshot::from_full_env(
+                Default::default(),
+            )),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn builtin_launch_option_maps_to_the_resolved_field_last_one_wins() {
-        let first = BuiltinLaunchSettings {
-            vcpus: 1,
-            ..BuiltinLaunchSettings::default()
-        };
-        let second = BuiltinLaunchSettings {
-            memory_mib: 512,
-            repo_state_dir: Some(PathBuf::from("/s")),
-            ..BuiltinLaunchSettings::default()
-        };
-        let resolved = ResolvedContainerOptions::resolve([
-            ContainerOption::BuiltinLaunch(first),
-            ContainerOption::BuiltinLaunch(second.clone()),
+    fn read_only_intent_cannot_be_cleared_by_a_later_option() {
+        let options = ResolvedContainerOptions::resolve([
+            ContainerOption::ReadOnlyWorkspace(true),
+            ContainerOption::ReadOnlyWorkspace(false),
+            ContainerOption::Tmpfs("/tmp".into()),
         ])
         .unwrap();
-        assert_eq!(resolved.builtin_launch.as_deref(), Some(&second));
-        // Generic resource limits stay separate: the settings are defaults.
-        assert_eq!(resolved.cpu, None);
-        assert_eq!(resolved.memory, None);
+        assert!(options.read_only_workspace);
+        assert_eq!(options.tmpfs, [PathBuf::from("/tmp")]);
     }
 
-    // ─── WI-0114 F-38: the lease factory is carried, not reached for ────────
+    #[test]
+    fn final_check_refuses_writable_aliases_missing_tmpfs_and_docker_socket() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::options::workspace_access_tests::final_check_refuses_writable_aliases_missing_tmpfs_and_docker_socket"));
+        let valid = options(&sandbox);
+        valid.validate_read_only_workspace().unwrap();
+        let mut writable = valid.clone();
+        writable.overlays[0].permission = OverlayPermission::ReadWrite;
+        assert!(writable.validate_read_only_workspace().is_err());
+        let mut alias = valid.clone();
+        alias.overlays.push(OverlaySpec {
+            host_path: sandbox.work(),
+            container_path: "/elsewhere".into(),
+            permission: OverlayPermission::ReadWrite,
+        });
+        assert!(alias.validate_read_only_workspace().is_err());
+        let mut missing_tmpfs = valid.clone();
+        missing_tmpfs.tmpfs.clear();
+        assert!(missing_tmpfs.validate_read_only_workspace().is_err());
+        let mut shadowed_tmpfs = valid.clone();
+        shadowed_tmpfs.overlays.push(OverlaySpec {
+            host_path: sandbox.tmp(),
+            container_path: "/tmp".into(),
+            permission: OverlayPermission::ReadWrite,
+        });
+        assert!(shadowed_tmpfs.validate_read_only_workspace().is_err());
+        let mut socket = valid;
+        socket.allow_docker = true;
+        assert!(socket.validate_read_only_workspace().is_err());
+    }
 
-    /// A delivery with fixed, never-touched paths: these two tests assert
-    /// only whether a lease is taken, so nothing reads the files.
-    fn unstaged_delivery() -> RefreshableCredentialDelivery {
-        RefreshableCredentialDelivery {
-            agent: crate::data::session::AgentName::new("claude").unwrap(),
-            spec_agent: "claude",
-            credential_env_key: "CLAUDE_CODE_OAUTH_TOKEN",
-            staged_path: PathBuf::from("/staged/.claude/.credentials.json"),
-            staged_root: PathBuf::from("/staged/.claude"),
-            initial_fingerprint: crate::engine::auth::credential::CredentialFingerprint::zeroed(),
+    #[test]
+    fn final_check_refuses_socket_and_parent_directory_overlays() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::options::workspace_access_tests::final_check_refuses_socket_and_parent_directory_overlays"));
+        let overlay = |p: &str, perm| OverlaySpec {
+            host_path: p.into(),
+            container_path: "/run/engine".into(),
+            permission: perm,
+        };
+        for p in ["/var/run", "/run", "/var", "/"] {
+            for perm in [OverlayPermission::ReadOnly, OverlayPermission::ReadWrite] {
+                assert!(
+                    super::reject_runtime_control_mounts(&[overlay(p, perm)], None, &[]).is_err(),
+                    "{p}"
+                );
+            }
         }
-    }
-
-    /// Options built WITHOUT a lease factory disable leases: no factory is
-    /// recorded and `register_container_leases` hands back nothing, even for a
-    /// launch that carries a file-delivered credential.
-    ///
-    /// This is the behaviour the absent process-global monitor used to
-    /// produce (`global().is_none()`), and it is what the
-    /// `authRefresh.enabled: false` kill switch now relies on.
-    #[test]
-    fn options_without_a_monitor_disable_leases() {
-        let resolved = ResolvedContainerOptions::resolve([
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::RefreshableCredential(unstaged_delivery()),
-        ])
-        .expect("resolve");
-
-        assert!(
-            resolved.lease_factory.is_none(),
-            "no factory was supplied, so none must be recorded"
-        );
-        assert_eq!(
-            resolved.refreshable_credentials.len(),
-            1,
-            "the credential itself is still delivered — only the lease is off"
-        );
-        assert!(
-            crate::engine::credential_refresh::register_container_leases(&resolved, "ctr")
-                .is_empty(),
-            "a launch with no lease factory must take no leases"
-        );
-    }
-
-    /// The counterpart: a factory supplied as an option is recorded on the
-    /// resolved bag, so the backends read it from the options they were handed
-    /// instead of from process-global state.
-    #[test]
-    fn a_supplied_lease_factory_is_carried_on_the_resolved_options() {
-        use crate::engine::credential_refresh::{
-            CredentialRefreshMonitor, LeaseFactoryHandle, MonitorConfig,
-        };
-        let monitor = CredentialRefreshMonitor::new(MonitorConfig::default());
-        let factory = LeaseFactoryHandle::new(std::sync::Arc::new(monitor));
-
-        let resolved = ResolvedContainerOptions::resolve([
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::CredentialLeaseFactory(factory.clone()),
-        ])
-        .expect("resolve");
-
-        assert_eq!(resolved.lease_factory, Some(factory));
-    }
-
-    fn prompt_guard() -> (PromptFileGuard, PathBuf) {
-        let guard = PromptFileGuard::new(tempfile::NamedTempFile::new().unwrap());
-        let path = guard.host_path().to_path_buf();
-        (guard, path)
-    }
-
-    #[test]
-    fn resolved_options_own_prompt_files_and_the_last_clone_removes_them() {
-        let (file_guard, file_path) = prompt_guard();
-        let (env_guard, env_path) = prompt_guard();
-        let resolved = ResolvedContainerOptions::resolve([
-            ContainerOption::SystemPromptFile {
-                host_path: file_path.clone(),
-                container_path: "/tmp/a.md".into(),
-                flag: "--sp".into(),
-                guard: file_guard,
-            },
-            ContainerOption::SystemPromptEnvFile {
-                env_var: "SP".into(),
-                host_path: env_path.clone(),
-                container_path: "/tmp/b.md".into(),
-                guard: env_guard,
-            },
-        ])
-        .expect("resolve");
-        assert_eq!(resolved.prompt_files.len(), 2);
-        let clone = resolved.clone();
-        drop(resolved);
-        assert!(file_path.exists() && env_path.exists());
-        drop(clone);
-        assert!(!file_path.exists() && !env_path.exists());
-    }
-
-    #[test]
-    fn failed_resolution_releases_prompt_files() {
-        let (guard, path) = prompt_guard();
-        let result = ResolvedContainerOptions::resolve([
-            ContainerOption::SystemPromptFile {
-                host_path: path.clone(),
-                container_path: "/tmp/a.md".into(),
-                flag: "--sp".into(),
-                guard,
-            },
-            ContainerOption::Yolo(YoloMode::Enabled),
-            ContainerOption::Plan(PlanMode::Enabled),
-        ]);
-        assert!(result.is_err());
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn yolo_and_plan_conflict_returns_error() {
-        let result = ResolvedContainerOptions::resolve([
-            ContainerOption::Yolo(YoloMode::Enabled),
-            ContainerOption::Plan(PlanMode::Enabled),
-        ]);
-        assert!(
-            matches!(result, Err(ResolveError::Conflict(_))),
-            "expected Conflict, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn all_options_round_trip_to_resolved() {
-        let image = ImageRef::new("my-image:latest");
-        let entrypoint = Entrypoint::new(["claude", "--print"]);
-        let result = ResolvedContainerOptions::resolve([
-            ContainerOption::Image(image.clone()),
-            ContainerOption::Entrypoint(entrypoint.clone()),
-            ContainerOption::Interactive(true),
-            ContainerOption::AllowedTools(vec!["Bash".to_string()]),
-            ContainerOption::Yolo(YoloMode::Disabled),
-        ]);
-        let resolved = result.expect("from_iter should succeed");
-        assert_eq!(
-            resolved.image.as_ref().map(|i| i.as_str()),
-            Some("my-image:latest")
-        );
-        assert_eq!(
-            resolved.entrypoint.as_ref().map(|e| &e.0),
-            Some(&vec!["claude".to_string(), "--print".to_string()])
-        );
-        assert!(resolved.interactive);
-        assert_eq!(resolved.allowed_tools, vec!["Bash".to_string()]);
-        assert!(matches!(resolved.yolo, YoloMode::Disabled));
-    }
-
-    #[test]
-    fn acp_defaults_to_false_and_round_trips_when_set() {
-        // Default: no ACP option → `acp` stays false (today's behaviour).
-        let default = ResolvedContainerOptions::resolve([ContainerOption::Image(ImageRef::new(
-            "img:latest",
-        ))])
-        .expect("resolve should succeed");
-        assert!(!default.acp, "acp must default to false");
-
-        // Explicitly requested → the resolved bag carries it through.
-        let enabled = ResolvedContainerOptions::resolve([
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::Acp(true),
-        ])
-        .expect("resolve should succeed");
-        assert!(enabled.acp, "ContainerOption::Acp(true) must set acp");
-    }
-
-    #[test]
-    fn dedup_is_not_required_at_resolve_level() {
-        let host = PathBuf::from("/host/overlay");
-        let container = PathBuf::from("/container/overlay");
-        let spec = OverlaySpec {
-            host_path: host.clone(),
-            container_path: container.clone(),
-            permission: OverlayPermission::ReadOnly,
-        };
-        let result = ResolvedContainerOptions::resolve([
-            ContainerOption::Overlay(spec.clone()),
-            ContainerOption::Overlay(spec.clone()),
-            ContainerOption::Overlay(spec.clone()),
-        ]);
-        let resolved = result.expect("from_iter should succeed");
-        // Multiple overlay entries accumulate — dedup is caller's responsibility.
-        assert_eq!(resolved.overlays.len(), 3);
-    }
-
-    // ── Part A: injection-time credential dedup (resolve-level, env_literal path) ──
-
-    /// `env_literal` (always-valued) coverage → same-service keychain credential
-    /// is dropped.  This goes through `resolve()` because env_literal entries
-    /// always have a value — no host lookup needed.
-    #[test]
-    fn declared_anthropic_env_literal_drops_oauth_token_from_agent_credentials() {
-        let resolved = ResolvedContainerOptions::resolve([
-            ContainerOption::EnvLiteral(EnvLiteral {
-                key: "ANTHROPIC_API_KEY".into(),
-                value: "sk-ant-key-literal".into(),
-            }),
-            ContainerOption::AgentCredentials {
-                env_vars: vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "sk-ant-oat-secret".into())],
-            },
-        ])
-        .expect("resolve must succeed");
-
-        assert!(
-            resolved.agent_credentials.is_empty(),
-            "ANTHROPIC_API_KEY via env_literal must still trigger dedup; \
-             got: {:?}",
-            resolved.agent_credentials
-        );
-    }
-
-    /// When agent_credentials is empty the dedup is a no-op (no panic, no error).
-    #[test]
-    fn dedup_with_empty_agent_credentials_is_noop() {
-        // Use env_literal so the test is hermetic (no host-env lookup).
-        let resolved =
-            ResolvedContainerOptions::resolve([ContainerOption::EnvLiteral(EnvLiteral {
-                key: "ANTHROPIC_API_KEY".into(),
-                value: "sk-key".into(),
-            })])
-            .expect("resolve must succeed");
-        assert!(resolved.agent_credentials.is_empty());
-    }
-
-    // ── Part A: dedup_credentials_by_declared_env unit tests (injectable lookup) ──
-    //
-    // All of these pass a hermetic closure as `lookup_env` so no process-global
-    // std::env mutation is needed.  The closure mimics the subset of env vars
-    // that would be set on the host in each scenario.
-
-    /// declared env(ANTHROPIC_API_KEY) that IS set on host + keychain OAuth →
-    /// OAuth dropped (the passthrough will be emitted; no need for two creds).
-    #[test]
-    fn dedup_fn_drops_oauth_when_anthropic_passthrough_set_on_host() {
-        let mut creds = vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into())];
-        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
-        // Simulate: ANTHROPIC_API_KEY is set on the host.
-        let lookup = |name: &str| -> Option<String> {
-            if name == "ANTHROPIC_API_KEY" {
-                Some("sk-ant-api-key".into())
-            } else {
-                None
-            }
-        };
-        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
-        assert!(
-            creds.is_empty(),
-            "OAuth must be dropped when ANTHROPIC_API_KEY is set on host; got: {creds:?}"
-        );
-    }
-
-    /// declared env(ANTHROPIC_API_KEY) that is NOT set on host + keychain OAuth →
-    /// OAuth retained (passthrough emits nothing; dropping it would leave zero
-    /// credentials for the 'anthropic' service).
-    #[test]
-    fn dedup_fn_retains_oauth_when_anthropic_passthrough_declared_but_unset() {
-        let mut creds = vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into())];
-        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
-        // Simulate: ANTHROPIC_API_KEY is NOT set on the host.
-        let lookup = |_name: &str| -> Option<String> { None };
-        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
-        assert_eq!(
-            creds.len(),
-            1,
-            "OAuth must be retained when the declared passthrough var is unset on host; \
-             got: {creds:?}"
-        );
-    }
-
-    /// No declared anthropic var → cloud harness path — keychain OAuth is
-    /// retained regardless of host env.
-    #[test]
-    fn dedup_fn_retains_oauth_when_no_anthropic_declared() {
-        let mut creds = vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into())];
-        let pt = vec![EnvVar("OPENAI_API_KEY".into())]; // covers openai, not anthropic
-                                                        // Even if OPENAI_API_KEY is set, it doesn't cover the anthropic service.
-        let lookup = |name: &str| -> Option<String> {
-            if name == "OPENAI_API_KEY" {
-                Some("sk-openai".into())
-            } else {
-                None
-            }
-        };
-        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
-        assert_eq!(
-            creds.len(),
-            1,
-            "no anthropic declared → OAuth must be retained"
-        );
-    }
-
-    /// env_literal (always-valued) coverage → same-service credential dropped.
-    #[test]
-    fn dedup_fn_handles_env_literal_source() {
-        let mut creds = vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into())];
-        let lit = vec![EnvLiteral {
-            key: "ANTHROPIC_API_KEY".into(),
-            value: "literal-key".into(),
-        }];
-        // lookup_env is irrelevant for literals but must be provided.
-        let lookup = |_: &str| -> Option<String> { None };
-        dedup_credentials_by_declared_env(&mut creds, &[], &lit, &lookup);
-        assert!(
-            creds.is_empty(),
-            "env_literal coverage must also trigger dedup"
-        );
-    }
-
-    /// No declared vars → no dedup, regardless of host env.
-    #[test]
-    fn dedup_fn_retains_credential_when_no_declared_vars() {
-        let mut creds = vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into())];
-        let lookup = |_: &str| -> Option<String> { None };
-        dedup_credentials_by_declared_env(&mut creds, &[], &[], &lookup);
-        assert_eq!(creds.len(), 1, "no declared vars → no dedup");
-    }
-
-    /// A credential with no known service mapping is never dropped by the dedup.
-    #[test]
-    fn dedup_fn_unmapped_credential_is_never_dropped() {
-        let mut creds = vec![
-            ("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok".into()),
-            ("MY_CUSTOM_INTERNAL_TOKEN".into(), "custom".into()),
-        ];
-        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
-        let lookup = |name: &str| -> Option<String> {
-            if name == "ANTHROPIC_API_KEY" {
-                Some("sk-ant".into())
-            } else {
-                None
-            }
-        };
-        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
-        // OAuth (anthropic) dropped; custom (no mapping) retained.
-        assert!(
-            !creds.iter().any(|(k, _)| k == "CLAUDE_CODE_OAUTH_TOKEN"),
-            "OAuth must be dropped when anthropic passthrough is set"
-        );
-        assert!(
-            creds.iter().any(|(k, _)| k == "MY_CUSTOM_INTERNAL_TOKEN"),
-            "unmapped credential must survive dedup; got: {creds:?}"
-        );
-    }
-
-    /// When keychain credential's OWN name equals the declared passthrough var
-    /// (e.g. declared env(ANTHROPIC_API_KEY) + keychain returns ANTHROPIC_API_KEY
-    /// itself), the keychain entry is dropped because both map to service
-    /// "anthropic" and the passthrough is set on host.
-    #[test]
-    fn dedup_fn_drops_when_credential_name_equals_declared_var() {
-        let mut creds = vec![("ANTHROPIC_API_KEY".into(), "sk-ant-from-keychain".into())];
-        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
-        // Passthrough is set on host (perhaps to a different value).
-        let lookup = |name: &str| -> Option<String> {
-            if name == "ANTHROPIC_API_KEY" {
-                Some("sk-ant-from-env".into())
-            } else {
-                None
-            }
-        };
-        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
-        assert!(
-            creds.is_empty(),
-            "credential whose own name equals the declared var must be dropped; \
-             got: {creds:?}"
-        );
-    }
-
-    /// Multi-service: declared var covers service X (anthropic), credential for
-    /// service Y (openai) is retained.
-    #[test]
-    fn dedup_fn_multi_service_declared_x_retains_credential_for_y() {
-        let mut creds = vec![
-            ("CLAUDE_CODE_OAUTH_TOKEN".into(), "tok-anthropic".into()),
-            ("OPENAI_API_KEY".into(), "tok-openai".into()),
-        ];
-        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
-        // Only anthropic passthrough is set on host.
-        let lookup = |name: &str| -> Option<String> {
-            if name == "ANTHROPIC_API_KEY" {
-                Some("sk-ant".into())
-            } else {
-                None
-            }
-        };
-        dedup_credentials_by_declared_env(&mut creds, &pt, &[], &lookup);
-        // Anthropic OAuth dropped; OpenAI retained (different service, not declared).
-        assert!(
-            !creds.iter().any(|(k, _)| k == "CLAUDE_CODE_OAUTH_TOKEN"),
-            "anthropic OAuth must be dropped"
-        );
-        assert!(
-            creds.iter().any(|(k, _)| k == "OPENAI_API_KEY"),
-            "openai credential must be retained (covers service 'openai', not declared); \
-             got: {creds:?}"
-        );
-    }
-
-    /// `resolve()`'s production closure is `host_var` (overlay first, then
-    /// the process environment) — the squad daemon is the one caller whose
-    /// covering value can *only* ever come from the overlay, since a daemon
-    /// process never inherits the shell that created the task. Dedup must
-    /// behave identically either way: with the process value absent
-    /// entirely, a value supplied purely through the daemon overlay must
-    /// still cover the service and drop the redundant keychain credential.
-    #[test]
-    fn dedup_is_unchanged_when_the_covering_value_comes_from_the_daemon_overlay() {
-        use crate::data::config::env::{
-            set_daemon_overlay, DaemonEnvMap, DAEMON_OVERLAY_TEST_LOCK,
-        };
-
-        let _lock = DAEMON_OVERLAY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        set_daemon_overlay(DaemonEnvMap::new());
-
-        let prev = std::env::var("ANTHROPIC_API_KEY").ok();
-        std::env::remove_var("ANTHROPIC_API_KEY");
-
-        let mut overlay = DaemonEnvMap::new();
-        overlay.insert("ANTHROPIC_API_KEY", "sk-from-overlay");
-        set_daemon_overlay(overlay);
-
-        let resolved = ResolvedContainerOptions::resolve([
-            ContainerOption::EnvPassthrough(EnvVar("ANTHROPIC_API_KEY".into())),
-            ContainerOption::AgentCredentials {
-                env_vars: vec![("CLAUDE_CODE_OAUTH_TOKEN".into(), "sk-ant-oat-secret".into())],
-            },
-        ])
-        .expect("resolve must succeed");
-
-        assert!(
-            resolved.agent_credentials.is_empty(),
-            "dedup must trigger when the covering value comes from the overlay alone \
-             (the process env has none); got: {:?}",
-            resolved.agent_credentials
-        );
-
-        set_daemon_overlay(DaemonEnvMap::new());
-        match prev {
-            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
-    }
-
-    // ─── WI-0107: refreshable (file) dedup — INV-9 + MEDIUM-8 fail-closed ─────
-
-    fn refreshable_delivery(staged_root: &std::path::Path) -> RefreshableCredentialDelivery {
-        let staged_path = staged_root.join(".credentials.json");
-        std::fs::write(
-            &staged_path,
-            br#"{"claudeAiOauth":{"accessToken":"sk-oat"}}"#,
+        // Unix device files are refused regardless of path.
+        #[cfg(unix)]
+        assert!(super::reject_runtime_control_mounts(
+            &[overlay("/dev/null", OverlayPermission::ReadOnly)],
+            None,
+            &[]
         )
-        .unwrap();
-        RefreshableCredentialDelivery {
-            agent: crate::data::session::AgentName::new("claude").unwrap(),
-            spec_agent: "claude",
-            credential_env_key: "CLAUDE_CODE_OAUTH_TOKEN",
-            staged_path,
-            staged_root: staged_root.to_path_buf(),
-            initial_fingerprint: crate::engine::auth::credential::CredentialFingerprint::zeroed(),
-        }
+        .is_err());
+        let dir = sandbox.tmp();
+        // Ordinary directories remain accepted.
+        assert!(super::reject_runtime_control_mounts(
+            &[overlay(dir.to_str().unwrap(), OverlayPermission::ReadWrite)],
+            None,
+            &[]
+        )
+        .is_ok());
     }
 
-    /// INV-9: a declared + host-resolvable `ANTHROPIC_API_KEY` drops the
-    /// refreshable delivery AND removes the staged file from disk.
-    #[test]
-    fn dedup_refreshable_drops_delivery_and_removes_file_when_covered() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut refreshable = vec![refreshable_delivery(tmp.path())];
-        let staged_path = refreshable[0].staged_path.clone();
-        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
-        let lookup = |name: &str| -> Option<String> {
-            (name == "ANTHROPIC_API_KEY").then(|| "sk-ant".into())
-        };
-        dedup_refreshable_by_declared_env(&mut refreshable, &pt, &[], &lookup).unwrap();
-        assert!(refreshable.is_empty(), "covered delivery must be dropped");
-        assert!(
-            !staged_path.exists(),
-            "staged OAuth file must be removed from disk so it is never mounted"
-        );
-    }
-
-    /// INV-9 counter-case: a declared-but-unset passthrough drops nothing and
-    /// leaves the staged file in place.
-    #[test]
-    fn dedup_refreshable_retains_delivery_when_declared_but_unset() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut refreshable = vec![refreshable_delivery(tmp.path())];
-        let staged_path = refreshable[0].staged_path.clone();
-        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
-        let lookup = |_: &str| -> Option<String> { None };
-        dedup_refreshable_by_declared_env(&mut refreshable, &pt, &[], &lookup).unwrap();
-        assert_eq!(refreshable.len(), 1, "unset passthrough must not dedup");
-        assert!(staged_path.exists(), "staged file must remain");
-    }
-
-    /// MEDIUM-8: suppression is fail-closed. Even when the staged file cannot be
-    /// unlinked (parent dir read-only), it is neutralized in place so the mount
-    /// carries no secret; the delivery is still dropped and resolve succeeds.
+    /// WI 0070 review finding 1: a runtime socket at a non-default location
+    /// (or a special file nested inside an otherwise ordinary directory)
+    /// must not reach a read-only launch through its parent, whatever the
+    /// mount permission.
+    /// hygiene-allow(H4): Socket path is leased by TestSandbox Ports and the listener is dropped and its file removed before the test ends.
     #[cfg(unix)]
     #[test]
-    fn dedup_refreshable_neutralizes_file_when_unlink_fails() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let locked = tmp.path().join("locked");
-        std::fs::create_dir_all(&locked).unwrap();
-        let mut refreshable = vec![refreshable_delivery(&locked)];
-        let staged_path = refreshable[0].staged_path.clone();
-        // Make the parent directory non-writable so unlink fails, but the file
-        // itself is still writable (so overwrite-in-place succeeds).
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let pt = vec![EnvVar("ANTHROPIC_API_KEY".into())];
-        let lookup = |name: &str| -> Option<String> {
-            (name == "ANTHROPIC_API_KEY").then(|| "sk-ant".into())
+    fn final_check_refuses_parents_of_non_default_runtime_sockets() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::options::workspace_access_tests::final_check_refuses_parents_of_non_default_runtime_sockets"));
+        let socket = sandbox.ports().unix_socket("d.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let socket_dir = socket.parent().unwrap().to_path_buf();
+        let nested = sandbox.root().join("rt/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        nix::unistd::mkfifo(&nested.join("pipe"), nix::sys::stat::Mode::S_IRWXU).unwrap();
+        for (source, permission) in [
+            (socket_dir.clone(), OverlayPermission::ReadOnly),
+            (socket_dir.clone(), OverlayPermission::ReadWrite),
+            (sandbox.root().join("rt"), OverlayPermission::ReadOnly),
+            (nested.clone(), OverlayPermission::ReadOnly),
+        ] {
+            let mut options = options(&sandbox);
+            options.overlays.push(OverlaySpec {
+                host_path: source.clone(),
+                container_path: "/control".into(),
+                permission,
+            });
+            let err = options.validate_read_only_workspace().unwrap_err();
+            assert!(
+                err.to_string().contains("socket"),
+                "{}: {err}",
+                source.display()
+            );
+        }
+        // The same directories without the special files are ordinary mounts.
+        drop(listener);
+        std::fs::remove_file(&socket).unwrap();
+        std::fs::remove_file(nested.join("pipe")).unwrap();
+        for source in [socket_dir, sandbox.root().join("rt")] {
+            let mut options = options(&sandbox);
+            options.overlays.push(OverlaySpec {
+                host_path: source,
+                container_path: "/control".into(),
+                permission: OverlayPermission::ReadOnly,
+            });
+            options.validate_read_only_workspace().unwrap();
+        }
+    }
+
+    /// The configured endpoint (`DOCKER_HOST`) protects its ancestors even
+    /// when nothing is listening there yet.
+    #[test]
+    #[cfg(unix)] // DOCKER_HOST unix:// endpoints are unix-only
+    fn final_check_protects_the_configured_runtime_endpoint() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::options::workspace_access_tests::final_check_protects_the_configured_runtime_endpoint"));
+        let endpoint_dir = sandbox.root().join("engine-home");
+        std::fs::create_dir_all(&endpoint_dir).unwrap();
+        let mut options = options(&sandbox);
+        options.host_env = Some(crate::data::config::env::EnvSnapshot::from_full_env(
+            [(
+                "DOCKER_HOST".to_string(),
+                format!("unix://{}/engine.sock", endpoint_dir.display()),
+            )]
+            .into_iter()
+            .collect(),
+        ));
+        options.validate_read_only_workspace().unwrap();
+        options.overlays.push(OverlaySpec {
+            host_path: endpoint_dir,
+            container_path: "/engine".into(),
+            permission: OverlayPermission::ReadOnly,
+        });
+        assert!(options.validate_read_only_workspace().is_err());
+    }
+
+    /// A source too large to inspect fails closed rather than unchecked.
+    #[test]
+    fn special_file_inspection_fails_closed_past_its_limit() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::options::workspace_access_tests::special_file_inspection_fails_closed_past_its_limit"));
+        let dir = sandbox.root().join("many");
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..4 {
+            std::fs::write(dir.join(format!("f{i}")), b"").unwrap();
+        }
+        let overlay = OverlaySpec {
+            host_path: dir.clone(),
+            container_path: "/many".into(),
+            permission: OverlayPermission::ReadOnly,
         };
-        let result = dedup_refreshable_by_declared_env(&mut refreshable, &pt, &[], &lookup);
-        // Restore perms so the TempDir can be cleaned up.
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(
-            result.is_ok(),
-            "in-place neutralization must succeed: {result:?}"
-        );
-        assert!(refreshable.is_empty(), "covered delivery must be dropped");
-        let contents = std::fs::read_to_string(&staged_path).unwrap();
-        assert!(
-            !contents.contains("sk-oat"),
-            "neutralized file must carry no secret; got {contents:?}"
-        );
+        super::reject_special_files(std::slice::from_ref(&overlay), &[], 4).unwrap();
+        assert!(super::reject_special_files(std::slice::from_ref(&overlay), &[], 3).is_err());
+        // A skipped root (the workspace) is not walked.
+        super::reject_special_files(&[overlay], &[std::fs::canonicalize(&dir).unwrap()], 0)
+            .unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn final_check_keeps_symlinked_socket_parents_protected() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::options::workspace_access_tests::final_check_keeps_symlinked_socket_parents_protected"));
+        let var = sandbox.root().join("var");
+        let run = sandbox.root().join("run");
+        std::fs::create_dir_all(&var).unwrap();
+        std::fs::create_dir_all(&run).unwrap();
+        std::os::unix::fs::symlink(&run, var.join("run")).unwrap();
+        // A known endpoint must protect its parents even without a live daemon.
+        std::fs::write(run.join("docker.sock"), b"").unwrap();
+        let sockets = [var.join("run/docker.sock")];
+        for source in [&var, &run, &var.join("run")] {
+            for permission in [OverlayPermission::ReadOnly, OverlayPermission::ReadWrite] {
+                let overlay = OverlaySpec {
+                    host_path: source.clone(),
+                    container_path: "/run/engine".into(),
+                    permission,
+                };
+                assert!(
+                    super::reject_runtime_control_mounts_at(&[overlay], &sockets).is_err(),
+                    "{}",
+                    source.display()
+                );
+            }
+        }
     }
 }

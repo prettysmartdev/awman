@@ -9,13 +9,15 @@
 //! Stateless helpers parse command overlay flags and report launch outcomes;
 //! session-bound policy resolves agent and transport intent against config.
 
+pub mod agent_session;
+
 pub use crate::command::commands::agent_trust::{
     ensure_agent_trusted, ensure_workflow_agents_trusted, AgentTrustFrontend, AgentTrustReview,
     HostCommandReview, TrustDecision, TrustOutcome,
 };
 use crate::command::error::CommandError;
+use crate::data::config::agents::LaunchMode;
 use crate::data::config::overlays::{ContextOverlaySpec, ContextScope, TypedOverlay};
-use crate::data::config::repo::LaunchMode;
 use crate::data::config::EffectiveConfig;
 use crate::data::fs::ContextDirResolver;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
@@ -102,17 +104,18 @@ impl<'a> LaunchPolicy<'a> {
         let mut flags = current.flags().clone();
         flags.agent = agent_flag.clone();
         flags.model = model_flag.clone();
-        flags.launch_mode = launch_mode_flag;
-        let config = EffectiveConfig::new(
-            flags,
-            current.env().clone(),
-            current.repo().clone(),
-            current.global().clone(),
-        );
-        let repo = current.repo();
+        let mut layers = current.layers().clone();
+        if let Some(mode) = launch_mode_flag {
+            layers.set.0.push((
+                "agents.launchMode".into(),
+                serde_json::to_value(mode).expect("launch mode serializes"),
+            ));
+        }
+        let config = EffectiveConfig::resolve(layers, flags, current.env().clone())?;
+        let repo = current.layers().repo.agents.clone().unwrap_or_default();
         let explicit_acp = launch_mode_flag == Some(LaunchMode::Acp)
             || (agent_flag.is_none()
-                && repo.agent.is_some()
+                && repo.default.is_some()
                 && repo.launch_mode == Some(LaunchMode::Acp));
         Self::resolve_launch_mode(self.session, &config, agent, explicit_acp)
     }
@@ -141,8 +144,8 @@ impl<'a> LaunchPolicy<'a> {
         agent: &AgentName,
         explicit_single_agent_acp: bool,
     ) -> Result<LaunchModeDecision, EngineError> {
-        use crate::data::config::global::LaunchModeFallback;
-        use crate::data::config::repo::LaunchMode;
+        use crate::data::config::agents::AcpFallback;
+        use crate::data::config::agents::LaunchMode;
 
         if config.launch_mode() == LaunchMode::Stdio {
             return Ok(LaunchModeDecision::Stdio);
@@ -150,7 +153,7 @@ impl<'a> LaunchPolicy<'a> {
         if AgentRegistry::resolve_for_session(session, agent)?.supports_acp {
             return Ok(LaunchModeDecision::Acp);
         }
-        if explicit_single_agent_acp || config.launch_mode_fallback() == LaunchModeFallback::Error {
+        if explicit_single_agent_acp || config.acp_fallback() == AcpFallback::Error {
             return Err(EngineError::AcpUnsupported {
                 agent: agent.as_str().to_string(),
             });
@@ -160,7 +163,7 @@ impl<'a> LaunchPolicy<'a> {
 
     pub fn acp_fallback_warning(agent: &AgentName) -> String {
         format!(
-            "agent '{}' does not support ACP; falling back to stdio for this session — see launchModeFallback",
+            "agent '{}' does not support ACP; falling back to stdio for this session — see agents.acpFallback",
             agent.as_str()
         )
     }
@@ -171,8 +174,7 @@ impl<'a> LaunchPolicy<'a> {
     /// The note is a per-agent fact and lives in the first-party table
     /// (`AgentDefinition::deprecation_note`, F-32; custom agents carry none).
     /// `chat` and `exec prompt` each carried their own
-    /// `if agent.as_str() == "gemini"` arm with a duplicated copy of the
-    /// text; they now ask here.
+    /// vendor-specific warning text; they now ask here.
     pub fn deprecation_warning(agent: &AgentName) -> Option<UserMessage> {
         first_party(agent.as_str())?
             .deprecation_note
@@ -180,6 +182,47 @@ impl<'a> LaunchPolicy<'a> {
                 level: MessageLevel::Warning,
                 text,
             })
+    }
+
+    /// The per-launch notes a first-party agent declares for this run, in the
+    /// order they are shown: the agent's informational `launch_note`
+    /// (opencode-v2's isolation note) and, when the run takes the interactive
+    /// model fallback, the interface-change warning (opencode-v2 `mini`).
+    ///
+    /// One helper for every launch path (`chat`, `exec prompt`, workflow
+    /// steps, API sessions that go through them) so the same agent shows the
+    /// same notes regardless of runtime. Sandbox runtimes receive them through
+    /// the same frontend; the Layer 1 sandbox builder adds only the
+    /// sandbox-specific `sandbox_auth_note`, so nothing is shown twice.
+    pub fn launch_notices(
+        agent: &AgentName,
+        run: &crate::engine::agent::AgentRunOptions,
+    ) -> Vec<UserMessage> {
+        let Some(def) = first_party(agent.as_str()) else {
+            return Vec::new();
+        };
+        let mut notes = Vec::new();
+        if let Some(text) = &def.launch_note {
+            notes.push(UserMessage {
+                level: MessageLevel::Info,
+                text: text.clone(),
+            });
+        }
+        if let Some(text) = def.interactive_model_notice(run) {
+            notes.push(UserMessage {
+                level: MessageLevel::Warning,
+                text: text.to_string(),
+            });
+        }
+        // WI 0070: an inherited environment default that would select an
+        // incompatible starting mode is not passed (the host is unchanged).
+        for name in crate::engine::agent::plan_env_dropped(&def, run) {
+            notes.push(UserMessage {
+                level: MessageLevel::Warning,
+                text: format!("{name} is not passed to a --plan launch"),
+            });
+        }
+        notes
     }
 
     /// Resolve `ContextOverlaySpec`s into `ContextOverlay`s (host paths ensured-to-exist)
@@ -204,12 +247,26 @@ impl<'a> LaunchPolicy<'a> {
         workflow_step_info: Option<&WorkflowStepInfo>,
         sink: &mut dyn UserMessageSink,
     ) -> Result<(Vec<ContextOverlay>, Option<String>), CommandError> {
+        let mut specs = specs.to_vec();
+        if matches!(
+            self.session.repo_context(),
+            crate::data::session::RepoContextBinding::Staged(_)
+        ) && !specs.iter().any(|s| s.scope == ContextScope::Repo)
+        {
+            specs.push(ContextOverlaySpec {
+                key: None,
+                scope: ContextScope::Repo,
+                permission: crate::data::config::overlays::OverlayPermission::ReadWrite,
+            });
+        }
         if specs.is_empty() {
             return Ok((vec![], None));
         }
 
-        let resolver = ContextDirResolver::from_process_env()
-            .map_err(|e| CommandError::Other(format!("context dir resolver: {e}")))?;
+        let resolver = ContextDirResolver::from_env(self.session.env()).map_err(|e| {
+            tracing::warn!(%e, "context resolver failed");
+            CommandError::Other("context directory is unavailable".into())
+        })?;
 
         // Read once, not once per spec: `remote_url` shells out to git.
         let remote_url = self.remote_url();
@@ -218,14 +275,28 @@ impl<'a> LaunchPolicy<'a> {
         let mut builder = ContextPromptBuilder::new();
         let mut saw_repo_fallback: Option<std::path::PathBuf> = None;
 
-        for spec in specs {
+        for spec in &specs {
             let (host_path, container_path) = match spec.scope {
                 ContextScope::Global => {
                     let p = resolver.global_dir();
                     (p, std::path::PathBuf::from("/awman/context/global"))
                 }
                 ContextScope::Repo => {
-                    let p = resolver.repo_dir(remote_url.as_deref(), self.session.git_root());
+                    let resolved = crate::command::context::scope::RepoContextScope::new(
+                        &resolver,
+                        self.session,
+                    )
+                    .resolve(spec.key.as_ref(), remote_url.as_deref());
+                    if let Some(ignored) = resolved.ignored_overlay_key {
+                        sink.write_message(UserMessage {
+                            level: MessageLevel::Warning,
+                            text: format!(
+                                "context overlay key {} is overridden by the session binding",
+                                ignored.as_str()
+                            ),
+                        });
+                    }
+                    let p = resolved.host_dir;
                     // Detect the `_local/...` fallback so we can surface an Info
                     // message naming the resolved dir.
                     if let Some(suffix) = p.iter().rev().nth(1).and_then(|c| c.to_str()) {
@@ -243,13 +314,16 @@ impl<'a> LaunchPolicy<'a> {
                 }
             };
 
+            crate::data::fs::context_dirs::validate_context_path(resolver.awman_home(), &host_path)
+                .map_err(|e| {
+                    tracing::warn!(%e, "context overlay path refused");
+                    CommandError::Other("context overlay directory is unavailable".into())
+                })?;
             if let Err(e) = ContextDirResolver::ensure_exists(&host_path) {
+                tracing::warn!(%e, "context overlay directory creation failed");
                 sink.write_message(UserMessage {
                     level: MessageLevel::Warning,
-                    text: format!(
-                        "context overlay: failed to create directory {}: {e}",
-                        host_path.display()
-                    ),
+                    text: "context overlay: failed to create directory".into(),
                 });
                 continue;
             }
@@ -285,12 +359,10 @@ impl<'a> LaunchPolicy<'a> {
         }
 
         if let Some(path) = saw_repo_fallback {
+            tracing::debug!(path = %path.display(), "context repo uses local fallback");
             sink.write_message(UserMessage {
                 level: MessageLevel::Info,
-                text: format!(
-                    "context(repo): no git remote configured; using local fallback directory {}",
-                    path.display()
-                ),
+                text: "context(repo): no git remote configured; using local fallback at /awman/context/repo".into(),
             });
         }
 
@@ -328,48 +400,17 @@ impl<'a> LaunchPolicy<'a> {
         Ok((overlays, prompt))
     }
 
-    /// Emit launch-time configuration warnings: the once-per-repo
-    /// `dynamicWorkflows` deprecation notice (gated by `notices`), deprecated
-    /// `envPassthrough` fields and `agentFlags` entries awman already manages.
-    pub fn warn_config(
-        &self,
-        notices: &crate::command::config_notices::ConfigNotices,
-        sink: &mut dyn UserMessageSink,
-    ) {
-        notices.warn_legacy_dynamic_workflows(self.session, sink);
+    /// Emit launch-time configuration warnings: `agents.flags` entries awman
+    /// already manages.
+    pub fn warn_config(&self, sink: &mut dyn UserMessageSink) {
         let ec = self.session.effective_config();
-        if ec.repo().legacy_env_passthrough.is_some() {
-            sink.write_message(UserMessage {
-                level: MessageLevel::Warning,
-                text: "'.awman/config.json' contains a deprecated 'envPassthrough' field. Move these vars to the 'overlays' array as env() expressions, e.g. \"env(VAR_NAME)\", then remove 'envPassthrough'.".into(),
-            });
-        }
-        if ec.global().legacy_env_passthrough.is_some() {
-            sink.write_message(UserMessage {
-                level: MessageLevel::Warning,
-                text: "'~/.awman/config.json' contains a deprecated 'envPassthrough' field. Move these vars to the 'overlays' array as env() expressions, e.g. \"env(VAR_NAME)\", then remove 'envPassthrough'.".into(),
-            });
-        }
-        // Load-time warnings (an unknown `workflows.prerequisites` key, a repo
-        // `allowApiClientGrants`, …): surfaced, never fatal (WI 0149 §5).
-        for (file, warnings) in [
-            ("'~/.awman/config.json'", &ec.global().load_warnings),
-            ("'.awman/config.json'", &ec.repo().load_warnings),
-        ] {
-            for warning in warnings {
-                sink.write_message(UserMessage {
-                    level: MessageLevel::Warning,
-                    text: format!("{file}: {warning}"),
-                });
-            }
-        }
         self.warn_redundant_agent_flags(&ec, sink);
     }
 
     /// Warn once per agent and flag when `agentFlags` (or `--agent-flag`)
     /// names a flag awman already passes on that agent's interactive
     /// launches (codex `--no-daemon`). The engine drops the duplicate on
-    /// those launches; a non-interactive launch keeps it as configured, and
+    /// those launches; a headless launch keeps it as configured, and
     /// the agent may reject it there (`codex exec` refuses `--no-daemon`).
     fn warn_redundant_agent_flags(&self, ec: &EffectiveConfig, sink: &mut dyn UserMessageSink) {
         for agent in FIRST_PARTY_AGENTS {
@@ -384,7 +425,7 @@ impl<'a> LaunchPolicy<'a> {
                         text: format!(
                             "agentFlags for {agent} includes `{flag}`, which awman already passes \
                              on interactive {agent} launches; it is not added twice there, and \
-                             non-interactive runs may reject it. Remove it from agentFlags."
+                             headless runs may reject it. Remove it from agentFlags."
                         ),
                     });
                 }
@@ -419,670 +460,430 @@ impl<'a> LaunchPolicy<'a> {
     }
 }
 
-#[cfg(test)]
-mod launch_mode_tests {
-    use super::*;
-    use crate::data::config::global::{GlobalConfig, LaunchModeFallback};
-    use crate::data::config::repo::LaunchMode;
+// ─── Native start mode and workspace access (WI 0070) ──────────────────────
 
-    fn config(fallback: LaunchModeFallback) -> EffectiveConfig {
-        EffectiveConfig::new(
-            crate::data::config::FlagConfig {
-                launch_mode: Some(LaunchMode::Acp),
-                ..Default::default()
-            },
-            Default::default(),
-            Default::default(),
-            GlobalConfig {
-                launch_mode_fallback: Some(fallback),
-                ..Default::default()
-            },
-        )
+/// One awman permission-mode flag as the command received it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModeRequest {
+    /// The flag's resolved value (explicit, or a frontend/profile default).
+    pub value: bool,
+    /// The caller supplied it themselves.
+    pub explicit: bool,
+}
+
+/// Everything one launch asks for that `resolve_agent_policy` decides.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentPolicyRequest<'r> {
+    pub agent: &'r AgentName,
+    pub plan: bool,
+    pub yolo: ModeRequest,
+    pub auto: ModeRequest,
+    /// `--read-only-workspace` ∨ a workflow step's `read_only_workspace`.
+    /// A read-only lease engine is added by the resolver.
+    pub requested_access: crate::data::workspace::WorkspaceAccess,
+    pub launch: LaunchModeDecision,
+    pub allow_docker: bool,
+    /// Route facts for the native plan probe.
+    pub non_interactive: bool,
+    pub model_requested: bool,
+}
+
+/// The one resolution of a launch's native mode, mount access and transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPolicyOutcome {
+    /// Reported verbatim (`flags_applied`, results, messages).
+    pub policy: crate::data::agent_policy::ResolvedAgentPolicy,
+    /// Effective `--yolo` / `--auto` after an inherited default was
+    /// suppressed by `--plan`.
+    pub yolo: bool,
+    pub auto: bool,
+    /// The ACP session mode to select and confirm before the first prompt.
+    pub acp_mode_id: Option<String>,
+    pub notices: Vec<UserMessage>,
+}
+
+/// The plain facts the pure resolver needs: no session, no runtime.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PureRequest<'r> {
+    pub agent: &'r str,
+    pub plan: bool,
+    pub yolo: ModeRequest,
+    pub auto: ModeRequest,
+    pub requested_access: crate::data::workspace::WorkspaceAccess,
+    pub engine_read_only: bool,
+    pub runtime_supports_read_only: bool,
+    pub runtime_name: &'r str,
+    pub allow_docker: bool,
+    pub plan_kind: Option<crate::data::agent_policy::NativePlanKind>,
+    pub launch: LaunchModeDecision,
+}
+
+/// The pure core of [`LaunchPolicy::resolve_agent_policy`]. The native-mode
+/// half and the mount half never read each other's inputs: `--plan` adds no
+/// mount restriction and `--read-only-workspace` selects no native mode.
+pub(crate) fn resolve_agent_policy_pure(
+    req: &PureRequest<'_>,
+) -> Result<AgentPolicyOutcome, CommandError> {
+    use crate::data::agent_policy::{NativeStartMode, ResolvedAgentPolicy};
+    use crate::data::workspace::WorkspaceAccess;
+
+    // ── native mode half ──
+    for (name, mode) in [("yolo", req.yolo), ("auto", req.auto)] {
+        if req.plan && mode.value && mode.explicit {
+            return Err(CommandError::MutuallyExclusive {
+                command: Vec::new(),
+                a: "plan".into(),
+                b: name.into(),
+            });
+        }
     }
+    let mut notices = Vec::new();
+    let (yolo, auto) = if req.plan {
+        for (name, mode) in [("yolo", req.yolo), ("auto", req.auto)] {
+            if mode.value {
+                notices.push(UserMessage {
+                    level: MessageLevel::Info,
+                    text: format!(
+                        "--plan: the inherited --{name} default is not applied to '{}'",
+                        req.agent
+                    ),
+                });
+            }
+        }
+        (false, false)
+    } else {
+        (req.yolo.value, req.auto.value)
+    };
+    let native_start_mode = if !req.plan {
+        NativeStartMode::Default
+    } else {
+        match req.plan_kind {
+            Some(kind) => kind.into(),
+            None => {
+                return Err(CommandError::from(EngineError::PlanModeUnsupported {
+                    agent: req.agent.to_string(),
+                }))
+            }
+        }
+    };
 
-    #[test]
-    fn repo_acp_policy_uses_session_env_and_repo_precedence() {
-        let root = tempfile::tempdir().unwrap();
-        let home = root.path().join("global");
-        let session = Session::for_tests_isolated(root.path(), &home);
-        let dir = root.path().join(".awman/agents");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("pi.toml");
-        let source =
-            "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[image]\ninstall=['install pi']\n";
-        let name = AgentName::new("pi").unwrap();
-        let approve = || {
-            let untrusted =
-                AgentRegistry::load_untrusted(session.env(), &name, Some(root.path())).unwrap();
-            AgentRegistry::record_approval(
-                session.env(),
-                untrusted.definition(),
-                Some(root.path()),
-            )
-            .unwrap();
+    // ── mount half ──
+    let workspace_access = req
+        .requested_access
+        .strictest(WorkspaceAccess::from_read_only(req.engine_read_only));
+    crate::command::commands::workspace_access::check_workspace_access(
+        workspace_access,
+        req.allow_docker,
+        req.runtime_supports_read_only,
+        req.runtime_name,
+    )?;
+
+    // ── transport ──
+    let launch_mode = if req.launch == LaunchModeDecision::Acp {
+        LaunchMode::Acp
+    } else {
+        LaunchMode::Stdio
+    };
+    Ok(AgentPolicyOutcome {
+        policy: ResolvedAgentPolicy {
+            native_start_mode,
+            workspace_access,
+            launch_mode,
+        },
+        yolo,
+        auto,
+        acp_mode_id: None,
+        notices,
+    })
+}
+
+impl LaunchPolicy<'_> {
+    /// The only place a launch's native start mode, workspace mount access
+    /// and transport are decided (WI 0070). Runs before image preparation,
+    /// credentials or mounts. A route that cannot deliver a requested
+    /// `--plan` (headless/interactive/ACP/sandbox kit) fails here too, by the
+    /// same Layer 1 rule `validate_run` applies again at launch.
+    pub fn resolve_agent_policy(
+        &self,
+        req: AgentPolicyRequest<'_>,
+        engine: &crate::engine::agent::AgentEngine,
+    ) -> Result<AgentPolicyOutcome, CommandError> {
+        use crate::engine::agent::definition::RunParadigm;
+        use crate::engine::container::options::PlanMode;
+        let runtime = engine.runtime();
+        let def = if req.plan {
+            Some(AgentRegistry::resolve_for_session(self.session, req.agent)?)
+        } else {
+            None
         };
-        std::fs::write(&path, format!("{source}[acp]\ncommand=['pi','--acp']\n")).unwrap();
-        approve();
-        assert_eq!(
-            LaunchPolicy::resolve_launch_mode(
-                &session,
-                &config(LaunchModeFallback::Stdio),
-                &name,
-                false
-            )
-            .unwrap(),
-            LaunchModeDecision::Acp
-        );
-        std::fs::create_dir_all(home.join("agents")).unwrap();
-        std::fs::write(
-            home.join("agents/pi.toml"),
-            format!("{source}[acp]\ncommand=['pi','--acp']\n"),
-        )
-        .unwrap();
-        std::fs::write(&path, source).unwrap();
-        approve();
-        assert_eq!(
-            LaunchPolicy::resolve_launch_mode(
-                &session,
-                &config(LaunchModeFallback::Stdio),
-                &name,
-                false
-            )
-            .unwrap(),
-            LaunchModeDecision::StdioWithFallbackWarning
-        );
+        let mut outcome = resolve_agent_policy_pure(&PureRequest {
+            agent: req.agent.as_str(),
+            plan: req.plan,
+            yolo: req.yolo,
+            auto: req.auto,
+            requested_access: req.requested_access,
+            engine_read_only: engine.read_only_workspace(),
+            runtime_supports_read_only: runtime.capabilities().read_only_workspace(),
+            runtime_name: runtime.display_name(),
+            allow_docker: req.allow_docker,
+            plan_kind: def
+                .as_ref()
+                .and_then(|d| d.native_plan.as_ref().map(|p| p.kind)),
+            launch: req.launch,
+        })?;
+        if let Some(def) = &def {
+            let probe = crate::engine::agent::AgentRunOptions {
+                plan: Some(PlanMode::Enabled),
+                non_interactive: req.non_interactive,
+                model: req.model_requested.then(String::new),
+                launch_mode: outcome.policy.launch_mode,
+                ..Default::default()
+            };
+            let paradigm = if runtime.capabilities().kit_declarative {
+                RunParadigm::Sandbox
+            } else {
+                RunParadigm::Container
+            };
+            outcome.acp_mode_id = def
+                .native_plan_delivery(&probe, paradigm)?
+                .and_then(|delivery| delivery.acp_mode_id);
+        }
+        Ok(outcome)
     }
 
-    #[test]
-    fn fallback_decision_matrix() {
-        let root = tempfile::tempdir().unwrap();
-        let session = Session::for_tests(root.path());
-        let supported = AgentName::new("cline").unwrap();
-        let unsupported = AgentName::new("claude").unwrap();
-
-        assert_eq!(
-            LaunchPolicy::resolve_launch_mode(
-                &session,
-                &config(LaunchModeFallback::Error),
-                &supported,
-                false
-            )
-            .unwrap(),
-            LaunchModeDecision::Acp
-        );
-        assert!(matches!(
-            LaunchPolicy::resolve_launch_mode(
-                &session,
-                &config(LaunchModeFallback::Error),
-                &unsupported,
-                false
-            ),
-            Err(EngineError::AcpUnsupported { .. })
-        ));
-        assert_eq!(
-            LaunchPolicy::resolve_launch_mode(
-                &session,
-                &config(LaunchModeFallback::Stdio),
-                &unsupported,
-                false
-            )
-            .unwrap(),
-            LaunchModeDecision::StdioWithFallbackWarning
-        );
-        assert!(matches!(
-            LaunchPolicy::resolve_launch_mode(
-                &session,
-                &config(LaunchModeFallback::Stdio),
-                &unsupported,
-                true
-            ),
-            Err(EngineError::AcpUnsupported { .. })
-        ));
+    /// The `Info` line a launch that requested a native mode shows, or
+    /// `None` for the default mode.
+    pub fn native_mode_message(
+        agent: &AgentName,
+        policy: &crate::data::agent_policy::ResolvedAgentPolicy,
+        step: Option<&str>,
+    ) -> Option<UserMessage> {
+        use crate::data::agent_policy::NativeStartMode;
+        let mode = match policy.native_start_mode {
+            NativeStartMode::Default => return None,
+            NativeStartMode::Plan => "plan",
+            NativeStartMode::ReadOnly => "read-only",
+            NativeStartMode::Custom => "custom",
+        };
+        let prefix = step
+            .map(|name| format!("Step '{name}': starting"))
+            .unwrap_or_else(|| "Starting".into());
+        let tail = if policy.workspace_access.is_read_only() {
+            ""
+        } else {
+            "; workspace mounts unchanged"
+        };
+        Some(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("{prefix} {} in native {mode} mode{tail}.", agent.as_str()),
+        })
     }
 }
 
 #[cfg(test)]
-mod warn_config_tests {
+mod agent_policy_tests {
+    //! WI 0070: the pure resolver over all four flag combinations, agents
+    //! with and without a native plan, runtimes with and without read-only
+    //! mounts. The two halves never read each other's inputs.
     use super::*;
-    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
-    use crate::data::message::{MessageLevel, RecordingMessageSink};
-    use crate::data::session::Session;
+    use crate::data::agent_policy::{NativePlanKind, NativeStartMode};
+    use crate::data::workspace::WorkspaceAccess::{ReadOnly, ReadWrite};
 
-    fn open_session(git_root: &std::path::Path, env: EnvSnapshot) -> Session {
-        Session::for_tests_with_env(git_root, env)
+    fn req(plan: bool, read_only: bool) -> PureRequest<'static> {
+        PureRequest {
+            agent: "agent",
+            plan,
+            yolo: ModeRequest::default(),
+            auto: ModeRequest::default(),
+            requested_access: crate::data::workspace::WorkspaceAccess::from_read_only(read_only),
+            engine_read_only: false,
+            runtime_supports_read_only: true,
+            runtime_name: "Docker",
+            allow_docker: false,
+            plan_kind: Some(NativePlanKind::Plan),
+            launch: LaunchModeDecision::Stdio,
+        }
     }
 
     #[test]
-    fn repo_legacy_env_passthrough_triggers_warning_mentioning_config_path() {
-        let git_tmp = tempfile::tempdir().unwrap();
-        let cfg_tmp = tempfile::tempdir().unwrap();
-
-        // Write a repo config with the legacy envPassthrough field.
-        let awman_dir = git_tmp.path().join(".awman");
-        std::fs::create_dir_all(&awman_dir).unwrap();
-        std::fs::write(
-            awman_dir.join("config.json"),
-            r#"{"envPassthrough": ["MY_VAR"]}"#,
-        )
-        .unwrap();
-
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
-        let session = open_session(git_tmp.path(), env);
-
-        let mut sink = RecordingMessageSink::new();
-        LaunchPolicy::for_session(&session).warn_config(&Default::default(), &mut sink);
-
-        let warnings: Vec<_> = sink
-            .queued()
-            .iter()
-            .filter(|m| m.level == MessageLevel::Warning)
-            .collect();
-        assert!(
-            !warnings.is_empty(),
-            "must emit at least one warning for legacy envPassthrough in repo config"
-        );
-        let text = &warnings[0].text;
-        assert!(
-            text.contains(".awman/config.json"),
-            "warning must mention .awman/config.json to identify the source file; got: {text}"
-        );
-    }
-
-    /// An `agentFlags` entry awman already manages warns once, naming the
-    /// agent and the flag; an unrelated entry does not.
-    #[test]
-    fn an_agent_flag_awman_already_passes_triggers_one_warning() {
-        let git_tmp = tempfile::tempdir().unwrap();
-        let cfg_tmp = tempfile::tempdir().unwrap();
-        let awman_dir = git_tmp.path().join(".awman");
-        std::fs::create_dir_all(&awman_dir).unwrap();
-        std::fs::write(
-            awman_dir.join("config.json"),
-            r#"{"agentFlags": {"codex": ["--no-daemon", "--search"], "claude": ["--verbose"]}}"#,
-        )
-        .unwrap();
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
-        let session = open_session(git_tmp.path(), env);
-
-        let mut sink = RecordingMessageSink::new();
-        LaunchPolicy::for_session(&session).warn_config(&Default::default(), &mut sink);
-        let warnings: Vec<_> = sink
-            .queued()
-            .iter()
-            .filter(|m| m.level == MessageLevel::Warning)
-            .collect();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].text.contains("codex"), "{}", warnings[0].text);
-        assert!(
-            warnings[0].text.contains("--no-daemon"),
-            "{}",
-            warnings[0].text
-        );
-    }
-
-    #[test]
-    fn global_legacy_env_passthrough_triggers_warning_mentioning_global_config_path() {
-        let git_tmp = tempfile::tempdir().unwrap();
-        let cfg_tmp = tempfile::tempdir().unwrap();
-
-        // Write a global config with the legacy envPassthrough field.
-        std::fs::write(
-            cfg_tmp.path().join("config.json"),
-            r#"{"envPassthrough": ["GLOBAL_VAR"]}"#,
-        )
-        .unwrap();
-
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
-        let session = open_session(git_tmp.path(), env);
-
-        let mut sink = RecordingMessageSink::new();
-        LaunchPolicy::for_session(&session).warn_config(&Default::default(), &mut sink);
-
-        let warnings: Vec<_> = sink
-            .queued()
-            .iter()
-            .filter(|m| m.level == MessageLevel::Warning)
-            .collect();
-        assert!(
-            !warnings.is_empty(),
-            "must emit at least one warning for legacy envPassthrough in global config"
-        );
-        let text = &warnings[0].text;
-        assert!(
-            text.contains("~/.awman/config.json"),
-            "warning must mention ~/.awman/config.json to identify the source file; got: {text}"
-        );
-    }
-
-    #[test]
-    fn no_legacy_fields_produces_no_warning() {
-        let tmp = tempfile::tempdir().unwrap();
-        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
-        let session = open_session(tmp.path(), env);
-
-        let mut sink = RecordingMessageSink::new();
-        LaunchPolicy::for_session(&session).warn_config(&Default::default(), &mut sink);
-
-        assert!(
-            sink.queued().is_empty(),
-            "no warning must be emitted when no legacy fields are present; got {:?}",
-            sink.queued()
-        );
-    }
-}
-
-#[cfg(test)]
-mod resolve_agent_tests {
-    use super::LaunchPolicy;
-    use crate::data::session::{Session, SessionOpenOptions};
-
-    fn session_with_default_agent(agent: Option<&str>) -> Session {
-        let tmp = tempfile::tempdir().expect("scratch git root");
-        let session = Session::for_tests_with_options(
-            tmp.path(),
-            SessionOpenOptions {
-                flags: crate::data::config::FlagConfig {
-                    agent: agent.map(str::to_string),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
-        std::mem::forget(tmp);
-        session
-    }
-
-    #[test]
-    fn an_explicit_flag_wins() {
-        let session = session_with_default_agent(Some("claude"));
-        let resolved = LaunchPolicy::for_session(&session)
-            .resolve_agent(&Some("codex".to_string()))
-            .expect("resolve");
-        assert_eq!(resolved.as_str(), "codex");
-    }
-
-    /// Moved here from the TUI (WI 0114 F-15): the overlay title used to
-    /// re-run this precedence in Layer 3, so the rule was asserted against a
-    /// frontend helper rather than against the resolver every caller shares.
-    #[test]
-    fn the_session_default_is_used_when_no_flag_is_given() {
-        let session = session_with_default_agent(Some("codex"));
-        let resolved = LaunchPolicy::for_session(&session)
-            .resolve_agent(&None)
-            .expect("resolve");
-        assert_eq!(
-            resolved.as_str(),
-            "codex",
-            "a configured default agent must beat the hard-coded fallback"
-        );
-    }
-
-    #[test]
-    fn claude_is_the_fallback_without_config() {
-        let session = session_with_default_agent(None);
-        let resolved = LaunchPolicy::for_session(&session)
-            .resolve_agent(&None)
-            .expect("resolve");
-        assert_eq!(resolved.as_str(), "claude");
-    }
-}
-
-#[cfg(test)]
-mod cross_entrypoint_tests {
-    use super::*;
-    use crate::command::commands::agents::test_support::{FakeFrontend, FakeRuntime};
-    use crate::command::commands::chat::{ChatCommand, ChatCommandFlags, ChatCommandFrontend};
-    use crate::command::commands::exec_prompt::{
-        ExecPromptCommand, ExecPromptCommandFlags, ExecPromptCommandFrontend,
-    };
-    use crate::command::commands::Command;
-    use crate::command::dispatch::Engines;
-    use crate::data::session::AgentHandle;
-    use crate::engine::agent_runtime::{
-        AgentInstance, AgentRuntimeEngine, AgentStats, Capabilities, ReadyAgentOptions,
-        ResolvedAgentOptions,
-    };
-    use std::sync::{Arc, Mutex};
-
-    impl ChatCommandFrontend for FakeFrontend {}
-    impl ExecPromptCommandFrontend for FakeFrontend {}
-    impl crate::engine::acp::AcpFrontend for FakeFrontend {
-        fn render_update(&mut self, _: crate::engine::acp::protocol::SessionUpdate) {
-            unreachable!("tests stop at runtime build")
-        }
-        fn request_permission(
-            &mut self,
-            _: crate::engine::acp::protocol::PermissionRequest,
-        ) -> crate::engine::acp::protocol::PermissionDecision {
-            unreachable!("tests stop at runtime build")
-        }
-        fn next_prompt(&mut self) -> Option<String> {
-            unreachable!("tests stop at runtime build")
-        }
-    }
-
-    /// Capture the final options at the real command/runtime boundary. No
-    /// process is launched, even when the selected transport is ACP.
-    struct CaptureLaunch {
-        fake: FakeRuntime,
-        options: Mutex<Vec<ResolvedAgentOptions>>,
-    }
-    impl AgentRuntimeEngine for CaptureLaunch {
-        fn runtime_name(&self) -> &'static str {
-            "capture"
-        }
-        fn display_name(&self) -> &'static str {
-            "Capture"
-        }
-        fn capabilities(&self) -> &Capabilities {
-            &self.fake.caps
-        }
-        fn is_available(&self) -> bool {
-            true
-        }
-        fn build(
-            &self,
-            options: ResolvedAgentOptions,
-        ) -> Result<Box<dyn AgentInstance>, EngineError> {
-            self.options.lock().unwrap().push(options);
-            Err(EngineError::Other("captured launch".into()))
-        }
-        fn list_running(&self, _: &Session) -> Result<Vec<AgentHandle>, EngineError> {
-            unreachable!()
-        }
-        fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
-            unreachable!()
-        }
-        fn list_running_with_name_prefix(&self, _: &str) -> Result<Vec<AgentHandle>, EngineError> {
-            unreachable!()
-        }
-        fn stats(&self, _: &AgentHandle) -> Result<AgentStats, EngineError> {
-            unreachable!()
-        }
-        fn stop(&self, _: &AgentHandle) -> Result<(), EngineError> {
-            unreachable!()
-        }
-        fn attach(&self, _: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
-            unreachable!()
-        }
-        fn ready_agent(
-            &self,
-            _: &str,
-            _: ReadyAgentOptions,
-            _: &mut dyn UserMessageSink,
-        ) -> Result<(), EngineError> {
-            unreachable!()
-        }
-        fn image_exists(&self, _: &str) -> Result<bool, EngineError> {
-            Ok(true)
-        }
-        fn image_home_dir(&self, _: &str) -> Result<Option<String>, EngineError> {
-            Ok(Some("/root".into()))
-        }
-        fn build_image(
-            &self,
-            _: &crate::engine::container::BuildRequest,
-            _: &mut dyn FnMut(&str),
-        ) -> Result<(), EngineError> {
-            unreachable!()
-        }
-    }
-
-    #[derive(Default)]
-    struct LaunchCase {
-        repo_agent: Option<&'static str>,
-        repo_mode: Option<LaunchMode>,
-        agent: Option<&'static str>,
-        mode: Option<LaunchMode>,
-        overlay: Vec<String>,
-        plan: bool,
-        yolo: bool,
-        non_interactive: bool,
-    }
-
-    async fn run_case(
-        case: LaunchCase,
-    ) -> (Vec<ResolvedAgentOptions>, Vec<CommandError>, Vec<String>) {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join(".awman")).unwrap();
-        std::fs::write(
-            tmp.path().join(".awman/config.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "agent": case.repo_agent,
-                "launchMode": case.repo_mode,
-                "auth": "none",
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        std::fs::create_dir(tmp.path().join("home")).unwrap();
-        std::fs::write(
-            tmp.path().join("home/config.json"),
-            r#"{"launchModeFallback":"stdio"}"#,
-        )
-        .unwrap();
-        let session = Session::for_tests_isolated(tmp.path(), &tmp.path().join("home"));
-        let capture = Arc::new(CaptureLaunch {
-            fake: FakeRuntime::new(),
-            options: Default::default(),
-        });
-        let mut engines = Engines::for_tests(tmp.path());
-        engines.runtime = capture.clone();
-        engines.agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
-            engines.overlay_engine.clone(),
-            capture.clone(),
-        ));
-        let mut errors = Vec::new();
-        let mut messages = Vec::new();
-        let (frontend, log) = FakeFrontend::new();
-        errors.push(
-            ChatCommand::new(
-                ChatCommandFlags {
-                    session_worktree: None,
-                    non_interactive: case.non_interactive,
-                    plan: case.plan,
-                    allow_docker: false,
-                    yolo: case.yolo,
-                    auto: false,
-                    agent: case.agent.map(str::to_string),
-                    model: Some("test-model".into()),
-                    launch_mode: case.mode,
-                    overlay: case.overlay.clone(),
-                    agent_flags: None,
-                },
-                engines.clone(),
-                session.clone(),
-            )
-            .run_with_frontend(Box::new(frontend))
-            .await
-            .unwrap_err(),
-        );
-        messages.extend(log.lock().unwrap().messages.iter().map(|m| m.text.clone()));
-        let (frontend, log) = FakeFrontend::new();
-        errors.push(
-            ExecPromptCommand::new(
-                ExecPromptCommandFlags {
-                    session_worktree: None,
-                    prompt: Some("seeded test prompt".into()),
-                    non_interactive: case.non_interactive,
-                    plan: case.plan,
-                    allow_docker: false,
-                    yolo: case.yolo,
-                    auto: false,
-                    agent: case.agent.map(str::to_string),
-                    model: Some("test-model".into()),
-                    launch_mode: case.mode,
-                    overlay: case.overlay,
-                    agent_flags: None,
-                    issue_source: Default::default(),
-                },
-                engines,
-                session,
-            )
-            .run_with_frontend(Box::new(frontend))
-            .await
-            .unwrap_err(),
-        );
-        messages.extend(log.lock().unwrap().messages.iter().map(|m| m.text.clone()));
-        let options = std::mem::take(&mut *capture.options.lock().unwrap());
-        (options, errors, messages)
-    }
-
-    #[tokio::test]
-    async fn explicit_and_repo_paired_acp_refuse_before_setup_in_both_commands() {
-        for case in [
-            LaunchCase {
-                mode: Some(LaunchMode::Acp),
-                ..Default::default()
-            },
-            LaunchCase {
-                repo_agent: Some("claude"),
-                repo_mode: Some(LaunchMode::Acp),
-                ..Default::default()
-            },
+    fn the_four_combinations_resolve_independently() {
+        for (plan, read_only, mode, access) in [
+            (false, false, NativeStartMode::Default, ReadWrite),
+            (true, false, NativeStartMode::Plan, ReadWrite),
+            (false, true, NativeStartMode::Default, ReadOnly),
+            (true, true, NativeStartMode::Plan, ReadOnly),
         ] {
-            let (options, errors, _) = run_case(case).await;
-            assert!(options.is_empty());
-            assert!(
-                errors.iter().all(|error| matches!(error,
-                    CommandError::Engine(EngineError::AcpUnsupported { agent }) if agent == "claude"
-                )),
-                "{errors:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn repo_acp_fallback_and_explicit_stdio_match_across_commands() {
-        for case in [
-            LaunchCase {
-                repo_mode: Some(LaunchMode::Acp),
-                ..Default::default()
-            },
-            LaunchCase {
-                repo_agent: Some("claude"),
-                repo_mode: Some(LaunchMode::Acp),
-                agent: Some("claude"),
-                ..Default::default()
-            },
-            LaunchCase {
-                repo_agent: Some("claude"),
-                repo_mode: Some(LaunchMode::Acp),
-                mode: Some(LaunchMode::Stdio),
-                ..Default::default()
-            },
-        ] {
-            let expect_warning = case.mode.is_none();
-            let (options, errors, messages) = run_case(case).await;
-            assert_eq!(options.len(), 2, "{errors:?}");
-            for option in options {
-                let ResolvedAgentOptions::Container(option) = option else {
-                    panic!("expected container options")
-                };
-                assert!(!option.acp);
-            }
+            let out = resolve_agent_policy_pure(&req(plan, read_only)).unwrap();
             assert_eq!(
-                messages
-                    .iter()
-                    .filter(|m| m.contains("falling back to stdio"))
-                    .count(),
-                if expect_warning { 2 } else { 0 }
+                out.policy.native_start_mode, mode,
+                "plan={plan} ro={read_only}"
+            );
+            assert_eq!(
+                out.policy.workspace_access, access,
+                "plan={plan} ro={read_only}"
+            );
+            assert_eq!(out.policy.launch_mode, LaunchMode::Stdio);
+        }
+    }
+
+    #[test]
+    fn a_missing_native_plan_refuses_only_plan() {
+        let mut no_plan = req(true, false);
+        no_plan.plan_kind = None;
+        let err = resolve_agent_policy_pure(&no_plan).unwrap_err();
+        assert_eq!(
+            err.code(),
+            crate::data::agent_failure::NATIVE_CAPABILITY_UNAVAILABLE
+        );
+        assert_eq!(err.http_status(), 409);
+        // Mount-only never needs a plan kind.
+        let mut mount_only = req(false, true);
+        mount_only.plan_kind = None;
+        let out = resolve_agent_policy_pure(&mount_only).unwrap();
+        assert_eq!(out.policy.native_start_mode, NativeStartMode::Default);
+        assert_eq!(out.policy.workspace_access, ReadOnly);
+    }
+
+    #[test]
+    fn a_runtime_without_read_only_mounts_refuses_only_the_mount_flag() {
+        for plan_kind in [Some(NativePlanKind::ReadOnly), None] {
+            let mut plan_only = req(true, false);
+            plan_only.runtime_supports_read_only = false;
+            plan_only.allow_docker = true;
+            plan_only.plan_kind = plan_kind.or(Some(NativePlanKind::Custom));
+            let out = resolve_agent_policy_pure(&plan_only).unwrap();
+            assert_eq!(out.policy.workspace_access, ReadWrite, "plan adds no mount");
+        }
+        let mut mount = req(false, true);
+        mount.runtime_supports_read_only = false;
+        mount.runtime_name = "Docker Sandboxes";
+        let err = resolve_agent_policy_pure(&mount).unwrap_err();
+        assert_eq!(err.code(), "read_only_workspace_unsupported");
+        let mut both = req(true, true);
+        both.runtime_supports_read_only = false;
+        assert!(resolve_agent_policy_pure(&both).is_err());
+        let mut docker = req(false, true);
+        docker.allow_docker = true;
+        assert!(matches!(
+            resolve_agent_policy_pure(&docker).unwrap_err(),
+            CommandError::InvalidFlagValue { .. }
+        ));
+    }
+
+    #[test]
+    fn explicit_yolo_or_auto_with_plan_is_refused_and_inherited_ones_are_suppressed() {
+        for name in ["yolo", "auto"] {
+            let explicit = ModeRequest {
+                value: true,
+                explicit: true,
+            };
+            let inherited = ModeRequest {
+                value: true,
+                explicit: false,
+            };
+            let mut r = req(true, false);
+            if name == "yolo" {
+                r.yolo = explicit
+            } else {
+                r.auto = explicit
+            }
+            let err = resolve_agent_policy_pure(&r).unwrap_err();
+            assert_eq!(err.exit_code(), 2, "{name}");
+            assert!(
+                matches!(err, CommandError::MutuallyExclusive { .. }),
+                "{name}"
+            );
+
+            let mut r = req(true, false);
+            if name == "yolo" {
+                r.yolo = inherited
+            } else {
+                r.auto = inherited
+            }
+            let out = resolve_agent_policy_pure(&r).unwrap();
+            assert!(!out.yolo && !out.auto, "{name} suppressed");
+            assert_eq!(out.notices.len(), 1);
+            assert!(out.notices[0].text.contains(&format!("--{name}")));
+
+            // Without --plan nothing is suppressed.
+            let mut r = req(false, false);
+            if name == "yolo" {
+                r.yolo = inherited
+            } else {
+                r.auto = inherited
+            }
+            let out = resolve_agent_policy_pure(&r).unwrap();
+            assert_eq!((out.yolo, out.auto), (name == "yolo", name == "auto"));
+            assert!(out.notices.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_read_only_lease_engine_makes_the_launch_read_only_without_a_plan() {
+        let mut lease = req(true, false);
+        lease.engine_read_only = true;
+        let out = resolve_agent_policy_pure(&lease).unwrap();
+        assert_eq!(out.policy.workspace_access, ReadOnly);
+        assert_eq!(out.policy.native_start_mode, NativeStartMode::Plan);
+        let mut lease_no_plan = req(false, false);
+        lease_no_plan.engine_read_only = true;
+        let out = resolve_agent_policy_pure(&lease_no_plan).unwrap();
+        assert_eq!(out.policy.native_start_mode, NativeStartMode::Default);
+    }
+
+    #[test]
+    fn the_transport_follows_the_launch_decision_and_kinds_map_to_start_modes() {
+        let mut acp = req(false, false);
+        acp.launch = LaunchModeDecision::Acp;
+        assert_eq!(
+            resolve_agent_policy_pure(&acp).unwrap().policy.launch_mode,
+            LaunchMode::Acp
+        );
+        let mut fallback = req(false, false);
+        fallback.launch = LaunchModeDecision::StdioWithFallbackWarning;
+        assert_eq!(
+            resolve_agent_policy_pure(&fallback)
+                .unwrap()
+                .policy
+                .launch_mode,
+            LaunchMode::Stdio
+        );
+        for kind in NativePlanKind::ALL {
+            let mut r = req(true, false);
+            r.plan_kind = Some(kind);
+            assert_eq!(
+                resolve_agent_policy_pure(&r)
+                    .unwrap()
+                    .policy
+                    .native_start_mode,
+                NativeStartMode::from(kind)
             );
         }
     }
 
-    #[tokio::test]
-    async fn supported_acp_and_plan_yolo_prompt_options_match_across_commands() {
-        for (mode, plan) in [
-            (LaunchMode::Stdio, true),
-            (LaunchMode::Stdio, false),
-            (LaunchMode::Acp, true),
-            (LaunchMode::Acp, false),
-        ] {
-            let (options, errors, _) = run_case(LaunchCase {
-                agent: Some("cline"),
-                mode: Some(mode),
-                plan,
-                yolo: !plan,
-                non_interactive: true,
-                overlay: vec![
-                    "env(F08_FIRST),env(F08_SECOND)".into(),
-                    "env(F08_THIRD)".into(),
-                ],
-                ..Default::default()
-            })
-            .await;
-            assert_eq!(options.len(), 2, "{errors:?}");
-            for (index, option) in options.iter().enumerate() {
-                let ResolvedAgentOptions::Container(option) = option else {
-                    panic!("expected container options")
-                };
-                assert_eq!(option.acp, mode == LaunchMode::Acp);
-                assert!(!option.interactive);
-                assert_eq!(
-                    option.plan,
-                    if plan {
-                        crate::engine::container::options::PlanMode::Enabled
-                    } else {
-                        crate::engine::container::options::PlanMode::Disabled
-                    }
-                );
-                assert_eq!(
-                    option.yolo,
-                    if plan {
-                        crate::engine::container::options::YoloMode::Disabled
-                    } else {
-                        crate::engine::container::options::YoloMode::Enabled
-                    }
-                );
-                assert_eq!(
-                    option.seeded_prompt.as_deref(),
-                    if index == 0 || mode == LaunchMode::Acp {
-                        None
-                    } else {
-                        Some("seeded test prompt")
-                    }
-                );
-                let names: Vec<_> = option
-                    .env_passthrough
-                    .iter()
-                    .map(|name| name.0.as_str())
-                    .collect();
-                assert!(names
-                    .windows(3)
-                    .any(|names| names == ["F08_FIRST", "F08_SECOND", "F08_THIRD"]));
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn plan_and_yolo_conflict_before_build_in_both_commands() {
-        let (options, errors, _) = run_case(LaunchCase {
-            plan: true,
-            yolo: true,
+    #[test]
+    fn the_native_mode_message_says_whether_mounts_changed() {
+        let agent = AgentName::new("codex").unwrap();
+        let mut policy = crate::data::agent_policy::ResolvedAgentPolicy {
+            native_start_mode: NativeStartMode::ReadOnly,
             ..Default::default()
-        })
-        .await;
-        assert!(options.is_empty());
-        assert!(errors.iter().all(|error| matches!(error,
-            CommandError::Engine(EngineError::ConflictingOptions(message)) if message.contains("plan and yolo")
-        )), "{errors:?}");
-    }
-
-    #[tokio::test]
-    async fn malformed_repeated_overlay_retains_the_failing_flag_in_both_commands() {
-        let bad = "context(unknown)";
-        let (options, errors, _) = run_case(LaunchCase {
-            overlay: vec!["env(F08_FIRST)".into(), bad.into()],
-            ..Default::default()
-        })
-        .await;
-        assert!(options.is_empty());
-        assert!(errors.iter().all(|error| matches!(error,
-            CommandError::InvalidOverlaySpec { spec, reason } if spec == bad && !reason.is_empty()
-        )), "{errors:?}");
+        };
+        assert_eq!(
+            LaunchPolicy::native_mode_message(&agent, &policy, None)
+                .unwrap()
+                .text,
+            "Starting codex in native read-only mode; workspace mounts unchanged."
+        );
+        policy.workspace_access = ReadOnly;
+        assert_eq!(
+            LaunchPolicy::native_mode_message(&agent, &policy, Some("plan"))
+                .unwrap()
+                .text,
+            "Step 'plan': starting codex in native read-only mode."
+        );
+        policy.native_start_mode = NativeStartMode::Default;
+        assert!(LaunchPolicy::native_mode_message(&agent, &policy, None).is_none());
     }
 }
+
+pub mod settings_profile;

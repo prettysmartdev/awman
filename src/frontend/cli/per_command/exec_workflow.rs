@@ -69,11 +69,11 @@ impl ExecWorkflowCommandFrontend for CliFrontend {
 
     fn notify_dynamic_workflow_resume_unavailable(
         &mut self,
-        work_item: u32,
+        work_item: &str,
         reason: &str,
     ) -> Result<(), CommandError> {
         eprintln!(
-            "awman: the worktree for work item {work_item:04} is still on disk, but the previous \
+            "awman: the worktree for work item {work_item} is still on disk, but the previous \
              dynamic workflow cannot be resumed: {reason}"
         );
         if self.non_interactive {
@@ -104,62 +104,4 @@ fn parse_resume_answer(input: &str, prompt: &WorkflowResumePrompt) -> WorkflowRe
         .and_then(|n| prompt.start_points.get(n - 1))
         .map(|p| WorkflowResumeDecision::ResumeFrom(p.name.clone()))
         .unwrap_or(WorkflowResumeDecision::Cancel)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::command::commands::exec_workflow::WorkflowResumeStep;
-
-    fn prompt() -> WorkflowResumePrompt {
-        WorkflowResumePrompt::new(
-            "wf".into(),
-            None,
-            None,
-            false,
-            1,
-            3,
-            vec![
-                WorkflowResumeStep {
-                    name: "b".into(),
-                    role: "the step that failed".into(),
-                },
-                WorkflowResumeStep {
-                    name: "a".into(),
-                    role: "the step before it".into(),
-                },
-            ],
-        )
-    }
-
-    #[test]
-    fn a_number_picks_that_start_point() {
-        assert_eq!(
-            parse_resume_answer("2\n", &prompt()),
-            WorkflowResumeDecision::ResumeFrom("a".into())
-        );
-    }
-
-    #[test]
-    fn only_an_explicit_f_discards_the_saved_run() {
-        for answer in ["f", "F", " f \n"] {
-            assert_eq!(
-                parse_resume_answer(answer, &prompt()),
-                WorkflowResumeDecision::Fresh,
-                "answer={answer:?}"
-            );
-        }
-    }
-
-    /// Nothing ambiguous may be read as "delete the previous run".
-    #[test]
-    fn anything_unrecognised_cancels_rather_than_discarding() {
-        for answer in ["", "\n", "  ", "0", "9", "yes", "fresh"] {
-            assert_eq!(
-                parse_resume_answer(answer, &prompt()),
-                WorkflowResumeDecision::Cancel,
-                "answer={answer:?}"
-            );
-        }
-    }
 }

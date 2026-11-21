@@ -1,7 +1,7 @@
 //! `AgentTrustFrontend` impl for the CLI.
 //!
 //! An interactive run shows the review summary and reads `y`/`n`. A run that
-//! cannot ask (`--non-interactive`, `--json`, or stdin that is not a TTY)
+//! cannot ask (`--headless`, `--json`, or stdin that is not a TTY)
 //! refuses with the "has not been approved" error rather than answering for
 //! the user; `--yes` plays no part.
 

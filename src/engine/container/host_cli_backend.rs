@@ -34,18 +34,15 @@ pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// The error says why: the CLI is missing, the probe timed out, or it exited
 /// non-zero (daemon down, logged out, …).
 pub(super) fn cli_is_available(cli: ContainerCli, probe_args: &[&str]) -> Result<(), EngineError> {
-    crate::engine::host_cli::checked_output(
-        Command::new(crate::engine::host_cli::program(cli.bin)).args(probe_args),
-        cli.bin,
-    )
-    .map(|_| ())
+    crate::engine::host_cli::checked_output(cli.command().args(probe_args), cli.bin).map(|_| ())
 }
 
 /// Whether `tag` exists in the CLI's local image store
 /// (`<cli> image inspect <tag>`). Best-effort: a missing CLI, an unreachable
 /// daemon or a timeout all answer `Ok(false)`, as they always have.
 pub(super) fn cli_image_exists(cli: ContainerCli, tag: &str) -> Result<bool, EngineError> {
-    let child = Command::new(crate::engine::host_cli::program(cli.bin))
+    let child = cli
+        .command()
         .args(["image", "inspect", tag])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -63,7 +60,7 @@ pub(super) fn cli_run_probe(
     request: &ProbeRequest<'_>,
 ) -> Result<String, EngineError> {
     let _ = request.timeout; // checked_output uses the same bounded ten-second probe budget.
-    let mut command = Command::new(crate::engine::host_cli::program(cli.bin));
+    let mut command = cli.command();
     command.args(["run", "--rm", "--network", "none"]);
     command.args([
         "--entrypoint",
@@ -86,7 +83,7 @@ pub(super) fn cli_run_probe(
 
 pub(super) fn cli_image_id(cli: ContainerCli, tag: &str) -> Result<Option<String>, EngineError> {
     let output = crate::engine::host_cli::checked_output(
-        Command::new(crate::engine::host_cli::program(cli.bin))
+        cli.command()
             .args(["image", "inspect", "--format", "{{.Id}}", tag]),
         cli.bin,
     )?;
@@ -106,20 +103,31 @@ pub(super) fn cli_image_id(cli: ContainerCli, tag: &str) -> Result<Option<String
 /// exit status is success even if a descendant keeps the output pipes open.
 pub(super) fn cli_build_image(
     cli: ContainerCli,
-    tag: &str,
-    dockerfile: &Path,
-    context: &Path,
-    no_cache: bool,
+    request: &super::BuildRequest,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<(), EngineError> {
     let cli_bin = cli.bin;
-    let mut command = Command::new(crate::engine::host_cli::program(cli_bin));
-    command.args(build_image_argv(tag, dockerfile, context, no_cache));
+    let mut command = cli.command();
+    let argv = BuildArgv {
+        labels: &request.labels,
+        ..BuildArgv::new(
+            &request.reference,
+            &request.dockerfile,
+            &request.context,
+            request.no_cache,
+        )
+    };
+    command.args(argv.to_args());
+    let output = crate::engine::agent_runtime::OutputTail::new(20);
     let status = ProcessHostCommandRunner
         .run(
             command,
             &BuildControl::unbounded(CancelToken::new()),
-            on_line,
+            &mut |line| {
+                output.push_bytes(line.as_bytes());
+                output.push_bytes(b"\n");
+                on_line(line);
+            },
         )
         .map_err(|e| match e {
             EngineError::ContainerRuntimeUnavailable { .. } => {
@@ -131,8 +139,9 @@ pub(super) fn cli_build_image(
         })?;
     if !status.success() {
         return Err(EngineError::ImageBuildExitNonzero {
-            tag: tag.to_string(),
+            tag: request.reference.clone(),
             exit_code: status.code().unwrap_or(-1),
+            output: output.snapshot_text(),
         });
     }
     Ok(())
@@ -352,6 +361,7 @@ pub(crate) struct BuildArgv<'a> {
     pub platform: Option<&'a str>,
     pub iidfile: Option<&'a Path>,
     pub build_args: &'a [(String, String)],
+    pub labels: &'a std::collections::BTreeMap<String, String>,
 }
 
 impl<'a> BuildArgv<'a> {
@@ -365,6 +375,7 @@ impl<'a> BuildArgv<'a> {
             platform: None,
             iidfile: None,
             build_args: &[],
+            labels: empty_labels(),
         }
     }
 
@@ -392,6 +403,9 @@ impl<'a> BuildArgv<'a> {
         if self.no_cache {
             args.push("--no-cache".into());
         }
+        for (key, value) in self.labels {
+            args.extend(["--label".into(), format!("{key}={value}")]);
+        }
         for (key, value) in self.build_args {
             args.extend(["--build-arg".into(), format!("{key}={value}")]);
         }
@@ -406,9 +420,10 @@ impl<'a> BuildArgv<'a> {
     }
 }
 
-/// The ordinary runtime `build` argv, without the leading CLI binary.
-fn build_image_argv(tag: &str, dockerfile: &Path, context: &Path, no_cache: bool) -> Vec<String> {
-    BuildArgv::new(tag, dockerfile, context, no_cache).to_args()
+fn empty_labels() -> &'static std::collections::BTreeMap<String, String> {
+    static LABELS: std::sync::OnceLock<std::collections::BTreeMap<String, String>> =
+        std::sync::OnceLock::new();
+    LABELS.get_or_init(Default::default)
 }
 
 /// `<cli> <subcommand> <target>` — container removal (`rm`) or image removal
@@ -419,12 +434,13 @@ pub(super) fn cli_remove(
     target: &str,
 ) -> Result<(), EngineError> {
     let cli_bin = cli.bin;
-    let output = Command::new(crate::engine::host_cli::program(cli_bin))
-        .args([subcommand, target])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| spawn_error(cli, &format!("{subcommand} {target}"), e))?;
+    let output = crate::engine::host_cli::checked_output(
+        cli.command()
+            .args([subcommand, target])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped()),
+        cli_bin,
+    )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(EngineError::Container(format!(
@@ -434,109 +450,16 @@ pub(super) fn cli_remove(
     Ok(())
 }
 
-/// A spawn failure: `NotFound` means the CLI is not installed.
-fn spawn_error(cli: ContainerCli, what: &str, e: std::io::Error) -> EngineError {
-    if e.kind() == std::io::ErrorKind::NotFound {
-        EngineError::ContainerRuntimeUnavailable {
-            binary: cli.bin.to_string(),
-        }
-    } else {
-        EngineError::Container(format!("{} {what}: {e}", cli.bin))
-    }
-}
-
 /// Explicit user stop: keep immutable identity and propagate failures.
 /// Removal remains the command's separate best-effort operation.
 pub(super) fn cli_stop_checked(cli: ContainerCli, id: &str) -> Result<(), EngineError> {
-    crate::engine::host_cli::checked_output(
-        Command::new(crate::engine::host_cli::program(cli.bin)).args(["stop", id]),
-        cli.bin,
-    )
-    .map(|_| ())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn missing_cli() -> ContainerCli {
-        ContainerCli {
-            bin: "/nonexistent/awman-host-cli-backend-test/cli",
-            ..ContainerCli::DOCKER
-        }
+    let output =
+        crate::engine::host_cli::checked_output(cli.command().args(["stop", id]), cli.bin)?;
+    if !output.status.success() {
+        return Err(EngineError::Container(format!(
+            "{} stop {id} failed",
+            cli.bin
+        )));
     }
-
-    #[test]
-    fn build_argv_shape_is_unchanged() {
-        let args = build_image_argv(
-            "awman-x:latest",
-            Path::new("/r/Dockerfile.dev"),
-            Path::new("/r"),
-            true,
-        );
-        assert_eq!(
-            args,
-            vec![
-                "build",
-                "--no-cache",
-                "-t",
-                "awman-x:latest",
-                "-f",
-                "/r/Dockerfile.dev",
-                "/r"
-            ]
-        );
-        assert!(
-            !build_image_argv("t", Path::new("f"), Path::new("c"), false)
-                .contains(&"--no-cache".to_string())
-        );
-    }
-
-    #[test]
-    fn missing_cli_is_reported_precisely() {
-        let cli = missing_cli();
-        match cli_is_available(cli, &["info"]) {
-            Err(EngineError::ContainerRuntimeUnavailable { binary }) => {
-                assert_eq!(binary, cli.bin)
-            }
-            other => panic!("expected ContainerRuntimeUnavailable, got {other:?}"),
-        }
-        assert!(matches!(
-            cli_remove(cli, "rm", "x"),
-            Err(EngineError::ContainerRuntimeUnavailable { .. })
-        ));
-        // Best-effort probe: a missing CLI is "no such image", not an error.
-        assert!(!cli_image_exists(cli, "x").unwrap());
-    }
-}
-
-#[cfg(all(test, unix))]
-mod requested_tools_review_tests {
-    use super::*;
-    #[test]
-    fn actual_probe_argv_carries_extra_requested_tools() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fixture-cli");
-        std::fs::write(
-            &path,
-            "#!/bin/sh\nwhile [ \"$1\" != -c ]; do shift; done\nexec sh \"$@\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let bin: &'static str = Box::leak(path.to_str().unwrap().to_owned().into_boxed_str());
-        let cli = ContainerCli {
-            bin,
-            ..ContainerCli::DOCKER
-        };
-        let request = ProbeRequest {
-            image: "fixture",
-            script: crate::engine::container::phase_tools::PHASE_TOOLS_SCRIPT,
-            tools: &["git", "__awman_missing_extra_tool_0149"],
-            timeout: Duration::from_secs(1),
-        };
-        let output = cli_run_probe(cli, &request).unwrap();
-        assert!(output.contains("git=1"));
-        assert!(output.contains("__awman_missing_extra_tool_0149=0"));
-    }
+    Ok(())
 }

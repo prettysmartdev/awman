@@ -8,6 +8,7 @@ use super::{
 
 #[derive(Default)]
 pub struct Translator {
+    observation: super::NativeObservation,
     candidate: Option<String>,
     finalized: bool,
 }
@@ -22,6 +23,31 @@ impl Translator {
     }
 
     fn translate(&mut self, event: &Value) -> Option<Vec<Translated>> {
+        let kind = event.get("type").and_then(Value::as_str);
+        let identity = match kind {
+            Some("thread.started") => event.get("thread_id"),
+            _ => None,
+        };
+        if let Some(id) = identity
+            .and_then(Value::as_str)
+            .and_then(|s| crate::data::settings_profile::NativeSessionId::parse(s).ok())
+        {
+            self.observation.identity = Some(id);
+        }
+        // Terminal outcomes latch: a completion never clears a failure.
+        if kind == Some("turn.completed") {
+            if event.get("is_error").and_then(Value::as_bool) == Some(true) {
+                self.observation.terminal(false, None);
+            } else {
+                // The confirmed answer is the turn's last agent message.
+                let answer = self.candidate.clone().unwrap_or_default();
+                self.observation.terminal(true, Some(answer));
+            }
+        }
+        if kind == Some("turn.failed") {
+            self.observation.terminal(false, None);
+        }
+
         let event_type = event.get("type")?.as_str()?;
         match event_type {
             "thread.started" if event.get("thread_id").and_then(Value::as_str).is_some() => {
@@ -112,6 +138,9 @@ impl Translator {
 }
 
 impl AgentOutputTranslator for Translator {
+    fn native_observation(&self) -> super::NativeObservation {
+        self.observation.clone()
+    }
     fn feed_line(&mut self, stream: OutputStream, line: &str) -> Vec<Translated> {
         if stream == OutputStream::Stderr {
             return passthrough(stream, line);

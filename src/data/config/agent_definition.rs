@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::data::config::{Env, GlobalConfig};
+use crate::data::config::Env;
 use crate::data::fs::agent_dirs::DefinitionScope;
 
 pub const AGENT_DEFINITION_SCHEMA: u32 = 1;
@@ -23,11 +23,42 @@ pub const FIRST_PARTY_AGENT_NAMES: &[&str] = &[
     "claude",
     "codex",
     "opencode",
-    "gemini",
+    "opencode-v2",
+    "cursor",
     "copilot",
     "cline",
     "antigravity",
 ];
+
+/// A name that used to be built in, with migration guidance shown only when
+/// no custom definition of that name exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormerBuiltinAgent {
+    pub name: &'static str,
+    pub guidance: &'static str,
+}
+
+pub const FORMER_BUILTIN_AGENTS: &[FormerBuiltinAgent] = &[
+    FormerBuiltinAgent {
+        name: "crush",
+        guidance: "'crush' is no longer built in — recreate it with: awman new agent crush --from crush",
+    },
+    FormerBuiltinAgent {
+        name: "maki",
+        guidance: "'maki' is no longer built in — recreate it with: awman new agent maki --from maki",
+    },
+    FormerBuiltinAgent {
+        name: "gemini",
+        guidance: "'gemini' is no longer a built-in agent, and awman has not changed your selection. Either switch to the built-in 'antigravity' agent (awman chat --agent antigravity, or set agents.default to \"antigravity\"), or define Gemini CLI as your own custom agent with: awman new agent gemini (custom agents go through the normal review and approval step). Google ended Gemini CLI access for consumer Google-login and AI-plan accounts on 2026-06-18; enterprise subscriptions and paid API keys still work, which is what a custom agent would use.",
+    },
+];
+
+pub fn former_builtin_guidance(name: &str) -> Option<&'static str> {
+    FORMER_BUILTIN_AGENTS
+        .iter()
+        .find(|agent| agent.name == name)
+        .map(|agent| agent.guidance)
+}
 
 /// Host directories (relative to `$HOME`) a definition may never mount. Checked at parse
 /// time here and again in `OverlayEngine` (defence in depth).
@@ -51,6 +82,8 @@ pub const HOST_DIR_DENY_LIST: &[&str] = &[
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentDefinitionFile {
+    #[serde(default)]
+    pub automation: Option<AutomationTable>,
     pub schema: u32,
     pub display_name: String,
     #[serde(default)]
@@ -92,7 +125,7 @@ pub struct RunTable {
     pub seed_prompt: SeedPromptSpec, // default Positional
     #[serde(default)]
     pub model: ModelFlagSpec, // default Space
-    /// The structured output mode a non-interactive run can print in
+    /// The structured output mode a headless run can print in
     /// (WI 0137 §4): `"text"` (default), `"claude_stream_json"` or
     /// `"codex_json"`. A structured format lets an API run produce
     /// `step_activity` events and a `final_message`.
@@ -134,6 +167,20 @@ pub struct ModesTable {
     pub auto: Vec<String>,
     #[serde(default)]
     pub plan: Vec<String>,
+    /// Interactive plan argv. Omitted inherits `plan`; an explicitly empty
+    /// array declares the interactive route unsupported.
+    #[serde(default)]
+    pub plan_interactive: Option<Vec<String>>,
+    /// Headless plan argv, with the same inheritance as `plan_interactive`.
+    #[serde(default)]
+    pub plan_headless: Option<Vec<String>>,
+    /// What the plan mapping selects; default `custom`.
+    #[serde(default)]
+    pub plan_kind: Option<crate::data::agent_policy::NativePlanKind>,
+    /// ACP session mode selected (and acknowledged) before the first prompt.
+    /// Never inferred from stdio argv.
+    #[serde(default)]
+    pub plan_acp_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -311,6 +358,60 @@ fn check_array_len(field: &str, len: usize, problems: &mut Vec<String>) {
     }
 }
 
+impl ModesTable {
+    /// Whether any plan delivery is declared: a `plan` fallback, a non-empty
+    /// route array or an ACP mode.
+    pub fn declares_plan(&self) -> bool {
+        !self.plan.is_empty()
+            || self
+                .plan_interactive
+                .as_ref()
+                .is_some_and(|v| !v.is_empty())
+            || self.plan_headless.as_ref().is_some_and(|v| !v.is_empty())
+            || self.plan_acp_mode.is_some()
+    }
+
+    /// Rules for the native plan keys (WI 0070).
+    fn validate_plan(&self, has_acp: bool, problems: &mut Vec<String>) {
+        for (field, argv) in [
+            ("modes.plan_interactive", &self.plan_interactive),
+            ("modes.plan_headless", &self.plan_headless),
+        ] {
+            if let Some(argv) = argv {
+                check_argv(field, argv, false, problems);
+            }
+        }
+        if let Some(mode) = &self.plan_acp_mode {
+            if !has_acp {
+                problems.push(
+                    "modes.plan_acp_mode: requires an [acp] table; ACP support is never inferred \
+                     from stdio argv"
+                        .into(),
+                );
+            }
+            if mode.is_empty()
+                || mode.len() > 64
+                || !mode
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
+            {
+                problems
+                    .push("modes.plan_acp_mode: must be 1-64 characters of [A-Za-z0-9_.:-]".into());
+            }
+        }
+        let route_keys = self.plan_kind.is_some()
+            || self.plan_interactive.is_some()
+            || self.plan_headless.is_some();
+        if route_keys && !self.declares_plan() {
+            problems.push(
+                "modes: declares a plan kind or route but no plan delivery (set modes.plan, a \
+                 non-empty plan_interactive/plan_headless, or plan_acp_mode)"
+                    .into(),
+            );
+        }
+    }
+}
+
 fn check_argv(field: &str, argv: &[String], command: bool, problems: &mut Vec<String>) {
     check_array_len(field, argv.len(), problems);
     if command && argv.is_empty() {
@@ -437,6 +538,7 @@ impl AgentDefinitionFile {
         check_argv("modes.yolo", &self.modes.yolo, false, &mut problems);
         check_argv("modes.auto", &self.modes.auto, false, &mut problems);
         check_argv("modes.plan", &self.modes.plan, false, &mut problems);
+        self.modes.validate_plan(self.acp.is_some(), &mut problems);
         if let Some(tools) = &self.tools {
             for (field, token) in [
                 ("tools.allowed_flag", &tools.allowed_flag),
@@ -589,7 +691,7 @@ impl AgentDefinitionFile {
             problems.push("image.install: required unless image.dockerfile is set".into());
         }
         if self.sandbox.is_some() {
-            problems.push("custom agents do not support Docker Sandboxes yet; remove [sandbox] and use docker, apple or builtin-experimental".into());
+            problems.push("custom agents do not support Docker Sandboxes yet; remove [sandbox] and use runtime.kind docker, apple or builtin".into());
         }
         problems
     }
@@ -652,7 +754,7 @@ pub fn content_hash(toml_bytes: &[u8], dockerfile_bytes: Option<&[u8]>) -> Strin
 /// Load using the process's global data home to identify the scope for diagnostics.
 /// Callers with an explicit environment/scope should use `load_agent_definition_with_scope`.
 pub fn load_agent_definition(path: &Path) -> Result<LoadedAgentDefinition, AgentDefinitionInvalid> {
-    let global = GlobalConfig::data_home_with(&Env::from_process())
+    let global = crate::data::fs::data_paths::data_home(&Env::from_process())
         .ok()
         .map(|home| home.join("agents"));
     let parent = path.parent().unwrap_or(Path::new("."));
@@ -872,407 +974,122 @@ fn field_location(source: &str, field: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+mod native_plan_tests {
     use super::*;
+    use crate::data::agent_policy::NativePlanKind;
 
-    fn minimal() -> AgentDefinitionFile {
-        toml::from_str(
-            "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[image]\ninstall=['install pi']\n",
-        )
-        .unwrap()
+    const BASE: &str = "schema = 1\ndisplay_name = \"Custom\"\n[run]\ncommand = [\"custom\"]\n\
+                        [image]\ninstall = [\"echo i\"]\n";
+
+    fn parse(extra: &str) -> Result<AgentDefinitionFile, String> {
+        toml::from_str(&format!("{BASE}{extra}")).map_err(|e| e.to_string())
+    }
+
+    fn plan_problems(file: &AgentDefinitionFile) -> Vec<String> {
+        file.validate()
+            .into_iter()
+            .filter(|p| p.starts_with("modes"))
+            .collect()
     }
 
     #[test]
-    fn protected_paths_include_ancestors_case_and_descendants() {
-        for path in [
-            ".config",
-            ".local",
-            "Library",
-            ".SSH",
-            ".Aws/config",
-            "library/keychains",
-            ".config/GH/tokens",
-        ] {
-            assert!(is_deny_listed_host_dir(path), "{path}");
-            let mut file = minimal();
-            file.settings = Some(SettingsTable {
-                host_dir: Some(path.into()),
-                skills_dir: None,
-            });
-            assert!(!file.validate().is_empty(), "{path}");
-        }
-        for path in [".config/crush", ".ssh-agent", "Library/Preferences"] {
-            assert!(!is_deny_listed_host_dir(path), "{path}");
-        }
-    }
-
-    #[test]
-    fn displayed_fields_reject_all_terminal_controls_and_excessive_lengths() {
-        for control in [
-            '\0', '\t', '\n', '\r', '\u{1b}', '\u{7f}', '\u{85}', '\u{9b}',
-        ] {
-            let value = format!("Pi{control}hidden");
-            let mut file = minimal();
-            file.display_name = value.clone();
-            file.description = Some(value.clone());
-            file.homepage = Some(value.clone());
-            file.run.command.push(value.clone());
-            file.run.env.insert("PI_TEST".into(), value.clone());
-            file.image.install = vec![value.clone()];
-            file.settings = Some(SettingsTable {
-                host_dir: Some(value.clone()),
-                skills_dir: Some(value.clone()),
-            });
-            file.system_prompt = Some(SystemPromptTable {
-                delivery: DeliveryKind::AppendInline,
-                flag: Some(value.clone()),
-                key: Some(value),
-                env: None,
-            });
-            let problems = file.validate();
-            for field in [
-                "display_name",
-                "description",
-                "homepage",
-                "run.command",
-                "run.env",
-                "image.install",
-                "settings.host_dir",
-                "settings.skills_dir",
-                "system_prompt.flag",
-                "system_prompt.key",
-            ] {
-                assert!(
-                    problems
-                        .iter()
-                        .any(|p| p.starts_with(field) && p.contains("control")),
-                    "{control:?} {field}: {problems:?}"
-                );
-            }
-        }
-        let mut file = minimal();
-        file.display_name = "x".repeat(257);
-        file.description = Some("x".repeat(4097));
-        file.homepage = Some("x".repeat(2049));
-        assert_eq!(file.validate().len(), 3);
-    }
-
-    #[test]
-    fn skills_destination_must_be_a_normal_relative_directory() {
-        for path in ["", ".", "./skills", "a/../b", "/skills"] {
-            let mut file = minimal();
-            file.settings = Some(SettingsTable {
-                host_dir: None,
-                skills_dir: Some(path.into()),
-            });
-            assert!(!file.validate().is_empty(), "{path}");
-        }
-    }
-
-    #[test]
-    fn escape_hatch_has_a_bounded_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pi.toml");
-        std::fs::write(&path, "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[image]\ndockerfile='pi.Dockerfile'\n").unwrap();
-        std::fs::write(
-            dir.path().join("pi.Dockerfile"),
-            vec![b'x'; MAX_DEFINITION_BYTES + 1],
+    fn the_four_route_keys_parse_and_default() {
+        let file = parse(
+            "[modes]\nplan = [\"--plan\"]\nplan_interactive = [\"--mode\", \"plan\"]\n\
+             plan_headless = []\nplan_kind = \"read_only\"\n",
         )
         .unwrap();
-        let error = load_agent_definition_with_scope(&path, DefinitionScope::Repo).unwrap_err();
-        assert!(error.to_string().contains("image.dockerfile"));
-        assert!(error.to_string().contains("64 KiB"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn fifo_definitions_are_rejected_without_opening() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pi.toml");
-        nix::unistd::mkfifo(
-            &path,
-            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
-        )
-        .unwrap();
-        let error = load_agent_definition_with_scope(&path, DefinitionScope::Repo).unwrap_err();
-        assert!(error.to_string().contains("not a regular file"));
-    }
-
-    #[test]
-    fn load_minimal_definition() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("pi.toml");
-        let source = "schema = 1\ndisplay_name = 'Pi'\n[run]\ncommand = ['pi']\n[image]\ninstall = ['install pi']\n";
-        std::fs::write(&path, source).unwrap();
-        let loaded = load_agent_definition_with_scope(&path, DefinitionScope::Repo).unwrap();
-        assert!(loaded.file.validate().is_empty());
-        assert_eq!(loaded.file.smoke_binary(), "pi");
-        assert_eq!(loaded.sha256, content_hash(source.as_bytes(), None));
-        assert!(field_location(source, "run.command[0]").starts_with("line 4, column 12"));
-    }
-
-    #[test]
-    fn validation_table_accepts_valid_values_and_accumulates_all_invalid_rows() {
-        for stem in ["a", "0", "agent_1", "agent-x", &"a".repeat(64)] {
-            assert!(validate_agent_file_stem(stem).is_ok(), "{stem:?}");
-        }
-        for stem in ["", "_agent", "-agent", "A", "a/b", &"a".repeat(65)] {
-            assert!(validate_agent_file_stem(stem).is_err(), "{stem:?}");
-        }
-        assert!(is_first_party_name("claude"));
-        assert!(!is_first_party_name("pi"));
-
-        let valid = "schema=1\ndisplay_name='Pi'\nhomepage='https://example.test'\n[run]\ncommand=['/usr/bin/pi']\nnon_interactive='run'\ninteractive_only_flags=['--interactive']\nseed_prompt={flag='--prompt'}\nmodel='equals'\nenv={PI_TEST='1'}\n[modes]\nyolo=['--yolo']\nauto=['--auto']\nplan=['--plan']\n[tools]\nallowed_flag='--allow'\ndisallowed_flag='--deny'\n[system_prompt]\ndelivery='append-inline'\nflag='--config'\nkey='instructions'\n[acp]\ncommand=['pi','--acp']\n[ping]\ncommand=['/usr/bin/pi','--ping']\n[settings]\nhost_dir='.config/pi'\nskills_dir='skills/pi'\n[auth]\nenv=['PI_TOKEN']\n[image]\napt=['ripgrep','libssl3']\ninstall=['install pi']\nbinary='pi'\n";
-        let accepted: AgentDefinitionFile = toml::from_str(valid).unwrap();
-        assert!(accepted.validate().is_empty(), "{:?}", accepted.validate());
-
-        // One deliberately invalid file exercises every semantic validation row. The test
-        // checks the complete set of independent diagnostics, not merely the first error.
-        let invalid = "schema=2\ndisplay_name=\"bad\\nname\"\ndescription='ok'\n[run]\ncommand=['./pi','']\nnon_interactive=''\ninteractive_only_flags=[\"x\\ny\"]\nseed_prompt='not-positional'\nmodel='space'\nenv={'BAD-NAME'='x', HOME='x', AWMAN_BAD='x', LD_BAD='x', OK=\"x\\ny\"}\n[modes]\nyolo=['']\nauto=[\"x\\ny\"]\nplan=['x']\n[tools]\nallowed_flag=''\ndisallowed_flag='--deny'\n[system_prompt]\ndelivery='append-inline'\nflag='--config'\nenv='NOT_ALLOWED'\n[acp]\ncommand=[]\n[ping]\ncommand=['bin/pi']\n[settings]\nhost_dir='../.ssh'\nskills_dir='./skills'\n[auth]\nenv=['AWMAN_X','SSH_AUTH_SOCK','bad-name']\n[image]\napt=['Bad_pkg']\ninstall=['  ',\"echo\\nhi\"]\nbinary='./pi'\n";
-        let rejected: AgentDefinitionFile = toml::from_str(invalid).unwrap();
-        let problems = rejected.validate();
-        for field in [
-            "display_name",
-            "schema 2 requires a newer awman",
-            "run.command[0]",
-            "run.command[1]",
-            "run.non_interactive",
-            "run.interactive_only_flags[0]",
-            "run.seed_prompt",
-            "run.env.BAD-NAME",
-            "run.env.HOME",
-            "run.env.AWMAN_BAD",
-            "run.env.LD_BAD",
-            "run.env.OK",
-            "modes.yolo[0]",
-            "modes.auto[0]",
-            "tools.allowed_flag",
-            "system_prompt.key",
-            "system_prompt.env",
-            "acp.command",
-            "ping.command[0]",
-            "settings.host_dir",
-            "settings.skills_dir",
-            "auth.env[0]",
-            "auth.env[1]",
-            "auth.env[2]",
-            "image.apt[0]",
-            "image.install[0]",
-            "image.install[1]",
-            "image.binary",
-        ] {
-            assert!(
-                problems.iter().any(|p| p.contains(field)),
-                "missing {field}: {problems:#?}"
-            );
-        }
-        assert!(
-            problems.len() >= 27,
-            "expected accumulated violations: {problems:#?}"
+        assert_eq!(file.modes.plan, vec!["--plan"]);
+        assert_eq!(
+            file.modes.plan_interactive,
+            Some(vec!["--mode".to_string(), "plan".to_string()])
         );
+        assert_eq!(file.modes.plan_headless, Some(Vec::new()));
+        assert_eq!(file.modes.plan_kind, Some(NativePlanKind::ReadOnly));
+        assert!(plan_problems(&file).is_empty(), "{:?}", file.validate());
+
+        let omitted = parse("[modes]\nplan = [\"--plan\"]\n").unwrap();
+        assert_eq!(omitted.modes.plan_interactive, None);
+        assert_eq!(omitted.modes.plan_headless, None);
+        assert_eq!(omitted.modes.plan_kind, None, "kind defaults at conversion");
+        assert_eq!(omitted.modes.plan_acp_mode, None);
     }
 
     #[test]
-    fn unknown_field_has_toml_location_and_sandbox_has_dedicated_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pi.toml");
-        std::fs::write(&path, "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[image]\ninstall=['x']\n[settings]\nhostdir='typo'\n").unwrap();
-        let error = load_agent_definition_with_scope(&path, DefinitionScope::Repo)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("unknown field `hostdir`"), "{error}");
-        assert!(error.contains("line 8, column 1"), "{error}");
-
-        std::fs::write(
-            &path,
-            "schema=2\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[image]\ninstall=['x']\n",
-        )
-        .unwrap();
-        let newer = load_agent_definition_with_scope(&path, DefinitionScope::Repo)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            newer.contains("schema 2 requires a newer awman (this build supports 1)"),
-            "{newer}"
-        );
-
-        let sandbox = "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[image]\ninstall=['x']\n[sandbox]\nfoo='bar'\n";
-        let file: AgentDefinitionFile = toml::from_str(sandbox).unwrap();
-        assert!(file
-            .validate()
-            .iter()
-            .any(|p| p.contains("custom agents do not support Docker Sandboxes yet")));
+    fn an_unknown_modes_key_and_kind_are_still_rejected() {
+        assert!(parse("[modes]\nplan_tui = [\"--plan\"]\n").is_err());
+        assert!(parse("[modes]\nplan = [\"--plan\"]\nplan_kind = \"planning\"\n").is_err());
     }
 
     #[test]
-    fn content_hash_tracks_escape_hatch_bytes_but_not_mtime() {
-        let toml = b"schema=1\ndisplay_name='Pi'";
-        let first = content_hash(toml, Some(b"FROM base\n"));
-        assert_eq!(first, content_hash(toml, Some(b"FROM base\n")));
-        assert_ne!(first, content_hash(toml, Some(b"FROM changed\n")));
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pi.toml");
-        let source = "schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[image]\ndockerfile='pi.Dockerfile'\n";
-        std::fs::write(&path, source).unwrap();
-        std::fs::write(
-            dir.path().join("pi.Dockerfile"),
-            "FROM {{AWMAN_BASE_IMAGE}}\n",
-        )
-        .unwrap();
-        let a = load_agent_definition_with_scope(&path, DefinitionScope::Repo)
-            .unwrap()
-            .sha256;
-        let touched = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(touched))
-            .unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(dir.path().join("pi.Dockerfile"))
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(touched))
-            .unwrap();
-        let b = load_agent_definition_with_scope(&path, DefinitionScope::Repo)
-            .unwrap()
-            .sha256;
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn host_ping_binary_is_absolute_on_this_host_or_one_bare_name() {
-        for bare in ["pi", "pi.exe", "pi-cli"] {
-            assert!(is_bare_host_binary(bare), "{bare}");
-        }
-        for not_bare in ["./pi", "bin/pi", r"bin\pi", ".", "..", "", "/pi", r"\pi"] {
-            assert!(!is_bare_host_binary(not_bare), "{not_bare:?}");
-        }
-        let problems = |binary: &str| {
-            let mut problems = Vec::new();
-            check_host_binary("ping.command[0]", binary, &mut problems);
-            problems
-        };
-        #[cfg(windows)]
-        {
-            for ok in [r"C:\tools\pi.exe", r"\\server\share\pi.exe", "pi.exe"] {
-                assert!(problems(ok).is_empty(), "{ok}");
-            }
-            for refused in [
-                "C:pi.exe",
-                r"\tools\pi.exe",
-                "/tools/pi.exe",
-                r"tools\pi.exe",
-            ] {
-                assert!(!problems(refused).is_empty(), "{refused}");
-                assert!(!is_bare_host_binary(refused), "{refused}");
-            }
-        }
-        #[cfg(unix)]
-        {
-            for ok in ["/usr/bin/pi", "pi"] {
-                assert!(problems(ok).is_empty(), "{ok}");
-            }
-            for refused in ["./pi", "bin/pi", r"bin\pi"] {
-                assert!(!problems(refused).is_empty(), "{refused}");
-            }
-        }
-    }
-    #[test]
-    fn definition_size_and_ping_command_constraints_are_enforced() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pi.toml");
-        std::fs::write(&path, vec![b' '; MAX_DEFINITION_BYTES + 1]).unwrap();
-        let error = load_agent_definition_with_scope(&path, DefinitionScope::Repo).unwrap_err();
-        assert!(error.to_string().contains("64 KiB"));
-
-        let absolute = if cfg!(windows) {
-            r"['C:\tools\pi.exe']"
-        } else {
-            "['/usr/bin/pi']"
-        };
-        for command in ["['pi']", absolute] {
-            let source = format!("schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand={command}\n[image]\ninstall=['x']\n");
-            let file: AgentDefinitionFile = toml::from_str(&source).unwrap();
-            assert!(
-                file.validate().is_empty(),
-                "{command}: {:?}",
-                file.validate()
-            );
-        }
-        for (command, field) in [
-            ("[]", "ping.command: command must not be empty"),
-            ("['./pi']", "ping.command[0]"),
-            ("['bin/pi']", "ping.command[0]"),
-        ] {
-            let source = format!("schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand={command}\n[image]\ninstall=['x']\n");
-            let file: AgentDefinitionFile = toml::from_str(&source).unwrap();
-            assert!(
-                file.validate()
-                    .iter()
-                    .any(|problem| problem.contains(field)),
-                "{command}: {:?}",
-                file.validate()
-            );
-        }
-        let long = std::iter::repeat_n("'x'", MAX_PING_TOKENS + 1)
-            .collect::<Vec<_>>()
-            .join(",");
-        let source = format!("schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand=['pi',{long}]\n[image]\ninstall=['x']\n");
-        let file: AgentDefinitionFile = toml::from_str(&source).unwrap();
-        assert!(file
-            .validate()
-            .iter()
-            .any(|problem| problem.contains("ping.command: must have at most 16 tokens")));
-        for token in ["bad\\u0000token", "bad\\ntoken"] {
-            let source = format!("schema=1\ndisplay_name='Pi'\n[run]\ncommand=['pi']\n[ping]\ncommand=['pi',\"{token}\"]\n[image]\ninstall=['x']\n");
-            let file: AgentDefinitionFile = toml::from_str(&source).unwrap();
-            assert!(
-                file.validate()
-                    .iter()
-                    .any(|problem| problem.contains("ping.command[1]")
-                        && problem.contains("control")),
-                "{token}: {:?}",
-                file.validate()
-            );
-        }
-    }
-
-    #[test]
-    fn argv_array_install_and_dockerfile_validation_rows_have_boundaries() {
-        let mut file = minimal();
-        file.run.command = vec!["pi".into(), "x".repeat(MAX_ARGV_TOKEN_BYTES + 1)];
-        file.run.interactive_only_flags = vec!["--x".into(); MAX_ARRAY_LEN + 1];
-        file.image.apt = vec!["valid-package".into(); MAX_ARRAY_LEN + 1];
-        file.image.install = vec!["x".repeat(MAX_INSTALL_STEP_BYTES + 1)];
-        let problems = file.validate();
-        for expected in [
-            "run.command[1]: argv token exceeds",
-            "run.interactive_only_flags: array exceeds",
-            "image.apt: array exceeds",
-            "image.install[0]: install step exceeds",
-        ] {
-            assert!(
-                problems.iter().any(|problem| problem.contains(expected)),
-                "missing {expected}: {problems:#?}"
-            );
-        }
-        let mut dockerfile = minimal();
-        dockerfile.image.install.clear();
-        dockerfile.image.dockerfile = Some("../Dockerfile".into());
-        let problems = dockerfile.validate();
+    fn plan_acp_mode_requires_acp_and_a_safe_id() {
+        let without_acp = parse("[modes]\nplan_acp_mode = \"plan\"\n").unwrap();
+        let problems = plan_problems(&without_acp);
         assert!(
             problems
                 .iter()
-                .any(|p| p.contains("image.dockerfile: must be a relative path")),
-            "{problems:#?}"
+                .any(|p| p.contains("requires an [acp] table")),
+            "{problems:?}"
         );
-        dockerfile.image.dockerfile = Some("pi.Dockerfile".into());
-        dockerfile.image.needs_node = true;
-        assert!(dockerfile
-            .validate()
-            .iter()
-            .any(|p| p.contains("mutually exclusive")));
+        let with_acp =
+            parse("[modes]\nplan_acp_mode = \"plan\"\n[acp]\ncommand = [\"custom\", \"--acp\"]\n")
+                .unwrap();
+        assert!(
+            plan_problems(&with_acp).is_empty(),
+            "{:?}",
+            with_acp.validate()
+        );
+        for bad in ["", "has space", "x/y", &"a".repeat(65)] {
+            let file = parse(&format!(
+                "[modes]\nplan_acp_mode = \"{bad}\"\n[acp]\ncommand = [\"custom\"]\n"
+            ))
+            .unwrap();
+            assert!(
+                plan_problems(&file)
+                    .iter()
+                    .any(|p| p.contains("1-64 characters")),
+                "{bad:?}"
+            );
+        }
     }
+
+    #[test]
+    fn a_kind_or_route_without_any_delivery_is_a_problem() {
+        for extra in [
+            "[modes]\nplan_kind = \"plan\"\n",
+            "[modes]\nplan_interactive = []\nplan_headless = []\n",
+        ] {
+            let file = parse(extra).unwrap();
+            assert!(
+                plan_problems(&file)
+                    .iter()
+                    .any(|p| p.contains("no plan delivery")),
+                "{extra}"
+            );
+        }
+        // An explicitly empty route beside a fallback is a declared refusal.
+        let file = parse("[modes]\nplan = [\"--plan\"]\nplan_headless = []\n").unwrap();
+        assert!(file.modes.declares_plan());
+        assert!(plan_problems(&file).is_empty());
+        // No plan keys at all: nothing to check.
+        assert!(plan_problems(&parse("").unwrap()).is_empty());
+    }
+
+    #[test]
+    fn route_argv_tokens_are_checked_like_plan() {
+        let file = parse("[modes]\nplan_interactive = [\"\"]\n").unwrap();
+        assert!(
+            plan_problems(&file)
+                .iter()
+                .any(|p| p.starts_with("modes.plan_interactive[0]")),
+            "{:?}",
+            file.validate()
+        );
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AutomationTable {
+    pub adapter: crate::data::automation::AutomationAdapterKind,
 }

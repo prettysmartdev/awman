@@ -1,0 +1,341 @@
+{
+  "about": "UTF-8 sequences split across output frames at every byte boundary (1- and 3-byte chunks)",
+  "expect": {
+    "alt_screen": false,
+    "app_cursor": false,
+    "bracketed_paste": false,
+    "cols": 40,
+    "cursor": {
+      "col": 0,
+      "row": 3,
+      "visible": true
+    },
+    "lines": [
+      "héllo 世界 🎉 naïve — ✓",
+      "héllo 世界 🎉 naïve — ✓",
+      "héllo 世界 🎉 naïve — ✓",
+      "",
+      "",
+      ""
+    ],
+    "mouse_mode": "none",
+    "mouse_sgr": false,
+    "rows": 6
+  },
+  "expect_from_snapshot": {
+    "alt_screen": false,
+    "app_cursor": false,
+    "bracketed_paste": false,
+    "cursor": {
+      "col": 0,
+      "row": 3,
+      "visible": true
+    },
+    "lines": [
+      "héllo 世界 🎉 naïve — ✓",
+      "héllo 世界 🎉 naïve — ✓",
+      "héllo 世界 🎉 naïve — ✓",
+      "",
+      "",
+      ""
+    ]
+  },
+  "final_snapshot": {
+    "cols": 40,
+    "has_output": true,
+    "rows": 6,
+    "screen": "G1s/MjVoG1ttG1tIG1tKaMOpbGxvIOS4lueVjCDwn46JIG5hw692ZSDigJQg4pyTDQpow6lsbG8g5LiW55WMIPCfjokgbmHDr3ZlIOKAlCDinJMNCmjDqWxsbyDkuJbnlYwg8J+OiSBuYcOvdmUg4oCUIOKckw0KGz4bWz8xbBtbPzIwMDRs",
+    "type": "snapshot"
+  },
+  "frames": [
+    {
+      "cols": 40,
+      "has_output": false,
+      "rows": 6,
+      "screen": "G1s/MjVoG1ttG1tIG1tKGz4bWz8xbBtbPzIwMDRs",
+      "type": "snapshot"
+    },
+    {
+      "bytes": "aA==",
+      "type": "output"
+    },
+    {
+      "bytes": "ww==",
+      "type": "output"
+    },
+    {
+      "bytes": "qQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "bA==",
+      "type": "output"
+    },
+    {
+      "bytes": "bA==",
+      "type": "output"
+    },
+    {
+      "bytes": "bw==",
+      "type": "output"
+    },
+    {
+      "bytes": "IA==",
+      "type": "output"
+    },
+    {
+      "bytes": "5A==",
+      "type": "output"
+    },
+    {
+      "bytes": "uA==",
+      "type": "output"
+    },
+    {
+      "bytes": "lg==",
+      "type": "output"
+    },
+    {
+      "bytes": "5w==",
+      "type": "output"
+    },
+    {
+      "bytes": "lQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "jA==",
+      "type": "output"
+    },
+    {
+      "bytes": "IA==",
+      "type": "output"
+    },
+    {
+      "bytes": "8A==",
+      "type": "output"
+    },
+    {
+      "bytes": "nw==",
+      "type": "output"
+    },
+    {
+      "bytes": "jg==",
+      "type": "output"
+    },
+    {
+      "bytes": "iQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "IA==",
+      "type": "output"
+    },
+    {
+      "bytes": "bg==",
+      "type": "output"
+    },
+    {
+      "bytes": "YQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "ww==",
+      "type": "output"
+    },
+    {
+      "bytes": "rw==",
+      "type": "output"
+    },
+    {
+      "bytes": "dg==",
+      "type": "output"
+    },
+    {
+      "bytes": "ZQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "IA==",
+      "type": "output"
+    },
+    {
+      "bytes": "4g==",
+      "type": "output"
+    },
+    {
+      "bytes": "gA==",
+      "type": "output"
+    },
+    {
+      "bytes": "lA==",
+      "type": "output"
+    },
+    {
+      "bytes": "IA==",
+      "type": "output"
+    },
+    {
+      "bytes": "4g==",
+      "type": "output"
+    },
+    {
+      "bytes": "nA==",
+      "type": "output"
+    },
+    {
+      "bytes": "kw==",
+      "type": "output"
+    },
+    {
+      "bytes": "DQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "Cg==",
+      "type": "output"
+    },
+    {
+      "bytes": "aA==",
+      "type": "output"
+    },
+    {
+      "bytes": "ww==",
+      "type": "output"
+    },
+    {
+      "bytes": "qQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "bA==",
+      "type": "output"
+    },
+    {
+      "bytes": "bA==",
+      "type": "output"
+    },
+    {
+      "bytes": "bw==",
+      "type": "output"
+    },
+    {
+      "bytes": "IA==",
+      "type": "output"
+    },
+    {
+      "bytes": "5A==",
+      "type": "output"
+    },
+    {
+      "bytes": "uA==",
+      "type": "output"
+    },
+    {
+      "bytes": "lg==",
+      "type": "output"
+    },
+    {
+      "bytes": "5w==",
+      "type": "output"
+    },
+    {
+      "bytes": "lQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "jA==",
+      "type": "output"
+    },
+    {
+      "bytes": "IA==",
+      "type": "output"
+    },
+    {
+      "bytes": "8A==",
+      "type": "output"
+    },
+    {
+      "bytes": "nw==",
+      "type": "output"
+    },
+    {
+      "bytes": "jg==",
+      "type": "output"
+    },
+    {
+      "bytes": "iSBu",
+      "type": "output"
+    },
+    {
+      "bytes": "YcOv",
+      "type": "output"
+    },
+    {
+      "bytes": "dmUg",
+      "type": "output"
+    },
+    {
+      "bytes": "4oCU",
+      "type": "output"
+    },
+    {
+      "bytes": "IOKc",
+      "type": "output"
+    },
+    {
+      "bytes": "kw0K",
+      "type": "output"
+    },
+    {
+      "bytes": "aMOp",
+      "type": "output"
+    },
+    {
+      "bytes": "bGxv",
+      "type": "output"
+    },
+    {
+      "bytes": "IOS4",
+      "type": "output"
+    },
+    {
+      "bytes": "lueV",
+      "type": "output"
+    },
+    {
+      "bytes": "jCDw",
+      "type": "output"
+    },
+    {
+      "bytes": "n46J",
+      "type": "output"
+    },
+    {
+      "bytes": "IG5h",
+      "type": "output"
+    },
+    {
+      "bytes": "w692",
+      "type": "output"
+    },
+    {
+      "bytes": "ZSDi",
+      "type": "output"
+    },
+    {
+      "bytes": "gJQg",
+      "type": "output"
+    },
+    {
+      "bytes": "4pyT",
+      "type": "output"
+    },
+    {
+      "bytes": "DQo=",
+      "type": "output"
+    }
+  ],
+  "name": "utf8_split",
+  "source": "vt100-ctt 0.17.1 (TerminalHub mirror parser); snapshot = Screen::state_formatted()"
+}

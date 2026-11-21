@@ -19,24 +19,26 @@ pub fn dockerfile_url_for(agent: &str) -> String {
     format!("{DOCKERFILE_RAW_URL_PREFIX}/Dockerfile.{agent}")
 }
 
-/// Write `body` to `dest` atomically (tmp file + rename) so a partial failure
-/// cannot leave a corrupt file behind.
-pub(crate) fn atomic_write(dest: &Path, body: &[u8]) -> Result<(), EngineError> {
-    use std::io::Write;
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| EngineError::io(parent.to_path_buf(), e))?;
-    }
-    let parent = dest
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    // A unique sibling avoids following a repo-planted .tmp symlink and lets
-    // concurrent provisioners publish complete files independently.
-    let mut tmp =
-        tempfile::NamedTempFile::new_in(parent).map_err(|e| EngineError::io(parent, e))?;
-    tmp.write_all(body).map_err(|e| EngineError::io(dest, e))?;
-    tmp.persist(dest)
-        .map_err(|e| EngineError::io(dest, e.error))?;
+/// Publish `body` at `dest`, which must lie below `git_root`. The write goes
+/// through the Layer 0 [`RepoTree`](crate::data::fs::repo_tree::RepoTree):
+/// atomic (sibling file + rename), never through a linked ancestor such as a
+/// symlinked `.awman/`, and never through a link at `dest` itself.
+pub(crate) fn publish_in_repo(
+    git_root: &Path,
+    dest: &Path,
+    body: &[u8],
+) -> Result<(), EngineError> {
+    use crate::data::fs::repo_tree::RepoTree;
+    let tree = RepoTree::open(git_root).map_err(|e| EngineError::Other(e.to_string()))?;
+    let rel = tree.relative(dest).ok_or_else(|| {
+        EngineError::Other(format!(
+            "{} is outside the git root {}; awman does not write it",
+            dest.display(),
+            git_root.display()
+        ))
+    })?;
+    tree.write(&rel, body)
+        .map_err(|e| EngineError::Other(e.to_string()))?;
     Ok(())
 }
 
@@ -49,6 +51,7 @@ pub(crate) fn atomic_write(dest: &Path, body: &[u8]) -> Result<(), EngineError> 
 /// downloaded (or bundled) Dockerfile content.
 pub async fn download_agent_dockerfile(
     agent: &str,
+    git_root: &Path,
     dest: &Path,
     project_base_tag: &str,
 ) -> Result<(), EngineError> {
@@ -89,13 +92,13 @@ pub async fn download_agent_dockerfile(
         Ok(body) => {
             let body_str = String::from_utf8_lossy(&body);
             let substituted = body_str.replace("{{AWMAN_BASE_IMAGE}}", project_base_tag);
-            atomic_write(dest, substituted.as_bytes())
+            publish_in_repo(git_root, dest, substituted.as_bytes())
         }
         Err(network_error) => {
             // Fall back to bundled template when one exists.
             if let Some(bundled) = crate::data::templates::agent_dockerfile_for(agent) {
                 let substituted = bundled.replace("{{AWMAN_BASE_IMAGE}}", project_base_tag);
-                atomic_write(dest, substituted.as_bytes())
+                publish_in_repo(git_root, dest, substituted.as_bytes())
             } else {
                 Err(EngineError::AgentDockerfileDownloadFailed {
                     agent: agent.to_string(),

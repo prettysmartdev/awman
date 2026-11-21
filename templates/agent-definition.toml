@@ -11,6 +11,7 @@ schema = 1 # required; higher schemas need a newer awman
 [run]
 command = ["agent"] # required argv entrypoint; no shell
 # non_interactive = "-p" # optional token for -n / exec / workflow
+# output_format = "text" # text, claude_stream_json, or codex_json for non-interactive API runs
 # interactive_only_flags = [] # optional argv flags for interactive launches only
 # seed_prompt = "positional" # default; or { flag = "--prompt" }
 # model = "space" # space, equals, or unsupported
@@ -19,7 +20,11 @@ command = ["agent"] # required argv entrypoint; no shell
 [modes]
 # yolo = ["--yolo"]
 # auto = []
-# plan = ["--plan"]
+# plan = ["--plan"] # native plan argv; --plan is refused when no route declares one
+# plan_interactive = ["--mode", "plan"] # omitted: inherit plan; [] = interactive unsupported
+# plan_headless = [] # omitted: inherit plan; [] = headless unsupported
+# plan_kind = "custom" # plan, read_only or custom (default)
+# plan_acp_mode = "plan" # ACP session mode; needs [acp]; never inferred from argv
 
 [tools]
 # allowed_flag = "--allowed-tools"

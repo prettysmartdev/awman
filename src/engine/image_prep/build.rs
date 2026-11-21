@@ -146,6 +146,12 @@ impl AgentImagePreparer {
         selected: &BuilderSelection,
         request: &AgentImageRequest<'_>,
     ) -> Result<BuildPreparation, String> {
+        let diagnostic = |error: EngineError| {
+            crate::engine::oci::docker_engine::failure_message_at(
+                &error,
+                resolved.docker_endpoint.as_ref(),
+            )
+        };
         let tag = request.tag;
         let agent = request.agent;
         let policy = request.policy;
@@ -180,7 +186,7 @@ impl AgentImagePreparer {
             }
         };
         crate::engine::oci::docker_engine::validate_reference(&resolved.reference)
-            .map_err(|e| e.to_string())?;
+            .map_err(diagnostic)?;
         let store = resolved
             .store_key
             .clone()
@@ -207,8 +213,52 @@ impl AgentImagePreparer {
                     .await?,
             );
         }
+        // Check the working tree while both source leases are held. Registry
+        // and archive sources never reach this local-builder path.
+        let project_inputs =
+            super::project_inputs_from_disk(git_root, &self.context.project_dockerfile)
+                .map_err(diagnostic)?
+                .unwrap_or_else(|| {
+                    crate::data::image_inputs::project_inputs_at(
+                        None,
+                        &crate::data::image_inputs::DirBuildContext::new(git_root),
+                        &self
+                            .context
+                            .project_dockerfile
+                            .strip_prefix(git_root)
+                            .unwrap_or(&self.context.project_dockerfile)
+                            .to_string_lossy(),
+                    )
+                    .hash
+                });
+        let parent = self
+            .source_freshness(target.clone(), project_tag.clone(), &project_inputs)
+            .await
+            .map_err(diagnostic)?;
+        let parent_current = matches!(parent, ImageFreshness::Fresh(_));
+        let parent_id = match &parent {
+            ImageFreshness::Fresh(image)
+            | ImageFreshness::Stale(image)
+            | ImageFreshness::Unlabelled(image) => Some(image.id.clone()),
+            ImageFreshness::Missing => None,
+        };
+        let agent_bytes =
+            std::fs::read(RepoDockerfilePaths::new(git_root).agent_dockerfile(agent)).ok();
+        let inputs_current = if let (Some(parent_id), Some(agent_bytes)) = (parent_id, agent_bytes)
+        {
+            let expected = crate::data::image_inputs::agent_inputs_hash(&agent_bytes, &parent_id);
+            parent_current
+                && matches!(
+                    self.source_freshness(target.clone(), resolved.reference.clone(), &expected)
+                        .await
+                        .map_err(diagnostic)?,
+                    ImageFreshness::Fresh(_)
+                )
+        } else {
+            false
+        };
         let pending = self.load_receipt(&key).await?;
-        if !policy.force_build() {
+        if !policy.force_build() && inputs_current {
             let installed = if self.runtime.image_exists(tag).unwrap_or(false) {
                 self.runtime.image_identity(tag).ok().flatten()
             } else {
@@ -229,14 +279,15 @@ impl AgentImagePreparer {
                         && installed.is_some()
                         && !crate::engine::oci::retry::is_cancelled(&e) =>
                 {
+                    let detail = diagnostic(e);
                     let note = format!(
-                        "{} is unreachable; using the installed image ({e})",
+                        "{} is unreachable; using the installed image ({detail})",
                         target.describe()
                     );
                     let warning = ReadyImageWarning::BuilderUnreachable {
                         tag: tag.to_string(),
                         builder: target.describe(),
-                        detail: e.to_string(),
+                        detail,
                     };
                     frontend.write_message(UserMessage {
                         level: MessageLevel::Warning,
@@ -251,9 +302,9 @@ impl AgentImagePreparer {
                     return Ok(prepared);
                 }
                 // The build row is a `StepStatus`, whose failure is display
-                // text by design (Layer 0 result data); the typed error's
-                // `Display` is that text, so every frontend shows the same.
-                Err(e) => return Err(e.to_string()),
+                // text by design (Layer 0 result data). Format the typed
+                // diagnosis here so every frontend receives the same text.
+                Err(e) => return Err(diagnostic(e)),
                 // Importable as the builder-disabled path imports it; the
                 // store cannot vouch for one platform manifest.
                 Ok(SourceImage::Unbound) => {
@@ -329,20 +380,7 @@ impl AgentImagePreparer {
             return Err(error.clone());
         }
         if !self.prepared_bases.contains_key(&base_key) {
-            let base_exists = if policy.force_build() {
-                false
-            } else {
-                !matches!(
-                    self.inspect_source(
-                        target.clone(),
-                        project_tag.clone(),
-                        resolved.platform.clone()
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?,
-                    SourceImage::Absent
-                )
-            };
+            let base_exists = !policy.force_build() && parent_current;
             if !base_exists {
                 let dockerfile = self.context.project_dockerfile.clone();
                 let step: SetupStep = ReadyStep::BuildBaseImageIn {
@@ -352,6 +390,7 @@ impl AgentImagePreparer {
                 .into();
                 frontend.report_step(&step, StepStatus::Running);
                 let request = BuildRequest {
+                    labels: Default::default(),
                     target: target.clone(),
                     reference: project_tag.clone(),
                     dockerfile,
@@ -360,7 +399,19 @@ impl AgentImagePreparer {
                     build_args: Vec::new(),
                     no_cache: policy.no_cache(),
                 };
-                let result = self.build_source(request, frontend).await;
+                self.last_installed_inputs = match &parent {
+                    ImageFreshness::Fresh(image)
+                    | ImageFreshness::Stale(image)
+                    | ImageFreshness::Unlabelled(image) => image
+                        .labels
+                        .get(crate::data::image_inputs::INPUTS_LABEL)
+                        .cloned(),
+                    ImageFreshness::Missing => None,
+                };
+                self.last_build_inputs = Some(project_inputs.clone());
+                let result = self
+                    .build_source(request, resolved.docker_endpoint.as_ref(), frontend)
+                    .await;
                 let result = match result {
                     Ok(receipt) => match self
                         .inspect_source(
@@ -387,7 +438,12 @@ impl AgentImagePreparer {
                 };
                 let status = match &result {
                     Ok(_) => StepStatus::Done,
-                    Err(e) => StepStatus::Failed(e.to_string()),
+                    Err(e) => {
+                        StepStatus::Failed(crate::engine::oci::docker_engine::failure_message_at(
+                            e,
+                            resolved.docker_endpoint.as_ref(),
+                        ))
+                    }
                 };
                 frontend.report_step(&step, status.clone());
                 self.base_results.push(ReadyBaseImageResult {
@@ -397,7 +453,7 @@ impl AgentImagePreparer {
                     optional: agent != self.context.default_agent,
                 });
                 if let Err(e) = result {
-                    let message = e.to_string();
+                    let message = diagnostic(e);
                     self.prepared_bases.insert(base_key, Err(message.clone()));
                     return Err(message);
                 }
@@ -407,14 +463,47 @@ impl AgentImagePreparer {
         let dockerfile = RepoDockerfilePaths::new(git_root).agent_dockerfile(agent);
         self.provision_agent_dockerfile(frontend, git_root, agent, &dockerfile)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(diagnostic)?;
         if !dockerfile.exists() {
             return Err(format!(
                 "agent Dockerfile {} is unavailable",
                 dockerfile.display()
             ));
         }
+        let parent_id = match self
+            .source_freshness(target.clone(), project_tag.clone(), &project_inputs)
+            .await
+            .map_err(diagnostic)?
+        {
+            ImageFreshness::Fresh(image)
+            | ImageFreshness::Stale(image)
+            | ImageFreshness::Unlabelled(image) => Some(image.id),
+            ImageFreshness::Missing => None,
+        };
+        self.last_build_inputs = parent_id.and_then(|id| {
+            std::fs::read(&dockerfile)
+                .ok()
+                .map(|bytes| crate::data::image_inputs::agent_inputs_hash(&bytes, &id))
+        });
+        self.last_installed_inputs = if let Some(expected) = self.last_build_inputs.clone() {
+            match self
+                .source_freshness(target.clone(), resolved.reference.clone(), &expected)
+                .await
+                .map_err(diagnostic)?
+            {
+                ImageFreshness::Fresh(image)
+                | ImageFreshness::Stale(image)
+                | ImageFreshness::Unlabelled(image) => image
+                    .labels
+                    .get(crate::data::image_inputs::INPUTS_LABEL)
+                    .cloned(),
+                ImageFreshness::Missing => None,
+            }
+        } else {
+            None
+        };
         let request = BuildRequest {
+            labels: Default::default(),
             target,
             reference: resolved.reference.clone(),
             dockerfile,
@@ -423,12 +512,17 @@ impl AgentImagePreparer {
             build_args: Vec::new(),
             no_cache: policy.no_cache(),
         };
-        let receipt = self.build_source(request, frontend).await.map_err(|e| {
-            match self.definitions.get(agent) {
-                Some(def) => crate::engine::agent::custom_build_failure(def, e),
-                None => e.to_string(),
-            }
-        })?;
+        let receipt = self
+            .build_source(request, resolved.docker_endpoint.as_ref(), frontend)
+            .await
+            .map_err(|e| match self.definitions.get(agent) {
+                Some(def)
+                    if crate::engine::oci::docker_engine::local_unavailability(&e).is_none() =>
+                {
+                    crate::engine::agent::custom_build_failure(def, e)
+                }
+                _ => diagnostic(e),
+            })?;
         // The build succeeded. Anything that stops the import from here on
         // fails the import, not the build.
         let blocked = self

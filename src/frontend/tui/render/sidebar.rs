@@ -12,7 +12,7 @@ use super::*;
 /// surrounding chrome.
 /// Render the git sidebar into the right chunk: a rounded, green-bordered
 /// block titled with a condensed `git status` line (branch + change count),
-/// containing bold `+A -D` totals and a color-coded per-file change list.
+/// containing bold `+A -D (branch)` totals and a color-coded per-file change list.
 pub(super) fn render_git_sidebar(frame: &mut Frame, area: Rect, summary: &Option<GitDiffSummary>) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -42,7 +42,7 @@ pub(super) fn render_git_sidebar(frame: &mut Frame, area: Rect, summary: &Option
         return;
     };
 
-    // Bold `+A -D` totals on the first inner row.
+    // Bold `+A -D` totals and the branch on the first inner row.
     let title = Line::from(vec![
         Span::styled(
             format!("+{}", summary.added),
@@ -55,6 +55,10 @@ pub(super) fn render_git_sidebar(frame: &mut Frame, area: Rect, summary: &Option
             format!("-{}", summary.removed),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
+        Span::raw(format!(
+            " ({})",
+            summary.branch.as_deref().unwrap_or("HEAD")
+        )),
     ]);
 
     // Split the inner area into the title row and the file list. The list is

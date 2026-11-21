@@ -10,6 +10,9 @@ pub struct SandboxSpec {
     pub image: String,
     pub labels: BTreeMap<String, String>,
     pub mounts: Vec<MountSpec>,
+    /// Writable memory-backed mounts. These precede bind mounts so files
+    /// mounted under /tmp (system prompts) are visible inside the guest.
+    pub tmpfs: Vec<String>,
     pub mount_owner: Option<(u32, u32)>,
     pub vcpus: u8,
     pub memory_mib: u32,
@@ -89,6 +92,9 @@ pub struct SandboxSummary {
 }
 #[derive(Clone, Default)]
 pub struct SandboxImageConfig {
+    pub id: String,
+    pub labels: BTreeMap<String, String>,
+    pub size_bytes: u64,
     pub home: Option<String>,
     pub user: Option<String>,
     pub workdir: Option<String>,
@@ -107,7 +113,7 @@ pub enum ExecEvent {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     Exited(i32),
-    Failed,
+    Failed(String),
 }
 pub enum Control {
     Stdin(Vec<u8>),
@@ -118,6 +124,11 @@ pub enum Control {
 }
 pub trait ExecControl: Send + Sync {
     fn send(&self, command: Control) -> Result<(), EngineError>;
+    /// Bounded input consumed by the actual guest/socket writer. Viewer input
+    /// must never be forwarded into the ordinary unbounded control queue.
+    fn terminal_stdin(&self) -> Option<tokio::sync::mpsc::Sender<Vec<u8>>> {
+        None
+    }
 }
 pub struct ExecSession {
     pub events: tokio::sync::broadcast::Receiver<ExecEvent>,
@@ -152,7 +163,7 @@ pub trait SandboxDriver: Send + Sync {
     fn list(&self) -> Result<Vec<SandboxSummary>, EngineError>;
     fn exec(&self, id: &str, request: ExecRequest) -> Result<ExecSession, EngineError>;
     fn stop_owned(&self, id: &str, owner: &str, grace: Duration) -> Result<(), EngineError> {
-        self.finish_owned(id, owner, grace, true)
+        self.finish_owned(id, owner, grace, false)
     }
     fn finish_owned(
         &self,
@@ -161,93 +172,21 @@ pub trait SandboxDriver: Send + Sync {
         grace: Duration,
         remove: bool,
     ) -> Result<(), EngineError>;
-    fn remove_stopped(&self, id: &str) -> Result<(), EngineError>;
+    fn remove_stopped_checked(
+        &self,
+        _handle: &AgentHandle,
+        _owner: &str,
+        _execution: &str,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::NotImplemented(
+            "identity-checked sandbox removal",
+        ))
+    }
+    fn remove_stopped(&self, id: &str, owner: &str) -> Result<(), EngineError>;
     fn stats(&self, id: &str) -> Result<AgentStats, EngineError>;
     fn image_config(&self, tag: &str) -> Result<Option<SandboxImageConfig>, EngineError>;
     fn import_archive(&self, path: PathBuf, tag: String) -> Result<(), EngineError>;
     fn remove_image(&self, tag: &str) -> Result<(), EngineError>;
-}
-
-#[cfg(all(test, unix))]
-mod spec_tests {
-    use super::*;
-
-    fn spec(mounts: Vec<MountSpec>) -> SandboxSpec {
-        SandboxSpec {
-            name: "awman-spec".into(),
-            image: "awman-x:latest".into(),
-            labels: BTreeMap::new(),
-            mounts,
-            mount_owner: None,
-            vcpus: 1,
-            memory_mib: 256,
-            root_disk_mib: 512,
-            mount_quota_mib: 64,
-            network: NetworkPlan::default(),
-        }
-    }
-
-    #[test]
-    fn docker_socket_is_not_a_file_bridge() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("docker.sock");
-        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        let error = spec(vec![MountSpec {
-            host: socket,
-            guest: "/var/run/docker.sock".into(),
-            read_only: false,
-        }])
-        .check()
-        .unwrap_err();
-        assert!(
-            matches!(&error, EngineError::Config(m) if m.contains("not bridged")),
-            "{error:?}"
-        );
-        // A symlink to the socket is resolved and refused the same way.
-        let link = dir.path().join("link.sock");
-        std::os::unix::fs::symlink(dir.path().join("docker.sock"), &link).unwrap();
-        assert!(spec(vec![MountSpec {
-            host: link,
-            guest: "/var/run/docker.sock".into(),
-            read_only: true,
-        }])
-        .check()
-        .is_err());
-        // Files and directories are accepted.
-        let file = dir.path().join("f");
-        std::fs::write(&file, "x").unwrap();
-        spec(vec![
-            MountSpec {
-                host: dir.path().into(),
-                guest: "/workspace".into(),
-                read_only: false,
-            },
-            MountSpec {
-                host: file,
-                guest: "/workspace/f".into(),
-                read_only: true,
-            },
-        ])
-        .check()
-        .unwrap();
-    }
-
-    #[test]
-    fn spec_resources_below_the_floor_are_refused() {
-        let mut zero_cpu = spec(Vec::new());
-        zero_cpu.vcpus = 0;
-        assert!(zero_cpu.check().is_err());
-        let mut small = spec(Vec::new());
-        small.memory_mib = 127;
-        assert!(small.check().is_err());
-        let mut tiny_disk = spec(Vec::new());
-        tiny_disk.root_disk_mib = 255;
-        assert!(tiny_disk.check().is_err());
-        let mut no_quota = spec(Vec::new());
-        no_quota.mount_quota_mib = 0;
-        assert!(no_quota.check().is_err());
-        assert!(spec(Vec::new()).check().is_ok());
-    }
 }
 
 /// The home directory `/etc/passwd` gives the image's effective user, the
@@ -271,45 +210,4 @@ pub(super) fn passwd_home(passwd: &str, user: Option<&str>) -> Option<String> {
         };
         (matches && fields[5].starts_with('/')).then(|| fields[5].to_string())
     })
-}
-
-#[cfg(test)]
-mod passwd_home_tests {
-    use super::passwd_home;
-
-    const PASSWD: &str = "root:x:0:0:root:/root:/bin/sh\nprobe:x:1234:1234::/home/probe:/bin/sh\nnohome:x:5:5:::/bin/sh\n";
-
-    #[test]
-    fn unset_user_is_root() {
-        assert_eq!(passwd_home(PASSWD, None).as_deref(), Some("/root"));
-        assert_eq!(passwd_home(PASSWD, Some("")).as_deref(), Some("/root"));
-    }
-
-    #[test]
-    fn named_and_numeric_users_with_or_without_group() {
-        assert_eq!(
-            passwd_home(PASSWD, Some("probe")).as_deref(),
-            Some("/home/probe")
-        );
-        assert_eq!(
-            passwd_home(PASSWD, Some("1234")).as_deref(),
-            Some("/home/probe")
-        );
-        assert_eq!(
-            passwd_home(PASSWD, Some("probe:staff")).as_deref(),
-            Some("/home/probe")
-        );
-        assert_eq!(
-            passwd_home(PASSWD, Some("1234:1234")).as_deref(),
-            Some("/home/probe")
-        );
-    }
-
-    #[test]
-    fn unknown_users_and_relative_or_empty_homes_give_nothing() {
-        assert_eq!(passwd_home(PASSWD, Some("ghost")), None);
-        assert_eq!(passwd_home(PASSWD, Some("99")), None);
-        assert_eq!(passwd_home(PASSWD, Some("nohome")), None);
-        assert_eq!(passwd_home("garbage", None), None);
-    }
 }

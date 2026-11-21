@@ -6,7 +6,8 @@
 pub struct WorkflowStepInfo {
     pub workflow_title: String,
     pub current_step_name: String,
-    pub current_step_index: usize,
+    /// Main-step index, or `None` for planning and remediation phases.
+    pub current_step_index: Option<usize>,
     pub total_steps: usize,
     pub steps: Vec<(String, WorkflowStepState)>,
     pub work_item_number: Option<u32>,
@@ -172,13 +173,17 @@ fn render_workflow_prompt(info: &WorkflowStepInfo) -> String {
     out.push_str(&format!(
         "## Workflow Context\n\n\
          You are running as part of the multi-agent \"{}\" workflow, managed by awman.\n\n\
-         Your current step: {} (step {} of {})\n\n\
-         Workflow progress:\n",
-        info.workflow_title,
-        info.current_step_name,
-        info.current_step_index + 1,
-        info.total_steps,
+         Your current step: {}",
+        info.workflow_title, info.current_step_name,
     ));
+    if let Some(index) = info.current_step_index {
+        out.push_str(&format!(" (step {} of {})", index + 1, info.total_steps));
+    }
+    if info.steps.is_empty() {
+        out.push_str("\n\nWorkflow steps are being planned.\n");
+    } else {
+        out.push_str("\n\nWorkflow progress:\n");
+    }
 
     for (name, state) in &info.steps {
         let marker = match state {
@@ -188,7 +193,10 @@ fn render_workflow_prompt(info: &WorkflowStepInfo) -> String {
         };
         let label = match state {
             WorkflowStepState::Completed => "completed",
-            WorkflowStepState::InProgress => "in progress (this is you)",
+            WorkflowStepState::InProgress if name == &info.current_step_name => {
+                "in progress (this is you)"
+            }
+            WorkflowStepState::InProgress => "in progress",
             WorkflowStepState::Pending => "pending",
         };
         out.push_str(&format!("  {marker} {name} — {label}\n"));
@@ -218,118 +226,4 @@ fn render_workflow_prompt(info: &WorkflowStepInfo) -> String {
     );
 
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn outputs_line_names_the_mount_for_every_role() {
-        for role in [
-            OutputsPromptRole::Prompt,
-            OutputsPromptRole::Leader,
-            OutputsPromptRole::Step("tests"),
-        ] {
-            assert!(outputs_prompt_line(role).contains("/awman/output"));
-            assert!(!outputs_prompt_line(role).contains('\n'));
-        }
-        assert!(
-            outputs_prompt_line(OutputsPromptRole::Step("tests")).contains("/awman/output/tests/")
-        );
-        assert!(!outputs_prompt_line(OutputsPromptRole::Prompt).contains("parallel"));
-    }
-
-    #[test]
-    fn outputs_section_is_appended_last_or_stands_alone() {
-        let alone = with_outputs_section(None, OutputsPromptRole::Prompt);
-        assert!(alone.starts_with("## Outputs"));
-        let combined = with_outputs_section(
-            ContextPromptBuilder::new().with_repo().build(),
-            OutputsPromptRole::Leader,
-        );
-        assert!(combined.starts_with("## Repository-Specific Context"));
-        assert!(combined.ends_with(&outputs_prompt_line(OutputsPromptRole::Leader)));
-        assert!(combined.contains("\n---\n## Outputs"));
-    }
-
-    #[test]
-    fn empty_builder_returns_none() {
-        assert!(ContextPromptBuilder::new().build().is_none());
-    }
-
-    #[test]
-    fn global_only_contains_global_path() {
-        let prompt = ContextPromptBuilder::new().with_global().build().unwrap();
-        assert!(prompt.contains("/awman/context/global"));
-        assert!(!prompt.contains("/awman/context/repo"));
-        assert!(!prompt.contains("/awman/context/workflow"));
-    }
-
-    #[test]
-    fn repo_only_contains_repo_path() {
-        let prompt = ContextPromptBuilder::new().with_repo().build().unwrap();
-        assert!(prompt.contains("/awman/context/repo"));
-        assert!(!prompt.contains("/awman/context/global"));
-    }
-
-    #[test]
-    fn workflow_oneshot_contains_oneshot_text() {
-        let prompt = ContextPromptBuilder::new()
-            .with_workflow_oneshot()
-            .build()
-            .unwrap();
-        assert!(prompt.contains("one-shot"));
-        assert!(prompt.contains("/awman/context/workflow"));
-    }
-
-    #[test]
-    fn workflow_full_contains_step_markers() {
-        let info = WorkflowStepInfo {
-            workflow_title: "My Workflow".to_string(),
-            current_step_name: "step-b".to_string(),
-            current_step_index: 1,
-            total_steps: 3,
-            steps: vec![
-                ("step-a".to_string(), WorkflowStepState::Completed),
-                ("step-b".to_string(), WorkflowStepState::InProgress),
-                ("step-c".to_string(), WorkflowStepState::Pending),
-            ],
-            work_item_number: None,
-            work_item_title: None,
-        };
-        let prompt = ContextPromptBuilder::new()
-            .with_workflow(&info)
-            .build()
-            .unwrap();
-        assert!(prompt.contains("My Workflow"));
-        assert!(prompt.contains("[✓] step-a"));
-        assert!(prompt.contains("[→] step-b"));
-        assert!(prompt.contains("[○] step-c"));
-        assert!(prompt.contains("step 2 of 3"));
-    }
-
-    #[test]
-    fn combined_scopes_joined_by_separator_workflow_last() {
-        let info = WorkflowStepInfo {
-            workflow_title: "T".to_string(),
-            current_step_name: "s".to_string(),
-            current_step_index: 0,
-            total_steps: 1,
-            steps: vec![("s".to_string(), WorkflowStepState::InProgress)],
-            work_item_number: None,
-            work_item_title: None,
-        };
-        let prompt = ContextPromptBuilder::new()
-            .with_global()
-            .with_repo()
-            .with_workflow(&info)
-            .build()
-            .unwrap();
-        let parts: Vec<&str> = prompt.split("\n---\n").collect();
-        assert_eq!(parts.len(), 3, "expected 3 sections; got {}", parts.len());
-        assert!(parts[0].contains("Global Developer Context"));
-        assert!(parts[1].contains("Repository-Specific Context"));
-        assert!(parts[2].contains("Workflow Context"));
-    }
 }

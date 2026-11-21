@@ -120,6 +120,10 @@ impl GitRemoteUrl {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkflowPrerequisite {
+    AgentImage {
+        agent: String,
+        tag: String,
+    },
     GitIdentity,
     GitRemote {
         remote: String,
@@ -191,6 +195,7 @@ pub enum AcquireScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Remediation {
+    PrepareImage,
     ReplaceRejectedToken,
     UseHostIdentity {
         name: String,
@@ -252,7 +257,7 @@ pub struct PrerequisiteCheck {
     pub prerequisite: WorkflowPrerequisite,
     pub status: PrerequisiteStatus,
     pub explanation: String,
-    /// Empty means "any teardown step" (AssumedAll).
+    /// Empty means "workflow-wide" (AssumedAll).
     pub needed_by: Vec<StepRef>,
     pub remediations: Vec<Remediation>,
 }
@@ -276,6 +281,21 @@ pub struct WorkflowPrerequisiteReport {
 }
 
 impl WorkflowPrerequisiteReport {
+    /// Include image preparation diagnostics in returned failures as well as
+    /// the report, so unattended callers receive the builder's output tail.
+    pub fn failure_summary(&self) -> String {
+        let mut text = self.summary_line();
+        for check in &self.checks {
+            if matches!(check.prerequisite, WorkflowPrerequisite::AgentImage { .. })
+                && check.status == PrerequisiteStatus::Missing
+            {
+                text.push('\n');
+                text.push_str(&check.explanation);
+            }
+        }
+        text
+    }
+
     /// A compact, stable summary for persisted execution events.
     pub fn summary_line(&self) -> String {
         let count = self
@@ -299,69 +319,5 @@ impl WorkflowPrerequisiteReport {
                 self.checks.len()
             )
         }
-    }
-}
-
-#[cfg(test)]
-mod pure_validation_tests {
-    use super::*;
-
-    #[test]
-    fn remote_parse_removes_credentials_before_data_can_be_persisted() {
-        let remote = GitRemoteUrl::parse(
-            "https://user:password@ghe.example/owner/repo.git?access_token=secret#fragment",
-        );
-        assert_eq!(remote.display(), "https://ghe.example/owner/repo.git");
-        assert_eq!(remote.host(), Some("ghe.example"));
-        assert_eq!(remote.owner_repo, Some(("owner".into(), "repo".into())));
-        let serialized = serde_json::to_string(&remote).unwrap();
-        assert!(!serialized.contains("password"));
-        assert!(!serialized.contains("secret"));
-    }
-}
-
-#[cfg(test)]
-mod layering_tests {
-    use std::path::Path;
-
-    fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                rust_files(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
-
-    #[test]
-    fn no_layer_zero_type_holds_a_secret_string() {
-        // Built from parts so this test does not match itself.
-        let needle = format!("{}{}", "Secret", "String");
-        let mut files = vec![];
-        rust_files(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src/data"),
-            &mut files,
-        );
-        assert!(files.len() > 20);
-        let offenders: Vec<_> = files
-            .iter()
-            .filter(|f| std::fs::read_to_string(f).unwrap().contains(&needle))
-            .collect();
-        assert!(
-            offenders.is_empty(),
-            "Layer 0 must not hold secrets: {offenders:?}"
-        );
-    }
-
-    #[test]
-    fn layer_zero_prerequisite_types_derive_serialize_but_hold_no_value_fields() {
-        // The only free-text fields in a report are explanations/notes; the
-        // serialized shape of every remediation names a choice, not a value.
-        let remediation =
-            serde_json::to_string(&crate::data::workflow_prerequisites::Remediation::PasteToken)
-                .unwrap();
-        assert_eq!(remediation, r#"{"type":"paste_token"}"#);
     }
 }

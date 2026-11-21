@@ -106,6 +106,16 @@ Instructions:
 
 This prompt is regenerated for each workflow step. Template variables are resolved at step-execution time.
 
+All agents participating in a workflow receive this context, including the
+dynamic leader, workflow-definition repair attempts, setup/teardown
+`on_failure` agents and merge remediation. Planning and remediation identify
+their phase instead of claiming a main-step index; remediation includes live
+main-step progress. The leader allocates the invocation UUID before launch,
+and generated steps adopt it when creating fresh workflow state. Resume keeps
+the persisted UUID. The same context directory and read/write guidance apply
+throughout, subject to the configured overlay permissions. The one-shot prompt
+and outside-workflow notice are reserved for actual non-workflow commands.
+
 ```
 ## Workflow Context
 

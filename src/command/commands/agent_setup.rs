@@ -72,6 +72,9 @@ impl<F: ?Sized + HasAgentFrontend> UserMessageSink for AgentFrontendAdapter<'_, 
     fn replay_queued(&mut self) {
         self.inner.replay_queued();
     }
+    fn report_image_stale(&mut self, warning: &crate::data::execution_event::ImageStaleWarning) {
+        self.inner.report_image_stale(warning);
+    }
 }
 
 impl<F: ?Sized + HasAgentFrontend> crate::engine::agent::AgentImageFrontend
@@ -105,7 +108,7 @@ impl<F: ?Sized + HasAgentFrontend> crate::engine::agent::AgentImageFrontend
 
 /// The surface every command that launches an agent needs from its frontend.
 ///
-/// `chat`, `exec prompt`, `exec workflow` and `specs` each declared the same
+/// `chat`, `exec prompt`, `exec workflow` and `new spec` each declared the same
 /// mount-scope / agent-setup / agent-auth / container-frontend bounds plus
 /// their own copy of `set_pty_active` and `set_stuck_sender`. This trait is
 /// that shared surface, declared once (F-35).
@@ -120,7 +123,7 @@ pub trait AgentLaunchFrontend:
     /// container (`true`) or has been released (`false`).
     ///
     /// **Required, with no default.** The two frontends that previously took
-    /// the no-op default — `SpecsCommandFrontend` and
+    /// the no-op default — `NewSpecFrontend` and
     /// `ExecPromptCommandFrontend` — were the CLI and API, and both already
     /// had a real implementation through their `chat` / `exec workflow` impls;
     /// the default only ever hid the fact that the same type answered the same
@@ -129,10 +132,31 @@ pub trait AgentLaunchFrontend:
     /// says so there, which is visible in review; a silent default is not.
     fn set_pty_active(&mut self, active: bool);
 
+    /// Where an automation execution launched through this frontend is
+    /// hosted (WI 0070). Frontends that run commands in the invoking
+    /// process keep the default, an intentional foreground run that records
+    /// itself in the shared data-home store. A daemon-hosted frontend
+    /// returns its command's shared host, or an error when that host cannot
+    /// be bound; a storage failure is never reported as `Foreground`.
+    fn automation_host(
+        &self,
+    ) -> Result<crate::command::automation::launch::AutomationHosting, CommandError> {
+        Ok(crate::command::automation::launch::AutomationHosting::Foreground)
+    }
+
+    /// Wait for a relayed command's stdout and stderr readers before releasing
+    /// the status text queued while the agent owned the terminal.
+    fn wait_output_drained(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+
     /// Called after the agent container launches. The sender is the broadcast
-    /// channel from the container's stuck detector; the TUI stores it so the
-    /// tab can subscribe for stuck-colouring. CLI and API frontends ignore it,
-    /// so this one keeps its no-op default.
+    /// channel from the container's status detector, carrying both silence
+    /// warnings and OSC 7501 reports. The instance frontend attaches it to the
+    /// container feed so tabs and container windows can display agent status.
+    /// Frontends without a status display may use the no-op default.
     fn set_stuck_sender(
         &mut self,
         _sender: std::sync::Arc<
@@ -145,7 +169,7 @@ pub trait AgentLaunchFrontend:
 /// An agent frontend that binds no I/O and reports nothing.
 ///
 /// For frontends that satisfy [`AgentLaunchFrontend`] only to be dispatchable
-/// and never actually launch a container — the `new`/`specs` test fakes, for
+/// and never actually launch a container — the `new`/`edit` test fakes, for
 /// instance. Anything that really runs an agent must hand back a real sink.
 pub struct NullAgentFrontend;
 

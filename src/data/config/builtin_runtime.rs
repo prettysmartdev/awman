@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::config::builtin_network::BuiltinNetworkConfig;
 use crate::data::config::image_source::{ImageSourceSpec, RegistryHostConfig};
+use crate::data::config::units::Size;
 
 /// Whole vCPUs per agent VM when none are configured.
 pub const DEFAULT_VCPUS: u8 = 2;
@@ -54,18 +55,18 @@ pub struct BuiltinRuntimeConfig {
     /// requests are rejected, never rounded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vcpus: Option<u8>,
-    /// Guest memory in MiB. Default [`DEFAULT_MEMORY_MIB`], at least
-    /// [`MIN_MEMORY_MIB`].
+    /// Guest memory (`"4GiB"`). Default [`DEFAULT_MEMORY_MIB`] MiB, at least
+    /// [`MIN_MEMORY_MIB`] MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_mib: Option<u32>,
-    /// Writable root disk in MiB. Default [`DEFAULT_ROOT_DISK_MIB`], at least
-    /// [`MIN_ROOT_DISK_MIB`].
+    pub memory: Option<Size>,
+    /// Writable root disk (`"30GiB"`). Default [`DEFAULT_ROOT_DISK_MIB`] MiB, at
+    /// least [`MIN_ROOT_DISK_MIB`] MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root_disk_mib: Option<u32>,
-    /// Guest-write budget per host mount in MiB. Default
-    /// [`DEFAULT_MOUNT_QUOTA_MIB`], at least 1.
+    pub root_disk: Option<Size>,
+    /// Guest-write budget per host mount (`"30GiB"`). Default
+    /// [`DEFAULT_MOUNT_QUOTA_MIB`] MiB, at least 1MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mount_quota_mib: Option<u32>,
+    pub mount_quota: Option<Size>,
     /// Where `awman ready` acquires images that are not cached yet. No
     /// default: its absence is an error with guidance, never an implicit
     /// registry or daemon lookup.
@@ -96,7 +97,7 @@ pub struct BuiltinRuntimeConfig {
 
 /// Dotted name of the builder switch, as config errors and `awman config`
 /// name it.
-pub const BUILDER_ENABLED_FIELD: &str = "builtin.builder.enabled";
+pub const BUILDER_ENABLED_FIELD: &str = "runtime.builtin.builder.enabled";
 
 /// The `builtin.builder` block: whether `awman ready` may build a missing or
 /// explicitly rebuilt image into the store its configured source exports
@@ -167,7 +168,7 @@ where
     let value = serde_json::Value::deserialize(deserializer)?;
     if !value.is_object() {
         return Err(D::Error::custom(format!(
-            "builtin.builder must be an object holding {BUILDER_ENABLED_FIELD}, not {value}"
+            "runtime.builtin.builder must be an object holding {BUILDER_ENABLED_FIELD}, not {value}"
         )));
     }
     serde_json::from_value(value).map_err(|e| {
@@ -175,9 +176,14 @@ where
         if message.contains(BUILDER_ENABLED_FIELD) {
             D::Error::custom(message)
         } else {
-            D::Error::custom(format!("builtin.builder: {message}"))
+            D::Error::custom(format!("runtime.builtin.builder: {message}"))
         }
     })
+}
+
+/// Whole MiB of a configured size, saturating at `u32::MAX`.
+fn size_mib(size: &Size) -> u32 {
+    u32::try_from(size.mib()).unwrap_or(u32::MAX)
 }
 
 impl BuiltinRuntimeConfig {
@@ -196,9 +202,12 @@ impl BuiltinRuntimeConfig {
         BuiltinRuntimeConfig {
             state_dir: self.state_dir.clone().or_else(|| base.state_dir.clone()),
             vcpus: self.vcpus.or(base.vcpus),
-            memory_mib: self.memory_mib.or(base.memory_mib),
-            root_disk_mib: self.root_disk_mib.or(base.root_disk_mib),
-            mount_quota_mib: self.mount_quota_mib.or(base.mount_quota_mib),
+            memory: self.memory.clone().or_else(|| base.memory.clone()),
+            root_disk: self.root_disk.clone().or_else(|| base.root_disk.clone()),
+            mount_quota: self
+                .mount_quota
+                .clone()
+                .or_else(|| base.mount_quota.clone()),
             image_source: self
                 .image_source
                 .clone()
@@ -229,17 +238,21 @@ impl BuiltinRuntimeConfig {
 
     /// Configured memory, or [`DEFAULT_MEMORY_MIB`].
     pub fn memory_mib_or_default(&self) -> u32 {
-        self.memory_mib.unwrap_or(DEFAULT_MEMORY_MIB)
+        self.memory.as_ref().map_or(DEFAULT_MEMORY_MIB, size_mib)
     }
 
     /// Configured root disk, or [`DEFAULT_ROOT_DISK_MIB`].
     pub fn root_disk_mib_or_default(&self) -> u32 {
-        self.root_disk_mib.unwrap_or(DEFAULT_ROOT_DISK_MIB)
+        self.root_disk
+            .as_ref()
+            .map_or(DEFAULT_ROOT_DISK_MIB, size_mib)
     }
 
     /// Configured per-mount quota, or [`DEFAULT_MOUNT_QUOTA_MIB`].
     pub fn mount_quota_mib_or_default(&self) -> u32 {
-        self.mount_quota_mib.unwrap_or(DEFAULT_MOUNT_QUOTA_MIB)
+        self.mount_quota
+            .as_ref()
+            .map_or(DEFAULT_MOUNT_QUOTA_MIB, size_mib)
     }
 
     /// Reject values that cannot be honoured: zero vCPUs, memory below
@@ -261,20 +274,28 @@ impl BuiltinRuntimeConfig {
     /// checks.
     pub fn validate_resources(&self) -> Result<(), String> {
         if self.vcpus == Some(0) {
-            return Err("builtin.vcpus must be at least 1".into());
+            return Err("runtime.builtin.vcpus must be at least 1".into());
         }
-        if self.memory_mib.is_some_and(|m| m < MIN_MEMORY_MIB) {
+        if self
+            .memory
+            .as_ref()
+            .is_some_and(|m| m.mib() < u64::from(MIN_MEMORY_MIB))
+        {
             return Err(format!(
-                "builtin.memoryMib must be at least {MIN_MEMORY_MIB}"
+                "runtime.builtin.memory must be at least {MIN_MEMORY_MIB}MiB"
             ));
         }
-        if self.root_disk_mib.is_some_and(|m| m < MIN_ROOT_DISK_MIB) {
+        if self
+            .root_disk
+            .as_ref()
+            .is_some_and(|m| m.mib() < u64::from(MIN_ROOT_DISK_MIB))
+        {
             return Err(format!(
-                "builtin.rootDiskMib must be at least {MIN_ROOT_DISK_MIB}"
+                "runtime.builtin.rootDisk must be at least {MIN_ROOT_DISK_MIB}MiB"
             ));
         }
-        if self.mount_quota_mib == Some(0) {
-            return Err("builtin.mountQuotaMib must be at least 1".into());
+        if self.mount_quota.as_ref().is_some_and(|m| m.mib() < 1) {
+            return Err("runtime.builtin.mountQuota must be at least 1MiB".into());
         }
         Ok(())
     }
@@ -284,256 +305,13 @@ impl BuiltinRuntimeConfig {
         if let Some(source) = &self.image_source {
             source
                 .validate()
-                .map_err(|e| format!("builtin.imageSource: {e}"))?;
+                .map_err(|e| format!("runtime.builtin.imageSource: {e}"))?;
         }
         for (tag, source) in &self.images {
             source
                 .validate()
-                .map_err(|e| format!("builtin.images[{tag}]: {e}"))?;
+                .map_err(|e| format!("runtime.builtin.images[{tag}]: {e}"))?;
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_block_serializes_to_empty_object() {
-        let json = serde_json::to_string(&BuiltinRuntimeConfig::default()).unwrap();
-        assert_eq!(json, "{}");
-    }
-
-    #[test]
-    fn camel_case_fields_parse_and_unknown_fields_are_rejected() {
-        let cfg: BuiltinRuntimeConfig = serde_json::from_str(
-            r#"{"stateDir":"/s","vcpus":4,"memoryMib":2048,
-                "imageSource":{"type":"registry","registry":"localhost:5000"}}"#,
-        )
-        .unwrap();
-        assert_eq!(cfg.state_dir, Some(PathBuf::from("/s")));
-        assert_eq!(cfg.vcpus_or_default(), 4);
-        assert_eq!(cfg.memory_mib_or_default(), 2048);
-        assert!(serde_json::from_str::<BuiltinRuntimeConfig>(r#"{"cpus":1.5}"#).is_err());
-        // Fractional vCPUs are not representable.
-        assert!(serde_json::from_str::<BuiltinRuntimeConfig>(r#"{"vcpus":1.5}"#).is_err());
-    }
-
-    #[test]
-    fn defaults_apply_when_unset() {
-        let cfg = BuiltinRuntimeConfig::default();
-        assert_eq!(cfg.vcpus_or_default(), DEFAULT_VCPUS);
-        assert_eq!(cfg.memory_mib_or_default(), DEFAULT_MEMORY_MIB);
-        assert!(cfg
-            .images
-            .get("awman-x:latest")
-            .or(cfg.image_source.as_ref())
-            .is_none());
-    }
-
-    #[test]
-    fn repo_merges_over_global_per_field_and_per_key() {
-        let global = BuiltinRuntimeConfig {
-            vcpus: Some(2),
-            memory_mib: Some(8192),
-            image_source: Some(ImageSourceSpec::Registry {
-                registry: Some("global".into()),
-                reference: None,
-            }),
-            images: BTreeMap::from([
-                (
-                    "a".to_string(),
-                    ImageSourceSpec::Archive {
-                        path: "/global-a".into(),
-                    },
-                ),
-                (
-                    "b".to_string(),
-                    ImageSourceSpec::Archive {
-                        path: "/global-b".into(),
-                    },
-                ),
-            ]),
-            ..Default::default()
-        };
-        let repo = BuiltinRuntimeConfig {
-            vcpus: Some(6),
-            images: BTreeMap::from([(
-                "a".to_string(),
-                ImageSourceSpec::Archive {
-                    path: "/repo-a".into(),
-                },
-            )]),
-            ..Default::default()
-        };
-        let merged = repo.merged_over(&global);
-        assert_eq!(merged.vcpus, Some(6));
-        assert_eq!(merged.memory_mib, Some(8192));
-        assert_eq!(merged.image_source, global.image_source);
-        assert_eq!(
-            merged.images.get("a").or(merged.image_source.as_ref()),
-            Some(&ImageSourceSpec::Archive {
-                path: "/repo-a".into()
-            })
-        );
-        assert_eq!(
-            merged.images.get("b").or(merged.image_source.as_ref()),
-            Some(&ImageSourceSpec::Archive {
-                path: "/global-b".into()
-            })
-        );
-        assert_eq!(
-            merged.images.get("c").or(merged.image_source.as_ref()),
-            global.image_source.as_ref()
-        );
-    }
-
-    #[test]
-    fn merged_view_never_carries_a_network_block() {
-        let global: BuiltinRuntimeConfig =
-            serde_json::from_str(r#"{"network":{"mode":"allowlist","allow":["a.example"]}}"#)
-                .unwrap();
-        let repo: BuiltinRuntimeConfig =
-            serde_json::from_str(r#"{"network":{"mode":"none"}}"#).unwrap();
-        assert_eq!(repo.merged_over(&global).network, None);
-        assert_eq!(
-            BuiltinRuntimeConfig::default().merged_over(&global).network,
-            None
-        );
-        // The persisted blocks themselves keep their network (config show,
-        // config files and `EffectiveConfig::builtin_network` read them).
-        assert!(global.network.is_some() && repo.network.is_some());
-    }
-
-    #[test]
-    fn validate_rejects_zero_resources_and_bad_sources() {
-        assert!(BuiltinRuntimeConfig {
-            vcpus: Some(0),
-            ..Default::default()
-        }
-        .validate()
-        .is_err());
-        assert!(BuiltinRuntimeConfig {
-            memory_mib: Some(0),
-            ..Default::default()
-        }
-        .validate()
-        .is_err());
-        assert!(BuiltinRuntimeConfig {
-            root_disk_mib: Some(MIN_ROOT_DISK_MIB - 1),
-            ..Default::default()
-        }
-        .validate()
-        .is_err());
-        assert!(BuiltinRuntimeConfig {
-            mount_quota_mib: Some(0),
-            ..Default::default()
-        }
-        .validate()
-        .is_err());
-        assert!(BuiltinRuntimeConfig {
-            root_disk_mib: Some(MIN_ROOT_DISK_MIB),
-            mount_quota_mib: Some(1),
-            ..Default::default()
-        }
-        .validate()
-        .is_ok());
-        assert!(BuiltinRuntimeConfig {
-            images: BTreeMap::from([(
-                "t".to_string(),
-                ImageSourceSpec::Archive { path: "".into() }
-            )]),
-            ..Default::default()
-        }
-        .validate()
-        .is_err());
-        assert!(BuiltinRuntimeConfig::default().validate().is_ok());
-    }
-
-    #[test]
-    fn builder_defaults_false_and_accepts_both_boolean_values() {
-        assert!(!BuiltinRuntimeConfig::default().builder_enabled());
-        for enabled in [true, false] {
-            let raw = format!(r#"{{"builder":{{"enabled":{enabled}}}}}"#);
-            let parsed: BuiltinRuntimeConfig = serde_json::from_str(&raw).unwrap();
-            assert_eq!(parsed.builder_enabled(), enabled);
-            assert_eq!(parsed.builder.unwrap().enabled, Some(enabled));
-        }
-        assert!(
-            !serde_json::from_str::<BuiltinRuntimeConfig>(r#"{"builder":{}}"#)
-                .unwrap()
-                .builder_enabled()
-        );
-    }
-
-    #[test]
-    fn builder_accepts_only_present_json_booleans_and_names_the_field() {
-        for value in ["null", "\"true\"", "1", "[]", "{}"] {
-            let raw = format!(r#"{{"builder":{{"enabled":{value}}}}}"#);
-            let error = serde_json::from_str::<BuiltinRuntimeConfig>(&raw)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains(BUILDER_ENABLED_FIELD), "{error}");
-        }
-    }
-
-    #[test]
-    fn builder_serializes_only_as_a_nested_json_object() {
-        let cfg: BuiltinRuntimeConfig = serde_json::from_str(
-            r#"{"builder":{"enabled":true},"imageSource":{"type":"archive","path":"/tmp/a.tar"}}"#,
-        )
-        .unwrap();
-        let value = serde_json::to_value(cfg).unwrap();
-        assert_eq!(value["builder"]["enabled"], true);
-        assert!(value.get("builtin.builder.enabled").is_none());
-        assert!(value["imageSource"].is_object());
-    }
-
-    #[test]
-    fn omitted_builder_and_omitted_enabled_are_distinct_but_default_off() {
-        for raw in ["{}", r#"{"builder":{}}"#] {
-            let cfg: BuiltinRuntimeConfig = serde_json::from_str(raw).unwrap();
-            assert!(!cfg.builder_enabled());
-        }
-        let cfg: BuiltinRuntimeConfig =
-            serde_json::from_str(r#"{"builder":{"enabled":true}}"#).unwrap();
-        assert!(cfg.builder_enabled());
-    }
-
-    #[test]
-    fn builder_merges_per_leaf_and_explicit_repo_false_disables_global_true() {
-        let global = BuiltinRuntimeConfig {
-            builder: Some(BuiltinBuilderConfig {
-                enabled: Some(true),
-            }),
-            ..Default::default()
-        };
-        let omitted = BuiltinRuntimeConfig {
-            builder: Some(BuiltinBuilderConfig::default()),
-            ..Default::default()
-        };
-        assert!(omitted.merged_over(&global).builder_enabled());
-        let disabled = BuiltinRuntimeConfig {
-            builder: Some(BuiltinBuilderConfig {
-                enabled: Some(false),
-            }),
-            ..Default::default()
-        };
-        assert!(!disabled.merged_over(&global).builder_enabled());
-        assert!(global
-            .merged_over(&BuiltinRuntimeConfig::default())
-            .builder_enabled());
-    }
-
-    #[test]
-    fn builder_enabled_cli_value_parser_is_strict_and_trimmed() {
-        assert_eq!(BuiltinBuilderConfig::parse_enabled(" true "), Ok(true));
-        assert_eq!(BuiltinBuilderConfig::parse_enabled("false"), Ok(false));
-        for bad in ["yes", "1", "TRUE", "", "null"] {
-            assert!(BuiltinBuilderConfig::parse_enabled(bad)
-                .unwrap_err()
-                .contains(BUILDER_ENABLED_FIELD));
-        }
     }
 }

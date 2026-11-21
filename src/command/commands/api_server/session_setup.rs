@@ -153,6 +153,14 @@ impl UserMessageSink for SetupReadyFrontend {
         });
     }
 
+    fn report_image_stale(&mut self, warning: &crate::data::execution_event::ImageStaleWarning) {
+        let mut warning = warning.clone();
+        warning.reason = self.event_bus.redaction().redact(&warning.reason);
+        self.bus
+            .emit(SetupEventPayload::ImageStale(warning.clone()));
+        self.event_bus.emit(EventPayload::ImageStale(warning));
+    }
+
     fn replay_queued(&mut self) {}
 }
 
@@ -420,5 +428,95 @@ fn format_step_status(status: &StepStatus) -> String {
         StepStatus::Skipped => "skipped".into(),
         StepStatus::Warn(s) => format!("warn({s})"),
         StepStatus::Failed(s) => format!("failed({s})"),
+    }
+}
+
+use super::event_bus::EventBus;
+use crate::command::session_setup::SessionSetupPresenter;
+use crate::engine::git::GitFrontend;
+
+/// Presentation adapter shared by typed and HTTP session setup: the
+/// session-setup broadcast bus, the session-tagged log, and the ready-checks
+/// frontend. It persists nothing and decides nothing.
+pub struct BusSessionSetupPresenter {
+    session_id: String,
+    setup_bus: Arc<SessionSetupBus>,
+    bus_sender: SessionSetupBusSender,
+    /// Whether per-session setup lines are logged at `info` or `debug`.
+    /// Read once from the Layer 0 snapshot when the presenter is built; Layer
+    /// 0 owns `AWMAN_API_VERBOSE_SETUP` and nothing above it reads the
+    /// environment directly (F-37).
+    verbose_setup: bool,
+}
+
+#[async_trait::async_trait]
+impl SessionSetupPresenter for BusSessionSetupPresenter {
+    fn log(&mut self, line: &str) {
+        log_session_setup(&self.session_id, self.verbose_setup, line);
+    }
+
+    fn emit(&mut self, event: SetupEventPayload) {
+        self.bus_sender.emit(event);
+    }
+
+    fn ready_frontend(&mut self) -> Box<dyn ReadyFrontend> {
+        // A throwaway EventBus satisfies the ready frontend's container sink; its
+        // events are mirrored to the tracing log and the session-setup bus.
+        let event_bus = EventBus::new(4096);
+        Box::new(SetupReadyFrontend::new(
+            &self.session_id,
+            self.setup_bus.sender(),
+            event_bus.sender(),
+            self.verbose_setup,
+        ))
+    }
+
+    fn git_log_sink(&mut self) -> Box<dyn GitFrontend + Send> {
+        Box::new(TracingSetupSink::new(&self.session_id, self.verbose_setup))
+    }
+
+    async fn finished(&mut self) {}
+}
+
+impl BusSessionSetupPresenter {
+    pub fn new(session_id: &str, setup_bus: Arc<SessionSetupBus>, verbose_setup: bool) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            bus_sender: setup_bus.sender(),
+            setup_bus,
+            verbose_setup,
+        }
+    }
+}
+
+#[cfg(test)]
+mod source_choice_contracts {
+    use super::*;
+    use crate::data::config::image_source_prompt::{ImageSourceAnswer, ImageSourcePrompt};
+
+    /// API session setup drives `ReadyEngine` through this frontend: it
+    /// keeps the trait default and never asks for an image source.
+    #[test]
+    fn session_setup_frontend_answers_unavailable() {
+        let bus = SessionSetupBus::new(16);
+        let events = super::super::event_bus::EventBus::new(16);
+        let mut frontend = SetupReadyFrontend::new("s-1", bus.sender(), events.sender(), false);
+        let prompt = ImageSourcePrompt::Confirm(
+            crate::data::config::image_source_prompt::ImageSourcePreview {
+                scope: crate::data::config::image_source_prompt::ImageSourceScope::Global,
+                path: "/nowhere/config.json".into(),
+                field: "runtime.builtin.imageSource".into(),
+                fragment: "{}".into(),
+                effective: vec![],
+                builder: crate::data::config::image_source_prompt::BuilderPreview::Unchanged {
+                    effective: false,
+                },
+                notes: vec![],
+            },
+        );
+        assert_eq!(
+            ReadyFrontend::ask_image_source(&mut frontend, &prompt),
+            ImageSourceAnswer::Unavailable
+        );
     }
 }
