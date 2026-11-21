@@ -927,6 +927,26 @@ impl EffectiveConfig {
         })
     }
 
+    /// The operator's ceiling: the trusted global layers alone, with no
+    /// repository, task file, stored task or flags. A request from a remote
+    /// client or a work server may not grant beyond it, and nothing a
+    /// repository says may lift one of its denies for such a request.
+    pub fn trusted_prerequisite_policy(
+        &self,
+        context: super::workflows::PrerequisiteResolveContext,
+    ) -> super::workflows::PrerequisitePolicy {
+        use super::workflows::{PrerequisitePolicy, PrerequisitePolicyLayers};
+        let trusted = self.trusted_prerequisites();
+        PrerequisitePolicy::resolve(PrerequisitePolicyLayers {
+            global: trusted.as_ref(),
+            task_file: None,
+            repo: None,
+            task: None,
+            flags: &Default::default(),
+            context,
+        })
+    }
+
     /// The global file's `workflows.prerequisites` with env and `--set`
     /// prerequisite leaves applied over it.
     fn trusted_prerequisites(&self) -> Option<super::workflows::PrerequisitesConfig> {

@@ -6,7 +6,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex},
 };
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, watch, Notify};
 mod http;
 pub mod lease_context;
 pub mod lease_exec;
@@ -18,6 +18,7 @@ pub use http::ServingMock;
 pub enum MockFault {
     IgnorePreferences,
     IgnoreEpoch,
+    IgnoreTerminalReplacement,
     IgnoreWorkflowContextCapability,
     IgnoreExecCapabilities,
     DuplicateEvents,
@@ -51,7 +52,9 @@ struct State {
     releases: HashMap<String, ReleaseRequest<Value>>,
     events: HashMap<String, BTreeMap<(u32, u64), Value>>,
     frames: HashMap<String, Vec<LeaseTerminalFrame>>,
+    terminal_connections: HashMap<String, Vec<Vec<LeaseTerminalFrame>>>,
     terminal_errors: HashMap<String, String>,
+    terminal_attempts: HashMap<String, usize>,
     next_id: u64,
     fault: Option<MockFault>,
 }
@@ -84,6 +87,8 @@ struct ActiveLease {
     cancel: Option<String>,
     heartbeat: Option<HeartbeatRequest>,
     outbound: broadcast::Sender<LeaseTerminalFrame>,
+    terminal_stop: watch::Sender<bool>,
+    terminal_connection: usize,
 }
 fn error(code: &str) -> ApiError {
     ApiError {
@@ -311,6 +316,8 @@ impl MockWorkServer {
                 cancel: None,
                 heartbeat: None,
                 outbound: broadcast::channel(128).0,
+                terminal_stop: watch::channel(false).0,
+                terminal_connection: 0,
             },
         );
         Ok(Some(lease))
@@ -516,6 +523,37 @@ impl MockWorkServer {
             .lock()
             .unwrap()
             .frames
+            .get(id)
+            .cloned()
+            .unwrap_or_default()
+    }
+    /// Terminal handshake attempts, including refused reconnects.
+    pub fn terminal_open_attempts(&self, id: &str) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .terminal_attempts
+            .get(id)
+            .copied()
+            .unwrap_or(0)
+    }
+    /// Close the current socket without changing lease ownership or expiry.
+    /// A later socket at the same epoch is accepted normally.
+    pub fn drop_terminal(&self, id: &str) -> Result<(), ApiError> {
+        let mut s = self.inner.lock().unwrap();
+        expire(&mut s, Utc::now());
+        let lease = s.leases.get(id).ok_or_else(|| error("lease_lost"))?;
+        lease.terminal_stop.send_replace(true);
+        Ok(())
+    }
+
+    /// Frames grouped by accepted socket, in connection order. Empty groups
+    /// also count accepted sockets; useful for waiting for a replacement.
+    pub fn terminal_connection_frames(&self, id: &str) -> Vec<Vec<LeaseTerminalFrame>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .terminal_connections
             .get(id)
             .cloned()
             .unwrap_or_default()

@@ -31,28 +31,30 @@ const ALLOWED_VALUE: &str = "test-secret-lease-exec-worker-allowed";
 const DENIED_VALUE: &str = "test-secret-lease-exec-worker-denied";
 
 /// One daemon with pull enabled, linked to one mock work server (`mock`).
-struct Host {
-    s: TestSandbox,
-    seed: PathBuf,
-    http: FakeGitHttp,
-    wsp: FakeWorkServer,
-    server: Option<Api>,
-    docker: FakeCli,
-    key: String,
-    url: String,
-    config: Value,
+pub(crate) struct Host {
+    pub(crate) s: TestSandbox,
+    pub(crate) seed: PathBuf,
+    pub(crate) http: FakeGitHttp,
+    pub(crate) wsp: FakeWorkServer,
+    pub(crate) server: Option<Api>,
+    pub(crate) docker: FakeCli,
+    pub(crate) key: String,
+    pub(crate) url: String,
+    pub(crate) config: Value,
 }
 
-struct Options {
-    mock: MockWorkServer,
+pub(crate) struct Options {
+    pub(crate) mock: MockWorkServer,
     /// Merged into the `workServers.mock` entry.
-    server: Value,
+    pub(crate) server: Value,
     /// Merged into the global config.
-    extra: Value,
-    pull: bool,
+    pub(crate) extra: Value,
+    pub(crate) pull: bool,
     /// Worker (host) variables, set before the daemon captures its
     /// environment.
-    vars: Vec<(&'static str, &'static str)>,
+    pub(crate) vars: Vec<(&'static str, &'static str)>,
+    /// Also enable push commands (`/v1/worker/commands`) in the seed checkout.
+    pub(crate) push_sessions: bool,
 }
 
 impl Default for Options {
@@ -63,6 +65,7 @@ impl Default for Options {
             extra: json!({}),
             pull: true,
             vars: Vec::new(),
+            push_sessions: false,
         }
     }
 }
@@ -74,7 +77,7 @@ impl Host {
     ///
     /// hygiene-allow(H1): the daemon resolves `docker`, its temp root and worker variables from its process environment; nextest gives each test its own process, and every value points into this test's sandbox (as `daemon::init_api`).
     /// hygiene-allow(H7): reads the process PATH only to prepend this sandbox's fake `bin` to it.
-    async fn start(
+    pub(crate) async fn start(
         id: &'static str,
         options: Options,
         prepare: impl FnOnce(&TestSandbox),
@@ -130,6 +133,13 @@ impl Host {
                 "pull":{"enabled":options.pull,"interaction":"headless"}}},
             "network":{"listeners":{"component":{"features":["engine","worker"]}}}},
             "workServers":{"mock": entry}});
+        if options.push_sessions {
+            super::support::merge(
+                &mut config,
+                json!({"daemon":{"features":{"worker":{"push":{"enabled":true,
+                    "workDirs":{"allow":[&seed]}}}}}}),
+            );
+        }
         super::support::merge(&mut config, options.extra);
         let mut fake = None;
         let api = Api::with_docker(&s, config.clone(), |docker| {
@@ -166,11 +176,11 @@ impl Host {
         host
     }
 
-    fn api(&self) -> &Api {
+    pub(crate) fn api(&self) -> &Api {
         self.server.as_ref().expect("daemon running")
     }
 
-    async fn registered(&self) -> worker_pull::ServerStatus {
+    pub(crate) async fn registered(&self) -> worker_pull::ServerStatus {
         wait_for_async(
             "work server registered",
             Duration::from_secs(15),
@@ -186,7 +196,7 @@ impl Host {
     /// The pull worker registers during startup recovery and starts claiming
     /// just after. A claim of an item the server does not have reaches the
     /// server (`item_not_found`) only once it does; nothing is leased.
-    async fn accepting(&self) {
+    pub(crate) async fn accepting(&self) {
         wait_for_async(
             "the pull worker accepts claims",
             Duration::from_secs(15),
@@ -206,7 +216,7 @@ impl Host {
         .await
     }
 
-    fn item(&self, id: &str) -> WorkItem {
+    pub(crate) fn item(&self, id: &str) -> WorkItem {
         let mut item = awman_wsp::conformance::work_item(id);
         item.repo.url = self.url.clone();
         item.exec.agent = Some("claude".into());
@@ -214,14 +224,14 @@ impl Host {
         item
     }
 
-    fn workflow(&self, id: &str, toml: &str) -> WorkItem {
+    pub(crate) fn workflow(&self, id: &str, toml: &str) -> WorkItem {
         let mut item = self.item(id);
         item.kind = WorkKind::Workflow;
         item.exec.workflow_toml = Some(toml.into());
         item
     }
 
-    fn dynamic(&self, id: &str) -> WorkItem {
+    pub(crate) fn dynamic(&self, id: &str) -> WorkItem {
         let mut item = self.item(id);
         item.kind = WorkKind::Workflow;
         item.exec.dynamic = true;
@@ -231,7 +241,7 @@ impl Host {
 
     /// Enqueue and claim `item` manually; `Err` is the claim refusal's code
     /// and message.
-    async fn claim(&self, item: WorkItem) -> Result<LeaseResource, (String, String)> {
+    pub(crate) async fn claim(&self, item: WorkItem) -> Result<LeaseResource, (String, String)> {
         let id = item.id.clone();
         self.wsp.server().enqueue(item, chrono::Utc::now()).unwrap();
         worker_pull::queue_claim(&self.api().api, &id, Some("mock"))
@@ -242,7 +252,7 @@ impl Host {
     /// The release the server recorded for the latest refused claim. (The
     /// mock numbers lease IDs `server_<n>` in issue order and records
     /// releases by lease ID.)
-    fn refused(&self, item: &str) -> Value {
+    pub(crate) fn refused(&self, item: &str) -> Value {
         let mock = self.wsp.server();
         let release = (0..10_000)
             .rev()
@@ -252,7 +262,7 @@ impl Host {
     }
 
     /// Wait for the server to receive the lease's terminal report.
-    async fn terminal(&self, lease: &LeaseResource) -> Terminal {
+    pub(crate) async fn terminal(&self, lease: &LeaseResource) -> Terminal {
         let mock = self.wsp.server();
         wait_for_async("lease reported", Duration::from_secs(30), || async {
             match (
@@ -271,7 +281,7 @@ impl Host {
     }
 
     /// Agent containers started so far (not probes).
-    fn runs(&self) -> Vec<Call> {
+    pub(crate) fn runs(&self) -> Vec<Call> {
         self.docker
             .calls()
             .into_iter()
@@ -280,18 +290,18 @@ impl Host {
             .collect()
     }
 
-    fn leases(&self) -> LeaseStore {
+    pub(crate) fn leases(&self) -> LeaseStore {
         LeaseStore::open(self.api().api.worker.as_ref().unwrap().store.clone()).unwrap()
     }
 
-    async fn stop(&mut self) {
+    pub(crate) async fn stop(&mut self) {
         if let Some(server) = self.server.take() {
             server.shutdown().await;
         }
     }
 
     /// Stop everything; `check` reads the private state before cleanup.
-    async fn finish(mut self, check: impl FnOnce(&Path, &Path)) {
+    pub(crate) async fn finish(mut self, check: impl FnOnce(&Path, &Path)) {
         self.stop().await;
         check(self.s.root(), self.docker.dir());
         self.wsp.shutdown().await;
@@ -300,10 +310,10 @@ impl Host {
     }
 }
 
-struct Terminal {
-    result: Option<Value>,
-    release: Option<Value>,
-    events: Value,
+pub(crate) struct Terminal {
+    pub(crate) result: Option<Value>,
+    pub(crate) release: Option<Value>,
+    pub(crate) events: Value,
 }
 
 fn secrets(pairs: &[(&str, &str)]) -> ExecSecrets {
@@ -829,15 +839,16 @@ async fn the_commit_author_follows_exec_prerequisites_and_widening_is_refused() 
         .as_str()
         .unwrap()
         .starts_with("prerequisite_widening_refused: "));
-    // Prerequisites apply to workflows only.
+    // A prompt takes a git identity only; credentials stay workflow-only.
     let mut prompt = host.item("prompt-prereq");
     prompt.exec.prerequisites = Some(awman_wsp::ExecPrerequisites {
         git_identity: identity("Lease Author", "lease-author@example.invalid"),
-        ssh: None,
+        ssh: Some(awman_wsp::ExecCredentialChoice::Deny),
         github_token: None,
     });
-    let (code, _) = host.claim(prompt).await.expect_err("prompt");
+    let (code, message) = host.claim(prompt).await.expect_err("prompt");
     assert_eq!(code, "ineligible");
+    assert!(message.contains("exec.prerequisites.ssh"), "{message}");
     assert_eq!(host.runs().len(), runs);
     host.finish(|_, _| {}).await;
 }
@@ -873,6 +884,320 @@ async fn a_fixed_identity_is_widening_where_the_worker_denies_identities() {
     host.finish(|_, _| {}).await;
 }
 
+const IDENTITY_VARS: [&str; 4] = [
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+];
+
+/// The commit identity a container was started with, from its `-e KEY=VALUE`
+/// literals or (for a name-only `-e KEY`) its environment.
+fn identity_env(call: &Call) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for arg in env_args(call) {
+        let (key, value) = match arg.split_once('=') {
+            Some((key, value)) => (key, Some(value.to_string())),
+            None => (arg, call.env.get(arg).cloned()),
+        };
+        if IDENTITY_VARS.contains(&key) {
+            if let Some(value) = value {
+                out.insert(key.to_string(), value);
+            }
+        }
+    }
+    out
+}
+
+fn expected_identity(name: &str, email: &str) -> BTreeMap<String, String> {
+    IDENTITY_VARS
+        .iter()
+        .zip([name, email, name, email])
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+/// Two parallel steps and a join: every container the run starts.
+const PARALLEL_STEPS: &str = r#"
+[[steps]]
+name = "left"
+prompt = "change the left half"
+
+[[steps]]
+name = "right"
+prompt = "change the right half"
+
+[[steps]]
+name = "join"
+prompt = "join both halves"
+depends_on = ["left", "right"]
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_step_commit_and_every_parallel_container_use_the_lease_identity() {
+    let host = Host::start(
+        "daemon::lease_exec::a_step_commit_and_every_parallel_container_use_the_lease_identity",
+        Options {
+            // As the leftover-commit test: commit identity, not push timing.
+            mock: MockWorkServer::new().with_lease_ttl(chrono::Duration::seconds(30)),
+            ..Options::default()
+        },
+        |_| {},
+        |docker| {
+            docker.on(&["run"]).hold_until_released();
+        },
+    )
+    .await;
+    let mut item = host.workflow("step-commits", PARALLEL_STEPS);
+    item.push = Some(awman_wsp::Push {
+        enabled: true,
+        branch: String::new(),
+    });
+    item.exec.prerequisites = Some(awman_wsp::ExecPrerequisites {
+        git_identity: Some(awman_wsp::ExecGitIdentity {
+            name: "Lease Author".into(),
+            email: "lease-author@example.invalid".into(),
+        }),
+        ssh: Some(awman_wsp::ExecCredentialChoice::Deny),
+        github_token: Some(awman_wsp::ExecCredentialChoice::Deny),
+    });
+    let branch = item.repo.branch.clone();
+    let lease = host.claim(item).await.expect("admitted");
+    let expected = expected_identity("Lease Author", "lease-author@example.invalid");
+
+    // The agent in the first container commits its own work, with only the
+    // environment its container was given. The clone has a different local
+    // identity, which the granted environment overrides.
+    let held = host.docker.wait_until_held(Duration::from_secs(20));
+    assert_eq!(identity_env(&held), expected, "{:?}", held.argv);
+    let clone = workspace_mount(&held);
+    let git = |dir: &Path, args: &[&str], env: &BTreeMap<String, String>| {
+        let mut command = host.s.command("git").arg("-C").arg(dir).args(args);
+        for (key, value) in env {
+            command = command.env(key, value);
+        }
+        command.label("git").run().stdout_text()
+    };
+    let none = BTreeMap::new();
+    git(
+        &clone,
+        &["config", "user.name", "Container Identity"],
+        &none,
+    );
+    git(
+        &clone,
+        &["config", "user.email", "container@example.invalid"],
+        &none,
+    );
+    std::fs::write(clone.join("agent.txt"), "agent work").unwrap();
+    git(&clone, &["add", "agent.txt"], &none);
+    git(
+        &clone,
+        &["commit", "-m", "agent commit"],
+        &identity_env(&held),
+    );
+    host.docker.release();
+    let done = host.terminal(&lease).await;
+    let result = done.result.expect("result");
+    assert_eq!(result["result"]["outcome"], "done", "{result}");
+
+    // Both parallel steps and the join saw the same identity.
+    let runs = host.runs();
+    assert_eq!(runs.len(), 3, "one container per step: {runs:#?}");
+    for run in &runs {
+        assert_eq!(identity_env(run), expected, "{:?}", run.argv);
+    }
+    // The pushed branch holds the agent's own commit (the worker may add
+    // its leftover commit on top), authored and committed as the lease.
+    git(&host.seed, &["fetch", "origin", &branch], &none);
+    let log = git(
+        &host.seed,
+        &["log", "--format=%s|%an <%ae>|%cn <%ce>", "FETCH_HEAD"],
+        &none,
+    );
+    assert!(
+        log.lines().any(|line| line
+            == "agent commit|Lease Author <lease-author@example.invalid>|Lease Author <lease-author@example.invalid>"),
+        "{log}"
+    );
+    host.finish(|_, _| {}).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_a_lease_identity_no_container_is_given_one() {
+    let host = Host::start(
+        "daemon::lease_exec::without_a_lease_identity_no_container_is_given_one",
+        Options::default(),
+        |_| {},
+        |_| {},
+    )
+    .await;
+    let mut item = host.workflow("no-identity", PARALLEL_STEPS);
+    item.exec.prerequisites = Some(awman_wsp::ExecPrerequisites {
+        git_identity: None,
+        ssh: Some(awman_wsp::ExecCredentialChoice::Deny),
+        github_token: None,
+    });
+    let lease = host.claim(item).await.expect("admitted");
+    let done = host.terminal(&lease).await;
+    let result = done.result.expect("result");
+    assert_eq!(result["result"]["outcome"], "done", "{result}");
+    let runs = host.runs();
+    assert_eq!(runs.len(), 3, "{runs:#?}");
+    for run in &runs {
+        assert!(identity_env(run).is_empty(), "{:?}", run.argv);
+    }
+    host.finish(|_, _| {}).await;
+}
+
+/// A push command's workflow: a parallel group, a join, and a teardown
+/// cleanup step that receives no credential.
+const PUSH_WORKFLOW: &str = r#"
+[[steps]]
+name = "left"
+prompt = "change the left half"
+
+[[steps]]
+name = "right"
+prompt = "change the right half"
+
+[[steps]]
+name = "join"
+prompt = "join both halves"
+depends_on = ["left", "right"]
+
+[[teardown]]
+type = "run_shell"
+command = "echo identity-teardown-marker"
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_prerequisite_identity_reaches_the_same_containers_as_a_lease() {
+    let host = Host::start(
+        "daemon::lease_exec::push_prerequisite_identity_reaches_the_same_containers_as_a_lease",
+        Options {
+            pull: false,
+            push_sessions: true,
+            ..Options::default()
+        },
+        |_| {},
+        // Setup and teardown steps run in their phase container through `exec`.
+        |docker| {
+            docker.on(&["exec"]).stdout("phase step finished\n");
+        },
+    )
+    .await;
+    std::fs::write(host.seed.join("identity.toml"), PUSH_WORKFLOW).unwrap();
+    // A second file: its own run state, so the `deny` run resumes nothing.
+    std::fs::write(host.seed.join("no-identity.toml"), PUSH_WORKFLOW).unwrap();
+    let (code, created) = host
+        .api()
+        .request(
+            "POST",
+            "/v1/worker/sessions",
+            Some(&host.key),
+            None,
+            Some(json!({"session_type":"local","workdir":host.seed})),
+        )
+        .await;
+    assert!(code == 201 || code == 202, "{created}");
+    let session = created["id"].as_str().unwrap().to_owned();
+    wait_for_async("session setup", Duration::from_secs(30), || async {
+        let (_, v) = host
+            .api()
+            .get(&format!("/v1/worker/sessions/{session}"), Some(&host.key))
+            .await;
+        matches!(v["setup_status"].as_str(), Some("ready" | "failed")).then_some(())
+    })
+    .await;
+    let before = host.docker.calls().len();
+    let run = |args: Value| {
+        let host = &host;
+        let session = session.clone();
+        async move {
+            let (code, created) = host
+                .api()
+                .request(
+                    "POST",
+                    "/v1/worker/commands",
+                    Some(&host.key),
+                    None,
+                    Some(json!({"session_id":session,"subcommand":"exec workflow","args":args})),
+                )
+                .await;
+            assert!(code == 201 || code == 202, "{created}");
+            let path = format!("/v1/worker/commands/{}", created["id"].as_str().unwrap());
+            wait_for_async("command finished", Duration::from_secs(30), || async {
+                let (_, v) = host.api().get(&path, Some(&host.key)).await;
+                matches!(
+                    v["status"].as_str(),
+                    Some("done" | "error" | "failed" | "cancelled")
+                )
+                .then_some(v)
+            })
+            .await
+        }
+    };
+    let done = run(json!([
+        "identity.toml",
+        "--agent",
+        "claude",
+        "--prerequisite-identity",
+        "Push Author <push-author@example.invalid>"
+    ]))
+    .await;
+    assert_eq!(done["status"], "done", "{done}");
+    let started: Vec<Call> = host.docker.calls()[before..]
+        .iter()
+        .filter(|call| call.argv.first().map(String::as_str) == Some("run"))
+        .cloned()
+        .collect();
+    let agents: Vec<&Call> = started
+        .iter()
+        .filter(|call| !call.argv.iter().any(|a| a == "--entrypoint"))
+        .collect();
+    // The teardown step runs by `exec` in its phase container, which is
+    // started (with its environment) by the one non-agent `run`.
+    let teardown: Vec<&Call> = started
+        .iter()
+        .filter(|call| call.argv.iter().any(|a| a == "--entrypoint"))
+        .collect();
+    assert!(host.docker.calls()[before..].iter().any(|call| {
+        call.argv.first().map(String::as_str) == Some("exec")
+            && call
+                .argv
+                .iter()
+                .any(|a| a.contains("identity-teardown-marker"))
+    }));
+    assert_eq!(agents.len(), 3, "one container per step: {started:#?}");
+    assert_eq!(teardown.len(), 1, "one teardown container: {started:#?}");
+    let expected = expected_identity("Push Author", "push-author@example.invalid");
+    for call in agents.iter().chain(&teardown) {
+        assert_eq!(identity_env(call), expected, "{:?}", call.argv);
+    }
+
+    // `deny` keeps today's behaviour: no container is given an identity.
+    let before = host.docker.calls().len();
+    let done = run(json!([
+        "no-identity.toml",
+        "--agent",
+        "claude",
+        "--prerequisite-identity",
+        "deny"
+    ]))
+    .await;
+    assert_eq!(done["status"], "done", "{done}");
+    let started: Vec<Call> = host.docker.calls()[before..]
+        .iter()
+        .filter(|call| call.argv.first().map(String::as_str) == Some("run"))
+        .cloned()
+        .collect();
+    assert!(started.len() >= 4, "{started:#?}");
+    for call in &started {
+        assert!(identity_env(call).is_empty(), "{:?}", call.argv);
+    }
+    host.finish(|_, _| {}).await;
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_workflows_dynamic_changes_the_leader_and_mapping_for_one_item_only() {
     let host = Host::start(
@@ -899,11 +1224,26 @@ async fn exec_workflows_dynamic_changes_the_leader_and_mapping_for_one_item_only
         )])),
         guidance: Some(vec!["lease guidance".into()]),
     });
+    // The dynamic leader gets the run's identity like every step container.
+    item.exec.prerequisites = Some(awman_wsp::ExecPrerequisites {
+        git_identity: Some(awman_wsp::ExecGitIdentity {
+            name: "Leader Author".into(),
+            email: "leader-author@example.invalid".into(),
+        }),
+        ssh: None,
+        github_token: None,
+    });
     let lease = host.claim(item).await.expect("admitted");
     host.terminal(&lease).await;
     let first = host.runs();
     assert!(!first.is_empty(), "the leader started");
     let leader = &first[0];
+    assert_eq!(
+        identity_env(leader),
+        expected_identity("Leader Author", "leader-author@example.invalid"),
+        "{:?}",
+        leader.argv
+    );
     assert!(
         image(leader).ends_with("-codex:latest"),
         "{:?}",
@@ -936,6 +1276,7 @@ async fn exec_workflows_dynamic_changes_the_leader_and_mapping_for_one_item_only
         .expect("admitted");
     host.terminal(&lease).await;
     let second = &host.runs()[first.len()];
+    assert!(identity_env(second).is_empty(), "{:?}", second.argv);
     assert!(
         image(second).ends_with("-claude:latest"),
         "{:?}",
@@ -1324,4 +1665,315 @@ async fn generated_step_can_request_an_item_secret() {
         true,
     )
     .await;
+}
+
+fn prompt_identity(item: &mut WorkItem) {
+    item.exec.prerequisites = Some(awman_wsp::ExecPrerequisites {
+        git_identity: Some(awman_wsp::ExecGitIdentity {
+            name: "Prompt Author".into(),
+            email: "prompt-author@example.invalid".into(),
+        }),
+        ssh: None,
+        github_token: None,
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prompt_item_with_a_git_identity_commits_as_that_identity() {
+    let host = Host::start(
+        "daemon::lease_exec::a_prompt_item_with_a_git_identity_commits_as_that_identity",
+        Options {
+            mock: MockWorkServer::new().with_lease_ttl(chrono::Duration::seconds(30)),
+            ..Options::default()
+        },
+        |_| {},
+        |docker| {
+            docker.on(&["run"]).hold_until_released();
+        },
+    )
+    .await;
+    let mut item = host.item("prompt-identity");
+    item.push = Some(awman_wsp::Push {
+        enabled: true,
+        branch: String::new(),
+    });
+    prompt_identity(&mut item);
+    let branch = item.repo.branch.clone();
+    let lease = host.claim(item).await.expect("admitted");
+    // The prompt's container is given the identity; the leftover is committed as it.
+    let held = host.docker.wait_until_held(Duration::from_secs(20));
+    assert_eq!(
+        identity_env(&held),
+        expected_identity("Prompt Author", "prompt-author@example.invalid"),
+        "{:?}",
+        held.argv
+    );
+    std::fs::write(workspace_mount(&held).join("leftover.txt"), "agent work").unwrap();
+    host.docker.release();
+    let done = host.terminal(&lease).await;
+    let result = done.result.expect("result");
+    assert_eq!(result["result"]["outcome"], "done", "{result}");
+    let git = |args: &[&str]| {
+        host.s
+            .command("git")
+            .arg("-C")
+            .arg(&host.seed)
+            .args(args)
+            .label("git")
+            .run()
+            .stdout_text()
+    };
+    git(&["fetch", "origin", &branch]);
+    assert_eq!(
+        git(&["log", "-1", "--format=%an <%ae>|%cn <%ce>", "FETCH_HEAD"]).trim(),
+        "Prompt Author <prompt-author@example.invalid>|Prompt Author <prompt-author@example.invalid>"
+    );
+    host.finish(|_, _| {}).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prompt_identity_is_widening_where_the_worker_denies_identities() {
+    let host = Host::start(
+        "daemon::lease_exec::a_prompt_identity_is_widening_where_the_worker_denies_identities",
+        Options {
+            extra: json!({"workflows":{"prerequisites":{"gitIdentity":{"use":"deny"}}}}),
+            ..Options::default()
+        },
+        |_| {},
+        |_| {},
+    )
+    .await;
+    let mut item = host.item("prompt-denied-identity");
+    prompt_identity(&mut item);
+    let (code, message) = host.claim(item).await.expect_err("widening");
+    assert_eq!(code, "ineligible");
+    assert!(
+        message.contains("prerequisite_widening_refused: "),
+        "{message}"
+    );
+    assert!(host.runs().is_empty());
+    host.finish(|_, _| {}).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_prompt_accepts_a_git_identity_and_ignores_it() {
+    let host = Host::start(
+        "daemon::lease_exec::a_read_only_prompt_accepts_a_git_identity_and_ignores_it",
+        Options::default(),
+        |_| {},
+        |docker| {
+            docker.on(&["run"]).hold_until_released();
+        },
+    )
+    .await;
+    let mut item = host.item("prompt-read-only-identity");
+    item.exec.read_only = true;
+    prompt_identity(&mut item);
+    let lease = host.claim(item).await.expect("admitted");
+    let held = host.docker.wait_until_held(Duration::from_secs(20));
+    assert!(identity_env(&held).is_empty(), "{:?}", held.argv);
+    host.docker.release();
+    let done = host.terminal(&lease).await;
+    let result = done.result.expect("result");
+    assert_eq!(result["result"]["outcome"], "done", "{result}");
+    host.finish(|_, _| {}).await;
+}
+
+/// Run one held prompt lease with push and no `exec.prerequisites`, leave a
+/// change for the worker to commit, and return the held container's identity
+/// env and the pushed leftover commit's `author|committer`.
+async fn prompt_leftover_without_prerequisites(
+    id: &'static str,
+    worker_identity: Value,
+    repo_config: Option<&str>,
+) -> (BTreeMap<String, String>, String) {
+    let host = Host::start(
+        id,
+        Options {
+            mock: MockWorkServer::new().with_lease_ttl(chrono::Duration::seconds(30)),
+            extra: json!({"workflows":{"prerequisites":{"gitIdentity": worker_identity}}}),
+            ..Options::default()
+        },
+        |_| {},
+        |docker| {
+            docker.on(&["run"]).hold_until_released();
+        },
+    )
+    .await;
+    let git = |dir: &Path, args: &[&str]| {
+        host.s
+            .command("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .label("git")
+            .run()
+            .stdout_text()
+    };
+    if let Some(config) = repo_config {
+        std::fs::create_dir_all(host.seed.join(".awman")).unwrap();
+        std::fs::write(host.seed.join(".awman/config.json"), config).unwrap();
+        git(&host.seed, &["add", ".awman/config.json"]);
+        git(
+            &host.seed,
+            &[
+                "-c",
+                "user.name=Seed",
+                "-c",
+                "user.email=seed@example.invalid",
+                "commit",
+                "-q",
+                "-m",
+                "repo identity",
+            ],
+        );
+        git(&host.seed, &["push", "-q", "origin", "HEAD:main"]);
+    }
+    let mut item = host.item(id.rsplit("::").next().unwrap());
+    item.push = Some(awman_wsp::Push {
+        enabled: true,
+        branch: String::new(),
+    });
+    assert!(item.exec.prerequisites.is_none());
+    let branch = item.repo.branch.clone();
+    let lease = host.claim(item).await.expect("admitted");
+    let held = host.docker.wait_until_held(Duration::from_secs(20));
+    let env = identity_env(&held);
+    std::fs::write(workspace_mount(&held).join("leftover.txt"), "agent work").unwrap();
+    host.docker.release();
+    let done = host.terminal(&lease).await;
+    let result = done.result.expect("result");
+    assert_eq!(result["result"]["outcome"], "done", "{result}");
+    git(&host.seed, &["fetch", "origin", &branch]);
+    let leftover = git(
+        &host.seed,
+        &["log", "-1", "--format=%an <%ae>|%cn <%ce>", "FETCH_HEAD"],
+    )
+    .trim()
+    .to_string();
+    host.finish(|_, _| {}).await;
+    (env, leftover)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repository_identity_never_lifts_the_workers_identity_deny() {
+    let (env, leftover) = prompt_leftover_without_prerequisites(
+        "daemon::lease_exec::a_repository_identity_never_lifts_the_workers_identity_deny",
+        json!({"use": "deny"}),
+        Some(
+            r#"{"workflows":{"prerequisites":{"gitIdentity":{"use":"allow","name":"Review Canary","email":"review-canary@example.invalid"}}}}"#,
+        ),
+    )
+    .await;
+    assert!(env.is_empty(), "{env:?}");
+    assert!(!leftover.contains("Review Canary"), "{leftover}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_exec_prerequisites_the_workers_identity_reaches_the_agent_and_the_leftover() {
+    let (env, leftover) = prompt_leftover_without_prerequisites(
+        "daemon::lease_exec::without_exec_prerequisites_the_workers_identity_reaches_the_agent_and_the_leftover",
+        json!({"use": "allow", "name": "Worker Bot", "email": "worker-bot@example.invalid"}),
+        None,
+    )
+    .await;
+    assert_eq!(
+        env,
+        expected_identity("Worker Bot", "worker-bot@example.invalid")
+    );
+    assert_eq!(
+        leftover,
+        "Worker Bot <worker-bot@example.invalid>|Worker Bot <worker-bot@example.invalid>"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pushed_prompt_identity_is_refused_at_admission_where_the_server_denies_identities() {
+    let host = Host::start(
+        "daemon::lease_exec::a_pushed_prompt_identity_is_refused_at_admission_where_the_server_denies_identities",
+        Options {
+            pull: false,
+            push_sessions: true,
+            extra: json!({"workflows":{"prerequisites":{"gitIdentity":{"use":"deny"}}}}),
+            ..Options::default()
+        },
+        |_| {},
+        |_| {},
+    )
+    .await;
+    let (code, created) = host
+        .api()
+        .request(
+            "POST",
+            "/v1/worker/sessions",
+            Some(&host.key),
+            None,
+            Some(json!({"session_type":"local","workdir":host.seed})),
+        )
+        .await;
+    assert!(code == 201 || code == 202, "{created}");
+    let session = created["id"].as_str().unwrap().to_owned();
+    wait_for_async("session setup", Duration::from_secs(30), || async {
+        let (_, v) = host
+            .api()
+            .get(&format!("/v1/worker/sessions/{session}"), Some(&host.key))
+            .await;
+        matches!(v["setup_status"].as_str(), Some("ready" | "failed")).then_some(())
+    })
+    .await;
+    let before = host.docker.calls().len();
+    let submit = |args: Value| {
+        let host = &host;
+        let session = session.clone();
+        async move {
+            host.api()
+                .request(
+                    "POST",
+                    "/v1/worker/commands",
+                    Some(&host.key),
+                    None,
+                    Some(json!({"session_id":session,"subcommand":"exec prompt","args":args})),
+                )
+                .await
+        }
+    };
+    // Refused synchronously, before anything is queued or launched.
+    let (code, refused) = submit(json!([
+        "--agent",
+        "claude",
+        "--prerequisite-identity",
+        "Push Author <push-author@example.invalid>",
+        "say hello"
+    ]))
+    .await;
+    assert_eq!(code, 403, "{refused}");
+    assert!(
+        refused
+            .to_string()
+            .contains("prerequisite_widening_refused"),
+        "{refused}"
+    );
+    assert!(!host.docker.calls()[before..].iter().any(|call| call
+        .argv
+        .first()
+        .map(String::as_str)
+        == Some("run")));
+    // An admitted prompt reports the identity policy it runs under.
+    let (code, created) = submit(json!(["--agent", "claude", "say hello"])).await;
+    assert!(code == 201 || code == 202, "{created}");
+    assert_eq!(
+        created["flags_applied"]["prerequisites"]["gitIdentity"]["use"], "deny",
+        "{created}"
+    );
+    let path = format!("/v1/worker/commands/{}", created["id"].as_str().unwrap());
+    wait_for_async("command finished", Duration::from_secs(30), || async {
+        let (_, v) = host.api().get(&path, Some(&host.key)).await;
+        matches!(
+            v["status"].as_str(),
+            Some("done" | "error" | "failed" | "cancelled")
+        )
+        .then_some(())
+    })
+    .await;
+    host.finish(|_, _| {}).await;
 }

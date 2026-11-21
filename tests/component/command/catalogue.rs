@@ -365,6 +365,7 @@ fn exec_prompt_flags_are_the_base_set_plus_work_item() {
             "settings-profile",
             "agent-session",
             "automation",
+            "prerequisite-identity",
         ]
     );
     // Remote derivation drops the local-only selectors (worktree selectors and the
@@ -386,6 +387,7 @@ fn exec_prompt_flags_are_the_base_set_plus_work_item() {
             "work-item",
             "interactive",
             "read-only-workspace",
+            "prerequisite-identity",
         ]
     );
     // It composes with 0151's session-worktree selectors.

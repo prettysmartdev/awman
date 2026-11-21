@@ -240,16 +240,24 @@ pub(super) fn apply_item_config(
             ..Default::default()
         })?;
     }
-    Ok(plan.prerequisites.as_ref().and_then(|flags| {
-        let policy =
-            crate::command::commands::workflow_prerequisites::policy_for(session, flags, None);
-        match (policy.git_identity.use_, policy.git_identity.fixed) {
-            (crate::data::config::workflows::CredentialUse::Allow, Some(fixed)) => {
-                Some((fixed.name, fixed.email))
-            }
-            _ => None,
-        }
-    }))
+    // The same answer the run's own prerequisite flow injects into every
+    // step container, so the leftover commit and the agents' commits agree.
+    // An absent `exec.prerequisites` is no request overrides, not "no
+    // identity": the worker's own policy still applies, as it does in-run.
+    if plan.read_only_prompt {
+        return Ok(None);
+    }
+    use crate::command::commands::workflow_prerequisites as prerequisites;
+    let mut flags = plan.prerequisites.clone().unwrap_or_default();
+    prerequisites::apply_identity_ceiling(
+        crate::command::dispatch::catalogue::FrontendKind::WORKER_LOCAL,
+        &mut flags,
+        &prerequisites::remote_ceiling(session),
+    );
+    Ok(
+        prerequisites::granted_fixed_identity(&prerequisites::policy_for(session, &flags, None))
+            .map(|identity| (identity.name, identity.email)),
+    )
 }
 fn command_scratch(
     paths: crate::data::fs::api_paths::ApiPaths,
@@ -1007,6 +1015,7 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
         let execution = worker.execute_lease(command, execute_cancel);
         tokio::pin!(execution);
         let terminal_stop = active.done.child_token();
+        let _terminal_guard = terminal_stop.clone().drop_guard();
         let terminal = if lease.terminal {
             let session = session.clone();
             let reference = LeaseRef::of(lease);
@@ -1019,18 +1028,19 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
             let granted = lease.remote_input;
             let fence = active.control.clone();
             Some(tokio::spawn(async move {
-                let socket = tokio::select! { biased; _ = stop.cancelled() => return, socket = session.open_terminal(&reference) => socket };
-                let result = match socket {
-                    Ok(mut socket) => {
-                        terminal_relay(shared, hub, owner, granted)
-                            .run(&mut socket, stop)
-                            .await
-                    }
-                    Err(error) => Err(error),
+                use crate::engine::worker::terminal_relay::{
+                    LeaseTerminalOpener, TerminalRelayOutcome,
+                };
+                let mut opener = LeaseTerminalOpener::new(session, reference);
+                let result = tokio::select! {
+                    biased;
+                    _ = fence.cancelled().cancelled_owned() => return,
+                    result = terminal_relay(shared, hub, owner, granted)
+                        .run_reconnecting(&mut opener, stop) => result,
                 };
                 if matches!(
                     result,
-                    Err(WorkerEngineError::LeaseLost | WorkerEngineError::LinkRevoked)
+                    TerminalRelayOutcome::LeaseLost | TerminalRelayOutcome::LinkRevoked
                 ) {
                     fence.fence();
                 }
@@ -1279,6 +1289,8 @@ pub(super) async fn complete_foreground(
     if let Some(events) = events.take() {
         drain_events(events, &active.control).await?;
     }
+    // Stop terminal opening before the upstream result/release is polled.
+    active.done.cancel();
     if !active.control.may_report() {
         return Err("lease lost; result discarded".into());
     }
@@ -1626,6 +1638,7 @@ mod item_config_tests {
             command: vec!["exec".into(), "workflow".into()],
             args: vec![],
             prerequisites,
+            read_only_prompt: false,
             workflows_dynamic: dynamic,
         }
     }
@@ -1722,5 +1735,67 @@ mod item_config_tests {
             ),
         );
         assert!(error.is_err());
+    }
+
+    /// The leftover commit follows the worker's policy when the lease sends no
+    /// `exec.prerequisites`, and a repository identity never lifts a worker deny.
+    #[test]
+    fn leftover_identity_follows_worker_policy_and_its_deny_beats_the_repo() {
+        let sandbox = awman_test_support::TestSandbox::for_test(awman_test_support::TestCase::component(
+            "command::worker::runner::item_config_tests::leftover_identity_follows_worker_policy_and_its_deny_beats_the_repo",
+        ));
+        let run = |name: &str, global: &str, repo: Option<&str>, plan: &policy::LeasePlan| {
+            let home = sandbox.root().join(name).join("data");
+            let env = crate::data::config::env::EnvSnapshot::with_overrides([(
+                "AWMAN_HOME",
+                home.to_string_lossy().into_owned(),
+            )]);
+            let path = crate::data::config::file::global_config_path(&env).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, global).unwrap();
+            let root = sandbox.root().join(name).join("clone");
+            std::fs::create_dir_all(root.join(".awman")).unwrap();
+            if let Some(repo) = repo {
+                std::fs::write(root.join(".awman/config.json"), repo).unwrap();
+            }
+            let mut session = Session::open_at_git_root(
+                root.clone(),
+                root,
+                SessionOpenOptions {
+                    env: Some(env),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            apply_item_config(&mut session, plan).unwrap()
+        };
+        let allow_bot = r#"{"workflows":{"prerequisites":{"gitIdentity":{"use":"allow","name":"Bot","email":"bot@example.invalid"}}}}"#;
+        let deny = r#"{"workflows":{"prerequisites":{"gitIdentity":{"use":"deny"}}}}"#;
+        let repo_canary = r#"{"workflows":{"prerequisites":{"gitIdentity":{"use":"allow","name":"Review Canary","email":"review-canary@example.invalid"}}}}"#;
+
+        // No wire object: the worker's own fixed identity, as the agents get.
+        assert_eq!(
+            run("inherit", allow_bot, None, &plan(None, None)),
+            Some(("Bot".to_string(), "bot@example.invalid".to_string()))
+        );
+        // An empty wire object is the same request.
+        assert_eq!(
+            run(
+                "empty",
+                allow_bot,
+                None,
+                &plan(None, Some(PrerequisiteFlags::default()))
+            ),
+            Some(("Bot".to_string(), "bot@example.invalid".to_string()))
+        );
+        // A worker deny holds against the repository's own identity.
+        assert_eq!(
+            run("deny", deny, Some(repo_canary), &plan(None, None)),
+            None
+        );
+        // A read-only prompt resolves nothing.
+        let mut read_only = plan(None, None);
+        read_only.read_only_prompt = true;
+        assert_eq!(run("read-only", allow_bot, None, &read_only), None);
     }
 }

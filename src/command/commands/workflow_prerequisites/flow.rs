@@ -164,6 +164,33 @@ pub fn policy_for(
     session.prerequisite_policy()
 }
 
+/// The fixed identity `policy` grants to every container of a run: only
+/// `gitIdentity.use = "allow"` with a `fixed` name and email (a config
+/// value, `--prerequisite-identity "Name <email>"`, or a lease's
+/// `exec.prerequisites.git_identity`, which admission turns into that flag).
+/// `deny`, `host` and an unset identity give `None`, keeping the
+/// container's own identity and then the `awman <awman@localhost>`
+/// fallback. Push and lease runs both resolve the identity here; the lease
+/// runner's leftover commit uses the same answer.
+pub fn granted_fixed_identity(policy: &PrerequisitePolicy) -> Option<GitIdentityGrant> {
+    let identity = &policy.git_identity;
+    let fixed = identity.fixed.as_ref()?;
+    if identity.use_ != CredentialUse::Allow
+        || super::flags::validate_identity(&fixed.name, &fixed.email).is_err()
+    {
+        return None;
+    }
+    Some(GitIdentityGrant {
+        name: fixed.name.clone(),
+        email: fixed.email.clone(),
+        source: match identity.source {
+            PolicySource::Repo => IdentitySource::RepoConfig,
+            PolicySource::Flag => IdentitySource::Flag,
+            _ => IdentitySource::GlobalConfig,
+        },
+    })
+}
+
 /// Every custom agent definition's binary and name, for the host-command
 /// refusal list. First-party agents are refused by `HostSecretCommand` itself.
 pub fn custom_agent_binaries(session: &Session) -> Vec<String> {
@@ -789,6 +816,8 @@ impl WorkflowPrerequisiteFlow {
         show: bool,
     ) -> Result<PrerequisiteOutcome, CommandError> {
         let can_ask = frontend.can_ask_prerequisites();
+        // A fixed identity the policy grants is the run's, whatever its needs.
+        grants.run_identity = granted_fixed_identity(&self.options.policy);
         if show && can_ask {
             let unresolved = self.options.policy.unresolved_or(UnresolvedMode::Warn);
             frontend.show_workflow_prerequisites(
@@ -939,8 +968,14 @@ impl WorkflowPrerequisiteFlow {
                 email: email.to_string(),
                 source,
             });
+            let reach = if grants.run_identity == grants.identity {
+                "every workflow container"
+            } else {
+                "commit_changes containers"
+            };
+            // The values stay out of the report: it reaches events and logs.
             Resolution::Satisfied(Some(format!(
-                "identity \"{name} <{email}>\" injected into commit_changes containers"
+                "the granted git identity was injected into {reach}"
             )))
         };
         if grants.identity.is_some() {
@@ -1912,5 +1947,64 @@ fn headless_declined(check: &PrerequisiteCheck, what: &str) -> Resolution {
             check.explanation
         )),
         _ => Resolution::Unchanged,
+    }
+}
+
+#[cfg(test)]
+mod granted_identity_tests {
+    use super::*;
+    use crate::data::config::workflows::FixedIdentity;
+
+    fn policy(use_: CredentialUse, source: PolicySource, email: &str) -> PrerequisitePolicy {
+        let mut policy = PrerequisitePolicy::default();
+        policy.git_identity.use_ = use_;
+        policy.git_identity.source = source;
+        policy.git_identity.fixed = Some(FixedIdentity {
+            name: "Lease Bot".into(),
+            email: email.into(),
+        });
+        policy
+    }
+
+    #[test]
+    fn only_an_allowed_valid_fixed_identity_reaches_the_whole_run() {
+        let granted = granted_fixed_identity(&policy(
+            CredentialUse::Allow,
+            PolicySource::Flag,
+            "bot@x.test",
+        ))
+        .expect("granted");
+        assert_eq!(
+            (
+                granted.name.as_str(),
+                granted.email.as_str(),
+                granted.source
+            ),
+            ("Lease Bot", "bot@x.test", IdentitySource::Flag)
+        );
+        assert_eq!(
+            granted_fixed_identity(&policy(
+                CredentialUse::Allow,
+                PolicySource::Repo,
+                "bot@x.test"
+            ))
+            .map(|g| g.source),
+            Some(IdentitySource::RepoConfig)
+        );
+        // `deny` (and `host`/unset, which carry no fixed value) keep the
+        // container's own identity; a malformed value is never injected.
+        assert_eq!(
+            granted_fixed_identity(&policy(
+                CredentialUse::Deny,
+                PolicySource::Flag,
+                "bot@x.test"
+            )),
+            None
+        );
+        assert_eq!(
+            granted_fixed_identity(&policy(CredentialUse::Allow, PolicySource::Flag, "bot\n@x")),
+            None
+        );
+        assert_eq!(granted_fixed_identity(&PrerequisitePolicy::default()), None);
     }
 }

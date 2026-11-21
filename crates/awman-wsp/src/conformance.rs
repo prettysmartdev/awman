@@ -1,6 +1,8 @@
 //! Reusable HTTP conformance probes. The admin adapter provisions fixtures out of band.
 pub mod lease_context;
 pub mod lease_exec;
+#[cfg(feature = "terminal")]
+pub mod terminal;
 pub mod workflow_context;
 use crate::*;
 use serde_json::{json, Value};
@@ -9,6 +11,12 @@ pub type AdminFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 /// Object-safe async administration; implementations may call a server's own test API.
 pub trait ConformanceAdmin: Sync {
     fn enqueue(&self, item: WorkItem) -> AdminFuture<'_>;
+    /// Offer terminal access on a queued fixture before it is claimed. Servers
+    /// with terminals enabled by default need no override. The reconnect probe
+    /// requires the claimed fixture to advertise `terminal: true`.
+    fn enable_terminal<'a>(&'a self, _item_id: &'a str) -> AdminFuture<'a> {
+        Box::pin(async {})
+    }
     /// Set fixture age explicitly, including equal timestamps for preference ties.
     fn enqueue_at(&self, item: WorkItem, at: chrono::DateTime<chrono::Utc>) -> AdminFuture<'_>;
     /// Expire this lease so the item can be claimed again. A server that
@@ -57,6 +65,8 @@ pub fn cases() -> &'static [&'static str] {
         "release",
         "credentials",
         "heartbeat_cancel",
+        #[cfg(feature = "terminal")]
+        "terminal_reconnect",
     ]
 }
 /// Test fixture shared by the conformance runner and server implementers.
@@ -222,6 +232,10 @@ async fn probe(
     admin: &dyn ConformanceAdmin,
 ) -> Result<(), Error> {
     let id = format!("{prefix}_{case}");
+    #[cfg(feature = "terminal")]
+    if case == "terminal_reconnect" {
+        return terminal::reconnect(&id, a, admin).await;
+    }
     if case.starts_with("affinity_") {
         let op = match case {
             "affinity_in" => MatchOp::In,
@@ -526,6 +540,9 @@ async fn probe(
 }
 #[cfg(feature = "mock")]
 impl ConformanceAdmin for crate::mock::MockWorkServer {
+    fn enable_terminal<'a>(&'a self, item_id: &'a str) -> AdminFuture<'a> {
+        Box::pin(async move { self.set_terminal(item_id, true, false) })
+    }
     fn enqueue_at(&self, item: WorkItem, at: chrono::DateTime<chrono::Utc>) -> AdminFuture<'_> {
         Box::pin(async move {
             self.enqueue(item, at).expect("valid fixture");

@@ -461,7 +461,8 @@ pub(super) const EXEC_PROMPT_FLAGS: [FlagSpec;
         + READ_ONLY_WORKSPACE_FLAG.len()
         + SETTINGS_PROFILE_FLAG.len()
         + AGENT_SESSION_FLAG.len()
-        + AUTOMATION_FLAG.len()] = concat_flags(&[
+        + AUTOMATION_FLAG.len()
+        + PREREQUISITE_IDENTITY_FLAG.len()] = concat_flags(&[
     &AGENT_RUN_FLAGS_NO_WORKTREE,
     &WORK_ITEM_FLAG,
     &INTERACTIVE_FLAG,
@@ -470,6 +471,7 @@ pub(super) const EXEC_PROMPT_FLAGS: [FlagSpec;
     &SETTINGS_PROFILE_FLAG,
     &AGENT_SESSION_FLAG,
     &AUTOMATION_FLAG,
+    &PREREQUISITE_IDENTITY_FLAG,
 ]);
 
 /// `--work-item`, which `exec workflow` lists before everything else.
@@ -554,6 +556,21 @@ pub(super) const EXEC_WORKFLOW_TRAILING_FLAGS: [FlagSpec; 5] = [
     },
 ];
 
+/// `--prerequisite-identity`, shared by the grant flags below and `exec prompt`,
+/// which accepts only this one (a prompt has no SSH or token prerequisites).
+pub(super) const PREREQUISITE_IDENTITY_FLAG: [FlagSpec; 1] = [FlagSpec {
+    long: "prerequisite-identity",
+    short: None,
+    help: "Git identity for commit_changes and every agent container: host (your global \
+           git identity), \"Name <email>\", or deny. Never granted by --yes.",
+    kind: FlagKind::OptionalString,
+    default: FlagDefault::None,
+    frontends: FrontendVisibility::All,
+    conflicts_with: &[],
+    implies: &[],
+    optional: true,
+}];
+
 /// The workflow prerequisite grant flags (WI 0149), shared by `exec workflow`
 /// and `squad add` / `squad edit`.
 ///
@@ -563,18 +580,7 @@ pub(super) const EXEC_WORKFLOW_TRAILING_FLAGS: [FlagSpec; 5] = [
 /// command box and API `args`; an API or squad-daemon client is refused a
 /// value that grants beyond the server's global policy.
 pub(super) const PREREQUISITE_GRANT_FLAGS: [FlagSpec; 4] = [
-    FlagSpec {
-        long: "prerequisite-identity",
-        short: None,
-        help: "Git identity for commit_changes: host (your global git identity), \
-               \"Name <email>\", or deny. Never granted by --yes.",
-        kind: FlagKind::OptionalString,
-        default: FlagDefault::None,
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
+    PREREQUISITE_IDENTITY_FLAG[0],
     FlagSpec {
         long: "prerequisite-ssh",
         short: None,

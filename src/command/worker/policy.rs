@@ -316,6 +316,8 @@ pub struct LeasePlan {
     pub args: Vec<String>,
     /// `exec.prerequisites` as admitted; its flags are also in `args`.
     pub prerequisites: Option<PrerequisiteFlags>,
+    /// A read-only prompt: it commits nothing, so no identity is resolved for it.
+    pub read_only_prompt: bool,
     /// `exec.workflows_dynamic`, validated; the runner installs it as the
     /// lease session's task config layer.
     pub workflows_dynamic: Option<DynamicConfig>,
@@ -458,8 +460,18 @@ pub fn plan(
     }
     let command = match item.kind {
         WorkKind::Prompt => {
-            if item.exec.prerequisites.is_some() {
-                return Err("exec.prerequisites is only valid on workflow items".into());
+            // A prompt may carry a git identity only; credentials stay workflow-only.
+            if let Some(wire) = &item.exec.prerequisites {
+                for (field, set) in [
+                    ("ssh", wire.ssh.is_some()),
+                    ("github_token", wire.github_token.is_some()),
+                ] {
+                    if set {
+                        return Err(format!(
+                            "exec.prerequisites.{field} is only valid on workflow items"
+                        ));
+                    }
+                }
             }
             if item.exec.workflows_dynamic.is_some() {
                 return Err(DYNAMIC_ONLY.into());
@@ -506,14 +518,39 @@ pub fn plan(
             vec!["exec".into(), "workflow".into()]
         }
     };
-    let prerequisites = match &item.exec.prerequisites {
+    let mut prerequisites = match &item.exec.prerequisites {
         Some(wire) => {
             let (flags, flag_args) = lease_prerequisites(wire, host)?;
-            args.extend(flag_args);
-            Some(flags)
+            // A read-only prompt commits nothing and its container is never given
+            // an identity, so a valid request is accepted and then ignored.
+            if item.kind == WorkKind::Prompt && item.exec.read_only {
+                None
+            } else {
+                args.extend(flag_args);
+                Some(flags)
+            }
         }
         None => None,
     };
+    // A worker whose global policy denies identities denies one the cloned
+    // repository supplies too, for the agents and the leftover commit alike.
+    if let Some(ceiling) = host.prerequisite_policy {
+        use crate::command::commands::workflow_prerequisites as prerequisites_flow;
+        let mut flags = prerequisites.clone().unwrap_or_default();
+        let requested = flags.identity.is_some();
+        prerequisites_flow::apply_identity_ceiling(
+            crate::command::dispatch::catalogue::FrontendKind::WORKER_LOCAL,
+            &mut flags,
+            ceiling,
+        );
+        if !requested && flags.identity.is_some() {
+            args.extend([
+                format!("--{}", prerequisites_flow::FLAG_IDENTITY),
+                "deny".into(),
+            ]);
+            prerequisites = Some(flags);
+        }
+    }
     let workflows_dynamic = item
         .exec
         .workflows_dynamic
@@ -539,6 +576,7 @@ pub fn plan(
         command,
         args,
         prerequisites,
+        read_only_prompt: item.kind == WorkKind::Prompt && item.exec.read_only,
         workflows_dynamic,
     })
 }
@@ -939,7 +977,7 @@ mod lease_prerequisite_and_dynamic_tests {
                     .worker
             },
             &LeaseRuntimeSupport {
-                read_only_workspace: false,
+                read_only_workspace: item.exec.read_only,
                 outputs_mount: false,
                 skill_mounts: true,
                 secret_env: true,
@@ -1007,6 +1045,21 @@ mod lease_prerequisite_and_dynamic_tests {
         let plan = admit(&plain, None, &[]).unwrap();
         assert!(plan.prerequisites.is_none());
         assert!(tail(&plan).is_empty());
+        let plan = admit(&plain, Some(&policy(serde_json::json!({}))), &[]).unwrap();
+        assert!(tail(&plan).is_empty());
+        // A worker that denies identities denies the repository's one too.
+        let denying = policy(serde_json::json!({"gitIdentity": {"use": "deny"}}));
+        let mut prompt = workflow(serde_json::json!({}));
+        prompt.kind = WorkKind::Prompt;
+        prompt.exec.dynamic = false;
+        for item in [plain, prompt] {
+            let plan = admit(&item, Some(&denying), &[]).unwrap();
+            assert_eq!(tail(&plan), ["--prerequisite-identity", "deny"]);
+            assert_eq!(
+                plan.prerequisites.unwrap().identity,
+                Some(IdentityFlag::Deny)
+            );
+        }
     }
 
     #[test]
@@ -1081,13 +1134,38 @@ mod lease_prerequisite_and_dynamic_tests {
                 "{error}"
             );
         }
-        let mut prompt = workflow(serde_json::json!({"prerequisites": {"ssh": "deny"}}));
+        // A prompt takes a git identity only; credentials stay workflow-only.
+        for (field, value) in [("ssh", "deny"), ("github_token", "allow")] {
+            let mut prompt = workflow(serde_json::json!({"prerequisites": {field: value}}));
+            prompt.kind = WorkKind::Prompt;
+            prompt.exec.dynamic = false;
+            assert_eq!(
+                admit(&prompt, Some(&worker), FEATURES).unwrap_err(),
+                format!("exec.prerequisites.{field} is only valid on workflow items")
+            );
+        }
+        let identity = serde_json::json!({"prerequisites": {"git_identity": {"name": "A", "email": "a@b.test"}}});
+        let mut prompt = workflow(identity.clone());
         prompt.kind = WorkKind::Prompt;
         prompt.exec.dynamic = false;
-        assert_eq!(
-            admit(&prompt, Some(&worker), FEATURES).unwrap_err(),
-            "exec.prerequisites is only valid on workflow items"
-        );
+        let plan = admit(&prompt, Some(&worker), FEATURES).unwrap();
+        assert_eq!(plan.command, ["exec", "prompt"]);
+        assert!(plan
+            .args
+            .windows(2)
+            .any(|w| w == ["--prerequisite-identity", "A <a@b.test>"]));
+        assert!(plan.prerequisites.is_some());
+        // A read-only prompt accepts the identity and ignores it.
+        prompt.exec.read_only = true;
+        let plan = admit(&prompt, Some(&worker), FEATURES).unwrap();
+        assert!(plan.prerequisites.is_none());
+        assert!(!plan.args.iter().any(|a| a.starts_with("--prerequisite")));
+        // A worker that denies identities refuses a prompt's too.
+        let deny = policy(serde_json::json!({"gitIdentity": {"use": "deny"}}));
+        prompt.exec.read_only = false;
+        assert!(admit(&prompt, Some(&deny), FEATURES)
+            .unwrap_err()
+            .starts_with("prerequisite_widening_refused: "));
         let mut prompt = workflow(serde_json::json!({"workflows_dynamic": {}}));
         prompt.kind = WorkKind::Prompt;
         prompt.exec.dynamic = false;

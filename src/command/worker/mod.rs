@@ -921,8 +921,9 @@ impl<F: ApiCommandFrontendFactory + 'static> PullController<F> {
                     .map_err(|error| error.to_string())?
                     .merged();
                 // The worker's own global policy, with no request flags: the
-                // ceiling `exec.prerequisites` may not widen. Daemon only (D7).
-                let prerequisite_policy = (!foreground && lease.item.exec.prerequisites.is_some())
+                // ceiling `exec.prerequisites` may not widen, and whose identity
+                // deny no repository may lift. Daemon only (D7).
+                let prerequisite_policy = (!foreground)
                     .then(|| self.global_prerequisite_policy())
                     .flatten();
                 policy::plan(
@@ -1449,8 +1450,8 @@ impl<F: ApiCommandFrontendFactory + 'static> PullHandle for PullHandleAdapter<F>
     async fn foreground_terminal(
         &self,
         id: &crate::data::ids::LeaseId,
-        frames: Vec<awman_wsp::terminal::LeaseTerminalFrame>,
-    ) -> Result<Vec<awman_wsp::terminal::LeaseTerminalFrame>, WorkerError> {
+        frames: crate::data::worker::wire::TerminalExchange,
+    ) -> Result<crate::data::worker::wire::TerminalExchangeReply, WorkerError> {
         let bridge = {
             let runs = self.0.foreground.lock().await;
             let (run, _) = runs.get(id.as_str()).ok_or(WorkerError::LeaseNotFound)?;

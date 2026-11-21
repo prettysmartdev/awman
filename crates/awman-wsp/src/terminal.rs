@@ -95,7 +95,38 @@ mod transport {
         MaybeTlsStream, WebSocketStream,
     };
 
-    pub struct TerminalSocket(WebSocketStream<MaybeTlsStream<TcpStream>>);
+    /// A lease terminal WebSocket. It records when the peer was last heard
+    /// from (any message, including a pong) so a holder can send keepalive
+    /// pings and notice a peer that vanished without closing the connection.
+    pub struct TerminalSocket {
+        socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        last_seen: tokio::time::Instant,
+        last_ping: Option<tokio::time::Instant>,
+    }
+    impl TerminalSocket {
+        fn new(socket: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
+            Self {
+                socket,
+                last_seen: tokio::time::Instant::now(),
+                last_ping: None,
+            }
+        }
+        /// When any message last arrived from the peer.
+        pub fn last_seen(&self) -> tokio::time::Instant {
+            self.last_seen
+        }
+        /// When [`Self::ping`] last sent a ping.
+        pub fn last_ping(&self) -> Option<tokio::time::Instant> {
+            self.last_ping
+        }
+        /// Send a keepalive ping; the peer's pong refreshes [`Self::last_seen`].
+        pub async fn ping(&mut self) -> Result<(), Error> {
+            self.last_ping = Some(tokio::time::Instant::now());
+            futures_util::SinkExt::send(&mut self.socket, Message::Ping(Default::default()))
+                .await
+                .map_err(Error::from)
+        }
+    }
     impl std::fmt::Debug for TerminalSocket {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("TerminalSocket").finish_non_exhaustive()
@@ -105,16 +136,22 @@ mod transport {
         type Item = Result<LeaseTerminalFrame, Error>;
         fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             loop {
-                match std::task::ready!(Pin::new(&mut self.0).poll_next(cx)) {
+                let message = std::task::ready!(Pin::new(&mut self.socket).poll_next(cx));
+                if matches!(message, Some(Ok(_))) {
+                    self.last_seen = tokio::time::Instant::now();
+                }
+                match message {
+                    // A frame this worker cannot decode (a newer frame type, a
+                    // server-only frame or a binary message) is skipped: failing
+                    // the stream would only reconnect into the same frame again.
                     Some(Ok(Message::Text(text))) => {
-                        return Poll::Ready(Some(
-                            LeaseTerminalFrame::decode_input(&text)
-                                .map_err(|_| Error::InvalidResponse),
-                        ))
+                        match LeaseTerminalFrame::decode_input(&text) {
+                            Ok(frame) => return Poll::Ready(Some(Ok(frame))),
+                            Err(_) => continue,
+                        }
                     }
                     Some(Ok(Message::Close(_))) | None => return Poll::Ready(None),
-                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
-                    Some(Ok(_)) => return Poll::Ready(Some(Err(Error::InvalidResponse))),
+                    Some(Ok(_)) => continue,
                     Some(Err(e)) => return Poll::Ready(Some(Err(e.into()))),
                 }
             }
@@ -123,19 +160,25 @@ mod transport {
     impl Sink<LeaseTerminalFrame> for TerminalSocket {
         type Error = Error;
         fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-            Pin::new(&mut self.0).poll_ready(cx).map_err(Error::from)
+            Pin::new(&mut self.socket)
+                .poll_ready(cx)
+                .map_err(Error::from)
         }
         fn start_send(mut self: Pin<&mut Self>, frame: LeaseTerminalFrame) -> Result<(), Error> {
             let text = serde_json::to_string(&frame).map_err(|_| Error::InvalidResponse)?;
-            Pin::new(&mut self.0)
+            Pin::new(&mut self.socket)
                 .start_send(Message::Text(text.into()))
                 .map_err(Error::from)
         }
         fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-            Pin::new(&mut self.0).poll_flush(cx).map_err(Error::from)
+            Pin::new(&mut self.socket)
+                .poll_flush(cx)
+                .map_err(Error::from)
         }
         fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
-            Pin::new(&mut self.0).poll_close(cx).map_err(Error::from)
+            Pin::new(&mut self.socket)
+                .poll_close(cx)
+                .map_err(Error::from)
         }
     }
     impl Client {
@@ -174,7 +217,7 @@ mod transport {
                         {
                             return Err(Error::InvalidResponse);
                         }
-                        return Ok(TerminalSocket(socket));
+                        return Ok(TerminalSocket::new(socket));
                     }
                     Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
                         if response.status() == StatusCode::UNAUTHORIZED && retry == 0 {
@@ -185,6 +228,14 @@ mod transport {
                             .body()
                             .as_ref()
                             .and_then(|b| serde_json::from_slice(b).ok())
+                            .or_else(|| {
+                                (response.status() == StatusCode::NOT_FOUND).then(|| {
+                                    crate::ApiError {
+                                        code: "not_found".into(),
+                                        error: "lease terminals are unavailable".into(),
+                                    }
+                                })
+                            })
                             .ok_or(Error::InvalidResponse)?;
                         return Err(crate::client::response_error(response.status(), body));
                     }

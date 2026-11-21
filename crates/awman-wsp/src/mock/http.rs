@@ -165,6 +165,13 @@ async fn dispatch_inner(
             .as_ref()
             .and_then(|(_, w)| w.as_deref())
             .ok_or_else(|| error("worker_not_found"))?;
+        *server
+            .inner
+            .lock()
+            .unwrap()
+            .terminal_attempts
+            .entry(segments[2].to_string())
+            .or_default() += 1;
         let lease = lease_auth(&server, segments[2], worker, &parts.headers)?;
         if let Some(code) = server
             .inner
@@ -192,20 +199,42 @@ async fn dispatch_inner(
         let upgrade = WebSocketUpgrade::from_request_parts(&mut parts, &())
             .await
             .map_err(|_| error("invalid_request"))?;
-        let mut outbound = server
-            .inner
-            .lock()
-            .unwrap()
-            .leases
-            .get(&lease.id)
-            .ok_or_else(|| error("lease_lost"))?
-            .outbound
-            .subscribe();
+        // Install ownership in handshake order, before upgrade tasks can race.
+        let (mut outbound, mut stop, connection, _stop_keepalive) = {
+            let mut state = server.inner.lock().unwrap();
+            let ignore_replacement = state.fault == Some(MockFault::IgnoreTerminalReplacement);
+            let connection = state
+                .terminal_connections
+                .get(&lease.id)
+                .map_or(1, |sockets| sockets.len() + 1);
+            let active = state
+                .leases
+                .get_mut(&lease.id)
+                .filter(|l| l.lease.epoch == lease.epoch)
+                .ok_or_else(|| error("lease_lost"))?;
+            if !ignore_replacement {
+                active.terminal_stop.send_replace(true);
+            }
+            active.terminal_stop = watch::channel(false).0;
+            active.terminal_connection = connection;
+            let outbound = active.outbound.subscribe();
+            let stop = active.terminal_stop.subscribe();
+            let keepalive = active.terminal_stop.clone();
+            state
+                .terminal_connections
+                .entry(lease.id.clone())
+                .or_default()
+                .push(Vec::new());
+            (outbound, stop, connection, keepalive)
+        };
         let headers = parts.headers.clone();
         return Ok(upgrade.protocols([crate::terminal::SUBPROTOCOL]).on_upgrade(move |mut socket| async move {
+            let _stop_keepalive = _stop_keepalive;
             let mut tick=tokio::time::interval(std::time::Duration::from_millis(25));
             loop {
                 tokio::select! {
+                    biased;
+                    _=stop.changed()=> { break; }
                     _=tick.tick()=> {
                         if super::http::identity(&server,&headers).is_err() || lease_auth(&server,&lease.id,&worker_id(&server,&lease.id),&headers).is_err() { break; }
                     }
@@ -224,8 +253,9 @@ async fn dispatch_inner(
                                     let _=socket.send(Message::Close(Some(axum::extract::ws::CloseFrame{code:1007,reason:"invalid_frame".into()}))).await; break;
                                 }
                                 let mut s=server.inner.lock().unwrap(); expire(&mut s,Utc::now());
-                                if s.leases.get(&lease.id).is_none_or(|l| l.lease.epoch != lease.epoch) { break; }
-                                s.frames.entry(lease.id.clone()).or_default().push(frame);
+                                if s.leases.get(&lease.id).is_none_or(|l| l.lease.epoch != lease.epoch || l.terminal_connection != connection) { break; }
+                                s.frames.entry(lease.id.clone()).or_default().push(frame.clone());
+                                s.terminal_connections.get_mut(&lease.id).unwrap()[connection - 1].push(frame);
                             }
                             Some(Ok(Message::Ping(bytes)))=> { if socket.send(Message::Pong(bytes)).await.is_err() { break; } }
                             Some(Ok(Message::Pong(_)))=> {}
@@ -234,6 +264,7 @@ async fn dispatch_inner(
                     }
                 }
             }
+            let _ = socket.send(Message::Close(None)).await;
         }).into_response());
     }
     let bytes = to_bytes(body, 4 * 1024 * 1024)

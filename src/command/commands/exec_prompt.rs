@@ -110,6 +110,8 @@ pub struct ExecPromptCommand {
     /// `--read-only-workspace` (WI 0152). A pulled lease's read-only engine
     /// makes the launch read-only whatever this says.
     workspace_access: crate::data::workspace::WorkspaceAccess,
+    /// `--prerequisite-identity` (the only prerequisite a prompt takes).
+    prerequisites: crate::data::config::flags::PrerequisiteFlags,
 }
 
 impl ExecPromptCommand {
@@ -122,7 +124,17 @@ impl ExecPromptCommand {
             cancel: tokio_util::sync::CancellationToken::new(),
             output_dir: None,
             workspace_access: Default::default(),
+            prerequisites: Default::default(),
         }
+    }
+
+    /// Grant the flag-selected git identity to the agent container.
+    pub fn with_prerequisites(
+        mut self,
+        prerequisites: crate::data::config::flags::PrerequisiteFlags,
+    ) -> Self {
+        self.prerequisites = prerequisites;
+        self
     }
 
     /// Mount the workspace read-only (`--read-only-workspace`, WI 0152).
@@ -523,6 +535,21 @@ impl Command for ExecPromptCommand {
                 launch_mode: match launch_decision {
                     LaunchModeDecision::Acp => crate::data::config::agents::LaunchMode::Acp,
                     _ => crate::data::config::agents::LaunchMode::Stdio,
+                },
+                // A fixed identity reaches the container as GIT_* env, which wins over
+                // any repository or global `user.name`. A read-only prompt ignores it.
+                grant_env: if workspace_access.is_read_only() {
+                    Vec::new()
+                } else {
+                    crate::command::commands::workflow_prerequisites::granted_fixed_identity(
+                        &crate::command::commands::workflow_prerequisites::policy_for(
+                            &session,
+                            &self.prerequisites,
+                            None,
+                        ),
+                    )
+                    .map(|identity| crate::engine::overlay::prerequisite_grants::identity_env(&identity))
+                    .unwrap_or_default()
                 },
                 ..Default::default()
             };

@@ -182,11 +182,14 @@ impl UserMessageSink for AgentFrontendProxy {
 // container instance from per-step parameters + command flags, then binds a
 // `AgentFrontendProxy` to it via `run_with_frontend`.
 //
-// Workflow prerequisite grants (WI 0149) are deliberately not a field and
-// never passed in: this factory launches main agent steps, the dynamic leader
-// and `on_failure` remediation agents (`launch_on_failure_agent`), none of
-// which may receive the user's SSH key, token or identity. Grants reach only
+// Workflow prerequisite credentials (WI 0149) are deliberately not a field
+// and never passed in: this factory launches main agent steps, parallel
+// groups and `on_failure` remediation agents (`launch_on_failure_agent`),
+// none of which may receive the user's SSH key or token. Those reach only
 // setup/teardown containers, through `apply_grant_overlays` in `prepare.rs`.
+// The one grant every container shares is the run's fixed commit identity
+// (`grant_env`, from `agent_container_env`), the same value setup/teardown
+// containers get from `prerequisite_grant_overlays`.
 
 pub(crate) struct CommandLayerFactory {
     pub(crate) settings_profile: Option<crate::data::settings_profile::SettingsProfileName>,
@@ -223,6 +226,9 @@ pub(crate) struct CommandLayerFactory {
     /// read-only when this, its own `read_only_workspace` or a read-only
     /// lease engine says so.
     pub(crate) workspace_access: crate::data::workspace::WorkspaceAccess,
+    /// `GIT_AUTHOR_*`/`GIT_COMMITTER_*` for the run's fixed identity, set on
+    /// every agent container this factory launches. Empty without one.
+    pub(crate) grant_env: Vec<(String, String)>,
 }
 
 /// The `agentFlags` resolver for every agent a workflow run launches.
@@ -446,6 +452,7 @@ impl CommandLayerFactory {
             image_tag_override: Some(correct_tag),
             system_prompt,
             context_overlays,
+            grant_env: self.grant_env.clone(),
         };
         let request = crate::command::commands::launch_policy::settings_profile::ProfileRequest {
             name: step
