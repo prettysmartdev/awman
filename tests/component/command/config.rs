@@ -63,17 +63,17 @@ fn active_runtime_config_examples_parse_and_retired_names_hint_current_syntax() 
         "{obsolete_scalar}"
     );
 
-    let getting_started = include_str!("../../../docs/00-getting-started.md");
-    let docs_example = json_examples(getting_started)
+    let runtimes = include_str!("../../../docs/11-runtimes.md");
+    let docs_example = json_examples(runtimes)
         .into_iter()
         .find(|(_, example)| example.contains("\"kind\": \"builtin\""))
-        .expect("builtin config example in getting started");
+        .expect("builtin config example in runtimes guide");
     ConfigFile::parse(
         &docs_example.1,
         FileKind::Global,
-        Path::new("getting-started.json"),
+        Path::new("runtimes-guide.json"),
     )
-    .expect("the getting-started builtin config example should use current syntax");
+    .expect("the runtimes guide builtin config example should use current syntax");
 
     // Parse every active builtin config sample in the configuration guide
     // through the same production decoder used for config files.
