@@ -515,10 +515,12 @@ async fn builtin_default_state_directory_is_retained_during_session_admission() 
         )
         .await
         .unwrap_or_else(|e| panic!("unchanged process binding must admit: {e:?}"));
-    assert_eq!(admitted.plan.mount_authority.unwrap().root(), repo.path());
+    assert_eq!(
+        admitted.plan.mount_authority.unwrap().root(),
+        repo.path().canonicalize().unwrap()
+    );
     api.lifecycle().close(&admitted.session_id).await.unwrap();
     runtime.shutdown(StopMode::Now).await;
-    s.finish();
 }
 
 #[test]

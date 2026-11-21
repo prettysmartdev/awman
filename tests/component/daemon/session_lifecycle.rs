@@ -147,10 +147,11 @@ async fn typed_and_http_setup_have_identical_authority_state_and_events() {
         assert_eq!(row.setup_status, SessionSetupStatus::Failed);
         let session = api.sessions.get_by_key(id).expect("setup opened session");
         let session = session.read().await;
-        assert_eq!(session.git_root(), repo.path());
+        let canonical_repo = repo.path().canonicalize().unwrap();
+        assert_eq!(session.git_root(), canonical_repo);
         assert_eq!(
             session.granted_mount_authority().unwrap().root(),
-            repo.path()
+            canonical_repo
         );
         let bus = api.setup_buses.lock().await.get(id).unwrap().clone();
         let saved = api.paths.read_setup_state(id).unwrap();

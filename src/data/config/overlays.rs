@@ -313,17 +313,18 @@ fn parse_single_typed_overlay(expr: &str) -> Result<TypedOverlay, String> {
     }
 }
 
-/// Split a leading Windows drive (`C:` before `\` or `/`) from `args`.
+/// Split a Windows drive (`C:` or `\\?\C:` before `\` or `/`) from `args`.
 /// Other platforms have no drives, so their parsing is unchanged.
 fn split_windows_drive(args: &str) -> (&str, &str) {
     if cfg!(windows) {
         let bytes = args.as_bytes();
-        if bytes.len() > 2
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && matches!(bytes[2], b'\\' | b'/')
+        let offset = if args.starts_with(r"\\?\") { 4 } else { 0 };
+        if bytes.len() > offset + 2
+            && bytes[offset].is_ascii_alphabetic()
+            && bytes[offset + 1] == b':'
+            && matches!(bytes[offset + 2], b'\\' | b'/')
         {
-            return args.split_at(2);
+            return args.split_at(offset + 2);
         }
     }
     ("", args)
@@ -541,6 +542,7 @@ mod windows_drive_tests {
                 r"C:\work\payload.json",
             ),
             ("dir(d:/work:/work)", "d:/work"),
+            (r"dir(\\?\D:\work:/work:ro)", r"\\?\D:\work"),
         ] {
             let parsed = parse_overlay_list(raw).unwrap();
             let TypedOverlay::Directory(spec) = &parsed[0] else {

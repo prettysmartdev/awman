@@ -925,7 +925,9 @@ async fn profile_api_admission_requires_authenticated_local_owner() {
             fs::api_labels::Labels,
         },
     };
-    let s = TestSandbox::new();
+    let s = crate::support::sandbox(
+        "command::settings_profiles::profile_api_admission_requires_authenticated_local_owner",
+    );
     let fixture = super::support::AdmissionFixture::new(&s);
     let command = || CommandSubmission {
         secrets: None,

@@ -45,8 +45,9 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -59,6 +60,41 @@ const LOCAL_SYSTEM: &str = "S-1-5-18";
 const BUILTIN_ADMINISTRATORS: &str = "S-1-5-32-544";
 const OWNER_RIGHTS: &str = "S-1-3-4";
 const CREATOR_OWNER: &str = "S-1-3-0";
+
+/// Identity of the object currently resolved by a source path. Open the
+/// directory without OPEN_REPARSE_POINT so a replaced link is followed, then
+/// compare the volume and file index captured from the open handle.
+pub fn source_identity(path: &Path) -> io::Result<(u64, u64)> {
+    let name = wide(path)?;
+    // FILE_READ_ATTRIBUTES; only metadata access is needed.
+    const READ_ATTRIBUTES: u32 = 0x80;
+    // SAFETY: name is NUL-terminated; the handle is owned below on success.
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: CreateFileW returned a valid handle that nothing else owns.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    // SAFETY: zeroed is a valid BY_HANDLE_FILE_INFORMATION; handle is live.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(handle.as_raw_handle() as HANDLE, &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((
+        u64::from(info.dwVolumeSerialNumber),
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
 
 /// Create the directory `path` (its parent must exist) owned by this user,
 /// with a protected DACL granting only this user, inherited by its children.

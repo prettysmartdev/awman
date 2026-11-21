@@ -591,7 +591,6 @@ mod authority {
             matches!(e, EngineError::MountOutsideAuthority { .. })
         });
         assert_eq!(w.launches().len(), 2, "refused before the runtime");
-        s.finish();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -625,7 +624,6 @@ mod authority {
                 assert_only_root(launch, dir);
             }
         }
-        s.finish();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -683,7 +681,6 @@ mod authority {
         assert!(w.sessions.get_by_key(&id).is_none());
         assert!(w.store.mount_authority(&id).unwrap().is_none());
         assert!(w.launches().is_empty());
-        s.finish();
     }
 
     #[cfg(unix)]
@@ -727,7 +724,6 @@ mod authority {
         assert!(w.launches().is_empty());
         std::fs::remove_file(&root).unwrap();
         std::fs::rename(&moved, &root).unwrap();
-        s.finish();
     }
 
     /// The workspace is swapped while the engine prepares the launch, after
@@ -788,7 +784,6 @@ mod authority {
         let launches = w.launches();
         assert_eq!(launches.len(), 1);
         assert_only_root(&launches[0], &root);
-        s.finish();
     }
 
     /// A Git directory mount (presented to the guest as `.git`, like the
@@ -854,7 +849,6 @@ mod authority {
             1,
             "every redirect refused before the runtime"
         );
-        s.finish();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -910,7 +904,6 @@ mod authority {
             w.launches().is_empty(),
             "no runtime create for an unrevalidated session"
         );
-        s.finish();
     }
 
     #[cfg(unix)]
@@ -965,6 +958,5 @@ mod authority {
             plan.mount_authority.unwrap().root(),
             repo.path().canonicalize().unwrap()
         );
-        s.finish();
     }
 }

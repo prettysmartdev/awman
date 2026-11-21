@@ -238,7 +238,6 @@ async fn api_process_overrides_are_refused_before_session_and_queue_allocation()
             .len(),
         1
     );
-    s.finish();
 }
 
 #[test]

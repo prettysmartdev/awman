@@ -411,5 +411,4 @@ async fn restart_publishes_committed_automation_once_and_never_requeues_input() 
         assert!(events.windows(2).all(|w| w[0].cursor() < w[1].cursor()));
         restarted.shutdown().await;
     }
-    sandbox.finish();
 }

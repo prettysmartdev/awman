@@ -46,6 +46,7 @@ pub use metadata::publish as publish_git_metadata;
 #[cfg(windows)]
 pub fn install_metadata_publisher() {
     awman::data::fs::git_metadata::GitMetadataCopy::install_windows_publisher(metadata::publish);
+    awman::data::mount_authority::install_windows_source_identity(private_fs::source_identity);
     install_private_files();
 }
 

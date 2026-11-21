@@ -609,7 +609,12 @@ impl LaunchMountPins {
             // A local invocation over a path that does not exist (an
             // in-memory fixture) has nothing to pin; policy grants fail
             // closed like their authority check.
-            if authority.is_policy_granted() {
+            if authority.is_policy_granted()
+                || !matches!(
+                    std::fs::metadata(host),
+                    Err(ref error) if error.kind() == std::io::ErrorKind::NotFound
+                )
+            {
                 Err(outside_authority(authority, host, e))
             } else {
                 Ok(None)

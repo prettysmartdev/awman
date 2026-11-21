@@ -12,6 +12,8 @@
 //! passes the verified result to a named constructor here.
 
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -438,14 +440,45 @@ pub struct SourceIdentity {
     ino: u64,
 }
 
+#[cfg(windows)]
+type WindowsSourceIdentity = fn(&Path) -> std::io::Result<(u64, u64)>;
+#[cfg(windows)]
+static WINDOWS_SOURCE_IDENTITY: OnceLock<WindowsSourceIdentity> = OnceLock::new();
+
+/// Install the binary's native Windows file-identity reader before any mount
+/// source is admitted. An uninstalled reader causes a refusal.
+#[cfg(windows)]
+pub fn install_windows_source_identity(reader: fn(&Path) -> std::io::Result<(u64, u64)>) {
+    let _ = WINDOWS_SOURCE_IDENTITY.set(reader);
+}
+
 impl SourceIdentity {
     /// The identity of what `path` resolves to now, following links.
     pub fn of(path: &Path) -> Result<Option<Self>, MountAuthorityError> {
-        let metadata = std::fs::metadata(path).map_err(|e| MountAuthorityError::Unresolvable {
-            path: path.to_path_buf(),
-            reason: e.to_string(),
-        })?;
-        Ok(Self::from_metadata(&metadata))
+        #[cfg(windows)]
+        {
+            let reader =
+                WINDOWS_SOURCE_IDENTITY
+                    .get()
+                    .ok_or_else(|| MountAuthorityError::Unresolvable {
+                        path: path.to_path_buf(),
+                        reason: "native Windows file identity is not installed".into(),
+                    })?;
+            let (dev, ino) = reader(path).map_err(|e| MountAuthorityError::Unresolvable {
+                path: path.to_path_buf(),
+                reason: e.to_string(),
+            })?;
+            return Ok(Some(Self { dev, ino }));
+        }
+        #[cfg(not(windows))]
+        {
+            let metadata =
+                std::fs::metadata(path).map_err(|e| MountAuthorityError::Unresolvable {
+                    path: path.to_path_buf(),
+                    reason: e.to_string(),
+                })?;
+            Ok(Self::from_metadata(&metadata))
+        }
     }
 
     #[cfg(unix)]
@@ -457,7 +490,7 @@ impl SourceIdentity {
         })
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn from_metadata(_: &std::fs::Metadata) -> Option<Self> {
         None
     }
