@@ -506,9 +506,11 @@ impl TerminalRelay {
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         for record in self.hub.list(Some(&self.owner)) {
-                            if !subscriptions.contains_key(&record.id) {
-                                if let Ok(subscription) = self.hub.subscribe(&record.id) {
-                                    subscriptions.insert(record.id, subscription);
+                            if let std::collections::hash_map::Entry::Vacant(entry) =
+                                subscriptions.entry(record.id)
+                            {
+                                if let Ok(subscription) = self.hub.subscribe(entry.key()) {
+                                    entry.insert(subscription);
                                 }
                             }
                         }
