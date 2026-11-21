@@ -457,13 +457,23 @@ impl SourceIdentity {
     pub fn of(path: &Path) -> Result<Option<Self>, MountAuthorityError> {
         #[cfg(windows)]
         {
-            let reader =
-                WINDOWS_SOURCE_IDENTITY
-                    .get()
-                    .ok_or_else(|| MountAuthorityError::Unresolvable {
+            let reader = if let Some(reader) = WINDOWS_SOURCE_IDENTITY.get() {
+                *reader
+            } else {
+                // The library's unit tests link a separate copy of awman
+                // through the native shim dev-dependency.
+                #[cfg(test)]
+                {
+                    awman_host_shims::mount_source_identity
+                }
+                #[cfg(not(test))]
+                {
+                    return Err(MountAuthorityError::Unresolvable {
                         path: path.to_path_buf(),
                         reason: "native Windows file identity is not installed".into(),
-                    })?;
+                    });
+                }
+            };
             let (dev, ino) = reader(path).map_err(|e| MountAuthorityError::Unresolvable {
                 path: path.to_path_buf(),
                 reason: e.to_string(),

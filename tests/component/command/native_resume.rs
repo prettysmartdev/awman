@@ -7,11 +7,14 @@ use awman::{
         overlay::OverlayEngine,
     },
 };
+#[cfg(unix)]
 use awman_test_support::TestSandbox;
 use std::sync::Arc;
 #[test]
 fn per_agent_exact_resume_argv_parity_and_parent_option_order() {
-    let s = TestSandbox::new();
+    let s = crate::support::sandbox(
+        "command::native_resume::per_agent_exact_resume_argv_parity_and_parent_option_order",
+    );
     let session = super::settings_profiles::session(&s);
     let runtime = super::settings_profiles::Runtime::new();
     let overlay = Arc::new(OverlayEngine::with_auth_resolver(
@@ -81,7 +84,9 @@ fn breaking_opencode_layouts_have_distinct_profile_identity() {
 }
 #[test]
 fn plan_reapplied_on_resume_and_conflicting_provider_selector_refused() {
-    let s = TestSandbox::new();
+    let s = crate::support::sandbox(
+        "command::native_resume::plan_reapplied_on_resume_and_conflicting_provider_selector_refused",
+    );
     let session = super::settings_profiles::session(&s);
     let runtime = super::settings_profiles::Runtime::new();
     let engine = AgentEngine::new(

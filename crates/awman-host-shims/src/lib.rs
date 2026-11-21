@@ -60,7 +60,8 @@ pub use metadata::publish_replacing as publish_private_file;
 #[cfg(windows)]
 pub use private_fs::{
     create_dir as private_create_dir, create_file as private_create_file,
-    final_path as private_final_path, verify as private_verify,
+    final_path as private_final_path, source_identity as mount_source_identity,
+    verify as private_verify,
 };
 
 /// Install the native Windows boundary used by `awman::data::fs::private_files`.
