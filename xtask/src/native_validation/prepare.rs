@@ -100,8 +100,17 @@ pub(super) fn run(r: &mut Run, m: &Manifest) -> Result<()> {
     let store = r.work.join("fixtures");
     fs::create_dir_all(&store)?;
     // Preparation can use the network. Tests receive only the resulting pinned bytes.
-    // Resolve the tag once, then pull/save by immutable digest; record both provenance
-    // and archive hashes. A future reviewer can reproduce this input independently.
+    // Pull the reviewed immutable reference, then record the local archive bytes.
+    let pinned_image = fs::read_to_string(r.root.join("ci/fixture-base-image.txt"))?;
+    let pinned_image = pinned_image.trim();
+    ensure!(
+        pinned_image.starts_with("alpine@sha256:")
+            && pinned_image.len() == "alpine@sha256:".len() + 64
+            && pinned_image["alpine@sha256:".len()..]
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit()),
+        "ci/fixture-base-image.txt must pin an Alpine SHA-256 digest"
+    );
     r.command(
         "pull-base",
         "docker",
@@ -109,7 +118,7 @@ pub(super) fn run(r: &mut Run, m: &Manifest) -> Result<()> {
             "pull",
             "--platform",
             r.platform.image_platform,
-            "alpine:3.22",
+            pinned_image,
         ],
     )?;
     let image = r.command(
@@ -118,21 +127,27 @@ pub(super) fn run(r: &mut Run, m: &Manifest) -> Result<()> {
         &[
             "image",
             "inspect",
-            "alpine:3.22",
+            pinned_image,
             "--format",
-            "{{index .RepoDigests 0}}",
+            "{{json .RepoDigests}}",
         ],
     )?;
-    let image = image.trim();
+    let digests: Vec<String> = serde_json::from_str(image.trim())?;
     ensure!(
-        image.starts_with("alpine@sha256:") && image.len() == "alpine@sha256:".len() + 64,
-        "base image did not resolve to an immutable digest"
+        digests.iter().any(|digest| digest == pinned_image),
+        "base image digest differs from ci/fixture-base-image.txt"
     );
     let base = r.work.join("base.tar");
     r.command(
         "save-base",
         "docker",
-        &["image", "save", "--output", base.to_str().unwrap(), image],
+        &[
+            "image",
+            "save",
+            "--output",
+            base.to_str().unwrap(),
+            pinned_image,
+        ],
     )?;
     let base_hash = sha256_file(&base)?;
     let built = r.work.join("fixture-build");
@@ -165,7 +180,7 @@ pub(super) fn run(r: &mut Run, m: &Manifest) -> Result<()> {
     fs::write(
         r.out.join("fixture-provenance.json"),
         serde_json::to_vec_pretty(
-            &serde_json::json!({"base_image": image, "base_archive_sha256": base_hash, "guest_archive_sha256": r.packet.fixture_sha256, "docker_archive_sha256": r.packet.docker_fixture_sha256, "recipe_commit": r.packet.commit}),
+            &serde_json::json!({"base_image": pinned_image, "base_archive_sha256": base_hash, "guest_archive_sha256": r.packet.fixture_sha256, "docker_archive_sha256": r.packet.docker_fixture_sha256, "recipe_commit": r.packet.commit}),
         )?,
     )?;
     if let Some(previous) = m.previous_release.get(r.platform.target) {

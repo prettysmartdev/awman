@@ -221,7 +221,7 @@ fn preflight(f: &Flags) -> Step {
         Err(e) => return Ok(Err(Stop::Failed(format!("{e:#}")))),
     };
     let mut pending = ins.pending_pins();
-    pending.extend(crate::manifest::validate::pins(&m));
+    pending.extend(crate::manifest::validate::pins_for_gate(&m, "candidate"));
     if !pending.is_empty() {
         return Ok(Err(Stop::Blocked(format!(
             "pins are not published yet, so no candidate can be validated: {}",

@@ -487,10 +487,8 @@ fi
 step "Release workflow"
 
 if ! $USE_LOCAL_RUNNER; then
-  ok "Candidate started; the Release workflow will publish $VERSION after the build gates pass"
-  echo "  Follow it with: gh run watch \$(gh run list --workflow candidate.yml --limit 1 --json databaseId -q '.[0].databaseId')"
-  echo ""
-  echo -e "${GREEN}${BOLD}Release ${VERSION} tagged!${NC}"
+  ok "Candidate dispatched; release $VERSION awaits CI validation and publication"
+  echo "  Check its state with: make release-status VERSION=$VERSION"
   echo ""
   exit 0
 fi

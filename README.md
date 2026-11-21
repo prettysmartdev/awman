@@ -8,7 +8,7 @@
 
 **Custom agent workflows for your hardest tasks, run safely in isolation.**
 
-`awman` creates custom, repeatable agent workflows to encode best practices like clear specs, task breakdown, independent review, enforced tests, and autoremediation into one developer tool.
+`awman` is a developer tool packaged as a single Rust binary. It creates and executes custom, repeatable code agent workflows that encode best practices like clear specs, task breakdown, independent review, enforced tests, and autoremediation.
 
 Give awman any task:
 - The `awman` leader agent designs a custom workflow.

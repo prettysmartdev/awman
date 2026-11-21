@@ -254,6 +254,7 @@ pub(crate) fn suites_for_target(m: &Manifest, target: &str) -> Result<Vec<String
 fn source_hashes(root: &Path) -> Result<BTreeMap<String, String>> {
     [
         "ci/gates.toml",
+        "ci/fixture-base-image.txt",
         "Cargo.lock",
         "rust-toolchain.toml",
         ".config/nextest.toml",

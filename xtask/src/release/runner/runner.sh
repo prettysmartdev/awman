@@ -17,6 +17,9 @@
 # State lives in $AWMAN_RELEASE_RUNNER_HOME (default ~/.awman/release-runner):
 # a cached, checksum-verified runner archive, the cached guest fixture and the
 # directory of the one runner currently registered. Fixtures stay inside it.
+# `make apple-prerelease` also uses this implementation with
+# AWMAN_RELEASE_RUNNER_ROLE=ci-guest, a separate home/work directory and the
+# workflow-restricted CI guest runner group.
 
 set -euo pipefail
 umask 077
@@ -31,7 +34,12 @@ WORK_DIR="${AWMAN_RELEASE_RUNNER_WORK:-/tmp/awr}"
 ONLINE_TIMEOUT="${AWMAN_RELEASE_RUNNER_ONLINE_TIMEOUT:-120}"
 STATE="$RUNNER_HOME/state"
 RUN_DIR="$RUNNER_HOME/run"
-LABEL=awman-release
+ROLE="${AWMAN_RELEASE_RUNNER_ROLE:-release}"
+case "$ROLE" in
+  release) LABEL=awman-release ;;
+  ci-guest) LABEL=awman-ci-guest ;;
+  *) echo 'AWMAN_RELEASE_RUNNER_ROLE must be release or ci-guest' >&2; exit 1 ;;
+esac
 
 say() { echo "  $*"; }
 die() { echo "release-runner: $*" >&2; exit 1; }
@@ -130,11 +138,31 @@ runner_id() { # repo name
 
 # Labels route jobs; only the service-enforced group authorizes them.
 release_group() {
-  local repo=$1 org=${1%%/*} group_id=${AWMAN_RELEASE_RUNNER_GROUP_ID:-} group
+  local repo=$1 org=${1%%/*} group_id group expected
   case "$repo" in *[!a-zA-Z0-9_./-]*|*..*) die "invalid repository" ;; esac
-  case "$group_id" in ''|*[!0-9]*) die "AWMAN_RELEASE_RUNNER_GROUP_ID must name a workflow-restricted organization runner group (P1)" ;; esac
-  group=$(gh api "orgs/$org/actions/runner-groups/$group_id" --jq ". | select(.restricted_to_workflows == true) | select((.selected_workflows | sort) == ([\"$repo/.github/workflows/candidate.yml@refs/heads/main\", \"$repo/.github/workflows/promote.yml@refs/heads/main\"] | sort)) | .name") || die "cannot verify release runner group policy"
-  [ -n "$group" ] || die "runner group must restrict execution to candidate.yml and promote.yml on protected main"
+  if [ "$ROLE" = ci-guest ]; then
+    group_id=${AWMAN_CI_GUEST_RUNNER_GROUP_ID:-}
+    expected="[\"$repo/.github/workflows/ci.yml@refs/heads/main\", \"$repo/.github/workflows/nightly.yml@refs/heads/main\"]"
+  else
+    group_id=${AWMAN_RELEASE_RUNNER_GROUP_ID:-}
+    expected="[\"$repo/.github/workflows/candidate.yml@refs/heads/main\", \"$repo/.github/workflows/promote.yml@refs/heads/main\"]"
+  fi
+  case "$group_id" in
+    ''|*[!0-9]*)
+      if [ "$ROLE" = release ]; then
+        die "AWMAN_RELEASE_RUNNER_GROUP_ID must name a workflow-restricted organization runner group (P1)"
+      else
+        die "AWMAN_CI_GUEST_RUNNER_GROUP_ID must name a workflow-restricted organization runner group"
+      fi ;;
+  esac
+  group=$(gh api "orgs/$org/actions/runner-groups/$group_id" --jq ". | select(.restricted_to_workflows == true) | select((.selected_workflows | sort) == ($expected | sort)) | .name") || die "cannot verify $ROLE runner group policy"
+  if [ -z "$group" ]; then
+    if [ "$ROLE" = release ]; then
+      die "runner group must restrict execution to candidate.yml and promote.yml on protected main"
+    else
+      die "runner group must restrict execution to ci.yml and nightly.yml on protected main"
+    fi
+  fi
   printf '%s\n' "$group"
 }
 
@@ -162,7 +190,7 @@ cmd_up() {
   chmod 700 "$WORK_DIR"
   rm -rf "$RUN_DIR"
   mkdir -p "$RUN_DIR"
-  name="awman-release-$tag-$(hostname -s)"
+  name="$LABEL-$tag-$(hostname -s)"
   printf 'repo=%s\nname=%s\nwork=%s\nowned_work=%s\nregistered=false\n' "$repo" "$name" "$WORK_DIR" "$owned_work" > "$STATE"
   tar -xzf "$archive" -C "$RUN_DIR"
   token=$(gh api -X POST "orgs/${repo%%/*}/actions/runners/registration-token" -q .token)

@@ -511,7 +511,7 @@ If nothing was stored to begin with, that line instead reads
 ### Persisting values across a restart
 
 By default (`daemon.features.squad.envPersistence` is `keychain` — see [Configuration: Squad
-daemon configuration](07-configuration.md#squad-daemon-configuration)), squad
+daemon configuration](07-configuration.md#squad-feature-configuration)), squad
 stores the values it holds for `env()` names in the OS keychain, so a daemon
 the OS restarts on your behalf — launchd at login, systemd after a crash —
 comes back already armed instead of needing every task's variables pushed
@@ -768,7 +768,7 @@ seconds:
 | Colour | Meaning |
 |--------|---------|
 | Grey | No squad daemon is running |
-| Yellow | A daemon is running but this awman cannot get an answer from it — no bearer key for it (see [Authenticating to the daemon](#authenticating-to-the-daemon)), a connection refused, a timeout, or any other error |
+| Yellow | A daemon is running but this awman cannot get an answer from it — no bearer key for it (see [Authenticating network clients](#authenticating-network-clients)), a connection refused, a timeout, or any other error |
 | Red | Reachable, and some active task's most recent run failed |
 | Yellow | Reachable, nothing failed, and some task has an `env()` name the daemon doesn't currently hold a value for — see [Task environment values](#task-environment-values) |
 | Blue | Reachable, and a task is executing right now |
@@ -967,7 +967,7 @@ valid reload clears it. It continues to observe existing runs and resumes schedu
 a valid config reload; if the error later recurs, it is reported again. The
 scheduler does not silently substitute defaults or keep a last-known-good
 config. See
-[Configuration: Squad daemon configuration](07-configuration.md#squad-daemon-configuration)
+[Configuration: Squad feature configuration](07-configuration.md#squad-feature-configuration)
 for the full field reference, validation rules, and how to edit it with
 `awman config set`.
 

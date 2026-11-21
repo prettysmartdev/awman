@@ -106,7 +106,7 @@ retains that warning instead of declaring the image satisfied.
 
 Image tags are named after the repository folder, so alternating between branches whose Dockerfiles or copied files differ rebuilds the image each time you switch.
 
-If a rebuild fails, awman **warns and continues** with the image it already has. The warning reads `[image] warning: <build> failed; still using <image> (<reason>)`, and API clients receive an [`image_stale` event](09-api-and-remote-mode.md#image-stale-event). `awman ready --build` is different: it still fails when its build fails. Plain `awman ready` does not rebuild stale images. When builtin execution uses an enabled Docker-local or Apple-local builder, session setup and launch/preflight also check source image labels, rebuild stale source images, and import the result. Failed source rebuilds keep the installed image and emit the same warning. Registry/archive sources and disabled builders retain their import behavior.
+If a rebuild fails, awman **warns and continues** with the image it already has. API clients receive an `image_stale` event. `awman ready --build` still fails when its build fails. Plain `awman ready` does not rebuild stale images. With an enabled Docker-local or Apple-local builder, builtin session setup can also rebuild stale source images before import; a failed rebuild keeps the installed image. Registry/archive sources and disabled builders retain their import behavior.
 
 ### Content awman cannot see
 

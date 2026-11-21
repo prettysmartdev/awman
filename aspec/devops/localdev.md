@@ -146,15 +146,24 @@ invoking user, then atomically installs to `/usr/local/bin`; use
 `INSTALL_PATH=/your/bin` for a user-owned location. Restart long-running awman
 daemons after upgrading the executable.
 
-Run `make linux-prerelease` from a clean, committed checkout on Linux x86_64
-with read/write `/dev/kvm` access and a running Docker Engine on a local Unix
-socket. Docker supplies image-source and builder evidence; agents execute only
-inside guests. The runner needs curl, tar, network access during preparation,
-and enough disk for debug/test and release artifacts. Offline acceptance uses
+Run `make linux-prerelease REMOTE_LOGIN=user@host` from a clean checkout
+after the release prep skill has committed the new version and notes. Either
+prerelease target creates or resumes `release/vX.Y.Z` and pins the reviewed
+arm64 guest fixtures and this Mac's OS build on that branch. The Linux target
+then creates or updates its own release-branch checkout under
+`~/.cache/awman-prerelease/release-vX.Y.Z` on the Linux x86_64 host over SSH.
+Build caches are retained for subsequent runs. It passes the Mac's `gh` token through SSH
+stdin for the HTTPS clone; the token is removed before tests start. The Linux
+target needs `gh`, `python3`, SSH and `scp` on the Mac. The Linux
+host needs read/write `/dev/kvm` access and a Docker Engine on a local Unix
+socket. It needs the pinned Rust toolchain, build tools, curl, tar, network
+access during preparation and enough disk for debug/test and release artifacts.
+Docker supplies image-source and builder evidence; agents execute only inside
+guests. Offline acceptance uses
 kernel seccomp filters to deny IP sockets while preserving Unix IPC and the
 invoking user's identity. A registered prerequisite test proves enforcement
 before the release build; unavailable seccomp support blocks acceptance.
-The make target sets `umask 0002` only in its recipe subprocess, and the packet
+The remote runner sets `umask 0002` only in its process, and the packet
 records it, so acceptance exercises private state under permissive defaults
 without changing the developer's shell profile.
 On Debian, add the user to `kvm` and `docker` groups and log in again first.
@@ -165,8 +174,10 @@ sources, builders and upgrade acceptance against the native executable.
 
 The target uses the manifest native-validation runner, prepares private fixtures
 and an owned loopback registry, runs the registered guest, Docker/registry
-boundary and artifact suites, and removes its registry even on failure.
-Evidence is written under `target/native-validation/` and archived as a tarball.
+boundary and artifact suites, and removes its registry even on failure. It
+streams the packet back to `target/prerelease/linux-<commit>/`, safely extracts
+it, and verifies it against the exact local commit. The remote credential file
+is removed before native validation; the managed checkout and build cache stay.
 Verify an extracted packet with
 `cargo xtask native-validation verify /path/to/evidence`.
 Missing prerequisites fail the run; they never count as passing skips.

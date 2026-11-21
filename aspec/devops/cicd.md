@@ -52,7 +52,7 @@ twice.
 | Gate | Runs on | Contents |
 |---|---|---|
 | `pr` | pull requests and merge groups | every lint (fmt, clippy, architecture, hygiene, shell, workflows, deny, notice), doctests, the web app, the `unit` and `component` tiers on Linux x86_64, macOS arm64 and Windows x86_64, the `boundary` tier on Linux with Docker, the builtin-feature unit tests on Linux arm64, the xtask, release-contract, pipeline and CI-helper suites, and a static musl build smoke |
-| `main` | pushes to `main` | everything in `pr`, plus the `guest` tier on the CI Mac (hardware) |
+| `main` | pushes to `main`, or an authenticated dispatch for an open same-repository `release/vX.Y.Z` PR head | everything in `pr`, plus the `guest` tier on the CI Mac (hardware) |
 | `nightly` | 03:23 UTC schedule | everything in `main`, plus the Apple Containers and `sbx` boundary suites, the soak suites, and the nightly modes below |
 | `candidate` | release candidate validation | everything in `main`, plus the `artifact` tier against each exact release executable, the signed offline boot of the macOS asset, and the `guest` tier on the release Mac |
 | `promote` | release promotion | requires a passed `candidate` gate; see [release.md](release.md) |
@@ -84,6 +84,7 @@ reported as passed because it was skipped.
 | `nightly.yml` (generated) | daily schedule, `workflow_dispatch` | the `nightly` gate and its modes |
 | `candidate.yml` | `workflow_dispatch` or `workflow_call` from `main` only | build once, validate those exact bytes, hand off to promotion |
 | `promote.yml` | called by `candidate.yml` | tag, publish the validated draft, verify the published bytes |
+| `fixtures.yml` | `workflow_dispatch` from a release branch | pull the reviewed Alpine digest, derive and attest both guest fixtures, publish an immutable fixture release |
 
 ### `ci.yml` job graph
 
@@ -181,7 +182,7 @@ and break a sequence of measured main-gate budget overruns.
 | Label set | Used by | Registered by |
 |---|---|---|
 | hosted `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-15`, `windows-2025` | every hosted cell | GitHub |
-| `self-hosted, macOS, ARM64, awman-ci-guest` | the `guest` and Apple boundary cells of `main` and `nightly` | a long-lived CI Mac |
+| `self-hosted, macOS, ARM64, awman-ci-guest` | the `guest` and Apple boundary cells of `main` and `nightly` | `make apple-prerelease` temporarily, or a long-lived CI Mac |
 | `self-hosted, macOS, ARM64, awman-release` | `candidate.yml` and the verify job of `promote.yml` | `make release`, for one release, or an already-online release runner |
 
 The label sets are disjoint, so a CI job cannot take the release runner.
@@ -190,14 +191,15 @@ The label sets are disjoint, so a CI job cannot take the release runner.
   so every guest cell needs bare-metal Apple Silicon.
 - Self-hosted jobs run only when the plan admits hardware: the gate is not `pr`,
   the event is a push, schedule or dispatch, the ref is `refs/heads/main`, the
-  `ref` input is empty or equal to the triggering commit, and the repository
+  `ref` input is empty, equal to the triggering commit, or names the exact head
+  of an open same-repository `release/vX.Y.Z` PR targeting `main`, and the repository
   variable `AWMAN_CI_GUEST_RUNNER` is `enabled`. Each job repeats the event and
   ref test. A pull request edits its own workflow file, so this is defence in
   depth; the real boundary is the runner group, which must be restricted to this
   repository and the workflow paths `ci.yml` and `nightly.yml` at
   `refs/heads/main`.
 - Every self-hosted job starts with `cargo xtask ci runner-preflight` (disk,
-  `kern.hv_support`, toolchain, fixture digests, Apple Containers) and exits
+  `kern.hv_support`, toolchain, pinned macOS build, fixture digests, Apple Containers) and exits
   `BLOCKED` with the reason before any expensive step. It ends with
   `cargo xtask ci sweep`, which fails the job if processes, VMs, images or temp
   roots of the run remain.
@@ -209,7 +211,8 @@ The label sets are disjoint, so a CI job cannot take the release runner.
 ## Required checks and repository settings
 
 The required status for `main` is the single check `gate` from `ci.yml`, with
-the merge queue enabled; `ci.yml` triggers on `merge_group`. `main` may not be
+at least one approving PR review and a squash-method merge queue enabled;
+`ci.yml` triggers on `merge_group`. `main` may not be
 force-pushed or deleted, and creation, update and deletion of `v*` tags is
 restricted to the release promotion identity. The expected values are recorded in
 `ci/branch-protection.expected.json`. The repository must require `gate`; deleted workflow names are not valid required statuses.

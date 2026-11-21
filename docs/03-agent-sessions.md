@@ -1134,170 +1134,24 @@ test -f ~/.cline/data/settings/providers.json
 ```
 
 
-## Reference: `awman init`
+## Preparing and checking agents
 
-```sh
-awman init [--agent=<name>] [--aspec]
-```
+`awman init` creates the repository setup; `awman ready` checks the runtime, images, and agent authentication. Run `awman ready --refresh` after changing your project's toolchain so the agent can update `Dockerfile.dev`. Use `--agent NAME` to check a different agent. For all options, see the [command reference](14-command-reference.md#awman-ready).
 
-Initialises the current Git repository for use with awman. See [Getting Started](00-getting-started.md) for a full walkthrough.
-
-| Flag | Values | Default |
-|------|--------|---------|
-| `--agent` | `claude`, `codex`, `opencode`, `opencode-v2`, `cursor`, `antigravity`, `copilot`, `cline`, or a [custom agent](15-custom-agents.md) name | `claude` |
-| `--aspec` | (flag) | off |
-
-`--aspec` downloads the `aspec/` folder from `github.com/prettysmartdev/aspec`, providing spec templates and work item scaffolding. Skipped without the flag.
-
-When `--aspec` is not passed and no `aspec/` folder exists, `init` offers to configure a custom work items directory and template path interactively. This sets `workItems.dir` (and optionally `workItems.template`) in the repo config so commands like `new spec` and `exec workflow` work without requiring the `aspec/` folder layout. See [Work item paths](07-configuration.md#custom-work-item-paths).
-
----
-
-## Reference: `awman ready`
-
-```sh
-awman ready [--refresh | --prepare-only] [--build] [--no-cache] [-n|--headless] [--allow-docker] [--json] [--agent <name>]
-```
-
-Verifies your environment is ready for agent sessions. Progress lines read `ready: <phase>` on stderr (suppressed with `--json`). A Docker or Apple Containers runtime error exits with status 3; every other engine failure, including builtin and image-builder errors, exits with status 1, and the CLI prints the same message the TUI and API show.
-
-| Flag | Description |
-|------|-------------|
-| `--refresh` | Run the Dockerfile agent audit, which updates `Dockerfile.dev` for your project's toolchain (skipped by default) |
-| `--prepare-only` | Prepare images only: build, import and trust-check them, but run no host agent check, credential refresh or audit. Authentication is reported as not checked. Conflicts with `--refresh`; composes with `--agent`, `--build`, `--no-cache`, `--headless` and `--json` |
-| `--build` | Rebuild the project base image and every agent image with a `.awman/Dockerfile.<agent>` (on the [builtin runtime](11-runtimes.md), re-acquire them from their image source) |
-| `--no-cache` | Skip the build cache for any build `ready` runs; on the builtin runtime, also force a fresh image import |
-| `--headless` / `-n` | Run the audit agent in print mode, and answer `ready`'s own questions non-interactively |
-| `--allow-docker` | Give the audit container access to the host Docker socket |
-| `--json` | Emit machine-readable JSON instead of the summary table. Implies `--headless`. See [`ready --json`](#ready---json) |
-| `--agent <name>` | Check and build this agent instead of the configured one. For a [custom agent](15-custom-agents.md) whose definition needs approval, this is where you review and approve it |
-
-When `runtime.kind` is `builtin`, `ready` imports the selected agent image from its configured source. If no usable source is configured, an interactive CLI or TUI run offers `docker-local`, `apple-local` (macOS), `archive`, `registry`, or **Leave unconfigured**. The prompt previews the JSON change and shows which file will be written; when both scopes are available, you can choose repository or global config. Saving reloads the config and lets that same `ready` run continue. Local-store imports need an image that already exists there. Enabling `runtime.builtin.builder.enabled` is a separate, explicit opt-in offered only for supported local sources; it allows building into that store before import. See [Interactive image-source setup](11-runtimes.md#interactive-image-source-setup).
-
-For a missing source, `--headless`/`-n`, `--json`, API session setup, workflow prerequisites, and squad preparation do not prompt or write source config. `ready`, API session setup, and workflow prerequisite errors identify `runtime.builtin.imageSource` or the tagged field ``runtime.builtin.images["<tag>"]``; squad image failures give the tag and source setup guidance. The operation continues or fails according to its required image check. An import failure from a source that is already configured does not offer source setup.
-
-The human-readable `ready` summary prints each failure reason once; when a recovery hint is available, it appears once as `Tip:`. With `--json`, the diagnostic appears in the corresponding status `message` field instead of as an interactive prompt.
-
-Use `--refresh` after your project's toolchain changes. The audit only edits `Dockerfile.dev`; agent Dockerfiles are not touched.
-
-### Other agents' images
-
-`ready` checks the default agent's image and, for every other agent with a `.awman/Dockerfile.<agent>`, whether its image exists. Missing ones are listed on a `Missing images` row (a warning, not a failure) with a hint naming what `ready --build` would do for each. `ready --build` builds them all, one after another; a failed build for a non-default agent is reported but does not change `ready`'s exit status.
-
-The summary also warns (without failing) when the repo has no `aspec/` folder or no `.awman/config.json`; run `awman init` to create them.
-
-### Credential health
-
-`awman ready` sends a fixed host-side greeting to the selected agent and every
-other agent with a `.awman/Dockerfile.<agent>`, checking that each is installed
-and authenticated. It checks all agents even if one fails. The summary groups
-their results into one success row and, when needed, one failure row:
-
-```text
-Auth: claude, codex   | success
-Auth: opencode       | fail
-```
-
-Failure details appear in the progress output. Custom definitions must pass
-the usual trust checks; a custom agent without `[ping]` skips its host check.
-
-`awman ready` also reports the health of any live-refreshed agent credential (currently Claude's Keychain-backed OAuth token), as read on the host at the time you ran `ready`:
-
-```
-Credential claude (68432s remaining)   ✓
-```
-
-If the credential can't be read, has already expired, or its expiry can't be determined, the row shows a warning instead (`credential unreadable: ...`, `credential expired`, or `credential expiry unknown`) rather than failing the whole `ready` check.
+On the builtin runtime, `ready` imports the selected image from its configured source. An interactive run can help you configure a missing source; see [Getting an agent image](11-runtimes.md#getting-an-agent-image).
 
 ### Preparing images without authentication (`ready --prepare-only`)
 
-`ready` has two separate questions: *are the images ready?* and *is the agent
-authenticated?* A plain `awman ready` answers both. `awman ready --prepare-only`
-answers only the first. It still checks the runtime, verifies definition trust, and
-inspects, builds or imports the project and agent images, but it never runs the host
-agent greeting, never reads or refreshes a credential and never runs the Dockerfile
-audit. It is the right command for CI, image-baking jobs and a freshly provisioned
-machine that has no login yet.
+Use `awman ready --prepare-only` in CI or before you have logged in. It checks the runtime and definition trust, and builds or imports images. It does not run the host agent check, read or refresh agent credentials, or audit `Dockerfile.dev`. The result says authentication was **not checked**. `--prepare-only` cannot be combined with `--refresh`.
 
 ```sh
-awman ready --prepare-only --agent claude                 # prepare the Claude image
-awman ready --prepare-only --build --agent codex          # rebuild/import Codex's image
-awman ready --prepare-only --build --no-cache --agent claude --json
+awman ready --prepare-only
+awman ready --prepare-only --build --agent codex
 ```
 
-The summary shows `Authentication (not checked)` and ends `awman images are ready;
-authentication was not checked.` A failed build, import or trust check still fails
-with a non-zero exit. `--prepare-only` conflicts with `--refresh` (usage error, exit 2).
-With `--json` the object adds `"preparation_policy": "images_only"`,
-`"images_ready": true` and `"authentication": "not_checked"` (a full `ready` reports
-`passed`, `failed` or `unknown` there). `ready: true` means ready for the policy you
-selected; it never claims authentication passed.
+`--build` rebuilds images on building runtimes or reacquires them on the builtin runtime. Add `--json` if a script needs the result: it prints one JSON object, implies headless mode, and reports `images_ready` and `authentication` separately. See [Runtimes](11-runtimes.md) for image sources and build behavior.
 
-To pick up a newer agent CLI, rebuild its image with
-`awman ready --prepare-only --build --agent <name>`. A newer CLI version needs no awman
-update: an unreadable or unrecognized version only produces a warning, and the only
-version refusal is a confirmed wrong OpenCode major version.
-
-### `ready --json`
-
-With `--json`, `awman ready` prints one JSON object on stdout instead of the summary table — useful for CI and scripts:
-
-```json
-{
-  "ready": true,
-  "runtime": "docker",
-  "agent_credentials": [
-    { "agent": "claude", "refreshable": true, "expires_in_secs": 68432, "expired": false, "read_error": null }
-  ],
-  "steps": {
-    "docker_daemon":     { "status": "ok",      "message": "" },
-    "dockerfile":        { "status": "ok",      "message": "" },
-    "aspec_folder":      { "status": "skipped", "message": "" },
-    "work_items_config": { "status": "skipped", "message": "" },
-    "local_agent":       { "status": "ok",      "message": "" },
-    "dev_image":         { "status": "ok",      "message": "" },
-    "refresh":           { "status": "skipped", "message": "" },
-    "image_rebuild":     { "status": "skipped", "message": "" }
-  }
-}
-```
-
-Each step's `status` is `ok`, `skipped`, `warn`, `failed`, `pending` or `running`, with the reason in `message`. `refresh` is `ok` when `--refresh` ran the audit. On the builtin runtime the object also carries `steps.image_source` and, when images were built or imported, `image_results`, `base_image_results` and `warnings`.
-
-`--json` implies `--headless`, so no prompts are shown, and audit output is not streamed. `agent_auth` lists each agent's host greeting result, including failure details; `steps.local_agent` reports their combined status. In `agent_credentials` (one entry per agent with a live-refreshed credential), `expires_in_secs` is `null` when the expiry couldn't be determined, and `read_error` is set when the credential couldn't be read at all. No token value ever appears in this output.
-
----
-
-## Reference: all `chat` and `exec` flags
-
-| Flag | `chat` | `exec prompt` | `exec workflow` | Description |
-|------|--------|---------------|-----------------|-------------|
-| `--agent=<name>` | ✓ | ✓ | ✓ | Override the agent for this session |
-| `--model=<NAME>` | ✓ | ✓ | ✓ | Override the model used by the agent |
-| `--headless` / `-n` | ✓ | ✓ | ✓ | Print/batch mode |
-| `--set agents.launchMode=<stdio\|acp>` | ✓ | ✓ | ✓ | Choose standard stdio or ACP mode |
-| `--plan` | ✓ | ✓ | ✓ | Start in the agent's native plan mode (workspace stays writable) |
-| `--read-only-workspace` | ✓ | ✓ | ✓ | Mount the workspace read-only (independent of `--plan`) |
-| `--allow-docker` | ✓ | ✓ | ✓ | Mount host Docker socket |
-| `--overlay=<SPEC>` | ✓ | ✓ | ✓ | `dir()`, `env()`, `skill()`, `ssh()` overlays (repeatable) |
-| `--agent-flag=<ARG>` | ✓ | ✓ | ✓ | Extra argument for the agent command (repeatable); replaces its `agents.flags` entry |
-| `--branch <NAME>` | ✓ | ✓ | — | Run in a worktree for this branch (CLI/TUI only) |
-| `--pr <N\|URL\|owner/repo#N>` | ✓ | ✓ | — | Run in a worktree for a GitHub pull request (CLI/TUI only) |
-| `--worktree <NAME\|PATH>` | ✓ | ✓ | — | Reuse an existing worktree (CLI/TUI only) |
-| `--worktree` | — | — | ✓ | Run in an isolated, managed Git worktree (a switch on this command) |
-| `--auto` | ✓ | ✓ | ✓ | Auto-approve file edits, prompt for shell commands |
-| `--yolo` | ✓ | ✓ | ✓ | Fully autonomous mode |
-| `--settings-profile <NAME>` | ✓ | ✓ | ✓ | Persistent private settings and history; see [Settings profiles](#settings-profiles) |
-| `--agent-session <ID>` | ✓ | ✓ | — | Resume an exact native conversation from the profile |
-| `--automation[=auto\|require_full]` | ✓ | ✓ | — | Owned execution with turn and assurance reporting; requires `--settings-profile` |
-| `--work-item <REF>` | `-w` | ✓ | ✓ | Supply a local or external work item; see [GitHub Integration](10-github-integration.md) |
-| `--dynamic` | — | — | ✓ | Have a leader agent design the workflow; implies `--yolo`, `--worktree`, `context(workflow)` |
-| `--leader <agent::model>` | — | — | ✓ | Leader agent and model for `--dynamic` |
-| `--on-existing-worktree`, `--on-dirty-merge-target`, `--on-merge-failure` | — | — | ✓ | Answer worktree lifecycle questions up front — see [Workflows](05-workflows.md#worktrees) |
-| `--prerequisite-*`, `--check-prerequisites` | — | — | ✓ | Grant or check what setup/teardown steps need — see [Workflows](05-workflows.md) |
-| `--json` | — | — | ✓ | Print the workflow outcome and prerequisite report as JSON |
-
-The [Command Reference](14-command-reference.md) lists every flag with its exact values.
+For `chat`, `exec prompt`, and `exec workflow` flags, use the [command reference](14-command-reference.md). The sections above explain their behavior in context.
 
 ---
 

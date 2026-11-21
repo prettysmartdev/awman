@@ -2,14 +2,6 @@ name: Fixtures
 on:
   workflow_dispatch:
     inputs:
-      base_url:
-        description: HTTPS URL of a reviewed arm64 Docker-save base archive
-        required: true
-        type: string
-      base_sha256:
-        description: Verified SHA-256 of the base archive
-        required: true
-        type: string
       tag:
         description: New immutable fixtures-* release tag
         required: true
@@ -21,8 +13,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
-    if: ${{ github.ref == 'refs/heads/main' }}
-    environment: fixtures
+    if: ${{ startsWith(github.ref, 'refs/heads/release/v') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -39,18 +30,18 @@ jobs:
       - name: Resolve the fixture publication plan
         run: cargo xtask fixtures publish-plan > fixture-plan.json
       - name: Build the reviewed immutable guest fixture
-        env:
-          BASE_URL: ${{ inputs.base_url }}
-          BASE_SHA256: ${{ inputs.base_sha256 }}
         run: |
-          [[ "$BASE_URL" == https://* ]] || exit 1
-          [[ "$BASE_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 1
-          curl --fail --location --proto '=https' --proto-redir '=https' --output base.tar "$BASE_URL"
+          BASE_IMAGE=$(cat ci/fixture-base-image.txt)
+          [[ "$BASE_IMAGE" =~ ^alpine@sha256:[0-9a-f]{64}$ ]] || exit 1
+          docker pull --platform linux/arm64 "$BASE_IMAGE"
+          docker image save --output base.tar "$BASE_IMAGE"
+          BASE_SHA256=$(sha256sum base.tar | cut -d ' ' -f 1)
           mkdir -p out
           cargo xtask fixtures build guest-oci-base --base base.tar --sha256 "$BASE_SHA256" --out built
           cargo xtask fixtures verify-build --base base.tar --sha256 "$BASE_SHA256" --out built
+          printf '%s\n' "$BASE_IMAGE" > out/base-image.txt
           cp built/fixture-oci.tar built/fixture-docker.tar built/provenance.json out/
-          (cd out && sha256sum fixture-oci.tar fixture-docker.tar provenance.json > SHA256SUMS)
+          (cd out && sha256sum fixture-oci.tar fixture-docker.tar provenance.json base-image.txt > SHA256SUMS)
           cp fixture-plan.json out/
       - name: Attest the exact fixture archives and reproduction record
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -59,6 +50,7 @@ jobs:
             out/fixture-oci.tar
             out/fixture-docker.tar
             out/provenance.json
+            out/base-image.txt
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fixture-${{ github.run_id }}
@@ -67,8 +59,7 @@ jobs:
           retention-days: 90
   publish:
     needs: build
-    if: ${{ github.ref == 'refs/heads/main' }}
-    environment: fixtures
+    if: ${{ startsWith(github.ref, 'refs/heads/release/v') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -85,7 +76,7 @@ jobs:
           TAG: ${{ inputs.tag }}
           COMMIT: ${{ github.sha }}
         run: |
-          [[ "$TAG" =~ ^fixtures-[a-zA-Z0-9._-]+$ ]] || exit 1
+          [ "$TAG" = "fixtures-$COMMIT" ] || { echo 'Fixture tag must bind the source commit' >&2; exit 1; }
           (cd out && sha256sum -c SHA256SUMS)
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo 'Refusing to replace an existing fixture release' >&2

@@ -46,6 +46,10 @@ const TRIGGERS: &str = r##"on:
         type: choice
         options: [pr, main, nightly]
         default: pr
+      ref:
+        description: Exact open release PR head to test through the main workflow
+        type: string
+        default: ""
   workflow_call:
     inputs:
       gate:
@@ -92,6 +96,7 @@ const PLAN: &str = r##"  plan:
     permissions:
       contents: read
       actions: read
+      pull-requests: read
     outputs:
       gate: ${{ steps.gate.outputs.gate }}
       builds: ${{ steps.outputs.outputs.builds }}
@@ -128,21 +133,27 @@ const PLAN: &str = r##"  plan:
           REQUESTED_REF: ${{ inputs.ref }}
           SHA: ${{ github.sha }}
           RUNNER_ENABLED: ${{ vars.AWMAN_CI_GUEST_RUNNER }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Self-hosted CI hardware is reachable only from a protected-main
-          # push, schedule or dispatch of the trusted gate on the commit that
-          # triggered the run. Pull requests, merge groups (even from forks),
-          # other refs and ref overrides never get it. The runner group's own
-          # repository/workflow restriction is the server-side half (P1/P3).
+          # The workflow and runner group stay pinned to protected main.
+          # A release branch override is admitted only for the exact head of
+          # an open, same-repository release PR targeting main.
           hardware=false
           case "$EVENT" in
             push|schedule|workflow_dispatch) ;;
             *) EVENT_OK=no ;;
           esac
+          release_pr=false
+          if [ "$EVENT" = workflow_dispatch ] && [ "$GATE" = main ] \
+            && [[ "$REQUESTED_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            matches=$(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" --paginate \
+              --jq ".[] | select(.head.sha == \"$REQUESTED_REF\" and .head.repo.full_name == \"$GITHUB_REPOSITORY\" and .base.ref == \"main\" and (.head.ref | test(\"^release/v[0-9]+[.][0-9]+[.][0-9]+$\"))) | .number")
+            [ -z "$matches" ] || release_pr=true
+          fi
           if [ "${EVENT_OK:-yes}" = yes ] \
             && [ "$GATE" != pr ] \
             && [ "$REF" = refs/heads/main ] \
-            && { [ -z "$REQUESTED_REF" ] || [ "$REQUESTED_REF" = "$SHA" ]; } \
+            && { [ -z "$REQUESTED_REF" ] || [ "$REQUESTED_REF" = "$SHA" ] || [ "$release_pr" = true ]; } \
             && [ "$RUNNER_ENABLED" = enabled ]; then
             hardware=true
           fi
@@ -423,6 +434,7 @@ const GATE: &str = r##"  gate:
     permissions:
       contents: read
       actions: read
+      pull-requests: read
     outputs:
       verdict: ${{ steps.verdict.outputs.verdict }}
     env:
@@ -473,7 +485,7 @@ const GATE: &str = r##"  gate:
         if: ${{ always() }}
         uses: @@UPLOAD@@
         with:
-          name: gate-evidence-${{ env.GATE }}-${{ github.sha }}
+          name: gate-evidence-${{ env.GATE }}-${{ inputs.ref || github.sha }}
           path: gate-out
           if-no-files-found: warn
           retention-days: 90

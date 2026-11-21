@@ -74,29 +74,7 @@ and WSP v1 for server authors.
 
 ### Worker status
 
-`GET /v1/status` reports the worker feature's usual `state`, `running`, and
-`queued` fields, plus push and pull summaries when worker is enabled. The shape
-is:
-
-```json
-"worker": {
-  "push": { "running": 1, "queued": 2 },
-  "pull": {
-    "servers": [
-      { "name": "team", "state": "registered", "running": 1, "queued_eligible": 2 }
-    ]
-  }
-}
-```
-
-These are the `push` and `pull` fields inside `features.worker`; the worker
-feature record also includes its `name`, `state`, `enabled_by`,
-`max_concurrent_jobs`, `running`, `queued`, `oldest_queued_age_ms`,
-`restarts`, `last_error`, and `since_at` fields. Each pull server summary has
-`name`, `state`, `running`, and `queued_eligible`. Server state can be
-`registered`, `registering`, `disconnected`, `revoked`, `error`, `retiring`,
-or `disabled`. `awman daemon status` prints push running/queued counts and one
-line per pull server.
+Run `awman daemon status` to see push jobs and linked work servers. For machine-readable status, use `GET /v1/status`; see [API conventions](09-api-and-remote-mode.md#api-conventions).
 
 ### Lease management
 

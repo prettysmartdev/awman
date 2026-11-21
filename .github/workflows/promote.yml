@@ -83,6 +83,33 @@ jobs:
       nextest_url: ${{ steps.verify.outputs.nextest_url }}
       nextest_sha256: ${{ steps.verify.outputs.nextest_sha256 }}
     steps:
+      - name: Verify the promotion App can mint a write token without publishing
+        id: rehearsal_app
+        if: ${{ inputs.dry_run }}
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.AWMAN_RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AWMAN_RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+      - name: Verify that App is the v-tag ruleset bypass
+        if: ${{ inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ steps.rehearsal_app.outputs.token }}
+          APP_SLUG: ${{ steps.rehearsal_app.outputs.app-slug }}
+          CLIENT_ID: ${{ vars.AWMAN_RELEASE_APP_CLIENT_ID }}
+        run: |
+          app_id=$(gh api "apps/$APP_SLUG" --jq .id)
+          actual_client=$(gh api "apps/$APP_SLUG" --jq .client_id)
+          [ "$actual_client" = "$CLIENT_ID" ] || { echo 'BLOCKED: promotion App client ID changed'; exit 1; }
+          matched=false
+          while IFS= read -r ruleset_id; do
+            [ -n "$ruleset_id" ] || continue
+            rule="repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id"
+            allowed=$(gh api "$rule" --jq "[.bypass_actors[]? | select(.actor_type == \"Integration\" and .actor_id == $app_id and .bypass_mode == \"always\")] | length > 0")
+            applies=$(gh api "$rule" --jq '(.conditions.ref_name.include // []) | index("refs/tags/v*") != null')
+            if [ "$allowed" = true ] && [ "$applies" = true ]; then matched=true; break; fi
+          done < <(gh api "repos/$GITHUB_REPOSITORY/rulesets?targets=tag" --paginate --jq '.[] | select(.enforcement == "active") | .id')
+          [ "$matched" = true ] || { echo 'BLOCKED: promotion App is not the v-tag ruleset bypass'; exit 1; }
       - &main
         name: Check out main (current release policy; never built or run)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -481,13 +481,17 @@ fn all_source_layers_and_root_select_their_dependents() {
 }
 
 #[test]
-fn fixtures_workflow_supplies_the_verified_base_recipe_inputs() {
+fn fixtures_workflow_builds_from_the_reviewed_image_digest() {
     let workflow = std::fs::read_to_string(root().join(".github/workflows/fixtures.yml")).unwrap();
     assert!(workflow.contains("fixtures publish-plan"));
+    assert!(workflow.contains("BASE_IMAGE=$(cat ci/fixture-base-image.txt)"));
+    assert!(workflow.contains("docker pull --platform linux/arm64 \"$BASE_IMAGE\""));
+    assert!(workflow.contains("docker image save --output base.tar \"$BASE_IMAGE\""));
     assert!(workflow.contains(
         "fixtures build guest-oci-base --base base.tar --sha256 \"$BASE_SHA256\" --out built"
     ));
-    assert!(workflow.contains("github.ref == 'refs/heads/main'"));
+    assert!(!workflow.contains("base_url"));
+    assert!(workflow.contains("startsWith(github.ref, 'refs/heads/release/v')"));
     assert!(workflow.contains("Refusing to replace an existing fixture release"));
 }
 

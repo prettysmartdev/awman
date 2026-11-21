@@ -4,7 +4,7 @@ INSTALL_PATH ?= /usr/local/bin
 # default of `target`.
 TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 
-.PHONY: all build sign-macos install payloads payloads-verify clean release apple-silicon-prerelease linux-prerelease architecture-lint docs-reference
+.PHONY: all build sign-macos install payloads payloads-verify clean release apple-prerelease apple-silicon-prerelease linux-prerelease architecture-lint docs-reference
 
 all: build
 
@@ -146,27 +146,26 @@ clean:
 	cargo clean
 
 # ── Release ──────────────────────────────────────────────────────────────────
-# Dispatch and watch the authenticated candidate rehearsal for current main.
-# For a local Apple Silicon acceptance packet, use validate-native instead.
+# Full prerelease closure from the Apple Silicon Mac after Linux native acceptance.
+apple-prerelease:
+	@bash tools/prerelease/apple.sh
+
+# The narrower authenticated candidate rehearsal for current main.
 apple-silicon-prerelease:
 	@cargo xtask release validate
 
-# Local Linux KVM acceptance and portable evidence for the current commit.
-# Exercise a common developer umask without changing the invoking shell.
+# Publish and pin inputs, then run Linux KVM acceptance through SSH. The remote
+# checkout is created by the script; REMOTE_LOGIN is a user@host destination.
 linux-prerelease:
-	umask 0002; CARGO_TARGET_DIR=target/native-validation-tools cargo xtask native-validation run --platform linux
+	@bash tools/prerelease/linux.sh
 
-# Release VERSION. A managed Apple Silicon runner verifies the manifest fixtures
-# in its private runner directory, registers for the candidate job, and
-# deregisters after the pipeline finishes.
+# Wait for the release PR checks and human squash merge, then validate and
+# promote the merged commit through the protected-main candidate pipeline.
 # RELEASE_RUNNER=auto|local|none (see aspec/devops/release.md).
 RELEASE_RUNNER ?= auto
+export RELEASE_RUNNER
 release:
-	@if [ -z "$(VERSION)" ]; then \
-		echo "Usage: make release VERSION=vx.y.z [RELEASE_RUNNER=auto|local|none]"; \
-		exit 1; \
-	fi
-	@RELEASE_RUNNER="$(RELEASE_RUNNER)" cargo xtask release run "$(VERSION)"
+	@bash tools/prerelease/release.sh
 
 .PHONY: release-status release-abandon
 release-status:

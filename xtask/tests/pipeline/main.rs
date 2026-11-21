@@ -1235,6 +1235,26 @@ fn pending_pins_block_preflight_before_any_build() {
 }
 
 #[test]
+fn nightly_only_platform_pin_does_not_block_candidate_preflight() {
+    let mut w = World::new();
+    w.manifest["platforms"]["macos-arm64-sbx"]["image"] = "pending-provisioned-image-digest".into();
+    let manifest = toml::to_string(&w.manifest).unwrap();
+    w.write_src("ci/gates.toml", &manifest);
+    w.preflight(100, C1, &[]).succeeded();
+}
+
+#[test]
+fn release_platform_pin_still_blocks_candidate_preflight() {
+    let mut w = World::new();
+    w.manifest["platforms"]["macos-arm64-release"]["image"] =
+        "pending-provisioned-image-digest".into();
+    let manifest = toml::to_string(&w.manifest).unwrap();
+    w.write_src("ci/gates.toml", &manifest);
+    w.preflight(100, C1, &[])
+        .stopped("platform macos-arm64-release: image digest pending provisioning");
+}
+
+#[test]
 fn preflight_refuses_bad_version_notes_and_triggers() {
     let mut w = World::new();
     w.write_src("Cargo.toml", "[workspace.package]\nversion = \"0.13.9\"\n");

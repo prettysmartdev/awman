@@ -71,9 +71,21 @@ fn fixture_publication_attests_both_archives_and_the_reproduction_record() {
     let text = fs::read_to_string(root().join(".github/workflows/fixtures.yml")).unwrap();
     assert!(text
         .contains("fixtures verify-build --base base.tar --sha256 \"$BASE_SHA256\" --out built"));
+    assert!(text.contains("BASE_IMAGE=$(cat ci/fixture-base-image.txt)"));
+    assert!(!text.contains("base_url"));
     assert!(text.contains(
-        "out/fixture-oci.tar\n            out/fixture-docker.tar\n            out/provenance.json"
+        "out/fixture-oci.tar\n            out/fixture-docker.tar\n            out/provenance.json\n            out/base-image.txt"
     ));
     assert!(text.contains("Refusing to replace an existing fixture release"));
     assert!(!text.contains("--clobber"));
+}
+
+#[test]
+fn rehearsal_mints_the_promotion_identity_without_publishing() {
+    let text = fs::read_to_string(root().join(".github/workflows/promote.yml")).unwrap();
+    assert!(text.contains("Verify the promotion App can mint a write token without publishing"));
+    assert!(text.contains("id: rehearsal_app\n        if: ${{ inputs.dry_run }}\n        uses: actions/create-github-app-token@"));
+    assert!(text.contains("Verify that App is the v-tag ruleset bypass"));
+    assert!(text.contains("if: ${{ !inputs.dry_run }}"));
+    assert!(text.contains("permission-contents: write"));
 }

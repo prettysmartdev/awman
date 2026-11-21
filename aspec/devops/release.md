@@ -44,7 +44,10 @@ Rules that never change:
 
 ## Active path
 
-`make release` invokes the manifest pipeline and starts `candidate.yml`. There is one release path; no tag-triggered fallback publisher exists. Candidate evidence and protected promotion remain mandatory. Native local acceptance is available through `make validate-native`; its packet cannot authorize a release.
+`make release` waits for the release PR's complete checks and the human squash
+merge, then invokes the manifest candidate pipeline from merged `main`.
+Candidate evidence and protected promotion remain mandatory. Native packets
+alone cannot authorize a release.
 
 ## Prerequisites
 
@@ -57,7 +60,9 @@ acceptance packets built on newer developer distributions record their host
 ABI separately; they do not establish distribution compatibility. The musl
 build smoke remains separate and does not include the builtin runtime.
 
-- A clean checkout, normally on `main`, in sync with `origin/main`, with a `gh`
+- A clean `release/vX.Y.Z` checkout, created or resumed by the prerelease
+  targets after the release prep skill has committed its version and notes,
+  with a `gh`
   login (`gh auth login`) that can dispatch workflows and, when the Mac is managed
   as a runner, administer repository runners.
 - Release notes: `docs/releases/vX.Y.Z.md`, containing no placeholder.
@@ -66,18 +71,39 @@ build smoke remains separate and does not include the builtin runtime.
   pinned Rust toolchain and enough disk. Hosted Macs are VMs and cannot boot a
   guest. The first release on a Mac needs Docker or Apple Containers running to
   build the cached guest fixture.
-- The pins that releases depend on are published: the guest fixture
-  (`[fixtures.guest-oci-base]`), the previous release's asset digest
-  (`[previous_release.*]`) and the macOS payload record. While any is `pending`,
-  validation reports `BLOCKED: pins are not published yet` and nothing releases.
+- The pins that the `candidate` gate depends on are published: both guest
+  fixtures, the previous release's asset digest, the macOS payload record and
+  the CI and release Mac runner images. A pending pin in that gate reports
+  `BLOCKED: pins are not published yet`; a nightly-only platform pin does not
+  block a candidate.
 - The version has the form `vX.Y.Z`; pre-release suffixes are refused.
 
-## Normal path: `make release VERSION=vX.Y.Z`
+## Normal path: release branch, PR, then promotion
 
 ```sh
-make release VERSION=v0.14.0                      # RELEASE_RUNNER=auto by default
-make release VERSION=v0.14.0 RELEASE_RUNNER=none  # someone else provides the release Mac
+make linux-prerelease REMOTE_LOGIN=user@host
+make apple-prerelease
+make release
+# Review and click Merge when ready (the queue uses squash) while make release waits.
 ```
+
+`make apple-prerelease` and `make linux-prerelease` may run in either order.
+The first creates or resumes `release/vX.Y.Z`, publishes and commits its pins
+there, and pushes it. The Apple target opens the PR and runs the full main CI
+gate for that exact PR head through the protected-main workflow; it also runs
+native Apple acceptance. The Linux target creates or updates its managed
+release-branch checkout and runs native KVM acceptance. `make release` requires
+both packets for the same commit, checks the authenticated full main gate and
+all PR checks, then waits for the human merge. It compares the merged tree to
+the validated branch tree before starting candidate, promotion and published
+asset verification. A changed PR head or different merged tree requires both
+prerelease targets again. The version comes from the release prep skill's
+committed Cargo version; `VERSION=vX.Y.Z` is an optional consistency check.
+
+### Post-merge operator internals
+
+`make release` invokes `cargo xtask release run vX.Y.Z` only after the
+reviewed PR has merged. The following table describes that internal stage.
 
 `RELEASE_RUNNER` is `auto` (use an online `awman-release` runner if there is one,
 otherwise register this Mac when it can serve), `local` (require this Mac) or
@@ -97,9 +123,8 @@ capitals; answering *no* to a *Proceed* question prints `  Aborting.` and exits 
 | **Release workflow** | finds the run (up to 5 minutes) and watches it with `gh run watch … --exit-status` through candidate, validation, promotion and verification (up to 3 hours) | an earlier unsuccessful run: `Re-run its failed jobs on this Mac?` [Y/n]. Success requires state `verified`, the matching commit and the tag on origin; then `Release vX.Y.Z published!` |
 
 With `RELEASE_RUNNER=none` the command stops after starting the candidate:
-`Candidate started; the Release workflow will publish vX.Y.Z after the build gates
-pass`, followed by the `gh run watch` command to follow it and
-`Release vX.Y.Z tagged!`.
+`Candidate dispatched; release vX.Y.Z awaits CI validation and publication`,
+followed by `make release-status VERSION=vX.Y.Z` to check its state.
 
 An `EXIT` trap stops the temporary runner's process group (SIGINT, after 30 s
 SIGKILL, only while the group still holds the runner's processes) and
@@ -200,7 +225,7 @@ infrastructure-blocked, never a pass or a skip.
 
 - Cause was flaky or infrastructure and is fixed: `gh run rerun <run id>
   --failed` reruns that cell against the same artifacts.
-- Real product bug: fix it on `main`, then `make release` again. The new commit
+- Real product bug: prepare a new reviewed release PR with the fix, then `make release` again. The new commit
   is a new identity, so candidate N+1 is built and N is superseded (its draft
   deleted, evidence kept in the run artifacts). Reproduce the failure from its
   record as described in [testing.md](testing.md#reproducing-a-ci-failure).
@@ -283,7 +308,7 @@ supersedes the other draft under the publication lock.
 
 | Message | Fix |
 |---|---|
-| `BLOCKED: pins are not published yet …` | publish the guest fixture and record the previous release digest in `ci/gates.toml` (`cargo xtask fixtures publish-plan` lists what is missing), commit the pins |
+| `BLOCKED: pins are not published yet …` | run the two prerelease targets below; they publish, verify and commit the guest and Mac pins on the release branch before PR review. Verify any other pending candidate pin with `cargo xtask fixtures publish-plan` |
 | `BLOCKED: no Rust toolchain …` or `runner toolchain … is not the pinned` | provision the runner (the first release on a new Mac) |
 | runner preflight `BLOCKED:` (disk, `kern.hv_support`, Apple Containers) | free disk, or use real Apple Silicon (hosted Macs cannot boot a guest) |
 | `BLOCKED: the release GitHub App … is not configured` | install the promotion App and its secrets (`AWMAN_RELEASE_APP_CLIENT_ID`, `AWMAN_RELEASE_APP_PRIVATE_KEY`); nothing was tagged |
@@ -314,10 +339,35 @@ published, verification against the run's own bytes), and then the draft is
 deleted. A rehearsal never reads, changes or deletes a production draft, and its
 evidence can never promote production.
 
-`make apple-silicon-prerelease` starts the same rehearsal for the current `main`
-commit from your terminal and watches it. It creates no tag and publishes
-nothing. Run it on the release Mac before the first release on the pipeline path
-and after any change to the release inputs.
+After release prep commits the new Cargo version and finished release notes on
+`release/vX.Y.Z`, run from the Apple Silicon Mac that also serves the CI guest
+role:
+
+```sh
+make linux-prerelease REMOTE_LOGIN=user@host
+make apple-prerelease
+```
+
+The Linux target creates or updates a managed release-branch checkout on the KVM host, with the Mac's
+`gh` credential passed privately for the clone. It first dispatches the
+Fixtures workflow when pins are pending. That workflow pulls the immutable
+`ci/fixture-base-image.txt` reference, creates the Docker save archive inside
+CI, reproduces the OCI and Docker fixtures, attests their bytes and publishes
+them once. The target verifies the public checksums, provenance and
+attestations, pins both archives and the shared Mac OS build in `ci/gates.toml`,
+then commits and pushes the pins to the release branch. Native Linux validation
+and packet verification run on that exact branch commit.
+
+The Apple target can run first. It pins the same inputs, opens or reuses the
+release PR, checks both Mac runner image pins, then brings up a temporary CI
+guest runner on this Mac. It refuses other online guest runners, dispatches and
+watches the full main gate for the exact PR head through the trusted main
+workflow, and checks its guest jobs ran on this Mac. It then runs and verifies
+native Apple acceptance and requires its rebuilt arm64 fixtures to equal the
+published pins. Both native packets and the main gate must cover the same
+branch commit before `make release` will wait for the PR review. Candidate
+artifact tests and the final tag remain in the protected
+post-merge pipeline; they cannot publish until their own gates pass.
 
 ## The release runner
 
@@ -356,7 +406,16 @@ Older published releases may lack attestations; never infer provenance from thei
 
 ## Trust and fixture publication
 
-Temporary runners require `AWMAN_RELEASE_RUNNER_GROUP_ID`. The runner queries the group policy and requires exactly candidate.yml and promote.yml at `refs/heads/main`; repository-scoped registration is refused. The group must also be allocated to this repository. Protected-main and release-environment settings are external prerequisites, not properties proven by a local test. Runner teardown retains state when ownership or deregistration cannot be established.
+The normal release runner requires `AWMAN_RELEASE_RUNNER_GROUP_ID`. The runner
+queries the group policy and requires exactly candidate.yml and promote.yml at
+`refs/heads/main`; repository-scoped registration is refused. The prerelease
+targets discover that group from the live organization policy. For main CI,
+`apple-prerelease` uses the same runner manager with a separate home and work
+directory and a group restricted to ci.yml and nightly.yml on main. Each group
+must be allocated to this repository. Protected-main and release-environment
+settings are checked from the live GitHub APIs before prerelease admission.
+Runner teardown retains state when ownership or deregistration cannot be
+established.
 
 Candidate fetch exports an absolute, hash-verified executable path. On Unix it
 restores owner execution and removes write permission before exporting that
@@ -375,9 +434,11 @@ Native acceptance remains open as recorded in WI144. Publication still requires 
 
 Fixture preparation writes `provenance.json` with base, archive, recipe and
 contract digests. `cargo xtask fixtures verify-build --base B --sha256 SHA
---out DIR` reproduces both fixture archives. The Fixtures workflow attests and
-publishes `fixture-oci.tar`, `fixture-docker.tar` and `provenance.json`.
-Maintainers verify the public bytes and attestations before committing pins;
-global manifest guest pins remain pending until publication. Native guest
+--out DIR` reproduces both fixture archives. The Fixtures workflow pulls the
+reviewed digest in `ci/fixture-base-image.txt` and creates the transient base
+archive itself; no separately hosted base tar is needed. It attests and
+publishes `fixture-oci.tar`, `fixture-docker.tar`, `provenance.json` and the
+base-image record. `make linux-prerelease` verifies the public bytes and
+attestations and commits the fixture pins on the release branch for PR review. Native guest
 qualification is separate, and a local build does not establish that a guest
 boots.

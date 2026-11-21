@@ -40,7 +40,7 @@ awman exec workflow --dynamic --work-item 42
 
 Use `exec workflow` to run any workflow file. If you don't want to write a workflow file yourself, see [Dynamic Workflows](06-dynamic-workflows.md) — `--dynamic` launches a leader agent that designs a purpose-built workflow for its required work item and then executes it automatically. A regular workflow can run without a work item; associate one with `--work-item` for template substitution. A missing or unreadable reference is an error, and dynamic workflows require an item. See [API mode](09-api-and-remote-mode.md) for usage in CI and scripting contexts. For GitHub issues, see [GitHub Integration](10-github-integration.md).
 
-The TUI shows the **Workflow Overview** between the execution window and the command box, with one coloured box per step. After each step completes, a confirmation dialog appears — press **Enter** to advance, **q** to pause. State is saved to disk so you can resume later.
+The TUI shows the **Workflow Overview** between the execution window and the command box. After each step, press **Enter** to advance or **Esc** to pause. State is saved so you can resume later.
 
 ---
 
@@ -1311,137 +1311,29 @@ A step marked `abort_on_failure = true` still stops the workflow immediately, wi
 
 ## Workflow Overview and step status
 
-The **Workflow Overview** shows the state of every step in the workflow:
+The TUI's Workflow Overview shows each step, its agent or model override, and whether it is pending, running, complete, failed, or being repaired. Setup and teardown have their own columns. Press **Ctrl+O** to expand parallel groups; **Ctrl+W** opens the full control board. See [Using the TUI](02-using-the-tui.md#the-workflow-overview--ctrl-o) for layout and scrolling.
 
-```
-Running: plan     ┃  ● implement    ✓ review    ⚠️ docs
-```
-
-| Visual | Meaning |
-|--------|---------|
-| **●** (Blue, bold) | Step is currently running |
-| **✓** (Green) | Step completed successfully |
-| **⚠️** (Yellow, bold) | A non-reporting agent is stuck (no output for the configured timeout) |
-| **●** (Gray, dim) | Step is pending |
-| **✗** (Red, bold) | Step encountered an error |
-| **🔧** (Magenta, bold) | Step failed and remediation is in progress (on_failure agent running) |
-
-### Agent and model labels
-
-When a step declares its own `agent` and/or `model`, the box shows the resolved **`agent/model`** on its top border (for example `claude/opus-4-8`) so you can see at a glance which agent and model will run each step:
-
-```
- ╭claude/opus-4-8──╮   ╭codex────────────╮
- │ ● implement     │ → │ ○ review        │
- ╰─────────────────╯   ╰─────────────────╯
-```
-
-Steps that declare **neither** an `agent` nor a `model` field inherit the project-default agent and model, so they carry no label — an unlabelled box always means "project defaults". If a step overrides only one of the two, the label shows just that part. The label is truncated to fit narrow boxes.
-
-### Setup and teardown steps
-
-Setup and teardown steps get their own dedicated column at the start and end of the overview — never mixed in with the main steps' columns, however those happen to be grouped by `depends_on`. Each box carries the same status glyph and colour as any other step, with a `[setup]` or `[teardown]` title on the top border instead of an `agent/model` label:
-
-```
-╭[setup]──────────╮   ╭claude/opus-4-8──╮   ╭[teardown]────────╮
-│ ✓ install deps  │ → │ ● implement     │ → │ ○ push and clean │
-╰─────────────────╯   ╰─────────────────╯   ╰─────────────────╯
-```
-
-Multiple setup (or teardown) steps share that one leading (or trailing) column, and collapse to a `N steps…` summary in the minimized overview the same way a parallel group of main steps does — the `[setup]`/`[teardown]` title stays on the collapsed box too.
-
-The complete setup and teardown lists appear when the workflow plan is available,
-with steps marked pending until they start. Entering teardown shows all of its
-steps immediately; each keeps its own row and status, even when descriptions
-repeat. The TUI and API instance snapshots and updates share this overview.
-
-### Remediation in progress
-
-When a setup or teardown step fails and has an `on_failure` block, the step status changes to **🔧** (remediating) while the agent runs. The workflow status indicator shows which remediation attempt is in progress (e.g., "attempt 1 of 2"). After the agent completes, the original step is automatically retried. The status returns to **●** (running) for the retry.
+| Mark | Meaning |
+|---|---|
+| `●` | Running (blue) or pending (gray) |
+| `✓` | Completed |
+| `✗` | Failed |
+| `🔧` | Repair agent running |
+| `⚠️` | Stuck; see below |
 
 ### Stuck steps
 
-When a step whose agent is not reporting program status produces no output for longer than the configured stuck timeout (30 seconds by default), it is marked as stuck in the overview. Stuck steps show a warning indicator (⚠️) both in the overview box and in the tab label. A reported `working` status suppresses this silence rule; quiet reporting agents may show `working · silent …` as an informational note.
-
-Stuck steps trigger automatic behavior depending on the mode:
-- In **yolo mode**: the engine starts a 60-second countdown. When it expires, the step is auto-advanced. If the user cancels (Esc) and the step re-stucks, the countdown restarts from 60 seconds with no backoff.
-- In **non-yolo mode**: the workflow control board opens automatically so you can decide what to do.
-- For a non-reporting agent, new PTY output immediately clears the stuck state and cancels any active countdown.
-
-You can always open the control board manually via **Ctrl+W** regardless of stuck status.
-
-### Parallel step groups
-
-Steps that share the same dependencies form a **parallel group** and run concurrently, each in its own container, up to the [`workflows.maxConcurrentSteps`](07-configuration.md#reference-all-keys) cap (unlimited by default). An interactive final group starts all its members together for review, even when that exceeds the cap.
-
-The overview shows a parallel group in one of two ways, toggled with **Ctrl-O**:
-
-- **Minimized** (the default) — the whole group is one box reading `3 steps…`, coloured by the group's overall state (a failed step colours the box red, otherwise a running step colours it blue, and so on). The overview stays 3 rows tall no matter how wide the workflow fans out.
-- **Maximized** — every step in the group gets its own box, stacked vertically at the same indent, keeping its full name, its `agent/model` label, and its own status colour for the whole run. Completed steps are never rolled up or hidden behind finished siblings.
-
-The maximized overview grows to fill the vertical space between the tab bar and the command box — half of it when a container window is maximized too, since **Ctrl-O** and **Ctrl-M** are independent and neither puts the other away. If a group is larger than the overview's height, the last box becomes a `+ N more…` marker — use the **mouse wheel** over the overview to scroll through the rest.
-
-Workflows with many stages scroll the other way: once the stages no longer fit side by side, the overview scrolls horizontally instead of shrinking columns further. See [Wide workflows scroll horizontally](02-using-the-tui.md#wide-workflows-scroll-horizontally) for the `‹`/`›` markers and the **Shift+←/→** / horizontal wheel controls.
-
-In the TUI, running steps beyond the concurrency cap wait their turn with a `·` prefix on their name until a slot frees up.
-
-See [Parallel workflows](05-workflows.md#parallel-workflows) for the full scheduling model, and [Using the TUI](02-using-the-tui.md#parallel-containers) for how multiple running containers are displayed and switched between.
-
-### Viewing the full control board
-
-When a step completes, awman shows the lightweight confirmation dialog. To see all available actions and options, press **Ctrl+W** to open the full control board. Pressing **Esc** on the lightweight dialog pauses the workflow for manual input.
+If an agent without program status produces no output for the configured timeout (30 seconds by default), awman marks it stuck. New output clears the state. In yolo mode, a 60-second countdown then advances the step; otherwise the control board opens so you can choose what to do. An agent reporting `working` is not marked stuck for silence. See [Auto-advance when stuck](#auto-advance-when-stuck-yolo-mode).
 
 ---
 
 ## Agent-reported status
 
-Agents that report program status can guide workflow progression without
-waiting for silence detection. `working` keeps the step running indefinitely,
-even when it produces no output. `done` or `idle` starts a 10-second
-completion countdown in unattended or yolo runs; intermediate steps then stop
-that agent and advance to the next step. Interactive runs always pause at the
-Workflow Control Board before leaving the final agent step or parallel group
-for teardown, including dynamic and yolo workflows. Final agents remain alive
-after reporting `done` or `idle` until you choose **Finish workflow**. Dismissing
-the board lets you review their output and continue interacting; use **Ctrl+W**
-to reopen it. Agents that exit naturally also require final review.
-Pending teardown steps may already be visible in the overview; they do not
-start until you choose **Finish workflow** and the remaining live agents stop.
-`--non-interactive` (also called `--headless`) skips this review, as do unattended
-API, squad, and worker workflow frontends. An interactive agent terminal alone
-does not make an unattended frontend capable of answering the board.
-While you are typing or scrolling on that agent's tab in the TUI,
-the completion countdown waits and starts in full once you stop. In attended
-non-yolo runs, awman opens the step-completion confirmation immediately and
-opens the workflow review board for the last step. If the agent reports
-`working` again before you touch a board it opened, the board closes by
-itself and the step keeps running.
+Agents that report status can say `working`, `done`, `idle`, `blocked`, or `error`. A `working` report keeps the step running even when output is quiet. In unattended or yolo runs, `done` and `idle` start a 10-second countdown to advance an intermediate step. In an interactive run, awman waits for you to review the final agent step before teardown, including when the agent exits on its own. Open the control board with **Ctrl+W** to finish or change course.
 
-`blocked` and `error` reports never trigger automatic progression to the next
-step. You can still choose an explicit next-step action on the control board.
-In an attended non-yolo run, awman opens the control board with the
-reported reason. In yolo mode with a user present, `blocked` pauses for you;
-answer the question in the running agent terminal so it can report `working`,
-or use the control board to choose an action. An `error` report keeps the
-container running for interactive repair, with its overview box and status
-strip shown in red. It stays in error until the agent reports a new status.
-A step that exits after an unanswered `error` or `blocked` report is failed
-even with exit code 0, including a report made just before it exited. With
-no user present (for example a squad or headless API run), `blocked` starts
-a 60-second fail countdown; `error` keeps the container running until it
-exits or reports recovery. Normal failure handling and retry rules then
-apply. Each agent in a parallel group is handled from its own reports; one
-agent's status does not advance or fail a sibling.
+`blocked` and `error` do not skip a step. An attended run opens the control board or leaves the agent available for repair. In an unattended run, `blocked` fails after a 60-second countdown if it stays unresolved. A step that exits while still reporting `blocked` or `error` fails even with exit code 0. Each agent in a parallel group has its own status.
 
-The countdown labels identify the reported status: **“Agent reported done:
-advancing in Ns”** and **“Agent is waiting for input: failing step in Ns.”**
-A fail countdown's action means fail the step, never skip past the problem.
-
-There is an important limit: if an agent reports `working` and then hangs,
-silence detection stays suppressed for as long as that report remains
-effective. The TUI may show `working · silent …` as an informational hint,
-but it does not mark the step stuck. Agents that do not report program status
-continue to use the silence behavior below.
+If an agent stays at `working` but hangs, silence detection cannot tell that it is stuck; the TUI may show `working · silent …` as a hint. Agents without status reports use the silence rule below.
 
 ## Auto-advance when stuck (yolo mode)
 

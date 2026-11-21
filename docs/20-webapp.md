@@ -44,29 +44,6 @@ last twelve hours and are dropped when the daemon stops. Within those twelve
 hours, reloading the page does not need a new approval; see
 [Reloading and relinking](#reloading-and-relinking).
 
-## Run the web app locally
-
-From the repository root, install the web dependencies and start the development
-server with `make web/dev`. Open <http://127.0.0.1:3000> or
-<http://localhost:3000>. If Tailscale is
-running, the target also prints a URL using this machine's tailnet IPv4 address;
-a page loaded from that address still connects to `127.0.0.1:9877` on the
-browser's own computer, so it only works in a browser on this machine. Both local origins are allowed by the default loopback listener. If you have
-overridden `allowedOrigins`, include both local origins in its exact origin list:
-
-```sh
-make web/reinstall
-awman config set daemon.network.listeners.loopback.allowedOrigins https://awman.prettysmart.dev,http://127.0.0.1:3000,http://localhost:3000
-make web/dev
-```
-
-If development reports a Next.js `LoaderRunnerError`, stop the development
-server, run `make web/reinstall`, then start it again with `make web/dev`.
-Reinstalling clears the Next.js build cache and restores the locked dependencies
-for the current machine. Stop the server before reinstalling so it cannot keep
-using modules from the previous installation. Run this sequence on the machine
-that reports the error, especially after using the checkout inside a container.
-
 ## Workspaces
 
 A browser has no shell of its own, so the web app opens sessions in

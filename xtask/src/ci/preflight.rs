@@ -16,6 +16,7 @@ pub struct Facts {
     pub hv_support: Option<String>,
     pub rustc: Option<String>,
     pub os: String,
+    pub macos_build: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -24,6 +25,7 @@ pub struct Needs {
     pub hypervisor: bool,
     pub toolchain: String,
     pub macos: bool,
+    pub image: String,
 }
 
 pub fn needs(m: &Manifest, platform: &str) -> Result<Needs> {
@@ -36,6 +38,7 @@ pub fn needs(m: &Manifest, platform: &str) -> Result<Needs> {
         hypervisor: p.provides.iter().any(|c| c == "hypervisor"),
         toolchain: p.toolchain.clone(),
         macos: p.triple.contains("apple-darwin"),
+        image: p.image.clone(),
     })
 }
 
@@ -67,6 +70,18 @@ pub fn evaluate(f: &Facts, n: &Needs) -> Vec<String> {
             f.hv_support
         ));
     }
+    if n.macos {
+        let observed = f
+            .macos_build
+            .as_deref()
+            .map(|build| format!("macos-{build}"));
+        if observed.as_deref() != Some(n.image.as_str()) {
+            why.push(format!(
+                "macOS build {:?} does not match manifest image {}",
+                observed, n.image
+            ));
+        }
+    }
     why
 }
 
@@ -87,6 +102,7 @@ fn facts() -> Facts {
         hv_support: cmd_out("sysctl", &["-n", "kern.hv_support"]),
         rustc: cmd_out("rustc", &["--version"]),
         os: std::env::consts::OS.into(),
+        macos_build: cmd_out("sw_vers", &["-buildVersion"]),
     }
 }
 
@@ -112,6 +128,7 @@ mod tests {
             hypervisor: true,
             toolchain: "1.94.0".into(),
             macos: true,
+            image: "macos-25A100".into(),
         }
     }
     fn healthy() -> Facts {
@@ -120,6 +137,7 @@ mod tests {
             hv_support: Some("1".into()),
             rustc: Some("rustc 1.94.0 (abc 2026-01-01)".into()),
             os: "macos".into(),
+            macos_build: Some("25A100".into()),
         }
     }
 
@@ -151,6 +169,15 @@ mod tests {
             &mac_needs(),
         );
         assert!(why.len() >= 3, "{why:?}");
+    }
+
+    #[test]
+    fn mismatched_self_hosted_macos_build_blocks() {
+        let mut f = healthy();
+        f.macos_build = Some("25B200".into());
+        assert!(evaluate(&f, &mac_needs())
+            .iter()
+            .any(|reason| reason.contains("manifest image macos-25A100")));
     }
 
     #[test]

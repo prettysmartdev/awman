@@ -63,6 +63,17 @@ fn api(path: &str) -> Result<Value> {
         None,
     )?)?)
 }
+fn release_pr_head(pr: &Value, sha: &str, repo: &str) -> bool {
+    let branch = pr["head"]["ref"].as_str().unwrap_or("");
+    let version = branch.strip_prefix("release/v").unwrap_or("");
+    version.split('.').count() == 3
+        && version
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        && pr["head"]["sha"] == sha
+        && pr["head"]["repo"]["full_name"] == repo
+        && pr["base"]["ref"] == "main"
+}
 fn pages(path: &str, field: &str) -> Result<Vec<Value>> {
     let data: Vec<Value> = serde_json::from_slice(&output(
         "gh",
@@ -336,14 +347,54 @@ pub fn aggregate(root: &Path, m: &Manifest, p: &Plan) -> Result<GateEvidence> {
     let event_name = environment("GITHUB_EVENT_NAME")?;
     ensure!(run["event"] == event_name, "event differs from service");
     let current = source(root)?;
+    let trigger_sha = environment("GITHUB_SHA")?;
+    let requested = event["inputs"]["ref"].as_str().unwrap_or("");
+    let release_override = event_name == "workflow_dispatch"
+        && event["inputs"]["gate"] == "main"
+        && !requested.is_empty()
+        && requested != trigger_sha;
+    if release_override {
+        ensure!(
+            environment("GITHUB_REF")? == "refs/heads/main" && run["head_sha"] == trigger_sha,
+            "release gate controller must run from protected main"
+        );
+        let pages: Vec<Value> = serde_json::from_slice(&output(
+            "gh",
+            &[
+                "api",
+                "--paginate",
+                "--slurp",
+                &format!("repos/{repo}/pulls?state=open&per_page=100"),
+            ],
+            None,
+        )?)?;
+        let matching = pages
+            .iter()
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter(|pr| release_pr_head(pr, requested, &repo))
+            .count();
+        ensure!(
+            matching == 1,
+            "release gate ref is not an exact open release PR head"
+        );
+    }
     ensure!(
-        current["clean"] == true && current["commit"] == environment("GITHUB_SHA")?,
+        current["clean"] == true
+            && current["commit"]
+                == if release_override {
+                    requested
+                } else {
+                    &trigger_sha
+                },
         "checkout differs from triggering source"
     );
     // PR API head_sha describes the contributor head; GITHUB_SHA is the tested
     // merge commit. Both are checked against the provider event envelope.
     let service_head = if event_name == "pull_request" {
         &event["pull_request"]["head"]["sha"]
+    } else if release_override {
+        &run["head_sha"]
     } else {
         &current["commit"]
     };
@@ -564,6 +615,21 @@ pub fn aggregate(root: &Path, m: &Manifest, p: &Plan) -> Result<GateEvidence> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn release_override_requires_exact_same_repo_pr_head() {
+        let original = json!({"head":{"ref":"release/v0.14.0","sha":"abc","repo":{"full_name":"owner/repo"}},"base":{"ref":"main"}});
+        assert!(release_pr_head(&original, "abc", "owner/repo"));
+        for (pointer, value) in [
+            ("/head/ref", json!("feature/unsafe")),
+            ("/head/sha", json!("other")),
+            ("/head/repo/full_name", json!("attacker/fork")),
+            ("/base/ref", json!("other")),
+        ] {
+            let mut changed = original.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert!(!release_pr_head(&changed, "abc", "owner/repo"));
+        }
+    }
     fn setup(dir: &Path) -> (Value, Value, Manifest, BTreeSet<String>) {
         let source = json!({"commit":"source", "clean":true});
         let producer = json!({"run_id":"42", "attempt":"2", "job":"test-unit-linux-x64"});

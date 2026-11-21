@@ -10,14 +10,20 @@ Use this skill when the user asks to "prepare for release vX.Y.Z", "bump the ver
 ## What this skill does
 
 1. Determine the new version from the user's request (e.g. `v0.3.0`)
-2. Identify what changed since the last release (git log, new work items, new features)
-3. Update all version numbers
-4. Update documentation to reflect new features
-5. Review and refresh the status-dashboard tips
-6. Write release notes
-7. Write a blog post
+2. Create or resume the `release/vX.Y.Z` branch before changing release files
+3. Identify what changed since the last release (git log, new work items, new features)
+4. Update all version numbers
+5. Update documentation to reflect new features
+6. Review and refresh the status-dashboard tips
+7. Write release notes
+8. Write a blog post
 
 Do **not** run `make release` or push any tags. Stop before the release script.
+
+Before editing, start from a clean, synchronized `main` checkout and create
+`release/vX.Y.Z`, or resume that existing branch. Commit all release prep
+changes on the release branch. The prerelease targets push it, create the PR,
+and pin/validate its inputs; the skill does not merge the PR.
 
 ---
 

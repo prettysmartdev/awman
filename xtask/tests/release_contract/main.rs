@@ -18,6 +18,34 @@ fn root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
     manifest_dir.parent().unwrap().to_path_buf()
 }
+
+#[test]
+fn full_prerelease_make_targets_use_the_native_orchestrators() {
+    let make = fs::read_to_string(root().join("Makefile")).unwrap();
+    assert!(make.contains("linux-prerelease:\n\t@bash tools/prerelease/linux.sh"));
+    assert!(make.contains("apple-prerelease:\n\t@bash tools/prerelease/apple.sh"));
+    let linux = fs::read_to_string(root().join("tools/prerelease/linux.sh")).unwrap();
+    let remote = fs::read_to_string(root().join("tools/prerelease/remote-linux.sh")).unwrap();
+    let apple = fs::read_to_string(root().join("tools/prerelease/apple.sh")).unwrap();
+    assert!(linux.contains("gh auth token | ssh"));
+    assert!(remote.contains("git -c credential.helper= clone"));
+    assert!(remote.contains("cargo xtask native-validation run --platform linux"));
+    assert!(apple.contains("cargo xtask native-validation verify \"$work/evidence\""));
+    assert!(apple.contains("ci_runner up \"$repo\""));
+    assert!(apple.contains("ci_runner down"));
+    assert!(apple.contains("gh workflow run ci.yml"));
+    let release = fs::read_to_string(root().join("tools/prerelease/release.sh")).unwrap();
+    assert!(release.contains("cargo xtask native-validation verify \"$linux\""));
+    assert!(release.contains("cargo xtask native-validation verify \"$apple\""));
+    assert!(release.contains("gh pr checks"));
+    assert!(release.contains("cargo xtask release run \"$version\""));
+    assert!(
+        release.find("gh pr checks").unwrap() < release.rfind("cargo xtask release run").unwrap()
+    );
+    let runner = fs::read_to_string(root().join("xtask/src/release/runner/runner.sh")).unwrap();
+    assert!(runner.contains("AWMAN_RELEASE_RUNNER_ROLE"));
+    assert!(runner.contains("LABEL=awman-ci-guest"));
+}
 fn write(path: &Path, body: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, body).unwrap();
@@ -241,10 +269,9 @@ fn row_01_usage_and_runner_mode() {
         f.s.command("/usr/bin/make")
             .args(["-f", root().join("Makefile").to_str().unwrap(), "release"])
             .run();
-    contains(
-        &out.stdout_text(),
-        "Usage: make release VERSION=vx.y.z [RELEASE_RUNNER=auto|local|none]",
-    );
+    assert!(fs::read_to_string(root().join("Makefile"))
+        .unwrap()
+        .contains("release:\n\t@bash tools/prerelease/release.sh"));
     assert!(!out.exit.success());
     // These recipes exercise the public dispatch names without calling GitHub.
     for (target, subcommand) in [
@@ -763,10 +790,10 @@ fn row_21_unmanaged_follow_line() {
     let out = f.run();
     contains(
         &out,
-        "Candidate started; the Release workflow will publish v1.2.3 after the build gates pass",
+        "Candidate dispatched; release v1.2.3 awaits CI validation and publication",
     );
-    contains(&out, "gh run watch $(gh run list --workflow candidate.yml");
-    contains(&out, "Release v1.2.3 tagged!");
+    contains(&out, "make release-status VERSION=v1.2.3");
+    assert!(!out.contains("tagged!"));
     assert!(!f.calls().contains("gh <run> <watch>"));
 }
 #[test]
