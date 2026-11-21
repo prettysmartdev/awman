@@ -709,7 +709,11 @@ impl ChildCore {
         *guard = None;
         *self.exit.lock().unwrap() = Some(exit);
         drop(guard);
-        if self.group.has_members() {
+        #[cfg(windows)]
+        let survivors = self.group.has_survivors();
+        #[cfg(not(windows))]
+        let survivors = self.group.has_members();
+        if survivors {
             self.survivors.store(true, Ordering::SeqCst);
         } else {
             self.group_gone.store(true, Ordering::SeqCst);

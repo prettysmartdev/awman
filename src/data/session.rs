@@ -491,6 +491,17 @@ impl Session {
             },
         )
     }
+    /// The operator's trusted global prerequisite ceiling, without the
+    /// repository, task or flag layers.
+    pub fn trusted_prerequisite_policy(
+        &self,
+    ) -> crate::data::config::workflows::PrerequisitePolicy {
+        self.effective_config().trusted_prerequisite_policy(
+            crate::data::config::workflows::PrerequisiteResolveContext {
+                remote_session: self.session_type().is_remote(),
+            },
+        )
+    }
     /// Open a session at the supplied working directory, resolving the git
     /// root via `resolver` and loading repo + global config from disk.
     pub fn open(

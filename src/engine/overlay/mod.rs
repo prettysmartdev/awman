@@ -200,17 +200,20 @@ impl OverlayEngine {
 
         let mut out = GrantOverlays::none();
         let home = target.container_home.unwrap_or("/root");
-        match target.step_kind {
+        // The run-wide fixed identity reaches every setup/teardown container
+        // (as `agent_container_env` does every agent container); a
+        // `commit_changes` step also takes an identity resolved for its need.
+        let identity = match target.step_kind {
             PrerequisiteStepKind::CommitChanges => {
-                if let Some(identity) = &grants.identity {
-                    out.env_literals.extend([
-                        ("GIT_AUTHOR_NAME".into(), identity.name.clone()),
-                        ("GIT_AUTHOR_EMAIL".into(), identity.email.clone()),
-                        ("GIT_COMMITTER_NAME".into(), identity.name.clone()),
-                        ("GIT_COMMITTER_EMAIL".into(), identity.email.clone()),
-                    ]);
-                }
+                grants.identity.as_ref().or(grants.run_identity.as_ref())
             }
+            _ => grants.run_identity.as_ref(),
+        };
+        if let Some(identity) = identity {
+            out.identity_env = identity_env(identity);
+        }
+        match target.step_kind {
+            PrerequisiteStepKind::CommitChanges => {}
             PrerequisiteStepKind::PushBranch
             | PrerequisiteStepKind::PullBranch
             | PrerequisiteStepKind::CloneRepo => {

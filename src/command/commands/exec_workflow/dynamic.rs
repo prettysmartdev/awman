@@ -664,6 +664,9 @@ impl ExecWorkflowCommand {
         // unattended evaluator drives the same object. Only the *driving* of the
         // leader container (stuck → yolo countdown → control board) is specific
         // to this interactive caller.
+        // The leader commits as every step will: the run's fixed identity.
+        let leader_grant_env =
+            crate::engine::overlay::prerequisite_grants::agent_container_env(&prerequisites.grants);
         let mut repair = WorkflowRepairLoop::new(generated_path.clone(), leader_prompt.clone());
         let validated_workflow = loop {
             if self.cancel.is_cancelled() {
@@ -684,6 +687,7 @@ impl ExecWorkflowCommand {
                     prepared_input.overlay.as_ref(),
                     &label,
                     &mut engine_rx,
+                    leader_grant_env.clone(),
                 )
                 .await?;
             match drive {
@@ -1080,6 +1084,7 @@ impl ExecWorkflowCommand {
         work_item_overlay: Option<&TypedOverlay>,
         label: &str,
         engine_rx: &mut tokio::sync::mpsc::UnboundedReceiver<EngineRequest>,
+        grant_env: Vec<(String, String)>,
     ) -> Result<LeaderDriveOutcome, CommandError> {
         use crate::engine::agent_runtime::execution::{StuckEvent, KILLED_EXIT_CODE};
 
@@ -1151,6 +1156,7 @@ impl ExecWorkflowCommand {
                 )
                 .agent_flags(agent.as_str()),
             ),
+            grant_env,
             ..Default::default()
         };
         let resolved_credentials = self

@@ -144,8 +144,9 @@ pub(crate) type StepCommandOptionsByStep = Vec<((PhaseKind, usize), StepCommandO
 /// options (SSH key / HTTPS token push auth) the engine renders steps with.
 ///
 /// Only `OverlayEngine::prerequisite_grant_overlays` turns grants into mounts
-/// or env; step kinds that never receive grants (`run_shell`, `run_script`,
-/// `checkout_create_branch`, `poll_ci`) get nothing from it. Secret values go
+/// or env; step kinds that never receive credentials (`run_shell`,
+/// `run_script`, `checkout_create_branch`, `poll_ci`) get only the run-wide
+/// fixed identity from it. Secret values go
 /// into the launch env map, which reaches the container by name only.
 pub(crate) fn apply_grant_overlays(
     engines: &Engines,
@@ -239,6 +240,11 @@ pub(crate) fn apply_grant_overlays(
                 )));
             }
             continue;
+        }
+        // The run's fixed identity reaches every setup/teardown container,
+        // including steps that receive no credential.
+        for (name, value) in &grant.identity_env {
+            env.insert(name.clone(), value.clone());
         }
         if grant.is_empty() {
             continue;

@@ -253,7 +253,7 @@ The requirements depend on the steps and the repository's remote:
 | Workflow need | When it is needed | What awman checks or supplies |
 |---|---|---|
 | Agent images | Every selected agent, including the dynamic leader | Images are included in the same prerequisite report and prepared before any agent starts. |
-| Git identity | `commit_changes` | A complete `user.name` and `user.email` in the repository/worktree config is used directly. If missing, you can provide an identity for this run or explicitly allow use of your host Git identity. awman does not change your global Git configuration. |
+| Git identity | `commit_changes` and any run with a fixed identity grant | Without a fixed grant, a complete `user.name` and `user.email` in the repository/worktree config is used directly for `commit_changes`. A fixed identity granted by the prerequisite policy (for example, with `--prerequisite-identity`) takes precedence and is also set in every workflow container, including the dynamic leader and setup/teardown steps, and is used for the leftover commit. If identity is missing, you can provide one for this run or explicitly allow use of your host Git identity. awman does not change your global Git configuration. |
 | SSH access | `push_branch` when the remote uses SSH | awman checks for a usable key and the `ssh` tool in the base image. With consent, it mounts a selected key read-only, or the whole `~/.ssh` directory if you choose that broader access. |
 | GitHub token | GitHub HTTPS `clone_repo` / `pull_branch`, `create_pull_request`, HTTPS `push_branch`, and token-authenticated `poll_ci` | awman can use a token from an approved host variable, `gh auth token`, a token you paste, or a configured `acquire` command. Credentials are supplied only to the steps that need them. For `poll_ci`, an already-authenticated host `gh` may be used without a token grant. |
 | GitHub CLI | `create_pull_request` and some GitHub operations | The base image must contain `gh` for `create_pull_request`; awman checks the image before execution. |
@@ -271,6 +271,11 @@ Under the checks, the report says what happens if you continue:
 If you leave items unresolved after the questions, by declining or picking "continue without", the run still starts by default. You get a warning for each item, and the steps that need it fail when they run. With `--prerequisite-unresolved fail` (or `workflows.prerequisites.unresolved: "fail"`), the run stops before any agent starts. The report says which of these applies. When every check is satisfied, **Enter** starts the workflow. With `--check-prerequisites`, the report is the whole result and the only choice is **Close**.
 
 Repo-local Git identity is preferred: it follows the repository/worktree and avoids exposing your global identity to a container. Host identity use requires an explicit choice. For SSH, a key mount is read-only; the private key itself is not copied into the workflow configuration.
+
+A fixed identity granted by the prerequisite policy is supplied to each
+workflow agent and phase container as Git author and committer environment, as
+well as to awman's leftover commit. An agent can still choose a different
+author by passing `git commit --author`; awman does not rewrite that commit.
 
 Use `--check-prerequisites` with `exec workflow` to run the checks and display their report without starting the workflow. Exit code `0` means every check is satisfied; `1` means a check is missing, awaiting consent, or unknown. Dynamic workflow checks happen before the leader as well. See [Dynamic Workflows](06-dynamic-workflows.md#workflow-prerequisites).
 

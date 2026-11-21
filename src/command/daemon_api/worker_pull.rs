@@ -168,8 +168,8 @@ pub trait PullHandle: Send + Sync {
     async fn foreground_terminal(
         &self,
         _id: &LeaseId,
-        _frames: Vec<awman_wsp::terminal::LeaseTerminalFrame>,
-    ) -> Result<Vec<awman_wsp::terminal::LeaseTerminalFrame>, WorkerError> {
+        _frames: crate::data::worker::wire::TerminalExchange,
+    ) -> Result<crate::data::worker::wire::TerminalExchangeReply, WorkerError> {
         Err(WorkerError::LeaseNotFound)
     }
     async fn foreground_checkout(
@@ -333,8 +333,8 @@ pub async fn foreground_events(
 pub async fn foreground_terminal(
     api: &DaemonApi,
     id: &LeaseId,
-    frames: Vec<awman_wsp::terminal::LeaseTerminalFrame>,
-) -> Result<Vec<awman_wsp::terminal::LeaseTerminalFrame>, WorkerError> {
+    frames: crate::data::worker::wire::TerminalExchange,
+) -> Result<crate::data::worker::wire::TerminalExchangeReply, WorkerError> {
     api.pull
         .as_deref()
         .ok_or_else(|| WorkerError::PullDisabled("worker stopped".into()))?

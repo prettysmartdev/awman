@@ -22,9 +22,10 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
-    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
-    TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
     OpenThread, ResumeThread, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME,
@@ -154,6 +155,46 @@ impl Group {
                 std::ptr::null_mut(),
             );
             ok != 0 && info.ActiveProcesses > 0
+        }
+    }
+
+    /// After the leader exits, job accounting can still include its PID.
+    /// Inspect the active IDs so that only a surviving descendant is a leak.
+    pub(crate) fn has_survivors(&self) -> bool {
+        let mut slots = 16usize;
+        loop {
+            let bytes = std::mem::size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+                + (slots - 1) * std::mem::size_of::<usize>();
+            let mut storage = vec![0usize; bytes.div_ceil(std::mem::size_of::<usize>())];
+            // SAFETY: `storage` is aligned for the C struct and has `bytes`
+            // writable bytes, including room for `slots` process IDs.
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    self.job,
+                    JobObjectBasicProcessIdList,
+                    storage.as_mut_ptr().cast(),
+                    bytes as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok != 0 {
+                // SAFETY: the successful query initialized the struct and at
+                // most `slots` IDs in the aligned buffer above.
+                let list =
+                    unsafe { &*(storage.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST) };
+                let count = list.NumberOfProcessIdsInList as usize;
+                if count <= slots && list.NumberOfAssignedProcesses as usize <= count {
+                    // SAFETY: `count` was bounded by the allocation above.
+                    let ids =
+                        unsafe { std::slice::from_raw_parts(list.ProcessIdList.as_ptr(), count) };
+                    return ids.iter().any(|&id| id != self.pid as usize);
+                }
+            }
+            if slots >= 4096 {
+                // An incomplete query cannot prove the group is empty.
+                return self.has_members();
+            }
+            slots *= 2;
         }
     }
 }

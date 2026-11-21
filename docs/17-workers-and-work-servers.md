@@ -424,16 +424,25 @@ the WorkItem's `context` field instead. Environment overlays must meet the
 and either in the builtin library or allowed by `allowSkills`. Overlays in
 server-supplied `workflow_toml` and generated or resumed dynamic workflows are\nreviewed by the same env and skill rules before their steps launch.
 
-`prerequisites` is valid only for workflow items. It may contain
-`git_identity: {name, email}`, `ssh: "allow"|"deny"`, and
-`github_token: "allow"|"deny"`. An `allow` choice can select only credentials
-already named by the worker's prerequisite policy; widening beyond that policy
-is refused. A fixed `git_identity` applies to the worker's commit of leftover
-changes before lease publication. Main agent containers retain their own Git
-identity; commits they create themselves are not rewritten or assigned this
-identity. `workflows_dynamic` uses the snake_case fields shown above, is
+`prerequisites` may contain `git_identity: {name, email}`, `ssh:
+"allow"|"deny"`, and `github_token: "allow"|"deny"`. Prompt items accept only
+`git_identity`; `ssh` and `github_token` remain workflow-only. A read-only
+prompt accepts `git_identity` but ignores it. An `allow` choice can select only
+credentials already named by the worker's prerequisite policy; widening beyond
+that policy is refused.
 
-valid only for dynamic workflow items (`dynamic: true`), and is applied as the
+A fixed `git_identity` is supplied to every container in a workflow run: the
+dynamic leader, agent steps (including parallel groups and repair steps), and
+setup or teardown phase containers. It is also used for the worker's commit of
+leftover changes before lease publication. Prompt items receive the same
+identity in their writable agent container and leftover commit. The identity
+sets Git's author and committer environment; an agent that passes `--author`
+explicitly can still choose a different commit author, while the committer
+remains the granted identity. Work-server authors can inspect authors and
+committers in the returned result if their policy requires a particular
+identity. The `exec prompt --prerequisite-identity` flag has the same behavior
+for pushed prompt commands. `workflows_dynamic` uses the snake_case fields shown
+above, is valid only for dynamic workflow items (`dynamic: true`), and is applied as the
 lease's workflow configuration layer.
 
 An unsupported feature or invalid lease request is released with reason
@@ -578,6 +587,29 @@ epoch headers. Text frames are JSON objects with a `terminal_id` and tagged
 may send `input`, resize, or take-control frames only when the lease grants a
 terminal; awman accepts remote input only when the lease grants `remote_input`
 and `daemon.terminal.remoteInput` is currently enabled.
+
+A server may close a terminal socket at any time without ending the lease run.
+The worker reconnects with backoff capped at 10 seconds and may open a
+replacement socket for the same lease and epoch. On each replacement, the
+worker sends a fresh `snapshot` for every live terminal before sending further
+output, then sends `exit` frames for terminals that ended while disconnected.
+Remote input and control are connection-scoped: after reconnecting, the server
+must re-establish remote-input authorization and send a fresh `take_control`
+frame when it wants to control a terminal. An HTTP 404 when opening
+the terminal endpoint disables terminal retries for that lease; the lease run
+continues.
+
+#### Notes for work-server authors
+
+Treat terminal sockets as replaceable transports, not as lease lifetime. Accept
+a replacement connection for the current lease epoch and close or supersede the
+previous socket. Rebuild the displayed terminal from each reconnect's initial
+snapshots, and re-establish remote-input authorization or send `take_control`
+again when needed on that new connection. A 404 tells the worker that
+terminals are unavailable for the rest of that lease; it does not cancel
+execution. Validate the author and
+committer in the result if your work-server policy requires identity checks;
+an agent can override the author with `git commit --author`.
 
 Foreground CLI and engine-instance runs keep their terminal hub in the executing
 process. The daemon retains the WSP connection and credentials. The owner-only

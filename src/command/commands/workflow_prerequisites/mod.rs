@@ -20,18 +20,20 @@ mod task_policy;
 mod widening;
 
 pub use flags::{
-    flags_applied_policy, parse_identity, parse_prerequisite_flags, parse_ssh, parse_token,
-    policy_lines, policy_summary, prerequisite_flag_args, validate_identity, FLAG_CHECK,
-    FLAG_IDENTITY, FLAG_SSH, FLAG_TOKEN, FLAG_UNRESOLVED,
+    flags_applied_policy, parse_identity, parse_identity_only, parse_prerequisite_flags, parse_ssh,
+    parse_token, policy_lines, policy_summary, prerequisite_flag_args, validate_identity,
+    FLAG_CHECK, FLAG_IDENTITY, FLAG_SSH, FLAG_TOKEN, FLAG_UNRESOLVED,
 };
 pub use flow::{
-    custom_agent_binaries, headless_for, policy_for, repo_overlay_notes, PreparedPrerequisites,
-    PrerequisiteOutcome, WorkflowPrerequisiteFlow, WorkflowPrerequisiteFlowOptions,
-    ACQUIRE_TRUST_NAME,
+    custom_agent_binaries, granted_fixed_identity, headless_for, policy_for, repo_overlay_notes,
+    PreparedPrerequisites, PrerequisiteOutcome, WorkflowPrerequisiteFlow,
+    WorkflowPrerequisiteFlowOptions, ACQUIRE_TRUST_NAME,
 };
 pub use frontend::{
     GapChoice, IdentityChoice, IdentityPersist, PrerequisiteReportNext, SshChoice, TokenConsent,
     TokenSourceChoice, ToolChoice, WorkflowPrerequisiteFrontend,
 };
 pub use task_policy::{collect_task_prerequisites, edit_task_policy, task_policy_from_outcome};
-pub use widening::{check_flag_widening, check_task_widening};
+pub use widening::{
+    apply_identity_ceiling, check_flag_widening, check_task_widening, remote_ceiling,
+};

@@ -555,11 +555,11 @@ impl<F: CommandFrontend> Dispatch<F> {
             .catalogue
             .lookup(&canonical)
             .ok_or_else(|| CommandError::unknown_command(path))?;
-        if !spec
-            .flags
-            .iter()
-            .any(|f| f.long == prerequisites::FLAG_TOKEN)
-        {
+        let declares = |long: &str| spec.flags.iter().any(|f| f.long == long);
+        // `exec workflow` declares every prerequisite flag; `exec prompt` only
+        // `--prerequisite-identity`.
+        let full = declares(prerequisites::FLAG_TOKEN);
+        if !full && !declares(prerequisites::FLAG_IDENTITY) {
             return Ok(None);
         }
         let flags = ResolvedFlags::resolve(&self.frontend, &canonical, spec)?;
@@ -569,13 +569,12 @@ impl<F: CommandFrontend> Dispatch<F> {
             .try_read()
             .map_err(|_| CommandError::Other("session is write-locked".into()))?
             .clone();
-        let with_check = spec
-            .flags
-            .iter()
-            .any(|f| f.long == prerequisites::FLAG_CHECK);
-        let mut context_flags = session.flags().clone();
-        context_flags.squad_prerequisites = !with_check;
-        session.set_flags(context_flags);
+        let with_check = declares(prerequisites::FLAG_CHECK);
+        if full {
+            let mut context_flags = session.flags().clone();
+            context_flags.squad_prerequisites = !with_check;
+            session.set_flags(context_flags);
+        }
         let ctx = BuildContext {
             remote_target: self.frontend.flag_string(&canonical, "remote")?,
             set_args: crate::data::config::overrides::forwardable_set_args(
@@ -593,14 +592,16 @@ impl<F: CommandFrontend> Dispatch<F> {
             output_dir: self.output_dir.clone(),
             command_secrets: self.engines.command_secrets(),
         };
-        let parsed = prerequisites::parse_prerequisite_flags(&ctx, with_check)?;
-        prerequisites::check_flag_widening(
-            self.frontend.kind(),
-            &parsed,
-            &prerequisites::policy_for(&ctx.session, &Default::default(), None),
-        )?;
+        let mut parsed = if full {
+            prerequisites::parse_prerequisite_flags(&ctx, with_check)?
+        } else {
+            prerequisites::parse_identity_only(&ctx)?
+        };
+        let ceiling = prerequisites::remote_ceiling(&ctx.session);
+        prerequisites::check_flag_widening(self.frontend.kind(), &parsed, &ceiling)?;
+        prerequisites::apply_identity_ceiling(self.frontend.kind(), &mut parsed, &ceiling);
         let mut summary = prerequisites::flags_applied_policy(&ctx.session, &parsed);
-        if summary["unresolved"].is_null() {
+        if full && summary["unresolved"].is_null() {
             let origin = if with_check && !ctx.flags.bool("dynamic") {
                 crate::data::workflow_prerequisites::PrerequisiteOrigin::Static
             } else {

@@ -464,18 +464,16 @@ impl ExecWorkflowCommand {
     /// non-dynamic run requires (the catalogue marks it optional so
     /// `--dynamic` may omit it).
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
-        let prerequisites =
-            crate::command::commands::workflow_prerequisites::parse_prerequisite_flags(ctx, true)?;
+        use crate::command::commands::workflow_prerequisites as prerequisites_flow;
+        let mut prerequisites = prerequisites_flow::parse_prerequisite_flags(ctx, true)?;
         // An API client may only narrow what the server grants (WI 0149 §6).
-        crate::command::commands::workflow_prerequisites::check_flag_widening(
+        let ceiling = prerequisites_flow::remote_ceiling(&ctx.session);
+        prerequisites_flow::check_flag_widening(ctx.caller.frontend(), &prerequisites, &ceiling)?;
+        prerequisites_flow::apply_identity_ceiling(
             ctx.caller.frontend(),
-            &prerequisites,
-            &crate::command::commands::workflow_prerequisites::policy_for(
-                &ctx.session,
-                &Default::default(),
-                None,
-            ),
-        )?;
+            &mut prerequisites,
+            &ceiling,
+        );
         let flags = ExecWorkflowCommandFlags {
             prerequisites: Box::new(prerequisites),
             squad_task_prerequisites: None,

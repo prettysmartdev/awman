@@ -69,7 +69,20 @@ pub struct PrerequisiteGrants {
     /// Credential-stripped destinations approved during this run. Empty fails closed.
     pub ssh_destinations: std::collections::BTreeSet<String>,
     pub token_destinations: std::collections::BTreeSet<String>,
+    /// The identity granted to `commit_changes` containers (WI 0149): the
+    /// run-wide identity below, or one resolved for a `GitIdentity` need
+    /// (host, remembered or entered). Dropped by `retain_for` when no step
+    /// needs it.
     pub identity: Option<GitIdentityGrant>,
+    /// A fixed identity the resolved policy grants to the whole run
+    /// (`gitIdentity.use = "allow"` with `fixed`, e.g. from
+    /// `--prerequisite-identity "Name <email>"` or a lease's
+    /// `exec.prerequisites.git_identity`). Not a secret and not tied to a
+    /// need: it reaches every container of the run (agent steps, parallel
+    /// groups, the dynamic leader, `on_failure` agents, setup and teardown)
+    /// as `GIT_AUTHOR_*`/`GIT_COMMITTER_*`. `None` keeps the container's
+    /// own identity.
+    pub run_identity: Option<GitIdentityGrant>,
     pub ssh: Option<SshGrant>,
     pub token: Option<TokenGrant>,
 }
@@ -78,6 +91,7 @@ impl std::fmt::Debug for PrerequisiteGrants {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrerequisiteGrants")
             .field("identity", &self.identity)
+            .field("run_identity", &self.run_identity)
             .field("ssh", &self.ssh)
             .field("token", &self.token)
             .finish()

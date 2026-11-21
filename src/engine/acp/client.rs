@@ -39,7 +39,10 @@ use crate::engine::agent_runtime::frontend::{
 use crate::engine::error::EngineError;
 
 type SharedSink = Arc<Mutex<Box<dyn UserMessageSink>>>;
-type PendingSender = oneshot::Sender<Answer>;
+struct PendingSender {
+    sender: oneshot::Sender<Answer>,
+    prompt: bool,
+}
 
 /// A response delivered to a waiting request. Until the caller takes it (or
 /// stops waiting and drops it) its bytes are charged to the control budget,
@@ -47,6 +50,7 @@ type PendingSender = oneshot::Sender<Answer>;
 struct Answer {
     result: Result<Value, EngineError>,
     _credit: Option<ControlCredit>,
+    bulk_barrier: Option<oneshot::Receiver<()>>,
 }
 
 impl Answer {
@@ -54,6 +58,7 @@ impl Answer {
         Self {
             result: Err(error),
             _credit: None,
+            bulk_barrier: None,
         }
     }
 }
@@ -255,7 +260,7 @@ impl Shared {
             .drain()
             .collect();
         for (_, sender) in drained {
-            let _ = sender.send(Answer::failed(self.closed_error()));
+            let _ = sender.sender.send(Answer::failed(self.closed_error()));
         }
     }
 
@@ -528,7 +533,13 @@ impl AcpClient {
                     queue: "pending_requests",
                 });
             }
-            pending.insert(id.clone(), tx);
+            pending.insert(
+                id.clone(),
+                PendingSender {
+                    sender: tx,
+                    prompt: method == "session/prompt",
+                },
+            );
             shared
                 .high_pending
                 .fetch_max(pending.len(), Ordering::SeqCst);
@@ -547,8 +558,23 @@ impl AcpClient {
             .await?;
         tokio::select! {
             response = rx => match response {
-                // The credit is returned as the answer is dropped here.
-                Ok(answer) => answer.result,
+                Ok(answer) => {
+                    let Answer { result, _credit, bulk_barrier } = answer;
+                    // Retain the control credit until the ordering marker is
+                    // reached, bounding markers even if callers keep issuing
+                    // prompt requests while bulk output is stalled.
+                    if let Some(barrier) = bulk_barrier {
+                        tokio::select! {
+                            result = barrier => {
+                                if result.is_err() {
+                                    return Err(shared.closed_error());
+                                }
+                            },
+                            _ = shared.cancel.cancelled() => return Err(shared.closed_error()),
+                        }
+                    }
+                    result
+                },
                 Err(_) => Err(EngineError::Acp(format!(
                     "ACP connection closed while waiting for {method}"
                 ))),
@@ -718,18 +744,25 @@ fn spawn_tasks(
             let writable = shared.bulk.writable();
             tokio::pin!(writable);
             writable.as_mut().enable();
-            while let Some((update, cost)) = ahead.pop() {
-                match shared.bulk.try_push_update(update, cost) {
-                    Ok(()) => {}
-                    Err(PushUpdate::Full(update, cost)) => {
-                        ahead.unpop(*update, cost);
-                        break;
+            while let Some(item) = ahead.pop() {
+                match item {
+                    AheadItem::Barrier(sender) => {
+                        let _ = sender.send(());
                     }
-                    Err(PushUpdate::TooLarge) => {
-                        shared.overflow("bulk");
-                        break 'run;
+                    AheadItem::Update(update, cost) => {
+                        match shared.bulk.try_push_update(*update, cost) {
+                            Ok(()) => {}
+                            Err(PushUpdate::Full(update, cost)) => {
+                                ahead.unpop(update, cost);
+                                break;
+                            }
+                            Err(PushUpdate::TooLarge) => {
+                                shared.overflow("bulk");
+                                break 'run;
+                            }
+                            Err(PushUpdate::Closed) => break 'run,
+                        }
                     }
-                    Err(PushUpdate::Closed) => break 'run,
                 }
             }
             shared.note_decode_ahead(&ahead, framer.buffered());
@@ -753,8 +786,15 @@ fn spawn_tasks(
             for frame in framer.push_sized(&chunk) {
                 match frame.value {
                     Ok(value) => {
-                        match dispatch(&shared, value, frame.bytes, filesystem.as_ref(), &sink)
-                            .await
+                        match dispatch(
+                            &shared,
+                            &mut ahead,
+                            value,
+                            frame.bytes,
+                            filesystem.as_ref(),
+                            &sink,
+                        )
+                        .await
                         {
                             Ok(Some((update, cost))) => ahead.push(update, cost),
                             Ok(None) => {}
@@ -787,38 +827,53 @@ fn spawn_tasks(
 /// Session updates decoded while the bulk queue was full, in order.
 #[derive(Default)]
 struct DecodeAhead {
-    updates: VecDeque<(SessionUpdate, usize)>,
+    items: VecDeque<AheadItem>,
+    updates: usize,
     bytes: usize,
+}
+
+enum AheadItem {
+    Update(Box<SessionUpdate>, usize),
+    Barrier(oneshot::Sender<()>),
 }
 
 impl DecodeAhead {
     fn push(&mut self, update: SessionUpdate, cost: usize) {
         self.bytes += cost;
-        self.updates.push_back((update, cost));
+        self.updates += 1;
+        self.items
+            .push_back(AheadItem::Update(Box::new(update), cost));
     }
-    fn pop(&mut self) -> Option<(SessionUpdate, usize)> {
-        let (update, cost) = self.updates.pop_front()?;
-        self.bytes -= cost;
-        Some((update, cost))
+    fn push_barrier(&mut self, sender: oneshot::Sender<()>) {
+        self.items.push_back(AheadItem::Barrier(sender));
     }
-    fn unpop(&mut self, update: SessionUpdate, cost: usize) {
+    fn pop(&mut self) -> Option<AheadItem> {
+        let item = self.items.pop_front()?;
+        if let AheadItem::Update(_, cost) = &item {
+            self.bytes -= cost;
+            self.updates -= 1;
+        }
+        Some(item)
+    }
+    fn unpop(&mut self, update: Box<SessionUpdate>, cost: usize) {
         self.bytes += cost;
-        self.updates.push_front((update, cost));
+        self.updates += 1;
+        self.items.push_front(AheadItem::Update(update, cost));
     }
     fn is_empty(&self) -> bool {
-        self.updates.is_empty()
+        self.items.is_empty()
     }
 }
 
 impl Shared {
     fn decode_ahead_has_room(&self, ahead: &DecodeAhead, partial: usize) -> bool {
         let usage = self.decode_ahead.lock().unwrap_or_else(|e| e.into_inner());
-        ahead.updates.len() < usage.max_items && ahead.bytes + partial < usage.max_bytes
+        ahead.updates < usage.max_items && ahead.bytes + partial < usage.max_bytes
     }
 
     fn note_decode_ahead(&self, ahead: &DecodeAhead, partial: usize) {
         let mut usage = self.decode_ahead.lock().unwrap_or_else(|e| e.into_inner());
-        usage.items = ahead.updates.len();
+        usage.items = ahead.updates;
         usage.bytes = ahead.bytes + partial;
         usage.high_items = usage.high_items.max(usage.items);
         usage.high_bytes = usage.high_bytes.max(usage.bytes);
@@ -830,6 +885,7 @@ struct Stop;
 
 async fn dispatch(
     shared: &Arc<Shared>,
+    ahead: &mut DecodeAhead,
     value: Value,
     cost: usize,
     filesystem: &dyn ContainerFileSystem,
@@ -869,13 +925,13 @@ async fn dispatch(
                 Ok(()) => {}
                 Err(QueueError::Full) => {
                     shared.overflow("control");
-                    let _ = sender.send(Answer::failed(EngineError::AcpOverflow {
+                    let _ = sender.sender.send(Answer::failed(EngineError::AcpOverflow {
                         queue: "control",
                     }));
                     return Err(Stop);
                 }
                 Err(QueueError::Closed) => {
-                    let _ = sender.send(Answer::failed(shared.closed_error()));
+                    let _ = sender.sender.send(Answer::failed(shared.closed_error()));
                     return Err(Stop);
                 }
             }
@@ -890,9 +946,20 @@ async fn dispatch(
             };
             // A caller that already stopped waiting drops the answer (and
             // its credit) right here.
-            let _ = sender.send(Answer {
+            // A prompt response may be framed while earlier updates still
+            // wait in decode-ahead. Mark their place in that queue so the
+            // driver can drain them before treating the turn as complete.
+            let bulk_barrier = if sender.prompt && !ahead.is_empty() {
+                let (tx, rx) = oneshot::channel();
+                ahead.push_barrier(tx);
+                Some(rx)
+            } else {
+                None
+            };
+            let _ = sender.sender.send(Answer {
                 result,
                 _credit: Some(credit),
+                bulk_barrier,
             });
         }
         return Ok(None);

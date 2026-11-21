@@ -137,3 +137,18 @@ pub struct ForegroundResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release_reason: Option<awman_wsp::ReleaseReason>,
 }
+
+/// Owner-local terminal exchange. Frames belong to one remote socket generation.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TerminalExchange {
+    pub generation: Option<u64>,
+    pub frames: Vec<awman_wsp::terminal::LeaseTerminalFrame>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TerminalExchangeReply {
+    pub generation: Option<u64>,
+    pub accepted: bool,
+    pub unavailable: bool,
+    pub frames: Vec<awman_wsp::terminal::LeaseTerminalFrame>,
+}

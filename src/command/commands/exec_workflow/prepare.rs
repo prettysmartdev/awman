@@ -544,6 +544,9 @@ pub(crate) async fn execute_prepared_with_outputs(
             agent_flags: workflow_agent_flags,
             output_dir: output_dir.map(Path::to_path_buf),
             workspace_access,
+            grant_env: crate::engine::overlay::prerequisite_grants::agent_container_env(
+                &prerequisites.grants,
+            ),
         };
         let cleanup_workflow = workflow.clone();
         let cleanup_work_item_context = engine_work_item_context.clone();
@@ -872,7 +875,13 @@ pub(crate) async fn execute_prepared_with_outputs(
                     );
                 }
                 if cancelled {
-                    prerequisites.grants = Default::default();
+                    // Credentials go; the run's fixed identity is not one, and
+                    // cleanup containers commit as every other container did.
+                    prerequisites.grants =
+                        crate::engine::workflow::prerequisite_grants::PrerequisiteGrants {
+                            run_identity: prerequisites.grants.run_identity.take(),
+                            ..Default::default()
+                        };
                     engine.set_ci_token(None);
                 }
                 let mut resolved = resolve_phase_overlays(

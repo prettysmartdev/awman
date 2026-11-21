@@ -256,16 +256,24 @@ pub struct AgentRunOptions {
     /// replaces the configured `agentFlags` entry; `None` resolves it from the
     /// session (see [`resolve_agent_flags`]).
     pub agent_flags: Option<Vec<String>>,
+    /// Non-secret `KEY=VALUE` env from the run's workflow prerequisite grants
+    /// (the fixed `GIT_AUTHOR_*`/`GIT_COMMITTER_*` identity), from
+    /// `engine::overlay::prerequisite_grants::agent_container_env`. Empty
+    /// outside workflow runs. An explicit `env()` overlay or per-launch
+    /// secret of the same name takes precedence.
+    pub grant_env: Vec<(String, String)>,
 }
 
 /// Extra user arguments appended to `agent`'s launch command: the run's
 /// explicit `--agent-flag` list, else the session's effective `agentFlags`.
 impl AgentRunOptions {
     pub fn secret_env(&self) -> Vec<(String, crate::data::secret::SecretString)> {
+        let granted = granted_env_names(self);
         self.env_passthrough
             .as_deref()
             .unwrap_or_default()
             .iter()
+            .filter(|name| !granted.contains(&name.as_str()))
             .filter_map(|name| {
                 self.command_secrets
                     .as_ref()?
@@ -274,6 +282,27 @@ impl AgentRunOptions {
             })
             .collect()
     }
+}
+
+/// The valid names of `run.grant_env` (the run's fixed commit identity).
+/// A grant wins over an explicit `env()` passthrough or per-launch secret of
+/// the same name, so every container of a run commits as one identity and an
+/// unset passthrough can never erase part of it.
+fn granted_env_names(run: &AgentRunOptions) -> Vec<&str> {
+    run.grant_env
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .filter(|key| crate::data::config::workflows::valid_env_name(key))
+        .collect()
+}
+
+/// `run.grant_env` with invalid names dropped.
+fn grant_env_values(run: &AgentRunOptions) -> Vec<(String, String)> {
+    run.grant_env
+        .iter()
+        .filter(|(key, _)| crate::data::config::workflows::valid_env_name(key))
+        .cloned()
+        .collect()
 }
 
 /// The container options that decide an agent's argv for one launch:
@@ -803,7 +832,15 @@ fn plan_env_passthrough(
     def: &AgentDefinition,
     run: &AgentRunOptions,
 ) -> Result<Vec<String>, EngineError> {
-    let names = run.env_passthrough.clone().unwrap_or_default();
+    // A granted identity variable is set by the grant, never passed through.
+    let granted = granted_env_names(run);
+    let names: Vec<String> = run
+        .env_passthrough
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|name| !granted.contains(&name.as_str()))
+        .collect();
     if !matches!(run.plan, Some(PlanMode::Enabled)) || def.plan_env_drop.is_empty() {
         return Ok(names);
     }
@@ -1527,6 +1564,16 @@ impl AgentEngine {
                 },
             ));
         }
+        // Workflow grant env (the run's fixed commit identity). Delivered
+        // like a secret override (`-e NAME`, value in the runtime child env)
+        // so the values are registered for output redaction, exactly as for
+        // setup and teardown phase containers.
+        for (key, value) in grant_env_values(run) {
+            options.push(ContainerOption::EnvOverride {
+                key,
+                value: crate::data::secret::SecretString::new(value),
+            });
+        }
 
         // Mount the project source into the container's working directory.
         pins.pin(session, session.git_root())?;
@@ -2103,6 +2150,11 @@ impl AgentEngine {
                 value: value.clone(),
             }));
         }
+        // The sandbox has no runtime child env or output redaction, so the
+        // non-secret identity goes as a literal here.
+        for (key, value) in grant_env_values(run) {
+            options.push(SandboxOption::EnvLiteral(EnvLiteral { key, value }));
+        }
 
         // Every sandbox has a private DinD daemon, so the host-socket mount
         // `--allow-docker` requests is meaningless here (same trace as ready).
@@ -2514,6 +2566,66 @@ mod workspace_access_tests {
             .contains("host Docker daemon"));
     }
 
+    #[test]
+    fn granted_identity_wins_over_explicit_env_and_is_redacted_in_output() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::agent::workspace_access_tests::granted_identity_wins_over_explicit_env_and_is_redacted_in_output"));
+        let session = session(&sandbox);
+        let engine = AgentEngine::new(
+            Arc::new(OverlayEngine::new(&session).unwrap()),
+            Arc::new(crate::engine::container::ContainerRuntime::docker_in(
+                session.env().clone(),
+            )),
+        );
+        let run = AgentRunOptions {
+            grant_env: vec![
+                ("GIT_AUTHOR_NAME".into(), "Review Canary".into()),
+                ("GIT_COMMITTER_NAME".into(), "Review Canary".into()),
+                ("NOT=VALID".into(), "x".into()),
+            ],
+            // An explicit overlay of a granted name (set or unset on this
+            // worker) neither erases nor replaces the grant.
+            env_passthrough: Some(vec!["GIT_AUTHOR_NAME".into(), "OTHER_VAR".into()]),
+            ..Default::default()
+        };
+        let options = engine
+            .build_options(&session, &AgentName::new("claude").unwrap(), &run)
+            .unwrap();
+        assert!(!options.iter().any(
+            |o| matches!(o, ContainerOption::EnvPassthrough(EnvVar(name)) if name.starts_with("GIT_"))
+        ));
+        assert!(options.iter().any(
+            |o| matches!(o, ContainerOption::EnvPassthrough(EnvVar(name)) if name == "OTHER_VAR")
+        ));
+        let mut granted: Vec<_> = options
+            .iter()
+            .filter_map(|o| match o {
+                ContainerOption::EnvOverride { key, value } => {
+                    Some((key.clone(), value.expose().to_string()))
+                }
+                _ => None,
+            })
+            .collect();
+        granted.sort();
+        assert_eq!(
+            granted,
+            [
+                ("GIT_AUTHOR_NAME".to_string(), "Review Canary".to_string()),
+                (
+                    "GIT_COMMITTER_NAME".to_string(),
+                    "Review Canary".to_string()
+                ),
+            ]
+        );
+        assert!(!options
+            .iter()
+            .any(|o| matches!(o, ContainerOption::EnvLiteral(l) if l.key.starts_with("GIT_"))));
+        let resolved =
+            crate::engine::container::options::ResolvedContainerOptions::resolve(options).unwrap();
+        assert!(!resolved
+            .output_redaction
+            .redact("author=Review Canary")
+            .contains("Review Canary"));
+    }
     #[test]
     fn cache_redirects_use_effective_home_and_respect_explicit_env() {
         let mut def = first_party::first_party("claude").unwrap();

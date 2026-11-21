@@ -68,6 +68,26 @@ pub fn parse_prerequisite_flags(
     })
 }
 
+/// Read only `--prerequisite-identity`, for `exec prompt`, which declares no
+/// other prerequisite flag.
+pub fn parse_identity_only(ctx: &BuildContext) -> Result<PrerequisiteFlags, CommandError> {
+    let identity = ctx
+        .flags
+        .string(FLAG_IDENTITY)
+        .map(|raw| {
+            parse_identity(&raw).map_err(|reason| CommandError::InvalidFlagValue {
+                command: ctx.path().iter().map(|s| s.to_string()).collect(),
+                flag: FLAG_IDENTITY.to_string(),
+                reason,
+            })
+        })
+        .transpose()?;
+    Ok(PrerequisiteFlags {
+        identity,
+        ..Default::default()
+    })
+}
+
 /// `host`, `deny`, or `Name <email>`.
 pub fn parse_identity(raw: &str) -> Result<IdentityFlag, String> {
     let raw = raw.trim();

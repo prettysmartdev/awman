@@ -430,7 +430,33 @@ mod transport_contract_tests {
     use std::time::Duration;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pushed_command_adapter_retries_baseline_publishes_and_observes_cancellation() {
+    async fn pushed_command_adapter_retries_baseline_and_publishes() {
+        assert_eq!(push_back_transport_scenario(0).await, Ok(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pushed_command_adapter_cancels_ls_remote_retry() {
+        let Err((code, receive_packs, latency)) = push_back_transport_scenario(2).await else {
+            panic!("ls-remote retry was not cancelled");
+        };
+        assert_eq!(code, "cancelled");
+        assert_eq!(receive_packs, 0, "no push after cancellation");
+        assert!(latency < Duration::from_secs(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pushed_command_adapter_cancels_push_retry() {
+        let Err((code, receive_packs, latency)) = push_back_transport_scenario(3).await else {
+            panic!("push retry was not cancelled");
+        };
+        assert_eq!(code, "cancelled");
+        assert_eq!(receive_packs, 0, "no push after cancellation");
+        assert!(latency < Duration::from_secs(2));
+    }
+
+    async fn push_back_transport_scenario(
+        operation: usize,
+    ) -> Result<usize, (String, usize, Duration)> {
         #[cfg(windows)]
         {
             crate::data::fs::git_metadata::GitMetadataCopy::install_windows_publisher(
@@ -438,7 +464,13 @@ mod transport_contract_tests {
             );
             crate::engine::git::transport::install_windows_spawn(awman_host_shims::spawn_git);
         }
-        let s=TestSandbox::for_test(TestCase::component("command::push_back::pushed_command_adapter_retries_baseline_publishes_and_observes_cancellation"));
+        let id = match operation {
+            0 => "command::push_back::pushed_command_adapter_retries_baseline_and_publishes",
+            2 => "command::push_back::pushed_command_adapter_cancels_ls_remote_retry",
+            3 => "command::push_back::pushed_command_adapter_cancels_push_retry",
+            _ => unreachable!("unknown push-back transport scenario"),
+        };
+        let s = TestSandbox::for_test(TestCase::component(id));
         s.require::<awman_test_support::capability::LocalGit>();
         s.require::<awman_test_support::capability::Loopback>();
         let secret = "test-secret-adapter";
@@ -527,7 +559,7 @@ mod transport_contract_tests {
         bus.redaction()
             .add(crate::data::secret::SecretString::new(secret));
         let mut events = bus.subscribe();
-        mode.store(1, Ordering::SeqCst);
+        mode.store(usize::from(operation == 0), Ordering::SeqCst);
         let baseline = capture_baseline(
             git.clone(),
             record.clone(),
@@ -536,76 +568,67 @@ mod transport_contract_tests {
         )
         .await
         .unwrap();
-        let retry = loop {
-            let event = events.recv().await.unwrap();
-            if matches!(event.payload, EventPayload::PushRetry { .. }) {
-                break event;
-            }
-        };
-        assert!(
-            matches!(retry.payload,EventPayload::PushRetry { ref operation, attempt:2,.. } if operation=="ls-remote")
-        );
-        mode.store(0, Ordering::SeqCst);
-        std::fs::write(clone.join("command-result"), "successful command").unwrap();
-        let result = publish_after_success(
-            git.clone(),
-            record.clone(),
-            "exec prompt".into(),
-            vec!["go".into()],
-            baseline,
-            context(CancellationToken::new()),
-            PushEventSink(bus.sender()),
-        )
-        .await
-        .unwrap();
-        assert!(matches!(result, PushBackOutcome::Pushed(_)));
-        assert_eq!(http.receive_packs(), 1);
-        for operation in [2, 3] {
-            let bus = EventBus::new(64);
-            let mut events = bus.subscribe();
-            let cancel = CancellationToken::new();
-            let stop = cancel.clone();
-            let watcher = tokio::spawn(async move {
-                loop {
-                    let event = events.recv().await.unwrap();
-                    assert!(!serde_json::to_string(&event)
-                        .unwrap()
-                        .contains("test-secret-adapter"));
-                    if matches!(event.payload, EventPayload::PushRetry { .. }) {
-                        let cancelled_at = std::time::Instant::now();
-                        stop.cancel();
-                        break cancelled_at;
-                    }
+        if operation == 0 {
+            let retry = loop {
+                let event = events.recv().await.unwrap();
+                if matches!(event.payload, EventPayload::PushRetry { .. }) {
+                    break event;
                 }
-            });
+            };
+            assert!(
+                matches!(retry.payload,EventPayload::PushRetry { ref operation, attempt:2,.. } if operation=="ls-remote")
+            );
             mode.store(0, Ordering::SeqCst);
-            let baseline = capture_baseline(
-                git.clone(),
-                record.clone(),
-                context(CancellationToken::new()),
-                PushEventSink(bus.sender()),
-            )
-            .await
-            .unwrap();
-            std::fs::write(clone.join("command-result"), format!("next {operation}")).unwrap();
-            mode.store(operation, Ordering::SeqCst);
-            let error = publish_after_success(
+            std::fs::write(clone.join("command-result"), "successful command").unwrap();
+            let result = publish_after_success(
                 git.clone(),
                 record.clone(),
                 "exec prompt".into(),
                 vec!["go".into()],
                 baseline,
-                context(cancel),
+                context(CancellationToken::new()),
                 PushEventSink(bus.sender()),
             )
             .await
-            .unwrap_err();
-            let cancelled_at = watcher.await.unwrap();
-            assert_eq!(error.code(), "cancelled");
-            // Bound cancellation latency, excluding the metadata copy,
-            // commit and first remote attempt before cancellation is requested.
-            assert!(cancelled_at.elapsed() < Duration::from_secs(2));
-            assert_eq!(http.receive_packs(), 1, "no push after cancellation");
+            .unwrap();
+            assert!(matches!(result, PushBackOutcome::Pushed(_)));
+            return Ok(http.receive_packs());
         }
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let watcher = tokio::spawn(async move {
+            loop {
+                let event = events.recv().await.unwrap();
+                assert!(!serde_json::to_string(&event)
+                    .unwrap()
+                    .contains("test-secret-adapter"));
+                if matches!(event.payload, EventPayload::PushRetry { .. }) {
+                    let cancelled_at = std::time::Instant::now();
+                    stop.cancel();
+                    break cancelled_at;
+                }
+            }
+        });
+        std::fs::write(clone.join("command-result"), format!("next {operation}")).unwrap();
+        mode.store(operation, Ordering::SeqCst);
+        let error = publish_after_success(
+            git,
+            record,
+            "exec prompt".into(),
+            vec!["go".into()],
+            baseline,
+            context(cancel),
+            PushEventSink(bus.sender()),
+        )
+        .await
+        .unwrap_err();
+        let cancelled_at = watcher.await.unwrap();
+        // Bound cancellation latency, excluding the metadata copy,
+        // commit and first remote attempt before cancellation is requested.
+        Err((
+            error.code().to_owned(),
+            http.receive_packs(),
+            cancelled_at.elapsed(),
+        ))
     }
 }

@@ -171,22 +171,18 @@ async fn handle(
                 .map(|l| Json(l).into_response())
         }
         Operation::WorkerLeasesTerminal => {
-            let frames =
-                match serde_json::from_slice::<Vec<awman_wsp::terminal::LeaseTerminalFrame>>(&body)
-                {
-                    Ok(frames) => frames,
-                    Err(error) => {
-                        return ApiError::invalid_request(format!(
-                            "invalid terminal frames: {error}"
-                        ))
+            let frames = match serde_json::from_slice::<crate::data::worker::wire::TerminalExchange>(
+                &body,
+            ) {
+                Ok(frames) => frames,
+                Err(error) => {
+                    return ApiError::invalid_request(format!("invalid terminal frames: {error}"))
                         .into_response()
-                    }
-                };
+                }
+            };
             worker_pull::foreground_terminal(&api, &lease_id(&params), frames)
                 .await
-                .map(|items| {
-                    Json(serde_json::json!({"items":items,"next_cursor":null})).into_response()
-                })
+                .map(|reply| Json(reply).into_response())
         }
         Operation::WorkerLeasesEvents => {
             let events = match serde_json::from_slice::<

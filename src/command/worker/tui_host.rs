@@ -752,7 +752,6 @@ impl Host {
                     run.writer.command_id(),
                     run.lease.remote_input,
                     run.active.done.child_token(),
-                    run.active.control.cancelled(),
                     move |frames| {
                         let bridge = bridge.clone();
                         async move { bridge.exchange(frames).await }
@@ -845,18 +844,7 @@ impl Host {
             (close == Some(LeaseCloseChoice::Release)).then_some(ReleaseReason::UserDeclined);
         if let Some(mut run) = self.proxy_runs.remove(id) {
             if let Some(terminal) = &run.terminal {
-                if let Err(error) = terminal.flush().await {
-                    run.cancel.cancel();
-                    let _ = run
-                        .client
-                        .call(&proxy_request(
-                            id,
-                            "release",
-                            Some(serde_json::json!({"reason":"error", "message":error})),
-                        ))
-                        .await;
-                    return Err(error);
-                }
+                terminal.flush().await;
             }
             let mounted = self
                 .view
@@ -1516,6 +1504,9 @@ impl ManualRun {
         reason: ReleaseReason,
         message: &str,
     ) -> Result<(), String> {
+        if let Some(bridge) = &self.terminal {
+            bridge.stop().await;
+        }
         if let Some(job) = &self.record.job_id {
             crate::command::commands::api_server::owned_runtime::stop_command_containers(
                 self.runtime.as_ref(),
@@ -1594,10 +1585,10 @@ impl ManualRun {
         result: CommandResult,
     ) -> Result<CommandResult, String> {
         if let Some(terminal) = &self.local_terminal {
-            if let Err(error) = terminal.flush().await {
-                let _ = self.release(ReleaseReason::Error, &error).await;
-                return Err(error);
-            }
+            terminal.flush().await;
+        }
+        if let Some(bridge) = &self.terminal {
+            bridge.stop().await;
         }
         let result = super::runner::complete_foreground(
             engines,
@@ -1890,7 +1881,6 @@ impl ProxyRun {
                 job_id,
                 lease.remote_input,
                 terminal_stop.clone(),
-                cancel.clone(),
                 move |frames| {
                     let client = terminal_client.clone();
                     let id = terminal_id.clone();
@@ -1903,7 +1893,7 @@ impl ProxyRun {
                             ))
                             .await
                             .map_err(|e| e.to_string())?;
-                        serde_json::from_value(value["items"].clone()).map_err(|e| e.to_string())
+                        serde_json::from_value(value).map_err(|e| e.to_string())
                     }
                 },
             ));

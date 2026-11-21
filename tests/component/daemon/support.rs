@@ -15,7 +15,7 @@ use awman_test_support::TestSandbox;
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
-pub(super) struct Api {
+pub(crate) struct Api {
     pub base: String,
     pub api: Arc<DaemonApi>,
     stop: CancellationToken,
@@ -160,7 +160,7 @@ impl Api {
 }
 
 /// One more production router for a listener name on a fresh address.
-pub(super) struct Served {
+pub(crate) struct Served {
     pub addr: String,
     pub base: String,
     stop: CancellationToken,

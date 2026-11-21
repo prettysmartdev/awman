@@ -32,6 +32,10 @@ pub enum Error {
     TerminalTransport(#[from] tokio_tungstenite::tungstenite::Error),
     #[error("work server returned an invalid response")]
     InvalidResponse,
+    /// A conformance probe step that failed, named so a server author can
+    /// tell which expectation the server did not meet.
+    #[error("conformance check failed: {0}")]
+    ConformanceCheck(&'static str),
 }
 
 /// A client holds its refresh token only in memory. The owner stores it in an

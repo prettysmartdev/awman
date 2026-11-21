@@ -33,6 +33,17 @@ impl super::ExecPromptCommand {
     /// whitespace-only positional prompt is normalised to `None`; the
     /// prompt-or-work-item requirement is checked at run time.
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        // Only `--prerequisite-identity` exists on a prompt. An API client may only
+        // narrow what the server grants, exactly as for `exec workflow`.
+        use crate::command::commands::workflow_prerequisites as prerequisites_flow;
+        let mut prerequisites = prerequisites_flow::parse_identity_only(ctx)?;
+        let ceiling = prerequisites_flow::remote_ceiling(&ctx.session);
+        prerequisites_flow::check_flag_widening(ctx.caller.frontend(), &prerequisites, &ceiling)?;
+        prerequisites_flow::apply_identity_ceiling(
+            ctx.caller.frontend(),
+            &mut prerequisites,
+            &ceiling,
+        );
         let prompt = match ctx.args.get("prompt") {
             Some(prompt) if prompt.trim().is_empty() => None,
             other => other.map(str::to_string),
@@ -78,7 +89,8 @@ impl super::ExecPromptCommand {
         .with_workspace_access(crate::data::workspace::WorkspaceAccess::from_read_only(
             ctx.flags
                 .bool(crate::data::workspace::READ_ONLY_WORKSPACE_FLAG),
-        )))
+        ))
+        .with_prerequisites(prerequisites))
     }
 }
 
