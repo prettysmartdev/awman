@@ -1,4 +1,6 @@
-**Title:** `feat(sdk): build a LocalBackend without reading user or managed config files`
+> Reviewed 2026-11-19 against Microsandbox `abff71505fc46416b3d704ee2787f8e55ae66efa`. Local proposal only; not filed. See the saved PR bundle for current API changes and validation status.
+
+**Title:** `feat(sdk): build a LocalContext without reading user or managed config files`
 
 **Labels:** 💗 enhancement
 
@@ -6,14 +8,14 @@
 
 ## Summary
 
-`LocalBackendBuilder::build_lazy()` (and `build()`, which calls it) always loads the
+`LocalContextBuilder::build()` always loads the
 user config file (`config_path`, `MSB_CONFIG_PATH`, or the default path) and the
 machine-wide managed config through `BackendConfig::load_from`. An application that
 embeds the SDK cannot get a backend made only from built-in defaults and the values
 it sets on the builder.
 
-We'd like an additive constructor, for example `build_lazy_isolated()`, that skips
-both config-file layers and otherwise behaves like `build_lazy()`.
+We'd like an additive constructor, for example `build_isolated()`, that skips
+both config-file layers and otherwise behaves like `build()`.
 
 ## Motivation
 
@@ -25,7 +27,7 @@ Microsandbox config files are an unwanted input:
 - **Determinism.** A user's `~/.microsandbox` config, or a managed config pushed to
   the machine, can silently change how the embedded runtime behaves (paths, defaults,
   limits). The embedding application can't see or override this.
-- **Robustness.** A malformed or hostile config file makes `build_lazy()` fail, even
+- **Robustness.** A malformed or hostile config file makes `build()` fail, even
   though the embedder never meant to read it. Today any user who also has a broken
   standalone Microsandbox setup can't use the embedded one.
 - **Coexistence.** An installed standalone Microsandbox and an embedded one should
@@ -38,14 +40,14 @@ the constructor. That keeps the new method narrow.
 ## Proposed API
 
 ```rust
-impl LocalBackendBuilder {
+impl LocalContextBuilder {
     /// Build a lazy local backend from built-in defaults and this builder only.
     ///
     /// Never reads the user configuration file, `MSB_CONFIG_PATH`, or the
     /// machine-wide managed configuration. SDK-registered runtime paths and the
     /// `MSB_PATH`/`MSB_LIBKRUNFW_PATH`/`MSB_AGENTD_PATH` overrides are still
     /// layered by `prepare_for_local_backend`.
-    pub fn build_lazy_isolated(self) -> MicrosandboxResult<LocalBackend>;
+    pub fn build_isolated(self) -> MicrosandboxResult<LocalContext>;
 }
 ```
 
@@ -60,7 +62,7 @@ let config = BackendConfig::new(
     GlobalConfigPatch::new(),
 )
 .prepare_for_local_backend(self.config)?;
-Ok(LocalBackend::from_backend_config(config, BackendSelectionSource::Programmatic, None))
+Ok(LocalContext::from_backend_config(config, BackendSelectionSource::Programmatic, None))
 ```
 
 An async `build_isolated()` that opens the database, mirroring `build()`, could be
@@ -70,8 +72,8 @@ added the same way if you want both.
 
 We carry this as a patch on `microsandbox 0.7.8` (tag revision `7b7b9dc`) with an
 in-crate regression test. It writes a hostile user config and, separately, a hostile
-managed config. It then asserts that `build_lazy()` rejects each one while
-`build_lazy_isolated()` succeeds. The patch is about 20 lines plus the test, and
+managed config. It then asserts that `build()` rejects each one while
+`build_isolated()` succeeds. The patch is about 20 lines plus the test, and
 we're happy to open a PR.
 
 ## Questions

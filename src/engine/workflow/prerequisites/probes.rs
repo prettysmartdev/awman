@@ -37,6 +37,28 @@ impl PrerequisitePreflight {
             .map_err(|_| ())
     }
 
+    /// `reason`, followed (on an importing runtime, when configuration gives
+    /// `tag` no source) by the full config keys, files and accepted values
+    /// that fix it. A configured source that fails is not "missing", so it
+    /// gets no guidance. Never prompts or writes.
+    fn with_missing_source_guidance(&self, reason: String, agent: &str, tag: &str) -> String {
+        if self.options.runtime.capabilities().image_acquisition
+            != crate::engine::agent_runtime::ImageAcquisition::Import
+        {
+            return reason;
+        }
+        let Some(session) = &self.options.image_session else {
+            return reason;
+        };
+        let is_default = agent == session.configured_agent().as_str();
+        match crate::data::config::image_source_setup::missing_image_source_guidance(
+            session, tag, agent, is_default,
+        ) {
+            Some(guidance) => format!("{reason}; {guidance}"),
+            None => reason,
+        }
+    }
+
     pub(super) fn probe(
         &self,
         need: &PrerequisiteNeed,
@@ -44,6 +66,52 @@ impl PrerequisitePreflight {
     ) -> Vec<PrerequisiteCheck> {
         use WorkflowPrerequisite::*;
         let check = match &need.prerequisite {
+            AgentImage { tag, agent } => {
+                if self.options.runtime.capabilities().image_acquisition
+                    == crate::engine::agent_runtime::ImageAcquisition::Kit
+                {
+                    return vec![Self::check(
+                        need,
+                        PrerequisiteStatus::Satisfied,
+                        "agent image managed by the runtime kit",
+                        vec![],
+                    )];
+                }
+                let readiness = if let Some(session) = &self.options.image_session {
+                    crate::engine::image_prep::workflow_image_preparation(
+                        self.options.runtime.clone(),
+                        session,
+                        agent,
+                        tag,
+                    )
+                } else {
+                    self.options.runtime.image_exists(tag).map(|present| {
+                        (!present).then(|| {
+                            format!("image {tag} must be prepared before the workflow starts")
+                        })
+                    })
+                };
+                let (status, explanation) = match readiness {
+                    Ok(None) => (
+                        PrerequisiteStatus::Satisfied,
+                        format!("image {tag} is available"),
+                    ),
+                    Ok(Some(reason)) => (
+                        PrerequisiteStatus::Missing,
+                        self.with_missing_source_guidance(reason, agent, tag),
+                    ),
+                    Err(error) => (
+                        PrerequisiteStatus::Unknown,
+                        format!("could not inspect image {tag}: {error}"),
+                    ),
+                };
+                let remediations = if status == PrerequisiteStatus::Satisfied {
+                    vec![]
+                } else {
+                    vec![Remediation::PrepareImage]
+                };
+                Self::check(need, status, explanation, remediations)
+            }
             GitIdentity => self.identity(need),
             GitRemote { remote } => match self.remote(remote) {
                 Ok(Some(url)) => Self::check(
@@ -68,6 +136,18 @@ impl PrerequisitePreflight {
             PushAuth { remote } => match self.remote(remote) {
                 Ok(Some(url)) => {
                     let mut classified = need.clone();
+                    if let Some(scope) = self
+                        .options
+                        .session_git_scope
+                        .as_ref()
+                        .filter(|scope| scope.matches_url(&url.redacted))
+                    {
+                        classified.prerequisite = PushAuthHttps {
+                            remote: remote.clone(),
+                            host: scope.host().into(),
+                        };
+                        return vec![self.https(&classified, scope.host(), secrets)];
+                    }
                     match url.kind {
                         GitRemoteKind::Ssh { host } => {
                             classified.prerequisite = PushAuthSsh {
@@ -449,6 +529,24 @@ impl PrerequisitePreflight {
         host: &str,
         secrets: &RedactionSet,
     ) -> PrerequisiteCheck {
+        if self.destination(need).is_some_and(|remote| {
+            self.options
+                .session_git_scope
+                .as_ref()
+                .is_some_and(|scope| scope.matches_url(&remote.redacted))
+        }) && need.needed_by.iter().all(|step| {
+            matches!(
+                step.kind,
+                PrerequisiteStepKind::PushBranch | PrerequisiteStepKind::PullBranch
+            )
+        }) {
+            return Self::check(
+                need,
+                PrerequisiteStatus::Satisfied,
+                "session Git credential available through the private helper",
+                vec![],
+            );
+        }
         if !github_host(host) {
             Self::unsupported(need, "HTTPS authentication for non-GitHub remotes is unsupported; configure a credential overlay")
         } else {

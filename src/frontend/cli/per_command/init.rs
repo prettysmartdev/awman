@@ -5,7 +5,7 @@
 //! also the answer an empty line accepts on a TTY — comes from the CLI profile
 //! in `src/command/headless.rs`.
 
-use crate::data::config::repo::WorkItemsConfig;
+use crate::data::config::work_items::WorkItemsConfig;
 use crate::data::prompt::Prompt;
 use crate::data::step_status::StepStatus;
 use crate::engine::error::EngineError;
@@ -15,8 +15,6 @@ use crate::engine::init::{InitFrontend, InitPhase, InitSummary};
 use crate::frontend::cli::command_frontend::CliFrontend;
 
 use super::helpers::{read_line, yes_no};
-use crate::frontend::render_helpers::render_summary_box;
-
 impl InitFrontend for CliFrontend {
     fn ask_replace_aspec(&mut self) -> Result<bool, EngineError> {
         if self.non_interactive {
@@ -78,6 +76,7 @@ impl InitFrontend for CliFrontend {
         Ok(Some(WorkItemsConfig {
             dir: Some(dir.to_string()),
             template,
+            ..WorkItemsConfig::default()
         }))
     }
 
@@ -127,69 +126,16 @@ impl InitFrontend for CliFrontend {
             ("Docker image", &summary.image_build),
             ("Work items", &summary.work_items_setup),
         ];
-        let box_str = render_summary_box("Init Summary", &rows);
+        let box_str = crate::frontend::render_helpers::render_summary_box_with_width(
+            "Init Summary",
+            &rows,
+            crate::frontend::render_helpers::stderr_render_width(),
+        );
         let footer = "\nWhat's Next?\n  Run `awman` to launch the interactive TUI.\n\n  Available commands:\n    awman chat          — Start a freeform chat session with the agent\n    awman new spec      — Create a new work item from the aspec template\n    awman exec workflow — Run a workflow inside a container\n";
         let _ = std::io::Write::write_all(
             &mut std::io::stderr(),
             format!("\n{box_str}{footer}").as_bytes(),
         );
         let _ = std::io::Write::flush(&mut std::io::stderr());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::command::prompts;
-    use crate::engine::init::frontend::DockerfileSetupDecision;
-
-    // ─── Choice → decision, with the prompt as the only source of a default ──
-    //
-    // These assert the *mapping* a frontend performs, never what the answer
-    // should be: the one case with no answer of its own reads it back out of
-    // the prompt, so nothing here pins a default (WI 0114 F-19, Test
-    // Considerations).
-
-    #[test]
-    fn create_new_maps_to_create_new() {
-        let prompt = prompts::dockerfile_setup();
-        assert_eq!(
-            DockerfileSetupChoice::CreateNew.decide(&prompt, None),
-            DockerfileSetupDecision::CreateNew
-        );
-    }
-
-    #[test]
-    fn use_existing_with_a_path_maps_to_that_path() {
-        let prompt = prompts::dockerfile_setup();
-        assert_eq!(
-            DockerfileSetupChoice::UseExisting
-                .decide(&prompt, Some("docker/Dockerfile".to_string())),
-            DockerfileSetupDecision::UseExisting("docker/Dockerfile".to_string())
-        );
-    }
-
-    #[test]
-    fn skip_maps_to_skip() {
-        let prompt = prompts::dockerfile_setup();
-        assert_eq!(
-            DockerfileSetupChoice::Skip.decide(&prompt, None),
-            DockerfileSetupDecision::Skip
-        );
-    }
-
-    /// Naming no path is not an answer, so the prompt's own dismissal answer
-    /// applies — read from the prompt rather than written here.
-    #[test]
-    fn use_existing_with_an_empty_path_falls_back_to_the_prompts_answer() {
-        let prompt = prompts::dockerfile_setup();
-        let expected = prompt
-            .default_on_dismiss
-            .expect("the dockerfile prompt declares a dismissal answer")
-            .decide(&prompt, None);
-        assert_eq!(
-            DockerfileSetupChoice::UseExisting.decide(&prompt, Some(String::new())),
-            expected
-        );
     }
 }

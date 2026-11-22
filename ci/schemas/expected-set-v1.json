@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WI 0144 independently listed expected set v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "build",
+    "cell",
+    "manifest_version",
+    "archive_sha256",
+    "tests",
+    "partitions",
+    "contracts"
+  ],
+  "properties": {
+    "schema": {
+      "const": 1
+    },
+    "build": {
+      "type": "string"
+    },
+    "cell": {
+      "type": "string"
+    },
+    "manifest_version": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "archive_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "partitions": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[1-9][0-9]*$"},
+      "additionalProperties": {"type": "array", "items": {"type": "string"}, "minItems": 1, "uniqueItems": true}
+    },
+    "contracts": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "minItems": 1,
+        "uniqueItems": true
+      }
+    }
+  }
+}

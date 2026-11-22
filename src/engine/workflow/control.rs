@@ -7,7 +7,56 @@
 
 use super::*;
 
+fn failure_exit_detail(exit_code: i32) -> String {
+    if exit_code == -1 {
+        "exit status unavailable".into()
+    } else {
+        format!("exit {exit_code}")
+    }
+}
+
 impl WorkflowEngine {
+    /// Natural exits (or resuming a completed main phase) still require an
+    /// explicit Finish before the command layer may enter teardown. Dismissing
+    /// the board leaves the workflow here until the user reopens it.
+    pub(super) async fn review_completed_workflow(
+        &mut self,
+    ) -> Result<IterationOutcome, EngineError> {
+        let progress = self.workflow_progress_info();
+        self.frontend.report_workflow_progress(&progress);
+        loop {
+            let mut available = self.compute_available_actions()?;
+            // A resumed, completed workflow may have no current step or
+            // container. It still waits here for an explicit review decision.
+            available.can_dismiss = true;
+            let action = self
+                .frontend
+                .show_workflow_control_board(&self.state, &available)?;
+            self.log_wcb_action(&action);
+            if !matches!(
+                action,
+                NextAction::Dismiss | NextAction::LaunchNext | NextAction::RetryFailedStep { .. }
+            ) {
+                return Ok(match self.execute_top_level_action(action)? {
+                    InterruptibleStepResult::WorkflowEnded(outcome) => {
+                        IterationOutcome::Ended(outcome)
+                    }
+                    _ => IterationOutcome::Continue,
+                });
+            }
+            loop {
+                tokio::select! {
+                    _ = self.cancel.cancelled() => return Ok(IterationOutcome::Ended(self.cancel_run()?)),
+                    Some(request) = Self::recv_engine(&mut self.engine_rx) => {
+                        if let EngineRequest::OpenControlBoard { .. } = request {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Compose the failure-scoped [`AvailableActions`] for the Workflow
     /// Control Board (WI-0115 §1).
     ///
@@ -33,7 +82,20 @@ impl WorkflowEngine {
         if let Some(sig) = signal {
             detail_lines.push(format!("Container terminated by signal {sig}"));
         }
-        detail_lines.push(format!("Exit code: {exit_code}"));
+        if exit_code == -1 {
+            detail_lines.push("Exit status unavailable".into());
+        } else {
+            detail_lines.push(format!("Exit code: {exit_code}"));
+        }
+        // A step failed on its agent's own report (WI 0141) carries the
+        // reason the agent gave; it explains a 0 or 137 exit code.
+        if let Some(StepState::Failed {
+            error_message: Some(reason),
+            ..
+        }) = self.state.status_of(step_name)
+        {
+            detail_lines.push(format!("Reason: {reason}"));
+        }
         if let Some(e) = &exit {
             let secs = e
                 .ended_at
@@ -65,7 +127,7 @@ impl WorkflowEngine {
             cancel_to_previous_unavailable_reason: previous_step
                 .is_none()
                 .then(|| "this is the first step".to_string()),
-            continue_unavailable_reason: Some("the failed step's container has exited".into()),
+            continue_unavailable_reason: Some("the failed step's container has stopped".into()),
             finish_workflow_unavailable_reason: Some(
                 "a step failed; choose a recovery action or Ctrl-C to cancel".into(),
             ),
@@ -91,7 +153,7 @@ impl WorkflowEngine {
     ///
     /// Interactive frontends (CLI on a TTY, TUI) get the Workflow Control Board
     /// with the failure attached and drive the recovery themselves. Unattended
-    /// frontends (squad daemon, API server, `--non-interactive`) get one yolo
+    /// frontends (squad daemon, API server, `--headless`) get one yolo
     /// countdown and one automatic retry; a second failure of the same step
     /// fails the workflow (WI-0115 §1, §3).
     pub(super) async fn handle_step_failure(
@@ -120,8 +182,9 @@ impl WorkflowEngine {
         step_name: &str,
         exit_code: i32,
     ) -> Result<IterationOutcome, EngineError> {
+        let exit_detail = failure_exit_detail(exit_code);
         self.msg_error(format!(
-            "Step '{step_name}' failed (exit {exit_code}); choose how to recover"
+            "Step '{step_name}' failed ({exit_detail}); choose how to recover"
         ));
         loop {
             let available = self.compute_failure_actions(step_name, exit_code)?;
@@ -192,9 +255,10 @@ impl WorkflowEngine {
         step_name: &str,
         exit_code: i32,
     ) -> Result<IterationOutcome, EngineError> {
+        let exit_detail = failure_exit_detail(exit_code);
         if self.auto_retried_steps.contains(step_name) {
             self.msg_error(format!(
-                "Step '{step_name}' failed again after its automatic retry (exit {exit_code}); \
+                "Step '{step_name}' failed again after its automatic retry ({exit_detail}); \
                  failing workflow",
             ));
             for s in &self.workflow.steps {
@@ -207,7 +271,7 @@ impl WorkflowEngine {
                 StepState::Failed {
                     exit_code,
                     error_message: Some(format!(
-                        "failed twice (exit {exit_code}); automatic retry exhausted"
+                        "failed twice ({exit_detail}); automatic retry exhausted"
                     )),
                 },
             );
@@ -221,7 +285,7 @@ impl WorkflowEngine {
         }
 
         self.msg_warning(format!(
-            "Step '{step_name}' failed (exit {exit_code}); retrying once in {}s",
+            "Step '{step_name}' failed ({exit_detail}); retrying once in {}s",
             timing::yolo_countdown_duration().as_secs(),
         ));
         let countdown = self.run_failure_retry_countdown(step_name).await?;
@@ -323,6 +387,22 @@ impl WorkflowEngine {
         )>,
     ) -> Result<MidStepOutcome, EngineError> {
         let available = self.compute_available_actions()?;
+        self.handle_mid_step_board_with(step_name, cancel_handle, wait_rx, available)
+    }
+
+    /// [`Self::handle_mid_step_control_board`] with the board's actions
+    /// supplied by the caller — a board opened because the agent reported
+    /// `done`/`blocked`/`error` carries the report (WI 0141).
+    pub(super) fn handle_mid_step_board_with(
+        &mut self,
+        step_name: &str,
+        cancel_handle: &Option<crate::engine::agent_runtime::execution::CancelHandle>,
+        wait_rx: &mut tokio::sync::oneshot::Receiver<(
+            AgentExecution,
+            Result<AgentExitInfo, EngineError>,
+        )>,
+        available: AvailableActions,
+    ) -> Result<MidStepOutcome, EngineError> {
         let action = self
             .frontend
             .show_workflow_control_board(&self.state, &available)?;
@@ -341,7 +421,7 @@ impl WorkflowEngine {
             NextAction::Dismiss | NextAction::RetryFailedStep { .. } => {
                 if let Some(exit_result) = already_finished {
                     return Ok(MidStepOutcome::StepCompleted(
-                        self.finalize_step(step_name, exit_result?)?,
+                        self.finalize_step(step_name, exit_result)?,
                     ));
                 }
                 Ok(MidStepOutcome::Continue)
@@ -355,7 +435,7 @@ impl WorkflowEngine {
                 }
                 if let Some(exit_result) = already_finished {
                     return Ok(MidStepOutcome::StepCompleted(
-                        self.finalize_step(step_name, exit_result?)?,
+                        self.finalize_step(step_name, exit_result)?,
                     ));
                 }
                 Ok(MidStepOutcome::Continue)
@@ -434,8 +514,7 @@ impl WorkflowEngine {
         }
     }
 
-    /// Execute a top-level action from the WCB (used after yolo auto-advance
-    /// on the last step, and in run_to_completion inter-step transitions).
+    /// Execute a top-level action from the final review WCB.
     pub(super) fn execute_top_level_action(
         &mut self,
         action: NextAction,
@@ -566,6 +645,23 @@ impl WorkflowEngine {
         }
     }
 
+    /// True when `next` runs with the same step-level workspace access as the
+    /// step that owns the live container. Command-level access applies to every
+    /// step equally, so comparing the step flags is sufficient; an unknown
+    /// current step is treated as a mismatch (fail closed).
+    fn access_matches_current(&self, next: &WorkflowStep) -> bool {
+        self.current_step_name
+            .as_deref()
+            .and_then(|n| self.find_step(n).ok())
+            .is_some_and(|cur| cur.read_only_workspace == next.read_only_workspace)
+    }
+
+    fn settings_scope_matches_current(&self, next: &WorkflowStep) -> bool {
+        self.current_step_name
+            .as_deref()
+            .and_then(|n| self.find_step(n).ok())
+            .is_some_and(|current| self.agent_factory.settings_scope_matches(&current, next))
+    }
     pub(super) fn handle_continue_in_current_container(
         &mut self,
         prompt: &str,
@@ -586,6 +682,21 @@ impl WorkflowEngine {
             .map(|a| *a == next_agent)
             .unwrap_or(false);
         let model_ok = self.current_step_model == next_model;
+        // A running container keeps the workspace access it was launched with;
+        // never carry a prompt across a read-only/writable boundary.
+        if !self.settings_scope_matches_current(&next_step) {
+            return Err(EngineError::InvalidAdvanceAction(
+                "settings profiles differ; use LaunchNext for a fresh private execution".into(),
+            ));
+        }
+        if !self.access_matches_current(&next_step) {
+            return Err(EngineError::InvalidAdvanceAction(
+                "ContinueInCurrentContainer requires the same workspace access \
+                 (read-only or writable) for the current and next steps; \
+                 use LaunchNext to start a fresh container"
+                    .into(),
+            ));
+        }
         if !agent_ok || !model_ok {
             return Err(EngineError::InvalidAdvanceAction(
                 "ContinueInCurrentContainer requires the same agent and model \
@@ -616,7 +727,11 @@ impl WorkflowEngine {
     pub fn compute_available_actions(&self) -> Result<AvailableActions, EngineError> {
         let has_execution = self.focused_execution().is_some();
         let mut a = AvailableActions {
-            can_launch_next: !self.state.is_complete(),
+            can_launch_next: !self.state.is_complete()
+                && !self
+                    .current_step_name
+                    .as_deref()
+                    .is_some_and(|name| self.is_final_review_step(name)),
             can_restart_current_step: self.current_step_name.is_some(),
             can_pause: true,
             can_abort: true,
@@ -628,7 +743,12 @@ impl WorkflowEngine {
             let next_agent = self.resolve_agent(&next)?;
             let next_model = self.resolve_model(&next);
             let ok = match (&self.current_step_agent, &self.current_step_model) {
-                (Some(curr_a), curr_m) => *curr_a == next_agent && *curr_m == next_model,
+                (Some(curr_a), curr_m) => {
+                    *curr_a == next_agent
+                        && *curr_m == next_model
+                        && self.access_matches_current(&next)
+                        && self.settings_scope_matches_current(&next)
+                }
                 _ => false,
             };
             if ok && has_execution {
@@ -638,7 +758,7 @@ impl WorkflowEngine {
                 a.continue_unavailable_reason = Some(if self.current_step_agent.is_none() {
                     "no current container".into()
                 } else {
-                    "next step targets a different agent or model".into()
+                    "next step targets a different agent, model, workspace access or settings profile".into()
                 });
             }
         }
@@ -675,7 +795,15 @@ impl WorkflowEngine {
                 Some("Cannot finish while other agents in this group are still running.".into());
         }
 
-        a.focused_step = self.running_step_name();
+        a.focused_step = self
+            .active_steps
+            .first()
+            .map(|slot| slot.step_name.clone())
+            .or_else(|| self.running_step_name());
+        a.reported_status = self
+            .active_steps
+            .first()
+            .and_then(|s| s.last_report.clone());
         a.simple_advance = self.simple_advance(&a);
         Ok(a)
     }
@@ -683,9 +811,14 @@ impl WorkflowEngine {
     /// `FinishWorkflow` is valid on the topologically last step (as before)
     /// and once every step is terminal. In a DAG with more than one sink the
     /// step that finishes last is often not topologically last, and the final
-    /// yolo board must still be able to finish the run.
+    /// review board must still be able to finish the run while that agent lives.
     pub(super) fn workflow_can_finish(&self) -> bool {
-        self.is_last_step() || self.state.is_complete()
+        self.is_last_step()
+            || self.state.is_complete()
+            || self
+                .current_step_name
+                .as_deref()
+                .is_some_and(|name| self.is_final_review_step(name))
     }
 
     /// The step currently in `Running` state, if exactly one is.

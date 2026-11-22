@@ -8,6 +8,8 @@
 
 /// Maximum line prefix retained by production output pumps (64 KiB).
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
+/// Structured agent frames can contain tool bodies larger than a text line.
+pub const MAX_STRUCTURED_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 /// One line without its newline delimiter.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,89 +91,5 @@ impl LineFramer {
             ),
             truncated: std::mem::replace(&mut self.truncated, false),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn text(lines: Vec<FramedLine>) -> Vec<(String, bool)> {
-        lines
-            .into_iter()
-            .map(|line| (line.lossy_text(), line.truncated))
-            .collect()
-    }
-
-    #[test]
-    fn every_multibyte_utf8_split_point_is_preserved() {
-        let input = "a¢€🦀z\n".as_bytes();
-        for split in 1..input.len() {
-            let mut framer = LineFramer::default();
-            let mut lines = framer.push(&input[..split]);
-            lines.extend(framer.push(&input[split..]));
-            assert_eq!(text(lines), vec![("a¢€🦀z".into(), false)], "split {split}");
-        }
-    }
-
-    #[test]
-    fn frames_many_and_empty_lines_in_one_chunk() {
-        let mut framer = LineFramer::default();
-        assert_eq!(
-            text(framer.push(b"one\n\nthree\nfour\n")),
-            vec![
-                ("one".into(), false),
-                ("".into(), false),
-                ("three".into(), false),
-                ("four".into(), false),
-            ]
-        );
-        assert!(framer.finish().is_none());
-    }
-
-    #[test]
-    fn invalid_utf8_is_replaced_explicitly() {
-        let mut framer = LineFramer::default();
-        let lines = framer.push(b"valid\xff\xfe\n");
-        assert_eq!(lines[0].lossy_text(), "valid��");
-        assert!(!lines[0].truncated);
-    }
-
-    #[test]
-    fn eof_flushes_unterminated_line_but_not_empty_tail() {
-        let mut framer = LineFramer::default();
-        assert!(framer.push(b"last").is_empty());
-        assert_eq!(framer.finish().unwrap().lossy_text(), "last");
-        assert!(framer.finish().is_none());
-
-        let mut after_newline = LineFramer::default();
-        assert_eq!(
-            text(after_newline.push(b"done\n")),
-            vec![("done".into(), false)]
-        );
-        assert!(after_newline.finish().is_none());
-    }
-
-    #[test]
-    fn overlong_lines_keep_a_bounded_marked_prefix_and_skip_the_rest() {
-        let mut exact = LineFramer::new(4);
-        let exact_line = exact.push(b"abcd\n").pop().unwrap();
-        assert_eq!(exact_line.bytes, b"abcd");
-        assert!(!exact_line.truncated);
-
-        let mut framer = LineFramer::new(4);
-        let mut lines = framer.push(b"abcdef");
-        assert!(lines.is_empty());
-        lines.extend(framer.push(b"ghi\nnext\n"));
-        assert_eq!(lines[0].bytes, b"abcd");
-        assert!(lines[0].truncated);
-        assert_eq!(lines[0].marked_lossy_text(), "abcd [line truncated]");
-        assert_eq!(text(lines[1..].to_vec()), vec![("next".into(), false)]);
-
-        let mut eof = LineFramer::new(2);
-        eof.push(b"long");
-        let final_line = eof.finish().unwrap();
-        assert_eq!(final_line.bytes, b"lo");
-        assert!(final_line.truncated);
     }
 }

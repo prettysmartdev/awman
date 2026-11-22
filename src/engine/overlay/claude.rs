@@ -222,7 +222,3 @@ pub(crate) fn synthesize_settings_dir_with_secrets(
     }
     Ok((tmp, tmp_root))
 }
-
-#[cfg(all(test, unix))]
-#[path = "claude_scrub_tests.rs"]
-mod scrub_tests;

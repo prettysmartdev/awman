@@ -1,24 +1,84 @@
 //! JSON-RPC transport, correlation, and inbound ACP dispatch.
+//!
+//! The transport is bounded end to end (see [`crate::engine::acp::budget`]):
+//!
+//! - a **pump** task moves container stdout into the client, charging the
+//!   stdout budget itself when the runtime bridge does not apply it;
+//! - a **dispatcher** task frames and decodes lines in order, completes
+//!   pending requests, answers agent-initiated requests, and queues permission
+//!   requests on the *control* queue and session updates on the *bulk* queue;
+//! - a **stderr** pump keeps the newest diagnostics and counts what it drops.
+//!
+//! Every task selects on the client's cancellation token. Cancelling (or
+//! dropping the [`AcpClient`]) stops them, frees what is queued, closes the
+//! stream gates so a blocked bridge thread resumes and discards, and fails
+//! every pending request.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+use crate::engine::acp::budget::{
+    AcpBudgets, AcpQueueStats, DecodedQueue, PushUpdate, QueueError, QueueUsage, StderrRing,
+};
 use crate::engine::acp::protocol::{
     encode_line, JsonRpcError, JsonRpcId, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    LineFramer, PermissionDecision, PermissionRequest, ReadTextFileRequest,
-    SessionUpdateNotification, WriteTextFileRequest,
+    LineFramer, PermissionDecision, PermissionRequest, ReadTextFileRequest, SessionUpdate,
+    SessionUpdateNotification, WriteTextFileRequest, MAX_ACP_LINE_BYTES,
 };
-use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
+use crate::engine::agent_runtime::frontend::{
+    AcpIoGates, AgentFrontend, AgentIo, AgentProgress, AgentStatus, GateError, StreamGate,
+};
 use crate::engine::error::EngineError;
 
 type SharedSink = Arc<Mutex<Box<dyn UserMessageSink>>>;
-type PendingMap = Arc<AsyncMutex<HashMap<JsonRpcId, oneshot::Sender<Result<Value, EngineError>>>>>;
+struct PendingSender {
+    sender: oneshot::Sender<Answer>,
+    prompt: bool,
+}
+
+/// A response delivered to a waiting request. Until the caller takes it (or
+/// stops waiting and drops it) its bytes are charged to the control budget,
+/// so unread responses cannot accumulate beyond it.
+struct Answer {
+    result: Result<Value, EngineError>,
+    _credit: Option<ControlCredit>,
+    bulk_barrier: Option<oneshot::Receiver<()>>,
+}
+
+impl Answer {
+    fn failed(error: EngineError) -> Self {
+        Self {
+            result: Err(error),
+            _credit: None,
+            bulk_barrier: None,
+        }
+    }
+}
+
+/// Returns a response's control-budget charge when dropped.
+struct ControlCredit {
+    shared: Weak<Shared>,
+    cost: usize,
+}
+
+impl Drop for ControlCredit {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.control.release_reserved(self.cost);
+        }
+    }
+}
+
+/// The largest line the client writes: a maximum-size frame plus newline.
+const MAX_OUTBOUND_LINE_BYTES: usize = MAX_ACP_LINE_BYTES + 1;
 
 /// I/O detached from an ACP runtime frontend. It is consumed once by
 /// [`AcpClient::new`] after the runtime has taken the matching `AgentIo`.
@@ -26,28 +86,37 @@ pub struct AcpTransport {
     stdout_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     stderr_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     stdin_tx: mpsc::UnboundedSender<Vec<u8>>,
+    gates: AcpIoGates,
+    budgets: AcpBudgets,
 }
 
 /// Runtime adapter used to select the persistent piped ACP spawn path.
 ///
 /// `initial_size` and `resize` are deliberately `None`; a PTY would corrupt
-/// line framing. It carries no presentation logic.
+/// line framing. It carries no presentation logic. It offers the transport's
+/// byte budgets to the runtime bridge through
+/// [`AgentFrontend::acp_io_gates`].
 pub struct AcpTransportFrontend {
     io: Option<AgentIo>,
-}
-
-impl AcpTransportFrontend {
-    #[cfg(test)]
-    pub(crate) fn into_io_for_test(mut self) -> AgentIo {
-        self.io.take().expect("test ACP frontend has no AgentIo")
-    }
+    gates: AcpIoGates,
 }
 
 impl AcpTransport {
+    /// A transport with the production budgets.
     pub fn channel() -> (AcpTransportFrontend, Self) {
+        Self::with_budgets(AcpBudgets::default())
+    }
+
+    /// A transport with explicit budgets (tests and diagnostics).
+    pub fn with_budgets(budgets: AcpBudgets) -> (AcpTransportFrontend, Self) {
         let (stdout_tx, stdout_rx) = mpsc::unbounded_channel();
         let (stderr_tx, stderr_rx) = mpsc::unbounded_channel();
         let (stdin_tx, stdin_rx) = mpsc::unbounded_channel();
+        let gates = AcpIoGates {
+            stdout: StreamGate::new(budgets.stdout_items, budgets.stdout_bytes),
+            stdin: StreamGate::new(budgets.stdin_items, budgets.stdin_bytes),
+            stderr: StreamGate::new(budgets.stderr_items, budgets.stderr_bytes),
+        };
         (
             AcpTransportFrontend {
                 io: Some(AgentIo {
@@ -58,11 +127,14 @@ impl AcpTransport {
                     resize: None,
                     initial_size: None,
                 }),
+                gates: gates.clone(),
             },
             Self {
                 stdout_rx,
                 stderr_rx,
                 stdin_tx,
+                gates,
+                budgets,
             },
         )
     }
@@ -77,6 +149,9 @@ impl UserMessageSink for AcpTransportFrontend {
 impl AgentFrontend for AcpTransportFrontend {
     fn report_status(&mut self, _status: AgentStatus) {}
     fn report_progress(&mut self, _progress: AgentProgress) {}
+    fn acp_io_gates(&self) -> Option<AcpIoGates> {
+        Some(self.gates.clone())
+    }
     fn take_io(&mut self) -> AgentIo {
         self.io
             .take()
@@ -114,13 +189,237 @@ pub enum IncomingRequest {
     Permission(PermissionRequest),
 }
 
+/// State shared by the client handle and its tasks.
+struct Shared {
+    stdin_tx: mpsc::UnboundedSender<Vec<u8>>,
+    gates: AcpIoGates,
+    max_pending: usize,
+    pending: Mutex<HashMap<JsonRpcId, PendingSender>>,
+    high_pending: AtomicUsize,
+    control: DecodedQueue<IncomingRequest>,
+    bulk: DecodedQueue<SessionUpdate>,
+    stderr: StderrRing,
+    cancel: CancellationToken,
+    failure: Mutex<Option<&'static str>>,
+    reader_stopped: AtomicBool,
+    /// Decoded-ahead session updates and the framer's partial line.
+    decode_ahead: Mutex<QueueUsage>,
+}
+
+impl Shared {
+    fn closed_error(&self) -> EngineError {
+        match self.failure() {
+            Some(queue) => EngineError::AcpOverflow { queue },
+            None => EngineError::Acp("ACP connection closed".into()),
+        }
+    }
+
+    fn failure(&self) -> Option<&'static str> {
+        *self.failure.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A budget that must not wait was exceeded: record it (first wins) and
+    /// cancel the session.
+    fn overflow(&self, queue: &'static str) {
+        self.failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(queue);
+        self.shutdown();
+    }
+
+    /// Stop every task, free queued data, unblock the bridge and fail
+    /// pending requests. Idempotent.
+    fn shutdown(&self) {
+        self.cancel.cancel();
+        self.control.abort();
+        self.bulk.abort();
+        self.stderr.abort();
+        self.gates.stdout.close();
+        self.gates.stdin.close();
+        self.gates.stderr.close();
+        self.fail_pending();
+    }
+
+    /// Refuse a line no conforming peer could accept, before it is charged
+    /// to a gate (a gate admits one item into an empty budget).
+    fn check_outbound(len: usize) -> Result<(), EngineError> {
+        if len > MAX_OUTBOUND_LINE_BYTES {
+            return Err(EngineError::Acp(format!(
+                "ACP message of {len} bytes exceeds the {MAX_ACP_LINE_BYTES}-byte line limit"
+            )));
+        }
+        Ok(())
+    }
+
+    fn fail_pending(&self) {
+        let drained: Vec<_> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .collect();
+        for (_, sender) in drained {
+            let _ = sender.sender.send(Answer::failed(self.closed_error()));
+        }
+    }
+
+    /// Write one encoded line toward the container, waiting (cancellably) for
+    /// stdin budget.
+    async fn send_bytes(&self, bytes: Vec<u8>) -> Result<(), EngineError> {
+        let len = bytes.len();
+        Self::check_outbound(len)?;
+        let gate = &self.gates.stdin;
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Err(self.closed_error()),
+            acquired = gate.acquire(len) => {
+                if acquired.is_err() {
+                    return Err(self.closed_error());
+                }
+            }
+        }
+        if self.stdin_tx.send(bytes).is_err() {
+            gate.release(len);
+            return Err(EngineError::Acp("ACP stdin connection closed".into()));
+        }
+        // A bridge that does not release after writing gives no consumption
+        // signal; do not hold budget it will never return.
+        if !gate.is_attached() {
+            gate.release(len);
+        }
+        Ok(())
+    }
+
+    /// Like [`send_bytes`](Self::send_bytes) but never waits: teardown must
+    /// not depend on an agent that stopped reading its stdin.
+    fn send_bytes_now(&self, bytes: Vec<u8>) -> Result<(), EngineError> {
+        let len = bytes.len();
+        Self::check_outbound(len)?;
+        let gate = &self.gates.stdin;
+        match gate.try_acquire(len) {
+            Ok(()) => {}
+            Err(GateError::Full) => return Err(EngineError::AcpOverflow { queue: "stdin" }),
+            Err(GateError::Closed) => return Err(self.closed_error()),
+        }
+        if self.stdin_tx.send(bytes).is_err() {
+            gate.release(len);
+            return Err(EngineError::Acp("ACP stdin connection closed".into()));
+        }
+        if !gate.is_attached() {
+            gate.release(len);
+        }
+        Ok(())
+    }
+
+    async fn send<T: Serialize>(&self, message: &T) -> Result<(), EngineError> {
+        self.send_bytes(encode_line(message).map_err(EngineError::Acp)?)
+            .await
+    }
+
+    fn stats(&self) -> AcpQueueStats {
+        let (stderr, stderr_dropped_bytes) = self.stderr.usage();
+        AcpQueueStats {
+            stdout: self.gates.stdout.usage().into(),
+            stdin: self.gates.stdin.usage().into(),
+            stderr,
+            stderr_transport: self.gates.stderr.usage().into(),
+            decode_ahead: *self.decode_ahead.lock().unwrap_or_else(|e| e.into_inner()),
+            bulk: self.bulk.usage(),
+            control: self.control.usage(),
+            pending_requests: self.pending.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            high_pending_requests: self.high_pending.load(Ordering::SeqCst),
+            stderr_dropped_bytes,
+            coalesced_updates: self.bulk.coalesced(),
+            reader_stopped: self.reader_stopped.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// Removes a request's pending entry when its caller stops waiting (timeout,
+/// cancellation, drop), so a never-answered request does not hold a slot.
+struct PendingGuard<'a> {
+    shared: &'a Shared,
+    id: JsonRpcId,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.shared
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+/// Cancels an ACP client from outside the task driving it.
+#[derive(Clone)]
+pub struct AcpCancelHandle {
+    shared: Arc<Shared>,
+}
+
+impl AcpCancelHandle {
+    /// Stop the reader tasks, free queued data and fail pending requests.
+    pub fn cancel(&self) {
+        self.shared.shutdown();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.shared.cancel.is_cancelled()
+    }
+
+    /// Current occupancy and high-water marks of every queue.
+    pub fn stats(&self) -> AcpQueueStats {
+        self.shared.stats()
+    }
+}
+
+/// Permission requests from the agent, in arrival order.
+pub struct AcpIncoming {
+    shared: Arc<Shared>,
+}
+
+impl AcpIncoming {
+    /// The next request; `None` once the connection ended or was cancelled.
+    pub async fn recv(&mut self) -> Option<IncomingRequest> {
+        self.shared.control.pop().await
+    }
+    pub fn try_recv(&mut self) -> Option<IncomingRequest> {
+        self.shared.control.try_pop()
+    }
+}
+
+/// Session updates from the agent, in arrival order (replaceable state may
+/// have been coalesced under pressure).
+pub struct AcpUpdates {
+    shared: Arc<Shared>,
+}
+
+impl AcpUpdates {
+    /// The next update; `None` once the connection ended (after the queued
+    /// tail) or was cancelled.
+    pub async fn recv(&mut self) -> Option<SessionUpdate> {
+        self.shared.bulk.pop().await
+    }
+    pub fn try_recv(&mut self) -> Option<SessionUpdate> {
+        self.shared.bulk.try_pop()
+    }
+}
+
 /// An ACP JSON-RPC client bound to one agent process's stdin/stdout.
 pub struct AcpClient {
-    stdin_tx: mpsc::UnboundedSender<Vec<u8>>,
+    shared: Arc<Shared>,
     next_id: AtomicI64,
-    pending: PendingMap,
-    incoming_rx: Option<mpsc::UnboundedReceiver<IncomingRequest>>,
-    updates_rx: Option<mpsc::UnboundedReceiver<crate::engine::acp::protocol::SessionUpdate>>,
+    incoming_taken: AtomicBool,
+    updates_taken: AtomicBool,
+}
+
+impl Drop for AcpClient {
+    /// The consumer is gone: release everything the transport owns.
+    fn drop(&mut self) {
+        self.shared.shutdown();
+    }
 }
 
 impl AcpClient {
@@ -141,135 +440,366 @@ impl AcpClient {
         sink: Box<dyn UserMessageSink>,
         filesystem: Arc<dyn ContainerFileSystem>,
     ) -> Self {
-        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
-        let (updates_tx, updates_rx) = mpsc::unbounded_channel();
-        let pending = Arc::new(AsyncMutex::new(HashMap::new()));
-        let shared_sink = Arc::new(Mutex::new(sink));
-        spawn_reader(
-            transport.stdout_rx,
-            transport.stderr_rx,
-            transport.stdin_tx.clone(),
-            pending.clone(),
-            incoming_tx,
-            updates_tx,
-            filesystem,
-            shared_sink,
-        );
+        let AcpTransport {
+            stdout_rx,
+            stderr_rx,
+            stdin_tx,
+            gates,
+            budgets,
+        } = transport;
+        let shared = Arc::new(Shared {
+            stdin_tx,
+            gates,
+            max_pending: budgets.pending_requests.max(1),
+            pending: Mutex::new(HashMap::new()),
+            high_pending: AtomicUsize::new(0),
+            control: DecodedQueue::new(budgets.control_items, budgets.control_bytes),
+            bulk: DecodedQueue::new(budgets.bulk_items, budgets.bulk_bytes),
+            stderr: StderrRing::new(budgets.stderr_items, budgets.stderr_bytes),
+            cancel: CancellationToken::new(),
+            failure: Mutex::new(None),
+            reader_stopped: AtomicBool::new(false),
+            decode_ahead: Mutex::new(QueueUsage {
+                max_items: budgets.decode_ahead_items.max(1),
+                max_bytes: budgets.decode_ahead_bytes.max(1),
+                ..QueueUsage::default()
+            }),
+        });
+        let sink = Arc::new(Mutex::new(sink));
+        spawn_tasks(shared.clone(), stdout_rx, stderr_rx, filesystem, sink);
         Self {
-            stdin_tx: transport.stdin_tx,
+            shared,
             next_id: AtomicI64::new(1),
-            pending,
-            incoming_rx: Some(incoming_rx),
-            updates_rx: Some(updates_rx),
+            incoming_taken: AtomicBool::new(false),
+            updates_taken: AtomicBool::new(false),
         }
     }
 
-    pub fn take_incoming(&mut self) -> mpsc::UnboundedReceiver<IncomingRequest> {
-        self.incoming_rx
-            .take()
-            .expect("AcpClient incoming receiver already taken")
+    pub fn take_incoming(&mut self) -> AcpIncoming {
+        assert!(
+            !self.incoming_taken.swap(true, Ordering::SeqCst),
+            "AcpClient incoming receiver already taken"
+        );
+        AcpIncoming {
+            shared: self.shared.clone(),
+        }
     }
 
-    pub fn take_updates(
-        &mut self,
-    ) -> mpsc::UnboundedReceiver<crate::engine::acp::protocol::SessionUpdate> {
-        self.updates_rx
-            .take()
-            .expect("AcpClient update receiver already taken")
+    pub fn take_updates(&mut self) -> AcpUpdates {
+        assert!(
+            !self.updates_taken.swap(true, Ordering::SeqCst),
+            "AcpClient update receiver already taken"
+        );
+        AcpUpdates {
+            shared: self.shared.clone(),
+        }
     }
 
+    pub fn cancel_handle(&self) -> AcpCancelHandle {
+        AcpCancelHandle {
+            shared: self.shared.clone(),
+        }
+    }
+
+    /// The overflow that cancelled this client, if any.
+    pub fn failure(&self) -> Option<EngineError> {
+        self.shared
+            .failure()
+            .map(|queue| EngineError::AcpOverflow { queue })
+    }
+
+    pub fn stats(&self) -> AcpQueueStats {
+        self.shared.stats()
+    }
+
+    /// Send a request and wait for its response. At most
+    /// `pending_requests` may be outstanding; a further one fails with
+    /// [`EngineError::AcpOverflow`]. Dropping the future frees its slot.
     pub async fn request<T: Serialize>(
         &self,
         method: &str,
         params: T,
     ) -> Result<Value, EngineError> {
+        let shared = &*self.shared;
+        if shared.cancel.is_cancelled() {
+            return Err(shared.closed_error());
+        }
         let id = JsonRpcId::Number(self.next_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id.clone(), tx);
-        let request = JsonRpcRequest {
-            jsonrpc: "2.0".into(),
+        {
+            let mut pending = shared.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if pending.len() >= shared.max_pending {
+                return Err(EngineError::AcpOverflow {
+                    queue: "pending_requests",
+                });
+            }
+            pending.insert(
+                id.clone(),
+                PendingSender {
+                    sender: tx,
+                    prompt: method == "session/prompt",
+                },
+            );
+            shared
+                .high_pending
+                .fetch_max(pending.len(), Ordering::SeqCst);
+        }
+        let _guard = PendingGuard {
+            shared,
             id: id.clone(),
-            method: method.into(),
-            params,
         };
-        self.send(&request)?;
-        rx.await.map_err(|_| {
-            EngineError::Acp(format!("ACP connection closed while waiting for {method}"))
-        })?
+        shared
+            .send(&JsonRpcRequest {
+                jsonrpc: "2.0".into(),
+                id,
+                method: method.into(),
+                params,
+            })
+            .await?;
+        tokio::select! {
+            response = rx => match response {
+                Ok(answer) => {
+                    let Answer { result, _credit, bulk_barrier } = answer;
+                    // Retain the control credit until the ordering marker is
+                    // reached, bounding markers even if callers keep issuing
+                    // prompt requests while bulk output is stalled.
+                    if let Some(barrier) = bulk_barrier {
+                        tokio::select! {
+                            result = barrier => {
+                                if result.is_err() {
+                                    return Err(shared.closed_error());
+                                }
+                            },
+                            _ = shared.cancel.cancelled() => return Err(shared.closed_error()),
+                        }
+                    }
+                    result
+                },
+                Err(_) => Err(EngineError::Acp(format!(
+                    "ACP connection closed while waiting for {method}"
+                ))),
+            },
+            _ = shared.cancel.cancelled() => Err(shared.closed_error()),
+        }
     }
 
-    pub fn notify<T: Serialize>(&self, method: &str, params: T) -> Result<(), EngineError> {
-        self.send(&JsonRpcNotification {
-            jsonrpc: "2.0".into(),
-            method: method.into(),
-            params,
-        })
+    pub async fn notify<T: Serialize>(&self, method: &str, params: T) -> Result<(), EngineError> {
+        self.shared
+            .send(&JsonRpcNotification {
+                jsonrpc: "2.0".into(),
+                method: method.into(),
+                params,
+            })
+            .await
     }
 
-    pub fn respond_permission(
+    pub async fn respond_permission(
         &self,
         request_id: JsonRpcId,
         decision: PermissionDecision,
     ) -> Result<(), EngineError> {
-        self.respond_result(request_id, decision.as_result())
+        self.respond_result(request_id, decision.as_result()).await
     }
 
-    pub fn respond_result(&self, id: JsonRpcId, result: Value) -> Result<(), EngineError> {
-        self.send(&JsonRpcResponse {
-            jsonrpc: "2.0".into(),
-            id,
-            result: Some(result),
-            error: None,
-        })
+    pub async fn respond_result(&self, id: JsonRpcId, result: Value) -> Result<(), EngineError> {
+        self.shared
+            .send(&JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id,
+                result: Some(result),
+                error: None,
+            })
+            .await
     }
 
-    fn send<T: Serialize>(&self, message: &T) -> Result<(), EngineError> {
-        let bytes = encode_line(message).map_err(EngineError::Acp)?;
-        self.stdin_tx
-            .send(bytes)
-            .map_err(|_| EngineError::Acp("ACP stdin connection closed".into()))
+    /// Send a notification only if the stdin budget has room now.
+    pub fn notify_now<T: Serialize>(&self, method: &str, params: T) -> Result<(), EngineError> {
+        self.shared.send_bytes_now(
+            encode_line(&JsonRpcNotification {
+                jsonrpc: "2.0".into(),
+                method: method.into(),
+                params,
+            })
+            .map_err(EngineError::Acp)?,
+        )
+    }
+
+    /// Send a response only if the stdin budget has room now.
+    pub fn respond_now(&self, id: JsonRpcId, result: Value) -> Result<(), EngineError> {
+        self.shared.send_bytes_now(
+            encode_line(&JsonRpcResponse {
+                jsonrpc: "2.0".into(),
+                id,
+                result: Some(result),
+                error: None,
+            })
+            .map_err(EngineError::Acp)?,
+        )
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn spawn_reader(
+fn spawn_tasks(
+    shared: Arc<Shared>,
     mut stdout_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     mut stderr_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    stdin_tx: mpsc::UnboundedSender<Vec<u8>>,
-    pending: PendingMap,
-    incoming_tx: mpsc::UnboundedSender<IncomingRequest>,
-    updates_tx: mpsc::UnboundedSender<crate::engine::acp::protocol::SessionUpdate>,
     filesystem: Arc<dyn ContainerFileSystem>,
     sink: SharedSink,
 ) {
+    // stderr: keep draining into the ring so the runtime channel never
+    // grows; a separate writer surfaces it (without interpreting it as
+    // protocol frames). A bridge that honours the stderr gate drops (and
+    // counts) at ingress while this pump is behind, so the channel itself
+    // stays within the stderr budget.
+    let pump = shared.clone();
     tokio::spawn(async move {
-        // ACP permits diagnostics on stderr. Surface them without trying to
-        // interpret them as protocol frames.
-        let stderr_sink = sink.clone();
-        tokio::spawn(async move {
-            while let Some(bytes) = stderr_rx.recv().await {
-                let text = String::from_utf8_lossy(&bytes).trim().to_owned();
+        let gate = &pump.gates.stderr;
+        loop {
+            tokio::select! {
+                biased;
+                _ = pump.cancel.cancelled() => break,
+                chunk = stderr_rx.recv() => match chunk {
+                    Some(chunk) => {
+                        let len = chunk.len();
+                        pump.stderr.note_dropped(gate.take_dropped());
+                        pump.stderr.push(chunk);
+                        if gate.is_attached() {
+                            gate.release(len);
+                        }
+                    }
+                    None => break,
+                },
+            }
+        }
+        pump.stderr.note_dropped(gate.take_dropped());
+        pump.stderr.close();
+    });
+    let writer = shared.clone();
+    let stderr_sink = sink.clone();
+    tokio::spawn(async move {
+        while let Some((chunk, dropped)) = writer.stderr.pop().await {
+            if dropped > 0 {
+                warning(
+                    &stderr_sink,
+                    format!("{dropped} bytes of agent stderr dropped"),
+                );
+            }
+            if let Some(chunk) = chunk {
+                let text = String::from_utf8_lossy(&chunk).trim().to_owned();
                 if !text.is_empty() {
                     warning(&stderr_sink, format!("ACP agent stderr: {text}"));
                 }
             }
-        });
+        }
+    });
 
+    // stdout pump: move runtime chunks to the dispatcher. When the bridge
+    // honours the stdout gate it has already acquired each chunk (and fails
+    // the gate if it cannot wait and finds it full); otherwise the pump
+    // charges it and refuses to let an unbounded stream outgrow the budget.
+    let (staged_tx, mut staged_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let pump = shared.clone();
+    tokio::spawn(async move {
+        let gate = &pump.gates.stdout;
+        loop {
+            tokio::select! {
+                biased;
+                _ = pump.cancel.cancelled() => break,
+                _ = gate.closed() => {
+                    if gate.is_overflowed() {
+                        pump.overflow("transport_stdout");
+                    }
+                    break;
+                }
+                chunk = stdout_rx.recv() => {
+                    let Some(chunk) = chunk else { break };
+                    if !gate.is_attached() && gate.try_acquire(chunk.len()).is_err() {
+                        if !gate.is_closed() {
+                            pump.overflow("transport_stdout");
+                        }
+                        break;
+                    }
+                    if staged_tx.send(chunk).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        // Dropping `stdout_rx` here makes further bridge sends fail, so the
+        // bridge drains and discards rather than queueing for nobody.
+    });
+
+    // Dispatcher. Control frames (permission requests, RPC responses,
+    // agent-initiated requests) are handled as soon as they are framed.
+    // Session updates that do not fit the bulk queue wait in `ahead` while
+    // framing continues, so a saturated bulk queue never hides a later
+    // control frame. `ahead` and the framer's partial line together are
+    // bounded by the decode-ahead budget: once it is reached no further
+    // chunk is taken, the staged chunks keep their stdout budget, and the
+    // bridge stops reading.
+    tokio::spawn(async move {
         let mut framer = LineFramer::default();
-        while let Some(bytes) = stdout_rx.recv().await {
-            for frame in framer.push(&bytes) {
-                match frame {
+        let mut ahead = DecodeAhead::default();
+        let mut input_open = true;
+        'run: loop {
+            let writable = shared.bulk.writable();
+            tokio::pin!(writable);
+            writable.as_mut().enable();
+            while let Some(item) = ahead.pop() {
+                match item {
+                    AheadItem::Barrier(sender) => {
+                        let _ = sender.send(());
+                    }
+                    AheadItem::Update(update, cost) => {
+                        match shared.bulk.try_push_update(*update, cost) {
+                            Ok(()) => {}
+                            Err(PushUpdate::Full(update, cost)) => {
+                                ahead.unpop(update, cost);
+                                break;
+                            }
+                            Err(PushUpdate::TooLarge) => {
+                                shared.overflow("bulk");
+                                break 'run;
+                            }
+                            Err(PushUpdate::Closed) => break 'run,
+                        }
+                    }
+                }
+            }
+            shared.note_decode_ahead(&ahead, framer.buffered());
+            if !input_open && ahead.is_empty() {
+                break;
+            }
+            let room = ahead.is_empty() || shared.decode_ahead_has_room(&ahead, framer.buffered());
+            let chunk = tokio::select! {
+                biased;
+                _ = shared.cancel.cancelled() => break,
+                _ = &mut writable, if !ahead.is_empty() => continue,
+                chunk = staged_rx.recv(), if input_open && room => match chunk {
+                    Some(chunk) => chunk,
+                    None => {
+                        input_open = false;
+                        continue;
+                    }
+                },
+            };
+            let len = chunk.len();
+            for frame in framer.push_sized(&chunk) {
+                match frame.value {
                     Ok(value) => {
-                        dispatch(
+                        match dispatch(
+                            &shared,
+                            &mut ahead,
                             value,
-                            &stdin_tx,
-                            &pending,
-                            &incoming_tx,
-                            &updates_tx,
+                            frame.bytes,
                             filesystem.as_ref(),
                             &sink,
                         )
                         .await
+                        {
+                            Ok(Some((update, cost))) => ahead.push(update, cost),
+                            Ok(None) => {}
+                            Err(Stop) => break 'run,
+                        }
                     }
                     Err(error) => warning(
                         &sink,
@@ -277,36 +807,103 @@ fn spawn_reader(
                     ),
                 }
             }
+            // The chunk's bytes now live in the framer or the decode-ahead
+            // queue, which are bounded on their own.
+            shared.gates.stdout.release(len);
+            shared.note_decode_ahead(&ahead, framer.buffered());
         }
-        let mut pending = pending.lock().await;
-        for (_, sender) in pending.drain() {
-            let _ = sender.send(Err(EngineError::Acp("ACP connection closed".into())));
-        }
+        drop(framer);
+        drop(ahead);
+        // End of stream or cancellation. Queued updates and requests stay
+        // readable after a clean end; cancellation already freed them.
+        shared.control.close();
+        shared.bulk.close();
+        shared.gates.stdout.close();
+        shared.fail_pending();
+        shared.reader_stopped.store(true, Ordering::SeqCst);
     });
 }
 
+/// Session updates decoded while the bulk queue was full, in order.
+#[derive(Default)]
+struct DecodeAhead {
+    items: VecDeque<AheadItem>,
+    updates: usize,
+    bytes: usize,
+}
+
+enum AheadItem {
+    Update(Box<SessionUpdate>, usize),
+    Barrier(oneshot::Sender<()>),
+}
+
+impl DecodeAhead {
+    fn push(&mut self, update: SessionUpdate, cost: usize) {
+        self.bytes += cost;
+        self.updates += 1;
+        self.items
+            .push_back(AheadItem::Update(Box::new(update), cost));
+    }
+    fn push_barrier(&mut self, sender: oneshot::Sender<()>) {
+        self.items.push_back(AheadItem::Barrier(sender));
+    }
+    fn pop(&mut self) -> Option<AheadItem> {
+        let item = self.items.pop_front()?;
+        if let AheadItem::Update(_, cost) = &item {
+            self.bytes -= cost;
+            self.updates -= 1;
+        }
+        Some(item)
+    }
+    fn unpop(&mut self, update: Box<SessionUpdate>, cost: usize) {
+        self.bytes += cost;
+        self.updates += 1;
+        self.items.push_front(AheadItem::Update(update, cost));
+    }
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+
+impl Shared {
+    fn decode_ahead_has_room(&self, ahead: &DecodeAhead, partial: usize) -> bool {
+        let usage = self.decode_ahead.lock().unwrap_or_else(|e| e.into_inner());
+        ahead.updates < usage.max_items && ahead.bytes + partial < usage.max_bytes
+    }
+
+    fn note_decode_ahead(&self, ahead: &DecodeAhead, partial: usize) {
+        let mut usage = self.decode_ahead.lock().unwrap_or_else(|e| e.into_inner());
+        usage.items = ahead.updates;
+        usage.bytes = ahead.bytes + partial;
+        usage.high_items = usage.high_items.max(usage.items);
+        usage.high_bytes = usage.high_bytes.max(usage.bytes);
+    }
+}
+
+/// The session is gone (closed queue or cancellation): stop dispatching.
+struct Stop;
+
 async fn dispatch(
+    shared: &Arc<Shared>,
+    ahead: &mut DecodeAhead,
     value: Value,
-    stdin_tx: &mpsc::UnboundedSender<Vec<u8>>,
-    pending: &PendingMap,
-    incoming_tx: &mpsc::UnboundedSender<IncomingRequest>,
-    updates_tx: &mpsc::UnboundedSender<crate::engine::acp::protocol::SessionUpdate>,
+    cost: usize,
     filesystem: &dyn ContainerFileSystem,
     sink: &SharedSink,
-) {
+) -> Result<Option<(SessionUpdate, usize)>, Stop> {
     let Some(object) = value.as_object() else {
         warning(
             sink,
             "ACP protocol warning: ignoring non-object JSON-RPC frame".into(),
         );
-        return;
+        return Ok(None);
     };
     if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         warning(
             sink,
             "ACP protocol warning: ignoring frame without jsonrpc: 2.0".into(),
         );
-        return;
+        return Ok(None);
     }
     if object.contains_key("result") || object.contains_key("error") {
         let Some(id) = object.get("id").and_then(parse_id) else {
@@ -314,30 +911,73 @@ async fn dispatch(
                 sink,
                 "ACP protocol warning: response has no usable id".into(),
             );
-            return;
+            return Ok(None);
         };
-        if let Some(sender) = pending.lock().await.remove(&id) {
+        let sender = shared
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+        if let Some(sender) = sender {
+            // Charge the response to the control budget until its caller
+            // takes it; a caller that never does cannot grow memory past it.
+            match shared.control.try_reserve(cost) {
+                Ok(()) => {}
+                Err(QueueError::Full) => {
+                    shared.overflow("control");
+                    let _ = sender.sender.send(Answer::failed(EngineError::AcpOverflow {
+                        queue: "control",
+                    }));
+                    return Err(Stop);
+                }
+                Err(QueueError::Closed) => {
+                    let _ = sender.sender.send(Answer::failed(shared.closed_error()));
+                    return Err(Stop);
+                }
+            }
+            let credit = ControlCredit {
+                shared: Arc::downgrade(shared),
+                cost,
+            };
             let result = if let Some(error) = object.get("error") {
                 Err(EngineError::Acp(format!("agent RPC error: {error}")))
             } else {
                 Ok(object.get("result").cloned().unwrap_or(Value::Null))
             };
-            let _ = sender.send(result);
+            // A caller that already stopped waiting drops the answer (and
+            // its credit) right here.
+            // A prompt response may be framed while earlier updates still
+            // wait in decode-ahead. Mark their place in that queue so the
+            // driver can drain them before treating the turn as complete.
+            let bulk_barrier = if sender.prompt && !ahead.is_empty() {
+                let (tx, rx) = oneshot::channel();
+                ahead.push_barrier(tx);
+                Some(rx)
+            } else {
+                None
+            };
+            let _ = sender.sender.send(Answer {
+                result,
+                _credit: Some(credit),
+                bulk_barrier,
+            });
         }
-        return;
+        return Ok(None);
     }
     let Some(method) = object.get("method").and_then(Value::as_str) else {
         warning(
             sink,
             "ACP protocol warning: request/notification has no method".into(),
         );
-        return;
+        return Ok(None);
     };
     let params = object.get("params").cloned().unwrap_or(Value::Null);
     match method {
         "session/update" => match serde_json::from_value::<SessionUpdateNotification>(params) {
             Ok(notification) => {
-                let _ = updates_tx.send(notification.update);
+                // Bulk: the dispatcher queues it, coalescing replaceable
+                // state, and keeps framing control traffic meanwhile.
+                return Ok(Some((notification.update, cost)));
             }
             Err(e) => warning(
                 sink,
@@ -350,7 +990,7 @@ async fn dispatch(
                     sink,
                     "ACP protocol warning: permission request has no id".into(),
                 );
-                return;
+                return Ok(None);
             };
             match serde_json::from_value::<PermissionRequestWire>(params) {
                 Ok(request) => {
@@ -360,43 +1000,57 @@ async fn dispatch(
                         tool_call: request.tool_call,
                         options: request.options,
                     };
-                    let _ = incoming_tx.send(IncomingRequest::Permission(request));
+                    // Control never waits behind anything: a full control
+                    // queue is an explicit failure, never a silent drop.
+                    match shared
+                        .control
+                        .try_push(IncomingRequest::Permission(request), cost)
+                    {
+                        Ok(()) => {}
+                        Err(QueueError::Full) => {
+                            shared.overflow("control");
+                            return Err(Stop);
+                        }
+                        Err(QueueError::Closed) => return Err(Stop),
+                    }
                 }
                 Err(e) => {
                     warning(
                         sink,
                         format!("ACP protocol warning: invalid permission request: {e}"),
                     );
-                    send_error(stdin_tx, id, -32602, "invalid permission request");
+                    send_error(shared, id, -32602, "invalid permission request").await?;
                 }
             }
         }
         "fs/read_text_file" => {
             let Some(id) = object.get("id").and_then(parse_id) else {
                 warning(sink, "ACP protocol warning: file request has no id".into());
-                return;
+                return Ok(None);
             };
             match serde_json::from_value::<ReadTextFileRequest>(params).and_then(|r| {
                 filesystem
                     .read_text_file(&r)
                     .map_err(|e| serde_json::Error::io(std::io::Error::other(e.to_string())))
             }) {
-                Ok(content) => send_result(stdin_tx, id, serde_json::json!({"content": content})),
-                Err(e) => send_error(stdin_tx, id, -32603, &e.to_string()),
+                Ok(content) => {
+                    send_result(shared, id, serde_json::json!({"content": content})).await?
+                }
+                Err(e) => send_error(shared, id, -32603, &e.to_string()).await?,
             }
         }
         "fs/write_text_file" => {
             let Some(id) = object.get("id").and_then(parse_id) else {
                 warning(sink, "ACP protocol warning: file request has no id".into());
-                return;
+                return Ok(None);
             };
             match serde_json::from_value::<WriteTextFileRequest>(params).and_then(|r| {
                 filesystem
                     .write_text_file(&r)
                     .map_err(|e| serde_json::Error::io(std::io::Error::other(e.to_string())))
             }) {
-                Ok(()) => send_result(stdin_tx, id, serde_json::json!({})),
-                Err(e) => send_error(stdin_tx, id, -32603, &e.to_string()),
+                Ok(()) => send_result(shared, id, serde_json::json!({})).await?,
+                Err(e) => send_error(shared, id, -32603, &e.to_string()).await?,
             }
         }
         _ => {
@@ -405,10 +1059,11 @@ async fn dispatch(
                     sink,
                     format!("ACP protocol warning: unsupported agent request '{method}'"),
                 );
-                send_error(stdin_tx, id, -32601, "method not supported by awman");
+                send_error(shared, id, -32601, "method not supported by awman").await?;
             }
         }
     }
+    Ok(None)
 }
 
 #[derive(serde::Deserialize)]
@@ -422,20 +1077,25 @@ struct PermissionRequestWire {
 fn parse_id(value: &Value) -> Option<JsonRpcId> {
     serde_json::from_value(value.clone()).ok()
 }
-fn send_result(stdin: &mpsc::UnboundedSender<Vec<u8>>, id: JsonRpcId, result: Value) {
-    let _ = send_response(
-        stdin,
+
+/// Answer an agent-initiated request. Waiting for stdin budget is the
+/// backpressure for an agent that floods requests without reading replies.
+async fn send_result(shared: &Shared, id: JsonRpcId, result: Value) -> Result<(), Stop> {
+    respond(
+        shared,
         JsonRpcResponse {
             jsonrpc: "2.0".into(),
             id,
             result: Some(result),
             error: None,
         },
-    );
+    )
+    .await
 }
-fn send_error(stdin: &mpsc::UnboundedSender<Vec<u8>>, id: JsonRpcId, code: i64, message: &str) {
-    let _ = send_response(
-        stdin,
+
+async fn send_error(shared: &Shared, id: JsonRpcId, code: i64, message: &str) -> Result<(), Stop> {
+    respond(
+        shared,
         JsonRpcResponse {
             jsonrpc: "2.0".into(),
             id,
@@ -446,104 +1106,25 @@ fn send_error(stdin: &mpsc::UnboundedSender<Vec<u8>>, id: JsonRpcId, code: i64, 
                 data: None,
             }),
         },
-    );
+    )
+    .await
 }
-fn send_response(
-    stdin: &mpsc::UnboundedSender<Vec<u8>>,
-    response: JsonRpcResponse,
-) -> Result<(), EngineError> {
-    stdin
-        .send(encode_line(&response).map_err(EngineError::Acp)?)
-        .map_err(|_| EngineError::Acp("ACP stdin connection closed".into()))
+
+async fn respond(shared: &Shared, response: JsonRpcResponse) -> Result<(), Stop> {
+    match shared.send(&response).await {
+        Ok(()) => Ok(()),
+        Err(_) if shared.cancel.is_cancelled() => Err(Stop),
+        // stdin closed while stdout is still readable: keep reading so the
+        // remaining output and the exit still reach the driver.
+        Err(_) => Ok(()),
+    }
 }
+
 fn warning(sink: &SharedSink, text: String) {
     if let Ok(mut sink) = sink.lock() {
         sink.write_message(UserMessage {
             level: MessageLevel::Warning,
             text,
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::message::{RecordingMessageSink, UserMessage};
-    use crate::engine::acp::protocol::ContentBlock;
-
-    struct CapturingSink(Arc<Mutex<Vec<UserMessage>>>);
-    impl UserMessageSink for CapturingSink {
-        fn write_message(&mut self, msg: UserMessage) {
-            self.0.lock().unwrap().push(msg);
-        }
-        fn replay_queued(&mut self) {}
-    }
-
-    #[tokio::test]
-    async fn malformed_line_is_a_warning_and_later_update_arrives() {
-        let (frontend, transport) = AcpTransport::channel();
-        let io = frontend.into_io_for_test();
-        let messages = Arc::new(Mutex::new(Vec::new()));
-        let mut client = AcpClient::new(transport, Box::new(CapturingSink(messages.clone())));
-        let mut updates = client.take_updates();
-        io.stdout.send(b"not json\n".to_vec()).unwrap();
-        io.stdout.send(serde_json::to_vec(&serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ok"}}}})).unwrap()).unwrap();
-        io.stdout.send(vec![b'\n']).unwrap();
-        let update = updates.recv().await.unwrap();
-        assert_eq!(
-            update,
-            crate::engine::acp::protocol::SessionUpdate::AgentMessageChunk {
-                chunk: crate::engine::acp::protocol::ContentChunk {
-                    content: ContentBlock::Text { text: "ok".into() },
-                    message_id: None
-                }
-            }
-        );
-        assert!(messages.lock().unwrap().iter().any(|message| {
-            message.level == MessageLevel::Warning
-                && message.text.contains("ignoring malformed line")
-        }));
-    }
-
-    #[tokio::test]
-    async fn two_concurrent_requests_keep_their_ids() {
-        let (frontend, transport) = AcpTransport::channel();
-        let mut io = frontend.into_io_for_test();
-        let client = Arc::new(AcpClient::new(
-            transport,
-            Box::new(RecordingMessageSink::new()),
-        ));
-        let a = {
-            let c = client.clone();
-            tokio::spawn(async move { c.request("one", serde_json::json!({})).await.unwrap() })
-        };
-        let b = {
-            let c = client.clone();
-            tokio::spawn(async move { c.request("two", serde_json::json!({})).await.unwrap() })
-        };
-        let first: Value = serde_json::from_slice(&io.stdin_rx.recv().await.unwrap()).unwrap();
-        let second: Value = serde_json::from_slice(&io.stdin_rx.recv().await.unwrap()).unwrap();
-        let first_id = first["id"].clone();
-        let second_id = second["id"].clone();
-        io.stdout
-            .send(
-                format!(
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"value\":\"second\"}}}}\n",
-                    second_id
-                )
-                .into_bytes(),
-            )
-            .unwrap();
-        io.stdout
-            .send(
-                format!(
-                    "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"value\":\"first\"}}}}\n",
-                    first_id
-                )
-                .into_bytes(),
-            )
-            .unwrap();
-        assert_eq!(a.await.unwrap()["value"], "first");
-        assert_eq!(b.await.unwrap()["value"], "second");
     }
 }

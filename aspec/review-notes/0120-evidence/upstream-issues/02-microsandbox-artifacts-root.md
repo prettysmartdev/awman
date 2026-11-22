@@ -1,3 +1,5 @@
+> Reviewed 2026-11-19 against Microsandbox `abff71505fc46416b3d704ee2787f8e55ae66efa`. Local proposal only; not filed. See the saved PR bundle for current API changes and validation status.
+
 **Title:** `feat(filesystem): target-aware agentd lookup for embedded builds (MSB_EMBED_ARTIFACTS_ROOT)`
 
 **Labels:** 💗 enhancement

@@ -1,0 +1,1 @@
+/* Test-only static asset. */

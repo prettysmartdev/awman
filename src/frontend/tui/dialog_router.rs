@@ -93,6 +93,12 @@ pub(super) fn handle_dialog_submit(app: &mut App) {
             app.command_dialog_active = false;
         }
 
+        Some(Dialog::Review(state)) if is_command && state.accepts('\n') => {
+            app.send_dialog_response(DialogResponse::Char('\n'));
+            app.active_dialog = None;
+            app.command_dialog_active = false;
+        }
+
         // A single-key Custom dialog is an acknowledgement, not a choice —
         // Enter accepts its one action. Multi-key Custom dialogs are real
         // choices and keep requiring the letter, so Enter cannot pick one of
@@ -132,7 +138,7 @@ fn open_squad_run_detail(app: &mut App) {
 /// Handle Enter in the ConfigShow dialog: advance the add-mapping flow, save
 /// the active inline edit, or begin editing the selected row.
 fn config_show_submit(app: &mut App) {
-    use crate::command::commands::config::{ConfigEditRequest, ConfigRowShape};
+    use crate::command::commands::config::{ConfigEditRequest, ConfigRowKind};
     use dialogs::NewMapEntryPhase;
 
     let mut toast: Option<String> = None;
@@ -213,7 +219,7 @@ fn config_show_submit(app: &mut App) {
                         .map(|(index, _)| {
                             state.rows[index + 1..]
                                 .iter()
-                                .take_while(|row| matches!(row.shape, ConfigRowShape::ListEntry))
+                                .take_while(|row| matches!(row.shape, ConfigRowKind::ListEntry))
                                 .filter(|row| {
                                     let value = if state.edit_column == 0 {
                                         &row.global
@@ -401,6 +407,7 @@ pub(super) fn handle_dialog_delete(app: &mut App) {
 pub(super) fn handle_dialog_scroll(app: &mut App, direction: i32) {
     let step = direction.unsigned_abs() as usize;
     match &mut app.active_dialog {
+        Some(Dialog::MultilineInput { editor, .. }) => editor.move_vertical(direction),
         Some(Dialog::Review(state)) => {
             if direction < 0 {
                 state.scroll = state.scroll.saturating_sub(step);
@@ -483,35 +490,16 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
             }
             _ => {}
         },
-        // `y` is the only recovery there is: the previous key was never stored
-        // in plaintext, so a working client means a *new* key, which means a
-        // new hash and a restarted daemon. `n` opens no tab — see the variant's
-        // doc comment.
-        Some(Dialog::SquadKeyMissing) => match c {
-            'y' | 'Y' => {
-                app.active_dialog = None;
-                app.start_squad_key_refresh();
-            }
-            'n' | 'N' => {
-                app.active_dialog = None;
-                app.status_bar.text =
-                    "squad needs a bearer key; the squad tab was not opened.".to_string();
-            }
-            _ => {}
-        },
-        // WI 0110: `y` accepts starting a squad daemon in the background and
-        // opening the tab; `n`/`Esc` opens no tab and starts nothing. The
-        // dialog decides nothing itself — it only collects the consent
-        // `open_or_focus_squad_tab` asked for.
-        Some(Dialog::SquadStartConfirm) => match c {
+        // `y` accepts the config change and/or daemon start described by the
+        // dialog; `n`/`Esc` leaves both untouched and opens no tab.
+        Some(Dialog::SquadStartConfirm { .. }) => match c {
             'y' | 'Y' => {
                 app.active_dialog = None;
                 app.build_and_install_squad_tab();
             }
             'n' | 'N' => {
                 app.active_dialog = None;
-                app.status_bar.text =
-                    "squad daemon not started; the squad tab was not opened.".to_string();
+                app.status_bar.text = "squad tab was not opened.".to_string();
             }
             _ => {}
         },
@@ -600,7 +588,17 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
         // A gated choice (approve) is ignored until the whole review has
         // been on screen; the others (decline) are always accepted.
         Some(Dialog::Review(ref state)) => {
-            if state.accepts(c) {
+            if c == 's'
+                && matches!(
+                    &state.body,
+                    crate::data::dialog::ReviewBody::Prerequisites(_)
+                )
+            {
+                if let Some(Dialog::Review(state)) = app.active_dialog.as_mut() {
+                    state.satisfied_expanded = !state.satisfied_expanded;
+                    state.scroll = 0;
+                }
+            } else if state.accepts(c) {
                 app.send_dialog_response(DialogResponse::Char(c));
                 app.active_dialog = None;
                 app.command_dialog_active = false;
@@ -740,6 +738,7 @@ pub(super) fn handle_dialog_char(app: &mut App, c: char) {
         // via `handle_dialog_scroll`, Enter opens a run's detail and Esc
         // leaves it. Per-task actions stay in
         // the detail modal, so no char key is silently overloaded here.
+        Some(Dialog::QueuePanel(_)) | Some(Dialog::LeaseCloseConfirm(_)) => {}
         Some(Dialog::SquadTaskHistory(_))
         | Some(Dialog::Loading { .. })
         | Some(Dialog::ListPicker { .. })

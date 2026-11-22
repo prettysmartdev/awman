@@ -1,0 +1,380 @@
+[
+  {
+    "seq": 1,
+    "type": "welcome",
+    "frontend_id": "fe_3c4d5e6f708192a3b4c5d6e7f8091a2b",
+    "instance_id": "ins_5f0c2a9e7b1d4c3e8a6f9b2d1c0e4a7b",
+    "protocol": "awman.frontend.v1",
+    "build": "0.42.0",
+    "role": "primary"
+  },
+  {
+    "seq": 2,
+    "type": "snapshot",
+    "instance_id": "ins_5f0c2a9e7b1d4c3e8a6f9b2d1c0e4a7b",
+    "created_at": "2026-11-09T09:15:02.481233Z",
+    "annotations": {
+      "web/origin": "https://awman.prettysmart.dev"
+    },
+    "primary_frontend_kind": "web",
+    "frontends": [
+      {
+        "frontend_id": "fe_3c4d5e6f708192a3b4c5d6e7f8091a2b",
+        "kind": "web",
+        "role": "primary",
+        "annotations": {},
+        "connected_at": "2026-11-09T09:15:02.6Z",
+        "view": null,
+        "reconnecting": false
+      },
+      {
+        "frontend_id": "fe_9a8b7c6d5e4f30211203f4e5d6c7b8a9",
+        "kind": "web",
+        "role": "secondary",
+        "annotations": {},
+        "connected_at": "2026-11-09T09:20:00Z",
+        "view": {
+          "tab": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90"
+        },
+        "reconnecting": false
+      }
+    ],
+    "tabs": [
+      {
+        "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "session": {
+          "session_id": "2b8e4f1a-9c3d-4e5f-a6b7-c8d9e0f1a2b3",
+          "session_type": {
+            "type": "local",
+            "workdir": "/Users/me/src/awman"
+          },
+          "cwd": "/Users/me/src/awman",
+          "git_root": "/Users/me/src/awman",
+          "default_agent": "claude",
+          "labels": {}
+        },
+        "kind": "normal",
+        "label": {
+          "text": "awman",
+          "color": "running"
+        },
+        "execution_phase": {
+          "phase": "running",
+          "command": "exec workflow"
+        },
+        "current_workflow": {
+          "invocation_id": "9f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a",
+          "workflow_name": "implement-work-item",
+          "work_item": 159,
+          "phase": "Main",
+          "total_steps": 3,
+          "completed_steps": 1,
+          "failed_steps": 0,
+          "current_step": "implement",
+          "updated_at": "2026-11-09T09:16:10.001Z"
+        },
+        "current_container": {
+          "id": "4b1f0c2d9e8a",
+          "image_tag": "awman-claude:latest",
+          "name": "awman-claude-7d0f5e2c",
+          "started_at": "2026-11-09T09:16:09.9Z"
+        },
+        "workflow": {
+          "steps": [
+            {
+              "name": "plan",
+              "status": "done",
+              "agent": "claude",
+              "model": "opus",
+              "depends_on": [],
+              "kind": "agent"
+            },
+            {
+              "name": "implement",
+              "status": "running",
+              "agent": "claude",
+              "model": "opus",
+              "depends_on": [
+                "plan"
+              ],
+              "kind": "agent"
+            },
+            {
+              "name": "review",
+              "status": "pending",
+              "agent": "codex",
+              "model": null,
+              "depends_on": [
+                "implement"
+              ],
+              "kind": "agent"
+            }
+          ],
+          "current_step": "implement",
+          "max_concurrent": null,
+          "reported": {
+            "plan": "done"
+          }
+        },
+        "workflow_invocation_id": "9f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a",
+        "context_path": "/Users/me/src/awman/.awman/context",
+        "worktree_path": null,
+        "slots": [
+          {
+            "slot_id": "7d0f5e2c-3b1a-4c9d-8e6f-2a1b3c4d5e6f",
+            "step_name": "implement",
+            "agent_display_name": "Claude",
+            "model": "opus",
+            "container_name": "awman-claude-7d0f5e2c",
+            "terminal_id": "term_4e5f60718293a4b5c6d7e8f901a2b3c4",
+            "acp": {
+              "history": [
+                {
+                  "sessionUpdate": "agent_message_chunk",
+                  "content": {
+                    "type": "text",
+                    "text": "Reading the work item…"
+                  }
+                },
+                {
+                  "sessionUpdate": "tool_call",
+                  "toolCallId": "call_0",
+                  "title": "Read aspec/work-items/0159-webapp-v0.md",
+                  "kind": "read",
+                  "status": "completed",
+                  "content": [],
+                  "locations": [
+                    {
+                      "path": "aspec/work-items/0159-webapp-v0.md"
+                    }
+                  ]
+                },
+                {
+                  "sessionUpdate": "plan",
+                  "entries": [
+                    {
+                      "content": "Write types.ts",
+                      "priority": "high",
+                      "status": "in_progress"
+                    }
+                  ]
+                }
+              ],
+              "pending_permission": null
+            },
+            "started_at": "2026-11-09T09:16:10.002345Z",
+            "stats": {
+              "name": "awman-claude-7d0f5e2c",
+              "cpu_percent": 12.5,
+              "memory_mb": 512.25
+            },
+            "program_status": {
+              "state": "working",
+              "kind": null,
+              "progress": 40,
+              "msg": "editing src/lib.rs",
+              "app": "claude"
+            },
+            "stuck": false,
+            "countdown_kind": "stuck_step",
+            "yolo": null,
+            "sandboxed": false,
+            "phase_step_title": null,
+            "dormant": false
+          }
+        ],
+        "focused_slot": "7d0f5e2c-3b1a-4c9d-8e6f-2a1b3c4d5e6f",
+        "yolo": null,
+        "yolo_mode": false,
+        "stuck": false,
+        "git_summary": {
+          "branch": "wi-0159",
+          "files": [
+            {
+              "path": "web/src/lib/client/types.ts",
+              "change": "added",
+              "added": 900,
+              "removed": 0,
+              "binary": false
+            }
+          ],
+          "added": 900,
+          "removed": 0
+        },
+        "status_log": [
+          {
+            "level": "info",
+            "text": "workflow started"
+          }
+        ],
+        "agents_dashboard": null,
+        "last_container_summary": null,
+        "annotations": {
+          "web/tab": "main"
+        }
+      },
+      {
+        "tab_id": "tab_0f9e8d7c6b5a49382716051f2e3d4c5b",
+        "session": {
+          "session_id": "5c6d7e8f-0a1b-4c2d-8e3f-4a5b6c7d8e9f",
+          "session_type": {
+            "type": "local",
+            "workdir": "/Users/me/src/awman"
+          },
+          "cwd": "/Users/me/src/awman",
+          "git_root": "/Users/me/src/awman",
+          "default_agent": null,
+          "labels": {}
+        },
+        "kind": "squad",
+        "label": {
+          "text": "squad",
+          "color": "default"
+        },
+        "execution_phase": {
+          "phase": "idle"
+        },
+        "current_workflow": null,
+        "current_container": null,
+        "workflow": null,
+        "workflow_invocation_id": null,
+        "context_path": null,
+        "worktree_path": null,
+        "slots": [],
+        "focused_slot": null,
+        "yolo": null,
+        "yolo_mode": false,
+        "stuck": false,
+        "git_summary": null,
+        "status_log": [],
+        "agents_dashboard": null,
+        "last_container_summary": null,
+        "annotations": {}
+      }
+    ],
+    "active_tab_hint": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "squad_health": "running",
+    "pending_dialogs": [
+      {
+        "dialog_id": "dlg_6a7b8c9d0e1f20314253647586970a1b",
+        "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "request": {
+          "kind": "mount_scope",
+          "git_root": "/Users/me/src/awman",
+          "cwd": "/Users/me/src/awman/web"
+        },
+        "raised_at": "2026-11-09T09:16:00.5Z"
+      }
+    ],
+    "running_jobs": 1
+  },
+  {
+    "seq": 3,
+    "type": "delta",
+    "delta": "tab_label",
+    "value": {
+      "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      "label": {
+        "text": "awman",
+        "color": "blocked"
+      }
+    }
+  },
+  {
+    "seq": 4,
+    "type": "command_output",
+    "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "stream": "stdout",
+    "level": "info",
+    "text": "Step implement started"
+  },
+  {
+    "seq": 5,
+    "type": "command_bytes",
+    "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "stream": "stdout",
+    "bytes": "G1szMm3inJMbWzBtIHBsYW4gZG9uZQ0K"
+  },
+  {
+    "seq": 6,
+    "type": "program_status",
+    "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "slot_id": "7d0f5e2c-3b1a-4c9d-8e6f-2a1b3c4d5e6f",
+    "status": {
+      "state": "blocked",
+      "kind": "permission",
+      "progress": null,
+      "msg": "waiting for approval",
+      "app": "claude",
+      "id": "tool"
+    }
+  },
+  {
+    "seq": 7,
+    "type": "notice",
+    "level": "warning",
+    "text": "environment stale, run `awman daemon api launch_contexts.refresh id=lc_…`"
+  },
+  {
+    "seq": 8,
+    "type": "dialog_request",
+    "dialog_id": "dlg_2b3c4d5e6f708192a3b4c5d6e7f80912",
+    "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "request": {
+      "kind": "yes_no",
+      "title": "Continue?",
+      "body": "The agent wants to push wi-0159."
+    }
+  },
+  {
+    "seq": 9,
+    "type": "dialog_closed",
+    "dialog_id": "dlg_2b3c4d5e6f708192a3b4c5d6e7f80912",
+    "answered_by": {
+      "by": "frontend",
+      "frontend_id": "fe_3c4d5e6f708192a3b4c5d6e7f8091a2b"
+    }
+  },
+  {
+    "seq": 10,
+    "type": "command_finished",
+    "tab_id": "tab_a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "result": {
+      "exit_code": 0,
+      "outcome": {
+        "workflow": "implement-work-item",
+        "steps": 3
+      },
+      "error": null
+    }
+  },
+  {
+    "seq": 11,
+    "type": "ui_ack",
+    "request_seq": 4,
+    "outcome": {
+      "claimed_by_host": false,
+      "claimed_by": null,
+      "detail": null
+    }
+  },
+  {
+    "seq": 12,
+    "type": "snapshot_chunk",
+    "chunk": 0,
+    "of": 2,
+    "bytes": "eyJpbnN0YW5jZV9pZCI6Imluc181ZjBjMmE5ZTdiMWQ0YzNlOGE2ZjliMmQxYzBlNGE3YiIsImNyZWF0ZWRfYXQiOiIyMDI2LTExLTA5VDA5OjE1OjAyLjQ4MTIzM1oiLCJhbm5vdGF0aW9ucyI6eyJ3ZWIvb3JpZ2luIjoiaHR0cHM6Ly9hd21hbi5wcmV0dHlzbWFydC5kZXYifSwicHJpbWFyeV9mcm9udGVuZF9raW5kIjoid2ViIiwiZnJvbnRlbmRzIjpbeyJmcm9udGVuZF9pZCI6ImZlXzNjNGQ1ZTZmNzA4MTkyYTNiNGM1ZDZlN2Y4MDkxYTJiIiwia2luZCI6IndlYiIsInJvbGUiOiJwcmltYXJ5IiwiYW5ub3RhdGlvbnMiOnt9LCJjb25uZWN0ZWRfYXQiOiIyMDI2LTExLTA5VDA5OjE1OjAyLjZaIiwidmlldyI6bnVsbCwicmVjb25uZWN0aW5nIjpmYWxzZX0seyJmcm9udGVuZF9pZCI6ImZlXzlhOGI3YzZkNWU0ZjMwMjExMjAzZjRlNWQ2YzdiOGE5Iiwia2luZCI6IndlYiIsInJvbGUiOiJzZWNvbmRhcnkiLCJhbm5vdGF0aW9ucyI6e30sImNvbm5lY3RlZF9hdCI6IjIwMjYtMTEtMDlUMDk6MjA6MDBaIiwidmlldyI6eyJ0YWIiOiJ0YWJfYTFiMmMzZDRlNWY2MDcxODI5M2E0YjVjNmQ3ZThmOTAifSwicmVjb25uZWN0aW5nIjpmYWxzZX1dLCJ0YWJzIjpbeyJ0YWJfaWQiOiJ0YWJfYTFiMmMzZDRlNWY2MDcxODI5M2E0YjVjNmQ3ZThmOTAiLCJzZXNzaW9uIjp7InNlc3Npb25faWQiOiIyYjhlNGYxYS05YzNkLTRlNWYtYTZiNy1jOGQ5ZTBmMWEyYjMiLCJzZXNzaW9uX3R5cGUiOnsidHlwZSI6ImxvY2FsIiwid29ya2RpciI6Ii9Vc2Vycy9tZS9zcmMvYXdtYW4ifSwiY3dkIjoiL1VzZXJzL21lL3NyYy9hd21hbiIsImdpdF9yb290IjoiL1VzZXJzL21lL3NyYy9hd21hbiIsImRlZmF1bHRfYWdlbnQiOiJjbGF1ZGUiLCJsYWJlbHMiOnt9fSwia2luZCI6Im5vcm1hbCIsImxhYmVsIjp7InRleHQiOiJhd21hbiIsImNvbG9yIjoicnVubmluZyJ9LCJleGVjdXRpb25fcGhhc2UiOnsicGhhc2UiOiJydW5uaW5nIiwiY29tbWFuZCI6ImV4ZWMgd29ya2Zsb3cifSwiY3VycmVudF93b3JrZmxvdyI6eyJpbnZvY2F0aW9uX2lkIjoiOWY4ZTdkNmMtNWI0YS00MzkyLTgxNzAtNmY1ZTRkM2MyYjFhIiwid29ya2Zsb3dfbmFtZSI6ImltcGxlbWVudC13b3JrLWl0ZW0iLCJ3b3JrX2l0ZW0iOjE1OSwicGhhc2UiOiJNYWluIiwidG90YWxfc3RlcHMiOjMsImNvbXBsZXRlZF9zdGVwcyI6MSwiZmFpbGVkX3N0ZXBzIjowLCJjdXJyZW50X3N0ZXAiOiJpbXBsZW1lbnQiLCJ1cGRhdGVkX2F0IjoiMjAyNi0xMS0wOVQwOToxNjoxMC4wMDFaIn0sImN1cnJlbnRfY29udGFpbmVyIjp7ImlkIjoiNGIxZjBjMmQ5ZThhIiwiaW1hZ2VfdGFnIjoiYXdtYW4tY2xhdWRlOmxhdGVzdCIsIm5hbWUiOiJhd21hbi1jbGF1ZGUtN2QwZjVlMmMiLCJzdGFydGVkX2F0IjoiMjAyNi0xMS0wOVQwOToxNjowOS45WiJ9LCJ3b3JrZmxvdyI6eyJzdGVwcyI6W3sibmFtZSI6InBsYW4iLCJzdGF0dXMiOiJkb25lIiwiYWdlbnQiOiJjbGF1ZGUiLCJtb2RlbCI6Im9wdXMiLCJkZXBlbmRzX29uIjpbXSwia2luZCI6ImFnZW50In0seyJuYW1lIjoiaW1wbGVtZW50Iiwic3RhdHVzIjoicnVubmluZyIsImFnZW50IjoiY2xhdWRlIiwibW9kZWwiOiJvcHVzIiwiZGVwZW5kc19vbiI6WyJwbGFuIl0sImtpbmQiOiJhZ2VudCJ9LHsibmFtZSI6InJldmlldyIsInN0YXR1cyI6InBlbmRpbmciLCJhZ2VudCI6ImNvZGV4IiwibW9kZWwiOm51bGwsImRlcGVuZHNfb24iOlsiaW1wbGVtZW50Il0sImtpbmQiOiJhZ2VudCJ9XSwiY3VycmVudF9zdGVwIjoiaW1wbGVtZW50IiwibWF4X2NvbmN1cnJlbnQiOm51bGwsInJlcG9ydGVkIjp7InBsYW4iOiJkb25lIn19LCJ3b3JrZmxvd19pbnZvY2F0aW9uX2lkIjoiOWY4ZTdkNmMtNWI0YS00MzkyLTgxNzAtNmY1ZTRkM2MyYjFhIiwiY29udGV4dF9wYXRoIjoiL1VzZXJzL21lL3NyYy9hd21hbi8uYXdtYW4vY29udGV4dCIsIndvcmt0cmVlX3BhdGgiOm51bGwsInNsb3RzIjpbeyJzbG90X2lkIjoiN2QwZjVlMmMtM2IxYS00YzlkLThlNmYtMmExYjNjNGQ1ZTZmIiwic3RlcF9uYW1lIjoiaW1wbGVtZW50IiwiYWdlbnRfZGlzcGxheV9uYW1lIjoiQ2xhdWRlIiwibW9kZWwiOiJvcHVzIiwiY29udGFpbmVyX25hbWUiOiJhd21hbi1jbGF1ZGUtN2QwZjVlMmMiLCJ0ZXJtaW5hbF9pZCI6InRlcm1fNGU1ZjYwNzE4MjkzYTRiNWM2ZDdlOGY5MDFhMmIzYzQiLCJhY3AiOnsiaGlzdG9yeSI6W3sic2Vzc2lvblVwZGF0ZSI6ImE="
+  },
+  {
+    "seq": 13,
+    "type": "snapshot_chunk",
+    "chunk": 1,
+    "of": 2,
+    "bytes": "Z2VudF9tZXNzYWdlX2NodW5rIiwiY29udGVudCI6eyJ0eXBlIjoidGV4dCIsInRleHQiOiJSZWFkaW5nIHRoZSB3b3JrIGl0ZW3igKYifX0seyJzZXNzaW9uVXBkYXRlIjoidG9vbF9jYWxsIiwidG9vbENhbGxJZCI6ImNhbGxfMCIsInRpdGxlIjoiUmVhZCBhc3BlYy93b3JrLWl0ZW1zLzAxNTktd2ViYXBwLXYwLm1kIiwia2luZCI6InJlYWQiLCJzdGF0dXMiOiJjb21wbGV0ZWQiLCJjb250ZW50IjpbXSwibG9jYXRpb25zIjpbeyJwYXRoIjoiYXNwZWMvd29yay1pdGVtcy8wMTU5LXdlYmFwcC12MC5tZCJ9XX0seyJzZXNzaW9uVXBkYXRlIjoicGxhbiIsImVudHJpZXMiOlt7ImNvbnRlbnQiOiJXcml0ZSB0eXBlcy50cyIsInByaW9yaXR5IjoiaGlnaCIsInN0YXR1cyI6ImluX3Byb2dyZXNzIn1dfV0sInBlbmRpbmdfcGVybWlzc2lvbiI6bnVsbH0sInN0YXJ0ZWRfYXQiOiIyMDI2LTExLTA5VDA5OjE2OjEwLjAwMjM0NVoiLCJzdGF0cyI6eyJuYW1lIjoiYXdtYW4tY2xhdWRlLTdkMGY1ZTJjIiwiY3B1X3BlcmNlbnQiOjEyLjUsIm1lbW9yeV9tYiI6NTEyLjI1fSwicHJvZ3JhbV9zdGF0dXMiOnsic3RhdGUiOiJ3b3JraW5nIiwia2luZCI6bnVsbCwicHJvZ3Jlc3MiOjQwLCJtc2ciOiJlZGl0aW5nIHNyYy9saWIucnMiLCJhcHAiOiJjbGF1ZGUifSwic3R1Y2siOmZhbHNlLCJjb3VudGRvd25fa2luZCI6InN0dWNrX3N0ZXAiLCJ5b2xvIjpudWxsLCJzYW5kYm94ZWQiOmZhbHNlLCJwaGFzZV9zdGVwX3RpdGxlIjpudWxsLCJkb3JtYW50IjpmYWxzZX1dLCJmb2N1c2VkX3Nsb3QiOiI3ZDBmNWUyYy0zYjFhLTRjOWQtOGU2Zi0yYTFiM2M0ZDVlNmYiLCJ5b2xvIjpudWxsLCJ5b2xvX21vZGUiOmZhbHNlLCJzdHVjayI6ZmFsc2UsImdpdF9zdW1tYXJ5Ijp7ImJyYW5jaCI6IndpLTAxNTkiLCJmaWxlcyI6W3sicGF0aCI6IndlYi9zcmMvbGliL2NsaWVudC90eXBlcy50cyIsImNoYW5nZSI6ImFkZGVkIiwiYWRkZWQiOjkwMCwicmVtb3ZlZCI6MCwiYmluYXJ5IjpmYWxzZX1dLCJhZGRlZCI6OTAwLCJyZW1vdmVkIjowfSwic3RhdHVzX2xvZyI6W3sibGV2ZWwiOiJpbmZvIiwidGV4dCI6IndvcmtmbG93IHN0YXJ0ZWQifV0sImFnZW50c19kYXNoYm9hcmQiOm51bGwsImxhc3RfY29udGFpbmVyX3N1bW1hcnkiOm51bGwsImFubm90YXRpb25zIjp7IndlYi90YWIiOiJtYWluIn19LHsidGFiX2lkIjoidGFiXzBmOWU4ZDdjNmI1YTQ5MzgyNzE2MDUxZjJlM2Q0YzViIiwic2Vzc2lvbiI6eyJzZXNzaW9uX2lkIjoiNWM2ZDdlOGYtMGExYi00YzJkLThlM2YtNGE1YjZjN2Q4ZTlmIiwic2Vzc2lvbl90eXBlIjp7InR5cGUiOiJsb2NhbCIsIndvcmtkaXIiOiIvVXNlcnMvbWUvc3JjL2F3bWFuIn0sImN3ZCI6Ii9Vc2Vycy9tZS9zcmMvYXdtYW4iLCJnaXRfcm9vdCI6Ii9Vc2Vycy9tZS9zcmMvYXdtYW4iLCJkZWZhdWx0X2FnZW50IjpudWxsLCJsYWJlbHMiOnt9fSwia2luZCI6InNxdWFkIiwibGFiZWwiOnsidGV4dCI6InNxdWFkIiwiY29sb3IiOiJkZWZhdWx0In0sImV4ZWN1dGlvbl9waGFzZSI6eyJwaGFzZSI6ImlkbGUifSwiY3VycmVudF93b3JrZmxvdyI6bnVsbCwiY3VycmVudF9jb250YWluZXIiOm51bGwsIndvcmtmbG93IjpudWxsLCJ3b3JrZmxvd19pbnZvY2F0aW9uX2lkIjpudWxsLCJjb250ZXh0X3BhdGgiOm51bGwsIndvcmt0cmVlX3BhdGgiOm51bGwsInNsb3RzIjpbXSwiZm9jdXNlZF9zbG90IjpudWxsLCJ5b2xvIjpudWxsLCJ5b2xvX21vZGUiOmZhbHNlLCJzdHVjayI6ZmFsc2UsImdpdF9zdW1tYXJ5IjpudWxsLCJzdGF0dXNfbG9nIjpbXSwiYWdlbnRzX2Rhc2hib2FyZCI6bnVsbCwibGFzdF9jb250YWluZXJfc3VtbWFyeSI6bnVsbCwiYW5ub3RhdGlvbnMiOnt9fV0sImFjdGl2ZV90YWJfaGludCI6InRhYl9hMWIyYzNkNGU1ZjYwNzE4MjkzYTRiNWM2ZDdlOGY5MCIsInNxdWFkX2hlYWx0aCI6InJ1bm5pbmciLCJwZW5kaW5nX2RpYWxvZ3MiOlt7ImRpYWxvZ19pZCI6ImRsZ182YTdiOGM5ZDBlMWYyMDMxNDI1MzY0NzU4Njk3MGExYiIsInRhYl9pZCI6InRhYl9hMWIyYzNkNGU1ZjYwNzE4MjkzYTRiNWM2ZDdlOGY5MCIsInJlcXVlc3QiOnsia2luZCI6Im1vdW50X3Njb3BlIiwiZ2l0X3Jvb3QiOiIvVXNlcnMvbWUvc3JjL2F3bWFuIiwiY3dkIjoiL1VzZXJzL21lL3NyYy9hd21hbi93ZWIifSwicmFpc2VkX2F0IjoiMjAyNi0xMS0wOVQwOToxNjowMC41WiJ9XSwicnVubmluZ19qb2JzIjoxfQ=="
+  },
+  {
+    "seq": 14,
+    "type": "detach",
+    "reason": "instance_ended"
+  }
+]

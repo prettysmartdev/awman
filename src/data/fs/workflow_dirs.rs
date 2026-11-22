@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 
 use crate::data::config::env::{Env, EnvSnapshot};
-use crate::data::config::global::GlobalConfig;
 use crate::data::error::DataError;
 
 /// Directory name for global workflows under the global home.
@@ -27,7 +26,7 @@ impl WorkflowDirs {
 
     /// Same as [`from_process_env`] but reads from a supplied env snapshot.
     pub fn from_env(env: &EnvSnapshot, git_root: Option<PathBuf>) -> Result<Self, DataError> {
-        let global_home = GlobalConfig::data_home_with(env)?;
+        let global_home = crate::data::fs::data_paths::data_home(env)?;
         Ok(Self {
             global_home,
             git_root,
@@ -70,6 +69,11 @@ impl WorkflowDirs {
         Self::repo_dir_for(git_root).join(format!("dynamic-{work_item:04}.toml"))
     }
 
+    pub fn dynamic_workflow_path_for_key(git_root: &Path, key: &str) -> Result<PathBuf, DataError> {
+        validate_work_item_key(key)?;
+        Ok(Self::repo_dir_for(git_root).join(format!("dynamic-{key}.toml")))
+    }
+
     /// Create the global workflows directory on disk, if missing.
     pub fn ensure_global(&self) -> Result<PathBuf, DataError> {
         let dir = self.global_dir();
@@ -87,30 +91,20 @@ impl WorkflowDirs {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn repo_dir_for_is_under_dot_awman() {
-        assert_eq!(
-            WorkflowDirs::repo_dir_for(Path::new("/r/proj")),
-            PathBuf::from("/r/proj/.awman/workflows")
-        );
-    }
-
-    #[test]
-    fn dynamic_workflow_path_is_zero_padded_beside_the_state_file() {
-        assert_eq!(
-            WorkflowDirs::dynamic_workflow_path(Path::new("/r/proj"), 7),
-            PathBuf::from("/r/proj/.awman/workflows/dynamic-0007.toml")
-        );
-    }
-
-    #[test]
-    fn dynamic_workflow_paths_differ_per_work_item() {
-        let a = WorkflowDirs::dynamic_workflow_path(Path::new("/r/proj"), 7);
-        let b = WorkflowDirs::dynamic_workflow_path(Path::new("/r/proj"), 8);
-        assert_ne!(a, b);
+pub fn validate_work_item_key(key: &str) -> Result<(), DataError> {
+    let numeric = !key.is_empty() && key.len() <= 10 && key.bytes().all(|b| b.is_ascii_digit());
+    let hashed = key
+        .strip_prefix("remote-")
+        .or_else(|| key.strip_prefix("local-"))
+        .is_some_and(|hash| {
+            hash.len() == 24
+                && hash
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+    if numeric || hashed {
+        Ok(())
+    } else {
+        Err(DataError::Other("invalid work item state key".into()))
     }
 }

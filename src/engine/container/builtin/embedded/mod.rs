@@ -52,24 +52,3 @@ fn replaced_on_disk(executable: &std::path::Path) -> bool {
         .is_some_and(|path| path.ends_with(" (deleted)"))
         || !executable.exists()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ambient_overrides_are_refused_before_resolving_the_executable() {
-        let error = EmbeddedRuntime::resolve(&["MSB_PATH"]).unwrap_err();
-        assert!(
-            matches!(error, EngineError::AmbientRuntimeOverride { variable } if variable == "MSB_PATH")
-        );
-    }
-    #[test]
-    fn detects_a_replaced_executable() {
-        assert!(replaced_on_disk(std::path::Path::new(
-            "/usr/local/bin/awman (deleted)"
-        )));
-        assert!(replaced_on_disk(std::path::Path::new("/nonexistent/awman")));
-        assert!(!replaced_on_disk(&std::env::current_exe().unwrap()));
-    }
-}

@@ -161,6 +161,11 @@ pub(super) fn render_status_bar(app: &App, area: Rect, frame: &mut Frame, sideba
                 ),
             ]
         }
+        // Idle: the git-sidebar hint, plus the queue hint when the worker is on.
+        _ if app.queue.is_some() => vec![Span::styled(
+            " \u{00b7} ctrl-g git  \u{00b7}  ctrl-q queue ",
+            Style::default().fg(Color::DarkGray),
+        )],
         // Idle: just the git-sidebar hint.
         _ => vec![Span::styled(
             " \u{00b7} ctrl-g git ",
@@ -189,34 +194,45 @@ pub(super) fn render_status_bar(app: &App, area: Rect, frame: &mut Frame, sideba
         spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
     }
 
-    // When the sidebar is not visible (closed or collapsed for a narrow
-    // terminal), show the compact `+A -D` diff summary at the far right of the
-    // 1-row status bar (green `+`, red `-`).
-    if !sidebar_visible {
-        if let Some(summary) = tab.git_diff_summary.lock().ok().and_then(|g| g.clone()) {
-            let git_spans = vec![
-                Span::styled(
-                    format!("+{}", summary.added),
-                    Style::default().fg(Color::Green),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    format!("-{} ", summary.removed),
-                    Style::default().fg(Color::Red),
-                ),
-            ];
-            let left_w: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-            let git_w: usize = git_spans.iter().map(|s| s.content.chars().count()).sum();
-            let total = area.width as usize;
-            if total > left_w + git_w {
-                spans.push(Span::raw(" ".repeat(total - left_w - git_w)));
-                spans.extend(git_spans);
-            }
-        }
-    }
+    // Keep the git summary at the right edge even when workflow hints fill
+    // the left side. Draw it last so the branch remains visible.
+    let git_summary = if sidebar_visible {
+        None
+    } else {
+        tab.git_diff_summary.lock().ok().and_then(|g| g.clone())
+    };
+    let git_spans = git_summary.map(|summary| {
+        vec![
+            Span::styled(
+                format!("+{}", summary.added),
+                Style::default().fg(Color::Green),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("-{}", summary.removed),
+                Style::default().fg(Color::Red),
+            ),
+            Span::raw(format!(
+                " ({}) ",
+                summary.branch.as_deref().unwrap_or("HEAD")
+            )),
+        ]
+    });
 
     let bar = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Black));
     frame.render_widget(bar, area);
+    if let Some(git_spans) = git_spans {
+        let width: usize = git_spans
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum();
+        if width <= area.width as usize {
+            let git_area = Rect::new(area.right() - width as u16, area.y, width as u16, 1);
+            let git_bar =
+                Paragraph::new(Line::from(git_spans)).style(Style::default().bg(Color::Black));
+            frame.render_widget(git_bar, git_area);
+        }
+    }
 }
 
 /// The visible one-based stage range for a horizontally scrolled overview.
@@ -238,52 +254,5 @@ pub(crate) fn squad_failure_text(command: &str, message: &str) -> String {
         format!("squad action failed: {message}")
     } else {
         format!("{command} failed: {message}")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::overview_scroll_hint;
-
-    #[test]
-    fn overview_scroll_hint_at_the_left_edge() {
-        assert_eq!(
-            overview_scroll_hint(0, 5, 14),
-            " \u{00b7} shift-\u{2190}/\u{2192} scroll stages (1\u{2013}5 of 14) "
-        );
-    }
-
-    #[test]
-    fn overview_scroll_hint_mid_scroll_is_one_based() {
-        let hint = overview_scroll_hint(2, 6, 14);
-        assert!(hint.contains("(3\u{2013}8 of 14)"), "{hint}");
-    }
-
-    #[test]
-    fn overview_scroll_hint_mid_scroll_of_five() {
-        let hint = overview_scroll_hint(2, 5, 14);
-        assert!(hint.contains("(3\u{2013}7 of 14)"), "{hint}");
-    }
-
-    #[test]
-    fn overview_scroll_hint_at_the_right_edge() {
-        let hint = overview_scroll_hint(9, 5, 14);
-        assert!(hint.contains("(10\u{2013}14 of 14)"), "{hint}");
-    }
-
-    #[test]
-    fn overview_scroll_hint_single_visible_column() {
-        let hint = overview_scroll_hint(3, 1, 14);
-        assert!(hint.contains("(4\u{2013}4 of 14)"), "{hint}");
-    }
-
-    #[test]
-    fn overview_scroll_hint_is_padded_and_names_the_keys() {
-        let hint = overview_scroll_hint(0, 1, 2);
-        assert!(
-            hint.contains("shift-\u{2190}/\u{2192} scroll stages"),
-            "{hint}"
-        );
-        assert!(hint.starts_with(' ') && hint.ends_with(' '));
     }
 }

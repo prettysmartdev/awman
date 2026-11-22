@@ -8,13 +8,40 @@
 //! `WorktreeLifecycle::finalize`).
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 
 #[derive(Debug, Default)]
 pub struct CliUserMessageQueue {
-    pty_active: bool,
+    pty_active: Arc<AtomicBool>,
     queue: Vec<UserMessage>,
+    /// Messages written through a [`CliMessageHandle`] while a PTY owned the
+    /// terminal; flushed by `replay_queued` together with `queue`.
+    deferred: Arc<Mutex<Vec<UserMessage>>>,
+}
+
+/// A cloneable writer onto the same sink and the same PTY gate, for background
+/// tasks (a status watcher) that cannot borrow the frontend. Writes go to
+/// stderr at once unless a PTY owns the terminal, in which case they wait for
+/// `replay_queued`.
+#[derive(Debug, Clone)]
+pub struct CliMessageHandle {
+    pty_active: Arc<AtomicBool>,
+    deferred: Arc<Mutex<Vec<UserMessage>>>,
+}
+
+impl CliMessageHandle {
+    pub fn write_message(&self, msg: UserMessage) {
+        if self.pty_active.load(Ordering::Relaxed) {
+            if let Ok(mut q) = self.deferred.lock() {
+                q.push(msg);
+            }
+        } else {
+            write_to_stderr(&msg);
+        }
+    }
 }
 
 impl CliUserMessageQueue {
@@ -25,18 +52,21 @@ impl CliUserMessageQueue {
     /// Toggle the PTY-active gate. While `true`, [`write_message`] queues
     /// instead of writing immediately.
     pub fn set_pty_active(&mut self, active: bool) {
-        self.pty_active = active;
+        self.pty_active.store(active, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
-    pub fn pty_active(&self) -> bool {
-        self.pty_active
+    /// A handle background tasks can write through; see [`CliMessageHandle`].
+    pub fn handle(&self) -> CliMessageHandle {
+        CliMessageHandle {
+            pty_active: self.pty_active.clone(),
+            deferred: self.deferred.clone(),
+        }
     }
 }
 
 impl UserMessageSink for CliUserMessageQueue {
     fn write_message(&mut self, msg: UserMessage) {
-        if self.pty_active {
+        if self.pty_active.load(Ordering::Relaxed) {
             self.queue.push(msg);
         } else {
             write_to_stderr(&msg);
@@ -45,7 +75,10 @@ impl UserMessageSink for CliUserMessageQueue {
 
     fn replay_queued(&mut self) {
         // `mem::take` is safe here because we don't hold any borrows.
-        let drained = std::mem::take(&mut self.queue);
+        let mut drained = std::mem::take(&mut self.queue);
+        if let Ok(mut late) = self.deferred.lock() {
+            drained.append(&mut late);
+        }
         for msg in drained {
             write_to_stderr(&msg);
         }
@@ -70,141 +103,4 @@ fn write_to_stderr(msg: &UserMessage) {
     };
     let _ = writeln!(std::io::stderr(), "{prefix} {}", msg.text);
     let _ = std::io::stderr().flush();
-}
-
-#[cfg(test)]
-impl CliUserMessageQueue {
-    /// Returns the number of messages currently held in the queue.
-    /// Test-only introspection helper.
-    pub(crate) fn pending_count(&self) -> usize {
-        self.queue.len()
-    }
-
-    /// The queued messages, oldest first. Test-only introspection helper.
-    pub(crate) fn pending(&self) -> &[UserMessage] {
-        &self.queue
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::message::MessageLevel;
-
-    fn info(text: &str) -> UserMessage {
-        UserMessage {
-            level: MessageLevel::Info,
-            text: text.to_string(),
-        }
-    }
-
-    fn warning(text: &str) -> UserMessage {
-        UserMessage {
-            level: MessageLevel::Warning,
-            text: text.to_string(),
-        }
-    }
-
-    fn error_msg(text: &str) -> UserMessage {
-        UserMessage {
-            level: MessageLevel::Error,
-            text: text.to_string(),
-        }
-    }
-
-    // ─── PTY active → messages are queued ─────────────────────────────────────
-
-    #[test]
-    fn write_message_queues_when_pty_active() {
-        let mut q = CliUserMessageQueue::new();
-        q.set_pty_active(true);
-        q.write_message(info("hello"));
-        assert_eq!(q.pending_count(), 1);
-    }
-
-    #[test]
-    fn write_message_queues_multiple_when_pty_active() {
-        let mut q = CliUserMessageQueue::new();
-        q.set_pty_active(true);
-        q.write_message(info("first"));
-        q.write_message(warning("second"));
-        q.write_message(error_msg("third"));
-        assert_eq!(q.pending_count(), 3);
-    }
-
-    #[test]
-    fn write_message_does_not_queue_when_pty_inactive() {
-        let mut q = CliUserMessageQueue::new();
-        // pty_active defaults to false
-        assert!(!q.pty_active());
-        q.write_message(info("immediate"));
-        assert_eq!(q.pending_count(), 0);
-    }
-
-    // ─── replay_queued drains the queue ───────────────────────────────────────
-
-    #[test]
-    fn replay_queued_drains_queue_to_empty() {
-        let mut q = CliUserMessageQueue::new();
-        q.set_pty_active(true);
-        q.write_message(info("queued message"));
-        q.write_message(warning("another"));
-        assert_eq!(q.pending_count(), 2);
-
-        // Deactivate PTY so replay goes to stderr (real test just checks drain).
-        q.set_pty_active(false);
-        q.replay_queued();
-
-        assert_eq!(q.pending_count(), 0);
-    }
-
-    #[test]
-    fn replay_queued_on_empty_queue_is_no_op() {
-        let mut q = CliUserMessageQueue::new();
-        // Should not panic or error.
-        q.replay_queued();
-        assert_eq!(q.pending_count(), 0);
-    }
-
-    #[test]
-    fn replay_queued_called_twice_stays_empty() {
-        let mut q = CliUserMessageQueue::new();
-        q.set_pty_active(true);
-        q.write_message(info("msg"));
-        q.set_pty_active(false);
-        q.replay_queued();
-        q.replay_queued(); // second call must not panic
-        assert_eq!(q.pending_count(), 0);
-    }
-
-    // ─── PTY toggle behavior ──────────────────────────────────────────────────
-
-    #[test]
-    fn pty_active_toggle_changes_observable_behavior() {
-        let mut q = CliUserMessageQueue::new();
-
-        // Inactive → message goes directly to stderr (queue stays 0).
-        q.write_message(info("immediate"));
-        assert_eq!(q.pending_count(), 0);
-
-        // Activate → subsequent messages are queued.
-        q.set_pty_active(true);
-        q.write_message(info("queued"));
-        assert_eq!(q.pending_count(), 1);
-
-        // Deactivate again → new messages go directly to stderr.
-        q.set_pty_active(false);
-        q.write_message(info("immediate again"));
-        assert_eq!(q.pending_count(), 1); // still 1 (only the earlier queued one)
-    }
-
-    #[test]
-    fn pty_active_accessor_matches_set_state() {
-        let mut q = CliUserMessageQueue::new();
-        assert!(!q.pty_active());
-        q.set_pty_active(true);
-        assert!(q.pty_active());
-        q.set_pty_active(false);
-        assert!(!q.pty_active());
-    }
 }

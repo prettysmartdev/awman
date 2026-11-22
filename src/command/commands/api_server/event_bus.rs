@@ -1,10 +1,11 @@
-//! `EventBus` — broadcast channel for execution events within the API server.
+//! `EventBus` — ordered publication for worker command execution events.
 //!
 //! Created once per command/job execution. The API frontend's trait
 //! implementations emit events through the sender. SSE connections subscribe
-//! to the broadcast channel; the sole logfile writer uses a reliable queue.
+//! to the broadcast channel. The ordered logfile writer acknowledges lifecycle
+//! flushes before completion reaches any subscriber.
 //!
-//! This is a Layer 3 type — the engine layer has no knowledge of it.
+//! Layer 2 owns publication; HTTP and foreground frontends use its senders.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,16 +21,29 @@ pub struct EventBus {
     attempt: u32,
     drains: TaskTracker,
     drain_shutdown: tokio_util::sync::CancellationToken,
+    awaiting_input: Option<crate::engine::worker::heartbeat::AwaitingInputSignal>,
 }
 
 #[derive(Default)]
 struct Publication {
+    redaction: crate::engine::auth::redaction::RedactionSet,
     next_sequence: u64,
     finished: bool,
     log: Option<mpsc::UnboundedSender<ExecutionEvent>>,
+    followers: Vec<mpsc::UnboundedSender<ExecutionEvent>>,
+    durable_log: Option<Box<dyn crate::data::fs::api_command_log::EventLog>>,
+    failure: Option<String>,
+    recovery_required: bool,
+    reserved: Option<crate::data::automation_store::LifecycleProjection>,
+    deferred: Vec<ExecutionEvent>,
+    deferred_spool: Option<std::fs::File>,
+    deferred_bytes: usize,
 }
 
 impl EventBus {
+    pub fn redaction(&self) -> crate::engine::auth::redaction::RedactionSet {
+        self.sender().redaction()
+    }
     /// A bus for the first attempt of a command.
     pub fn new(capacity: usize) -> Self {
         Self::for_attempt(capacity, FIRST_ATTEMPT)
@@ -45,11 +59,41 @@ impl EventBus {
             attempt,
             drains: TaskTracker::new(),
             drain_shutdown: Default::default(),
+            awaiting_input: None,
         }
     }
 
+    /// Install the sole ordered writer before the first event.
+    pub fn set_log_writer(
+        &self,
+        writer: Result<
+            Box<dyn crate::data::fs::api_command_log::EventLog>,
+            crate::data::error::DataError,
+        >,
+    ) {
+        let mut p = self.publication.lock().expect("publication lock");
+        assert!(p.next_sequence == 0 && p.durable_log.is_none());
+        match writer {
+            Ok(writer) => p.durable_log = Some(writer),
+            Err(e) => p.failure = Some(e.to_string()),
+        }
+    }
+
+    pub fn recovery_required(&self) -> bool {
+        self.publication
+            .lock()
+            .expect("publication lock")
+            .recovery_required
+    }
     pub fn attempt(&self) -> u32 {
         self.attempt
+    }
+    pub fn with_awaiting_input(
+        mut self,
+        signal: crate::engine::worker::heartbeat::AwaitingInputSignal,
+    ) -> Self {
+        self.awaiting_input = Some(signal);
+        self
     }
 
     pub fn sender(&self) -> EventBusSender {
@@ -59,6 +103,7 @@ impl EventBus {
             attempt: self.attempt,
             drains: self.drains.clone(),
             drain_shutdown: self.drain_shutdown.clone(),
+            awaiting_input: self.awaiting_input.clone(),
             source: None,
         }
     }
@@ -86,6 +131,17 @@ impl EventBus {
         rx
     }
 
+    /// Lossless lease forwarding, registered before command publication.
+    pub fn subscribe_ordered(&self) -> mpsc::UnboundedReceiver<ExecutionEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.publication
+            .lock()
+            .expect("publication lock")
+            .followers
+            .push(tx);
+        rx
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<ExecutionEvent> {
         self.tx.subscribe()
     }
@@ -106,6 +162,7 @@ pub struct EventBusSender {
     attempt: u32,
     drains: TaskTracker,
     drain_shutdown: tokio_util::sync::CancellationToken,
+    awaiting_input: Option<crate::engine::worker::heartbeat::AwaitingInputSignal>,
     /// Stamped on every event this sender emits (WI 0137 §5). `None` on the
     /// bus's root sender; set by [`EventBusSender::with_source`] or
     /// [`EventBusSender::with_shared_source`].
@@ -130,6 +187,25 @@ impl SourceStamp {
 }
 
 impl EventBusSender {
+    /// Transport health only: never allocates an event cursor or fabricates Done.
+    pub(crate) fn require_recovery(&self) {
+        self.publication
+            .lock()
+            .expect("publication lock")
+            .recovery_required = true;
+    }
+
+    pub fn redaction(&self) -> crate::engine::auth::redaction::RedactionSet {
+        self.publication
+            .lock()
+            .expect("publication lock")
+            .redaction
+            .clone()
+    }
+    /// Hold this guard for the duration of a frontend dialog.
+    pub fn awaiting_input(&self) -> Option<crate::engine::worker::heartbeat::AwaitingInputGuard> {
+        self.awaiting_input.as_ref().map(|signal| signal.hold())
+    }
     pub fn output_shutdown(&self) -> tokio_util::sync::CancellationToken {
         self.drain_shutdown.clone()
     }
@@ -177,6 +253,52 @@ impl EventBusSender {
         // Allocation and both publications are one operation across all
         // producer clones. No cursor can overtake an earlier event.
         let mut publication = self.publication.lock().expect("publication lock poisoned");
+        if publication.failure.is_some() || publication.finished {
+            return;
+        }
+        if publication.reserved.is_some() {
+            let event = ExecutionEvent {
+                timestamp: chrono::Utc::now(),
+                attempt: self.attempt,
+                sequence: publication.next_sequence,
+                source: self
+                    .source()
+                    .and_then(|s| publication.redaction.redact_source(s)),
+                payload: publication.redaction.redact_event(payload),
+            };
+            let bytes = serde_json::to_vec(&event).map_or(usize::MAX, |v| v.len());
+            let written = (|| -> std::io::Result<()> {
+                use std::io::Write as _;
+                if publication.deferred_spool.is_none()
+                    && (publication.deferred.len() >= 1024
+                        || bytes
+                            > (8 * 1024 * 1024usize).saturating_sub(publication.deferred_bytes))
+                {
+                    let mut file = tempfile::tempfile()?;
+                    for previous in std::mem::take(&mut publication.deferred) {
+                        serde_json::to_writer(&mut file, &previous)?;
+                        file.write_all(b"\n")?;
+                    }
+                    publication.deferred_bytes = 0;
+                    publication.deferred_spool = Some(file);
+                }
+                if let Some(file) = &mut publication.deferred_spool {
+                    serde_json::to_writer(&mut *file, &event)?;
+                    file.write_all(b"\n")?;
+                } else {
+                    publication.deferred_bytes += bytes;
+                    publication.deferred.push(event);
+                }
+                Ok(())
+            })();
+            match written {
+                Ok(()) => publication.next_sequence += 1,
+                Err(error) => {
+                    publication.failure = Some(format!("deferred output storage failed: {error}"))
+                }
+            }
+            return;
+        }
         self.publish(&mut publication, payload);
     }
 
@@ -187,24 +309,79 @@ impl EventBusSender {
         let mut publication = self.publication.lock().expect("publication lock poisoned");
         self.publish(&mut publication, status);
         self.publish(&mut publication, EventPayload::Done);
+        publication.redaction.clear();
+    }
+
+    /// Fan out only the terminal records already flushed by in-process recovery.
+    pub(crate) fn recovered_terminal(&self, events: impl IntoIterator<Item = ExecutionEvent>) {
+        let mut p = self.publication.lock().expect("publication lock");
+        for event in events {
+            if event.attempt == self.attempt
+                && matches!(
+                    event.payload,
+                    EventPayload::CommandStatus { .. } | EventPayload::Done
+                )
+            {
+                p.followers.retain(|tx| tx.send(event.clone()).is_ok());
+                let _ = self.tx.send(event);
+            }
+        }
+        p.finished = true;
+    }
+    pub fn try_finish(&self, status: EventPayload) -> Result<(), crate::data::error::DataError> {
+        self.finish(status);
+        let p = self.publication.lock().expect("publication lock");
+        match &p.failure {
+            Some(e) => Err(crate::data::error::DataError::Other(e.clone())),
+            None if p.reserved.is_some() => Err(crate::data::error::DataError::Other(
+                "lifecycle publication pending".into(),
+            )),
+            None => Ok(()),
+        }
     }
 
     fn publish(&self, publication: &mut Publication, payload: EventPayload) {
-        if publication.finished {
+        if publication.finished || publication.failure.is_some() || publication.reserved.is_some() {
             return;
         }
         publication.finished = matches!(payload, EventPayload::Done);
+        let payload = publication.redaction.redact_event(payload);
         let event = ExecutionEvent {
             timestamp: chrono::Utc::now(),
             attempt: self.attempt,
             sequence: publication.next_sequence,
-            source: self.source(),
+            source: self
+                .source()
+                .and_then(|source| publication.redaction.redact_source(source)),
             payload,
         };
         publication.next_sequence += 1;
+        self.publish_event(publication, event);
+    }
+
+    fn publish_event(&self, publication: &mut Publication, event: ExecutionEvent) {
+        if let Some(log) = &mut publication.durable_log {
+            let saved = log.append(&event).and_then(|()| {
+                if matches!(
+                    event.payload,
+                    EventPayload::CommandStatus { .. } | EventPayload::Done
+                ) {
+                    log.flush()
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(e) = saved {
+                publication.failure = Some(e.to_string());
+                return;
+            }
+        }
         if let Some(log) = &publication.log {
             let _ = log.send(event.clone());
         }
+        publication
+            .followers
+            .retain(|tx| tx.send(event.clone()).is_ok());
         let _ = self.tx.send(event);
     }
 }
@@ -213,180 +390,244 @@ impl EventBusSender {
 mod tests {
     use super::*;
 
-    #[test]
-    fn concurrent_publishers_keep_both_consumers_ordered_and_done_fences_output() {
-        let bus = EventBus::for_attempt(16_384, 2);
-        let mut live = bus.subscribe();
+    #[tokio::test]
+    async fn sender_clones_redact_before_log_ordered_and_broadcast_consumers() {
+        let bus = EventBus::new(16);
         let mut log = bus.subscribe_log();
-        let start = Arc::new(std::sync::Barrier::new(8));
-        std::thread::scope(|scope| {
-            for producer in 0..8 {
-                let sender = bus.sender();
-                let start = Arc::clone(&start);
-                scope.spawn(move || {
-                    start.wait();
-                    for line in 0..1_000 {
-                        sender.emit(EventPayload::StdoutLine(format!("{producer}:{line}")));
+        let mut ordered = bus.subscribe_ordered();
+        let mut broadcast = bus.subscribe();
+        let sender = bus.sender();
+        let clone = sender.clone();
+        clone
+            .redaction()
+            .add(crate::data::secret::SecretString::new("test-secret-bus"));
+        let mut source = EventSource::phase(crate::data::execution_event::EventSourcePhase::Main);
+        source.step_name = Some("test-secret-bus".into());
+        let sender = sender.with_source(source);
+        sender.emit(EventPayload::StdoutLine(
+            "test-secret-bus test-secret-bus".into(),
+        ));
+        for event in [
+            log.recv().await.unwrap(),
+            ordered.recv().await.unwrap(),
+            broadcast.recv().await.unwrap(),
+        ] {
+            assert!(
+                matches!(event.payload, EventPayload::StdoutLine(ref line) if line == "*** ***")
+            );
+            assert_eq!(event.sequence, 0);
+            assert_eq!(event.source.unwrap().step_name.as_deref(), Some("***"));
+        }
+    }
+}
+
+/// A reservation is never observable until both its database transaction and log
+/// flush succeeded. Dropped/failed reservations fence this bus until recovery.
+#[derive(Clone)]
+pub struct LifecyclePublisher {
+    sender: Arc<EventBusSender>,
+}
+impl EventBusSender {
+    pub fn lifecycle_publisher(&self) -> LifecyclePublisher {
+        LifecyclePublisher {
+            sender: Arc::new(self.clone()),
+        }
+    }
+}
+impl LifecyclePublisher {
+    pub fn ensure_available(&self) -> Result<(), crate::data::error::DataError> {
+        let p = self.sender.publication.lock().expect("publication lock");
+        if p.finished || p.failure.is_some() || p.durable_log.is_none() || p.reserved.is_some() {
+            return Err(crate::data::error::DataError::Other(format!(
+                "lifecycle writer unavailable: {}",
+                p.failure
+                    .as_deref()
+                    .unwrap_or("missing writer or pending publication")
+            )));
+        }
+        Ok(())
+    }
+    pub fn emit(&self, payload: EventPayload) {
+        self.sender.emit(payload);
+    }
+    /// The command set must also redact the result before its immutable commit.
+    pub fn redaction(&self) -> crate::engine::auth::redaction::RedactionSet {
+        self.sender.redaction()
+    }
+
+    pub fn abort(&self, error: &str) {
+        self.sender
+            .publication
+            .lock()
+            .expect("publication lock")
+            .failure = Some(error.to_owned());
+    }
+    pub fn reserve(
+        &self,
+        payloads: Vec<EventPayload>,
+    ) -> Result<crate::data::automation_store::LifecycleProjection, crate::data::error::DataError>
+    {
+        use crate::data::{automation_store::LifecycleProjection, error::DataError};
+        let mut p = self.sender.publication.lock().expect("publication lock");
+        if p.finished || p.reserved.is_some() || p.failure.is_some() || p.durable_log.is_none() {
+            return Err(DataError::Other(format!(
+                "lifecycle publication unavailable: {}",
+                p.failure
+                    .as_deref()
+                    .unwrap_or("missing writer or outstanding reservation")
+            )));
+        }
+        if payloads.is_empty() || payloads.len() > 8 {
+            return Err(DataError::Other("invalid lifecycle batch".into()));
+        }
+        let mut events = Vec::new();
+        for payload in payloads {
+            events.push(ExecutionEvent {
+                timestamp: chrono::Utc::now(),
+                attempt: self.sender.attempt,
+                sequence: p.next_sequence,
+                source: self
+                    .sender
+                    .source()
+                    .and_then(|s| p.redaction.redact_source(s)),
+                payload: p.redaction.redact_event(payload),
+            });
+            p.next_sequence += 1;
+        }
+        let batch = LifecycleProjection {
+            cursor: events.last().expect("nonempty").cursor(),
+            events,
+        };
+        if serde_json::to_vec(&batch.events)
+            .map_err(|e| DataError::Other(e.to_string()))?
+            .len()
+            > 16 * 1024 * 1024
+        {
+            return Err(DataError::Other("lifecycle batch exceeds bound".into()));
+        }
+        p.reserved = Some(batch.clone());
+        Ok(batch)
+    }
+    pub fn publish(
+        &self,
+        batch: &crate::data::automation_store::LifecycleProjection,
+    ) -> Result<(), crate::data::error::DataError> {
+        use crate::data::error::DataError;
+        let mut p = self.sender.publication.lock().expect("publication lock");
+        if p.failure.is_some()
+            || p.reserved.as_ref().map(|b| b.cursor) != Some(batch.cursor)
+            || serde_json::to_value(p.reserved.as_ref().map(|b| &b.events))
+                .map_err(|e| DataError::Other(e.to_string()))?
+                != serde_json::to_value(&batch.events)
+                    .map_err(|e| DataError::Other(e.to_string()))?
+        {
+            return Err(DataError::Other(
+                "invalid or failed lifecycle reservation".into(),
+            ));
+        }
+        let log = p
+            .durable_log
+            .as_mut()
+            .ok_or_else(|| DataError::Other("missing lifecycle writer".into()))?;
+        let saved = batch
+            .events
+            .iter()
+            .try_for_each(|event| log.append(event))
+            .and_then(|()| log.flush());
+        if let Err(e) = saved {
+            p.failure = Some(e.to_string());
+            return Err(DataError::Other(format!(
+                "completion recorded, not yet published: {e}"
+            )));
+        }
+        for event in &batch.events {
+            if let Some(log) = &p.log {
+                let _ = log.send(event.clone());
+            }
+            p.followers.retain(|tx| tx.send(event.clone()).is_ok());
+            let _ = self.sender.tx.send(event.clone());
+        }
+        p.reserved = None;
+        p.deferred_bytes = 0;
+        for event in std::mem::take(&mut p.deferred) {
+            if p.failure.is_some() {
+                break;
+            }
+            self.sender.publish_event(&mut p, event);
+        }
+        if let Some(mut file) = p.deferred_spool.take() {
+            use std::io::{BufRead as _, Seek as _};
+            let replay = (|| -> std::io::Result<()> {
+                file.rewind()?;
+                for line in std::io::BufReader::new(file).lines() {
+                    let event = serde_json::from_str(&line?)?;
+                    self.sender.publish_event(&mut p, event);
+                    if p.failure.is_some() {
+                        break;
                     }
-                });
+                }
+                Ok(())
+            })();
+            if let Err(error) = replay {
+                p.failure = Some(format!("deferred output replay failed: {error}"));
             }
-        });
-        bus.sender().emit(EventPayload::Done);
-        bus.sender()
-            .emit(EventPayload::StdoutLine("too late".into()));
-        bus.sender().emit(EventPayload::Done);
-        for sequence in 0..=8_000 {
-            let event = live.try_recv().unwrap();
-            let persisted = log.try_recv().unwrap();
-            assert_eq!(
-                event.cursor(),
-                crate::data::execution_event::EventCursor::new(2, sequence)
-            );
-            assert_eq!(
-                serde_json::to_value(&event).unwrap(),
-                serde_json::to_value(persisted).unwrap()
-            );
-            assert_eq!(
-                matches!(event.payload, EventPayload::Done),
-                sequence == 8_000
-            );
         }
-        assert!(live.try_recv().is_err());
-        assert!(log.try_recv().is_err());
+        // Completion itself was flushed and delivered. A later output error
+        // fences future publications; it cannot retract this acknowledgement.
+        Ok(())
     }
+}
 
-    #[tokio::test]
-    async fn sender_with_source_stamps_its_events_and_shares_the_sequence() {
-        use crate::data::execution_event::EventSourcePhase;
+#[cfg(test)]
+mod deferred_output_tests {
+    use super::*;
+    use crate::data::fs::api_command_log::OrderedCommandLog;
+    use crate::data::fs::api_paths::ApiPaths;
 
+    #[test]
+    fn output_burst_spills_without_poisoning_committed_completion() {
+        let s = awman_test_support::TestSandbox::for_test(awman_test_support::TestCase::component(
+            "event_bus::output_burst_spills_without_poisoning_committed_completion",
+        ));
+        let paths = ApiPaths::from_root(s.tmp().join("api"));
         let bus = EventBus::new(16);
-        let mut rx = bus.subscribe();
-        let root = bus.sender();
-        let step = root.with_source(EventSource::step(EventSourcePhase::Main, "tests", 1));
-
-        root.emit(EventPayload::StdoutLine("root".into()));
-        step.emit(EventPayload::StdoutLine("step".into()));
-        root.emit(EventPayload::Done);
-
-        let first = rx.recv().await.unwrap();
-        assert_eq!(first.sequence, 0);
-        assert!(first.source.is_none());
-        let second = rx.recv().await.unwrap();
-        assert_eq!(second.sequence, 1);
-        assert_eq!(
-            second.source.as_ref().and_then(|s| s.step_name.as_deref()),
-            Some("tests")
+        bus.set_log_writer(Ok(Box::new(
+            OrderedCommandLog::open(&paths, "session", "command").unwrap(),
+        )));
+        let mut observed = bus.subscribe_ordered();
+        let publisher = bus.sender().lifecycle_publisher();
+        let batch = publisher
+            .reserve(vec![EventPayload::StatusMessage {
+                phase: "completion".into(),
+                message: "verified".into(),
+            }])
+            .unwrap();
+        for n in 0..1100 {
+            bus.sender()
+                .emit(EventPayload::StdoutLine(format!("line-{n}")));
+        }
+        assert!(
+            observed.try_recv().is_err(),
+            "output cannot overtake the commit"
         );
-        assert_eq!(step.source().map(|s| s.step_index), Some(Some(1)));
-        let done = rx.recv().await.unwrap();
-        assert_eq!(done.sequence, 2);
-        assert!(done.source.is_none());
-    }
-
-    #[tokio::test]
-    async fn emit_and_receive() {
-        let bus = EventBus::new(16);
-        let mut rx = bus.subscribe();
-        let sender = bus.sender();
-
-        sender.emit(EventPayload::StdoutLine("hello".into()));
-        sender.emit(EventPayload::StdoutLine("world".into()));
-        sender.emit(EventPayload::Done);
-
-        let e1 = rx.recv().await.unwrap();
-        assert_eq!(e1.sequence, 0);
-        assert!(matches!(e1.payload, EventPayload::StdoutLine(ref s) if s == "hello"));
-
-        let e2 = rx.recv().await.unwrap();
-        assert_eq!(e2.sequence, 1);
-
-        let e3 = rx.recv().await.unwrap();
-        assert_eq!(e3.sequence, 2);
-        assert!(matches!(e3.payload, EventPayload::Done));
-    }
-
-    #[tokio::test]
-    async fn multiple_subscribers() {
-        let bus = EventBus::new(16);
-        let mut rx1 = bus.subscribe();
-        let mut rx2 = bus.subscribe();
-        let sender = bus.sender();
-
-        sender.emit(EventPayload::StdoutLine("test".into()));
-
-        let e1 = rx1.recv().await.unwrap();
-        let e2 = rx2.recv().await.unwrap();
-        assert_eq!(e1.sequence, e2.sequence);
-    }
-
-    #[tokio::test]
-    async fn emit_10_events_all_received_with_correct_sequence_numbers() {
-        let bus = EventBus::new(32);
-        let mut rx = bus.subscribe();
-        let sender = bus.sender();
-
-        for i in 0..10u32 {
-            sender.emit(EventPayload::StdoutLine(format!("line {i}")));
-        }
-        sender.emit(EventPayload::Done);
-
-        for expected_seq in 0u64..10 {
-            let ev = rx.recv().await.unwrap();
-            assert_eq!(ev.sequence, expected_seq);
-            assert!(matches!(ev.payload, EventPayload::StdoutLine(_)));
-        }
-        let done = rx.recv().await.unwrap();
-        assert_eq!(done.sequence, 10);
-        assert!(matches!(done.payload, EventPayload::Done));
-    }
-
-    #[tokio::test]
-    async fn three_subscribers_each_receive_all_five_events() {
-        let bus = EventBus::new(32);
-        let mut rx1 = bus.subscribe();
-        let mut rx2 = bus.subscribe();
-        let mut rx3 = bus.subscribe();
-        let sender = bus.sender();
-
-        for i in 0..5u32 {
-            sender.emit(EventPayload::StdoutLine(format!("ev{i}")));
-        }
-
-        for rx in [&mut rx1, &mut rx2, &mut rx3] {
-            for expected_seq in 0u64..5 {
-                let ev = rx.recv().await.unwrap();
-                assert_eq!(ev.sequence, expected_seq);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn lagged_receiver_gets_lag_error_then_remaining_events() {
-        use tokio::sync::broadcast::error::RecvError;
-
-        // capacity=4: buffer holds the most recent 4 events.
-        let bus = EventBus::new(4);
-        let mut rx = bus.subscribe();
-        let sender = bus.sender();
-
-        // Emit 10 events without reading — fills and overwrites the 4-slot buffer.
-        for i in 0..10u32 {
-            sender.emit(EventPayload::StdoutLine(format!("ev{i}")));
-        }
-
-        // The first recv must report Lagged(6) — 6 messages were lost.
-        match rx.recv().await {
-            Err(RecvError::Lagged(n)) => assert_eq!(n, 6, "expected 6 lagged messages"),
-            other => panic!("expected Lagged(6), got {other:?}"),
-        }
-
-        // After lag recovery the receiver delivers the last 4 messages.
-        for i in 6u32..10 {
-            let ev = rx.recv().await.unwrap();
-            match &ev.payload {
-                EventPayload::StdoutLine(s) => assert_eq!(s, &format!("ev{i}")),
-                other => panic!("unexpected payload {other:?}"),
-            }
-        }
+        publisher.publish(&batch).unwrap();
+        let events: Vec<_> = std::iter::from_fn(|| observed.try_recv().ok()).collect();
+        assert_eq!(events.len(), 1101);
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence));
+        assert!(
+            matches!(&events.last().unwrap().payload, EventPayload::StdoutLine(line) if line == "line-1099")
+        );
+        assert!(publisher
+            .reserve(vec![EventPayload::StatusMessage {
+                phase: "next".into(),
+                message: "healthy".into()
+            }])
+            .is_ok());
+        drop(observed);
+        drop(publisher);
+        drop(bus);
+        s.finish();
     }
 }

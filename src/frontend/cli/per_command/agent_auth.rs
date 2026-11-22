@@ -30,7 +30,7 @@ impl AgentAuthFrontend for CliFrontend {
             agent.as_str()
         );
         let mut buf = String::new();
-        if std::io::stdin().read_line(&mut buf).is_err() {
+        if super::helpers::read_input_line(&mut buf).is_err() {
             return Ok(AgentAuthDecision::DeclineOnce);
         }
         Ok(match buf.trim() {

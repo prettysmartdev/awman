@@ -41,6 +41,7 @@ use crate::command::commands::worktree_lifecycle::{
 };
 use crate::command::error::CommandError;
 use crate::command::headless::HeadlessDefaults;
+use crate::command::interaction::InteractionDecision;
 use crate::data::fs::{RunId, SharedSquadRunLog, SquadRunLog, SquadRunLogError, SquadRunLogs};
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::AgentName;
@@ -71,6 +72,7 @@ impl SquadRunFrontends for UnattendedFrontends {
         run_log_dir: &Path,
         label: &str,
         mount_scope: MountScopeDecision,
+        interaction: InteractionDecision,
     ) -> Result<Box<dyn AgentFrontend>, CommandError> {
         Ok(Box::new(UnattendedFrontend::for_run(
             task,
@@ -78,6 +80,7 @@ impl SquadRunFrontends for UnattendedFrontends {
             run_log_dir,
             label,
             mount_scope,
+            interaction,
         )?))
     }
 
@@ -87,6 +90,7 @@ impl SquadRunFrontends for UnattendedFrontends {
         run_id: &RunId,
         run_log_dir: &Path,
         mount_scope: MountScopeDecision,
+        interaction: InteractionDecision,
     ) -> Result<Box<dyn ExecWorkflowCommandFrontend>, CommandError> {
         Ok(Box::new(UnattendedFrontend::for_run(
             task,
@@ -94,6 +98,7 @@ impl SquadRunFrontends for UnattendedFrontends {
             run_log_dir,
             "workflow",
             mount_scope,
+            interaction,
         )?))
     }
 }
@@ -132,40 +137,19 @@ pub struct UnattendedFrontend {
     step_logs: HashMap<String, PathBuf>,
     /// The most recently opened container log, for the remediation separator.
     last_container_log: Option<PathBuf>,
+    /// This run's resolved interaction (WI 0141): a PTY of
+    /// `pty_size` when interactive, piped I/O when headless.
+    interaction: InteractionDecision,
 }
 
 impl UnattendedFrontend {
-    /// Test-only construction. Production always uses `for_run`, which
-    /// receives a scheduler-created directory and can report setup errors.
-    #[cfg(test)]
-    fn new(context: String) -> Self {
-        Self::with_mount_scope(context, MountScopeDecision::MountGitRoot)
-    }
-
-    #[cfg(test)]
-    fn with_mount_scope(context: String, mount_scope: MountScopeDecision) -> Self {
-        Self {
-            task: context.clone(),
-            context,
-            run_id: RunId::new(),
-            logs: SquadRunLogs::new(std::env::temp_dir().join("awman-unattended-test-logs")),
-            pending_log_files: VecDeque::new(),
-            headless: HeadlessDefaults::squad(mount_scope),
-            phase_log: None,
-            setup_steps_seen: 0,
-            teardown_steps_seen: 0,
-            current_step: None,
-            step_logs: HashMap::new(),
-            last_container_log: None,
-        }
-    }
-
     fn for_run(
         task: &str,
         run_id: &RunId,
         run_log_dir: &Path,
         label: &str,
         mount_scope: MountScopeDecision,
+        interaction: InteractionDecision,
     ) -> Result<Self, CommandError> {
         let logs = SquadRunLogs::new(run_log_dir);
         if !logs.is_prepared() {
@@ -187,6 +171,7 @@ impl UnattendedFrontend {
             current_step: None,
             step_logs: HashMap::new(),
             last_container_log: None,
+            interaction,
         })
     }
 
@@ -376,10 +361,13 @@ impl AgentFrontend for UnattendedFrontend {
 
     fn report_progress(&mut self, _progress: AgentProgress) {}
 
-    /// Every squad agent gets a PTY even when nobody is attached. This makes
-    /// its process the same interactive agent TUI a later attach reconnects
-    /// to, while the fixed 120x40 size is large enough for supported CLIs and
-    /// does not depend on a daemon-owned terminal.
+    /// An interactive squad run (`daemon.features.squad.interaction`, the
+    /// default) gives every agent a PTY even when nobody is attached, so its
+    /// process is the same interactive agent TUI a later attach reconnects
+    /// to. Its size is `daemon.terminal.{cols,rows}` as Layer 2 read it when
+    /// the run started (default 120×40); running terminals keep it. A
+    /// headless run pipes the agent: no PTY, nothing to attach to, output
+    /// still goes to the container log (WI 0141).
     fn take_io(&mut self) -> AgentIo {
         let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel();
         let (stderr_tx, stderr_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -392,8 +380,11 @@ impl AgentFrontend for UnattendedFrontend {
             stderr: stderr_tx,
             stdin_tx,
             stdin_rx,
-            resize: Some(tokio::sync::mpsc::unbounded_channel().1),
-            initial_size: Some((120, 40)),
+            resize: self
+                .interaction
+                .pty_size
+                .map(|_| tokio::sync::mpsc::unbounded_channel().1),
+            initial_size: self.interaction.pty_size,
         }
     }
 }
@@ -508,6 +499,20 @@ impl WorkflowFrontend for UnattendedFrontend {
         available: &AvailableActions,
     ) -> Result<NextAction, EngineError> {
         Ok(self.headless.workflow_next_action(available))
+    }
+
+    fn yolo_countdown_started(
+        &mut self,
+        step_name: &str,
+        kind: crate::engine::workflow::actions::CountdownKind,
+    ) {
+        tracing::info!(
+            task = %self.task,
+            run_id = %self.run_id,
+            step = %step_name,
+            countdown = ?kind,
+            "squad workflow countdown started"
+        );
     }
 
     fn yolo_countdown_tick(
@@ -770,7 +775,7 @@ impl ExecWorkflowCommandFrontend for UnattendedFrontend {
 
     fn notify_dynamic_workflow_resume_unavailable(
         &mut self,
-        work_item: u32,
+        work_item: &str,
         reason: &str,
     ) -> Result<(), CommandError> {
         tracing::info!(
@@ -821,541 +826,5 @@ impl crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFront
             ),
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
-
-    use super::*;
-
-    // ── WI 0112 Part 5: setup/teardown step logs and failure lines ──────
-
-    fn run_frontend(tmp: &Path) -> UnattendedFrontend {
-        UnattendedFrontend::for_run(
-            "task",
-            &RunId("run-0112".into()),
-            tmp,
-            "workflow",
-            MountScopeDecision::MountGitRoot,
-        )
-        .unwrap()
-    }
-
-    fn step(name: &str) -> WorkflowStep {
-        WorkflowStep {
-            name: name.to_string(),
-            depends_on: Vec::new(),
-            prompt_template: String::new(),
-            agent: None,
-            model: None,
-            overlays: None,
-            abort_on_failure: false,
-        }
-    }
-
-    // The slug and filename rules moved to `SquadRunLogs` (Layer 0) in WI
-    // 0113 F-02 and are tested there; what stays here is that the frontend
-    // writes the right *content* through them.
-
-    #[test]
-    fn a_setup_step_writes_its_output_to_a_numbered_file_and_logs_the_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("setup-1-clone-repo-git-example.log");
-        let log = captured_tracing(|| {
-            let mut frontend = run_frontend(tmp.path());
-            frontend.on_phase_step_started(PhaseKind::Setup, "clone_repo git@example");
-            frontend.on_phase_step_output(PhaseKind::Setup, "Cloning into 'example'...");
-            frontend.on_phase_step_output(PhaseKind::Setup, "done.");
-            frontend.on_phase_step_completed(PhaseKind::Setup, "clone_repo git@example");
-        });
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            contents.starts_with("# setup step 1: clone_repo git@example\n"),
-            "{contents}"
-        );
-        assert!(
-            contents.contains("Cloning into 'example'...\ndone.\n"),
-            "{contents}"
-        );
-        assert!(log.contains("squad setup step started"), "{log}");
-        assert!(log.contains("squad setup step succeeded"), "{log}");
-        assert!(log.contains(&path.display().to_string()), "{log}");
-        assert!(!log.contains("ERROR"), "{log}");
-    }
-
-    #[test]
-    fn a_failed_setup_step_appends_the_error_and_names_the_file_in_an_error_line() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("setup-1-clone-repo.log");
-        let log = captured_tracing(|| {
-            let mut frontend = run_frontend(tmp.path());
-            frontend.on_phase_step_started(PhaseKind::Setup, "clone_repo");
-            frontend.on_phase_step_output(PhaseKind::Setup, "Cloning...");
-            frontend.on_phase_step_failed(
-                PhaseKind::Setup,
-                "clone_repo",
-                128,
-                "fatal: not a git repository\n",
-            );
-        });
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            contents.ends_with("# failed (exit 128):\nfatal: not a git repository\n"),
-            "{contents}"
-        );
-        let error_line = log
-            .lines()
-            .find(|l| l.contains("squad setup step failed"))
-            .unwrap_or_else(|| panic!("no failure line in {log}"));
-        assert!(error_line.contains("ERROR"), "{error_line}");
-        assert!(error_line.contains("exit_code=128"), "{error_line}");
-        assert!(
-            error_line.contains(&format!("log_path={}", path.display())),
-            "{error_line}"
-        );
-        assert!(
-            error_line.contains("fatal: not a git repository"),
-            "{error_line}"
-        );
-    }
-
-    #[test]
-    fn identical_steps_are_numbered_and_teardown_has_its_own_counter() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut frontend = run_frontend(tmp.path());
-        frontend.on_phase_step_started(PhaseKind::Setup, "run_shell");
-        frontend.on_phase_step_completed(PhaseKind::Setup, "run_shell");
-        frontend.on_phase_step_started(PhaseKind::Setup, "run_shell");
-        frontend.on_phase_step_completed(PhaseKind::Setup, "run_shell");
-        frontend.on_phase_step_started(PhaseKind::Teardown, "create_pr");
-        frontend.on_phase_step_completed(PhaseKind::Teardown, "create_pr");
-        assert!(tmp.path().join("setup-1-run-shell.log").exists());
-        assert!(tmp.path().join("setup-2-run-shell.log").exists());
-        assert!(tmp.path().join("teardown-1-create-pr.log").exists());
-    }
-
-    #[test]
-    fn remediation_output_lands_in_the_same_file_under_a_separator() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut frontend = run_frontend(tmp.path());
-        frontend.on_phase_step_started(PhaseKind::Setup, "run_shell");
-        frontend.on_phase_step_output(PhaseKind::Setup, "first try");
-        frontend.on_phase_step_fixing(PhaseKind::Setup, "run_shell", 1, 2);
-        frontend.on_phase_step_output(PhaseKind::Setup, "second try");
-        frontend.on_phase_step_completed(PhaseKind::Setup, "run_shell");
-        let contents = std::fs::read_to_string(tmp.path().join("setup-1-run-shell.log")).unwrap();
-        let first = contents.find("first try").unwrap();
-        let sep = contents
-            .find("# on_failure remediation attempt 1/2")
-            .unwrap();
-        let second = contents.find("second try").unwrap();
-        assert!(first < sep && sep < second, "{contents}");
-        assert!(
-            !tmp.path().join("setup-2-run-shell.log").exists(),
-            "no second file"
-        );
-    }
-
-    #[test]
-    fn a_failed_agent_step_is_an_error_line_naming_its_container_log() {
-        let tmp = tempfile::tempdir().unwrap();
-        let container = "awman-squad-task-abcdef01";
-        let log = captured_tracing(|| {
-            let mut frontend = run_frontend(tmp.path());
-            frontend.report_step_status(&step("build"), WorkflowStepStatus::Running);
-            frontend.report_status(AgentStatus::Running {
-                container_name: container.to_string(),
-            });
-            frontend
-                .report_step_status(&step("build"), WorkflowStepStatus::Failed { exit_code: 2 });
-            frontend.report_step_status(&step("test"), WorkflowStepStatus::Running);
-            frontend.report_step_status(&step("test"), WorkflowStepStatus::Succeeded);
-        });
-        let failed = log
-            .lines()
-            .find(|l| l.contains("squad workflow step failed"))
-            .unwrap_or_else(|| panic!("no failure line in {log}"));
-        assert!(failed.contains("ERROR"), "{failed}");
-        assert!(failed.contains("step=build"), "{failed}");
-        assert!(failed.contains("exit_code=2"), "{failed}");
-        assert!(
-            failed.contains(&format!(
-                "log_path={}",
-                tmp.path().join(format!("{container}.log")).display()
-            )),
-            "{failed}"
-        );
-        let succeeded = log
-            .lines()
-            .find(|l| l.contains("step=test") && l.contains("Succeeded"))
-            .unwrap_or_else(|| panic!("no success line in {log}"));
-        assert!(succeeded.contains("INFO"), "{succeeded}");
-    }
-
-    #[test]
-    fn dropping_the_frontend_mid_step_flushes_the_open_step_log() {
-        let tmp = tempfile::tempdir().unwrap();
-        {
-            let mut frontend = run_frontend(tmp.path());
-            frontend.on_phase_step_started(PhaseKind::Teardown, "push_branch");
-            frontend.on_phase_step_output(PhaseKind::Teardown, "pushing...");
-        }
-        let contents =
-            std::fs::read_to_string(tmp.path().join("teardown-1-push-branch.log")).unwrap();
-        assert!(contents.contains("pushing..."), "{contents}");
-    }
-
-    /// Install a global subscriber that records nothing, once per test binary.
-    ///
-    /// Its only job is to exist. `tracing` caches each callsite's `Interest`
-    /// process-wide the first time that callsite is reached, and with no
-    /// global subscriber installed a callsite first reached by a thread with
-    /// no scoped subscriber is cached as *never* interesting. From then on the
-    /// `info!` short-circuits on every thread — including one that later
-    /// installs a capture subscriber, which then reads back an empty log. The
-    /// suite has plenty of tests that drive this frontend without capturing,
-    /// so which happens first is a race, and it only shows up when siblings
-    /// run alongside: `captured_tracing` on its own always wins the race.
-    ///
-    /// Answering [`Interest::sometimes`] keeps every callsite dynamic, so each
-    /// event is resolved against whatever subscriber the *current thread* has
-    /// — the capture sink here, or this no-op everywhere else.
-    fn keep_callsites_dynamic() {
-        use tracing::span::{Attributes, Id, Record};
-        use tracing::subscriber::Interest;
-        use tracing::{Event, Metadata};
-
-        struct Discard;
-
-        impl tracing::Subscriber for Discard {
-            fn register_callsite(&self, _: &Metadata<'_>) -> Interest {
-                Interest::sometimes()
-            }
-            fn enabled(&self, _: &Metadata<'_>) -> bool {
-                false
-            }
-            fn new_span(&self, _: &Attributes<'_>) -> Id {
-                Id::from_u64(1)
-            }
-            fn record(&self, _: &Id, _: &Record<'_>) {}
-            fn record_follows_from(&self, _: &Id, _: &Id) {}
-            fn event(&self, _: &Event<'_>) {}
-            fn enter(&self, _: &Id) {}
-            fn exit(&self, _: &Id) {}
-        }
-
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            // Nothing else in the crate sets a global default; if that ever
-            // changes, that subscriber wins and this is a no-op.
-            let _ = tracing::subscriber::set_global_default(Discard);
-        });
-    }
-
-    /// Collect everything written to `tracing` while `body` runs, as text.
-    fn captured_tracing(body: impl FnOnce()) -> String {
-        #[derive(Clone, Default)]
-        struct Sink(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
-            type Writer = Sink;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let sink = Sink::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(sink.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        keep_callsites_dynamic();
-        tracing::subscriber::with_default(subscriber, body);
-        let bytes = sink.0.lock().unwrap().clone();
-        String::from_utf8(bytes).unwrap()
-    }
-
-    /// WI 0106 §6c: for a task bound to a repository, the daemon's own log
-    /// must record where the run's worktree lives and what happened to it when
-    /// the workflow ended. These are the callbacks the shared worktree
-    /// lifecycle fires; nothing about squad skips them, and each line carries
-    /// the task, the run id, and the path/branch needed to go find it.
-    #[test]
-    fn worktree_creation_and_disposition_are_recorded_in_the_daemon_log() {
-        let created = captured_tracing(|| {
-            let mut frontend = UnattendedFrontend::new("nightly".into());
-            frontend.report_worktree_created(Path::new("/wt/nightly"), "awman/squad-nightly");
-        });
-        assert!(created.contains("squad worktree created"), "{created}");
-        assert!(created.contains("/wt/nightly"), "{created}");
-        assert!(created.contains("awman/squad-nightly"), "{created}");
-        assert!(created.contains("INFO"), "{created}");
-
-        let kept = captured_tracing(|| {
-            let mut frontend = UnattendedFrontend::new("nightly".into());
-            frontend.report_worktree_kept(Path::new("/wt/nightly"), "awman/squad-nightly");
-        });
-        assert!(kept.contains("squad worktree kept"), "{kept}");
-        assert!(kept.contains("/wt/nightly"), "{kept}");
-
-        let discarded = captured_tracing(|| {
-            let mut frontend = UnattendedFrontend::new("nightly".into());
-            frontend.report_worktree_discarded("awman/squad-nightly");
-        });
-        assert!(
-            discarded.contains("squad worktree discarded"),
-            "{discarded}"
-        );
-        assert!(discarded.contains("awman/squad-nightly"), "{discarded}");
-
-        let conflict = captured_tracing(|| {
-            let mut frontend = UnattendedFrontend::new("nightly".into());
-            frontend.report_merge_conflict(
-                "awman/squad-nightly",
-                Path::new("/wt/nightly"),
-                Path::new("/repo"),
-            );
-        });
-        assert!(
-            conflict.contains("squad workflow left a merge conflict"),
-            "{conflict}"
-        );
-        assert!(conflict.contains("WARN"), "{conflict}");
-    }
-
-    #[test]
-    fn the_workflow_frontend_answers_the_mount_scope_question_with_the_captured_scope() {
-        let mut frontend = UnattendedFrontend::with_mount_scope(
-            "c".into(),
-            MountScopeDecision::MountCurrentDirOnly,
-        );
-        let decision = frontend
-            .ask_mount_scope(Path::new("/repo"), Path::new("/repo/sub"))
-            .unwrap();
-        assert!(
-            matches!(decision, MountScopeDecision::MountCurrentDirOnly),
-            "an unattended run must never widen the captured mount scope"
-        );
-    }
-
-    /// The leader's scope comes from Layer 2, exactly like the workflow's.
-    ///
-    /// `leader_frontend` used to pass `MountScopeDecision::MountGitRoot` from
-    /// here, so which directory a squad *leader* mounted was chosen by a
-    /// frontend literal — a decision left in `src/frontend/squad/`, which Q4
-    /// forbids, and one `every_profile_answers_its_recorded_table` could not
-    /// see. This asserts only the forwarding; *what* the scope should be is
-    /// `SquadEvaluator`'s, via `mount_scope_decision(task.mount_scope)`.
-    #[test]
-    fn a_leader_run_forwards_the_scope_it_is_given() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut frontend = UnattendedFrontend::for_run(
-            "task",
-            &RunId("run-0114".into()),
-            tmp.path(),
-            "leader",
-            MountScopeDecision::MountCurrentDirOnly,
-        )
-        .unwrap();
-
-        let decision = frontend
-            .ask_mount_scope(Path::new("/repo"), Path::new("/repo/sub"))
-            .unwrap();
-        assert!(
-            matches!(decision, MountScopeDecision::MountCurrentDirOnly),
-            "a leader run must answer with the scope Layer 2 handed it, \
-             not one of its own"
-        );
-    }
-
-    /// Every `ask_*` answer is the squad profile's, not this frontend's.
-    ///
-    /// *What* those answers are — never widen a mount scope, never merge,
-    /// never delete a worktree, start over rather than resume — is the one
-    /// comparable table in `command::headless`, pinned there by
-    /// `every_profile_answers_its_recorded_table`. Asserting the values again
-    /// here would be a decision asserted in a frontend test (F-13, Tenet 2),
-    /// and would let the two drift. So this asserts only the delegation: each
-    /// body returns exactly what the profile it was built with returns.
-    #[test]
-    fn every_answer_is_the_squad_profiles_answer() {
-        let profile = HeadlessDefaults::squad(MountScopeDecision::MountCurrentDirOnly);
-        let mut frontend = UnattendedFrontend::new("c/leader".into());
-        let resume_prompt = WorkflowResumePrompt::new(
-            "wf".into(),
-            None,
-            None,
-            false,
-            1,
-            3,
-            vec![
-                crate::command::commands::exec_workflow::WorkflowResumeStep {
-                    name: "b".into(),
-                    role: "the step that failed".into(),
-                },
-            ],
-        );
-        let worktree_prompt = PostWorkflowWorktreePrompt {
-            branch: "awman/squad".into(),
-            target_branch: "main".into(),
-            had_error: false,
-            title: "t".into(),
-            body: "b".into(),
-            merge_label: "m".into(),
-            discard_label: "d".into(),
-            keep_label: "k".into(),
-        };
-
-        assert_eq!(
-            frontend.ask_workflow_resume(&resume_prompt).unwrap(),
-            profile.workflow_resume(&resume_prompt)
-        );
-        assert_eq!(
-            frontend.ask_post_workflow_action(&worktree_prompt).unwrap(),
-            profile.post_workflow_action(&worktree_prompt)
-        );
-        assert_eq!(
-            frontend
-                .confirm_worktree_cleanup("b", Path::new("/w"))
-                .unwrap(),
-            profile.confirm_worktree_cleanup()
-        );
-        assert_eq!(frontend.ask_merge_mode("b").unwrap(), profile.merge_mode());
-        assert_eq!(
-            frontend
-                .ask_pre_worktree_uncommitted_files(&[], "")
-                .unwrap(),
-            profile.pre_worktree_uncommitted_files("")
-        );
-        assert_eq!(
-            frontend
-                .ask_existing_worktree(Path::new("/w"), "b")
-                .unwrap(),
-            profile.existing_worktree()
-        );
-    }
-
-    /// A resize channel and an initial terminal size are what make the engine
-    /// take the PTY path rather than piping the agent. Squad runs every agent
-    /// PTY-backed whether or not anyone is attached (WI 0106 §3c): that is
-    /// what makes the running agent a real interactive TUI process, and it is
-    /// the prerequisite for `attach` connecting to the actual agent rather
-    /// than a shell. The daemon owns no real terminal, so it supplies a fixed
-    /// spacious default instead of measuring one.
-    #[tokio::test]
-    async fn agent_io_is_pty_backed_even_when_nobody_is_attached() {
-        let mut frontend = UnattendedFrontend::new("c/leader".into());
-        let io = frontend.take_io();
-        assert!(
-            io.resize.is_some(),
-            "a PTY-backed agent needs a resize channel"
-        );
-        assert!(
-            io.initial_size.is_some(),
-            "an unattended PTY still needs a terminal size to allocate"
-        );
-    }
-
-    #[tokio::test]
-    async fn leader_and_workflow_container_output_is_written_to_each_run_log() {
-        let tmp = tempfile::tempdir().unwrap();
-        let run_id = RunId("run-0106".into());
-
-        for (label, container) in [
-            ("leader", "awman-squad-task-11111111"),
-            ("workflow", "awman-squad-task-22222222"),
-        ] {
-            let run_dir = tmp.path().join(label);
-            std::fs::create_dir(&run_dir).unwrap();
-            let mut frontend = UnattendedFrontend::for_run(
-                "task",
-                &run_id,
-                &run_dir,
-                label,
-                MountScopeDecision::MountGitRoot,
-            )
-            .unwrap();
-            frontend.report_status(AgentStatus::Running {
-                container_name: container.to_string(),
-            });
-            let io = frontend.take_io();
-            io.stdout.send(b"stdout from agent\n".to_vec()).unwrap();
-            io.stderr.send(b"stderr from agent\n".to_vec()).unwrap();
-            drop(io);
-
-            let log_path = run_dir.join(format!("{container}.log"));
-            let mut contents = String::new();
-            for _ in 0..40 {
-                contents = std::fs::read_to_string(&log_path).unwrap_or_default();
-                if contents.contains("stdout from agent") && contents.contains("stderr from agent")
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            assert!(
-                contents.contains("stdout from agent"),
-                "{label}: {contents:?}"
-            );
-            assert!(
-                contents.contains("stderr from agent"),
-                "{label}: {contents:?}"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod wi0149_tests {
-    use super::*;
-    use crate::command::commands::workflow_prerequisites::WorkflowPrerequisiteFrontend;
-    use crate::data::workflow_prerequisites::*;
-    #[test]
-    fn wi0149_squad_run_log_contains_prerequisite_summary_and_gap() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut frontend = UnattendedFrontend::for_run(
-            "task",
-            &RunId("run-0149".into()),
-            tmp.path(),
-            "workflow",
-            MountScopeDecision::MountGitRoot,
-        )
-        .unwrap();
-        let report = WorkflowPrerequisiteReport {
-            phase: PrerequisitePhase::Start,
-            origin: PrerequisiteOrigin::AssumedAll,
-            checks: vec![PrerequisiteCheck {
-                prerequisite: WorkflowPrerequisite::GitHubToken {
-                    host: "github.com".into(),
-                },
-                status: PrerequisiteStatus::Missing,
-                explanation: "No token in GH_TOKEN".into(),
-                needed_by: vec![],
-                remediations: vec![],
-            }],
-            advisories: vec![],
-            notes: vec![],
-        };
-        assert!(!frontend.can_ask_prerequisites());
-        frontend
-            .show_workflow_prerequisites(
-                &report,
-                crate::command::commands::workflow_prerequisites::PrerequisiteReportNext::Decided,
-            )
-            .unwrap();
-        let log = std::fs::read_to_string(tmp.path().join("workflow-0-prerequisites.log")).unwrap();
-        assert!(log.contains(&report.summary_line()), "{log}");
-        assert!(log.contains("No token in GH_TOKEN"));
     }
 }

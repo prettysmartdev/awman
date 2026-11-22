@@ -156,6 +156,12 @@ The implementing agent must add a regression test in `tests/` (or extend an exis
 
 ## Subprocess transparency via the user message sink (load-bearing)
 
+Current readiness-output exception (see `aspec/uxui/cli.md`): `ready`'s
+read-only `version`, `ls` and `kit validate` probes are quiet on success.
+Warnings remain visible, and failures retain the command and captured output.
+The announcement/publication rules below still apply to mutating commands and
+agent lifecycle operations.
+
 The user must have full visibility into everything awman does with the `sbx` CLI on their behalf. Every `sbx` subprocess invocation — across `awman ready`, launch, re-attach, stop, remove, listing, and validation — is reported through the existing user message sink (`UserMessageSink`), so the messages surface uniformly in the TUI status log, CLI output, and API event stream.
 
 Concretely:

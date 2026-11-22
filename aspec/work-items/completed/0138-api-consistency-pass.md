@@ -4,13 +4,13 @@ Title: API consistency pass: error codes, resource layout, session readiness, an
 Issue: issuelink
 
 ## Summary:
-An audit of the whole HTTP API covered the routes as built (through 0136 and 0149) and the pending proposals (0137–0145). Most of it holds together: sessions, commands, runs, labels, idempotency, cancellation and resumable SSE compose well. The structured-result and event-attribution findings are fixed in 0137. This item collects the remaining inconsistencies. Each one is small, but together they make clients match strings, make extra round trips, or read documentation that contradicts the server.
+An audit of the whole HTTP API covered the routes as built (through 0136 and 0149) and the pending proposals (0137–0145, as numbered at the time). Most of it holds together: sessions, commands, runs, labels, idempotency, cancellation and resumable SSE compose well. The structured-result and event-attribution findings are fixed in 0137. This item collects the remaining inconsistencies. Each one is small, but together they make clients match strings, make extra round trips, or read documentation that contradicts the server.
 
 1. **Errors have no machine-readable code.** Every HTTP error is `{"error": "<text>"}`. Clients have to match prose, and the prose varies for the same condition:
    - `/v1/commands/{id}/status` answers 404 with `"Command '<id>' not found"`, while `/v1/workflows/{id}` answers `"command not found"`;
    - the workflow route's four 404 meanings (`command not found`, `no workflow for this command`, `workflow not started`, `workflow never started`) are documented as exact strings to compare.
 
-   Proposals add their own spellings: 0140 `mode_disabled`, 0146 412 on `If-Match`, 0147 `credentials_lost`.
+   Proposals add their own spellings: 0140 `mode_disabled`, 0146 412 on `If-Match`, 0145 `credentials_lost`.
 2. **Per-command resources are split across two roots.** `/v1/workflows/{command_id}` is the only per-command resource outside `/v1/commands/{id}/`, where `status`, `logs`, `cancel`, and the proposed `outputs` (0137), `context-changes` (0146) and `terminals` (0141) sit. Meanwhile `GET /v1/commands/{id}` (the record itself) does not exist: the record is at `/status`, which 0140 notes the docs already get wrong. Sessions have both `/sessions/{id}` (the record) and `/sessions/{id}/status` (setup progress), so `/status` means different things on the two resources.
 3. **A session's record hides whether it can be used.** `GET /v1/sessions` and `GET /v1/sessions/{id}` return `status: active|closing|closed` but not `setup_status`, although the row stores it (`SessionResponse` in `routes.rs`). `?status=active` therefore includes sessions whose clone or merge failed. The only way to tell is one extra `GET /sessions/{id}/status` per session.
 4. **The docs contradict the server on admission.** The "API edge cases" table says an unknown flag in `args` is enqueued (202) and fails later at the worker. The "Malformed `args`" section, and the code, return 400 at admission. The "Submit a command" section says `exec`'s `args` "starts with the exec action", but every example puts the action in `subcommand` (`"exec prompt"`).
@@ -45,7 +45,7 @@ navigate the API by one rule and skip a round trip per session
   - Every error body becomes `{"error": "<message>", "code": "<snake_case>"}`. `error` keeps its current text (additive).
   - Add one `ApiError { status, code, message }` type in `src/frontend/api/` with constructors per condition, and have `error_json` callers use it. Codes are stable and documented in one table.
   - The asynchronous `result.failure.code` (0137) uses the same vocabulary where conditions overlap (`worktree_exists`, `merge_conflict`, …).
-  - 0146, 0147 and 0140 use this shape for their new errors. 0143's WSP errors use the same flat shape so one decoder serves both.
+  - 0146, 0145 and 0140 use this shape for their new errors. 0143's WSP errors use the same flat shape so one decoder serves both.
   - Initial codes:
     - `unauthorized`, `forbidden_workdir`, `invalid_request`, `unknown_subcommand`, `unknown_flag`;
     - `session_not_found`, `session_closing`, `session_not_ready`;

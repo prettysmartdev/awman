@@ -10,18 +10,28 @@ use super::*;
 
 impl WorkflowEngine {
     pub fn next_ready_steps(&self) -> Result<Vec<WorkflowStep>, EngineError> {
-        self.state
-            .next_ready(&self.dag)
+        // A dependency can make part of a later stage ready while another
+        // member of the current stage is being retried. Keep the scheduler
+        // on the earliest incomplete stage, as shown by the overview.
+        let current_stage = self.state.stages().into_iter().find(|stage| {
+            stage
+                .iter()
+                .any(|name| !self.state.completed_steps.contains(name))
+        });
+        let ready = self.state.next_ready(&self.dag);
+        ready
             .into_iter()
+            .filter(|name| {
+                current_stage
+                    .as_ref()
+                    .is_some_and(|stage| stage.contains(name))
+            })
             .map(|name| self.find_step(&name))
             .collect()
     }
 
     pub(super) fn next_ready_step(&self) -> Result<Option<WorkflowStep>, EngineError> {
-        match self.state.next_ready(&self.dag).into_iter().next() {
-            Some(name) => Ok(Some(self.find_step(&name)?)),
-            None => Ok(None),
-        }
+        Ok(self.next_ready_steps()?.into_iter().next())
     }
 
     pub(super) fn previous_step_name(&self) -> Option<String> {
@@ -181,12 +191,12 @@ impl WorkflowEngine {
             .clone()
             .unwrap_or_else(|| "Untitled Workflow".to_string());
         let total = self.workflow.steps.len();
-        let mut current_index = 0;
+        let mut current_index = None;
         let mut steps = Vec::with_capacity(total);
 
         for (i, step) in self.workflow.steps.iter().enumerate() {
             let state = if step.name == current_step_name {
-                current_index = i;
+                current_index = Some(i);
                 WorkflowStepState::InProgress
             } else {
                 match self.state.status_of(&step.name) {
@@ -198,11 +208,8 @@ impl WorkflowEngine {
             steps.push((step.name.clone(), state));
         }
 
-        let work_item_number = self.work_item_context.as_ref().map(|c| c.number);
-        let work_item_title = self
-            .work_item_context
-            .as_ref()
-            .and_then(|c| c.content.lines().next().map(|l| l.trim().to_string()));
+        let work_item_number = self.work_item_context.as_ref().and_then(|c| c.number);
+        let work_item_title = self.work_item_context.as_ref().map(|c| c.title.clone());
 
         Some(CtxStepInfo {
             workflow_title: title,

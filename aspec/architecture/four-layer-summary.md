@@ -67,24 +67,34 @@ type (Tenet 1, D1).
   are defined by capability shape, not isolation technology: OCI images,
   ephemeral lifecycle and host mounts make a container-tier runtime; a
   persistent per-session VM with its own lifecycle makes a sandbox-tier one.
-  Runtime selection is `agent_runtime::detect_effective(&EffectiveConfig)`
-  over `docker` / unset, `apple-containers`, `docker-sbx-experimental` and
-  `builtin-experimental`.
+  `runtime.kind` is global-only and accepts `docker` (default), `apple`,
+  `sbx` and `builtin`; `sbx` and `builtin` are experimental. Builtin is an
+  experimental preview on macOS Apple Silicon and Linux x86_64 GNU/KVM, with
+  Linux ARM64 still gated. Unsupported platforms fail without runtime
+  substitution. `agent_runtime::detect_effective(&EffectiveConfig)` selects
+  the configured runtime.
 - Builtin settings scope: one process-wide runtime (state dir, embedded
   runtime, ambient `MSB_*` override check); per-launch settings (network,
   vCPUs, memory) are resolved from each `Session`'s `EffectiveConfig` and
   carried in `ResolvedContainerOptions` for a runtime with
-  `Capabilities::per_launch_vm_settings`. A repo `builtin.stateDir` that differs
-  from the process's is rejected at launch. Detection resolves only the
+  `Capabilities::per_launch_vm_settings`. `runtime.builtin.stateDir` is
+  process-scoped with `runtime.kind`; other builtin launch settings are
+  session-scoped. A repo state directory that differs from the process's is
+  rejected at launch. Detection resolves only the
   process-wide part. A worktree session keeps the invoker's `builtin` block,
   default agent, env and global config (`Session::open_worktree_for`).
 - `AgentImagePreparer` (builtin image preparation) — resolves an image's
-  source once and, when `builtin.builder.enabled` and the source is a local
+  source once and, when `runtime.builtin.builder.enabled` and the source is a local
   Docker (Unix socket) or Apple store, may run a source-matched build before
   importing from that same source. It reaches host Docker/Apple builds only
   through `LocalImageBuilder` (build-time operations only; agent execution
   never leaves the builtin runtime). `BuildPolicy` decides which commands may
   build: `Ready`, `SessionSetup`, `ImportOnly`, `CheckOnly`.
+  The builder is opt-in and builds only through a local Docker Engine selected
+  by a Unix-socket `docker-local` source or Apple Containers selected by
+  `apple-local`, then imports from that same source. Registry, archive, remote
+  Docker and unconfigured sources cannot select a builder. `ImportOnly` and
+  `CheckOnly` never build; `awman init` does not use the builtin builder.
 - Agent-execution release contract: a runtime MUST drop the frontend (and the
   I/O sinks it handed out) no later than when `AgentExecution::wait()`
   resolves, when the `wait()` future is dropped, or when the execution is
@@ -263,8 +273,8 @@ snapshot silently ignores a relocated `AWMAN_CONFIG_HOME`.
 
 ```bash
 cargo build --release        # Single binary
-make test-fast              # Hermetic tests
-make test-full              # All tests (Docker needed)
+make test                   # Unit and component contracts
+make test-boundary          # Explicitly granted external services
 make architecture-lint      # No upward imports
 cargo clippy -- -D warnings # No warnings
 ```

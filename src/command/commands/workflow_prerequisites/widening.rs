@@ -131,5 +131,36 @@ pub fn check_task_widening(
             None => TokenFlag::Acquire,
         });
     }
-    check_flag_widening(FrontendKind::SquadDaemon, &flags, global)
+    check_flag_widening(FrontendKind::SQUAD_LOCAL, &flags, global)
+}
+
+/// The ceiling a remote request's `--prerequisite-*` flags are checked
+/// against: the server's policy without request flags, except that a git
+/// identity the operator's trusted global config denies stays denied even
+/// when the repository supplies a fixed one (the WI 0149 §5 repo exception
+/// is for the user's own runs, not for a client or work server).
+pub fn remote_ceiling(session: &crate::data::session::Session) -> PrerequisitePolicy {
+    let mut ceiling = super::policy_for(session, &PrerequisiteFlags::default(), None);
+    if session.trusted_prerequisite_policy().git_identity.use_ == CredentialUse::Deny {
+        ceiling.git_identity.use_ = CredentialUse::Deny;
+        ceiling.git_identity.fixed = None;
+    }
+    ceiling
+}
+
+/// For a remote caller with no identity flag, a ceiling that denies
+/// identities becomes an explicit `--prerequisite-identity deny`, so no
+/// repository identity reaches the run's containers or its leftover commit.
+/// The user's own CLI/TUI runs keep the repository identity.
+pub fn apply_identity_ceiling(
+    kind: FrontendKind,
+    flags: &mut PrerequisiteFlags,
+    ceiling: &PrerequisitePolicy,
+) {
+    if !kind.is_local_user()
+        && flags.identity.is_none()
+        && ceiling.git_identity.use_ == CredentialUse::Deny
+    {
+        flags.identity = Some(IdentityFlag::Deny);
+    }
 }

@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Serialize;
 
-pub(crate) use prepare::finish_cancelled_cleanup;
+pub(crate) use prepare::{finish_cancelled_cleanup, workflow_effective_config};
 
 use crate::command::commands::launch_policy::LaunchPolicy;
 use crate::command::commands::mount_scope::MountScope;
@@ -47,22 +47,23 @@ pub struct ExecWorkflowCommandFlags {
     /// invocations with `None` produce the existing missing-required-argument
     /// error.
     pub workflow: Option<PathBuf>,
+    /// Raw `--work-item` reference, as the user wrote it (WI 0147).
     pub work_item: Option<String>,
     pub non_interactive: bool,
     pub plan: bool,
     pub allow_docker: bool,
     pub worktree: bool,
     pub yolo: bool,
+    pub yolo_authorized: bool,
     pub auto: bool,
     pub agent: Option<String>,
     pub model: Option<String>,
-    pub launch_mode: Option<crate::data::config::repo::LaunchMode>,
+    pub launch_mode: Option<crate::data::config::agents::LaunchMode>,
     pub overlay: Vec<String>,
     /// `--agent-flag` values for the workflow's default agent; `None` lets
     /// config `agentFlags` apply.
     pub agent_flags: Option<Vec<String>>,
     pub max_concurrent: Option<usize>,
-    pub issue_source: crate::engine::issue::IssueSourceFlags,
     /// When true, a leader agent designs and runs a workflow for the work item.
     /// Implies `--yolo`, `--worktree`, and `context(workflow)`.
     pub dynamic: bool,
@@ -70,9 +71,9 @@ pub struct ExecWorkflowCommandFlags {
     /// `--dynamic`.
     pub leader: Option<String>,
     /// `--on-dirty-merge-target`; `None` lets config and the host default apply.
-    pub on_dirty_merge_target: Option<crate::data::config::repo::OnDirtyMergeTarget>,
+    pub on_dirty_merge_target: Option<crate::data::config::worktree::OnDirtyMergeTarget>,
     /// `--on-merge-failure`; `None` lets config and the host default apply.
-    pub on_merge_failure: Option<crate::data::config::repo::OnMergeFailure>,
+    pub on_merge_failure: Option<crate::data::config::worktree::OnMergeFailure>,
     /// `--on-existing-worktree`; `None` (absent or `ask`) lets the host ask or
     /// answer from its headless profile.
     pub on_existing_worktree:
@@ -144,6 +145,28 @@ pub trait ExecWorkflowCommandFrontend:
 
     fn report_workflow_context_path(&mut self, _host_path: &std::path::Path) {}
 
+    /// A launch's workspace is mounted read-only (WI 0152). Called by the
+    /// command once per run with `step: None` when the command-level
+    /// `--read-only-workspace` is set. Each read-only step launch is reported
+    /// through the `Info` message `Step '<name>': workspace mounted
+    /// read-only; …` (the step factory talks to the shared frontend, which
+    /// reaches this method too, with `step: Some(name)`). Presentation only.
+    fn report_workspace_access(
+        &mut self,
+        _access: crate::data::workspace::WorkspaceAccess,
+        _step: Option<&str>,
+    ) {
+    }
+
+    /// The resolved native start mode, mount access and transport of one
+    /// agent step (WI 0070), with `step: Some(name)`. Presentation only.
+    fn report_agent_policy(
+        &mut self,
+        _policy: crate::data::agent_policy::ResolvedAgentPolicy,
+        _step: Option<&str>,
+    ) {
+    }
+
     /// Persist teardown inputs before starting work on a durable API command.
     fn record_cancel_cleanup(
         &mut self,
@@ -189,7 +212,7 @@ pub trait ExecWorkflowCommandFrontend:
     /// workflow starts; the rest return immediately.
     fn notify_dynamic_workflow_resume_unavailable(
         &mut self,
-        work_item: u32,
+        work_item: &str,
         reason: &str,
     ) -> Result<(), CommandError>;
 }
@@ -217,6 +240,7 @@ pub struct WorkflowResumePrompt {
     /// The work item this run is bound to, when there is one.
     pub work_item: Option<u32>,
     /// The worktree the previous run left behind, when the run used one.
+    pub work_item_key: Option<String>,
     pub worktree_path: Option<PathBuf>,
     /// True when this is a `--dynamic` resume, meaning accepting it also skips
     /// a leader-design pass.
@@ -279,12 +303,23 @@ impl WorkflowResumePrompt {
             fresh_label,
             workflow_name,
             work_item,
+            work_item_key: None,
             worktree_path,
             dynamic,
             completed_steps,
             total_steps,
             start_points,
         }
+    }
+
+    pub fn with_work_item_key(mut self, key: Option<String>) -> Self {
+        if let Some(key) = &key {
+            if self.work_item.is_none() {
+                self.body.insert_str(0, &format!("Work item: {key}\n\n"));
+            }
+        }
+        self.work_item_key = key;
+        self
     }
 
     /// The unattended answer: pick up at the step the previous run stopped on,
@@ -331,6 +366,8 @@ pub enum WorkflowResumeDecision {
 /// before it, and the step after it. Empty when that run has nothing left to do
 /// — every step succeeded or was skipped.
 pub struct ExecWorkflowCommand {
+    profile_owner: bool,
+    settings_profile: Option<crate::data::settings_profile::SettingsProfileName>,
     flags: ExecWorkflowCommandFlags,
     engines: Engines,
     session: Session,
@@ -357,7 +394,7 @@ pub struct ExecWorkflowCommand {
     /// daemon's and has no viewer, and for tests built with
     /// [`ExecWorkflowCommand::new`].
     managed_session: Option<Arc<tokio::sync::RwLock<Session>>>,
-    /// Fired by an external cancel (the API's `POST /v1/commands/{id}/cancel`).
+    /// Fired by an external cancel (the API's `POST /v1/worker/commands/{id}/cancel`).
     /// Never fired for the CLI, the TUI or squad, which never install one.
     cancel: tokio_util::sync::CancellationToken,
     /// Which frontend runs this command: picks the headless profile the
@@ -366,11 +403,17 @@ pub struct ExecWorkflowCommand {
     /// container (WI 0137 §3). Set only under the API.
     output_dir: Option<PathBuf>,
     frontend_kind: crate::command::dispatch::catalogue::FrontendKind,
+    /// The command-level `--read-only-workspace` (WI 0152). Each step's own
+    /// `read_only_workspace` and a pulled lease's read-only engine can only
+    /// make a step stricter than this, never more permissive.
+    workspace_access: crate::data::workspace::WorkspaceAccess,
 }
 
 impl ExecWorkflowCommand {
     pub fn new(flags: ExecWorkflowCommandFlags, engines: Engines, session: Session) -> Self {
         Self {
+            profile_owner: true,
+            settings_profile: None,
             flags,
             engines,
             session,
@@ -381,7 +424,22 @@ impl ExecWorkflowCommand {
             cancel: tokio_util::sync::CancellationToken::new(),
             frontend_kind: crate::command::dispatch::catalogue::FrontendKind::Cli,
             output_dir: None,
+            workspace_access: Default::default(),
         }
+    }
+
+    /// Mount the workspace read-only for every agent step
+    /// (`--read-only-workspace`, WI 0152).
+    pub fn with_workspace_access(
+        mut self,
+        access: crate::data::workspace::WorkspaceAccess,
+    ) -> Self {
+        self.workspace_access = access;
+        self
+    }
+
+    pub fn workspace_access(&self) -> crate::data::workspace::WorkspaceAccess {
+        self.workspace_access
     }
 
     /// Mount `dir` at `/awman/output` into every agent container of the run
@@ -406,44 +464,37 @@ impl ExecWorkflowCommand {
     /// non-dynamic run requires (the catalogue marks it optional so
     /// `--dynamic` may omit it).
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
-        let prerequisites =
-            crate::command::commands::workflow_prerequisites::parse_prerequisite_flags(ctx, true)?;
+        use crate::command::commands::workflow_prerequisites as prerequisites_flow;
+        let mut prerequisites = prerequisites_flow::parse_prerequisite_flags(ctx, true)?;
         // An API client may only narrow what the server grants (WI 0149 §6).
-        crate::command::commands::workflow_prerequisites::check_flag_widening(
+        let ceiling = prerequisites_flow::remote_ceiling(&ctx.session);
+        prerequisites_flow::check_flag_widening(ctx.caller.frontend(), &prerequisites, &ceiling)?;
+        prerequisites_flow::apply_identity_ceiling(
             ctx.caller.frontend(),
-            &prerequisites,
-            &crate::command::commands::workflow_prerequisites::policy_for(
-                &ctx.session,
-                &Default::default(),
-                None,
-            ),
-        )?;
+            &mut prerequisites,
+            &ceiling,
+        );
         let flags = ExecWorkflowCommandFlags {
             prerequisites: Box::new(prerequisites),
             squad_task_prerequisites: None,
             workflow: ctx.args.get("workflow").map(PathBuf::from),
             work_item: ctx.flags.string("work-item"),
-            non_interactive: ctx.flags.bool("non-interactive"),
+            non_interactive: ctx.flags.bool("headless"),
             plan: ctx.flags.bool("plan"),
             allow_docker: ctx.flags.bool("allow-docker"),
             worktree: ctx.flags.bool("worktree"),
             yolo: ctx.flags.bool("yolo"),
+            yolo_authorized: ctx.flags.explicit("yolo"),
             auto: ctx.flags.bool("auto"),
             agent: ctx.flags.string("agent"),
             model: ctx.flags.string("model"),
-            launch_mode: crate::command::dispatch::parse_launch_mode(
-                ctx.flags.string("launch-mode"),
-                &ctx.path(),
-            )?,
+            launch_mode: None, // `--set agents.launchMode=…` (WI 0139)
             overlay: ctx.flags.strs("overlay").to_vec(),
             agent_flags: crate::command::dispatch::parse_agent_flags(
                 ctx.flags.strs("agent-flag"),
                 &ctx.path(),
             )?,
-            max_concurrent: ctx.flags.usize("max-concurrent"),
-            issue_source: crate::engine::issue::IssueSourceFlags {
-                issue: ctx.flags.string("issue"),
-            },
+            max_concurrent: None, // `--set workflows.maxConcurrentSteps=…` (WI 0139)
             dynamic: ctx.flags.bool("dynamic"),
             leader: ctx.flags.string("leader"),
             on_dirty_merge_target: crate::command::dispatch::parse_on_dirty_merge_target(
@@ -459,7 +510,15 @@ impl ExecWorkflowCommand {
                 &ctx.path(),
             )?,
         };
-        validate_dynamic_flags(&flags)?;
+        validate_dynamic_flags(&flags, ctx.session.inline_work_item().is_some())?;
+        let workspace_access = crate::data::workspace::WorkspaceAccess::from_read_only(
+            ctx.flags
+                .bool(crate::data::workspace::READ_ONLY_WORKSPACE_FLAG),
+        );
+        crate::command::commands::workspace_access::check_workflow_flags(
+            workspace_access,
+            flags.dynamic,
+        )?;
         if !flags.dynamic && flags.workflow.is_none() {
             return Err(CommandError::missing_required_argument(
                 &ctx.path(),
@@ -468,9 +527,12 @@ impl ExecWorkflowCommand {
         }
         Ok(Self::new(flags, ctx.engines.clone(), ctx.session.clone())
             .with_frontend_kind(ctx.caller.frontend())
+            .with_profile_owner(ctx.caller.profile_owner())
             .mirroring_into(Arc::clone(&ctx.managed_session))
             .with_cancellation(ctx.cancel.clone())
-            .with_output_dir(ctx.output_dir.clone()))
+            .with_output_dir(ctx.output_dir.clone())
+            .with_settings_profile(crate::command::commands::launch_policy::settings_profile::ProfileRequest::from_context(ctx)?.name)
+        .with_workspace_access(workspace_access))
     }
 
     /// Carry a squad container identity so every generated-workflow step
@@ -524,6 +586,17 @@ impl ExecWorkflowCommand {
         self
     }
 
+    pub fn with_profile_owner(mut self, owner: bool) -> Self {
+        self.profile_owner = owner;
+        self
+    }
+    pub fn with_settings_profile(
+        mut self,
+        name: Option<crate::data::settings_profile::SettingsProfileName>,
+    ) -> Self {
+        self.settings_profile = name;
+        self
+    }
     pub fn flags(&self) -> &ExecWorkflowCommandFlags {
         &self.flags
     }
@@ -538,24 +611,25 @@ impl ExecWorkflowCommand {
 mod dynamic;
 mod execute;
 mod factory;
-#[cfg(test)]
-pub(crate) use factory::AgentFrontendProxy;
-mod issue;
+
 mod merge_fix_prompt;
-mod phase_container;
+pub(crate) mod phase_container;
 mod prepare;
 mod prerequisites;
 mod shared_frontend;
 pub(crate) use shared_frontend::SharedWorkflowFrontend;
 
 #[cfg(test)]
-pub(crate) mod tests;
+mod contract_tests;
+#[cfg(test)]
+mod dockerfile_preflight_contracts;
+#[cfg(test)]
+mod session_contracts;
 
 // The child modules' items are `pub(super)`; re-exporting them here is what
 // lets each one say `use super::*;` and see the others, exactly as they all
 // saw each other when this was one file.
 pub(super) use factory::*;
-pub(super) use issue::*;
 pub(super) use prepare::*;
 pub(super) use prerequisites::*;
 

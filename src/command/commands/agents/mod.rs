@@ -21,13 +21,11 @@ pub mod attach;
 pub mod detail;
 pub mod kill;
 pub mod list;
+pub mod profile;
 pub mod resolve;
 pub mod snapshot;
 pub mod status;
 pub mod tips;
-
-#[cfg(test)]
-pub(crate) mod test_support;
 
 pub use attach::{AgentsAttachCommand, AgentsAttachOutcome};
 pub use detail::{AgentsDetailCommand, AgentsDetailFlags, AgentsDetailOutcome};
@@ -74,6 +72,9 @@ pub trait AgentsCommandFrontend: AgentLaunchFrontend + Send + Sync {
 
     /// One-shot results, for frontends that do not render outcomes
     /// themselves (the TUI). The CLI renders from the outcome on stdout.
+    /// Profile results have no default: every admitted frontend must present
+    /// the shared [`profile::ProfileResultProjection`].
+    fn show_profile_result(&mut self, outcome: &profile::ProfileOutcome);
     fn show_list(&mut self, _outcome: &AgentsListOutcome) {}
     fn show_detail(&mut self, _outcome: &AgentsDetailOutcome) {}
     fn show_kill_result(&mut self, _outcome: &AgentsKillOutcome) {}
@@ -96,6 +97,7 @@ pub trait AgentsCommandFrontend: AgentLaunchFrontend + Send + Sync {
 
 /// The `agents` subcommand dispatch built (one builder serves every leaf).
 pub enum AgentsCommand {
+    Profile(Box<profile::ProfileCommand>),
     Status(AgentsStatusCommand),
     List(AgentsListCommand),
     Detail(AgentsDetailCommand),
@@ -122,6 +124,7 @@ impl AgentsCommand {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum AgentsOutcome {
+    Profile(profile::ProfileOutcome),
     Status(AgentsStatusOutcome),
     List(AgentsListOutcome),
     Detail(AgentsDetailOutcome),
@@ -133,6 +136,9 @@ impl AgentsOutcome {
     /// The process/API exit code: `attach` reports the session's own.
     pub fn exit_code(&self) -> i32 {
         match self {
+            AgentsOutcome::Profile(profile::ProfileOutcome::Close {
+                failure: Some(_), ..
+            }) => 1,
             AgentsOutcome::Attach(outcome) => outcome.exit_code,
             _ => 0,
         }
@@ -149,6 +155,7 @@ impl Command for AgentsCommand {
         frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
         Ok(match self {
+            Self::Profile(c) => AgentsOutcome::Profile(c.run_with_frontend(frontend).await?),
             Self::Status(c) => AgentsOutcome::Status(c.run_with_frontend(frontend).await?),
             Self::List(c) => AgentsOutcome::List(c.run_with_frontend(frontend).await?),
             Self::Detail(c) => AgentsOutcome::Detail(c.run_with_frontend(frontend).await?),

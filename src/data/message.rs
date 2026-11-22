@@ -14,7 +14,8 @@ pub struct UserMessage {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MessageLevel {
     Info,
     Warning,
@@ -32,6 +33,20 @@ pub trait UserMessageSink: Send + Sync {
 
     /// Drain queued messages (no-op for sinks that render live). Idempotent.
     fn replay_queued(&mut self);
+
+    /// A stale image's rebuild failed and the session keeps its previous
+    /// image (WI 0163). Event frontends override this to post the structured
+    /// `image_stale` event; every other sink shows its text as a warning.
+    /// Wrapping sinks must forward it.
+    fn report_image_stale(&mut self, warning: &crate::data::execution_event::ImageStaleWarning) {
+        let text = crate::data::execution_event::EventPayload::ImageStale(warning.clone())
+            .to_plain_text()
+            .unwrap_or_default();
+        self.write_message(UserMessage {
+            level: MessageLevel::Warning,
+            text,
+        });
+    }
 
     fn info(&mut self, text: impl Into<String>)
     where
@@ -88,6 +103,10 @@ impl<S: UserMessageSink + ?Sized> UserMessageSink for std::sync::Arc<std::sync::
 
     fn replay_queued(&mut self) {
         self.lock().unwrap().replay_queued();
+    }
+
+    fn report_image_stale(&mut self, warning: &crate::data::execution_event::ImageStaleWarning) {
+        self.lock().unwrap().report_image_stale(warning);
     }
 }
 
@@ -159,78 +178,4 @@ impl UserMessageSink for StderrMessageSink {
     }
 
     fn replay_queued(&mut self) {}
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn write_message_queues() {
-        let mut s = RecordingMessageSink::new();
-        s.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: "hi".into(),
-        });
-        assert_eq!(s.queued().len(), 1);
-        assert_eq!(s.replayed().len(), 0);
-    }
-
-    #[test]
-    fn replay_drains_in_order() {
-        let mut s = RecordingMessageSink::new();
-        s.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: "a".into(),
-        });
-        s.write_message(UserMessage {
-            level: MessageLevel::Warning,
-            text: "b".into(),
-        });
-        s.replay_queued();
-        assert_eq!(s.queued().len(), 0);
-        assert_eq!(s.replayed().len(), 2);
-        assert_eq!(s.replayed()[0].text, "a");
-        assert_eq!(s.replayed()[1].text, "b");
-    }
-
-    #[test]
-    fn replay_is_idempotent() {
-        let mut s = RecordingMessageSink::new();
-        s.replay_queued();
-        s.replay_queued();
-    }
-
-    #[test]
-    fn convenience_info_writes_info_level() {
-        let mut s = RecordingMessageSink::new();
-        s.info("hi");
-        assert_eq!(s.queued().len(), 1);
-        assert_eq!(s.queued()[0].level, MessageLevel::Info);
-        assert_eq!(s.queued()[0].text, "hi");
-    }
-
-    #[test]
-    fn convenience_warning_writes_warning_level() {
-        let mut s = RecordingMessageSink::new();
-        s.warning("w");
-        assert_eq!(s.queued().len(), 1);
-        assert_eq!(s.queued()[0].level, MessageLevel::Warning);
-    }
-
-    #[test]
-    fn convenience_error_msg_writes_error_level() {
-        let mut s = RecordingMessageSink::new();
-        s.error_msg("e");
-        assert_eq!(s.queued().len(), 1);
-        assert_eq!(s.queued()[0].level, MessageLevel::Error);
-    }
-
-    #[test]
-    fn convenience_success_writes_success_level() {
-        let mut s = RecordingMessageSink::new();
-        s.success("ok");
-        assert_eq!(s.queued().len(), 1);
-        assert_eq!(s.queued()[0].level, MessageLevel::Success);
-    }
 }

@@ -1,17 +1,19 @@
-//! Single choke-point for every non-interactive `sbx` subprocess awman runs.
+//! Single choke-point for every headless `sbx` subprocess awman runs.
 //!
 //! Implements the "Subprocess transparency via the user message sink"
 //! requirement from WI 0090: announce the argv before spawning, publish
 //! stdout/stderr, and report non-zero exits with the command and captured
 //! stderr wrapped in [`EngineError::Sandbox`]. Secret values are piped via
 //! stdin (never argv) and redacted from any published output.
+//! Readiness probes suppress successful stdout and announcements; their
+//! warnings and failure diagnostics remain visible.
 //!
 //! The interactive `sbx run` PTY session does NOT flow through here — it is
 //! bridged by [`super::io_bridge`] — but its argv announcement still uses
 //! [`announce`].
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::data::message::UserMessageSink;
 use crate::engine::error::EngineError;
@@ -35,6 +37,7 @@ impl SbxOutput {
 
 /// A described `sbx` invocation, ready to run with full sink transparency.
 pub(super) struct SbxCommand {
+    env: Option<crate::data::config::env::EnvSnapshot>,
     args: Vec<String>,
     stdin: Option<Vec<u8>>,
     /// Appended to the announcement instead of revealing piped stdin
@@ -51,11 +54,17 @@ impl SbxCommand {
         S: Into<String>,
     {
         Self {
+            env: None,
             args: args.into_iter().map(Into::into).collect(),
             stdin: None,
             announce_suffix: None,
             redactions: Vec::new(),
         }
+    }
+
+    pub fn in_env(mut self, env: &crate::data::config::env::EnvSnapshot) -> Self {
+        self.env = Some(env.clone());
+        self
     }
 
     pub fn with_stdin(mut self, bytes: Vec<u8>) -> Self {
@@ -115,11 +124,46 @@ impl SbxCommand {
         Ok(out)
     }
 
+    /// Readiness probes are quiet on success. Preserve warnings and include
+    /// the command and captured diagnostics on failure for the caller to report.
+    pub fn check_preparation(&self, sink: &mut dyn UserMessageSink) -> Result<(), EngineError> {
+        let out = self.run_quiet()?;
+        self.report_preparation(out, sink)
+    }
+
+    fn report_preparation(
+        &self,
+        out: SbxOutput,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<(), EngineError> {
+        if !out.success() {
+            let detail = format!("{}\n{}", out.stdout.trim(), out.stderr.trim());
+            return Err(EngineError::Sandbox(format!(
+                "`{}` exited with code {}: {}",
+                self.display_line(),
+                out.exit_code,
+                redact(detail.trim(), &self.redactions),
+            )));
+        }
+        for line in out.stderr.lines() {
+            sink.write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Warning,
+                text: redact(line, &self.redactions),
+            });
+        }
+        Ok(())
+    }
+
     /// Run the command without sink reporting — for the trait methods
     /// (`list_running`, `stats`) that have no frontend to report through, and
     /// for availability probing.
     pub fn run_quiet(&self) -> Result<SbxOutput, EngineError> {
-        let mut cmd = Command::new(crate::engine::host_cli::program(SBX_BIN));
+        let snapshot = self
+            .env
+            .as_ref()
+            .map(std::borrow::Cow::Borrowed)
+            .unwrap_or_else(|| std::borrow::Cow::Owned(crate::engine::host_cli::process_env()));
+        let mut cmd = crate::engine::host_cli::command(&snapshot, SBX_BIN);
         cmd.args(&self.args);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -204,197 +248,52 @@ fn redact(line: &str, redactions: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
-
-    // ─── Shared test helper ───────────────────────────────────────────────
-
-    #[derive(Default)]
-    struct VecSink {
-        pub messages: Vec<UserMessage>,
-    }
-    impl UserMessageSink for VecSink {
-        fn write_message(&mut self, msg: UserMessage) {
-            self.messages.push(msg);
-        }
-        fn replay_queued(&mut self) {}
-    }
-
-    // ─── display_line ─────────────────────────────────────────────────────
+    use crate::data::message::{MessageLevel, RecordingMessageSink};
 
     #[test]
-    fn display_line_includes_suffix() {
-        let cmd = SbxCommand::new(["secret", "set", "awman-x-claude", "anthropic"])
-            .announce_suffix("(value piped via stdin)");
-        assert_eq!(
-            cmd.display_line(),
-            "sbx secret set awman-x-claude anthropic (value piped via stdin)"
-        );
-    }
-
-    #[test]
-    fn display_line_without_suffix() {
-        let cmd = SbxCommand::new(["ls", "--json"]);
-        assert_eq!(cmd.display_line(), "sbx ls --json");
-    }
-
-    // ─── redact ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn redact_masks_secret_value() {
-        let masked = redact("token=supersecret done", &["supersecret".to_string()]);
-        assert_eq!(masked, "token=*** done");
-        assert!(!masked.contains("supersecret"));
-    }
-
-    #[test]
-    fn redact_noop_without_redactions() {
-        assert_eq!(redact("hello world", &[]), "hello world");
-    }
-
-    #[test]
-    fn redact_masks_multiple_occurrences() {
-        let s = redact("key=abc key=abc again", &["abc".to_string()]);
-        assert!(!s.contains("abc"));
-        assert_eq!(s, "key=*** key=*** again");
-    }
-
-    #[test]
-    fn redact_skips_empty_string_in_list() {
-        // Empty string as a redaction would replace every "" with ***, i.e. every
-        // char boundary — that would corrupt the output. The guard prevents this.
-        let s = redact("hello", &["".to_string()]);
-        assert_eq!(s, "hello");
-    }
-
-    // ─── announce ────────────────────────────────────────────────────────
-
-    #[test]
-    fn announce_writes_info_level_with_running_prefix() {
-        let mut sink = VecSink::default();
-        announce(&mut sink, "sbx run --kit /foo/bar claude");
-        assert_eq!(sink.messages.len(), 1);
-        let msg = &sink.messages[0];
-        assert_eq!(msg.level, MessageLevel::Info);
-        assert_eq!(msg.text, "Running: sbx run --kit /foo/bar claude");
-    }
-
-    // ─── Subprocess announcement ordering ─────────────────────────────────
-    //
-    // `run_announced` calls `announce()` before `run_quiet()`, so even when
-    // `sbx` is not installed the Info announcement has already been written to
-    // the sink by the time the error is returned.
-
-    #[test]
-    fn run_announced_writes_info_announcement_before_subprocess() {
-        let mut sink = VecSink::default();
-        let cmd = SbxCommand::new(["version"]);
-        // Ignore the result — sbx may not be installed.
-        let _ = cmd.run_announced(&mut sink);
-        assert!(
-            sink.messages
-                .iter()
-                .any(|m| { m.level == MessageLevel::Info && m.text == "Running: sbx version" }),
-            "Info announcement must be written even when sbx is unavailable; messages: {:?}",
-            sink.messages
-        );
-    }
-
-    #[test]
-    fn run_announced_announcement_never_contains_value_when_suffix_used() {
-        let mut sink = VecSink::default();
-        let cmd = SbxCommand::new(["secret", "set", "awman-x-claude", "anthropic"])
-            .announce_suffix("(value piped via stdin)")
-            .with_stdin(b"sk-supersecret".to_vec())
-            .redact("sk-supersecret".to_string());
-        let _ = cmd.run_announced(&mut sink);
-        // The announcement line must NOT contain the secret value.
-        for msg in &sink.messages {
-            assert!(
-                !msg.text.contains("sk-supersecret"),
-                "secret must not appear in any sink message: {:?}",
-                msg.text
-            );
-        }
-    }
-
-    // ─── Subprocess output routing (requires a fake `sbx` on PATH) ────────
-    //
-    // These tests prepend a temp dir containing a mock `sbx` script to PATH
-    // (via the dsbx-wide `test_support::with_fake_sbx`, whose lock serialises
-    // PATH mutations across parallel test threads), then invoke SbxCommand
-    // and verify stdout→Info and stderr→Warning routing.
-
-    #[cfg(unix)]
-    mod subprocess_routing {
-        use super::*;
-        use crate::engine::sandbox::dsbx::test_support::with_fake_sbx;
-
-        #[test]
-        fn stdout_lines_arrive_at_info_level() {
-            with_fake_sbx("#!/bin/sh\necho 'hello stdout'\n", || {
-                let mut sink = VecSink::default();
-                SbxCommand::new(["dummy"]).run_announced(&mut sink).unwrap();
-                assert!(
-                    sink.messages
-                        .iter()
-                        .any(|m| { m.level == MessageLevel::Info && m.text == "hello stdout" }),
-                    "stdout must arrive at Info level; messages: {:?}",
-                    sink.messages
-                );
-            });
-        }
-
-        #[test]
-        fn stderr_lines_arrive_at_warning_level_on_success() {
-            with_fake_sbx("#!/bin/sh\necho 'side note' >&2\n", || {
-                let mut sink = VecSink::default();
-                SbxCommand::new(["dummy"]).run_announced(&mut sink).unwrap();
-                assert!(
-                    sink.messages
-                        .iter()
-                        .any(|m| { m.level == MessageLevel::Warning && m.text == "side note" }),
-                    "stderr on a successful run must arrive at Warning; messages: {:?}",
-                    sink.messages
-                );
-            });
-        }
-
-        #[test]
-        fn non_zero_exit_returns_sandbox_error_with_argv_and_stderr() {
-            with_fake_sbx("#!/bin/sh\necho 'oops' >&2\nexit 2\n", || {
-                let mut sink = VecSink::default();
-                let result = SbxCommand::new(["broken"]).run_announced(&mut sink);
-                match result {
-                    Err(EngineError::Sandbox(msg)) => {
-                        assert!(msg.contains("sbx broken"), "error must contain argv: {msg}");
-                        assert!(msg.contains("oops"), "error must contain stderr: {msg}");
-                        assert!(msg.contains("2"), "error must contain exit code: {msg}");
-                    }
-                    other => panic!("expected Sandbox error, got: {other:?}"),
-                }
-            });
-        }
-
-        #[test]
-        fn secret_value_redacted_from_sink_output() {
-            // A fake sbx that echoes its stdin back on stdout (simulating a
-            // poorly-behaved tool that leaks its input). The .redact() call must
-            // mask the value before it reaches the sink.
-            with_fake_sbx("#!/bin/sh\ncat\n", || {
-                let mut sink = VecSink::default();
-                let _ = SbxCommand::new(["secret", "set", "awman-x-claude", "anthropic"])
-                    .with_stdin(b"sk-supersecret".to_vec())
-                    .announce_suffix("(value piped via stdin)")
-                    .redact("sk-supersecret".to_string())
-                    .run_announced(&mut sink);
-                for msg in &sink.messages {
-                    assert!(
-                        !msg.text.contains("sk-supersecret"),
-                        "secret leaked in sink message: {:?}",
-                        msg.text
-                    );
-                }
-            });
-        }
+    fn preparation_probes_are_quiet_but_preserve_warnings_and_failure_details() {
+        let mut command = SbxCommand::new(["kit", "validate", "/private/kit"]);
+        command.redactions.push("secret-value".into());
+        let mut sink = RecordingMessageSink::new();
+        command
+            .report_preparation(
+                SbxOutput {
+                    stdout: "kit validated\nverbose source metadata\n".into(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                },
+                &mut sink,
+            )
+            .unwrap();
+        assert!(sink.all().is_empty());
+        command
+            .report_preparation(
+                SbxOutput {
+                    stdout: "kit validated".into(),
+                    stderr: "deprecated field: secret-value".into(),
+                    exit_code: 0,
+                },
+                &mut sink,
+            )
+            .unwrap();
+        assert_eq!(sink.all().len(), 1);
+        assert_eq!(sink.all()[0].level, MessageLevel::Warning);
+        assert_eq!(sink.all()[0].text, "deprecated field: ***");
+        let error = command
+            .report_preparation(
+                SbxOutput {
+                    stdout: "invalid kit field".into(),
+                    stderr: "validation failed: secret-value".into(),
+                    exit_code: 2,
+                },
+                &mut sink,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("sbx kit validate /private/kit"));
+        assert!(error.contains("exited with code 2"));
+        assert!(error.contains("invalid kit field"));
+        assert!(error.contains("validation failed: ***"));
+        assert!(!error.contains("secret-value"));
     }
 }

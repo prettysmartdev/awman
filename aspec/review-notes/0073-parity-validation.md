@@ -30,7 +30,7 @@ No row is **REGRESSION** at the time of writing.
 | 5 | `amux implement 0001` end-to-end with all flags | PASS-by-construction | Catalogue completeness covers every flag; colocated unit tests in `src/command/commands/implement.rs`. Yolo+workflow⇒worktree implication asserted in catalogue tests. |
 | 6 | `amux chat` interactive + non-interactive | PASS-by-construction | `src/command/commands/chat.rs` colocated tests. PTY round-trip deferred. |
 | 7 | `amux specs new --interview` | PASS-by-construction | `tests/cli_parity/catalogue_completeness.rs::specs_new_flags_interview_and_non_interactive`; flow tested in colocated unit tests. |
-| 8 | `amux specs amend 0042` | PASS-by-construction | `tests/cli_parity/catalogue_completeness.rs::specs_amend_has_work_item_argument`; colocated unit tests. |
+| 8 | Spec amendment command (since replaced by `edit spec --amend`) | PASS-by-construction | `tests/cli_parity/catalogue_completeness.rs::(historical test name)`; colocated unit tests. |
 | 9 | `amux new spec` is alias for `amux specs new` | PASS | Path-alias resolved in `CommandCatalogue::canonical_path`; `--help` output confirms the alias note. Subprocess test pending. |
 | 10 | `amux new workflow` formats | PASS-by-construction | `--format toml/yaml/md` enum covered in catalogue; format-detection tested in `src/data/workflow_definition.rs` and `tests/engine/workflow_end_to_end.rs`. |
 | 11 | `amux new skill` | PASS-by-construction | Catalogue + colocated unit tests; subprocess test deferred. |

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="1" skipped="0" failures="0" errors="0" uuid="cac26c64-4564-4274-bd9c-cec9d8dfa6b6" timestamp="2026-11-11T21:57:31.250+00:00" time="2.808">
+    <testsuite name="awman-cli::component" tests="1" skipped="0" errors="0" failures="0">
+        <testcase name="command::differential::command_traces_match_between_builtin_and_daemon" classname="awman-cli::component" timestamp="2026-11-11T21:57:31.253+00:00" time="2.804"/>
+    </testsuite>
+</testsuites>

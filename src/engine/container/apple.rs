@@ -10,7 +10,7 @@ use crate::engine::agent_runtime::{Capabilities, ImageImportRequest, ImportedIma
 use crate::engine::container::runtime::{ContainerImageInfo, CONTAINER_CAPABILITIES};
 use crate::engine::container::{background, host_cli_backend};
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use crate::data::session::{AgentHandle, Session};
 use crate::engine::agent_runtime::execution::{AgentInstance, AgentStats};
@@ -110,7 +110,7 @@ fn extract_apple_started_at(row: &serde_json::Value) -> chrono::DateTime<chrono:
         .and_then(|v| v.as_str())
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.with_timezone(&chrono::Utc))
-        .unwrap_or_else(chrono::Utc::now)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
 }
 
 /// Check whether the row represents a running container.
@@ -119,9 +119,28 @@ fn extract_apple_started_at(row: &serde_json::Value) -> chrono::DateTime<chrono:
 /// If absent (Docker-style output from `ps`), assume running.
 fn is_apple_running(row: &serde_json::Value) -> bool {
     match row.get("status").and_then(|v| v.as_str()) {
-        Some(s) => s == "running",
+        // Paused, stopping and unknown states cannot prove shutdown. Keep
+        // them visible to lifecycle reconciliation until terminal is known.
+        Some(s) => !matches!(s, "stopped" | "exited" | "dead"),
         None => true,
     }
+}
+
+fn validate_apple_listing(stdout: &str) -> Result<(), EngineError> {
+    if let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(stdout) {
+        if rows.iter().all(serde_json::Value::is_object) {
+            return Ok(());
+        }
+    } else if !stdout.trim().is_empty()
+        && stdout.lines().all(|line| {
+            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|row| row.is_object())
+        })
+    {
+        return Ok(());
+    }
+    Err(EngineError::Container(
+        "container list returned invalid state; shutdown is unconfirmed".into(),
+    ))
 }
 
 /// Check whether the row's name matches awman container patterns.
@@ -135,6 +154,14 @@ fn is_awman_container(name: &str) -> bool {
 /// has no server-side name filter, so name-prefix discovery is done here,
 /// client-side.
 fn parse_apple_list_output(stdout: &str, name_prefix: Option<&str>) -> Vec<AgentHandle> {
+    parse_apple_list_state(stdout, name_prefix, false)
+}
+
+fn parse_apple_list_state(
+    stdout: &str,
+    name_prefix: Option<&str>,
+    stopped: bool,
+) -> Vec<AgentHandle> {
     let arr: Result<Vec<serde_json::Value>, _> = serde_json::from_str(stdout);
     let rows: Vec<serde_json::Value> = match arr {
         Ok(v) => v,
@@ -145,7 +172,15 @@ fn parse_apple_list_output(stdout: &str, name_prefix: Option<&str>) -> Vec<Agent
     };
     let mut handles = Vec::new();
     for row in rows {
-        if !is_apple_running(&row) {
+        let terminal = matches!(
+            row.get("status").and_then(|v| v.as_str()),
+            Some("stopped" | "exited" | "dead")
+        );
+        if if stopped {
+            !terminal
+        } else {
+            !is_apple_running(&row)
+        } {
             continue;
         }
         let name = extract_apple_name(&row);
@@ -174,13 +209,53 @@ fn parse_apple_list_output(stdout: &str, name_prefix: Option<&str>) -> Vec<Agent
 }
 
 #[derive(Debug, Default)]
-pub(super) struct AppleBackend;
+pub(super) struct AppleBackend {
+    env: Option<crate::data::config::env::EnvSnapshot>,
+}
+
+impl AppleBackend {
+    pub(super) fn new(env: crate::data::config::env::EnvSnapshot) -> Self {
+        Self { env: Some(env) }
+    }
+    fn cli(&self) -> ContainerCli {
+        let cli = ContainerCli::APPLE;
+        match &self.env {
+            Some(env) => cli.in_env(env.clone()),
+            None => cli,
+        }
+    }
+}
 
 impl ContainerBackend for AppleBackend {
+    fn inspect_image(
+        &self,
+        tag: &str,
+    ) -> Result<Option<super::runtime::ImageMetadata>, EngineError> {
+        super::image_metadata::inspect(self.cli(), tag)
+    }
+    fn list_images_by_repo(
+        &self,
+        repo: &crate::data::image_inputs::RepoKey,
+    ) -> Result<Vec<super::runtime::ImageMetadata>, EngineError> {
+        super::image_metadata::list_by_repo(self.cli(), repo)
+    }
+
     fn build(
         &self,
-        options: ResolvedContainerOptions,
+        mut options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        options.validate_read_only_workspace()?;
+        // Apple's --tmpfs accepts a destination, rather than Docker's
+        // destination:options syntax. See apple/container docs/volumes.md.
+        options.tmpfs_bare_paths = true;
+        if options.host_env.is_none() {
+            options.host_env = self.env.clone();
+        }
+        let cli = options
+            .host_env
+            .as_ref()
+            .map(|env| self.cli().in_env(env.clone()))
+            .unwrap_or_else(|| self.cli());
         let image = options.image.clone().ok_or_else(|| {
             EngineError::ConflictingOptions("missing required Image option".into())
         })?;
@@ -197,7 +272,7 @@ impl ContainerBackend for AppleBackend {
         // Apple's CLI has no `attach` verb, so the launching process must
         // serve the container's PTY itself; `serve_attach_socket` is that hook.
         Ok(Box::new(ContainerInstance::new(
-            ContainerCli::APPLE,
+            cli,
             image,
             name,
             options,
@@ -208,7 +283,8 @@ impl ContainerBackend for AppleBackend {
 
     fn list_running(&self, _session: &Session) -> Result<Vec<AgentHandle>, EngineError> {
         let output = crate::engine::host_cli::checked_output(
-            Command::new(crate::engine::host_cli::program("container"))
+            self.cli()
+                .command()
                 .args(["list", "--format", "json"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null()),
@@ -220,20 +296,26 @@ impl ContainerBackend for AppleBackend {
 
     fn list_running_all(&self) -> Result<Vec<AgentHandle>, EngineError> {
         let output = crate::engine::host_cli::checked_output(
-            Command::new(crate::engine::host_cli::program("container"))
-                .args(["list", "--format", "json"])
+            self.cli()
+                .command()
+                .args(["list", "--all", "--format", "json"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null()),
             "container",
         )?;
         let stdout = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success() {
+            return Err(EngineError::Container("container list --all failed".into()));
+        }
+        validate_apple_listing(&stdout)?;
         Ok(parse_apple_list_output(&stdout, None))
     }
 
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
         let take_sample = |name: &str| -> Result<(u64, u64), EngineError> {
             let out = crate::engine::host_cli::checked_output(
-                Command::new(crate::engine::host_cli::program("container"))
+                self.cli()
+                    .command()
                     .args(["stats", "--no-stream", "--format", "json", name])
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null()),
@@ -311,12 +393,12 @@ impl ContainerBackend for AppleBackend {
             &current,
             self.stats(&current),
         );
-        detail.owner = launcher_owner(&handle.name);
+        detail.owner = launcher_owner(&self.cli().snapshot(), &handle.name);
         Ok(detail)
     }
 
     fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
-        let owner = launcher_owner(&handle.name).ok_or_else(|| EngineError::Container(format!(
+        let owner = launcher_owner(&self.cli().snapshot(), &handle.name).ok_or_else(|| EngineError::Container(format!(
             "cannot attach to {}: launcher identity is unavailable; restart the agent with this version of awman", handle.name
         )))?;
         if !owner.alive {
@@ -332,7 +414,7 @@ impl ContainerBackend for AppleBackend {
         // Docker keeps its native `docker attach`; the semantics are the same
         // either way — the real agent TTY, never a sibling shell.
         let path = crate::engine::container::attach_socket::attach_socket_path(
-            &crate::data::config::env::Env::from_process(),
+            &self.cli().snapshot(),
             &handle.name,
         )
         .ok_or_else(|| {
@@ -352,7 +434,8 @@ impl ContainerBackend for AppleBackend {
         // Apple has no server-side name filter; list everything and filter by
         // the prefix client-side.
         let output = crate::engine::host_cli::checked_output(
-            Command::new(crate::engine::host_cli::program("container"))
+            self.cli()
+                .command()
                 .args(["list", "--format", "json"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null()),
@@ -379,20 +462,57 @@ impl ContainerBackend for AppleBackend {
     }
 
     fn is_available(&self) -> Result<(), EngineError> {
-        host_cli_backend::cli_is_available(ContainerCli::APPLE, &["system", "status"])
+        host_cli_backend::cli_is_available(self.cli(), &["system", "status"])
     }
 
+    fn resource_label(
+        &self,
+        handle: &AgentHandle,
+        key: &str,
+    ) -> Result<Option<String>, EngineError> {
+        let cli = self.cli();
+        let out = crate::engine::host_cli::checked_output(
+            cli.command().args(["inspect", &handle.id]),
+            cli.bin,
+        )?;
+        if !out.status.success() {
+            return Err(EngineError::Container(
+                "resource identity inspection failed".into(),
+            ));
+        }
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .map_err(|e| EngineError::Container(e.to_string()))?;
+        let row = value.as_array().and_then(|v| v.first()).unwrap_or(&value);
+        let labels = row
+            .pointer("/configuration/labels")
+            .or_else(|| row.get("labels"))
+            .ok_or_else(|| EngineError::Container("resource labels unavailable".into()))?;
+        Ok(labels.get(key).and_then(|v| v.as_str()).map(str::to_owned))
+    }
     fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
-        host_cli_backend::cli_stop_checked(ContainerCli::APPLE, &handle.id)
+        host_cli_backend::cli_stop_checked(self.cli(), &handle.id)
     }
 
     fn remove_agent(&self, id: &str) -> Result<(), EngineError> {
-        host_cli_backend::cli_remove(ContainerCli::APPLE, "rm", id)
+        host_cli_backend::cli_remove(self.cli(), "rm", id)
     }
 
     fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
-        // Apple's CLI cannot enumerate stopped containers by awman ownership.
-        Ok(Vec::new())
+        let output = crate::engine::host_cli::checked_output(
+            self.cli()
+                .command()
+                .args(["list", "--all", "--format", "json"]),
+            "container",
+        )?;
+        if !output.status.success() {
+            return Err(EngineError::Container("container list --all failed".into()));
+        }
+        validate_apple_listing(&String::from_utf8_lossy(&output.stdout))?;
+        Ok(parse_apple_list_state(
+            &String::from_utf8_lossy(&output.stdout),
+            None,
+            true,
+        ))
     }
 
     fn list_dangling_images(&self) -> Result<Vec<ContainerImageInfo>, EngineError> {
@@ -401,18 +521,18 @@ impl ContainerBackend for AppleBackend {
     }
 
     fn image_exists(&self, tag: &str) -> Result<bool, EngineError> {
-        host_cli_backend::cli_image_exists(ContainerCli::APPLE, tag)
+        host_cli_backend::cli_image_exists(self.cli(), tag)
     }
 
     fn run_probe(
         &self,
         request: &crate::engine::container::backend::ProbeRequest<'_>,
     ) -> Result<String, EngineError> {
-        host_cli_backend::cli_run_probe(ContainerCli::APPLE, request)
+        host_cli_backend::cli_run_probe(self.cli(), request)
     }
 
     fn image_id(&self, tag: &str) -> Result<Option<String>, EngineError> {
-        host_cli_backend::cli_image_id(ContainerCli::APPLE, tag)
+        Ok(self.inspect_image(tag)?.map(|image| image.id))
     }
 
     fn build_image(
@@ -421,19 +541,8 @@ impl ContainerBackend for AppleBackend {
         on_line: &mut dyn FnMut(&str),
     ) -> Result<(), EngineError> {
         request.require_runtime_build()?;
-        let tag = request.reference.as_str();
-        let dockerfile = request.dockerfile.as_path();
-        let context = request.context.as_path();
-        let no_cache = request.no_cache;
 
-        host_cli_backend::cli_build_image(
-            ContainerCli::APPLE,
-            tag,
-            dockerfile,
-            context,
-            no_cache,
-            on_line,
-        )
+        host_cli_backend::cli_build_image(self.cli(), request, on_line)
     }
 
     fn import_image(
@@ -448,7 +557,7 @@ impl ContainerBackend for AppleBackend {
     }
 
     fn remove_image(&self, id: &str) -> Result<(), EngineError> {
-        host_cli_backend::cli_remove(ContainerCli::APPLE, "rmi", id)
+        super::image_metadata::remove_apple(self.cli(), id)
     }
 
     /// Docker and Apple Containers have no builtin launch settings; the
@@ -457,15 +566,7 @@ impl ContainerBackend for AppleBackend {
         &self,
         request: &background::BackgroundLaunchRequest<'_>,
     ) -> Result<String, EngineError> {
-        background::default_start_background(
-            ContainerCli::APPLE,
-            request.name,
-            request.image,
-            request.workdir,
-            request.env,
-            request.overlays,
-            request.secret_env,
-        )
+        background::default_start_background(self.cli(), request)
     }
 
     fn exec_in_background(
@@ -475,7 +576,7 @@ impl ContainerBackend for AppleBackend {
         working_dir: &str,
         env: Option<&HashMap<String, String>>,
     ) -> Result<ExecOutput, EngineError> {
-        background::default_exec_in_background(ContainerCli::APPLE, id, command, working_dir, env)
+        background::default_exec_in_background(self.cli(), id, command, working_dir, env)
     }
 
     fn exec_in_background_streaming(
@@ -483,39 +584,28 @@ impl ContainerBackend for AppleBackend {
         request: &crate::engine::container::background::BackgroundExecRequest<'_>,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<ExecOutput, EngineError> {
-        let id = request.id;
-        let command = request.command;
-        let working_dir = request.working_dir;
-        let env = request.env;
-
-        background::default_exec_in_background_streaming(
-            ContainerCli::APPLE,
-            id,
-            command,
-            working_dir,
-            env,
-            on_line,
-        )
+        background::default_exec_in_background_streaming(self.cli(), request, on_line)
     }
 
     fn stop_and_remove(&self, id: &str) -> Result<(), EngineError> {
-        background::default_stop_and_remove(ContainerCli::APPLE, id);
+        background::default_stop_and_remove(self.cli(), id);
         Ok(())
     }
 
     fn image_home_dir(&self, tag: &str) -> Result<Option<String>, EngineError> {
-        Ok(apple_image_home_dir(tag))
+        Ok(apple_image_home_dir(self.cli(), tag))
     }
 }
 
 /// Read `HOME` from `tag`'s image config via `container image inspect`. `None`
 /// when the image is missing, the CLI is unreachable, or no `HOME` is declared.
-fn apple_image_home_dir(tag: &str) -> Option<String> {
+fn apple_image_home_dir(cli: ContainerCli, tag: &str) -> Option<String> {
     // `container image inspect` emits a JSON array of variants; the env
     // list lives at `[0].variants[*].config.config.Env`. We pick the
     // first variant whose env contains a non-empty `HOME=…` entry, which
     // matches the runtime selection for single-platform images.
-    let output = Command::new(crate::engine::host_cli::program("container"))
+    let output = cli
+        .command()
         .args(["image", "inspect", tag])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -592,6 +682,8 @@ fn resize_pty_forcing_winch(master: &dyn portable_pty::MasterPty, cols: u16, row
 /// container still runs; it simply cannot be attached to.
 fn serve_attach_socket(ctx: AttachHookCtx<'_>) -> Option<AttachSocketGuard> {
     let AttachHookCtx {
+        env,
+        terminal,
         container_name,
         output_broadcast,
         stdin_injector,
@@ -609,24 +701,23 @@ fn serve_attach_socket(ctx: AttachHookCtx<'_>) -> Option<AttachSocketGuard> {
             }
         });
 
-    let path = match crate::engine::container::attach_socket::attach_socket_path(
-        &crate::data::config::env::Env::from_process(),
-        container_name,
-    ) {
-        Some(path) => path,
-        None => {
-            tracing::warn!(
-                container = %container_name,
-                "no home directory to place the attach socket in; the container \
-                 runs but cannot be attached to"
-            );
-            return None;
-        }
-    };
+    let path =
+        match crate::engine::container::attach_socket::attach_socket_path(env, container_name) {
+            Some(path) => path,
+            None => {
+                tracing::warn!(
+                    container = %container_name,
+                    "no home directory to place the attach socket in; the container \
+                     runs but cannot be attached to"
+                );
+                return None;
+            }
+        };
 
     crate::engine::container::attach_socket::spawn_attach_socket_server(
         &path,
         crate::engine::container::attach_socket::AttachHooks {
+            terminal,
             output: output_broadcast,
             stdin: stdin_injector,
             resize,
@@ -642,17 +733,17 @@ fn serve_attach_socket(ctx: AttachHookCtx<'_>) -> Option<AttachSocketGuard> {
     .ok()
 }
 
-fn launcher_owner(name: &str) -> Option<crate::engine::agent_runtime::AgentOwner> {
-    crate::engine::container::attach_socket::attach_socket_path(
-        &crate::data::config::env::Env::from_process(),
-        name,
-    )
-    .and_then(|path| std::fs::read_to_string(path.with_extension("owner")).ok())
-    .and_then(|pid| pid.trim().parse::<u32>().ok())
-    .map(|pid| crate::engine::agent_runtime::AgentOwner {
-        pid,
-        alive: owner_is_alive(pid),
-    })
+fn launcher_owner(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    name: &str,
+) -> Option<crate::engine::agent_runtime::AgentOwner> {
+    crate::engine::container::attach_socket::attach_socket_path(snapshot, name)
+        .and_then(|path| std::fs::read_to_string(path.with_extension("owner")).ok())
+        .and_then(|pid| pid.trim().parse::<u32>().ok())
+        .map(|pid| crate::engine::agent_runtime::AgentOwner {
+            pid,
+            alive: owner_is_alive(pid),
+        })
 }
 
 fn owner_is_alive(pid: u32) -> bool {
@@ -674,198 +765,53 @@ fn owner_is_alive(pid: u32) -> bool {
 }
 
 #[cfg(test)]
-mod apple_tests {
+mod workspace_access_tests {
     use super::*;
+    use awman_test_support::{TestCase, TestSandbox};
 
     #[test]
-    fn parse_apple_list_picks_up_running_awman_containers() {
-        let json = r#"[
-            {
-                "status": "running",
-                "configuration": {
-                    "id": "awman-12345-999",
-                    "image": {"repository": "awman/dev", "tag": "latest"}
-                },
-                "startedDate": 1715000000.0
-            },
-            {
-                "status": "running",
-                "configuration": {
-                    "id": "awman-claws-controller",
-                    "image": {"repository": "awman/dev", "tag": "latest"}
-                },
-                "startedDate": 1715000100.5
-            },
-            {
-                "status": "stopped",
-                "configuration": {
-                    "id": "awman-old-stopped",
-                    "image": {"repository": "awman/dev", "tag": "latest"}
-                },
-                "startedDate": 1714000000.0
-            },
-            {
-                "status": "running",
-                "configuration": {
-                    "id": "unrelated-container",
-                    "image": {"repository": "nginx", "tag": "latest"}
-                },
-                "startedDate": 1715000200.0
-            }
-        ]"#;
-        let handles = parse_apple_list_output(json, None);
-        assert_eq!(handles.len(), 2);
-        assert_eq!(handles[0].name, "awman-12345-999");
-        assert_eq!(handles[0].id, "awman-12345-999");
-        assert_eq!(handles[1].name, "awman-claws-controller");
-    }
-
-    #[test]
-    fn parse_apple_list_rejects_nanoclaw_names_outside_awman_namespace() {
-        let json = r#"[{
-            "status": "running",
-            "configuration": {
-                "id": "nanoclaw-worker-1",
-                "image": {"repository": "awman/dev"}
-            },
-            "startedDate": 1715000000.0
-        }]"#;
-        let handles = parse_apple_list_output(json, None);
-        assert!(handles.is_empty());
-    }
-
-    #[test]
-    fn parse_apple_list_empty_array() {
-        let handles = parse_apple_list_output("[]", None);
-        assert!(handles.is_empty());
-    }
-
-    #[test]
-    fn parse_apple_list_skips_non_running() {
-        let json = r#"[{
-            "status": "stopping",
-            "configuration": { "id": "awman-dying" },
-            "startedDate": 1715000000.0
-        }]"#;
-        let handles = parse_apple_list_output(json, None);
-        assert!(handles.is_empty());
-    }
-
-    #[test]
-    fn extract_apple_image_formats_repo_and_tag() {
-        let row: serde_json::Value = serde_json::from_str(
-            r#"{"configuration": {"image": {"repository": "awman/dev", "tag": "latest"}}}"#,
+    fn read_only_apple_launch_uses_bare_tmpfs_destination() {
+        let sandbox = TestSandbox::for_test(TestCase::component("engine::container::apple::workspace_access_tests::read_only_apple_launch_uses_bare_tmpfs_destination"));
+        let mut options = super::super::options::workspace_access_tests::options(&sandbox);
+        // Exercise Apple's build path too: it validates and selects the bare
+        // syntax without starting the CLI or registering credentials.
+        let backend = AppleBackend::new(options.host_env.clone().unwrap());
+        assert!(backend.capabilities().read_only_workspace());
+        backend.build(options.clone()).unwrap();
+        options.tmpfs_bare_paths = true;
+        let argv = super::super::docker::build_run_argv(
+            &ContainerName::new("test"),
+            options.image.as_ref().unwrap(),
+            &options,
         )
         .unwrap();
-        assert_eq!(extract_apple_image(&row), "awman/dev:latest");
+        assert!(argv.windows(2).any(|p| p == ["--tmpfs", "/tmp"]));
+        assert!(argv.contains(&format!("{}:/workspace:ro", sandbox.work().display())));
+        assert!(argv.contains(&format!(
+            "{}:/awman/output",
+            sandbox.root().join("output").display()
+        )));
+        assert!(argv.contains(&format!(
+            "{}:/awman/context/repo",
+            sandbox.root().join("context").display()
+        )));
+        options.tmpfs.clear();
+        assert!(backend.build(options).is_err());
     }
+}
 
+#[cfg(test)]
+mod missing_timestamp_tests {
     #[test]
-    fn extract_apple_image_repo_only_without_tag() {
-        let row: serde_json::Value =
-            serde_json::from_str(r#"{"configuration": {"image": {"repository": "awman/dev"}}}"#)
-                .unwrap();
-        assert_eq!(extract_apple_image(&row), "awman/dev");
-    }
-
-    #[test]
-    fn extract_apple_image_plain_string() {
-        let row: serde_json::Value =
-            serde_json::from_str(r#"{"configuration": {"image": "awman/dev:latest"}}"#).unwrap();
-        assert_eq!(extract_apple_image(&row), "awman/dev:latest");
-    }
-
-    #[test]
-    fn extract_apple_image_reference_field() {
-        let row: serde_json::Value = serde_json::from_str(
-            r#"{"configuration": {"image": {"reference": "ghcr.io/awman/dev:latest"}}}"#,
-        )
-        .unwrap();
-        assert_eq!(extract_apple_image(&row), "ghcr.io/awman/dev:latest");
-    }
-
-    #[test]
-    fn extract_apple_image_descriptor_annotations() {
-        let row: serde_json::Value = serde_json::from_str(
-            r#"{
-            "configuration": {
-                "image": {
-                    "descriptor": {
-                        "annotations": {
-                            "com.apple.containerization.image.name": "awman-myproj-claude:latest"
-                        }
-                    }
-                }
-            }
-        }"#,
-        )
-        .unwrap();
-        assert_eq!(extract_apple_image(&row), "awman-myproj-claude:latest");
-    }
-
-    #[test]
-    fn parse_apple_list_formats_image_correctly() {
-        let json = r#"[{
-            "status": "running",
-            "configuration": {
-                "id": "awman-test",
-                "image": {
-                    "descriptor": {
-                        "annotations": {
-                            "com.apple.containerization.image.name": "awman-myproj-claude:latest"
-                        }
-                    }
-                }
-            },
-            "startedDate": 1715000000.0
-        }]"#;
-        let handles = parse_apple_list_output(json, None);
-        assert_eq!(handles.len(), 1);
-        assert_eq!(handles[0].image_tag, "awman-myproj-claude:latest");
-    }
-
-    #[test]
-    fn image_home_dir_returns_none_for_unknown_image() {
-        // `container image inspect` exits non-zero for an unknown tag, and
-        // the helper must collapse that to `None` rather than panic — also
-        // covers the case where the `container` CLI itself isn't installed.
-        let backend = AppleBackend;
-        let bogus = "awman-test-image-that-does-not-exist:tag-xyz123";
-        assert!(backend.image_home_dir(bogus).unwrap().is_none());
-    }
-
-    /// A same-size attach resize must still land on the requested size after
-    /// its WINCH-forcing bounce, and a changed size must apply directly.
-    #[test]
-    #[cfg(unix)]
-    fn resize_forcing_winch_always_lands_on_the_requested_size() {
-        use portable_pty::{native_pty_system, PtySize};
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
-
-        // Unchanged size: the reattach case. The bounce must be invisible in
-        // the final state.
-        resize_pty_forcing_winch(pair.master.as_ref(), 80, 24);
-        let size = pair.master.get_size().expect("get_size");
-        assert_eq!((size.cols, size.rows), (80, 24));
-
-        // Changed size: the ordinary case.
-        resize_pty_forcing_winch(pair.master.as_ref(), 132, 50);
-        let size = pair.master.get_size().expect("get_size");
-        assert_eq!((size.cols, size.rows), (132, 50));
-    }
-
-    #[test]
-    fn extract_apple_started_at_from_float() {
-        let row: serde_json::Value =
-            serde_json::from_str(r#"{"startedDate": 1715000000.5}"#).unwrap();
-        let dt = extract_apple_started_at(&row);
-        assert_eq!(dt.timestamp(), 1715000000);
+    fn a_stopped_row_without_timestamp_has_stable_identity() {
+        let row = serde_json::json!({"name":"awman-stopped", "status":"stopped"});
+        assert_eq!(
+            super::extract_apple_started_at(&row),
+            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
+        );
+        assert_eq!(
+            super::extract_apple_started_at(&row),
+            super::extract_apple_started_at(&row)
+        );
     }
 }

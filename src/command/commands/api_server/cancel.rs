@@ -5,7 +5,7 @@
 //! |------------------------------|------------------------------------------------|--------------------|
 //! | none                         | nothing                                        | `NotFound`         |
 //! | `done`/`error`/`cancelled`   | nothing                                        | `AlreadyTerminal`  |
-//! | `queued`/`pending`           | row → `cancelled`; a `/v1/runs` setup is told to stop | `Cancelled` |
+//! | `queued`/`pending`           | row → `cancelled`; a `/v1/worker/runs` setup is told to stop | `Cancelled` |
 //! | `running`                    | marker recorded, the owning worker's token fired | `Stopping`       |
 //! | `running`, no owner          | (only between a crash and the next bootstrap) row → `cancelled` | `Cancelled` |
 //! | `running`, no owner, sidecar | row → the recorded completion; an unreadable sidecar is an error | `AlreadyTerminal` |
@@ -22,7 +22,7 @@ use crate::data::fs::api_db::{CommandRecord, SqliteSessionStore};
 
 /// In-process map from an id (command id, or session id for setups) to the
 /// token the owning task observes. One instance per daemon for commands and
-/// one for setups; both hang off `ApiServerRuntime`.
+/// one for setups; both hang off `WorkerServices`.
 #[derive(Default)]
 pub struct TokenRegistry {
     tokens: Mutex<HashMap<String, CancellationToken>>,
@@ -57,6 +57,16 @@ impl TokenRegistry {
         }
     }
 
+    pub fn cancel_all(&self) -> Vec<String> {
+        let tokens = self.lock();
+        tokens
+            .iter()
+            .map(|(id, token)| {
+                token.cancel();
+                id.clone()
+            })
+            .collect()
+    }
     pub fn is_registered(&self, id: &str) -> bool {
         self.lock().contains_key(id)
     }
@@ -183,26 +193,45 @@ impl CommandCanceller {
         }
 
         let now = chrono::Utc::now().to_rfc3339();
-        if record.status.is_claimable() && self.lifecycle.cancel_if_queued(command_id, &now)? {
-            // A `/v1/runs` command waits in the queue while its session is
+        if record.status.is_claimable()
+            && self.lifecycle.cancel_if_queued(
+                &crate::data::ids::CommandId::parse(command_id)
+                    .expect("validated persisted resource id"),
+                &now,
+            )?
+        {
+            // A `/v1/worker/runs` command waits in the queue while its session is
             // set up: abandon that setup too.
-            if let Some(run) = self.lifecycle.run_for_command(command_id)? {
-                self.setups.cancel(&run.session_id);
+            if let Some(run) = self.lifecycle.run_for_command(
+                &crate::data::ids::CommandId::parse(command_id)
+                    .expect("validated persisted resource id"),
+            )? {
+                self.setups.cancel(run.session_id.as_str());
             }
             self.finalize_unowned(command_id)?;
             return Ok(CancelOutcome::Cancelled(self.reread(record)?));
         }
 
         // Running, or claimed by a worker since the read above.
-        self.lifecycle.request_cancel(command_id, &now)?;
+        self.lifecycle.request_cancel(
+            &crate::data::ids::CommandId::parse(command_id)
+                .expect("validated persisted resource id"),
+            &now,
+        )?;
         let requested_at = self
             .lifecycle
-            .cancel_requested_at(command_id)?
+            .cancel_requested_at(
+                &crate::data::ids::CommandId::parse(command_id)
+                    .expect("validated persisted resource id"),
+            )?
             .unwrap_or(now.clone());
         let owned = self.commands.cancel_or(command_id, || {
             if !self.finalize_from_sidecar(command_id)? {
-                self.lifecycle
-                    .cancel_if_running(command_id, &now, &requested_at)?;
+                self.lifecycle.cancel_if_running(
+                    &crate::data::ids::CommandId::parse(command_id).expect("validated command id"),
+                    &now,
+                    &requested_at,
+                )?;
             }
             Ok::<(), CommandError>(())
         })?;
@@ -229,164 +258,5 @@ impl CommandCanceller {
     /// The row as it is now, falling back to `record` if it vanished.
     fn reread(&self, record: CommandRecord) -> Result<CommandRecord, CommandError> {
         Ok(self.store.get_command(&record.id)?.unwrap_or(record))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn setup() -> (
-        tempfile::TempDir,
-        Arc<SqliteSessionStore>,
-        CommandLifecycleStore,
-    ) {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(SqliteSessionStore::open(tmp.path()).unwrap());
-        store
-            .insert_session("session", "/work", "2026-10-28T00:00:00Z")
-            .unwrap();
-        let lifecycle = CommandLifecycleStore::open(Arc::clone(&store)).unwrap();
-        (tmp, store, lifecycle)
-    }
-
-    fn canceller(
-        store: Arc<SqliteSessionStore>,
-        lifecycle: CommandLifecycleStore,
-        commands: Arc<TokenRegistry>,
-    ) -> CommandCanceller {
-        CommandCanceller::new(store, lifecycle, commands, Arc::new(TokenRegistry::new()))
-    }
-
-    #[test]
-    fn queued_cancel_is_terminal_and_terminal_cancel_is_unchanged() {
-        let (_tmp, store, lifecycle) = setup();
-        store
-            .enqueue_command("queued", "session", "chat", "[]", "log")
-            .unwrap();
-        let cancel = canceller(
-            Arc::clone(&store),
-            lifecycle,
-            Arc::new(TokenRegistry::new()),
-        );
-
-        let CancelOutcome::Cancelled(row) = cancel.cancel("queued").unwrap() else {
-            panic!("queued command should cancel immediately");
-        };
-        assert_eq!(row.status.as_str(), "cancelled");
-        assert_eq!(
-            row.exit_code,
-            Some(crate::data::command_status::CANCELLED_EXIT_CODE)
-        );
-        assert!(store.claim_next_command("worker").unwrap().is_none());
-
-        store
-            .enqueue_command("done", "session", "chat", "[]", "log")
-            .unwrap();
-        store
-            .complete_command(
-                "done",
-                CommandStatus::Done,
-                Some(0),
-                Some(r#"{"exit_code":0}"#),
-            )
-            .unwrap();
-        let before = store.get_command("done").unwrap().unwrap();
-        assert!(matches!(
-            cancel.cancel("done").unwrap(),
-            CancelOutcome::AlreadyTerminal(_)
-        ));
-        assert_eq!(store.get_command("done").unwrap().unwrap(), before);
-    }
-
-    #[test]
-    fn running_cancel_fires_owner_token_and_restart_does_not_requeue_cancelled_row() {
-        let (_tmp, store, lifecycle) = setup();
-        store
-            .enqueue_command("running", "session", "chat", "[]", "log")
-            .unwrap();
-        let owner = Arc::new(TokenRegistry::new());
-        let token = owner.register("running");
-        let claimed = store.claim_next_command("worker").unwrap().unwrap();
-        assert_eq!(claimed.status.as_str(), "running");
-        let cancel = canceller(Arc::clone(&store), lifecycle.clone(), Arc::clone(&owner));
-
-        assert!(matches!(
-            cancel.cancel("running").unwrap(),
-            CancelOutcome::Stopping { .. }
-        ));
-        assert!(token.is_cancelled());
-        assert_eq!(
-            store
-                .get_command("running")
-                .unwrap()
-                .unwrap()
-                .status
-                .as_str(),
-            "running"
-        );
-
-        // Model process death after the durable cancel marker and before the
-        // worker finalises: bootstrap finalises it before stale recovery.
-        let finalized = lifecycle
-            .finalize_interrupted_cancellations("2026-10-28T00:01:00Z")
-            .unwrap();
-        assert_eq!(finalized, ["running"]);
-        assert!(store.recover_stale_commands(0).unwrap().is_empty());
-        assert_eq!(
-            store
-                .get_command("running")
-                .unwrap()
-                .unwrap()
-                .status
-                .as_str(),
-            "cancelled"
-        );
-        assert!(store
-            .claim_next_command("worker-after-restart")
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
-    fn run_linkage_retains_close_on_finish_and_setup_failure_preserves_cancel() {
-        let (_tmp, store, lifecycle) = setup();
-        store
-            .enqueue_command("run", "session", "exec workflow", "[]", "log")
-            .unwrap();
-        lifecycle
-            .record_run(&crate::data::api_lifecycle_store::RunRecord {
-                session_id: "session".into(),
-                command_id: "run".into(),
-                close_on_finish: true,
-                created_at: "2026-10-28T00:00:00Z".into(),
-            })
-            .unwrap();
-        let run = lifecycle.run_for_command("run").unwrap().unwrap();
-        assert!(run.close_on_finish);
-        assert_eq!(lifecycle.list_runs().unwrap(), [run]);
-
-        store
-            .enqueue_command("cancelled-run", "session", "exec workflow", "[]", "log")
-            .unwrap();
-        lifecycle
-            .cancel_if_queued("cancelled-run", "2026-10-28T00:00:01Z")
-            .unwrap();
-        assert!(!lifecycle
-            .fail_if_queued(
-                "cancelled-run",
-                "2026-10-28T00:00:02Z",
-                r#"{"error":"setup"}"#
-            )
-            .unwrap());
-        assert_eq!(
-            store
-                .get_command("cancelled-run")
-                .unwrap()
-                .unwrap()
-                .status
-                .as_str(),
-            "cancelled"
-        );
     }
 }

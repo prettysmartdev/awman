@@ -2,12 +2,6 @@
 //!
 //! This module owns the *engine* half of squad's machinery:
 //!
-//! * [`SquadDaemonEngine`] — the daemon runtime itself: database relocation,
-//!   store open and migrate, orphaned-run reconciliation, the stray-container
-//!   scan, the scheduler, and the endpoint sidecar. Layer 3 adds only a
-//!   router and a socket (WI 0113 F-02).
-//! * [`SquadSupervisor`] — daemon lifecycle for *clients*: is one running,
-//!   what does this process authenticate with, and start one on demand.
 //! * [`SquadScheduler`] — the 30s tick loop that selects due tasks
 //!   (wholly in SQL, via [`TaskStore::due_for_evaluation`]), dispatches
 //!   each onto a bounded task set, records run rows, and grows an exponential
@@ -24,22 +18,19 @@
 //!
 //! [`TaskStore::due_for_evaluation`]: crate::data::fs::TaskStore::due_for_evaluation
 
-pub mod daemon;
 pub mod env_state;
 pub mod env_store;
 pub mod evaluator;
-pub mod key_setup;
 pub mod launcher;
 pub mod scheduler;
 pub mod supervisor;
 
-pub use daemon::{SquadDaemonDeps, SquadDaemonEngine};
 pub use evaluator::{
     EvaluationOutcome, EvaluationRequest, NoRunProgress, RunProgress, TaskEvaluator,
 };
 pub use launcher::{LeaderExit, LeaderRunSpec, SquadAgentLauncher, UnattendedExit};
 pub use scheduler::{SchedulerStatus, SquadScheduler, TICK_INTERVAL};
-pub use supervisor::{SquadEndpoint, SquadHealth, SquadKeyState, SquadSupervisor};
+pub use supervisor::{SquadHealth, SquadSupervisor};
 // The verdict file is an on-disk, cross-process contract written by the
 // leader agent, so it lives in Layer 0 now (F-47). Re-exported here for one
 // release: `command::commands::squad::evaluation` and the daemon both name it

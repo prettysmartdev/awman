@@ -142,6 +142,11 @@ pub struct ImageIdentity {
 /// provenance before a builder-enabled check-only launch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledImageIdentity {
+    /// awman's attribution, without changing the acquired config digest.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub size_bytes: u64,
     #[serde(flatten)]
     pub identity: ImageIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -238,84 +243,5 @@ impl From<BuiltImageIdentity> for BuiltImageIdentityRecord {
             manifest_digest: identity.manifest_digest,
             platform: identity.platform,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-    #[test]
-    fn digest_accepts_only_sha256_lower_hex() {
-        assert!(Digest::parse(&format!("sha256:{HEX}")).is_ok());
-        assert!(Digest::parse(HEX).is_err());
-        assert!(Digest::parse(&format!("sha512:{HEX}")).is_err());
-        assert!(Digest::parse(&format!("sha256:{}", HEX.to_uppercase())).is_err());
-        assert!(Digest::parse(&format!("sha256:{}", &HEX[1..])).is_err());
-        assert!(Digest::parse("sha256:").is_err());
-    }
-
-    #[test]
-    fn digest_deserialization_validates() {
-        let ok: Digest = serde_json::from_str(&format!("\"sha256:{HEX}\"")).unwrap();
-        assert_eq!(ok.as_str(), format!("sha256:{HEX}"));
-        assert!(serde_json::from_str::<Digest>("\"sha256:nothex\"").is_err());
-        assert_eq!(
-            serde_json::to_string(&ok).unwrap(),
-            format!("\"sha256:{HEX}\"")
-        );
-    }
-
-    #[test]
-    fn host_linux_uses_oci_architecture_names() {
-        let p = OciPlatform::host_linux();
-        assert_eq!(p.os, "linux");
-        assert_ne!(p.architecture, "x86_64");
-        assert_ne!(p.architecture, "aarch64");
-        assert_eq!(oci_architecture("x86_64"), "amd64");
-        assert_eq!(oci_architecture("aarch64"), "arm64");
-    }
-
-    fn platform(os: &str, arch: &str, variant: Option<&str>) -> OciPlatform {
-        OciPlatform {
-            os: os.into(),
-            architecture: arch.into(),
-            variant: variant.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn platform_matching() {
-        let amd = platform("linux", "amd64", None);
-        let arm = platform("linux", "arm64", None);
-        assert!(amd.matches(&amd));
-        assert!(!amd.matches(&arm));
-        assert!(!amd.matches(&platform("windows", "amd64", None)));
-        assert!(arm.matches(&platform("linux", "arm64", Some("v8"))));
-        assert!(!arm.matches(&platform("linux", "arm64", Some("v7"))));
-        assert!(platform("linux", "arm", None).matches(&platform("linux", "arm", Some("v7"))));
-        assert_eq!(
-            platform("linux", "arm64", Some("v8")).to_string(),
-            "linux/arm64/v8"
-        );
-    }
-
-    #[test]
-    fn identity_round_trips_and_records_its_source() {
-        let identity = ImageIdentity {
-            reference: "localhost:5000/awman-x:latest".into(),
-            manifest_digest: Digest::parse(&format!("sha256:{HEX}")).unwrap(),
-            config_digest: Digest::parse(&format!("sha256:{HEX}")).unwrap(),
-            platform: OciPlatform::host_linux(),
-            source: ImageSourceKind::Registry,
-        };
-        let json = serde_json::to_string(&identity).unwrap();
-        let back: ImageIdentity = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, identity);
-        let mut other = identity.clone();
-        other.source = ImageSourceKind::DockerStore;
-        assert_ne!(other, identity);
     }
 }

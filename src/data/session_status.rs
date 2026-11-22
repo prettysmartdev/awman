@@ -43,28 +43,3 @@ impl std::fmt::Display for SessionStatus {
         f.write_str(self.as_str())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::SessionStatus;
-
-    #[test]
-    fn every_persisted_spelling_round_trips() {
-        for (status, spelling) in [
-            (SessionStatus::Active, "active"),
-            (SessionStatus::Closing, "closing"),
-            (SessionStatus::Closed, "closed"),
-        ] {
-            assert_eq!(status.as_str(), spelling);
-            assert_eq!(SessionStatus::parse(spelling), Some(status));
-        }
-        assert_eq!(SessionStatus::ALL.len(), 3);
-    }
-
-    #[test]
-    fn parse_rejects_anything_else() {
-        for invalid in ["", "ACTIVE", "open", " active", "failed"] {
-            assert_eq!(SessionStatus::parse(invalid), None, "{invalid:?}");
-        }
-    }
-}

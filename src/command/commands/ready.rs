@@ -7,11 +7,17 @@ use crate::command::commands::launch_policy::{ensure_agent_trusted, LaunchPolicy
 use crate::command::commands::Command;
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
+use crate::command::headless::HeadlessDefaults;
 use crate::data::message::{MessageLevel, UserMessage};
+use crate::data::preparation::{AuthenticationCheck, PreparationPolicy};
 use crate::data::ready_image::{ReadyBaseImageResult, ReadyImageResult};
 use crate::data::ready_summary::AgentCredentialHealth;
 use crate::data::step_status::StepStatus;
 use crate::engine::ready::{ReadyEngine, ReadyEngineOptions, ReadyFrontend, ReadySummary};
+
+mod source_setup;
+#[cfg(test)]
+mod source_setup_contracts;
 
 #[derive(Debug, Clone)]
 pub struct ReadyCommandFlags {
@@ -21,6 +27,9 @@ pub struct ReadyCommandFlags {
     pub non_interactive: bool,
     pub allow_docker: bool,
     pub json: bool,
+    /// `--prepare-only`: image preparation without host-agent pings, credential
+    /// checks or audits.
+    pub prepare_only: bool,
     /// `--agent`; `None` readies the configured agent.
     pub agent: Option<String>,
 }
@@ -37,6 +46,8 @@ pub struct ReadyOutcome {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_definition: Option<StepStatus>,
     pub local_agent: StepStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_auth: Vec<(String, StepStatus)>,
     pub audit: StepStatus,
     pub image_rebuild: StepStatus,
     pub agent_credentials: Vec<AgentCredentialHealth>,
@@ -55,6 +66,14 @@ pub struct ReadyOutcome {
     /// exit code; the legacy JSON `ready` field also requires the host-side
     /// checks to have passed.
     pub ready: bool,
+    /// Which policy this run used.
+    pub preparation_policy: PreparationPolicy,
+    /// Every requested non-authentication prerequisite succeeded (same
+    /// reading as `ready`). Never implies authentication passed.
+    pub images_ready: bool,
+    /// What was established about provider authentication; `not_checked`
+    /// under `images_only`.
+    pub authentication: AuthenticationCheck,
     /// `true` when `--json` was passed; controls how the CLI renders the outcome.
     #[serde(skip)]
     pub json_requested: bool,
@@ -66,6 +85,8 @@ pub struct ReadyOutcome {
 impl From<ReadySummary> for ReadyOutcome {
     fn from(s: ReadySummary) -> Self {
         let ready = s.is_ready();
+        let preparation_policy = s.preparation_policy;
+        let authentication = s.authentication();
         Self {
             runtime: s.runtime_name,
             dockerfile: s.dockerfile,
@@ -74,6 +95,7 @@ impl From<ReadySummary> for ReadyOutcome {
             image_source: s.image_source,
             agent_definition: s.agent_definition,
             local_agent: s.local_agent,
+            agent_auth: s.agent_auth,
             audit: s.audit,
             image_rebuild: s.image_rebuild,
             agent_credentials: s.agent_credentials,
@@ -81,6 +103,9 @@ impl From<ReadySummary> for ReadyOutcome {
             image_results: s.image_results,
             base_image_results: s.base_image_results,
             ready,
+            preparation_policy,
+            images_ready: ready,
+            authentication,
             json_requested: false,
             refresh_requested: false,
         }
@@ -143,8 +168,12 @@ impl ReadyOutcome {
 
         let mut result = serde_json::json!({
             "ready": checks_passed,
+            "preparation_policy": self.preparation_policy.as_str(),
+            "images_ready": self.images_ready,
+            "authentication": self.authentication.as_str(),
             "runtime": self.runtime,
             "agent_credentials": self.agent_credentials,
+            "agent_auth": self.agent_auth,
             "steps": {
                 "docker_daemon": step_to_json(&docker_daemon),
                 "dockerfile": step_to_json(&self.dockerfile),
@@ -197,6 +226,13 @@ pub struct ReadyCommand {
     flags: ReadyCommandFlags,
     engines: Engines,
     session: crate::data::session::Session,
+    headless: Option<HeadlessDefaults>,
+    /// The caller is a local user's own CLI/TUI session, so a person may be
+    /// asked to choose an image source. `false` unless `from_input` saw a
+    /// local frontend (fail closed).
+    local_user: bool,
+    #[cfg(test)]
+    host_ping: Option<std::sync::Arc<dyn crate::engine::ready::ReadyHostPing>>,
 }
 
 impl ReadyCommand {
@@ -209,26 +245,90 @@ impl ReadyCommand {
             flags,
             engines,
             session,
+            headless: None,
+            local_user: false,
+            #[cfg(test)]
+            host_ping: None,
         }
     }
 
+    /// Inject a fixed host check; component journeys never execute a host agent.
+    #[cfg(test)]
+    pub(crate) fn with_host_ping(
+        mut self,
+        ping: std::sync::Arc<dyn crate::engine::ready::ReadyHostPing>,
+    ) -> Self {
+        self.host_ping = Some(ping);
+        self
+    }
+
+    /// Let a hand-built command ask for an image source, as `from_input`
+    /// does for a local frontend.
+    #[cfg(test)]
+    pub(crate) fn with_local_user(mut self, local_user: bool) -> Self {
+        self.local_user = local_user;
+        self
+    }
+
+    /// Set the headless defaults `from_input` derives for an API caller.
+    #[cfg(test)]
+    pub(crate) fn with_headless(mut self, headless: Option<HeadlessDefaults>) -> Self {
+        self.headless = headless;
+        self
+    }
+
     /// Construct from the catalogue-resolved input (WI 0113 F-10). `--json`
-    /// declares `implies: ["non-interactive"]`, so the implication is already
+    /// declares `implies: ["headless"]`, so the implication is already
     /// applied in `flags` and is not re-derived here.
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
-        Ok(Self::new(
-            ReadyCommandFlags {
-                refresh: ctx.flags.bool("refresh"),
-                build: ctx.flags.bool("build"),
-                no_cache: ctx.flags.bool("no-cache"),
-                non_interactive: ctx.flags.bool("non-interactive"),
-                allow_docker: ctx.flags.bool("allow-docker"),
-                json: ctx.flags.bool("json"),
-                agent: ctx.flags.string("agent"),
-            },
-            ctx.engines.clone(),
-            ctx.session.clone(),
-        ))
+        let flags = ReadyCommandFlags {
+            refresh: ctx.flags.bool("refresh"),
+            build: ctx.flags.bool("build"),
+            no_cache: ctx.flags.bool("no-cache"),
+            non_interactive: ctx.flags.bool("headless"),
+            allow_docker: ctx.flags.bool("allow-docker"),
+            json: ctx.flags.bool("json"),
+            prepare_only: ctx.flags.bool("prepare-only"),
+            agent: ctx.flags.string("agent"),
+        };
+        // `--refresh` runs an agent audit; preparation-only runs no agent.
+        // The catalogue declares the conflict; this keeps every route that
+        // builds the command directly honest too.
+        if flags.prepare_only && flags.refresh {
+            return Err(CommandError::InvalidFlagValue {
+                command: vec!["ready".into()],
+                flag: "prepare-only".into(),
+                reason: "--prepare-only runs no agent audit and cannot be combined with --refresh"
+                    .into(),
+            });
+        }
+        if flags.refresh && Self::headless_for(ctx.caller.frontend()).is_some() {
+            return Err(CommandError::InvalidFlagValue {
+                command: vec!["ready".into()],
+                flag: "refresh".into(),
+                reason: "--refresh is unavailable through the API because its audit runs an agent outside a command".into(),
+            });
+        }
+        let mut command = Self::new(flags, ctx.engines.clone(), ctx.session.clone());
+        command.headless = Self::headless_for(ctx.caller.frontend());
+        command.local_user = ctx.caller.frontend().is_local_user();
+        Ok(command)
+    }
+
+    /// API ready answers the two setup questions from the same Layer 2
+    /// profile as API init. Local CLI/TUI invocations retain their frontend's
+    /// interactive or piped-stdin behavior.
+    pub fn headless_for(
+        kind: crate::command::dispatch::catalogue::FrontendKind,
+    ) -> Option<HeadlessDefaults> {
+        match kind {
+            crate::command::dispatch::catalogue::FrontendKind::Daemon { .. }
+                if !kind.is_engine_local() =>
+            {
+                Some(HeadlessDefaults::api())
+            }
+            _ => None,
+        }
     }
 
     pub fn flags(&self) -> &ReadyCommandFlags {
@@ -250,7 +350,7 @@ impl Command for ReadyCommand {
             text: "ready: checking environment…".into(),
         });
 
-        let session = self.session;
+        let mut session = self.session;
         // Resolve the agent from .awman/config.json (or global default), so
         // the per-agent Dockerfile lookup and image-tag computation match
         // whatever the user actually configured. Falls back to "claude" only
@@ -283,6 +383,7 @@ impl Command for ReadyCommand {
             allow_docker: self.flags.allow_docker,
             non_interactive: self.flags.non_interactive,
             env_passthrough: None,
+            preparation: PreparationPolicy::from_prepare_only(self.flags.prepare_only),
         };
 
         frontend.write_message(UserMessage {
@@ -308,12 +409,20 @@ impl Command for ReadyCommand {
         // refuses a custom agent on a runtime that cannot run one as a failed
         // step, before any kit or image work.
         let runtime = self.engines.runtime.clone();
-        let resolved_builtin = ReadyEngine::builtin_inputs(&session, runtime.as_ref())?;
+        let resolved_builtin = resolve_builtin_inputs(
+            &mut session,
+            runtime.as_ref(),
+            &agent,
+            SourceSetupPolicy {
+                flags: &self.flags,
+                headless: self.headless.as_ref(),
+                local_user: self.local_user,
+            },
+            frontend.as_mut(),
+        )?;
         let mut engine = ReadyEngine::new(
             resolved_builtin,
-            crate::data::config::global::GlobalConfig::data_home_with(
-                session.effective_config().env(),
-            )?,
+            crate::data::fs::data_paths::data_home(session.effective_config().env())?,
             std::sync::Arc::new(session),
             self.engines.git_engine.clone(),
             self.engines.overlay_engine.clone(),
@@ -321,10 +430,21 @@ impl Command for ReadyCommand {
             self.engines.agent_engine.clone(),
             options,
         );
-        engine.set_agent_credentials(credential_health(&self.engines.auth_engine, &agent));
+        #[cfg(test)]
+        if let Some(ping) = self.host_ping {
+            engine.set_host_ping(ping);
+        }
+        // Preparation-only does not look at provider credentials either.
+        if !self.flags.prepare_only {
+            engine.set_agent_credentials(credential_health(&self.engines.auth_engine, &agent));
+        }
         let cancel = engine.cancel_token();
+        let mut answering = HeadlessReadyFrontend {
+            inner: frontend.as_mut(),
+            defaults: self.headless.clone(),
+        };
         let result = {
-            let run = engine.run_to_completion(frontend.as_mut());
+            let run = engine.run_to_completion(&mut answering);
             tokio::pin!(run);
             tokio::select! {
                 result = &mut run => result,
@@ -337,12 +457,9 @@ impl Command for ReadyCommand {
         let summary = match result {
             Ok(s) => s,
             Err(e) => {
-                let cmd_err = CommandError::from(e);
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("ready: engine run failed: {cmd_err}"),
-                });
-                return Err(cmd_err);
+                // Acquisition owns bounded retries against the selected source.
+                // Never restart ready or reopen source setup on a final failure.
+                return Err(finish_ready_error(e));
             }
         };
         frontend.replay_queued();
@@ -350,21 +467,121 @@ impl Command for ReadyCommand {
         outcome.json_requested = self.flags.json;
         outcome.refresh_requested = self.flags.refresh;
 
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: format!(
-                "ready: complete — runtime={}, dockerfile={:?}, base_image={:?}, agent_image={:?}, local_agent={:?}",
-                outcome.runtime,
-                outcome.dockerfile,
-                outcome.base_image,
-                outcome.agent_image,
-                outcome.local_agent,
-            ),
-        });
-
         Ok(outcome)
     }
 }
+
+/// Who may be asked for an image source in this invocation.
+struct SourceSetupPolicy<'a> {
+    flags: &'a ReadyCommandFlags,
+    headless: Option<&'a HeadlessDefaults>,
+    local_user: bool,
+}
+
+/// The builtin inputs the engine is built from. On an importing runtime, and
+/// only when this invocation may ask a person, an image without a source is
+/// offered once; after a saved choice the session is reloaded and the inputs
+/// are resolved again, so the same `ready` run continues with the new source.
+/// An invalid configured `builtin` block fails here, before any offer.
+fn resolve_builtin_inputs(
+    session: &mut crate::data::session::Session,
+    runtime: &dyn crate::engine::agent_runtime::AgentRuntimeEngine,
+    agent: &crate::data::session::AgentName,
+    policy: SourceSetupPolicy<'_>,
+    frontend: &mut dyn ReadyFrontend,
+) -> Result<Option<crate::data::config::ResolvedBuiltinConfig>, CommandError> {
+    let resolved = ReadyEngine::builtin_inputs(session, runtime)?;
+    if resolved.is_none()
+        || !source_setup::prompt_allowed(policy.flags, policy.headless, policy.local_user)
+    {
+        return Ok(resolved);
+    }
+    let installed = |tag: &str| runtime.image_exists(tag).unwrap_or(false);
+    let setup = source_setup::offer_image_source(
+        source_setup::SourceSetupContext {
+            session,
+            agent,
+            build: policy.flags.build,
+            installed: &installed,
+        },
+        frontend,
+    )?;
+    match setup {
+        source_setup::SourceSetup::Saved { .. } => {
+            Ok(ReadyEngine::builtin_inputs(session, runtime)?)
+        }
+        source_setup::SourceSetup::Unchanged => Ok(resolved),
+    }
+}
+
+/// Applies API ready's Layer 2 answers while preserving build progress and
+/// every other frontend report. A missing builtin image source remains the
+/// engine's ordinary non-interactive configuration error; no source prompt
+/// is introduced here.
+struct HeadlessReadyFrontend<'a> {
+    inner: &'a mut dyn ReadyCommandFrontend,
+    defaults: Option<HeadlessDefaults>,
+}
+
+impl crate::data::message::UserMessageSink for HeadlessReadyFrontend<'_> {
+    fn write_message(&mut self, message: UserMessage) {
+        self.inner.write_message(message);
+    }
+    fn replay_queued(&mut self) {
+        self.inner.replay_queued();
+    }
+}
+
+impl crate::engine::agent::AgentImageFrontend for HeadlessReadyFrontend<'_> {
+    fn report_step_status(
+        &mut self,
+        step: &crate::data::setup_step::SetupStep,
+        status: StepStatus,
+    ) {
+        // The final summary owns diagnostics. Progress keeps only the status;
+        // the outcome retains the full reasons for JSON and API consumers.
+        let status = match status {
+            StepStatus::Failed(_) => StepStatus::Failed(String::new()),
+            StepStatus::Warn(_) => StepStatus::Warn(String::new()),
+            other => other,
+        };
+        self.inner.report_step_status(step, status);
+    }
+    fn container_frontend(
+        &mut self,
+    ) -> Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend> {
+        self.inner.container_frontend()
+    }
+}
+
+impl ReadyFrontend for HeadlessReadyFrontend<'_> {
+    fn ask_create_dockerfile(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<bool, crate::engine::error::EngineError> {
+        match &self.defaults {
+            Some(defaults) => Ok(defaults.create_dockerfile()),
+            None => self.inner.ask_create_dockerfile(path),
+        }
+    }
+    fn ask_run_audit_on_template(&mut self) -> Result<bool, crate::engine::error::EngineError> {
+        match &self.defaults {
+            Some(defaults) => Ok(defaults.run_audit_on_template()),
+            None => self.inner.ask_run_audit_on_template(),
+        }
+    }
+    fn report_phase(&mut self, phase: &crate::data::ready_phase::ReadyPhase) {
+        self.inner.report_phase(phase);
+    }
+    fn report_summary(&mut self, summary: &ReadySummary) {
+        self.inner.report_summary(summary);
+    }
+    fn report_ping(&mut self, result: &crate::engine::ready::host_agent::LocalAgentPingResult) {
+        self.inner.report_ping(result);
+    }
+}
+
+impl crate::command::commands::agent_trust::AgentTrustFrontend for HeadlessReadyFrontend<'_> {}
 
 fn credential_health(
     auth_engine: &crate::engine::auth::AuthEngine,
@@ -404,140 +621,14 @@ fn credential_health(
     }]
 }
 
-#[cfg(test)]
-mod compat_tests {
-    use super::*;
-    use crate::data::config::image_source::ImageSourceKind;
-    use crate::data::ready_image::ReadyImageWarning;
-
-    #[test]
-    fn builtin_image_source_is_visible_without_changing_docker_json() {
-        let base = ReadySummary::new("docker");
-        let docker = ReadyOutcome::from(base.clone()).to_legacy_json();
-        assert!(docker["steps"].get("image_source").is_none());
-        let mut builtin = base;
-        builtin.image_source = Some(StepStatus::Done);
-        let json = ReadyOutcome::from(builtin).to_legacy_json();
-        assert_eq!(json["steps"]["image_source"]["status"], "ok");
+/// Consume typed local-source finality before formatting the generic Io carrier.
+/// Remote transient errors retain their type and acquisition's bounded retries.
+/// There is no command-level retry, source-setup recovery or store fallback.
+fn finish_ready_error(error: crate::engine::error::EngineError) -> CommandError {
+    if crate::engine::oci::docker_engine::local_unavailability(&error).is_some() {
+        return CommandError::Engine(crate::engine::error::EngineError::Other(
+            crate::engine::oci::docker_engine::failure_message(&error),
+        ));
     }
-
-    fn image_result(build: StepStatus, import: StepStatus) -> ReadyImageResult {
-        ReadyImageResult {
-            agent: "claude".into(),
-            tag: "awman-repo-claude:latest".into(),
-            source_kind: Some(ImageSourceKind::DockerStore),
-            reference: Some("awman-repo-claude:latest".into()),
-            build,
-            import,
-            warnings: Vec::new(),
-            optional: false,
-        }
-    }
-
-    /// `From<ReadySummary>` no longer recomputes readiness from a handful of
-    /// legacy fields: `ReadyOutcome::ready` is exactly
-    /// `ReadySummary::is_ready()`, which a failed per-image build or import
-    /// stage affects even though every legacy top-level field
-    /// (`dockerfile`/`local_agent`/`image_rebuild`) stays `Done`.
-    #[test]
-    fn ready_outcome_ready_field_tracks_is_ready_not_just_legacy_fields() {
-        let mut summary = ReadySummary::new("builtin");
-        summary.base_image = StepStatus::Done;
-        summary.agent_image = StepStatus::Done;
-        summary.dockerfile = StepStatus::Done;
-        summary.local_agent = StepStatus::Done;
-        summary.image_rebuild = StepStatus::Skipped;
-        summary
-            .image_results
-            .push(image_result(StepStatus::Done, StepStatus::Done));
-        assert!(ReadyOutcome::from(summary.clone()).ready);
-
-        summary.image_results[0].import = StepStatus::Failed("daemon unreachable".into());
-        let outcome = ReadyOutcome::from(summary);
-        assert!(
-            !outcome.ready,
-            "a failed per-image import must make the outcome not-ready even \
-             though every legacy field is Done"
-        );
-    }
-
-    /// `ReadyOutcome::from` copies `image_results`/`base_image_results`
-    /// through unchanged — it does not drop or recompute them.
-    #[test]
-    fn ready_outcome_carries_image_and_base_image_results_through() {
-        let mut summary = ReadySummary::new("builtin");
-        summary
-            .base_image_results
-            .push(crate::data::ready_image::ReadyBaseImageResult {
-                store: "docker unix:///var/run/docker.sock".into(),
-                tag: "awman-repo:latest".into(),
-                build: StepStatus::Done,
-                optional: false,
-            });
-        let mut result = image_result(StepStatus::Done, StepStatus::Done);
-        result
-            .warnings
-            .push(ReadyImageWarning::IncompatibleBuilder {
-                tag: "awman-repo-codex:latest".into(),
-                source_kind: ImageSourceKind::Archive,
-                reason: "the configured source is not a local writable image store".into(),
-            });
-        summary.image_results.push(result);
-
-        let outcome = ReadyOutcome::from(summary);
-        assert_eq!(outcome.base_image_results.len(), 1);
-        assert_eq!(outcome.image_results.len(), 1);
-        assert_eq!(outcome.image_results[0].warnings.len(), 1);
-    }
-
-    /// Additive legacy-JSON fields: absent when there is nothing to report
-    /// (an ordinary build-runtime `ready`, as today), present — with
-    /// warnings flattened out of `image_results` — once a builder-enabled
-    /// run recorded any.
-    #[test]
-    fn to_legacy_json_image_fields_are_additive() {
-        let empty = ReadyOutcome::from(ReadySummary::new("docker")).to_legacy_json();
-        assert!(empty.get("image_results").is_none());
-        assert!(empty.get("base_image_results").is_none());
-        assert!(empty.get("warnings").is_none());
-
-        let mut summary = ReadySummary::new("builtin");
-        let mut result = image_result(StepStatus::Done, StepStatus::Done);
-        result
-            .warnings
-            .push(ReadyImageWarning::IncompatibleBuilder {
-                tag: result.tag.clone(),
-                source_kind: ImageSourceKind::Archive,
-                reason: "the configured source is not a local writable image store".into(),
-            });
-        summary.image_results.push(result);
-        let json = ReadyOutcome::from(summary).to_legacy_json();
-        assert_eq!(json["image_results"].as_array().unwrap().len(), 1);
-        assert_eq!(json["warnings"].as_array().unwrap().len(), 1);
-        assert!(json.get("base_image_results").is_none());
-    }
-
-    /// The legacy `ready` field keeps its broad reading (M-7): it additionally
-    /// requires `self.ready`, so a failed per-image stage now also turns the
-    /// legacy `ready` false, even though no top-level legacy field failed.
-    #[test]
-    fn to_legacy_json_ready_requires_image_stages_too() {
-        let mut outcome = ReadyOutcome::from({
-            let mut summary = ReadySummary::new("builtin");
-            summary.base_image = StepStatus::Done;
-            summary.agent_image = StepStatus::Done;
-            summary
-                .image_results
-                .push(image_result(StepStatus::Done, StepStatus::Done));
-            summary
-        });
-        assert_eq!(outcome.to_legacy_json()["ready"], true);
-
-        outcome.ready = false;
-        assert_eq!(
-            outcome.to_legacy_json()["ready"],
-            false,
-            "the legacy field must also go false once self.ready is false"
-        );
-    }
+    error.into()
 }

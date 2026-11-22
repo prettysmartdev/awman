@@ -27,41 +27,56 @@ pub fn substitute_prompt(template: &str, work_item: Option<&WorkItemContext>) ->
         );
     }
 
-    // {{work_item_number}} → zero-padded four-digit
-    out = replace_token(&out, "{{work_item_number}}", |_| match work_item {
-        Some(wi) => format!("{:04}", wi.number),
-        None => String::new(),
-    });
-    // {{work_item}} → bare numeric
-    out = replace_token(&out, "{{work_item}}", |_| match work_item {
-        Some(wi) => wi.number.to_string(),
-        None => String::new(),
-    });
-    // {{work_item_content}} → full file body
-    out = replace_token(&out, "{{work_item_content}}", |_| match work_item {
-        Some(wi) => wi.content.clone(),
-        None => String::new(),
-    });
-    // {{work_item_section:[Name]}} → body of the named section
-    while let Some(start) = out.find("{{work_item_section:") {
-        let end = match out[start..].find("}}") {
-            Some(e) => start + e + 2,
-            None => break,
+    // Scan the original template once. Work item content is opaque data.
+    out.clear();
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let Some(end) = rest[start..].find("}}") else {
+            out.push_str(&rest[start..]);
+            rest = "";
+            break;
         };
-        let body_start = start + "{{work_item_section:".len();
-        let body_end = end - 2;
-        let raw = out[body_start..body_end].trim();
-        let name = raw
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .trim_end_matches(':')
-            .trim();
-        let replacement = match work_item {
-            Some(wi) => extract_section(&wi.content, name).unwrap_or_default(),
-            None => String::new(),
+        let end = start + end + 2;
+        let token = &rest[start + 2..end - 2];
+        let replacement = match token {
+            "work_item_number" => Some(
+                work_item
+                    .and_then(|wi| wi.number)
+                    .map(|n| format!("{n:04}"))
+                    .unwrap_or_default(),
+            ),
+            "work_item" => Some(
+                work_item
+                    .map(|wi| {
+                        wi.number
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| wi.key.clone())
+                    })
+                    .unwrap_or_default(),
+            ),
+            "work_item_key" => Some(work_item.map(|wi| wi.key.clone()).unwrap_or_default()),
+            "work_item_title" => Some(work_item.map(|wi| wi.title.clone()).unwrap_or_default()),
+            "work_item_content" => Some(work_item.map(|wi| wi.content.clone()).unwrap_or_default()),
+            token if token.starts_with("work_item_section:") => {
+                let name = token["work_item_section:".len()..]
+                    .trim()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .trim_end_matches(':')
+                    .trim();
+                Some(
+                    work_item
+                        .and_then(|wi| extract_section(&wi.content, name))
+                        .unwrap_or_default(),
+                )
+            }
+            _ => None,
         };
-        out.replace_range(start..end, &replacement);
+        out.push_str(replacement.as_deref().unwrap_or(&rest[start..end]));
+        rest = &rest[end..];
     }
+    out.push_str(rest);
 
     Substitution {
         rendered: out,
@@ -69,22 +84,50 @@ pub fn substitute_prompt(template: &str, work_item: Option<&WorkItemContext>) ->
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WorkItemContext {
-    pub number: u32,
+    pub number: Option<u32>,
+    pub key: String,
+    pub title: String,
+    pub source_id: String,
+    pub content_hash: String,
     pub content: String,
 }
 
-pub(crate) fn replace_token<F: Fn(&str) -> String>(input: &str, token: &str, f: F) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(idx) = rest.find(token) {
-        out.push_str(&rest[..idx]);
-        out.push_str(&f(token));
-        rest = &rest[idx + token.len()..];
+impl WorkItemContext {
+    pub fn from_legacy(number: u32, content: String) -> Self {
+        Self {
+            number: Some(number),
+            key: format!("{number:04}"),
+            title: String::new(),
+            source_id: String::new(),
+            content_hash: crate::data::fs::hash::sha256_hex(content.as_bytes()),
+            content,
+        }
     }
-    out.push_str(rest);
-    out
+
+    /// Missing identity is accepted only for legacy numbered local states.
+    pub fn validate_saved_identity(
+        &self,
+        state: &crate::data::workflow_state::WorkflowState,
+    ) -> Result<(), crate::data::error::DataError> {
+        let legacy_local = self.key.bytes().all(|b| b.is_ascii_digit());
+        if state
+            .work_item_source_id
+            .as_deref()
+            .is_some_and(|id| id != self.source_id)
+            || (state.work_item_source_id.is_none() && !legacy_local)
+            || state
+                .work_item_key
+                .as_deref()
+                .is_some_and(|key| key != self.key)
+        {
+            return Err(crate::data::error::DataError::Other(
+                "saved workflow belongs to a different work item; refusing to resume".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Extract the body of an H1 or H2 section whose heading matches `name`
@@ -120,45 +163,37 @@ pub fn extract_section(content: &str, name: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+mod placeholder_tests {
     use super::*;
-
-    fn wi(content: &str) -> WorkItemContext {
-        WorkItemContext {
-            number: 42,
-            content: content.into(),
-        }
-    }
-
     #[test]
-    fn substitutes_zero_padded_number() {
-        let sub = substitute_prompt("WI {{work_item_number}}", Some(&wi("body")));
-        assert_eq!(sub.rendered, "WI 0042");
-    }
-
-    #[test]
-    fn substitutes_bare_number() {
-        let sub = substitute_prompt("WI {{work_item}}", Some(&wi("body")));
-        assert_eq!(sub.rendered, "WI 42");
-    }
-
-    #[test]
-    fn substitutes_content() {
-        let sub = substitute_prompt("== {{work_item_content}} ==", Some(&wi("body")));
-        assert_eq!(sub.rendered, "== body ==");
-    }
-
-    #[test]
-    fn extracts_section() {
-        let body = "# Title\n\n## Goal\nDo the thing\n\n## Notes\nN/A\n";
-        let sub = substitute_prompt("Goal: {{work_item_section:[Goal]}}", Some(&wi(body)));
-        assert_eq!(sub.rendered, "Goal: Do the thing");
-    }
-
-    #[test]
-    fn warning_when_no_work_item() {
-        let sub = substitute_prompt("WI {{work_item_number}}", None);
-        assert_eq!(sub.rendered, "WI ");
-        assert_eq!(sub.warnings.len(), 1);
+    fn nonnumeric_identity_and_replacement_text_stay_data() {
+        let context = WorkItemContext {
+            number: None,
+            key: "remote-1234567890abcdef12345678".into(),
+            title: "{{work_item_content}}".into(),
+            source_id: "https://tracker.example/items/PROJ-7".into(),
+            content_hash: String::new(),
+            content: "# Title\n\n## Summary\n{{work_item_title}} --work-item local:0".into(),
+        };
+        let result = substitute_prompt("{{work_item}}|{{work_item_number}}|{{work_item_key}}|{{work_item_title}}|{{work_item_content}}|{{work_item_section:[Summary]}}",Some(&context));
+        assert_eq!(
+            result.rendered,
+            format!(
+                "{}||{}|{}|{}|{{{{work_item_title}}}} --work-item local:0",
+                context.key, context.key, context.title, context.content
+            )
+        );
+        assert!(result.warnings.is_empty());
+        let mut numbered = context;
+        numbered.number = Some(42);
+        assert_eq!(
+            substitute_prompt("{{work_item_number}}/{{work_item}}", Some(&numbered)).rendered,
+            "0042/42"
+        );
+        numbered.number = Some(12345);
+        assert_eq!(
+            substitute_prompt("{{work_item_number}}", Some(&numbered)).rendered,
+            "12345"
+        );
     }
 }

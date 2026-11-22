@@ -1,0 +1,677 @@
+{
+  "server": [
+    {
+      "type": "snapshot",
+      "has_output": true,
+      "cols": 120,
+      "rows": 36,
+      "screen": "G1tIG1syShtbMW1jbGF1ZGUbWzBtID4gZWRpdGluZyBzcmMvbGliLnJzDQo="
+    },
+    {
+      "type": "output",
+      "bytes": "aMOpbGxvIPCfmYINCg=="
+    },
+    {
+      "type": "output",
+      "bytes": "G1v/"
+    },
+    {
+      "type": "resize",
+      "cols": 100,
+      "rows": 30
+    },
+    {
+      "type": "error",
+      "code": "control_held",
+      "error": "another viewer holds terminal control"
+    },
+    {
+      "type": "error",
+      "code": "input_not_allowed",
+      "error": "input is not allowed for this viewer"
+    },
+    {
+      "type": "error",
+      "code": "input_backpressure",
+      "error": "terminal input queue is full; the agent is not reading input"
+    },
+    {
+      "type": "lagged"
+    },
+    {
+      "type": "snapshot",
+      "cols": 100,
+      "rows": 30,
+      "screen": "G1tIG1sySg=="
+    },
+    {
+      "type": "exit",
+      "code": 0
+    },
+    {
+      "type": "automation_state",
+      "execution_id": "exe_11111111111111111111111111111111",
+      "provider": "fixture",
+      "provider_version": null,
+      "native_session_id": null,
+      "automation_mode": "auto",
+      "minimum_status_support": "best_effort",
+      "state": "ready",
+      "revision": 7,
+      "active_turn_id": null,
+      "native_start_mode": "default",
+      "workspace_access": "read_write",
+      "status_support": "full",
+      "status_source": "native",
+      "status_reason": null,
+      "capabilities": {
+        "agent": "fixture",
+        "runtime": "fixture",
+        "provider_version": null,
+        "image_digest": null,
+        "minimum_version": null,
+        "version_warning": null,
+        "evidence": "none",
+        "native_plan": {
+          "interactive": null,
+          "headless": null,
+          "acp": null,
+          "kind": null
+        },
+        "headless_turns": {
+          "supported": null,
+          "reason": null
+        },
+        "terminal_turns": {
+          "supported": null,
+          "status_support": null,
+          "sources": [],
+          "reason": null
+        },
+        "native_resume": {
+          "interactive": null,
+          "headless": null,
+          "reason": null
+        },
+        "settings_profiles": false,
+        "credential_updates": {
+          "routes": []
+        }
+      }
+    },
+    {
+      "type": "turn_accepted",
+      "request_id": "12345678-1234-4234-8234-123456789abc",
+      "execution_id": "exe_11111111111111111111111111111111",
+      "turn_id": "turn_22222222222222222222222222222222",
+      "status_support": "full",
+      "status_source": "native"
+    },
+    {
+      "type": "turn_result",
+      "request_id": "12345678-1234-4234-8234-123456789abc",
+      "execution_id": "exe_11111111111111111111111111111111",
+      "turn_id": "turn_22222222222222222222222222222222",
+      "result": {
+        "status": "completed",
+        "status_support": "full",
+        "readiness_source": "native",
+        "completion_source": "native",
+        "completion_verified": true,
+        "native_turn_id": null,
+        "final_message": "",
+        "output_status": "complete",
+        "failure": null
+      }
+    },
+    {
+      "type": "execution_closed",
+      "request_id": "12345678-1234-4234-8234-123456789abc",
+      "execution_id": "exe_11111111111111111111111111111111",
+      "result": {
+        "exit_code": 0,
+        "automation": {
+          "execution_id": "exe_11111111111111111111111111111111",
+          "native_session_id": null,
+          "last_turn_id": "turn_22222222222222222222222222222222",
+          "native_start_mode": "default",
+          "workspace_access": "read_write",
+          "status_support": "full",
+          "completion_verified": true,
+          "output_status": "complete",
+          "cleanup_status": "complete"
+        }
+      }
+    },
+    {
+      "type": "execution_replaced",
+      "request_id": "12345678-1234-4234-8234-123456789abc",
+      "previous_execution_id": "exe_11111111111111111111111111111111",
+      "execution_id": "exe_44444444444444444444444444444444",
+      "credential_generation": 2
+    },
+    {
+      "type": "operation_error",
+      "request_id": "12345678-1234-4234-8234-123456789abc",
+      "code": "stale_revision",
+      "error": "Refresh execution state"
+    },
+    {
+      "type": "credential_update_state",
+      "snapshot": {
+        "execution_id": "exe_44444444444444444444444444444444",
+        "revision": 13,
+        "generations": [
+          {
+            "credential_generation": 2,
+            "pending_generation": 3,
+            "generation_state": "confirmed",
+            "refresh_owner": "caller",
+            "status": "applying"
+          }
+        ]
+      }
+    }
+  ],
+  "client": [
+    {
+      "type": "take_control"
+    },
+    {
+      "type": "input",
+      "bytes": "bHMgLWxhDQ=="
+    },
+    {
+      "type": "resize",
+      "cols": 100,
+      "rows": 30
+    },
+    {
+      "type": "detached",
+      "reason": "user"
+    },
+    {
+      "type": "submit_turn",
+      "request_id": "12345678-1234-4234-8234-123456789abc",
+      "execution_id": "exe_11111111111111111111111111111111",
+      "expected_revision": 7,
+      "prompt": "Review café 🙂\nKeep context."
+    },
+    {
+      "type": "close_execution",
+      "request_id": "12345678-1234-4234-8234-123456789abc",
+      "execution_id": "exe_11111111111111111111111111111111",
+      "expected_revision": 9
+    }
+  ],
+  "decoded": {
+    "first_snapshot_screen_utf8": "\u001b[H\u001b[2J\u001b[1mclaude\u001b[0m > editing src/lib.rs\r\n",
+    "first_output_utf8": "héllo 🙂\r\n",
+    "second_output_bytes": [
+      27,
+      91,
+      255
+    ]
+  },
+  "automation_examples": {
+    "snapshot": {
+      "execution_id": "exe_11111111111111111111111111111111",
+      "provider": "fixture",
+      "provider_version": null,
+      "native_session_id": null,
+      "automation_mode": "auto",
+      "minimum_status_support": "best_effort",
+      "state": "ready",
+      "revision": 7,
+      "active_turn_id": null,
+      "native_start_mode": "default",
+      "workspace_access": "read_write",
+      "status_support": "full",
+      "status_source": "native",
+      "status_reason": null,
+      "capabilities": {
+        "agent": "fixture",
+        "runtime": "fixture",
+        "provider_version": null,
+        "image_digest": null,
+        "minimum_version": null,
+        "version_warning": null,
+        "evidence": "none",
+        "native_plan": {
+          "interactive": null,
+          "headless": null,
+          "acp": null,
+          "kind": null
+        },
+        "headless_turns": {
+          "supported": null,
+          "reason": null
+        },
+        "terminal_turns": {
+          "supported": null,
+          "status_support": null,
+          "sources": [],
+          "reason": null
+        },
+        "native_resume": {
+          "interactive": null,
+          "headless": null,
+          "reason": null
+        },
+        "settings_profiles": false,
+        "credential_updates": {
+          "routes": []
+        }
+      }
+    },
+    "turn_result": {
+      "status": "completed",
+      "status_support": "full",
+      "readiness_source": "native",
+      "completion_source": "native",
+      "completion_verified": true,
+      "native_turn_id": null,
+      "final_message": "",
+      "output_status": "complete",
+      "failure": null
+    },
+    "pending_turn": {
+      "request_id": "12345678-1234-4234-8234-123456789abc",
+      "turn_id": "turn_22222222222222222222222222222222",
+      "execution_id": "exe_11111111111111111111111111111111",
+      "command_id": "cmd_33333333333333333333333333333333",
+      "attempt": 1,
+      "ordinal": 1,
+      "native_session_id": null,
+      "native_turn_id": null,
+      "accepted_at": "2026-11-18T00:00:00Z",
+      "started_at": null,
+      "completed_at": null,
+      "accepted_revision": 7,
+      "status_support": "full",
+      "status_source": "native",
+      "result": null
+    },
+    "finished_turn": {
+      "request_id": "12345678-1234-4234-8234-123456789abc",
+      "turn_id": "turn_22222222222222222222222222222222",
+      "execution_id": "exe_11111111111111111111111111111111",
+      "command_id": "cmd_33333333333333333333333333333333",
+      "attempt": 1,
+      "ordinal": 1,
+      "native_session_id": null,
+      "native_turn_id": null,
+      "accepted_at": "2026-11-18T00:00:00Z",
+      "started_at": null,
+      "completed_at": "2026-11-18T00:01:00Z",
+      "accepted_revision": 7,
+      "status_support": "full",
+      "status_source": "native",
+      "result": {
+        "status": "completed",
+        "status_support": "full",
+        "readiness_source": "native",
+        "completion_source": "native",
+        "completion_verified": true,
+        "native_turn_id": null,
+        "final_message": "",
+        "output_status": "complete",
+        "failure": null
+      }
+    },
+    "full": {
+      "type": "automation_state",
+      "execution_id": "exe_11111111111111111111111111111111",
+      "provider": "fixture",
+      "provider_version": null,
+      "native_session_id": null,
+      "automation_mode": "auto",
+      "minimum_status_support": "best_effort",
+      "state": "ready",
+      "revision": 7,
+      "active_turn_id": null,
+      "native_start_mode": "default",
+      "workspace_access": "read_write",
+      "status_support": "full",
+      "status_source": "native",
+      "status_reason": null,
+      "capabilities": {
+        "agent": "fixture",
+        "runtime": "fixture",
+        "provider_version": null,
+        "image_digest": null,
+        "minimum_version": null,
+        "version_warning": null,
+        "evidence": "none",
+        "native_plan": {
+          "interactive": null,
+          "headless": null,
+          "acp": null,
+          "kind": null
+        },
+        "headless_turns": {
+          "supported": null,
+          "reason": null
+        },
+        "terminal_turns": {
+          "supported": null,
+          "status_support": null,
+          "sources": [],
+          "reason": null
+        },
+        "native_resume": {
+          "interactive": null,
+          "headless": null,
+          "reason": null
+        },
+        "settings_profiles": false,
+        "credential_updates": {
+          "routes": []
+        }
+      }
+    },
+    "best_effort": {
+      "type": "automation_state",
+      "execution_id": "exe_11111111111111111111111111111111",
+      "provider": "fixture",
+      "provider_version": null,
+      "native_session_id": null,
+      "automation_mode": "auto",
+      "minimum_status_support": "best_effort",
+      "state": "ready",
+      "revision": 7,
+      "active_turn_id": null,
+      "native_start_mode": "default",
+      "workspace_access": "read_write",
+      "status_support": "best_effort",
+      "status_source": "osc7501",
+      "status_reason": null,
+      "capabilities": {
+        "agent": "fixture",
+        "runtime": "fixture",
+        "provider_version": null,
+        "image_digest": null,
+        "minimum_version": null,
+        "version_warning": null,
+        "evidence": "none",
+        "native_plan": {
+          "interactive": null,
+          "headless": null,
+          "acp": null,
+          "kind": null
+        },
+        "headless_turns": {
+          "supported": null,
+          "reason": null
+        },
+        "terminal_turns": {
+          "supported": null,
+          "status_support": null,
+          "sources": [],
+          "reason": null
+        },
+        "native_resume": {
+          "interactive": null,
+          "headless": null,
+          "reason": null
+        },
+        "settings_profiles": false,
+        "credential_updates": {
+          "routes": []
+        }
+      }
+    },
+    "none": {
+      "type": "automation_state",
+      "execution_id": "exe_11111111111111111111111111111111",
+      "provider": "fixture",
+      "provider_version": null,
+      "native_session_id": null,
+      "automation_mode": "auto",
+      "minimum_status_support": "best_effort",
+      "state": "unknown",
+      "revision": 7,
+      "active_turn_id": null,
+      "native_start_mode": "default",
+      "workspace_access": "read_write",
+      "status_support": "none",
+      "status_source": "none",
+      "status_reason": null,
+      "capabilities": {
+        "agent": "fixture",
+        "runtime": "fixture",
+        "provider_version": null,
+        "image_digest": null,
+        "minimum_version": null,
+        "version_warning": null,
+        "evidence": "none",
+        "native_plan": {
+          "interactive": null,
+          "headless": null,
+          "acp": null,
+          "kind": null
+        },
+        "headless_turns": {
+          "supported": null,
+          "reason": null
+        },
+        "terminal_turns": {
+          "supported": null,
+          "status_support": null,
+          "sources": [],
+          "reason": null
+        },
+        "native_resume": {
+          "interactive": null,
+          "headless": null,
+          "reason": null
+        },
+        "settings_profiles": false,
+        "credential_updates": {
+          "routes": []
+        }
+      }
+    },
+    "unverified_result": {
+      "type": "turn_result",
+      "request_id": "12345678-1234-4234-8234-123456789abc",
+      "execution_id": "exe_11111111111111111111111111111111",
+      "turn_id": "turn_22222222222222222222222222222222",
+      "result": {
+        "status": "completed_unverified",
+        "status_support": "best_effort",
+        "readiness_source": "osc7501",
+        "completion_source": "osc7501",
+        "completion_verified": false,
+        "native_turn_id": null,
+        "final_message": null,
+        "output_status": "complete",
+        "failure": null
+      }
+    }
+  },
+  "invalid": {
+    "client": [
+      {
+        "type": "submit_turn",
+        "request_id": "invalid",
+        "execution_id": "exe_11111111111111111111111111111111",
+        "expected_revision": 7,
+        "prompt": "hello"
+      },
+      {
+        "type": "submit_turn",
+        "request_id": "12345678-1234-4234-8234-123456789abc",
+        "execution_id": "invalid",
+        "expected_revision": 7,
+        "prompt": "hello"
+      },
+      {
+        "type": "submit_turn",
+        "request_id": "12345678-1234-4234-8234-123456789abc",
+        "execution_id": "exe_11111111111111111111111111111111",
+        "expected_revision": 9007199254740992,
+        "prompt": "hello"
+      },
+      {
+        "type": "close_execution",
+        "request_id": "12345678-1234-4234-8234-123456789abc",
+        "execution_id": "exe_11111111111111111111111111111111"
+      },
+      {
+        "type": "unknown"
+      }
+    ],
+    "server": [
+      {
+        "type": "automation_state",
+        "execution_id": "exe_11111111111111111111111111111111",
+        "provider": "fixture",
+        "provider_version": null,
+        "native_session_id": null,
+        "automation_mode": "auto",
+        "minimum_status_support": "best_effort",
+        "state": "ready",
+        "revision": 9007199254740992,
+        "active_turn_id": null,
+        "native_start_mode": "default",
+        "workspace_access": "read_write",
+        "status_support": "full",
+        "status_source": "native",
+        "status_reason": null,
+        "capabilities": {
+          "agent": "fixture",
+          "runtime": "fixture",
+          "provider_version": null,
+          "image_digest": null,
+          "minimum_version": null,
+          "version_warning": null,
+          "evidence": "none",
+          "native_plan": {
+            "interactive": null,
+            "headless": null,
+            "acp": null,
+            "kind": null
+          },
+          "headless_turns": {
+            "supported": null,
+            "reason": null
+          },
+          "terminal_turns": {
+            "supported": null,
+            "status_support": null,
+            "sources": [],
+            "reason": null
+          },
+          "native_resume": {
+            "interactive": null,
+            "headless": null,
+            "reason": null
+          },
+          "settings_profiles": false,
+          "credential_updates": {
+            "routes": []
+          }
+        }
+      },
+      {
+        "type": "turn_accepted",
+        "request_id": null,
+        "execution_id": "exe_11111111111111111111111111111111",
+        "turn_id": "turn_22222222222222222222222222222222",
+        "status_support": "full",
+        "status_source": "native"
+      },
+      {
+        "type": "turn_result",
+        "request_id": "12345678-1234-4234-8234-123456789abc",
+        "execution_id": "exe_11111111111111111111111111111111",
+        "turn_id": "turn_22222222222222222222222222222222",
+        "result": {
+          "status": "completed",
+          "status_support": "full",
+          "readiness_source": "native",
+          "completion_source": "native",
+          "completion_verified": true,
+          "native_turn_id": "\u0000",
+          "final_message": "",
+          "output_status": "complete",
+          "failure": null
+        }
+      },
+      {
+        "type": "execution_replaced",
+        "request_id": "12345678-1234-4234-8234-123456789abc",
+        "previous_execution_id": "exe_11111111111111111111111111111111",
+        "execution_id": "exe_44444444444444444444444444444444",
+        "credential_generation": -1
+      },
+      {
+        "type": "automation_state",
+        "execution_id": "exe_11111111111111111111111111111111",
+        "provider": "fixture",
+        "provider_version": null,
+        "automation_mode": "auto",
+        "minimum_status_support": "best_effort",
+        "state": "ready",
+        "revision": 7,
+        "active_turn_id": null,
+        "native_start_mode": "default",
+        "workspace_access": "read_write",
+        "status_support": "full",
+        "status_source": "native",
+        "status_reason": null,
+        "capabilities": {
+          "agent": "fixture",
+          "runtime": "fixture",
+          "provider_version": null,
+          "image_digest": null,
+          "minimum_version": null,
+          "version_warning": null,
+          "evidence": "none",
+          "native_plan": {
+            "interactive": null,
+            "headless": null,
+            "acp": null,
+            "kind": null
+          },
+          "headless_turns": {
+            "supported": null,
+            "reason": null
+          },
+          "terminal_turns": {
+            "supported": null,
+            "status_support": null,
+            "sources": [],
+            "reason": null
+          },
+          "native_resume": {
+            "interactive": null,
+            "headless": null,
+            "reason": null
+          },
+          "settings_profiles": false,
+          "credential_updates": {
+            "routes": []
+          }
+        }
+      }
+    ]
+  },
+  "wsp": {
+    "server": [
+      "error",
+      "snapshot",
+      "output",
+      "resize",
+      "exit",
+      "lagged"
+    ],
+    "client": [
+      "input",
+      "resize",
+      "take_control",
+      "detached"
+    ]
+  }
+}

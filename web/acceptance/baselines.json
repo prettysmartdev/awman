@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "release_ready": false,
+  "measured_at": "2026-11-09",
+  "environment": "Debian 12 aarch64 container, Rust 1.94.0, unoptimized test profile, four Tokio workers, tests run serially",
+  "native_owner_socket": {
+    "submit_first_output_p95_ms": 1.314292,
+    "dialog_round_trip_p95_ms": 0.249042,
+    "backend_submit_p95_ms": 1.606792,
+    "backend_dialog_response_p95_ms": 1.670791,
+    "terminal_source": "synthetic real TerminalHub frames; not agent PTY or browser rendering",
+    "terminal_frame_bytes": 4096,
+    "terminal_frame_samples": 300,
+    "terminal_frame_p95_ms": 0.697792,
+    "terminal_throughput_mib_s": 6.5986154098890974,
+    "reconnect_snapshot_samples": 100,
+    "reconnect_snapshot_p95_ms": 0.716167,
+    "warmup_samples_per_metric": 25
+  },
+  "web": {
+    "frame_latency_p95_ms": null,
+    "terminal_throughput_mib_s": null,
+    "reconnect_snapshot_p95_ms": null,
+    "narrow_viewport_memory_bytes": null,
+    "reason": "web measurements are not yet recorded: they need a browser performance harness (frame latency, terminal throughput, reconnect, narrow-viewport memory) driven against a real daemon from the deployed HTTPS origin; unit and Chromium e2e runs do not produce comparable numbers"
+  },
+  "release_regression_limit_percent": 20,
+  "regression_gate_status": "blocked until comparable web measurements exist; null is not a passing baseline"
+}

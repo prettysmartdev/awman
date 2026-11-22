@@ -1,4 +1,4 @@
-//! `GET /v1/commands/{id}/outputs` and `GET /v1/commands/{id}/outputs/{path}`
+//! `GET /v1/worker/commands/{id}/outputs` and `GET /v1/worker/commands/{id}/outputs/{path}`
 //! (WI 0137 §3): list and serve the files an agent left in the command's
 //! `/awman/output` directory.
 //!
@@ -19,22 +19,23 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
+use crate::command::daemon_api::worker::{self, OutputError};
 use crate::data::fs::command_outputs::{
-    content_type_for, list_output_dir, open_output_file, validate_output_path,
-    MAX_SERVED_OUTPUT_BYTES,
+    content_type_for, validate_output_path, MAX_SERVED_OUTPUT_BYTES,
 };
 use crate::frontend::api::error::ApiError;
 use crate::frontend::api::routes::AppState;
 
-/// `GET /v1/commands/{id}/outputs`.
+/// `GET /v1/worker/commands/{id}/outputs`.
 pub async fn handle_list_outputs(
     State(state): State<Arc<AppState>>,
     AxumPath(command_id): AxumPath<String>,
+    Query(query): Query<crate::data::wire::ListQuery>,
 ) -> Response {
     // Bound concurrent CPU/I/O work and cancel it when the request is dropped.
     static LISTINGS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
@@ -54,20 +55,42 @@ pub async fn handle_list_outputs(
     let id = command_id.clone();
     let listed = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let command = lookup_command(&state, &id)?;
-        let dir = state
-            .paths
-            .command_output_dir(&command.session_id, &command.id);
-        Some(list_output_dir(&dir, &cancelled))
+        worker::commands_outputs(
+            &state,
+            &crate::data::ids::CommandId::parse(&id).expect("route validated command id"),
+            &cancelled,
+        )
     })
     .await;
     match listed {
-        Ok(Some(Ok(listing))) => Json(listing).into_response(),
-        Ok(Some(Err(_))) => {
+        Ok(Ok(listing)) => {
+            let files = listing
+                .files
+                .into_iter()
+                .map(|file| OutputEntry {
+                    path: file.path,
+                    size_bytes: file.size,
+                    sha256: file.sha256,
+                    modified_at: file
+                        .modified_at
+                        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(&raw).ok())
+                        .map(|t| t.with_timezone(&chrono::Utc)),
+                })
+                .collect();
+            match crate::command::daemon_api::core::page(files, &query) {
+                Ok(page) => Json(page).into_response(),
+                Err(e) => ApiError::invalid_request(e.to_string()).into_response(),
+            }
+        }
+        Ok(Err(OutputError::CommandNotFound)) => command_not_found(&command_id),
+        Ok(Err(OutputError::Storage(error))) => {
+            tracing::error!(%error, "Failed to read command for outputs");
+            ApiError::internal("failed to read command outputs").into_response()
+        }
+        Ok(Err(_)) => {
             ApiError::output_listing_unavailable("output listing could not complete; retry later")
                 .into_response()
         }
-        Ok(None) => command_not_found(&command_id),
         Err(error) => internal_error(error),
     }
 }
@@ -81,7 +104,7 @@ enum Fetched {
     File(Vec<u8>),
 }
 
-/// `GET /v1/commands/{id}/outputs/{*path}`.
+/// `GET /v1/worker/commands/{id}/outputs/{*path}`.
 pub async fn handle_get_output(
     State(state): State<Arc<AppState>>,
     AxumPath((command_id, path)): AxumPath<(String, String)>,
@@ -94,15 +117,14 @@ pub async fn handle_get_output(
     let id = command_id.clone();
     let requested = path.clone();
     let fetched = tokio::task::spawn_blocking(move || {
-        let Some(command) = lookup_command(&state, &id) else {
-            return Fetched::UnknownCommand;
-        };
-        let dir = state
-            .paths
-            .command_output_dir(&command.session_id, &command.id);
-        let mut opened = match open_output_file(&dir, &requested) {
+        let mut opened = match worker::commands_output(
+            &state,
+            &crate::data::ids::CommandId::parse(&id).expect("route validated command id"),
+            &requested,
+        ) {
             Ok(Some(opened)) => opened,
             Ok(None) => return Fetched::Missing,
+            Err(OutputError::CommandNotFound) => return Fetched::UnknownCommand,
             Err(error) => return Fetched::BadPath(error.to_string()),
         };
         if opened.size > MAX_SERVED_OUTPUT_BYTES {
@@ -159,19 +181,6 @@ pub async fn handle_get_output(
     }
 }
 
-fn lookup_command(
-    state: &AppState,
-    command_id: &str,
-) -> Option<crate::data::fs::api_db::CommandRecord> {
-    match state.store.get_command(command_id) {
-        Ok(found) => found,
-        Err(error) => {
-            tracing::error!(%error, command_id, "Failed to look up command for outputs");
-            None
-        }
-    }
-}
-
 fn command_not_found(command_id: &str) -> Response {
     ApiError::command_not_found(format!("Command '{command_id}' not found")).into_response()
 }
@@ -179,4 +188,14 @@ fn command_not_found(command_id: &str) -> Response {
 fn internal_error(error: tokio::task::JoinError) -> Response {
     tracing::error!(%error, "Command outputs task failed");
     ApiError::internal("failed to read command outputs").into_response()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OutputEntry {
+    pub path: String,
+    #[serde(with = "crate::data::wire::bytes")]
+    pub size_bytes: u64,
+    pub sha256: String,
+    #[serde(default, with = "crate::data::wire::opt_timestamp")]
+    pub modified_at: Option<chrono::DateTime<chrono::Utc>>,
 }

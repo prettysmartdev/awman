@@ -98,6 +98,17 @@ ride out transient agent/container failures without a human in the loop.
   single failure-recovery surface, and leaving a dead engine→frontend contract
   behind would invite divergence.
 
+Execution-stream failures participate in the same main-step recovery policy
+as non-zero exits, for sequential and parallel workflows and daemon-backed
+interactive clients. The runtime preserves a redacted failure reason and a
+typed confirmation that the old execution has stopped. Recovery is allowed
+only with that confirmation; unrelated engine errors and unconfirmed stops
+remain fatal. Persist these failures with the existing unknown-status sentinel
+`-1` and the reason, without fabricating an `AgentExitInfo`. The failure board
+says "Exit status unavailable" and offers the usual restart/back/skip/pause/abort
+actions. Authentication recovery must not treat stream loss as an agent exit.
+Existing `abort_on_failure`, cancellation and unattended retry limits apply.
+
 ### 2. Workflow resume — one flow for both modes
 
 Resume is a single code path. `WorkflowResumePrompt` (built by the command
@@ -132,9 +143,15 @@ command layer nor the engine reimplements them:
 
 - `resume_stop_point(&dag)` — index of the first `Failed`/`Cancelled` step in
   topological order, falling back to the first step that never succeeded.
-- `rewind_to(&dag, start)` — steps at or after `start` back to `Pending`;
-  earlier non-succeeded steps to `Skipped` so they count as satisfied
-  dependencies without re-running.
+- `rewind_to(&dag, start)` — reset `start` and its transitive dependents to
+  `Pending`. Mark unfinished prerequisites of `start` as `Skipped` so an
+  explicit resume after an unfinished step can advance. Preserve all other
+  branches, including their succeeded/skipped states and unfinished work.
+  A topological-order suffix is not a valid reset boundary: a depth-first
+  traversal can place completed earlier-stage steps after `start`. Both
+  plain and dynamic resume must use dependency reachability, independent of
+  definition order. Replaying an earlier step deliberately invalidates its
+  dependents, including completed joins, but not the joins' other branches.
 - `unrecovered_steps()` — the `Failed`/`Cancelled` steps a saved run left behind.
 - `retain_steps_in(&dag)` — drop steps the workflow no longer defines. A saved
   state outlives edits to its workflow file; such a step can never run (the DAG

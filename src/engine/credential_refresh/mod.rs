@@ -28,11 +28,21 @@ use crate::engine::container::options::ResolvedContainerOptions;
 /// no leases, which is the same behaviour the absent global produced and is
 /// also how the `authRefresh.enabled: false` kill switch is implemented.
 pub trait CredentialLeaseFactory: Send + Sync {
+    fn add_checkout_roots(&self, _roots: Vec<std::path::PathBuf>) {}
     fn register_lease(
         &self,
         delivery: &RefreshableCredentialDelivery,
         container: &str,
     ) -> CredentialLease;
+    fn register_redacted_lease(
+        &self,
+        delivery: &RefreshableCredentialDelivery,
+        container: &str,
+        redaction: crate::engine::auth::redaction::RedactionSet,
+    ) -> CredentialLease {
+        let _ = redaction;
+        self.register_lease(delivery, container)
+    }
 }
 
 /// The factory as it travels on a `ContainerOption` / `ResolvedContainerOptions`.
@@ -47,14 +57,6 @@ pub struct LeaseFactoryHandle(Arc<dyn CredentialLeaseFactory>);
 impl LeaseFactoryHandle {
     pub fn new(factory: Arc<dyn CredentialLeaseFactory>) -> Self {
         Self(factory)
-    }
-
-    fn register_lease(
-        &self,
-        delivery: &RefreshableCredentialDelivery,
-        container: &str,
-    ) -> CredentialLease {
-        self.0.register_lease(delivery, container)
     }
 }
 
@@ -73,6 +75,17 @@ impl std::fmt::Debug for LeaseFactoryHandle {
 /// The monitor registers through `Arc<Self>` (it hands a clone to the tick
 /// thread), so the factory impl lives on the handle rather than on the value.
 impl CredentialLeaseFactory for Arc<CredentialRefreshMonitor> {
+    fn add_checkout_roots(&self, roots: Vec<std::path::PathBuf>) {
+        CredentialRefreshMonitor::add_checkout_roots(self, roots);
+    }
+    fn register_redacted_lease(
+        &self,
+        delivery: &RefreshableCredentialDelivery,
+        container: &str,
+        redaction: crate::engine::auth::redaction::RedactionSet,
+    ) -> CredentialLease {
+        self.register_redacted(delivery, container, redaction)
+    }
     fn register_lease(
         &self,
         delivery: &RefreshableCredentialDelivery,
@@ -96,6 +109,15 @@ pub(crate) fn register_container_leases(
     options: &ResolvedContainerOptions,
     container: &str,
 ) -> Vec<CredentialLease> {
+    if let Some(factory) = &options.lease_factory {
+        let roots = options
+            .working_dir
+            .iter()
+            .cloned()
+            .chain(options.agent_add_dirs.iter().map(|(_, p)| p.clone()))
+            .collect();
+        factory.0.add_checkout_roots(roots);
+    }
     if options.refreshable_credentials.is_empty() {
         return Vec::new();
     }
@@ -103,8 +125,17 @@ pub(crate) fn register_container_leases(
         Some(factory) => options
             .refreshable_credentials
             .iter()
-            .map(|delivery| factory.register_lease(delivery, container))
+            .map(|delivery| {
+                factory.0.register_redacted_lease(
+                    delivery,
+                    container,
+                    options.output_redaction.clone(),
+                )
+            })
             .collect(),
         None => Vec::new(),
     }
 }
+
+pub mod authority;
+pub mod delivery;

@@ -1,40 +1,38 @@
-# awman Documentation
+# awman documentation
 
-A guide to using awman, the containerized multi-agent terminal multiplexer.
+Start with [Getting started](00-getting-started.md). Then use the guides for what you want to do; the references are for exact syntax and settings.
 
----
+## Learn the basics
 
-## Contents
+1. [Getting started](00-getting-started.md) — install, set up a repository, and start an agent.
+2. [Concepts](01-concepts.md) — sessions, work items, workflows, and isolation.
+3. [Using the TUI](02-using-the-tui.md) — navigate tabs, agent windows, and workflow controls.
+4. [Agent sessions](03-agent-sessions.md) — chat, one-off tasks, permissions, authentication, and settings profiles.
+5. [Security and isolation](04-security-and-isolation.md) — mounts, worktrees, credentials, and host access.
 
-| # | File | What's covered |
-|---|------|----------------|
-| 00 | [Getting Started](00-getting-started.md) | Installation, `init`, `ready`, your first agent session |
-| 01 | [Concepts](01-concepts.md) | Mental model: containers, agents, modes, overlays |
-| 02 | [Using the TUI](02-using-the-tui.md) | TUI layout, tabs, container window, Workflow Overview, keyboard reference |
-| 03 | [Agent Sessions](03-agent-sessions.md) | `chat`, permission modes (`--plan`/`--auto`/`--yolo`), ACP, work items, skills, agent authentication |
-| 04 | [Security & Isolation](04-security-and-isolation.md) | Worktrees, Docker socket, SSH keys, custom agent approval, command transparency |
-| 05 | [Workflows](05-workflows.md) | Multi-step workflows, setup/teardown, control board, parallel groups, state persistence |
-| 06 | [Dynamic Workflows](06-dynamic-workflows.md) | `--dynamic` — leader agent designs the workflow, repair loop, `--leader` |
-| 07 | [Configuration](07-configuration.md) | Config files, precedence, runtime selection, builtin runtime settings, every field |
-| 08 | [Overlays](08-overlays.md) | `dir()`, `env()`, `skill()`, `ssh()`, `context()` — sources, merge semantics |
-| 09 | [API & Remote Mode](09-api-and-remote-mode.md) | HTTP server, command cancel, labels, idempotency, one-shot runs, headless operation, CI/automation, and the `awman remote` client |
-| 10 | [GitHub Integration](10-github-integration.md) | `--issue` flag, fetching issues, authentication |
-| 11 | [Runtimes](11-runtimes.md) | Docker, Apple Containers, the builtin microVM, and Docker Sandboxes — platform support, setup, image sources, lifecycle |
-| 12 | [squad](12-squad.md) | Your squad of agents: tasks, durable workspaces, the squad tab, attach, guardrails |
-| 13 | [Cleaning Up](13-cleaning-up.md) | `awman clean` — remove containers, workflow files, and dangling images |
-| 14 | [Command Reference](14-command-reference.md) | Every command, subcommand, flag, and argument awman accepts, generated from the source of truth |
-| 15 | [Custom Agents](15-custom-agents.md) | Define your own agents in TOML: locations, reference, images, approval and trust, `awman new agent`, crush/maki migration |
-| — | [Architecture (Detailed)](architecture.md) | Source layout, in-depth design decisions |
+## Get work done
 
----
+- [Workflows](05-workflows.md) — create and run repeatable, multi-step work.
+- [Dynamic workflows](06-dynamic-workflows.md) — let an agent design the steps for a work item.
+- [GitHub integration](10-github-integration.md) — use issues and pull requests.
+- [Squad](12-squad.md) — run recurring tasks with a group of agents.
+- [Web app](20-webapp.md) — connect a browser to the local daemon.
 
-Start with [Getting Started](00-getting-started.md) if this is your first time.
+## Set up and operate
 
-### Looking for something that moved?
+- [Configuration](07-configuration.md) — set defaults and inspect all config keys.
+- [Overlays](08-overlays.md) — give an agent specific files, variables, skills, or context.
+- [Runtimes](11-runtimes.md) — choose Docker, Apple Containers, Docker Sandboxes, or the builtin microVM.
+- [Custom agents](15-custom-agents.md) — define an agent that is not built in.
+- [Cleaning up](13-cleaning-up.md) — remove stopped sessions and completed workflow data.
+- [The daemon](16-daemon.md) and [engine frontends](19-engine-and-frontends.md) — run shared background services and daemon-backed TUI sessions.
+- [Workers and work servers](17-workers-and-work-servers.md) — connect to work queues and run pulled jobs.
+- [API and remote mode](09-api-and-remote-mode.md) — automate with HTTP or `awman remote`.
 
-| Was | Now |
-|-----|-----|
-| Yolo Mode | [Permission modes](03-agent-sessions.md#permission-modes) (flags, disallowed tools) and [Auto-advance when stuck](05-workflows.md#auto-advance-when-stuck-yolo-mode) (the countdown) |
-| ACP Mode | [ACP launch mode](03-agent-sessions.md#acp-launch-mode) |
-| Parallel Workflows | [Parallel workflows](05-workflows.md#parallel-workflows) |
-| Remote Mode | [Remote mode](09-api-and-remote-mode.md#remote-mode) |
+## Reference
+
+- [Command reference](14-command-reference.md) — all commands and flags, generated from the command catalogue.
+- [Configuration keys](07-configuration.md#reference-all-keys) — exact settings and defaults.
+- [HTTP API](09-api-and-remote-mode.md#http-api) and [Work Server Protocol](17-workers-and-work-servers.md#work-server-protocol-v1-reference) — integration contracts.
+
+Contributing to awman? See the [architecture overview](architecture.md) and the authoritative [specs](../aspec/).

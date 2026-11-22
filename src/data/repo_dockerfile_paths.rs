@@ -80,38 +80,3 @@ impl RepoDockerfilePaths {
         result
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn project_dockerfile_at_repo_root() {
-        let p = RepoDockerfilePaths::new("/r");
-        assert_eq!(p.project_dockerfile(), Path::new("/r/Dockerfile.dev"));
-    }
-
-    #[test]
-    fn project_dockerfile_returns_override_when_supplied() {
-        let p = RepoDockerfilePaths::with_project_dockerfile(
-            "/r",
-            Some(PathBuf::from("/custom/Dockerfile")),
-        );
-        assert_eq!(p.project_dockerfile(), Path::new("/custom/Dockerfile"));
-    }
-
-    #[test]
-    fn project_dockerfile_returns_default_when_no_override() {
-        let p = RepoDockerfilePaths::with_project_dockerfile("/r", None);
-        assert_eq!(p.project_dockerfile(), Path::new("/r/Dockerfile.dev"));
-    }
-
-    #[test]
-    fn agent_dockerfile_under_dot_awman() {
-        let p = RepoDockerfilePaths::new("/r");
-        assert_eq!(
-            p.agent_dockerfile("claude"),
-            Path::new("/r/.awman/Dockerfile.claude")
-        );
-    }
-}

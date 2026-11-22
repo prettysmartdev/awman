@@ -1,0 +1,113 @@
+{
+  "about": "CJK, fullwidth, combining marks, wide char at the wrap boundary (split across frames)",
+  "expect": {
+    "alt_screen": false,
+    "app_cursor": false,
+    "bracketed_paste": false,
+    "cols": 10,
+    "cursor": {
+      "col": 0,
+      "row": 6,
+      "visible": true
+    },
+    "lines": [
+      "中文字符测",
+      "试",
+      "é ä ok",
+      "12345678中",
+      "ｆｕｌｌｗ",
+      "ｉｄｔｈ",
+      "",
+      ""
+    ],
+    "mouse_mode": "none",
+    "mouse_sgr": false,
+    "rows": 8
+  },
+  "expect_from_snapshot": {
+    "alt_screen": false,
+    "app_cursor": false,
+    "bracketed_paste": false,
+    "cursor": {
+      "col": 0,
+      "row": 6,
+      "visible": true
+    },
+    "lines": [
+      "中文字符测",
+      "试",
+      "é ä ok",
+      "12345678中",
+      "ｆｕｌｌｗ",
+      "ｉｄｔｈ",
+      "",
+      ""
+    ]
+  },
+  "final_snapshot": {
+    "cols": 10,
+    "has_output": true,
+    "rows": 8,
+    "screen": "G1s/MjVoG1ttG1tIG1tK5Lit5paH5a2X56ym5rWL6K+VDQplzIEgYcyIIG9rDQoxMjM0NTY3OOS4rQ0K772G772V772M772M772X772J772E772U772IDQobPhtbPzFsG1s/MjAwNGw=",
+    "type": "snapshot"
+  },
+  "frames": [
+    {
+      "cols": 10,
+      "has_output": false,
+      "rows": 8,
+      "screen": "G1s/MjVoG1ttG1tIG1tKGz4bWz8xbBtbPzIwMDRs",
+      "type": "snapshot"
+    },
+    {
+      "bytes": "G1syShtbSA==",
+      "type": "output"
+    },
+    {
+      "bytes": "5Lit5paH5Q==",
+      "type": "output"
+    },
+    {
+      "bytes": "rZfnrKbmtQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "i+ivlQ0KZQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "zIEgYcyIIA==",
+      "type": "output"
+    },
+    {
+      "bytes": "b2sNCjEyMw==",
+      "type": "output"
+    },
+    {
+      "bytes": "NDU2NzjkuA==",
+      "type": "output"
+    },
+    {
+      "bytes": "rQ0K772G7w==",
+      "type": "output"
+    },
+    {
+      "bytes": "vZXvvYzvvQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "jO+9l++9iQ==",
+      "type": "output"
+    },
+    {
+      "bytes": "772E772U7w==",
+      "type": "output"
+    },
+    {
+      "bytes": "vYgNCg==",
+      "type": "output"
+    }
+  ],
+  "name": "wide_graphemes",
+  "source": "vt100-ctt 0.17.1 (TerminalHub mirror parser); snapshot = Screen::state_formatted()"
+}

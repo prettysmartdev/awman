@@ -12,6 +12,8 @@ Dynamic workflows are useful when:
 - You want a custom workflow per work item rather than reusing a generic template
 - You're running in fully autonomous mode and want end-to-end execution from a single command
 
+When selecting `cursor` or `opencode-v2` for the leader or steps, pass `--yolo` explicitly: implied automation defaults do not authorize their broad approval modes, and such launches are refused.
+
 Dynamic mode always implies `--yolo`, `--worktree`, and a `context(workflow)` overlay. Local runs use an isolated Git worktree; remote sessions reuse their isolated clone. The leader and workflow steps share a context directory for coordination.
 
 ---
@@ -26,13 +28,63 @@ awman exec workflow --dynamic --work-item 42
 awman exec workflow --dynamic --work-item 42 --leader claude::claude-opus-4-8
 ```
 
-`--work-item` is required with `--dynamic`. Without it, awman cannot provide the leader agent with the work item it is designing the workflow for.
+`--work-item` is required with `--dynamic`. Without it, awman cannot provide the leader agent with the work item it is designing the workflow for, and the command fails before launch.
+
+## Work item inputs
+
+Pass a local work item or an external reference through the same flag:
+
+```sh
+# A local numbered file, using workItems.source = "local"
+awman exec workflow --dynamic --work-item 42
+
+# Explicit GitHub issue, independent of the configured default
+awman exec workflow --dynamic --work-item github:42
+
+# Explicit local path
+awman exec workflow --dynamic --work-item docs/requests/import.md
+```
+
+A bare value is resolved according to `workItems.source`: `local` looks in
+`workItems.dir`, `github` looks on the repository's GitHub `origin`, and
+`http:<name>` uses that globally configured HTTP provider. Explicit local
+paths, GitHub references (`github:<N>`, `#<N>`, `owner/repo#N`, or a GitHub
+issue URL), and HTTP provider IDs or URLs select their source directly. A
+missing or unreadable item is an error; dynamic workflows do not start without
+their required input. See [Work item source configuration](07-configuration.md#work-item-sources).
+
+For ordinary `exec workflow` runs, the resolved item's content is available
+to workflow templates as `{{work_item_content}}`; numbered items also
+provide `{{work_item_number}}` and `{{work_item}}`. Use
+`{{work_item_section:[Name]}}` to include a named section. These variables
+come from the resolved work item, whether it is local or remote.
 
 ## Workflow prerequisites
 
-Dynamic workflows check prerequisites after reading the work item and before offering resume or starting the leader. Because the final workflow does not exist yet, this first report covers the possible workflow requirements. `--check-prerequisites` displays that report and exits without starting the leader.
+Dynamic workflows check all prerequisites in one pass before starting the leader: its image, the images of every agent available to it, workflow credentials, Git requirements and container tools. A resumed run checks the saved workflow’s concrete requirements instead. The checks appear together in one prerequisite review; continuing prepares the approved requirements before any agent starts. `--check-prerequisites` displays that report and exits without starting the leader.
 
-The leader receives a summary of the available workflow credentials and tools, so it can plan around them. After awman validates the generated workflow, it narrows the grants to the needs that workflow actually uses: unused grants are dropped, and any newly introduced requirement is checked and reported. When unresolved requirements use `--prerequisite-unresolved fail`, awman stops before executing the generated workflow. See [Workflow prerequisite checks](05-workflows.md#workflow-prerequisite-checks) for the available choices and credential behavior.
+The leader receives a summary of the available workflow credentials and tools, so it can plan around them. After awman validates the generated workflow, it narrows the grants to the needs that workflow actually uses: unused grants are dropped, and any newly introduced requirement remains unavailable. No further prerequisite or image-setup dialog opens after the leader, and generation cannot authorize new credentials or image builds. When unresolved requirements use `--prerequisite-unresolved fail`, awman stops before executing the generated workflow. See [Workflow prerequisite checks](05-workflows.md#workflow-prerequisite-checks) for the available choices and credential behavior.
+
+Before launching the leader, awman checks that the project has a Dockerfile
+for the selected leader and every agent configured for the dynamic workflow.
+If one is missing, the command fails with an error naming each agent and its
+expected `.awman/Dockerfile.<agent>` path, followed by an `init` action for
+each one. For example:
+
+```text
+dynamic workflow references agents with no Dockerfile in the project:
+  - "claude" (expected .awman/Dockerfile.claude)
+Run init for each missing agent before retrying:
+  POST /v1/worker/commands {"subcommand":"init","args":["--agent","claude"]} / awman init --agent claude
+```
+
+This check is read-only and runs before the leader starts, so it does not use
+a leader repair attempt or create project files. In an API worker session,
+run [`init` through the API](09-api-and-remote-mode.md#initialize-a-project)
+for every missing agent, commit every reported file marked
+`"uncommitted": true`, then retry the dynamic workflow. Pull leases prepare
+missing built-in agent Dockerfiles in their session clone before dispatch;
+this preflight catches any Dockerfiles still missing afterwards.
 
 ---
 
@@ -42,12 +94,12 @@ When you run `exec workflow --dynamic`, awman follows these steps:
 
 1. **Validate flags** — checks for conflicts before doing any work (see [Flag rules](#flag-rules))
 2. **Read the work item** — loads the work item file; fails immediately if it cannot be found or read
-3. **Set up the worktree** — creates an isolated Git worktree (the same path as `--yolo --worktree`); all subsequent agent work runs inside it
-4. **Seed the context directory** — writes `workflow-usage.md`, including several inline examples, into the `context(workflow)` directory so the leader has reference material
-5. **Launch the leader agent** — starts a container with a pre-built prompt describing the work item, available agents, and path conventions; the agent's job is to write a `workflow.toml` to the context directory
-6. **Wait for the leader to finish** — stuck detection runs normally; after 30 seconds of silence the 60-second yolo countdown starts; when it expires (or you press `[n]`), the container is killed and awman reads the file
-7. **Validate the workflow** — checks that `workflow.toml` is valid TOML, references only agents that exist in the project, and has all required fields; if validation fails, a repair agent is launched (see [Repair loop](#repair-loop))
-8. **Build missing images** — for any agent referenced in the generated workflow that has a `Dockerfile.<agent>` but no built image, awman builds the image automatically before starting the workflow
+3. **Check and prepare prerequisites** — review all workflow requirements and prepare agent images before the leader starts
+4. **Set up the worktree** — creates an isolated Git worktree (the same path as `--yolo --worktree`); all subsequent agent work runs inside it
+5. **Seed the context directory** — writes `workflow-usage.md`, including several inline examples, into the `context(workflow)` directory so the leader has reference material
+6. **Launch the leader agent** — starts a container with a pre-built prompt describing the work item, available agents, and path conventions; the agent's job is to write a `workflow.toml` to the context directory
+7. **Wait for the leader to finish** — stuck detection runs normally; after 30 seconds of silence the 60-second yolo countdown starts; when it expires (or you press `[n]`), the container is killed and awman reads the file
+8. **Validate the workflow** — checks that `workflow.toml` is valid TOML, references only agents that exist in the project, and has all required fields; if validation fails, a repair agent is launched (see [Repair loop](#repair-loop))
 9. **Execute the workflow** — runs the generated workflow exactly as if you had written it yourself and passed it to `exec workflow --yolo --work-item 42`
 
 The leader may write in the context directory and, for API runs on runtimes with host directory mounts, `/awman/output`. The checkout is mounted read-only when the runtime supports it. A guard compares HEAD and source-file contents before and after the leader runs, including already dirty and untracked files; a change aborts the dynamic run before the generated workflow executes.
@@ -111,17 +163,17 @@ When more than one source could determine the leader, awman applies this precede
 
 ## Configuring dynamic workflows
 
-Add a `workflows.dynamic` block to either `.awman/config.json` or `~/.awman/config.json` to configure which agents and models the leader may schedule, cap how many steps run concurrently, set a default leader, and provide guidance.
+Add a `workflows.dynamic` block to either the repo config (`.awman/config.json`) or the global config (`~/.awman/config.json`) to configure which agents and models the leader may schedule, set a default leader, and provide guidance. The step cap is the ordinary `workflows.maxConcurrentSteps` key.
 
 ```json
 {
   "workflows": {
+    "maxConcurrentSteps": 3,
     "dynamic": {
       "agentsToModels": {
         "claude": ["claude-opus-4-8", "claude-sonnet-4-6"],
         "codex": ["codex-mini-latest"]
       },
-      "maxConcurrentSteps": 3,
       "defaultLeader": "claude::claude-opus-4-8",
       "guidance": [
         "Never spawn more than two agents in parallel.",
@@ -132,7 +184,7 @@ Add a `workflows.dynamic` block to either `.awman/config.json` or `~/.awman/conf
 }
 ```
 
-All four fields are optional and independent.
+All of these keys are optional and independent.
 
 ### `agentsToModels`
 
@@ -142,7 +194,7 @@ Restricts the leader to a known, approved set of agents and models instead of ev
 
   ```
   Error: workflows.dynamic.agentsToModels references agents that have no Dockerfile in this repo: [foo, bar].
-  Available agents: [claude, codex, gemini].
+  Available agents: [claude, codex, cursor].
   Add a .awman/Dockerfile.<agent> for each missing agent, or remove it from agentsToModels.
   ```
 
@@ -158,18 +210,16 @@ Restricts the leader to a known, approved set of agents and models instead of ev
 - An empty repo map (`{}`) is treated the same as omitting it and falls through to the global map. A repo that wants to use only its own agents instead of inheriting a global map must set a non-empty repo map listing the agents and models it allows.
 - Each agent's model list must be non-empty, and no model name may be empty or whitespace-only; both are rejected when the config is loaded.
 
-### `maxConcurrentSteps`
+### `workflows.maxConcurrentSteps`
 
-An advisory cap the leader is told to plan around:
+The cap on concurrently running steps — enforced by the engine for every workflow, and also the number the leader is told to plan around. Interactive final groups may exceed the cap so all remaining agents stay available for review:
 
 ```
 Maximum concurrent steps advised: 3. Plan parallelism
 accordingly.
 ```
 
-This is advisory only — awman does not enforce it in the workflow scheduler. It is a hint the leader agent uses when deciding how much of the workflow to run in parallel via `depends_on`. Must be `>= 1` if set; `0` is rejected when the config is loaded, since it would deadlock any workflow.
-
-Don't confuse this with [`maxConcurrentAgents`](07-configuration.md#reference), a differently-named, differently-scoped setting: `maxConcurrentAgents` is the cap the engine actually enforces at run time, for every workflow (dynamic or not), regardless of what the leader planned. See [Parallel workflows](05-workflows.md#parallel-workflows).
+The leader uses it as a hint when deciding how much of the workflow to run in parallel via `depends_on`, and the scheduler enforces it at run time, whatever the leader planned. Interactive final groups may exceed the cap so every remaining agent stays available for review. Must be `>= 1` if set; `0` is rejected when the config is loaded, since it would deadlock any workflow. See [Parallel workflows](05-workflows.md#parallel-workflows).
 
 ### `defaultLeader`
 
@@ -194,11 +244,11 @@ You MUST follow these project-specific instructions when building the workflow:
 
 ### Managing this config
 
-`workflows.dynamic.defaultLeader` and `workflows.dynamic.maxConcurrentSteps` are editable with `awman config set` / the TUI config dialog:
+`workflows.dynamic.defaultLeader` and `workflows.maxConcurrentSteps` are editable with `awman config set` / the TUI config dialog:
 
 ```sh
 awman config set workflows.dynamic.defaultLeader claude::claude-opus-4-8
-awman config set workflows.dynamic.maxConcurrentSteps 3
+awman config set workflows.maxConcurrentSteps 3
 ```
 
 `agentsToModels` is managed one agent at a time. On the command line, set an agent's comma-separated model list (or clear it with an empty value):
@@ -208,14 +258,14 @@ awman config set workflows.dynamic.agentsToModels.claude "claude-opus-4-8, claud
 awman config set workflows.dynamic.agentsToModels.claude ""   # remove the mapping
 ```
 
-In `awman config show` and the TUI config dialog, the map appears as a summary row plus one editable row per agent (`workflows.dynamic.agentsToModels.<agentName>`); in the TUI, **Ctrl+N** adds a new mapping and per-agent rows are edited inline — see [Using the TUI](02-using-the-tui.md#agentmodel-mappings-workflowsdynamicagentstomodels). See [Configuration](07-configuration.md#reference) for the full field reference.
+In `awman config show` and the TUI config dialog, the map appears as a summary row plus one editable row per agent (`workflows.dynamic.agentsToModels.<agentName>`); in the TUI, **Ctrl+N** adds a new mapping and per-agent rows are edited inline — see [Using the TUI](02-using-the-tui.md#agentmodel-mappings-workflowsdynamicagentstomodels). See [Configuration](07-configuration.md#reference-all-keys) for the full field reference.
 
-`guidance` is managed one entry at a time, addressed by index on the command line:
+`guidance` is a list; on the command line, set the whole list with comma-separated entries (a later layer adds to the earlier ones, so a repo list extends the global one):
 
 ```sh
-awman config set workflows.dynamic.guidance.0 "Never spawn more than two agents in parallel."
-awman config set workflows.dynamic.guidance.1 "Always include a validation step after each implementation step."
-awman config set workflows.dynamic.guidance.0 ""   # remove entry 0; remaining entries shift down and re-index
+awman config set workflows.dynamic.guidance "Never spawn more than two agents in parallel."
+awman config set workflows.dynamic.guidance "Always include a validation step after each implementation step." --global
+awman config unset workflows.dynamic.guidance   # remove the list from this repo
 ```
 
 In `awman config show` and the TUI config dialog, the list appears as a summary row (`workflows.dynamic.guidance`, showing the entry count or `(none)`) plus one editable row per entry (`workflows.dynamic.guidance.<index>`). In the TUI:
@@ -224,7 +274,7 @@ In `awman config show` and the TUI config dialog, the list appears as a summary 
 - Existing entries are edited inline like any other field.
 - Saving an **empty** value on an entry row removes it; remaining entries re-index automatically.
 
-See [Using the TUI](02-using-the-tui.md#developer-guidance-list-workflowsdynamicguidance) for the walkthrough and [Configuration](07-configuration.md#reference) for the full field reference.
+See [Using the TUI](02-using-the-tui.md#developer-guidance-list-workflowsdynamicguidance) for the walkthrough and [Configuration](07-configuration.md#reference-all-keys) for the full field reference.
 
 ### Global and repo settings
 
@@ -232,11 +282,7 @@ Both the global config and repo config can set `workflows.dynamic`. For `agentsT
 
 Guidance from the global and repo lists is combined in that order, with duplicate entries dropped. The combined list can contain at most 50 entries. The repo can add project-specific instructions while inheriting the global guidance.
 
-The scalar fields `defaultLeader` and `maxConcurrentSteps` use the repo value when set, then the global value. A repo `defaultLeader` takes precedence over a global one, which is why leader resolution checks the global setting after repo config.
-
-### Upgrading from `dynamicWorkflows`
-
-The older repo key `dynamicWorkflows` is still accepted as an alias. Run `awman config migrate` to move it to `workflows.dynamic`; saving repo config (for example with `config set` or the TUI dialog) also moves it automatically. Older awman versions do not read `workflows.dynamic`, so teammates using an older version will stop seeing these settings after the migrated config is committed. The old global key was never read; move any desired settings into the global `workflows.dynamic` block yourself.
+The scalar keys `defaultLeader` and `workflows.maxConcurrentSteps` use the repo value when set, then the global value. A repo `defaultLeader` takes precedence over a global one, which is why leader resolution checks the global setting after repo config.
 
 ---
 
@@ -287,7 +333,7 @@ If all 3 repair attempts fail, awman surfaces the final error and the path to th
 
 ```
 leader agent failed to produce a valid workflow.toml after 3 repair attempts; last error: workflow.toml references agents with no Dockerfile in the project:
-  - "gemini" (expected .awman/Dockerfile.gemini)
+  - "cursor" (expected .awman/Dockerfile.cursor)
 Available agents: claude, codex; file is at /home/user/.awman/context/workflows/<run-id>/workflow.toml
 ```
 
@@ -331,7 +377,7 @@ awman exec workflow --dynamic --work-item 42
 ╰────────────────────────────────────────────────────────────╯
 ```
 
-This is the same prompt a plain `exec workflow` shows when it finds saved state — see [Resuming](05-workflows.md#resuming). The three offered start points are named after the real steps in the saved workflow: the one that failed, its predecessor, and its successor. Picking one rewinds the saved state — everything from that step onwards runs again; earlier steps that never succeeded are marked skipped so they do not block their dependents. The only thing dynamic mode adds is that accepting the resume also skips the leader-design pass entirely, so a resume costs no leader tokens at all.
+This is the same prompt a plain `exec workflow` shows when it finds saved state — see [Resuming](05-workflows.md#resuming). The three offered start points are named after the real steps in the saved workflow: the one that failed, its predecessor, and its successor. Picking one reruns that step and its direct and indirect dependents. Completed or skipped steps on other branches keep their status and do not run again. Unfinished prerequisites of the chosen step are marked skipped; unfinished work on other branches remains eligible to run. Accepting a dynamic resume also skips the leader-design pass entirely, so a resume costs no leader tokens at all.
 
 For interactive hosts, accepting a resume also answers the [existing-worktree question](05-workflows.md#worktrees), so awman reuses that checkout without a second dialog. An explicit `--on-existing-worktree` policy takes precedence: `recreate` discards the saved workflow and state and runs a fresh leader pass; `fail` stops before any resume prompt or state change. The API defaults to `fail` even when saved dynamic state exists, so API clients must select `resume` explicitly. Squad and piped CLI continue to default to `resume`.
 
@@ -383,9 +429,9 @@ All flag errors are surfaced before any container work begins.
 | `--work-item <N>` | Required with `--dynamic`; the work item number to pass to the leader |
 | `--leader <agent::model>` | Override the agent container and model used for the leader step |
 | `--model <NAME>` | Default model for the generated workflow's steps; also the leader's model when neither `--leader` nor `defaultLeader` is set |
-| `--agent-flag=<ARG>` | Extra argument for the selected agent (`--agent`, else config): the leader when it runs that agent, and generated steps that use the workflow's default agent. Other agents keep their configured [`agentFlags`](07-configuration.md#pass-extra-flags-to-an-agent) |
+| `--agent-flag=<ARG>` | Extra argument for the selected agent (`--agent`, else config): the leader when it runs that agent, and generated steps that use the workflow's default agent. Other agents keep their configured [`agents.flags`](07-configuration.md#pass-extra-flags-to-an-agent) |
 
-The leader and every generated step also get their agent's configured `agentFlags`. These are read from the repository you launched from, not the worktree, so an `agentFlags` entry you haven't committed still reaches the leader.
+The leader and every generated step also get their agent's configured `agents.flags`. These are read from the repository you launched from, not the worktree, so an `agents.flags` entry you haven't committed still reaches the leader.
 
 Dynamic mode always enforces `--yolo`, `--worktree`, and `--overlay context(workflow)`. Passing any of these explicitly has no effect (they are already active).
 
@@ -405,7 +451,8 @@ Dynamic mode always enforces `--yolo`, `--worktree`, and `--overlay context(work
 | Agent image build fails | Hard error with build output; workflow does not start; repair loop is not entered |
 | Leader modifies source files outside the context directory | Dynamic run aborts before executing the generated workflow; changed paths are reported |
 | User restarts the leader via WCB | Current leader container killed, `workflow.toml` deleted, fresh leader launched |
-| User aborts during the leader yolo countdown | Leader container killed, entire dynamic run aborts — no workflow executes |
+| Esc during the leader yolo countdown | Countdown cancelled; leader stays running for further interaction |
+| User aborts from the leader control board | Leader container killed, entire dynamic run aborts — no workflow executes |
 | User pauses during the leader step | Leader container killed; resume semantics follow the standard workflow pause/resume path |
 | A generated workflow step fails | The [step-failure control board](05-workflows.md#when-a-step-fails) opens: restart, go back, skip ahead, pause, or Ctrl+C to cancel |
 | Re-run after cancelling a failed run, worktree kept | Resume prompt offers the failed step, the one before it, and the one after it, by name |
@@ -421,7 +468,7 @@ Dynamic mode always enforces `--yolo`, `--worktree`, and `--overlay context(work
 | Repo `workflows.dynamic.agentsToModels` is `{}` (empty map) | Falls through to the global map; set an explicit repo map to use only this repo's Dockerfile discovery |
 | `workflows.dynamic.agentsToModels` key matches a Dockerfile only after case folding | Workflow proceeds using the lowercase agent name; a warning is shown |
 | Two `workflows.dynamic.agentsToModels` keys fold to the same agent (e.g. `"Claude"` and `"claude"`) | Error at workflow start, before any container is spawned; ambiguous model lists are never merged |
-| `workflows.dynamic.maxConcurrentSteps` is `0` | Rejected when the config is loaded — awman never starts with this value |
+| `workflows.maxConcurrentSteps` is `0` | Rejected when the config is loaded — awman never starts with this value |
 | `workflows.dynamic.defaultLeader` is malformed | Rejected when the config is loaded, before any UI or workflow starts |
 | `--leader` and `workflows.dynamic.defaultLeader` both set | `--leader` wins |
 | `--model` and `workflows.dynamic.defaultLeader` both set, no `--leader` | `defaultLeader` controls the leader's model; `--model` still applies to the generated workflow's steps |

@@ -45,8 +45,10 @@ impl SquadAttachFrontend for CliFrontend {
         instance: Box<dyn AgentInstance>,
     ) -> Result<(), CommandError> {
         let matches = self.matches.clone();
+        let mut child_frontend = CliFrontend::new(matches.clone());
+        child_frontend.host_output_policy = self.host_output_policy;
         let mut execution = instance
-            .run_with_frontend(Box::new(CliFrontend::new(matches.clone())))
+            .run_with_frontend(Box::new(child_frontend))
             .map_err(CommandError::from)?;
         let cancel = self.squad_attach_cancel.clone().unwrap_or_default();
         let exit_code: Arc<AtomicI32> = self.squad_attach_exit_code.clone();

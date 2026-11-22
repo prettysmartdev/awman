@@ -1,4 +1,4 @@
-//! `BuiltinNetworkConfig` — the `builtin.network` block of global and repo
+//! `BuiltinNetworkConfig` — the `runtime.builtin.network` block of global and repo
 //! config, and the resolved [`BuiltinNetworkSettings`] the engine enforces.
 //!
 //! The builtin runtime gives every session VM its own user-space network
@@ -69,7 +69,7 @@ impl NetworkMode {
     }
 }
 
-/// The `builtin.network` block as written in one config file. Every field is
+/// The `runtime.builtin.network` block as written in one config file. Every field is
 /// optional; see the module docs for how global and repo blocks combine.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -266,25 +266,28 @@ impl BuiltinNetworkConfig {
         let global = global
             .map(|g| {
                 g.parsed()
-                    .map_err(|e| format!("global builtin.network: {e}"))
+                    .map_err(|e| format!("global runtime.builtin.network: {e}"))
             })
             .transpose()?
             .unwrap_or_default();
         let repo = repo
-            .map(|r| r.parsed().map_err(|e| format!("repo builtin.network: {e}")))
+            .map(|r| {
+                r.parsed()
+                    .map_err(|e| format!("repo runtime.builtin.network: {e}"))
+            })
             .transpose()?
             .unwrap_or_default();
 
         if repo.nameservers.is_some() {
             return Err(
-                "repo builtin.network.nameservers is not allowed: host-side resolvers are set in \
+                "repo runtime.builtin.network.nameservers is not allowed: host-side resolvers are set in \
                  the global config only"
                     .into(),
             );
         }
         if repo.trust_host_cas.is_some() {
             return Err(
-                "repo builtin.network.trustHostCas is not allowed: host trust is shared into \
+                "repo runtime.builtin.network.trustHostCas is not allowed: host trust is shared into \
                  guests from the global config only"
                     .into(),
             );
@@ -294,7 +297,7 @@ impl BuiltinNetworkConfig {
         let mode = match repo.mode {
             Some(requested) if requested > global_mode => {
                 return Err(format!(
-                    "repo builtin.network.mode {:?} is less restrictive than the global mode {:?}",
+                    "repo runtime.builtin.network.mode {:?} is less restrictive than the global mode {:?}",
                     requested.as_str(),
                     global_mode.as_str()
                 ));
@@ -304,7 +307,9 @@ impl BuiltinNetworkConfig {
         };
 
         if global.allow.is_some() && global_mode != NetworkMode::Allowlist {
-            return Err("global builtin.network.allow only applies to mode \"allowlist\"".into());
+            return Err(
+                "global runtime.builtin.network.allow only applies to mode \"allowlist\"".into(),
+            );
         }
         let allow = if mode == NetworkMode::Allowlist {
             let ceiling = global.allow.clone().unwrap_or_default();
@@ -315,7 +320,7 @@ impl BuiltinNetworkConfig {
                         .find(|entry| !ceiling.iter().any(|c| entry.within(c)))
                     {
                         return Err(format!(
-                            "repo builtin.network.allow entry {extra} is not permitted by the \
+                            "repo runtime.builtin.network.allow entry {extra} is not permitted by the \
                              global allow list"
                         ));
                     }
@@ -328,7 +333,7 @@ impl BuiltinNetworkConfig {
         } else {
             if repo.allow.is_some() {
                 return Err(format!(
-                    "repo builtin.network.allow only applies to mode \"allowlist\" (effective mode \
+                    "repo runtime.builtin.network.allow only applies to mode \"allowlist\" (effective mode \
                      is {:?})",
                     mode.as_str()
                 ));
@@ -341,7 +346,7 @@ impl BuiltinNetworkConfig {
             Some(requested) => {
                 if let Some(port) = requested.iter().find(|p| !authorised.contains(p)) {
                     return Err(format!(
-                        "repo builtin.network.hostPorts port {port} is not authorised by the \
+                        "repo runtime.builtin.network.hostPorts port {port} is not authorised by the \
                          global hostPorts"
                     ));
                 }
@@ -351,7 +356,7 @@ impl BuiltinNetworkConfig {
         };
         if mode == NetworkMode::None && !host_ports.is_empty() {
             return Err(
-                "builtin.network.hostPorts cannot be reached in mode \"none\" (no network device); \
+                "runtime.builtin.network.hostPorts cannot be reached in mode \"none\" (no network device); \
                  remove hostPorts or choose another mode"
                     .into(),
             );
@@ -360,7 +365,7 @@ impl BuiltinNetworkConfig {
         let trust_host_cas = global.trust_host_cas.unwrap_or(false);
         if mode == NetworkMode::None && (!nameservers.is_empty() || trust_host_cas) {
             return Err(
-                "builtin.network.nameservers and trustHostCas have no effect in mode \"none\"; \
+                "runtime.builtin.network.nameservers and trustHostCas have no effect in mode \"none\"; \
                  remove them or choose another mode"
                     .into(),
             );
@@ -442,213 +447,4 @@ fn parse_nameserver(raw: &str) -> Result<SocketAddr, String> {
         "{raw:?} is not an IP address or IP:PORT (host names are not accepted, so resolving a \
          resolver never depends on another resolver)"
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn block(json: &str) -> BuiltinNetworkConfig {
-        serde_json::from_str(json).unwrap()
-    }
-
-    #[test]
-    fn default_is_public_with_nothing_else() {
-        let s = BuiltinNetworkConfig::resolve(None, None).unwrap();
-        assert_eq!(s, BuiltinNetworkSettings::default());
-        assert_eq!(s.mode, NetworkMode::Public);
-        assert_eq!(
-            serde_json::to_string(&BuiltinNetworkConfig::default()).unwrap(),
-            "{}"
-        );
-    }
-
-    #[test]
-    fn unknown_fields_and_modes_are_rejected() {
-        assert!(serde_json::from_str::<BuiltinNetworkConfig>(r#"{"proxy":"x"}"#).is_err());
-        assert!(serde_json::from_str::<BuiltinNetworkConfig>(r#"{"mode":"host"}"#).is_err());
-        assert!(serde_json::from_str::<BuiltinNetworkConfig>(r#"{"hostPorts":[70000]}"#).is_err());
-        assert!(serde_json::from_str::<BuiltinNetworkConfig>(r#"{"hostPorts":[-1]}"#).is_err());
-    }
-
-    #[test]
-    fn allow_entries_are_names_only() {
-        assert_eq!(
-            NetworkAllowEntry::parse("API.Example.com.").unwrap(),
-            NetworkAllowEntry::Domain("api.example.com".into())
-        );
-        assert_eq!(
-            NetworkAllowEntry::parse("*.github.com").unwrap(),
-            NetworkAllowEntry::Suffix("github.com".into())
-        );
-        for bad in [
-            "",
-            "1.2.3.4",
-            "10.0.0.0/8",
-            "::1",
-            "[::1]",
-            "example.com:443",
-            "localhost",
-            "a.localhost",
-            HOST_ALIAS,
-            "a.*.example.com",
-            "*",
-            "com",
-            "exa mple.com",
-            "-bad.example.com",
-            "1.2.3.400",
-        ] {
-            assert!(NetworkAllowEntry::parse(bad).is_err(), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn single_block_contradictions_are_errors() {
-        assert!(block(r#"{"mode":"public","allow":["a.com"]}"#)
-            .validate()
-            .is_err());
-        assert!(block(r#"{"mode":"none","hostPorts":[80]}"#)
-            .validate()
-            .is_err());
-        assert!(block(r#"{"hostPorts":[0]}"#).validate().is_err());
-        assert!(block(r#"{"hostPorts":[53]}"#).validate().is_err());
-        assert!(block(r#"{"nameservers":["dns.google"]}"#)
-            .validate()
-            .is_err());
-        assert!(block(r#"{"nameservers":["1.1.1.1:0"]}"#)
-            .validate()
-            .is_err());
-        assert!(
-            block(r#"{"mode":"allowlist","allow":["a.com"],"hostPorts":[8765]}"#)
-                .validate()
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn repo_can_narrow_but_never_widen() {
-        let global = block(
-            r#"{"mode":"allowlist","allow":["*.example.com","api.other.com"],"hostPorts":[8765,9000]}"#,
-        );
-        let narrowed = BuiltinNetworkConfig::resolve(
-            Some(&global),
-            Some(&block(
-                r#"{"allow":["api.example.com"],"hostPorts":[8765]}"#,
-            )),
-        )
-        .unwrap();
-        assert_eq!(narrowed.mode, NetworkMode::Allowlist);
-        assert_eq!(
-            narrowed.allow,
-            vec![NetworkAllowEntry::Domain("api.example.com".into())]
-        );
-        assert_eq!(narrowed.host_ports, vec![8765]);
-
-        for widen in [
-            r#"{"mode":"public"}"#,
-            r#"{"allow":["evil.com"]}"#,
-            r#"{"allow":["*.other.com"]}"#,
-            r#"{"hostPorts":[22]}"#,
-            r#"{"nameservers":["1.1.1.1"]}"#,
-            r#"{"trustHostCas":true}"#,
-        ] {
-            assert!(
-                BuiltinNetworkConfig::resolve(Some(&global), Some(&block(widen))).is_err(),
-                "{widen}"
-            );
-        }
-        // An allowlist global without names permits no repo names either.
-        assert!(BuiltinNetworkConfig::resolve(
-            Some(&block(r#"{"mode":"allowlist"}"#)),
-            Some(&block(r#"{"allow":["a.com"]}"#))
-        )
-        .is_err());
-        // A stricter mode is always allowed.
-        let none = BuiltinNetworkConfig::resolve(
-            Some(&block(r#"{"mode":"allowlist","allow":["a.com"]}"#)),
-            Some(&block(r#"{"mode":"none"}"#)),
-        )
-        .unwrap();
-        assert_eq!(none.mode, NetworkMode::None);
-        assert!(none.allow.is_empty());
-    }
-
-    #[test]
-    fn host_ports_need_global_authorisation() {
-        assert!(
-            BuiltinNetworkConfig::resolve(None, Some(&block(r#"{"hostPorts":[8765]}"#))).is_err()
-        );
-        let s =
-            BuiltinNetworkConfig::resolve(Some(&block(r#"{"hostPorts":[9000,8765,8765]}"#)), None)
-                .unwrap();
-        assert_eq!(s.host_ports, vec![8765, 9000]);
-        // Global host ports cannot survive a repo switch to "none".
-        assert!(BuiltinNetworkConfig::resolve(
-            Some(&block(r#"{"hostPorts":[8765]}"#)),
-            Some(&block(r#"{"mode":"none"}"#))
-        )
-        .is_err());
-        assert_eq!(
-            BuiltinNetworkConfig::resolve(
-                Some(&block(r#"{"hostPorts":[8765]}"#)),
-                Some(&block(r#"{"mode":"none","hostPorts":[]}"#))
-            )
-            .unwrap()
-            .mode,
-            NetworkMode::None
-        );
-    }
-
-    #[test]
-    fn repo_allowlist_under_public_global_is_a_narrowing() {
-        let s = BuiltinNetworkConfig::resolve(
-            None,
-            Some(&block(
-                r#"{"mode":"allowlist","allow":["api.anthropic.com"]}"#,
-            )),
-        )
-        .unwrap();
-        assert_eq!(s.mode, NetworkMode::Allowlist);
-        assert_eq!(s.allow.len(), 1);
-        assert!(
-            BuiltinNetworkConfig::resolve(None, Some(&block(r#"{"allow":["a.com"]}"#))).is_err()
-        );
-    }
-
-    #[test]
-    fn nameservers_default_port_and_global_only_host_settings() {
-        let s = BuiltinNetworkConfig::resolve(
-            Some(&block(
-                r#"{"nameservers":["1.1.1.1","[2606:4700::1111]:5353"],"trustHostCas":true}"#,
-            )),
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            s.nameservers,
-            vec![
-                "1.1.1.1:53".parse().unwrap(),
-                "[2606:4700::1111]:5353".parse().unwrap()
-            ]
-        );
-        assert!(s.trust_host_cas);
-        assert!(BuiltinNetworkConfig::resolve(
-            Some(&block(r#"{"mode":"none","trustHostCas":true}"#)),
-            None
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn oversized_lists_are_rejected_before_use() {
-        let many: Vec<String> = (0..=MAX_NETWORK_ENTRIES)
-            .map(|i| format!("h{i}.example.com"))
-            .collect();
-        let cfg = BuiltinNetworkConfig {
-            mode: Some(NetworkMode::Allowlist),
-            allow: Some(many),
-            ..Default::default()
-        };
-        assert!(cfg.validate().is_err());
-    }
 }

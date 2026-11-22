@@ -7,6 +7,12 @@ awman has two execution modes:
 
 This guide covers TUI mode.
 
+awman's browser frontend connects to a daemon on the same machine. Its controls
+and shortcuts follow the TUI where the browser permits them; browser-reserved
+keys such as **Ctrl+T** and **Ctrl+W** use **Alt+T** and **Alt+W** alternatives,
+and some actions use visible buttons. Text inputs keep their normal editing
+keys. See the [Web App guide](20-webapp.md#shortcuts) for details.
+
 ---
 
 ## Startup
@@ -28,6 +34,14 @@ non-Git directory: awman keeps that directory as the tab's working directory
 and starts the same live status view there.
 
 In both cases, terminal raw mode, alternate screen, and mouse capture are enabled on entry and restored unconditionally on exit, even if awman crashes.
+
+### Builtin or daemon engine
+
+The TUI can run its work in its own process or on the daemon's engine (see [The Engine and Frontends](19-engine-and-frontends.md)). It looks and behaves identically on either; everything in this guide applies to both.
+
+### Status in your terminal's tab bar
+
+Supported terminals can show awman's activity and agent status in their tab bar. awman detects support automatically; other terminals continue normally. To turn reporting off for one run, use `awman --set tui.programStatus.emit=false`. Save `tui.programStatus.emit=false` in your config to keep it off.
 
 ---
 
@@ -66,258 +80,67 @@ indicator — a circle whose colour is the squad daemon's health (grey not
 running, green healthy, yellow unreachable, blue a task is running, red a
 task's last run failed). See [The squad indicator](12-squad.md#the-squad-indicator).
 
+## Work queue panel
+
+The TUI has a work queue panel bound to **Ctrl+Q**. Its controls are **↑ / ↓**
+and **PageUp / PageDown** to move through rows, **Enter** to view item details,
+**p** to pick an item, **r** to refresh, and **Esc** to close the panel or
+return from the details view. Each row shows the item's title, its work
+server, labels, priority and age, and a **for you** marker when the item is
+assigned to this worker's owner. Queue listings can include a Markdown body
+preview; servers without previews show the summary. When new items arrive while
+the panel is closed, the status bar shows a badge such as
+`2 new work items · 1 for you`. If one of several work servers cannot be
+reached, the panel keeps listing the others and shows that server's error.
+
+A picked run opens in its own tab, titled with the item's title and its
+server (`Add OAuth login · infact`). If you close
+a tab while its lease is active, choose whether to release the item, cancel
+the run, or leave it running. The engine instance owns the prepared lease and
+reports its final result after execution and publication.
+
+The panel is controlled by the repository setting `tui.worker.enabled`, which
+defaults to `false` and is read when the TUI starts:
+
+```sh
+awman config set tui.worker.enabled true
+```
+
+To enable it for one run only, start the TUI with
+`awman --set tui.worker.enabled=true`.
+
+When enabled, the worker reuses a running daemon's registration or registers a
+manual worker for the instance lifetime. If the daemon starts or stops pulling
+while the TUI is open, the TUI switches over between runs, so a server never
+has two workers for the same machine. When a terminal uses XON/XOFF flow control, it may
+consume Ctrl+Q before awman receives it. See [Workers and Work Servers](17-workers-and-work-servers.md)
+for work server configuration and queue commands.
+
 ---
 
 ## Git Sidebar
 
-Press **Ctrl+G** to toggle the Git Sidebar — a live view of staged and unstaged changes in the current repository. The sidebar appears on the right side of the TUI and displays changed files with line change counts.
-
-The sidebar's border always carries a title summarizing the repository state, like a condensed `git status`:
-
-- `main: 3 changed` — current branch and the number of changed files
-- `main: clean` — no uncommitted changes
-- `HEAD: 2 changed` — detached HEAD state
-- `git status` — no git data available (e.g. not a git repository)
-
-```
-┌─ Tab 1: myproject ──────────────┬─ +5 -3 ─┐
-│  exec workflow                   │ ┌─ main: 5 changed ─┐
-└──────────────────────────────────┴─│ +11 -10           │
-┌─── ● running: exec workflow ────────┤ +3 -1 file.rs    │
-│ $ docker run --rm -it ...           │ +0 -8 old.rs     │
-│                                     │ +8 -0 new.rs     │
-│  ╭─ 🔒 Claude Code (containerized)  │ +0 -1 config     │
-│  │                                  │ +0 -0 (binary)   │
-│  │  [agent output here]              ╰─────────────────┘
-│  │                                  │
-│  ╰──────────────────────────────────╯
-│                                     │
-│  Ctrl-M toggle · Ctrl-W workflow   │
-└──────────────────────────────────────┘
-```
-
-### Opening and closing
-
-When the sidebar is **open**, press **Ctrl+G** again to close it. The execution window expands to fill the space, and a compact `+X -Y` summary appears in the bottom status bar showing the total additions and deletions across all files.
-
-When the sidebar is **closed**, the `+X -Y` summary is always visible on the right side of the status bar (when there are changes to display).
-
-### File list
-
-The sidebar displays each modified file with:
-- The **line change counts** in the format `+additions -deletions`
-- The **file path**, truncated with `…` if too long to fit
-
-Binary files are marked with a `(binary)` suffix and show `+0 -0` line counts.
-
-### Colors
-
-Each file row is color-coded by the type of change:
-
-- **Green** — added files
-- **Red** — deleted files
-- **Blue** — modified files
-
-The `+` symbol in the summary is always green, and the `-` symbol is always red, regardless of the actual changes displayed.
-
-### Narrow terminals
-
-If your terminal is narrower than 80 columns, the sidebar may not have enough space to display usefully. In this case, the sidebar automatically treats itself as closed even if you toggle it open — the `+X -Y` summary still appears in the status bar, giving you a quick overview of changes on narrow screens.
-
-### Refresh cadence
-
-The sidebar updates every 2 seconds, reflecting any staged or unstaged changes in the repository. Changes are polled automatically — there's no manual refresh needed.
+Press **Ctrl+G** to show or hide changed files, line counts, and the current branch. The summary remains in the status bar when the sidebar is closed. The view updates automatically; on terminals narrower than 80 columns, awman keeps the sidebar hidden and shows the summary instead.
 
 ---
 
 ## The command box
 
-The command box is where you interact with awman. Type any subcommand and press **Enter**.
+Type any awman subcommand and press **Enter**. Suggestions appear as you type; use **Tab** and **Shift+Tab** to choose one. The box accepts the same commands and flags as the CLI and keeps your input if validation fails. Use **Ctrl+Enter** or **Shift+Enter** for a new line. The [shortcut reference](#reference-all-keyboard-shortcuts) lists editing keys.
 
-| Key | Action |
-|-----|--------|
-| Type | Update input; suggestions appear below |
-| **Enter** | Execute command |
-| **Ctrl+Enter** or **Shift+Enter** | Insert a newline (multi-line input) |
-| **← / →** | Move cursor within input; long input scrolls to keep cursor visible |
-| **Ctrl+← / Ctrl+→** | Move cursor by word |
-| **Home / End** | Move cursor to start / end of input |
-| **↑** | Focus the execution window (for scrolling) |
-| **Backspace / Delete** | Edit input |
-| **Ctrl+Backspace** | Delete previous word |
-| **Tab** | Cycle to next autocomplete suggestion |
-| **Shift+Tab** | Cycle to previous autocomplete suggestion |
-| **Ctrl+Y** | Copy the execution-window text selection without leaving the command box |
-| **q** | Open the quit confirmation (when the command box is empty and the tab is idle) |
-| **Ctrl+C** | Open the quit or close-tab confirmation (see [Quitting](#quitting)) |
-
-### Input handling
-
-The command box supports long inputs with automatic horizontal scrolling:
-
-- When your input is longer than the visible width, the text scrolls automatically to keep the cursor in view
-- You can move freely within the input using **← / →**, **Home**, and **End** — the visible portion scrolls to follow your cursor
-- Multi-line inputs are supported via **Ctrl+Enter** or **Shift+Enter**; lines are joined with `↵` in the display
-
-When the command box is empty and the tab is idle (no command running), you'll see a helpful ghost text: `q to quit`. This disappears as soon as you type.
-
-### Autocomplete and suggestions
-
-As you type, matching command completions appear in the suggestion row below the command box:
-
-```
-> chat · init · agents
-```
-
-When you type a partial command, the list narrows. Use **Tab** / **Shift+Tab** to cycle through suggestions and fill them into the input. Every command available in `awman` is also available in the TUI command box. Both `--flag value` and `--flag=value` forms are accepted. For example:
-
-```
-chat --agent codex
-chat --agent=codex
-exec workflow path/to/workflow.toml --agent opencode --plan
-```
-
-Suggestions include flag hints from the command catalogue:
-
-```
---yolo — enable auto-advance mode    --plan — read-only run
-```
-
-### Flag validation
-
-The command box parses your input through the same validation the CLI and the
-API use, so it rejects what they would reject rather than carrying a bad value
-into the command:
-
-```
-chat --launch-mode banana
-```
-```
-invalid value for flag 'launch-mode' on ["chat"]: 'banana' is not one of ["stdio", "acp"]
-```
-
-A non-numeric value for a numeric flag (`squad start --port abc`) is rejected
-the same way. In both cases the text you typed stays in the box so you can fix
-just the bad part instead of retyping the whole command. A `-`-prefixed token
-is never accepted as a flag's value (`--agent -c` is a missing value for
-`--agent`, not `-c`), and `--flag=false` on a boolean flag turns it off, the
-same as it does everywhere else awman parses flags. An unrecognised short flag
-or short-flag cluster (e.g. `ready -ab`) is reported as `unknown flag: -ab`.
-
-When a suggestion shows a file path (worktree or working directory), long paths are automatically truncated in the middle to fit the display:
-
-```
-Worktree: /home/user/my…/worktree-branch
-```
-
-### Context display
-
-When the input is empty or there are no matching completions, the suggestion row shows contextual information instead:
-
-```
-CWD: /home/user/myproject
-```
-
-If a worktree is active for the session, it shows the worktree path:
-
-```
-Worktree: /home/user/myproject-worktree
-```
-
-If you type an unrecognised command, awman suggests the closest known one —
-including a typo in a subcommand, not just the top-level command:
-
-```
-exec wrkflow
-```
-```
-did you mean: exec workflow?
-```
+When the box is empty, the suggestion row shows the current directory or worktree. Press **↑** to focus the execution window and scroll command output.
 
 ### Quitting
 
-Press **Ctrl+C** (or **q** with an empty, idle command box) to open the quit confirmation:
-
-```
-╭─── Quit awman? ────────────────────╮
-│  Press Ctrl-C again to quit awman  │
-│                                    │
-│  [Esc] cancel                      │
-╰────────────────────────────────────╯
-```
-
-Press **Ctrl+C** again to quit, or **Esc** to cancel. With multiple tabs open, **Ctrl+C** shows a close-tab dialog instead:
-
-```
-╭─── Close tab? ─────────────────────╮
-│  Press Ctrl-C again to quit awman  │
-│  Press Ctrl-T to close this tab    │
-│                                    │
-│  [Esc] cancel                      │
-╰────────────────────────────────────╯
-```
-
-While a workflow is running on the tab, **Ctrl+C** first asks whether to cancel the workflow: **y** kills the running container and returns the current step to pending so the run can be resumed later; **n** or **Esc** keeps it running.
-
----
+Press **Ctrl+C** (or **q** in an empty, idle command box) to open the quit dialog. Press **Ctrl+C** again to quit, or **Esc** to stay. With multiple tabs, **Ctrl+T** in that dialog closes only the current tab. During a workflow, the first **Ctrl+C** asks whether to cancel it; a cancelled workflow can be resumed.
 
 ## The execution window
 
-The execution window shows plain-text streaming output from commands — Docker build logs, status messages, error output. It is separate from the container window (see below).
-
-### Scrolling
-
-When the window is selected (press **↑** from the command box to select it):
-
-| Key / Action | Effect |
-|---|---|
-| **↑ / ↓** | Scroll line by line |
-| **PageUp / PageDown** | Scroll 20 lines |
-| **b / e** | Jump to beginning / end |
-| **l** | Toggle the [status log](#status-log) |
-| Mouse scroll | Scroll at any time |
-| **Esc** | Return focus to command box |
-
-Once the command has finished, any other key also returns focus to the command box.
-
-### Selecting and copying text
-
-Execution window text is mouse-selectable whenever the container window is hidden or minimized (when the container window is maximized, it owns text selection instead — see below):
-
-1. **Click and drag** to highlight text (shown with inverted colors)
-2. **Ctrl+Y** to copy the selection to clipboard
-
-While a selection is active, a ` CTRL-Y to copy/yank text ` hint appears on the window's bottom border — the same flow as the container window. The selection captures the text as displayed when you started dragging, so output arriving mid-selection doesn't change what gets copied. Toggling the container window with **Ctrl+M** clears any active selection.
+This window shows command progress, build output, and awman's messages. It is separate from the agent's [container window](#the-container-window). Press **↑** from the command box to focus it; use arrow keys, **PageUp/PageDown**, or the mouse wheel to scroll. Drag to select text and press **Ctrl+Y** to copy it. Press **Esc** to return to the command box.
 
 ### Status log
 
-awman itself writes informational messages — not agent output, but messages from awman about what it is doing — into a per-tab **status log**. Examples include "container started", "worktree created", "auth token accepted", and error messages from failed commands.
-
-The status log appears in the execution window. By default it is **collapsed**: only the most recent message is shown as a single line at the bottom of the output area.
-
-Press **l** (lowercase L) while the execution window is focused to toggle between collapsed and expanded view. In expanded view the full message history is visible and scrollable, with color-coded level prefixes:
-
-| Level | Colour |
-|-------|--------|
-| Info | Dark gray |
-| Warning | Yellow |
-| Error | Red |
-| Success | Green |
-
-The status log is per-tab and accumulates for the lifetime of the session. It does not include agent output (that lives in the container window's scrollback).
-
-### Crash log
-
-If awman hits an internal error (a panic) while the TUI is running, the full error and backtrace are appended to `$HOME/.awman/panic.log`. When a running command dies this way, its tab shows an error in the status log pointing at that file — include its contents when filing a bug report. A crash on the TUI thread itself restores your terminal to a usable state before the error is printed.
-
-### Border colours
-
-| Colour | Meaning |
-|--------|---------|
-| Blue | Running (selected) |
-| Grey | Running (unselected) or idle |
-| Green | Completed successfully |
-| Red | Completed with error |
+Awman's own messages appear in a collapsed line at the bottom of the execution window. Press **l** while the window is focused to expand or collapse the full log. Agent output appears in the container window. If a command crashes, the status log points to `~/.awman/panic.log` for the backtrace.
 
 ---
 
@@ -336,7 +159,7 @@ Workflow [setup and teardown](05-workflows.md#container-execution-model) steps g
   ctrl-m minimize  ·  ctrl-\ detach  ·  scroll ↕ history
 ```
 
-The title bar shows the agent, `(containerized)` — or `(sandboxed)` under `docker-sbx-experimental` — the workflow step when one is running, and on the right the container name, live CPU usage, memory, and total runtime. Stats are polled from the container runtime every 3 seconds.
+The title bar shows the agent, `(containerized)` — or `(sandboxed)` under the `sbx` runtime — the workflow step when one is running, and on the right the container name, live CPU usage, memory, and total runtime. Stats are polled from the container runtime every 3 seconds.
 
 ### Keyboard and mouse
 
@@ -377,7 +200,7 @@ This mirrors tmux's copy-mode behavior: scrolling enters historical view, reachi
 
 Mouse click, drag, and drag-release events are never forwarded to the agent. They always perform awman's native text selection, ensuring you can always select and copy text from the container overlay, even when the agent has mouse tracking enabled.
 
-Scrollback holds up to 10,000 lines by default (`terminal_scrollback_lines` in [Configuration](07-configuration.md)). While scrolled, the title bar shows `↑ scrollback (N / M lines)` where `N` is your current offset and `M` is the total depth.
+Scrollback holds up to 10,000 lines by default (`tui.scrollbackLines` in [Configuration](07-configuration.md)). While scrolled, the title bar shows `↑ scrollback (N / M lines)` where `N` is your current offset and `M` is the total depth.
 
 awman always intercepts **Ctrl+Y**; with no active selection it does nothing, and the agent never receives it.
 
@@ -560,9 +383,9 @@ Press **Ctrl+,** from anywhere in the TUI, or type `config show` in the command 
 ```
 ╭──────────────────────────────── awman config ─────────────────────────────────╮
 │  Field                              Global        Repo           Effective     │
-│  agent                              claude                       claude        │
-│  runtime                            docker                       docker        │
-│  terminal_scrollback_lines          10000         5000           5000          │
+│  agents.default                     claude                       claude        │
+│  runtime.kind                       docker                       docker        │
+│  tui.scrollbackLines                10000         5000           5000          │
 │  ...                                                                           │
 │  workflows.dynamic.agentsToModels                 2 agents ma…   2 agents ma…  │
 │▶ workflows.dynamic.agentsToModels.…               claude-opus…   claude-opus…  │
@@ -589,13 +412,13 @@ Press **Ctrl+,** from anywhere in the TUI, or type `config show` in the command 
 
 While editing, the value is edited inline in its table cell with a visible `|` cursor; **← / →**, **Home / End**, **Backspace**, and **Delete** work as expected. Values longer than the cell scroll horizontally so the cursor never leaves view. Row navigation is frozen until you save or cancel.
 
-A detail pane below the table always shows the full, untruncated value of the selected row's focused column — long values wrap across multiple lines there, and while editing it mirrors the complete edit buffer. Beneath it, a hint line shows the accepted value format for the field (e.g. `one of: claude, codex, …` for `agent`, `positive integer` for numeric fields, `comma-separated list` for list fields).
+A detail pane below the table always shows the full, untruncated value of the selected row's focused column — long values wrap across multiple lines there, and while editing it mirrors the complete edit buffer. Beneath it, a hint line shows the accepted value format for the field (e.g. `one of: claude, codex, …` for `agents.default`, `positive integer` for numeric fields, `comma-separated list` for list fields).
 
 Each edit is validated and written immediately when you press **Enter** (surrounding whitespace is trimmed first). If the value is invalid (an unknown agent name, a non-numeric value for a numeric field, a malformed `agent::model` leader) or the config file cannot be written, nothing is saved: the dialog stays in edit mode with your input intact and shows the reason in red where the format hint normally appears, so you can correct the value instead of retyping it. Press **Esc** to abandon the rejected edit. After a successful save the table refreshes with the selected row preserved, so consecutive edits don't send you back to the top.
 
-Editing targets the column the selection is on: the **Global** column writes `$HOME/.awman/config.json`, the **Repo** column writes `GITROOT/.awman/config.json`. Scope-restricted fields snap automatically — starting an edit on the Global column of a repo-only field moves the edit to the Repo column with a status-bar note, and vice versa for global-only fields (like `runtime`). Dynamic workflow settings can be edited in either column.
+Editing targets the column the selection is on: the **Global** column writes the global config (`$AWMAN_HOME/config.json`, default `~/.awman/config.json`), the **Repo** column writes `GITROOT/.awman/config.json`. Scope-restricted fields snap automatically — starting an edit on the Global column of a repo-only field moves the edit to the Repo column with a status-bar note, and vice versa for global-only fields (like `runtime.kind`). Dynamic workflow settings can be edited in either column.
 
-Fields marked read-only — such as `auto_agent_auth_accepted` — are shown dimmed; pressing **Enter** on one shows `This field is read-only` in the status bar.
+Fields marked read-only — such as map and object headers — are shown dimmed; pressing **Enter** on one shows `This field is read-only` in the status bar.
 
 There are more fields than fit at once — the table scrolls automatically to keep the selected row visible as you move past the bottom or top of the visible window.
 
@@ -619,7 +442,7 @@ The [leader guidance list](06-dynamic-workflows.md#guidance) — project-specifi
 - **Ctrl+N** appends a new entry to the selected scope in a single step: type the instruction text and press **Enter**. **Esc** cancels. Unlike `agentsToModels`, there's no key to type first — the index is assigned automatically as the next position in the selected list.
 - Saving an **empty** value on an entry row removes it; the remaining entries shift down and re-index, and the row list refreshes to reflect the new indices.
 
-The same per-entry edits work on the command line: `awman config set workflows.dynamic.guidance.0 "Never spawn more than two agents in parallel."` or pass `--global` to edit global config.
+The same per-entry edits work on the command line: `awman config set workflows.dynamic.guidance "Never spawn more than two agents in parallel."` (a list value; separate several entries with commas) or pass `--global` to edit global config.
 
 ---
 
@@ -636,6 +459,14 @@ If the tab cannot be opened — the path is not a directory, or its
 created and a **could not open new tab** modal shows the error. Press
 **Enter** or **Esc** to dismiss it.
 
+When the daemon engine is at capacity, the new tab shows an **Engine capacity
+reached** warning before its startup command runs. Both the engine limit and
+the shared daemon limit default to **8** jobs. The warning shows current usage
+and offers **i** to increase the full limits by one, save them globally, apply
+them immediately, and continue; **w** to wait for a slot; or **c** / **Esc** to
+cancel the command. Existing configured limits are respected. The same warning
+appears when another command needs a slot while the engine is full.
+
 ```
 Ctrl+T          open a new tab (prompts for working directory)
 Ctrl+A          switch to the previous tab
@@ -643,7 +474,32 @@ Ctrl+D          switch to the next tab
 Ctrl+C, Ctrl+T  (multiple tabs open) close the current tab
 ```
 
-The tab bar shows each tab's project name, current or last command, and an arrow (`➡`) on the active tab. The active tab's bottom border is suppressed so it visually opens into the content area.
+The tab bar shows each tab's project name, current or last command, and an arrow (`➡`) on the active tab. The active tab's bottom border is suppressed so it visually opens into the content area. When the agent reports its program status, a glyph appears before the tab label:
+
+| Glyph | Reported status | Tab colour |
+|-------|-----------------|------------|
+| `◐` | Working; includes reported progress when available, for example `◐ 42%`. | Blue |
+| `?` | Blocked on a question. | Yellow |
+| `🔒` | Blocked on permission or authentication. | Yellow |
+| `✓` | Done. | Green |
+| `✗` | Error. | Red |
+| *(none)* | Idle. | Green |
+| *(none)* | No status report. | Usual tab colour |
+
+These indicators also appear for agents launched by `new spec`, `new workflow`
+and `new skill`, and by `edit spec|workflow|skill|agent`,
+including specs stored in a remote tracker.
+
+A yolo countdown overrides these colours. A reporting agent is never marked
+stuck: it does not turn yellow from silence or get the `⚠️` silence prefix.
+An agent that does not report keeps the usual colours and the silence warning.
+
+The container window title and minimized status bar also show the reported
+glyph and state, followed by the blocked kind (when present) and the agent's
+message. For example, `🔒 blocked: permission — Allow this edit?`. The message
+is displayed as plain text with invisible/control characters removed and is
+shortened to fit. A quiet agent that continues to report `working` may show
+`working · silent 12m`; this is informational and does not mark the tab stuck.
 
 All tabs share one width: wide enough for the longest tab label (at least 20 columns), or, when that many tabs don't fit, the terminal width divided evenly between them (at least 12 columns each). Names that don't fit are truncated with `…` — at 20 columns that leaves 14 characters of the name.
 
@@ -750,7 +606,7 @@ for the full behavior and overlay reference.
 If the squad daemon needs a bearer key this session does not have, the tab is
 not opened; a modal explains why and offers to mint a new key and restart the
 daemon onto it. Accepting shows you the new key and its shell snippet — see
-[squad: When the key is missing](12-squad.md#when-the-key-is-missing).
+[Squad: Authenticating network clients](12-squad.md#authenticating-network-clients).
 
 See [squad](12-squad.md) for what tasks are, the squad tab's key
 bindings, and attaching to a running task.
@@ -759,7 +615,7 @@ bindings, and attaching to a running task.
 
 ## Stuck detection
 
-If a running container produces no output for longer than the stuck timeout (30 seconds by default; `agentStuckTimeout` in [Configuration](07-configuration.md)), the tab turns yellow and the subcommand label gains a `⚠️` prefix (e.g. `⚠️ chat`). The warning clears automatically when you:
+If a running container produces no output for longer than the stuck timeout (30 seconds by default; `agents.stuckTimeout` in [Configuration](07-configuration.md)), the tab turns yellow and the subcommand label gains a `⚠️` prefix (e.g. `⚠️ chat`). This silence rule applies when the agent is not reporting program status. An agent that reports `working` remains judged by its reports even if its output is quiet; the TUI may show the informational `working · silent …` note, but does not mark it stuck. A `done`, `blocked`, or `error` report likewise takes precedence over silence. The warning clears automatically when you:
 
 - Switch to the yellow tab
 - Press any key while the tab is active
@@ -781,13 +637,14 @@ For workflow tabs, awman goes further: the [workflow control board](05-workflows
 | **Ctrl+A** | Switch to the previous tab |
 | **Ctrl+D** | Switch to the next tab |
 | **Ctrl+G** | Toggle Git Sidebar (live view of repository changes) |
+| **Ctrl+Q** | Open the work queue panel when the TUI worker is enabled |
 | **Ctrl+Shift+C** | Copy the workflow context host directory (only while the current tab has an active workflow context overlay) |
 | **Ctrl+M** | Toggle container window between maximized, minimized, and hidden |
 | **Ctrl+O** | Minimize / maximize the Workflow Overview (independent of Ctrl+M) |
 | **Shift+← / Shift+→** | Scroll the Workflow Overview sideways (only while it doesn't fit at full width; mouse wheel and Shift+mouse wheel also scroll it) |
 | **Ctrl+\\** | Detach from the container view, leaving every container running (see [Detaching](#detaching-from-a-container)) |
 | **Ctrl+S** | Switch focus to the next running container (only when [multiple parallel containers](#parallel-containers) are running; otherwise passed to the container's PTY) |
-| **Ctrl+W** | Open workflow control board (between steps or mid-step while running) |
+| **Ctrl+W** | Open workflow control board (during steps, between steps, or at final review after agents exit) |
 | **Ctrl+,** | Open the configuration dialog |
 | **Ctrl+C** | Open the quit or close-tab confirmation, or the workflow-cancel confirmation while a workflow runs (forwarded to the agent while a container is maximized) |
 

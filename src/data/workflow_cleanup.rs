@@ -11,6 +11,8 @@ use std::path::PathBuf;
 pub struct WorkflowCleanup {
     pub workflow: Workflow,
     pub work_item: Option<(u32, String)>,
+    #[serde(default)]
+    pub work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
     pub workdir: PathBuf,
     pub mount_path: PathBuf,
     pub state_root: Option<PathBuf>,

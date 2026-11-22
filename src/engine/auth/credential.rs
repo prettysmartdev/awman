@@ -21,7 +21,10 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ring::digest;
+use ring::{
+    hmac,
+    rand::{SecureRandom, SystemRandom},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::data::fs::auth_paths::AuthPathResolver;
@@ -29,65 +32,7 @@ use crate::data::fs::auth_paths::AuthPathResolver;
 /// macOS Keychain generic-password service name for the Claude Code credential.
 pub const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
-/// Wrapper that keeps a credential value out of logs, `Debug` output and
-/// serialized payloads. Deliberately implements neither `Display` nor
-/// `Serialize`; the only way to reach the bytes is [`SecretString::expose`].
-#[derive(Clone, PartialEq, Eq)]
-pub struct SecretString(String);
-
-impl SecretString {
-    pub fn input_buffer() -> Self {
-        Self(String::with_capacity(8192))
-    }
-
-    pub fn push_char(&mut self, ch: char) {
-        if self.0.len() + ch.len_utf8() <= 8192 {
-            self.0.push(ch);
-        }
-    }
-
-    pub fn pop_char(&mut self) {
-        if let Some(ch) = self.0.chars().last() {
-            let len = self.0.len() - ch.len_utf8();
-            self.0.truncate(len);
-            self.0.extend(std::iter::repeat_n('\0', ch.len_utf8()));
-            std::hint::black_box(&mut self.0);
-            self.0.truncate(len);
-        }
-    }
-
-    pub fn new(s: impl Into<String>) -> Self {
-        Self(s.into())
-    }
-
-    /// The only accessor. Every call site is a place a reviewer must check.
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Drop for SecretString {
-    /// Best-effort overwrite of the buffer before it is freed (no `unsafe`, no
-    /// `zeroize` crate): truncate, then refill the retained capacity with NULs
-    /// in place. Pushing at most `capacity` bytes never reallocates, so the
-    /// writes land on the allocation that held the secret. `black_box` keeps
-    /// the optimiser from discarding writes to memory about to be freed.
-    fn drop(&mut self) {
-        let buffer = &mut self.0;
-        let capacity = buffer.capacity();
-        buffer.clear();
-        buffer.extend(std::iter::repeat_n('\0', capacity));
-        std::hint::black_box(buffer);
-    }
-}
-
-impl std::fmt::Debug for SecretString {
-    /// Renders exactly `SecretString(<redacted>)` — never the value, never a
-    /// prefix of the value, never its length.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("SecretString(<redacted>)")
-    }
-}
+pub use crate::data::secret::SecretString;
 
 /// Agent-specific materialization inputs. Claude is the only consumer in this
 /// work item; a second agent's fields would join here.
@@ -115,22 +60,37 @@ pub struct CredentialSnapshot {
     pub extra: CredentialExtra,
 }
 
-/// Stable, non-reversible identity of a snapshot, for change detection and
-/// logging. Not derivable back to the secret: SHA-256 over
-/// (secret bytes || expiry) truncated to 8 hex chars.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CredentialFingerprint([u8; 4]);
+/// Protected in-memory change detector. Never exposed through Debug, status,
+/// logs or persistence. Durable generations are independent counters.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct CredentialFingerprint([u8; 32]);
+impl std::fmt::Debug for CredentialFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CredentialFingerprint(<private>)")
+    }
+}
 
 impl CredentialFingerprint {
     pub fn of(snapshot: &CredentialSnapshot) -> Self {
-        let mut ctx = digest::Context::new(&digest::SHA256);
+        static KEY: std::sync::OnceLock<hmac::Key> = std::sync::OnceLock::new();
+        let key = KEY.get_or_init(|| {
+            let mut bytes = [0u8; 32];
+            SystemRandom::new()
+                .fill(&mut bytes)
+                .expect("OS randomness for credential equality");
+            let key = hmac::Key::new(hmac::HMAC_SHA256, &bytes);
+            bytes.fill(0);
+            std::hint::black_box(&mut bytes);
+            key
+        });
+        let mut ctx = hmac::Context::with_key(key);
         ctx.update(snapshot.secret.expose().as_bytes());
         if let Some(ms) = snapshot.expires_at.and_then(system_time_to_ms) {
             ctx.update(&ms.to_le_bytes());
         }
-        let d = ctx.finish();
-        let mut out = [0u8; 4];
-        out.copy_from_slice(&d.as_ref()[..4]);
+        let d = ctx.sign();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(d.as_ref());
         Self(out)
     }
 
@@ -138,17 +98,7 @@ impl CredentialFingerprint {
     /// discriminant-only [`super::RefreshableCredentialDelivery`] the auth layer
     /// produces before staging assigns a real one.
     pub fn zeroed() -> Self {
-        Self([0u8; 4])
-    }
-
-    /// 8 lowercase hex chars. This is the ONLY form allowed in logs.
-    pub fn to_hex(&self) -> String {
-        let mut s = String::with_capacity(8);
-        for b in self.0 {
-            use std::fmt::Write as _;
-            let _ = write!(s, "{b:02x}");
-        }
-        s
+        Self([0u8; 32])
     }
 }
 
@@ -211,7 +161,10 @@ impl std::fmt::Debug for CredentialFile {
 pub enum HostCredentialSource {
     /// macOS Keychain generic password. For Claude: service
     /// `"Claude Code-credentials"`, no account.
-    MacosKeychain { service: &'static str },
+    MacosKeychain {
+        service: &'static str,
+        account: Option<&'static str>,
+    },
     /// A host file. For Claude on non-macOS: the path resolved from
     /// `AuthPathResolver::resolve("claude").settings_dir` joined with
     /// `.credentials.json`. READ ONLY — this path is never mounted (INV-2).
@@ -348,6 +301,7 @@ fn claude_source(resolver: &AuthPathResolver) -> HostCredentialSource {
     if cfg!(target_os = "macos") {
         HostCredentialSource::MacosKeychain {
             service: CLAUDE_KEYCHAIN_SERVICE,
+            account: None,
         }
     } else {
         let settings_dir = resolver
@@ -367,12 +321,19 @@ fn claude_source(resolver: &AuthPathResolver) -> HostCredentialSource {
 pub(crate) fn read_claude_credential(
     source: &HostCredentialSource,
 ) -> Result<CredentialSnapshot, CredentialReadError> {
+    read_claude_credential_in(&crate::engine::host_cli::process_env(), source)
+}
+
+pub(crate) fn read_claude_credential_in(
+    snapshot: &crate::data::config::env::EnvSnapshot,
+    source: &HostCredentialSource,
+) -> Result<CredentialSnapshot, CredentialReadError> {
     let raw = match source {
-        HostCredentialSource::MacosKeychain { service } => {
+        HostCredentialSource::MacosKeychain { service, account } => {
             if !cfg!(target_os = "macos") {
                 return Err(CredentialReadError::Unsupported);
             }
-            super::keychain::run_macos_keychain_lookup(service, None)
+            super::keychain::run_macos_keychain_lookup_in(snapshot, service, *account)
                 .ok_or(CredentialReadError::NotFound)?
         }
         HostCredentialSource::HostFile { path } => match std::fs::read_to_string(path) {
@@ -493,183 +454,27 @@ fn system_time_to_ms(t: SystemTime) -> Option<i64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const SAMPLE: &str = r#"{
-        "claudeAiOauth": {
-            "accessToken": "sk-ant-oat-ACCESS",
-            "refreshToken": "sk-ant-ort-REFRESH-SENTINEL",
-            "refreshTokenExpiresAt": 1799999999000,
-            "expiresAt": 1750000000000,
-            "scopes": ["user:inference", "user:profile"],
-            "subscriptionType": "max"
-        }
-    }"#;
-
+mod protected_equality_tests {
     #[test]
-    fn parse_captures_secret_and_expiry_and_drops_refresh_token() {
-        let snap = parse_claude_payload(SAMPLE).expect("parse");
-        assert_eq!(snap.secret.expose(), "sk-ant-oat-ACCESS");
-        assert_eq!(
-            snap.expires_at.and_then(system_time_to_ms),
-            Some(1_750_000_000_000)
-        );
-        assert_eq!(snap.extra.subscription_type.as_deref(), Some("max"));
-        // The refresh token appears nowhere reachable from the snapshot.
-        let dbg = format!("{snap:?}");
-        assert!(
-            !dbg.contains("REFRESH-SENTINEL"),
-            "refresh token leaked into Debug: {dbg}"
-        );
-        assert!(
-            !dbg.contains("sk-ant-oat-ACCESS"),
-            "secret leaked into Debug"
-        );
-    }
-
-    #[test]
-    fn materialized_file_has_no_refresh_token_and_is_0600() {
-        let snap = parse_claude_payload(SAMPLE).expect("parse");
-        let file = claude_materialize(&snap);
-        assert_eq!(file.mode, 0o600);
-        assert_eq!(file.relative_path, PathBuf::from(".credentials.json"));
-        let text = String::from_utf8(file.contents.clone()).unwrap();
-        assert!(text.contains("sk-ant-oat-ACCESS"));
-        assert!(text.contains("\"expiresAt\":1750000000000"));
-        assert!(!text.contains("refreshToken"), "rendered file: {text}");
-        assert!(!text.contains("REFRESH-SENTINEL"));
-    }
-
-    #[test]
-    fn materialize_omits_absent_optional_fields() {
-        let minimal = r#"{"claudeAiOauth":{"accessToken":"tok"}}"#;
-        let snap = parse_claude_payload(minimal).expect("parse");
-        let file = claude_materialize(&snap);
-        let text = String::from_utf8(file.contents).unwrap();
-        assert!(!text.contains("scopes"), "{text}");
-        assert!(!text.contains("subscriptionType"), "{text}");
-        assert!(!text.contains("expiresAt"), "{text}");
-    }
-
-    #[test]
-    fn malformed_payload_is_typed_error() {
-        assert!(matches!(
-            parse_claude_payload("not json"),
-            Err(CredentialReadError::Malformed)
-        ));
-        assert!(matches!(
-            parse_claude_payload("{}"),
-            Err(CredentialReadError::Malformed)
-        ));
-    }
-
-    #[test]
-    fn secret_debug_is_redacted() {
-        let s = SecretString::new("super-secret");
-        assert_eq!(format!("{s:?}"), "SecretString(<redacted>)");
-    }
-
-    #[test]
-    fn fingerprint_is_eight_hex_chars_and_stable() {
-        let snap = parse_claude_payload(SAMPLE).expect("parse");
-        let fp = CredentialFingerprint::of(&snap);
-        let hex = fp.to_hex();
-        assert_eq!(hex.len(), 8);
-        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(fp, CredentialFingerprint::of(&snap));
-    }
-
-    #[test]
-    fn host_file_read_missing_is_not_found() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = HostCredentialSource::HostFile {
-            path: dir.path().join("nope").join(".credentials.json"),
+    fn change_detection_is_stable_in_process_and_not_an_unsalted_digest() {
+        use super::*;
+        let snapshot = CredentialSnapshot {
+            secret: SecretString::new("test-secret-detector"),
+            expires_at: None,
+            extra: Default::default(),
         };
-        assert!(matches!(
-            read_claude_credential(&source),
-            Err(CredentialReadError::NotFound)
-        ));
-    }
-
-    #[test]
-    fn host_file_read_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".credentials.json");
-        std::fs::write(&path, SAMPLE).unwrap();
-        let source = HostCredentialSource::HostFile { path };
-        let snap = read_claude_credential(&source).expect("read");
-        assert_eq!(snap.secret.expose(), "sk-ant-oat-ACCESS");
-    }
-
-    #[test]
-    fn claude_is_auth_failure_matches_signatures() {
-        assert!(claude_is_auth_failure("HTTP 401 Unauthorized"));
-        assert!(claude_is_auth_failure("invalid OAuth access token"));
-        assert!(claude_is_auth_failure("Failed to authenticate with server"));
-        assert!(!claude_is_auth_failure("everything is fine"));
-    }
-}
-
-#[cfg(test)]
-mod secret_string_tests {
-    use super::*;
-
-    #[test]
-    fn debug_never_contains_the_value_or_its_length() {
-        for value in ["a", "ghp_0123456789abcdefghij", ""] {
-            let text = format!(
-                "{:?} {:#?}",
-                SecretString::new(value),
-                SecretString::new(value)
-            );
-            assert!(!text.contains("ghp_"));
-            assert!(text.contains("<redacted>"));
-            assert!(!text.contains(&value.len().to_string()) || value.is_empty());
-        }
-    }
-
-    #[test]
-    fn clone_and_equality_work_without_exposing() {
-        let a = SecretString::new("same-value");
-        let b = a.clone();
-        assert_eq!(a, b);
-        assert_ne!(a, SecretString::new("other"));
-        assert_eq!(b.expose(), "same-value");
-    }
-
-    #[test]
-    fn nested_in_a_debug_struct_stays_redacted() {
-        #[derive(Debug)]
-        #[allow(dead_code)]
-        struct Holder {
-            token: SecretString,
-            list: Vec<SecretString>,
-            opt: Option<SecretString>,
-        }
-        let holder = Holder {
-            token: SecretString::new("ghp_nested_value"),
-            list: vec![SecretString::new("ghp_nested_value2")],
-            opt: Some(SecretString::new("ghp_nested_value3")),
+        let first = CredentialFingerprint::of(&snapshot);
+        assert_eq!(first, CredentialFingerprint::of(&snapshot));
+        assert_ne!(
+            first.0.as_slice(),
+            ring::digest::digest(&ring::digest::SHA256, snapshot.secret.expose().as_bytes())
+                .as_ref()
+        );
+        let changed = CredentialSnapshot {
+            secret: SecretString::new("test-secret-changed"),
+            ..snapshot
         };
-        assert!(!format!("{holder:?}").contains("ghp_nested"));
-    }
-}
-
-#[cfg(test)]
-mod input_buffer_review_tests {
-    use super::*;
-    #[test]
-    fn input_is_bounded_from_the_first_keystroke_and_debug_is_redacted() {
-        let mut input = SecretString::input_buffer();
-        for _ in 0..10000 {
-            input.push_char('x');
-        }
-        assert_eq!(input.expose().len(), 8192);
-        input.pop_char();
-        assert_eq!(input.expose().len(), 8191);
-        input.push_char('é');
-        assert_eq!(input.expose().len(), 8191);
-        assert!(!format!("{input:?}").contains("xxx"));
+        assert_ne!(first, CredentialFingerprint::of(&changed));
+        assert!(!format!("{first:?}").contains("test-secret"));
     }
 }

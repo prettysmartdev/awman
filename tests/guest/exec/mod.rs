@@ -1,0 +1,181 @@
+use crate::support;
+#[test]
+fn exit_code_and_streams_survive_the_vm_boundary() {
+    let s = support::sandbox("exec::exit_code_and_streams_survive_the_vm_boundary");
+    let out = support::scenario(&s, "exit-code");
+    assert!(out.contains("EXIT\t37"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(s.work().join("exit-code.stdout")).unwrap(),
+        "out-marker"
+    );
+    assert_eq!(
+        std::fs::read_to_string(s.work().join("exit-code.stderr")).unwrap(),
+        "err-marker"
+    );
+}
+#[test]
+fn cancellation_removes_only_the_owned_vm() {
+    let s = support::sandbox("exec::cancellation_removes_only_the_owned_vm");
+    let out = support::scenario(&s, "cancel");
+    assert!(out.contains("RUNNING_AFTER\t0"), "{out}");
+}
+#[test]
+fn acp_is_binary_clean_and_stdin_eof_finishes() {
+    let s = support::sandbox("exec::acp_is_binary_clean_and_stdin_eof_finishes");
+    let out = support::scenario(&s, "acp-framing");
+    assert!(out.contains("ACP_ECHO_EQUAL\ttrue"), "{out}");
+    assert!(out.contains("EXIT\t0"), "{out}");
+}
+#[test]
+fn mounts_credentials_and_atomic_refresh_reach_the_guest() {
+    let s = support::sandbox("exec::mounts_credentials_and_atomic_refresh_reach_the_guest");
+    let out = support::scenario(&s, "mounts");
+    assert!(out.contains("HOST_WRITEBACK\tguest"), "{out}");
+    let stdout = std::fs::read_to_string(s.work().join("mounts.stdout")).unwrap();
+    support::transcript(&stdout, "guest-checks.sh", "guest-suite-complete");
+}
+#[test]
+fn credential_refresh_reaches_multiple_consumers() {
+    let s = support::sandbox("exec::credential_refresh_reaches_multiple_consumers");
+    support::scenario(&s, "refresh-multi");
+    for n in 0..2 {
+        assert_eq!(
+            std::fs::read_to_string(s.work().join(format!("refresh-multi-{n}.stdout")))
+                .unwrap()
+                .trim(),
+            "seen-v2"
+        );
+    }
+}
+#[test]
+fn vcpu_and_memory_limits_reach_the_guest() {
+    let s = support::sandbox("exec::vcpu_and_memory_limits_reach_the_guest");
+    support::scenario(&s, "limits");
+    // msb_krun_arch 0.1.41's x86 bundled-kernel layout below the MMIO
+    // gap adds low RAM and the kernel extent before the requested RAM region.
+    // Private-memory boot changes ownership, not this address-space layout.
+    let boot_overhead_kib = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        let manifest: toml::Value = toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../third_party/msb-payloads/manifest.toml"
+        )))
+        .unwrap();
+        let kernel = &manifest["targets"]["x86_64-unknown-linux-gnu"];
+        let end =
+            kernel["guest_address"].as_integer().unwrap() + kernel["size"].as_integer().unwrap();
+        u64::try_from(end).unwrap().div_ceil(1024)
+    } else {
+        0
+    };
+    let mut totals = Vec::new();
+    for (file, cpu, requested_mib) in [("limits-default", 1, 512), ("limits", 2, 768)] {
+        let text = std::fs::read_to_string(s.work().join(format!("{file}.stdout"))).unwrap();
+        let values: Vec<u64> = text
+            .lines()
+            .map(|v| v.trim().parse().expect("guest resource value"))
+            .collect();
+        assert_eq!(values.len(), 2, "{file}: {text}");
+        assert_eq!(values[0], cpu, "{file}: {text}");
+        let requested_kib = requested_mib * 1024;
+        // MemTotal excludes Linux's reserved pages. Bound those reservations
+        // as well as the exact pin-derived architectural addition.
+        assert!(
+            values[1] > requested_kib - 128 * 1024
+                && values[1] <= requested_kib + boot_overhead_kib,
+            "{file}: requested={requested_kib} KiB, boot overhead={boot_overhead_kib} KiB, guest={text}"
+        );
+        totals.push(values[1]);
+    }
+    // The per-launch override must change actual RAM by the requested 256 MiB.
+    // Allow 16 MiB for changed page tables, kernel reservations and the second
+    // vCPU; an ignored override or an oversized allocation still fails.
+    let growth = totals[1]
+        .checked_sub(totals[0])
+        .expect("guest RAM must grow");
+    assert!(
+        growth.abs_diff(256 * 1024) <= 16 * 1024,
+        "512/768 MiB guest totals={totals:?} KiB, growth={growth} KiB"
+    );
+}
+#[test]
+fn pty_resize_is_observed_in_the_guest() {
+    let s = support::sandbox("exec::pty_resize_is_observed_in_the_guest");
+    let out = support::scenario(&s, "pty-resize");
+    assert!(out.contains("24 80") && out.contains("30 100"), "{out}");
+}
+#[test]
+fn reattachment_shares_streams_without_killing_the_owner() {
+    let s = support::sandbox("exec::reattachment_shares_streams_without_killing_the_owner");
+    let out = support::scenario(&s, "reattach");
+    assert!(
+        out.contains("REATTACH_BOTH_SAW\ttrue") && out.contains("EXIT\t5"),
+        "{out}"
+    );
+}
+#[test]
+fn workspace_readonly_and_output_receipts_require_real_mounts() {
+    let s = support::sandbox("exec::workspace_readonly_and_output_receipts_require_real_mounts");
+    support::scenario(&s, "worker-mount");
+}
+
+#[test]
+fn explicit_image_overrides_preserve_non_root_identity() {
+    let s = support::sandbox("exec::explicit_image_overrides_preserve_non_root_identity");
+    support::scenario(&s, "image-overrides");
+    let text = std::fs::read_to_string(s.work().join("image-overrides.stdout")).unwrap();
+    assert_eq!(
+        text.lines().collect::<Vec<_>>(),
+        [
+            "1234",
+            "1234",
+            "/tmp",
+            "/home/probe",
+            "runtime override",
+            "added"
+        ]
+    );
+}
+
+#[test]
+fn concurrent_vm_stop_leaves_other_owners_running() {
+    let s = support::sandbox("exec::concurrent_vm_stop_leaves_other_owners_running");
+    let out = support::scenario(&s, "multi-vm");
+    assert!(out.contains("RUNNING_DURING\t3"), "{out}");
+    assert!(
+        out.contains("1:0:vm-1") && out.contains("2:0:vm-2"),
+        "{out}"
+    );
+    assert!(out.contains("RUNNING_AFTER\t0"), "{out}");
+}
+
+#[test]
+fn failed_guest_workload_allows_repeated_kernel_boot() {
+    let s = support::sandbox("exec::failed_guest_workload_allows_repeated_kernel_boot");
+    let out = support::scenario(&s, "kernel-repeat");
+    assert_eq!(
+        out.lines().filter(|l| *l == "ROUND_REMAINING\t0").count(),
+        3,
+        "{out}"
+    );
+    for round in 0..3 {
+        let text = std::fs::read_to_string(s.work().join(format!("kernel-repeat-{round}.stdout")))
+            .unwrap();
+        assert!(text.contains(&format!("round-{round}")), "{text}");
+    }
+}
+
+#[test]
+fn quiet_phase_keeps_full_ordered_failure_transcript_and_cancels() {
+    let s = support::sandbox("exec::quiet_phase_keeps_full_ordered_failure_transcript_and_cancels");
+    let out = support::scenario(&s, "phase-quiet-transcript");
+    assert!(out.contains("PHASE_EXIT\t37"), "{out}");
+    assert!(out.contains("TRANSCRIPT_LINES\t20000"), "{out}");
+    assert!(out.contains("QUIET_CANCELLED\ttrue"), "{out}");
+}
+
+#[test]
+fn stopped_builtin_instance_is_inspectable_until_owned_removal() {
+    let s = support::sandbox("exec::stopped_builtin_instance_is_inspectable_until_owned_removal");
+    let out = support::scenario(&s, "phase-stop-remove");
+    assert!(out.contains("STOP_GET_REMOVE\ttrue"), "{out}");
+}

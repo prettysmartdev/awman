@@ -25,6 +25,7 @@ fn command_box_locked(app: &App) -> bool {
 /// Determine focus context and dispatch the key event through the keymap.
 mod dialog;
 mod edit;
+pub(super) mod queue;
 mod scroll;
 mod squad;
 mod tab;
@@ -73,6 +74,15 @@ pub(super) fn focus_context(app: &App) -> FocusContext {
 /// keymap because they depend on *which* dialog is open, which the keymap's
 /// `FocusContext::Dialog` does not distinguish.
 fn intercept_dialog_keys(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+    // The work-queue panel and the lease close prompt own every key.
+    if matches!(app.active_dialog, Some(Dialog::QueuePanel(_))) {
+        queue::handle_panel_key(app, key);
+        return true;
+    }
+    if matches!(app.active_dialog, Some(Dialog::LeaseCloseConfirm(_))) {
+        queue::handle_close_key(app, key);
+        return true;
+    }
     // WorkflowControlBoard intercepts arrow keys and Ctrl+Enter before the
     // generic keymap so they map to workflow navigation rather than scroll/cursor.
     if matches!(app.active_dialog, Some(Dialog::WorkflowControlBoard(_)))
@@ -119,6 +129,12 @@ fn intercept_dialog_keys(app: &mut App, key: crossterm::event::KeyEvent) -> bool
     {
         app.active_dialog = None;
         app.active_tab_mut().cycle_focused_slot();
+        let tab = app.active_tab();
+        tab.shared.signals.touch_user_for_step(
+            tab.focused_slot()
+                .map(|slot| slot.step_name.as_str())
+                .filter(|s| !s.is_empty()),
+        );
         return true;
     }
 
@@ -157,6 +173,11 @@ fn intercept_dialog_keys(app: &mut App, key: crossterm::event::KeyEvent) -> bool
     {
         let tab = app.active_tab_mut();
         tab.cycle_focused_slot();
+        tab.shared.signals.touch_user_for_step(
+            tab.focused_slot()
+                .map(|slot| slot.step_name.as_str())
+                .filter(|s| !s.is_empty()),
+        );
         // No manual resize here: `tick_all_tabs` keeps every slot's parser
         // and PTY in lockstep with the overlay's actual inner rect, so the
         // rotated-in slot is already correctly sized.
@@ -218,6 +239,11 @@ fn intercept_agents_watch_stop(
     true
 }
 pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
+    // Active-tab suppression input: the user is interacting with this tab.
+    let tab = app.active_tab();
+    tab.shared
+        .signals
+        .touch_user_for_step(app.activity_step_name());
     // A runtime notice stays in the status bar until the next key press.
     app.status_bar.notice = None;
     if keymap::is_workflow_context_copy_key(key) {
@@ -252,6 +278,8 @@ pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         | Action::FocusCommandBox
         | Action::ToggleStatusLog
         | Action::DetachContainers => tab::handle(app, action),
+
+        Action::OpenQueuePanel => queue::open_panel(app),
 
         Action::ScrollUp
         | Action::ScrollDown
@@ -373,7 +401,7 @@ fn forward_key_to_pty(app: &mut App, key: crossterm::event::KeyEvent) {
     let attaching = matches!(&app.active_tab().execution_phase,
         crate::frontend::tui::tabs::ExecutionPhase::Running { command, .. }
             if crate::command::dispatch::catalogue::CommandCatalogue::get()
-                .is_agent_attach(&command.split_whitespace().collect::<Vec<_>>()));
+                .is_terminal_attach(&command.split_whitespace().collect::<Vec<_>>()));
     if attaching && key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
     {
         app.active_tab().shared.command_cancel.cancel();
@@ -714,7 +742,6 @@ pub(super) fn handle_new_tab_path(app: &mut App, path: &str) {
             return;
         }
     };
+    // The instance started the tab's startup command when it opened it.
     app.active_tab = idx;
-    let startup = app.catalogue.startup_command(&app.tabs[idx].session);
-    app.spawn_command(startup);
 }

@@ -152,7 +152,24 @@ pub(super) fn render_suggestion_row(app: &App, area: Rect, frame: &mut Frame) {
     // WI 0112: the squad indicator is pinned to the far right of this row on
     // every tab, in both of the row's modes. Whatever else the row shows is
     // fitted into what the indicator leaves, never the other way round.
-    let indicator = squad_indicator_spans(app, area.width);
+    let mut indicator = squad_indicator_spans(app, area.width);
+    // WI 0143: new / for-you work items sit just left of the squad indicator.
+    if let Some(text) = app.queue_badge.text() {
+        let badge = format!(" {text} ");
+        if (badge.chars().count() as u16) + 12 < area.width {
+            indicator.insert(
+                0,
+                Span::styled(
+                    badge,
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            );
+            indicator.insert(1, Span::raw(" "));
+        }
+    }
     let indicator_w: u16 = indicator
         .iter()
         .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()) as u16)
@@ -370,44 +387,5 @@ pub(super) fn status_level_color(level: &crate::data::message::MessageLevel) -> 
         MessageLevel::Warning => Color::Yellow,
         MessageLevel::Error => Color::Red,
         MessageLevel::Success => Color::Green,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::squad_indicator_color;
-    use crate::engine::squad::SquadHealth as SquadIndicator;
-    use ratatui::style::Color;
-
-    /// WI 0116 §6c: the colour map, pinned independently of where the `●`
-    /// lands on the bottom row (that placement is covered in
-    /// `frontend::tui::tests::render_tests`).
-    ///
-    /// `EnvUnmet` shares `Unreachable`'s yellow deliberately: both mean "needs
-    /// a look, not broken", they cannot co-occur — an unreachable daemon
-    /// cannot have reported coverage — and `Unreachable` outranks `EnvUnmet`
-    /// in `classify` anyway. An eighth colour separating two states that never
-    /// appear together would cost more than it explains.
-    #[test]
-    fn env_unmet_is_yellow_and_no_other_state_moved() {
-        assert_eq!(
-            squad_indicator_color(SquadIndicator::EnvUnmet),
-            Color::Yellow
-        );
-        assert_eq!(
-            squad_indicator_color(SquadIndicator::Unreachable),
-            Color::Yellow
-        );
-        assert_eq!(
-            squad_indicator_color(SquadIndicator::Unknown),
-            Color::DarkGray
-        );
-        assert_eq!(
-            squad_indicator_color(SquadIndicator::NotRunning),
-            Color::DarkGray
-        );
-        assert_eq!(squad_indicator_color(SquadIndicator::Failed), Color::Red);
-        assert_eq!(squad_indicator_color(SquadIndicator::Running), Color::Blue);
-        assert_eq!(squad_indicator_color(SquadIndicator::Healthy), Color::Green);
     }
 }

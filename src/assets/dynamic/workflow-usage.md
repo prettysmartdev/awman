@@ -44,8 +44,10 @@ the prompt is sent to the agent:
 
 | Variable | Expands to |
 |---|---|
-| `{{work_item_number}}` | Zero-padded four-digit work item number (e.g. `0042`) |
-| `{{work_item}}` | Bare numeric work item number (e.g. `42`) |
+| `{{work_item_number}}` | Minimum-four-digit work item number (e.g. `0042`), empty when unavailable |
+| `{{work_item}}` | Bare number when available (e.g. `42`), otherwise the stable work item key |
+| `{{work_item_key}}` | Stable identity used for state and resume |
+| `{{work_item_title}}` | Work item title |
 | `{{work_item_content}}` | Full text content of the work item file |
 | `{{work_item_section:[Section Name]}}` | Content of a named H1 or H2 section within the work item file |
 

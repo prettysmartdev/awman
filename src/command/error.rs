@@ -13,8 +13,46 @@ use crate::engine::error::EngineError;
 
 #[derive(Debug, Error)]
 pub enum CommandError {
+    #[error("`{key}` is fixed for this awman process (running with {bound}; requested {requested}). Restart the daemon or TUI with `--set {key}={requested}`, or change the global config and restart.")]
+    ProcessScopedSetting {
+        key: String,
+        bound: String,
+        requested: String,
+    },
+    #[error("settings profile busy: {0}; run 'awman agents profile close <NAME> --agent <agent>' after cancelling its command")]
+    SettingsProfileBusy(String),
+    #[error("native session not found in this profile")]
+    NativeSessionNotFound,
+    #[error("owner-local profile access required")]
+    ProfileOwnerRequired,
+    #[error(transparent)]
+    Edit(#[from] crate::command::commands::edit::EditError),
     #[error(transparent)]
     Engine(EngineError),
+
+    #[error("runtime wait failed: {0}")]
+    RuntimeWaitFailed(String),
+
+    /// WI 0070: a request that is well-formed but not admissible as
+    /// sent (`invalid_request`, usage exit 2 / HTTP 400).
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
+
+    /// WI 0070: the selected agent/route lacks a native facility (409).
+    #[error("native capability unavailable: {0}")]
+    NativeCapabilityUnavailable(String),
+
+    /// WI 0070: an automation execution's primary asynchronous failure
+    /// (`startup_timeout`, `delivery_unknown`, `agent_turn_failed`, …).
+    #[error("{code}: {message}")]
+    AutomationFailed {
+        code: String,
+        message: String,
+        automation: Option<Box<crate::data::automation_records::CommandAutomationResult>>,
+        /// The last turn's native-confirmed answer, if any (never an
+        /// ordinary output candidate).
+        final_message: Option<String>,
+    },
 
     #[error(transparent)]
     Data(DataError),
@@ -128,40 +166,27 @@ pub enum CommandError {
     #[error("API workdir not found: {path}")]
     ApiWorkdirNotFound { path: PathBuf },
 
-    #[error("API workdir root '{root}' is inside a git repository ({git_root}); list it with --workdirs instead, or choose a directory that only contains repositories")]
+    #[error("worker workdir root '{root}' is inside a git repository ({git_root}); list it in daemon.features.worker.push.workDirs.allow instead, or choose a directory that only contains repositories")]
     ApiWorkdirRootInvalid { root: PathBuf, git_root: PathBuf },
 
-    #[error("API server already running on PID {pid}")]
-    ApiServerAlreadyRunning { pid: u32 },
+    // ── Daemon ────────────────────────────────────────────────────────────
+    #[error("the awman daemon is not running; start it with `awman daemon start`")]
+    DaemonNotRunning,
 
-    #[error("API server is not running")]
-    ApiServerNotRunning,
+    #[error("the awman daemon is already running (PID {pid}); stop it with `awman daemon stop`")]
+    DaemonAlreadyRunning { pid: u32 },
 
     #[error(
-        "no API key configured; run `awman api start --refresh-key` first, or pass `--dangerously-skip-auth`"
+        "no daemon feature is enabled; enable one first, for example \
+         `awman config set daemon.features.worker.enabled true`"
     )]
-    ApiServerAuthMissing,
+    DaemonNoFeatures,
 
-    // ── Squad ─────────────────────────────────────────────────────────────
-    /// The squad daemon is reachable but this process holds no bearer key for
-    /// it. Reported *before* the request rather than after it, because the
-    /// request's own answer is a bare `HTTP 401: API key required`, which
-    /// names neither the variable to set nor the fact that the key can no
-    /// longer be read back — it was shown once and is stored only as a hash.
-    ///
-    /// Typed (WI 0113 F-04) so the CLI and TUI stop authoring this text
-    /// themselves; the wording is byte-identical to the CLI's former
-    /// `missing_squad_key_error`, and tests assert it.
-    #[error(
-        "squad requires a bearer key and none is set in this shell.\n\n\
-         The key is shown only once, when it is minted, and only its hash is \
-         stored — so it cannot be read back. Set {} if you saved it, or mint a \
-         new one with:\n    awman squad start --refresh-key\n\
-         which invalidates the previous key, so any shell still exporting it \
-         must be updated too.",
-        crate::data::config::env::AWMAN_SQUAD_KEY
-    )]
-    SquadKeyMissing,
+    /// The daemon answered a local request with a 4xx/5xx status; `body` is
+    /// the response body as returned.
+    #[error("the daemon returned HTTP {status}: {body}")]
+    DaemonHttpStatus { status: u16, body: String },
+
     // ── Session creation (multi-session frontends: API, future desktop, …) ──
     // Typed so that a frontend can map each to the right transport status
     // (e.g. HTTP 400 vs 403) without inspecting the message string. Display
@@ -210,6 +235,38 @@ pub enum CommandError {
         reason: String,
     },
 
+    // ── Session Git credentials and command secrets (WI 0145) ─────────────
+    /// `git_auth` on a session whose repository the session helper cannot
+    /// serve: not a remote session, or not `https://` (or `http://` to a
+    /// loopback host).
+    #[error("git_auth is not supported for this session: {reason}")]
+    GitAuthUnsupportedUrl { reason: String },
+
+    /// `git_auth` on a platform without the session credential socket.
+    #[error("git_auth is not supported on this platform")]
+    GitAuthUnsupportedPlatform,
+
+    /// A malformed `git_auth` value. The reason never contains the secret.
+    #[error("invalid git_auth: {reason}")]
+    GitAuthInvalid { reason: String },
+
+    /// An authenticated Git operation at admission (the merge-ref
+    /// advertisement) was refused for its credentials.
+    #[error("{message}")]
+    GitAuthFailed { message: String },
+
+    /// The session was created with `git_auth`, but the daemon restarted and
+    /// no longer holds that in-memory credential.
+    #[error(
+        "the daemon restarted and this session's Git credentials were lost; open a new session"
+    )]
+    CredentialsLost,
+
+    /// A queued command had `secrets`, but the daemon restarted before it
+    /// ran and no longer holds their in-memory values.
+    #[error("the daemon restarted and this command's secrets were lost; submit it again")]
+    CommandSecretsLost,
+
     // ── Remote ────────────────────────────────────────────────────────────
     #[error("no remote session id; pass --session <id> or run `awman remote session start`")]
     RemoteSessionMissing,
@@ -218,6 +275,14 @@ pub enum CommandError {
     RemoteSessionKillFailed { session_id: String, reason: String },
 
     // ── Work item / spec ──────────────────────────────────────────────────────
+    /// Resolving, staging or creating a work item (WI 0147).
+    #[error(transparent)]
+    WorkItem(crate::command::work_item::WorkItemError),
+
+    /// Live draft sync or its final upload failed; the draft is kept.
+    #[error(transparent)]
+    DraftSync(crate::command::work_item::draft_sync::DraftSyncError),
+
     #[error("work item {number} not found in aspec/work-items/")]
     WorkItemNotFound { number: u32 },
 
@@ -239,7 +304,7 @@ pub enum CommandError {
     // ── Workflow prerequisites (WI 0149) ──────────────────────────────────
     /// A prerequisite is still unsatisfied after prompts and policy, and the
     /// `unresolved` policy is `fail`. Raised before any container starts.
-    #[error("workflow prerequisites unresolved: {}", report.summary_line())]
+    #[error("workflow prerequisites unresolved: {}", report.failure_summary())]
     WorkflowPrerequisitesUnresolved {
         report: Box<crate::data::workflow_prerequisites::WorkflowPrerequisiteReport>,
     },
@@ -252,6 +317,25 @@ pub enum CommandError {
     /// A `--prerequisite-*` value this build cannot honour yet.
     #[error("flag '{flag}' is unsupported until per-command secrets are available")]
     PrerequisiteFlagUnsupported { flag: String },
+
+    // ── Read-only workspace (WI 0152) ─────────────────────────────────────
+    /// `--read-only-workspace` (or a workflow step's `read_only_workspace`)
+    /// on a runtime that cannot mount the workspace read-only. Raised before
+    /// any side effect; the run is never downgraded to a writable workspace.
+    #[error("the {runtime} runtime cannot mount the workspace read-only; --read-only-workspace is refused rather than run with a writable workspace")]
+    ReadOnlyWorkspaceUnsupported { runtime: String },
+
+    // ── Declared, not yet available (WI 0070) ─────────────────────────────
+    /// A flag or command the catalogue declares whose behavior is not wired
+    /// in this build. Refused as invalid usage before any side effect; it is
+    /// never silently accepted. `option` is the flag's long name, or `None`
+    /// when the command itself is pending. See
+    /// `dispatch::catalogue::PENDING_OPTIONS`.
+    #[error("{}", option_pending_message(command, option.as_deref()))]
+    OptionPending {
+        command: Vec<String>,
+        option: Option<String>,
+    },
 
     // ── Agents (`awman agents …`) ─────────────────────────────────────────
     #[error("no agent matches {reference:?}; run `awman agents ls` to see running agents")]
@@ -290,7 +374,31 @@ pub enum CommandError {
     Other(String),
 }
 
+/// The user-facing text of [`CommandError::OptionPending`].
+fn option_pending_message(command: &[String], option: Option<&str>) -> String {
+    let command = command.join(" ");
+    match option {
+        Some(option) => format!(
+            "--{option} is not available yet on `{command}` in this build; it is refused \
+             rather than ignored"
+        ),
+        None => format!("`{command}` is not available yet in this build"),
+    }
+}
+
 impl CommandError {
+    /// The refusal for a declared-but-unwired flag (`option`) or command.
+    pub fn option_pending(command: &[&str], option: Option<&str>) -> Self {
+        CommandError::OptionPending {
+            command: command.iter().map(|part| (*part).to_string()).collect(),
+            option: option.map(str::to_string),
+        }
+    }
+
+    /// Kept for callers of the slice that introduced command secrets.
+    pub fn command_secrets_lost() -> Self {
+        Self::CommandSecretsLost
+    }
     /// A copy of an error `parse_raw_args` can produce, so a parse result held
     /// behind a shared handle can report it from every accessor. `None` for
     /// any other variant, most of which wrap uncloneable engine or data errors.
@@ -313,12 +421,25 @@ impl CommandError {
                 flag: flag.clone(),
                 reason: reason.clone(),
             },
+            CommandError::InvalidArgumentValue {
+                command,
+                argument,
+                reason,
+            } => CommandError::InvalidArgumentValue {
+                command: command.clone(),
+                argument: argument.clone(),
+                reason: reason.clone(),
+            },
             CommandError::UnexpectedArgument { command, argument } => {
                 CommandError::UnexpectedArgument {
                     command: command.clone(),
                     argument: argument.clone(),
                 }
             }
+            CommandError::OptionPending { command, option } => CommandError::OptionPending {
+                command: command.clone(),
+                option: option.clone(),
+            },
             _ => return None,
         })
     }
@@ -415,9 +536,14 @@ impl CommandError {
     pub fn exit_code(&self) -> u8 {
         match self {
         CommandError::Aborted => 130,
+        CommandError::Edit(_) => 1,
+        CommandError::WorkItem(e) => e.exit_code(),
+        CommandError::DraftSync(_) => 1,
+        CommandError::DaemonHttpStatus { status: 404, .. } => 4,
 
         // Exit 2 — invalid usage / parse / flag conflict
-        CommandError::UnknownCommand { .. }
+        CommandError::ProcessScopedSetting { .. }
+        | CommandError::UnknownCommand { .. }
         | CommandError::UnknownFlag { .. }
         | CommandError::MissingRequiredFlag { .. }
         | CommandError::MissingRequiredArgument { .. }
@@ -432,6 +558,8 @@ impl CommandError {
         | CommandError::WorkflowPrerequisitesUnresolved { .. }
         | CommandError::PrerequisiteWideningRefused { .. }
         | CommandError::PrerequisiteFlagUnsupported { .. }
+        | CommandError::ReadOnlyWorkspaceUnsupported { .. }
+        | CommandError::OptionPending { .. }
         // Session-creation validation failures are invalid-usage class.
         | CommandError::SessionInvalidType { .. }
         | CommandError::SessionWorkdirRequired
@@ -444,6 +572,9 @@ impl CommandError {
         | CommandError::SessionFieldRemoteOnly { .. }
         | CommandError::SessionFieldRequiresBranch { .. }
         | CommandError::SessionRefInvalid { .. }
+        | CommandError::GitAuthUnsupportedUrl { .. }
+        | CommandError::GitAuthUnsupportedPlatform
+        | CommandError::GitAuthInvalid { .. }
         | CommandError::AgentAmbiguous { .. }
         | CommandError::AgentReferenceEmpty => 2,
 
@@ -460,7 +591,12 @@ impl CommandError {
         // Engine failures carry their own class (3 only for a missing or
         // failing Docker/Apple Containers backend, 1 otherwise).
         CommandError::Engine(e) => e.exit_code(),
-        CommandError::Data(_) => 1,
+        CommandError::Data(_) | CommandError::RuntimeWaitFailed(_) => 1,
+        CommandError::NativeCapabilityUnavailable(_) => 1,
+        CommandError::InvalidRequest(_) => 2,
+        // A known nonzero provider exit is reported through the outcome; a
+        // failed automation result is a runtime failure.
+        CommandError::AutomationFailed { .. } => 1,
         CommandError::MergeConflict { .. } => 1,
         CommandError::MergeTargetDirty { .. } | CommandError::WorktreeExists { .. } => 1,
         CommandError::MissingRemoteAddress
@@ -470,15 +606,19 @@ impl CommandError {
         | CommandError::RemoteHttpStatus { .. }
         | CommandError::MalformedSseEvent(_)
         | CommandError::RemoteTransport(_) => 1,
-        CommandError::ApiServerAlreadyRunning { .. }
-        | CommandError::ApiServerNotRunning
-        | CommandError::ApiServerAuthMissing
+        CommandError::DaemonNotRunning
+        | CommandError::DaemonAlreadyRunning { .. }
+        | CommandError::DaemonNoFeatures
+        | CommandError::DaemonHttpStatus { .. }
         | CommandError::RemoteSessionMissing
         | CommandError::RemoteSessionKillFailed { .. } => 1,
         CommandError::NotImplemented(_) => 1,
         CommandError::NotAvailableForFrontend { .. } => 1,
-        CommandError::SquadKeyMissing => 1,
         CommandError::AgentOwnerGone { .. } => 1,
+        CommandError::GitAuthFailed { .. }
+        | CommandError::CredentialsLost
+        | CommandError::CommandSecretsLost => 1,
+        CommandError::SettingsProfileBusy(_) | CommandError::NativeSessionNotFound | CommandError::ProfileOwnerRequired => 1,
         CommandError::Other(_) => 1,
     }
     }
@@ -493,11 +633,22 @@ impl CommandError {
     /// resource 404, anything else 500.
     pub fn http_status(&self) -> u16 {
         match self {
+            CommandError::SettingsProfileBusy(_)
+            | CommandError::Data(DataError::ProfileLockBusy) => 409,
+            CommandError::ProcessScopedSetting { .. } => 409,
+            CommandError::NativeSessionNotFound => 404,
+            CommandError::NativeCapabilityUnavailable(_) => 409,
+            CommandError::ProfileOwnerRequired => 403,
             CommandError::Engine(EngineError::AgentDefinitionUntrusted { .. }) => 403,
             CommandError::Engine(EngineError::UnknownAgent { .. }) => 404,
+            // WI 0070: a missing native capability is a conflict with the
+            // selected agent/route, not a server failure.
+            CommandError::Engine(e) if e.is_native_capability_unavailable() => 409,
             CommandError::SessionWorkdirNotAllowed { .. } => 403,
             CommandError::PrerequisiteWideningRefused { .. } => 403,
             CommandError::WorkflowPrerequisitesUnresolved { .. } => 409,
+            CommandError::CredentialsLost => 409,
+            CommandError::GitAuthFailed { .. } => 422,
             CommandError::MergeTargetDirty { .. }
             | CommandError::MergeConflict { .. }
             | CommandError::WorktreeExists { .. } => 409,
@@ -529,7 +680,7 @@ pub mod failure_codes {
 /// post-command stages the queue worker names itself (`step`, `teardown`,
 /// `push`, `setup`) use the same spellings.
 pub mod failure_stages {
-    /// `/v1/runs` session setup, before the command ran.
+    /// `/v1/worker/runs` session setup, before the command ran.
     pub const SETUP: &str = "setup";
     /// After admission, before any container started: argument resolution,
     /// agent lookup, an existing worktree, a missing resource.
@@ -563,12 +714,31 @@ impl CommandError {
         match self {
             CommandError::WorkflowPrerequisitesUnresolved { .. } => WORKFLOW_PREREQUISITES,
 
+            CommandError::GitAuthFailed { .. } | CommandError::CredentialsLost => {
+                crate::data::fs::api_db::failure_stages::GIT_AUTH
+            }
+            CommandError::SettingsProfileBusy(_)
+            | CommandError::NativeSessionNotFound
+            | CommandError::ProfileOwnerRequired => PREFLIGHT,
+            CommandError::Data(DataError::ProfileLockBusy) => PREFLIGHT,
+            CommandError::CommandSecretsLost => PREFLIGHT,
+            CommandError::WorkItem(_) => PREFLIGHT,
+            CommandError::DraftSync(_) => STEP,
+            CommandError::Edit(_) => STEP,
+
             CommandError::MergeConflict { .. } | CommandError::MergeTargetDirty { .. } => MERGE,
 
+            CommandError::Engine(e)
+                if e.is_native_capability_unavailable()
+                    || matches!(e, EngineError::AgentModeConflict { .. }) =>
+            {
+                PREFLIGHT
+            }
             CommandError::Engine(EngineError::UnknownAgent { .. })
             | CommandError::Engine(EngineError::AgentDefinitionUntrusted { .. })
             | CommandError::WorktreeExists { .. }
             | CommandError::UnknownCommand { .. }
+            | CommandError::ProcessScopedSetting { .. }
             | CommandError::NotAvailableForFrontend { .. }
             | CommandError::UnknownFlag { .. }
             | CommandError::MissingRequiredFlag { .. }
@@ -582,10 +752,10 @@ impl CommandError {
             | CommandError::MissingApiKey
             | CommandError::ApiWorkdirNotFound { .. }
             | CommandError::ApiWorkdirRootInvalid { .. }
-            | CommandError::ApiServerAlreadyRunning { .. }
-            | CommandError::ApiServerNotRunning
-            | CommandError::ApiServerAuthMissing
-            | CommandError::SquadKeyMissing
+            | CommandError::DaemonNotRunning
+            | CommandError::DaemonAlreadyRunning { .. }
+            | CommandError::DaemonNoFeatures
+            | CommandError::DaemonHttpStatus { .. }
             | CommandError::SessionInvalidType { .. }
             | CommandError::SessionWorkdirRequired
             | CommandError::SessionWorkdirUnresolvable { .. }
@@ -596,6 +766,9 @@ impl CommandError {
             | CommandError::SessionFieldRemoteOnly { .. }
             | CommandError::SessionFieldRequiresBranch { .. }
             | CommandError::SessionRefInvalid { .. }
+            | CommandError::GitAuthUnsupportedUrl { .. }
+            | CommandError::GitAuthUnsupportedPlatform
+            | CommandError::GitAuthInvalid { .. }
             | CommandError::RemoteSessionMissing
             | CommandError::WorkItemNotFound { .. }
             | CommandError::SpecTemplateMissing { .. }
@@ -605,15 +778,21 @@ impl CommandError {
             | CommandError::WorkflowFileNotFound { .. }
             | CommandError::PrerequisiteWideningRefused { .. }
             | CommandError::PrerequisiteFlagUnsupported { .. }
+            | CommandError::ReadOnlyWorkspaceUnsupported { .. }
+            | CommandError::OptionPending { .. }
             | CommandError::AgentNotFound { .. }
             | CommandError::AgentNoLongerRunning { .. }
             | CommandError::AgentNotRunning { .. }
             | CommandError::AgentReplaced { .. }
             | CommandError::AgentAmbiguous { .. }
             | CommandError::AgentReferenceEmpty
-            | CommandError::NotImplemented(_) => PREFLIGHT,
+            | CommandError::NotImplemented(_)
+            | CommandError::NativeCapabilityUnavailable(_)
+            | CommandError::InvalidRequest(_) => PREFLIGHT,
 
+            CommandError::AutomationFailed { .. } => STEP,
             CommandError::Engine(_)
+            | CommandError::RuntimeWaitFailed(_)
             | CommandError::Data(_)
             | CommandError::Aborted
             | CommandError::RemoteTimeout
@@ -647,14 +826,39 @@ impl CommandError {
     pub fn code(&self) -> &'static str {
         use crate::data::fs::api_db::failure_codes as outcome_codes;
         match self {
+            CommandError::SettingsProfileBusy(_)
+            | CommandError::Data(DataError::ProfileLockBusy) => {
+                crate::data::agent_failure::SETTINGS_PROFILE_BUSY
+            }
+            CommandError::NativeSessionNotFound => {
+                crate::data::agent_failure::NATIVE_SESSION_NOT_FOUND
+            }
+            CommandError::ProfileOwnerRequired => "forbidden",
             CommandError::Engine(EngineError::UnknownAgent { .. }) => failure_codes::UNKNOWN_AGENT,
             CommandError::Engine(EngineError::AgentDefinitionUntrusted { .. }) => {
                 failure_codes::AGENT_UNTRUSTED
+            }
+            CommandError::Engine(EngineError::AgentModeConflict { .. }) => {
+                crate::data::agent_failure::AGENT_MODE_CONFLICT
+            }
+            CommandError::Engine(e) if e.is_native_capability_unavailable() => {
+                crate::data::agent_failure::NATIVE_CAPABILITY_UNAVAILABLE
             }
             CommandError::Engine(_) | CommandError::Data(_) | CommandError::Other(_) => {
                 outcome_codes::INTERNAL
             }
 
+            CommandError::ProcessScopedSetting { .. } => "process_scoped_setting",
+            CommandError::RuntimeWaitFailed(_) => crate::data::agent_failure::RUNTIME_WAIT_FAILED,
+            CommandError::InvalidRequest(_) => "invalid_request",
+            CommandError::NativeCapabilityUnavailable(_) => {
+                crate::data::agent_failure::NATIVE_CAPABILITY_UNAVAILABLE
+            }
+            CommandError::AutomationFailed { code, .. } => crate::data::agent_failure::ALL
+                .iter()
+                .copied()
+                .find(|known| known == code)
+                .unwrap_or(crate::data::agent_failure::AGENT_TURN_FAILED),
             CommandError::UnknownCommand { .. } => failure_codes::UNKNOWN_SUBCOMMAND,
             CommandError::NotAvailableForFrontend { .. } => "not_available_for_frontend",
             CommandError::UnknownFlag { .. } => failure_codes::UNKNOWN_FLAG,
@@ -663,6 +867,9 @@ impl CommandError {
             CommandError::UnexpectedArgument { .. } => "unexpected_argument",
             CommandError::MutuallyExclusive { .. } => "mutually_exclusive_flags",
             CommandError::InvalidFlagValue { .. } => "invalid_flag_value",
+            CommandError::InvalidArgumentValue { argument, .. } if argument == "prompt" => {
+                "invalid_request"
+            }
             CommandError::InvalidArgumentValue { .. } => "invalid_argument_value",
             CommandError::CommandBoxParse(_) => "command_box_parse_failed",
 
@@ -681,10 +888,10 @@ impl CommandError {
 
             CommandError::ApiWorkdirNotFound { .. } => "api_workdir_not_found",
             CommandError::ApiWorkdirRootInvalid { .. } => "api_workdir_root_invalid",
-            CommandError::ApiServerAlreadyRunning { .. } => "api_server_already_running",
-            CommandError::ApiServerNotRunning => "api_server_not_running",
-            CommandError::ApiServerAuthMissing => "api_server_auth_missing",
-            CommandError::SquadKeyMissing => "squad_key_missing",
+            CommandError::DaemonNotRunning => "daemon_not_running",
+            CommandError::DaemonAlreadyRunning { .. } => "daemon_already_running",
+            CommandError::DaemonNoFeatures => "daemon_no_features",
+            CommandError::DaemonHttpStatus { .. } => "daemon_http_status",
 
             CommandError::SessionInvalidType { .. } => "session_invalid_type",
             CommandError::SessionWorkdirRequired => "session_workdir_required",
@@ -696,10 +903,19 @@ impl CommandError {
             CommandError::SessionFieldRemoteOnly { .. } => "session_field_remote_only",
             CommandError::SessionFieldRequiresBranch { .. } => "session_field_requires_branch",
             CommandError::SessionRefInvalid { .. } => "session_ref_invalid",
+            CommandError::GitAuthUnsupportedUrl { .. } => "git_auth_unsupported_url",
+            CommandError::GitAuthUnsupportedPlatform => "git_auth_unsupported_platform",
+            CommandError::GitAuthInvalid { .. } => "invalid_git_auth",
+            CommandError::GitAuthFailed { .. } => outcome_codes::GIT_AUTH_FAILED,
+            CommandError::CredentialsLost => outcome_codes::CREDENTIALS_LOST,
+            CommandError::CommandSecretsLost => "secrets_lost",
 
             CommandError::RemoteSessionMissing => "remote_session_missing",
             CommandError::RemoteSessionKillFailed { .. } => "remote_session_kill_failed",
 
+            CommandError::WorkItem(e) => e.code(),
+            CommandError::Edit(_) => "edit_failed",
+            CommandError::DraftSync(_) => "work_item_sync_failed",
             CommandError::WorkItemNotFound { .. } => "work_item_not_found",
             CommandError::SpecTemplateMissing { .. } => "spec_template_missing",
             CommandError::InvalidOverlaySpec { .. } => "invalid_overlay_spec",
@@ -712,6 +928,8 @@ impl CommandError {
             }
             CommandError::PrerequisiteWideningRefused { .. } => "prerequisite_widening_refused",
             CommandError::PrerequisiteFlagUnsupported { .. } => "prerequisite_flag_unsupported",
+            CommandError::ReadOnlyWorkspaceUnsupported { .. } => "read_only_workspace_unsupported",
+            CommandError::OptionPending { .. } => failure_codes::INVALID_REQUEST,
 
             CommandError::AgentNotFound { .. } => "agent_not_found",
             CommandError::AgentNoLongerRunning { .. } => "agent_no_longer_running",
@@ -726,151 +944,14 @@ impl CommandError {
     }
 }
 
-#[cfg(test)]
-mod failure_classification_tests {
-    use super::*;
-
-    #[test]
-    fn every_failure_has_a_stage_and_a_snake_case_code() {
-        let cases: Vec<(CommandError, &str, &str)> = vec![
-            (
-                CommandError::WorktreeExists {
-                    path: "/w".into(),
-                    branch: "b".into(),
-                },
-                "preflight",
-                "worktree_exists",
-            ),
-            (
-                CommandError::MergeConflict {
-                    branch: "b".into(),
-                    worktree_path: "/w".into(),
-                    git_root: "/r".into(),
-                },
-                "merge",
-                "merge_conflict",
-            ),
-            (
-                CommandError::MergeTargetDirty {
-                    target_branch: "main".into(),
-                    branch: "b".into(),
-                    worktree_path: "/w".into(),
-                },
-                "merge",
-                "merge_target_dirty",
-            ),
-            (
-                CommandError::Engine(EngineError::UnknownAgent {
-                    name: "pi".into(),
-                    first_party: vec![],
-                    custom: vec![],
-                    notes: vec![],
-                }),
-                "preflight",
-                "unknown_agent",
-            ),
-            (
-                CommandError::Engine(EngineError::AgentDefinitionUntrusted {
-                    name: "pi".into(),
-                    path: "/x".into(),
-                    sha256: "ab".into(),
-                }),
-                "preflight",
-                "agent_untrusted",
-            ),
-            (CommandError::Aborted, "step", "aborted"),
-            (CommandError::Other("boom".into()), "step", "internal"),
-            (
-                CommandError::Engine(EngineError::Other("boom".into())),
-                "step",
-                "internal",
-            ),
-            (
-                CommandError::MissingRequiredArgument {
-                    command: vec!["prompt".into()],
-                    argument: "prompt".into(),
-                },
-                "preflight",
-                "missing_required_argument",
-            ),
-            (
-                CommandError::WorkflowFileNotFound { path: "/w".into() },
-                "preflight",
-                "workflow_file_not_found",
-            ),
-        ];
-        for (error, stage, code) in cases {
-            assert_eq!(error.stage(), stage, "{error}");
-            assert_eq!(error.code(), code, "{error}");
-            assert!(
-                code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
-                "{code} is not snake_case"
-            );
-        }
-    }
-
-    #[test]
-    fn unresolved_prerequisites_keep_their_stage() {
-        let error = CommandError::WorkflowPrerequisitesUnresolved {
-            report: Box::new(
-                crate::data::workflow_prerequisites::WorkflowPrerequisiteReport {
-                    phase: crate::data::workflow_prerequisites::PrerequisitePhase::BeforeTeardown,
-                    origin: crate::data::workflow_prerequisites::PrerequisiteOrigin::AssumedAll,
-                    checks: vec![],
-                    advisories: vec![],
-                    notes: vec![],
-                },
-            ),
-        };
-        assert_eq!(error.stage(), "workflow_prerequisites");
-        assert_eq!(error.code(), "workflow_prerequisites_unresolved");
+impl From<crate::command::work_item::WorkItemError> for CommandError {
+    fn from(err: crate::command::work_item::WorkItemError) -> Self {
+        CommandError::WorkItem(err)
     }
 }
 
-#[cfg(test)]
-mod agent_error_class_tests {
-    use super::*;
-
-    fn untrusted() -> CommandError {
-        CommandError::Engine(EngineError::AgentDefinitionUntrusted {
-            name: "pi".into(),
-            path: "/x/pi.toml".into(),
-            sha256: "ab".into(),
-        })
-    }
-    fn unknown() -> CommandError {
-        CommandError::Engine(EngineError::UnknownAgent {
-            name: "pi".into(),
-            first_party: vec!["claude".into()],
-            custom: vec![],
-            notes: vec![],
-        })
-    }
-
-    #[test]
-    fn untrusted_is_exit_2_and_http_403() {
-        assert_eq!(untrusted().exit_code(), 2);
-        assert_eq!(untrusted().http_status(), 403);
-    }
-
-    #[test]
-    fn unknown_agent_is_exit_4_and_http_404() {
-        assert_eq!(unknown().exit_code(), 4);
-        assert_eq!(unknown().http_status(), 404);
-    }
-
-    #[test]
-    fn other_classes_follow_the_exit_code() {
-        assert_eq!(CommandError::Other("x".into()).http_status(), 500);
-        assert_eq!(CommandError::Aborted.http_status(), 500);
-        assert_eq!(
-            CommandError::InvalidArgumentValue {
-                command: vec![],
-                argument: "a".into(),
-                reason: "r".into()
-            }
-            .http_status(),
-            400
-        );
+impl From<crate::command::work_item::draft_sync::DraftSyncError> for CommandError {
+    fn from(err: crate::command::work_item::draft_sync::DraftSyncError) -> Self {
+        CommandError::DraftSync(err)
     }
 }

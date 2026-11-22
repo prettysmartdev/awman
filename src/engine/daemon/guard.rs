@@ -1,120 +1,95 @@
-//! `DaemonGuard` — cross-daemon mutual exclusion.
-//!
-//! Layer 1 (WI 0114 F-29): the guard's whole job is deciding whether the
-//! *other* daemon's process is alive, which is a process operation. It moved
-//! up with `DaemonSupervisor`, whose `running_pid` it consults.
-//!
-//! `awman api` and the squad daemon both open the shared sqlite database. Only
-//! one long-lived process may hold it at a time, which removes multi-process
-//! SQLite contention on squad data by construction. `DaemonGuard` enforces that:
-//! before opening the database, a starting daemon checks that the *other*
-//! daemon is not alive, claims its own pidfile, then checks again to close the
-//! window where both pass an initial check before either commits.
-
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
-
+//! Single daemon identity and startup arbitration.
 use crate::data::config::env::EnvSnapshot;
 use crate::data::error::DataError;
-use crate::data::fs::api_paths::ApiPaths;
-use crate::data::fs::daemon_process::{
-    API_PLIST_LABEL, API_UNIT_NAME, SQUAD_PLIST_LABEL, SQUAD_UNIT_NAME,
-};
-use crate::data::fs::squad_paths::SquadPaths;
+use crate::data::fs::{daemon_paths::DaemonPaths, data_paths::DataPaths};
 use crate::engine::daemon::supervisor::DaemonSupervisor;
 use crate::engine::error::EngineError;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
-/// Name of the shared startup-arbitration lock. It lives beside the shared
-/// database because that is the one directory both daemons already agree on.
-const STARTUP_LOCK_FILENAME: &str = ".daemon-startup.lock";
-
-/// How long a startup lock may sit before it is treated as abandoned. Acquiring
-/// it covers only a check → claim → check sequence, so anything older is the
-/// residue of a process that died mid-start.
-const STALE_STARTUP_LOCK_AGE: Duration = Duration::from_secs(30);
-
-/// How long a starting daemon waits for the other one to finish arbitrating.
-const STARTUP_LOCK_WAIT: Duration = Duration::from_secs(5);
-
-/// Why a daemon could not claim the machine.
 #[derive(Debug)]
 pub enum AcquireError {
-    /// *This* daemon is already running under `pid`. Callers map this to their
-    /// own already-running error so existing messages are preserved.
     AlreadyRunning { pid: u32 },
-    /// The other daemon holds the machine, or the claim itself failed.
     Blocked(EngineError),
 }
-
 impl AcquireError {
-    /// Collapse back to an `EngineError` for callers that have no distinct
-    /// already-running error of their own.
     pub fn into_engine_error(self) -> EngineError {
         match self {
-            AcquireError::AlreadyRunning { pid } => {
-                EngineError::Other(format!("this daemon is already running (PID {pid})"))
+            Self::AlreadyRunning { pid } => {
+                EngineError::Other(format!("the awman daemon is already running (PID {pid})"))
             }
-            AcquireError::Blocked(error) => error,
+            Self::Blocked(e) => e,
         }
     }
 }
-
 impl std::fmt::Display for AcquireError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AcquireError::AlreadyRunning { pid } => {
-                write!(f, "this daemon is already running (PID {pid})")
+            Self::AlreadyRunning { pid } => {
+                write!(f, "the awman daemon is already running (PID {pid})")
             }
-            AcquireError::Blocked(error) => write!(f, "{error}"),
+            Self::Blocked(e) => write!(f, "{e}"),
         }
     }
 }
-
 impl From<EngineError> for AcquireError {
-    fn from(error: EngineError) -> Self {
-        AcquireError::Blocked(error)
+    fn from(e: EngineError) -> Self {
+        Self::Blocked(e)
     }
 }
-
 impl From<DataError> for AcquireError {
-    fn from(error: DataError) -> Self {
-        AcquireError::Blocked(EngineError::from(error))
+    fn from(e: DataError) -> Self {
+        Self::Blocked(e.into())
     }
 }
 
-/// An exclusively-created marker file held across one daemon's whole
-/// check → claim → check sequence.
-///
-/// The double check alone leaves a window in which two simultaneous starters
-/// each observe the other and both back off, so a clean race could end with
-/// *zero* winners. Serialising the sequence behind this lock makes the outcome
-/// exactly one winner: the second starter does not begin checking until the
-/// first has committed its pidfile.
 struct StartupLock {
     path: PathBuf,
+    identity: String,
 }
-
 impl StartupLock {
-    fn acquire(root: &Path) -> Result<Self, DataError> {
-        std::fs::create_dir_all(root).map_err(|e| DataError::io(root, e))?;
-        let path = root.join(STARTUP_LOCK_FILENAME);
-        let deadline = SystemTime::now() + STARTUP_LOCK_WAIT;
+    fn acquire(paths: &DaemonPaths) -> Result<Self, DataError> {
+        use std::io::Write;
+        paths.ensure_root()?;
+        let path = paths.startup_lock_file();
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
             {
-                Ok(_) => return Ok(Self { path }),
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(mut file) => {
+                    let identity = format!("{} {}", std::process::id(), uuid::Uuid::new_v4());
+                    let lock = Self {
+                        path: path.clone(),
+                        identity,
+                    };
+                    file.write_all(lock.identity.as_bytes())
+                        .map_err(|e| DataError::io(&path, e))?;
+                    return Ok(lock);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if is_stale(&path) {
+                    let old = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| SystemTime::now().duration_since(t).ok())
+                        .is_some_and(|age| age > Duration::from_secs(30));
+                    // A slow, live startup keeps its claim even past the stale threshold.
+                    let alive = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|s| s.split_whitespace().next()?.parse().ok())
+                        .is_some_and(DaemonSupervisor::is_process_alive);
+                    if old && !alive {
                         let _ = std::fs::remove_file(&path);
                         continue;
                     }
-                    if SystemTime::now() >= deadline {
+                    if Instant::now() >= deadline {
                         return Err(DataError::Other(format!(
-                            "another awman daemon is starting (lock held at {}); \
-                             retry in a moment",
+                            "another awman daemon is starting (lock held at {}); retry in a moment",
                             path.display()
                         )));
                     }
@@ -125,270 +100,98 @@ impl StartupLock {
         }
     }
 }
-
 impl Drop for StartupLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-fn is_stale(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .and_then(|modified| {
-            SystemTime::now()
-                .duration_since(modified)
-                .map_err(|_| std::io::Error::other("clock skew"))
-        })
-        .map(|age| age > STALE_STARTUP_LOCK_AGE)
-        .unwrap_or(false)
-}
-
-/// Which daemon a guard is being acquired for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DaemonKind {
-    Api,
-    Squad,
-}
-
-impl DaemonKind {
-    /// Human-facing daemon name for error text.
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            DaemonKind::Api => "awman api",
-            DaemonKind::Squad => "the squad daemon",
-        }
-    }
-
-    /// The command that stops this daemon (for the "run X first" hint).
-    pub fn stop_hint(&self) -> &'static str {
-        match self {
-            DaemonKind::Api => "awman api kill",
-            DaemonKind::Squad => "awman squad stop",
+        if std::fs::read_to_string(&self.path).ok().as_deref() == Some(&self.identity) {
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 }
 
-/// Guards a daemon start against the other daemon already running.
+pub struct DaemonClaim {
+    _lock: StartupLock,
+    pid: u32,
+    paths: DaemonPaths,
+}
+impl DaemonClaim {
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+    pub fn remove_stale_endpoint(&self, path: &Path) -> Result<(), EngineError> {
+        if path != self.paths.local_endpoint() {
+            return Err(EngineError::Other(
+                "endpoint does not belong to this daemon startup claim".into(),
+            ));
+        }
+        if crate::data::fs::daemon_process::DaemonProcess::unified(self.paths.clone()).read_pid()?
+            != Some(self.pid)
+        {
+            return Err(EngineError::Other(
+                "daemon startup claim is no longer owned".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.file_type().is_socket() => {
+                    std::fs::remove_file(path).map_err(|e| DataError::io(path, e))?
+                }
+                Ok(_) => {
+                    return Err(EngineError::Other(format!(
+                        "refusing to remove non-socket endpoint {}",
+                        path.display()
+                    )))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(DataError::io(path, e).into()),
+            }
+        }
+        Ok(())
+    }
+    pub fn finish(self) {}
+}
+
 pub struct DaemonGuard {
-    this: DaemonKind,
-    api: DaemonSupervisor,
-    squad: DaemonSupervisor,
-    /// Directory holding the shared startup-arbitration lock.
-    arbiter_root: PathBuf,
+    paths: DaemonPaths,
+    supervisor: DaemonSupervisor,
 }
-
 impl DaemonGuard {
-    /// Build both daemon processes from the environment.
-    pub fn for_daemon(this: DaemonKind, env: &EnvSnapshot) -> Result<Self, EngineError> {
-        let api_paths = ApiPaths::from_env(env)?;
-        let squad_paths = SquadPaths::from_env(env)?;
-        Ok(Self::with_paths(this, &api_paths, &squad_paths))
-    }
-
-    /// Build from explicitly-resolved paths.
-    ///
-    /// Callers that already thread an `ApiPaths` (the `awman api` command does)
-    /// must use this, so the pidfile the guard claims is the same one the rest
-    /// of the command reads. The shared arbitration lock is scoped to those
-    /// paths' data root for the same reason.
-    pub fn with_paths(this: DaemonKind, api_paths: &ApiPaths, squad_paths: &SquadPaths) -> Self {
-        let api = DaemonSupervisor::for_paths(api_paths.daemon(), API_UNIT_NAME, API_PLIST_LABEL);
-        let squad =
-            DaemonSupervisor::for_paths(squad_paths.daemon(), SQUAD_UNIT_NAME, SQUAD_PLIST_LABEL);
-        let arbiter_root = api_paths.data_paths().root().to_path_buf();
+    pub fn new(paths: DaemonPaths) -> Self {
         Self {
-            this,
-            api,
-            squad,
-            arbiter_root,
+            supervisor: DaemonSupervisor::for_paths(paths.clone()),
+            paths,
         }
     }
-
-    fn this_process(&self) -> &DaemonSupervisor {
-        match self.this {
-            DaemonKind::Api => &self.api,
-            DaemonKind::Squad => &self.squad,
-        }
+    pub fn for_env(env: &EnvSnapshot) -> Result<Self, EngineError> {
+        Ok(Self::new(DataPaths::from_env(env)?.daemon()))
     }
-
-    fn other(&self) -> (&DaemonSupervisor, DaemonKind) {
-        match self.this {
-            DaemonKind::Api => (&self.squad, DaemonKind::Squad),
-            DaemonKind::Squad => (&self.api, DaemonKind::Api),
-        }
+    pub fn paths(&self) -> &DaemonPaths {
+        &self.paths
     }
-
-    /// Error if the *other* daemon is alive, naming it and its PID. A stale or
-    /// absent pidfile is `Ok(())` — `running_pid` cleans stale files itself.
-    pub fn check(&self) -> Result<(), EngineError> {
-        let (other, other_kind) = self.other();
-        if let Some(pid) = other.running_pid()? {
-            return Err(EngineError::Other(format!(
-                "{} is already running (PID {pid}). Run `{}` first; \
-                 awman api and the squad daemon cannot run at the same time.",
-                other_kind.display_name(),
-                other_kind.stop_hint(),
+    pub fn supervisor(&self) -> &DaemonSupervisor {
+        &self.supervisor
+    }
+    pub fn running_pid(&self) -> Result<Option<u32>, EngineError> {
+        self.supervisor.running_pid()
+    }
+    pub fn acquire(&self, pid: u32) -> Result<DaemonClaim, AcquireError> {
+        let lock = StartupLock::acquire(&self.paths)?;
+        if let Some(pid) = self.running_pid()? {
+            return Err(AcquireError::AlreadyRunning { pid });
+        }
+        if !self.supervisor.process().claim_pidfile(pid)? {
+            return Err(AcquireError::Blocked(EngineError::Other(
+                "daemon pidfile changed during startup".into(),
             )));
         }
-        Ok(())
+        Ok(DaemonClaim {
+            _lock: lock,
+            pid,
+            paths: self.paths.clone(),
+        })
     }
-
-    /// Claim the machine for this daemon: take the shared startup lock, then
-    /// `check()` → claim this daemon's pidfile → `check()` again.
-    ///
-    /// The shared lock is what makes a clean concurrent start produce *exactly*
-    /// one winner: the second starter cannot begin checking until the first has
-    /// committed (or released) its pidfile. The second check is retained as a
-    /// defence against a daemon that started outside this protocol; a loser
-    /// releases its own pidfile rather than leaving a stale one.
-    pub fn acquire(&self, pid: u32) -> Result<(), AcquireError> {
-        let _lock = StartupLock::acquire(&self.arbiter_root)?;
-        self.check()?;
-
-        if !self.this_process().process().claim_pidfile(pid)? {
-            // Our pidfile already exists. If it names a live awman process,
-            // this daemon is already running; otherwise it was stale (and
-            // running_pid just cleaned it) so we retake it.
-            if let Some(existing) = self.this_process().running_pid()? {
-                return Err(AcquireError::AlreadyRunning { pid: existing });
-            }
-            self.this_process().process().force_write_pidfile(pid)?;
-        }
-
-        // Second check closes the both-passed-initial-check window. On failure,
-        // release our pidfile before surfacing the error.
-        if let Err(e) = self.check() {
-            let _ = self.this_process().process().release_pidfile();
-            return Err(AcquireError::Blocked(e));
-        }
-        Ok(())
-    }
-
-    /// Release this daemon's pidfile.
-    pub fn release(&self) -> Result<(), EngineError> {
-        Ok(self.this_process().process().release_pidfile()?)
-    }
-
-    /// Release this daemon's pidfile **only while it still names `pid`**,
-    /// reporting whether it did.
-    ///
-    /// What a shutting-down daemon must use. Between the stop request and the
-    /// dying daemon's own teardown, a successor can claim the root; releasing
-    /// unconditionally would drop the successor's claim. See
-    /// [`DaemonProcess::release_pidfile_owned_by`].
     pub fn release_owned_by(&self, pid: u32) -> Result<bool, EngineError> {
-        Ok(self
-            .this_process()
-            .process()
-            .release_pidfile_owned_by(pid)?)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::config::env::{AWMAN_API_ROOT, AWMAN_CONFIG_HOME, AWMAN_SQUAD_ROOT};
-
-    /// `AWMAN_CONFIG_HOME` is set as well so the shared startup-arbitration
-    /// lock (which lives beside the shared database) also lands in the
-    /// fixture, never in the developer's real `~/.awman`.
-    fn env_for(api_root: &std::path::Path, squad_root: &std::path::Path) -> EnvSnapshot {
-        EnvSnapshot::with_overrides([
-            (AWMAN_API_ROOT, api_root.to_str().unwrap()),
-            (AWMAN_SQUAD_ROOT, squad_root.to_str().unwrap()),
-            (
-                AWMAN_CONFIG_HOME,
-                api_root.parent().unwrap_or(api_root).to_str().unwrap(),
-            ),
-        ])
-    }
-
-    #[test]
-    fn kind_names_and_hints_differ() {
-        assert_ne!(
-            DaemonKind::Api.display_name(),
-            DaemonKind::Squad.display_name()
-        );
-        assert_ne!(DaemonKind::Api.stop_hint(), DaemonKind::Squad.stop_hint());
-    }
-
-    #[test]
-    fn acquire_then_release_round_trip() {
-        let api = tempfile::tempdir().unwrap();
-        let squad = tempfile::tempdir().unwrap();
-        let env = env_for(api.path(), squad.path());
-        let guard = DaemonGuard::for_daemon(DaemonKind::Api, &env).unwrap();
-        guard.acquire(std::process::id()).unwrap();
-        // Our pidfile now exists.
-        assert!(ApiPaths::from_env(&env).unwrap().pid_file().exists());
-        guard.release().unwrap();
-        assert!(!ApiPaths::from_env(&env).unwrap().pid_file().exists());
-    }
-
-    #[test]
-    fn check_errors_when_other_daemon_alive() {
-        let api = tempfile::tempdir().unwrap();
-        let squad = tempfile::tempdir().unwrap();
-        let env = env_for(api.path(), squad.path());
-
-        // Squad daemon "runs" — claim its pidfile with our own (live, awman) PID.
-        let squad_guard = DaemonGuard::for_daemon(DaemonKind::Squad, &env).unwrap();
-        squad_guard.acquire(std::process::id()).unwrap();
-
-        // The API guard's cross-check must now fail, naming the squad daemon.
-        let api_guard = DaemonGuard::for_daemon(DaemonKind::Api, &env).unwrap();
-        match api_guard.check() {
-            Err(EngineError::Other(msg)) => {
-                assert!(
-                    msg.contains("squad"),
-                    "message must name the squad daemon: {msg}"
-                );
-                assert!(
-                    msg.contains(&std::process::id().to_string()),
-                    "message must include the PID: {msg}"
-                );
-            }
-            other => panic!("expected cross-daemon error, got {other:?}"),
-        }
-        squad_guard.release().unwrap();
-    }
-
-    /// A daemon on its way out must not evict the successor that claimed the
-    /// root while it was still shutting down — `awman squad stop` releases the
-    /// pidfile the moment it has signalled, so that overlap is ordinary, not
-    /// exotic. Losing the successor's claim costs the *next* command a third
-    /// daemon with an empty payload environment.
-    #[test]
-    fn release_owned_by_never_removes_a_successors_claim() {
-        let api = tempfile::tempdir().unwrap();
-        let squad = tempfile::tempdir().unwrap();
-        let env = env_for(api.path(), squad.path());
-        let guard = DaemonGuard::for_daemon(DaemonKind::Squad, &env).unwrap();
-
-        let me = std::process::id();
-        guard.acquire(me).unwrap();
-        assert!(guard.release_owned_by(me).unwrap(), "ours to release");
-
-        // The successor claims the root; the predecessor's teardown arrives late.
-        guard.acquire(me).unwrap();
-        let predecessor = me + 1;
-        assert!(
-            !guard.release_owned_by(predecessor).unwrap(),
-            "a late teardown owns nothing"
-        );
-        let pid_file = SquadPaths::from_env(&env).unwrap().daemon().pid_file();
-        assert!(pid_file.exists(), "the successor keeps its claim");
-
-        guard.release_owned_by(me).unwrap();
-    }
-
-    #[test]
-    fn absent_other_pidfile_is_ok() {
-        let api = tempfile::tempdir().unwrap();
-        let squad = tempfile::tempdir().unwrap();
-        let env = env_for(api.path(), squad.path());
-        let guard = DaemonGuard::for_daemon(DaemonKind::Api, &env).unwrap();
-        assert!(guard.check().is_ok());
+        Ok(self.supervisor.process().release_pidfile_owned_by(pid)?)
     }
 }

@@ -3,40 +3,169 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::command::commands::launch_policy::LaunchPolicy;
-use crate::command::commands::prompt_templates::{
-    render_skill_interview_prompt, render_workflow_interview_prompt,
-};
 use crate::command::commands::skill_library::{
     pull_all_libraries, pull_library, resolve_pull_target, PullOutcome,
 };
 use crate::command::commands::Command;
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
-use crate::data::fs::{SkillDirs, WorkflowDirs, SKILL_INTERVIEW_CONTAINER_DIR};
+use crate::data::fs::{SkillDirs, WorkflowDirs};
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::Session;
-use crate::engine::agent::AgentRunOptions;
-use crate::engine::container::options::ContainerOption;
 
-#[derive(Debug, Clone)]
-pub struct NewSpecFlags {
-    pub interview: bool,
-    pub non_interactive: bool,
-    pub issue_source: crate::engine::issue::IssueSourceFlags,
+/// Supplied answers to the simple creation questions, including headless runs.
+#[derive(Debug, Clone, Default)]
+pub struct NewInput {
+    pub title: Option<String>,
+    pub summary: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+impl NewInput {
+    fn from_context(ctx: &BuildContext) -> Self {
+        Self {
+            title: ctx.flags.string("title"),
+            summary: ctx.flags.string("prompt"),
+        }
+    }
+
+    pub(crate) fn title(
+        &self,
+        headless: bool,
+        ask: impl FnOnce() -> Result<String, CommandError>,
+    ) -> Result<String, CommandError> {
+        answer(self.title.as_deref(), headless, "title", ask)
+    }
+
+    pub(crate) fn summary(
+        &self,
+        headless: bool,
+        ask: impl FnOnce() -> Result<String, CommandError>,
+    ) -> Result<String, CommandError> {
+        answer(self.summary.as_deref(), headless, "prompt", ask)
+    }
+}
+
+fn answer(
+    supplied: Option<&str>,
+    headless: bool,
+    flag: &str,
+    ask: impl FnOnce() -> Result<String, CommandError>,
+) -> Result<String, CommandError> {
+    if let Some(value) = supplied.filter(|value| !value.trim().is_empty()) {
+        return Ok(value.trim().to_owned());
+    }
+    if headless {
+        return Err(CommandError::InteractiveInputUnavailable {
+            prompt: format!("supply --{flag} for headless creation"),
+        });
+    }
+    let value = ask()?;
+    if value.trim().is_empty() {
+        return Err(CommandError::Aborted);
+    }
+    Ok(value.trim().to_owned())
+}
+
+struct NewSession {
+    headless: bool,
+    yolo: bool,
+    yolo_authorized: bool,
+    summary: String,
+}
+
+/// Use the same staging, prompt, validation and cancellation path as editing.
+async fn author_artifact(
+    command: &NewCommand,
+    kind: crate::data::fs::edit_target::ArtifactKind,
+    path: &std::path::Path,
+    global: bool,
+    authoring: NewSession,
+    frontend: &mut dyn NewCommandFrontend,
+) -> Result<(), CommandError> {
+    use crate::command::commands::edit::{
+        EditArtifactFlags, EditCommand, EditCommonFlags, EditSubcommand,
+    };
+    let flags = EditArtifactFlags {
+        common: EditCommonFlags {
+            reference: path.display().to_string(),
+            headless: authoring.headless,
+            yolo: authoring.yolo,
+            yolo_authorized: authoring.yolo_authorized,
+            prompt: Some(authoring.summary),
+            ..Default::default()
+        },
+        global,
+    };
+    let subcommand = match kind {
+        crate::data::fs::edit_target::ArtifactKind::Workflow => {
+            EditSubcommand::Workflow(flags.clone())
+        }
+        crate::data::fs::edit_target::ArtifactKind::Skill => EditSubcommand::Skill(flags.clone()),
+        crate::data::fs::edit_target::ArtifactKind::Agent => EditSubcommand::Agent(flags.clone()),
+    };
+    let mut edit = EditCommand::new(subcommand, command.engines.clone(), command.session.clone())
+        .with_cancellation(command.cancel.clone());
+    edit.creating = true;
+    crate::command::commands::edit::artifact::run(&edit, kind, flags, frontend).await?;
+    Ok(())
+}
+
+/// Create only a seed file, refusing existing files and symlinked ancestors.
+fn write_seed(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    body: &str,
+) -> Result<(), CommandError> {
+    use crate::data::error::DataError;
+    use std::io::Write;
+    crate::data::fs::path_guard::validate_under_root(
+        root,
+        path,
+        "creation target escapes its root",
+    )?;
+    for parent in path.ancestors().take_while(|parent| *parent != root) {
+        crate::data::fs::path_guard::ensure_not_symlinked(parent)?;
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| CommandError::Other("creation target has no parent".into()))?;
+    std::fs::create_dir_all(parent).map_err(|e| DataError::io(parent, e))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| DataError::io(path, e))?;
+    file.write_all(body.as_bytes())
+        .map_err(|e| DataError::io(path, e))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NewSpecFlags {
+    pub yolo: bool,
+    pub yolo_authorized: bool,
+    pub input: NewInput,
+    pub kind: Option<crate::command::work_item::spec_service::WorkItemKind>,
+    pub non_interactive: bool,
+    /// Raw `--work-item` reference that seeds the new spec (WI 0147).
+    pub work_item: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct NewWorkflowFlags {
-    pub interview: bool,
+    pub yolo: bool,
+    pub yolo_authorized: bool,
+    pub input: NewInput,
     pub non_interactive: bool,
     pub global: bool,
     pub format: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NewSkillFlags {
-    pub interview: bool,
+    pub yolo: bool,
+    pub yolo_authorized: bool,
+    pub input: NewInput,
     pub non_interactive: bool,
     pub global: bool,
     pub pull: Option<String>,
@@ -44,14 +173,17 @@ pub struct NewSkillFlags {
     pub subdir: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NewAgentFlags {
+    pub yolo: bool,
+    pub yolo_authorized: bool,
+    pub input: NewInput,
+    pub non_interactive: bool,
     /// The positional name; becomes the file stem.
     pub name: String,
     pub global: bool,
     /// `--from <example>`; `None` writes the commented skeleton.
     pub from: Option<String>,
-    pub force: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -64,13 +196,17 @@ pub enum NewSubcommand {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NewSpecOutcome {
-    pub interview: bool,
     pub path: Option<String>,
+    /// The created remote work item (WI 0147); `None` for local files.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// The work item number: the local file number, or the provider's.
+    #[serde(default)]
+    pub number: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct NewWorkflowOutcome {
-    pub interview: bool,
     pub global: bool,
     pub format: String,
     pub path: Option<String>,
@@ -87,7 +223,6 @@ pub struct PullLibraryOutcome {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct NewSkillOutcome {
-    pub interview: bool,
     pub global: bool,
     pub path: Option<String>,
     /// `true` when this run was a `--pull`/`--pull-all` library operation
@@ -104,15 +239,8 @@ pub struct NewAgentOutcome {
     /// The definition's TOML path.
     pub path: String,
     pub scope: crate::data::fs::agent_dirs::DefinitionScope,
-    /// `true` when the commented skeleton (not an example) was written.
-    pub skeleton: bool,
     /// The TOML, plus `maki.Dockerfile` for `--from maki`.
     pub files_written: Vec<String>,
-    /// Whether the written content was recorded as approved (repo scope
-    /// always; global scope only with `[ping]`; never the unfilled skeleton).
-    pub approved: bool,
-    /// The review summary's host-command block, when the content has `[ping]`.
-    pub host_command_block: Option<String>,
     /// `awman ready --agent <name>`.
     pub next_step: String,
 }
@@ -126,129 +254,52 @@ pub enum NewOutcome {
     Agent(NewAgentOutcome),
 }
 
-/// A single step collected from the user during `new workflow`.
-#[derive(Debug, Clone)]
-pub struct WorkflowStepInput {
-    pub name: String,
-    pub agent: Option<String>,
-    pub model: Option<String>,
-    pub prompt: String,
-}
-
-/// `NewCommandFrontend` extends `SpecsCommandFrontend` so the `Spec`
+/// `NewCommandFrontend` extends `NewSpecFrontend` so the `Spec`
 /// subcommand can drive the same Q&A (kind / title / summary).
 pub trait NewCommandFrontend:
-    UserMessageSink + crate::command::commands::specs::SpecsCommandFrontend + Send + Sync
+    UserMessageSink + crate::command::work_item::spec_service::NewSpecFrontend + Send + Sync
 {
-    /// Prompt for a workflow name. CLI implementations gate on stdin TTY.
-    fn ask_workflow_name(&mut self) -> Result<String, CommandError> {
-        Ok("workflow".to_string())
-    }
     /// Prompt for a human-readable workflow title.
     fn ask_workflow_title(&mut self) -> Result<String, CommandError> {
-        Ok(String::new())
+        Err(CommandError::InteractiveInputUnavailable {
+            prompt: "workflow title".into(),
+        })
     }
-    /// Prompt for a one-line summary for the new workflow (used in interview mode).
+    /// Prompt for a one-line summary for the new workflow.
     fn ask_workflow_summary(&mut self) -> Result<String, CommandError> {
-        Ok(String::new())
-    }
-    /// Prompt for a step name.
-    fn ask_workflow_step_name(&mut self) -> Result<String, CommandError> {
-        Ok(String::new())
-    }
-    /// Prompt for the optional agent override for the current step.
-    fn ask_workflow_step_agent(&mut self) -> Result<Option<String>, CommandError> {
-        Ok(None)
-    }
-    /// Prompt for the optional model override for the current step.
-    fn ask_workflow_step_model(&mut self) -> Result<Option<String>, CommandError> {
-        Ok(None)
-    }
-    /// Prompt for the step prompt text.
-    fn ask_workflow_step_prompt(&mut self) -> Result<String, CommandError> {
-        Ok(String::new())
-    }
-    /// Ask whether to add another workflow step.
-    fn ask_add_another_step(&mut self) -> Result<bool, CommandError> {
-        Ok(false)
+        Err(CommandError::InteractiveInputUnavailable {
+            prompt: "workflow summary".into(),
+        })
     }
     /// Prompt for a skill name.
     fn ask_skill_name(&mut self) -> Result<String, CommandError> {
-        Ok("skill".to_string())
+        Err(CommandError::InteractiveInputUnavailable {
+            prompt: "skill name".into(),
+        })
     }
-    /// Prompt for a one-line summary for the new skill (used in interview mode).
+    /// Prompt for a one-line summary for the new skill.
     fn ask_skill_summary(&mut self) -> Result<String, CommandError> {
-        Ok(String::new())
+        Err(CommandError::InteractiveInputUnavailable {
+            prompt: "skill summary".into(),
+        })
     }
-    /// Prompt for the body content of the new skill.
-    fn ask_skill_body(&mut self) -> Result<String, CommandError> {
-        Ok(String::new())
+    /// The short brief for the agent definition to author.
+    fn ask_agent_summary(&mut self) -> Result<String, CommandError> {
+        Err(CommandError::InteractiveInputUnavailable {
+            prompt: "agent summary".into(),
+        })
     }
+
     /// `new agent` finished, for frontends that do not render outcomes
     /// themselves (the TUI). The CLI renders from the outcome on stdout.
     fn show_new_agent(&mut self, _outcome: &NewAgentOutcome) {}
 }
 
-// ─── Serde structs for workflow serialization ────────────────────────────────
-
-#[derive(Debug, Serialize)]
-struct WorkflowFileToml<'a> {
-    title: &'a str,
-    #[serde(rename = "step", skip_serializing_if = "Vec::is_empty")]
-    steps_toml: Vec<WorkflowStepSerde<'a>>,
-}
-
-#[derive(Debug, Serialize)]
-struct WorkflowFileYaml<'a> {
-    title: &'a str,
-    steps: Vec<WorkflowStepSerde<'a>>,
-}
-
-#[derive(Debug, Serialize)]
-struct WorkflowStepSerde<'a> {
-    name: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    agent: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<&'a str>,
-    prompt: &'a str,
-}
-
-fn serialize_steps(steps: &[WorkflowStepInput]) -> Vec<WorkflowStepSerde<'_>> {
-    steps
-        .iter()
-        .map(|s| WorkflowStepSerde {
-            name: &s.name,
-            agent: s.agent.as_deref(),
-            model: s.model.as_deref(),
-            prompt: &s.prompt,
-        })
-        .collect()
-}
-
-fn serialize_workflow_toml(title: &str, steps: &[WorkflowStepInput]) -> String {
-    let file = WorkflowFileToml {
-        title,
-        steps_toml: serialize_steps(steps),
-    };
-    toml::to_string_pretty(&file).unwrap_or_else(|_| format!("title = \"{title}\"\n"))
-}
-
-fn serialize_workflow_yaml(title: &str, steps: &[WorkflowStepInput]) -> String {
-    let file = WorkflowFileYaml {
-        title,
-        steps: serialize_steps(steps),
-    };
-    serde_yaml::to_string(&file).unwrap_or_else(|_| format!("title: \"{title}\"\nsteps: []\n"))
-}
-
-/// Subdirectory under the git root for user-authored workflow definitions.
-const REPO_WORKFLOW_DEFINITIONS_DIR: &str = "aspec/workflows";
-
 pub struct NewCommand {
     sub: NewSubcommand,
     engines: Engines,
     session: Session,
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl NewCommand {
@@ -257,24 +308,42 @@ impl NewCommand {
             sub,
             engines,
             session,
+            cancel: tokio_util::sync::CancellationToken::new(),
         }
     }
 
-    /// Construct from the catalogue-resolved input (WI 0113 F-10). The three
+    /// Let an external cancel stop the authoring agent. A remote work item's
+    /// draft is still uploaded once after the agent exits.
+    pub fn with_cancellation(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.cancel = token;
+        self
+    }
+
+    /// Construct from the catalogue-resolved input (WI 0113 F-10). The four
     /// `new` leaves share one entry point, selected by the caller's canonical
     /// path; `--format` takes its `"toml"` from the catalogue.
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
         let sub = match ctx.caller.leaf() {
             "spec" => NewSubcommand::Spec(NewSpecFlags {
-                interview: ctx.flags.bool("interview"),
-                non_interactive: ctx.flags.bool("non-interactive"),
-                issue_source: crate::engine::issue::IssueSourceFlags {
-                    issue: ctx.flags.string("issue"),
-                },
+                input: NewInput::from_context(ctx),
+                yolo: ctx.flags.bool("yolo"),
+                yolo_authorized: ctx.flags.explicit("yolo"),
+                kind: ctx.flags.string("kind").map(|kind| match kind.as_str() {
+                    "feature" => crate::command::work_item::spec_service::WorkItemKind::Feature,
+                    "bug" => crate::command::work_item::spec_service::WorkItemKind::Bug,
+                    "enhancement" => {
+                        crate::command::work_item::spec_service::WorkItemKind::Enhancement
+                    }
+                    _ => crate::command::work_item::spec_service::WorkItemKind::Task,
+                }),
+                non_interactive: ctx.flags.bool("headless"),
+                work_item: ctx.flags.string("work-item"),
             }),
             "workflow" => NewSubcommand::Workflow(NewWorkflowFlags {
-                interview: ctx.flags.bool("interview"),
-                non_interactive: ctx.flags.bool("non-interactive"),
+                input: NewInput::from_context(ctx),
+                yolo: ctx.flags.bool("yolo"),
+                yolo_authorized: ctx.flags.explicit("yolo"),
+                non_interactive: ctx.flags.bool("headless"),
                 global: ctx.flags.bool("global"),
                 format: ctx.flags.require_str("format")?,
             }),
@@ -293,8 +362,10 @@ impl NewCommand {
                     });
                 }
                 NewSubcommand::Skill(NewSkillFlags {
-                    interview: ctx.flags.bool("interview"),
-                    non_interactive: ctx.flags.bool("non-interactive"),
+                    input: NewInput::from_context(ctx),
+                    yolo: ctx.flags.bool("yolo"),
+                    yolo_authorized: ctx.flags.explicit("yolo"),
+                    non_interactive: ctx.flags.bool("headless"),
                     global: ctx.flags.bool("global"),
                     pull,
                     pull_all,
@@ -302,14 +373,23 @@ impl NewCommand {
                 })
             }
             "agent" => NewSubcommand::Agent(NewAgentFlags {
+                // `new agent` takes its name as an argument and declares no
+                // `--title`; reading it would panic in `ResolvedFlags::get`.
+                input: NewInput {
+                    title: None,
+                    summary: ctx.flags.string("prompt"),
+                },
+                yolo: ctx.flags.bool("yolo"),
+                yolo_authorized: ctx.flags.explicit("yolo"),
+                non_interactive: ctx.flags.bool("headless"),
                 name: ctx.args.require("name")?,
                 global: ctx.flags.bool("global"),
                 from: ctx.flags.string("from"),
-                force: ctx.flags.bool("force"),
             }),
             _ => return Err(CommandError::unknown_command(&ctx.path())),
         };
-        Ok(Self::new(sub, ctx.engines.clone(), ctx.session.clone()))
+        Ok(Self::new(sub, ctx.engines.clone(), ctx.session.clone())
+            .with_cancellation(ctx.cancel.clone()))
     }
 
     pub fn subcommand(&self) -> &NewSubcommand {
@@ -327,8 +407,7 @@ impl Command for NewCommand {
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
         // One clone of the subcommand's flags so `self` can be lent to each
-        // runner alongside them (WI 0114 F-51). The flag structs are three
-        // `Option<String>`s and a bool apiece.
+        // runner alongside them (WI 0114 F-51).
         let outcome = match self.sub.clone() {
             NewSubcommand::Spec(f) => spec::run(&self, f, frontend.as_mut()).await?,
             NewSubcommand::Workflow(f) => workflow::run(&self, f, frontend.as_mut()).await?,
@@ -337,35 +416,6 @@ impl Command for NewCommand {
         };
         frontend.replay_queued();
         Ok(outcome)
-    }
-}
-
-/// Container-side path of the skill file the interview agent is told to edit.
-///
-/// Pairs with [`skill_interview_overlay`]: the skill's directory is mounted at
-/// [`SKILL_INTERVIEW_CONTAINER_DIR`], so the file the host wrote at
-/// `<dir>/SKILL.md` is reachable at `/awman/skill/SKILL.md` inside the
-/// container. Naming the host path in the prompt instead would send the agent
-/// to a path that does not exist there.
-fn skill_interview_container_file(host_path: &std::path::Path) -> String {
-    let name = host_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("SKILL.md");
-    format!("{SKILL_INTERVIEW_CONTAINER_DIR}/{name}")
-}
-
-/// Structural mount for `new skill --interview`: the new skill's own
-/// directory, read-write, at [`SKILL_INTERVIEW_CONTAINER_DIR`].
-///
-/// Not a user-supplied overlay — it is how the interview agent reaches the
-/// only file it is asked to write, so its container path is fixed and the
-/// prompt names it outright.
-fn skill_interview_overlay(dir: &std::path::Path) -> crate::engine::overlay::DirectorySpec {
-    crate::engine::overlay::DirectorySpec {
-        host: dir.to_string_lossy().into_owned(),
-        container: SKILL_INTERVIEW_CONTAINER_DIR.to_string(),
-        permission: crate::engine::container::options::OverlayPermission::ReadWrite,
     }
 }
 
@@ -390,742 +440,6 @@ fn pull_library_outcome(outcome: PullOutcome) -> PullLibraryOutcome {
         updated: outcome.was_update,
         skills_found: outcome.skills_found,
         error: None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct FakeNewFrontend {
-        workflow_name: String,
-        workflow_title: String,
-        steps: Vec<WorkflowStepInput>,
-        step_index: std::sync::atomic::AtomicUsize,
-        skill_name: String,
-        skill_body: String,
-    }
-    impl FakeNewFrontend {
-        fn new(workflow: &str, skill: &str, body: &str) -> Self {
-            Self {
-                workflow_name: workflow.into(),
-                workflow_title: workflow.into(),
-                steps: vec![WorkflowStepInput {
-                    name: "step-1".into(),
-                    agent: None,
-                    model: None,
-                    prompt: "do something".into(),
-                }],
-                step_index: std::sync::atomic::AtomicUsize::new(0),
-                skill_name: skill.into(),
-                skill_body: body.into(),
-            }
-        }
-        fn with_steps(mut self, title: &str, steps: Vec<WorkflowStepInput>) -> Self {
-            self.workflow_title = title.into();
-            self.steps = steps;
-            self
-        }
-    }
-    impl crate::data::message::UserMessageSink for FakeNewFrontend {
-        fn write_message(&mut self, _: crate::data::message::UserMessage) {}
-        fn replay_queued(&mut self) {}
-    }
-    impl crate::command::commands::mount_scope::MountScopeFrontend for FakeNewFrontend {
-        fn ask_mount_scope(
-            &mut self,
-            _git_root: &std::path::Path,
-            _cwd: &std::path::Path,
-        ) -> Result<
-            crate::command::commands::mount_scope::MountScopeDecision,
-            crate::command::error::CommandError,
-        > {
-            Ok(crate::command::commands::mount_scope::MountScopeDecision::MountGitRoot)
-        }
-    }
-    impl crate::command::commands::agent_setup::AgentSetupFrontend for FakeNewFrontend {
-        fn ask_agent_setup(
-            &mut self,
-            _requested: &crate::data::session::AgentName,
-            _default: &crate::data::session::AgentName,
-            _default_available: bool,
-            _image_only: bool,
-        ) -> Result<
-            crate::command::commands::agent_setup::AgentSetupDecision,
-            crate::command::error::CommandError,
-        > {
-            Ok(crate::command::commands::agent_setup::AgentSetupDecision::Setup)
-        }
-        fn record_fallback(
-            &mut self,
-            _requested: &crate::data::session::AgentName,
-            _fallback: &crate::data::session::AgentName,
-        ) {
-        }
-    }
-    impl crate::command::commands::agent_auth::AgentAuthFrontend for FakeNewFrontend {
-        fn ask_agent_auth_consent(
-            &mut self,
-            _agent: &crate::data::session::AgentName,
-            _env_var_names: &[&str],
-        ) -> Result<
-            crate::command::commands::agent_auth::AgentAuthDecision,
-            crate::command::error::CommandError,
-        > {
-            Ok(crate::command::commands::agent_auth::AgentAuthDecision::DeclineOnce)
-        }
-    }
-    /// The fake never launches a container; both methods are inert.
-    impl crate::command::commands::agent_setup::HasAgentFrontend for FakeNewFrontend {
-        fn container_frontend(
-            &mut self,
-        ) -> Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend> {
-            Box::new(crate::command::commands::agent_setup::NullAgentFrontend)
-        }
-    }
-
-    impl crate::command::commands::agent_trust::AgentTrustFrontend for FakeNewFrontend {}
-    impl crate::command::commands::agent_setup::AgentLaunchFrontend for FakeNewFrontend {
-        fn set_pty_active(&mut self, _active: bool) {}
-    }
-
-    impl crate::command::commands::specs::SpecsCommandFrontend for FakeNewFrontend {}
-    impl NewCommandFrontend for FakeNewFrontend {
-        fn ask_workflow_name(&mut self) -> Result<String, crate::command::error::CommandError> {
-            Ok(self.workflow_name.clone())
-        }
-        fn ask_workflow_title(&mut self) -> Result<String, crate::command::error::CommandError> {
-            Ok(self.workflow_title.clone())
-        }
-        fn ask_workflow_step_name(
-            &mut self,
-        ) -> Result<String, crate::command::error::CommandError> {
-            let idx = self.step_index.load(std::sync::atomic::Ordering::Relaxed);
-            if idx < self.steps.len() {
-                Ok(self.steps[idx].name.clone())
-            } else {
-                Ok(String::new())
-            }
-        }
-        fn ask_workflow_step_agent(
-            &mut self,
-        ) -> Result<Option<String>, crate::command::error::CommandError> {
-            let idx = self.step_index.load(std::sync::atomic::Ordering::Relaxed);
-            if idx < self.steps.len() {
-                Ok(self.steps[idx].agent.clone())
-            } else {
-                Ok(None)
-            }
-        }
-        fn ask_workflow_step_model(
-            &mut self,
-        ) -> Result<Option<String>, crate::command::error::CommandError> {
-            let idx = self.step_index.load(std::sync::atomic::Ordering::Relaxed);
-            if idx < self.steps.len() {
-                Ok(self.steps[idx].model.clone())
-            } else {
-                Ok(None)
-            }
-        }
-        fn ask_workflow_step_prompt(
-            &mut self,
-        ) -> Result<String, crate::command::error::CommandError> {
-            let idx = self.step_index.load(std::sync::atomic::Ordering::Relaxed);
-            if idx < self.steps.len() {
-                Ok(self.steps[idx].prompt.clone())
-            } else {
-                Ok(String::new())
-            }
-        }
-        fn ask_add_another_step(&mut self) -> Result<bool, crate::command::error::CommandError> {
-            let idx = self
-                .step_index
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1;
-            Ok(idx < self.steps.len())
-        }
-        fn ask_skill_name(&mut self) -> Result<String, crate::command::error::CommandError> {
-            Ok(self.skill_name.clone())
-        }
-        fn ask_skill_body(&mut self) -> Result<String, crate::command::error::CommandError> {
-            Ok(self.skill_body.clone())
-        }
-    }
-
-    #[tokio::test]
-    async fn new_workflow_toml_writes_file_in_aspec_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let engines = Engines::for_tests(tmp.path());
-        let session = Session::for_tests(tmp.path());
-        let cmd = NewCommand::new(
-            NewSubcommand::Workflow(NewWorkflowFlags {
-                interview: false,
-                non_interactive: false,
-                global: false,
-                format: "toml".into(),
-            }),
-            engines,
-            session,
-        );
-        let fe = FakeNewFrontend::new("my-wf", "skill", "").with_steps(
-            "My Workflow",
-            vec![
-                WorkflowStepInput {
-                    name: "plan".into(),
-                    agent: None,
-                    model: None,
-                    prompt: "Plan the work.".into(),
-                },
-                WorkflowStepInput {
-                    name: "implement".into(),
-                    agent: Some("codex".into()),
-                    model: Some("claude-opus-4-7".into()),
-                    prompt: "Do the work.".into(),
-                },
-            ],
-        );
-        let outcome = cmd.run_with_frontend(Box::new(fe)).await.unwrap();
-        if let NewOutcome::Workflow(w) = outcome {
-            let path_str = w.path.expect("path must be Some");
-            let path = std::path::Path::new(&path_str);
-            assert!(
-                path_str.contains("aspec/workflows/"),
-                "path must be under aspec/workflows/: {path_str}"
-            );
-            assert!(path.exists(), "workflow file must exist: {path_str}");
-            let content = std::fs::read_to_string(path).unwrap();
-            assert!(
-                content.contains("[[step]]"),
-                "TOML workflow must contain [[step]]: {content}"
-            );
-            assert!(content.contains("plan"), "must contain step name 'plan'");
-            assert!(
-                content.contains("codex"),
-                "must contain agent 'codex': {content}"
-            );
-        } else {
-            panic!("unexpected outcome variant");
-        }
-    }
-
-    #[tokio::test]
-    async fn new_workflow_yaml_writes_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let engines = Engines::for_tests(tmp.path());
-        let session = Session::for_tests(tmp.path());
-        let cmd = NewCommand::new(
-            NewSubcommand::Workflow(NewWorkflowFlags {
-                interview: false,
-                non_interactive: false,
-                global: false,
-                format: "yaml".into(),
-            }),
-            engines,
-            session,
-        );
-        let outcome = cmd
-            .run_with_frontend(Box::new(FakeNewFrontend::new("my-wf", "skill", "")))
-            .await
-            .unwrap();
-        if let NewOutcome::Workflow(w) = outcome {
-            let path_str = w.path.expect("path must be Some");
-            assert!(
-                path_str.ends_with(".yaml"),
-                "path must have .yaml extension: {path_str}"
-            );
-            assert!(
-                path_str.contains("aspec/workflows/"),
-                "path must be under aspec/workflows/: {path_str}"
-            );
-            let content = std::fs::read_to_string(&path_str).unwrap();
-            assert!(
-                content.contains("steps:"),
-                "YAML workflow must contain steps key: {content}"
-            );
-            assert!(
-                content.contains("step-1"),
-                "must contain default step name: {content}"
-            );
-        } else {
-            panic!("unexpected outcome variant");
-        }
-    }
-
-    #[tokio::test]
-    async fn new_workflow_toml_writes_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let engines = Engines::for_tests(tmp.path());
-        let session = Session::for_tests(tmp.path());
-        let cmd = NewCommand::new(
-            NewSubcommand::Workflow(NewWorkflowFlags {
-                interview: false,
-                non_interactive: false,
-                global: false,
-                format: "toml".into(),
-            }),
-            engines,
-            session,
-        );
-        let outcome = cmd
-            .run_with_frontend(Box::new(FakeNewFrontend::new("my-wf", "skill", "")))
-            .await
-            .unwrap();
-        if let NewOutcome::Workflow(w) = outcome {
-            let path_str = w.path.expect("path must be Some");
-            assert!(
-                path_str.ends_with(".toml"),
-                "path must have .toml extension: {path_str}"
-            );
-            assert!(
-                path_str.contains("aspec/workflows/"),
-                "path must be under aspec/workflows/: {path_str}"
-            );
-            let content = std::fs::read_to_string(&path_str).unwrap();
-            assert!(
-                content.contains("[[step]]"),
-                "TOML workflow must contain [[step]]: {content}"
-            );
-        } else {
-            panic!("unexpected outcome variant");
-        }
-    }
-
-    #[tokio::test]
-    async fn new_skill_writes_skill_md_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let engines = Engines::for_tests(tmp.path());
-        let session = Session::for_tests(tmp.path());
-        let cmd = NewCommand::new(
-            NewSubcommand::Skill(NewSkillFlags {
-                interview: false,
-                non_interactive: false,
-                global: false,
-                pull: None,
-                pull_all: false,
-                subdir: None,
-            }),
-            engines,
-            session,
-        );
-        let outcome = cmd
-            .run_with_frontend(Box::new(FakeNewFrontend::new(
-                "wf",
-                "my-skill",
-                "Do something useful.",
-            )))
-            .await
-            .unwrap();
-        if let NewOutcome::Skill(s) = outcome {
-            let path_str = s.path.expect("path must be Some");
-            let path = std::path::Path::new(&path_str);
-            assert!(path.exists(), "SKILL.md must exist: {path_str}");
-            assert!(
-                path.file_name().unwrap() == "SKILL.md",
-                "file must be named SKILL.md"
-            );
-            let content = std::fs::read_to_string(path).unwrap();
-            assert!(
-                content.contains("my-skill"),
-                "skill name must appear in SKILL.md"
-            );
-            assert!(
-                content.contains("Do something useful."),
-                "body must appear in SKILL.md"
-            );
-        } else {
-            panic!("unexpected outcome variant");
-        }
-    }
-
-    #[tokio::test]
-    async fn new_skill_empty_body_writes_default_skeleton() {
-        let tmp = tempfile::tempdir().unwrap();
-        let engines = Engines::for_tests(tmp.path());
-        let session = Session::for_tests(tmp.path());
-        let cmd = NewCommand::new(
-            NewSubcommand::Skill(NewSkillFlags {
-                interview: false,
-                non_interactive: false,
-                global: false,
-                pull: None,
-                pull_all: false,
-                subdir: None,
-            }),
-            engines,
-            session,
-        );
-        let outcome = cmd
-            .run_with_frontend(Box::new(FakeNewFrontend::new("wf", "my-skill", "")))
-            .await
-            .unwrap();
-        if let NewOutcome::Skill(s) = outcome {
-            let path_str = s.path.expect("path must be Some");
-            let content = std::fs::read_to_string(&path_str).unwrap();
-            assert!(
-                content.contains("## Body"),
-                "empty-body skill must contain ## Body skeleton: {content}"
-            );
-        } else {
-            panic!("unexpected outcome variant");
-        }
-    }
-
-    /// `new skill --interview` hands the skill file to an agent running in a
-    /// container that only ever has the repo mounted at `/workspace`. A
-    /// `--global` skill lives under `~/.awman/skills/`, which is nowhere
-    /// inside that mount, so the skill's own directory has to be mounted at
-    /// the fixed container path and the prompt has to name the file there —
-    /// naming the host path sent the agent to a path the container has not
-    /// got.
-    #[test]
-    fn the_skill_interview_mounts_the_skill_dir_and_names_it_in_the_prompt() {
-        use crate::engine::container::options::OverlayPermission;
-
-        let tmp = tempfile::tempdir().unwrap();
-        // A global skill dir: deliberately outside any repo/workspace root.
-        let dir = tmp.path().join("awman-home/skills/my-skill");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("SKILL.md");
-        std::fs::write(&file, "# Skill: my-skill\n").unwrap();
-
-        let overlay = skill_interview_overlay(&dir);
-        assert_eq!(overlay.host, dir.to_string_lossy());
-        assert_eq!(overlay.container, SKILL_INTERVIEW_CONTAINER_DIR);
-        assert_eq!(
-            overlay.permission,
-            OverlayPermission::ReadWrite,
-            "the interview agent has to write the skill file"
-        );
-
-        // The spec must survive the same resolution every overlay goes
-        // through, and land at exactly the path the prompt names.
-        let engines = Engines::for_tests(tmp.path());
-        let resolved = engines
-            .overlay_engine
-            .resolve_user_overlay(&overlay, tmp.path(), None)
-            .expect("the skill dir exists, so its overlay must resolve");
-        assert_eq!(
-            resolved.container_path,
-            std::path::Path::new(SKILL_INTERVIEW_CONTAINER_DIR)
-        );
-
-        let prompt =
-            render_skill_interview_prompt(&skill_interview_container_file(&file), "a summary");
-        assert!(
-            prompt.contains("/awman/skill/SKILL.md"),
-            "the prompt must point at the mounted skill file: {prompt}"
-        );
-        assert!(
-            !prompt.contains(&*dir.to_string_lossy()),
-            "the host path must never reach the agent: {prompt}"
-        );
-    }
-
-    /// `awman new agent` (WI 0130).
-    mod new_agent {
-        use super::*;
-        use crate::data::fs::agent_trust::TrustStore;
-
-        struct Fx {
-            root: tempfile::TempDir,
-            home: std::path::PathBuf,
-        }
-        fn fx() -> Fx {
-            let root = tempfile::tempdir().unwrap();
-            let home = root.path().join("global");
-            std::fs::create_dir_all(&home).unwrap();
-            Fx { root, home }
-        }
-        async fn run_new(
-            fx: &Fx,
-            name: &str,
-            global: bool,
-            from: Option<&str>,
-            force: bool,
-        ) -> Result<NewAgentOutcome, CommandError> {
-            let session = Session::for_tests_isolated(fx.root.path(), &fx.home);
-            let cmd = NewCommand::new(
-                NewSubcommand::Agent(NewAgentFlags {
-                    name: name.into(),
-                    global,
-                    from: from.map(String::from),
-                    force,
-                }),
-                Engines::for_tests(fx.root.path()),
-                session,
-            );
-            match cmd
-                .run_with_frontend(Box::new(FakeNewFrontend::new("w", "s", "")))
-                .await?
-            {
-                NewOutcome::Agent(o) => Ok(o),
-                other => panic!("{other:?}"),
-            }
-        }
-        fn approved_entries(fx: &Fx) -> usize {
-            TrustStore::load(&fx.home).entries().len()
-        }
-
-        #[tokio::test]
-        async fn skeleton_is_written_unapproved_with_fill_in_hint() {
-            let fx = fx();
-            let out = run_new(&fx, "pi", false, None, false).await.unwrap();
-            let path = fx.root.path().join(".awman/agents/pi.toml");
-            assert_eq!(out.path, path.display().to_string());
-            assert!(out.skeleton && !out.approved && out.host_command_block.is_none());
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), SKELETON_FOR_TEST);
-            assert!(out.render().contains("Fill in display_name"));
-            assert!(out.render().contains("awman ready --agent pi"));
-            assert_eq!(approved_entries(&fx), 0);
-        }
-        const SKELETON_FOR_TEST: &str = agent::SKELETON;
-
-        #[tokio::test]
-        async fn from_crush_writes_example_approves_and_prints_host_block() {
-            let fx = fx();
-            let out = run_new(&fx, "crush", false, Some("crush"), false)
-                .await
-                .unwrap();
-            let path = fx.root.path().join(".awman/agents/crush.toml");
-            assert_eq!(
-                std::fs::read_to_string(&path).unwrap(),
-                agent::EXAMPLE_CRUSH
-            );
-            assert!(!out.skeleton && out.approved);
-            assert_eq!(out.files_written.len(), 1);
-            let block = out.host_command_block.clone().expect("crush has [ping]");
-            assert!(block.starts_with("⚠ `awman ready` will run this command ON YOUR HOST"));
-            assert!(block.contains("'<greeting>'"));
-            let text = out.render();
-            assert!(text.contains("Next: awman ready --agent crush"));
-            assert!(text.ends_with(&block));
-            assert_eq!(approved_entries(&fx), 1);
-        }
-
-        #[tokio::test]
-        async fn from_maki_writes_both_files() {
-            let fx = fx();
-            let out = run_new(&fx, "maki", false, Some("maki"), false)
-                .await
-                .unwrap();
-            let dir = fx.root.path().join(".awman/agents");
-            assert_eq!(
-                std::fs::read_to_string(dir.join("maki.Dockerfile")).unwrap(),
-                agent::EXAMPLE_MAKI_DOCKERFILE
-            );
-            assert_eq!(out.files_written.len(), 2);
-            assert!(out.approved);
-        }
-
-        #[tokio::test]
-        async fn global_writes_under_config_home_and_and_approves_ping_definitions() {
-            let fx = fx();
-            let out = run_new(&fx, "crush", true, Some("crush"), false)
-                .await
-                .unwrap();
-            assert_eq!(
-                out.path,
-                fx.home.join("agents/crush.toml").display().to_string()
-            );
-            assert!(out.approved, "crush declares [ping]");
-            assert!(!fx.root.path().join(".awman/agents/crush.toml").exists());
-
-            // maki also declares [ping], so global scope approves it too.
-            let before = approved_entries(&fx);
-            let out = run_new(&fx, "maki", true, Some("maki"), false)
-                .await
-                .unwrap();
-            assert!(out.approved);
-            assert_eq!(approved_entries(&fx), before + 1);
-        }
-
-        #[tokio::test]
-        async fn existing_file_needs_force() {
-            let fx = fx();
-            run_new(&fx, "pi", false, None, false).await.unwrap();
-            let path = fx.root.path().join(".awman/agents/pi.toml");
-            std::fs::write(&path, "mine").unwrap();
-            let err = run_new(&fx, "pi", false, None, false).await.unwrap_err();
-            assert!(
-                err.to_string().contains("already exists; pass --force"),
-                "{err}"
-            );
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine");
-            run_new(&fx, "pi", false, None, true).await.unwrap();
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), agent::SKELETON);
-        }
-
-        #[tokio::test]
-        async fn existing_sibling_dockerfile_also_blocks_without_force() {
-            let fx = fx();
-            let dir = fx.root.path().join(".awman/agents");
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("maki.Dockerfile"), "FROM x").unwrap();
-            let err = run_new(&fx, "maki", false, Some("maki"), false)
-                .await
-                .unwrap_err();
-            assert!(
-                err.to_string().contains("maki.Dockerfile already exists"),
-                "{err}"
-            );
-            assert!(!dir.join("maki.toml").exists());
-        }
-
-        #[tokio::test]
-        async fn reserved_and_malformed_names_are_rejected_before_any_write() {
-            let fx = fx();
-            for name in ["claude", "antigravity", "Bad Name", "-x", "", "a/b"] {
-                let err = run_new(&fx, name, false, None, false).await.unwrap_err();
-                assert!(
-                    matches!(err, CommandError::InvalidArgumentValue { .. }),
-                    "{name}: {err:?}"
-                );
-                assert_eq!(err.exit_code(), 2);
-            }
-            assert!(!fx.root.path().join(".awman/agents").exists());
-        }
-
-        #[tokio::test]
-        async fn unknown_from_value_is_a_flag_error() {
-            let fx = fx();
-            let err = run_new(&fx, "pi", false, Some("cursor"), false)
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(err, CommandError::InvalidFlagValue { .. }),
-                "{err:?}"
-            );
-        }
-
-        #[test]
-        fn shipped_examples_validate() {
-            let dir = tempfile::tempdir().unwrap();
-            for (file, body) in [
-                ("crush.toml", agent::EXAMPLE_CRUSH),
-                ("maki.toml", agent::EXAMPLE_MAKI),
-                ("maki.Dockerfile", agent::EXAMPLE_MAKI_DOCKERFILE),
-            ] {
-                std::fs::write(dir.path().join(file), body).unwrap();
-            }
-            for f in ["crush.toml", "maki.toml"] {
-                crate::data::config::agent_definition::load_agent_definition_with_scope(
-                    &dir.path().join(f),
-                    crate::data::fs::agent_dirs::DefinitionScope::Repo,
-                )
-                .unwrap_or_else(|e| panic!("{f}: {e}"));
-            }
-        }
-
-        /// A definition replaced between publication and approval (say, by a
-        /// running container) is never approved, for either example.
-        #[test]
-        fn approval_is_bound_to_the_bundled_bytes_not_the_file_on_disk() {
-            use crate::data::config::agent_definition::content_hash;
-            use crate::data::fs::agent_dirs::DefinitionScope;
-            for (example, toml, dockerfile) in [
-                ("crush", agent::EXAMPLE_CRUSH, None),
-                (
-                    "maki",
-                    agent::EXAMPLE_MAKI,
-                    Some(agent::EXAMPLE_MAKI_DOCKERFILE),
-                ),
-            ] {
-                let fx = fx();
-                let env = Session::for_tests_isolated(fx.root.path(), &fx.home)
-                    .env()
-                    .clone();
-                let dir = fx.root.path().join(".awman/agents");
-                std::fs::create_dir_all(&dir).unwrap();
-                if let Some(body) = dockerfile {
-                    std::fs::write(dir.join("maki.Dockerfile"), body).unwrap();
-                }
-                let path = dir.join("pi.toml");
-                let expected = content_hash(toml.as_bytes(), dockerfile.map(str::as_bytes));
-                // The substitute is a valid definition with another [ping].
-                let swapped = toml.replacen("[ping]", "[ping]\n# swapped", 1);
-                assert_ne!(swapped, toml, "{example} declares [ping]");
-                std::fs::write(&path, swapped).unwrap();
-                let err = agent::approve_bundled(
-                    &env,
-                    fx.root.path(),
-                    "pi",
-                    DefinitionScope::Repo,
-                    &path,
-                    example,
-                    &expected,
-                )
-                .unwrap_err();
-                assert!(err.to_string().contains("was not approved"), "{err}");
-                assert_eq!(approved_entries(&fx), 0, "{example}");
-                // The unmodified bytes are approved.
-                std::fs::write(&path, toml).unwrap();
-                let (approved, _) = agent::approve_bundled(
-                    &env,
-                    fx.root.path(),
-                    "pi",
-                    DefinitionScope::Repo,
-                    &path,
-                    example,
-                    &expected,
-                )
-                .unwrap();
-                assert!(approved);
-                assert_eq!(approved_entries(&fx), 1, "{example}");
-            }
-        }
-
-        #[cfg(unix)]
-        #[tokio::test]
-        async fn repo_planted_directory_symlinks_are_refused_and_outside_files_untouched() {
-            use std::os::unix::fs::symlink;
-            for planted in [".awman", ".awman/agents"] {
-                let fx = fx();
-                let outside = tempfile::tempdir().unwrap();
-                std::fs::write(outside.path().join("pi.toml"), "outside").unwrap();
-                let link = fx.root.path().join(planted);
-                std::fs::create_dir_all(link.parent().unwrap()).unwrap();
-                symlink(outside.path(), &link).unwrap();
-                for force in [false, true] {
-                    let err = run_new(&fx, "pi", false, Some("crush"), force)
-                        .await
-                        .unwrap_err();
-                    assert!(err.to_string().contains("symlink"), "{planted}: {err}");
-                }
-                assert_eq!(
-                    std::fs::read_to_string(outside.path().join("pi.toml")).unwrap(),
-                    "outside"
-                );
-                assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
-                assert_eq!(approved_entries(&fx), 0);
-            }
-        }
-
-        #[cfg(unix)]
-        #[tokio::test]
-        async fn dangling_leaf_symlink_counts_as_existing_and_force_replaces_only_the_link() {
-            use std::os::unix::fs::symlink;
-            let fx = fx();
-            let outside = tempfile::tempdir().unwrap();
-            let target = outside.path().join("created-through-link.toml");
-            let dir = fx.root.path().join(".awman/agents");
-            std::fs::create_dir_all(&dir).unwrap();
-            symlink(&target, dir.join("pi.toml")).unwrap();
-            let err = run_new(&fx, "pi", false, Some("crush"), false)
-                .await
-                .unwrap_err();
-            assert!(err.to_string().contains("already exists"), "{err}");
-            assert!(!target.exists());
-            run_new(&fx, "pi", false, Some("crush"), true)
-                .await
-                .unwrap();
-            assert!(!target.exists(), "--force must not write through the link");
-            let meta = std::fs::symlink_metadata(dir.join("pi.toml")).unwrap();
-            assert!(meta.is_file());
-            assert_eq!(
-                std::fs::read_to_string(dir.join("pi.toml")).unwrap(),
-                agent::EXAMPLE_CRUSH
-            );
-        }
     }
 }
 

@@ -1,0 +1,14 @@
+# defect: Shrink overlapping secret ranges so overlapping suffix bytes escape redaction
+# expect-red: component-core-internals
+diff --git a/src/engine/auth/redaction.rs b/src/engine/auth/redaction.rs
+--- a/src/engine/auth/redaction.rs
++++ b/src/engine/auth/redaction.rs
+@@ -416,7 +416,7 @@
+     let mut merged: Vec<(usize, usize)> = Vec::new();
+     for (start, end) in ranges {
+         if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+-            last.1 = last.1.max(end);
++            last.1 = last.1.min(end);
+         } else {
+             merged.push((start, end));
+         }

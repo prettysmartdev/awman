@@ -6,20 +6,7 @@ use serde_json::Value;
 pub const JSONRPC_VERSION: &str = "2.0";
 pub const ACP_PROTOCOL_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum JsonRpcId {
-    Number(i64),
-    String(String),
-}
-
-impl Default for JsonRpcId {
-    fn default() -> Self {
-        // Only used for a serde-skipped, locally-attached request id. ACP
-        // wire messages never rely on this placeholder.
-        Self::Number(0)
-    }
-}
+pub use crate::data::acp_protocol::JsonRpcId;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JsonRpcRequest<T> {
@@ -139,6 +126,17 @@ pub struct NewSessionRequest {
 #[serde(rename_all = "camelCase")]
 pub struct NewSessionResponse {
     pub session_id: String,
+    /// The session modes the agent advertises, when it has any.
+    #[serde(default)]
+    pub modes: Option<SessionModeState>,
+}
+
+/// `session/set_mode` parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionModeRequest {
+    pub session_id: String,
+    pub mode_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -154,152 +152,29 @@ pub struct PromptResponse {
     pub stop_reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ContentBlock {
-    Text {
-        text: String,
-    },
-    Image {
-        data: String,
-        mime_type: String,
-    },
-    Audio {
-        data: String,
-        mime_type: String,
-    },
-    ResourceLink {
-        name: String,
-        uri: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        mime_type: Option<String>,
-    },
-    Resource {
-        resource: Value,
-    },
-}
+pub use crate::data::acp_protocol::ContentBlock;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ContentChunk {
-    pub content: ContentBlock,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message_id: Option<String>,
-}
+pub use crate::data::acp_protocol::ContentChunk;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolCall {
-    pub tool_call_id: String,
-    pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-    #[serde(default)]
-    pub content: Vec<Value>,
-    #[serde(default)]
-    pub locations: Vec<ToolCallLocation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_input: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_output: Option<Value>,
-}
+pub use crate::data::acp_protocol::ToolCall;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolCallUpdate {
-    pub tool_call_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<Vec<Value>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub locations: Option<Vec<ToolCallLocation>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_input: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raw_output: Option<Value>,
-}
+pub use crate::data::acp_protocol::ToolCallUpdate;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolCallLocation {
-    pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub line: Option<u32>,
-}
+pub use crate::data::acp_protocol::ToolCallLocation;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanEntry {
-    pub content: String,
-    pub priority: String,
-    pub status: String,
-}
+pub use crate::data::acp_protocol::PlanEntry;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AvailableCommand {
-    pub name: String,
-    pub description: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input: Option<Value>,
-}
+pub use crate::data::acp_protocol::AvailableCommand;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "sessionUpdate", rename_all = "snake_case")]
-pub enum SessionUpdate {
-    AgentMessageChunk {
-        #[serde(flatten)]
-        chunk: ContentChunk,
-    },
-    AgentThoughtChunk {
-        #[serde(flatten)]
-        chunk: ContentChunk,
-    },
-    ToolCall {
-        #[serde(flatten)]
-        tool_call: ToolCall,
-    },
-    ToolCallUpdate {
-        #[serde(flatten)]
-        tool_call: ToolCallUpdate,
-    },
-    Plan {
-        entries: Vec<PlanEntry>,
-    },
-    AvailableCommandsUpdate {
-        available_commands: Vec<AvailableCommand>,
-    },
-}
+pub use crate::data::acp_protocol::SessionUpdate;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionUpdateNotification {
-    pub session_id: String,
-    pub update: SessionUpdate,
-}
+pub use crate::data::acp_protocol::SessionUpdateNotification;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PermissionOption {
-    pub option_id: String,
-    pub name: String,
-    pub kind: String,
-}
+pub use crate::data::acp_protocol::{SessionMode, SessionModeState};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PermissionRequest {
-    /// The JSON-RPC id to pass to `AcpSession::respond_permission`.
-    #[serde(skip)]
-    pub request_id: JsonRpcId,
-    pub session_id: String,
-    pub tool_call: ToolCallUpdate,
-    pub options: Vec<PermissionOption>,
-}
+pub use crate::data::acp_protocol::PermissionOption;
+
+pub use crate::data::acp_protocol::PermissionRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionDecision {
@@ -359,6 +234,14 @@ pub struct WriteTextFileRequest {
 /// bound).
 pub const MAX_ACP_LINE_BYTES: usize = 8 * 1024 * 1024;
 
+/// One decoded line and the number of wire bytes it occupied (without its
+/// newline). Queues charge decoded items by this length.
+#[derive(Debug)]
+pub struct Frame {
+    pub bytes: usize,
+    pub value: Result<Value, String>,
+}
+
 /// Incremental newline-delimited JSON framing. A bad line is returned to the
 /// caller and never poisons later frames. The buffered length is capped at
 /// [`MAX_ACP_LINE_BYTES`]; an over-long line is discarded (with a warning) and
@@ -366,12 +249,23 @@ pub const MAX_ACP_LINE_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Debug, Default)]
 pub struct LineFramer {
     pending: Vec<u8>,
+    /// Prefix of `pending` already known to hold no newline, so each push
+    /// scans only new bytes (a maximum-size line stays linear).
+    scanned: usize,
     /// True while dropping the tail of an over-long line until the next `\n`.
     discarding: bool,
 }
 
 impl LineFramer {
     pub fn push(&mut self, bytes: &[u8]) -> Vec<Result<Value, String>> {
+        self.push_sized(bytes)
+            .into_iter()
+            .map(|frame| frame.value)
+            .collect()
+    }
+
+    /// Like [`push`](Self::push), also reporting each line's wire length.
+    pub fn push_sized(&mut self, bytes: &[u8]) -> Vec<Frame> {
         let mut frames = Vec::new();
         let mut rest = bytes;
 
@@ -388,17 +282,39 @@ impl LineFramer {
         }
 
         self.pending.extend_from_slice(rest);
-        while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
-            let line: Vec<u8> = self.pending.drain(..=end).collect();
-            let line = &line[..line.len() - 1];
+        let mut start = 0;
+        let mut from = self.scanned;
+        while let Some(offset) = self.pending[from..].iter().position(|b| *b == b'\n') {
+            let end = from + offset;
+            let line = &self.pending[start..end];
+            start = end + 1;
+            from = start;
             if line.iter().all(|b| b.is_ascii_whitespace()) {
                 continue;
             }
-            match std::str::from_utf8(line) {
-                Ok(text) => frames.push(serde_json::from_str(text).map_err(|e| e.to_string())),
-                Err(e) => frames.push(Err(format!("invalid UTF-8 ACP line: {e}"))),
+            // A completed line is held to the same cap as an unterminated
+            // one, before any decoding, however the bytes were partitioned.
+            if line.len() > MAX_ACP_LINE_BYTES {
+                frames.push(Frame {
+                    bytes: 0,
+                    value: Err(format!(
+                        "ACP line exceeded {MAX_ACP_LINE_BYTES}-byte cap ({} bytes); discarded",
+                        line.len()
+                    )),
+                });
+                continue;
             }
+            let value = match std::str::from_utf8(line) {
+                Ok(text) => serde_json::from_str(text).map_err(|e| e.to_string()),
+                Err(e) => Err(format!("invalid UTF-8 ACP line: {e}")),
+            };
+            frames.push(Frame {
+                bytes: line.len(),
+                value,
+            });
         }
+        self.pending.drain(..start);
+        self.scanned = self.pending.len();
 
         // Cap the unterminated remainder. A peer that never emits `\n` (or emits
         // a pathologically long line) must not grow `pending` without bound.
@@ -406,15 +322,24 @@ impl LineFramer {
         // next newline realigns framing instead of prepending the dropped bytes.
         if self.pending.len() > MAX_ACP_LINE_BYTES {
             let buffered = self.pending.len();
-            self.pending.clear();
+            self.pending = Vec::new();
+            self.scanned = 0;
             self.discarding = true;
-            frames.push(Err(format!(
-                "ACP line exceeded {MAX_ACP_LINE_BYTES}-byte cap ({buffered} bytes buffered with \
-                 no newline); discarding until next newline"
-            )));
+            frames.push(Frame {
+                bytes: 0,
+                value: Err(format!(
+                    "ACP line exceeded {MAX_ACP_LINE_BYTES}-byte cap ({buffered} bytes buffered \
+                     with no newline); discarding until next newline"
+                )),
+            });
         }
 
         frames
+    }
+
+    /// Bytes currently buffered for an unterminated line.
+    pub fn buffered(&self) -> usize {
+        self.pending.len()
     }
 }
 
@@ -483,182 +408,84 @@ pub fn summarize_update(update: &SessionUpdate) -> String {
         SessionUpdate::AvailableCommandsUpdate { available_commands } => {
             format!("available commands: {}", available_commands.len())
         }
+        SessionUpdate::CurrentModeUpdate { current_mode_id } => {
+            format!(
+                "mode changed to {}",
+                sanitize_terminal_text(current_mode_id)
+            )
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod framer_cap_tests {
     use super::*;
-    fn text_chunk() -> ContentChunk {
-        ContentChunk {
-            content: ContentBlock::Text {
-                text: "hello".into(),
-            },
-            message_id: Some("m1".into()),
-        }
+
+    /// A valid JSON line of exactly `len` bytes (without the newline).
+    fn line_of(len: usize) -> Vec<u8> {
+        let overhead = br#"{"jsonrpc":"2.0","method":"x","params":""}"#.len();
+        let mut line = br#"{"jsonrpc":"2.0","method":"x","params":""#.to_vec();
+        line.extend(std::iter::repeat_n(b'a', len - overhead));
+        line.extend_from_slice(br#""}"#);
+        assert_eq!(line.len(), len);
+        line
     }
-    fn tool() -> ToolCall {
-        ToolCall {
-            tool_call_id: "tool-1".into(),
-            title: "Read".into(),
-            kind: Some("read".into()),
-            status: Some("pending".into()),
-            content: vec![],
-            locations: vec![],
-            raw_input: None,
-            raw_output: None,
-        }
-    }
-    fn update() -> ToolCallUpdate {
-        ToolCallUpdate {
-            tool_call_id: "tool-1".into(),
-            kind: None,
-            status: Some("completed".into()),
-            title: None,
-            content: None,
-            locations: None,
-            raw_input: None,
-            raw_output: None,
-        }
-    }
-    #[test]
-    fn every_supported_session_update_round_trips_as_one_line() {
-        let updates = vec![
-            SessionUpdate::AgentMessageChunk {
-                chunk: text_chunk(),
-            },
-            SessionUpdate::AgentThoughtChunk {
-                chunk: text_chunk(),
-            },
-            SessionUpdate::ToolCall { tool_call: tool() },
-            SessionUpdate::ToolCallUpdate {
-                tool_call: update(),
-            },
-            SessionUpdate::Plan {
-                entries: vec![PlanEntry {
-                    content: "do it".into(),
-                    priority: "high".into(),
-                    status: "pending".into(),
-                }],
-            },
-            SessionUpdate::AvailableCommandsUpdate {
-                available_commands: vec![AvailableCommand {
-                    name: "help".into(),
-                    description: "help".into(),
-                    input: None,
-                }],
-            },
-        ];
-        for update in updates {
-            let line = encode_line(&update).unwrap();
-            let mut framer = LineFramer::default();
-            let frame = framer.push(&line).pop().unwrap().unwrap();
-            assert_eq!(
-                serde_json::from_value::<SessionUpdate>(frame).unwrap(),
-                update
-            );
-        }
+
+    fn ok_sizes(frames: &[Frame]) -> Vec<usize> {
+        frames
+            .iter()
+            .filter(|f| f.value.is_ok())
+            .map(|f| f.bytes)
+            .collect()
     }
 
     #[test]
-    fn line_framer_caps_an_endless_unterminated_line() {
-        // An agent that streams bytes forever with no newline must not grow the
-        // framer's buffer without bound; the buffer is capped and a warning is
-        // emitted instead of an OOM.
+    fn a_completed_line_over_the_cap_is_refused_however_it_is_partitioned() {
+        let over = line_of(MAX_ACP_LINE_BYTES + 130);
+        let ok = line_of(64);
+        // One push: the whole oversize line plus its newline, then a valid line.
         let mut framer = LineFramer::default();
-        let chunk = vec![b'a'; 1024 * 1024];
-        let mut warned = false;
-        // Push ~2x the cap worth of no-newline bytes.
-        for _ in 0..(2 * MAX_ACP_LINE_BYTES / chunk.len() + 1) {
-            for frame in framer.push(&chunk) {
-                assert!(frame.is_err(), "no complete frame can parse from garbage");
-                warned = true;
-            }
-        }
-        assert!(warned, "over-cap line must surface a warning frame");
-    }
-
-    #[test]
-    fn line_framer_realigns_after_discarding_an_over_long_line() {
-        // After discarding an over-long line, the next newline resynchronises
-        // framing and a following valid frame still parses.
+        let mut bytes = over.clone();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&ok);
+        bytes.push(b'\n');
+        let frames = framer.push_sized(&bytes);
+        assert_eq!(ok_sizes(&frames), vec![64], "oversize line must not decode");
+        assert!(frames.iter().any(|f| f.value.is_err()));
+        // Split exactly at the cap: the remainder check sees MAX bytes (legal),
+        // then the final bytes and the newline complete an oversize line.
         let mut framer = LineFramer::default();
-        let huge = vec![b'x'; MAX_ACP_LINE_BYTES + 16];
-        let warnings = framer.push(&huge);
-        assert!(warnings.iter().any(|f| f.is_err()), "cap must warn");
-        // Terminate the discarded line, then send a real frame on the next line.
-        let good = SessionUpdate::Plan { entries: vec![] };
-        let mut tail = vec![b'\n'];
-        tail.extend_from_slice(&encode_line(&good).unwrap());
-        let frames = framer.push(&tail);
-        let parsed = frames
-            .into_iter()
-            .find_map(|f| f.ok())
-            .expect("valid frame after realignment");
-        assert_eq!(
-            serde_json::from_value::<SessionUpdate>(parsed).unwrap(),
-            good
-        );
-    }
-
-    #[test]
-    fn sanitize_terminal_text_strips_control_but_keeps_newline_and_tab() {
-        let dirty = "safe\x1b]52;c;paste\x07\ttab\nmore\x00end";
-        let clean = sanitize_terminal_text(dirty);
-        assert!(!clean.contains('\x1b'), "ESC must be stripped: {clean:?}");
-        assert!(!clean.contains('\x07'), "BEL must be stripped: {clean:?}");
-        assert!(!clean.contains('\x00'), "NUL must be stripped: {clean:?}");
+        assert!(framer.push_sized(&over[..MAX_ACP_LINE_BYTES]).is_empty());
+        let mut tail = over[MAX_ACP_LINE_BYTES..].to_vec();
+        tail.push(b'\n');
+        let frames = framer.push_sized(&tail);
         assert!(
-            clean.contains('\t') && clean.contains('\n'),
-            "keep \\t and \\n"
+            ok_sizes(&frames).is_empty(),
+            "split oversize line must not decode"
         );
+        assert_eq!(frames.len(), 1);
+        assert_eq!(framer.buffered(), 0);
+        // Framing continues normally afterwards.
+        let mut next = ok.clone();
+        next.push(b'\n');
+        assert_eq!(ok_sizes(&framer.push_sized(&next)), vec![64]);
     }
 
     #[test]
-    fn summarize_update_is_readable_and_sanitized_not_debug_json() {
-        let s = summarize_update(&SessionUpdate::AgentMessageChunk {
-            chunk: ContentChunk {
-                content: ContentBlock::Text {
-                    text: "hi\x1bthere".into(),
-                },
-                message_id: None,
-            },
-        });
-        assert!(s.starts_with("agent: "), "summary: {s}");
-        assert!(!s.contains('\x1b'), "summary must be sanitized: {s:?}");
-        assert!(!s.contains('{'), "summary must not be Debug JSON: {s:?}");
-    }
-
-    #[test]
-    fn approve_fails_closed_when_no_allow_option_offered() {
-        // Only reject-style options → approve must NOT pick one; it Cancels.
-        let only_reject = vec![PermissionOption {
-            option_id: "no".into(),
-            name: "Reject".into(),
-            kind: "reject_once".into(),
-        }];
+    fn a_line_of_exactly_the_cap_is_accepted_with_the_newline_in_any_push() {
+        let max = line_of(MAX_ACP_LINE_BYTES);
+        let mut framer = LineFramer::default();
+        let mut bytes = max.clone();
+        bytes.push(b'\n');
         assert_eq!(
-            PermissionDecision::approve(&only_reject),
-            PermissionDecision::Cancelled
+            ok_sizes(&framer.push_sized(&bytes)),
+            vec![MAX_ACP_LINE_BYTES]
         );
-        // An allow option present → approve selects it.
-        let with_allow = vec![
-            PermissionOption {
-                option_id: "no".into(),
-                name: "Reject".into(),
-                kind: "reject_once".into(),
-            },
-            PermissionOption {
-                option_id: "yes".into(),
-                name: "Allow".into(),
-                kind: "allow_once".into(),
-            },
-        ];
+        let mut framer = LineFramer::default();
+        assert!(framer.push_sized(&max).is_empty());
         assert_eq!(
-            PermissionDecision::approve(&with_allow),
-            PermissionDecision::Selected {
-                option_id: "yes".into()
-            }
+            ok_sizes(&framer.push_sized(b"\n")),
+            vec![MAX_ACP_LINE_BYTES]
         );
     }
 }

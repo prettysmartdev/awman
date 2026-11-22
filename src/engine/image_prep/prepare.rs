@@ -3,8 +3,8 @@ use crate::engine::oci::ImageBuildGuidance;
 impl AgentImagePreparer {
     /// Prepare one image. Build/import failures are separate result stages;
     /// inability to use the runtime and check-only refusals return `Err`.
-    /// Configured sources always pass through provenance-checked acquisition,
-    /// even when this tag is already installed.
+    /// Installed images are reused after source, content and refresh checks;
+    /// acquisition only runs when preparation actually requires it.
     pub async fn prepare(
         &mut self,
         request: &AgentImageRequest<'_>,
@@ -14,6 +14,16 @@ impl AgentImagePreparer {
         let tag = request.tag.to_string();
         let agent = request.agent;
         let mut policy = request.policy;
+        // On-demand preparation of an incompatible source is still an import,
+        // without builder probes, provisioning, or a new build warning.
+        if policy == BuildPolicy::SessionSetup
+            && matches!(
+                self.plan(&tag, agent).selection,
+                BuilderSelection::Incompatible(_)
+            )
+        {
+            policy = BuildPolicy::ImportOnly;
+        }
         let git_root_buf = self.context.git_root.clone();
         let git_root = git_root_buf.as_path();
         let hint = self.context.hint(agent);
@@ -55,6 +65,7 @@ impl AgentImagePreparer {
                 if let Some(source) = &plan.source {
                     let pending = self.pending_import(source, &tag, frontend).await?;
                     let check = ImageImportRequest {
+                        labels: self.repo_labels(),
                         tag: tag.clone(),
                         source: source.source.clone(),
                         platform: source.platform.clone(),
@@ -96,7 +107,11 @@ impl AgentImagePreparer {
         // A fixed default source cannot represent another agent. Decide
         // before opening a progress row, just as ready's old skip path did.
         if let Some(reason) = plan.pinned_default {
-            if policy.allows_build() && matches!(plan.selection, BuilderSelection::Local(_)) {
+            if matches!(policy, BuildPolicy::Ready { .. })
+                && agent == self.context.default_agent
+                && !self.runtime.image_exists(&tag).unwrap_or(false)
+                || policy.allows_build() && matches!(plan.selection, BuilderSelection::Local(_))
+            {
                 image_result.build = StepStatus::Failed(reason);
                 image_result.import = StepStatus::Skipped;
             } else {
@@ -131,37 +146,12 @@ impl AgentImagePreparer {
             }),
         };
         let refresh = policy.refresh_import();
-        // Progress rows reported Running here are resolved to Done/Failed
-        // once the import finishes, so no row is left spinning.
-        let mut pending: Vec<SetupStep> = Vec::new();
         if !refresh && self.runtime.image_exists(&tag).unwrap_or(false) {
-            let identity = self.runtime.image_identity(&tag).ok().flatten();
             // Nothing configured to compare against: keep the image.
             let current = matches!(resolved, Err(EngineError::ImageSourceUnconfigured { .. }));
             if current {
-                if let Some(identity) = identity {
-                    frontend.report_step(
-                        &SetupStep::output(format!(
-                            "{tag}: cached {} ({}, from {})",
-                            identity.manifest_digest, identity.platform, identity.source
-                        )),
-                        StepStatus::Done,
-                    );
-                }
                 image_result.import = StepStatus::Done;
                 return Ok(image_result);
-            }
-            if let (Ok(source), Some(id)) = (&resolved, &identity) {
-                let reference = &source.reference;
-                let step = SetupStep::output(format!(
-                    "{tag}: cached from {} ({}); the configured source is {} ({reference}), \
-                     importing again",
-                    id.source,
-                    id.reference,
-                    source.source.kind()
-                ));
-                frontend.report_step(&step, StepStatus::Running);
-                pending.push(step);
             }
         }
 
@@ -180,7 +170,7 @@ impl AgentImagePreparer {
                     .await?;
                 }
                 let text = e.to_string();
-                if policy.allows_build() {
+                if policy.allows_build() && !matches!(policy, BuildPolicy::Ready { .. }) {
                     frontend.write_message(UserMessage {
                         level: MessageLevel::Warning,
                         text: text.clone(),
@@ -207,9 +197,6 @@ impl AgentImagePreparer {
                     image_result.build = StepStatus::Failed(error.clone());
                     image_result.import = StepStatus::Skipped;
 
-                    for step in &pending {
-                        frontend.report_step(step, StepStatus::Failed(error.clone()));
-                    }
                     return Ok(image_result);
                 }
                 match self
@@ -224,12 +211,62 @@ impl AgentImagePreparer {
                         Some(prepared)
                     }
                     Err(error) => {
+                        if policy == BuildPolicy::SessionSetup
+                            && self.runtime.image_exists(&tag).unwrap_or(false)
+                            && !self.cancel.is_cancelled()
+                        {
+                            let failed_base = self.base_results.iter_mut().find(|r| {
+                                matches!(r.build, StepStatus::Failed(_) | StepStatus::Warn(_))
+                            });
+                            let (kind, image, warning_agent) = if let Some(base) = failed_base {
+                                base.build = StepStatus::Warn(error.clone());
+                                (
+                                    crate::data::execution_event::StaleImageKind::Project,
+                                    base.tag.clone(),
+                                    None,
+                                )
+                            } else {
+                                (
+                                    crate::data::execution_event::StaleImageKind::Agent,
+                                    tag.clone(),
+                                    Some(agent.to_string()),
+                                )
+                            };
+                            let warning = crate::data::execution_event::ImageStaleWarning {
+                                build: format!("build image {image}"),
+                                image,
+                                kind,
+                                agent: warning_agent,
+                                expected_inputs: self
+                                    .last_build_inputs
+                                    .as_ref()
+                                    .map(|inputs| inputs.as_str().to_string())
+                                    .unwrap_or_else(|| {
+                                        crate::data::image_inputs::project_inputs(
+                                            std::fs::read(&self.context.project_dockerfile)
+                                                .ok()
+                                                .as_deref(),
+                                            &crate::data::image_inputs::DirBuildContext::new(
+                                                &self.context.git_root,
+                                            ),
+                                        )
+                                        .hash
+                                        .as_str()
+                                        .to_string()
+                                    }),
+                                installed_inputs: self.last_installed_inputs.clone(),
+                                reason: crate::engine::agent::image_freshness::failure_reason(
+                                    &EngineError::Other(error.clone()),
+                                ),
+                            };
+                            frontend.report_image_stale(&warning);
+                            image_result.build = StepStatus::Warn(error);
+                            image_result.import = StepStatus::Done;
+                            return Ok(image_result);
+                        }
                         image_result.build = StepStatus::Failed(error.clone());
                         image_result.import = StepStatus::Skipped;
 
-                        for step in &pending {
-                            frontend.report_step(step, StepStatus::Failed(error.clone()));
-                        }
                         return Ok(image_result);
                     }
                 }
@@ -242,11 +279,11 @@ impl AgentImagePreparer {
                 match self.pending_import(&frozen, &tag, frontend).await {
                     Ok(prepared) => Some(prepared),
                     Err(error) => {
-                        let text = error.to_string();
+                        let text = crate::engine::oci::docker_engine::failure_message_at(
+                            &error,
+                            frozen.docker_endpoint.as_ref(),
+                        );
                         image_result.import = StepStatus::Failed(text.clone());
-                        for step in &pending {
-                            frontend.report_step(step, StepStatus::Failed(text.clone()));
-                        }
                         return Ok(image_result);
                     }
                 }
@@ -254,9 +291,6 @@ impl AgentImagePreparer {
         if let Some(blocked) = preparation.as_ref().and_then(|p| p.blocked.clone()) {
             image_result.import = StepStatus::Failed(blocked.clone());
 
-            for step in &pending {
-                frontend.report_step(step, StepStatus::Failed(blocked.clone()));
-            }
             return Ok(image_result);
         }
         let built_here = preparation
@@ -266,30 +300,13 @@ impl AgentImagePreparer {
             .as_ref()
             .is_some_and(|p| p.pending_key.is_some());
 
-        // Preflight and squad prepare every step agent on every run; an image
-        // already installed is verified against its source (normally a cache
-        // hit), which is not worth a line each time.
-        if policy == BuildPolicy::ImportOnly && !self.runtime.image_exists(&tag).unwrap_or(false) {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Info,
-                text: format!(
-                    "Importing image for agent '{agent}' ({tag}) from {} ({reference})…",
-                    source.kind()
-                ),
-            });
-        }
-        let importing = SetupStep::output(format!(
-            "Importing {tag} from {} ({reference})",
-            source.kind()
-        ));
-        frontend.report_step(&importing, StepStatus::Running);
-        pending.push(importing);
         let docker_source = matches!(
             source,
             crate::data::config::image_source::ImageSourceSpec::DockerStore { .. }
         );
         let expected = preparation.as_ref().and_then(|p| p.expected.clone());
         let request = ImageImportRequest {
+            labels: self.repo_labels(),
             tag: tag.clone(),
             source,
             platform,
@@ -306,6 +323,35 @@ impl AgentImagePreparer {
             // resolved with.
             registries: self.image_sources.registries.clone(),
         };
+        // Decide only after source builds and pending receipts have resolved,
+        // while their leases are still held. Matching a tag alone is not enough.
+        // Explicit refreshes and newly built content must reach acquisition.
+        // Archives retain acquisition's replaced-file fingerprint check.
+        if !request.refresh
+            && !matches!(
+                request.source,
+                crate::data::config::image_source::ImageSourceSpec::Archive { .. }
+            )
+        {
+            let runtime = self.runtime.clone();
+            let check = request.clone();
+            if self
+                .blocking(move || runtime.image_matches_source(&check))
+                .await??
+            {
+                image_result.import = StepStatus::Done;
+                return Ok(image_result);
+            }
+        }
+        // Acquisition may itself reuse cached content (especially archives).
+        // Describe preparation without claiming a transfer or extraction, and
+        // keep one progress row for the whole operation. Installed reuse above
+        // stays quiet across ready, chat and workflow callers.
+        let importing = SetupStep::PrepareImage {
+            tag: tag.clone(),
+            source: request.source.kind(),
+        };
+        frontend.report_step(&importing, StepStatus::Running);
         let imported_result = self.import_source(request, frontend).await;
         match imported_result {
             Ok(imported) => {
@@ -325,28 +371,27 @@ impl AgentImagePreparer {
                         );
                     }
                 }
-                for step in &pending {
-                    frontend.report_step(step, StepStatus::Done);
-                }
-                frontend.report_step(
-                    &SetupStep::output(format!(
-                        "{tag}: imported {} ({}, from {})",
-                        imported.identity.manifest_digest,
-                        imported.identity.platform,
-                        imported.identity.source
-                    )),
-                    StepStatus::Done,
-                );
+                frontend.report_step(&importing, StepStatus::Done);
                 Ok(image_result)
             }
             Err(e) => {
-                let text = e.to_string();
+                if matches!(e, EngineError::AppleImageContentMissing { .. }) {
+                    image_result.import_failure = Some(
+                        crate::data::ready_image::ReadyImageImportFailure::AppleContentMissing,
+                    );
+                }
+                let text = crate::engine::oci::docker_engine::failure_message_at(
+                    &e,
+                    frozen.docker_endpoint.as_ref(),
+                );
                 image_result.import = StepStatus::Failed(text.clone());
 
-                for step in &pending {
-                    frontend.report_step(step, StepStatus::Failed(text.clone()));
-                }
-                if crate::engine::oci::retry::is_cancelled(&e) {
+                frontend.report_step(&importing, StepStatus::Failed(text.clone()));
+                // A lost local source is final, even after a successful build.
+                // Do not suggest rebuilding or start another recovery attempt.
+                if crate::engine::oci::docker_engine::local_unavailability(&e).is_some()
+                    || crate::engine::oci::retry::is_cancelled(&e)
+                {
                     return Ok(image_result);
                 }
                 if built_here {

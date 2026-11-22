@@ -22,9 +22,19 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-mod bridge;
+pub(crate) mod bridge;
 mod build;
+mod readiness;
+pub(crate) use readiness::project_inputs_from_disk;
+pub(crate) use readiness::workflow_image_preparation;
+pub(crate) mod freshness;
+pub(crate) use freshness::label_runtime_build;
+pub use freshness::{
+    repo_key, ImageBuildOutcome, ImageBuildSpec, ImageFreshness, PreparedSourceImage,
+};
 pub mod builder;
+#[cfg(test)]
+pub(crate) mod contracts;
 pub(crate) mod helpers;
 pub use bridge::ImageImporter;
 
@@ -83,16 +93,20 @@ pub struct ImageBuildContext {
 }
 impl ImageBuildContext {
     pub fn for_session(session: &crate::data::session::Session, default_agent: &str) -> Self {
-        Self::for_repo(session.git_root(), session.repo_config(), default_agent)
+        Self::for_repo(
+            session.git_root(),
+            &session.effective_config(),
+            default_agent,
+        )
     }
     pub fn for_repo(
         git_root: &std::path::Path,
-        config: &crate::data::config::RepoConfig,
+        config: &crate::data::config::EffectiveConfig,
         default_agent: &str,
     ) -> Self {
         Self {
             git_root: git_root.to_path_buf(),
-            project_dockerfile: config.dockerfile_path_or_default(git_root),
+            project_dockerfile: config.dockerfile_path(git_root),
             default_agent: default_agent.to_string(),
         }
     }
@@ -111,6 +125,11 @@ impl ImageBuildContext {
 
 pub trait ImagePreparationSink: crate::data::message::UserMessageSink {
     fn report_step(&mut self, step: &SetupStep, status: StepStatus);
+    fn build_started(&mut self, _tag: &str) {}
+    fn build_output(&mut self, line: &str) {
+        self.report_step(&SetupStep::output(line), StepStatus::Running);
+    }
+    fn build_finished(&mut self, _tag: &str, _error: Option<&str>) {}
 }
 impl<T: crate::engine::agent::AgentImageFrontend + ?Sized> ImagePreparationSink for T {
     fn report_step(&mut self, step: &SetupStep, status: StepStatus) {
@@ -125,6 +144,9 @@ impl crate::data::message::UserMessageSink for MessageSink<'_> {
     }
     fn replay_queued(&mut self) {
         self.0.replay_queued();
+    }
+    fn report_image_stale(&mut self, warning: &crate::data::execution_event::ImageStaleWarning) {
+        self.0.report_image_stale(warning);
     }
 }
 impl ImagePreparationSink for MessageSink<'_> {
@@ -147,6 +169,7 @@ pub struct AgentImagePreparer {
     definitions: HashMap<String, crate::engine::agent::ResolvedAgent>,
     runtime: Arc<dyn AgentRuntimeEngine>,
     context: ImageBuildContext,
+    default_source_agent: String,
     image_sources: ImageSources,
     builder_enabled: bool,
     local_builder: Option<Arc<dyn LocalImageBuilder>>,
@@ -159,9 +182,34 @@ pub struct AgentImagePreparer {
     validated_policy: Option<BuildPolicy>,
     plans: HashMap<(String, String), ImagePlan>,
     warned_tags: HashSet<String>,
+    last_build_inputs: Option<crate::data::image_inputs::InputsHash>,
+    last_installed_inputs: Option<String>,
     cancel: crate::engine::oci::CancelToken,
 }
 impl AgentImagePreparer {
+    /// On-demand preparation shared by launches and workflow prerequisites.
+    /// An enabled local builder checks installed images' source inputs too.
+    /// Disabled/unusable builders retain the caller's check/import policy.
+    pub fn missing_image_policy(
+        &mut self,
+        tag: &str,
+        agent: &str,
+        fallback: BuildPolicy,
+    ) -> Result<BuildPolicy, EngineError> {
+        if self.builder_enabled
+            && (!self.runtime.image_exists(tag)?
+                || matches!(self.plan(tag, agent).selection, BuilderSelection::Local(_)))
+            && matches!(
+                self.missing_image_plan(tag, agent),
+                ReadyImagePlan::BuildAndImport | ReadyImagePlan::Import
+            )
+        {
+            Ok(BuildPolicy::SessionSetup)
+        } else {
+            Ok(fallback)
+        }
+    }
+
     pub fn new(
         resolved: ResolvedBuiltinConfig,
         runtime: Arc<dyn AgentRuntimeEngine>,
@@ -190,6 +238,7 @@ impl AgentImagePreparer {
             builder_enabled,
             image_importer: Arc::new(bridge::RuntimeImageImporter(runtime.clone())),
             runtime,
+            default_source_agent: context.default_agent.clone(),
             context,
             local_builder: None,
             build_locks: ImageBuildLockStore::under_data_home(&data_home),
@@ -200,8 +249,16 @@ impl AgentImagePreparer {
             validated_policy: None,
             plans: HashMap::new(),
             warned_tags: HashSet::new(),
+            last_build_inputs: None,
+            last_installed_inputs: None,
             cancel: crate::engine::oci::CancelToken::new(),
         }
+    }
+    /// Keep pinned-source ownership separate from the invocation's required image.
+    pub(crate) fn with_default_source_agent(mut self, agent: &str) -> Self {
+        self.default_source_agent = agent.to_string();
+        self.plans.clear();
+        self
     }
     pub fn with_definition_env(mut self, env: crate::data::config::env::EnvSnapshot) -> Self {
         self.definition_env = env;
@@ -225,36 +282,7 @@ impl AgentImagePreparer {
     ) -> Self {
         Self::with_inputs(ImageSources::default(), false, runtime, data_home, context)
     }
-    #[cfg(test)]
-    pub(crate) fn replace_sources(&mut self, sources: ImageSources) {
-        self.image_sources = sources;
-        self.plans.clear();
-        self.validated_policy = None;
-    }
-    #[cfg(test)]
-    pub(crate) fn image_sources(&self) -> &ImageSources {
-        &self.image_sources
-    }
-    #[cfg(test)]
-    pub(crate) fn with_build_stores(
-        mut self,
-        locks: ImageBuildLockStore,
-        receipts: PendingBuiltImageStore,
-    ) -> Self {
-        self.build_locks = locks;
-        self.pending_builds = receipts;
-        self
-    }
-    #[cfg(test)]
-    pub(crate) fn with_local_builder(mut self, builder: Arc<dyn LocalImageBuilder>) -> Self {
-        self.local_builder = Some(builder);
-        self
-    }
-    #[cfg(test)]
-    pub(crate) fn with_image_importer(mut self, importer: Arc<dyn ImageImporter>) -> Self {
-        self.image_importer = importer;
-        self
-    }
+
     pub fn cancel_token(&self) -> crate::engine::oci::CancelToken {
         self.cancel.clone()
     }
@@ -270,7 +298,9 @@ impl AgentImagePreparer {
     }
     fn builder(&mut self) -> Arc<dyn LocalImageBuilder> {
         self.local_builder
-            .get_or_insert_with(|| Arc::new(HostLocalImageBuilder::default()))
+            .get_or_insert_with(|| {
+                Arc::new(HostLocalImageBuilder::with_env(self.definition_env.clone()))
+            })
             .clone()
     }
     fn plan(&mut self, tag: &str, agent: &str) -> ImagePlan {
@@ -283,12 +313,9 @@ impl AgentImagePreparer {
                     .get(tag)
                     .or(self.image_sources.default.as_ref())
                     .map(|spec| (spec.kind(), spec.reference_or(tag)));
-                // The same acquisition env the backend pulls with
-                // (`BuiltinBackend` import, `Env::for_image_acquisition`): source
-                // resolution and the pull must see one Docker endpoint, proxy and
-                // credential set, so neither reads the session snapshot alone.
-                let env = Env::for_image_acquisition(&self.image_sources.registries);
-                let resolved = ImageSourceResolver::new(&self.image_sources, &env)
+                // Resolution and acquisition use the same instance snapshot,
+                // including its endpoint, proxy and credential variables.
+                let resolved = ImageSourceResolver::new(&self.image_sources, &self.definition_env)
                     .with_builder_enabled(self.builder_enabled)
                     .resolve_for_image(
                         tag,
@@ -303,18 +330,15 @@ impl AgentImagePreparer {
                 let source = resolved.ok();
                 let selection =
                     BuilderSelection::from_source(source.as_ref(), self.builder_enabled);
-                let pinned_default = if agent != self.context.default_agent
+                let pinned_default = if agent != self.default_source_agent
                     && !self.image_sources.images.contains_key(tag)
                 {
                     self.image_sources.default.as_ref().and_then(|spec| {
-                        let single_image = matches!(
-                            spec,
-                            crate::data::config::image_source::ImageSourceSpec::Archive { .. }
-                        ) || spec.reference_or(tag) != tag;
+                        let single_image = spec.names_single_image(tag);
                         if single_image {
                             Some(format!(
-                                "`builtin.imageSource` ({}) names a single image; add a \
-                                 `builtin.images` entry for {tag} to import it",
+                                "`runtime.builtin.imageSource` ({}) names a single image; add a \
+                                 `runtime.builtin.images` entry for {tag} to import it",
                                 spec.kind()
                             ))
                         } else {
@@ -363,7 +387,7 @@ impl AgentImagePreparer {
     }
 
     /// Whether a source is configured for the default agent image (the
-    /// `builtin.images` entry, else `builtin.imageSource`).
+    /// `runtime.builtin.images` entry, else `runtime.builtin.imageSource`).
     pub(crate) fn default_image_has_source(&self) -> bool {
         let tag = crate::data::image_tags::agent_image_tag(
             &self.context.git_root,
@@ -449,7 +473,7 @@ impl AgentImagePreparer {
             for tag in tags {
                 let error = format!(
                     "{names} target the same local image reference {reference}; \
-                     give each agent its own `builtin.images` entry"
+                     give each agent its own `runtime.builtin.images` entry"
                 );
                 self.prevalidation_failures.insert(tag, error);
             }
@@ -458,6 +482,3 @@ impl AgentImagePreparer {
 }
 
 mod prepare;
-
-#[cfg(test)]
-mod tests;

@@ -1,114 +1,34 @@
 # Concepts
 
-This page is the mental model for awman: what runs where, what the moving pieces are called, and where to read more. Each section is a summary — the linked guides carry the detail.
+These are the pieces you will see as you use awman. Start with [Getting started](00-getting-started.md) if you have not run a session yet.
 
----
+## Isolated agent sessions
 
-## Why isolated environments?
+awman launches each agent in a container or microVM with your project mounted inside. The agent does not get your whole machine. You can grant specific files, environment values, skills, or SSH access with [overlays](08-overlays.md). A normal `awman ready` also makes a limited host-side agent check for authentication; see [Security and isolation](04-security-and-isolation.md).
 
-An agent running directly on your machine can touch your home directory, SSH keys, credentials, and anything else your user account can. awman never does that. Every agent session runs in an isolated environment — a Docker container, an Apple VM, a Docker Sandbox microVM, or an embedded builtin microVM — that sees only your project directory plus whatever you explicitly add. Credentials are injected per-session, SSH keys stay out unless you opt in, and the environment is stopped or removed when the session ends.
+`awman init` sets a default agent and prepares the project image. `Dockerfile.dev` describes your project's tools; `.awman/Dockerfile.<agent>` adds the agent. [Runtimes](11-runtimes.md) explains how image preparation differs outside Docker.
 
-This is what makes autonomous operation (the [`--yolo` permission mode](03-agent-sessions.md#--yolo)) reasonable: the blast radius of a bad agent decision is the container or VM and the mounted project, nothing else. See [Security & Isolation](04-security-and-isolation.md) for the full model, and [Runtimes](11-runtimes.md) for the difference between container-based and microVM-based isolation.
+## Ways to work
 
-## The two-layer image system (Docker and Apple Containers)
+| If you want to… | Use | Read |
+|---|---|---|
+| Talk to an agent | `awman` then `chat`, or `awman chat` | [TUI](02-using-the-tui.md), [agent sessions](03-agent-sessions.md) |
+| Run one task and exit | `awman exec prompt "…"` | [Agent sessions](03-agent-sessions.md) |
+| Run several planned steps | `awman exec workflow <file>` | [Workflows](05-workflows.md) |
+| Let an agent design the steps | `awman exec workflow --dynamic --work-item <ref>` | [Dynamic workflows](06-dynamic-workflows.md) |
+| Run tasks from a script or another machine | The daemon API or `awman remote` | [API and remote mode](09-api-and-remote-mode.md) |
+| Delegate recurring work | `awman squad` | [Squad](12-squad.md) |
 
-For the Docker and Apple Containers runtimes, awman builds two images per project:
+The [command reference](14-command-reference.md) lists the exact syntax and flags.
 
-| File | Image | Contains |
-|------|-------|----------|
-| `Dockerfile.dev` (Git root) | `awman-{project}:latest` | Your project's OS, language runtimes, build and test tools — nothing agent-specific |
-| `.awman/Dockerfile.{agent}` | `awman-{project}-{agent}:latest` | The agent tooling, layered on top (`FROM awman-{project}:latest`) |
+## Work items and workflows
 
-The split means you can update project tooling without touching the agent setup, and switch agents without rebuilding your project environment. Both files come from templates: the **agent audit** (run during `awman init` or via `awman ready --refresh`) launches an agent to inspect your codebase and fill `Dockerfile.dev` with the tools your project actually needs; agent Dockerfiles are maintained by awman and rarely need editing. Commit both files.
+A **work item** is a task description, usually a numbered Markdown file in `aspec/work-items/`. Project specs in `aspec/` are optional; they give agents context about your codebase. Use `awman new spec` to draft a work item.
 
-For the Docker Sandboxes runtime, agent environments are set up using **kit YAML specs** instead of Dockerfiles. awman generates per-agent kit files at `~/.awman/kits/<agent>/` when you run `awman ready`. No custom image build or registry push is required. See [Runtimes](11-runtimes.md#docker-sandboxes-experimental).
-
-For the experimental builtin runtime (macOS on Apple Silicon), `awman ready` imports images from an explicit source. By default, you build images elsewhere; optionally, `builtin.builder.enabled` lets `ready` (and a launch whose agent image is missing) build through a compatible local Docker or Apple Containers source and then import from that same source. See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
-
-## Agents
-
-awman drives seven built-in agents: `claude`, `codex`, `opencode`, `gemini`, `copilot`, `cline`, and `antigravity`, plus any [custom agent](15-custom-agents.md) you define. The repo default is set at init time; override per-command with `--agent`, or change it with `awman config set agent <name>`. Not every agent supports every feature (plan mode, yolo, model override) — see the capability table in [Agent Sessions](03-agent-sessions.md).
-
-## Sessions and modes
-
-The same engine runs in several modes; pick whichever fits the task:
-
-- **TUI** (`awman`) — interactive multiplexer: tabs, live agent terminals, a command box with autocomplete. See [Using the TUI](02-using-the-tui.md).
-- **One-shot CLI** (`awman chat`, `awman exec prompt`, `awman exec workflow`) — single commands from your shell. See [Agent Sessions](03-agent-sessions.md).
-- **Headless** — non-interactive output for scripts and CI; awman detects the missing TTY or you force it with `-n`. See [Non-interactive operation](09-api-and-remote-mode.md#non-interactive-headless-operation).
-- **API** (`awman api start`) — an HTTP server that queues and executes prompts and workflows. See [API mode](09-api-and-remote-mode.md).
-- **Remote** (`awman remote …`) — a thin client for an awman API server on another machine. See [Remote mode](09-api-and-remote-mode.md).
-
-Permission levels apply across modes: default (agent asks), `--plan` (read-only), `--auto` (auto-approve edits), `--yolo` (fully autonomous, isolated in a Git worktree). See [Permission modes](03-agent-sessions.md#permission-modes).
-
-## Specs and work items
-
-`aspec/` is an optional folder of Markdown specs describing your project to agents — purpose, architecture, security constraints, conventions. With it, agents make decisions consistent with your codebase instead of guessing.
-
-A **work item** is one numbered Markdown file (`0001-add-auth.md`) describing a feature, bug, task, or enhancement in enough detail for an agent to implement, test, and document it. Create them with `awman new spec` (add `--interview` to have an agent draft the spec from a summary), point awman at a custom directory with `awman config set work_items.dir <path>`, and execute them through workflows (`awman exec workflow <file> --work-item 0001`). After implementation, `awman specs amend 0001` updates the spec to match what was actually built.
-
-## Workflows
-
-A workflow is a TOML (or YAML) file describing a multi-step agent run: optional setup steps (clone, branch, shell), a DAG of prompt steps with per-step agent/model overrides, and teardown steps (commit, push, open a PR, poll CI). Workflows live in `.awman/workflows/` (repo) or `~/.awman/workflows/` (personal, via `--global`), and are created by hand, interactively, or by an agent with `awman new workflow --interview`. See [Workflows](05-workflows.md).
-
-## Overlays
-
-Overlays add things to an agent's container beyond the project mount:
-
-- `dir(host:container:ro|rw)` — mount an extra directory
-- `env(VAR)` — pass through a host environment variable
-- `skill(name)` / `skill(*)` — mount reusable skill files
-- `ssh()` — mount your `~/.ssh` read-only
-- `context(scope)` — mount a persistent context directory shared across sessions
-
-They can be set per-command (`--overlay`), per-repo or globally (config `overlays`), per workflow step, or via `AWMAN_OVERLAYS`. See [Overlays](08-overlays.md), including [Context overlays in depth](08-overlays.md#context-overlays-in-depth) for persistent context and system prompts.
+A **workflow** is a TOML or YAML file that orders agent prompts and optional setup and teardown steps. Use `awman new workflow` to draft one, or `--dynamic` to have a leader agent design steps for a work item. Workflows can use a Git worktree so their changes stay separate until you review them. See [Workflows](05-workflows.md) and [Worktree isolation](04-security-and-isolation.md#worktree-isolation).
 
 ## Configuration
 
-Two JSON files: `<git root>/.awman/config.json` (per-repo, committed) and `~/.awman/config.json` (global). Effective values resolve as flags > environment variables > repo config > global config > built-in defaults. Inspect and edit with `awman config show|get|set`. See [Configuration](07-configuration.md) for every field.
+Repository settings live in `.awman/config.json`; personal settings live in `~/.awman/config.json`. Command flags and environment overrides take priority over both. See [Configuration](07-configuration.md) for examples and the full key reference.
 
----
-
-## Reference
-
-### Command surface at a glance
-
-| Command | Purpose | Guide |
-|---------|---------|-------|
-| `awman` | Open the TUI | [02](02-using-the-tui.md) |
-| `awman init` | Set up a repo (agent, Dockerfiles, images) | [00](00-getting-started.md) |
-| `awman ready` | Verify environment; `--refresh` re-runs the audit | [00](00-getting-started.md) |
-| `awman chat` | Interactive agent session | [03](03-agent-sessions.md) |
-| `awman exec prompt` | One-shot prompt | [03](03-agent-sessions.md) |
-| `awman exec workflow` | Run a workflow file | [05](05-workflows.md) |
-| `awman new spec\|workflow\|skill` | Create artefacts | [03](03-agent-sessions.md), [05](05-workflows.md) |
-| `awman new agent` | Define a custom agent type | [15](15-custom-agents.md) |
-| `awman specs amend <N>` | Sync a spec with the implementation | [03](03-agent-sessions.md) |
-| `awman agents status` | Show running agents; add `--watch` to refresh continuously | [03](03-agent-sessions.md) |
-| `awman agents list` (`ps`, `ls`) | List agents; `--all` includes stopped agents eligible for cleanup | [03](03-agent-sessions.md) |
-| `awman agents detail` (`inspect`) | Show an agent's identity, lifecycle, resources, and runtime details | [03](03-agent-sessions.md) |
-| `awman agents kill` (`rm`) / `attach` | Stop and remove an agent, or connect to its terminal | [03](03-agent-sessions.md) |
-| `awman config show\|get\|set\|migrate` | Inspect, edit and migrate config | [07](07-configuration.md) |
-| `awman config prerequisite-grants` | Review or revoke remembered workflow credential choices | [05](05-workflows.md#workflow-prerequisite-checks) |
-| `awman api start\|status\|logs\|kill` | HTTP API server | [09](09-api-and-remote-mode.md) |
-| `awman remote …` | Client for a remote awman server | [09](09-api-and-remote-mode.md) |
-| `awman squad …` | Your squad of agents, working unattended on the tasks you give them | [12](12-squad.md) |
-| `awman clean` | Reclaim stopped containers, stale workflow data, dangling images | [13](13-cleaning-up.md) |
-
-`awman agents status` and `awman agents list` show each agent's source:
-`session` for agents started directly and `squad:<task>` for agents your squad started,
-such as `squad:issue-triage`. This makes background
-evaluations identifiable even if you have never configured squad.
-
-### Key locations
-
-| Path | Contents |
-|------|----------|
-| `Dockerfile.dev` | Project base image definition (committed) |
-| `.awman/` | Repo config, agent Dockerfile, workflows, skills (committed) |
-| `aspec/` | Optional project specs and work items |
-| `~/.awman/` | Global config, personal workflows/skills, worktrees, API state |
-
----
-
-[← Getting Started](00-getting-started.md) · [Next: Using the TUI →](02-using-the-tui.md)
+[← Getting started](00-getting-started.md) · [Back to contents](contents.md) · [Next: Using the TUI →](02-using-the-tui.md)

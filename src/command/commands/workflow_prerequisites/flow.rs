@@ -25,7 +25,6 @@ use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::command::headless::HeadlessDefaults;
 use crate::data::config::flags::{IdentityFlag, PrerequisiteFlags, SshFlag, TokenFlag};
-use crate::data::config::global::GlobalConfig;
 use crate::data::config::workflows::{
     AcquirePolicy, CredentialUse, PolicySource, PrerequisitePolicy, UnresolvedMode,
 };
@@ -103,7 +102,7 @@ impl WorkflowPrerequisiteFlowOptions {
         Self {
             frontend_kind,
             headless: headless_for(frontend_kind),
-            origin: if frontend_kind == FrontendKind::SquadDaemon {
+            origin: if frontend_kind == FrontendKind::SQUAD_LOCAL {
                 PrerequisiteOrigin::AssumedAll
             } else {
                 origin
@@ -111,7 +110,7 @@ impl WorkflowPrerequisiteFlowOptions {
             policy: {
                 let mut session = session.clone();
                 let mut config = session.flags().clone();
-                config.squad_prerequisites = frontend_kind == FrontendKind::SquadDaemon;
+                config.squad_prerequisites = frontend_kind == FrontendKind::SQUAD_LOCAL;
                 session.set_flags(config);
                 policy_for(&session, flags, squad_task)
             },
@@ -129,11 +128,24 @@ impl WorkflowPrerequisiteFlowOptions {
 /// The headless profile a frontend kind answers from.
 pub fn headless_for(kind: FrontendKind) -> HeadlessDefaults {
     match kind {
-        FrontendKind::Api => HeadlessDefaults::api(),
-        FrontendKind::SquadDaemon => HeadlessDefaults::squad(
+        // An engine instance answers like the TUI it serves (WI 0142).
+        FrontendKind::Daemon { .. } if kind.is_engine_local() => HeadlessDefaults::cli(),
+        FrontendKind::Daemon {
+            feature:
+                crate::data::daemon_state::FeatureName::Worker
+                | crate::data::daemon_state::FeatureName::Engine,
+            ..
+        } => HeadlessDefaults::api(),
+        FrontendKind::Daemon {
+            feature: crate::data::daemon_state::FeatureName::Squad,
+            ..
+        } => HeadlessDefaults::squad(
             crate::command::commands::mount_scope::MountScopeDecision::MountGitRoot,
         ),
-        FrontendKind::Cli | FrontendKind::Tui => HeadlessDefaults::cli(),
+        // A relayed CLI or TUI answers like the frontend relaying it.
+        FrontendKind::Cli | FrontendKind::Tui | FrontendKind::Relayed { .. } => {
+            HeadlessDefaults::cli()
+        }
     }
 }
 
@@ -150,6 +162,33 @@ pub fn policy_for(
     config.squad_task_prerequisites = squad_task.cloned();
     session.set_flags(config);
     session.prerequisite_policy()
+}
+
+/// The fixed identity `policy` grants to every container of a run: only
+/// `gitIdentity.use = "allow"` with a `fixed` name and email (a config
+/// value, `--prerequisite-identity "Name <email>"`, or a lease's
+/// `exec.prerequisites.git_identity`, which admission turns into that flag).
+/// `deny`, `host` and an unset identity give `None`, keeping the
+/// container's own identity and then the `awman <awman@localhost>`
+/// fallback. Push and lease runs both resolve the identity here; the lease
+/// runner's leftover commit uses the same answer.
+pub fn granted_fixed_identity(policy: &PrerequisitePolicy) -> Option<GitIdentityGrant> {
+    let identity = &policy.git_identity;
+    let fixed = identity.fixed.as_ref()?;
+    if identity.use_ != CredentialUse::Allow
+        || super::flags::validate_identity(&fixed.name, &fixed.email).is_err()
+    {
+        return None;
+    }
+    Some(GitIdentityGrant {
+        name: fixed.name.clone(),
+        email: fixed.email.clone(),
+        source: match identity.source {
+            PolicySource::Repo => IdentitySource::RepoConfig,
+            PolicySource::Flag => IdentitySource::Flag,
+            _ => IdentitySource::GlobalConfig,
+        },
+    })
 }
 
 /// Every custom agent definition's binary and name, for the host-command
@@ -191,7 +230,8 @@ pub fn custom_agent_binaries(session: &Session) -> Vec<String> {
 /// Credential-bearing overlays the repository's `.awman/config.json` adds to
 /// every step, so the summary shows what the checkout itself mounts.
 pub fn repo_overlay_notes(session: &Session) -> Vec<String> {
-    let Some(overlays) = session.repo_config().overlays.as_ref() else {
+    let effective = session.effective_config();
+    let Some(overlays) = effective.layers().repo.overlays.as_ref() else {
         return Vec::new();
     };
     let mut notes = Vec::new();
@@ -292,12 +332,11 @@ impl WorkflowPrerequisiteFlow {
         session: &Session,
         options: WorkflowPrerequisiteFlowOptions,
     ) -> Self {
-        let data_home = GlobalConfig::data_home_with(session.env()).ok();
+        let data_home = crate::data::fs::data_paths::data_home(session.env()).ok();
         let grant_store = data_home.as_deref().map(PrerequisiteGrantStore::load);
         let home = session
             .env()
             .home_dir()
-            .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("/"));
         Self {
             workflow_git_source: engines
@@ -423,10 +462,22 @@ impl WorkflowPrerequisiteFlow {
             ));
             return;
         };
-        if let Err(e) = store.remember(key, grant) {
-            sink.write_message(warning(format!(
+        match store.remember(key, grant) {
+            Err(e) => sink.write_message(warning(format!(
                 "could not remember this decision ({e}); it applies to this run only"
-            )));
+            ))),
+            Ok(()) => sink.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: format!(
+                    "Tip: this repo's prerequisite preference is stored in {}",
+                    PrerequisiteGrantStore::path_for(
+                        self.data_home
+                            .as_deref()
+                            .expect("grant store has a data home")
+                    )
+                    .display()
+                ),
+            }),
         }
     }
 
@@ -496,6 +547,7 @@ impl WorkflowPrerequisiteFlow {
                 verify: self.options.policy.github_token.verify,
                 timeout: GITHUB_TOKEN_PROBE_TIMEOUT,
             })
+            .with_env_snapshot(self.session.env().clone())
             .with_refused_binaries(self.options.custom_agent_binaries.clone())
             .with_repository_root(self.options.git_root.clone())
     }
@@ -524,6 +576,11 @@ impl WorkflowPrerequisiteFlow {
         options.repo_acquire_approved = self.repo_acquire_approved();
         options.can_ask = can_ask;
         options.existing_grants = existing_grants;
+        options.session_git_scope = self
+            .engines
+            .ephemeral_secrets
+            .container_git_socket()
+            .map(|listener| listener.scope().clone());
         options.notes = self.notes();
         let cache = self
             .data_home
@@ -550,21 +607,107 @@ impl WorkflowPrerequisiteFlow {
             .run()
     }
 
+    pub fn preflight_with_messages(
+        &self,
+        needs: &WorkflowPrerequisites,
+        can_ask: bool,
+        frontend: &mut dyn WorkflowPrerequisiteFrontend,
+    ) -> WorkflowPrerequisiteReport {
+        Self::announce_preflight(needs.needs.len(), frontend);
+        let preflight =
+            self.build_preflight(needs.clone(), PrerequisitePhase::Start, can_ask, None);
+        Self::run_preflight_with_messages(&preflight, frontend)
+    }
+
+    fn announce_preflight(count: usize, frontend: &mut dyn WorkflowPrerequisiteFrontend) {
+        frontend.begin_workflow_prerequisites();
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("Checking {count} workflow prerequisites…"),
+        });
+    }
+
+    fn run_preflight_with_messages(
+        preflight: &PrerequisitePreflight,
+        frontend: &mut dyn WorkflowPrerequisiteFrontend,
+    ) -> WorkflowPrerequisiteReport {
+        preflight.run_with_progress(&mut |need, checks| match checks {
+            None => frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: format!("Checking prerequisite: {}…", need.label()),
+            }),
+            Some(checks) => {
+                if checks.is_empty() {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Info,
+                        text: format!("Prerequisite: {} — not required", need.label()),
+                    });
+                }
+                for check in checks {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Info,
+                        text: format!(
+                            "Prerequisite: {} — {}",
+                            check.prerequisite.label(),
+                            check.status.label()
+                        ),
+                    });
+                }
+            }
+        })
+    }
+
     /// Run the whole start-of-run flow: probe, show, ask, apply policy.
     /// Returns everything the run carries, or the error that stops it before
     /// any container starts.
     pub fn prepare(
-        mut self,
+        self,
         needs: &WorkflowPrerequisites,
         frontend: &mut dyn WorkflowPrerequisiteFrontend,
     ) -> Result<PreparedPrerequisites, CommandError> {
         let can_ask = frontend.can_ask_prerequisites();
+        Self::announce_preflight(needs.needs.len(), frontend);
         let preflight =
             self.build_preflight(needs.clone(), PrerequisitePhase::Start, can_ask, None);
-        let report = preflight.run();
-        let resolved_needs = preflight.resolved_prerequisites(&report);
+        let report = Self::run_preflight_with_messages(&preflight, frontend);
+        self.prepare_report(report, frontend, true)
+    }
+
+    /// Resolve an already collected report. Workflow startup combines image
+    /// checks with the engine probes and presents it once before decisions.
+    pub(crate) fn prepare_report(
+        mut self,
+        report: WorkflowPrerequisiteReport,
+        frontend: &mut dyn WorkflowPrerequisiteFrontend,
+        show: bool,
+    ) -> Result<PreparedPrerequisites, CommandError> {
+        let resolved_needs = WorkflowPrerequisites {
+            origin: report.origin,
+            needs: report
+                .checks
+                .iter()
+                .filter(|check| {
+                    !matches!(check.prerequisite, WorkflowPrerequisite::AgentImage { .. })
+                })
+                .map(
+                    |check| crate::data::workflow_prerequisites::PrerequisiteNeed {
+                        prerequisite: check.prerequisite.clone(),
+                        needed_by: check.needed_by.clone(),
+                    },
+                )
+                .collect(),
+            advisories: report.advisories.clone(),
+        };
         let redaction = RedactionSet::new();
-        let outcome = self.resolve(&resolved_needs, report, &redaction, frontend)?;
+        self.engines
+            .ephemeral_secrets
+            .register_current_git_redaction(&redaction);
+        if let Some(secrets) = self.engines.command_secrets() {
+            for secret in secrets.values() {
+                redaction.add(secret.clone());
+            }
+        }
+        let outcome = self.resolve_report(&resolved_needs, report, &redaction, frontend, show)?;
         let remotes = self.remotes_for(&resolved_needs);
         Ok(PreparedPrerequisites {
             needs: resolved_needs,
@@ -609,11 +752,22 @@ impl WorkflowPrerequisiteFlow {
         redaction: &RedactionSet,
         frontend: &mut dyn WorkflowPrerequisiteFrontend,
     ) -> Result<PrerequisiteOutcome, CommandError> {
+        self.resolve_report(needs, report, redaction, frontend, true)
+    }
+
+    fn resolve_report(
+        &mut self,
+        needs: &WorkflowPrerequisites,
+        report: WorkflowPrerequisiteReport,
+        redaction: &RedactionSet,
+        frontend: &mut dyn WorkflowPrerequisiteFrontend,
+        show: bool,
+    ) -> Result<PrerequisiteOutcome, CommandError> {
         let default = if frontend.can_ask_prerequisites() {
             UnresolvedMode::Warn
         } else {
             self.options.headless.prerequisite_unresolved(
-                if self.options.frontend_kind == FrontendKind::SquadDaemon {
+                if self.options.frontend_kind == FrontendKind::SQUAD_LOCAL {
                     PrerequisiteOrigin::AssumedAll
                 } else {
                     needs.origin
@@ -625,7 +779,7 @@ impl WorkflowPrerequisiteFlow {
             PrerequisiteGrants::default(),
             redaction,
             frontend,
-            true,
+            show,
         )?;
         let mode = self.options.policy.unresolved_or(default);
         if !outcome.unresolved.is_empty() {
@@ -634,7 +788,14 @@ impl WorkflowPrerequisiteFlow {
                     report: Box::new(outcome.report),
                 });
             }
-            for check in outcome.report.needs_attention() {
+            for check in outcome
+                .report
+                .needs_attention()
+                .into_iter()
+                .filter(|check| {
+                    !matches!(check.prerequisite, WorkflowPrerequisite::AgentImage { .. })
+                })
+            {
                 frontend.write_message(warning(format!(
                     "workflow prerequisite not satisfied: {}: {}",
                     check.prerequisite.label(),
@@ -655,6 +816,8 @@ impl WorkflowPrerequisiteFlow {
         show: bool,
     ) -> Result<PrerequisiteOutcome, CommandError> {
         let can_ask = frontend.can_ask_prerequisites();
+        // A fixed identity the policy grants is the run's, whatever its needs.
+        grants.run_identity = granted_fixed_identity(&self.options.policy);
         if show && can_ask {
             let unresolved = self.options.policy.unresolved_or(UnresolvedMode::Warn);
             frontend.show_workflow_prerequisites(
@@ -673,11 +836,18 @@ impl WorkflowPrerequisiteFlow {
                 _ => "origin".into(),
             };
             let resolution = match &check.prerequisite {
+                WorkflowPrerequisite::AgentImage { .. } => Resolution::Unchanged,
                 WorkflowPrerequisite::GitIdentity => {
                     self.resolve_identity(&check, &mut grants, frontend, can_ask)?
                 }
                 WorkflowPrerequisite::PushAuthSsh { remote, .. } => {
                     self.resolve_ssh(&check, remote, &mut grants, frontend, can_ask)?
+                }
+                WorkflowPrerequisite::PushAuthHttps { remote, .. }
+                    if self.remote_url(remote).is_some_and(|url| self.engines.ephemeral_secrets.container_git_socket().is_some_and(|listener| listener.matches_url(&url.redacted)))
+                        && check.needed_by.iter().all(|step| matches!(step.kind, crate::data::workflow_prerequisites::PrerequisiteStepKind::PushBranch | crate::data::workflow_prerequisites::PrerequisiteStepKind::PullBranch)) =>
+                {
+                    Resolution::Satisfied(Some("session Git credential available through the private helper".into()))
                 }
                 WorkflowPrerequisite::GitHubToken { host }
                 | WorkflowPrerequisite::PushAuthHttps { host, .. } => {
@@ -773,6 +943,7 @@ impl WorkflowPrerequisiteFlow {
         let unresolved = report
             .needs_attention()
             .into_iter()
+            .filter(|c| !matches!(c.prerequisite, WorkflowPrerequisite::AgentImage { .. }))
             .map(|c| c.prerequisite.clone())
             .collect();
         Ok(PrerequisiteOutcome {
@@ -797,8 +968,14 @@ impl WorkflowPrerequisiteFlow {
                 email: email.to_string(),
                 source,
             });
+            let reach = if grants.run_identity == grants.identity {
+                "every workflow container"
+            } else {
+                "commit_changes containers"
+            };
+            // The values stay out of the report: it reaches events and logs.
             Resolution::Satisfied(Some(format!(
-                "identity \"{name} <{email}>\" injected into commit_changes containers"
+                "the granted git identity was injected into {reach}"
             )))
         };
         if grants.identity.is_some() {
@@ -1058,7 +1235,9 @@ impl WorkflowPrerequisiteFlow {
             .remote_url(remote)
             .map(|u| u.redacted)
             .unwrap_or_else(|| remote.to_string());
-        let prompt = crate::command::prompts::prerequisite_ssh(check, &remote_display);
+        let home = self.session.env().home_dir();
+        let prompt =
+            crate::command::prompts::prerequisite_ssh(check, &remote_display, home.as_deref());
         match frontend.ask_prerequisite_ssh(&prompt)? {
             SshChoice::Key { path, remember } => match self.ssh_key_grant(&path) {
                 Ok(grant) => {
@@ -1094,6 +1273,18 @@ impl WorkflowPrerequisiteFlow {
     // ─── GitHub token ───────────────────────────────────────────────────────
 
     fn env_grant(&self, host: &str, var: &str) -> Option<TokenGrant> {
+        if let Some(secret) = self
+            .engines
+            .command_secrets()
+            .and_then(|secrets| secrets.get(var).cloned())
+        {
+            return Some(TokenGrant {
+                secret,
+                source: TokenGrantSource::ApiSecret(var.to_string()),
+                host: host.to_string(),
+                acquire: None,
+            });
+        }
         self.resolver(host).env_token(var).map(|secret| TokenGrant {
             secret,
             source: TokenGrantSource::Env(var.to_string()),
@@ -1134,16 +1325,20 @@ impl WorkflowPrerequisiteFlow {
         }
         let granted = |grants: &mut PrerequisiteGrants, grant: TokenGrant| {
             let text = match &grant.source {
-                TokenGrantSource::Env(var) => format!("token from {var} granted to teardown steps"),
-                TokenGrantSource::Pasted => "pasted token granted to teardown steps".to_string(),
+                TokenGrantSource::Env(var) => {
+                    format!("token from {var} granted to workflow steps that need it")
+                }
+                TokenGrantSource::Pasted => {
+                    "pasted token granted to workflow steps that need it".to_string()
+                }
                 TokenGrantSource::HostCommand(label) => {
-                    format!("token from {label} granted to teardown steps")
+                    format!("token from {label} granted to workflow steps that need it")
                 }
                 TokenGrantSource::ApiSecret(name) => {
-                    format!("token from secret {name} granted to teardown steps")
+                    format!("token from secret {name} granted to workflow steps that need it")
                 }
                 TokenGrantSource::GhAuthToken => {
-                    "token from gh auth token granted to teardown steps".to_string()
+                    "token from gh auth token granted to workflow steps that need it".to_string()
                 }
             };
             if grants
@@ -1478,7 +1673,7 @@ impl WorkflowPrerequisiteFlow {
 
     // ─── Later phases ───────────────────────────────────────────────────────
 
-    /// The non-interactive re-check just before teardown: verifies granted
+    /// The headless re-check just before teardown: verifies granted
     /// env vars are still set and re-runs a `refresh: "beforeTeardown"`
     /// token command. Writes **one** warning when anything is not satisfied.
     pub fn recheck_before_teardown(
@@ -1518,17 +1713,17 @@ impl WorkflowPrerequisiteFlow {
 
     /// Dynamic runs: recompute the needs from the generated workflow, drop
     /// grants nothing uses, warn about newly needed prerequisites that were
-    /// not granted (and ask again when a person is there), and warn when a
+    /// not granted, without asking again, and warn when a
     /// generated step's own overlays ask for a credential the user declined.
     pub fn narrow_after_generation(
         &mut self,
         workflow: &Workflow,
+        initial_report: &WorkflowPrerequisiteReport,
         prepared_grants: &mut PrerequisiteGrants,
         redaction: &RedactionSet,
         frontend: &mut dyn WorkflowPrerequisiteFrontend,
     ) -> Result<(WorkflowPrerequisites, WorkflowPrerequisiteReport), CommandError> {
-        let can_ask = frontend.can_ask_prerequisites();
-        let needs = WorkflowPrerequisites::from_workflow(workflow);
+        let mut needs = WorkflowPrerequisites::from_workflow(workflow);
         let destinations: std::collections::BTreeSet<_> = self
             .remotes_for(&needs)
             .into_values()
@@ -1556,14 +1751,6 @@ impl WorkflowPrerequisiteFlow {
             }
             _ => false,
         });
-        if changed_ssh {
-            self.options.flags.ssh = None;
-            self.options.policy.ssh.use_ = CredentialUse::Ask;
-        }
-        if changed_token {
-            self.options.flags.token = None;
-            self.options.policy.github_token.use_ = CredentialUse::Ask;
-        }
         prepared_grants
             .ssh_destinations
             .retain(|u| destinations.contains(u));
@@ -1576,14 +1763,72 @@ impl WorkflowPrerequisiteFlow {
         if changed_token {
             prepared_grants.token = None;
         }
-        let preflight = self.build_preflight(
-            needs,
-            PrerequisitePhase::Start,
-            can_ask,
-            Some(prepared_grants.clone()),
-        );
-        let mut report = preflight.run();
-        let resolved = preflight.resolved_prerequisites(&report);
+        // Classify the generated requirements, but never repeat the probes or
+        // obtain new grants. An unreviewed destination stays unavailable.
+        needs.needs.retain_mut(|need| {
+            if let WorkflowPrerequisite::PushAuth { remote } = &need.prerequisite {
+                if let Some(url) = self.remote_url(remote) {
+                    need.prerequisite = match url.kind {
+                        crate::data::workflow_prerequisites::GitRemoteKind::Ssh { host } => {
+                            WorkflowPrerequisite::PushAuthSsh {
+                                remote: remote.clone(),
+                                host,
+                            }
+                        }
+                        crate::data::workflow_prerequisites::GitRemoteKind::Https { host } => {
+                            WorkflowPrerequisite::PushAuthHttps {
+                                remote: remote.clone(),
+                                host,
+                            }
+                        }
+                        crate::data::workflow_prerequisites::GitRemoteKind::File => return false,
+                        _ => return true,
+                    };
+                }
+            }
+            true
+        });
+        let ssh_needs: Vec<_> = needs
+            .needs
+            .iter()
+            .filter(|need| matches!(need.prerequisite, WorkflowPrerequisite::PushAuthSsh { .. }))
+            .map(
+                |need| crate::data::workflow_prerequisites::PrerequisiteNeed {
+                    prerequisite: WorkflowPrerequisite::ContainerTool { name: "ssh".into() },
+                    needed_by: need.needed_by.clone(),
+                },
+            )
+            .collect();
+        for need in ssh_needs {
+            needs.merge_needs(need);
+        }
+        if let Some(host) = self
+            .remote_url("origin")
+            .and_then(|url| url.host().map(str::to_owned))
+        {
+            for need in &mut needs.needs {
+                if let WorkflowPrerequisite::GitHubToken { host: token_host } =
+                    &mut need.prerequisite
+                {
+                    *token_host = host.clone();
+                }
+            }
+        }
+        let mut report = initial_report.narrow_to(&needs);
+        for check in &mut report.checks {
+            let invalidated = match &check.prerequisite {
+                WorkflowPrerequisite::PushAuthSsh { .. } => changed_ssh,
+                WorkflowPrerequisite::PushAuthHttps { .. }
+                | WorkflowPrerequisite::GitHubToken { .. } => changed_token,
+                _ => false,
+            };
+            if invalidated {
+                check.status = PrerequisiteStatus::Missing;
+                check.explanation =
+                    "destination was not authorized during workflow preflight".into();
+            }
+        }
+        let resolved = needs;
         for dropped in prepared_grants.retain_for(&resolved) {
             frontend.write_message(warning(match dropped {
                 DroppedGrant::Identity => "granted but unused: git identity (not injected)",
@@ -1609,19 +1854,15 @@ impl WorkflowPrerequisiteFlow {
                 )));
             }
         }
-        let outcome = if can_ask && !report.needs_attention().is_empty() {
-            self.decide(report, prepared_grants.clone(), redaction, frontend, true)?
-        } else {
-            let unresolved = report
-                .needs_attention()
-                .into_iter()
-                .map(|c| c.prerequisite.clone())
-                .collect();
-            PrerequisiteOutcome {
-                report,
-                grants: prepared_grants.clone(),
-                unresolved,
-            }
+        let unresolved = report
+            .needs_attention()
+            .into_iter()
+            .map(|c| c.prerequisite.clone())
+            .collect();
+        let outcome = PrerequisiteOutcome {
+            report,
+            grants: prepared_grants.clone(),
+            unresolved,
         };
         // The need was assumed until now, so only an explicit `fail` stops
         // the run after the leader has designed it.
@@ -1706,5 +1947,64 @@ fn headless_declined(check: &PrerequisiteCheck, what: &str) -> Resolution {
             check.explanation
         )),
         _ => Resolution::Unchanged,
+    }
+}
+
+#[cfg(test)]
+mod granted_identity_tests {
+    use super::*;
+    use crate::data::config::workflows::FixedIdentity;
+
+    fn policy(use_: CredentialUse, source: PolicySource, email: &str) -> PrerequisitePolicy {
+        let mut policy = PrerequisitePolicy::default();
+        policy.git_identity.use_ = use_;
+        policy.git_identity.source = source;
+        policy.git_identity.fixed = Some(FixedIdentity {
+            name: "Lease Bot".into(),
+            email: email.into(),
+        });
+        policy
+    }
+
+    #[test]
+    fn only_an_allowed_valid_fixed_identity_reaches_the_whole_run() {
+        let granted = granted_fixed_identity(&policy(
+            CredentialUse::Allow,
+            PolicySource::Flag,
+            "bot@x.test",
+        ))
+        .expect("granted");
+        assert_eq!(
+            (
+                granted.name.as_str(),
+                granted.email.as_str(),
+                granted.source
+            ),
+            ("Lease Bot", "bot@x.test", IdentitySource::Flag)
+        );
+        assert_eq!(
+            granted_fixed_identity(&policy(
+                CredentialUse::Allow,
+                PolicySource::Repo,
+                "bot@x.test"
+            ))
+            .map(|g| g.source),
+            Some(IdentitySource::RepoConfig)
+        );
+        // `deny` (and `host`/unset, which carry no fixed value) keep the
+        // container's own identity; a malformed value is never injected.
+        assert_eq!(
+            granted_fixed_identity(&policy(
+                CredentialUse::Deny,
+                PolicySource::Flag,
+                "bot@x.test"
+            )),
+            None
+        );
+        assert_eq!(
+            granted_fixed_identity(&policy(CredentialUse::Allow, PolicySource::Flag, "bot\n@x")),
+            None
+        );
+        assert_eq!(granted_fixed_identity(&PrerequisitePolicy::default()), None);
     }
 }

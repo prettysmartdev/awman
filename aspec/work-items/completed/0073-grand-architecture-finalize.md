@@ -1,5 +1,7 @@
 # Work Item: Task
 
+> Testing policy update (WI144): test commands, harness paths and test counts in this historical record are superseded by [the current testing contract](/aspec/devops/testing.md). Use manifest suites and `make validate-native` for native acceptance. Removed test sources and raw evidence bundles are available only in Git history; they must not be restored as test patterns.
+
 Title: grand architecture refactor — final parity validation, docs and aspec refresh
 Issue: n/a — eighth and final work item implementing `aspec/architecture/2026-grand-architecture.md`
 
@@ -216,7 +218,7 @@ The following specific behaviors MUST each have at least one targeted test. Trac
 5. `amux implement 0001 [--workflow PATH] [--worktree] [--yolo] [--auto] [--plan] [--agent NAME] [--model NAME] [--non-interactive] [--allow-docker] [--mount-ssh] [--overlay SPEC]…` runs end-to-end. Cover the implication rule (`--yolo + --workflow ⇒ --worktree`).
 6. `amux chat [flags]` runs interactively (PTY); `amux chat -n` runs non-interactively. Verify exit code propagation.
 7. `amux specs new --interview` prompts for kind+title+summary+interview, creates file at `aspec/work-items/<NNNN>-<slug>.md`, hands to agent.
-8. `amux specs amend 0042 [-n] [--allow-docker]` runs agent against existing work-item file.
+8. `amux edit spec 0042 --amend [-n] [--allow-docker]` runs agent against existing work-item file.
 9. `amux new spec` is an alias for `amux specs new`.
 10. `amux new workflow [--interview] [--global] [--format toml|yaml|md]` creates workflow at right location in right format.
 11. `amux new skill [--interview] [--global]` creates skill at right location.

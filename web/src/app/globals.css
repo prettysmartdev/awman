@@ -1,0 +1,7 @@
+/* External styles only: compatible with style-src 'self'. */
+@import './tokens.css';
+@import './base.css';
+@import './legacy-surfaces.css';
+@import './shell.css';
+@import './surfaces.css';
+@import './entry.css';

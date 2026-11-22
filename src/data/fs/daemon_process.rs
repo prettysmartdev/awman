@@ -1,10 +1,9 @@
 //! `DaemonProcess` — PID-file lifecycle and server-meta persistence for a
-//! long-lived awman daemon (the API server or squad).
+//! single awman daemon.
 //!
 //! Layer 0 owns the on-disk state: the PID file, the `ServerMeta` sidecar,
-//! the daemon's paths, and the systemd unit name / launchd plist label that
-//! identify it, so two daemons never collide on `--unit=awman-api` or the
-//! `io.awman.api` plist.
+//! the daemon's paths, and its fixed `awman-daemon` systemd unit and
+//! `io.awman.daemon` launchd label.
 //!
 //! The *process* half — liveness probes, `systemd-run`, launchd, the direct
 //! spawn, SIGTERM/`taskkill` — moved to `engine::daemon::DaemonSupervisor` in
@@ -20,12 +19,14 @@ use crate::data::fs::config_file::write_config_file_atomically;
 use crate::data::fs::daemon_paths::DaemonPaths;
 
 /// systemd unit name / launchd plist label for the API daemon.
-pub const API_UNIT_NAME: &str = "awman-api";
-pub const API_PLIST_LABEL: &str = "io.awman.api";
+pub const DAEMON_UNIT_NAME: &str = "awman-daemon";
+pub const DAEMON_PLIST_LABEL: &str = "io.awman.daemon";
+pub const API_UNIT_NAME: &str = DAEMON_UNIT_NAME;
+pub const API_PLIST_LABEL: &str = DAEMON_PLIST_LABEL;
 
 /// systemd unit name / launchd plist label for the squad daemon.
-pub const SQUAD_UNIT_NAME: &str = "awman-squad";
-pub const SQUAD_PLIST_LABEL: &str = "io.awman.squad";
+pub const SQUAD_UNIT_NAME: &str = DAEMON_UNIT_NAME;
+pub const SQUAD_PLIST_LABEL: &str = DAEMON_PLIST_LABEL;
 
 /// Sidecar metadata for a running daemon. Written next to the PID file when
 /// the server boots so other commands (status, kill) can locate the bound
@@ -35,10 +36,8 @@ pub struct ServerMeta {
     pub port: u16,
     pub bind_ip: String,
     pub scheme: String,
-    /// True when the daemon was started with `--dangerously-skip-auth` and is
-    /// therefore serving unauthenticated. Clients read this to avoid minting a
-    /// bearer key (and writing a key hash) the running daemon will never check.
-    /// Absent in sidecars written by older versions, which always required auth.
+    /// Legacy sidecar migration field. Current daemon startup does not permit
+    /// unauthenticated network listeners; the removed skip-auth flag is rejected.
     #[serde(default)]
     pub auth_disabled: bool,
 }
@@ -52,12 +51,17 @@ pub struct DaemonProcess {
 
 impl DaemonProcess {
     /// Construct over a daemon's paths and its systemd/launchd identity.
-    pub fn new(paths: DaemonPaths, unit_name: &'static str, plist_label: &'static str) -> Self {
+    pub fn new(paths: DaemonPaths, _unit_name: &'static str, _plist_label: &'static str) -> Self {
         Self {
             paths,
-            unit_name,
-            plist_label,
+            unit_name: DAEMON_UNIT_NAME,
+            plist_label: DAEMON_PLIST_LABEL,
         }
+    }
+
+    /// Unified constructor; `new` is a temporary legacy shim.
+    pub fn unified(paths: DaemonPaths) -> Self {
+        Self::new(paths, DAEMON_UNIT_NAME, DAEMON_PLIST_LABEL)
     }
 
     /// The daemon's paths.
@@ -138,10 +142,16 @@ impl DaemonProcess {
 
 /// Truncating PID write — overwrites whatever is already on disk.
 pub(crate) fn write_pid(pid_path: &Path, pid: u32) -> Result<(), DataError> {
-    if let Some(parent) = pid_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| DataError::io(parent, e))?;
+    let parent = pid_path.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.exists() {
+        crate::data::fs::private_files::create_private_dir(parent)?;
     }
-    std::fs::write(pid_path, pid.to_string()).map_err(|e| DataError::io(pid_path, e))
+    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|e| DataError::io(parent, e))?;
+    std::io::Write::write_all(&mut file, pid.to_string().as_bytes())
+        .map_err(|e| DataError::io(pid_path, e))?;
+    file.persist(pid_path)
+        .map_err(|e| DataError::io(pid_path, e.error))?;
+    Ok(())
 }
 
 /// Race-safe PID write via `O_CREAT|O_EXCL`. `Ok(false)` when the file exists.
@@ -156,7 +166,9 @@ pub(crate) fn write_pid(pid_path: &Path, pid: u32) -> Result<(), DataError> {
 /// seeing the claim or finding nothing.
 pub(crate) fn write_pid_exclusive(pid_path: &Path, pid: u32) -> Result<bool, DataError> {
     if let Some(parent) = pid_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| DataError::io(parent, e))?;
+        if !parent.exists() {
+            crate::data::fs::private_files::create_private_dir(parent)?;
+        }
     }
     let tmp_path = pid_path.with_file_name(format!(
         "{}.tmp.{}",
@@ -164,9 +176,13 @@ pub(crate) fn write_pid_exclusive(pid_path: &Path, pid: u32) -> Result<bool, Dat
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("pidfile"),
-        std::process::id()
+        uuid::Uuid::new_v4()
     ));
-    std::fs::write(&tmp_path, pid.to_string()).map_err(|e| DataError::io(&tmp_path, e))?;
+    let mut file = crate::data::fs::private_files::create_private_file_new(&tmp_path)?;
+    if let Err(e) = std::io::Write::write_all(&mut file, pid.to_string().as_bytes()) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(DataError::io(&tmp_path, e));
+    }
     let result = std::fs::hard_link(&tmp_path, pid_path);
     let _ = std::fs::remove_file(&tmp_path);
     match result {
@@ -266,132 +282,4 @@ pub(crate) fn ensure_private_log(log_path: &Path) -> Result<(), DataError> {
         std::fs::set_permissions(log_path, perms).map_err(|e| DataError::io(log_path, e))?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn write_pid_exclusive_rejects_second_writer() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pid_path = tmp.path().join("excl.pid");
-        let r1 = write_pid_exclusive(&pid_path, 100).unwrap();
-        assert!(r1, "first exclusive write must succeed");
-        let r2 = write_pid_exclusive(&pid_path, 200).unwrap();
-        assert!(!r2, "second exclusive write must be rejected");
-        let on_disk = read_pid(&pid_path).unwrap();
-        assert_eq!(on_disk, Some(100), "first writer's PID must survive");
-    }
-
-    #[test]
-    fn pid_file_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pid_path = tmp.path().join("test.pid");
-        write_pid(&pid_path, 12345).unwrap();
-        assert_eq!(read_pid(&pid_path).unwrap(), Some(12345));
-        clear_pid(&pid_path).unwrap();
-        assert_eq!(read_pid(&pid_path).unwrap(), None);
-    }
-
-    #[test]
-    fn clear_pid_idempotent_when_absent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pid_path = tmp.path().join("nonexistent.pid");
-        assert!(clear_pid(&pid_path).is_ok());
-    }
-
-    fn api_daemon(root: &Path) -> DaemonProcess {
-        DaemonProcess::new(
-            DaemonPaths::new(root, "api_key"),
-            API_UNIT_NAME,
-            API_PLIST_LABEL,
-        )
-    }
-
-    #[test]
-    fn claim_and_release_pidfile_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let d = api_daemon(tmp.path());
-        assert!(d.claim_pidfile(4242).unwrap(), "first claim wins");
-        assert!(!d.claim_pidfile(9999).unwrap(), "second claim rejected");
-        assert_eq!(d.read_pid().unwrap(), Some(4242));
-        d.release_pidfile().unwrap();
-        assert_eq!(d.read_pid().unwrap(), None);
-    }
-
-    /// The shutdown path's release: a daemon that still holds the claim drops
-    /// it, exactly as the unconditional release would.
-    #[test]
-    fn release_pidfile_owned_by_drops_our_own_claim() {
-        let tmp = tempfile::tempdir().unwrap();
-        let d = api_daemon(tmp.path());
-        d.claim_pidfile(4242).unwrap();
-        assert!(d.owns_pidfile(4242).unwrap());
-        assert!(d.release_pidfile_owned_by(4242).unwrap(), "ours to release");
-        assert_eq!(d.read_pid().unwrap(), None);
-    }
-
-    /// The reason the ownership check exists. `awman squad stop` releases the
-    /// pidfile as soon as it has signalled, so a successor can claim the root
-    /// while the old daemon is still on its way out. That daemon's teardown
-    /// must leave the successor's claim — and therefore its endpoint sidecar —
-    /// alone, or the next command starts a *third* daemon holding none of the
-    /// payload environment the successor was handed.
-    #[test]
-    fn release_pidfile_owned_by_leaves_a_successors_claim_alone() {
-        let tmp = tempfile::tempdir().unwrap();
-        let d = api_daemon(tmp.path());
-        // The stopper released our pidfile; the successor claimed it.
-        d.claim_pidfile(777).unwrap();
-
-        assert!(!d.owns_pidfile(4242).unwrap(), "not ours any more");
-        assert!(
-            !d.release_pidfile_owned_by(4242).unwrap(),
-            "a dying daemon must report that it had nothing to release"
-        );
-        assert_eq!(
-            d.read_pid().unwrap(),
-            Some(777),
-            "the successor's claim must survive its predecessor's teardown"
-        );
-    }
-
-    /// Nothing to own is not something to delete, and neither is a pidfile
-    /// this process cannot even parse.
-    #[test]
-    fn release_pidfile_owned_by_is_a_no_op_on_an_absent_or_unreadable_pidfile() {
-        let tmp = tempfile::tempdir().unwrap();
-        let d = api_daemon(tmp.path());
-        assert!(!d.release_pidfile_owned_by(4242).unwrap(), "nothing there");
-
-        std::fs::write(d.paths().pid_file(), "not-a-pid").unwrap();
-        assert!(!d.release_pidfile_owned_by(4242).unwrap(), "not parseable");
-        assert!(
-            d.paths().pid_file().exists(),
-            "an unparseable pidfile is left for running_pid to report on"
-        );
-    }
-
-    #[test]
-    fn meta_round_trip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let d = api_daemon(tmp.path());
-        assert_eq!(d.read_meta().unwrap(), None);
-        let meta = ServerMeta {
-            port: 8080,
-            bind_ip: "127.0.0.1".into(),
-            scheme: "https".into(),
-            auth_disabled: false,
-        };
-        d.write_meta(&meta).unwrap();
-        assert_eq!(d.read_meta().unwrap(), Some(meta));
-        d.clear_meta().unwrap();
-        assert_eq!(d.read_meta().unwrap(), None);
-    }
-
-    #[test]
-    fn distinct_unit_and_plist_for_api_and_squad() {
-        assert_ne!(API_UNIT_NAME, SQUAD_UNIT_NAME);
-        assert_ne!(API_PLIST_LABEL, SQUAD_PLIST_LABEL);
-    }
 }

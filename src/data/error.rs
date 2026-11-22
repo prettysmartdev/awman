@@ -10,6 +10,8 @@ use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum DataError {
+    #[error("profile path is busy; retry after the concurrent operation finishes")]
+    ProfileLockBusy,
     #[error("git root not found for working directory {working_dir}")]
     GitRootNotFound { working_dir: PathBuf },
 
@@ -93,6 +95,19 @@ pub enum DataError {
 
     #[error("{0}")]
     Other(String),
+
+    /// A legacy database and a current database were both written
+    /// independently; neither was copied, merged, renamed or deleted.
+    #[error(
+        "two awman databases exist and awman will not choose between them: the legacy database {} \
+         and the current database {} were written independently. Both were left untouched, \
+         including their -wal and -shm files. Stop every awman process, back up both databases \
+         (each with its -wal and -shm files), then move the one you do not want to keep, with its \
+         -wal and -shm files, to another directory (do not delete it) and run awman again.",
+        legacy.display(),
+        current.display()
+    )]
+    StoreMigrationConflict { legacy: PathBuf, current: PathBuf },
 }
 
 impl DataError {

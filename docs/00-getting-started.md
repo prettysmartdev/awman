@@ -1,126 +1,50 @@
-# Getting Started
+# Getting started
 
-`awman` is a terminal multiplexer for AI code agents. Every agent runs inside a container — never directly on your machine. This quickstart takes you from nothing to a working agent session in about five minutes.
+awman runs coding agents in isolated containers or microVMs. This guide uses Docker, the default runtime. For other runtimes, see [Runtimes](11-runtimes.md).
 
-New to awman? Skim [Concepts](01-concepts.md) after this for the mental model behind these steps.
+## Before you start
 
----
+You need a Git repository, a running Docker daemon, and an account with a [supported agent](03-agent-sessions.md). Run these commands from the repository root.
 
-## Prerequisites
-
-- **Git** — your project must be in a Git repository
-- **A container runtime** — Docker (all platforms, daemon running), Apple Containers (macOS 26+), Docker Sandboxes (`sbx` CLI, macOS arm64 / Windows), or the experimental builtin microVM runtime (macOS on Apple Silicon only; included in the `awman-macos-arm64` release — see [Runtimes](11-runtimes.md#builtin-microvm-experimental))
-- **An account with a supported agent** — Claude Code, OpenAI Codex, OpenCode, Google Gemini, GitHub Copilot CLI, Cline, or Google Antigravity (or any other CLI agent you add as a [custom agent](15-custom-agents.md))
-
-## 1. Install
+## Install
 
 ```sh
 curl -s https://prettysmart.dev/install/awman.sh | sh
 ```
 
-The installer detects your platform and installs `awman` to `/usr/local/bin`. Other installation methods are listed in the [reference](#installation-options) below.
+The installer puts `awman` in `/usr/local/bin`. You can also [download a release](https://github.com/prettysmartdev/awman/releases), run `mise use -g github:prettysmartdev/awman`, or build from source with `make install`. Intel Macs are unsupported; the Linux x86_64 release needs glibc 2.35 or newer. See [Runtimes](11-runtimes.md) for platform details.
 
-## 2. Initialize your project
-
-From your project's Git root:
+## Set up the repository
 
 ```sh
-awman init                 # sets up Claude Code
-awman init --agent codex   # or pick another agent
+awman init                 # Claude Code
+awman init --agent codex   # choose Codex instead
 ```
 
-The agent you pass (`claude` by default) becomes the repo default; change it later with `awman config set agent <name>`. Init then asks you to:
+Follow the prompts to select or create `Dockerfile.dev` and, if useful, let the agent adapt it to your project's toolchain. Work item setup is optional. Commit `Dockerfile.dev` and `.awman/` to share the environment with your team.
 
-1. **Choose a project Dockerfile** — only if the repo has none: create `Dockerfile.dev` from the template (recommended), use an existing Dockerfile, or skip.
-2. **Run the agent audit** — say yes. An agent inspects your codebase and fills `Dockerfile.dev` with the exact toolchain your project needs.
-3. **Set up work items** — optional; configures where structured task specs live (or downloads the `aspec/` template).
-
-Init creates the agent Dockerfile, builds the container images, and prints a summary. Commit `Dockerfile.dev` and `.awman/` so teammates get the same environment.
-
-## 3. Verify
+## Check readiness
 
 ```sh
 awman ready
 ```
 
-This checks your container runtime, Dockerfiles, images, and agent authentication (it sends the agent a test greeting and shows the response). All green means you're ready.
+This checks the runtime, images, and agent authentication. If you need images before logging in, use `awman ready --prepare-only`; it reports authentication as **not checked**. See [Agent sessions](03-agent-sessions.md#preparing-images-without-authentication-ready---prepare-only).
 
-## 4. Run your first session
+## Start an agent
 
 ```sh
 awman
 ```
 
-This opens the TUI: a tab bar on top, an execution window in the middle, and a command box at the bottom. Type:
+In the TUI command box, type `chat` and press **Enter**. Talk to the agent in the terminal window. **Ctrl-M** minimizes or restores the window without stopping the session. To start directly from your shell, run `awman chat`.
 
-```
-chat
-```
+## Where to go next
 
-and press **Enter**. An agent session starts in a container, and a terminal window connected to the agent opens. Talk to it as you would in any agent CLI. Press **Ctrl-M** to toggle the agent window between maximized and minimized — it keeps running either way.
+- [Concepts](01-concepts.md) explains the main pieces.
+- [Using the TUI](02-using-the-tui.md) covers navigation and shortcuts.
+- [Agent sessions](03-agent-sessions.md) covers agents, permissions, authentication, and one-off prompts.
+- [Workflows](05-workflows.md) covers multi-step work; [dynamic workflows](06-dynamic-workflows.md) let an agent design the steps.
+- [Command reference](14-command-reference.md) lists every command and flag.
 
-That's it — you have an isolated agent working in your repo.
-
-## What's next
-
-- [Concepts](01-concepts.md) — the mental model: images, work items, overlays, modes
-- [Using the TUI](02-using-the-tui.md) — tabs, keybindings, the container window
-- [Agent Sessions](03-agent-sessions.md) — all `chat` flags and session management
-- [Workflows](05-workflows.md) — multi-step agent runs with setup and teardown
-- [Dynamic Workflows](06-dynamic-workflows.md) — let a leader agent design and run a workflow for you, no file to write
-- [Permission modes](03-agent-sessions.md#permission-modes) — `--plan`, `--auto`, and fully autonomous `--yolo`
-- [GitHub Integration](10-github-integration.md) — drive `new spec`, `exec workflow`, and `exec prompt` from GitHub issues with `--issue`
-- [squad](12-squad.md) — hand recurring work to a group of agents that watches for it and runs a workflow unattended
-- [Runtimes](11-runtimes.md) — Docker, Apple Containers, Docker Sandboxes, and the builtin embedded microVM runtime
-
----
-
-## Reference
-
-### Installation options
-
-| Method | Command |
-|--------|---------|
-| Installer script | `curl -s https://prettysmart.dev/install/awman.sh \| sh` |
-| mise | `mise use -g github:prettysmartdev/awman` (pin: `@0.13.0`) |
-| GitHub Releases | Download the asset for your platform, `chmod +x`, move onto `PATH` |
-| From source | `git clone https://github.com/prettysmartdev/awman.git && cd awman && make install` (Rust 1.94+) |
-
-Release assets: `awman-linux-amd64`, `awman-linux-arm64`, `awman-macos-arm64`, `awman-windows-amd64.exe`. Intel Macs are not supported.
-
-The **experimental builtin microVM runtime** (macOS on Apple Silicon only in this release) is compiled into awman itself, so installing awman is the only install step for it: no Docker, `container`, or `sbx` is required to run agents. The `awman-macos-arm64` release binary includes it and is ad-hoc signed with the hypervisor entitlement it needs; see [The macOS binary, Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions) if macOS refuses to open a downloaded copy. Enable it explicitly in your global config with `awman config set --global runtime builtin-experimental`, then follow [Getting an agent image](11-runtimes.md#getting-an-agent-image). By default `awman ready` imports an image you built elsewhere. To build and import in one command instead, point the image source at a local store and enable the builder:
-
-```json
-{
-  "runtime": "builtin-experimental",
-  "builtin": {
-    "builder": { "enabled": true },
-    "imageSource": { "type": "docker-local" }
-  }
-}
-```
-
-Then `awman ready` builds the Dockerfiles in that Docker Engine (`apple-local` uses Apple Containers) and imports the result; agents still run only in the builtin microVM. See [Building from a local image source](11-runtimes.md#building-from-a-local-image-source). `awman init` still builds images with the configured runtime, so under `builtin-experimental` its image-build step fails and the agent audit is skipped: run `awman init` while `runtime` is `docker` or `apple-containers`, then switch.
-
-### `awman init`
-
-| Flag | Effect |
-|------|--------|
-| `--agent <name>` | Agent to set up: `claude` (default), `codex`, `opencode`, `gemini`, `copilot`, `cline`, `antigravity`, or the name of a [custom agent](15-custom-agents.md) defined in `.awman/agents/` or `~/.awman/agents/` |
-| `--aspec` | Download the `aspec/` spec-folder template into the repo |
-
-### `awman ready`
-
-| Flag | Effect |
-|------|--------|
-| `--refresh` | Re-run the agent audit and update `Dockerfile.dev` (use after toolchain changes) |
-| `--build` | Force-rebuild the images, including every agent in `.awman/` (builtin runtime: re-import them all from the configured image sources, building first when `builtin.builder.enabled` is on and the source is a local store) |
-| `--no-cache` | Disable the layer cache for any build that runs (builtin runtime: also re-import from the source) |
-| `-n`, `--non-interactive` | Run the verification agent in non-interactive mode |
-| `--json` | Print structured JSON instead of human output (implies `-n`) |
-| `--allow-docker` | Mount the host Docker socket into the agent container (not supported by the builtin runtime) |
-| `--agent <name>` | Check and build this agent instead of the repo default; reviews and approves a [custom agent](15-custom-agents.md) definition that needs approval |
-
----
-
-[Next: Concepts →](01-concepts.md)
+[Back to contents](contents.md) · [Next: Concepts →](01-concepts.md)

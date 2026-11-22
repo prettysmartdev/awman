@@ -9,11 +9,12 @@
 use super::*;
 pub(crate) use crate::command::commands::workflow_prerequisites::PreparedPrerequisites;
 use crate::command::commands::workflow_prerequisites::{
-    PrerequisiteReportNext, WorkflowPrerequisiteFlow, WorkflowPrerequisiteFlowOptions,
+    PrerequisiteReportNext, WorkflowPreflightPlan, WorkflowPrerequisiteFlow,
+    WorkflowPrerequisiteFlowOptions,
 };
 use crate::data::workflow_definition::{SetupStep, TeardownStep};
 use crate::data::workflow_prerequisites::{
-    PrerequisiteOrigin, PrerequisiteStepKind, WorkflowPrerequisiteReport, WorkflowPrerequisites,
+    PrerequisiteOrigin, PrerequisiteStepKind, WorkflowPrerequisiteReport,
 };
 use crate::engine::overlay::prerequisite_grants::{GrantOverlays, GrantTarget};
 use crate::engine::workflow::step_commands::StepCommandOptions;
@@ -42,7 +43,7 @@ impl ExecWorkflowCommand {
             origin,
             Some(phase_image),
         );
-        options.worktree_planned = self.flags.worktree;
+        options.worktree_planned = self.flags.worktree || self.flags.dynamic;
         WorkflowPrerequisiteFlow::new(&self.engines, &self.session, options)
     }
 
@@ -51,13 +52,15 @@ impl ExecWorkflowCommand {
     /// still at the keyboard. `--check-prerequisites` stops here.
     pub(super) async fn start_prerequisites(
         &self,
-        needs: &WorkflowPrerequisites,
+        plan: &WorkflowPreflightPlan,
         workflow_name: String,
         frontend: &SharedWorkflowFrontend,
     ) -> Result<PrerequisiteStart, CommandError> {
-        let flow = self.prerequisite_flow(needs.origin);
+        let flow = self.prerequisite_flow(plan.needs.origin);
+        let can_ask =
+            !self.flags.prerequisites.check_only && frontend.with(|f| f.can_ask_prerequisites());
+        let report = frontend.with(|f| flow.preflight_with_messages(&plan.needs, can_ask, f));
         if self.flags.prerequisites.check_only {
-            let report = flow.preflight(needs, false);
             frontend.with(|f| {
                 f.show_workflow_prerequisites(&report, PrerequisiteReportNext::CheckOnly)
             })?;
@@ -69,8 +72,21 @@ impl ExecWorkflowCommand {
                 worktree_used: false,
             }));
         }
-        let prepared = frontend.with(|f| flow.prepare(needs, f));
-        let prepared = match prepared {
+        if can_ask {
+            frontend.with(|f| {
+                f.show_workflow_prerequisites(
+                    &report,
+                    PrerequisiteReportNext::Questions {
+                        unresolved: flow
+                            .options()
+                            .policy
+                            .unresolved_or(crate::data::config::workflows::UnresolvedMode::Warn),
+                    },
+                )
+            })?;
+        }
+        let prepared = frontend.with(|f| flow.prepare_report(report, f, false));
+        let mut prepared = match prepared {
             Ok(prepared) => prepared,
             Err(e) => {
                 if let CommandError::WorkflowPrerequisitesUnresolved { report } = &e {
@@ -85,7 +101,22 @@ impl ExecWorkflowCommand {
                 return Err(e);
             }
         };
+        let image_result = plan
+            .prepare_images(
+                &mut prepared.report,
+                &self.engines,
+                &self.session,
+                (!can_ask).then_some(prepared.flow.options().headless.clone()),
+                &mut frontend.clone(),
+            )
+            .await;
+        if !can_ask {
+            frontend.with(|f| {
+                f.show_workflow_prerequisites(&prepared.report, PrerequisiteReportNext::Decided)
+            })?;
+        }
         self.record_prerequisite_report(&prepared.report).await;
+        image_result?;
         Ok(PrerequisiteStart::Run(Box::new(prepared)))
     }
 
@@ -101,6 +132,10 @@ impl ExecWorkflowCommand {
     }
 }
 
+/// Stable message prefix (WI 0145) of a `push_branch`/`pull_branch` step of a
+/// `git_auth` session targeting another repository.
+pub(crate) const SESSION_GIT_AUTH_SCOPE_MISMATCH: &str = "session_git_auth_scope_mismatch";
+
 /// Per-step command options, keyed by phase and step index.
 pub(crate) type StepCommandOptionsByStep = Vec<((PhaseKind, usize), StepCommandOptions)>;
 
@@ -109,8 +144,9 @@ pub(crate) type StepCommandOptionsByStep = Vec<((PhaseKind, usize), StepCommandO
 /// options (SSH key / HTTPS token push auth) the engine renders steps with.
 ///
 /// Only `OverlayEngine::prerequisite_grant_overlays` turns grants into mounts
-/// or env; step kinds that never receive grants (`run_shell`, `run_script`,
-/// `checkout_create_branch`, `poll_ci`) get nothing from it. Secret values go
+/// or env; step kinds that never receive credentials (`run_shell`,
+/// `run_script`, `checkout_create_branch`, `poll_ci`) get only the run-wide
+/// fixed identity from it. Secret values go
 /// into the launch env map, which reaches the container by name only.
 pub(crate) fn apply_grant_overlays(
     engines: &Engines,
@@ -127,6 +163,8 @@ pub(crate) fn apply_grant_overlays(
         .and_then(|rt| rt.image_home_dir(image_tag));
     let mut keep = Vec::new();
     let mut options = Vec::new();
+    // Match the session scope before granting a private in-container helper.
+    let session_socket = engines.ephemeral_secrets.container_git_socket();
     for (index, (kind, remote)) in kinds.iter().enumerate() {
         let Some(Ok((overlays, env))) = resolved.get_mut(index) else {
             continue;
@@ -149,6 +187,14 @@ pub(crate) fn apply_grant_overlays(
             phase,
             container_home: container_home.as_deref(),
             remote: remote_url.as_ref(),
+            session_git_socket: session_socket
+                .as_ref()
+                .filter(|listener| {
+                    remote_url
+                        .as_ref()
+                        .is_some_and(|r| listener.matches_url(&r.redacted))
+                })
+                .map(|listener| listener.as_ref()),
         };
         let grant = match engines
             .overlay_engine
@@ -164,9 +210,42 @@ pub(crate) fn apply_grant_overlays(
                         kind.label()
                     ),
                 });
+                resolved[index] = Err(CommandError::Other(format!(
+                    "workflow prerequisite grants unavailable: {e}"
+                )));
                 continue;
             }
         };
+        if session_socket.is_some()
+            && session_socket.as_ref().is_some_and(|listener| {
+                !remote_url
+                    .as_ref()
+                    .is_some_and(|r| listener.matches_url(&r.redacted))
+            })
+            && matches!(
+                kind,
+                PrerequisiteStepKind::PushBranch | PrerequisiteStepKind::PullBranch
+            )
+            && grant.push_auth == crate::engine::workflow::step_commands::PushAuth::None
+            && remote_url.as_ref().is_some_and(|r| {
+                let lower = r.redacted.to_ascii_lowercase();
+                lower.starts_with("https://") || lower.starts_with("http://")
+            })
+        {
+            if let Some(slot) = resolved.get_mut(index) {
+                *slot = Err(CommandError::Other(format!(
+                    "{SESSION_GIT_AUTH_SCOPE_MISMATCH}: {} step {index} ({}) targets a repository outside the session credential's scope",
+                    phase.label(),
+                    kind.label()
+                )));
+            }
+            continue;
+        }
+        // The run's fixed identity reaches every setup/teardown container,
+        // including steps that receive no credential.
+        for (name, value) in &grant.identity_env {
+            env.insert(name.clone(), value.clone());
+        }
         if grant.is_empty() {
             continue;
         }

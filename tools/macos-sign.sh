@@ -7,15 +7,20 @@
 # it. The signature is ad-hoc (no Developer ID, no notarization): it proves the
 # bytes are unmodified, not who built them. See docs/11-runtimes.md.
 #
-# Usage: tools/macos-sign.sh PATH_TO_AWMAN
+# Usage: tools/macos-sign.sh [--verify] PATH_TO_AWMAN
 set -euo pipefail
+verify_only=false
+action=signed
+if [ "${1:-}" = --verify ]; then verify_only=true; action=verified; shift; fi
 binary=${1:?usage: macos-sign.sh PATH_TO_AWMAN}
 root=$(cd "$(dirname "$0")/.." && pwd -P)
 entitlements="$root/packaging/macos/awman.entitlements"
 [ "$(uname -s)" = Darwin ] || { echo "macos-sign.sh: macOS is required" >&2; exit 2; }
 [ -f "$binary" ] || { echo "macos-sign.sh: no such file: $binary" >&2; exit 2; }
 
-codesign --force --sign - --identifier awman --entitlements "$entitlements" "$binary"
+if [ "$verify_only" = false ]; then
+    codesign --force --sign - --identifier awman --entitlements "$entitlements" "$binary"
+fi
 codesign --verify --strict --verbose=2 "$binary"
 
 # The embedded entitlements must be exactly the committed file: nothing added.
@@ -31,4 +36,4 @@ if [ "$want" != "$got" ]; then
     exit 1
 fi
 codesign -dvvv "$binary" 2>&1 | grep -E '^(Identifier|Signature|CDHash)='
-echo "signed: $binary (ad-hoc, entitlements: $want)"
+echo "$action: $binary (ad-hoc, entitlements: $want)"

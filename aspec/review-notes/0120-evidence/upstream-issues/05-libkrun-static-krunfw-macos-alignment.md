@@ -1,3 +1,5 @@
+> Reviewed 2026-11-19 against libkrun `35cf9e345365b9500e3ef1c9823c3edcfb35a52b`. Local proposal only; not filed. See the saved PR bundle for current API changes and validation status.
+
 **Title:** `docs(static-krunfw): repr(align(65536)) static example is misaligned on macOS (Mach-O)`
 
 ---
@@ -39,3 +41,8 @@ This is a documentation change only, with no API change:
   `com.apple.security.hypervisor` entitlement.
 
 We have the wording and example ready and are happy to open a PR.
+
+A process-owned accessor may return the same allocation repeatedly. On x86_64,
+independent VMs must use private-memory boot (or equivalent per-VM copies) before
+that buffer can be reused safely. A heap allocation and pointer-equality test
+alone do not prove guest memory isolation; see proposal 06.

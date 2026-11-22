@@ -24,6 +24,16 @@ pub use crate::engine::container::{BuildRequest, BuildTarget};
 /// Fakeable seam for the whole ready flow. Implementations may hold a fake
 /// store and script probe, inspect, build, failure and cancellation outcomes.
 pub trait LocalImageBuilder: Send + Sync {
+    /// Local metadata, without acquiring or building an image. Unknown
+    /// metadata must never be treated as a matching inputs label.
+    fn inspect_metadata(
+        &self,
+        _target: &BuildTarget,
+        _reference: &str,
+        _control: &BuildControl,
+    ) -> Result<Option<crate::engine::container::runtime::ImageMetadata>, EngineError> {
+        Err(EngineError::NotImplemented("source image metadata"))
+    }
     fn probe(&self, target: &BuildTarget, control: &BuildControl) -> Result<(), EngineError>;
     fn inspect(
         &self,
@@ -41,6 +51,7 @@ pub trait LocalImageBuilder: Send + Sync {
 }
 
 pub struct HostLocalImageBuilder {
+    env: crate::data::config::env::EnvSnapshot,
     runner: Arc<dyn HostCommandRunner>,
 }
 
@@ -48,23 +59,49 @@ impl Default for HostLocalImageBuilder {
     fn default() -> Self {
         Self {
             runner: Arc::new(ProcessHostCommandRunner),
+            env: crate::engine::host_cli::process_env(),
         }
     }
 }
 
 impl HostLocalImageBuilder {
-    #[cfg(test)]
-    pub(crate) fn with_runner(runner: Arc<dyn HostCommandRunner>) -> Self {
-        Self { runner }
+    pub fn with_env(env: crate::data::config::env::EnvSnapshot) -> Self {
+        Self {
+            env,
+            runner: Arc::new(ProcessHostCommandRunner),
+        }
     }
 }
 
 impl HostLocalImageBuilder {
-    fn bound_command(target: &BuildTarget) -> Command {
+    fn run_build(
+        &self,
+        request: &BuildRequest,
+        command: Command,
+        control: &BuildControl,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), EngineError> {
+        let output = crate::engine::agent_runtime::OutputTail::new(20);
+        let status = self.run_host(&request.target, command, control, &mut |line| {
+            output.push_bytes(line.as_bytes());
+            output.push_bytes(b"\n");
+            on_line(line);
+        })?;
+        if !status.success() {
+            return Err(EngineError::ImageBuildExitNonzero {
+                tag: request.reference.clone(),
+                exit_code: status.code().unwrap_or(-1),
+                output: output.snapshot_text(),
+            });
+        }
+        Ok(())
+    }
+
+    fn bound_command(&self, target: &BuildTarget) -> Command {
         match target {
-            BuildTarget::Runtime => Command::new(crate::engine::host_cli::program("docker")),
-            BuildTarget::Docker { endpoint } => Self::bound_docker_command(endpoint),
-            BuildTarget::Apple => Command::new(crate::engine::host_cli::program("container")),
+            BuildTarget::Runtime => crate::engine::host_cli::command(&self.env, "docker"),
+            BuildTarget::Docker { endpoint } => self.docker_command(endpoint),
+            BuildTarget::Apple => crate::engine::host_cli::command(&self.env, "container"),
         }
     }
 }
@@ -115,7 +152,8 @@ impl HostLocalImageBuilder {
         control: &BuildControl,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<std::process::ExitStatus, EngineError> {
-        self.runner
+        let status = self
+            .runner
             .run(command, control, on_line)
             .map_err(|e| match e {
                 EngineError::ContainerRuntimeUnavailable { binary } => {
@@ -129,7 +167,13 @@ impl HostLocalImageBuilder {
                     detail,
                 },
                 other => other,
-            })
+            })?;
+        if !status.success() {
+            if let BuildTarget::Docker { endpoint } = target {
+                crate::engine::oci::docker_engine::check_local_connection(endpoint, control)?;
+            }
+        }
+        Ok(status)
     }
 }
 
@@ -181,7 +225,7 @@ impl HostLocalImageBuilder {
         target: &BuildTarget,
         control: &BuildControl,
     ) -> Result<bool, EngineError> {
-        let mut command = Self::bound_command(target);
+        let mut command = self.bound_command(target);
         command.args(["info", "--format", "{{json .DriverStatus}}"]);
         let mut lines = Vec::new();
         let status = self.run_host(
@@ -224,7 +268,7 @@ impl HostLocalImageBuilder {
         platform: &OciPlatform,
         control: &BuildControl,
     ) -> Result<SourceImage, EngineError> {
-        let mut command = Self::bound_command(target);
+        let mut command = self.bound_command(target);
         command.args(["image", "inspect", "--format", "{{json .}}", reference]);
         let mut lines = Vec::new();
         let status = self.run_host(
@@ -267,8 +311,39 @@ impl HostLocalImageBuilder {
 }
 
 impl LocalImageBuilder for HostLocalImageBuilder {
+    fn inspect_metadata(
+        &self,
+        target: &BuildTarget,
+        reference: &str,
+        control: &BuildControl,
+    ) -> Result<Option<crate::engine::container::runtime::ImageMetadata>, EngineError> {
+        let mut command = self.bound_command(target);
+        command.args(["image", "inspect", reference]);
+        let mut lines = Vec::new();
+        let status = self.run_host(
+            target,
+            command,
+            &control.bounded(INSPECT_TIMEOUT),
+            &mut |line| lines.push(line.to_owned()),
+        )?;
+        if !status.success() {
+            let error = lines.join("\n").to_ascii_lowercase();
+            if error.contains("no such image") || error.contains("not found") {
+                return Ok(None);
+            }
+            return Err(EngineError::Container(
+                "source image metadata inspection failed".into(),
+            ));
+        }
+        crate::engine::container::host_build::parse_image_inspection(
+            lines.join("\n").as_bytes(),
+            reference,
+            *target == BuildTarget::Apple,
+        )
+        .map(Some)
+    }
     fn probe(&self, target: &BuildTarget, control: &BuildControl) -> Result<(), EngineError> {
-        let mut command = Self::bound_command(target);
+        let mut command = self.bound_command(target);
         let what = match target {
             BuildTarget::Runtime => {
                 return Err(EngineError::Config(
@@ -347,6 +422,19 @@ impl LocalImageBuilder for HostLocalImageBuilder {
         control: &BuildControl,
         on_line: &mut dyn FnMut(&str),
     ) -> Result<BuiltImageIdentity, EngineError> {
+        let request = super::freshness::label_build(request, &self.env, |reference| {
+            if let Some(image) = self.inspect_metadata(&request.target, reference, control)? {
+                return Ok(Some(image.id));
+            }
+            match self.inspect(&request.target, reference, &request.platform, control)? {
+                SourceImage::Present(id) => Ok(id
+                    .config_digest()
+                    .or(id.manifest_digest())
+                    .map(ToString::to_string)),
+                _ => Ok(None),
+            }
+        })?;
+        let request = &request;
         self.probe(&request.target, control)?;
         match &request.target {
             BuildTarget::Runtime => Err(EngineError::Config(
@@ -394,11 +482,12 @@ impl LocalImageBuilder for HostLocalImageBuilder {
                 }
             }
             BuildTarget::Apple => {
-                let mut command = Self::bound_command(&request.target);
+                let mut command = self.bound_command(&request.target);
                 let platform = request.platform.to_string();
                 let argv = crate::engine::container::host_build::BuildArgv {
                     platform: Some(&platform),
                     build_args: &request.build_args,
+                    labels: &request.labels,
                     ..crate::engine::container::host_build::BuildArgv::new(
                         &request.reference,
                         &request.dockerfile,
@@ -408,7 +497,7 @@ impl LocalImageBuilder for HostLocalImageBuilder {
                 };
                 command.args(argv.to_args());
                 let mut produced_manifest = None;
-                let status = self.run_host(&request.target, command, control, &mut |line| {
+                self.run_build(request, command, control, &mut |line| {
                     if let Some(marker) = line.find("exporting manifest sha256:") {
                         let digest = line[marker + "exporting manifest ".len()..]
                             .split_whitespace()
@@ -418,12 +507,6 @@ impl LocalImageBuilder for HostLocalImageBuilder {
                     }
                     on_line(line);
                 })?;
-                if !status.success() {
-                    return Err(EngineError::ImageBuildExitNonzero {
-                        tag: request.reference.clone(),
-                        exit_code: status.code().unwrap_or(-1),
-                    });
-                }
                 let produced_manifest = produced_manifest.ok_or_else(|| {
                     EngineError::ImageBuilder(BuilderFailure::AppleManifestUnreported)
                 })?;
@@ -460,8 +543,8 @@ impl LocalImageBuilder for HostLocalImageBuilder {
 }
 
 impl HostLocalImageBuilder {
-    pub(crate) fn bound_docker_command(endpoint: &str) -> Command {
-        let mut command = Command::new(crate::engine::host_cli::program("docker"));
+    fn docker_command(&self, endpoint: &str) -> Command {
+        let mut command = crate::engine::host_cli::command(&self.env, "docker");
         command.args(["--host", endpoint]);
         for key in DOCKER_AMBIENT_ENV {
             command.env_remove(key);
@@ -495,6 +578,7 @@ impl HostLocalImageBuilder {
             platform: Some(&platform),
             iidfile: Some(iid.path()),
             build_args: &request.build_args,
+            labels: &request.labels,
             ..BuildArgv::new(
                 &request.reference,
                 &request.dockerfile,
@@ -502,15 +586,9 @@ impl HostLocalImageBuilder {
                 request.no_cache,
             )
         };
-        let mut command = Self::bound_docker_command(endpoint);
+        let mut command = self.docker_command(endpoint);
         command.args(argv.to_args());
-        let status = self.run_host(&request.target, command, control, on_line)?;
-        if !status.success() {
-            return Err(EngineError::ImageBuildExitNonzero {
-                tag: request.reference.clone(),
-                exit_code: status.code().unwrap_or(-1),
-            });
-        }
+        self.run_build(request, command, control, on_line)?;
         let raw = std::fs::read_to_string(iid.path()).map_err(|e| {
             EngineError::ImageBuilder(BuilderFailure::ImageIdFileRead {
                 detail: e.to_string(),
@@ -531,7 +609,7 @@ impl HostLocalImageBuilder {
         control: &BuildControl,
     ) -> Result<DockerBuildPath, EngineError> {
         let probe = control.bounded(PROBE_TIMEOUT);
-        let mut version = Self::bound_docker_command(endpoint);
+        let mut version = self.docker_command(endpoint);
         version.args(["buildx", "version"]);
         let target = BuildTarget::Docker {
             endpoint: endpoint.to_string(),
@@ -542,7 +620,7 @@ impl HostLocalImageBuilder {
         {
             return Ok(DockerBuildPath::Legacy);
         }
-        let mut inspect = Self::bound_docker_command(endpoint);
+        let mut inspect = self.docker_command(endpoint);
         inspect.args(["buildx", "inspect", "default"]);
         let mut lines = Vec::new();
         let status = self.run_host(&target, inspect, &probe, &mut |line| {
@@ -592,318 +670,587 @@ const DOCKER_AMBIENT_ENV: &[&str] = &[
     "BUILDX_BUILDER",
 ];
 
-#[cfg(test)]
-mod tests {
+#[cfg(all(test, unix))]
+mod contracts {
     use super::*;
-    use std::sync::Mutex;
+    use std::os::unix::process::ExitStatusExt;
 
-    /// A process exit status with `code`, on any host.
-    fn exit_status(code: i32) -> std::process::ExitStatus {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            std::process::ExitStatus::from_raw(code << 8)
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::ExitStatusExt;
-            std::process::ExitStatus::from_raw(code as u32)
-        }
-    }
-
-    #[derive(Default)]
-    struct RecordingRunner {
-        argv: Mutex<Vec<Vec<String>>>,
-    }
-
-    impl HostCommandRunner for RecordingRunner {
+    struct Inspection(serde_json::Value);
+    impl HostCommandRunner for Inspection {
         fn run(
             &self,
             command: Command,
-            _control: &BuildControl,
+            _: &BuildControl,
             on_line: &mut dyn FnMut(&str),
         ) -> Result<std::process::ExitStatus, EngineError> {
-            let args: Vec<String> = command
-                .get_args()
-                .map(|arg| arg.to_string_lossy().to_string())
-                .collect();
-            if args.iter().any(|arg| arg == "inspect") {
-                on_line(&format!(
-                    r#"{{"Id":"sha256:{}","Os":"linux","Architecture":"{}"}}"#,
-                    "a".repeat(64),
-                    OciPlatform::host_linux().architecture
-                ));
-            } else if args.iter().any(|arg| arg == "--format") {
-                on_line(r#"[["driver-type","io.containerd.snapshotter.v1"]]"#);
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                ["image", "inspect", "project:latest"]
+            );
+            for line in serde_json::to_string_pretty(&self.0).unwrap().lines() {
+                on_line(line);
             }
-            self.argv.lock().unwrap().push(args);
-            Ok(exit_status(0))
+            Ok(std::process::ExitStatus::from_raw(0))
         }
     }
 
     #[test]
-    fn host_builder_binds_inspection_and_classifies_old_containerd_ids() {
-        let runner = Arc::new(RecordingRunner::default());
-        let builder = HostLocalImageBuilder::with_runner(runner.clone());
-        let target = BuildTarget::Docker {
-            endpoint: "unix:///run/explicit.sock".into(),
-        };
-        let image = builder
-            .inspect(
-                &target,
-                "agent:latest",
-                &OciPlatform::host_linux(),
-                &BuildControl::source_build(crate::engine::oci::CancelToken::new()),
-            )
-            .unwrap();
-        assert!(
-            matches!(image, SourceImage::Present(id) if id.manifest_digest().is_some() && id.config_digest().is_none())
-        );
-        let calls = runner.argv.lock().unwrap();
-        assert_eq!(calls.len(), 3);
-        assert!(calls
-            .iter()
-            .all(|args| args[0..2] == ["--host", "unix:///run/explicit.sock"]));
-    }
-
-    /// An ambient Docker context, TLS setting or buildx builder cannot
-    /// redirect a bound build: each is removed from the command's env and
-    /// `DOCKER_HOST` is pinned to the endpoint, alongside `--host`.
-    #[test]
-    fn bound_docker_command_strips_ambient_redirects_and_pins_the_endpoint() {
-        let command = HostLocalImageBuilder::bound_docker_command("unix:///run/explicit.sock");
-        let envs: std::collections::HashMap<_, _> = command
-            .get_envs()
-            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_owned())))
-            .collect();
-        for key in DOCKER_AMBIENT_ENV {
-            assert_eq!(envs.get(*key), Some(&None), "{key} must be removed");
+    fn apple_metadata_accepts_legacy_index_and_current_manifest_without_confusing_receipts() {
+        use crate::data::image_inputs::{InputsHash, INPUTS_LABEL};
+        use crate::engine::image_prep::ImageFreshness;
+        let index = format!("sha256:{}", "1".repeat(64));
+        let manifest = format!("sha256:{}", "2".repeat(64));
+        let variant = serde_json::json!({
+            "platform": {"os": "linux", "architecture": OciPlatform::host_linux().architecture},
+            "size": 123,
+            "config": {"config": {"Labels": {INPUTS_LABEL: "inputs"}}}
+        });
+        // Apple 0.12: ClientImage.details() -> ImageDetail; no variant digest.
+        let legacy = serde_json::json!([{
+            "name": "project:latest", "index": {"digest": index},
+            "variants": [variant.clone()]
+        }]);
+        let mut current_variant = variant;
+        current_variant["digest"] = manifest.clone().into();
+        // Apple 1.4/1.5: ImageResource with the selected manifest's digest.
+        let current = serde_json::json!([{
+            "configuration": {"name": "project:latest", "descriptor": {"digest": index}},
+            "variants": [
+                {"platform": {"os": "unknown", "architecture": "unknown"}},
+                current_variant
+            ]
+        }]);
+        let control = BuildControl::source_build(crate::engine::oci::CancelToken::new());
+        for (json, expected_id, expected_manifest) in [
+            (legacy.clone(), index.as_str(), None),
+            (
+                current,
+                manifest.as_str(),
+                Some(Digest::parse(&manifest).unwrap()),
+            ),
+        ] {
+            let builder = HostLocalImageBuilder {
+                env: crate::data::config::env::EnvSnapshot::from_full_env(Default::default()),
+                runner: Arc::new(Inspection(json)),
+            };
+            let image = builder
+                .inspect_metadata(&BuildTarget::Apple, "project:latest", &control)
+                .unwrap()
+                .unwrap();
+            assert_eq!(image.id, expected_id);
+            assert_eq!(image.manifest_digest, expected_manifest);
+            assert_eq!(image.tags, ["project:latest"]);
+            assert_eq!(image.size_bytes, 123);
+            assert!(matches!(
+                ImageFreshness::from_image(Some(image), &InputsHash::from_label("inputs")),
+                ImageFreshness::Fresh(_)
+            ));
         }
-        assert_eq!(
-            envs.get("DOCKER_HOST"),
-            Some(&Some(std::ffi::OsString::from("unix:///run/explicit.sock")))
-        );
-        let args: Vec<_> = command.get_args().collect();
-        assert_eq!(args, ["--host", "unix:///run/explicit.sock"]);
-    }
-
-    fn host_platform() -> OciPlatform {
-        OciPlatform::host_linux()
-    }
-
-    fn other_platform(platform: &OciPlatform) -> OciPlatform {
-        OciPlatform {
-            os: platform.os.clone(),
-            architecture: if platform.architecture == "amd64" {
-                "arm64".to_string()
+        for (pointer, value, reason) in [
+            (
+                "/0/index/digest",
+                serde_json::Value::Null,
+                "missing image identity",
+            ),
+            (
+                "/0/variants/0/platform/os",
+                "windows".into(),
+                "no variant for the host Linux platform",
+            ),
+            (
+                "/0/variants/0/digest",
+                "broken".into(),
+                "invalid variant manifest digest",
+            ),
+            (
+                "/0/variants/0/config/config/Labels",
+                serde_json::json!({"key": 1}),
+                "labels must be a string map",
+            ),
+        ] {
+            let mut json = legacy.clone();
+            if pointer.ends_with("/0/digest") {
+                json[0]["variants"][0]["digest"] = value;
             } else {
-                "amd64".to_string()
-            },
-            variant: None,
+                *json.pointer_mut(pointer).unwrap() = value;
+            }
+            let builder = HostLocalImageBuilder {
+                env: crate::data::config::env::EnvSnapshot::from_full_env(Default::default()),
+                runner: Arc::new(Inspection(json)),
+            };
+            let error = builder
+                .inspect_metadata(&BuildTarget::Apple, "project:latest", &control)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("project:latest (Apple Containers)"),
+                "{error}"
+            );
+            assert!(error.contains(reason), "{error}");
         }
     }
 
-    fn digest(c: char) -> String {
-        format!("sha256:{}", c.to_string().repeat(64))
-    }
-
-    /// A Docker that reports one image ID for the build and holds a different
-    /// image under that ID's inspection (another process retagged or rebuilt
-    /// in between). Every other call succeeds; buildx is absent.
-    struct RetaggingRunner;
-
-    impl HostCommandRunner for RetaggingRunner {
+    struct Failing;
+    impl HostCommandRunner for Failing {
         fn run(
             &self,
-            command: Command,
-            _control: &BuildControl,
+            _: Command,
+            _: &BuildControl,
             on_line: &mut dyn FnMut(&str),
         ) -> Result<std::process::ExitStatus, EngineError> {
-            let args: Vec<String> = command
-                .get_args()
-                .map(|arg| arg.to_string_lossy().to_string())
-                .collect();
-            if args.iter().any(|a| a == "buildx") {
-                return Ok(exit_status(1));
+            for i in 0..40 {
+                on_line(&format!("build progress {i}"));
             }
-            if args.iter().any(|a| a == "build") {
-                let at = args.iter().position(|a| a == "--iidfile").unwrap();
-                std::fs::write(&args[at + 1], digest('b')).unwrap();
-            } else if args.iter().any(|a| a == "inspect") {
-                on_line(&format!(
-                    r#"{{"Id":"{}","Os":"linux","Architecture":"{}"}}"#,
-                    digest('c'),
-                    OciPlatform::host_linux().architecture
-                ));
-            } else if args.iter().any(|a| a == "--format") {
-                on_line(r#"[["driver-type","io.containerd.snapshotter.v1"]]"#);
-            }
-            Ok(exit_status(0))
+            on_line("stderr: invalid build option");
+            Ok(std::process::ExitStatus::from_raw(64 << 8))
         }
     }
-
-    /// The build's own image ID is what gets classified, and an image under
-    /// it that is not that ID is refused (`BuiltImageChanged`) rather than
-    /// imported as the new build.
     #[test]
-    fn a_retag_between_build_and_inspection_is_refused() {
-        let builder = HostLocalImageBuilder::with_runner(Arc::new(RetaggingRunner));
-        let tmp = tempfile::tempdir().unwrap();
+    fn stopped_source_matched_docker_builder_keeps_socket_diagnosis() {
+        use awman_test_support::{TestCase, TestSandbox};
+        let s = TestSandbox::for_test(TestCase::component("engine::image_prep::builder::contracts::stopped_source_matched_docker_builder_keeps_socket_diagnosis"));
+        let endpoint = format!("unix://{}", s.ports().unix_socket("missing.sock").display());
+        let target = BuildTarget::Docker {
+            endpoint: endpoint.clone(),
+        };
+        let builder = HostLocalImageBuilder {
+            env: crate::data::config::env::EnvSnapshot::empty(),
+            runner: Arc::new(Failing),
+        };
+        let control = BuildControl::source_build(crate::engine::oci::CancelToken::new());
         let request = BuildRequest {
-            target: BuildTarget::Docker {
-                endpoint: "unix:///run/explicit.sock".into(),
-            },
+            labels: Default::default(),
+            target: target.clone(),
             reference: "agent:latest".into(),
-            dockerfile: tmp.path().join("Dockerfile"),
-            context: tmp.path().to_path_buf(),
+            dockerfile: s.work().join("Dockerfile"),
+            context: s.work(),
             platform: OciPlatform::host_linux(),
-            build_args: Vec::new(),
+            build_args: vec![],
             no_cache: false,
         };
-        let result = builder.build(
-            &request,
-            &BuildControl::source_build(crate::engine::oci::CancelToken::new()),
-            &mut |_| {},
-        );
-        match result {
-            Err(EngineError::ImageBuilder(BuilderFailure::BuiltImageChanged {
-                image_id,
-                reference,
-                ..
-            })) => {
-                assert_eq!(image_id, digest('b'));
-                assert_eq!(reference, "agent:latest");
-            }
-            other => panic!("expected BuiltImageChanged, got {other:?}"),
+        for error in [
+            builder.probe(&target, &control).unwrap_err(),
+            builder
+                .inspect_metadata(&target, "agent:latest", &control)
+                .unwrap_err(),
+            builder
+                .run_build(
+                    &request,
+                    builder.bound_command(&target),
+                    &control,
+                    &mut |_| {},
+                )
+                .unwrap_err(),
+        ] {
+            assert!(
+                matches!(
+                    crate::engine::oci::docker_engine::local_unavailability(&error),
+                    Some(crate::engine::oci::docker_engine::LocalDockerUnavailable::Stopped { .. })
+                ),
+                "{error}"
+            );
+            assert!(!crate::engine::oci::retry::is_retryable(&error));
+            assert!(error.to_string().contains(&endpoint));
+            assert!(error
+                .to_string()
+                .contains("Start Docker, then run `awman ready` again."));
         }
+        s.finish();
     }
 
-    // ── classify_docker_inspect ──────────────────────────────────────────
-
-    /// The classic image store reports no `Descriptor`: the ID is the image's
-    /// config digest, the only digest kind that store can give.
-    #[test]
-    fn classify_docker_inspect_classic_store_is_a_config_digest() {
-        let platform = host_platform();
-        let json = format!(
-            r#"{{"Id":"{}","Os":"{}","Architecture":"{}"}}"#,
-            digest('a'),
-            platform.os,
-            platform.architecture
+    #[tokio::test]
+    async fn stopped_docker_builder_reuses_installed_image_with_warning_but_required_build_fails() {
+        use crate::data::{config::image_source::ImageSourceSpec, step_status::StepStatus};
+        use crate::engine::image_prep::{
+            contracts::{identity, preparer, Sink, Store},
+            AgentImageRequest, BuildPolicy,
+        };
+        use awman_test_support::{TestCase, TestSandbox};
+        let s = TestSandbox::for_test(TestCase::component("engine::image_prep::builder::contracts::stopped_docker_builder_reuses_installed_image_with_warning_but_required_build_fails"));
+        let endpoint = format!("unix://{}", s.ports().unix_socket("missing.sock").display());
+        let source = ImageSourceSpec::DockerStore {
+            host: Some(endpoint.clone()),
+            tls: None,
+            reference: None,
+        };
+        let store = Arc::new(Store::default());
+        let tag = crate::data::image_tags::agent_image_tag(&s.work(), "claude");
+        let mut installed = identity(&tag);
+        installed.source = crate::data::config::image_source::ImageSourceKind::DockerStore;
+        store
+            .installed
+            .lock()
+            .unwrap()
+            .insert(tag.clone(), installed);
+        store
+            .installed_sources
+            .lock()
+            .unwrap()
+            .insert(tag.clone(), source.clone());
+        let mut prep = preparer(&s, store.clone(), true, Some(source));
+        prep.local_builder = Some(Arc::new(HostLocalImageBuilder {
+            env: crate::data::config::env::EnvSnapshot::empty(),
+            runner: Arc::new(Failing),
+        }));
+        let result = prep
+            .prepare(
+                &AgentImageRequest {
+                    tag: &tag,
+                    agent: "claude",
+                    policy: BuildPolicy::SessionSetup,
+                },
+                &mut Sink::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(result.build, StepStatus::Warn(ref text) if text.contains("Docker is not running")),
+            "{result:?}"
         );
-        match HostLocalImageBuilder::classify_docker_inspect(&json, &platform).unwrap() {
-            SourceImage::Present(identity) => {
-                assert_eq!(identity.config_digest().unwrap().as_str(), digest('a'));
-                assert!(identity.manifest_digest().is_none());
-            }
-            other => panic!("expected Present, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_pre_28_containerd_store_id_as_manifest_digest() {
-        let platform = host_platform();
-        let json = format!(
-            r#"{{"Id":"{}","Os":"{}","Architecture":"{}"}}"#,
-            digest('a'),
-            platform.os,
-            platform.architecture
-        );
-        match classify_docker_inspect_for_store(&json, &platform, true).unwrap() {
-            SourceImage::Present(identity) => {
-                assert_eq!(identity.manifest_digest().unwrap().as_str(), digest('a'));
-                assert!(identity.config_digest().is_none());
-            }
-            other => panic!("expected Present, got {other:?}"),
-        }
-    }
-
-    /// The containerd store reports a manifest `Descriptor`: the stored
-    /// digest is the manifest digest, never compared as a config digest.
-    #[test]
-    fn classify_docker_inspect_containerd_store_manifest_is_a_manifest_digest() {
-        let platform = host_platform();
-        let json = format!(
-            r#"{{"Id":"{}","Os":"{}","Architecture":"{}",
-                 "Descriptor":{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{}"}}}}"#,
-            digest('a'),
-            platform.os,
-            platform.architecture,
-            digest('b'),
-        );
-        match HostLocalImageBuilder::classify_docker_inspect(&json, &platform).unwrap() {
-            SourceImage::Present(identity) => {
-                assert_eq!(identity.manifest_digest().unwrap().as_str(), digest('b'));
-                assert!(identity.config_digest().is_none());
-            }
-            other => panic!("expected Present, got {other:?}"),
-        }
-    }
-
-    /// The older Docker distribution manifest media type is accepted the
-    /// same way as the OCI one.
-    #[test]
-    fn classify_docker_inspect_accepts_the_docker_distribution_manifest_media_type() {
-        let platform = host_platform();
-        let json = format!(
-            r#"{{"Id":"{}","Os":"{}","Architecture":"{}",
-                 "Descriptor":{{"mediaType":"application/vnd.docker.distribution.manifest.v2+json","digest":"{}"}}}}"#,
-            digest('a'),
-            platform.os,
-            platform.architecture,
-            digest('c'),
-        );
-        match HostLocalImageBuilder::classify_docker_inspect(&json, &platform).unwrap() {
-            SourceImage::Present(identity) => {
-                assert_eq!(identity.manifest_digest().unwrap().as_str(), digest('c'));
-            }
-            other => panic!("expected Present, got {other:?}"),
-        }
-    }
-
-    /// A multi-platform index descriptor cannot be bound to one identity
-    /// without exporting it.
-    #[test]
-    fn classify_docker_inspect_an_index_descriptor_is_unbound() {
-        let platform = host_platform();
-        let json = format!(
-            r#"{{"Id":"{}","Os":"{}","Architecture":"{}",
-                 "Descriptor":{{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"{}"}}}}"#,
-            digest('a'),
-            platform.os,
-            platform.architecture,
-            digest('d'),
-        );
+        assert_eq!(result.import, StepStatus::Done);
+        let StepStatus::Warn(text) = &result.build else {
+            panic!("{result:?}")
+        };
         assert_eq!(
-            HostLocalImageBuilder::classify_docker_inspect(&json, &platform).unwrap(),
-            SourceImage::Unbound
+            text,
+            &format!(
+                "Docker is not running at {endpoint}. Start Docker, then run `awman ready` again."
+            )
         );
+        assert!(store.imports.lock().unwrap().is_empty());
+        // Explicit ready must fail even with an installed matching image.
+        let result = prep
+            .prepare(
+                &AgentImageRequest {
+                    tag: &tag,
+                    agent: "claude",
+                    policy: BuildPolicy::Ready {
+                        build: false,
+                        no_cache: false,
+                        refresh: false,
+                    },
+                },
+                &mut Sink::default(),
+            )
+            .await
+            .unwrap();
+        assert!(result.has_failure(), "{result:?}");
+        assert_eq!(result.build, StepStatus::Failed(text.clone()));
+        assert_eq!(result.import, StepStatus::Skipped);
+        assert!(store.imports.lock().unwrap().is_empty());
+        assert!(store.built.lock().unwrap().is_empty());
+        store.installed.lock().unwrap().clear();
+        let result = prep
+            .prepare(
+                &AgentImageRequest {
+                    tag: &tag,
+                    agent: "claude",
+                    policy: BuildPolicy::SessionSetup,
+                },
+                &mut Sink::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(result.build, StepStatus::Failed(ref text) if text.contains("Docker is not running")),
+            "{result:?}"
+        );
+        assert_eq!(result.import, StepStatus::Skipped);
+        assert!(store.imports.lock().unwrap().is_empty());
+        assert!(store.built.lock().unwrap().is_empty());
+        s.finish();
     }
 
-    /// An image for a different platform is absent for this platform — it
-    /// must be rebuilt, not imported.
-    #[test]
-    fn classify_docker_inspect_wrong_platform_is_absent() {
-        let platform = host_platform();
-        let wrong = other_platform(&platform);
-        let json = format!(
-            r#"{{"Id":"{}","Os":"{}","Architecture":"{}"}}"#,
-            digest('a'),
-            wrong.os,
-            wrong.architecture,
-        );
-        assert_eq!(
-            HostLocalImageBuilder::classify_docker_inspect(&json, &platform).unwrap(),
-            SourceImage::Absent
-        );
+    /// The import seam invokes production acquisition against only the selected
+    /// private socket. A successful acquire would be a test fixture failure.
+    struct StoppedImporter {
+        acquirer: crate::engine::oci::CachingAcquirer,
+        endpoint: String,
+        calls: std::sync::atomic::AtomicUsize,
     }
 
-    /// Unreadable JSON from `docker image inspect` is an error, not a
-    /// silent `Absent` (which would trigger an unnecessary rebuild) or a
-    /// silent `Present` (which would claim unverified content).
+    #[tokio::test]
+    async fn default_socket_diagnosis_survives_a_source_matched_builder() {
+        use crate::data::{config::image_source::ImageSourceSpec, step_status::StepStatus};
+        use crate::engine::image_prep::{
+            contracts::{preparer, Sink, Store},
+            AgentImageRequest, BuildPolicy,
+        };
+        use crate::engine::oci::docker_engine::Endpoint;
+        use awman_test_support::{TestCase, TestSandbox};
+        let s = TestSandbox::for_test(TestCase::component("engine::image_prep::builder::contracts::default_socket_diagnosis_survives_a_source_matched_builder"));
+        let path = s.ports().unix_socket("default.sock");
+        let endpoint = format!("unix://{}", path.display());
+        let store = Arc::new(Store::default());
+        let source = ImageSourceSpec::DockerStore {
+            host: Some(endpoint.clone()),
+            tls: None,
+            reference: None,
+        };
+        let mut prep = preparer(&s, store.clone(), true, Some(source));
+        let tag = crate::data::image_tags::agent_image_tag(&s.work(), "claude");
+        // Inject only the platform default's path, keeping every actual socket
+        // connect in this sandbox. The frozen builder host stays explicit.
+        let mut plan = prep.plan(&tag, "claude");
+        plan.source.as_mut().unwrap().docker_endpoint = Some(Endpoint::DefaultUnix(path));
+        prep.plans.insert((tag.clone(), "claude".into()), plan);
+        prep.local_builder = Some(Arc::new(HostLocalImageBuilder {
+            env: crate::data::config::env::EnvSnapshot::empty(),
+            runner: Arc::new(Failing),
+        }));
+        let result = prep
+            .prepare(
+                &AgentImageRequest {
+                    tag: &tag,
+                    agent: "claude",
+                    policy: BuildPolicy::Ready {
+                        build: false,
+                        no_cache: false,
+                        refresh: false,
+                    },
+                },
+                &mut Sink::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.build, StepStatus::Failed(format!("No Docker daemon at the default socket {endpoint}. Start Docker, or set the source's `host` (or DOCKER_HOST) if Docker uses another socket/context, then run `awman ready` again.")));
+        assert_eq!(result.import, StepStatus::Skipped);
+        assert!(store.imports.lock().unwrap().is_empty());
+        assert!(store.built.lock().unwrap().is_empty());
+        // Build completion reports the same normalized, origin-aware reason
+        // when a daemon fails during a build rather than the freshness probe.
+        #[derive(Default)]
+        struct Completion(Option<String>);
+        impl crate::data::message::UserMessageSink for Completion {
+            fn write_message(&mut self, _: crate::data::message::UserMessage) {}
+            fn replay_queued(&mut self) {}
+        }
+        impl crate::engine::image_prep::ImagePreparationSink for Completion {
+            fn report_step(&mut self, _: &crate::data::setup_step::SetupStep, _: StepStatus) {}
+            fn build_finished(&mut self, _: &str, error: Option<&str>) {
+                self.0 = error.map(str::to_string);
+            }
+        }
+        let resolved = prep.plan(&tag, "claude").source.unwrap();
+        let request = BuildRequest {
+            labels: Default::default(),
+            target: BuildTarget::Docker { endpoint },
+            reference: tag,
+            dockerfile: s.work().join("Dockerfile.dev"),
+            context: s.work(),
+            platform: OciPlatform::host_linux(),
+            build_args: vec![],
+            no_cache: false,
+        };
+        let mut completion = Completion::default();
+        prep.build_source(request, resolved.docker_endpoint.as_ref(), &mut completion)
+            .await
+            .unwrap_err();
+        let StepStatus::Failed(reason) = result.build else {
+            unreachable!()
+        };
+        assert_eq!(completion.0, Some(reason));
+        s.finish();
+    }
+    impl crate::engine::image_prep::ImageImporter for StoppedImporter {
+        fn import(
+            &self,
+            request: &crate::engine::agent_runtime::ImageImportRequest,
+            _: &crate::engine::oci::CancelToken,
+            _: &mut dyn crate::data::message::UserMessageSink,
+        ) -> Result<crate::engine::agent_runtime::ImportedImage, EngineError> {
+            use crate::data::config::image_source::ImageSourceSpec;
+            use crate::engine::oci::{AcquirePolicy, AcquireRequest, ImageAcquirer};
+            assert!(
+                matches!(&request.source, ImageSourceSpec::DockerStore { host: Some(host), .. } if host == &self.endpoint)
+            );
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.acquirer.acquire(
+                &AcquireRequest {
+                    tag: request.tag.clone(),
+                    source: request.source.clone(),
+                    platform: request.platform.clone(),
+                    policy: AcquirePolicy::IfMissing,
+                    registries: request.registries.clone(),
+                },
+                &mut |_| {},
+            )?;
+            panic!("stopped socket must fail acquisition")
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_docker_import_fails_once_without_building_or_falling_back() {
+        use crate::data::{config::image_source::ImageSourceSpec, step_status::StepStatus};
+        use crate::engine::image_prep::{
+            contracts::{preparer, Sink, Store},
+            AgentImageRequest, BuildPolicy,
+        };
+        use crate::engine::oci::{AcquireLimits, CachingAcquirer, DiskSpace};
+        use awman_test_support::{TestCase, TestSandbox};
+        struct Space;
+        impl DiskSpace for Space {
+            fn available(&self, _: &std::path::Path) -> Option<u64> {
+                Some(u64::MAX)
+            }
+        }
+        let s = TestSandbox::for_test(TestCase::component("engine::image_prep::builder::contracts::stopped_docker_import_fails_once_without_building_or_falling_back"));
+        let endpoint = format!("unix://{}", s.ports().unix_socket("missing.sock").display());
+        let source = ImageSourceSpec::DockerStore {
+            host: Some(endpoint.clone()),
+            tls: None,
+            reference: None,
+        };
+        let importer = Arc::new(StoppedImporter {
+            acquirer: CachingAcquirer::new(
+                &s.work().join("cache"),
+                AcquireLimits {
+                    min_free_bytes: 0,
+                    ..Default::default()
+                },
+                crate::data::config::env::EnvSnapshot::empty(),
+                Arc::new(Space),
+            ),
+            endpoint: endpoint.clone(),
+            calls: Default::default(),
+        });
+        for (enabled, policy, default_socket) in [
+            (true, BuildPolicy::ImportOnly, false),
+            (true, BuildPolicy::ImportOnly, true),
+            (
+                false,
+                BuildPolicy::Ready {
+                    build: false,
+                    no_cache: false,
+                    refresh: false,
+                },
+                false,
+            ),
+            (
+                false,
+                BuildPolicy::Ready {
+                    build: false,
+                    no_cache: false,
+                    refresh: false,
+                },
+                true,
+            ),
+        ] {
+            let store = Arc::new(Store::default());
+            let mut prep = preparer(&s, store.clone(), enabled, Some(source.clone()));
+            // Any builder probe fails the test, even before a build is attempted.
+            prep.local_builder = Some(Arc::new(NoBuilder));
+            prep.image_importer = importer.clone();
+            let tag = crate::data::image_tags::agent_image_tag(&s.work(), "claude");
+            if default_socket {
+                let mut plan = prep.plan(&tag, "claude");
+                plan.source.as_mut().unwrap().docker_endpoint =
+                    Some(crate::engine::oci::docker_engine::Endpoint::DefaultUnix(
+                        endpoint.strip_prefix("unix://").unwrap().into(),
+                    ));
+                prep.plans.insert((tag.clone(), "claude".into()), plan);
+            }
+            let result = prep
+                .prepare(
+                    &AgentImageRequest {
+                        tag: &tag,
+                        agent: "claude",
+                        policy,
+                    },
+                    &mut Sink::default(),
+                )
+                .await
+                .unwrap();
+            assert!(result.has_failure());
+            assert_eq!(result.build, StepStatus::Skipped);
+            let expected = if default_socket {
+                format!("No Docker daemon at the default socket {endpoint}. Start Docker, or set the source's `host` (or DOCKER_HOST) if Docker uses another socket/context, then run `awman ready` again.")
+            } else {
+                format!("Docker is not running at {endpoint}. Start Docker, then run `awman ready` again.")
+            };
+            assert_eq!(result.import, StepStatus::Failed(expected));
+            assert!(store.imports.lock().unwrap().is_empty());
+            assert!(store.built.lock().unwrap().is_empty());
+        }
+        assert_eq!(importer.calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+        s.finish();
+    }
+
+    struct NoBuilder;
+    impl LocalImageBuilder for NoBuilder {
+        fn probe(&self, _: &BuildTarget, _: &BuildControl) -> Result<(), EngineError> {
+            panic!("unexpected builder probe")
+        }
+        fn inspect_metadata(
+            &self,
+            _: &BuildTarget,
+            _: &str,
+            _: &BuildControl,
+        ) -> Result<Option<crate::engine::container::runtime::ImageMetadata>, EngineError> {
+            panic!("unexpected builder metadata")
+        }
+        fn inspect(
+            &self,
+            _: &BuildTarget,
+            _: &str,
+            _: &OciPlatform,
+            _: &BuildControl,
+        ) -> Result<SourceImage, EngineError> {
+            panic!("unexpected builder inspect")
+        }
+        fn build(
+            &self,
+            _: &BuildRequest,
+            _: &BuildControl,
+            _: &mut dyn FnMut(&str),
+        ) -> Result<BuiltImageIdentity, EngineError> {
+            panic!("unexpected builder build")
+        }
+    }
     #[test]
-    fn classify_docker_inspect_malformed_json_is_an_error() {
-        let platform = host_platform();
-        assert!(HostLocalImageBuilder::classify_docker_inspect("not json", &platform).is_err());
+    fn apple_and_docker_build_failures_retain_bounded_output_without_hiding_streamed_lines() {
+        let builder = HostLocalImageBuilder {
+            env: crate::data::config::env::EnvSnapshot::from_full_env(Default::default()),
+            runner: Arc::new(Failing),
+        };
+        for target in [
+            BuildTarget::Apple,
+            BuildTarget::Docker {
+                // A remote endpoint keeps the CLI's failure; no local
+                // socket diagnosis (or connection) applies to this test.
+                endpoint: "tcp://127.0.0.1:2375".into(),
+            },
+        ] {
+            let request = BuildRequest {
+                labels: Default::default(),
+                target,
+                reference: "test:latest".into(),
+                dockerfile: "Dockerfile".into(),
+                context: ".".into(),
+                platform: OciPlatform::host_linux(),
+                build_args: vec![],
+                no_cache: false,
+            };
+            let mut lines = vec![];
+            let error = builder
+                .run_build(
+                    &request,
+                    builder.bound_command(&request.target),
+                    &BuildControl::source_build(crate::engine::oci::CancelToken::new()),
+                    &mut |line| lines.push(line.to_string()),
+                )
+                .unwrap_err();
+            assert_eq!(lines.len(), 41);
+            let EngineError::ImageBuildExitNonzero {
+                output, exit_code, ..
+            } = &error
+            else {
+                panic!("wrong error")
+            };
+            assert_eq!(*exit_code, 64);
+            assert_eq!(output.lines().count(), 20);
+            assert!(error.to_string().contains("stderr: invalid build option"));
+            assert!(!output.contains("build progress 0\n"));
+        }
     }
 }
