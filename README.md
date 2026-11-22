@@ -1,24 +1,28 @@
 <p align="center">
-  <img src="docs/awman_logo.svg" width="440" alt="awman logo">
+  <img src="docs/awman_logo.svg" width="500" alt="awman logo">
   <br>
   <a href="https://github.com/prettysmartdev/awman/actions/workflows/ci.yml"><img src="https://github.com/prettysmartdev/awman/actions/workflows/ci.yml/badge.svg" alt="CI tests"></a>
 </p>
 
 # awman - Agent Workflow Manager
 
-**Custom agent workflows for your hardest tasks, run safely in isolation.**
+**Workspace + orchestrator for advanced agent workflows that tackle your hardest tasks, run safely in isolation.**
 
-`awman` is a developer tool packaged as a single Rust binary. It creates and executes custom, repeatable code agent workflows that encode best practices like clear specs, task breakdown, independent review, enforced tests, and autoremediation.
+`awman` is a developer tool installed as a single rust binary. It allows you to easily create and execute custom, repeatable multi-agent workflows that automate best practices like clear specs, task breakdown, independent review, enforced tests, and autoremediation.
 
-Give awman any task:
-- The `awman` leader agent designs a custom workflow.
+Give `awman` any task:
+- The leader agent designs a custom workflow.
 - The workflow is validated and executed in isolated containers or microVMs.
 - Shared context system carries progress and decisions between agent steps.
 - Every run finishes with a PR and passing CI.
-- Runs on your laptop, server, cluster, or homelab.
 - Combine Claude Code, Codex, OpenCode, or any preferred code agent with your own subscriptions.
+- Runs on your laptop, server, cluster, or homelab.
 
 ![Parallel agent workflow in the awman TUI](docs/blog/images/dynamic-workflows.png)
+
+## One engine, five ways to use it
+
+Use `awman` in whichever way makes sense to you: the [TUI](docs/02-using-the-tui.md) for live interaction, the [CLI](docs/14-command-reference.md) for scripting and CI, the [API](docs/09-api-and-remote-mode.md) for integrations, the [web app](docs/20-webapp.md) for point-and-click simplicity, or a [worker](docs/17-workers-and-work-servers.md) to pull jobs from anywhere. Each path uses the same workflow engine and isolated agent execution.
 
 ## Make quality repeatable
 
@@ -33,10 +37,6 @@ Give awman any task:
 - **Continuous checks so everything stays green:** Workflow steps can run tests, commit and push changes, open a PR, and wait for CI results. Failing checks can automatically trigger an `on_failure` agent.
 - **Delegate routine work to your squad:** The built-in [squad](docs/12-squad.md) can watch for any real world condition like new issues or failing PRs, and launch dynamic workflows automatically.
 - **Fan out and get more done:** The [`awman` API](docs/09-api-and-remote-mode.md) supports scripts, webhooks, and remote worker setups on any server or cloud.
-
-## One engine, five ways to use it
-
-Use `awman` in whichever way makes sense to you: the [TUI](docs/02-using-the-tui.md) for live interaction, the [CLI](docs/14-command-reference.md) for scripting and CI, the [API](docs/09-api-and-remote-mode.md) for integrations, the [web app](docs/20-webapp.md) for point-and-click simplicity, or a [worker](docs/17-workers-and-work-servers.md) to pull jobs from anywhere. Each path uses the same workflow engine and isolated agent execution.
 
 ## Get started
 
