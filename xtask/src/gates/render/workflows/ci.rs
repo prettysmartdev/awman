@@ -42,7 +42,7 @@ const TRIGGERS: &str = r##"on:
   workflow_dispatch:
     inputs:
       gate:
-        description: Gate to run (hardware jobs only ever run from main)
+        description: Hosted gate to run
         type: choice
         options: [pr, main, nightly]
         default: pr
@@ -102,7 +102,6 @@ const PLAN: &str = r##"  plan:
       builds: ${{ steps.outputs.outputs.builds }}
       jobs: ${{ steps.outputs.outputs.jobs }}
       shards: ${{ steps.outputs.outputs.shards }}
-      hardware: ${{ steps.hardware.outputs.hardware }}
     steps:
 @@CHECKOUT@@
 @@RUST@@
@@ -124,40 +123,6 @@ const PLAN: &str = r##"  plan:
           echo "gate=$gate" >> "$GITHUB_OUTPUT"
       - name: Validate the manifest and every generated file
         run: cargo xtask gates check
-      - name: Hardware admission (trusted refs only)
-        id: hardware
-        env:
-          GATE: ${{ steps.gate.outputs.gate }}
-          EVENT: ${{ github.event_name }}
-          REF: ${{ github.ref }}
-          REQUESTED_REF: ${{ inputs.ref }}
-          SHA: ${{ github.sha }}
-          RUNNER_ENABLED: ${{ vars.AWMAN_CI_GUEST_RUNNER }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # The workflow and runner group stay pinned to protected main.
-          # A release branch override is admitted only for the exact head of
-          # an open, same-repository release PR targeting main.
-          hardware=false
-          case "$EVENT" in
-            push|schedule|workflow_dispatch) ;;
-            *) EVENT_OK=no ;;
-          esac
-          release_pr=false
-          if [ "$EVENT" = workflow_dispatch ] && [ "$GATE" = main ] \
-            && [[ "$REQUESTED_REF" =~ ^[0-9a-f]{40}$ ]]; then
-            matches=$(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&per_page=100" --paginate \
-              --jq ".[] | select(.head.sha == \"$REQUESTED_REF\" and .head.repo.full_name == \"$GITHUB_REPOSITORY\" and .base.ref == \"main\" and (.head.ref | test(\"^release/v[0-9]+[.][0-9]+[.][0-9]+$\"))) | .number")
-            [ -z "$matches" ] || release_pr=true
-          fi
-          if [ "${EVENT_OK:-yes}" = yes ] \
-            && [ "$GATE" != pr ] \
-            && [ "$REF" = refs/heads/main ] \
-            && { [ -z "$REQUESTED_REF" ] || [ "$REQUESTED_REF" = "$SHA" ] || [ "$release_pr" = true ]; } \
-            && [ "$RUNNER_ENABLED" = enabled ]; then
-            hardware=true
-          fi
-          echo "hardware=$hardware" >> "$GITHUB_OUTPUT"
       - name: Load recorded timings (diagnostic input to shard counts)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -187,9 +152,7 @@ const PLAN: &str = r##"  plan:
           cargo xtask gates plan "${args[@]}"
       - name: Publish plan outputs
         id: outputs
-        env:
-          HARDWARE: ${{ steps.hardware.outputs.hardware }}
-        run: cargo xtask ci plan-outputs --plan plan.json --hardware "$HARDWARE" >> "$GITHUB_OUTPUT"
+        run: cargo xtask ci plan-outputs --plan plan.json >> "$GITHUB_OUTPUT"
       - name: Upload the plan
         uses: @@UPLOAD@@
         with:
@@ -525,22 +488,6 @@ const GATE: &str = r##"  gate:
           fi
 "##;
 
-const HARDWARE_BLOCKED: &str = r##"  hardware-blocked:
-    name: Hardware cells blocked (no CI guest runner admitted)
-    needs: plan
-    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.hardware != 'true' && @@COND@@ }}
-    runs-on: @@RUNS_ON@@
-    timeout-minutes: 5
-    steps:
-      - name: Report blocked, visibly non-green
-        env:
-          GATE: ${{ needs.plan.outputs.gate }}
-        run: |
-          echo "BLOCKED: gate $GATE selects hardware cells but no CI guest runner is admitted (repository variable AWMAN_CI_GUEST_RUNNER is not 'enabled', or this ref/event may not use hardware). pending-cutover P1/P3." >&2
-          echo "::error title=Hardware cells blocked::no admitted CI guest runner (pending-cutover P3)"
-          exit 1
-"##;
-
 pub fn render(m: &Manifest) -> Result<String> {
     let linux = &m.platforms["linux-x64"];
     let hosted_runs_on = runs_on(&linux.runs_on);
@@ -579,21 +526,6 @@ pub fn render(m: &Manifest) -> Result<String> {
             ],
         ),
     ));
-    let hw: Vec<String> = tests
-        .iter()
-        .filter(|t| graph::self_hosted(m, &t.platform))
-        .map(|t| format!("contains(fromJSON(needs.plan.outputs.jobs), '{}')", t.id))
-        .collect();
-    if !hw.is_empty() {
-        let cond = format!("({})", hw.join(" || "));
-        jobs.push((
-            "hardware-blocked".into(),
-            tpl(
-                HARDWARE_BLOCKED,
-                &[("COND", &cond), ("RUNS_ON", &hosted_runs_on)],
-            ),
-        ));
-    }
     let needs: Vec<String> = jobs.iter().map(|(id, _)| id.clone()).collect();
     let required = m.gates["pr"]
         .required_check

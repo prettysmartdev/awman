@@ -531,10 +531,11 @@ pub fn pipeline_faults(m: &Manifest) -> Result<Vec<Fault>> {
         detail: errors.join("; "),
     });
 
-    // 3. Hardware cells are silently skipped: the plan must show them blocked, never absent.
+    // 3. Release hardware cells are silently skipped: the candidate plan must
+    // show them blocked, never absent.
     let request = plan::Request {
         repository_id: "1".into(),
-        event: "push".into(),
+        event: "workflow_dispatch".into(),
         head_sha: "a".repeat(40),
         base_sha: None,
         paths: vec![],
@@ -544,7 +545,7 @@ pub fn pipeline_faults(m: &Manifest) -> Result<Vec<Fault>> {
         suite_test_counts: Default::default(),
         main_durations_ms: vec![],
     };
-    let p = plan::create(m, "main", request, today)?;
+    let p = plan::create(m, "candidate", request, today)?;
     let guest: Vec<_> = p.tests.iter().filter(|t| t.tier == "guest").collect();
     faults.push(Fault {
         name: "skipped hardware",

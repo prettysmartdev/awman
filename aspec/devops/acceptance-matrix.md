@@ -20,7 +20,7 @@ them; it is not a claim that those tests have passed on that platform.
 | security | contract | both | declared by suite | all-hosted | default | covered | `awman-cli::component security::trust::hostile_workflow_agent_definitions_are_refused_before_any_host_or_container_launch` (gate `pr`) |
 | templates | contract | both | declared by suite | all-hosted | default | covered | `awman-cli::boundary templates::shipped_templates_equal_the_files_under_templates` (gate `pr`) |
 | boundary | contract | both | declared by suite | all-hosted | default | covered | `awman-cli::boundary conformance::real_docker_cli_conforms` (gate `pr`) |
-| native | contract | both | hvf | macos-arm64-ci-guest | builtin | covered | `awman-cli::guest boot::actual_awman_boots_a_guest` (gate `main`) |
+| native | contract | both | hvf | macos-arm64-release | builtin | covered | `awman-cli::guest boot::actual_awman_boots_a_guest` (gate `candidate`) |
 | ci-release | contract | both | declared by suite | all-hosted | default | covered | `xtask::pipeline failed_commands_missing_shards_skipped_counts_and_empty_assertions_cannot_validate` (gate `pr`) |
 | release awman-linux-amd64 | contract | both | declared by suite | all-hosted | default | covered | `awman-cli::artifact smoke::exact_executable_runs_a_command_in_a_private_repository` (gate `candidate`) |
 | release awman-linux-arm64 | contract | both | declared by suite | all-hosted | default | covered | `awman-cli::artifact smoke::exact_executable_runs_a_command_in_a_private_repository` (gate `candidate`) |

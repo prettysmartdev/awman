@@ -381,14 +381,20 @@ fn measured_shards_and_recovery_history_are_bound_to_plan() {
     assert!(plan::create(&m, "pr", r, today()).is_ok());
 }
 #[test]
-fn hardware_without_admission_emits_hosted_blocked_rows() {
+fn main_does_not_require_hardware_but_candidate_does() {
     let m = manifest();
-    let p = plan::create(&m, "main", request("push", &[]), today()).unwrap();
-    let rows: Vec<_> = p.tests.iter().filter(|r| r.tier == "guest").collect();
-    assert!(!rows.is_empty());
-    assert!(rows
+    let main = plan::create(&m, "main", request("push", &[]), today()).unwrap();
+    assert!(main.tests.iter().all(|r| !r.self_hosted));
+    assert!(main.builds.iter().all(|b| b.blocked_reason.is_none()));
+    let candidate =
+        plan::create(&m, "candidate", request("workflow_dispatch", &[]), today()).unwrap();
+    let guest: Vec<_> = candidate
+        .tests
         .iter()
-        .all(|r| !r.self_hosted && r.blocked_reason.is_some()));
+        .filter(|r| r.tier == "guest")
+        .collect();
+    assert!(!guest.is_empty());
+    assert!(guest.iter().all(|r| r.blocked_reason.is_some()));
     assert!(
         plan::create(&m, "main", request("pull_request", &[]), today())
             .unwrap_err()
@@ -534,18 +540,42 @@ fn empty_prefix_suite_is_detected_without_a_compiled_inventory() {
 }
 
 #[test]
-fn sbx_nightly_requires_a_provisioned_native_runner_and_admission() {
+fn nightly_is_hosted_and_sbx_is_release_only() {
     let m = manifest();
-    let sbx = &m.platforms["macos-arm64-sbx"];
-    assert_eq!(sbx.trust, "ci-guest");
-    assert!(sbx.runs_on.contains(&"self-hosted".into()));
-    let p = plan::create(&m, "nightly", request("schedule", &[]), today()).unwrap();
-    let job = p
+    let nightly = plan::create(&m, "nightly", request("schedule", &[]), today()).unwrap();
+    assert!(nightly.tests.iter().all(|job| !job.self_hosted));
+    assert!(nightly
+        .builds
+        .iter()
+        .all(|build| build.blocked_reason.is_none()));
+    let candidate =
+        plan::create(&m, "candidate", request("workflow_dispatch", &[]), today()).unwrap();
+    assert!(candidate
+        .cells
+        .iter()
+        .any(|cell| cell.cell.suite == "boundary-sbx"));
+    assert!(candidate
         .tests
         .iter()
-        .find(|job| job.platform == "macos-arm64-sbx")
-        .unwrap();
-    assert!(job.blocked_reason.as_deref().unwrap().contains("admission"));
+        .any(|job| job.suites.contains("boundary-sbx") && job.blocked_reason.is_some()));
+}
+
+#[test]
+fn rendered_ci_rejects_hardware_cells_in_main_or_nightly() {
+    for gate in ["main", "nightly"] {
+        let mut m = manifest();
+        m.gates
+            .get_mut(gate)
+            .unwrap()
+            .cells
+            .push(manifest::CellGroup {
+                suites: vec!["guest-boot".into()],
+                builds: vec!["macos-arm64-ci-guest-builtin".into()],
+                platform: None,
+            });
+        let error = render::workflows::ci_builds(&m).unwrap_err().to_string();
+        assert!(error.contains("self-hosted cell"), "{gate}: {error}");
+    }
 }
 fn fake_checkout(dir: &std::path::Path) {
     std::fs::create_dir_all(dir.join("ci")).unwrap();

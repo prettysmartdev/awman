@@ -21,9 +21,8 @@ pub fn check(root: &Path, allow_placeholders: bool) -> Result<Report> {
         r.errors.push(format!("manifest: {e:#}"));
     }
     // `gates check` is the `pr` lint: it is red on every pin the pr gate depends
-    // on. Pins that only main/nightly/candidate cells need (guest fixtures, the
-    // previous release, hardware images) are enforced, unconditionally, by
-    // `evidence aggregate` and `release candidate gate` for those gates.
+    // on. Native pins needed only by candidate cells (guest fixtures, the
+    // previous release, hardware images) are enforced by the release gate.
     if !allow_placeholders {
         r.errors.extend(manifest::validate::pins_for_gate(&m, "pr"));
     }

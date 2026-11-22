@@ -1314,7 +1314,9 @@ fn operator_journal_dispatch_records_and_allocates_nothing() {
 fn rehearsal_never_touches_production_and_cleans_up_its_own_draft() {
     let mut w = World::new();
     w.validated(100, C1);
-    let o = w.preflight(400, C1, &["--dry-run", "--event", "schedule"]);
+    w.preflight(399, C1, &["--dry-run", "--event", "schedule"])
+        .stopped("release candidates run only from refs/heads/main");
+    let o = w.preflight(400, C1, &["--dry-run", "--event", "workflow_dispatch"]);
     o.succeeded();
     assert_eq!(o.outputs["namespace"], "rehearsal/400");
     w.build_all(400, "r");

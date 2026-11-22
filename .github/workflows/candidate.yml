@@ -611,7 +611,25 @@ jobs:
           AWMAN_TEST_ARTIFACT: ${{ steps.bytes.outputs.path }}
           AWMAN_TEST_ARTIFACT_SHA256: ${{ steps.bytes.outputs.sha256 }}
           AWMAN_TEST_HOST_RESOURCES: hypervisor,apple-containers
-        run: cargo xtask test run --tier guest --build macos-arm64-release-builtin --evidence-dir "$GITHUB_WORKSPACE/evidence"
+        run: cargo xtask test run --tier guest --build macos-arm64-release-builtin --evidence-dir "$GITHUB_WORKSPACE/evidence/guest"
+      - name: macOS builtin unit suite
+        working-directory: candidate
+        run: cargo xtask test run --suite unit-awman-builtin --build macos-arm64-release-builtin --evidence-dir "$GITHUB_WORKSPACE/evidence/unit"
+      - name: Apple Containers boundary suite
+        working-directory: candidate
+        env:
+          AWMAN_TEST_HOST_RESOURCES: apple-containers
+        run: cargo xtask test run --suite boundary-apple --build macos-arm64-release-builtin --evidence-dir "$GITHUB_WORKSPACE/evidence/boundary-apple"
+      - name: Docker sandbox boundary suite
+        working-directory: candidate
+        env:
+          AWMAN_TEST_HOST_RESOURCES: docker-sbx
+        run: cargo xtask test run --suite boundary-sbx --build macos-arm64-release-builtin --evidence-dir "$GITHUB_WORKSPACE/evidence/boundary-sbx"
+      - name: Guest soak suite
+        working-directory: candidate
+        env:
+          AWMAN_TEST_HOST_RESOURCES: hypervisor
+        run: cargo xtask test run --suite soak-guest --build macos-arm64-release-builtin --evidence-dir "$GITHUB_WORKSPACE/evidence/soak-guest"
       -
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

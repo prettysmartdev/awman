@@ -7,13 +7,6 @@ test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64 || {
 command -v python3 >/dev/null || { echo 'python3 is required on the release Mac' >&2; exit 1; }
 # shellcheck source=tools/prerelease/branch.sh
 source "$(dirname "$0")/branch.sh"
-for variable in AWMAN_CI_GUEST_RUNNER AWMAN_RELEASE_REHEARSAL; do
-  current=$(gh variable list --repo "$repo" --json name,value \
-    --jq ".[] | select(.name == \"$variable\") | .value")
-  if test "$current" != enabled; then
-    gh variable set "$variable" --repo "$repo" --body enabled
-  fi
-done
 bash "$root/tools/prerelease/check-policy.sh" "$repo"
 bash "$root/tools/prerelease/pin-inputs.sh"
 commit=$(git rev-parse HEAD)
@@ -25,21 +18,11 @@ test "$(git ls-remote origin "refs/heads/$branch" | cut -f 1)" = "$commit" || {
   echo 'Local HEAD must equal the remote release branch' >&2
   exit 1
 }
-ci_group_id=
-ci_up=0
 work=
 ci_evidence=
 started=
-ci_runner() {
-  AWMAN_RELEASE_RUNNER_ROLE=ci-guest \
-    AWMAN_CI_GUEST_RUNNER_GROUP_ID="$ci_group_id" \
-    AWMAN_RELEASE_RUNNER_HOME="${HOME:?}/.awman/ci-guest-runner" \
-    AWMAN_RELEASE_RUNNER_WORK=/tmp/awci \
-    cargo xtask release runner "$@"
-}
 cleanup() {
   result=$?
-  if test "$ci_up" = 1; then ci_runner down || result=1; fi
   if test -n "$work"; then rm -rf -- "$work"; fi
   if test -n "$ci_evidence"; then rm -rf -- "$ci_evidence"; fi
   if test -n "$started"; then rm -f -- "$started"; fi
@@ -47,7 +30,6 @@ cleanup() {
 }
 trap cleanup EXIT
 cargo xtask gates check
-cargo xtask ci runner-preflight --platform macos-arm64-ci-guest
 cargo xtask ci runner-preflight --platform macos-arm64-release
 cargo xtask release runner check --hardware
 cargo xtask release runner provision
@@ -61,7 +43,6 @@ test "$(gh pr view "$branch" --repo "$repo" --json state,baseRefName,headRefOid,
   exit 1
 }
 pr_number=$(gh pr view "$branch" --repo "$repo" --json number --jq .number)
-ci_group_id=$(bash "$root/tools/prerelease/group-id.sh" "$repo" ci-guest)
 AWMAN_RELEASE_RUNNER_GROUP_ID=$(bash "$root/tools/prerelease/group-id.sh" "$repo" release)
 export AWMAN_RELEASE_RUNNER_GROUP_ID
 gh variable list --repo "$repo" --env release --json name,value \
@@ -76,14 +57,6 @@ gh secret list --repo "$repo" --env release --json name \
     echo 'Release environment is missing AWMAN_RELEASE_APP_PRIVATE_KEY' >&2
     exit 1
   }
-other_ci_runners=$(ci_runner busy "$repo")
-test -z "$other_ci_runners" || {
-  echo "Other online CI guest runners could take the main gate; stop them before prerelease validation: $other_ci_runners" >&2
-  exit 1
-}
-ci_runner provision
-ci_runner up "$repo" "pre-${commit:0:12}"
-ci_up=1
 before=$(gh run list --repo "$repo" --workflow ci.yml --branch main --limit 1 \
   --json databaseId --jq '.[0].databaseId // 0')
 gh workflow run ci.yml --repo "$repo" --ref main -f gate=main -f "ref=$commit"
@@ -106,15 +79,6 @@ gate = json.load(open(sys.argv[1]))
 if gate.get("gate") != "main" or gate.get("commit") != sys.argv[2] or gate.get("verdict") != "passed":
     raise SystemExit("The dispatched main gate does not prove this release commit")
 PY
-ci_name=$(sed -n 's/^name=//p' "${HOME:?}/.awman/ci-guest-runner/state")
-test -n "$ci_name" || { echo 'Managed CI guest runner lost its identity' >&2; exit 1; }
-guest_job_runners=$(gh api "repos/$repo/actions/runs/$main_run/jobs?per_page=100" --paginate \
-  --jq '.jobs[] | select([.labels[]?] | index("awman-ci-guest")) | .runner_name')
-test -n "$guest_job_runners" && test -z "$(printf '%s\n' "$guest_job_runners" | grep -Fxv "$ci_name")" || {
-  echo 'The main gate did not run all CI guest jobs on this Mac' >&2
-  exit 1
-}
-if test "$ci_up" = 1; then ci_runner down; ci_up=0; fi
 started=$(mktemp "$root/target/prerelease/apple-start.XXXXXXXX")
 CARGO_TARGET_DIR=target/native-validation-tools cargo xtask native-validation run
 latest=

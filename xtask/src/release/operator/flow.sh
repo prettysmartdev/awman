@@ -418,8 +418,7 @@ fi
 if $USE_LOCAL_RUNNER; then
   step "Release runner"
 
-  # Only jobs waiting for the release label can take this runner. CI hardware
-  # uses disjoint labels and must never be included in the cancellation offer.
+  # Only jobs waiting for the release label can take this runner.
   # Keep the legacy terminal text below, as required by the operator contract.
   STALE=""
   for status in queued in_progress; do

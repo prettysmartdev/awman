@@ -45,7 +45,6 @@ test "$tag_protected" = true || {
   echo 'v* tags need an active immutable ruleset with the promotion App bypass' >&2
   exit 1
 }
-bash "$(dirname "$0")/group-id.sh" "$repo" ci-guest >/dev/null
 bash "$(dirname "$0")/group-id.sh" "$repo" release >/dev/null
 environment="repos/$repo/environments/release"
 test "$(gh api "$environment" --jq .deployment_branch_policy.custom_branch_policies)" = true || {
@@ -58,13 +57,5 @@ test "$(gh api "$environment/deployment-branch-policies?per_page=100" --jq '[.br
 }
 test "$(gh api "repos/$repo/actions/permissions/workflow" --jq .default_workflow_permissions)" = read || {
   echo 'Default GitHub Actions token permissions are not read-only' >&2
-  exit 1
-}
-test "$(gh variable list --repo "$repo" --json name,value --jq '.[] | select(.name == "AWMAN_RELEASE_REHEARSAL") | .value')" = enabled || {
-  echo 'AWMAN_RELEASE_REHEARSAL must be enabled' >&2
-  exit 1
-}
-test "$(gh variable list --repo "$repo" --json name,value --jq '.[] | select(.name == "AWMAN_CI_GUEST_RUNNER") | .value')" = enabled || {
-  echo 'AWMAN_CI_GUEST_RUNNER must be enabled' >&2
   exit 1
 }

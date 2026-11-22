@@ -42,7 +42,7 @@ capability and either gets it or the run is `blocked`.
 | `boundary` | `tests/boundary/` (target `boundary`) | the real Docker Engine, registry, Git transports, Apple Containers and `sbx`, to prove the fakes tell the truth | only those named in `AWMAN_TEST_HOST_RESOURCES` |
 | `guest` | `tests/guest/` (target `guest`, feature `guest-drivers`) | real builtin microVM guests: boot, exec, import, network, upgrade, builder, strategy | hypervisor, verified payload, pinned fixtures |
 | `artifact` | `tests/artifact/` (target `artifact`) | the exact signed release executables, run as a user would, with no access to library code | the executable under test |
-| `soak` | `tests/boundary/soak/`, guest soak | latency, fuzz, public/private registry, long guest runs; nightly only | as the suite declares |
+| `soak` | `tests/boundary/soak/`, guest soak | hosted latency, fuzz and registry runs nightly; long guest runs at release candidate validation | as the suite declares |
 
 `unit` and `component` are what `make test` runs. `boundary`, `guest` and
 `artifact` need a named host resource or a release executable and run on the

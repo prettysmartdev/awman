@@ -52,9 +52,9 @@ twice.
 | Gate | Runs on | Contents |
 |---|---|---|
 | `pr` | pull requests and merge groups | every lint (fmt, clippy, architecture, hygiene, shell, workflows, deny, notice), doctests, the web app, the `unit` and `component` tiers on Linux x86_64, macOS arm64 and Windows x86_64, the `boundary` tier on Linux with Docker, the builtin-feature unit tests on Linux arm64, the xtask, release-contract, pipeline and CI-helper suites, and a static musl build smoke |
-| `main` | pushes to `main`, or an authenticated dispatch for an open same-repository `release/vX.Y.Z` PR head | everything in `pr`, plus the `guest` tier on the CI Mac (hardware) |
-| `nightly` | 03:23 UTC schedule | everything in `main`, plus the Apple Containers and `sbx` boundary suites, the soak suites, and the nightly modes below |
-| `candidate` | release candidate validation | everything in `main`, plus the `artifact` tier against each exact release executable, the signed offline boot of the macOS asset, and the `guest` tier on the release Mac |
+| `main` | pushes to `main`, or an authenticated dispatch for an open same-repository `release/vX.Y.Z` PR head | the full hosted `pr` gate; no hardware runner is required |
+| `nightly` | 03:23 UTC schedule | everything in `main`, plus hosted soak suites and the nightly modes below |
+| `candidate` | release candidate validation | everything in `main`, plus the `artifact` tier against each exact release executable, signed offline boot, and the required guest, Apple Containers, Docker sandbox, guest soak, and builtin unit suites on the release Mac |
 | `promote` | release promotion | requires a passed `candidate` gate; see [release.md](release.md) |
 
 **Selection.** On a pull request only the suites whose declared `paths` changed
@@ -93,20 +93,18 @@ reported as passed because it was skipped.
 
 - `plan` checks out the commit, runs `cargo xtask gates check`, resolves the
   gate from the event, selects suites from the changed paths and emits the build
-  matrix and shards. It also decides whether hardware cells may run (see
-  *Runners and trust*).
+  matrix and shards.
 - `build-<build>` compiles one build cell, writes a nextest archive, the
   expected-test list and the digests of both. `build-linux-x64-default`,
-  `build-macos-arm64-default`, `build-windows-x64-default`,
-  `build-linux-arm64-builtin`, `build-macos-arm64-ci-guest-builtin`.
+  `build-macos-arm64-default`, `build-windows-x64-default`, and
+  `build-linux-arm64-builtin`.
 - `test-<tier>-<platform>` downloads the archive, verifies its SHA-256 against
   both the job output and `archive/digests.json`, then runs the shard's suites
   with the pinned nextest. Jobs need only `plan` and their own build.
 - `lint` runs fmt, clippy, architecture lint, hygiene, shell lint, workflow lint,
   `cargo deny`, the third-party notice check and doctests.
-- `hardware-blocked` is a hosted job that fails visibly when `main` or `nightly`
-  selects hardware cells but the CI guest runner is not admitted. A green `main`
-  therefore always means the guest tier ran.
+- `ci.yml` selects no hardware cells. Release candidate validation requires
+  native evidence and fails closed when the release runner is unavailable.
 - `gate` (job and status name `gate`) aggregates evidence and writes the step
   summary: tier × platform matrix of passed/failed/blocked/skipped/not-selected,
   slowest tests, quarantine and override state, cache statistics and the
@@ -121,7 +119,7 @@ reported as passed because it was skipped.
 
 `full` (the `nightly` gate through `ci.yml`), plus:
 
-- `flake-hunt`: every tier five times with recorded shuffle seeds under CPU
+- `flake-hunt`: hosted tiers five times with recorded shuffle seeds under CPU
   contention; any intermittent failure opens a `flaky-test` issue with its
   failure record.
 - `seeded-defects`: runs known defects from `ci/seeded-defects/` against an
@@ -134,8 +132,6 @@ reported as passed because it was skipped.
 - `repro-build`: a clean-room unsigned build compared with the latest
   candidate's unsigned digests; non-blocking.
 - `audit`: `cargo deny check advisories`.
-- `rehearsal`: `candidate.yml` with `dry_run: true`, a full dry run of the
-  release pipeline that publishes nothing (see [release.md](release.md)).
 - `ci-trends`: p50/p95 per gate, queue time, flake rate and cache hit rate
   from the last 30 days of `timing-*` artifacts.
 
@@ -182,27 +178,20 @@ and break a sequence of measured main-gate budget overruns.
 | Label set | Used by | Registered by |
 |---|---|---|
 | hosted `ubuntu-24.04`, `ubuntu-24.04-arm`, `macos-15`, `windows-2025` | every hosted cell | GitHub |
-| `self-hosted, macOS, ARM64, awman-ci-guest` | the `guest` and Apple boundary cells of `main` and `nightly` | `make apple-prerelease` temporarily, or a long-lived CI Mac |
-| `self-hosted, macOS, ARM64, awman-release` | `candidate.yml` and the verify job of `promote.yml` | `make release`, for one release, or an already-online release runner |
+| `self-hosted, macOS, ARM64, awman-release` | the native cells of `candidate.yml` and the verify job of `promote.yml` | `make release`, for one release, or an already-online release runner |
 
-The label sets are disjoint, so a CI job cannot take the release runner.
+Hosted `main` and nightly jobs cannot take the release runner.
 
 - Hosted VMs cannot boot a guest (macOS guests cannot nest Hypervisor.framework),
   so every guest cell needs bare-metal Apple Silicon.
-- Self-hosted jobs run only when the plan admits hardware: the gate is not `pr`,
-  the event is a push, schedule or dispatch, the ref is `refs/heads/main`, the
-  `ref` input is empty, equal to the triggering commit, or names the exact head
-  of an open same-repository `release/vX.Y.Z` PR targeting `main`, and the repository
-  variable `AWMAN_CI_GUEST_RUNNER` is `enabled`. Each job repeats the event and
-  ref test. A pull request edits its own workflow file, so this is defence in
-  depth; the real boundary is the runner group, which must be restricted to this
-  repository and the workflow paths `ci.yml` and `nightly.yml` at
-  `refs/heads/main`.
-- Every self-hosted job starts with `cargo xtask ci runner-preflight` (disk,
-  `kern.hv_support`, toolchain, pinned macOS build, fixture digests, Apple Containers) and exits
-  `BLOCKED` with the reason before any expensive step. It ends with
-  `cargo xtask ci sweep`, which fails the job if processes, VMs, images or temp
-  roots of the run remain.
+- Self-hosted release jobs run from the protected `main` candidate workflow.
+  The release runner group is restricted to this repository and the workflow
+  paths `candidate.yml` and `promote.yml` at `refs/heads/main`.
+- Release validation checks the native runner before expensive work (disk,
+  `kern.hv_support`, toolchain, pinned macOS build, fixture digests, Apple
+  Containers). A missing capability blocks the release gate. Native jobs use
+  `cargo xtask ci sweep`, which fails if processes, VMs, images or temp roots
+  of the run remain.
 - Require approval for fork pull-request workflows from all outside
   contributors, and do not send secrets or write tokens to fork pull requests.
 - Top-level `permissions: contents: read`; write scopes are granted per job and
@@ -221,12 +210,11 @@ restricted to the release promotion identity. The expected values are recorded i
 a maintainer and confirmed against the repository:
 
 1. Branch protection / ruleset for `main` as above.
-2. Runner groups for `awman-ci-guest` and `awman-release`, with
-   `AWMAN_CI_GUEST_RUNNER=enabled` once the CI Mac is registered.
+2. A workflow-restricted runner group for `awman-release`, registered only
+   during release validation or supplied by an already-online release Mac.
 3. A `release` environment limited to the `main` branch, the release GitHub App
    (`AWMAN_RELEASE_APP_CLIENT_ID`, `AWMAN_RELEASE_APP_PRIVATE_KEY`) used to create
-   the tag and publish, and `AWMAN_RELEASE_REHEARSAL=enabled` to turn on the
-   nightly rehearsal.
+   the tag and publish.
 4. Default `GITHUB_TOKEN` read-only; allow only pinned actions; keep `timing-*`
    artifacts for at least 90 days; create the `flaky-test` issue label.
 

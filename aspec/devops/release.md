@@ -333,15 +333,20 @@ A published release is never removed, re-tagged or re-uploaded.
 
 ## Rehearsal and pre-release validation
 
-The nightly `rehearsal` job calls `candidate.yml` with `dry_run: true`: a
+An explicit release rehearsal calls `candidate.yml` with `dry_run: true`: a
 namespaced draft (`rehearsal/<run id>/vX.Y.Z`), a dry promotion (no tag, nothing
 published, verification against the run's own bytes), and then the draft is
 deleted. A rehearsal never reads, changes or deletes a production draft, and its
 evidence can never promote production.
 
+Dispatch it from protected `main` for the intended release commit:
+
+```sh
+gh workflow run candidate.yml --ref main -f version=vX.Y.Z -f commit=<full-sha> -f dry_run=true
+```
+
 After release prep commits the new Cargo version and finished release notes on
-`release/vX.Y.Z`, run from the Apple Silicon Mac that also serves the CI guest
-role:
+`release/vX.Y.Z`, run from the Apple Silicon release Mac:
 
 ```sh
 make linux-prerelease REMOTE_LOGIN=user@host
@@ -359,15 +364,13 @@ then commits and pushes the pins to the release branch. Native Linux validation
 and packet verification run on that exact branch commit.
 
 The Apple target can run first. It pins the same inputs, opens or reuses the
-release PR, checks both Mac runner image pins, then brings up a temporary CI
-guest runner on this Mac. It refuses other online guest runners, dispatches and
-watches the full main gate for the exact PR head through the trusted main
-workflow, and checks its guest jobs ran on this Mac. It then runs and verifies
-native Apple acceptance and requires its rebuilt arm64 fixtures to equal the
-published pins. Both native packets and the main gate must cover the same
-branch commit before `make release` will wait for the PR review. Candidate
-artifact tests and the final tag remain in the protected
-post-merge pipeline; they cannot publish until their own gates pass.
+release PR, checks both Mac runner image pins, then dispatches and watches the
+hosted full main gate for the exact PR head through the trusted main workflow.
+It then runs and verifies native Apple acceptance and requires its rebuilt
+arm64 fixtures to equal the published pins. Both native packets and the main
+gate must cover the same branch commit before `make release` will wait for the
+PR review. Candidate hardware and artifact tests and the final tag remain in
+the protected post-merge pipeline; they cannot publish until their gates pass.
 
 ## The release runner
 

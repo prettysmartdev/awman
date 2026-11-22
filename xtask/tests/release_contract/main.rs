@@ -31,9 +31,18 @@ fn full_prerelease_make_targets_use_the_native_orchestrators() {
     assert!(remote.contains("git -c credential.helper= clone"));
     assert!(remote.contains("cargo xtask native-validation run --platform linux"));
     assert!(apple.contains("cargo xtask native-validation verify \"$work/evidence\""));
-    assert!(apple.contains("ci_runner up \"$repo\""));
-    assert!(apple.contains("ci_runner down"));
+    assert!(!apple.contains("ci_runner up"));
+    assert!(!apple.contains("AWMAN_CI_GUEST_RUNNER"));
     assert!(apple.contains("gh workflow run ci.yml"));
+    let candidate = fs::read_to_string(root().join(".github/workflows/candidate.yml")).unwrap();
+    for suite in [
+        "unit-awman-builtin",
+        "boundary-apple",
+        "boundary-sbx",
+        "soak-guest",
+    ] {
+        assert!(candidate.contains(&format!("--suite {suite}")));
+    }
     let release = fs::read_to_string(root().join("tools/prerelease/release.sh")).unwrap();
     assert!(release.contains("cargo xtask native-validation verify \"$linux\""));
     assert!(release.contains("cargo xtask native-validation verify \"$apple\""));

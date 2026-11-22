@@ -230,12 +230,10 @@ protection, tag rulesets, account isolation, and native teardown remain explicit
 administrator/hardware cutover obligations; source checks cannot certify them.
 
 The release-branch full main gate is dispatched through `ci.yml` on protected
-`main` and is admitted to the CI guest runner only when its requested commit
-is the exact head of an open, same-repository `release/vX.Y.Z` PR targeting
-`main`. Fork PRs and ordinary PR events cannot use that runner. This path
-executes release-branch source on the native Mac before human review, so write
-access to release branches is a trusted maintainer capability. The gate job
-rechecks the PR identity against the GitHub API before accepting evidence.
+`main` for the exact head of an open, same-repository `release/vX.Y.Z` PR.
+It runs only on hosted runners. Native guest, boundary, and soak checks run
+under the protected release candidate workflow after review, on the release
+Mac. Fork PRs and ordinary PR events cannot use that runner.
 
 The test supervisor rejects registered host keychain/clipboard/agent names before
 checking ordinary executable allowlists, and still examines registered

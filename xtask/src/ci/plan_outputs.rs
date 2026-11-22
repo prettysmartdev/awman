@@ -69,7 +69,7 @@ pub fn outputs(m: &Manifest, plan: &Plan) -> Result<BTreeMap<String, Value>> {
 }
 
 pub fn run(root: &Path, args: &[String]) -> Result<ExitCode> {
-    let a = Args::parse(args, &["plan", "hardware"], &[])?;
+    let a = Args::parse(args, &["plan"], &[])?;
     let m = manifest::load(root)?;
     let plan: Plan =
         serde_json::from_slice(&std::fs::read(a.need("plan")?).context("reading plan")?)?;
@@ -77,7 +77,6 @@ pub fn run(root: &Path, args: &[String]) -> Result<ExitCode> {
         plan.manifest_version == m.version(),
         "plan was made from a different manifest version"
     );
-    let _hardware = a.get("hardware").unwrap_or("false");
     for (k, v) in outputs(&m, &plan)? {
         match v {
             Value::String(s) => println!("{k}={s}"),
@@ -146,12 +145,13 @@ mod tests {
     }
 
     #[test]
-    fn main_plan_selects_guest_jobs_and_shards_have_entries() {
+    fn main_plan_uses_hosted_jobs_and_shards_have_entries() {
         let m = manifest::load(&crate::gates::root()).unwrap();
         let plan = create(&m, "main", request("push"), chrono::Utc::now().date_naive()).unwrap();
         let o = outputs(&m, &plan).unwrap();
         let jobs: BTreeSet<String> = serde_json::from_value(o["jobs"].clone()).unwrap();
-        assert!(jobs.contains("test-guest-macos-arm64-ci-guest"));
+        assert!(jobs.iter().all(|job| !job.contains("ci-guest")));
+        assert!(jobs.iter().all(|job| !job.contains("macos-arm64-sbx")));
         let shards = o["shards"].as_object().unwrap();
         for job in &jobs {
             if job != "web" {

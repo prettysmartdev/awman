@@ -3,7 +3,7 @@
 //! adds its jobs on the next render and a renamed build renames its job.
 
 use crate::manifest::{self, Manifest};
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Gates whose cells `ci.yml` runs (the candidate/promote gates belong to the
@@ -56,6 +56,11 @@ pub fn ci_builds(m: &Manifest) -> Result<BTreeSet<String>> {
     let mut out = BTreeSet::new();
     for gate in CI_GATES {
         for cell in manifest::validate::cells(m, gate)? {
+            ensure!(
+                m.platforms[&cell.platform].trust == "hosted",
+                "{gate} gate selects self-hosted cell {}; move it to the release candidate gate",
+                cell.id
+            );
             if !m.suites.contains_key(&cell.suite) || m.builds[&cell.build].kind == "test" {
                 out.insert(cell.build);
             }

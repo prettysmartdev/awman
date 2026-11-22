@@ -12,13 +12,6 @@ test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64 || {
 command -v python3 >/dev/null || { echo 'python3 is required on the release Mac' >&2; exit 1; }
 # shellcheck source=tools/prerelease/branch.sh
 source "$(dirname "$0")/branch.sh"
-for variable in AWMAN_CI_GUEST_RUNNER AWMAN_RELEASE_REHEARSAL; do
-  current=$(gh variable list --repo "$repo" --json name,value \
-    --jq ".[] | select(.name == \"$variable\") | .value")
-  if test "$current" != enabled; then
-    gh variable set "$variable" --repo "$repo" --body enabled
-  fi
-done
 bash "$root/tools/prerelease/check-policy.sh" "$repo"
 bash "$root/tools/prerelease/pin-inputs.sh"
 commit=$(git rev-parse HEAD)

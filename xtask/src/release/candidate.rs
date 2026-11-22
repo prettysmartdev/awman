@@ -176,15 +176,11 @@ fn preflight(f: &Flags) -> Step {
         outputs(&[("decision", "journal".into())])?;
         return Ok(Ok(()));
     }
-    // Trust: a release run starts only from protected main, by dispatch (or
-    // the nightly rehearsal's call from a schedule/dispatch on main).
+    // Trust: release runs and explicit dry-run rehearsals start only from
+    // protected main by dispatch.
     let event = f.get("event").unwrap_or("workflow_dispatch");
     let git_ref = f.get("ref").unwrap_or("refs/heads/main");
-    let allowed: &[&str] = if dry_run {
-        &["workflow_dispatch", "schedule"]
-    } else {
-        &["workflow_dispatch"]
-    };
+    let allowed: &[&str] = &["workflow_dispatch"];
     if git_ref != "refs/heads/main" || !allowed.contains(&event) {
         return Ok(Err(Stop::Failed(format!(
             "release candidates run only from refs/heads/main by {allowed:?}; got {event} on \

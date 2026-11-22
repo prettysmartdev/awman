@@ -161,10 +161,10 @@ subsystem = "native"
 mode = "contract"
 backend = "both"
 runtime = "hvf"
-platform = "macos-arm64-ci-guest"
+platform = "macos-arm64-release"
 feature = "builtin"
 status = "covered"
-gate = "main"
+gate = "candidate"
 tests = ["awman-cli::guest boot::actual_awman_boots_a_guest"]
 
 [[cell]]

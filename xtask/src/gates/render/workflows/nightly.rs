@@ -1,5 +1,5 @@
-//! Renders `.github/workflows/nightly.yml`: everything too slow, too random or
-//! too hardware-bound for the PR path (design 11.4). The full gate is `ci.yml`
+//! Renders `.github/workflows/nightly.yml`: everything too slow or random for
+//! the PR path. The full gate is `ci.yml`
 //! called with `gate: nightly`, so nightly runs the same build and test jobs.
 
 use super::pieces::*;
@@ -42,24 +42,8 @@ defaults:
 jobs:
 "####;
 
-const HEAD: &str = r####"  plan:
-    name: Plan
-    runs-on: @@RUNS_ON@@
-    timeout-minutes: 10
-    outputs:
-      cargo_version_tag: ${{ steps.version.outputs.tag }}
-    steps:
-@@CHECKOUT@@
-@@RUST@@
-      - name: Release version of this commit (v<Cargo.toml version>)
-        id: version
-        run: |
-          version="$(cargo metadata --no-deps --format-version 1 --locked | jq -r '.packages[] | select(.name == "awman") | .version')"
-          test -n "$version"
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
-
-  full:
-    name: Full gate (every tier on every platform)
+const HEAD: &str = r####"  full:
+    name: Full hosted gate
     uses: ./.github/workflows/ci.yml
     with:
       gate: nightly
@@ -269,23 +253,6 @@ const HEAD: &str = r####"  plan:
       - name: Check advisories against the current database
         run: cargo deny check advisories
 
-  rehearsal:
-    name: Release candidate and promote dry-run rehearsal
-    needs: plan
-    if: ${{ github.ref == 'refs/heads/main' && vars.AWMAN_RELEASE_REHEARSAL == 'enabled' }}
-    uses: ./.github/workflows/candidate.yml
-    with:
-      version: ${{ needs.plan.outputs.cargo_version_tag }}
-      commit: ${{ github.sha }}
-      dry_run: true
-      promote: true
-      operator_record: '{"source":"nightly-rehearsal"}'
-    permissions:
-      contents: write
-      id-token: write
-      attestations: write
-      actions: read
-
   ci-trends:
     name: Timing trends (p50/p95, queue time, flake rate, cache hit rate)
     needs: full
@@ -330,16 +297,16 @@ const HEAD: &str = r####"  plan:
 
   nightly:
     name: Nightly verdict
-    needs: [plan, full, flake-hunt, seeded-defects, mutation, coverage, repro-build, audit, rehearsal, ci-trends]
+    needs: [full, flake-hunt, seeded-defects, mutation, coverage, repro-build, audit, ci-trends]
     if: ${{ always() }}
     runs-on: @@RUNS_ON@@
     timeout-minutes: 10
     steps:
-      - name: Verdict (fails closed; a skipped rehearsal is blocked, not green)
+      - name: Verdict (fails closed on required jobs)
         env:
           NEEDS: ${{ toJSON(needs) }}
         run: |
-          blocking="plan full flake-hunt seeded-defects audit rehearsal"
+          blocking="full flake-hunt seeded-defects audit"
           diagnostic="mutation coverage repro-build ci-trends"
           status=0
           for job in $blocking; do
