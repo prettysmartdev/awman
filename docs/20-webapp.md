@@ -1,6 +1,7 @@
-# Web App
+# Web app (prerelease)
 
-The awman web app is a browser interface to an awman daemon. The hosted app is
+The awman web app is in prerelease. This guide describes its current behavior
+for preview users. The hosted preview is
 at <https://awman.prettysmart.dev>. It is a static site; it does not run agents
 or proxy browser requests to your daemon. Browser requests always go to
 `http://127.0.0.1:9877` and `ws://127.0.0.1:9877` on the browser's own computer,

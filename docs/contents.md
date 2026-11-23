@@ -16,7 +16,7 @@ Start with [Getting started](00-getting-started.md). Then use the guides for wha
 - [Dynamic workflows](06-dynamic-workflows.md) — let an agent design the steps for a work item.
 - [GitHub integration](10-github-integration.md) — use issues and pull requests.
 - [Squad](12-squad.md) — run recurring tasks with a group of agents.
-- [Web app](20-webapp.md) — connect a browser to the local daemon.
+- [Web app (prerelease)](20-webapp.md) — documentation for the upcoming browser interface.
 
 ## Set up and operate
 

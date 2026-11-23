@@ -123,11 +123,9 @@ pub const TIPS: &[&str] = &[
     // ── API and remote ───────────────────────────────────────────────────────
     "`awman daemon start --background` runs the awman daemon as a background service.",
     "`awman daemon status` shows the daemon's features, listeners and running jobs.",
-    "`awman link web-<code>` approves a browser connection to your local daemon.",
     "`awman link https://work.example.com` connects this machine to a work server.",
     "`awman queue` lists work items offered by your linked work servers.",
     "`awman queue pick` claims a queued work item and runs it here.",
-    "`awman daemon api launch_contexts.create default=true` registers a browser workspace.",
     "`awman config set daemon.features.worker.enabled true` turns on the worker API live.",
     "`awman config set daemon.features.engine.enabled true` keeps the TUI engine running.",
     "`awman remote exec workflow <file> --follow` runs a workflow on a remote awman host.",

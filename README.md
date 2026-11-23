@@ -22,7 +22,7 @@ Give `awman` any task:
 
 ## One engine, five ways to use it
 
-Use `awman` in whichever way makes sense to you: the [TUI](docs/02-using-the-tui.md) for live interaction, the [CLI](docs/14-command-reference.md) for scripting and CI, the [API](docs/09-api-and-remote-mode.md) for integrations, the [web app](docs/20-webapp.md) for point-and-click simplicity, or a [worker](docs/17-workers-and-work-servers.md) to pull jobs from anywhere. Each path uses the same workflow engine and isolated agent execution.
+Use `awman` in whichever way fits the task: the [CLI](docs/14-command-reference.md) for commands and scripts, the [TUI](docs/02-using-the-tui.md) for live interaction, the [API](docs/09-api-and-remote-mode.md) for integrations, [your squad](docs/12-squad.md) for recurring tasks, or a [worker](docs/17-workers-and-work-servers.md) for jobs offered by a work server. Each path uses the same command engine and isolated agent execution.
 
 ## Make quality repeatable
 
@@ -38,9 +38,9 @@ Use `awman` in whichever way makes sense to you: the [TUI](docs/02-using-the-tui
 - **Delegate routine work to your squad:** The built-in [squad](docs/12-squad.md) can watch for any real world condition like new issues or failing PRs, and launch dynamic workflows automatically.
 - **Fan out and get more done:** The [`awman` API](docs/09-api-and-remote-mode.md) supports scripts, webhooks, and remote worker setups on any server or cloud.
 
-## Keep work in view
+## Take work from a queue
 
-The [web app](docs/20-webapp.md) gives you a browser view of your local workspace, live agent terminals, squad tasks, and the work queue. The browser connects to the daemon on the same computer after you approve its link code. [Work servers](docs/17-workers-and-work-servers.md) can offer jobs to a linked awman worker; you can pick one from the TUI queue or let the daemon claim eligible work.
+[Work servers](docs/17-workers-and-work-servers.md) can offer jobs to a linked awman worker. Pick one from the TUI queue or let the daemon claim eligible work. Either way, the task uses the same workflow engine, setup checks, and agent isolation as work you start yourself.
 
 ## Get started
 
@@ -75,12 +75,11 @@ awman exec workflow --dynamic --work-item ./path/to/spec.md
 | [Serve work through the API](docs/09-api-and-remote-mode.md#running-the-api-server) | `awman config set daemon.features.worker.enabled true`<br>`awman config set daemon.features.worker.push.workDirs.allow "$PWD"`<br>`awman daemon start --background` |
 | [Pull jobs from a work server](docs/17-workers-and-work-servers.md#link-a-work-server) | `awman link https://work.example.com --name team` |
 | [Review and pick queued work](docs/17-workers-and-work-servers.md#queue-and-picking-work) | `awman queue` / `awman queue pick` |
-| [Connect the browser app](docs/20-webapp.md#install-and-connect) | `awman link web-<code>` |
 | [Check the unified daemon](docs/16-daemon.md#start-stop-status-and-logs) | `awman daemon status` |
 
 ## Documentation
 
-[Getting started](docs/00-getting-started.md) · [Security and isolation](docs/04-security-and-isolation.md) · [Web app](docs/20-webapp.md) · [Command reference](docs/14-command-reference.md) · [License](LICENSE)
+[Getting started](docs/00-getting-started.md) · [Security and isolation](docs/04-security-and-isolation.md) · [Command reference](docs/14-command-reference.md) · [License](LICENSE)
 
 ## Contributing
 
