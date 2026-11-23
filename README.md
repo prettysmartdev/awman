@@ -14,7 +14,7 @@ Give `awman` any task:
 - The leader agent designs a custom workflow.
 - The workflow is validated and executed in isolated containers or microVMs.
 - Shared context system carries progress and decisions between agent steps.
-- Every run finishes with a PR and passing CI.
+- Workflows can open a PR and wait for passing CI.
 - Combine Claude Code, Codex, OpenCode, or any preferred code agent with your own subscriptions.
 - Runs on your laptop, server, cluster, or homelab.
 
@@ -33,10 +33,14 @@ Use `awman` in whichever way makes sense to you: the [TUI](docs/02-using-the-tui
 
 ## Keep each task contained and reviewable
 
-- **Isolation lets you stay hands off, safely:** Agents run in microVMs or containers and can only access the mounted project. Optional [overlays](docs/08-overlays.md) grant extra directories, skills, or environment variables only where needed. Workflows execute in an isolated git corktree or fresh clone.
+- **Isolation lets you stay hands off, safely:** Agents run in microVMs or containers and can only access the mounted project. Optional [overlays](docs/08-overlays.md) grant extra directories, skills, or environment variables only where needed. Workflows execute in an isolated Git worktree or fresh clone.
 - **Continuous checks so everything stays green:** Workflow steps can run tests, commit and push changes, open a PR, and wait for CI results. Failing checks can automatically trigger an `on_failure` agent.
 - **Delegate routine work to your squad:** The built-in [squad](docs/12-squad.md) can watch for any real world condition like new issues or failing PRs, and launch dynamic workflows automatically.
 - **Fan out and get more done:** The [`awman` API](docs/09-api-and-remote-mode.md) supports scripts, webhooks, and remote worker setups on any server or cloud.
+
+## Keep work in view
+
+The [web app](docs/20-webapp.md) gives you a browser view of your local workspace, live agent terminals, squad tasks, and the work queue. The browser connects to the daemon on the same computer after you approve its link code. [Work servers](docs/17-workers-and-work-servers.md) can offer jobs to a linked awman worker; you can pick one from the TUI queue or let the daemon claim eligible work.
 
 ## Get started
 
@@ -70,6 +74,9 @@ awman exec workflow --dynamic --work-item ./path/to/spec.md
 | [Watch and manage live sessions](docs/02-using-the-tui.md) | `awman` |
 | [Serve work through the API](docs/09-api-and-remote-mode.md#running-the-api-server) | `awman config set daemon.features.worker.enabled true`<br>`awman config set daemon.features.worker.push.workDirs.allow "$PWD"`<br>`awman daemon start --background` |
 | [Pull jobs from a work server](docs/17-workers-and-work-servers.md#link-a-work-server) | `awman link https://work.example.com --name team` |
+| [Review and pick queued work](docs/17-workers-and-work-servers.md#queue-and-picking-work) | `awman queue` / `awman queue pick` |
+| [Connect the browser app](docs/20-webapp.md#install-and-connect) | `awman link web-<code>` |
+| [Check the unified daemon](docs/16-daemon.md#start-stop-status-and-logs) | `awman daemon status` |
 
 ## Documentation
 
