@@ -9,6 +9,23 @@ test "$(uname -s)" = Linux && test "$(uname -m)" = x86_64 || {
   echo 'Release Linux acceptance requires a native x86_64 Linux KVM host' >&2
   exit 1
 }
+# SSH uses a noninteractive shell; a login profile may not have put rustup or
+# mise on PATH. Resolve the installed user toolchain before accepting a token.
+if ! command -v cargo >/dev/null 2>&1; then
+  for cargo_bin in "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" \
+    "$HOME/.cargo/bin/cargo" "$HOME/.local/share/mise/shims/cargo" \
+    "$HOME/.local/bin/cargo"; do
+    if test -x "$cargo_bin"; then
+      PATH="$(dirname "$cargo_bin"):$PATH"
+      export PATH
+      break
+    fi
+  done
+fi
+command -v cargo >/dev/null 2>&1 || {
+  echo 'Cargo is unavailable to noninteractive SSH; install it under ~/.cargo/bin or expose it in the SSH command PATH' >&2
+  exit 1
+}
 work=$(dirname -- "$0")
 [[ "$work" =~ ^/tmp/awman-linux-prerelease\.[A-Za-z0-9]+$ ]] || exit 2
 trap 'rm -rf -- "$work"' EXIT

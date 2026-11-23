@@ -34,6 +34,38 @@ fn release_waits_for_the_exact_squash_commit_then_uses_local_promotion() {
     assert!(candidate.contains("inputs.dry_run && inputs.promote"));
 }
 
+#[test]
+fn remote_linux_resolves_cargo_without_a_login_shell() {
+    use awman_test_support::Exit;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut sandbox = TestSandbox::for_test(TestCase::component("remote-linux-cargo-path"));
+    let fake = Path::new(awman_test_support::cargo_bin!("xtask-fake-cli"));
+    let uname = sandbox.install_fake(fake, "uname");
+    uname.on(&["-s"]).stdout("Linux\n");
+    uname.on(&["-m"]).stdout("x86_64\n");
+    let cargo_home = sandbox.root().join("rustup");
+    sandbox.env_mut().set("CARGO_HOME", &cargo_home);
+    let script = root().join("tools/prerelease/remote-linux.sh");
+    let run = || {
+        sandbox.command("bash").arg(&script)
+            .args(["release/v0.14.0", "0123456789abcdef0123456789abcdef01234567"])
+            .run()
+    };
+    let missing = run();
+    assert_eq!(missing.exit, Exit::Code(1));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("Cargo is unavailable to noninteractive SSH"));
+
+    let cargo = cargo_home.join("bin/cargo");
+    write(&cargo, "#!/bin/sh\nexit 0\n");
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    let found = run();
+    // The copied script would live under /tmp on the Linux host. Reaching the
+    // work-directory check proves Cargo was resolved before any token is read.
+    assert_eq!(found.exit, Exit::Code(2));
+    assert!(!String::from_utf8_lossy(&found.stderr).contains("Cargo is unavailable"));
+}
+
 struct Publisher {
     sandbox: TestSandbox,
     state: PathBuf,
