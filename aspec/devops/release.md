@@ -1,447 +1,120 @@
 # Release operator runbook
 
-How a maintainer releases awman, resumes an interrupted release, recovers from
-each failure state and rolls back. The CI side (workflows, gates, runners) is in
-[cicd.md](cicd.md); the tests that back this procedure are in `xtask/tests/pipeline/`
-and `xtask/tests/release_contract/`.
+The release entry point is `make release` on the Apple Silicon release Mac.
+It waits for the maintainer to squash merge the release PR into `main`, then
+builds and validates a candidate from that exact merge commit. The command
+creates the version tag and publishes the validated draft using the
+maintainer's authenticated `gh` session. No GitHub App, branch protection,
+tag ruleset bypass, or approving PR review is required by this procedure.
 
-## The model
+## Release invariants
 
-A release is **built once, validated as those exact bytes, then published**:
-
-1. **Candidate** (`candidate.yml`): builds the four executables and `SHA256SUMS`
-   once, signs the macOS asset, attests every asset, and stores them as a **draft**
-   GitHub Release (`vX.Y.Z (candidate N)`) with a machine-readable
-   `release-state.json`. Nothing is public and no tag exists.
-2. **Validation**: the `candidate` gate (the full `main` gate, the `artifact`
-   tier against each exact executable, the signed offline boot of the macOS asset
-   and the `guest` tier on the release Mac) runs against those bytes. Artifact and
-   guest jobs download the recorded bytes from the run that built them, verify
-   digest and attestation, and never rebuild.
-3. **Promotion** (`promote.yml`): re-verifies everything under a publication lock,
-   creates the annotated tag at the candidate commit with the release GitHub App,
-   and publishes the draft. No asset is uploaded or changed at this step.
-4. **Post-publish verification**: downloads the *published* assets, checks
-   `SHA256SUMS`, runs `gh attestation verify`, smoke-tests each executable and boots
-   the macOS binary offline, then writes a verification receipt binding release id,
-   tag, candidate and every asset digest.
-
-Rules that never change:
-
-- A published tag is never moved or reused, and published assets are never
-  updated or replaced. A bad release is superseded by a new version.
-- Lost or changed candidate bytes are never rebuilt under the same candidate
-  number. A changed input is a new candidate.
-- A skipped local test run (`skipped by operator`) satisfies no gate. Local test
-  results are advisory; only CI evidence counts.
-- An override is a reviewed, expiring entry in `ci/gates.toml`, and never covers
-  artifact integrity, the signed-binary boot, the upgrade scenario or required
-  hardware coverage. Evidence expires after `release.evidence_valid_days` (14) and
-  at the earliest quarantine or override deadline.
-- Every failing job prints exactly one line starting with `BLOCKED:` (the
-  infrastructure is at fault: runner, hypervisor, pins, credentials, service) or
-  `FAILED:` (the product or evidence is at fault). Nothing is published on either.
-
-## Active path
-
-`make release` waits for the release PR's complete checks and the human squash
-merge, then invokes the manifest candidate pipeline from merged `main`.
-Candidate evidence and protected promotion remain mandatory. Native packets
-alone cannot authorize a release.
+- The release tag is plain `vX.Y.Z`, matching the version in `Cargo.toml`.
+  Pre-release suffixes are refused.
+- A candidate is built once for four assets: `awman-linux-amd64`,
+  `awman-linux-arm64`, `awman-macos-arm64`, and `awman-windows-amd64.exe`.
+  `SHA256SUMS`, attestations, and `release-state.json` bind those exact bytes.
+- The candidate gate must pass before the command creates a tag. It includes
+  the authenticated main gate, artifact tests against those bytes, native
+  guest validation, and the signed offline boot of the macOS asset. Local
+  prerelease packets alone cannot authorize publication.
+- Immediately before tagging and publishing, `cargo xtask release promote`
+  re-downloads the draft assets and verifies hashes, attestations, gate
+  evidence, expiry, version inputs, and the current `main` tip. It creates an
+  annotated tag at the merged PR commit and publishes the existing draft;
+  it does not rebuild, sign, or replace assets.
+- A published tag is never moved or reused. Published assets are never
+  replaced. A bad release is superseded with a new version.
+- The `promote.yml` workflow only verifies public bytes after the local
+  publication. It downloads every published asset, checks `SHA256SUMS` and
+  attestations, smoke tests the binaries, boots the macOS binary offline,
+  and records a receipt. Rehearsals use it to verify candidate bytes without
+  creating a tag or publishing anything.
+- Failed or blocked validation stops before tagging. Once a tag exists, a
+  retry resumes the same candidate and tag; it never silently switches
+  commit or bytes.
 
 ## Prerequisites
 
-The published `awman-linux-amd64` asset is a GNU x86_64 executable built on
-Ubuntu 22.04, with glibc 2.35 as its maximum required symbol version. The build
-step inspects the exact candidate with `readelf`, fails on newer or unknown
-glibc requirements, and records `abi.json` beside the candidate digest. The
-artifact and reproducibility jobs use the same baseline runner. Native Linux
-acceptance packets built on newer developer distributions record their host
-ABI separately; they do not establish distribution compatibility. The musl
-build smoke remains separate and does not include the builtin runtime.
+- Prepare and commit version, notes, and documentation on
+  `release/vX.Y.Z`. The release notes at `docs/releases/vX.Y.Z.md` must have
+  no placeholder.
+- Authenticate `gh` as a maintainer with permission to merge the PR, run
+  workflows, create tags, and edit releases. If the Mac will serve the native
+  release jobs, the login also needs repository runner administration.
+- Use a bare-metal Apple Silicon Mac with Hypervisor.framework and the pinned
+  toolchain. Native Linux acceptance requires an x86_64 KVM host reached
+  through `REMOTE_LOGIN=user@host`.
+- Keep the required fixture, prior-release, runner-image, and macOS payload
+  pins published and recorded in `ci/gates.toml`. The candidate gate reports
+  missing pins as blocked evidence.
+- Keep the `release` environment available to workflows on `main` and the
+  `awman-release` runner group restricted to `candidate.yml` and
+  `promote.yml`. Branch rules and PR review settings are the maintainer's
+  choice, not release prerequisites.
 
-- A clean `release/vX.Y.Z` checkout, created or resumed by the prerelease
-  targets after the release prep skill has committed its version and notes,
-  with a `gh`
-  login (`gh auth login`) that can dispatch workflows and, when the Mac is managed
-  as a runner, administer repository runners.
-- Release notes: `docs/releases/vX.Y.Z.md`, containing no placeholder.
-- For the Apple Silicon job, a bare-metal Apple Silicon Mac with
-  Hypervisor.framework (`kern.hv_support=1`), Apple Containers installed, the
-  pinned Rust toolchain and enough disk. Hosted Macs are VMs and cannot boot a
-  guest. The first release on a Mac needs Docker or Apple Containers running to
-  build the cached guest fixture.
-- The pins that the `candidate` gate depends on are published: both guest
-  fixtures, the previous release's asset digest, the macOS payload record and
-  the CI and release Mac runner images. A pending pin in that gate reports
-  `BLOCKED: pins are not published yet`; a nightly-only platform pin does not
-  block a candidate.
-- The version has the form `vX.Y.Z`; pre-release suffixes are refused.
+The GNU `awman-linux-amd64` asset is built on Ubuntu 22.04. The candidate
+checks the exact executable with `readelf` and records `abi.json`; native
+Linux packets from newer developer hosts do not prove the published ABI.
 
-## Normal path: release branch, PR, then promotion
+## Normal path
 
 ```sh
 make linux-prerelease REMOTE_LOGIN=user@host
 make apple-prerelease
 make release
-# Review and click Merge when ready (the queue uses squash) while make release waits.
 ```
 
-`make apple-prerelease` and `make linux-prerelease` may run in either order.
-The first creates or resumes `release/vX.Y.Z`, publishes and commits its pins
-there, and pushes it. The Apple target opens the PR and runs the full main CI
-gate for that exact PR head through the protected-main workflow; it also runs
-native Apple acceptance. The Linux target creates or updates its managed
-release-branch checkout and runs native KVM acceptance. `make release` requires
-both packets for the same commit, checks the authenticated full main gate and
-all PR checks, then waits for the human merge. It compares the merged tree to
-the validated branch tree before starting candidate, promotion and published
-asset verification. A changed PR head or different merged tree requires both
-prerelease targets again. The version comes from the release prep skill's
-committed Cargo version; `VERSION=vX.Y.Z` is an optional consistency check.
-
-### Post-merge operator internals
-
-`make release` invokes `cargo xtask release run vX.Y.Z` only after the
-reviewed PR has merged. The following table describes that internal stage.
-
-`RELEASE_RUNNER` is `auto` (use an online `awman-release` runner if there is one,
-otherwise register this Mac when it can serve), `local` (require this Mac) or
-`none` (never register). Prompts read from `/dev/tty`; the default is shown in
-capitals; answering *no* to a *Proceed* question prints `  Aborting.` and exits 1.
-
-| Step | What happens | Prompts and refusals |
-|---|---|---|
-| **Pre-checks** | `gh` is authenticated; remote state of the version is read from GitHub; branch, sync and working-tree checks; tag checks; runner selection | `Proceed with release from '<branch>'?` [y/N] when not on `main`. `Proceed anyway (you may be ahead, or behind)?` [y/N] when not equal to `origin/main`. `Proceed anyway? (consider committing or stashing these first)` [y/N] for changes other than `Cargo.toml`, `Cargo.lock` and `docs/releases/`. If the version is already verified: `Release vX.Y.Z is already published`, exit 0. If a candidate exists: `Candidate N for vX.Y.Z exists (state …); resuming`. With no runner available: `Continue? (the Apple Silicon job will wait for a runner, and nothing publishes until it passes)` [y/N]. A malformed version, a missing `gh` login or an invalid `RELEASE_RUNNER` stops here |
-| **Version in Cargo.toml** | bumps `Cargo.toml` and refreshes only awman's own `Cargo.lock` entry; verifies the result | warns if the installed `awman --version` disagrees with `Cargo.toml` |
-| **Release notes** | creates `docs/releases/vX.Y.Z.md` from a template if missing | with the placeholder still present: `Launch 'awman chat' to write release notes now?` [Y/n]; *no* stops with instructions to edit and re-run |
-| **Tests** | runs `make test` and records the result bound to the exact source tree, index, untracked build inputs, manifest, `Cargo.lock` and tool versions | on failure the output is copied to the clipboard (`pbcopy`, `xclip` or `xsel`); `Skip tests and continue the release anyway?` [y/N], then `Launch 'awman chat' to fix the failing tests?` [Y/n]. A skip is recorded as `skipped by operator` and authorises nothing. A record for an unchanged tree is reused: `Tests already passed for this source tree` |
-| **Commit** | commits exactly `docs/releases/vX.Y.Z.md`, `Cargo.toml`, `Cargo.lock` as `Add release notes for vX.Y.Z`; the commit tree must equal the tested tree | `Nothing to commit` when already committed |
-| **Tag** | creates the local tag `vX.Y.Z` (refuses a local tag on another commit). It is only a local marker: the public tag is created at publication | |
-| **Release runner** | when this Mac serves: fetches and verifies manifest fixtures in its private store, registers a temporary runner labelled `self-hosted, macOS, ARM64, awman-release` (token only in the environment), keeps the Mac awake with `caffeinate` | lists queued or running workflow runs that wait for a release runner: `Cancel them?` [Y/n]. A runner that cannot register stops the release before anything is pushed |
-| **Push** | pushes `main` only (never the tag) and starts the candidate: `gh workflow run candidate.yml --ref main -f version=… -f commit=… -f operator_record=…` | `Started the release candidate for vX.Y.Z; the tag is pushed when it is published` |
-| **Release workflow** | finds the run (up to 5 minutes) and watches it with `gh run watch … --exit-status` through candidate, validation, promotion and verification (up to 3 hours) | an earlier unsuccessful run: `Re-run its failed jobs on this Mac?` [Y/n]. Success requires state `verified`, the matching commit and the tag on origin; then `Release vX.Y.Z published!` |
-
-With `RELEASE_RUNNER=none` the command stops after starting the candidate:
-`Candidate dispatched; release vX.Y.Z awaits CI validation and publication`,
-followed by `make release-status VERSION=vX.Y.Z` to check its state.
-
-An `EXIT` trap stops the temporary runner's process group (SIGINT, after 30 s
-SIGKILL, only while the group still holds the runner's processes) and
-deregisters it whether the run succeeded, failed or was interrupted. Ctrl-C
-starts that teardown and the command exits 130; a second Ctrl-C is ignored until
-the runner is gone.
-
-### What a re-run resumes
-
-Every state is read from GitHub, never from the local checkout, so re-running
-`make release VERSION=vX.Y.Z` from any clone does the right thing:
-
-| State at start | A re-run |
-|---|---|
-| `verified` | prints `Release vX.Y.Z is already published` and exits 0 |
-| `promoted` | resumes the watch; post-publish verification is retried |
-| `validated` | resumes promotion (the tag may or may not be on origin; it is never recreated or moved) |
-| `candidate-built` | resumes the same candidate; failed jobs are re-run, passed cells are not |
-| `prepared` | resumes the run, or re-runs its failed jobs; if the run or its artifacts are gone, a new candidate number is allocated |
-| `abandoned` or `none` | starts a new candidate; abandoned numbers are never reused |
-
-Answers given to the prompts are recorded with the dispatch (as advisory
-evidence only), so an interrupted session does not ask twice. A candidate is
-resumed only for the same commit and inputs; if the release notes, `Cargo.lock`,
-the toolchain, the entitlement file, the pins or the manifest changed, the
-re-run builds candidate N+1 and supersedes N.
-
-## Inspecting state: `make release-status`
-
-```sh
-make release-status VERSION=vX.Y.Z      # same as: cargo xtask release status vX.Y.Z
-cargo xtask release status vX.Y.Z --json
-```
-
-Read-only. Prints the state, the candidate number and commit, whether the tag is
-on origin, the failing gate IDs with `blocked` or `failed` and the reason, and
-links to the evidence.
-
-| State | What exists | Next action |
-|---|---|---|
-| `none` | no draft, no published release, no candidate run | `make release VERSION=vX.Y.Z` |
-| `prepared` | a candidate run is queued or running, or ended before a complete draft | re-run `make release`, or `gh run rerun <id> --failed` |
-| `candidate-built` | draft with the four assets, `SHA256SUMS` and `release-state.json`; gate not passed yet | re-run the failed or blocked jobs (same bytes) |
-| `validated` | candidate gate passed; the tag may or may not be on origin | promotion runs automatically; re-run `make release` to resume it |
-| `promoted` | tag on origin at the candidate commit, release published | verification pending or failed; re-run `make release` |
-| `verified` | an authenticated receipt binds release id, tag, candidate and asset digests | done |
-| `abandoned` | draft deleted by `release-abandon`; evidence kept in the run's `candidate-record-…` artifact | `make release` starts the next candidate number |
-
-## Abandoning a candidate: `make release-abandon`
-
-```sh
-make release-abandon VERSION=vX.Y.Z      # same as: cargo xtask release abandon vX.Y.Z
-```
-
-Deletes the newest **unpromoted** draft after copying `release-state.json`,
-`SHA256SUMS` and the gate evidence to `target/release-abandoned/<version>-c<N>/`
-(the run's `candidate-record-…` artifact keeps them for 90 days). It refuses once
-the tag is on origin (resume instead) or the release is published. Abandoning
-never reuses the candidate number.
-
-## Recovery by failure state
-
-Always start with `make release-status VERSION=vX.Y.Z`; the failing gate and the
-`BLOCKED:`/`FAILED:` line say which of these applies. `<run id>` is the candidate
-run (`gh run list --workflow candidate.yml`).
-
-### Interrupted candidate build
-
-*Symptom:* state `prepared` with no draft, or a `build` job cancelled, timed out
-or failed.
-
-1. `gh run rerun <run id> --failed`, or answer *yes* to `Re-run its failed jobs
-   on this Mac?`. Only failed build jobs run again. A build job whose `build.json`
-   exists for the same input digest refuses to rebuild (`already built … not
-   rebuilding`).
-2. A cancelled self-hosted job may have left processes, VMs or images. The next
-   job's first step (`ci sweep`) fails with the leftover list. Clean the release
-   Mac (`cargo xtask release runner down`, then `up`) and rerun.
-3. If the run is gone or its artifacts have expired, re-run `make release`: a new
-   candidate number is allocated.
-
-### Runner lost mid-validation
-
-*Symptom:* `candidate-built`; the failing gate shows `blocked … lost hypervisor
-mid-run` or `no evidence` for a cell. A test whose capability vanished mid-run is
-infrastructure-blocked, never a pass or a skip.
-
-1. Bring the release runner back (`make release` with `RELEASE_RUNNER=auto` or
-   `local` re-registers it; `cargo xtask release runner down` removes stale
-   registrations).
-2. `gh run rerun <run id> --failed`. Artifact and guest jobs download the exact
-   recorded bytes, verify digest and attestation, and rerun; passed cells are not
-   rerun and the gate re-aggregates.
-
-### Failed suite
-
-*Symptom:* `candidate-built`; the failing gate shows `failed <cell>`.
-
-- Cause was flaky or infrastructure and is fixed: `gh run rerun <run id>
-  --failed` reruns that cell against the same artifacts.
-- Real product bug: prepare a new reviewed release PR with the fix, then `make release` again. The new commit
-  is a new identity, so candidate N+1 is built and N is superseded (its draft
-  deleted, evidence kept in the run artifacts). Reproduce the failure from its
-  record as described in [testing.md](testing.md#reproducing-a-ci-failure).
-
-### Partial asset upload
-
-*Symptom:* `prepared` with a draft that lacks some assets; `assemble` failed.
-
-1. `gh run rerun <run id> --failed`. Assembly recognises its own draft (run
-   marker and identity), uploads only the missing assets, then `SHA256SUMS` and the
-   final `release-state.json`. An existing asset with other bytes is a `FAILED`
-   (lost bytes are never rebuilt under the same candidate).
-2. If the original run's build artifacts are gone, `make release` allocates a new
-   candidate.
-
-### Promotion interrupted between tag and publish
-
-*Symptom:* `validated` with the tag on origin and the release still a draft.
-
-Re-run `make release VERSION=vX.Y.Z` (or dispatch `promote.yml` with the version,
-commit and candidate number). `release promote tag` sees the tag at the candidate
-commit and prints `Tag vX.Y.Z already on origin`; `publish` re-verifies everything
-under the publication lock and publishes the draft. A second publish prints
-`Release vX.Y.Z is already published`. The tag is never recreated or moved.
-
-### Tag exists on a different commit
-
-*Symptom:* `FAILED: tag vX.Y.Z exists on origin at <sha>, not at the candidate
-commit …; a tag is never moved`. Nothing was published.
-
-- If nothing was ever published from that tag (a stray manual tag), a maintainer
-  deletes it (a recorded ruleset bypass) and re-runs.
-- Otherwise release the next patch version.
-
-### Changed input after validation
-
-A force-push, edited release notes, a changed entitlement file, lockfile,
-toolchain, payload or fixture pin, or a manifest edit is a different candidate
-identity. `make release` allocates candidate N+1. Promotion of N is refused (`…
-changed on main since candidate N … start a new candidate`).
-
-### Commit no longer an ancestor of main
-
-*Symptom:* `FAILED: commit … is no longer the tip or an ancestor of main;
-candidate N … is void`. Release from the current `main`.
-
-### Expired evidence, quarantine or override
-
-Evidence expires after 14 days and at the earliest quarantine or override
-deadline; expiry during validation or while waiting for the publication lock
-invalidates it, and age is never reset by copying. Re-run `make release` to build
-and validate a new candidate, or renew the manifest entry through review first.
-
-### Promotion refused: missing or red gate
-
-*Symptom:* `FAILED: required gate main is missing …` or `… not validated`.
-Promotion checks every required gate (`candidate`, `main`) for the commit and
-manifest version, their digests on the draft, every candidate cell and every
-release-critical scenario. Finish validation (rerun failed jobs). There is no flag
-to skip it.
-
-### Override attempted on a non-overridable cell
-
-`cargo xtask gates check` and preflight refuse the manifest (`… override
-forbidden`). Artifact integrity, the signed boot, upgrade, guest and other
-hardware cells have no override path. Restore the hardware or fix the product.
-
-### Two operators start candidates for the same version
-
-Candidate dispatches are mutually excluded by repository, version and
-`dry_run`; only strict-boolean `record_only` runs use run-specific journals.
-GitHub Actions may replace pending runs in a concurrency group and does not
-guarantee FIFO order, so a queued run is not a durable release request. If two
-dispatches still allocate the same number, the second assembly ends `BLOCKED:
-candidate N … was allocated concurrently by another run; nothing was published`.
-Re-run `make release` on the commit you want: it allocates the next number and
-supersedes the other draft under the publication lock.
-
-### Blocked before any build
-
-| Message | Fix |
-|---|---|
-| `BLOCKED: pins are not published yet …` | run the two prerelease targets below; they publish, verify and commit the guest and Mac pins on the release branch before PR review. Verify any other pending candidate pin with `cargo xtask fixtures publish-plan` |
-| `BLOCKED: no Rust toolchain …` or `runner toolchain … is not the pinned` | provision the runner (the first release on a new Mac) |
-| runner preflight `BLOCKED:` (disk, `kern.hv_support`, Apple Containers) | free disk, or use real Apple Silicon (hosted Macs cannot boot a guest) |
-| `BLOCKED: the release GitHub App … is not configured` | install the promotion App and its secrets (`AWMAN_RELEASE_APP_CLIENT_ID`, `AWMAN_RELEASE_APP_PRIVATE_KEY`); nothing was tagged |
-| registry offline or rate-limited during a test | the cell is `blocked`; rerun when reachable |
-
-## Rollback
-
-A published release is never removed, re-tagged or re-uploaded.
-
-1. **Supersede, do not delete.** Edit the release notes on GitHub to point at the
-   fix (text only; assets untouched), and say so in `docs/releases/`.
-2. **Fix forward.** Fix on `main`, then `make release VERSION=vX.Y.Z+1`.
-3. **Failed verification.** If post-publish verification failed (`promoted`, no
-   receipt), the published bytes are still the validated bytes, because digests
-   are checked at every hop. Re-run the failed verify job (`make release` resumes
-   it). If the defect is real, follow steps 1 and 2.
-4. **Before publication** a bad candidate is simply abandoned
-   (`make release-abandon`) and superseded; nothing public exists to roll back.
-5. **A compromised or mis-signed release** is handled the same way: announce the
-   superseding version in the release notes. Never re-upload an asset under the
-   same tag.
-
-## Rehearsal and pre-release validation
-
-An explicit release rehearsal calls `candidate.yml` with `dry_run: true`: a
-namespaced draft (`rehearsal/<run id>/vX.Y.Z`), a dry promotion (no tag, nothing
-published, verification against the run's own bytes), and then the draft is
-deleted. A rehearsal never reads, changes or deletes a production draft, and its
-evidence can never promote production.
-
-Dispatch it from protected `main` for the intended release commit:
-
-```sh
-gh workflow run candidate.yml --ref main -f version=vX.Y.Z -f commit=<full-sha> -f dry_run=true
-```
-
-After release prep commits the new Cargo version and finished release notes on
-`release/vX.Y.Z`, run from the Apple Silicon release Mac:
-
-```sh
-make linux-prerelease REMOTE_LOGIN=user@host
-make apple-prerelease
-```
-
-The Linux target creates or updates a managed release-branch checkout on the KVM host, with the Mac's
-`gh` credential passed privately for the clone. It first dispatches the
-Fixtures workflow when pins are pending. That workflow pulls the immutable
-`ci/fixture-base-image.txt` reference, creates the Docker save archive inside
-CI, reproduces the OCI and Docker fixtures, attests their bytes and publishes
-them once. The target verifies the public checksums, provenance and
-attestations, pins both archives and the shared Mac OS build in `ci/gates.toml`,
-then commits and pushes the pins to the release branch. Native Linux validation
-and packet verification run on that exact branch commit.
-
-The Apple target can run first. It pins the same inputs, opens or reuses the
-release PR, checks both Mac runner image pins, then dispatches and watches the
-hosted full main gate for the exact PR head through the trusted main workflow.
-It then runs and verifies native Apple acceptance and requires its rebuilt
-arm64 fixtures to equal the published pins. Both native packets and the main
-gate must cover the same branch commit before `make release` will wait for the
-PR review. Candidate hardware and artifact tests and the final tag remain in
-the protected post-merge pipeline; they cannot publish until their gates pass.
-
-## The release runner
-
-`cargo xtask release runner <check [--hardware] | provision | busy <owner/repo> |
-verify-archive | up <owner/repo> <tag> | down>` manages the temporary runner that
-`make release` uses; you rarely call it directly.
-
-- `provision` fetches and verifies the manifest fixtures into `~/.awman/release-runner/fixtures`. It needs no global wrapper installation or sudo.
-- `up` downloads the latest `actions/runner` osx-arm64 archive, refuses it unless
-  its SHA-256 matches the checksum in that runner release's notes, registers it
-  with a registration token passed only in `ACTIONS_RUNNER_INPUT_TOKEN`
-  (labels `self-hosted, macOS, ARM64, awman-release`; name
-  `awman-release-<tag>-<host>`), and starts it under `caffeinate`.
-- Jobs run under `/tmp/awr` (mode 0700; refused if it is a symlink or someone
-  else's directory; removed afterwards only if created here), because macOS caps
-  Unix socket paths at 103 bytes.
-- `down` is idempotent: it stops the process group, deregisters the runner, and
-  retains repair state if deregistration fails so the next `down` can finish it.
-- Overrides: `AWMAN_RELEASE_RUNNER_HOME`,
-  `AWMAN_RELEASE_RUNNER_WORK`, `AWMAN_RELEASE_RUNNER_ONLINE_TIMEOUT`.
-- The runner must belong to an organization group restricted to candidate.yml and promote.yml on protected main. Labels only route jobs; they do not authorize them.
-
-## What users verify
-
-Every release publishes `SHA256SUMS` next to the four executables, and each
-executable has a build provenance attestation. Users verify them as described in
-`docs/11-runtimes.md`:
-
-```sh
-shasum -a 256 -c SHA256SUMS --ignore-missing
-gh attestation verify awman-macos-arm64 --repo prettysmartdev/awman \
-  --signer-workflow prettysmartdev/awman/.github/workflows/candidate.yml
-```
-
-Older published releases may lack attestations; never infer provenance from their filename.
-
-## Trust and fixture publication
-
-The normal release runner requires `AWMAN_RELEASE_RUNNER_GROUP_ID`. The runner
-queries the group policy and requires exactly candidate.yml and promote.yml at
-`refs/heads/main`; repository-scoped registration is refused. The prerelease
-targets discover that group from the live organization policy. For main CI,
-`apple-prerelease` uses the same runner manager with a separate home and work
-directory and a group restricted to ci.yml and nightly.yml on main. Each group
-must be allocated to this repository. Protected-main and release-environment
-settings are checked from the live GitHub APIs before prerelease admission.
-Runner teardown retains state when ownership or deregistration cannot be
-established.
-
-Candidate fetch exports an absolute, hash-verified executable path. On Unix it
-restores owner execution and removes write permission before exporting that
-path, including when artifact transport has discarded its executable mode.
-
-The trusted candidate gate writes `validation.json` containing the candidate
-record and gate digest. Only a successful gate step requests its attestation.
-Promotion requires that attestation and independently binds candidate identity,
-namespace, release ID, shipped byte digests, validation run and gate digest.
-The candidate gate's plan digest must equal the recomputed candidate digest.
-The draft journal remains advisory. Policy is reread from the live protected
-main tip through authenticated API reads before tagging and publication, and a
-tip change during verification requires a retry.
-
-Native acceptance remains open as recorded in WI144. Publication still requires the service-authenticated candidate gate, approved environment and immutable fixture pins; a local packet does not bypass them.
-
-Fixture preparation writes `provenance.json` with base, archive, recipe and
-contract digests. `cargo xtask fixtures verify-build --base B --sha256 SHA
---out DIR` reproduces both fixture archives. The Fixtures workflow pulls the
-reviewed digest in `ci/fixture-base-image.txt` and creates the transient base
-archive itself; no separately hosted base tar is needed. It attests and
-publishes `fixture-oci.tar`, `fixture-docker.tar`, `provenance.json` and the
-base-image record. `make linux-prerelease` verifies the public bytes and
-attestations and commits the fixture pins on the release branch for PR review. Native guest
-qualification is separate, and a local build does not establish that a guest
-boots.
+The two prerelease targets may run in either order. They create or resume the
+release branch, pin inputs, run native acceptance, and store packets for the
+same release branch commit. The Apple target opens the PR and dispatches the
+full main CI gate for that commit. Neither target checks GitHub branch rules,
+approval counts, tag rulesets, or App credentials.
+
+`make release` checks both native packets and the authenticated main gate,
+then waits for the PR to merge. Merge the PR using **Squash and merge** while
+the command waits. It reads the PR's merge commit from GitHub, requires that
+commit to be the tip of `origin/main` with one parent, and compares its tree
+to the validated release branch tree. If the PR head or merged tree changed,
+rerun both prerelease targets. If `main` moved after the PR merge, stop and
+inspect before retrying.
+
+The command then starts `candidate.yml` for that merge commit with automatic
+promotion disabled. It waits for the candidate gate, rechecks the validated
+draft, creates the annotated tag, publishes the draft, dispatches
+`promote.yml` for public asset verification, and waits for the receipt.
+`make release-status VERSION=vX.Y.Z` shows the current state. `VERSION` is
+optional for `make release`; if supplied, it must match `Cargo.toml`.
+
+`RELEASE_RUNNER=auto` (default) uses an online native release runner or
+registers this Mac temporarily. `RELEASE_RUNNER=local` always registers this
+Mac. `RELEASE_RUNNER=none` relies on an already managed runner, but the
+command still waits for validation and publication. When this command starts
+a local runner, an exit trap stops and deregisters it after success, failure,
+or interruption.
+
+## Recovery
+
+Re-run `make release` from the clean release branch or the merged `main`
+checkout. The command reads release state from GitHub and resumes the same
+candidate. A failed candidate run can be rerun from the Actions page after
+the underlying cause is fixed. A `validated` candidate is ready for local
+tagging and publication; `promoted` needs public verification; `verified` is
+complete. The command refuses a candidate for another commit or a tag at
+another commit. A draft can be abandoned with
+`make release-abandon VERSION=vX.Y.Z` before publication; its candidate
+number remains reserved.
+
+If public verification fails after publication, fix the runner or external
+condition and rerun `make release`; the tag and assets are not changed.
+If the published bytes are wrong, create a new version.
+
+## Rehearsal and status
+
+`cargo xtask release validate` runs a dry-run candidate for current `main`.
+It calls `promote.yml` to verify the candidate bytes and deletes the rehearsal
+draft. It never creates a public tag or release.
+
+`make release-status VERSION=vX.Y.Z` is read-only. It reports the candidate,
+commit, state, tag presence, failing gate IDs, and evidence links. Candidate
+and post-publication verification evidence is retained by GitHub Actions.

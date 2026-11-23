@@ -82,8 +82,8 @@ reported as passed because it was skipped.
 |---|---|---|
 | `ci.yml` (generated) | pull request, merge group, push to `main`, `workflow_call`, `workflow_dispatch` | the `pr` and `main` gates, and the base of `nightly` and `candidate` |
 | `nightly.yml` (generated) | daily schedule, `workflow_dispatch` | the `nightly` gate and its modes |
-| `candidate.yml` | `workflow_dispatch` or `workflow_call` from `main` only | build once, validate those exact bytes, hand off to promotion |
-| `promote.yml` | called by `candidate.yml` | tag, publish the validated draft, verify the published bytes |
+| `candidate.yml` | `workflow_dispatch` or `workflow_call` from `main` only | build once and validate those exact bytes |
+| `promote.yml` | dispatched by `make release` after publication; called by rehearsals | verify the published or rehearsal bytes |
 | `fixtures.yml` | `workflow_dispatch` from a release branch | pull the reviewed Alpine digest, derive and attest both guest fixtures, publish an immutable fixture release |
 
 ### `ci.yml` job graph
@@ -184,7 +184,7 @@ Hosted `main` and nightly jobs cannot take the release runner.
 
 - Hosted VMs cannot boot a guest (macOS guests cannot nest Hypervisor.framework),
   so every guest cell needs bare-metal Apple Silicon.
-- Self-hosted release jobs run from the protected `main` candidate workflow.
+- Self-hosted release jobs run from the `main` candidate workflow.
   The release runner group is restricted to this repository and the workflow
   paths `candidate.yml` and `promote.yml` at `refs/heads/main`.
 - Release validation checks the native runner before expensive work (disk,
@@ -197,33 +197,26 @@ Hosted `main` and nightly jobs cannot take the release runner.
 - Top-level `permissions: contents: read`; write scopes are granted per job and
   never to a job reachable from a pull request. No `ci.yml` job can write.
 
-## Required checks and repository settings
+## Repository settings
 
-The required status for `main` is the single check `gate` from `ci.yml`, with
-at least one approving PR review and a squash-method merge queue enabled;
-`ci.yml` triggers on `merge_group`. `main` may not be
-force-pushed or deleted, and creation, update and deletion of `v*` tags is
-restricted to the release promotion identity. The expected values are recorded in
-`ci/branch-protection.expected.json`. The repository must require `gate`; deleted workflow names are not valid required statuses.
+The release procedure does not require branch protection, PR approval rules,
+a merge queue, a tag ruleset, or a promotion App. The operator must squash
+merge the release PR, and `make release` checks the merged commit and exact
+tree before candidate validation. The candidate gate verifies the same
+commit before the operator's `gh` login tags and publishes it.
 
-`gates check` cannot read repository settings. Settings that must be applied by
-a maintainer and confirmed against the repository:
-
-1. Branch protection / ruleset for `main` as above.
-2. A workflow-restricted runner group for `awman-release`, registered only
-   during release validation or supplied by an already-online release Mac.
-3. A `release` environment limited to the `main` branch, the release GitHub App
-   (`AWMAN_RELEASE_APP_CLIENT_ID`, `AWMAN_RELEASE_APP_PRIVATE_KEY`) used to create
-   the tag and publish.
-4. Default `GITHUB_TOKEN` read-only; allow only pinned actions; keep `timing-*`
-   artifacts for at least 90 days; create the `flaky-test` issue label.
+Keep a workflow-restricted runner group for `awman-release`, registered only
+during release validation or supplied by an already-online release Mac. Keep
+the `release` environment limited to the `main` branch. The default
+`GITHUB_TOKEN` should be read-only; allow only pinned actions; keep `timing-*`
+artifacts for at least 90 days; create the `flaky-test` issue label.
 
 ## Versioning
 
 - Semantic versioning. Major version bumps reserved for incompatible CLI or on-disk format changes.
 - The `Cargo.toml` `version` is the source of truth. The release tag is `v<Cargo version>`.
 - Release tags are plain `vX.Y.Z`. Pre-release suffixes (`v1.2.3-rc1`) are not supported: the release operator refuse any other version.
-- `docs/releases/v<version>.md` MUST exist before a release starts. The release workflow publishes it as the GitHub Release body.
+- `docs/releases/v<version>.md` MUST exist before a release starts. `make release` publishes it as the GitHub Release body.
 
 ## Publishing
 

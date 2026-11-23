@@ -224,16 +224,20 @@ CLI/TUI, so raw terminal or attach output cannot precede redaction.
 ### WI 0144 test and release execution boundaries
 
 Temporary release runners register only into an organization group whose
-server-reported workflow allowlist matches the selected protected-main release
-path. Labels serve scheduling only. Repository allocation, branch/environment
-protection, tag rulesets, account isolation, and native teardown remain explicit
-administrator/hardware cutover obligations; source checks cannot certify them.
+server-reported workflow allowlist matches the selected `main` release
+workflows. Labels serve scheduling only. Repository allocation, the `release`
+environment, account isolation, and native teardown remain explicit
+administrator/hardware obligations; source checks cannot certify them.
+Branch protection, approval rules, and tag rulesets are optional repository
+settings and are not release admission checks.
 
-The release-branch full main gate is dispatched through `ci.yml` on protected
+The release-branch full main gate is dispatched through `ci.yml` on
 `main` for the exact head of an open, same-repository `release/vX.Y.Z` PR.
 It runs only on hosted runners. Native guest, boundary, and soak checks run
-under the protected release candidate workflow after review, on the release
-Mac. Fork PRs and ordinary PR events cannot use that runner.
+under the `main` release candidate workflow after the PR squash merge, on the
+release Mac. Fork PRs and ordinary PR events cannot use that runner. The
+operator's `make release` verifies the merge commit and tree, waits for the
+candidate gate, and then tags and publishes with the maintainer's GitHub login.
 
 The test supervisor rejects registered host keychain/clipboard/agent names before
 checking ordinary executable allowlists, and still examines registered

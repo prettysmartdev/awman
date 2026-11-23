@@ -1,23 +1,12 @@
-//! Own generated runner/protection files; emit documentation as fragments.
+//! Own generated runner files; emit documentation as fragments.
 pub mod docs;
 pub mod nextest;
 pub mod workflows;
 use crate::manifest::Manifest;
 use anyhow::Result;
 use std::{path::Path, process::ExitCode};
-pub fn protection(m: &Manifest) -> Result<String> {
-    Ok(format!(
-        "{}\n",
-        serde_json::to_string_pretty(
-            &serde_json::json!({"schema":1,"required_checks":[m.gates["pr"].required_check],"merge_queue":true,"main_force_push":false,"main_deletion":false,"settings_verified":false,"verification":"Expected policy only; query live repository rules before release admission"})
-        )?
-    ))
-}
 pub fn outputs(m: &Manifest) -> Result<Vec<(String, String)>> {
-    let mut out = vec![
-        (".config/nextest.toml".into(), nextest::render(m)?),
-        ("ci/branch-protection.expected.json".into(), protection(m)?),
-    ];
+    let mut out = vec![(".config/nextest.toml".into(), nextest::render(m)?)];
     out.extend(workflows::outputs(m)?);
     Ok(out)
 }

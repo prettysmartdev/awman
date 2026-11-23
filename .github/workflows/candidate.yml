@@ -1,5 +1,4 @@
-# Release candidate: build once, validate those exact bytes, then call
-# promote.yml (design 12.1; WI 0144 sections 5.1, 5.2, 5.4-5.6).
+# Release candidate: build once and validate those exact bytes.
 #
 # Started by `make release` (gh workflow run candidate.yml), by hand, or by
 # nightly.yml's dry-run rehearsal (workflow_call). Every decision is made by
@@ -34,9 +33,9 @@ on:
         type: boolean
         default: false
       promote:
-        description: Call promote.yml after validation
+        description: Run the verification rehearsal after validation
         type: boolean
-        default: true
+        default: false
       operator_record:
         description: JSON of the operator's answers and local-test record (advisory)
         type: string
@@ -54,7 +53,7 @@ on:
         default: false
       promote:
         type: boolean
-        default: true
+        default: false
       operator_record:
         type: string
         default: "{}"
@@ -789,16 +788,15 @@ jobs:
 
   promote:
     needs: [preflight, gate]
-    if: ${{ always() && inputs.promote && (needs.gate.result == 'success' || (needs.preflight.outputs.decision == 'published' && !inputs.dry_run)) }}
+    if: ${{ always() && inputs.dry_run && inputs.promote && needs.gate.result == 'success' }}
     uses: ./.github/workflows/promote.yml
     with:
       version: ${{ inputs.version }}
       commit: ${{ inputs.commit }}
       candidate: ${{ needs.preflight.outputs.candidate }}
       dry_run: ${{ inputs.dry_run }}
-    secrets: inherit
     permissions:
-      contents: write
+      contents: read
       actions: read
       attestations: read
 

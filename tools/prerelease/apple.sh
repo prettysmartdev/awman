@@ -7,7 +7,6 @@ test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64 || {
 command -v python3 >/dev/null || { echo 'python3 is required on the release Mac' >&2; exit 1; }
 # shellcheck source=tools/prerelease/branch.sh
 source "$(dirname "$0")/branch.sh"
-bash "$root/tools/prerelease/check-policy.sh" "$repo"
 bash "$root/tools/prerelease/pin-inputs.sh"
 commit=$(git rev-parse HEAD)
 test -z "$(git status --porcelain)" || {
@@ -45,18 +44,6 @@ test "$(gh pr view "$branch" --repo "$repo" --json state,baseRefName,headRefOid,
 pr_number=$(gh pr view "$branch" --repo "$repo" --json number --jq .number)
 AWMAN_RELEASE_RUNNER_GROUP_ID=$(bash "$root/tools/prerelease/group-id.sh" "$repo" release)
 export AWMAN_RELEASE_RUNNER_GROUP_ID
-gh variable list --repo "$repo" --env release --json name,value \
-  --jq '.[] | select(.name == "AWMAN_RELEASE_APP_CLIENT_ID" and .value != "") | .name' \
-  | grep -qx AWMAN_RELEASE_APP_CLIENT_ID || {
-    echo 'Release environment is missing AWMAN_RELEASE_APP_CLIENT_ID' >&2
-    exit 1
-  }
-gh secret list --repo "$repo" --env release --json name \
-  --jq '.[] | select(.name == "AWMAN_RELEASE_APP_PRIVATE_KEY") | .name' \
-  | grep -qx AWMAN_RELEASE_APP_PRIVATE_KEY || {
-    echo 'Release environment is missing AWMAN_RELEASE_APP_PRIVATE_KEY' >&2
-    exit 1
-  }
 before=$(gh run list --repo "$repo" --workflow ci.yml --branch main --limit 1 \
   --json databaseId --jq '.[0].databaseId // 0')
 gh workflow run ci.yml --repo "$repo" --ref main -f gate=main -f "ref=$commit"

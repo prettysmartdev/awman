@@ -22,14 +22,13 @@ fn allowed_write(path: &str, job: &str, scope: &str) -> bool {
         (path.rsplit('/').next().unwrap_or(path), job, scope),
         (
             "candidate.yml",
-            "preflight" | "assemble" | "gate" | "cleanup" | "promote",
+            "preflight" | "assemble" | "gate" | "cleanup",
             "contents"
         ) | (
             "candidate.yml",
             "controller" | "build" | "gate",
             "id-token" | "attestations"
-        ) | ("promote.yml", "verify-inputs" | "receipt", "contents")
-            | ("fixtures.yml", "publish", "contents")
+        ) | ("fixtures.yml", "publish", "contents")
             // Protected-main fixture preparation attests the exact archives and
             // reproduction record; only publication gets a contents write token.
             | ("fixtures.yml", "build", "id-token" | "attestations")

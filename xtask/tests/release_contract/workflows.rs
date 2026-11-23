@@ -81,11 +81,13 @@ fn fixture_publication_attests_both_archives_and_the_reproduction_record() {
 }
 
 #[test]
-fn rehearsal_mints_the_promotion_identity_without_publishing() {
+fn release_publication_belongs_to_the_operator() {
     let text = fs::read_to_string(root().join(".github/workflows/promote.yml")).unwrap();
-    assert!(text.contains("Verify the promotion App can mint a write token without publishing"));
-    assert!(text.contains("id: rehearsal_app\n        if: ${{ inputs.dry_run }}\n        uses: actions/create-github-app-token@"));
-    assert!(text.contains("Verify that App is the v-tag ruleset bypass"));
-    assert!(text.contains("if: ${{ !inputs.dry_run }}"));
-    assert!(text.contains("permission-contents: write"));
+    assert!(!text.contains("create-github-app-token"));
+    assert!(!text.contains("release promote tag"));
+    assert!(!text.contains("release promote publish"));
+    assert!(text.contains("release verify public"));
+    let operator = fs::read_to_string(root().join("tools/prerelease/publish.sh")).unwrap();
+    assert!(operator.contains("release promote tag"));
+    assert!(operator.contains("release promote publish"));
 }

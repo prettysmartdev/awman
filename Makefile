@@ -159,8 +159,8 @@ apple-silicon-prerelease:
 linux-prerelease:
 	@bash tools/prerelease/linux.sh
 
-# Wait for the release PR checks and human squash merge, then validate and
-# promote the merged commit through the protected-main candidate pipeline.
+# Wait for the release PR squash merge, validate its commit, then tag and
+# publish the validated candidate using the maintainer's GitHub login.
 # RELEASE_RUNNER=auto|local|none (see aspec/devops/release.md).
 RELEASE_RUNNER ?= auto
 export RELEASE_RUNNER

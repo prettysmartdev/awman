@@ -158,9 +158,9 @@ release_group() {
   group=$(gh api "orgs/$org/actions/runner-groups/$group_id" --jq ". | select(.restricted_to_workflows == true) | select((.selected_workflows | sort) == ($expected | sort)) | .name") || die "cannot verify $ROLE runner group policy"
   if [ -z "$group" ]; then
     if [ "$ROLE" = release ]; then
-      die "runner group must restrict execution to candidate.yml and promote.yml on protected main"
+      die "runner group must restrict execution to candidate.yml and promote.yml on main"
     else
-      die "runner group must restrict execution to ci.yml and nightly.yml on protected main"
+      die "runner group must restrict execution to ci.yml and nightly.yml on main"
     fi
   fi
   printf '%s\n' "$group"

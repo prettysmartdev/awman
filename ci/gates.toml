@@ -1276,7 +1276,7 @@ trust = "hosted"
 provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "public-network", "registry-credentials"]
 
 [workflows.".github/workflows/promote.yml"]
-jobs = ["verify-inputs", "publish", "verify"]
+jobs = ["verify-inputs", "verify", "receipt"]
 commands = ["release promote", "release verify"]
 timeout_minutes = 60
 

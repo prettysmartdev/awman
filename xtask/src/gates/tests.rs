@@ -447,11 +447,15 @@ fn scenario_test_removal_changes_the_independent_contract() {
 }
 
 #[test]
-fn only_the_candidate_pipeline_can_publish() {
+fn only_the_operator_can_publish() {
     assert!(!root().join(".github/workflows/release.yml").exists());
     assert_eq!(manifest().release.operator_path, "pipeline");
     let workflow = std::fs::read_to_string(root().join(".github/workflows/promote.yml")).unwrap();
-    assert!(workflow.contains("release promote"));
+    assert!(!workflow.contains("release promote tag"));
+    assert!(!workflow.contains("release promote publish"));
+    let operator = std::fs::read_to_string(root().join("tools/prerelease/publish.sh")).unwrap();
+    assert!(operator.contains("release promote tag"));
+    assert!(operator.contains("release promote publish"));
 }
 
 #[test]

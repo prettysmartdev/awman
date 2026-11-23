@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Wait for the reviewed release PR, then run protected-main candidate/promotion.
+# Wait for the release PR squash merge, then validate and promote that commit.
 set -euo pipefail
 test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64 || {
   echo 'make release runs from the Apple Silicon release Mac' >&2
@@ -74,37 +74,7 @@ test "$remote_head" = "$commit" || test "$pr_state" = MERGED || {
   echo 'Remote release branch differs from the validated commit' >&2
   exit 1
 }
-echo "Waiting for every release PR check to finish: https://github.com/$repo/pull/$pr"
-while :; do
-  checks=$(gh pr checks "$pr" --repo "$repo" --json name,state || true)
-  test -n "$checks" || { echo 'Cannot read release PR checks from GitHub' >&2; exit 1; }
-  check_state=$(printf '%s' "$checks" | python3 -c '
-import json, sys
-try:
-    checks = json.load(sys.stdin)
-except (ValueError, TypeError):
-    print("waiting")
-    raise SystemExit
-states = [item.get("state") for item in checks]
-if any(state in ("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED") for state in states):
-    print("failed")
-elif any(item.get("name") == "gate" and item.get("state") == "SUCCESS" for item in checks) and all(state in ("SUCCESS", "SKIPPED", "NEUTRAL") for state in states):
-    print("green")
-else:
-    print("waiting")
-')
-  case "$check_state" in
-    green) break ;;
-    failed) echo 'Release PR has a failed check; fix it and rerun both prerelease targets' >&2; exit 1 ;;
-  esac
-  test "$(gh pr view "$pr" --repo "$repo" --json state,headRefOid \
-    --jq 'select(.state == "OPEN") | .headRefOid')" = "$commit" || {
-    echo 'The release PR changed while checks were running' >&2
-    exit 1
-  }
-  sleep 30
-done
-echo "All release PR checks are green. Review, approve and click Merge when ready (the queue squashes): https://github.com/$repo/pull/$pr"
+echo "Waiting for the release PR to be squash merged: https://github.com/$repo/pull/$pr"
 while :; do
   state=$(gh pr view "$pr" --repo "$repo" --json state --jq .state)
   case "$state" in
@@ -118,14 +88,14 @@ while :; do
   }
   sleep 30
 done
-test -n "$(gh api "repos/$repo/pulls/$pr/reviews?per_page=100" --paginate \
-  --jq '.[] | select(.user.type == "User" and .state == "APPROVED") | .id')" || {
-  echo 'The release PR has no recorded human approval' >&2
+git fetch origin main --quiet
+merge_commit=$(gh pr view "$pr" --repo "$repo" --json mergeCommit --jq .mergeCommit.oid)
+test "$merge_commit" = "$(git rev-parse origin/main)" || {
+  echo 'main moved after the release PR merged; stop before promotion' >&2
   exit 1
 }
-git fetch origin main --quiet
-test "$(gh pr view "$pr" --repo "$repo" --json mergeCommit --jq .mergeCommit.oid)" = "$(git rev-parse origin/main)" || {
-  echo 'main moved after the release PR merged; stop before promotion' >&2
+test "$(git rev-list --parents -n 1 "$merge_commit" | wc -w | tr -d ' ')" = 2 || {
+  echo 'The release PR must use a squash merge with one parent' >&2
   exit 1
 }
 test "$(git rev-parse 'origin/main^{tree}')" = "$tree" || {
@@ -134,6 +104,7 @@ test "$(git rev-parse 'origin/main^{tree}')" = "$tree" || {
 }
 git switch main
 git merge --ff-only origin/main
+test "$(git rev-parse HEAD)" = "$merge_commit"
 AWMAN_RELEASE_RUNNER_GROUP_ID=$(bash "$root/tools/prerelease/group-id.sh" "$repo" release)
 export AWMAN_RELEASE_RUNNER_GROUP_ID
-RELEASE_RUNNER="${RELEASE_RUNNER:-auto}" cargo xtask release run "$version"
+RELEASE_RUNNER="${RELEASE_RUNNER:-auto}" bash "$root/tools/prerelease/publish.sh" "$version" "$merge_commit" "$repo"

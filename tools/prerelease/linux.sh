@@ -12,7 +12,6 @@ test "$(uname -s)" = Darwin && test "$(uname -m)" = arm64 || {
 command -v python3 >/dev/null || { echo 'python3 is required on the release Mac' >&2; exit 1; }
 # shellcheck source=tools/prerelease/branch.sh
 source "$(dirname "$0")/branch.sh"
-bash "$root/tools/prerelease/check-policy.sh" "$repo"
 bash "$root/tools/prerelease/pin-inputs.sh"
 commit=$(git rev-parse HEAD)
 test "$(git branch --show-current)" = "$branch" && test -z "$(git status --porcelain)" || {
