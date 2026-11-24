@@ -86,6 +86,6 @@ jobs:
             echo 'Refusing an existing remote fixture tag' >&2
             exit 1
           fi
-          gh release create "$TAG" --target "$COMMIT" --title "$TAG" --notes-file out/SHA256SUMS out/*
+          gh release create "$TAG" --target "$COMMIT" --title "$TAG" --prerelease --latest=false --notes-file out/SHA256SUMS out/*
           cat out/SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
           echo 'P7 remains open until the downloaded public bytes and all previous-release assets are verified and committed in ci/gates.toml.' >> "$GITHUB_STEP_SUMMARY"

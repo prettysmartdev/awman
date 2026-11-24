@@ -78,6 +78,9 @@ fn fixture_publication_attests_both_archives_and_the_reproduction_record() {
     ));
     assert!(text.contains("Refusing to replace an existing fixture release"));
     assert!(!text.contains("--clobber"));
+    assert!(text.contains(
+        "gh release create \"$TAG\" --target \"$COMMIT\" --title \"$TAG\" --prerelease --latest=false"
+    ));
 }
 
 #[test]

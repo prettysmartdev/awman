@@ -86,7 +86,12 @@ reported as passed because it was skipped.
 | `nightly.yml` (generated) | daily schedule, `workflow_dispatch` | the `nightly` gate and its modes |
 | `candidate.yml` | `workflow_dispatch` or `workflow_call` from `main` only | build once and validate those exact bytes |
 | `promote.yml` | dispatched by `make release` after publication; called by rehearsals | verify the published or rehearsal bytes |
-| `fixtures.yml` | `workflow_dispatch` from a release branch | pull the reviewed Alpine digest, derive and attest both guest fixtures, publish an immutable fixture release |
+| `fixtures.yml` | `workflow_dispatch` from a release branch | pull the reviewed Alpine digest, derive and attest both guest fixtures, publish an immutable fixture prerelease that is never marked Latest |
+
+Fixture releases use `fixtures-<source commit>` tags and remain downloadable by
+their exact tags for digest pinning. They contain test inputs, not awman
+executables, so publication marks them as prereleases and explicitly excludes
+them from GitHub's Latest release selection.
 
 ### `ci.yml` job graph
 
