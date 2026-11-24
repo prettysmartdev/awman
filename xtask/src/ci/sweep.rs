@@ -56,6 +56,9 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
             std::fs::create_dir_all(&root)?;
             root
         };
+        // /tmp is a symlink to /private/tmp on macOS. Children must receive
+        // the real path: secure build-context reads reject symlink ancestors.
+        let root = std::fs::canonicalize(root)?;
         let marker = root.join(".awman-owner");
         use std::io::Write;
         match std::fs::OpenOptions::new()
