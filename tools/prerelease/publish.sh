@@ -37,6 +37,10 @@ trap cleanup EXIT
 if test "$runner_mode" != none; then
   online=$(cargo xtask release runner busy "$repo")
   if test "$runner_mode" = local || test -z "$online"; then
+    # Only a Mac registering a runner needs organization runner-group access.
+    root=$(git rev-parse --show-toplevel)
+    AWMAN_RELEASE_RUNNER_GROUP_ID=$(bash "$root/tools/prerelease/group-id.sh" "$repo" release)
+    export AWMAN_RELEASE_RUNNER_GROUP_ID
     cargo xtask release runner provision
     local_runner=true
     cargo xtask release runner up "$repo" "$version"

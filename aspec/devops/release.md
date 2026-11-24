@@ -40,8 +40,9 @@ tag ruleset bypass, or approving PR review is required by this procedure.
   `release/vX.Y.Z`. The release notes at `docs/releases/vX.Y.Z.md` must have
   no placeholder.
 - Authenticate `gh` as a maintainer with permission to merge the PR, run
-  workflows, create tags, and edit releases. If the Mac will serve the native
-  release jobs, the login also needs repository runner administration.
+  workflows, create tags, and edit releases. If `make release` registers this
+  Mac as a runner, the login also needs organization runner-group access and
+  runner registration rights. `apple-prerelease` does not need those rights.
 - Use a bare-metal Apple Silicon Mac with Hypervisor.framework and the pinned
   toolchain. Native Linux acceptance requires an x86_64 KVM host reached
   through `REMOTE_LOGIN=user@host`.
@@ -91,7 +92,8 @@ registers this Mac temporarily. `RELEASE_RUNNER=local` always registers this
 Mac. `RELEASE_RUNNER=none` relies on an already managed runner, but the
 command still waits for validation and publication. When this command starts
 a local runner, an exit trap stops and deregisters it after success, failure,
-or interruption.
+or interruption. Runner-group discovery happens only when registration is
+needed; an existing runner or `RELEASE_RUNNER=none` does not need that lookup.
 
 ## Recovery
 

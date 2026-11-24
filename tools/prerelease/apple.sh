@@ -42,8 +42,6 @@ test "$(gh pr view "$branch" --repo "$repo" --json state,baseRefName,headRefOid,
   exit 1
 }
 pr_number=$(gh pr view "$branch" --repo "$repo" --json number --jq .number)
-AWMAN_RELEASE_RUNNER_GROUP_ID=$(bash "$root/tools/prerelease/group-id.sh" "$repo" release)
-export AWMAN_RELEASE_RUNNER_GROUP_ID
 before=$(gh run list --repo "$repo" --workflow ci.yml --branch main --limit 1 \
   --json databaseId --jq '.[0].databaseId // 0')
 gh workflow run ci.yml --repo "$repo" --ref main -f gate=main -f "ref=$commit"

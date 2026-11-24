@@ -24,11 +24,15 @@ fn release_waits_for_the_exact_squash_commit_then_uses_local_promotion() {
     assert!(release.contains("origin/main^{tree}"));
     assert!(release.contains("tools/prerelease/publish.sh"));
     assert!(!release.contains("/reviews?"));
+    assert!(!release.contains("group-id.sh"));
     for prerelease in ["apple.sh", "linux.sh"] {
         let text = fs::read_to_string(root().join("tools/prerelease").join(prerelease)).unwrap();
         assert!(!text.contains("check-policy.sh"));
         assert!(!text.contains("AWMAN_RELEASE_APP"));
+        assert!(!text.contains("group-id.sh"));
     }
+    let publish = fs::read_to_string(root().join("tools/prerelease/publish.sh")).unwrap();
+    assert!(publish.contains("AWMAN_RELEASE_RUNNER_GROUP_ID=$(bash"));
     let candidate = fs::read_to_string(root().join(".github/workflows/candidate.yml")).unwrap();
     assert!(candidate.contains("default: false"));
     assert!(candidate.contains("inputs.dry_run && inputs.promote"));

@@ -105,6 +105,4 @@ test "$(git rev-parse 'origin/main^{tree}')" = "$tree" || {
 git switch main
 git merge --ff-only origin/main
 test "$(git rev-parse HEAD)" = "$merge_commit"
-AWMAN_RELEASE_RUNNER_GROUP_ID=$(bash "$root/tools/prerelease/group-id.sh" "$repo" release)
-export AWMAN_RELEASE_RUNNER_GROUP_ID
 RELEASE_RUNNER="${RELEASE_RUNNER:-auto}" bash "$root/tools/prerelease/publish.sh" "$version" "$merge_commit" "$repo"
