@@ -363,7 +363,7 @@ belongs to rather than inventing a new code.
 
 ## Output and configuration
 
-- Across Docker, Apple Containers, builtin and Docker Sandboxes, preparation
+- Across Docker, Apple Containers and builtin, preparation
   reports work rather than every internal check. Image preparation is quiet
   when an installed image can be reused, including
   when no source is configured. When acquisition is needed, use one progress
@@ -376,7 +376,8 @@ belongs to rather than inventing a new code.
   needed. The CLI omits phase transitions and relies on work progress and the
   final readiness summary. Raw build output is shown without a `running` suffix
   on every line; there is no additional debug-style completion dump.
-- Sandbox readiness uses `Preparing <agent> kit (sbx)`. Successful `version`,
+- When Docker Sandboxes support is restored, sandbox readiness uses
+  `Preparing <agent> kit (sbx)`. Successful `version`,
   `ls` and `kit validate` probes omit command announcements and stdout, while
   stderr warnings and failed commands' diagnostics remain visible. Mutating
   sandbox commands retain their announcements. General networking guidance
@@ -502,7 +503,7 @@ the configured default one. The builtin backend does not silently choose another
 source or change the selected execution runtime.
 
 An agent that lacks an allowed/disallowed-tools flag is rejected with a
-configuration error on every runtime (Docker, Apple Containers, builtin and Docker Sandboxes),
+configuration error on every available runtime (Docker, Apple Containers and builtin),
 rather than launching with the tool restriction silently dropped. The effective
 `yoloDisallowedTools` list is such a restriction on every yolo-mode launch (any
 frontend, any workflow step): it is added to the launch's disallowed tools, and
