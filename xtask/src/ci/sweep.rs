@@ -58,6 +58,7 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
         };
         // /tmp is a symlink to /private/tmp on macOS. Children must receive
         // the real path: secure build-context reads reject symlink ancestors.
+        #[cfg(target_os = "macos")]
         let root = std::fs::canonicalize(root)?;
         let marker = root.join(".awman-owner");
         use std::io::Write;
