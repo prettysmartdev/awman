@@ -462,7 +462,10 @@ phase; both verified fixture pins are recorded in `run-config.toml` and do
 not change the repository's fixture policy. Linux native acceptance separately
 uses a local Unix-socket Docker Engine to reconstruct the fixtures and run its
 Docker and registry boundaries. The release candidate's `sbx` boundary runs
-later in GitHub Actions on the self-hosted release Mac.
+later in GitHub Actions on the self-hosted release Mac. That job first checks
+`sbx ls` using the runner's authenticated account. The boundary suite uses a
+private test home and validates emitted local kits with `sbx kit validate --offline`,
+so it never reads the runner's login state.
 
 Successful and failed runs both print a `target/native-validation/*.tar.gz`
 path and its SHA-256. Send that archive, the printed digest, and confirmation

@@ -619,6 +619,8 @@ jobs:
         env:
           AWMAN_TEST_HOST_RESOURCES: apple-containers
         run: cargo xtask test run --suite boundary-apple --build macos-arm64-release-builtin --evidence-dir "$GITHUB_WORKSPACE/evidence/boundary-apple"
+      - name: Check authenticated Docker sandbox CLI
+        run: PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" sbx ls
       - name: Docker sandbox boundary suite
         working-directory: candidate
         env:
