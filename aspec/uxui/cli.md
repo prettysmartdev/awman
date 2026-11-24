@@ -410,7 +410,8 @@ runtime". Dependency names belong in internal implementation details and the att
 guest hostname for explicitly allowed host ports is `host.builtin.internal`.
 
 `runtime.kind` selects `docker` (default), `apple`, `sbx`, or `builtin`.
-`sbx` and `builtin` are experimental. The builtin microVM is an experimental
+`sbx` is recognized but disabled in v0.14 with an explicit error and no
+fallback to another runtime (issue #86). `builtin` is experimental. The builtin microVM is an experimental
 preview on macOS Apple Silicon and Linux x86_64 GNU builds with read/write
 `/dev/kvm` access; Linux ARM64 remains gated. Unsupported hosts fail explicitly
 without substituting another runtime. Unknown values are rejected, never

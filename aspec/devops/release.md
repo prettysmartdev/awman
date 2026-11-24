@@ -46,9 +46,9 @@ tag ruleset bypass, or approving PR review is required by this procedure.
 - Use a bare-metal Apple Silicon Mac with Hypervisor.framework and the pinned
   toolchain. Native Linux acceptance requires an x86_64 KVM host reached
   through `REMOTE_LOGIN=user@host`. The Linux host needs Docker with a local
-  Unix-socket context. Apple prerelease needs Apple Containers, not Docker or
-  `sbx`; the later candidate workflow requires `sbx` and an authenticated
-  runner account on the release Mac.
+  Unix-socket context. Apple prerelease and the candidate workflow need Apple
+  Containers, not Docker or `sbx` on the release Mac. The `sbx` runtime is
+  disabled in v0.14 pending [issue #86](https://github.com/prettysmartdev/awman/issues/86).
 - Keep the required fixture, prior-release, runner-image, and macOS payload
   pins published and recorded in `ci/gates.toml`. The candidate gate reports
   missing pins as blocked evidence.

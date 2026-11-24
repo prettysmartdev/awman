@@ -539,8 +539,8 @@ jobs:
         if: ${{ always() && matrix.target.self_hosted }}
         run: cargo run --locked --quiet --manifest-path controller/Cargo.toml --target-dir "$XTASK_TARGET" -p xtask -- ci sweep
 
-  # Guest tier for the commit on the release Mac (Hypervisor.framework,
-  # Apple Containers and the dedicated Docker pool are separate budgets).
+  # Guest tier for the commit on the release Mac (Hypervisor.framework and
+  # Apple Containers are separate budgets).
   guest:
     name: Guest tier on the release Mac
     needs: [preflight, runner-preflight, assemble]
@@ -619,13 +619,6 @@ jobs:
         env:
           AWMAN_TEST_HOST_RESOURCES: apple-containers
         run: cargo xtask test run --suite boundary-apple --build macos-arm64-release-builtin --evidence-dir "$GITHUB_WORKSPACE/evidence/boundary-apple"
-      - name: Check authenticated Docker sandbox CLI
-        run: PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" sbx ls
-      - name: Docker sandbox boundary suite
-        working-directory: candidate
-        env:
-          AWMAN_TEST_HOST_RESOURCES: docker-sbx
-        run: cargo xtask test run --suite boundary-sbx --build macos-arm64-release-builtin --evidence-dir "$GITHUB_WORKSPACE/evidence/boundary-sbx"
       - name: Guest soak suite
         working-directory: candidate
         env:

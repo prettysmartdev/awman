@@ -260,7 +260,7 @@ If the header is still present but the body differs from what the definition wou
 
 ## Runtimes
 
-Custom agents run on **Docker**, **Apple Containers** and **builtin**. They do **not** run on **Docker Sandboxes** (`sbx`) yet; `awman ready` fails the agent-image step with a clear message if your runtime is Docker Sandboxes. See [Runtimes](11-runtimes.md).
+Custom agents run on **Docker**, **Apple Containers** and **builtin**. Docker Sandboxes (`sbx`) is disabled in v0.14 and selecting it fails before agent preparation. See [Runtimes](11-runtimes.md).
 
 ---
 

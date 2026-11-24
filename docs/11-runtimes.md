@@ -1,14 +1,13 @@
 # Runtimes
 
-awman supports four agent runtimes. The runtime controls how agent processes are isolated from your host machine. All four use the same `awman` commands, the same workflow files, and the same agent names — the runtime is a configuration choice, not a different tool.
+awman v0.14 supports Docker, Apple Containers, and the builtin microVM runtime. The runtime controls how agent processes are isolated from your host machine. These use the same `awman` commands, workflow files, and agent names. The `sbx` configuration value is recognized but disabled for this release.
 
 Preparation output follows the same rules on every runtime: reusing a ready
 image is quiet, and progress describes work that is needed. Docker and Apple
 Containers show build progress only when building. Builtin shows a short
-`Preparing <image> (<source>)` status, which may reuse cached content. Docker
-Sandboxes shows `Preparing <agent> kit (sbx)` while creating and validating its
-kit. Warnings and failures remain visible, and `ready` finishes with a readiness
-summary. Build output is printed without a `running` suffix on every line.
+`Preparing <image> (<source>)` status, which may reuse cached content. Warnings
+and failures remain visible, and `ready` finishes with a readiness summary.
+Build output is printed without a `running` suffix on every line.
 
 ---
 
@@ -18,7 +17,7 @@ summary. Build output is printed without a `running` suffix on every line.
 |---|---|---|---|
 | `docker` (default) | Linux, macOS, Windows | Linux container (shared kernel) | Docker daemon |
 | `apple` | macOS 26+ only | Lightweight VM per container | macOS 26 Tahoe |
-| `sbx` | macOS arm64; Windows x86_64 (experimental) | MicroVM per session | `sbx` CLI + Docker account |
+| `sbx` | Disabled in v0.14 | No sessions can start | See [issue #86](https://github.com/prettysmartdev/awman/issues/86) |
 | `builtin` | macOS on Apple Silicon and Linux x86_64 with KVM (experimental) | MicroVM per session, embedded in awman | The `awman-macos-arm64` or `awman-linux-amd64` release binary, or a supported source build. No Docker, `container`, or `sbx` needed to *run* agents |
 
 Set the runtime in your global config (`runtime.kind` is a global-only key):
@@ -26,15 +25,14 @@ Set the runtime in your global config (`runtime.kind` is a global-only key):
 ```sh
 awman config set runtime.kind docker                   # default
 awman config set runtime.kind apple         # macOS 26+ only
-awman config set runtime.kind sbx  # experimental
 awman config set runtime.kind builtin     # experimental, Apple Silicon or Linux x86_64 with KVM; see below
 ```
 
-You can switch runtimes at any time — each keeps its own separate state and does not interfere with the others. See [Switching runtimes](#switching-runtimes).
+You can switch among the supported runtimes at any time — each keeps its own separate state and does not interfere with the others. See [Switching runtimes](#switching-runtimes).
 
-[Custom agents](15-custom-agents.md) (including `crush` and `maki`) run on `docker`, `apple` and `builtin`, but not on `sbx` yet.
+[Custom agents](15-custom-agents.md) (including `crush` and `maki`) run on `docker`, `apple` and `builtin`.
 
-**Invalid values are a fatal error.** If `runtime.kind` holds anything other than the four values above (including the spellings earlier betas used), awman does not fall back to Docker, because launching agents under a different isolation model than the one you configured would be unsafe. Commands that would run an agent print the invalid value and the valid options, then exit; the interactive TUI opens a modal dialog on startup with the same message (press Enter to quit). `awman config …` keeps working so you can fix it (`awman config set runtime.kind docker`), or edit the global config file directly.
+**Invalid values are a fatal error.** If `runtime.kind` holds anything other than the four recognized values above (including the spellings earlier betas used), awman does not fall back to Docker, because launching agents under a different isolation model than the one you configured would be unsafe. Commands that would run an agent print the invalid value and the valid options, then exit; the interactive TUI opens a modal dialog on startup with the same message (press Enter to quit). `awman config …` keeps working so you can fix it (`awman config set runtime.kind docker`), or edit the global config file directly.
 
 ---
 
@@ -125,7 +123,7 @@ awman ready --build --no-cache   # rebuild from scratch
 
 **Isolation model:** a hardware-virtualized VM with its own kernel per session. The hypervisor, device emulation, and shared-filesystem implementations form part of the security boundary. The configured project, settings, and overlay mounts grant access to host files. There is no host Docker socket bridge.
 
-> **Experimental, macOS on Apple Silicon and Linux x86_64 with KVM.** This runtime is released as an experimental preview, like `sbx`: behaviour and configuration may still change. Linux requires a GNU/glibc x86_64 build and read/write access to `/dev/kvm`; see [Parity limits](#parity-limits-versus-docker-and-apple-containers) for what differs from the other runtimes.
+> **Experimental, macOS on Apple Silicon and Linux x86_64 with KVM.** This runtime is released as an experimental preview: behaviour and configuration may still change. Linux requires a GNU/glibc x86_64 build and read/write access to `/dev/kvm`; see [Parity limits](#parity-limits-versus-docker-and-apple-containers) for what differs from the other runtimes.
 
 ### Where it is available
 
@@ -508,7 +506,7 @@ For a newer catalog, use the newer awman. Otherwise quit any awman still using t
 |---|---|
 | `the builtin runtime is unavailable: this build of awman does not include the builtin-runtime feature` | This awman build lacks the runtime. Use an asset that includes it or build from source (see above), or select another runtime. |
 | `the experimental builtin runtime is only available on macOS on Apple Silicon …` | This release supports Apple Silicon Macs and Linux x86_64 with KVM. On other hosts, select a supported runtime such as `docker`. |
-| `runtime.kind: expected one of docker, apple, sbx, builtin` | The value is not one of the four runtime names (an earlier spelling such as `builtin-experimental` counts). Run `awman config set runtime.kind builtin`. |
+| `runtime.kind: expected one of docker, apple, sbx, builtin` | The value is not one of the recognized runtime names (an earlier spelling such as `builtin-experimental` counts). Run `awman config set runtime.kind builtin`. |
 | `embedded worker startup failed; verify KVM access or the macOS com.apple.security.hypervisor entitlement …` | On Linux, check read/write access to `/dev/kvm` and virtualization support. On macOS, the binary may lack its entitlement or have been modified after signing: run `make sign-macos BIN=$(command -v awman)` or reinstall it. |
 | `"awman-macos-arm64" cannot be opened because the developer cannot be verified` | The file is quarantined (downloaded with a browser). Verify its checksum, then `xattr -d com.apple.quarantine <file>` — see [The macOS binary, Gatekeeper and permissions](#the-macos-binary-gatekeeper-and-permissions). |
 | `builtin image <tag> has no absolute effective HOME` | The image sets no `HOME` and its user has no absolute home in `/etc/passwd`. Add `ENV HOME=/path` to the Dockerfile. |
@@ -558,280 +556,17 @@ These messages apply to configured sources. A stopped or inaccessible source doe
 
 ## Docker Sandboxes (experimental)
 
-`sbx` runs each agent session in a dedicated microVM, providing hypervisor-grade isolation. It uses Docker's `sbx` CLI and is distinct from Docker Desktop — `sbx` is a standalone binary and does not require Docker Desktop to be installed.
-
-This runtime is **experimental**, as the `-experimental` suffix says: `sbx` itself has open known bugs as of June 2026 and its per-VM API is partly undocumented.
-
-**Current status:** `awman ready`, `awman chat`, `awman exec`, and `awman exec workflow` all work end-to-end under `sbx`. Run `awman ready` once to prepare the runtime, then use `awman chat` and `awman exec` exactly as you would with any other runtime.
-
-### Platform support
-
-| Platform | Status |
-|---|---|
-| macOS arm64 (Apple Silicon) | Supported |
-| Windows x86_64 | Supported |
-| Linux x86_64 | Blocked — a confirmed virtiofs bug (docker/sbx-releases#51, open as of June 2026) prevents agents from creating files in the workspace. Configuring this runtime on Linux returns a clear error. |
-
-### What Docker Sandboxes is
-
-Each sandbox is an isolated microVM with its own kernel (Linux 6.12 in Ubuntu), dedicated CPUs, private filesystem, and private Docker daemon. The agent binary runs natively inside the VM. The VM is created from a published template image pulled by host-side containerd — awman does not push any images to a registry.
-
-The VM's private Docker daemon supports Docker-in-Docker, so agents that need to build and run containers work out of the box. The VM does not see your host Docker daemon, your host Docker images, or any host state outside the mounted workspace directory.
-
-### How it differs from Docker and Apple Containers
-
-| | Docker | Apple Containers | Docker Sandboxes |
-|---|---|---|---|
-| Isolation unit | Container (shared kernel) | Lightweight VM | MicroVM |
-| Host escape requires | Container escape | Hypervisor CVE | Hypervisor CVE |
-| Image model | Build from `Dockerfile.<agent>` | Same | Kit YAML — no custom OCI build or registry push |
-| Volume mounts | `-v` bind mounts | `-v` bind mounts | virtiofs; workspace appears at the same absolute path inside VM |
-| Env vars | `-e` flag or env file | Same | Credentials via `sbx secret set` + the credential proxy (not inherited from host shell) |
-| Networking | Host bridge or NAT | Per-container network | All traffic through HTTP/HTTPS proxy; raw TCP/UDP blocked |
-| Startup time | Milliseconds | ~1 second | 2–5 seconds cold (first launch per worktree) + startup script; subsequent restarts are faster |
-| Stats | `docker stats` | `container stats` | Not reported — `agents status` and `agents detail` show no CPU or memory metrics; `agents list` never samples resource metrics |
-| Persistence | Ephemeral (removed on exit) | Ephemeral | **Persistent** — sandbox state survives between sessions |
-
-### Setup
-
-**1. Install `sbx`**
-
-```sh
-brew install docker/tap/sbx   # macOS
-```
-
-For Windows, download from [Docker's releases page](https://docs.docker.com/go/sbx/).
-
-**2. Authenticate**
-
-```sh
-sbx login
-```
-
-A free Docker account is sufficient.
-
-**3. Run `awman ready`**
-
-```sh
-awman config set runtime.kind sbx
-awman ready
-```
-
-`awman ready` for the sbx runtime:
-- Verifies that `sbx` is on your PATH and that you are logged in.
-- Emits per-agent kit files to `~/.awman/kits/<agent>/` for every configured agent.
-- Validates each kit with `sbx kit validate`.
-
-No credentials are registered at ready time — all secret registration happens at agent launch, scoped to the launched sandbox. See [Credentials](#credentials) below.
-
-No images are built and nothing is pushed to a registry. `awman ready` for sbx writes kit files and runs short validation commands.
-
-Successful readiness probes (`sbx version`, `sbx ls`, and `sbx kit validate`)
-stay quiet. Warnings and failures retain their diagnostics; commands that change
-sandboxes, such as removal with `--no-cache`, are still announced.
-
-### Kits — what they are and where they live
-
-Instead of `Dockerfile.<agent>` files, the sbx runtime uses **kit YAML specs**. A kit is a directory containing a `spec.yaml` (which declares the base template image, install commands, network rules, and credential mappings) plus optional asset files (startup scripts, config templates).
-
-Kits are generated by awman and stored globally, not per-repo:
-
-```
-~/.awman/kits/
-├── claude/
-│   ├── spec.yaml
-│   └── files/home/.awman/apply-session-config.sh
-├── codex/
-│   ├── spec.yaml
-│   └── files/home/.awman/apply-session-config.sh
-└── …  (one directory per agent)
-```
-
-You do not edit these files by hand. Re-run `awman ready` to regenerate them (e.g., after upgrading awman or changing agent config). Use `awman ready --no-cache` to force a clean rebuild: awman removes any existing sandboxes for the affected agents and re-emits fresh kits. The next `awman chat` invocation pays the install cost again.
-
-**Kit kinds:** Docker ships built-in sandbox templates for some agents (`claude`, `codex`, `copilot`). awman extends these as `kind: mixin` kits, which reuse Docker's published base and add awman-specific install and startup steps on top. For agents without a Docker built-in (`opencode`, `opencode-v2`, `cursor`, `antigravity`, `cline`), awman bundles `kind: agent` kits that build on a generic shell base image. Cursor and OpenCode 2 are currently refused at readiness and launch because sandbox state and credentials are shared between executions.
-
-**Upgrading `opencode`:** earlier awman versions emitted `opencode` as a `mixin` kit. If `awman ready` finds that kit changed kind and sandboxes named `awman-*-opencode` exist, it warns and names them; run `awman ready --agent opencode --no-cache` to remove them and re-create them from the new kit. Launch under sbx checks OpenCode 1.x inside the sandbox and refuses a mismatched major or a failed version probe.
-
-### Persistent sandbox lifecycle
-
-Unlike Docker and Apple Containers, sbx sandboxes **persist between sessions**. The install cost (agent binary download, apt packages, etc.) is paid once per worktree-and-agent pair. After the first launch, subsequent `awman chat` calls restart the existing sandbox — the install does not re-run.
-
-**First launch:**
-
-```sh
-awman chat --agent claude          # sbx creates the sandbox, installs the agent (one-time), attaches
-```
-
-awman runs `sbx create --kit ~/.awman/kits/claude --name awman-<hash>-claude claude <worktree>` (the worktree is the positional workspace path; it appears inside the VM at the identical absolute path), registers any sandbox-scoped secrets (see [Credentials](#credentials)), then attaches with `sbx run awman-<hash>-claude`.
-
-**Subsequent launches (same worktree):**
-
-```sh
-awman chat --agent claude          # sbx restarts the existing sandbox, re-runs startup script, attaches
-```
-
-awman re-registers the sandbox-scoped secrets (so rotated keys apply), re-applies the per-launch session config (`sbx exec <sandbox> bash …/apply-session-config.sh` — the boot-time startup script only runs when the VM boots, so without this step a sandbox still running from a previous session would keep its old config and a changed `--model` would silently not apply), and runs `sbx run awman-<hash>-claude` (the existing sandbox is addressed by its positional name — `--name` is only valid when creating a new sandbox — and no `--kit` flag is passed, so the installed state is preserved).
-
-**Teardown:**
-
-```sh
-sbx rm awman-<hash>-claude   # stops and removes the sandbox, clearing its persistent volume
-```
-
-**Listing running sandboxes:**
-
-```sh
-awman agents status        # shows awman-managed agents on the configured runtime
-sbx ls                     # shows all sandboxes including non-awman ones
-```
-
-`awman agents status` includes a source marker for running agents. Regular user
-sessions are marked `session`; containers your squad launched are
-marked `squad:<task>` (for example, `squad:issue-triage`). The marker is
-informational and may be visible whether or not you use squad.
-
-**Sandbox naming:** awman names sandboxes `awman-<worktree-hash>-<agent>`. The hash is derived from the worktree's absolute path so the same worktree always produces the same name. Multi-agent workflows create one persistent sandbox per agent per worktree. When a workflow step runs, awman reuses the existing sandbox for that agent if one exists (restart, no reinstall), or creates a new one on first use. All steps that share the same agent share one sandbox — the per-agent install cost is paid once per worktree regardless of how many workflow steps use that agent.
-
-### Credentials
-
-The supported way to authenticate an sbx-backed agent is an `env(VAR)` overlay at launch time. Set the provider API key in your shell, then request it as an overlay:
-
-```sh
-export ANTHROPIC_API_KEY=sk-ant-...
-awman chat --agent claude --overlay 'env(ANTHROPIC_API_KEY)'
-```
-
-At agent launch (not `awman ready`), awman reads the value from your shell environment and registers it with a **sandbox-scoped** `sbx secret set <sandbox> <service>`, so the sbx host proxy is authenticated by the time the agent starts. On first launch awman creates the sandbox first (`sbx create --kit …`), sets the scoped secrets, then attaches with `sbx run <sandbox>`. awman never sets global (`-g`) secrets: scoped secrets take effect immediately (global ones only apply at sandbox creation), your keys never leak into sandboxes awman doesn't manage, and removing a sandbox removes its secrets with it. Because rotated keys are re-registered on every launch, you never need to re-run `awman ready` after changing a key.
-
-Each agent accepts a specific allowlist of auth variables (matching the [Docker Sandboxes credential services](https://docs.docker.com/ai/sandboxes/security/credentials/)):
-
-| Agent | Supported env vars | sbx service |
-|---|---|---|
-| `claude` | `ANTHROPIC_API_KEY` | `anthropic` |
-| `codex` | `OPENAI_API_KEY` | `openai` |
-| `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` | `github` |
-| `opencode` | `ANTHROPIC_API_KEY` | `anthropic` |
-
-Rules:
-
-- An `env(VAR)` overlay for a credential-class variable **not** on the agent's allowlist is dropped with a warning (it is never written anywhere workspace-readable).
-- Launching with no supported auth overlay does not warn blindly. awman first probes for a pre-existing sbx secret that already covers the agent's provider — it runs `sbx secret ls --service <service>` (the well-known service name, e.g. `anthropic` for `claude`) and `sbx secret ls -g` (the global store). If a matching secret is found (from a previous launch, a manual `sbx secret set`, or a global key), awman prints an informational note that the existing credential will authenticate the agent and launches normally. Only when no pre-existing secret is found does it warn that auth must be configured manually (`sbx secret set <sandbox> <service>` — sandbox-scoped secrets apply immediately, even to a running sandbox) or via the agent's own login flow inside the sandbox — and the launch still proceeds either way.
-- `cursor` and `opencode-v2` are refused on this runtime until per-execution state and credential isolation is available. Use `docker`, `apple` or `builtin`.
-- Other custom-kit agents (`antigravity`, `cline`) do not participate in launch-time auto-auth yet; register their credentials manually with `sbx secret set`.
-- Non-credential `env(VAR)` overlays (e.g. `LOG_LEVEL`) are unaffected — they reach the agent through `session.json` as before.
-
-Credentials are piped to `sbx secret set` via stdin — they never appear in process listings, and they are masked in all awman output.
-
-**Claude subscription tokens:** Docker Sandboxes does not yet support `CLAUDE_CODE_OAUTH_TOKEN` (the token from `claude setup-token`), so awman silently skips it — no warning is printed, since the token is surfaced on every launch whenever you are logged in to Claude Code and auth works without it. To use Claude Code under the sbx runtime, either set `ANTHROPIC_API_KEY` (the missing-auth warning above still fires when no supported variable is configured), or run `/login` inside the sandbox on first launch — the sbx credential proxy completes the OAuth flow and keeps the resulting token on the host. This is unchanged by, and unaffected by, the live-refreshed credential file awman writes for Claude under the Docker and Apple Containers runtimes (see [Agent authentication](03-agent-sessions.md#agent-authentication)) — sbx sessions still authenticate only through `ANTHROPIC_API_KEY` or in-sandbox login.
-
-Non-credential config (model selection, mode flags, system prompts, tool lists) is written to `<workspace>/.awman/session.json` before each launch and read by the startup script inside the VM. Credential values are never written to `session.json`.
-
-### Session config and seeded prompts
-
-How awman delivers a seeded prompt (e.g., from `awman exec prompt --agent claude "fix the bug"`) depends on the kit kind:
-
-| Kit kind | Prompt delivery |
-|---|---|
-| `kind: mixin` (`claude`, `codex`, `copilot`) | Written into the agent's stdin at launch (typed ahead for interactive sessions, piped for `--headless`) |
-| `kind: agent` (`opencode`, `antigravity`, `cline`) | Appended as a positional argument at launch |
-
-Mixin kits launch their agent through Docker's built-in sandbox template, so awman cannot put the prompt on the command line — stdin injection is the single delivery path. The prompt is also recorded in `session.json` and staged by the startup script at `~/.awman/seeded-prompt.txt` inside the VM for reference, but that copy is informational, not a second delivery.
-
-Mixin startup scripts consume these `session.json` fields where the agent supports them natively:
-
-- `model` — sets the agent's default model
-- `permission_mode` — `--plan` / `--auto` / `--yolo`; claude renders it as `permissions.defaultMode` (`plan` / `acceptEdits` / `bypassPermissions`) in its settings file. For `--yolo`, the script also sets `skipDangerousModePermissionPrompt: true` so claude does not ask for interactive confirmation of bypass-permissions mode — the sandbox is the isolation boundary, matching the container runtimes' behavior
-- `system_prompt_inline.text` — applies an inline system prompt via the agent's native config
-- `allowed_tools` / `disallowed_tools` — Claude applies tool allow/deny lists through its native permissions settings. Other sandbox agents reject these lists before launch because their startup scripts cannot apply them.
-
-If a mixin agent cannot express a field through its native config, awman prints a warning at launch time. Tool allow/deny lists instead refuse the launch when they cannot be applied. `kind: agent` kits do not consume these fields from `session.json` — configuration is delivered as launch arguments appended after the `--` delimiter, mirroring the container runtimes' argv: any non-interactive flag (for example `agy --print`), mode flags (`--yolo`, …), the model flag (`--model <NAME>`), then the seeded prompt. (`antigravity` delivers system prompts through extra directory mounts under the container runtimes; those mounts don't exist under sbx, so awman warns that the system prompt was not applied.)
-
-No prompt is delivered twice: mixin kits use stdin; `kind: agent` kits use positional arguments; neither path uses both.
-
-### Supported agents
-
-Six built-in agents are supported under `sbx`; two require a container runtime:
-
-| Agent | Kit kind | Notes |
-|---|---|---|
-| `claude` | mixin | Extends `docker/sandbox-templates:claude-code-docker` |
-| `codex` | mixin | Extends `docker/sandbox-templates:codex-docker` |
-| `copilot` | mixin | Extends `docker/sandbox-templates:copilot-docker` |
-| `opencode` | agent | OpenCode 1.x installed on the `shell-docker` base |
-| `opencode-v2` | unavailable | Requires per-execution state and credential isolation |
-| `cursor` | unavailable | Requires per-execution state and credential isolation |
-| `antigravity` | agent | Full install on `shell-docker` base |
-| `cline` | agent | Full install on `shell-docker` base |
-
-### Custom agents on Docker Sandboxes
-
-[Custom agents](15-custom-agents.md) — including `crush` and `maki`, which are now shipped as custom-agent examples — are not supported on Docker Sandboxes yet. Under `sbx`, `awman ready` fails the agent-image step for a custom agent and no kit is emitted. Switch the runtime to `docker`, `apple` or `builtin`, where custom agents run like any other agent.
+The `sbx` runtime is disabled in v0.14 because current Docker Sandboxes kits are
+incompatible with awman's kit definitions. Setting `runtime.kind` to `sbx`
+returns an explicit error before starting an agent. Select `docker`, `apple`,
+or `builtin` to run agents. Existing sandbox state is not deleted.
+
+See [issue #86](https://github.com/prettysmartdev/awman/issues/86) for the
+compatibility work and the plan to restore this runtime.
 
 ### Known limitations
 
-**Platform:** macOS arm64 and Windows x86_64 only. Linux is blocked until docker/sbx-releases#51 is fixed upstream.
-
-**Networking:** all traffic goes through an HTTP/HTTPS proxy. Raw TCP, UDP, and ICMP are blocked. This means SSH-based git remotes, database connections, and other raw-socket protocols do not work inside the VM by default. Agents that need npm, pip, or curl to reach the internet will work; agents that need to SSH into a server will not.
-
-**No per-resource stats:** `awman agents status` and the TUI status panel show running sandboxes from `sbx ls`, but cannot report per-sandbox CPU or memory usage. The `docker stats`-style live resource view is unavailable for sbx sandboxes.
-
-**`--allow-docker`:** Docker-in-Docker is always on inside an sbx sandbox (each VM has a private Docker daemon). The `--allow-docker` flag (which mounts the host daemon socket into Docker containers) is a no-op under sbx — it is ignored (noted in the debug log).
-
-**Directory overlays, skills, and context mounts:** the VM can only see the workspace, which is virtiofs-mounted at sandbox creation. `dir(...)` overlays, skill mounts (`skill(*)` / `skill(...)`), and context directory mounts (`context(...)`) cannot be honored — awman warns at launch and continues without them. For `context(...)`, the rendered system prompt text is still delivered to the agent; only the directory mount is skipped.
-
-**Mixin launch flags:** mixin kits launch the agent through Docker's built-in template, whose launch command takes no CLI flags from awman. Anything with a native config-file equivalent is delivered through `session.json` (see [Session config](#session-config-and-seeded-prompts)); the rest is warned about at launch instead of silently dropped:
-
-| Option | claude | codex | copilot |
-|---|---|---|---|
-| `--model` | applied (settings file) | applied (settings/config file) | **not deliverable** — warned; use the `/model` slash command in-session |
-| `--yolo` / `--auto` | applied (`permissions.defaultMode`) | **not deliverable** — warned | **not deliverable** — warned |
-| `--plan` | applied (`permissions.defaultMode = plan`) | **refused** before the sandbox is created (`native_capability_unavailable`) | **refused** before the sandbox is created (`native_capability_unavailable`) |
-| `--headless` | **not deliverable** — warned; the prompt is still piped to the agent's interactive entrypoint | same | same |
-| `agents.flags` / `--agent-flag` | **not deliverable** — warned | **not deliverable** — warned | **not deliverable** — warned |
-
-`kind: agent` kits (`opencode`, `antigravity`, `cline`) are unaffected: awman owns their entrypoint and passes mode flags, `--model`, `agents.flags`, and any non-interactive flag as launch arguments, exactly like the container runtimes.
-
-**Port mappings:** if a workflow binds a port inside the sandbox, that port mapping is lost when the sandbox stops. Port-based workflows must keep the sandbox running continuously.
-
-**Template drift:** if Docker updates a built-in sandbox template (e.g., changes the default entrypoint for `claude-code`), existing sandboxes keep the old template until they are destroyed and recreated. Run `awman ready --no-cache` to re-emit kits for the new template; existing sandboxes must be removed with `sbx rm` before the next launch picks up the new kit.
-
-### Troubleshooting
-
-**`sbx` not found:**
-```
-`sbx` binary not found on PATH. Install Docker Sandboxes with `brew install docker/tap/sbx`, then re-run `awman ready`.
-```
-
-**Not logged in** (a warning; `ready` continues):
-```
-sbx: `sbx ls` failed — you may not be logged in. Run `sbx login` to authenticate Docker Sandboxes, then re-run `awman ready`.
-```
-
-**Linux:**
-```
-backend docker-sbx-experimental is not supported on platform linux — blocked until the Docker Sandboxes virtiofs file-creation bug (sbx-releases Issue #51) is fixed upstream
-```
-Use `runtime.kind: docker` instead.
-
-**Stale kit version** (printed inside the sandbox):
-```
-awman: session.json has unsupported schema_version '<n>' (expected 1).
-```
-The kit on disk was emitted by a different awman version. Run `awman ready` to regenerate it.
-
-**Kit validation failure:**
-```
-kit validation failed for ~/.awman/kits/claude: <error from sbx>
-```
-The error text from `sbx kit validate` is printed verbatim. Common causes are a stale `sbx` binary (upgrade it) or a network issue during template pull. Run `awman ready --no-cache` to force a clean re-emit.
-
-**Launch failure:**
-```
-sbx exited with code 1; last output:
-ERROR: failed to create sandbox: <error from sbx>
-```
-When `sbx run` exits non-zero, awman replays the tail of sbx's output into the execution window alongside the exit code, so the failure is diagnosable without re-running the announced `sbx` command by hand.
+All SBX agent operations are unavailable in v0.14.
 
 ---
 
@@ -839,12 +574,12 @@ When `sbx run` exits non-zero, awman replays the tail of sbx's output into the e
 
 The native-agent features — `--plan`, `--read-only-workspace`, `--settings-profile`, `--agent-session` and `--automation` — behave the same on Docker, Apple Containers and the builtin runtime, on the host platforms each is released for. awman refuses, before building anything, a combination a runtime cannot honor; it never starts the agent with weaker guarantees instead.
 
-| Feature | Docker, Apple Containers, builtin | Docker Sandboxes (`sbx`) |
-|---|---|---|
-| `--plan` | All eight agents | `claude`, `opencode`, `cline`, `antigravity`; `codex` and `copilot` refused; `cursor` and `opencode-v2` refused by the sandbox's existing rules |
-| `--read-only-workspace` | Enforced by the workspace mount where the runtime can; otherwise refused at preflight | Refused where the runtime cannot enforce it |
-| `--settings-profile`, `--agent-session` | Supported; only the private per-execution profile copy is mounted | Not supported (declarative kits cannot take per-execution mounts) |
-| `--automation` | Supported; a private channel directory is mounted at `/awman/automation` for native lifecycle records | Starts without that channel, so only best-effort OSC 7501 status is available and `--automation=require_full` cannot deliver a task |
+| Feature | Docker, Apple Containers, builtin |
+|---|---|
+| `--plan` | All eight agents |
+| `--read-only-workspace` | Enforced by the workspace mount where the runtime can; otherwise refused at preflight |
+| `--settings-profile`, `--agent-session` | Supported; only the private per-execution profile copy is mounted |
+| `--automation` | Supported; a private channel directory is mounted at `/awman/automation` for native lifecycle records |
 
 Things that depend on the runtime and are reported honestly rather than assumed:
 
@@ -856,34 +591,22 @@ Things that depend on the runtime and are reported honestly rather than assumed:
 
 ## Switching runtimes
 
-You can switch between runtimes at any time by changing `runtime.kind`. Each runtime maintains its own state:
-
-- **Docker / Apple Containers:** per-repo `.awman/Dockerfile.<agent>` files and the local Docker / containerd image store. These are unchanged when you switch to sbx.
-- **Docker Sandboxes:** `~/.awman/kits/<agent>/` (host-global kit files) and `<workspace>/.awman/session.json` (per-launch dynamic config written just before each launch). These are not touched when you switch to Docker or Apple Containers.
-- **Builtin:** the private state directory (`~/.awman/builtin` by default) holding imported images and session VMs. Its images are separate from the Docker and Apple image stores.
-
-Switching runtimes does not delete state for the other runtimes. You can keep all four ready simultaneously.
-
-**Switching mid-project:** if you run `awman chat` under Docker and then switch to sbx and run `awman chat` against the same worktree, you start a fresh sbx sandbox. In-VM state from the Docker container is not transferred (containers and microVMs are completely separate environments). Your Git repo state is shared — both runtimes see the same files on disk.
-
-**Example: switch and switch back**
+Change `runtime.kind` to select a supported runtime. Docker and Apple
+Containers use their own image stores; builtin uses a private image and VM
+store. Changing the selection does not delete another runtime's state.
 
 ```sh
-# Set up Docker (already done at init)
+awman config set runtime.kind builtin
+awman ready
+awman chat --agent claude
+
 awman config set runtime.kind docker
 awman ready
-
-# Try the sbx runtime
-awman config set runtime.kind sbx
-awman ready                         # emits and validates kits
-awman chat --agent claude                   # runs in sbx sandbox
-
-# Switch back to Docker — Docker images are still there
-awman config set runtime.kind docker
-awman chat --agent claude                   # runs in Docker container, unchanged
+awman chat --agent claude
 ```
 
-`awman ready` is per-runtime: running it with `runtime.kind` set to `docker` does not touch sbx kits; with `sbx` does not touch Docker images; with `builtin` imports into the builtin store and builds only when the opt-in builder and a compatible local source schedule a build.
+`awman ready` prepares the selected runtime. Selecting `sbx` in v0.14 fails
+with a disabled-runtime error; choose a supported runtime to continue.
 
 ---
 

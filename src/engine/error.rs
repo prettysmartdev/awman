@@ -148,6 +148,11 @@ pub enum EngineError {
     BackendUnsupportedOnPlatform { backend: String, platform: String },
 
     #[error(
+        "runtime.kind=sbx is disabled in awman v0.14.0 because current Docker Sandboxes kits are incompatible; choose docker, apple, or builtin. Track https://github.com/prettysmartdev/awman/issues/86"
+    )]
+    SbxRuntimeDisabled,
+
+    #[error(
         "invalid runtime '{value}' in global config ($HOME/.awman/config.json); \
          valid values: {valid}"
     )]
@@ -788,6 +793,7 @@ impl EngineError {
             EngineError::AgentNotFound { .. } | EngineError::UnknownAgent { .. } => 4,
             EngineError::Container(_) | EngineError::ContainerRuntimeUnavailable { .. } => 3,
             EngineError::UnknownRuntime { .. }
+            | EngineError::SbxRuntimeDisabled
             | EngineError::AgentDefinitionUntrusted { .. }
             | EngineError::CustomAgentRuntimeUnsupported { .. }
             // A contradictory mode selector is invalid usage (WI 0070).

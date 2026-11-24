@@ -175,7 +175,7 @@ trust = "release"
 runs_on = ["self-hosted", "macOS", "ARM64", "awman-release"]
 triple = "aarch64-apple-darwin"
 image = "macos-25G83"
-provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "hypervisor", "builtin-payload", "guest-fixtures", "previous-release", "apple-containers", "docker-sbx", "release-artifact", "offline"]
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "hypervisor", "builtin-payload", "guest-fixtures", "previous-release", "apple-containers", "release-artifact", "offline"]
 max_vms = 2
 
 [builds.linux-x64-default]
@@ -1050,7 +1050,7 @@ suites = ["guest-boot", "guest-exec", "guest-import", "guest-network", "guest-up
 builds = ["macos-arm64-release-builtin"]
 
 [[gates.candidate.cells]]
-suites = ["unit-awman-builtin", "boundary-apple", "boundary-sbx", "soak-guest"]
+suites = ["unit-awman-builtin", "boundary-apple", "soak-guest"]
 builds = ["macos-arm64-release-builtin"]
 
 [gates.promote]

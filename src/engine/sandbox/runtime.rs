@@ -34,6 +34,10 @@ pub struct SandboxRuntime {
     backend: Arc<dyn SandboxBackend>,
 }
 
+// Keep the backend code available for the v3 migration, but refuse all public
+// construction paths in v0.14. See https://github.com/prettysmartdev/awman/issues/86.
+const SBX_RUNTIME_ENABLED: bool = false;
+
 impl SandboxRuntime {
     /// Prepare this runtime for a single agent at `awman ready` time: check
     /// the `sbx` binary and login, emit the agent's kit, register
@@ -58,12 +62,15 @@ impl SandboxRuntime {
 
     /// Construct with the Docker Sandbox (`sbx`) backend.
     ///
-    /// Platform guard: Docker Sandboxes are not available on Linux. Erroring
-    /// here (rather than from the first backend call) gives the user an actionable platform message up front.
+    /// In v0.14, construction fails before any platform or CLI access because
+    /// the Docker Sandboxes kit format is incompatible with this backend.
     pub fn dsbx() -> Result<Self, EngineError> {
         Self::dsbx_in(crate::engine::host_cli::process_env())
     }
     pub fn dsbx_in(env: crate::data::config::env::EnvSnapshot) -> Result<Self, EngineError> {
+        if !SBX_RUNTIME_ENABLED {
+            return Err(EngineError::SbxRuntimeDisabled);
+        }
         if cfg!(target_os = "linux") {
             return Err(EngineError::BackendUnsupportedOnPlatform {
                 backend: "docker-sbx-experimental".into(),
@@ -553,6 +560,14 @@ impl ExecutionBackend for SandboxAttachExecution {
 mod workspace_access_tests {
     use super::*;
     use awman_test_support::{TestCase, TestSandbox};
+
+    #[test]
+    fn sbx_runtime_is_disabled_for_this_release() {
+        assert!(matches!(
+            SandboxRuntime::dsbx_in(crate::data::config::env::EnvSnapshot::empty()),
+            Err(EngineError::SbxRuntimeDisabled)
+        ));
+    }
 
     #[test]
     fn sandbox_cannot_advertise_or_prepare_read_only_workspaces() {

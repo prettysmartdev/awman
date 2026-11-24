@@ -497,8 +497,7 @@ pub fn detect(global: &ConfigFile) -> Result<DetectedRuntime, EngineError> {
 /// - unset / blank / `"docker"` → `ContainerRuntime` with the Docker backend
 /// - `"apple-containers"` → `ContainerRuntime` with the Apple backend
 ///   (macOS only)
-/// - `"docker-sbx-experimental"` → `SandboxRuntime` with the (stubbed)
-///   Docker Sandbox backend (macOS arm64 / Windows only; see WI 0090)
+/// - `"sbx"` → an explicit disabled-runtime error in v0.14 (issue #86)
 /// - `"builtin-experimental"` → `ContainerRuntime` with the builtin microVM
 ///   backend (released for macOS on Apple Silicon only), or
 ///   the precise reason it cannot run here (`BuiltinRuntimeUnavailable`,
