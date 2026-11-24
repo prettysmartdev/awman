@@ -451,6 +451,11 @@ access and enough disk for debug/release builds, payloads and guest images. This
 command explicitly grants the test runner access to those named local runtimes
 and the hypervisor. It never runs an agent on the host.
 
+On macOS, native validation and the Actions runner allocate a short private
+test root under `/tmp` and check the canonical guest socket path against the
+103-byte limit before starting guest tests. The native packet records the
+selected root. A long ambient `TMPDIR` does not change this selection.
+
 The target installs the pinned test runner, fetches and verifies the builtin
 payload and published previous executable, fetches both published SHA-256-pinned
 OCI and Docker-save guest fixtures, compiles the native suites, captures their expected tests, signs the

@@ -71,7 +71,7 @@ fn sandbox_case(case: TestCase) -> GuestSandbox {
         s.register_exe(name, exe);
     }
     let vm_state = awman_test_support::sandbox::private_tempdir(
-        "awg-",
+        "g-",
         &awman_test_support::runtime_env::get()
             .tmproot
             .clone()

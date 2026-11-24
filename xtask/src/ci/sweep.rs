@@ -11,15 +11,19 @@ use std::{
 };
 
 pub const TEMP_PREFIX: &str = "awman-test-";
-/// Temp roots left by tests: `awman-test-*` directories directly under `parent`.
+/// Temp roots left by tests and runner attempts directly under `parent`.
 pub fn leaked_temp_roots(parent: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(parent)
         .map(|rd| {
             rd.flatten()
                 .map(|e| e.path())
                 .filter(|p| {
-                    p.file_name()
-                        .is_some_and(|n| n.to_string_lossy().starts_with(TEMP_PREFIX))
+                    p.file_name().is_some_and(|n| {
+                        let name = n.to_string_lossy();
+                        name.starts_with(TEMP_PREFIX)
+                            || name.starts_with("r-")
+                            || name.starts_with("awman-run-")
+                    })
                 })
                 .collect()
         })
@@ -36,14 +40,22 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
                 .is_empty(),
             "job sweep initialization requires a workflow run identity"
         );
-        let base = std::env::var_os("RUNNER_TEMP")
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow::anyhow!("RUNNER_TEMP is required"))?;
-        // Unix socket paths inside the run need room for both the run and
-        // per-test directories. The marker below still checks the full lease.
-        let digest = crate::evidence::digest::input_digest(&lease)?;
-        let root = base.join(format!("a-{}", &digest[..12]));
-        std::fs::create_dir_all(&root)?;
+        let short = if cfg!(target_os = "macos") {
+            Some(crate::test::temp_root::short_apple_root()?)
+        } else {
+            None
+        };
+        let root = if let Some(temp) = &short {
+            temp.path().to_path_buf()
+        } else {
+            let base = std::env::var_os("RUNNER_TEMP")
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow::anyhow!("RUNNER_TEMP is required"))?;
+            let digest = crate::evidence::digest::input_digest(&lease)?;
+            let root = base.join(format!("a-{}", &digest[..12]));
+            std::fs::create_dir_all(&root)?;
+            root
+        };
         let marker = root.join(".awman-owner");
         use std::io::Write;
         match std::fs::OpenOptions::new()
@@ -64,6 +76,9 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
             "AWMAN_TEST_TMPROOT={}",
             root.display()
         )?;
+        if let Some(temp) = short {
+            let _ = temp.keep();
+        }
         return Ok(ExitCode::SUCCESS);
     }
     let Some(root) = std::env::var_os("AWMAN_TEST_TMPROOT").map(PathBuf::from) else {
@@ -95,6 +110,14 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
     for l in &leaks {
         eprintln!("LEAK: {l}");
     }
+    if cfg!(target_os = "macos")
+        && root.parent() == Some(Path::new("/private/tmp"))
+        && root
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("a."))
+    {
+        std::fs::remove_dir_all(&root)?;
+    }
     verdict(leaks.is_empty())
 }
 
@@ -116,9 +139,14 @@ mod tests {
     fn only_private_lease_children_are_matched() {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir(d.path().join("awman-test-abc")).unwrap();
+        std::fs::create_dir(d.path().join("r-123456")).unwrap();
         std::fs::create_dir(d.path().join("unrelated")).unwrap();
-        let found = leaked_temp_roots(d.path());
-        assert_eq!(found, vec![d.path().join("awman-test-abc")]);
+        let mut found = leaked_temp_roots(d.path());
+        found.sort();
+        assert_eq!(
+            found,
+            vec![d.path().join("awman-test-abc"), d.path().join("r-123456")]
+        );
     }
     #[test]
     fn one_lease_cannot_remove_another_leases_diagnostics() {

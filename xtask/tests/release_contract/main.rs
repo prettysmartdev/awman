@@ -19,6 +19,62 @@ fn write(path: &Path, body: &str) {
     fs::write(path, body).unwrap();
 }
 
+fn run_main_ci(case: &str, id: &'static str) -> (awman_test_support::Output, String, String) {
+    let mut sandbox = TestSandbox::for_test(TestCase::component(id));
+    let state = sandbox.root().join("main-ci-fake");
+    let evidence = sandbox.root().join("main-ci-evidence");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&evidence).unwrap();
+    let fake = root().join("xtask/tests/release_contract/main-ci-fakes.sh");
+    sandbox.install_exe(&fake, "gh");
+    sandbox.install_exe(&fake, "python3");
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    sandbox.env_mut().set("FAKE_STATE", &state);
+    sandbox.env_mut().set("FAKE_CASE", case);
+    sandbox.env_mut().set("FAKE_COMMIT", commit);
+    let output = sandbox
+        .command("bash")
+        .arg(root().join("tools/prerelease/main-ci.sh"))
+        .arg("example/awman")
+        .arg(commit)
+        .arg(&evidence)
+        .run();
+    let calls = fs::read_to_string(state.join("calls")).unwrap();
+    let gate = fs::read_to_string(evidence.join("gate-evidence.json")).unwrap();
+    (output, calls, gate)
+}
+
+#[test]
+fn apple_prerelease_reuses_only_successful_ci_with_exact_gate_evidence() {
+    let (run, calls, gate) = run_main_ci("reuse", "release-reuse-main-ci");
+    run.assert_success();
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "99");
+    assert!(calls.contains("run download 100"));
+    assert!(calls.contains("run download 99"));
+    assert!(!calls.contains("workflow run"));
+    assert!(gate.contains("0123456789abcdef0123456789abcdef01234567"));
+}
+
+#[test]
+fn apple_prerelease_dispatches_when_existing_ci_is_not_successful() {
+    let (run, calls, gate) = run_main_ci("dispatch", "release-dispatch-main-ci");
+    run.assert_success();
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "101");
+    assert!(calls.contains("workflow run ci.yml"));
+    assert!(calls.contains("run watch 101"));
+    assert!(!calls.contains("run download 100"));
+    assert!(gate.contains("0123456789abcdef0123456789abcdef01234567"));
+}
+
+#[test]
+fn apple_prerelease_dispatches_when_exact_commit_evidence_is_missing() {
+    let (run, calls, gate) = run_main_ci("missing", "release-missing-main-ci");
+    run.assert_success();
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "101");
+    assert!(calls.contains("workflow run ci.yml"));
+    assert!(gate.contains("0123456789abcdef0123456789abcdef01234567"));
+}
+
 #[test]
 fn release_waits_for_the_exact_squash_commit_then_uses_local_promotion() {
     let make = fs::read_to_string(root().join("Makefile")).unwrap();

@@ -102,6 +102,7 @@ struct Run {
     env: BTreeMap<String, String>,
     packet: Packet,
     registry: Option<String>,
+    _test_tmproot: Option<tempfile::TempDir>,
 }
 impl Drop for Run {
     fn drop(&mut self) {
@@ -486,24 +487,43 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
             let build = root.join("target/native-validation-build");
             fs::create_dir_all(&out)?;
             fs::create_dir_all(&work)?;
+            let test_tmproot = if platform.apple() {
+                Some(crate::test::temp_root::short_apple_root()?)
+            } else {
+                None
+            };
+            if let Some(temp) = &test_tmproot {
+                fs::write(
+                    out.join("test-temp-root.txt"),
+                    format!("{}\n", temp.path().canonicalize()?.display()),
+                )?;
+            }
+            let mut env = BTreeMap::from([
+                ("CARGO_TARGET_DIR".into(), build.display().to_string()),
+                (
+                    "PATH".into(),
+                    format!(
+                        "{}:{}",
+                        root.join("target/xtask-tools/bin").display(),
+                        std::env::var("PATH")?
+                    ),
+                ),
+            ]);
+            if let Some(temp) = &test_tmproot {
+                env.insert(
+                    "AWMAN_TEST_TMPROOT".into(),
+                    temp.path().display().to_string(),
+                );
+            }
             let mut r = Run {
                 platform,
                 registry: None,
+                _test_tmproot: test_tmproot,
                 root: root.clone(),
                 out: out.clone(),
                 work: work.clone(),
                 build: build.clone(),
-                env: BTreeMap::from([
-                    ("CARGO_TARGET_DIR".into(), build.display().to_string()),
-                    (
-                        "PATH".into(),
-                        format!(
-                            "{}:{}",
-                            root.join("target/xtask-tools/bin").display(),
-                            std::env::var("PATH")?
-                        ),
-                    ),
-                ]),
+                env,
                 packet: Packet {
                     schema: 1,
                     commit: git(&root, &["rev-parse", "HEAD"])?,

@@ -71,8 +71,10 @@ make release
 
 The two prerelease targets may run in either order. They create or resume the
 release branch, pin inputs, run native acceptance, and store packets for the
-same release branch commit. The Apple target opens the PR and dispatches the
-full main CI gate for that commit. Neither target checks GitHub branch rules,
+same release branch commit. The Apple target opens the PR and reuses a
+successful full main CI gate when its authenticated run and downloaded
+evidence prove that exact commit; otherwise it dispatches a new main gate.
+Neither target checks GitHub branch rules,
 approval counts, tag rulesets, or App credentials.
 
 `make release` checks both native packets and the authenticated main gate,

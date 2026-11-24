@@ -190,6 +190,7 @@ fn run(id: &'static str, apple: bool) {
     );
 }
 #[test]
+#[cfg(target_os = "linux")]
 fn docker_build_import_rebuild_then_cached_execution() {
     run(
         "builder::docker_build_import_rebuild_then_cached_execution",

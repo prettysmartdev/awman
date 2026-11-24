@@ -88,7 +88,7 @@ impl Run {
     fn for_home(home: PathBuf) -> Result<Self> {
         let before = protected_snapshot(&home)?;
         let mut builder = tempfile::Builder::new();
-        builder.prefix("awman-run-");
+        builder.prefix("r-").rand_bytes(6);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

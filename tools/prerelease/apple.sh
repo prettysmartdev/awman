@@ -42,28 +42,8 @@ test "$(gh pr view "$branch" --repo "$repo" --json state,baseRefName,headRefOid,
   exit 1
 }
 pr_number=$(gh pr view "$branch" --repo "$repo" --json number --jq .number)
-before=$(gh run list --repo "$repo" --workflow ci.yml --branch main --limit 1 \
-  --json databaseId --jq '.[0].databaseId // 0')
-gh workflow run ci.yml --repo "$repo" --ref main -f gate=main -f "ref=$commit"
-main_run=
-for _ in $(seq 1 60); do
-  main_run=$(gh run list --repo "$repo" --workflow ci.yml --branch main --limit 30 \
-    --json databaseId,event --jq "[.[] | select(.databaseId > $before and .event == \"workflow_dispatch\") | .databaseId] | max // empty")
-  test -z "$main_run" || break
-  sleep 5
-done
-test -n "$main_run" || { echo "No dispatched main CI run found for $commit" >&2; exit 1; }
-gh run watch "$main_run" --repo "$repo" --exit-status --interval 60
 ci_evidence=$(mktemp -d "$root/target/prerelease/ci.XXXXXXXX")
-gh run download "$main_run" --repo "$repo" --name "gate-evidence-main-$commit" \
-  --dir "$ci_evidence"
-python3 - "$ci_evidence/gate-evidence.json" "$commit" <<'PY'
-import json
-import sys
-gate = json.load(open(sys.argv[1]))
-if gate.get("gate") != "main" or gate.get("commit") != sys.argv[2] or gate.get("verdict") != "passed":
-    raise SystemExit("The dispatched main gate does not prove this release commit")
-PY
+main_run=$(bash "$root/tools/prerelease/main-ci.sh" "$repo" "$commit" "$ci_evidence")
 started=$(mktemp "$root/target/prerelease/apple-start.XXXXXXXX")
 CARGO_TARGET_DIR=target/native-validation-tools cargo xtask native-validation run
 latest=
