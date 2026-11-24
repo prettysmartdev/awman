@@ -679,7 +679,7 @@ pub async fn agent_version_readiness_contract(kind: BackendKind, id: &'static st
     }
     let docs = include_str!("../../../docs/03-agent-sessions.md");
     assert!(docs.contains("skips the former host authentication ping"));
-    assert!(docs.contains("existing mixin sandboxes need"));
+    assert!(docs.contains("Docker Sandboxes is disabled in v0.14"));
     backend.shutdown().await;
     s.finish();
     json!(trace)

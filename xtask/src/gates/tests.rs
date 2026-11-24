@@ -555,7 +555,7 @@ fn empty_prefix_suite_is_detected_without_a_compiled_inventory() {
 }
 
 #[test]
-fn nightly_is_hosted_and_sbx_is_release_only() {
+fn nightly_is_hosted_and_sbx_is_excluded_from_candidate() {
     let m = manifest();
     let nightly = plan::create(&m, "nightly", request("schedule", &[]), today()).unwrap();
     assert!(nightly.tests.iter().all(|job| !job.self_hosted));
@@ -568,11 +568,11 @@ fn nightly_is_hosted_and_sbx_is_release_only() {
     assert!(candidate
         .cells
         .iter()
-        .any(|cell| cell.cell.suite == "boundary-sbx"));
+        .all(|cell| cell.cell.suite != "boundary-sbx"));
     assert!(candidate
         .tests
         .iter()
-        .any(|job| job.suites.contains("boundary-sbx") && job.blocked_reason.is_some()));
+        .all(|job| !job.suites.contains("boundary-sbx")));
 }
 
 #[test]
