@@ -209,6 +209,17 @@ fn incomplete_diff_and_missing_base_fail() {
         .contains("base SHA"));
 }
 #[test]
+fn dispatched_main_gate_needs_no_changed_path_base() {
+    assert!(plan::diff_complete_for("workflow_dispatch", None));
+    assert!(plan::diff_complete_for("workflow_call", None));
+    assert!(!plan::diff_complete_for("pull_request", None));
+    let mut r = request("workflow_dispatch", &[]);
+    r.base_sha = None;
+    r.diff_complete = plan::diff_complete_for(&r.event, r.base_sha.as_deref());
+    let p = plan::create(&manifest(), "main", r, today()).unwrap();
+    assert!(p.cells.iter().all(|c| c.selected));
+}
+#[test]
 fn malformed_paths_fail() {
     assert!(plan::create(
         &manifest(),

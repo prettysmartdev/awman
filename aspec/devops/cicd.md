@@ -63,8 +63,10 @@ are selected, with the exceptions printed in the manifest's `[selection]` table
 `.github/`, `.config/`, `xtask/`, `crates/awman-test-support/`, `Makefile`,
 `tools/`, `third_party/` and anything unknown) which select the full `pr` set.
 Unit, lint, doctest and parity suites are always selected. Merge-group and
-`main` runs always run the full set. A plan that fails, a missing base commit or
-a truncated diff is non-green, never an empty selection.
+`main` runs always run the full set. Pull requests require a base commit for
+changed-path selection; full-gate dispatches do not need one. A plan that fails,
+a missing pull-request base commit or a truncated diff is non-green, never an
+empty selection.
 
 **Evidence.** Each test job writes `run.json`, the selected test inventory,
 JUnit and failure records. The `gate` job reconstructs
@@ -249,6 +251,6 @@ see [testing.md](testing.md#reproducing-a-ci-failure).
 
 ## Evidence limits
 
-Native Apple Silicon acceptance remains open in WI144. The maintainer runs `make validate-native` and returns its packet for independent review. No hosted-Mac compilation or Linux pass is native runtime proof. The global guest fixture remains pending until the reviewed archive is published and pinned. Required native gates stay blocked without those inputs and admitted hardware.
+Native Apple Silicon acceptance requires a verified packet from `make validate-native`. No hosted-Mac compilation or Linux pass is native runtime proof. Guest fixtures are pinned to published archives. Required native gates stay blocked without verified packets and admitted hardware.
 
 Coverage and mutation results are diagnostics. Performance reports must distinguish cold builds, warm runs and queue time; a single run does not establish p95 or a flake rate. Dependency advisories are reviewed separately from the licenses, bans and sources gate.

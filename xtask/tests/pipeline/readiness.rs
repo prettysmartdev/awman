@@ -237,6 +237,14 @@ fn unrelated_pending_guest_pins_do_not_block_a_unit_fixture_fetch() {
         .as_table_mut()
         .unwrap()
         .retain(|id, _| id == "guest-oci-base");
+    let fixture = manifest["fixtures"]["guest-oci-base"]
+        .as_table_mut()
+        .unwrap();
+    fixture.remove("sha256");
+    fixture.insert(
+        "pending".into(),
+        "test fixture has not been published".into(),
+    );
     manifest["previous_release"] = toml::Value::Table(Default::default());
     std::fs::create_dir_all(s.work().join("ci")).unwrap();
     std::fs::write(

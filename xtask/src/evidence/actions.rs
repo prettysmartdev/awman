@@ -416,7 +416,7 @@ pub fn aggregate(root: &Path, m: &Manifest, p: &Plan) -> Result<GateEvidence> {
         Some(base) => plan::changed_paths(root, base, &request.head_sha)?,
         None => vec![],
     };
-    request.diff_complete = request.base_sha.is_some();
+    request.diff_complete = plan::diff_complete_for(&event_name, request.base_sha.as_deref());
     // This controller never turns uploader assertions into hardware admission.
     request.admitted_platforms.clear();
     let today = chrono::Utc::now().date_naive();

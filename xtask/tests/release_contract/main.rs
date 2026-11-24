@@ -3,10 +3,16 @@
 mod runner;
 mod workflows;
 use awman_test_support::{fakes::FakeCli, TestCase, TestSandbox};
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 fn write(path: &Path, body: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -52,13 +58,19 @@ fn remote_linux_resolves_cargo_without_a_login_shell() {
     sandbox.env_mut().set("CARGO_HOME", &cargo_home);
     let script = root().join("tools/prerelease/remote-linux.sh");
     let run = || {
-        sandbox.command("bash").arg(&script)
-            .args(["release/v0.14.0", "0123456789abcdef0123456789abcdef01234567"])
+        sandbox
+            .command("bash")
+            .arg(&script)
+            .args([
+                "release/v0.14.0",
+                "0123456789abcdef0123456789abcdef01234567",
+            ])
             .run()
     };
     let missing = run();
     assert_eq!(missing.exit, Exit::Code(1));
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("Cargo is unavailable to noninteractive SSH"));
+    assert!(String::from_utf8_lossy(&missing.stderr)
+        .contains("Cargo is unavailable to noninteractive SSH"));
 
     let cargo = cargo_home.join("bin/cargo");
     write(&cargo, "#!/bin/sh\nexit 0\n");
@@ -81,17 +93,27 @@ impl Publisher {
         fs::create_dir_all(&state).unwrap();
         fs::write(state.join("state"), "none").unwrap();
         sandbox.env_mut().set("FAKE_STATE", &state);
-        sandbox.env_mut().set("FAKE_COMMIT", "0123456789abcdef0123456789abcdef01234567");
+        sandbox
+            .env_mut()
+            .set("FAKE_COMMIT", "0123456789abcdef0123456789abcdef01234567");
         sandbox.env_mut().set("RELEASE_RUNNER", "none");
         for name in ["git", "gh", "cargo"] {
-            sandbox.install_exe(&root().join("xtask/tests/release_contract/publisher-fakes.sh"), name);
+            sandbox.install_exe(
+                &root().join("xtask/tests/release_contract/publisher-fakes.sh"),
+                name,
+            );
         }
         Self { sandbox, state }
     }
     fn run(&self) -> awman_test_support::Output {
-        self.sandbox.command("bash")
+        self.sandbox
+            .command("bash")
             .arg(root().join("tools/prerelease/publish.sh"))
-            .args(["v1.2.3", "0123456789abcdef0123456789abcdef01234567", "example/awman"])
+            .args([
+                "v1.2.3",
+                "0123456789abcdef0123456789abcdef01234567",
+                "example/awman",
+            ])
             .run()
     }
     fn calls(&self) -> String {
@@ -104,12 +126,17 @@ fn validated_candidate_is_tagged_and_published_by_make_release_path() {
     let p = Publisher::new("release-publish");
     p.run().assert_success();
     let calls = p.calls();
-    let validation = calls.find("cargo xtask release promote verify-inputs").unwrap();
+    let validation = calls
+        .find("cargo xtask release promote verify-inputs")
+        .unwrap();
     let tag = calls.find("cargo xtask release promote tag").unwrap();
     let publish = calls.find("cargo xtask release promote publish").unwrap();
     let verify = calls.find("gh workflow run promote.yml").unwrap();
     assert!(validation < tag && tag < publish && publish < verify);
-    assert_eq!(fs::read_to_string(p.state.join("state")).unwrap().trim(), "verified");
+    assert_eq!(
+        fs::read_to_string(p.state.join("state")).unwrap().trim(),
+        "verified"
+    );
 }
 
 #[test]
@@ -127,7 +154,11 @@ fn failed_candidate_cannot_be_tagged() {
 fn candidate_for_another_commit_is_refused_before_tagging() {
     let p = Publisher::new("release-wrong-commit");
     fs::write(p.state.join("state"), "validated").unwrap();
-    fs::write(p.state.join("commit"), "ffffffffffffffffffffffffffffffffffffffff").unwrap();
+    fs::write(
+        p.state.join("commit"),
+        "ffffffffffffffffffffffffffffffffffffffff",
+    )
+    .unwrap();
     assert!(!p.run().exit.success());
     assert!(!p.calls().contains("release promote tag"));
 }
@@ -141,5 +172,8 @@ fn published_release_retries_verification_without_rebuilding() {
     let calls = p.calls();
     assert!(!calls.contains("gh workflow run candidate.yml"));
     assert!(calls.contains("gh workflow run promote.yml"));
-    assert_eq!(fs::read_to_string(p.state.join("state")).unwrap().trim(), "verified");
+    assert_eq!(
+        fs::read_to_string(p.state.join("state")).unwrap().trim(),
+        "verified"
+    );
 }

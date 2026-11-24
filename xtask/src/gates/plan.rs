@@ -16,6 +16,7 @@ pub struct Request {
     pub head_sha: String,
     pub base_sha: Option<String>,
     pub paths: Vec<String>,
+    /// The changed-path diff is complete, or this event selects the full gate.
     pub diff_complete: bool,
     /// Obtained by the trusted CI controller's server-side runner admission.
     #[serde(default)]
@@ -298,6 +299,11 @@ pub fn create(m: &Manifest, gate: &str, request: Request, today: NaiveDate) -> R
 }
 pub fn is_commit(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|c| c.is_ascii_hexdigit())
+}
+/// Pull requests use changed paths to select suites. Other events select the
+/// full gate, so a dispatch without a base commit has no diff to complete.
+pub fn diff_complete_for(event: &str, base: Option<&str>) -> bool {
+    base.is_some() || event != "pull_request"
 }
 pub fn changed_paths(root: &Path, base: &str, head: &str) -> Result<Vec<String>> {
     ensure!(
