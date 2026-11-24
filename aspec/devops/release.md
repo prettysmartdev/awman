@@ -45,7 +45,9 @@ tag ruleset bypass, or approving PR review is required by this procedure.
   runner registration rights. `apple-prerelease` does not need those rights.
 - Use a bare-metal Apple Silicon Mac with Hypervisor.framework and the pinned
   toolchain. Native Linux acceptance requires an x86_64 KVM host reached
-  through `REMOTE_LOGIN=user@host`.
+  through `REMOTE_LOGIN=user@host`. The Linux host needs Docker with a local
+  Unix-socket context. Apple prerelease needs Apple Containers, not Docker or
+  `sbx`; the later candidate workflow still requires `sbx` on the release Mac.
 - Keep the required fixture, prior-release, runner-image, and macOS payload
   pins published and recorded in `ci/gates.toml`. The candidate gate reports
   missing pins as blocked evidence.

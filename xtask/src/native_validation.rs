@@ -228,7 +228,7 @@ fn suites(m: &Manifest, platform: Platform) -> Vec<String> {
                 && (s.tier == "guest"
                     || s.tier == "artifact"
                     || if platform.apple() {
-                        ["boundary-apple", "boundary-sbx"].contains(&id.as_str())
+                        id.as_str() == "boundary-apple"
                     } else {
                         [
                             "boundary-docker",

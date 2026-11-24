@@ -444,22 +444,25 @@ make validate-native
 ```
 
 Prerequisites: the repository's pinned Rust toolchain, Xcode command-line tools,
-Docker running with a local Unix-socket context, Apple Containers with its
-service running, and the `sbx` CLI installed and usable. Run as your normal user,
+and Apple Containers with its service running. Docker and `sbx` are not needed
+for this Apple prerelease packet. Run as your normal user,
 with no other validation process using this checkout. Preparation needs internet
 access and enough disk for debug/release builds, payloads and guest images. This
 command explicitly grants the test runner access to those named local runtimes
 and the hypervisor. It never runs an agent on the host.
 
 The target installs the pinned test runner, fetches and verifies the builtin
-payload and published previous executable, prepares digest-recorded OCI and
-Docker-save guest fixtures, compiles the native suites, captures their expected tests, signs the
+payload and published previous executable, fetches both published SHA-256-pinned
+OCI and Docker-save guest fixtures, compiles the native suites, captures their expected tests, signs the
 guest executables and release candidate, and runs the guest and artifact tiers
 plus the declared native boundaries. The signed candidate is copied into the
 packet and must retain the same digest throughout execution. The offline artifact
 tests enforce their own network denial. Image preparation is a separate online
-phase; both locally prepared fixture pins are recorded in `run-config.toml` and do
-not change the repository's fixture policy.
+phase; both verified fixture pins are recorded in `run-config.toml` and do
+not change the repository's fixture policy. Linux native acceptance separately
+uses a local Unix-socket Docker Engine to reconstruct the fixtures and run its
+Docker and registry boundaries. The release candidate's `sbx` boundary runs
+later in GitHub Actions on the self-hosted release Mac.
 
 Successful and failed runs both print a `target/native-validation/*.tar.gz`
 path and its SHA-256. Send that archive, the printed digest, and confirmation

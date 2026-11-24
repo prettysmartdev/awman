@@ -56,6 +56,7 @@ fn published(opts: &BTreeMap<String, String>) -> Result<()> {
     }
     let out = PathBuf::from(value(opts, "--out")?);
     if out.is_file() && verify(&out, hash).is_ok() {
+        executable(&out)?;
         return Ok(());
     }
     std::fs::create_dir_all(out.parent().context("--out needs a parent directory")?)?;
@@ -79,16 +80,22 @@ fn published(opts: &BTreeMap<String, String>) -> Result<()> {
         let _ = std::fs::remove_file(&partial);
         return Err(e);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755))?;
-    }
+    executable(&partial)?;
     std::fs::rename(&partial, &out)?;
     println!(
         "published previous release: {} sha256={hash}",
         out.display()
     );
+    Ok(())
+}
+fn executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 fn guest(recipe: &str, opts: &BTreeMap<String, String>) -> Result<()> {
@@ -217,6 +224,31 @@ mod tests {
         verify(&archive, &hash).unwrap();
         std::fs::write(&archive, b"replaced bytes").unwrap();
         assert!(verify(&archive, &hash).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn cached_published_executable_regains_its_execute_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let asset = root.path().join("awman");
+        std::fs::write(&asset, b"published binary").unwrap();
+        std::fs::set_permissions(&asset, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let opts = BTreeMap::from([
+            ("--out".into(), asset.display().to_string()),
+            (
+                "--sha256".into(),
+                crate::evidence::digest::sha256_file(&asset).unwrap(),
+            ),
+            (
+                "--url".into(),
+                "https://github.com/example/awman/releases/download/v1/awman".into(),
+            ),
+        ]);
+        published(&opts).unwrap();
+        assert_ne!(
+            std::fs::metadata(&asset).unwrap().permissions().mode() & 0o111,
+            0
+        );
     }
 
     #[test]
