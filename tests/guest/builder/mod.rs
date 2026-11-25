@@ -39,9 +39,7 @@ fn run(id: &'static str, apple: bool) {
         )
     };
     let apple_fixture = if apple {
-        let runtime =
-            awman::engine::container::ContainerRuntime::apple_in(support::env_snapshot(&s));
-        assert!(!runtime.image_exists(&source_tag), "BLOCKED[fixture-ownership]: private Apple fixture tag unexpectedly exists: {source_tag}");
+        awman_test_support::apple_image::assert_absent(&s, &cli, &source_tag);
         Some(OwnedAppleFixture {
             sandbox: &s,
             cli: cli.clone(),

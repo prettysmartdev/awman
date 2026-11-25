@@ -15,14 +15,10 @@ impl OwnedFixture<'_> {
     fn load<'a>(
         sandbox: &'a awman_test_support::TestSandbox,
         archive: &std::path::Path,
-        runtime: &ContainerRuntime,
     ) -> OwnedFixture<'a> {
         let (tag, private_archive) =
             awman_test_support::apple_image::private_fixture(sandbox, archive);
-        assert!(
-            !runtime.image_exists(&tag),
-            "BLOCKED[fixture-ownership]: private Apple fixture tag unexpectedly exists: {tag}"
-        );
+        awman_test_support::apple_image::assert_absent(sandbox, "container", &tag);
         let owned = OwnedFixture { sandbox, tag };
         sandbox
             .command("container")
@@ -96,7 +92,7 @@ fn native_store_export_validates_content_and_reuses_the_cache() {
     let fixture = s.require::<GuestFixtures>();
     let runtime = ContainerRuntime::apple_in(support::env_snapshot(&s));
     // Own cleanup before import: a partially successful load must not leak either.
-    let image = OwnedFixture::load(&s, &fixture.paths["guest-oci-base"], &runtime);
+    let image = OwnedFixture::load(&s, &fixture.paths["guest-oci-base"]);
     let acquirer = CachingAcquirer::new(
         &s.root().join("cache"),
         AcquireLimits::DEFAULT,
@@ -153,7 +149,7 @@ fn a_read_only_workspace_rejects_writes_while_scratch_output_context_and_home_st
     s.grant(&apple);
     let fixture = s.require::<GuestFixtures>();
     let runtime = ContainerRuntime::apple_in(support::env_snapshot(&s));
-    let image = OwnedFixture::load(&s, &fixture.paths["guest-oci-base"], &runtime);
+    let image = OwnedFixture::load(&s, &fixture.paths["guest-oci-base"]);
     support::read_only::prove(&support::read_only::Proof {
         runtime: std::sync::Arc::new(runtime),
         image: &image.tag,

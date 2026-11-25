@@ -20,6 +20,20 @@ pub fn private_fixture(sandbox: &TestSandbox, archive: &Path) -> (String, PathBu
     (tag, output)
 }
 
+/// Refuse to claim a tag unless the Apple store confirms it is absent.
+pub fn assert_absent(sandbox: &TestSandbox, cli: impl AsRef<std::ffi::OsStr>, tag: &str) {
+    let inspection = sandbox
+        .command(cli.as_ref())
+        .args(["image", "inspect", tag])
+        .run();
+    assert!(
+        !inspection.exit.success()
+            && (inspection.stderr_text().contains("Image not found")
+                || inspection.stdout_text().contains("Image not found")),
+        "BLOCKED[fixture-ownership]: private Apple fixture tag is present or could not be inspected: {tag}: {inspection:?}"
+    );
+}
+
 fn retag_oci_archive(source: &Path, output: &Path, tag: &str) -> std::io::Result<()> {
     let input = std::fs::File::open(source)?;
     let mut writer = tar::Builder::new(std::fs::File::create(output)?);
