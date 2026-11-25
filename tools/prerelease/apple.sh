@@ -32,16 +32,21 @@ cargo xtask gates check
 cargo xtask ci runner-preflight --platform macos-arm64-release
 cargo xtask release runner check --hardware
 cargo xtask release runner provision
-if ! gh pr view "$branch" --repo "$repo" >/dev/null 2>&1; then
+# A post-merge candidate failure can require a follow-up PR from this branch.
+# Select only an open PR; a prior merged PR is not the current release review.
+open_prs=$(gh pr list --repo "$repo" --state open --base main --head "$branch" --json number --jq length)
+if test "$open_prs" -eq 0; then
   gh pr create --repo "$repo" --base main --head "$branch" \
     --title "Release v$version" --body-file "docs/releases/v$version.md"
 fi
-test "$(gh pr view "$branch" --repo "$repo" --json state,baseRefName,headRefOid,isCrossRepository \
+pr_number=$(gh pr list --repo "$repo" --state open --base main --head "$branch" --json number \
+  --jq 'if length == 1 then .[0].number else empty end')
+test -n "$pr_number" || { echo 'Expected exactly one open release PR' >&2; exit 1; }
+test "$(gh pr view "$pr_number" --repo "$repo" --json state,baseRefName,headRefOid,isCrossRepository \
   --jq 'select(.state == "OPEN" and .baseRefName == "main" and .isCrossRepository == false) | .headRefOid')" = "$commit" || {
   echo 'The open release PR must target main at the exact prerelease commit' >&2
   exit 1
 }
-pr_number=$(gh pr view "$branch" --repo "$repo" --json number --jq .number)
 marker="$root/target/prerelease/apple-$commit"
 if test -f "$marker/evidence/packet.json" &&
   cargo xtask native-validation verify "$marker/evidence"; then
@@ -59,7 +64,16 @@ else
   rm -f -- "$started"
   test "$archive_count" -eq 1 || { echo 'Expected exactly one new Apple native packet' >&2; exit 1; }
   work=$(mktemp -d "$root/target/prerelease/apple.XXXXXXXX")
-  python3 "$root/tools/prerelease/extract-packet.py" "$latest" "$work"
+  if ! python3 "$root/tools/prerelease/extract-packet.py" "$latest" "$work"; then
+    # Packaging metadata must not force another successful native run. The
+    # runner keeps the original evidence next to its archive; verify those
+    # bytes independently before using them for this exact release commit.
+    echo 'Archive extraction failed; checking saved native evidence' >&2
+    native_evidence="${latest%.tar.gz}/evidence"
+    cargo xtask native-validation verify "$native_evidence"
+    rm -rf -- "$work/evidence"
+    cp -R "$native_evidence" "$work/evidence"
+  fi
   cargo xtask native-validation verify "$work/evidence"
   mkdir -p "$marker"
   if test -e "$marker/evidence"; then

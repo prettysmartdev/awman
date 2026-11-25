@@ -36,6 +36,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      pull-requests: read
 
   flake-hunt:
     name: Flake hunt (shuffled, repeated, under CPU contention)

@@ -552,6 +552,9 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
             )?;
             let archive = base.with_extension("tar.gz");
             let status = Command::new("tar")
+                // macOS tar otherwise adds AppleDouble `._` members that the
+                // untrusted-packet extractor correctly rejects.
+                .env("COPYFILE_DISABLE", "1")
                 .args(["-czf"])
                 .arg(&archive)
                 .arg("-C")

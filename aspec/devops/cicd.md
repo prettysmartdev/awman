@@ -203,6 +203,9 @@ Hosted `main` and nightly jobs cannot take the release runner.
   contributors, and do not send secrets or write tokens to fork pull requests.
 - Top-level `permissions: contents: read`; write scopes are granted per job and
   never to a job reachable from a pull request. No `ci.yml` job can write.
+  A job that calls a local reusable workflow grants every read scope requested
+  by the called jobs; the release contract checks this before GitHub admits a
+  candidate or nightly run.
 
 ## Repository settings
 

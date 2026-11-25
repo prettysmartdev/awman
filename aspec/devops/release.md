@@ -79,6 +79,10 @@ a native failure returns its packet without first waiting for a full CI run.
 It stores a verified native packet before starting CI and reuses that packet
 on a retry at the same commit. A later CI failure therefore does not require
 another native run; changed source or invalid packet evidence forces one.
+The Mac archive omits AppleDouble metadata. If extraction of a newly produced
+archive fails but the runner's saved evidence independently verifies at the
+same commit, Apple prerelease may stage that evidence without rerunning native
+execution; the archive problem remains visible for independent review.
 Neither target checks GitHub branch rules,
 approval counts, tag rulesets, or App credentials.
 
@@ -89,6 +93,10 @@ commit to be the tip of `origin/main` with one parent, and compares its tree
 to the validated release branch tree. If the PR head or merged tree changed,
 rerun both prerelease targets. If `main` moved after the PR merge, stop and
 inspect before retrying.
+If a post-merge workflow defect requires a source fix, create a new reviewed
+release-branch commit and an open follow-up PR. The old packets cannot be
+relabeled for that commit; both prerelease targets must validate it before
+the follow-up PR is squash merged.
 
 The command then starts `candidate.yml` for that merge commit with automatic
 promotion disabled. It waits for the candidate gate, rechecks the validated

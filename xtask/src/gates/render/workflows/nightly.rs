@@ -50,6 +50,7 @@ const HEAD: &str = r####"  full:
     permissions:
       contents: read
       actions: read
+      pull-requests: read
 
   flake-hunt:
     name: Flake hunt (shuffled, repeated, under CPU contention)

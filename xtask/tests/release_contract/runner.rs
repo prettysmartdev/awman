@@ -164,6 +164,20 @@ fn failed_registration_releases_owned_state_and_keeps_existing_work() {
     assert!(!argv.contains("private-") && !argv.contains("--token"));
 }
 #[test]
+fn organization_runner_visibility_is_used_for_reuse() {
+    let r = Runner::new("release::runner::org-visibility");
+    r.gh
+        .on(&["api", "orgs/example/actions/runners"])
+        .stdout("online-release-runner\n");
+    let out = r.run(&["busy", "example/repo"]);
+    out.assert_success();
+    assert_eq!(out.stdout_text().trim(), "online-release-runner");
+    assert!(!r.gh.calls().iter().any(|call| call
+        .argv
+        .iter()
+        .any(|arg| arg.contains("repos/example/repo/actions/runners"))));
+}
+#[test]
 fn deregistration_failure_retains_repair_state() {
     let r = Runner::new("release::runner::repair");
     write(
@@ -171,7 +185,7 @@ fn deregistration_failure_retains_repair_state() {
         "repo=example/repo\nname=test-runner\nregistered=true\nowned_work=false\n",
     );
     r.gh.on(&["api", "-X", "POST"]).exit(1);
-    r.gh.on(&["api", "repos/example/repo/actions/runners"])
+    r.gh.on(&["api", "orgs/example/actions/runners"])
         .stdout("42\n");
     r.gh.on(&["api", "-X", "DELETE"]).exit(1);
     let out = r.run(&["down"]);

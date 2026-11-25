@@ -74,19 +74,20 @@ cmd_provision() {
   cargo xtask fixtures verify --store "$RUNNER_HOME/fixtures" >&2
 }
 
-# Online runners in <repo> that carry the release-only label, excluding ours.
-# Listing (and registering) runners needs repository admin rights.
+# Online organization runners with the release-only label, excluding ours.
+# This runner is registered to the organization, so the repository endpoint
+# cannot report its online status.
 cmd_busy() {
   local repo=$1 ours="" names
   [ -f "$STATE" ] && ours=$(sed -n 's/^name=//p' "$STATE")
   mkdir -p "$RUNNER_HOME"
-  if ! names=$(gh api "repos/$repo/actions/runners" --paginate \
+  if ! names=$(gh api "orgs/${repo%%/*}/actions/runners" --paginate \
     -q ".runners[] | select(.status == \"online\") | select([.labels[].name] | index(\"$LABEL\")) | .name" \
     2> "$RUNNER_HOME/busy.err"); then
     case "$(cat "$RUNNER_HOME/busy.err")" in
       *"HTTP 403"*|*"HTTP 404"*)
-        die "listing $repo's self-hosted runners needs repository admin rights for the gh login. Ask an admin to run the release, or use RELEASE_RUNNER=none with a hypervisor runner someone else runs (RELEASE_RUNNER=local needs admin too, to register this Mac)." ;;
-      *) cat "$RUNNER_HOME/busy.err" >&2; die "could not list $repo's self-hosted runners" ;;
+        die "listing ${repo%%/*}'s self-hosted runners needs organization runner access for the gh login. Ask an admin to run the release, or use RELEASE_RUNNER=none with a hypervisor runner someone else runs (RELEASE_RUNNER=local needs admin too, to register this Mac)." ;;
+      *) cat "$RUNNER_HOME/busy.err" >&2; die "could not list ${repo%%/*}'s self-hosted runners" ;;
     esac
   fi
   [ -z "$names" ] || printf '%s\n' "$names" | awk -v ours="$ours" '$0 != ours'
@@ -133,7 +134,7 @@ cmd_verify_archive() {
 }
 
 runner_id() { # repo name
-  gh api "repos/$1/actions/runners" --paginate -q ".runners[] | select(.name == \"$2\") | .id"
+  gh api "orgs/${1%%/*}/actions/runners" --paginate -q ".runners[] | select(.name == \"$2\") | .id"
 }
 
 # Labels route jobs; only the service-enforced group authorizes them.
@@ -216,7 +217,8 @@ cmd_up() {
 
   deadline=$((SECONDS + ONLINE_TIMEOUT))
   while :; do
-    status=$(gh api "repos/$repo/actions/runners" --paginate -q ".runners[] | select(.name == \"$name\") | .status" || true)
+    status=$(gh api "orgs/${repo%%/*}/actions/runners" --paginate -q ".runners[] | select(.name == \"$name\") | .status") ||
+      die "cannot inspect organization runner status"
     [ "$status" = online ] && break
     kill -0 "$pid" 2>/dev/null || { tail -n 20 "$RUNNER_HOME/runner.log" >&2; cmd_down; die "runner exited before coming online"; }
     [ $SECONDS -lt $deadline ] || { cmd_down; die "runner did not come online within ${ONLINE_TIMEOUT}s"; }
@@ -270,7 +272,7 @@ cmd_down() {
   if [ -z "$token" ] || ! (cd "$RUN_DIR" && ACTIONS_RUNNER_INPUT_TOKEN="$token" ./config.sh remove) >/dev/null 2>&1; then
     if id=$(runner_id "$repo" "$name" 2>/dev/null); then
       if [ -n "$id" ]; then
-        gh api -X DELETE "repos/$repo/actions/runners/$id" >/dev/null 2>&1 ||
+        gh api -X DELETE "orgs/${repo%%/*}/actions/runners/$id" >/dev/null 2>&1 ||
           die "could not deregister '$name'; remove it under Settings → Actions → Runners, then retry down (state retained)"
       fi
     else
