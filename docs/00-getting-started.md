@@ -39,6 +39,21 @@ awman
 
 In the TUI command box, type `chat` and press **Enter**. Talk to the agent in the terminal window. **Ctrl-M** minimizes or restores the window without stopping the session. To start directly from your shell, run `awman chat`.
 
+## Give awman a task
+
+Once your agent is ready, you can give it a work item and let it plan and run a workflow in a separate Git worktree:
+
+```sh
+awman new spec
+awman exec workflow --dynamic --work-item 0042
+```
+
+`new spec` asks for a title and summary, then an agent writes the work item. Use the number it creates in the workflow command. You can also use a GitHub issue with `--work-item github:84` or a Markdown file path. Before starting, awman checks the workflow's image, Git and credential prerequisites. See [Dynamic workflows](06-dynamic-workflows.md) for options and [Workflows](05-workflows.md) for writing your own steps.
+
+## Use a work server
+
+To take tasks offered by a work server, use `awman link <server-url>`, then `awman queue` or the TUI's **Ctrl+Q** queue panel. The worker uses the same command engine and agent isolation as your own sessions. See [Workers and work servers](17-workers-and-work-servers.md) for setup and automatic claiming.
+
 ## Where to go next
 
 - [Concepts](01-concepts.md) explains the main pieces.

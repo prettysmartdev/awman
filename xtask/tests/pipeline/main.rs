@@ -1227,8 +1227,16 @@ fn abandon_keeps_evidence_and_refuses_promoted_versions() {
 #[test]
 fn pending_pins_block_preflight_before_any_build() {
     let mut w = World::new();
-    let real = std::fs::read_to_string(repo_root().join("ci/gates.toml")).unwrap();
-    w.write_src("ci/gates.toml", &real);
+    let fixture = w.manifest["fixtures"]["guest-oci-base"]
+        .as_table_mut()
+        .unwrap();
+    fixture.remove("sha256");
+    fixture.insert(
+        "pending".into(),
+        "test fixture has not been published".into(),
+    );
+    let manifest = toml::to_string(&w.manifest).unwrap();
+    w.write_src("ci/gates.toml", &manifest);
     w.preflight(100, C1, &[])
         .stopped("BLOCKED: pins are not published yet");
     assert!(!w.pf(100).exists());

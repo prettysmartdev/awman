@@ -11,12 +11,16 @@ case "$role" in
 esac
 org=${repo%%/*}
 matches=()
+if ! group_ids=$(gh api "orgs/$org/actions/runner-groups" --paginate --jq '.runner_groups[].id'); then
+  echo "Cannot inspect $org runner groups; the gh login needs organization runner-group access" >&2
+  exit 1
+fi
 while IFS= read -r id; do
   test -n "$id" || continue
   allowed=$(gh api "orgs/$org/actions/runner-groups/$id" --jq \
     ". | select(.restricted_to_workflows == true) | select((.selected_workflows | sort) == ([\"$repo/.github/workflows/$first@refs/heads/main\", \"$repo/.github/workflows/$second@refs/heads/main\"] | sort)) | .id")
   if test -n "$allowed"; then matches+=("$id"); fi
-done < <(gh api "orgs/$org/actions/runner-groups" --paginate --jq '.runner_groups[].id')
+done <<< "$group_ids"
 test "${#matches[@]}" -eq 1 || {
   echo "Expected exactly one workflow-restricted $role runner group for $repo" >&2
   exit 1

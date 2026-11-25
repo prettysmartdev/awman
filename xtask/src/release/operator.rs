@@ -1,13 +1,24 @@
-//! The operator shell preserves the terminal contract; Rust owns state/evidence.
-mod record;
-
+//! The operator uses `make release`; Rust owns state/evidence subcommands.
 use std::process::{Command, ExitCode};
 
 pub fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     if args.first().is_some_and(|a| a.starts_with("--internal-")) {
         return internal(args);
     }
-    exec_shell("xtask/src/release/operator/flow.sh", args)
+    let Some(version) = args.first() else {
+        eprintln!("usage: cargo xtask release run <vX.Y.Z>");
+        return Ok(ExitCode::from(2));
+    };
+    anyhow::ensure!(args.len() == 1, "release run takes one version");
+    let status = Command::new("make")
+        .arg("release")
+        .env("VERSION", version)
+        .status()?;
+    Ok(if status.success() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
 }
 
 pub(super) fn exec_shell(script: &str, args: &[String]) -> anyhow::Result<ExitCode> {
@@ -43,7 +54,7 @@ fn internal(args: &[String]) -> anyhow::Result<ExitCode> {
                 state.tag_on_origin
             );
         }
-        _ => record::run(args)?,
+        _ => anyhow::bail!("unsupported internal release command"),
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -44,23 +44,27 @@ fn runtime_opt_ins_have_no_effect_without_isolation() {
 fn test_isolation_only_reduces_access() {
     let mut s = support::sandbox("switches::test_isolation_only_reduces_access");
     let a = support::artifact(&mut s);
-    // `ready` would drive the host runtime when isolation is off. An installed
-    // fake records attempts; its path is outside TMPDIR so the release correctly
-    // treats it as a real runtime rather than its temp-tree fake exception.
+    // Listing agents queries the selected host runtime directly. Use Apple
+    // Containers on macOS and Docker elsewhere; no Docker service is needed
+    // on the release Mac. The installed fake records attempts.
     let fake_exe = support::fake_cli_exe();
     s.register_exe("fake-cli", fake_exe);
-    let fake = s.install_fake(fake_exe, "docker");
-    fake.on(&["version"]).stdout("27.5.1\n");
-    fake.on(&["info"]).stdout("{}\n");
-    fake.on(&["ps"]).stdout("");
-    let repo = awman_test_support::fixtures::RepoBuilder::new(&s, "app")
-        .file("Dockerfile.dev", "FROM scratch\n")
-        .init();
-    let observe_ready = |isolated: &str, opt: Option<&str>| {
+    let (runtime, cli) = if cfg!(target_os = "macos") {
+        ("apple", "container")
+    } else {
+        ("docker", "docker")
+    };
+    std::fs::write(
+        s.awman_home().join("config.json"),
+        serde_json::to_vec(&serde_json::json!({"runtime":{"kind":runtime}})).unwrap(),
+    )
+    .unwrap();
+    let fake = s.install_fake(fake_exe, cli);
+    fake.on(&[]).stdout("[]\n");
+    let observe_list = |isolated: &str, opt: Option<&str>| {
         let mut cmd = support::run_artifact(&s, &a)
             .env("AWMAN_TEST_ISOLATION", isolated)
-            .current_dir(repo.path())
-            .args(["ready", "--json"]);
+            .args(["agents", "list", "--json"]);
         for name in OPT_INS {
             cmd = cmd.env_remove(name);
         }
@@ -70,21 +74,23 @@ fn test_isolation_only_reduces_access() {
         cmd.run()
     };
     let before = fake.calls().len();
-    let isolated = observe_ready("1", None);
+    let isolated = observe_list("1", None);
     assert_eq!(
         fake.calls().len(),
         before,
-        "isolated release reached the host Docker CLI: {isolated:?}"
+        "isolated release reached the host {cli} CLI: {isolated:?}"
     );
-    let _normal = observe_ready("0", None);
+    let normal = observe_list("0", None);
     let normal_calls = fake.calls().len() - before;
     assert!(
         normal_calls > 0,
-        "positive control never reached the instrumented runtime"
+        "positive control never reached the instrumented {cli} runtime: stdout={} stderr={}",
+        normal.stdout_text(),
+        normal.stderr_text()
     );
     for switch in OPT_INS {
         let start = fake.calls().len();
-        let _ = observe_ready("1", Some(switch));
+        let _ = observe_list("1", Some(switch));
         let added = fake.calls().len() - start;
         assert!(
             added <= normal_calls,

@@ -151,21 +151,16 @@ pub(super) fn verify(root: &Path, out: &Path, m: &Manifest) -> Result<()> {
         "hypervisor",
         "os-version",
         "rust-version",
-        "docker-version",
-        "docker-context",
         "install-runner",
         "fetch-payload",
         "verify-payload",
-        "pull-base",
-        "base-provenance",
-        "save-base",
-        "build-fixture",
         "build-artifact",
     ];
     if platform.apple() {
         required.extend([
             "apple-service",
-            "sbx-service",
+            "fetch-fixtures",
+            "verify-fixtures",
             "sign-awman",
             "sign-awman-guest-driver",
             "sign-awman-guest-net-driver",
@@ -178,6 +173,12 @@ pub(super) fn verify(root: &Path, out: &Path, m: &Manifest) -> Result<()> {
     }
     if !platform.apple() {
         required.extend([
+            "docker-version",
+            "docker-context",
+            "pull-base",
+            "base-provenance",
+            "save-base",
+            "build-fixture",
             "start-registry",
             "registry-address",
             "registry-ready",
@@ -204,6 +205,20 @@ pub(super) fn verify(root: &Path, out: &Path, m: &Manifest) -> Result<()> {
             fs::read_to_string(out.join(format!("{name}.stdout")))?.trim() == value,
             "invalid native host evidence"
         );
+    }
+    if platform.apple() {
+        for (id, actual) in [
+            ("guest-oci-base", &p.fixture_sha256),
+            ("guest-docker-base", &p.docker_fixture_sha256),
+        ] {
+            ensure!(
+                m.fixtures
+                    .get(id)
+                    .and_then(|fixture| fixture.sha256.as_ref())
+                    == Some(actual),
+                "Apple fixture {id} differs from the published manifest pin"
+            );
+        }
     }
     if !platform.apple() {
         ensure!(
@@ -267,6 +282,7 @@ mod tests {
                 ids.iter().any(|id| id == "boundary-apple"),
                 platform.apple()
             );
+            assert!(!ids.iter().any(|id| id == "boundary-sbx"));
             assert_eq!(
                 ids.iter().any(|id| id == "boundary-registry"),
                 !platform.apple()

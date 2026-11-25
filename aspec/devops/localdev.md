@@ -158,6 +158,9 @@ target needs `gh`, `python3`, SSH and `scp` on the Mac. The Linux
 host needs read/write `/dev/kvm` access and a Docker Engine on a local Unix
 socket. It needs the pinned Rust toolchain, build tools, curl, tar, network
 access during preparation and enough disk for debug/test and release artifacts.
+The SSH command is noninteractive; the remote script resolves Cargo from its
+command `PATH`, then from the user's rustup or mise installation if a login
+profile did not add it to `PATH`.
 Docker supplies image-source and builder evidence; agents execute only inside
 guests. Offline acceptance uses
 kernel seccomp filters to deny IP sockets while preserving Unix IPC and the

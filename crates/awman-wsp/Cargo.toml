@@ -1,6 +1,6 @@
 [package]
 name = "awman-wsp"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 rust-version = "1.94.0"
 description = "Work Server Protocol v1 types and client for awman"

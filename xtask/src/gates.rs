@@ -150,7 +150,7 @@ pub fn run(args: &[String]) -> anyhow::Result<ExitCode> {
             } else {
                 Vec::new()
             };
-            let diff_complete = base.is_some();
+            let diff_complete = plan::diff_complete_for(&event, base.as_deref());
             let mut request = plan::Request {
                 repository_id,
                 event,

@@ -123,7 +123,13 @@ pub(in crate::engine::sandbox) fn ready_agent_in(
     //    with the kit path and fails loudly (WI 0090); only an sbx build that
     //    lacks the `kit validate` subcommand is soft-skipped.
     let kit_dir_str = kit_dir.display().to_string();
-    if let Err(e) = SbxCommand::new(["kit", "validate", &kit_dir_str])
+    let mut validate_args = vec!["kit", "validate", kit_dir_str.as_str()];
+    // Boundary tests give every case a private HOME. Its sbx session is
+    // intentionally unauthenticated; local kit syntax can still be checked.
+    if snapshot.test_isolation() {
+        validate_args.push("--offline");
+    }
+    if let Err(e) = SbxCommand::new(validate_args)
         .in_env(snapshot)
         .check_preparation(sink)
     {

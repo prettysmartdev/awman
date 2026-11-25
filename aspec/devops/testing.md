@@ -428,7 +428,7 @@ nextest parallelism without changing suite deadlines, retries or selection.
 
 Every selected suite must contain tests. The runner captures compiled inventory, executes with zero retries, clears stale JUnit, and records source hashes and actual results. Missing tests, required skips and changed inputs fail validation. Component contracts in private library modules are selected explicitly by the manifest; placement alone never grants unit-tier privileges.
 
-Tests own their private HOME, Git configuration, processes and sockets through TestSandbox. The runner also watches the real awman and Git configuration paths for changes. Unrelated editor caches are outside that canary. This is test resource ownership, not a sandbox for hostile native code; never run an untrusted PR on a privileged host.
+Tests own their private HOME, Git configuration, processes and sockets through TestSandbox. The runner watches the real Git configuration for changes and checks for run-owned process leaks on Linux. It does not watch the operator's live `.awman` tree: an ordinary session may update its heartbeat or disk while tests run. Child environment and capability checks remain the test escape boundary. An unexpected write to the operator's `.awman` by a test child is no longer caught by the runner's filesystem canary; restore that detection only with ownership attribution, not a snapshot of unrelated user activity. This is test resource ownership, not a sandbox for hostile native code; never run an untrusted PR on a privileged host.
 
 `--shuffle-seed` changes suite invocation order. It does not randomize tests inside a nextest invocation. Record repeats, time and failures accurately; a single clean run is not p95 or a long-term flake-rate measurement.
 
@@ -444,22 +444,36 @@ make validate-native
 ```
 
 Prerequisites: the repository's pinned Rust toolchain, Xcode command-line tools,
-Docker running with a local Unix-socket context, Apple Containers with its
-service running, and the `sbx` CLI installed and usable. Run as your normal user,
+and Apple Containers with its service running. Docker and `sbx` are not needed
+for this Apple prerelease packet. Run as your normal user,
 with no other validation process using this checkout. Preparation needs internet
 access and enough disk for debug/release builds, payloads and guest images. This
 command explicitly grants the test runner access to those named local runtimes
 and the hypervisor. It never runs an agent on the host.
 
+On macOS, native validation and the Actions runner allocate a short private
+test root under `/tmp` and check the canonical guest socket path against the
+103-byte limit before starting guest tests. The native packet records the
+selected root. A long ambient `TMPDIR` does not change this selection.
+
 The target installs the pinned test runner, fetches and verifies the builtin
-payload and published previous executable, prepares digest-recorded OCI and
-Docker-save guest fixtures, compiles the native suites, captures their expected tests, signs the
+payload and published previous executable, fetches both published SHA-256-pinned
+OCI and Docker-save guest fixtures, compiles the native suites, captures their expected tests, signs the
 guest executables and release candidate, and runs the guest and artifact tiers
 plus the declared native boundaries. The signed candidate is copied into the
 packet and must retain the same digest throughout execution. The offline artifact
 tests enforce their own network denial. Image preparation is a separate online
-phase; both locally prepared fixture pins are recorded in `run-config.toml` and do
-not change the repository's fixture policy.
+phase; both verified fixture pins are recorded in `run-config.toml` and do
+not change the repository's fixture policy. Apple store tests retag a private
+copy of the pinned OCI fixture for each attempt and remove only their own tag;
+preexisting user and prior-attempt images remain untouched. Linux native acceptance separately
+uses a local Unix-socket Docker Engine to reconstruct the fixtures and run its
+Docker and registry boundaries. The release candidate does not run the `sbx`
+boundary in v0.14 because the runtime is disabled pending
+[issue #86](https://github.com/prettysmartdev/awman/issues/86). The retained
+boundary suite uses a private test home and validates emitted local kits with
+`sbx kit validate --offline` when the runtime is restored; it does not read the
+runner's login state.
 
 Successful and failed runs both print a `target/native-validation/*.tar.gz`
 path and its SHA-256. Send that archive, the printed digest, and confirmation

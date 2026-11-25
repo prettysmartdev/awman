@@ -114,6 +114,7 @@ pub fn previous_schema(
         s.command(exe)
             .current_dir(s.work())
             .env("AWMAN_HOME", &probe)
+            .env("AWMAN_CONFIG_HOME", &probe)
     };
     if command()
         .args(["config", "get", "runtime.kind"])

@@ -66,7 +66,7 @@ pub fn render(s: &ReleaseStatus) -> String {
             "  next: re-run make release VERSION=… to resume, or rerun the failed jobs\n"
         }
         ReleaseState::Validated => {
-            "  next: promotion runs automatically; re-run make release to resume it\n"
+            "  next: re-run make release to tag and publish the validated candidate\n"
         }
         ReleaseState::Promoted => {
             "  next: post-publish verification is pending or failed; re-run make release\n"

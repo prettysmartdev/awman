@@ -497,7 +497,6 @@ Or per-invocation: `awman chat --overlay "env(ANTHROPIC_API_KEY)"`. See [Overlay
 ```sh
 awman config set runtime.kind docker     # default
 awman config set runtime.kind apple      # macOS only (Apple Containers)
-awman config set runtime.kind sbx        # experimental (Docker Sandboxes)
 awman config set runtime.kind builtin    # experimental; Apple Silicon or Linux x86_64 with KVM
 ```
 
@@ -708,10 +707,10 @@ Precedence is per key: a repository value overrides the matching global value, w
 |---|---|---|
 | `docker` (default) | Linux, macOS, Windows | Standard Docker; ephemeral containers torn down when the session ends |
 | `apple` | macOS 26+ only | Native `container` CLI; same user experience as Docker. On Linux/Windows this value is an error, not a silent fallback. `--allow-docker` is not supported under this runtime |
-| `sbx` | macOS arm64, Windows x86_64 (experimental) | Docker Sandboxes (persistent microVMs per session; hypervisor-grade isolation). Requires the `sbx` CLI and a Docker account. Linux is blocked by an upstream virtiofs bug. See [Runtimes](11-runtimes.md) |
+| `sbx` | Disabled in v0.14 | Recognized, but agent execution fails with an explicit disabled-runtime error. See [issue #86](https://github.com/prettysmartdev/awman/issues/86) and [Runtimes](11-runtimes.md) |
 | `builtin` | macOS on Apple Silicon and Linux x86_64 with KVM (experimental) | MicroVM per session embedded in the awman binary; needs no Docker, `container`, or `sbx` to run agents. Included in `awman-linux-amd64` and `awman-macos-arm64`; the macOS binary is ad-hoc signed (see [Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions)). Must be set explicitly in the global config. `awman ready` imports images from a configured source (and, with `runtime.builtin.builder.enabled`, can build them first in a local Docker or Apple Containers store). See [Runtimes](11-runtimes.md#builtin-microvm-experimental) |
 
-`sbx` and `builtin` are experimental; the value itself never says so. An unrecognized value (e.g. a typo, or one of the old spellings) is a fatal error — awman never falls back to a different isolation model than the one you configured. CLI commands print the invalid value and the list of valid values, then exit; the TUI shows the same message in a startup modal (Enter quits). `runtime.kind` is global scope and fixed for each awman process (see [Settings fixed for an awman process](#settings-fixed-for-an-awman-process)): fix it in the global file and relaunch. Builtin is an experimental preview on macOS Apple Silicon and Linux x86_64 GNU/KVM; Linux ARM64 is not supported yet.
+`builtin` is experimental; the value itself never says so. In v0.14, selecting `sbx` fails explicitly without falling back to another isolation model. An unrecognized value (e.g. a typo, or one of the old spellings) is also a fatal error. CLI commands print the invalid value and the list of valid values, then exit; the TUI shows the same message in a startup modal (Enter quits). `runtime.kind` is global scope and fixed for each awman process (see [Settings fixed for an awman process](#settings-fixed-for-an-awman-process)): fix it in the global file and relaunch. Builtin is an experimental preview on macOS Apple Silicon and Linux x86_64 GNU/KVM; Linux ARM64 is not supported yet.
 
 `awman ready` validates the configured runtime before any other check and reports which one is active. For full details on platform support, setup, credential registration, and the persistent-sandbox lifecycle see [Runtimes](11-runtimes.md).
 
@@ -831,7 +830,7 @@ have the effective defaults above.
 | `agents.automation.startupTimeout` | duration | `"120s"` | task | no | no | `AWMAN_AGENTS_AUTOMATION_STARTUP_TIMEOUT` | How long an automation launch may take to become ready for a task (1s to 1h). |
 | `agents.automation.cancelTimeout` | duration | `"10s"` | task | no | no | `AWMAN_AGENTS_AUTOMATION_CANCEL_TIMEOUT` | Total time to stop an owned agent after cancellation is accepted (1s to 1h). |
 | `agents.automation.outputDrainTimeout` | duration | `"5s"` | task | no | no | `AWMAN_AGENTS_AUTOMATION_OUTPUT_DRAIN_TIMEOUT` | How long to collect remaining output after an agent exits; at most the cancel timeout. |
-| `runtime.kind` | enum `docker\|apple\|sbx\|builtin` | `"docker"` | global | no | no | `AWMAN_RUNTIME_KIND` | Container runtime agents run in; sbx and builtin are experimental. |
+| `runtime.kind` | enum `docker\|apple\|sbx\|builtin` | `"docker"` | global | no | no | `AWMAN_RUNTIME_KIND` | Agent runtime; `sbx` is disabled in v0.14 and `builtin` is experimental. |
 | `runtime.baseImage` | string | `null` | repo | no | no | `AWMAN_RUNTIME_BASE_IMAGE` | Base image tag for setup and teardown containers. |
 | `runtime.dockerfile` | string | `"Dockerfile.dev"` | repo | no | no | `AWMAN_RUNTIME_DOCKERFILE` | Dockerfile, relative to the repo root, that agent images are built from. |
 | `runtime.builtin.stateDir` | string | `null` | repo | no | no | `AWMAN_RUNTIME_BUILTIN_STATE_DIR` | Absolute private state directory of the builtin runtime (default <AWMAN_HOME>/builtin). |

@@ -1,17 +1,11 @@
-# Release promote: same-bytes promotion of a validated candidate, then
-# post-publish verification from the public URL (design 12.1, 16.3-16.5;
-# WI 0144 sections 5.1, 5.5, 6.5).
+# Verify a validated candidate or the release published by make release.
 #
 # This workflow compiles, tests and signs NOTHING. Every decision is made by
-# the controller binary that candidate.yml built from its protected revision
-# and attested; it is downloaded, its attestation verified, then run. The
-# final tag and publication use the dedicated release GitHub App identity
-# (the `v*` tag ruleset allowlists that App, not GitHub Actions), held only by
-# the `publish` job, which re-verifies everything inside the publication lock
-# immediately before each irreversible call. Tag and publish are idempotent:
-# an interrupted promotion is resumed by running this workflow again.
-name: Release promote
-run-name: Promote ${{ inputs.version }} candidate ${{ inputs.candidate }}${{ inputs.dry_run && ' [rehearsal]' || '' }}
+# the controller binary that candidate.yml built from main and attested; it is
+# downloaded, its attestation verified, then run. The maintainer's make release
+# command performs tag creation and publication.
+name: Release verify
+run-name: Verify ${{ inputs.version }} candidate ${{ inputs.candidate }}${{ inputs.dry_run && ' [rehearsal]' || '' }}
 
 on:
   workflow_call:
@@ -39,7 +33,7 @@ on:
         type: string
         required: true
       candidate:
-        description: Candidate number being promoted
+        description: Candidate number being verified
         type: string
         required: true
       dry_run:
@@ -72,7 +66,7 @@ jobs:
     timeout-minutes: 20
     environment: release
     permissions:
-      contents: write
+      contents: read
       actions: read
       attestations: read
     outputs:
@@ -83,33 +77,6 @@ jobs:
       nextest_url: ${{ steps.verify.outputs.nextest_url }}
       nextest_sha256: ${{ steps.verify.outputs.nextest_sha256 }}
     steps:
-      - name: Verify the promotion App can mint a write token without publishing
-        id: rehearsal_app
-        if: ${{ inputs.dry_run }}
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          client-id: ${{ vars.AWMAN_RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.AWMAN_RELEASE_APP_PRIVATE_KEY }}
-          permission-contents: write
-      - name: Verify that App is the v-tag ruleset bypass
-        if: ${{ inputs.dry_run }}
-        env:
-          GH_TOKEN: ${{ steps.rehearsal_app.outputs.token }}
-          APP_SLUG: ${{ steps.rehearsal_app.outputs.app-slug }}
-          CLIENT_ID: ${{ vars.AWMAN_RELEASE_APP_CLIENT_ID }}
-        run: |
-          app_id=$(gh api "apps/$APP_SLUG" --jq .id)
-          actual_client=$(gh api "apps/$APP_SLUG" --jq .client_id)
-          [ "$actual_client" = "$CLIENT_ID" ] || { echo 'BLOCKED: promotion App client ID changed'; exit 1; }
-          matched=false
-          while IFS= read -r ruleset_id; do
-            [ -n "$ruleset_id" ] || continue
-            rule="repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id"
-            allowed=$(gh api "$rule" --jq "[.bypass_actors[]? | select(.actor_type == \"Integration\" and .actor_id == $app_id and .bypass_mode == \"always\")] | length > 0")
-            applies=$(gh api "$rule" --jq '(.conditions.ref_name.include // []) | index("refs/tags/v*") != null')
-            if [ "$allowed" = true ] && [ "$applies" = true ]; then matched=true; break; fi
-          done < <(gh api "repos/$GITHUB_REPOSITORY/rulesets?targets=tag" --paginate --jq '.[] | select(.enforcement == "active") | .id')
-          [ "$matched" = true ] || { echo 'BLOCKED: promotion App is not the v-tag ruleset bypass'; exit 1; }
       - &main
         name: Check out main (current release policy; never built or run)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -144,81 +111,6 @@ jobs:
           controller-bin/xtask release promote verify-inputs --version "$VERSION" --commit "$COMMIT" \
             --candidate "$CANDIDATE" $NAMESPACE_ARGS --main-checkout main --out verify
 
-  # The only job holding the publication identity and lock. Rechecks every
-  # input inside the lock, creates the annotated tag at the candidate commit
-  # if absent (fails if present elsewhere), freezes release-state.json and
-  # publishes the draft. A rehearsal never reaches this job.
-  publish:
-    name: Tag and publish
-    needs: verify-inputs
-    if: ${{ !inputs.dry_run }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    environment: release
-    permissions:
-      contents: read
-      actions: read
-      attestations: read
-    concurrency:
-      group: publish-${{ github.repository }}-${{ inputs.version }}
-      cancel-in-progress: false
-    steps:
-      - name: Promotion identity is configured
-        env:
-          CLIENT_ID: ${{ vars.AWMAN_RELEASE_APP_CLIENT_ID }}
-          HAS_KEY: ${{ secrets.AWMAN_RELEASE_APP_PRIVATE_KEY != '' }}
-        run: |
-          [ -n "$CLIENT_ID" ] && [ "$HAS_KEY" = true ] || {
-            echo "BLOCKED: the release GitHub App (vars.AWMAN_RELEASE_APP_CLIENT_ID, secrets.AWMAN_RELEASE_APP_PRIVATE_KEY) is not configured (pending-cutover P6); nothing was tagged or published"
-            exit 1
-          }
-      - name: Mint the short-lived promotion token
-        id: app
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          client-id: ${{ vars.AWMAN_RELEASE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.AWMAN_RELEASE_APP_PRIVATE_KEY }}
-          permission-contents: write
-      -
-        name: Check out main (current release policy; never built or run)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: main
-          path: main
-          persist-credentials: false
-      -
-        name: Download the attested controller of the candidate run
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if [ "$DRY_RUN" = true ]; then record="candidate-record-rehearsal-$VERSION-c$CANDIDATE"; else record="candidate-record-$VERSION-c$CANDIDATE"; fi
-          run_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$record&per_page=100" \
-            --jq '[.artifacts[] | select(.workflow_run.head_branch == "main" and (.expired | not))] | max_by(.id) | .workflow_run.id')
-          [ -n "$run_id" ] && [ "$run_id" != null ] || { echo "FAILED: no retained record $record; the candidate was abandoned or expired"; exit 1; }
-          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n release-controller -D controller-bin
-          gh attestation verify controller-bin/xtask --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/candidate.yml" --source-ref refs/heads/main
-          chmod +x controller-bin/xtask
-          if [ "$DRY_RUN" = true ]; then
-            echo "NAMESPACE_ARGS=--dry-run --namespace rehearsal/$run_id" >> "$GITHUB_ENV"
-          else
-            echo "NAMESPACE_ARGS=--namespace production" >> "$GITHUB_ENV"
-          fi
-      - name: Create the annotated tag at the candidate commit
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-        run: |
-          # shellcheck disable=SC2086
-          controller-bin/xtask release promote tag --version "$VERSION" --commit "$COMMIT" \
-            --candidate "$CANDIDATE" $NAMESPACE_ARGS --main-checkout main --out promote
-      - name: Publish the draft (same bytes; no asset is uploaded or changed)
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token }}
-        run: |
-          # shellcheck disable=SC2086
-          controller-bin/xtask release promote publish --version "$VERSION" --commit "$COMMIT" \
-            --candidate "$CANDIDATE" $NAMESPACE_ARGS --main-checkout main --out promote
-
   # Post-publish verification on every target's native OS (macOS on the
   # release Mac): download from the public URL without credentials, check
   # SHA256SUMS and the attestation, smoke the binary, and boot the published
@@ -226,8 +118,8 @@ jobs:
   # A rehearsal verifies the candidate run's bytes instead.
   verify:
     name: Verify ${{ matrix.target.asset }}
-    needs: [verify-inputs, publish]
-    if: ${{ github.ref == 'refs/heads/main' && always() && needs.verify-inputs.result == 'success' && (needs.publish.result == 'success' || inputs.dry_run) }}
+    needs: verify-inputs
+    if: ${{ github.ref == 'refs/heads/main' && needs.verify-inputs.result == 'success' && (inputs.dry_run || needs.verify-inputs.outputs.published == 'true') }}
     runs-on: ${{ matrix.target.runs_on }}
     timeout-minutes: 45
     environment: release
@@ -345,7 +237,7 @@ jobs:
     timeout-minutes: 15
     environment: release
     permissions:
-      contents: write
+      contents: read
       actions: read
       attestations: read
     steps:

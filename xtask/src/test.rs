@@ -12,6 +12,7 @@
 //!   archive --build <id> --out <dir>      nextest archive + expected set + digests
 //!   update-golden [--suite <id>]          rewrite golden files / snapshots
 pub(crate) mod isolation;
+pub(crate) mod temp_root;
 
 use anyhow::{bail, ensure, Context, Result};
 use std::{

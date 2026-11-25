@@ -165,7 +165,7 @@ toolchain = "1.94.0"
 trust = "ci-guest"
 runs_on = ["self-hosted", "macOS", "ARM64", "awman-ci-guest"]
 triple = "aarch64-apple-darwin"
-image = "pending-provisioned-image-digest"
+image = "macos-25G83"
 provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "hypervisor", "builtin-payload", "guest-fixtures", "previous-release", "apple-containers", "release-artifact", "offline"]
 max_vms = 2
 
@@ -174,8 +174,8 @@ toolchain = "1.94.0"
 trust = "release"
 runs_on = ["self-hosted", "macOS", "ARM64", "awman-release"]
 triple = "aarch64-apple-darwin"
-image = "pending-provisioned-image-digest"
-provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "hypervisor", "builtin-payload", "guest-fixtures", "previous-release", "apple-containers", "docker-sbx", "release-artifact", "offline"]
+image = "macos-25G83"
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "hypervisor", "builtin-payload", "guest-fixtures", "previous-release", "apple-containers", "release-artifact", "offline"]
 max_vms = 2
 
 [builds.linux-x64-default]
@@ -1050,7 +1050,7 @@ suites = ["guest-boot", "guest-exec", "guest-import", "guest-network", "guest-up
 builds = ["macos-arm64-release-builtin"]
 
 [[gates.candidate.cells]]
-suites = ["unit-awman-builtin", "boundary-apple", "boundary-sbx", "soak-guest"]
+suites = ["unit-awman-builtin", "boundary-apple", "soak-guest"]
 builds = ["macos-arm64-release-builtin"]
 
 [gates.promote]
@@ -1091,13 +1091,15 @@ not_overridable = true
 file = "guest-oci-base.tar"
 tiers = ["guest", "artifact"]
 build = "guest-oci-base"
-pending = "P7: slice-guest-and-artifact-tiers publishes immutable archive and digest"
+sha256 = "a923846938a4fe539e06b89b7bd6beeca20917344d59e4afee8a5882b84e041e"
+source = "https://github.com/prettysmartdev/awman/releases/download/fixtures-a66c55eec205f218235cf7fedf47f280705f1bfe/fixture-oci.tar"
 
 [fixtures.guest-docker-base]
 file = "guest-docker-base.tar"
 tiers = ["guest", "artifact"]
 build = "guest-docker-base"
-pending = "P7: slice-guest-and-artifact-tiers publishes immutable archive and digest"
+sha256 = "dec34ab2bde8e029726ef5fc2e2c6f869f45522a111b5de4070e5f8dd58cdb43"
+source = "https://github.com/prettysmartdev/awman/releases/download/fixtures-a66c55eec205f218235cf7fedf47f280705f1bfe/fixture-docker.tar"
 
 [fixtures.msb-payload-aarch64-apple-darwin]
 verified_record = "third_party/msb-payloads/aarch64-apple-darwin"
@@ -1276,7 +1278,7 @@ trust = "hosted"
 provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "public-network", "registry-credentials"]
 
 [workflows.".github/workflows/promote.yml"]
-jobs = ["verify-inputs", "publish", "verify"]
+jobs = ["verify-inputs", "verify", "receipt"]
 commands = ["release promote", "release verify"]
 timeout_minutes = 60
 

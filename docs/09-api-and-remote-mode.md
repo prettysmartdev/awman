@@ -110,7 +110,7 @@ Sessions and commands accept [labels](#labels). A label key is `<namespace>/<nam
 ```json
 {
   "status": "ok",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "protocol": { "api": 1 },
   "capabilities": ["daemon_features", "network_listener", "api_keys", "health", "trace_propagation", "api_init", "…"],
   "features": {

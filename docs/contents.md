@@ -16,13 +16,13 @@ Start with [Getting started](00-getting-started.md). Then use the guides for wha
 - [Dynamic workflows](06-dynamic-workflows.md) — let an agent design the steps for a work item.
 - [GitHub integration](10-github-integration.md) — use issues and pull requests.
 - [Squad](12-squad.md) — run recurring tasks with a group of agents.
-- [Web app](20-webapp.md) — connect a browser to the local daemon.
+- [Web app (prerelease)](20-webapp.md) — documentation for the upcoming browser interface.
 
 ## Set up and operate
 
 - [Configuration](07-configuration.md) — set defaults and inspect all config keys.
 - [Overlays](08-overlays.md) — give an agent specific files, variables, skills, or context.
-- [Runtimes](11-runtimes.md) — choose Docker, Apple Containers, Docker Sandboxes, or the builtin microVM.
+- [Runtimes](11-runtimes.md) — choose Docker, Apple Containers, or the builtin microVM; Docker Sandboxes is disabled in v0.14.
 - [Custom agents](15-custom-agents.md) — define an agent that is not built in.
 - [Cleaning up](13-cleaning-up.md) — remove stopped sessions and completed workflow data.
 - [The daemon](16-daemon.md) and [engine frontends](19-engine-and-frontends.md) — run shared background services and daemon-backed TUI sessions.

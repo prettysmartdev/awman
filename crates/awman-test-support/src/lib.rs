@@ -36,6 +36,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod apple_image;
 pub mod capability;
 mod config;
 pub mod conformance;

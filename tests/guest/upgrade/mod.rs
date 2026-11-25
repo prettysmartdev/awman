@@ -15,6 +15,10 @@ fn linux_published_previous_state_upgrades_and_boots() {
 
 fn published_upgrade(id: &'static str) {
     let mut s = support::sandbox(id);
+    // v0.13 reads AWMAN_CONFIG_HOME; current awman reads AWMAN_HOME. Both
+    // binaries must use the same private configuration and short stateDir.
+    let awman_home = s.awman_home();
+    s.env_mut().set("AWMAN_CONFIG_HOME", &awman_home);
     let archive = support::fixture(&s);
     let previous = s.require::<PreviousRelease>();
     s.grant(&previous);

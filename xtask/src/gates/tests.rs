@@ -209,6 +209,17 @@ fn incomplete_diff_and_missing_base_fail() {
         .contains("base SHA"));
 }
 #[test]
+fn dispatched_main_gate_needs_no_changed_path_base() {
+    assert!(plan::diff_complete_for("workflow_dispatch", None));
+    assert!(plan::diff_complete_for("workflow_call", None));
+    assert!(!plan::diff_complete_for("pull_request", None));
+    let mut r = request("workflow_dispatch", &[]);
+    r.base_sha = None;
+    r.diff_complete = plan::diff_complete_for(&r.event, r.base_sha.as_deref());
+    let p = plan::create(&manifest(), "main", r, today()).unwrap();
+    assert!(p.cells.iter().all(|c| c.selected));
+}
+#[test]
 fn malformed_paths_fail() {
     assert!(plan::create(
         &manifest(),
@@ -447,11 +458,15 @@ fn scenario_test_removal_changes_the_independent_contract() {
 }
 
 #[test]
-fn only_the_candidate_pipeline_can_publish() {
+fn only_the_operator_can_publish() {
     assert!(!root().join(".github/workflows/release.yml").exists());
     assert_eq!(manifest().release.operator_path, "pipeline");
     let workflow = std::fs::read_to_string(root().join(".github/workflows/promote.yml")).unwrap();
-    assert!(workflow.contains("release promote"));
+    assert!(!workflow.contains("release promote tag"));
+    assert!(!workflow.contains("release promote publish"));
+    let operator = std::fs::read_to_string(root().join("tools/prerelease/publish.sh")).unwrap();
+    assert!(operator.contains("release promote tag"));
+    assert!(operator.contains("release promote publish"));
 }
 
 #[test]
@@ -540,7 +555,7 @@ fn empty_prefix_suite_is_detected_without_a_compiled_inventory() {
 }
 
 #[test]
-fn nightly_is_hosted_and_sbx_is_release_only() {
+fn nightly_is_hosted_and_sbx_is_excluded_from_candidate() {
     let m = manifest();
     let nightly = plan::create(&m, "nightly", request("schedule", &[]), today()).unwrap();
     assert!(nightly.tests.iter().all(|job| !job.self_hosted));
@@ -553,11 +568,11 @@ fn nightly_is_hosted_and_sbx_is_release_only() {
     assert!(candidate
         .cells
         .iter()
-        .any(|cell| cell.cell.suite == "boundary-sbx"));
+        .all(|cell| cell.cell.suite != "boundary-sbx"));
     assert!(candidate
         .tests
         .iter()
-        .any(|job| job.suites.contains("boundary-sbx") && job.blocked_reason.is_some()));
+        .all(|job| !job.suites.contains("boundary-sbx")));
 }
 
 #[test]

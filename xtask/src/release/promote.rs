@@ -1,5 +1,5 @@
 //! `cargo xtask release promote`: re-verify the candidate, create the final
-//! annotated tag, publish the draft (`.github/workflows/promote.yml`).
+//! annotated tag, publish the draft from `make release`.
 //!
 //! Owner: workflow step `candidate-promote-pipeline` (see the WI 0144
 //! ownership map). The signature of `run` is fixed by `release/mod.rs`.
@@ -287,7 +287,7 @@ fn tag(f: &Flags) -> Result<Result<(), Stop>> {
         Ok(TagAction::Create) => {
             if hub.main_head()? != v.main_tip {
                 return Ok(Err(Stop::Failed(
-                    "protected main moved before tagging; retry verification".into(),
+                    "main moved before tagging; retry verification".into(),
                 )));
             }
             let message = format!("awman {version} (candidate {})", v.record.candidate);
@@ -329,7 +329,7 @@ fn publish(f: &Flags) -> Result<Result<(), Stop>> {
         Ok(PublishAction::Publish) => {
             if hub.main_head()? != v.main_tip {
                 return Ok(Err(Stop::Failed(
-                    "protected main moved before publication; retry verification".into(),
+                    "main moved before publication; retry verification".into(),
                 )));
             }
             let notes = std::fs::read_to_string(
@@ -349,7 +349,7 @@ fn publish(f: &Flags) -> Result<Result<(), Stop>> {
             }
             if hub.main_head()? != v.main_tip {
                 return Ok(Err(Stop::Failed(
-                    "protected main moved before publication; retry verification".into(),
+                    "main moved before publication; retry verification".into(),
                 )));
             }
             hub.edit_release(
