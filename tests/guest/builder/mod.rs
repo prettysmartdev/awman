@@ -2,6 +2,18 @@
 use crate::support;
 use awman_test_support::capability::{AppleContainers, Docker};
 
+struct OwnedAppleFixture<'a> {
+    sandbox: &'a awman_test_support::TestSandbox,
+    cli: std::path::PathBuf,
+    tag: String,
+}
+
+impl Drop for OwnedAppleFixture<'_> {
+    fn drop(&mut self) {
+        awman_test_support::apple_image::delete_and_verify(self.sandbox, &self.cli, &self.tag);
+    }
+}
+
 fn run(id: &'static str, apple: bool) {
     let mut s = support::sandbox(id);
     let archive = support::fixture(&s);
@@ -18,10 +30,25 @@ fn run(id: &'static str, apple: bool) {
         )
     };
     // This is an immutable, prebuilt fixture; loading it never builds or pulls.
-    let load_archive = if apple {
-        archive.clone()
+    let (source_tag, load_archive) = if apple {
+        awman_test_support::apple_image::private_fixture(&s, &archive)
     } else {
-        s.fixture("guest-docker-base")
+        (
+            "awman-test/guest:fixture".into(),
+            s.fixture("guest-docker-base"),
+        )
+    };
+    let apple_fixture = if apple {
+        let runtime =
+            awman::engine::container::ContainerRuntime::apple_in(support::env_snapshot(&s));
+        assert!(!runtime.image_exists(&source_tag), "BLOCKED[fixture-ownership]: private Apple fixture tag unexpectedly exists: {source_tag}");
+        Some(OwnedAppleFixture {
+            sandbox: &s,
+            cli: cli.clone(),
+            tag: source_tag.clone(),
+        })
+    } else {
+        None
     };
     s.command(&cli)
         .args(["image", "load", "--input"])
@@ -48,7 +75,9 @@ fn run(id: &'static str, apple: bool) {
     .unwrap();
     std::fs::write(
         repo.join("Dockerfile.dev"),
-        "FROM awman-test/guest:fixture\nUSER root\nRUN printf 'v1\\n' > /etc/builder-marker\nUSER probe\n",
+        format!(
+            "FROM {source_tag}\nUSER root\nRUN printf 'v1\\n' > /etc/builder-marker\nUSER probe\n"
+        ),
     )
     .unwrap();
     let mut global: serde_json::Value =
@@ -66,7 +95,7 @@ fn run(id: &'static str, apple: bool) {
         std::fs::write(
             repo.join("Dockerfile.dev"),
             format!(
-                "FROM awman-test/guest:fixture\nUSER root\nRUN printf '{version}\\n' > /etc/builder-marker\nUSER probe\n"
+                "FROM {source_tag}\nUSER root\nRUN printf '{version}\\n' > /etc/builder-marker\nUSER probe\n"
             ),
         )
         .unwrap();
@@ -106,6 +135,7 @@ fn run(id: &'static str, apple: bool) {
                 .assert_success();
         }
     }
+    drop(apple_fixture);
     // Switch PATH to private traps, preserving source endpoint identity. Cached
     // launch retains the source freshness check, but must survive its failure
     // without building, exporting or acquiring another image.

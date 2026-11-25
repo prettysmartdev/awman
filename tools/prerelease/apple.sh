@@ -42,27 +42,36 @@ test "$(gh pr view "$branch" --repo "$repo" --json state,baseRefName,headRefOid,
   exit 1
 }
 pr_number=$(gh pr view "$branch" --repo "$repo" --json number --jq .number)
-ci_evidence=$(mktemp -d "$root/target/prerelease/ci.XXXXXXXX")
-main_run=$(bash "$root/tools/prerelease/main-ci.sh" "$repo" "$commit" "$ci_evidence")
-started=$(mktemp "$root/target/prerelease/apple-start.XXXXXXXX")
-CARGO_TARGET_DIR=target/native-validation-tools cargo xtask native-validation run
-latest=
-archive_count=0
-for archive in target/native-validation/*.tar.gz; do
-  test -f "$archive" && test "$archive" -nt "$started" || continue
-  latest=$archive
-  archive_count=$((archive_count + 1))
-done
-rm -f -- "$started"
-test "$archive_count" -eq 1 || { echo 'Expected exactly one new Apple native packet' >&2; exit 1; }
-work=$(mktemp -d "$root/target/prerelease/apple.XXXXXXXX")
-python3 "$root/tools/prerelease/extract-packet.py" "$latest" "$work"
-cargo xtask native-validation verify "$work/evidence"
+marker="$root/target/prerelease/apple-$commit"
+if test -f "$marker/evidence/packet.json" &&
+  cargo xtask native-validation verify "$marker/evidence"; then
+  echo "Reusing verified Apple native packet for $commit" >&2
+else
+  started=$(mktemp "$root/target/prerelease/apple-start.XXXXXXXX")
+  CARGO_TARGET_DIR=target/native-validation-tools cargo xtask native-validation run
+  latest=
+  archive_count=0
+  for archive in target/native-validation/*.tar.gz; do
+    test -f "$archive" && test "$archive" -nt "$started" || continue
+    latest=$archive
+    archive_count=$((archive_count + 1))
+  done
+  rm -f -- "$started"
+  test "$archive_count" -eq 1 || { echo 'Expected exactly one new Apple native packet' >&2; exit 1; }
+  work=$(mktemp -d "$root/target/prerelease/apple.XXXXXXXX")
+  python3 "$root/tools/prerelease/extract-packet.py" "$latest" "$work"
+  cargo xtask native-validation verify "$work/evidence"
+  mkdir -p "$marker"
+  if test -e "$marker/evidence"; then
+    mv -- "$marker/evidence" "$marker/evidence.previous.$(date +%s).$$"
+  fi
+  mv -- "$work/evidence" "$marker/evidence"
+fi
 pin_for() {
   awk -v table="[fixtures.$1]" '$0 == table {inside=1;next} inside && /^\[/ {exit} inside && /^sha256 = / {gsub(/"/, "", $3); print $3; exit}' ci/gates.toml
 }
-native_oci=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["fixture_sha256"])' "$work/evidence/packet.json")
-native_docker=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["docker_fixture_sha256"])' "$work/evidence/packet.json")
+native_oci=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["fixture_sha256"])' "$marker/evidence/packet.json")
+native_docker=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["docker_fixture_sha256"])' "$marker/evidence/packet.json")
 test "$native_oci" = "$(pin_for guest-oci-base)" &&
   test "$native_docker" = "$(pin_for guest-docker-base)" || {
     echo 'Native Apple fixture bytes differ from the published manifest pins' >&2
@@ -72,12 +81,11 @@ test "$(git ls-remote origin "refs/heads/$branch" | cut -f 1)" = "$commit" || {
   echo 'The release branch changed during native validation; rerun both prerelease targets' >&2
   exit 1
 }
-marker="$root/target/prerelease/apple-$commit"
-mkdir -p "$marker"
-if test -e "$marker/evidence"; then
-  mv -- "$marker/evidence" "$marker/evidence.previous.$(date +%s).$$"
-fi
-mv -- "$work/evidence" "$marker/evidence"
+# Native failures need a fresh source revision; do not make the operator wait
+# for a full main gate before discovering one. An existing passing gate is
+# still authenticated and reused for this exact commit.
+ci_evidence=$(mktemp -d "$root/target/prerelease/ci.XXXXXXXX")
+main_run=$(bash "$root/tools/prerelease/main-ci.sh" "$repo" "$commit" "$ci_evidence")
 printf '%s\n' "$commit" > "$marker/commit"
 printf '%s\n' "$main_run" > "$marker/main-ci-run"
 printf '%s\n' "$pr_number" > "$marker/pr-number"

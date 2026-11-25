@@ -26,12 +26,13 @@ fn snapshot(root: &Path) -> Result<Snapshot> {
     Ok(out)
 }
 
-// Protect application state and Git configuration. The rest of the operator's
-// home belongs to unrelated applications (including the editor running tests).
-// Observing their logs, caches or databases cannot establish a test leak.
+// The operator may be using awman while native tests run. Its live VM state
+// changes independently of test children, so watching the whole .awman tree
+// would report that normal activity as a test leak. Children receive private
+// HOME/AWMAN_HOME and the runner still watches Git configuration.
 fn protected_snapshot(home: &Path) -> Result<Snapshot> {
     let mut result = Snapshot::new();
-    for relative in [".awman", ".gitconfig", ".config/git"] {
+    for relative in [".gitconfig", ".config/git"] {
         result.extend(snapshot(&home.join(relative))?);
     }
     Ok(result)
@@ -252,7 +253,17 @@ mod tests {
         std::fs::write(home.path().join(".editor/session.log"), "activity").unwrap();
         run.finish().unwrap();
 
-        for path in [".gitconfig", ".awman/config.json", ".config/git/config"] {
+        std::fs::create_dir_all(home.path().join(".awman/builtin/sandboxes/a/runtime")).unwrap();
+        let run = Run::for_home(home.path().to_owned()).unwrap();
+        std::fs::write(
+            home.path()
+                .join(".awman/builtin/sandboxes/a/runtime/heartbeat.json"),
+            "active user session",
+        )
+        .unwrap();
+        run.finish().unwrap();
+
+        for path in [".gitconfig", ".config/git/config"] {
             let run = Run::for_home(home.path().to_owned()).unwrap();
             let target = home.path().join(path);
             std::fs::create_dir_all(target.parent().unwrap()).unwrap();

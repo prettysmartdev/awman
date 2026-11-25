@@ -74,6 +74,11 @@ release branch, pin inputs, run native acceptance, and store packets for the
 same release branch commit. The Apple target opens the PR and reuses a
 successful full main CI gate when its authenticated run and downloaded
 evidence prove that exact commit; otherwise it dispatches a new main gate.
+The Apple target runs native acceptance before waiting for that main gate, so
+a native failure returns its packet without first waiting for a full CI run.
+It stores a verified native packet before starting CI and reuses that packet
+on a retry at the same commit. A later CI failure therefore does not require
+another native run; changed source or invalid packet evidence forces one.
 Neither target checks GitHub branch rules,
 approval counts, tag rulesets, or App credentials.
 

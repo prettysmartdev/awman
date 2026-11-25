@@ -6,6 +6,40 @@ use crate::support;
 use awman::engine::container::ContainerRuntime;
 use awman_test_support::capability::AppleContainers;
 
+struct OwnedFixture<'a> {
+    sandbox: &'a awman_test_support::TestSandbox,
+    tag: String,
+}
+
+impl OwnedFixture<'_> {
+    fn load<'a>(
+        sandbox: &'a awman_test_support::TestSandbox,
+        archive: &std::path::Path,
+        runtime: &ContainerRuntime,
+    ) -> OwnedFixture<'a> {
+        let (tag, private_archive) =
+            awman_test_support::apple_image::private_fixture(sandbox, archive);
+        assert!(
+            !runtime.image_exists(&tag),
+            "BLOCKED[fixture-ownership]: private Apple fixture tag unexpectedly exists: {tag}"
+        );
+        let owned = OwnedFixture { sandbox, tag };
+        sandbox
+            .command("container")
+            .args(["image", "load", "--input"])
+            .arg(private_archive)
+            .run()
+            .assert_success();
+        owned
+    }
+}
+
+impl Drop for OwnedFixture<'_> {
+    fn drop(&mut self) {
+        awman_test_support::apple_image::delete_and_verify(self.sandbox, "container", &self.tag);
+    }
+}
+
 /// awman's Apple runtime reaches the service, reports an unknown image as
 /// absent and lists running awman containers without error.
 #[test]
@@ -47,22 +81,12 @@ fn native_store_export_validates_content_and_reuses_the_cache() {
         AcquireLimits, AcquirePolicy, AcquireRequest, CachingAcquirer, DiskSpace, ImageAcquirer,
         RetryPolicy,
     };
-    use awman_test_support::{capability::GuestFixtures, TestSandbox};
+    use awman_test_support::capability::GuestFixtures;
     use std::{path::Path, sync::Arc};
     struct Space;
     impl DiskSpace for Space {
         fn available(&self, _: &Path) -> Option<u64> {
             None
-        }
-    }
-    struct Image<'a>(&'a TestSandbox);
-    impl Drop for Image<'_> {
-        fn drop(&mut self) {
-            awman_test_support::apple_image::delete_and_verify(
-                self.0,
-                "container",
-                "awman-test/guest:fixture",
-            );
         }
     }
     let mut s =
@@ -71,14 +95,8 @@ fn native_store_export_validates_content_and_reuses_the_cache() {
     s.grant(&apple);
     let fixture = s.require::<GuestFixtures>();
     let runtime = ContainerRuntime::apple_in(support::env_snapshot(&s));
-    assert!(!runtime.image_exists("awman-test/guest:fixture"), "BLOCKED[fixture-ownership]: remove or rename an existing awman-test/guest:fixture before this test");
     // Own cleanup before import: a partially successful load must not leak either.
-    let image = Image(&s);
-    s.command("container")
-        .args(["image", "load", "--input"])
-        .arg(&fixture.paths["guest-oci-base"])
-        .run()
-        .assert_success();
+    let image = OwnedFixture::load(&s, &fixture.paths["guest-oci-base"], &runtime);
     let acquirer = CachingAcquirer::new(
         &s.root().join("cache"),
         AcquireLimits::DEFAULT,
@@ -88,7 +106,7 @@ fn native_store_export_validates_content_and_reuses_the_cache() {
     .with_retry(RetryPolicy::NONE)
     .with_apple_transport(Some(Arc::new(awman_cli::NativeXpc)));
     let request = AcquireRequest {
-        tag: "awman-test/guest:fixture".into(),
+        tag: image.tag.clone(),
         source: ImageSourceSpec::AppleStore { reference: None },
         platform: OciPlatform::host_linux(),
         policy: AcquirePolicy::IfMissing,
@@ -98,7 +116,7 @@ fn native_store_export_validates_content_and_reuses_the_cache() {
         .acquire(&request, &mut |_| {})
         .expect("export through native XPC");
     let metadata = runtime
-        .inspect_image("awman-test/guest:fixture")
+        .inspect_image(&image.tag)
         .expect("read the installed Apple version's inspection format")
         .expect("loaded fixture is present");
     assert!(!metadata.id.is_empty());
@@ -107,8 +125,9 @@ fn native_store_export_validates_content_and_reuses_the_cache() {
     }
     assert_eq!(first.identity.source, ImageSourceKind::AppleStore);
     assert!(first.bytes > 0 && first.archive.is_file());
+    let tag = image.tag.clone();
     drop(image);
-    assert!(!runtime.image_exists("awman-test/guest:fixture"));
+    assert!(!runtime.image_exists(&tag));
     let cached = acquirer
         .acquire(&request, &mut |_| {})
         .expect("validated cached bytes remain usable after source removal");
@@ -126,17 +145,7 @@ fn native_store_export_validates_content_and_reuses_the_cache() {
     ignore = "not-applicable: Apple Containers exist only on macOS"
 )]
 fn a_read_only_workspace_rejects_writes_while_scratch_output_context_and_home_stay_writable() {
-    use awman_test_support::{capability::GuestFixtures, TestSandbox};
-    struct Image<'a>(&'a TestSandbox);
-    impl Drop for Image<'_> {
-        fn drop(&mut self) {
-            awman_test_support::apple_image::delete_and_verify(
-                self.0,
-                "container",
-                "awman-test/guest:fixture",
-            );
-        }
-    }
+    use awman_test_support::capability::GuestFixtures;
     let mut s = support::sandbox(
         "apple::a_read_only_workspace_rejects_writes_while_scratch_output_context_and_home_stay_writable",
     );
@@ -144,19 +153,10 @@ fn a_read_only_workspace_rejects_writes_while_scratch_output_context_and_home_st
     s.grant(&apple);
     let fixture = s.require::<GuestFixtures>();
     let runtime = ContainerRuntime::apple_in(support::env_snapshot(&s));
-    assert!(
-        !runtime.image_exists("awman-test/guest:fixture"),
-        "BLOCKED[fixture-ownership]: remove or rename an existing awman-test/guest:fixture before this test"
-    );
-    let image = Image(&s);
-    s.command("container")
-        .args(["image", "load", "--input"])
-        .arg(&fixture.paths["guest-oci-base"])
-        .run()
-        .assert_success();
+    let image = OwnedFixture::load(&s, &fixture.paths["guest-oci-base"], &runtime);
     support::read_only::prove(&support::read_only::Proof {
         runtime: std::sync::Arc::new(runtime),
-        image: "awman-test/guest:fixture",
+        image: &image.tag,
         root: &s.root().join("read-only-proof"),
         builtin: false,
     });

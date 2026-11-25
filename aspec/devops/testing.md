@@ -428,7 +428,7 @@ nextest parallelism without changing suite deadlines, retries or selection.
 
 Every selected suite must contain tests. The runner captures compiled inventory, executes with zero retries, clears stale JUnit, and records source hashes and actual results. Missing tests, required skips and changed inputs fail validation. Component contracts in private library modules are selected explicitly by the manifest; placement alone never grants unit-tier privileges.
 
-Tests own their private HOME, Git configuration, processes and sockets through TestSandbox. The runner also watches the real awman and Git configuration paths for changes. Unrelated editor caches are outside that canary. This is test resource ownership, not a sandbox for hostile native code; never run an untrusted PR on a privileged host.
+Tests own their private HOME, Git configuration, processes and sockets through TestSandbox. The runner watches the real Git configuration for changes and checks for run-owned process leaks on Linux. It does not watch the operator's live `.awman` tree: an ordinary session may update its heartbeat or disk while tests run. Child environment and capability checks remain the test escape boundary. An unexpected write to the operator's `.awman` by a test child is no longer caught by the runner's filesystem canary; restore that detection only with ownership attribution, not a snapshot of unrelated user activity. This is test resource ownership, not a sandbox for hostile native code; never run an untrusted PR on a privileged host.
 
 `--shuffle-seed` changes suite invocation order. It does not randomize tests inside a nextest invocation. Record repeats, time and failures accurately; a single clean run is not p95 or a long-term flake-rate measurement.
 
@@ -464,7 +464,9 @@ plus the declared native boundaries. The signed candidate is copied into the
 packet and must retain the same digest throughout execution. The offline artifact
 tests enforce their own network denial. Image preparation is a separate online
 phase; both verified fixture pins are recorded in `run-config.toml` and do
-not change the repository's fixture policy. Linux native acceptance separately
+not change the repository's fixture policy. Apple store tests retag a private
+copy of the pinned OCI fixture for each attempt and remove only their own tag;
+preexisting user and prior-attempt images remain untouched. Linux native acceptance separately
 uses a local Unix-socket Docker Engine to reconstruct the fixtures and run its
 Docker and registry boundaries. The release candidate does not run the `sbx`
 boundary in v0.14 because the runtime is disabled pending
