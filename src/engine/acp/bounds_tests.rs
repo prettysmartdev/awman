@@ -474,8 +474,20 @@ async fn a_permission_behind_saturated_output_is_answered_once_a_blocked_prompt_
         acp.drive_with_initial_prompt(&mut frontend, Some("first".into()))
             .await
     });
-    let at_budget = saturated(&handle).await;
+    // Either bounded queue can stop the producer here. Requiring both to be
+    // full depends on which task the executor schedules first and can time
+    // out even though the blocked-prompt/backpressure condition is present.
+    let at_budget = awman_test_support::wait_for_async("output queue at budget", LIMIT, || {
+        let stats = handle.stats();
+        let ready = full(&stats.bulk, 1100) || full(&stats.stdout, 4096);
+        std::future::ready(ready.then_some(stats))
+    })
+    .await;
     assert_eq!(controls.asked.load(Ordering::SeqCst), 0);
+    assert!(
+        agent.lines_sent.load(Ordering::SeqCst) < FLOOD,
+        "the permission is behind a producer blocked by output backpressure"
+    );
     assert_within_budgets(&at_budget);
 
     controls
