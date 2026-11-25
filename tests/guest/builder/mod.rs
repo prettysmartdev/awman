@@ -96,11 +96,15 @@ fn run(id: &'static str, apple: bool) {
         format!("awman-{stem}-claude:latest"),
         format!("awman-{stem}:latest"),
     ] {
-        s.command(&cli)
-            .args(["image", "rm"])
-            .arg(tag)
-            .run()
-            .assert_success();
+        if apple {
+            awman_test_support::apple_image::delete_and_verify(&s, &cli, &tag);
+        } else {
+            s.command(&cli)
+                .args(["image", "rm"])
+                .arg(tag)
+                .run()
+                .assert_success();
+        }
     }
     // Switch PATH to private traps, preserving source endpoint identity. Cached
     // launch retains the source freshness check, but must survive its failure

@@ -58,14 +58,11 @@ fn native_store_export_validates_content_and_reuses_the_cache() {
     struct Image<'a>(&'a TestSandbox);
     impl Drop for Image<'_> {
         fn drop(&mut self) {
-            let output = self
-                .0
-                .command("container")
-                .args(["image", "delete", "awman-test/guest:fixture"])
-                .run();
-            if !std::thread::panicking() {
-                output.assert_success();
-            }
+            awman_test_support::apple_image::delete_and_verify(
+                self.0,
+                "container",
+                "awman-test/guest:fixture",
+            );
         }
     }
     let mut s =
@@ -133,11 +130,11 @@ fn a_read_only_workspace_rejects_writes_while_scratch_output_context_and_home_st
     struct Image<'a>(&'a TestSandbox);
     impl Drop for Image<'_> {
         fn drop(&mut self) {
-            let _ = self
-                .0
-                .command("container")
-                .args(["image", "delete", "awman-test/guest:fixture"])
-                .run();
+            awman_test_support::apple_image::delete_and_verify(
+                self.0,
+                "container",
+                "awman-test/guest:fixture",
+            );
         }
     }
     let mut s = support::sandbox(
