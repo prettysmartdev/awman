@@ -44,14 +44,23 @@ fn runtime_opt_ins_have_no_effect_without_isolation() {
 fn test_isolation_only_reduces_access() {
     let mut s = support::sandbox("switches::test_isolation_only_reduces_access");
     let a = support::artifact(&mut s);
-    // Listing agents queries the host runtime directly. An installed fake
-    // records attempts; its path is outside TMPDIR so the release treats it
-    // as a real runtime rather than its temp-tree fake exception.
+    // Listing agents queries the selected host runtime directly. Use Apple
+    // Containers on macOS and Docker elsewhere; no Docker service is needed
+    // on the release Mac. The installed fake records attempts.
     let fake_exe = support::fake_cli_exe();
     s.register_exe("fake-cli", fake_exe);
-    let fake = s.install_fake(fake_exe, "docker");
-    fake.on(&["info"]).stdout("27.5.1\n");
-    fake.on(&["ps"]).stdout("");
+    let (runtime, cli) = if cfg!(target_os = "macos") {
+        ("apple", "container")
+    } else {
+        ("docker", "docker")
+    };
+    std::fs::write(
+        s.awman_home().join("config.json"),
+        serde_json::to_vec(&serde_json::json!({"runtime":{"kind":runtime}})).unwrap(),
+    )
+    .unwrap();
+    let fake = s.install_fake(fake_exe, cli);
+    fake.on(&[]).stdout("[]\n");
     let observe_list = |isolated: &str, opt: Option<&str>| {
         let mut cmd = support::run_artifact(&s, &a)
             .env("AWMAN_TEST_ISOLATION", isolated)
@@ -69,13 +78,15 @@ fn test_isolation_only_reduces_access() {
     assert_eq!(
         fake.calls().len(),
         before,
-        "isolated release reached the host Docker CLI: {isolated:?}"
+        "isolated release reached the host {cli} CLI: {isolated:?}"
     );
     let normal = observe_list("0", None);
     let normal_calls = fake.calls().len() - before;
     assert!(
         normal_calls > 0,
-        "positive control never reached the instrumented runtime: {normal:?}"
+        "positive control never reached the instrumented {cli} runtime: stdout={} stderr={}",
+        normal.stdout_text(),
+        normal.stderr_text()
     );
     for switch in OPT_INS {
         let start = fake.calls().len();

@@ -40,6 +40,17 @@ impl std::ops::DerefMut for ArtifactSandbox {
 }
 pub fn sandbox(id: &'static str) -> ArtifactSandbox {
     let mut sandbox = TestSandbox::for_test(TestCase::artifact(id));
+    #[cfg(target_os = "macos")]
+    {
+        // The release runner's short /tmp path is an alias for /private/tmp.
+        // Pass the resolved bin path to candidate processes as well as to the
+        // sandbox-exec profile, so executable lookup and policy agree.
+        let mut dirs = sandbox.env().path_dirs();
+        dirs[0] = sandbox.bin().canonicalize().expect("private test bin");
+        sandbox
+            .env_mut()
+            .set("PATH", std::env::join_paths(dirs).expect("artifact PATH"));
+    }
     sandbox.register_exe("fake-cli", fake_cli_exe());
     // The published predecessor reads this name; current awman reads AWMAN_HOME.
     // Both must use the same private config and VM state during upgrade tests.
@@ -127,11 +138,15 @@ pub fn run_exact(s: &TestSandbox, exe: &Path) -> OwnedCommand {
         // execution too: a helper extracted and deleted before our file scan
         // still cannot execute. Synthetic task agents are mounted only in VMs.
         let literal = serde_json::to_string(&exe.to_string_lossy()).unwrap();
-        let bin = serde_json::to_string(&s.bin().to_string_lossy()).unwrap();
+        // macOS resolves /tmp through /private/tmp before applying the
+        // process-exec rule. Name the directory as the kernel sees it.
+        let canonical_bin = s.bin().canonicalize().expect("private test bin");
+        let bin = serde_json::to_string(&canonical_bin.to_string_lossy()).unwrap();
+        let bin_alias = serde_json::to_string(&s.bin().to_string_lossy()).unwrap();
         let profile = format!(
             "(version 1)(allow default)(deny network*)\
              (allow network* (local unix-socket) (remote unix-socket))\
-             (deny process-exec)(allow process-exec (literal {literal}) (subpath {bin})\
+             (deny process-exec)(allow process-exec (literal {literal}) (subpath {bin}) (subpath {bin_alias})\
              (literal \"/usr/bin/git\") (literal \"/usr/bin/security\")\
              (literal \"/usr/bin/xcrun\")\
              (literal \"/Library/Developer/CommandLineTools/usr/bin/git\"))"
