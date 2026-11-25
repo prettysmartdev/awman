@@ -41,8 +41,12 @@ impl std::ops::DerefMut for ArtifactSandbox {
 pub fn sandbox(id: &'static str) -> ArtifactSandbox {
     let mut sandbox = TestSandbox::for_test(TestCase::artifact(id));
     sandbox.register_exe("fake-cli", fake_cli_exe());
+    // The published predecessor reads this name; current awman reads AWMAN_HOME.
+    // Both must use the same private config and VM state during upgrade tests.
+    let awman_home = sandbox.awman_home();
+    sandbox.env_mut().set("AWMAN_CONFIG_HOME", &awman_home);
     let state = awman_test_support::sandbox::private_tempdir(
-        "awa-",
+        "g-",
         &awman_test_support::runtime_env::get()
             .tmproot
             .clone()
