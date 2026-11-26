@@ -25,8 +25,15 @@ try {
     $toolsets = Join-Path $visualStudio "VC\Tools\MSVC"
     $toolset = Get-ChildItem $toolsets -Directory | Sort-Object Name -Descending | Select-Object -First 1
     if (-not $toolset) { throw "BLOCKED[msvc-linker]: MSVC toolset is unavailable" }
-    $linker = Join-Path $toolset.FullName "bin\Hostx64\x64\link.exe"
+    $compilerDir = Join-Path $toolset.FullName "bin\Hostx64\x64"
+    $compiler = Join-Path $compilerDir "cl.exe"
+    if (-not (Test-Path $compiler)) { throw "BLOCKED[msvc-compiler]: $compiler is unavailable" }
+    $linker = Join-Path $compilerDir "link.exe"
     if (-not (Test-Path $linker)) { throw "BLOCKED[msvc-linker]: $linker is unavailable" }
+    # The hosted runner's Git Bash PATH has its own tools first. Make MSVC's
+    # compiler and tools available to C build scripts in isolated test runs.
+    $env:PATH = "$compilerDir;$env:PATH"
+    $env:CC = $compiler
     $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $linker
     $kit = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10"
     $sdk = Get-ChildItem (Join-Path $kit "Lib") -Directory | Sort-Object Name -Descending | Select-Object -First 1
