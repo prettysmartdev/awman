@@ -15,6 +15,19 @@ $probeRule = "awman-probe-$nonce"
 $oldResources = $env:AWMAN_TEST_HOST_RESOURCES
 $status = 2
 try {
+    # Git Bash puts its Unix `link` ahead of MSVC's linker in PATH. The
+    # release test compile must use the installed Visual Studio linker.
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $vswhere)) { throw "BLOCKED[msvc-linker]: vswhere is unavailable" }
+    $visualStudio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    if (-not $visualStudio) { throw "BLOCKED[msvc-linker]: Visual Studio C++ tools are unavailable" }
+    $visualStudio = $visualStudio.Trim()
+    $toolsets = Join-Path $visualStudio "VC\Tools\MSVC"
+    $toolset = Get-ChildItem $toolsets -Directory | Sort-Object Name -Descending | Select-Object -First 1
+    if (-not $toolset) { throw "BLOCKED[msvc-linker]: MSVC toolset is unavailable" }
+    $linker = Join-Path $toolset.FullName "bin\Hostx64\x64\link.exe"
+    if (-not (Test-Path $linker)) { throw "BLOCKED[msvc-linker]: $linker is unavailable" }
+    $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $linker
     $exe = (Resolve-Path $Artifact).Path
     if ((Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant() -ne $Sha256) {
         throw "BLOCKED[artifact-digest]: executable digest changed"

@@ -4,6 +4,13 @@ pub mod session;
 use awman_test_support::capability::{Offline, ReleaseArtifact};
 use awman_test_support::{Granted, Leak, OwnedCommand, TestCase, TestSandbox};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+fn git_for_offline_profile(s: &TestSandbox) -> PathBuf {
+    let output = s.command("/usr/bin/xcrun").args(["--find", "git"]).run();
+    output.assert_success();
+    let git = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    git.canonicalize().expect("Xcode git must be installed")
+}
 pub fn fake_cli_exe() -> &'static Path {
     static EXE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     EXE.get_or_init(|| {
@@ -47,6 +54,15 @@ pub fn sandbox(id: &'static str) -> ArtifactSandbox {
         // sandbox-exec profile, so executable lookup and policy agree.
         let mut dirs = sandbox.env().path_dirs();
         dirs[0] = sandbox.bin().canonicalize().expect("private test bin");
+        // /usr/bin/git is an Xcode shim on hosted macOS. Run its selected
+        // executable directly so the offline profile can allow that one path.
+        dirs.insert(
+            1,
+            git_for_offline_profile(&sandbox)
+                .parent()
+                .unwrap()
+                .to_path_buf(),
+        );
         sandbox
             .env_mut()
             .set("PATH", std::env::join_paths(dirs).expect("artifact PATH"));
@@ -143,13 +159,13 @@ pub fn run_exact(s: &TestSandbox, exe: &Path) -> OwnedCommand {
         let canonical_bin = s.bin().canonicalize().expect("private test bin");
         let bin = serde_json::to_string(&canonical_bin.to_string_lossy()).unwrap();
         let bin_alias = serde_json::to_string(&s.bin().to_string_lossy()).unwrap();
+        let git = serde_json::to_string(&git_for_offline_profile(s).to_string_lossy()).unwrap();
         let profile = format!(
             "(version 1)(allow default)(deny network*)\
              (allow network* (local unix-socket) (remote unix-socket))\
              (deny process-exec)(allow process-exec (literal {literal}) (subpath {bin}) (subpath {bin_alias})\
-             (literal \"/usr/bin/git\") (literal \"/usr/bin/security\")\
-             (literal \"/usr/bin/xcrun\")\
-             (literal \"/Library/Developer/CommandLineTools/usr/bin/git\"))"
+             (literal {git}) (literal \"/usr/bin/security\")\
+             (literal \"/usr/bin/xcrun\"))"
         );
         s.command("/usr/bin/sandbox-exec")
             .arg("-p")
