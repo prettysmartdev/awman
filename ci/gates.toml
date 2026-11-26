@@ -1018,7 +1018,7 @@ file = "guest-oci-base.tar"
 tiers = ["guest", "artifact"]
 build = "guest-oci-base"
 sha256 = "a923846938a4fe539e06b89b7bd6beeca20917344d59e4afee8a5882b84e041e"
-source = "https://github.com/prettysmartdev/awman/releases/download/fixtures-a66c55eec205f218235cf7fedf47f280705f1bfe/fixture-oci.tar"
+source = "https://github.com/prettysmartdev/awman/releases/download/fixtures-eae27245598962b9e35582fcdeff960083194981/fixture-oci.tar"
 
 [fixtures.guest-docker-base]
 arch = "arm64"
@@ -1026,7 +1026,7 @@ file = "guest-docker-base.tar"
 tiers = ["guest", "artifact"]
 build = "guest-docker-base"
 sha256 = "dec34ab2bde8e029726ef5fc2e2c6f869f45522a111b5de4070e5f8dd58cdb43"
-source = "https://github.com/prettysmartdev/awman/releases/download/fixtures-a66c55eec205f218235cf7fedf47f280705f1bfe/fixture-docker.tar"
+source = "https://github.com/prettysmartdev/awman/releases/download/fixtures-eae27245598962b9e35582fcdeff960083194981/fixture-docker.tar"
 
 [fixtures.msb-payload-aarch64-apple-darwin]
 verified_record = "third_party/msb-payloads/aarch64-apple-darwin"
@@ -1364,7 +1364,8 @@ build = "guest-oci-base-amd64"
 arch = "amd64"
 recipe_sha256 = "cc0ead7736a5f16f36f4281bfd3cce6a679cc854036fde99aa93bff1c9306a71"
 image_contract_sha256 = "e7aaaaf242756ad402827bb35be57385f176892f57102f4b03aab2429155ee79"
-pending = "publish architecture-specific amd64 fixture before release cutover"
+sha256 = "c86291072784402551a5a223eaca257e3affd7ef37b6bb5bd2402f494f353f6f"
+source = "https://github.com/prettysmartdev/awman/releases/download/fixtures-eae27245598962b9e35582fcdeff960083194981/fixture-oci-amd64.tar"
 
 [[gates.native-diagnostic.cells]]
 suites = ["artifact-smoke", "artifact-entrypoints", "artifact-switches", "artifact-deps-scan", "artifact-upgrade-policy", "artifact-measure"]
