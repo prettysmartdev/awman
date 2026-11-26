@@ -1,11 +1,11 @@
 # Guest fixture publication: prepared infrastructure, never a release step.
 #
-# Dispatch from any branch when the reviewed recipe, image contract or base
-# image changes (`gates check` reports the drift on the PR that causes it).
+# Run `make fixtures-pin` on a clean branch based on main when the reviewed
+# recipe, image contract or base image changes (`gates check` reports drift).
 # Each architecture is built from the reviewed base image, independently
 # reproduced, attested and published once under fixtures-<commit> with
-# distinct filenames. A maintainer then runs `cargo xtask fixtures pin
-# --arch <arch> …` on the downloaded assets and commits the reviewed pins;
+# distinct filenames. The command downloads both architectures, runs
+# `cargo xtask fixtures pin` for each and commits the reviewed pins;
 # `make release` only consumes those pins.
 name: Fixtures
 on:

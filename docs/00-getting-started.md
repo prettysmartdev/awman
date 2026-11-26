@@ -37,7 +37,7 @@ This checks the runtime, images, and agent authentication. If you need images be
 awman
 ```
 
-In the TUI command box, type `chat` and press **Enter**. Talk to the agent in the terminal window. **Ctrl-M** minimizes or restores the window without stopping the session. To start directly from your shell, run `awman chat`.
+In the TUI command box, type `chat` and press **Enter**. Talk to the agent in the terminal window. **Ctrl-M** cycles the window through maximized, minimized, and hidden without stopping the session. To start directly from your shell, run `awman chat`.
 
 ## Give awman a task
 

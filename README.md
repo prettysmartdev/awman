@@ -44,7 +44,7 @@ Use `awman` in whichever way fits the task: the [CLI](docs/14-command-reference.
 
 ## Get started
 
-You'll need a project in a git repo, an account for your chosen agent(s), and a supported runtime such as Docker, Apple Containers, Docker sbx, or the builtin microVM runtime: [supported runtimes](docs/11-runtimes.md).
+You'll need a project in a git repo, an account for your chosen agent(s), and a supported runtime such as Docker, Apple Containers, or the builtin microVM runtime: [supported runtimes](docs/11-runtimes.md).
 
 ```sh
 curl -s https://prettysmart.dev/install/awman.sh | sh

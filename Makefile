@@ -158,7 +158,12 @@ clean:
 #   make release [VERSION=vX.Y.Z] [LINUX_HOST=user@host] [YES=1]
 #                [SUPERSEDE=1] [TAKEOVER=<owner>] [REHEARSE=1]
 RELEASE_ARGS = $(if $(VERSION),--version $(VERSION)) $(if $(LINUX_HOST),--linux-host $(LINUX_HOST))
-.PHONY: release release-status release-doctor release-abandon release-rehearse
+.PHONY: release release-status release-doctor release-abandon release-rehearse fixtures-pin
+# One-time fixture preparation, separate from the timed release. Publishes a
+# fixtures-<main commit> prerelease, verifies both architectures and commits pins.
+fixtures-pin:
+	@bash tools/fixtures/publish-and-pin.sh
+
 release:
 	@cargo xtask release run $(RELEASE_ARGS) $(if $(DECIDED_AT),--decided-at $(DECIDED_AT)) $(if $(REHEARSAL_REPO),--rehearsal-repo $(REHEARSAL_REPO)) $(if $(filter 1,$(YES)),--yes) $(if $(filter 1,$(SUPERSEDE)),--supersede) $(if $(TAKEOVER),--takeover $(TAKEOVER)) $(if $(filter 1,$(REHEARSE)),--rehearse)
 

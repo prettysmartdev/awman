@@ -126,6 +126,14 @@ their exact tags for digest pinning. They contain test inputs, not awman
 executables, so publication marks them as prereleases and explicitly excludes
 them from GitHub's Latest release selection.
 
+`make fixtures-pin` is the maintainer's one-time preparation command on a clean
+branch based on `origin/main`. It dispatches `fixtures.yml` at the current
+`main`, waits for the run or reuses its complete immutable fixture release,
+downloads the assets, verifies both architectures with `cargo xtask fixtures
+pin`, checks the manifest and commits the reviewed pins. It stops if `main`
+moves before dispatch or if the branch's fixture inputs differ from `main`.
+`make release` only consumes the committed pins and never publishes fixtures.
+
 ### `ci.yml` job graph
 
 `plan` → `lint`, `build-*`, `test-*`, `boundary-linux-docker`, `static-musl`,

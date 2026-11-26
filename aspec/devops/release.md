@@ -70,7 +70,9 @@ and stops at the first failure, before anything is pushed or dispatched.
   per-release step.
 - The reviewed fixture pins in `ci/gates.toml` are published, including the
   architecture-specific amd64 guest fixture. A pin still marked pending blocks
-  with `pin-pending`; nothing substitutes a locally built fixture.
+  with `pin-pending`; nothing substitutes a locally built fixture. A maintainer
+  can publish, verify and commit both architecture pins beforehand with
+  `make fixtures-pin` on a clean branch based on `origin/main`.
 
 **Release Mac (Apple Silicon)**
 

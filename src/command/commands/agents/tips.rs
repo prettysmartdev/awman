@@ -1,9 +1,8 @@
 //! Tips shown in the `awman agents status` footer.
 //!
 //! Reviewed and refreshed before every release (see the `release-prep`
-//! skill). Every `` `awman …` `` command and flag a tip names is checked
-//! against the `CommandCatalogue` by the tests below, so a renamed or removed
-//! command fails the build instead of leaving a stale tip behind.
+//! skill). Check named commands and flags against the `CommandCatalogue`
+//! during that review.
 
 /// Tips shown at the bottom of the agents dashboard, grouped by topic. The tip
 /// displayed on any given invocation is selected by [`select_random_tip`]
@@ -17,6 +16,7 @@ pub const TIPS: &[&str] = &[
     "`awman ready --build --no-cache` rebuilds the agent image from scratch with no layer cache.",
     "`awman ready --refresh` runs the Dockerfile agent audit, which is skipped by default.",
     "`awman ready --json` prints a machine-readable readiness report for scripts and CI.",
+    "`awman ready --prepare-only` prepares images without checking agent authentication.",
     "Run `awman` from any subdirectory of a Git repo — it locates the root automatically.",
     "Run `awman` with no arguments to open the TUI; add a subcommand to run it once and exit.",
     "Built-in agents include Claude, Codex, OpenCode 1.x and 2.x, Cursor, Copilot and Cline.",
@@ -81,7 +81,7 @@ pub const TIPS: &[&str] = &[
     // ── TUI ──────────────────────────────────────────────────────────────────
     "Press Ctrl+T in the TUI to open a new tab with its own working directory.",
     "Use Ctrl+A and Ctrl+D to switch between tabs in the TUI.",
-    "Press Ctrl+M to minimize or restore the container window without stopping the agent.",
+    "Press Ctrl+M to cycle the container window through maximized, minimized and hidden.",
     "Press Ctrl+Q to open the work queue panel when `tui.worker.enabled` is on.",
     "Press Ctrl+\\ to detach from a container view without sending anything to the agent.",
     "Press Ctrl+S to move focus to the next running container when several are running.",
@@ -105,8 +105,8 @@ pub const TIPS: &[&str] = &[
     "`awman config unset <key>` removes a stored setting, such as an old work server link.",
     "`--set key=value` overrides any config key for one run; `awman config show` lists them.",
     // ── Runtimes and security ────────────────────────────────────────────────
-    "Agents never run on your host: they run in Docker, Apple Containers, Docker Sandboxes or a microVM.",
-    "`awman config set runtime apple-containers --global` switches to Apple Containers.",
+    "Agent tasks run inside Docker, Apple Containers or builtin microVMs.",
+    "`awman config set runtime.kind apple --global` switches to Apple Containers.",
     "On Apple Silicon Macs, the experimental `builtin` runtime runs each agent in a microVM.",
     "The builtin runtime's `network` setting can be `public`, `allowlist` or `none`.",
     "awman mounts only your confirmed workspace; overlays can grant other paths explicitly.",

@@ -20,6 +20,11 @@ Use this skill when the user asks to "prepare for release vX.Y.Z", "bump the ver
 
 Do **not** run `make release` or push any tags. Stop with the prep committed; the maintainer runs the one release command.
 
+If a required guest fixture in `ci/gates.toml` is still pending, hand off
+`make fixtures-pin` first. It dispatches the Fixtures workflow, which publishes
+an immutable fixture tag and release, verifies both architectures and commits
+their pins. Release prep does not run that publication command.
+
 Before editing, start from a clean, synchronized `main` checkout and create
 `release/vX.Y.Z`, or resume that existing branch. Commit all release prep
 changes on that branch (or on `main`). Do not push, open a PR or merge: the
@@ -238,6 +243,7 @@ Before finishing, verify:
 - [ ] Status-dashboard tips reviewed: stale tips fixed, new features covered, `cargo test --lib tips` passes
 - [ ] `docs/releases/vX.Y.Z.md` created
 - [ ] If `WORKER_PROTOCOL` changed: previous protocol added to `UPGRADABLE_FROM`, or release notes have a `No in-place builtin state upgrade:` line
+- [ ] Required guest fixtures have published pins; if one is pending, the maintainer runs `make fixtures-pin` before `make release`
 - [ ] `docs/blog/NNNN-slug.md` created
 - [ ] `make release` NOT run and nothing pushed or tagged (the maintainer does that separately)
 
