@@ -25,8 +25,8 @@
     "awman-macos-arm64": 45845381866,
     "awman-windows-amd64.exe": 45845390884
   },
-  "draft_id": null,
-  "seal_sha256": null,
+  "draft_id": 459618622,
+  "seal_sha256": "2bc58b54bcb53da95cd9c383e1c2b9b623ee76ce21e3be5290a8ff3d83879dbb",
   "started": "2026-11-26T15:04:04.812371Z",
   "decided_at": null
 }

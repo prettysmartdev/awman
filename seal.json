@@ -1,0 +1,48 @@
+{
+  "schema": 1,
+  "version": "v0.14.0",
+  "repository_id": 1180183833,
+  "commit": "b3f403b7fe214daef87852f5812ffc765900c74d",
+  "tree": "ffb044101dd50812ff22e0e4f7095f0048d7b54c",
+  "plan_sha256": "64e0dc7c215179a55efbb4a70a2ef7933dba758d802ce1ccfc79c335ee4e2b94",
+  "policy_sha256": "30586a6d9c120a6613f764343c9e889ff00560796bd1d6dd7fc37e501d539d32",
+  "release_id": 459618622,
+  "assets": [
+    {
+      "name": "SHA256SUMS",
+      "asset_id": 796619789,
+      "sha256": "768a056f2be4877e4a5850b9088bee78d440f92196becf342a2b42091a87450f",
+      "size": 342
+    },
+    {
+      "name": "awman-linux-amd64",
+      "asset_id": 796599824,
+      "sha256": "ea6860596c5ab4597bcd0f2c751cf278dd8ec5aaed978dd574abedcae086beff",
+      "size": 129832192
+    },
+    {
+      "name": "awman-linux-arm64",
+      "asset_id": 796607394,
+      "sha256": "9c2fa448d4a2bcbb2a8bc4c2a4e8791ffb4f8f0992da2e6efb397e8f2f0b2f9e",
+      "size": 47229192
+    },
+    {
+      "name": "awman-macos-arm64",
+      "asset_id": 796610253,
+      "sha256": "f91589865fe695672ef2f1b18ff95effaae92f044e7cbcebee6af745bc5552e6",
+      "size": 118769408
+    },
+    {
+      "name": "awman-windows-amd64.exe",
+      "asset_id": 796616527,
+      "sha256": "6e20a01f9a085f98e17b157c5ffc5ecdb873540c94bff9b09b787f789836577d",
+      "size": 59822080
+    },
+    {
+      "name": "release-evidence.json",
+      "asset_id": 796619818,
+      "sha256": "51ee2645a2141fd47e65434cc60e095d2fc14566d2bf8e6f0ddd209dbb5e4388",
+      "size": 6385
+    }
+  ]
+}
