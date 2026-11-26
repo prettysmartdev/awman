@@ -18,8 +18,13 @@
     "pid": 52006
   },
   "previous_owners": [],
-  "ci_run": null,
-  "build_runs": {},
+  "ci_run": 45845357683,
+  "build_runs": {
+    "awman-linux-amd64": 45845365358,
+    "awman-linux-arm64": 45845374088,
+    "awman-macos-arm64": 45845381866,
+    "awman-windows-amd64.exe": 45845390884
+  },
   "draft_id": null,
   "seal_sha256": null,
   "started": "2026-11-26T15:04:04.812371Z",
