@@ -124,7 +124,10 @@ reported as passed because it was skipped.
 Fixture releases use `fixtures-<source commit>` tags and remain downloadable by
 their exact tags for digest pinning. They contain test inputs, not awman
 executables, so publication marks them as prereleases and explicitly excludes
-them from GitHub's Latest release selection.
+them from GitHub's Latest release selection. The workflow and `make fixtures-pin`
+check `releases/latest` after publication, clear an older fixture release's
+Latest designation if necessary, and refuse to finish while any fixture tag is
+Latest.
 
 `make fixtures-pin` is the maintainer's one-time preparation command on a clean
 branch based on `origin/main`. It dispatches `fixtures.yml` at the current

@@ -103,5 +103,11 @@ jobs:
             exit 1
           fi
           gh release create "$TAG" --target "$COMMIT" --title "$TAG" --prerelease --latest=false --notes-file out/SHA256SUMS out/*
+          latest=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)
+          if [[ "$latest" == fixtures-* ]]; then
+            gh release edit "$latest" --latest=false --prerelease
+            latest=$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)
+          fi
+          [[ "$latest" != fixtures-* ]] || { echo 'A fixture release is still marked Latest' >&2; exit 1; }
           cat out/SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
           echo 'Next: download the assets and run cargo xtask fixtures pin --arch arm64|amd64 for each, then commit ci/gates.toml.' >> "$GITHUB_STEP_SUMMARY"

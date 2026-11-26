@@ -8,6 +8,15 @@ cd "$root"
 repo=prettysmartdev/awman
 
 die() { echo "fixtures-pin: $*" >&2; exit 1; }
+ensure_product_latest() {
+    local latest
+    latest=$(gh api "repos/$repo/releases/latest" --jq .tag_name)
+    if [[ "$latest" == fixtures-* ]]; then
+        gh release edit "$latest" -R "$repo" --latest=false --prerelease
+        latest=$(gh api "repos/$repo/releases/latest" --jq .tag_name)
+    fi
+    [[ "$latest" != fixtures-* ]] || die "a fixture release is still marked Latest on GitHub"
+}
 for tool in git gh cargo; do
     command -v "$tool" >/dev/null || die "$tool is required"
 done
@@ -57,6 +66,7 @@ details=$(gh release view "$tag" -R "$repo" --json targetCommitish,isPrerelease,
 IFS=$'\t' read -r target prerelease draft <<< "$details"
 [[ "$target" == "$main_sha" && "$prerelease" == true && "$draft" == false ]] || \
     die "$tag is not a published prerelease for $main_sha"
+ensure_product_latest
 assets=$(gh release view "$tag" -R "$repo" --json assets --jq '[.assets[].name] | join(" ")')
 for name in base-image.txt fixture-oci.tar fixture-docker.tar provenance.json fixture-oci-amd64.tar provenance-amd64.json SHA256SUMS; do
     [[ " $assets " == *" $name "* ]] || die "$tag lacks $name; immutable fixture releases cannot be replaced"
@@ -81,6 +91,7 @@ for arch in arm64 amd64; do
     cargo xtask fixtures pin --arch "$arch" --repo "$repo" --tag "$tag" --assets "$temp/assets"
 done
 cargo xtask gates check
+ensure_product_latest
 git diff --check
 changes=$(git diff --name-only)
 [[ -z "$changes" || "$changes" == ci/gates.toml ]] || die "fixture pin changed unexpected files: $changes"

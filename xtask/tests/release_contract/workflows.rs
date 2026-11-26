@@ -121,6 +121,8 @@ fn fixture_publication_is_prepared_infrastructure_with_one_pin_per_architecture(
     assert!(text.contains("fixtures verify-build --base base.tar"));
     assert!(text.contains("fixture-oci-amd64.tar"));
     assert!(text.contains("Refusing to replace an existing fixture release"));
+    assert!(text.contains("--prerelease --latest=false"));
+    assert!(text.contains("releases/latest"));
     assert!(!text.contains("--clobber"));
     // Publication alone holds contents: write; the builders attest.
     assert_eq!(doc["jobs"]["publish"]["permissions"]["contents"], "write");
