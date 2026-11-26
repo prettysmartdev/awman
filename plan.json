@@ -1,0 +1,198 @@
+{
+  "assets": [
+    {
+      "abi": "glibc-2.35",
+      "asset": "awman-linux-amd64",
+      "binary": "target/release/awman",
+      "build": "linux-x64-release",
+      "builder": "hosted",
+      "cargo": [
+        "build",
+        "--locked",
+        "--release",
+        "-p",
+        "awman-cli",
+        "--bin",
+        "awman",
+        "--features",
+        "builtin-runtime"
+      ],
+      "native": "native.linux-x64",
+      "runs_on": [
+        "ubuntu-22.04"
+      ],
+      "sign": false,
+      "smoke_suites": [
+        "artifact-smoke",
+        "artifact-entrypoints",
+        "artifact-switches"
+      ],
+      "toolchain": "1.94.0",
+      "triple": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "abi": null,
+      "asset": "awman-linux-arm64",
+      "binary": "target/release/awman",
+      "build": "linux-arm64-release",
+      "builder": "hosted",
+      "cargo": [
+        "build",
+        "--locked",
+        "--release",
+        "-p",
+        "awman-cli",
+        "--bin",
+        "awman"
+      ],
+      "native": null,
+      "runs_on": [
+        "ubuntu-24.04-arm"
+      ],
+      "sign": false,
+      "smoke_suites": [
+        "artifact-smoke",
+        "artifact-entrypoints",
+        "artifact-switches"
+      ],
+      "toolchain": "1.94.0",
+      "triple": "aarch64-unknown-linux-gnu"
+    },
+    {
+      "abi": null,
+      "asset": "awman-macos-arm64",
+      "binary": "target/release/awman",
+      "build": "macos-arm64-release",
+      "builder": "hosted",
+      "cargo": [
+        "build",
+        "--locked",
+        "--release",
+        "-p",
+        "awman-cli",
+        "--bin",
+        "awman",
+        "--features",
+        "builtin-runtime"
+      ],
+      "native": "native.macos-arm64",
+      "runs_on": [
+        "macos-15"
+      ],
+      "sign": true,
+      "smoke_suites": [
+        "artifact-smoke",
+        "artifact-entrypoints",
+        "artifact-switches"
+      ],
+      "toolchain": "1.94.0",
+      "triple": "aarch64-apple-darwin"
+    },
+    {
+      "abi": null,
+      "asset": "awman-windows-amd64.exe",
+      "binary": "target/release/awman.exe",
+      "build": "windows-x64-release",
+      "builder": "hosted",
+      "cargo": [
+        "build",
+        "--locked",
+        "--release",
+        "-p",
+        "awman-cli",
+        "--bin",
+        "awman"
+      ],
+      "native": null,
+      "runs_on": [
+        "windows-2025"
+      ],
+      "sign": false,
+      "smoke_suites": [
+        "artifact-smoke",
+        "artifact-entrypoints",
+        "artifact-switches"
+      ],
+      "toolchain": "1.94.0",
+      "triple": "x86_64-pc-windows-msvc"
+    }
+  ],
+  "checksums": "SHA256SUMS",
+  "ci": {
+    "evidence_artifact_prefix": "gate-evidence-",
+    "evidence_file": "gate-evidence.json",
+    "inputs": {
+      "gate": "release"
+    },
+    "workflow": "ci.yml"
+  },
+  "evidence": "release-evidence.json",
+  "evidence_validity_days": 14,
+  "gate": "release",
+  "manifest_sha256": "8b98ae777f58396ba62374051cf23fedd720d25e736d2a3468722ea8a9674c18",
+  "native": [
+    {
+      "asset": "awman-linux-amd64",
+      "budget_seconds": 600,
+      "fixtures": [
+        {
+          "arch": "amd64",
+          "file": "guest-oci-base-amd64.tar",
+          "id": "guest-oci-base-amd64",
+          "pending": null,
+          "sha256": "c86291072784402551a5a223eaca257e3affd7ef37b6bb5bd2402f494f353f6f",
+          "url": "https://github.com/prettysmartdev/awman/releases/download/fixtures-eae27245598962b9e35582fcdeff960083194981/fixture-oci-amd64.tar"
+        }
+      ],
+      "host": "ssh",
+      "id": "native.linux-x64",
+      "kit_artifact": "native-kit-native.linux-x64",
+      "previous_release": null,
+      "required": true,
+      "suites": [
+        "artifact-linux-boot"
+      ],
+      "tests": [
+        "awman-cli::artifact signed_boot::linux_artifact_runs_an_offline_session"
+      ],
+      "triple": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "asset": "awman-macos-arm64",
+      "budget_seconds": 600,
+      "fixtures": [
+        {
+          "arch": "arm64",
+          "file": "guest-oci-base.tar",
+          "id": "guest-oci-base",
+          "pending": null,
+          "sha256": "a923846938a4fe539e06b89b7bd6beeca20917344d59e4afee8a5882b84e041e",
+          "url": "https://github.com/prettysmartdev/awman/releases/download/fixtures-eae27245598962b9e35582fcdeff960083194981/fixture-oci.tar"
+        }
+      ],
+      "host": "local",
+      "id": "native.macos-arm64",
+      "kit_artifact": "native-kit-native.macos-arm64",
+      "previous_release": {
+        "asset": "awman-macos-arm64",
+        "pending": null,
+        "sha256": "c952d15ecb630e84e878df272eaeb75ee57b186c810a27cc071601e2d7d16794",
+        "triple": "aarch64-apple-darwin",
+        "url": "https://github.com/prettysmartdev/awman/releases/download/v0.13.0/awman-macos-arm64",
+        "version": "v0.13.0"
+      },
+      "required": true,
+      "suites": [
+        "artifact-signed-boot"
+      ],
+      "tests": [
+        "awman-cli::artifact signed_boot::signed_artifact_runs_an_offline_session",
+        "awman-cli::artifact signed_boot::signed_artifact_upgrades_previous_state_offline"
+      ],
+      "triple": "aarch64-apple-darwin"
+    }
+  ],
+  "policy_sha256": "30586a6d9c120a6613f764343c9e889ff00560796bd1d6dd7fc37e501d539d32",
+  "release_workflow": "release.yml",
+  "schema": 1
+}

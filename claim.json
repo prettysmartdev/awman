@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "repository_id": 1180183833,
+  "version": "v0.14.0",
+  "mode": "production",
+  "commit": "cf527184dd7ad3dddcea61a704b625d746f1e1e7",
+  "tree": "06e84205153f3678b4f8e5212223d187268e5eb6",
+  "base_main": "eae27245598962b9e35582fcdeff960083194981",
+  "plan_sha256": "64e0dc7c215179a55efbb4a70a2ef7933dba758d802ce1ccfc79c335ee4e2b94",
+  "policy_sha256": "30586a6d9c120a6613f764343c9e889ff00560796bd1d6dd7fc37e501d539d32",
+  "generation": 1,
+  "operation": "dc9d55ca3a958609610b07c45c0c60e11def1a853fa9b18f7b0665220d84f162",
+  "nonce": "5ef3d078",
+  "push_ref": "heads/release/v0.14.0",
+  "owner": {
+    "id": "782de7cdc74eff5a7d140cd3c6f5897c",
+    "host": "cohix-studio.local",
+    "pid": 91210
+  },
+  "previous_owners": [],
+  "ci_run": null,
+  "build_runs": {},
+  "draft_id": null,
+  "seal_sha256": null,
+  "started": "2026-11-26T12:13:09.900986Z",
+  "decided_at": null
+}
