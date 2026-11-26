@@ -28,6 +28,25 @@ try {
     $linker = Join-Path $toolset.FullName "bin\Hostx64\x64\link.exe"
     if (-not (Test-Path $linker)) { throw "BLOCKED[msvc-linker]: $linker is unavailable" }
     $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $linker
+    $kit = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10"
+    $sdk = Get-ChildItem (Join-Path $kit "Lib") -Directory | Sort-Object Name -Descending | Select-Object -First 1
+    if (-not $sdk) { throw "BLOCKED[windows-sdk]: Windows SDK libraries are unavailable" }
+    $libraries = @(
+        (Join-Path $toolset.FullName "lib\x64"),
+        (Join-Path $sdk.FullName "ucrt\x64"),
+        (Join-Path $sdk.FullName "um\x64")
+    )
+    $includes = @(
+        (Join-Path $toolset.FullName "include"),
+        (Join-Path $kit "Include\$($sdk.Name)\ucrt"),
+        (Join-Path $kit "Include\$($sdk.Name)\shared"),
+        (Join-Path $kit "Include\$($sdk.Name)\um")
+    )
+    foreach ($path in @($libraries + $includes)) {
+        if (-not (Test-Path $path)) { throw "BLOCKED[windows-sdk]: $path is unavailable" }
+    }
+    $env:LIB = $libraries -join ';'
+    $env:INCLUDE = $includes -join ';'
     $exe = (Resolve-Path $Artifact).Path
     if ((Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant() -ne $Sha256) {
         throw "BLOCKED[artifact-digest]: executable digest changed"

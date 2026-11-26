@@ -68,6 +68,9 @@ fn inherited_input(name: &str) -> bool {
         "PLAYWRIGHT_BROWSERS_PATH",
     ]
     .contains(&name)
+        // Windows artifact tests compile their harness inside this private
+        // environment; MSVC needs the selected SDK's library and header paths.
+        || (cfg!(windows) && ["LIB", "INCLUDE"].contains(&name))
         || name.starts_with("CARGO_")
         || name.starts_with("RUSTUP_")
         || name.starts_with("PKG_CONFIG_")
@@ -370,6 +373,13 @@ mod tests {
             );
         }
         assert!(inherited_input("CI"));
+        #[cfg(windows)]
+        for sdk_input in ["LIB", "INCLUDE"] {
+            assert!(
+                inherited_input(sdk_input),
+                "lost MSVC SDK input {sdk_input}"
+            );
+        }
         for secret in [
             "GH_TOKEN",
             "GITHUB_TOKEN",

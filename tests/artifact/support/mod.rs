@@ -56,13 +56,9 @@ pub fn sandbox(id: &'static str) -> ArtifactSandbox {
         dirs[0] = sandbox.bin().canonicalize().expect("private test bin");
         // /usr/bin/git is an Xcode shim on hosted macOS. Run its selected
         // executable directly so the offline profile can allow that one path.
-        dirs.insert(
-            1,
-            git_for_offline_profile(&sandbox)
-                .parent()
-                .unwrap()
-                .to_path_buf(),
-        );
+        let git = git_for_offline_profile(&sandbox);
+        sandbox.allow_tool(&git);
+        dirs.insert(1, git.parent().unwrap().to_path_buf());
         sandbox
             .env_mut()
             .set("PATH", std::env::join_paths(dirs).expect("artifact PATH"));
