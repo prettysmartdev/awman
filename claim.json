@@ -18,8 +18,13 @@
     "pid": 91210
   },
   "previous_owners": [],
-  "ci_run": null,
-  "build_runs": {},
+  "ci_run": 45817674921,
+  "build_runs": {
+    "awman-linux-amd64": 45817681556,
+    "awman-linux-arm64": 45817688762,
+    "awman-macos-arm64": 45817695952,
+    "awman-windows-amd64.exe": 45817702579
+  },
   "draft_id": null,
   "seal_sha256": null,
   "started": "2026-11-26T12:13:09.900986Z",
