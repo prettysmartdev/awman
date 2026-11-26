@@ -45,6 +45,13 @@ try {
     foreach ($path in @($libraries + $includes)) {
         if (-not (Test-Path $path)) { throw "BLOCKED[windows-sdk]: $path is unavailable" }
     }
+    foreach ($library in @(
+        (Join-Path $libraries[0] "vcruntime.lib"),
+        (Join-Path $libraries[1] "ucrt.lib"),
+        (Join-Path $libraries[2] "kernel32.lib")
+    )) {
+        if (-not (Test-Path $library)) { throw "BLOCKED[windows-sdk]: $library is unavailable" }
+    }
     $env:LIB = $libraries -join ';'
     $env:INCLUDE = $includes -join ';'
     $exe = (Resolve-Path $Artifact).Path
