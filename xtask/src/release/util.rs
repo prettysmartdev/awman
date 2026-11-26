@@ -40,9 +40,8 @@ pub fn is_sha256(s: &str) -> bool {
 /// and private host allocations, never for stable operation identity.
 pub fn random_id() -> Result<String> {
     let mut bytes = [0u8; 16];
-    fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .context("reading /dev/urandom")?;
+    getrandom::fill(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("reading OS random source: {error}"))?;
     Ok(hex(&bytes))
 }
 

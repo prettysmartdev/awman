@@ -38,6 +38,7 @@ syn = { workspace = true }
 # JUnit reports written by cargo-nextest.
 roxmltree = { workspace = true }
 tempfile = { workspace = true }
+getrandom = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal", "process", "fs", "user"] }
