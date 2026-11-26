@@ -106,6 +106,13 @@ impl AttachCommandFrontend for CliFrontend {
     fn begin_attach(&mut self, _: &TerminalId) -> CancellationToken {
         let cancel = CancellationToken::new();
         self.attach_cancel = Some(cancel.clone());
+        let pending_cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = pending_cancel.cancelled() => {},
+                _ = tokio::signal::ctrl_c() => pending_cancel.cancel(),
+            }
+        });
         self.attach_hangup = CancellationToken::new();
         self.attach_exit_code
             .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -206,7 +213,9 @@ impl AttachCommandFrontend for CliFrontend {
     }
     fn end_attach(&mut self) {
         self.raw_mode_guard.take();
-        self.attach_cancel = None;
+        if let Some(cancel) = self.attach_cancel.take() {
+            cancel.cancel();
+        }
     }
     fn terminal_exit_code(&self) -> i32 {
         self.attach_exit_code

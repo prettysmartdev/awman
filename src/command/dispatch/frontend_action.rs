@@ -16,7 +16,68 @@
 use crate::command::dispatch::catalogue::CommandCatalogue;
 use crate::command::dispatch::parsed_input::ParsedCommandBoxInput;
 use crate::command::dispatch::projections::raw_args::ParsedArgs;
+use crate::data::config::env::EnvSnapshot;
 use crate::data::session::Session;
+use std::path::PathBuf;
+
+/// The kind of tab for which the New Tab dialog is being prepared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewTabKind {
+    /// A directory-backed tab, whose initial path is its current directory.
+    Directory,
+    /// The synthetic Squad tab, whose initial path is the user's home.
+    Squad,
+}
+
+/// Layer 2's typed proposal for the editable New Tab dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTabDialogProposal {
+    pub initial_directory: PathBuf,
+}
+
+/// Resolve the initial value shown in the New Tab dialog.
+///
+/// Squad's session is synthetic and may point into Squad storage. Resolve its
+/// dialog path from the invoking user's captured environment instead.
+pub fn propose_new_tab_dialog(
+    kind: NewTabKind,
+    user_env: &EnvSnapshot,
+    working_directory: &std::path::Path,
+) -> Result<NewTabDialogProposal, crate::command::error::CommandError> {
+    let initial_directory = match kind {
+        NewTabKind::Directory => working_directory.to_path_buf(),
+        NewTabKind::Squad => user_env
+            .home_dir()
+            .filter(|home| home.is_absolute())
+            .ok_or_else(|| {
+                crate::command::error::CommandError::Other(
+                    "Could not resolve your home directory for the New Tab dialog.".to_string(),
+                )
+            })?,
+    };
+    Ok(NewTabDialogProposal { initial_directory })
+}
+
+/// Resolve an edited path against the same proposal shown by the dialog.
+/// Frontends pass the user's text; directory validation stays in Layer 2.
+pub fn resolve_new_tab_directory(
+    proposal: &NewTabDialogProposal,
+    input: &str,
+) -> Result<PathBuf, crate::command::error::CommandError> {
+    let path = PathBuf::from(input.trim());
+    let directory = if path.is_absolute() {
+        path
+    } else {
+        proposal.initial_directory.join(path)
+    };
+    if !directory.is_dir() {
+        return Err(crate::command::error::CommandError::Other(format!(
+            "Not a directory: {}",
+            directory.display()
+        )));
+    }
+    Ok(directory)
+}
 
 /// One entry of the action table: the catalogue path an action dispatches to,
 /// and the boolean flags the action always carries.
@@ -178,5 +239,54 @@ impl CommandCatalogue {
     /// `session`. See [`FrontendAction::startup_for`].
     pub fn startup_command(&'static self, session: &Session) -> ParsedCommandBoxInput {
         self.action_input(FrontendAction::startup_for(session), None)
+    }
+}
+
+#[cfg(test)]
+mod new_tab_dialog_tests {
+    use super::*;
+    use crate::data::config::env::HOME;
+
+    #[test]
+    fn squad_proposal_uses_captured_home_and_directory_proposal_uses_cwd() {
+        let home = PathBuf::from(if cfg!(windows) {
+            "C:/private/user-home"
+        } else {
+            "/private/user-home"
+        });
+        let cwd = PathBuf::from(if cfg!(windows) {
+            "C:/private/project"
+        } else {
+            "/private/project"
+        });
+        let home_text = home.display().to_string();
+        let env = EnvSnapshot::with_overrides([(HOME, home_text)]);
+
+        assert_eq!(
+            propose_new_tab_dialog(NewTabKind::Squad, &env, &cwd)
+                .unwrap()
+                .initial_directory,
+            home
+        );
+        assert_eq!(
+            propose_new_tab_dialog(NewTabKind::Directory, &env, &cwd)
+                .unwrap()
+                .initial_directory,
+            cwd
+        );
+    }
+
+    #[test]
+    fn squad_proposal_errors_when_captured_home_is_unavailable() {
+        let error = propose_new_tab_dialog(
+            NewTabKind::Squad,
+            &EnvSnapshot::empty(),
+            std::path::Path::new("/private/project"),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Could not resolve your home directory"));
     }
 }

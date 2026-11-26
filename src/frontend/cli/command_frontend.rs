@@ -84,8 +84,6 @@ pub struct CliFrontend {
     /// interactive prompt and rebind by spawning a fresh reader thread that
     /// shares the same channel. Cleared when the active step ends.
     pub(crate) container_stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
-    pub(crate) squad_attach_cancel: Option<tokio_util::sync::CancellationToken>,
-    pub(crate) squad_attach_exit_code: Arc<AtomicI32>,
     pub(crate) agents_attach_cancel: tokio_util::sync::CancellationToken,
     pub(crate) agents_watch: Option<super::per_command::agents::WatchScreen>,
     pub(crate) attach_cancel: Option<tokio_util::sync::CancellationToken>,
@@ -475,8 +473,6 @@ impl CliFrontend {
             stdin_reader_shutdown: None,
             stdin_reader_handle: None,
             container_stdin_tx: None,
-            squad_attach_cancel: None,
-            squad_attach_exit_code: Arc::new(AtomicI32::new(0)),
             agents_watch: None,
             agents_attach_cancel: tokio_util::sync::CancellationToken::new(),
             attach_cancel: None,

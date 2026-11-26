@@ -449,7 +449,7 @@ package = "awman-cli"
 target = "test:component"
 contracts = ["component-squad"]
 requires = []
-paths = ["tests/component/squad/**", "src/engine/squad/**", "src/command/squad/**", "src/frontend/squad/**"]
+paths = ["tests/component/squad/**", "src/engine/squad/**", "src/command/commands/squad/**", "src/command/commands/workflow_prerequisites/**", "src/command/commands/exec_workflow/**", "src/command/commands/attach.rs", "src/engine/workflow/prerequisites/**", "src/data/workflow_prerequisites.rs", "src/data/config/workflows.rs", "src/data/config/overlays.rs", "src/command/prompts.rs", "src/frontend/squad/**"]
 filter = "test(/^squad::/)"
 
 [suites.component-worker-terminal-exchange]

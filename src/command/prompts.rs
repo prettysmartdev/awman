@@ -403,7 +403,7 @@ fn prerequisite_prompt<D>(
 /// The git identity question for `commit_changes`, built from the check's
 /// remediations so only the answers that apply are offered. The persistent
 /// `.git/config` write is listed last.
-pub fn prerequisite_identity(check: &PrerequisiteCheck) -> Prompt<IdentityChoice> {
+pub fn prerequisite_identity(check: &PrerequisiteCheck, optional: bool) -> Prompt<IdentityChoice> {
     let mut choices = Vec::new();
     let mut set_local = None;
     for remediation in &check.remediations {
@@ -447,19 +447,31 @@ pub fn prerequisite_identity(check: &PrerequisiteCheck) -> Prompt<IdentityChoice
     choices.extend(set_local);
     choices.push(Choice::new(
         'c',
-        "Continue without (commit_changes will fail)",
+        if optional {
+            "Continue without an identity"
+        } else {
+            "Continue without (commit_changes will fail)"
+        },
         IdentityChoice::Continue,
     ));
     prerequisite_prompt(
-        format!(
-            "{} needs a git identity inside its container",
-            prerequisite_steps(check)
-        ),
+        if optional {
+            "Optional Git identity for future commits".into()
+        } else {
+            format!(
+                "{} needs a git identity inside its container",
+                prerequisite_steps(check)
+            )
+        },
         format!(
             "{}\n\nA global ~/.gitconfig on this host is not visible inside the step container. \
              A chosen identity is injected as GIT_AUTHOR_*/GIT_COMMITTER_* only into \
              commit_changes containers.",
-            check.explanation
+            if optional {
+                "You may choose an identity now or leave it unset."
+            } else {
+                &check.explanation
+            }
         ),
         choices,
         Some(IdentityChoice::Continue),

@@ -37,6 +37,21 @@ pub(super) fn render_status_bar(app: &App, area: Rect, frame: &mut Frame, sideba
     // `container_slots.is_empty()` check), so fall through to the ordinary
     // hints below — including `ctrl-\ detach` — instead of returning early.
     if tab.is_squad && tab.container_slots.is_empty() {
+        if let Some(message) = tab
+            .shared
+            .attach_status
+            .lock()
+            .ok()
+            .and_then(|status| status.clone())
+            .filter(|_| !matches!(tab.execution_phase, ExecutionPhase::Error { .. }))
+        {
+            frame.render_widget(
+                Paragraph::new(message.text)
+                    .style(Style::default().fg(Color::Yellow).bg(Color::Black)),
+                area,
+            );
+            return;
+        }
         let spans = match &tab.execution_phase {
             ExecutionPhase::Error { command, message } => {
                 vec![Span::styled(

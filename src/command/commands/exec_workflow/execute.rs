@@ -404,7 +404,7 @@ impl Command for ExecWorkflowCommand {
         let cli_typed = {
             let mut all = Vec::new();
             for s in &self.flags.overlay {
-                match parse_overlay_list(s) {
+                match parse_overlay_list_with_env(s, self.session.env()) {
                     Ok(parsed) => all.extend(parsed),
                     Err(reason) => {
                         let e = CommandError::InvalidOverlaySpec {

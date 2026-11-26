@@ -38,7 +38,9 @@ pub const FLAG_ANNOTATION: &str = "annotation";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AttachOutcome {
-    pub terminal_id: TerminalId,
+    pub terminal_id: Option<TerminalId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_end: Option<super::squad::attach::TaskAttachEnd>,
     /// `0` after a normal detach; the agent's exit code when the terminal
     /// exited while attached.
     pub exit_code: i32,
@@ -52,6 +54,18 @@ pub trait AttachCommandFrontend: UserMessageSink + Send {
     /// Start the attach session. The returned token ends it on Ctrl-C (a
     /// `user` detach); the TUI cancels it when the tab closes.
     fn begin_attach(&mut self, terminal_id: &TerminalId) -> CancellationToken;
+
+    /// Called before lookup so the local viewer can be detached during startup.
+    fn begin_resolve(&mut self, _target: &str) -> CancellationToken {
+        self.begin_attach(&TerminalId::new())
+    }
+
+    fn attach_status(&mut self, message: crate::data::message::UserMessage) {
+        self.write_message(message);
+    }
+
+    /// Replace startup progress when the command has selected an open terminal.
+    fn terminal_ready(&mut self) {}
 
     /// Fires when the attach loses its own terminal (SIGHUP, stdout closed),
     /// so the command can say `detached{reason: hangup}` before exiting.
@@ -86,6 +100,7 @@ pub struct AttachCommand {
     task_gateway: Option<Arc<dyn TaskGateway>>,
     /// The invoking session's environment, which locates the daemon.
     env: EnvSnapshot,
+    container: Option<String>,
 }
 
 impl AttachCommand {
@@ -105,13 +120,16 @@ impl AttachCommand {
             task_name: None,
             task_gateway: None,
             env,
+            container: None,
         }
     }
 
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
         let target = AttachTarget::parse(&ctx.args.require(ARG_ID)?)
             .map_err(|error| CommandError::Other(error.to_string()))?;
-        Self::from_parts(ctx, target)
+        let mut command = Self::from_parts(ctx, target)?;
+        command.task_gateway = ctx.gateway.clone();
+        Ok(command)
     }
 
     pub fn from_task_input(ctx: &BuildContext, task: &str) -> Result<Self, CommandError> {
@@ -127,6 +145,7 @@ impl AttachCommand {
         let mut command = Self::from_parts(ctx, target)?;
         command.task_name = task_name;
         command.task_gateway = ctx.gateway.clone();
+        command.container = ctx.flags.string("container");
         Ok(command)
     }
 
@@ -178,58 +197,103 @@ impl Command for AttachCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
-        validate_step_target(&self.target, self.step())?;
-        let paths = DataPaths::from_env(&self.env)?;
-        let endpoint = discover(&paths.daemon())?.ok_or(CommandError::DaemonNotRunning)?;
-        let resolved_task = match (&self.task_name, &self.task_gateway) {
-            (Some(name), Some(gateway)) => Some(gateway.get(name).await?.id),
-            (Some(_), None) => {
-                return Err(CommandError::Other(
-                    "squad task lookup is unavailable".into(),
-                ));
-            }
-            (None, _) => None,
-        };
-        let target = resolved_task
-            .map(AttachTarget::Task)
-            .unwrap_or_else(|| self.target.clone());
-        let terminal_id = match &target {
-            AttachTarget::Terminal(id) => id.clone(),
-            target => {
-                let owner_id = match target {
-                    AttachTarget::Command(id) => id.as_str().to_owned(),
-                    AttachTarget::Task(id) => id.as_str().to_owned(),
-                    AttachTarget::Terminal(_) => unreachable!(),
-                };
-                let client = LocalClient::new(endpoint.address.clone())
-                    .with_timeout(Duration::from_secs(10));
-                resolve_owner_terminal(&client, &owner_id, self.step()).await?
-            }
-        };
-        let cancel = frontend.begin_attach(&terminal_id);
-        let hangup = frontend.hangup();
-        let stream = TerminalStream::connect_local(
-            &endpoint.address,
-            &terminal_id,
-            &TerminalClientOptions {
+        let label = self
+            .task_name
+            .clone()
+            .unwrap_or_else(|| format!("{:?}", self.target));
+        let cancel = frontend.begin_resolve(&label);
+        let result = async {
+            validate_step_target(&self.target, self.step())?;
+            let paths = DataPaths::from_env(&self.env)?;
+            let endpoint = discover(&paths.daemon())?.ok_or(CommandError::DaemonNotRunning)?;
+            let terminal_id = match &self.target {
+                AttachTarget::Task(id) => {
+                    use super::squad::attach::{
+                        resolve_task_terminal, AttachStartupPolicy, TaskAttachEnd,
+                        TaskTerminalResolution,
+                    };
+                    let gateway = match self.task_gateway.clone() {
+                        Some(gateway) => gateway,
+                        None => super::squad::supervisor::DaemonResolver::from_env(&self.env)?
+                            .gateway_for(crate::command::dispatch::catalogue::GatewayNeed::Running)
+                            .await?
+                            .ok_or(CommandError::DaemonNotRunning)?,
+                    };
+                    let policy = AttachStartupPolicy::default();
+                    match resolve_task_terminal(
+                        gateway,
+                        self.task_name.as_deref().unwrap_or(id.as_str()),
+                        self.step(),
+                        self.container.as_deref(),
+                        policy,
+                        &cancel,
+                        &mut |message| frontend.attach_status(message),
+                    )
+                    .await?
+                    {
+                        TaskTerminalResolution::Ready(record) => record.id,
+                        TaskTerminalResolution::End(end) => {
+                            frontend.attach_status(crate::data::message::UserMessage {
+                                level: if end == TaskAttachEnd::StartupTimedOut {
+                                    crate::data::message::MessageLevel::Warning
+                                } else {
+                                    crate::data::message::MessageLevel::Info
+                                },
+                                text: end.message(policy),
+                            });
+                            return Ok(AttachOutcome {
+                                terminal_id: None,
+                                startup_end: Some(end),
+                                exit_code: if end == TaskAttachEnd::StartupTimedOut {
+                                    1
+                                } else {
+                                    0
+                                },
+                                detach_reason: DetachReason::User,
+                            });
+                        }
+                    }
+                }
+                AttachTarget::Terminal(id) => id.clone(),
+                AttachTarget::Command(id) => {
+                    let client = LocalClient::new(endpoint.address.clone())
+                        .with_timeout(Duration::from_secs(10));
+                    resolve_owner_terminal(&client, id.as_str(), self.step()).await?
+                }
+            };
+            frontend.terminal_ready();
+            let hangup = frontend.hangup();
+            let options = TerminalClientOptions {
                 annotations: self.annotations.clone(),
                 actor: None,
                 read_only: self.read_only,
-            },
-        )
-        .await?;
-        let session = frontend.bind_terminal(stream, self.read_only, self.host_output_policy)?;
-        let (detach_reason, _) = wait_attach(cancel, hangup).await;
-        // The viewer sends Detached and closes before its frontend or runtime
-        // is torn down. Bound a dead peer's close handshake.
-        let _ = tokio::time::timeout(Duration::from_secs(2), session).await;
+            };
+            let connect = TerminalStream::connect_local(&endpoint.address, &terminal_id, &options);
+            let stream = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(CommandError::Aborted),
+                result = connect => result?,
+            };
+            if cancel.is_cancelled() {
+                return Err(CommandError::Aborted);
+            }
+            let session =
+                frontend.bind_terminal(stream, self.read_only, self.host_output_policy)?;
+            let (detach_reason, _) = wait_attach(cancel, hangup).await;
+            // The viewer sends Detached and closes before its frontend or runtime
+            // is torn down. Bound a dead peer's close handshake.
+            let _ = tokio::time::timeout(Duration::from_secs(2), session).await;
+            let exit_code = frontend.terminal_exit_code();
+            Ok(AttachOutcome {
+                terminal_id: Some(terminal_id),
+                startup_end: None,
+                exit_code,
+                detach_reason,
+            })
+        }
+        .await;
         frontend.end_attach();
-        let exit_code = frontend.terminal_exit_code();
-        Ok(AttachOutcome {
-            terminal_id,
-            exit_code,
-            detach_reason,
-        })
+        result
     }
 }
 

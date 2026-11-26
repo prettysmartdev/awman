@@ -609,3 +609,17 @@ refused. Listing exposes state and counts, never native IDs, host paths or histo
 Deletion requires inactive state under the lease. Close is idempotent for inactive
 profiles; it cannot displace a live awman lease. Runtime uncertainty preserves
 closing state, blocking both deletion and another writer.
+
+### Squad terminal startup
+
+`squad attach <task>` uses the same daemon terminal viewer as `attach task_…`,
+retaining `--step`, `--read-only` and repeatable `--annotation`. The additive
+`--container` selector chooses a terminal by its recorded container name
+or an unambiguous prefix. Selection is restricted to the current run. A
+confirmed running run without an open matching terminal waits up to ten
+seconds with short checks and the message “Waiting for agent terminal to
+start…”. Idle/unknown tasks, invalid known selectors, daemon and unrelated
+transport failures fail directly. Cancellation, run completion/replacement and
+timeout produce explicit outcomes. CLI and TUI consume this Layer 2 decision;
+they never perform independent runtime discovery. On the Squad tab, Ctrl-\\
+and Ctrl-C end only the local viewer and restore the card grid.

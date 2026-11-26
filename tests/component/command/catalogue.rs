@@ -707,3 +707,21 @@ fn plan_conflicts_with_yolo_and_auto_and_never_touches_mount_access() {
         }
     }
 }
+
+#[test]
+fn squad_attach_preserves_daemon_viewer_controls_and_adds_container_selection() {
+    let spec = CommandCatalogue::get()
+        .lookup(&["squad", "attach"])
+        .unwrap();
+    for flag in ["step", "read-only", "annotation", "container"] {
+        assert!(spec.find_flag(flag).is_some(), "missing --{flag}");
+    }
+    assert!(
+        !spec.requires_runtime && !spec.requires_container_tier,
+        "viewers use daemon terminals without probing a local runtime"
+    );
+    assert_eq!(
+        spec.gateway_need,
+        awman::command::dispatch::catalogue::GatewayNeed::Running
+    );
+}

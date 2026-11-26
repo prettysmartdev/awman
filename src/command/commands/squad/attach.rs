@@ -1,594 +1,205 @@
-//! Layer 2 implementation of `awman squad attach`.
-//!
-//! Runtime discovery, target selection, phase detection and workflow-step
-//! reconciliation live here. Frontends only choose among ambiguous candidates
-//! and bind each attached [`AgentInstance`] to their own presentation I/O.
+//! Task-terminal startup decisions shared by `attach task_…` and `squad attach`.
+//! The daemon owns terminals and input grants; viewers never attach through a
+//! second runtime client. Only absence in a confirmed running run is retried.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-
-use async_trait::async_trait;
+use crate::command::commands::squad::gateway::TaskGateway;
+use crate::command::error::CommandError;
+use crate::data::fs::{Run, RunStatus};
+use crate::data::message::{MessageLevel, UserMessage};
+use crate::data::terminal::{TerminalOwner, TerminalRecord, TerminalState};
 use serde::Serialize;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-use crate::command::commands::agents::match_reference;
-use crate::command::commands::remote_client::{
-    RemoteWorkflowPoller, SquadTaskWorkflowSource, WorkflowStateSource,
-};
-use crate::command::commands::squad::gateway::TaskGateway;
-use crate::command::commands::squad::supervisor::DaemonResolver;
-use crate::command::commands::Command;
-use crate::command::dispatch::catalogue::GatewayNeed;
-use crate::command::dispatch::BuildContext;
-use crate::command::error::CommandError;
-use crate::data::config::env::EnvSnapshot;
-use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
-use crate::data::session::AgentHandle;
-use crate::data::workflow_state::{StepState, WorkflowState};
-use crate::engine::agent_runtime::{AgentInstance, AgentRuntimeEngine};
-use crate::engine::container::naming::SQUAD_NAME_PREFIX;
+pub const WAITING_FOR_TERMINAL: &str = "Waiting for agent terminal to start…";
 
-/// One running squad container, as presented for disambiguation.
-#[derive(Debug, Clone)]
-pub struct SquadContainer {
-    pub handle: AgentHandle,
-    /// First 12 characters of the runtime handle ID.
-    pub short_id: String,
-    /// A workflow step name when known, otherwise the runtime container name.
-    pub label: String,
+/// Inject a short policy in component tests; production uses the bounded
+/// ten-second window and short checks below.
+#[derive(Debug, Clone, Copy)]
+pub struct AttachStartupPolicy {
+    pub window: Duration,
+    pub check_interval: Duration,
+}
+impl Default for AttachStartupPolicy {
+    fn default() -> Self {
+        Self {
+            window: Duration::from_secs(10),
+            check_interval: Duration::from_millis(100),
+        }
+    }
 }
 
-/// The non-guessing result of attach target selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskAttachEnd {
+    Cancelled,
+    RunCompleted,
+    StartupTimedOut,
+}
+
+impl TaskAttachEnd {
+    pub fn message(self, policy: AttachStartupPolicy) -> String {
+        match self {
+            Self::Cancelled => "Attach session ended.".into(),
+            Self::RunCompleted => "The run finished or was replaced; attach session ended.".into(),
+            Self::StartupTimedOut => format!(
+                "The agent terminal did not start within {} seconds. Try attaching again.",
+                policy.window.as_secs_f64()
+            ),
+        }
+    }
+}
+
 #[derive(Debug)]
-pub enum AttachResolution {
-    One(SquadContainer),
-    Ambiguous(Vec<SquadContainer>),
+pub enum TaskTerminalResolution {
+    Ready(Box<TerminalRecord>),
+    End(TaskAttachEnd),
 }
 
-/// A pure transition produced by [`SquadSlotDriver::reconcile`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SlotAction {
-    Attach {
-        step_name: String,
-        container_id: String,
-        agent: String,
-        model: Option<String>,
-    },
-    Exit {
-        step_name: String,
-    },
+async fn current_run(gateway: &dyn TaskGateway, task: &str) -> Result<Option<Run>, CommandError> {
+    Ok(gateway
+        .runs(task, 1)
+        .await?
+        .into_iter()
+        .next()
+        .filter(|r| r.status == RunStatus::Running))
 }
 
-/// Diff workflow snapshots into attach/exit transitions.
-#[derive(Debug, Default)]
-pub struct SquadSlotDriver {
-    /// Steps currently handed to the frontend, keyed by step name -> runtime
-    /// id/name published by the workflow state.
-    slotted: HashMap<String, String>,
-}
-
-impl SquadSlotDriver {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Diff the authoritative state against the currently slotted steps.
-    /// This method performs no runtime calls and no I/O.
-    pub fn reconcile(&mut self, state: &WorkflowState) -> Vec<SlotAction> {
-        let mut actions = Vec::new();
-
-        let mut slotted_names: Vec<String> = self.slotted.keys().cloned().collect();
-        slotted_names.sort();
-        for step_name in slotted_names {
-            let current_id = self.slotted.get(&step_name);
-            let still_same_slot = match state.step_states.get(&step_name) {
-                // The scheduler may publish Running just before its runtime
-                // id. Keep an existing attachment during that short window.
-                Some(StepState::Running { container_id: None }) => true,
-                Some(StepState::Running {
-                    container_id: Some(container_id),
-                }) => current_id == Some(container_id),
-                _ => false,
-            };
-            if !still_same_slot {
-                self.slotted.remove(&step_name);
-                actions.push(SlotAction::Exit { step_name });
-            }
-        }
-
-        let mut running: Vec<_> = state.step_states.iter().collect();
-        running.sort_by(|(left, _), (right, _)| left.cmp(right));
-        for (step_name, step_state) in running {
-            let StepState::Running {
-                container_id: Some(container_id),
-            } = step_state
-            else {
-                continue;
-            };
-            if self.slotted.contains_key(step_name) {
-                continue;
-            }
-
-            let step_info = state.steps.iter().find(|step| step.name == *step_name);
-            let agent = step_info
-                .and_then(|step| step.agent.clone())
-                .unwrap_or_else(|| "agent".to_string());
-            let model = step_info.and_then(|step| step.model.clone());
-            self.slotted.insert(step_name.clone(), container_id.clone());
-            actions.push(SlotAction::Attach {
-                step_name: step_name.clone(),
-                container_id: container_id.clone(),
-                agent,
-                model,
-            });
-        }
-
-        actions
-    }
-
-    /// Let a later snapshot retry an attach whose runtime handle was not yet
-    /// discoverable or whose frontend binding failed.
-    fn retry(&mut self, step_name: &str) {
-        self.slotted.remove(step_name);
-    }
-}
-
-/// Presentation and input required by `squad attach`.
-#[async_trait]
-pub trait SquadAttachFrontend: UserMessageSink + Send {
-    /// Start the frontend's attach-session lifecycle and return the token that
-    /// detaching/closing should cancel.
-    fn begin_attach(&mut self, _task: &str) -> Result<CancellationToken, CommandError> {
-        Ok(CancellationToken::new())
-    }
-
-    /// Pick one candidate in an evaluation phase. `None` means cancel.
-    fn ask_pick_candidate(
-        &mut self,
-        candidates: &[SquadContainer],
-    ) -> Result<Option<usize>, CommandError>;
-
-    /// Optional metadata used only to label a frontend slot.
-    fn on_slot_metadata(&mut self, _step: &str, _agent: &str, _model: Option<&str>) {}
-
-    /// Bind an already-built attach instance to frontend I/O.
-    fn on_slot_attached(
-        &mut self,
-        step: &str,
-        instance: Box<dyn AgentInstance>,
-    ) -> Result<(), CommandError>;
-
-    /// Remove a presentation slot after its workflow step leaves Running.
-    fn on_slot_exited(&mut self, step: &str);
-
-    /// Publish the workflow overview. Non-visual frontends may ignore it.
-    fn on_workflow_state(&mut self, _state: &WorkflowState) {}
-
-    /// Frontend-owned reachability indicator, when one exists.
-    fn reachable_flag(&self) -> Option<Arc<AtomicBool>> {
-        None
-    }
-
-    /// Called once after the poll loop ends.
-    fn on_attach_finished(&mut self) {}
-
-    /// Process outcome after a frontend-owned local attach client exits.
-    fn exit_code(&self) -> i32 {
-        0
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SquadAttachOutcome {
-    pub exit_code: i32,
-}
-
-pub struct SquadAttachCommand {
-    task: String,
-    requested_container: Option<String>,
-    runtime: Arc<dyn AgentRuntimeEngine>,
-    gateway: Option<Arc<dyn TaskGateway>>,
-    /// The invoking session's environment, which locates the daemon when
-    /// dispatch resolved no gateway.
-    env: EnvSnapshot,
-}
-
-impl SquadAttachCommand {
-    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
-        Ok(Self {
-            task: ctx.args.require("name")?,
-            requested_container: ctx.flags.string("container"),
-            runtime: ctx.engines.runtime.clone(),
-            gateway: ctx.gateway.clone(),
-            env: ctx.session.env().clone(),
-        })
-    }
-
-    pub async fn run_with_frontend(
-        self,
-        frontend: Box<dyn SquadAttachFrontend>,
-    ) -> Result<SquadAttachOutcome, CommandError> {
-        let gateway = match self.gateway {
-            Some(gateway) => gateway,
-            None => DaemonResolver::from_env(&self.env)?
-                .gateway_for(GatewayNeed::Running)
+/// Pin the task and run before waiting. Recheck the run after every terminal
+/// snapshot so a delayed response cannot bind a previous or replacement run.
+/// There is no blocking picker: the existing current-terminal selection is
+/// retained, with explicit `--step` / `--container` disambiguation available.
+pub async fn resolve_task_terminal(
+    gateway: Arc<dyn TaskGateway>,
+    task: &str,
+    step: Option<&str>,
+    container: Option<&str>,
+    policy: AttachStartupPolicy,
+    cancel: &CancellationToken,
+    progress: &mut (dyn FnMut(UserMessage) + Send),
+) -> Result<TaskTerminalResolution, CommandError> {
+    let resolve = async {
+        let task_record = if task.starts_with("task_") {
+            let id = crate::data::ids::TaskId::parse(task)
+                .map_err(|error| CommandError::Other(error.to_string()))?;
+            gateway
+                .list()
                 .await?
-                .ok_or_else(|| CommandError::Other("the awman daemon is not reachable".into()))?,
-        };
-        let source: Arc<dyn WorkflowStateSource> = Arc::new(SquadTaskWorkflowSource::new(
-            gateway.clone(),
-            self.task.clone(),
-        ));
-        let initial_workflow = source.fetch_workflow_state().await;
-
-        let mut candidates = list_task_containers(self.runtime.as_ref(), &self.task)?;
-        if let Ok(Some(state)) = &initial_workflow {
-            label_with_step_names(&mut candidates, state);
-        }
-
-        // An explicit selector is always validated against runtime discovery,
-        // including during a workflow phase. It must never escape the task's
-        // authoritative candidate set.
-        let explicit_target = if let Some(requested) = self.requested_container.as_deref() {
-            match resolve_attach_target(candidates.clone(), &self.task, Some(requested))? {
-                AttachResolution::One(candidate) => Some(candidate),
-                AttachResolution::Ambiguous(_) => unreachable!("an explicit target is exact"),
-            }
+                .into_iter()
+                .find(|t| t.id == id)
+                .ok_or_else(|| CommandError::Other(format!("task {task:?} was not found")))?
         } else {
-            None
+            gateway.get(task).await?
         };
-        let explicit_attach = explicit_target.is_some();
-
-        let workflow_phase = matches!(&initial_workflow, Ok(Some(_)));
-        if candidates.is_empty() && !workflow_phase {
-            return Err(no_run_in_progress(&self.task));
-        }
-
-        let frontend = Arc::new(Mutex::new(frontend));
-        let cancel = frontend
-            .lock()
-            .map_err(|_| CommandError::Other("squad attach frontend is unavailable".into()))?
-            .begin_attach(&self.task)?;
-
-        let driver = Arc::new(Mutex::new(SquadSlotDriver::new()));
-        let evaluation_attached = Arc::new(AtomicBool::new(false));
-
-        if let Some(target) = explicit_target {
-            let workflow_metadata = initial_workflow
-                .as_ref()
-                .ok()
-                .and_then(|state| state.as_ref())
-                .and_then(|state| workflow_slot_for_handle(state, &target.handle));
-            let (step, agent, model) = match workflow_metadata {
-                Some(metadata) => metadata,
-                None => {
-                    let (agent, model) = task_agent_metadata(&gateway, &self.task).await;
-                    ("evaluation".to_string(), agent, model)
-                }
-            };
-            let instance = self.runtime.attach(&target.handle)?;
-            let mut locked = frontend
-                .lock()
-                .map_err(|_| CommandError::Other("squad attach frontend is unavailable".into()))?;
-            locked.on_slot_metadata(&step, &agent, model.as_deref());
-            locked.on_slot_attached(&step, instance)?;
-        } else if let Ok(Some(state)) = &initial_workflow {
-            apply_workflow_state(
-                state,
-                self.runtime.as_ref(),
-                &driver,
-                &frontend,
-                &evaluation_attached,
-            );
-        } else {
-            let target = choose_target(&frontend, candidates, &self.task)?;
-            let (agent, model) = task_agent_metadata(&gateway, &self.task).await;
-            let instance = self.runtime.attach(&target.handle)?;
-            let mut locked = frontend
-                .lock()
-                .map_err(|_| CommandError::Other("squad attach frontend is unavailable".into()))?;
-            locked.on_slot_metadata("evaluation", &agent, model.as_deref());
-            locked.on_slot_attached("evaluation", instance)?;
-            evaluation_attached.store(true, Ordering::Relaxed);
-        }
-
-        let callback_runtime = self.runtime.clone();
-        let callback_driver = driver.clone();
-        let callback_frontend = frontend.clone();
-        let callback_evaluation = evaluation_attached.clone();
-        let on_state: Box<dyn FnMut(&WorkflowState) + Send> = Box::new(move |state| {
-            if explicit_attach {
-                if let Ok(mut frontend) = callback_frontend.lock() {
-                    frontend.on_workflow_state(state);
-                }
-            } else {
-                apply_workflow_state(
-                    state,
-                    callback_runtime.as_ref(),
-                    &callback_driver,
-                    &callback_frontend,
-                    &callback_evaluation,
-                );
-            }
-        });
-
-        let reachable = frontend
-            .lock()
-            .ok()
-            .and_then(|locked| locked.reachable_flag())
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(initial_workflow.is_ok())));
-        reachable.store(initial_workflow.is_ok(), Ordering::Relaxed);
-        let poller = RemoteWorkflowPoller::new(source, on_state)
-            .with_reachable(reachable)
-            .with_initial_state_seen(matches!(initial_workflow, Ok(Some(_))));
-        let _ = poller.start(cancel).await;
-
-        let mut locked = frontend
-            .lock()
-            .map_err(|_| CommandError::Other("squad attach frontend is unavailable".into()))?;
-        locked.on_attach_finished();
-        Ok(SquadAttachOutcome {
-            exit_code: locked.exit_code(),
-        })
-    }
-}
-
-async fn task_agent_metadata(
-    gateway: &Arc<dyn TaskGateway>,
-    task: &str,
-) -> (String, Option<String>) {
-    gateway
-        .get(task)
-        .await
-        .map(|task| {
-            (
-                task.agent.unwrap_or_else(|| "agent".to_string()),
-                task.model,
-            )
-        })
-        .unwrap_or_else(|_| ("agent".to_string(), None))
-}
-
-fn workflow_slot_for_handle(
-    state: &WorkflowState,
-    handle: &AgentHandle,
-) -> Option<(String, String, Option<String>)> {
-    let (step_name, _) = state.step_states.iter().find(|(_, step_state)| {
-        matches!(
-            step_state,
-            StepState::Running {
-                container_id: Some(container_id)
-            } if container_id_matches_handle(handle, container_id)
-        )
-    })?;
-    let info = state.steps.iter().find(|step| step.name == *step_name);
-    Some((
-        step_name.clone(),
-        info.and_then(|step| step.agent.clone())
-            .unwrap_or_else(|| "agent".to_string()),
-        info.and_then(|step| step.model.clone()),
-    ))
-}
-
-fn choose_target(
-    frontend: &Arc<Mutex<Box<dyn SquadAttachFrontend>>>,
-    candidates: Vec<SquadContainer>,
-    task: &str,
-) -> Result<SquadContainer, CommandError> {
-    match resolve_attach_target(candidates, task, None)? {
-        AttachResolution::One(candidate) => Ok(candidate),
-        AttachResolution::Ambiguous(candidates) => {
-            let choice = frontend
-                .lock()
-                .map_err(|_| CommandError::Other("squad attach frontend is unavailable".into()))?
-                .ask_pick_candidate(&candidates)?;
-            choice
-                .and_then(|index| candidates.get(index).cloned())
-                .ok_or(CommandError::Aborted)
-        }
-    }
-}
-
-fn apply_workflow_state(
-    state: &WorkflowState,
-    runtime: &dyn AgentRuntimeEngine,
-    driver: &Arc<Mutex<SquadSlotDriver>>,
-    frontend: &Arc<Mutex<Box<dyn SquadAttachFrontend>>>,
-    evaluation_attached: &Arc<AtomicBool>,
-) {
-    let Ok(mut frontend) = frontend.lock() else {
-        return;
-    };
-    frontend.on_workflow_state(state);
-    if evaluation_attached.swap(false, Ordering::Relaxed) {
-        frontend.on_slot_exited("evaluation");
-    }
-    let Ok(mut driver) = driver.lock() else {
-        return;
-    };
-    for action in driver.reconcile(state) {
-        match action {
-            SlotAction::Exit { step_name } => frontend.on_slot_exited(&step_name),
-            SlotAction::Attach {
-                step_name,
-                container_id,
-                agent,
-                model,
-            } => {
-                let handle = match handle_for_container_id(runtime, &container_id) {
-                    Ok(Some(handle)) => handle,
-                    Ok(None) => {
-                        driver.retry(&step_name);
-                        continue;
-                    }
-                    Err(error) => {
-                        driver.retry(&step_name);
-                        frontend.write_message(UserMessage {
-                            level: MessageLevel::Error,
-                            text: format!(
-                                "failed to find the running container for workflow step {step_name:?}: {error}"
-                            ),
-                        });
-                        continue;
-                    }
+        let name = &task_record.name;
+        let run = current_run(gateway.as_ref(), name)
+            .await?
+            .filter(|r| r.task_id == task_record.id)
+            .ok_or_else(|| {
+                CommandError::Other(format!("no run currently in progress for task {task:?}"))
+            })?;
+        let deadline = tokio::time::Instant::now() + policy.window;
+        let mut announced = false;
+        loop {
+            let check = async {
+                let Some(current) = current_run(gateway.as_ref(), name).await? else {
+                    return Ok(Some(TaskTerminalResolution::End(
+                        TaskAttachEnd::RunCompleted,
+                    )));
                 };
-                match runtime.attach(&handle) {
-                    Ok(instance) => {
-                        frontend.on_slot_metadata(&step_name, &agent, model.as_deref());
-                        if let Err(error) = frontend.on_slot_attached(&step_name, instance) {
-                            driver.retry(&step_name);
-                            frontend.write_message(UserMessage {
-                                level: MessageLevel::Error,
-                                text: format!(
-                                    "failed to attach workflow step {step_name:?}: {error}"
-                                ),
-                            });
+                if current.id != run.id || current.task_id != run.task_id {
+                    return Ok(Some(TaskTerminalResolution::End(
+                        TaskAttachEnd::RunCompleted,
+                    )));
+                }
+                let records = gateway.run_terminals(&run.id).await?;
+                if !current_run(gateway.as_ref(), name)
+                    .await?
+                    .is_some_and(|r| r.id == run.id && r.task_id == run.task_id)
+                {
+                    return Ok(Some(TaskTerminalResolution::End(
+                        TaskAttachEnd::RunCompleted,
+                    )));
+                }
+                let mut owned: Vec<_> = records
+                    .into_iter()
+                    .filter(|r| r.owner_id == TerminalOwner::Run(run.id.clone()))
+                    .collect();
+                if let Some(selector) = container {
+                    let known: Vec<_> = owned
+                        .iter()
+                        .filter_map(|r| r.source.as_ref()?.container.as_deref())
+                        .collect();
+                    if !known.is_empty() {
+                        let exact = known.contains(&selector);
+                        let matches: std::collections::BTreeSet<_> = known
+                            .iter()
+                            .copied()
+                            .filter(|id| {
+                                if exact {
+                                    *id == selector
+                                } else {
+                                    id.starts_with(selector)
+                                }
+                            })
+                            .collect();
+                        if matches.len() != 1 {
+                            return Err(CommandError::Other(format!("container {selector:?} is not an unambiguous running container for task {task:?}; legal containers: {}", known.join(", "))));
                         }
-                    }
-                    Err(error) => {
-                        driver.retry(&step_name);
-                        frontend.write_message(UserMessage {
-                            level: MessageLevel::Error,
-                            text: format!("failed to attach workflow step {step_name:?}: {error}"),
+                        let selected = matches.first().expect("one match").to_string();
+                        owned.retain(|r| {
+                            r.source.as_ref().and_then(|s| s.container.as_deref())
+                                == Some(selected.as_str())
                         });
                     }
                 }
+                if let Some(record) = owned.into_iter().find(|r| {
+                    r.state == TerminalState::Open
+                        && (container.is_none()
+                            || r.source
+                                .as_ref()
+                                .and_then(|s| s.container.as_ref())
+                                .is_some())
+                        && step.is_none_or(|step| {
+                            r.source.as_ref().and_then(|s| s.step_name.as_deref()) == Some(step)
+                        })
+                }) {
+                    return Ok(Some(TaskTerminalResolution::Ready(Box::new(record))));
+                }
+                Ok(None)
+            };
+            let snapshot = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Ok(TaskTerminalResolution::End(TaskAttachEnd::Cancelled)),
+                _ = tokio::time::sleep_until(deadline) => return Ok(TaskTerminalResolution::End(TaskAttachEnd::StartupTimedOut)),
+                snapshot = check => snapshot?,
+            };
+            match snapshot {
+                None => {}
+                Some(other) => return Ok(other),
+            }
+            if cancel.is_cancelled() {
+                return Ok(TaskTerminalResolution::End(TaskAttachEnd::Cancelled));
+            }
+            if !announced {
+                progress(UserMessage {
+                    level: MessageLevel::Info,
+                    text: WAITING_FOR_TERMINAL.into(),
+                });
+                announced = true;
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Ok(TaskTerminalResolution::End(TaskAttachEnd::Cancelled)),
+                _ = tokio::time::sleep_until(deadline) => return Ok(TaskTerminalResolution::End(TaskAttachEnd::StartupTimedOut)),
+                _ = tokio::time::sleep(policy.check_interval) => {},
             }
         }
-    }
-}
-
-#[async_trait]
-impl Command for SquadAttachCommand {
-    type Frontend = Box<dyn SquadAttachFrontend>;
-    type Outcome = SquadAttachOutcome;
-
-    async fn run_with_frontend(
-        self,
-        frontend: Self::Frontend,
-    ) -> Result<Self::Outcome, CommandError> {
-        SquadAttachCommand::run_with_frontend(self, frontend).await
-    }
-}
-
-/// The running-name prefix for one squad task.
-pub fn squad_name_prefix(task: &str) -> String {
-    format!("{SQUAD_NAME_PREFIX}{task}-")
-}
-
-/// Discover running containers for one task through the cross-runtime trait.
-pub fn list_task_containers(
-    runtime: &dyn AgentRuntimeEngine,
-    task: &str,
-) -> Result<Vec<SquadContainer>, CommandError> {
-    runtime.availability()?;
-    Ok(runtime
-        .list_running_with_name_prefix(&squad_name_prefix(task))?
-        .into_iter()
-        .map(|handle| SquadContainer {
-            short_id: handle.id.chars().take(12).collect(),
-            label: handle.name.clone(),
-            handle,
-        })
-        .collect())
-}
-
-/// Best-effort label enrichment. This never changes the candidate set/order.
-pub fn label_with_step_names(candidates: &mut [SquadContainer], state: &WorkflowState) {
-    for (step_name, step_state) in &state.step_states {
-        let StepState::Running {
-            container_id: Some(container_id),
-        } = step_state
-        else {
-            continue;
-        };
-        for candidate in candidates.iter_mut() {
-            if candidate.handle.id == container_id.as_str()
-                || candidate.handle.name == container_id.as_str()
-            {
-                candidate.label = step_name.clone();
-            }
-        }
-    }
-}
-
-/// Resolve a candidate without guessing.
-pub fn resolve_attach_target(
-    candidates: Vec<SquadContainer>,
-    task: &str,
-    requested: Option<&str>,
-) -> Result<AttachResolution, CommandError> {
-    if let Some(requested) = requested {
-        // The same matching rules as `awman agents`, over this task's
-        // containers only. An ambiguous prefix is reported like a miss.
-        let handles: Vec<AgentHandle> = candidates.iter().map(|c| c.handle.clone()).collect();
-        let matched = match_reference(&handles, requested)
-            .ok()
-            .flatten()
-            .and_then(|handle| candidates.iter().find(|c| c.handle.id == handle.id));
-        return match matched {
-            Some(candidate) => Ok(AttachResolution::One(candidate.clone())),
-            None => Err(not_in_task(task, requested, &candidates)),
-        };
-    }
-
-    if candidates.is_empty() {
-        return Err(no_run_in_progress(task));
-    }
-
-    match candidates.len() {
-        1 => Ok(AttachResolution::One(
-            candidates.into_iter().next().expect("one candidate"),
-        )),
-        _ => Ok(AttachResolution::Ambiguous(candidates)),
-    }
-}
-
-/// The explicit idle-task error shape shared by both frontends.
-pub fn no_run_in_progress(task: &str) -> CommandError {
-    CommandError::Other(format!("no run currently in progress for task {task:?}"))
-}
-
-/// An explicit `--container` is never allowed to escape the discovered set.
-pub fn not_in_task(task: &str, requested: &str, set: &[SquadContainer]) -> CommandError {
-    let legal = if set.is_empty() {
-        "(none)".to_string()
-    } else {
-        set.iter()
-            .map(|candidate| candidate.short_id.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
     };
-    CommandError::Other(format!(
-        "container {requested:?} is not a running container for task {task:?}; legal containers: {legal}"
-    ))
-}
-
-/// One line per candidate for prompts and errors.
-pub fn format_candidates(candidates: &[SquadContainer]) -> Vec<String> {
-    candidates
-        .iter()
-        .map(|candidate| format!("{}  {}", candidate.short_id, candidate.label))
-        .collect()
-}
-
-/// Resolve a daemon-reported id against currently running runtime handles.
-pub fn handle_for_container_id(
-    runtime: &dyn AgentRuntimeEngine,
-    container_id: &str,
-) -> Result<Option<AgentHandle>, CommandError> {
-    if container_id.is_empty() {
-        return Ok(None);
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Ok(TaskTerminalResolution::End(TaskAttachEnd::Cancelled)),
+        result = resolve => result,
     }
-    Ok(runtime
-        .list_running_all()?
-        .into_iter()
-        .find(|handle| container_id_matches_handle(handle, container_id)))
-}
-
-fn container_id_matches_handle(handle: &AgentHandle, container_id: &str) -> bool {
-    handle.id.starts_with(container_id)
-        || container_id.starts_with(&handle.id)
-        || handle.name == container_id
 }

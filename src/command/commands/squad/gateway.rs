@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::command::commands::squad::commands::resolved_git_root;
+use crate::command::commands::squad::commands::captured_mount_scope;
 use crate::command::commands::squad::runtime_guard::require_container_tier;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
@@ -345,6 +345,16 @@ pub trait TaskGateway: Send + Sync {
         Ok(None)
     }
 
+    /// Terminals owned by this exact run, never by the task's next run.
+    async fn run_terminals(
+        &self,
+        _run: &RunId,
+    ) -> Result<Vec<crate::data::terminal::TerminalRecord>, CommandError> {
+        Err(CommandError::Other(
+            "run terminal discovery is unavailable".into(),
+        ))
+    }
+
     /// The daemon's `required_env` with a salted digest per held name (§4a).
     ///
     /// Defaulted so the many small test gateways in this tree stay
@@ -410,6 +420,12 @@ impl TaskGateway for SharedTaskGateway {
     }
     async fn workflow_state(&self, task: &str) -> Result<Option<WorkflowState>, CommandError> {
         self.0.workflow_state(task).await
+    }
+    async fn run_terminals(
+        &self,
+        run: &RunId,
+    ) -> Result<Vec<crate::data::terminal::TerminalRecord>, CommandError> {
+        self.0.run_terminals(run).await
     }
     async fn env_coverage(&self) -> Result<EnvCoverage, CommandError> {
         self.0.env_coverage().await
@@ -554,7 +570,9 @@ impl LocalTaskGateway {
 
         let mut specs = task.overlays.clone();
         let root = if task.mount_scope.is_git_repo() {
-            self.engines.git_engine.resolve_root(&task.repo_scope).ok()
+            crate::command::commands::workflow_prerequisites::TaskPrerequisitePlan::for_task(task)
+                .repository_root(self.engines.git_engine.as_ref())
+                .ok()
         } else {
             Some(task.repo_scope.clone())
         };
@@ -759,25 +777,20 @@ impl LocalTaskGateway {
         // silently widen the run's view from the folder the user picked to its
         // entire enclosing repository, exactly the widening `mount_scope`'s
         // capture-once semantics exist to prevent.
-        match resolved_git_root(&self.engines.git_engine, &canonical) {
-            Some(git_root) if git_root == canonical => Ok(ResolvedWorkspace {
-                repo_scope: canonical,
-                // The chosen path *is* the root here, so `cwd` and `gitroot`
-                // name the same directory: the captured answer is stored
-                // verbatim and neither can widen anything.
-                mount_scope: req.mount_scope,
-                git_root: Some(git_root),
-                durable_workspace: durable,
-            }),
-            // Not a repository root: no worktree, direct mount, and the same
-            // durability expectation as the default workspace.
-            _ => Ok(ResolvedWorkspace {
-                repo_scope: canonical,
-                mount_scope: MountScope::Directory,
-                git_root: None,
-                durable_workspace: durable,
-            }),
-        }
+        //
+        // When the chosen path *is* the root, `cwd` and `gitroot` name the
+        // same directory: the captured answer is stored verbatim and neither
+        // can widen anything. Otherwise: no worktree, direct mount, and the
+        // same durability expectation as the default workspace. The add
+        // interview plans the task's prerequisites by this same rule.
+        let (mount_scope, git_root) =
+            captured_mount_scope(&self.engines.git_engine, &canonical, req.mount_scope);
+        Ok(ResolvedWorkspace {
+            repo_scope: canonical,
+            mount_scope,
+            git_root,
+            durable_workspace: durable,
+        })
     }
 
     /// Create (idempotently) the durable per-task workspace.
@@ -1204,6 +1217,18 @@ impl TaskGateway for LocalTaskGateway {
             return Ok(None);
         };
         Ok(crate::data::WorkflowStateStore::read_state_path(&path)?)
+    }
+
+    async fn run_terminals(
+        &self,
+        run: &RunId,
+    ) -> Result<Vec<crate::data::terminal::TerminalRecord>, CommandError> {
+        let hub = self.engines.runtime.terminal_hub().ok_or_else(|| {
+            CommandError::Other("daemon terminal discovery is unavailable".into())
+        })?;
+        Ok(hub.list(Some(&crate::data::terminal::TerminalOwner::Run(
+            run.clone(),
+        ))))
     }
 }
 

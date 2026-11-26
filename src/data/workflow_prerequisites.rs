@@ -150,6 +150,23 @@ pub enum WorkflowPrerequisite {
     NotDetachedHead,
 }
 
+/// What a prerequisite preflight may read about the run's root.
+///
+/// The root kind is a captured decision (a squad task's `MountScope`, say),
+/// never re-discovered from the filesystem: a plain directory nested inside a
+/// larger checkout is still a `Directory`, and the enclosing repository's
+/// remotes, branch, local config and credentials are never consulted for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrerequisiteRoot {
+    /// The root is a Git repository: its remotes, branch and local config
+    /// are inputs to the checks.
+    #[default]
+    Repository,
+    /// The root is a plain directory: no repository state is read.
+    Directory,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrerequisiteOrigin {

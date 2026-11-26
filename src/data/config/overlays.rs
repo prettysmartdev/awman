@@ -141,6 +141,21 @@ pub fn parse_overlay_spec(spec: &str) -> Result<DirectorySpec, String> {
 /// as legacy shorthand for `dir(...)`. Commas inside parentheses are ignored
 /// (paren-aware splitting).
 pub fn parse_overlay_list(input: &str) -> Result<Vec<TypedOverlay>, String> {
+    parse_overlay_list_at_home(input, dirs::home_dir().as_deref())
+}
+
+/// Parse host-home overlays using the invoking session, including daemon runs.
+pub fn parse_overlay_list_with_env(
+    input: &str,
+    env: &crate::data::config::env::EnvSnapshot,
+) -> Result<Vec<TypedOverlay>, String> {
+    parse_overlay_list_at_home(input, env.home_dir().as_deref())
+}
+
+fn parse_overlay_list_at_home(
+    input: &str,
+    home: Option<&std::path::Path>,
+) -> Result<Vec<TypedOverlay>, String> {
     let input = input.trim();
     if input.is_empty() {
         return Ok(vec![]);
@@ -151,7 +166,7 @@ pub fn parse_overlay_list(input: &str) -> Result<Vec<TypedOverlay>, String> {
         if expr.is_empty() {
             continue;
         }
-        results.push(parse_single_typed_overlay(expr)?);
+        results.push(parse_single_typed_overlay(expr, home)?);
     }
     Ok(results)
 }
@@ -179,7 +194,10 @@ fn split_top_level_commas(input: &str) -> Vec<&str> {
 /// Parse a single typed overlay expression like `dir(/host:/container:ro)`
 /// or `skill()`. If the input has no parentheses, it is treated as a legacy
 /// bare path spec (`host:container[:perm]`).
-fn parse_single_typed_overlay(expr: &str) -> Result<TypedOverlay, String> {
+fn parse_single_typed_overlay(
+    expr: &str,
+    home: Option<&std::path::Path>,
+) -> Result<TypedOverlay, String> {
     if !expr.contains('(') {
         return parse_overlay_spec(expr).map(TypedOverlay::Directory);
     }
@@ -235,7 +253,7 @@ fn parse_single_typed_overlay(expr: &str) -> Result<TypedOverlay, String> {
             if !args.is_empty() {
                 return Err("ssh() takes no arguments".to_string());
             }
-            let home = dirs::home_dir().unwrap_or_default();
+            let home = home.ok_or_else(|| "ssh(): home directory is unavailable in this session".to_string())?;
             let ssh_host = home.join(".ssh").to_string_lossy().into_owned();
             Ok(TypedOverlay::Directory(DirectorySpec {
                 host: ssh_host,
@@ -452,9 +470,11 @@ impl EffectiveConfig {
         // 1-3. Config overlays: global, repo, task, env, `--set` — additive
         // across layers, already merged and de-duplicated by `EffectiveConfig`.
         for s in ec.config().overlays.iter().flatten() {
-            let parsed = parse_overlay_list(s).map_err(|reason| DataError::InvalidOverlaySpec {
-                spec: s.clone(),
-                reason: format!("{reason} (from {})", overlay_source(ec, s)),
+            let parsed = parse_overlay_list_with_env(s, ec.env()).map_err(|reason| {
+                DataError::InvalidOverlaySpec {
+                    spec: s.clone(),
+                    reason: format!("{reason} (from {})", overlay_source(ec, s)),
+                }
             })?;
             for typed in parsed {
                 process_typed(typed);
@@ -469,11 +489,12 @@ impl EffectiveConfig {
         // 5. Workflow-level overlays (between CLI and step).
         if let Some(wf_strs) = workflow_overlays {
             for s in wf_strs {
-                let parsed =
-                    parse_overlay_list(s).map_err(|reason| DataError::InvalidOverlaySpec {
+                let parsed = parse_overlay_list_with_env(s, ec.env()).map_err(|reason| {
+                    DataError::InvalidOverlaySpec {
                         spec: s.clone(),
                         reason,
-                    })?;
+                    }
+                })?;
                 for typed in parsed {
                     process_typed(typed);
                 }
@@ -483,11 +504,12 @@ impl EffectiveConfig {
         // 6. Per-step overlays (highest priority).
         if let Some(step_strs) = step_overlays {
             for s in step_strs {
-                let parsed =
-                    parse_overlay_list(s).map_err(|reason| DataError::InvalidOverlaySpec {
+                let parsed = parse_overlay_list_with_env(s, ec.env()).map_err(|reason| {
+                    DataError::InvalidOverlaySpec {
                         spec: s.clone(),
                         reason,
-                    })?;
+                    }
+                })?;
                 for typed in parsed {
                     process_typed(typed);
                 }

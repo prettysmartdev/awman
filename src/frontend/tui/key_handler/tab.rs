@@ -15,12 +15,18 @@ pub(super) fn handle(app: &mut App, action: Action) {
                 app.close_active_tab();
                 return;
             }
-            let cwd = app
-                .active_tab()
-                .session
-                .working_dir()
-                .to_string_lossy()
-                .to_string();
+            let tab = app.active_tab();
+            let proposal = match crate::command::dispatch::frontend_action::propose_new_tab_dialog(
+                tab.new_tab_kind(),
+                tab.session.env(),
+                tab.session.working_dir(),
+            ) {
+                Ok(proposal) => proposal,
+                Err(error) => {
+                    report_new_tab_failure(app, error.to_string());
+                    return;
+                }
+            };
             // The squad shortcut is advertised in the dialog's key-hint row
             // (`render/dialog.rs`), next to Enter/Esc, not in the prompt.
             app.active_dialog = Some(Dialog::TextInput {
@@ -28,7 +34,7 @@ pub(super) fn handle(app: &mut App, action: Action) {
                 prompt: "Working directory:".to_string(),
                 editor: {
                     let mut ed = text_edit::TextEdit::new(false);
-                    ed.set_text(&cwd);
+                    ed.set_text(&proposal.initial_directory.to_string_lossy());
                     ed
                 },
             });

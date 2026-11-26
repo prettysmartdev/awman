@@ -28,6 +28,19 @@ impl AttachCommandFrontend for InstanceCommandFrontend {
         self.command_cancel.clone()
     }
 
+    fn attach_status(&mut self, message: crate::data::message::UserMessage) {
+        if let Ok(mut status) = self.attach_status.lock() {
+            *status = Some(message.clone());
+        }
+        crate::data::message::UserMessageSink::write_message(self, message);
+    }
+
+    fn terminal_ready(&mut self) {
+        if let Ok(mut status) = self.attach_status.lock() {
+            *status = None;
+        }
+    }
+
     fn hangup(&self) -> CancellationToken {
         self.attach_hangup.clone()
     }
@@ -139,6 +152,7 @@ impl AttachCommandFrontend for InstanceCommandFrontend {
     }
 
     fn end_attach(&mut self) {
+        self.attach_lease.take();
         if let Ok(mut events) = self.container.events.lock() {
             events.push_back(
                 crate::command::instance::feeds::ContainerSlotEvent::Exited {

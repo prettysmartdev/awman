@@ -458,6 +458,14 @@ impl Drop for Tab {
 }
 
 impl Tab {
+    pub fn new_tab_kind(&self) -> crate::command::dispatch::frontend_action::NewTabKind {
+        if self.is_squad {
+            crate::command::dispatch::frontend_action::NewTabKind::Squad
+        } else {
+            crate::command::dispatch::frontend_action::NewTabKind::Directory
+        }
+    }
+
     pub(crate) fn active_workflow_context_path(&self) -> Option<std::path::PathBuf> {
         if !matches!(self.execution_phase, ExecutionPhase::Running { .. }) {
             return None;

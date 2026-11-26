@@ -706,12 +706,19 @@ impl Command for SquadCommand {
                         };
                         let mut req = req;
                         if req.prerequisites.is_none() && !request.non_interactive {
+                            // Planned from the scope the gateway is about to
+                            // capture, never from the caller's directory.
+                            let plan = new_task_prerequisite_plan(
+                                &req,
+                                engines.git_engine.as_ref(),
+                                &env,
+                            )?;
                             req.prerequisites = ask_task_prerequisites(
                                 frontend.as_mut(),
                                 &engines,
                                 local_user,
-                                &req.workspace,
-                                cwd.as_deref(),
+                                plan.as_ref(),
+                                &env,
                             )?;
                         }
                         let task = gateway.create(req).await?;
@@ -728,7 +735,7 @@ impl Command for SquadCommand {
                             // prefill its prompts, so it starts from a read
                             // rather than from the flags.
                             let current = gateway.get(&name).await?;
-                            let pool = read_task_agent_pool(&name)?;
+                            let pool = read_task_agent_pool(&name, &env)?;
                             collect_task_edit_interview(
                                 frontend.as_mut(),
                                 &current,
@@ -740,15 +747,17 @@ impl Command for SquadCommand {
                         };
                         let mut update = update;
                         if interview {
-                            // The same prerequisite questions as `squad add`, against
-                            // the task's own workspace (WI 0149).
+                            // The same prerequisite questions as `squad add`, under
+                            // the task's captured scope (WI 0149, WI 0088): a
+                            // directory task stays a directory task.
                             let current = gateway.get(&name).await?;
+                            let plan = crate::command::commands::workflow_prerequisites::TaskPrerequisitePlan::for_task(&current);
                             if let Some(policy) = ask_task_prerequisites(
                                 frontend.as_mut(),
                                 &engines,
                                 local_user,
-                                &TaskWorkspace::Custom(current.repo_scope.clone()),
-                                cwd.as_deref(),
+                                Some(&plan),
+                                &env,
                             )? {
                                 update.prerequisites = Some(policy);
                             }
@@ -842,6 +851,89 @@ impl Command for SquadCommand {
     }
 }
 
+/// The workflow prerequisite questions for a squad task (WI 0149 §6), asked
+/// only when a person is at the frontend. Run under the task's captured
+/// [`TaskPrerequisitePlan`] (WI 0088): a repository-backed task assumes every
+/// teardown kind; a directory task is offered only the optional Git identity.
+/// The answers become the task's stored policy (decisions only). `None`
+/// leaves the policy unset.
+///
+/// [`TaskPrerequisitePlan`]: crate::command::commands::workflow_prerequisites::TaskPrerequisitePlan
+fn ask_task_prerequisites(
+    frontend: &mut dyn SquadCommandFrontend,
+    engines: &Engines,
+    local_user: bool,
+    plan: Option<&crate::command::commands::workflow_prerequisites::TaskPrerequisitePlan>,
+    env: &EnvSnapshot,
+) -> Result<Option<crate::data::config::workflows::PrerequisitePolicy>, CommandError> {
+    if !local_user || !frontend.can_ask_prerequisites() {
+        return Ok(None);
+    }
+    let Some(plan) = plan else {
+        return Ok(None);
+    };
+    crate::command::commands::workflow_prerequisites::collect_task_prerequisites(
+        engines,
+        crate::command::dispatch::catalogue::FrontendKind::Cli,
+        plan,
+        Some(env.clone()),
+        frontend,
+    )
+}
+
+/// The prerequisite plan for a task that is about to be created: the root and
+/// [`MountScope`] the gateway will capture for `req`, by the same rule
+/// ([`captured_mount_scope`]). The default workspace is the task's own durable
+/// directory — never the caller's current directory. `None` when the custom
+/// path cannot be resolved; the gateway then refuses the task with its own
+/// explicit error.
+fn new_task_prerequisite_plan(
+    req: &CreateTask,
+    git_engine: &GitEngine,
+    env: &EnvSnapshot,
+) -> Result<
+    Option<crate::command::commands::workflow_prerequisites::TaskPrerequisitePlan>,
+    CommandError,
+> {
+    use crate::command::commands::workflow_prerequisites::TaskPrerequisitePlan;
+    match &req.workspace {
+        TaskWorkspace::Default => {
+            let durable = SquadPaths::from_env(env)?.task_dir(&req.name)?;
+            Ok(Some(TaskPrerequisitePlan::captured(
+                durable,
+                MountScope::Directory,
+            )))
+        }
+        TaskWorkspace::Custom(path) => {
+            let Ok(canonical) = std::fs::canonicalize(path) else {
+                return Ok(None);
+            };
+            if !canonical.is_dir() {
+                return Ok(None);
+            }
+            let (mount_scope, _) = captured_mount_scope(git_engine, &canonical, req.mount_scope);
+            Ok(Some(TaskPrerequisitePlan::captured(canonical, mount_scope)))
+        }
+    }
+}
+
+/// The [`MountScope`] captured for a custom workspace whose canonical path is
+/// `canonical`, and its git root when it is repository-backed. Only a path
+/// that *is* a repository root is repository-backed (keeping `requested`); a
+/// plain folder, or a subdirectory inside a larger checkout, is a
+/// [`MountScope::Directory`] task. One rule, shared by the gateway that
+/// persists the scope and the interview that plans prerequisites for it.
+pub(crate) fn captured_mount_scope(
+    git_engine: &GitEngine,
+    canonical: &Path,
+    requested: MountScope,
+) -> (MountScope, Option<PathBuf>) {
+    match resolved_git_root(git_engine, canonical) {
+        Some(git_root) if git_root == canonical => (requested, Some(git_root)),
+        _ => (MountScope::Directory, None),
+    }
+}
+
 /// Collect a full `CreateTask` from the frontend's interview answers.
 /// Every field is asked; the frontend supplies the values and Layer 1 validates
 /// them, so this reproduces the same task from CLI and TUI given the same
@@ -851,38 +943,6 @@ impl Command for SquadCommand {
 /// including the workspace choice and the overlay loop — has been answered. An
 /// interview abandoned partway (Ctrl-C, a dismissed dialog) propagates its
 /// error out of this function, so a partial task can never be written.
-/// The workflow prerequisite questions for a squad task (WI 0149 §6), asked
-/// only when a person is at the frontend. Run against the task's workspace
-/// with every teardown kind assumed; the answers become the task's stored
-/// policy (decisions only). `None` leaves the policy unset.
-fn ask_task_prerequisites(
-    frontend: &mut dyn SquadCommandFrontend,
-    engines: &Engines,
-    local_user: bool,
-    workspace: &TaskWorkspace,
-    cwd: Option<&Path>,
-) -> Result<Option<crate::data::config::workflows::PrerequisitePolicy>, CommandError> {
-    if !local_user || !frontend.can_ask_prerequisites() {
-        return Ok(None);
-    }
-    let dir = match workspace {
-        TaskWorkspace::Custom(path) if path.is_dir() => path.clone(),
-        // The default workspace does not exist yet; the questions are about
-        // the host's keys and tokens, so the session's current directory
-        // stands in.
-        _ => match cwd {
-            Some(dir) => dir.to_path_buf(),
-            None => return Ok(None),
-        },
-    };
-    crate::command::commands::workflow_prerequisites::collect_task_prerequisites(
-        engines,
-        crate::command::dispatch::catalogue::FrontendKind::Cli,
-        &dir,
-        frontend,
-    )
-}
-
 fn collect_task_interview(
     frontend: &mut dyn SquadCommandFrontend,
     git_engine: &GitEngine,
@@ -1006,10 +1066,15 @@ fn collect_models_for_agent(
 /// The agent pool a task currently carries, read from its own `config.json`.
 /// Empty when the task has none (it inherits the global block) — the same
 /// answer the interview's "use the global settings" branch produces.
-fn read_task_agent_pool(name: &str) -> Result<BTreeMap<String, Vec<String>>, CommandError> {
+fn read_task_agent_pool(
+    name: &str,
+    env: &EnvSnapshot,
+) -> Result<BTreeMap<String, Vec<String>>, CommandError> {
     // Only the task's own `squad` block: other blocks in a task file are
     // outside its schema and must not change what the interview accepts.
-    let paths = SquadPaths::from_process_env()?;
+    // The invoking session's environment, like every other path this
+    // command resolves for the task.
+    let paths = SquadPaths::from_env(env)?;
     Ok(
         crate::data::config::squad::task_own_squad_config(&paths, name)?
             .and_then(|squad| squad.agents_to_models)
