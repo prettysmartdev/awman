@@ -3,30 +3,25 @@
   "repository_id": 1180183833,
   "version": "v0.14.0",
   "mode": "production",
-  "commit": "72dcd3b302fbc71e3ed1f4bf6ee5c04b0018a7df",
-  "tree": "ea0173aa0baaa5ab9cba546925a441b666436958",
+  "commit": "0a043473f5aa7f82eccb9c16615fe96ed606904f",
+  "tree": "9dd751b13e0a1d09ee8aa90c8e8d3deb30425ef1",
   "base_main": "eae27245598962b9e35582fcdeff960083194981",
   "plan_sha256": "64e0dc7c215179a55efbb4a70a2ef7933dba758d802ce1ccfc79c335ee4e2b94",
   "policy_sha256": "30586a6d9c120a6613f764343c9e889ff00560796bd1d6dd7fc37e501d539d32",
-  "generation": 2,
-  "operation": "1f33cb01ab9f13f13792afae62b9bb2ec26a0597dc5651633912f741078012f5",
-  "nonce": "19230c79",
+  "generation": 3,
+  "operation": "890ff95c222bb6e5bbcc61935f1578a29feb71bde6e97f4c858cce7417beab94",
+  "nonce": "2d2b3784",
   "push_ref": "heads/release/v0.14.0",
   "owner": {
     "id": "782de7cdc74eff5a7d140cd3c6f5897c",
     "host": "cohix-studio.local",
-    "pid": 9589
+    "pid": 32696
   },
   "previous_owners": [],
-  "ci_run": 45825577753,
-  "build_runs": {
-    "awman-linux-amd64": 45825584323,
-    "awman-linux-arm64": 45825591745,
-    "awman-macos-arm64": 45825599467,
-    "awman-windows-amd64.exe": 45825607642
-  },
+  "ci_run": null,
+  "build_runs": {},
   "draft_id": null,
   "seal_sha256": null,
-  "started": "2026-11-26T13:04:04.224300Z",
+  "started": "2026-11-26T14:11:27.042987Z",
   "decided_at": null
 }
