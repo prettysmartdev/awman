@@ -970,7 +970,7 @@ fn removed_nested_repository_never_uses_its_parent() {
     let env = env_with_token(&sandbox);
     let engines = engines(&sandbox, &env);
     assert_eq!(
-        engines.git_engine.resolve_root(&captured).unwrap(),
+        std::fs::canonicalize(engines.git_engine.resolve_root(&captured).unwrap()).unwrap(),
         captured
     );
     std::fs::remove_dir_all(captured.join(".git")).unwrap();
