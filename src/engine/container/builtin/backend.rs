@@ -597,6 +597,16 @@ impl ContainerBackend for BuiltinBackend {
             .labels
             .get(naming::LABEL_OWNER)
             .ok_or_else(|| EngineError::Other("builtin sandbox has no owner label".into()))?;
+        let endpoint = self.paths.attach(&summary.handle.id, owner);
+        match std::fs::metadata(&endpoint) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(EngineError::AgentTerminalStarting {
+                    id: handle.id.clone(),
+                });
+            }
+            Err(error) => return Err(EngineError::io(endpoint, error)),
+        }
         Ok(Box::new(AttachInstance {
             owner: owner.clone(),
             handle: summary.handle,

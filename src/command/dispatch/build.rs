@@ -118,9 +118,10 @@ pub fn squad(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
 }
 
 pub fn squad_attach(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {
-    let target = ctx.args.require("name")?;
-    let attach = AttachCommand::from_task_input(ctx, &target)?;
-    Ok(BuiltCommand::Attach(attach))
+    Ok(BuiltCommand::Attach(AttachCommand::from_task_input(
+        ctx,
+        &ctx.args.require("name")?,
+    )?))
 }
 
 pub fn remote(ctx: &BuildContext) -> Result<BuiltCommand, CommandError> {

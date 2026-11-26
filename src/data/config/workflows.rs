@@ -267,7 +267,19 @@ pub struct IdentityPolicy {
     #[serde(rename = "use")]
     pub use_: CredentialUse,
     pub fixed: Option<FixedIdentity>,
+    #[serde(default)]
+    pub scope: IdentityGrantScope,
     pub source: PolicySource,
+}
+
+/// An interview grants identity only to commit steps. Explicit fixed-identity
+/// configuration retains its existing run-wide behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IdentityGrantScope {
+    CommitSteps,
+    #[default]
+    Run,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshPolicy {
@@ -424,6 +436,7 @@ impl Default for PrerequisitePolicy {
             git_identity: IdentityPolicy {
                 use_: CredentialUse::Ask,
                 fixed: None,
+                scope: IdentityGrantScope::Run,
                 source: PolicySource::Default,
             },
             ssh: SshPolicy {
@@ -599,6 +612,7 @@ impl PrerequisitePolicy {
             }
             if let Some(fixed) = fixed {
                 self.git_identity.fixed = Some(fixed);
+                self.git_identity.scope = IdentityGrantScope::Run;
                 self.git_identity.source = source;
             }
         }
@@ -687,6 +701,7 @@ impl PrerequisitePolicy {
     fn apply_flags(&mut self, flags: &crate::data::config::flags::PrerequisiteFlags) {
         use crate::data::config::flags::{IdentityFlag, SshFlag, TokenFlag};
         if let Some(flag) = &flags.identity {
+            self.git_identity.scope = IdentityGrantScope::Run;
             self.git_identity.source = PolicySource::Flag;
             self.git_identity.fixed = match flag {
                 IdentityFlag::Fixed { name, email } => Some(FixedIdentity {

@@ -34,6 +34,10 @@ pub struct RememberedGrants {
 pub struct PrerequisitePreflightOptions {
     pub prerequisites: WorkflowPrerequisites,
     pub phase: PrerequisitePhase,
+    /// Whether `git_root` is a repository whose state the probes may read.
+    /// The caller supplies this from a captured decision; the preflight never
+    /// re-discovers an enclosing repository for a `Directory` root.
+    pub root: PrerequisiteRoot,
     pub git_root: PathBuf,
     pub worktree: Option<PathBuf>,
     pub worktree_planned: bool,
@@ -90,6 +94,7 @@ impl PrerequisitePreflightOptions {
             image_session: None,
             policy,
             phase: PrerequisitePhase::Start,
+            root: PrerequisiteRoot::Repository,
             worktree: None,
             worktree_planned: false,
             phase_image: None,

@@ -59,8 +59,8 @@ pub use launch_policy::{LaunchModeDecision, LaunchPolicy};
 // (`EffectiveConfig::collected_overlays`). These re-exports keep the names
 // reachable at their long-standing `command::commands::…` paths.
 pub use crate::data::config::overlays::{
-    parse_overlay_list, parse_overlay_spec, CollectedOverlays, ContextOverlaySpec, ContextScope,
-    SkillSpec, TypedOverlay,
+    parse_overlay_list, parse_overlay_list_with_env, parse_overlay_spec, CollectedOverlays,
+    ContextOverlaySpec, ContextScope, SkillSpec, TypedOverlay,
 };
 
 pub mod link;

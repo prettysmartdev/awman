@@ -18,10 +18,22 @@ impl PrerequisitePreflight {
         };
         self.remote(remote).ok().flatten()
     }
+    /// The root's current branch; a plain-directory root has none.
+    fn current_branch(&self) -> Option<String> {
+        match self.options.root {
+            PrerequisiteRoot::Repository => self.sources.git.current_branch(self.repo()),
+            PrerequisiteRoot::Directory => None,
+        }
+    }
     fn remote(&self, remote: &str) -> Result<Option<GitRemoteUrl>, ()> {
         // URLs in clone_repo/push_branch are already destinations, not remote names.
         if remote.contains("://") || remote.contains(':') || remote.starts_with(['/', '.']) {
             return Ok(Some(GitRemoteUrl::parse(remote)));
+        }
+        // A plain-directory root has no remotes of its own; asking Git would
+        // answer for whatever repository happens to enclose it.
+        if self.options.root == PrerequisiteRoot::Directory {
+            return Ok(None);
         }
         if let Some(SessionType::Remote { repo_url, .. }) = &self.options.session_type {
             return if remote == "origin" {
@@ -225,7 +237,7 @@ impl PrerequisitePreflight {
                 let attached = self.options.worktree_planned
                     || self.options.worktree.is_some()
                     || matches!(self.options.session_type, Some(SessionType::Remote { ref branch, .. }) if !branch.trim().is_empty())
-                    || self.sources.git.current_branch(self.repo()).is_some();
+                    || self.current_branch().is_some();
                 if attached {
                     Self::check(
                         need,
@@ -233,7 +245,9 @@ impl PrerequisitePreflight {
                         "HEAD is attached to a branch",
                         vec![],
                     )
-                } else if self.sources.git.is_detached_head(self.repo()) {
+                } else if self.options.root == PrerequisiteRoot::Repository
+                    && self.sources.git.is_detached_head(self.repo())
+                {
                     Self::check(
                         need,
                         PrerequisiteStatus::Missing,
@@ -258,7 +272,12 @@ impl PrerequisitePreflight {
             id.name.as_ref().is_some_and(|s| !s.trim().is_empty())
                 && id.email.as_ref().is_some_and(|s| !s.trim().is_empty())
         };
-        let local = self.sources.git.local_identity(self.repo());
+        // A plain-directory root has no repository-local config; an enclosing
+        // checkout's identity is not this root's.
+        let local = match self.options.root {
+            PrerequisiteRoot::Repository => self.sources.git.local_identity(self.repo()),
+            PrerequisiteRoot::Directory => Ok(GitIdentity::default()),
+        };
         let local_unavailable = local.is_err();
         match local {
             Ok(local) if complete(&local) => {
@@ -319,15 +338,18 @@ impl PrerequisitePreflight {
                     email: email.clone(),
                 });
                 remediations.push(Remediation::EnterIdentity);
-                remediations.push(Remediation::SetLocalIdentity {
-                    command: GitEngine::set_local_identity_command_display(
-                        self.repo(),
-                        &name,
-                        &email,
-                    ),
-                    name,
-                    email,
-                });
+                // Only a repository has a local config to write the identity to.
+                if self.options.root == PrerequisiteRoot::Repository {
+                    remediations.push(Remediation::SetLocalIdentity {
+                        command: GitEngine::set_local_identity_command_display(
+                            self.repo(),
+                            &name,
+                            &email,
+                        ),
+                        name,
+                        email,
+                    });
+                }
             } else {
                 remediations.push(Remediation::EnterIdentity);
             }
@@ -854,9 +876,7 @@ impl PrerequisitePreflight {
                     })
             });
         let upstream = self
-            .sources
-            .git
-            .current_branch(self.repo())
+            .current_branch()
             .and_then(|branch| self.sources.git.branch_upstream(self.repo(), &branch))
             .is_some();
         if ordered_push || upstream {

@@ -996,7 +996,7 @@ impl ExecWorkflowCommand {
         // Build the CLI overlay list (includes the implied context(workflow)).
         let mut cli_typed = Vec::new();
         for s in &effective_flags.overlay {
-            match parse_overlay_list(s) {
+            match parse_overlay_list_with_env(s, self.session.env()) {
                 Ok(parsed) => cli_typed.extend(parsed),
                 Err(reason) => {
                     return Err(CommandError::InvalidOverlaySpec {
@@ -1117,12 +1117,14 @@ impl ExecWorkflowCommand {
 
         let mut cli_overlays = Vec::new();
         for overlay in &self.flags.overlay {
-            cli_overlays.extend(parse_overlay_list(overlay).map_err(|reason| {
-                CommandError::InvalidOverlaySpec {
-                    spec: overlay.clone(),
-                    reason,
-                }
-            })?);
+            cli_overlays.extend(
+                parse_overlay_list_with_env(overlay, self.session.env()).map_err(|reason| {
+                    CommandError::InvalidOverlaySpec {
+                        spec: overlay.clone(),
+                        reason,
+                    }
+                })?,
+            );
         }
         let collected =
             self.session

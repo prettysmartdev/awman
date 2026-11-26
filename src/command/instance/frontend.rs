@@ -56,7 +56,7 @@ pub struct InstanceCommandFrontend {
 
     pub(crate) attach_exit_code: std::sync::Arc<std::sync::atomic::AtomicI32>,
     pub(crate) attach_hangup: tokio_util::sync::CancellationToken,
-    parsed: ParsedCommandBoxInput,
+    pub(crate) parsed: ParsedCommandBoxInput,
     pub(crate) messages: StatusLogSink,
     pub(crate) pty_active: bool,
     pub(crate) dialog_tx: std::sync::mpsc::Sender<DialogRequest>,
@@ -82,10 +82,8 @@ pub struct InstanceCommandFrontend {
     /// The tab's command-cancel token: ends an `agents status --watch` loop
     /// or an `agents attach` session (new command, tab closed, Esc).
     pub(crate) command_cancel: tokio_util::sync::CancellationToken,
-    pub(crate) squad_attach_session:
-        Option<std::sync::Arc<crate::command::instance::feeds::SquadAttachSession>>,
-    pub(crate) squad_attach_reachable: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    pub(crate) squad_attach_metadata: HashMap<String, (String, Option<String>)>,
+    pub(crate) attach_lease: Option<crate::command::instance::feeds::AttachSessionLease>,
+    pub(crate) attach_status: Arc<Mutex<Option<UserMessage>>>,
     pub(crate) parallel_group_active: bool,
     pub(crate) pending_step_slot_io:
         HashMap<String, crate::command::instance::feeds::ContainerSlotIo>,
@@ -186,12 +184,6 @@ impl InstanceCommandFrontend {
             && status.is_some_and(|s| matches!(s.state, ProgramState::Done | ProgramState::Idle))
     }
 
-    pub(crate) fn squad_attach_has_explicit_target(&self) -> bool {
-        // squad attach now resolves the task's hub terminal; the legacy
-        // container-selection flag is no longer part of its catalogue.
-        false
-    }
-
     /// Build the frontend for one command run in one tab.
     ///
     /// `shared` carries lifecycle owners intact into the command frontend.
@@ -203,6 +195,7 @@ impl InstanceCommandFrontend {
     ) -> Self {
         let TabCommandFeeds {
             command_bytes,
+            attach_status,
             workflow,
             container,
             yolo_state,
@@ -249,11 +242,10 @@ impl InstanceCommandFrontend {
             tui_context_shared,
             signals,
             command_cancel,
-            squad_attach_session: None,
             attach_exit_code: Default::default(),
             attach_hangup: Default::default(),
-            squad_attach_reachable: None,
-            squad_attach_metadata: HashMap::new(),
+            attach_lease: None,
+            attach_status,
             parallel_group_active: false,
             pending_step_slot_io: HashMap::new(),
             pending_parallel_yolo_cancel: HashMap::new(),

@@ -59,6 +59,7 @@ use super::frontend::{
     GapChoice, IdentityChoice, IdentityPersist, PrerequisiteReportNext, SshChoice, TokenConsent,
     TokenSourceChoice, ToolChoice, WorkflowPrerequisiteFrontend,
 };
+use super::scope::PrerequisiteScope;
 
 /// The trust-store name a repository's `acquire` command is approved under,
 /// keyed by repo root + the SHA-256 of its JSON argv.
@@ -86,6 +87,10 @@ pub struct WorkflowPrerequisiteFlowOptions {
     pub custom_agent_binaries: Vec<String>,
     /// "repo config mounts ~/.ssh into every step" and similar.
     pub repo_overlay_notes: Vec<String>,
+    /// Which requirements apply to the run's root (WI 0088). `Repository`
+    /// (the default) keeps every requirement; a captured plain-directory root
+    /// omits the Git/PR-only ones before the Layer 1 preflight sees them.
+    pub scope: PrerequisiteScope,
 }
 
 impl WorkflowPrerequisiteFlowOptions {
@@ -121,6 +126,7 @@ impl WorkflowPrerequisiteFlowOptions {
             phase_image,
             custom_agent_binaries: custom_agent_binaries(session),
             repo_overlay_notes: repo_overlay_notes(session),
+            scope: PrerequisiteScope::Repository,
         }
     }
 }
@@ -339,12 +345,11 @@ impl WorkflowPrerequisiteFlow {
             .home_dir()
             .unwrap_or_else(|| PathBuf::from("/"));
         Self {
-            workflow_git_source: engines
-                .git_engine
-                .capture_workflow_git_source(
-                    options.worktree.as_deref().unwrap_or(&options.git_root),
-                )
-                .ok(),
+            workflow_git_source: Self::capture_git_source(
+                engines,
+                &options,
+                options.worktree.as_deref(),
+            ),
             decision_remote: "origin".into(),
             engines: engines.clone(),
             session: session.clone(),
@@ -359,14 +364,32 @@ impl WorkflowPrerequisiteFlow {
         &self.options
     }
 
+    /// The Git source a workflow is cut from. A plain-directory root has
+    /// none of its own, so an enclosing checkout is never captured for it.
+    fn capture_git_source(
+        engines: &Engines,
+        options: &WorkflowPrerequisiteFlowOptions,
+        worktree: Option<&Path>,
+    ) -> Option<crate::engine::git::remote_push::WorkflowGitSource> {
+        if options.scope.is_directory() {
+            return None;
+        }
+        engines
+            .git_engine
+            .capture_workflow_git_source(worktree.unwrap_or(&options.git_root))
+            .ok()
+    }
+
+    /// `needs` without the requirements that do not apply to this root.
+    pub fn applicable(&self, needs: &WorkflowPrerequisites) -> WorkflowPrerequisites {
+        self.options.scope.project(needs, &self.options.policy)
+    }
+
     /// Point the probes at the run's worktree once it exists.
     pub fn set_worktree(&mut self, worktree: Option<PathBuf>) {
         if self.options.worktree != worktree {
-            self.workflow_git_source = self
-                .engines
-                .git_engine
-                .capture_workflow_git_source(worktree.as_deref().unwrap_or(&self.options.git_root))
-                .ok();
+            self.workflow_git_source =
+                Self::capture_git_source(&self.engines, &self.options, worktree.as_deref());
         }
         self.options.worktree = worktree;
     }
@@ -402,6 +425,11 @@ impl WorkflowPrerequisiteFlow {
     fn remote_url(&self, remote: &str) -> Option<GitRemoteUrl> {
         if is_url_like(remote) {
             return Some(GitRemoteUrl::parse(remote));
+        }
+        if self.options.scope.is_directory() {
+            // A plain-directory root has no remotes; an enclosing checkout's
+            // are not this root's.
+            return None;
         }
         if let SessionType::Remote { repo_url, .. } = self.session.session_type() {
             return (remote == "origin").then(|| GitRemoteUrl::parse(repo_url));
@@ -560,6 +588,8 @@ impl WorkflowPrerequisiteFlow {
         can_ask: bool,
         existing_grants: Option<PrerequisiteGrants>,
     ) -> PrerequisitePreflight {
+        // Layer 1 probes exactly what applies to this root.
+        let needs = self.applicable(&needs);
         let mut options = PrerequisitePreflightOptions::for_session(
             needs,
             &self.session,
@@ -568,6 +598,7 @@ impl WorkflowPrerequisiteFlow {
             self.options.policy.clone(),
         );
         options.phase = phase;
+        options.root = self.options.scope.root();
         options.worktree_planned = self.options.worktree_planned;
         options.git_root = self.options.git_root.clone();
         options.worktree = self.options.worktree.clone();
@@ -576,10 +607,13 @@ impl WorkflowPrerequisiteFlow {
         options.repo_acquire_approved = self.repo_acquire_approved();
         options.can_ask = can_ask;
         options.existing_grants = existing_grants;
+        // The caller's own Git credential lease belongs to the caller's
+        // repository, never to a plain-directory root.
         options.session_git_scope = self
             .engines
             .ephemeral_secrets
             .container_git_socket()
+            .filter(|_| !self.options.scope.is_directory())
             .map(|listener| listener.scope().clone());
         options.notes = self.notes();
         let cache = self
@@ -613,7 +647,7 @@ impl WorkflowPrerequisiteFlow {
         can_ask: bool,
         frontend: &mut dyn WorkflowPrerequisiteFrontend,
     ) -> WorkflowPrerequisiteReport {
-        Self::announce_preflight(needs.needs.len(), frontend);
+        Self::announce_preflight(self.applicable(needs).needs.len(), frontend);
         let preflight =
             self.build_preflight(needs.clone(), PrerequisitePhase::Start, can_ask, None);
         Self::run_preflight_with_messages(&preflight, frontend)
@@ -666,7 +700,7 @@ impl WorkflowPrerequisiteFlow {
         frontend: &mut dyn WorkflowPrerequisiteFrontend,
     ) -> Result<PreparedPrerequisites, CommandError> {
         let can_ask = frontend.can_ask_prerequisites();
-        Self::announce_preflight(needs.needs.len(), frontend);
+        Self::announce_preflight(self.applicable(needs).needs.len(), frontend);
         let preflight =
             self.build_preflight(needs.clone(), PrerequisitePhase::Start, can_ask, None);
         let report = Self::run_preflight_with_messages(&preflight, frontend);
@@ -794,6 +828,7 @@ impl WorkflowPrerequisiteFlow {
                 .into_iter()
                 .filter(|check| {
                     !matches!(check.prerequisite, WorkflowPrerequisite::AgentImage { .. })
+                        && !self.options.scope.is_optional(&check.prerequisite)
                 })
             {
                 frontend.write_message(warning(format!(
@@ -817,7 +852,13 @@ impl WorkflowPrerequisiteFlow {
     ) -> Result<PrerequisiteOutcome, CommandError> {
         let can_ask = frontend.can_ask_prerequisites();
         // A fixed identity the policy grants is the run's, whatever its needs.
-        grants.run_identity = granted_fixed_identity(&self.options.policy);
+        grants.run_identity = if self.options.policy.git_identity.scope
+            == crate::data::config::workflows::IdentityGrantScope::Run
+        {
+            granted_fixed_identity(&self.options.policy)
+        } else {
+            None
+        };
         if show && can_ask {
             let unresolved = self.options.policy.unresolved_or(UnresolvedMode::Warn);
             frontend.show_workflow_prerequisites(
@@ -944,6 +985,8 @@ impl WorkflowPrerequisiteFlow {
             .needs_attention()
             .into_iter()
             .filter(|c| !matches!(c.prerequisite, WorkflowPrerequisite::AgentImage { .. }))
+            // An optional choice left unmade is a decision, not a gap.
+            .filter(|c| !self.options.scope.is_optional(&c.prerequisite))
             .map(|c| c.prerequisite.clone())
             .collect();
         Ok(PrerequisiteOutcome {
@@ -1039,7 +1082,10 @@ impl WorkflowPrerequisiteFlow {
                 headless_declined(check, "git identity")
             });
         }
-        let prompt = crate::command::prompts::prerequisite_identity(check);
+        let prompt = crate::command::prompts::prerequisite_identity(
+            check,
+            self.options.scope.is_optional(&check.prerequisite),
+        );
         match frontend.ask_prerequisite_identity(&prompt)? {
             IdentityChoice::UseHost { name, email } => {
                 Ok(grant(grants, &name, &email, IdentitySource::Host))
@@ -1065,6 +1111,14 @@ impl WorkflowPrerequisiteFlow {
                     return Ok(declined_identity());
                 }
                 Ok(grant(grants, &name, &email, IdentitySource::Entered))
+            }
+            // A plain-directory root has no repository config of its own; a
+            // write would land in whatever checkout encloses it. Use the
+            // identity for the run instead (the choice is never offered there).
+            IdentityChoice::SetLocalFromHost { name, email }
+                if self.options.scope.is_directory() =>
+            {
+                Ok(grant(grants, &name, &email, IdentitySource::Host))
             }
             IdentityChoice::SetLocalFromHost { name, email } => {
                 let command = check
@@ -1104,9 +1158,16 @@ impl WorkflowPrerequisiteFlow {
                 }
             }
             IdentityChoice::Continue => {
-                frontend.write_message(warning(
-                    "continuing without a git identity: commit_changes will fail",
-                ));
+                // Declining an optional identity is a decision, not a gap.
+                if !self
+                    .options
+                    .scope
+                    .is_optional(&WorkflowPrerequisite::GitIdentity)
+                {
+                    frontend.write_message(warning(
+                        "continuing without a git identity: commit_changes will fail",
+                    ));
+                }
                 Ok(declined_identity())
             }
         }
@@ -1723,7 +1784,7 @@ impl WorkflowPrerequisiteFlow {
         redaction: &RedactionSet,
         frontend: &mut dyn WorkflowPrerequisiteFrontend,
     ) -> Result<(WorkflowPrerequisites, WorkflowPrerequisiteReport), CommandError> {
-        let mut needs = WorkflowPrerequisites::from_workflow(workflow);
+        let mut needs = self.applicable(&WorkflowPrerequisites::from_workflow(workflow));
         let destinations: std::collections::BTreeSet<_> = self
             .remotes_for(&needs)
             .into_values()

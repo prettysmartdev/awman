@@ -1,7 +1,5 @@
-//! Squad-tab attach actions (the TUI side). The `SquadAttachFrontend`
-//! producer and `SquadAttachSession` are Layer 2 since WI 0142
-//! (`command::instance::{per_command, feeds}`); the session type is
-//! re-exported here under its established path.
+//! Squad-tab attach presentation. The shared daemon viewer and its local
+//! session lifecycle live in Layer 2; this module restores the card grid.
 
 use crate::command::dispatch::Dispatch;
 use crate::frontend::tui::app::{App, Focus};
@@ -29,7 +27,13 @@ pub fn detach_squad_attach(app: &mut App) -> bool {
         return false;
     };
     tab.command_result_rx = None;
+    tab.dialog_request_rx = None;
+    tab.dialog_response_tx = None;
     tab.end_attach_session();
+    if app.command_dialog_active {
+        app.active_dialog = None;
+    }
+    app.command_dialog_active = false;
     app.focus = Focus::ExecutionWindow;
     app.status_bar.text =
         format!("Detached from {task}. Its containers are still running — press 'a' to reattach.");

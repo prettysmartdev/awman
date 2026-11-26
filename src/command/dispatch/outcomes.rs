@@ -23,7 +23,6 @@ pub enum CommandOutcome {
     DaemonApi(crate::command::commands::daemon::api::DaemonApiOutcome),
     Daemon(crate::command::commands::daemon::lifecycle::DaemonOutcome),
     Squad(crate::command::commands::squad::commands::SquadOutcome),
-    SquadAttach(crate::command::commands::squad::attach::SquadAttachOutcome),
     Remote(crate::command::commands::remote::RemoteOutcome),
     New(crate::command::commands::new::NewOutcome),
     Edit(crate::command::commands::edit::EditOutcome),
@@ -70,7 +69,6 @@ impl CommandOutcome {
             Self::ExecWorkflow(outcome) => outcome.exit_code.unwrap_or(0),
             Self::ExecPrompt(outcome) => outcome.exit_code.unwrap_or(1),
             Self::QueuePick(outcome) => outcome.exit_code.unwrap_or(1),
-            Self::SquadAttach(outcome) => outcome.exit_code,
             Self::Agents(outcome) => outcome.exit_code(),
             // `remote exec --follow` reports the remote command's result.
             Self::Remote(outcome) => outcome.exit_code(),

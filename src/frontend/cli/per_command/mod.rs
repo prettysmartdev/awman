@@ -17,7 +17,6 @@ pub(crate) mod queue;
 pub(crate) mod render;
 
 pub(crate) mod squad;
-pub(crate) mod squad_attach;
 
 mod chat;
 mod clean;

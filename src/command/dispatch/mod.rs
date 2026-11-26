@@ -26,7 +26,6 @@ use crate::command::commands::init::{InitCommand, InitCommandFrontend};
 use crate::command::commands::new::{NewCommand, NewCommandFrontend};
 use crate::command::commands::ready::{ReadyCommand, ReadyCommandFrontend};
 use crate::command::commands::remote::{RemoteCommand, RemoteCommandFrontend};
-use crate::command::commands::squad::attach::{SquadAttachCommand, SquadAttachFrontend};
 use crate::command::commands::squad::commands::{SquadCommand, SquadCommandFrontend};
 use crate::command::commands::squad::gateway::TaskGateway;
 use crate::command::commands::squad::runtime_guard::require_container_tier;
@@ -225,7 +224,6 @@ pub trait DispatchFrontend:
     + DaemonApiCommandFrontend
     + LinkFrontend
     + SquadCommandFrontend
-    + SquadAttachFrontend
     + RemoteCommandFrontend
     + NewCommandFrontend
     + EditCommandFrontend
@@ -248,7 +246,6 @@ impl<T> DispatchFrontend for T where
         + DaemonApiCommandFrontend
         + LinkFrontend
         + SquadCommandFrontend
-        + SquadAttachFrontend
         + RemoteCommandFrontend
         + NewCommandFrontend
         + EditCommandFrontend
@@ -278,7 +275,6 @@ pub enum BuiltCommand {
     DaemonApi(DaemonApiCommand),
     Link(LinkCommand),
     Squad(SquadCommand),
-    SquadAttach(SquadAttachCommand),
     Remote(RemoteCommand),
     New(NewCommand),
     Edit(EditCommand),
@@ -1343,7 +1339,6 @@ impl BuiltCommand {
             DaemonApi => DaemonApiCommandFrontend,
             Link => LinkFrontend,
             Squad => SquadCommandFrontend,
-            SquadAttach => SquadAttachFrontend,
             Remote => RemoteCommandFrontend,
             New => NewCommandFrontend,
             Edit => EditCommandFrontend,

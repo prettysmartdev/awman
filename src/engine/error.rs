@@ -111,6 +111,11 @@ pub enum EngineError {
     #[error("agent {id} no longer exists")]
     AgentNotFound { id: String },
 
+    /// The live owner's local attach endpoint has not been published yet.
+    /// Only startup-aware callers may retry this typed readiness result.
+    #[error("agent terminal for {id} is still starting")]
+    AgentTerminalStarting { id: String },
+
     #[error("sandbox backend error: {0}")]
     Sandbox(String),
 

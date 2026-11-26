@@ -153,31 +153,6 @@ pub struct ApiDispatchFrontend {
 #[async_trait::async_trait]
 impl crate::command::commands::squad::commands::SquadCommandFrontend for ApiDispatchFrontend {}
 
-impl crate::command::commands::squad::attach::SquadAttachFrontend for ApiDispatchFrontend {
-    fn ask_pick_candidate(
-        &mut self,
-        _candidates: &[crate::command::commands::squad::attach::SquadContainer],
-    ) -> Result<Option<usize>, CommandError> {
-        Err(CommandError::NotAvailableForFrontend {
-            command: "squad attach".into(),
-            frontend: "api".into(),
-        })
-    }
-
-    fn on_slot_attached(
-        &mut self,
-        _step: &str,
-        _instance: Box<dyn crate::engine::agent_runtime::AgentInstance>,
-    ) -> Result<(), CommandError> {
-        Err(CommandError::NotAvailableForFrontend {
-            command: "squad attach".into(),
-            frontend: "api".into(),
-        })
-    }
-
-    fn on_slot_exited(&mut self, _step: &str) {}
-}
-
 impl ApiDispatchFrontend {
     /// Construct a new frontend from the HTTP request's subcommand + args.
     ///

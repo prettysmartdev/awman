@@ -16,7 +16,7 @@ use crate::command::commands::worktree_lifecycle::{
     FinalizePolicy, WorktreeLifecycle, WorktreeLifecycleFrontend,
 };
 use crate::command::commands::Command;
-use crate::command::commands::{parse_overlay_list, TypedOverlay};
+use crate::command::commands::{parse_overlay_list_with_env, TypedOverlay};
 use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
@@ -383,6 +383,11 @@ pub struct ExecWorkflowCommand {
     /// ordinary `awman exec workflow`, which keeps its own per-invocation
     /// workflow context directory.
     task_workspace: Option<PathBuf>,
+    /// Which workflow prerequisites apply to this run's root (WI 0088).
+    /// `Repository` for an ordinary `awman exec workflow`; a squad task
+    /// bound to a plain directory supplies its captured scope so Git/PR-only
+    /// checks are omitted rather than reported missing.
+    prerequisite_scope: crate::command::commands::workflow_prerequisites::PrerequisiteScope,
     /// When set (only for squad-generated workflows whose session root must
     /// stay untouched between runs), the directory the engine's workflow-state
     /// file lives under, instead of the session's git root. `None` for an
@@ -419,6 +424,7 @@ impl ExecWorkflowCommand {
             session,
             squad_identity: None,
             task_workspace: None,
+            prerequisite_scope: Default::default(),
             workflow_state_root: None,
             managed_session: None,
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -552,6 +558,17 @@ impl ExecWorkflowCommand {
     /// container path serves the leader and every step.
     pub fn with_task_workspace(mut self, workspace: PathBuf) -> Self {
         self.task_workspace = Some(workspace);
+        self
+    }
+
+    /// The typed applicability of workflow prerequisites to this run's root,
+    /// applied by the prerequisite flow at run start, after generation and
+    /// before teardown. A failing Git step still fails visibly as a step.
+    pub fn with_prerequisite_scope(
+        mut self,
+        scope: crate::command::commands::workflow_prerequisites::PrerequisiteScope,
+    ) -> Self {
+        self.prerequisite_scope = scope;
         self
     }
 

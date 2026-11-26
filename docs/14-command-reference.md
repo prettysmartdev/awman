@@ -619,15 +619,18 @@ Attach to a running squad task container.
 
 Available via: CLI, TUI
 
+Runs without a working agent runtime — reachable even when the configured runtime cannot be started on this host.
+
 | Argument | Kind | Required | Help |
 |---|---|---|---|
 | `name` | string | yes | Task name. |
 
 | Flag | Kind | Default | Implies | Conflicts | Frontends | Help |
 |---|---|---|---|---|---|---|
-| `--step` | string | — | — | — | CLI, TUI | Workflow step whose terminal to open. |
+| `--step` | string | — | — | — | CLI, TUI | Step whose terminal to open. |
 | `--read-only` | bool | false | — | — | CLI, TUI | Never send input or resize; watch only. |
 | `--annotation` | string (repeatable) | [] | — | — | CLI, TUI | Integration metadata on this view, k=v (repeatable). |
+| `--container` | string | — | — | — | CLI, TUI | Recorded container name or unambiguous prefix. |
 
 ### `awman squad env`
 

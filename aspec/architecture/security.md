@@ -199,6 +199,12 @@ reported as `git_auth_failed`.
 
 Workflow grants are ephemeral command state, never session or workflow-state data. Each grant is limited to the repository/run, the relevant remote and credential kind, and only the setup or teardown steps whose declared needs require it. A selected SSH key is mounted read-only to only the relevant phase-step container; token environment values are injected only into the relevant step, and token-authenticated CI receives the token through an explicit typed engine input. Before non-cancelled teardown, granted credentials are rechecked; only an existing host-command token grant configured for `beforeTeardown` may be refreshed. Cancellation cleanup receives no grants and skips publishing steps. Dynamic workflows narrow grants to the generated workflow's actual needs and discard unused grants.
 
+An identity selected in a task prerequisite interview retains a typed
+commit-step-only scope when saved on the task. It does not become a run-wide
+fixed identity. Explicit fixed-identity configuration/flags retain their
+existing run-wide scope. Older serialized policies without the scope field
+retain that existing scope.
+
 Remembered decisions are stored in `~/.awman/prerequisite-grants.json`, scoped by canonical repository root, normalized remote, and credential kind. The store contains decisions and key selection metadata only, never private key bytes or token values. Revocation is supported. Repository configuration can never grant host credential use: it may narrow policy, suggest a key, or define an acquisition command that needs its own exact-argv approval. Credential `allow` policy is limited to trusted global/task/explicit-flag sources; repository `allow` is ignored. Repository policy also cannot turn preflight off, relax global unresolved `fail`, expand the configured token environment-variable set, or disable globally enabled token verification. API clients cannot widen credential grants unless the global-only `workflows.prerequisites.allowApiClientGrants` setting enables that behavior.
 
 Workflow prerequisite grants exclude `run_shell`, `run_script`, main agent steps,

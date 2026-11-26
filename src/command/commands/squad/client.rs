@@ -242,4 +242,12 @@ impl TaskGateway for DaemonSquadClient {
             Err(e) => Err(e),
         }
     }
+
+    async fn run_terminals(
+        &self,
+        run: &RunId,
+    ) -> Result<Vec<crate::data::terminal::TerminalRecord>, CommandError> {
+        self.all(&["terminals"], vec![("owner_id", run.to_string())])
+            .await
+    }
 }

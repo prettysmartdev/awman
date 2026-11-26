@@ -89,7 +89,6 @@ pub fn render(outcome: &CommandOutcome, json: bool) -> Option<String> {
         CommandOutcome::Edit(o) => render_edit(o, json),
         CommandOutcome::Clean(o) => render_clean(o),
         CommandOutcome::Squad(o) => super::squad::render_squad(o, json),
-        CommandOutcome::SquadAttach(_) => None,
     }
 }
 

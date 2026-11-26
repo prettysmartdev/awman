@@ -239,6 +239,12 @@ fn intercept_agents_watch_stop(
     true
 }
 pub(super) fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
+    if key.code == KeyCode::Char('c')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && crate::frontend::tui::squad_attach::detach_squad_attach(app)
+    {
+        return;
+    }
     // Active-tab suppression input: the user is interacting with this tab.
     let tab = app.active_tab();
     tab.shared
@@ -724,16 +730,22 @@ pub(super) fn handle_new_tab_path(app: &mut App, path: &str) {
     if path.is_empty() {
         return;
     }
-    let raw = std::path::PathBuf::from(path);
-    let dir = if raw.is_absolute() {
-        raw
-    } else {
-        app.active_tab().session.working_dir().join(raw)
+    let tab = app.active_tab();
+    let dir = crate::command::dispatch::frontend_action::propose_new_tab_dialog(
+        tab.new_tab_kind(),
+        tab.session.env(),
+        tab.session.working_dir(),
+    )
+    .and_then(|proposal| {
+        crate::command::dispatch::frontend_action::resolve_new_tab_directory(&proposal, path)
+    });
+    let dir = match dir {
+        Ok(dir) => dir,
+        Err(error) => {
+            report_new_tab_failure(app, error.to_string());
+            return;
+        }
     };
-    if !dir.is_dir() {
-        report_new_tab_failure(app, format!("Not a directory: {path}"));
-        return;
-    }
 
     let idx = match app.add_tab(dir, crate::data::session::SessionOpenOptions::default()) {
         Ok(idx) => idx,

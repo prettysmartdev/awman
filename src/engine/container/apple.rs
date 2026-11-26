@@ -422,6 +422,15 @@ impl ContainerBackend for AppleBackend {
                 "cannot resolve the attach socket directory (no home directory)".into(),
             )
         })?;
+        match std::fs::metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(EngineError::AgentTerminalStarting {
+                    id: handle.id.clone(),
+                });
+            }
+            Err(error) => return Err(EngineError::io(&path, error)),
+        }
         Ok(Box::new(
             crate::engine::container::attach_socket::SocketAttachInstance {
                 handle: handle.clone(),

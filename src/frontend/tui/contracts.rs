@@ -1,10 +1,12 @@
 //! User journeys through the real key handler and renderer on private state.
 use super::*;
+use crate::command::dispatch::Dispatch;
 use crate::command::{
     dispatch::Engines,
     instance::{local::LocalInstanceBackend, InstanceParts},
 };
 use crate::data::session::SessionOpenOptions;
+use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use awman_test_support::{TestCase, TestSandbox};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{backend::TestBackend, Terminal};
@@ -21,6 +23,10 @@ fn app(s: &TestSandbox) -> App {
             })
             .collect(),
     );
+    app_with_env(s, env)
+}
+
+fn app_with_env(s: &TestSandbox, env: EnvSnapshot) -> App {
     let session = Session::open_at_directory_root(
         s.work(),
         SessionOpenOptions {
@@ -42,6 +48,84 @@ fn app(s: &TestSandbox) -> App {
         Tab::new(session),
         tokio::runtime::Handle::current(),
     )
+}
+
+#[tokio::test]
+async fn ctrl_t_dialog_uses_working_directory_for_normal_tab() {
+    let s = TestSandbox::for_test(TestCase::component(
+        "frontend::tui::contracts::ctrl_t_dialog_uses_working_directory_for_normal_tab",
+    ));
+    let mut app = app(&s);
+    let cwd = app
+        .active_tab()
+        .session
+        .working_dir()
+        .to_string_lossy()
+        .to_string();
+
+    press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+    match app.active_dialog.as_ref().unwrap() {
+        Dialog::TextInput { editor, .. } => assert_eq!(editor.text, cwd),
+        _ => panic!("expected editable New Tab dialog"),
+    }
+    drop(app);
+    s.finish();
+}
+
+#[tokio::test]
+async fn ctrl_t_dialog_uses_captured_home_for_squad_tab() {
+    let s = TestSandbox::for_test(TestCase::component(
+        "frontend::tui::contracts::ctrl_t_dialog_uses_captured_home_for_squad_tab",
+    ));
+    let mut app = app(&s);
+    let session = Session::open_squad_root(app.active_tab().session.env()).unwrap();
+    assert_ne!(session.working_dir(), s.home());
+    app.push_tab(Tab::new_squad(session));
+    app.active_tab = 1;
+    let home = s.home().display().to_string();
+
+    press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+    match app.active_dialog.as_ref().unwrap() {
+        Dialog::TextInput { editor, .. } => assert_eq!(editor.text, home),
+        _ => panic!("expected editable New Tab dialog"),
+    }
+    drop(app);
+    s.finish();
+}
+
+#[tokio::test]
+async fn ctrl_t_dialog_reports_unresolved_squad_home() {
+    let s = TestSandbox::for_test(TestCase::component(
+        "frontend::tui::contracts::ctrl_t_dialog_reports_unresolved_squad_home",
+    ));
+    let mut values: std::collections::BTreeMap<String, String> = s
+        .env()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    values.remove(crate::data::config::env::HOME);
+    let mut app = app_with_env(&s, EnvSnapshot::from_full_env(values));
+    let session = app.active_tab().session.clone();
+    app.push_tab(Tab::new_squad(session));
+    app.active_tab = 1;
+
+    press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+
+    match app.active_dialog.as_ref().unwrap() {
+        Dialog::Notice { body, .. } => {
+            assert!(body.contains("Could not resolve your home directory"))
+        }
+        _ => panic!("expected home-resolution error notice"),
+    }
+    drop(app);
+    s.finish();
 }
 fn press(app: &mut App, key: KeyCode, modifiers: KeyModifiers) {
     key_handler::handle_key_event(app, KeyEvent::new(key, modifiers));
@@ -597,4 +681,205 @@ async fn retired_gemini_selection_journey(s: &TestSandbox) {
         "a container slot was started for a refused agent"
     );
     drop(app);
+}
+
+fn squad_app(s: &TestSandbox) -> App {
+    let mut app = app(s);
+    let session = Session::open_squad_root(app.active_tab().session.env()).unwrap();
+    app.push_tab(Tab::new_squad(session));
+    app.active_tab = 1;
+    app.focus = app::Focus::ExecutionWindow;
+    app
+}
+
+#[tokio::test]
+async fn squad_detach_returns_grid_and_discards_late_events_and_completion() {
+    use crate::command::instance::feeds::ContainerSlotEvent;
+    use crate::frontend::tui::tabs::ExecutionPhase;
+    let s = TestSandbox::for_test(TestCase::component("frontend::tui::contracts::squad_detach_returns_grid_and_discards_late_events_and_completion"));
+    let mut app = squad_app(&s);
+    let tab_id = app.active_tab().session_id;
+    let state = app.active_tab_mut().squad.as_mut().unwrap();
+    state.selected = 3;
+    let poller = state.cancel.clone();
+    let session = state.attach_session.clone();
+    let cancel = app.active_tab().shared.command_cancel.clone();
+    let generation = session.begin_command("squad attach task", cancel.clone());
+    let events = app.active_tab().shared.container.clone();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    {
+        let tab = app.active_tab_mut();
+        tab.command_result_rx = Some(result_rx);
+        tab.execution_phase = ExecutionPhase::Running {
+            command: "squad attach task".into(),
+        };
+        tab.start_container("agent".into(), "daemon-owned".into(), 80, 24);
+        tab.container_window_state = tabs::ContainerWindowState::Maximized;
+    }
+    events.push(ContainerSlotEvent::Launched {
+        step_name: "queued".into(),
+        agent: "agent".into(),
+        model: None,
+        io: None,
+    });
+    press(&mut app, KeyCode::Char('\\'), KeyModifiers::CONTROL);
+    assert!(cancel.is_cancelled());
+    assert_eq!(app.active_tab().session_id, tab_id);
+    assert!(app.squad_grid_active());
+    assert!(draw(&mut app, 120, 40).contains(" squad "));
+    assert_eq!(app.active_tab().squad.as_ref().unwrap().selected, 3);
+    assert!(!poller.is_cancelled());
+    assert!(app.active_tab().command_result_rx.is_none());
+    assert!(app.active_tab().container_slots.is_empty());
+    events.push(ContainerSlotEvent::Launched {
+        step_name: "late".into(),
+        agent: "agent".into(),
+        model: None,
+        io: None,
+    });
+    assert!(result_tx
+        .send(Ok(crate::command::dispatch::CommandOutcome::Empty))
+        .is_err());
+    app.active_tab_mut().drain_container_slot_events();
+    app.active_tab_mut().poll_command_completion();
+    assert!(app.squad_grid_active());
+    let next_cancel = tokio_util::sync::CancellationToken::new();
+    let next_generation = session.begin_command("reattach", next_cancel.clone());
+    session.end_if_current(generation);
+    assert!(
+        !next_cancel.is_cancelled(),
+        "old completion must not end the new viewer"
+    );
+    session.end_if_current(next_generation);
+    assert!(next_cancel.is_cancelled());
+    assert!(
+        !squad_attach::detach_squad_attach(&mut app),
+        "double detach is harmless"
+    );
+    drop(app);
+    s.finish();
+}
+
+#[tokio::test]
+async fn squad_waiting_and_timeout_are_visible_and_ctrl_c_drops_dialogs() {
+    use crate::command::commands::attach::AttachCommandFrontend;
+    use crate::data::message::{MessageLevel, UserMessage};
+    let s = TestSandbox::for_test(TestCase::component(
+        "frontend::tui::contracts::squad_waiting_and_timeout_are_visible_and_ctrl_c_drops_dialogs",
+    ));
+    let mut app = squad_app(&s);
+    // Exercise the production instance producer, including synchronous submit
+    // registration, before any daemon round trip has had a chance to finish.
+    let tab = app.active_tab_mut();
+    let parsed =
+        Dispatch::<TuiCommandFrontend>::parse_command_box_input("squad attach task").unwrap();
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let (response_tx, response_rx) = std::sync::mpsc::channel();
+    let (stdout_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut producer = crate::command::instance::frontend::InstanceCommandFrontend::new(
+        parsed,
+        crate::command::instance::frontend::DialogChannels::new(request_tx, response_rx),
+        crate::engine::agent_runtime::frontend::AgentIo {
+            stdout: stdout_tx.clone(),
+            stderr: stdout_tx,
+            stdin_tx,
+            stdin_rx,
+            resize: None,
+            initial_size: None,
+        },
+        tab.shared(),
+    )
+    .with_squad_attach(Some(crate::command::instance::feeds::SharedSquadAttach {
+        session: tab.squad.as_ref().unwrap().attach_session.clone(),
+        daemon_reachable: tab.squad.as_ref().unwrap().daemon_reachable.clone(),
+    }));
+    let cancel = producer.begin_resolve("task");
+    producer.attach_status(UserMessage {
+        level: MessageLevel::Info,
+        text: crate::command::commands::squad::attach::WAITING_FOR_TERMINAL.into(),
+    });
+    assert!(draw(&mut app, 120, 40).contains("Waiting for agent terminal to start…"));
+    app.active_tab_mut().execution_phase = tabs::ExecutionPhase::Error {
+        command: "squad attach task".into(),
+        message: "daemon unavailable".into(),
+    };
+    let frame = draw(&mut app, 140, 40);
+    assert!(frame.contains("daemon unavailable"));
+    assert!(!frame.contains("Waiting for agent terminal to start…"));
+    app.active_tab_mut().execution_phase = tabs::ExecutionPhase::Idle;
+    producer.terminal_ready();
+    assert!(app
+        .active_tab()
+        .shared
+        .attach_status
+        .lock()
+        .unwrap()
+        .is_none());
+    producer.attach_status(UserMessage {
+        level: MessageLevel::Warning,
+        text: crate::command::commands::squad::attach::TaskAttachEnd::StartupTimedOut
+            .message(Default::default()),
+    });
+    assert!(draw(&mut app, 140, 40).contains("The agent terminal did not start within 10 seconds"));
+    let (agent_input, mut received_input) = tokio::sync::mpsc::unbounded_channel();
+    app.active_tab_mut()
+        .start_container("agent".into(), "daemon-owned".into(), 80, 24);
+    app.active_tab_mut()
+        .focused_slot_mut()
+        .unwrap()
+        .container_stdin_tx = Some(agent_input);
+    app.active_tab_mut().container_window_state = tabs::ContainerWindowState::Maximized;
+    app.active_tab_mut().dialog_request_rx = Some(request_rx);
+    app.active_tab_mut().dialog_response_tx = Some(response_tx);
+    app.active_dialog = Some(Dialog::Notice {
+        title: "command dialog".into(),
+        body: "pending".into(),
+        copy_key: None,
+        copy_zshrc_snippet: None,
+    });
+    app.command_dialog_active = true;
+    press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+    assert!(cancel.is_cancelled());
+    assert!(
+        received_input.try_recv().is_err(),
+        "Ctrl-C must not reach the daemon-owned agent"
+    );
+    assert!(app.active_dialog.is_none() && !app.command_dialog_active);
+    assert!(
+        app.active_tab().dialog_request_rx.is_none()
+            && app.active_tab().dialog_response_tx.is_none()
+    );
+    assert!(app.squad_grid_active());
+    assert!(draw(&mut app, 120, 40).contains(" squad "));
+    producer.end_attach();
+    app.active_tab_mut().drain_container_slot_events();
+    assert!(app.squad_grid_active());
+    drop(producer);
+    drop(app);
+    s.finish();
+}
+
+#[tokio::test]
+async fn squad_new_tab_cancel_opens_nothing_and_relative_confirm_uses_home() {
+    let s = TestSandbox::for_test(TestCase::component("frontend::tui::contracts::squad_new_tab_cancel_opens_nothing_and_relative_confirm_uses_home"));
+    let mut app = squad_app(&s);
+    std::fs::create_dir_all(s.home().join("projects/chosen")).unwrap();
+    let count = app.tabs.len();
+    press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+    press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    assert_eq!(app.tabs.len(), count);
+    press(&mut app, KeyCode::Char('t'), KeyModifiers::CONTROL);
+    let Some(Dialog::TextInput { editor, .. }) = app.active_dialog.as_mut() else {
+        panic!("New Tab dialog missing")
+    };
+    editor.set_text("projects/chosen");
+    press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.tabs.len(), count + 1);
+    assert_eq!(
+        app.active_tab().session.working_dir(),
+        s.home().join("projects/chosen")
+    );
+    drop(app);
+    s.finish();
 }

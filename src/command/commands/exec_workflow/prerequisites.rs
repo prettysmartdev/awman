@@ -44,6 +44,7 @@ impl ExecWorkflowCommand {
             Some(phase_image),
         );
         options.worktree_planned = self.flags.worktree || self.flags.dynamic;
+        options.scope = self.prerequisite_scope;
         WorkflowPrerequisiteFlow::new(&self.engines, &self.session, options)
     }
 

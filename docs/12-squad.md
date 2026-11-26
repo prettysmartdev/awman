@@ -70,8 +70,27 @@ awman squad add \
 
 The interactive interview also asks which workflow prerequisites (commit
 identity, SSH key, GitHub token) the task may use; on the command line, set them
-with the `--prerequisite-*` flags. Do not add `env(GITHUB_TOKEN)` or `ssh()`
-overlays just so workflows can push and open pull requests.
+with the `--prerequisite-*` flags. For repository-backed tasks, these grants
+let workflow Git/PR steps use credentials without broad task overlays.
+
+What the interview asks depends on the task's workspace. A task whose
+workspace is a plain directory — the default workspace, or a custom folder that
+is not a Git repository root, including a subdirectory inside a repository —
+has no Git remote to push to, so it is never asked about, checked for, or
+warned about a Git remote, upstream, push access (SSH key or GitHub token), a
+pushed branch, or pull requests. The only question it can get is the optional
+commit identity, and declining or leaving it unset produces no warning. An
+identity chosen in the interview is passed only to containers running
+`commit_changes`. A fixed identity set through explicit flags still applies to
+every workflow container. Directory task
+leaders and runs omit the Git/PR checks described above. If a directory task's workflow clones a repository and
+pushes or opens a pull request, supply the SSH key or GitHub token through
+explicit task overlays (for example `ssh()` or `env(GITHUB_TOKEN)`; see
+[Overlays](08-overlays.md)). `ssh()` uses the home directory captured for the
+task session, and `env()` reads that session's explicit environment. Without
+them, such a step runs and fails visibly as a step rather than being blocked
+beforehand. A task whose workspace is a Git
+repository root keeps the full set of checks described above.
 
 Task policies are layered over the global former squad prerequisite setting
 defaults: a task that changes only its SSH policy still inherits the global
@@ -581,8 +600,11 @@ happen to have `awman` open.
 
 Two ways to get there:
 
-- **`Ctrl-S` from the New Tab dialog.** Press **Ctrl-T** to open a new tab;
-  the key-hint row under the text box reads `[Enter] submit   [Esc] cancel
+- **`Ctrl-S` from the New Tab dialog.** Press **Ctrl-T** to open a new tab.
+  On the squad tab, the path box is pre-filled with your home directory and
+  can be edited before you confirm; on any other tab it is pre-filled with that
+  tab's working directory. If your home directory cannot be determined, a
+  notice says so instead of opening the dialog. The key-hint row under the text box reads `[Enter] submit   [Esc] cancel
   [Ctrl+S] open squad`. Pressing **Ctrl-S** while that dialog is focused
   closes the dialog and opens (or focuses) the squad tab instead of creating
   a directory-bound tab. This doesn't change what
@@ -802,72 +824,51 @@ once:
 awman squad attach issue-triage
 ```
 
-If exactly one container is running for the task, this attaches your
-terminal directly to the running agent's terminal UI. Squad-launched agents
-run with a PTY even when nobody is attached, so attach reconnects to the
-actual agent process rather than opening a shell beside it. If the task has
-no run in progress right now,
-the command fails immediately rather than pretending an old run is still
-live. If the configured runtime is unavailable or its listing request fails,
-attach reports that runtime error instead of claiming there are no task
-containers; restore runtime availability and retry. If more than one container
-is running (a generated workflow with
-parallel steps), the command lists each one's short ID and label and asks
-you to disambiguate:
+This opens the current agent terminal served by the daemon, using the same
+viewer as `awman attach task_…`. Squad agents normally run with a PTY, so you
+see the agent's terminal UI. With parallel steps, choose a particular terminal
+by step name or container name:
 
 ```sh
-awman squad attach issue-triage --container a1b2c3d4e5f6
+awman squad attach issue-triage --step implement
+awman squad attach issue-triage --container awman-squad-issue-triage-abc123
+awman squad attach issue-triage --read-only --annotation source=monitor
 ```
 
-Detaching (`Ctrl-C`, closing the terminal) only ends your local attach
-session — the container and the daemon are left running, and you can
-attach again later. Note that `Ctrl-C` here ends the *client*; from the TUI, use
-`Ctrl-\` instead, which never reaches the agent (see below).
+The viewer preserves the daemon's input-control rules. Use `--read-only` to
+watch without requesting input or resizing the agent's terminal.
+
+If a run is in progress but its terminal is still starting, attach displays
+`Waiting for agent terminal to start…` and checks for up to ten seconds.
+It waits only for that run. Cancellation, run completion or replacement ends
+the wait with an explanation; a timeout asks you to try again. An idle or
+unknown task, an invalid selector once containers are known, and daemon or
+transport errors are reported directly. The viewer closes when its selected
+terminal exits; attach again to view the next step or run.
+
+Detaching with **Ctrl-C** or closing your terminal ends only your local viewer.
+The daemon and its containers continue running, and you can attach again.
 
 ### From the TUI
 
-Pressing **a** in the squad tab attaches to every running container for the
-selected task at once, showing the actual agent TUIs and reproducing the same view you'd get from
-`awman exec workflow --dynamic`: the Workflow Overview across the
-bottom, one container maximized and the rest as minimized bars, and
-**Ctrl-S** to cycle focus between them. If the task is still in its
-evaluation phase (no workflow yet), you instead see the single evaluation
-container with no Workflow Overview.
+Press **a** on a task card to open its current terminal in the same tab.
+Startup waiting and timeout messages appear in the visible hint bar above the
+command box. You can also type the CLI forms above in the command box to
+select a step or container or watch read-only.
 
-**Press Ctrl-\\ to detach.** While you are attached, every other key — including
-**Ctrl-C** — is forwarded straight into the focused agent's terminal, which is
-what makes an attached agent usable and what makes Ctrl-C the wrong way out:
-it interrupts the agent's unattended work. Ctrl-\\ never reaches the agent. It
-ends your local attach session, leaves every container running, and returns you
-to the task grid, where **a** reattaches. The hint bar above the command box
-shows `ctrl-\ detach` whenever keys are going to a container.
+**Ctrl-\\** or **Ctrl-C** ends the local attachment, including while waiting.
+The next frame shows the same tab's task cards, with your selection retained.
+Task-list polling continues, and **a** reattaches to the still-running task.
+These detach keys are consumed locally and never sent to the agent. Starting
+another command also ends the old viewer.
 
-Ctrl-\\ is not squad-specific: it detaches from any container view in the TUI.
-On an ordinary tab it minimizes the running command's container — the command
-keeps running, output keeps streaming into its status bar, and **Ctrl-M** brings
-the view back.
+On ordinary tabs, **Ctrl-\\** minimizes the running command's container view;
+**Ctrl-M** restores it.
 
-While attached, the daemon dying doesn't interrupt anything already
-streaming — those are direct connections to the container runtime, not
-proxied through the daemon — but the Workflow Overview freezes and the tab
-shows a "daemon not reachable" indicator until the daemon comes back.
-
-If the local attach client itself dies (for example, the container stopped a
-moment earlier), the session ends and the client's exit code and final output
-are written to the tab's status log, so a failed attach explains itself
-rather than silently returning to the task grid.
-
-Attach has the same semantics on every supported runtime. On **docker**, it is a
-native `docker attach` to the agent's TTY. On **apple** and
-**builtin**, which have no attach verb, the awman process that launched the agent (the squad daemon, for squad tasks)
-serves the agent's live terminal on a local, user-private socket, and attach
-connects to that. Either way you reach the real agent TUI, several clients
-can attach at once, and detaching never stops the container.
-
-The caveat on those two runtimes: the launching process is the only holder of
-the agent's terminal there, so if it has exited (say, the daemon was
-restarted mid-run), attach reports that there is no live attach endpoint —
-the agent's per-run log file still has everything it printed.
+All supported runtimes use the daemon terminal service for these viewers.
+Several viewers can watch a terminal, subject to its input-control rules.
+If the daemon disconnects, the viewer closes; reconnect after the daemon is
+available. Per-run logs remain available for output from a finished agent.
 
 ---
 
@@ -880,7 +881,10 @@ guardrails to every run rather than leaving them optional:
   A custom workspace that is a repository root is the repository root, so
   `--mount-scope cwd` and `--mount-scope gitroot` name the same directory
   there. Every other workspace mounts directly; there is no repository root to
-  widen to.
+  widen to. If a captured repository disappears or discovery finds a different
+  enclosing repository, editing its prerequisites and running it fail clearly.
+  Recreate the task with the intended workspace. Older tasks bound inside a
+  repository without a captured repository boundary also require recreation.
 - **Worktree isolation follows the workspace type.** A custom workspace that
   is a Git repository *root* always runs in its own isolated worktree, exactly
   as `--worktree` does for a manual `exec workflow` run — see [Security &
@@ -920,11 +924,11 @@ guardrails to every run rather than leaving them optional:
 - **A sandbox runtime (`runtime.kind` `sbx`) is refused entirely.**
   squad's task-directory mounts, its evaluation-agent handshake, and
   workflow setup/teardown steps all depend on a real container runtime.
-  Every squad command — including daemon lifecycle commands such as `start`,
-  `stop`, and `logs`, task commands, and the TUI — fails with a clear error
-  naming the configured runtime rather than degrading silently.
-  Use `docker`, `apple` or `builtin` (below) instead.
-- **The experimental builtin runtime (`runtime.kind` `builtin`; Apple Silicon, or Linux x86_64 with KVM) works with squad, with limits.** Squad discovers and attaches to its agents by name and label as on the other runtimes, and its tasks need imported images. Squad evaluates images by importing them from the configured source; it does not build on its own. Prepare them first with `awman ready` (with `runtime.builtin.builder.enabled` and a local `docker-local` or `apple-local` source, `ready` builds then imports; `awman ready --build` forces a refresh). Registry, archive and remote Docker sources are import-only. Like Apple Containers, a builtin session can be reattached only while the awman process that launched it (the squad daemon, for squad tasks) is still running; if the daemon exits, the agent VMs it launched stop with it. On macOS the squad daemon runs in the background under launchd, so macOS may ask for folder access again after every awman upgrade if a task's workspace is under `~/Desktop`, `~/Documents` or another protected folder; see [The macOS binary, Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
+  Task management, daemon lifecycle commands and the Squad tab fail with a
+  clear error naming the configured runtime. Use `docker`, `apple` or `builtin`
+  (below) instead. Terminal viewers (`attach` and `squad attach`) connect to an
+  already-running daemon and do not probe the viewer's local runtime.
+- **The experimental builtin runtime (`runtime.kind` `builtin`; Apple Silicon, or Linux x86_64 with KVM) works with squad, with limits.** Squad runs its agents there and serves their terminals through the daemon, as on other runtimes. Its tasks need imported images. Squad evaluates images by importing them from the configured source; it does not build on its own. Prepare them first with `awman ready` (with `runtime.builtin.builder.enabled` and a local `docker-local` or `apple-local` source, `ready` builds then imports; `awman ready --build` forces a refresh). Registry, archive and remote Docker sources are import-only. Like Apple Containers, a builtin session can be reattached only while the awman process that launched it (the squad daemon, for squad tasks) is still running; if the daemon exits, the agent VMs it launched stop with it. On macOS the squad daemon runs in the background under launchd, so macOS may ask for folder access again after every awman upgrade if a task's workspace is under `~/Desktop`, `~/Documents` or another protected folder; see [The macOS binary, Gatekeeper and permissions](11-runtimes.md#the-macos-binary-gatekeeper-and-permissions). See [Runtimes: Builtin microVM](11-runtimes.md#builtin-microvm-experimental).
 
 ---
 

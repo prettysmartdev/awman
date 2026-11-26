@@ -16,6 +16,7 @@ mod flow;
 mod frontend;
 #[cfg(test)]
 mod images;
+mod scope;
 mod task_policy;
 mod widening;
 
@@ -33,7 +34,10 @@ pub use frontend::{
     GapChoice, IdentityChoice, IdentityPersist, PrerequisiteReportNext, SshChoice, TokenConsent,
     TokenSourceChoice, ToolChoice, WorkflowPrerequisiteFrontend,
 };
-pub use task_policy::{collect_task_prerequisites, edit_task_policy, task_policy_from_outcome};
+pub use scope::{DirectoryIdentity, PrerequisiteScope};
+pub use task_policy::{
+    collect_task_prerequisites, edit_task_policy, task_policy_from_outcome, TaskPrerequisitePlan,
+};
 pub use widening::{
     apply_identity_ceiling, check_flag_widening, check_task_widening, remote_ceiling,
 };

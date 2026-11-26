@@ -31,7 +31,8 @@ use crate::command::commands::workflow_preflight::{
     format_agents_with_models, format_available_agents, refresh_stale_workflow_images,
     validate_generated_workflow, BuildOutputTarget, MissingDockerfilePolicy,
 };
-use crate::command::commands::{parse_overlay_list, CollectedOverlays, Command};
+use crate::command::commands::workflow_prerequisites::TaskPrerequisitePlan;
+use crate::command::commands::{parse_overlay_list_with_env, CollectedOverlays, Command};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::command::interaction::{resolve_interaction, InteractionDecision, InteractionSlot};
@@ -40,7 +41,7 @@ use crate::data::config::env::EnvSnapshot;
 use crate::data::dynamic_workflow_assets::build_squad_leader_prompt;
 use crate::data::fs::task_store::{MountScope, Task};
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
-use crate::data::session::{AgentName, Session, SessionOpenOptions};
+use crate::data::session::{AgentName, Session};
 use crate::data::WorkflowStateStore;
 use crate::engine::agent::AgentRunOptions;
 use crate::engine::agent_runtime::frontend::AgentFrontend;
@@ -387,46 +388,15 @@ impl LocalTaskEvaluator {
     /// task was created fails loudly here rather than silently degrading into
     /// a direct mount of a path that is no longer a repository.
     fn open_session(&self, task: &Task) -> Result<Session, CommandError> {
-        let repo_scope = task.repo_scope.clone();
-        let (working_dir, git_root) = match task.mount_scope {
-            MountScope::Directory => {
-                if !repo_scope.is_dir() {
-                    return Err(CommandError::Other(format!(
-                        "task {:?} is bound to {}, which no longer exists or is not a directory",
-                        task.name,
-                        repo_scope.display()
-                    )));
-                }
-                (repo_scope.clone(), repo_scope)
-            }
-            MountScope::GitRoot => {
-                let git_root = self
-                    .engines
-                    .git_engine
-                    .resolve_root(&repo_scope)
-                    .map_err(CommandError::from)?;
-                (git_root.clone(), git_root)
-            }
-            MountScope::Cwd => {
-                let git_root = self
-                    .engines
-                    .git_engine
-                    .resolve_root(&repo_scope)
-                    .map_err(CommandError::from)?;
-                (repo_scope, git_root)
-            }
-        };
-        let opts = SessionOpenOptions {
-            env: Some(self.env.clone()),
-            ..Default::default()
-        };
-        let session = if task.mount_scope.is_git_repo() {
-            Session::open_at_git_root(working_dir, git_root, opts)
-        } else {
-            Session::open_at_directory_root(working_dir, opts)
-        };
-        let mut session = session
-            .map_err(|error| CommandError::Other(format!("opening squad task session: {error}")))?;
+        if !task.repo_scope.is_dir() {
+            return Err(CommandError::Other(format!(
+                "task {:?} is bound to {}, which no longer exists or is not a directory",
+                task.name,
+                task.repo_scope.display()
+            )));
+        }
+        let mut session = TaskPrerequisitePlan::for_task(task)
+            .open_session(&self.engines, Some(self.env.clone()))?;
         // The task's own config file is a config layer for everything this
         // session runs; env and `--set` still sit above it.
         let task_file = crate::data::fs::SquadPaths::from_env(&self.env)
@@ -955,6 +925,36 @@ impl LocalTaskEvaluator {
             "squad workflow starting"
         );
 
+        let outcome = self
+            .execute_generated_workflow(request, session, &generated_path, interaction)
+            .await?;
+
+        tracing::info!(
+            task = %task.name,
+            run_id = %request.run_id,
+            exit_code = ?outcome.exit_code,
+            "squad workflow finished"
+        );
+
+        Ok(EvaluationOutcome::WorkflowExecuted {
+            reason: verdict_reason,
+            workflow_path: generated_path,
+            workflow_state_path: Some(state_path),
+            exit_code: outcome.exit_code,
+        })
+    }
+
+    /// Execute the validated leader output through the ordinary workflow
+    /// command, retaining the task's captured scope, policy and overlays.
+    pub async fn execute_generated_workflow(
+        &self,
+        request: &EvaluationRequest,
+        session: Session,
+        generated_path: &Path,
+        interaction: InteractionDecision,
+    ) -> Result<crate::command::commands::exec_workflow::ExecWorkflowOutcome, CommandError> {
+        let task = &request.task;
+        let uses_worktree = task.uses_worktree();
         // Stamp every generated-workflow step container with the same squad
         // identity the evaluation leader carries, so prefix discovery finds the
         // whole task's container set — not just the leader (BLOCKER-1).
@@ -972,7 +972,7 @@ impl LocalTaskEvaluator {
             )?;
         }
         let mut workflow_flags = squad_workflow_flags(
-            &generated_path,
+            generated_path,
             uses_worktree,
             &task.overlays,
             task.prerequisites.clone().map(Box::new),
@@ -984,7 +984,15 @@ impl LocalTaskEvaluator {
             // Every step container also gets the durable task workspace at the
             // stable `context(workflow)` path, so a task's persistent data is
             // reachable from its workflow as well as from its leader.
-            .with_task_workspace(request.task_dir.clone());
+            .with_task_workspace(request.task_dir.clone())
+            // The task's captured scope decides which prerequisites the run
+            // preflight and the generated workflow check (WI 0088).
+            .with_prerequisite_scope(
+                crate::command::commands::workflow_prerequisites::TaskPrerequisitePlan::for_task(
+                    task,
+                )
+                .run_scope(),
+            );
         if !uses_worktree {
             // No worktree means the engine's session is rooted at the task's
             // own mounted directory, which must survive every run untouched.
@@ -1001,7 +1009,7 @@ impl LocalTaskEvaluator {
             mount_scope_decision(task.mount_scope),
             interaction,
         )?;
-        if task.prerequisites.is_none() {
+        if task.prerequisites.is_none() && !TaskPrerequisitePlan::for_task(task).is_directory() {
             // A task created before workflow prerequisites existed (WI 0149):
             // "ask" resolves to deny here, and explicit step overlays still work.
             let notice = format!(
@@ -1014,21 +1022,7 @@ impl LocalTaskEvaluator {
                 text: notice,
             });
         }
-        let outcome = command.run_with_frontend(workflow_frontend).await?;
-
-        tracing::info!(
-            task = %task.name,
-            run_id = %request.run_id,
-            exit_code = ?outcome.exit_code,
-            "squad workflow finished"
-        );
-
-        Ok(EvaluationOutcome::WorkflowExecuted {
-            reason: verdict_reason,
-            workflow_path: generated_path,
-            workflow_state_path: Some(state_path),
-            exit_code: outcome.exit_code,
-        })
+        command.run_with_frontend(workflow_frontend).await
     }
 
     /// The leader's run options: yolo (so an unattended agent never blocks on
@@ -1192,12 +1186,14 @@ fn collect_task_overlays(
 ) -> Result<CollectedOverlays, CommandError> {
     let mut cli_typed = Vec::new();
     for spec in &task.overlays {
-        cli_typed.extend(parse_overlay_list(spec).map_err(|reason| {
-            CommandError::InvalidOverlaySpec {
-                spec: spec.clone(),
-                reason,
-            }
-        })?);
+        cli_typed.extend(
+            parse_overlay_list_with_env(spec, session.env()).map_err(|reason| {
+                CommandError::InvalidOverlaySpec {
+                    spec: spec.clone(),
+                    reason,
+                }
+            })?,
+        );
     }
     session
         .effective_config()
@@ -1398,22 +1394,12 @@ fn with_prerequisite_summary(
     session: &Session,
     task: &Task,
 ) -> String {
-    use crate::command::commands::workflow_prerequisites::{
-        WorkflowPrerequisiteFlow, WorkflowPrerequisiteFlowOptions,
-    };
-    use crate::data::workflow_prerequisites::{PrerequisiteOrigin, WorkflowPrerequisites};
-    let options = WorkflowPrerequisiteFlowOptions::for_session(
-        session,
-        crate::command::dispatch::catalogue::FrontendKind::SQUAD_LOCAL,
-        &Default::default(),
-        task.prerequisites.as_ref(),
-        PrerequisiteOrigin::AssumedAll,
-        None,
-    );
-    let flow = WorkflowPrerequisiteFlow::new(engines, session, options);
-    let summary = flow
-        .preflight(&WorkflowPrerequisites::assume_all(), false)
-        .leader_summary();
+    // A directory task has no remote, branch or pull request: those checks
+    // are omitted (not marked unavailable), so the leader is never told a
+    // Git step is impossible merely because the task has no repository.
+    let summary =
+        crate::command::commands::workflow_prerequisites::TaskPrerequisitePlan::for_task(task)
+            .leader_summary(engines, session, task.prerequisites.as_ref());
     if summary.trim().is_empty() {
         return prompt;
     }

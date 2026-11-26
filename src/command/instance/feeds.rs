@@ -451,6 +451,7 @@ impl ContainerLifecycle {
 #[derive(Clone)]
 pub struct TabCommandFeeds {
     pub command_bytes: super::output::CommandBytes,
+    pub attach_status: Arc<Mutex<Option<UserMessage>>>,
     pub workflow: SharedWorkflowPresentation,
     pub container: ContainerLifecycle,
     pub yolo_state: SharedYoloState,
@@ -466,6 +467,7 @@ impl TabCommandFeeds {
     pub fn new() -> Self {
         Self {
             command_bytes: Default::default(),
+            attach_status: Default::default(),
             workflow: SharedWorkflowPresentation::default(),
             container: ContainerLifecycle::default(),
             yolo_state: Arc::new(Mutex::new(None)),
@@ -495,6 +497,7 @@ impl TabCommandFeeds {
     pub fn detach(&mut self) {
         self.command_cancel.cancel();
         self.command_cancel = tokio_util::sync::CancellationToken::new();
+        self.attach_status = Default::default();
         self.workflow = SharedWorkflowPresentation::default();
         self.container = ContainerLifecycle::default();
         self.yolo_state = Arc::new(Mutex::new(None));
@@ -580,7 +583,8 @@ impl UserMessageSink for StatusLogSink {
 /// UI state (formerly `frontend::tui::squad_attach::SquadAttachSession`).
 pub struct SquadAttachSession {
     root_cancel: CancellationToken,
-    current: Mutex<Option<(String, CancellationToken)>>,
+    current: Mutex<Option<(u64, String, CancellationToken)>>,
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl SquadAttachSession {
@@ -588,21 +592,45 @@ impl SquadAttachSession {
         Self {
             root_cancel,
             current: Mutex::new(None),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     pub fn begin(&self, task: &str) -> CancellationToken {
-        let _ = self.end();
         let cancel = self.root_cancel.child_token();
-        if let Ok(mut current) = self.current.lock() {
-            *current = Some((task.to_string(), cancel.clone()));
-        }
+        self.begin_command(task, cancel.clone());
         cancel
+    }
+
+    pub fn begin_command(&self, task: &str, cancel: CancellationToken) -> u64 {
+        let id = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut current = self.current.lock().expect("attach session lock");
+        if let Some((_, _, previous)) = current.take() {
+            previous.cancel();
+        }
+        *current = Some((id, task.to_string(), cancel));
+        id
+    }
+
+    /// An older command may finish after a new one starts. It owns only its
+    /// generation, never whatever session happens to be current now.
+    pub fn end_if_current(&self, id: u64) {
+        let mut current = self.current.lock().expect("attach session lock");
+        if current
+            .as_ref()
+            .is_some_and(|(current_id, _, _)| *current_id == id)
+        {
+            if let Some((_, _, cancel)) = current.take() {
+                cancel.cancel();
+            }
+        }
     }
 
     pub fn end(&self) -> Option<String> {
         let current = self.current.lock().ok()?.take();
-        current.map(|(task, cancel)| {
+        current.map(|(_, task, cancel)| {
             cancel.cancel();
             task
         })
@@ -612,14 +640,25 @@ impl SquadAttachSession {
         self.current
             .lock()
             .ok()
-            .and_then(|current| current.as_ref().map(|(task, _)| task.clone()))
+            .and_then(|current| current.as_ref().map(|(_, task, _)| task.clone()))
     }
+}
 
-    pub(crate) fn cancel_token(&self) -> Option<CancellationToken> {
-        self.current
-            .lock()
-            .ok()
-            .and_then(|current| current.as_ref().map(|(_, cancel)| cancel.clone()))
+/// A command owns only this generation. Cleanup also runs when dispatch
+/// fails before entering the command, or its future/frontend is dropped.
+pub struct AttachSessionLease {
+    session: Arc<SquadAttachSession>,
+    id: u64,
+}
+impl AttachSessionLease {
+    pub fn begin(session: Arc<SquadAttachSession>, task: &str, cancel: CancellationToken) -> Self {
+        let id = session.begin_command(task, cancel);
+        Self { session, id }
+    }
+}
+impl Drop for AttachSessionLease {
+    fn drop(&mut self) {
+        self.session.end_if_current(self.id);
     }
 }
 
