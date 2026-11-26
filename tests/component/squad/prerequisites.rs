@@ -974,7 +974,10 @@ fn removed_nested_repository_never_uses_its_parent() {
         captured
     );
     std::fs::remove_dir_all(captured.join(".git")).unwrap();
-    assert_eq!(engines.git_engine.resolve_root(&captured).unwrap(), parent);
+    assert_eq!(
+        std::fs::canonicalize(engines.git_engine.resolve_root(&captured).unwrap()).unwrap(),
+        parent
+    );
     for scope in [MountScope::GitRoot, MountScope::Cwd] {
         let error = TaskPrerequisitePlan::captured(captured.clone(), scope)
             .open_session(&engines, Some(env.clone()))
@@ -1149,6 +1152,9 @@ async fn generated_directory_workflow_reaches_teardown_without_prerequisite_warn
         .enumerate()
     {
         std::fs::create_dir_all(root.join(".awman")).unwrap();
+        // The session uses the canonical workspace path. On Windows that has
+        // an extended-length prefix, so fake CLI rules must use it too.
+        let root = std::fs::canonicalize(root).unwrap();
         std::fs::write(root.join(".awman/Dockerfile.codex"), "FROM scratch\n").unwrap();
         let before_calls = docker.calls().len();
         let plan = TaskPrerequisitePlan::captured(root.clone(), MountScope::Directory);

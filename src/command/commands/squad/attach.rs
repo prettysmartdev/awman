@@ -53,7 +53,7 @@ impl TaskAttachEnd {
 
 #[derive(Debug)]
 pub enum TaskTerminalResolution {
-    Ready(TerminalRecord),
+    Ready(Box<TerminalRecord>),
     End(TaskAttachEnd),
 }
 
@@ -165,7 +165,7 @@ pub async fn resolve_task_terminal(
                             r.source.as_ref().and_then(|s| s.step_name.as_deref()) == Some(step)
                         })
                 }) {
-                    return Ok(Some(TaskTerminalResolution::Ready(record)));
+                    return Ok(Some(TaskTerminalResolution::Ready(Box::new(record))));
                 }
                 Ok(None)
             };
