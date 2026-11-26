@@ -154,7 +154,7 @@ pub fn validate(m: &Manifest, today: NaiveDate) -> Result<()> {
     for tier in ["unit", "component", "boundary", "guest", "artifact", "soak"] {
         ensure!(m.tiers.contains_key(tier), "missing tier {tier}");
     }
-    for gate in ["pr", "main", "nightly", "candidate", "promote"] {
+    for gate in ["pr", "main", "nightly", "release", "native-diagnostic"] {
         ensure!(m.gates.contains_key(gate), "missing gate {gate}");
     }
     for (id, t) in &m.tiers {
@@ -240,11 +240,13 @@ pub fn validate(m: &Manifest, today: NaiveDate) -> Result<()> {
     }
     for (id, p) in &m.platforms {
         ensure!(
-            !p.runs_on.is_empty() && !p.image.is_empty() && p.toolchain == "1.94.0",
+            (p.trust == "operator" || !p.runs_on.is_empty())
+                && !p.image.is_empty()
+                && p.toolchain == "1.94.0",
             "platform {id} needs pinned image, labels and toolchain 1.94.0"
         );
         ensure!(
-            ["hosted", "ci-guest", "release"].contains(&p.trust.as_str()),
+            ["hosted", "operator"].contains(&p.trust.as_str()),
             "unknown trust for {id}"
         );
         for cap in &p.provides {
@@ -306,6 +308,14 @@ pub fn validate(m: &Manifest, today: NaiveDate) -> Result<()> {
             );
         }
     }
+    for (id, gate) in &m.gates {
+        ensure!(
+            gate.execution.as_deref().is_none_or(|e| e == "operator"),
+            "unknown gate execution {id}"
+        );
+        ensure!(!cells(m, id)?.is_empty(), "empty gate {id}");
+    }
+    super::release_policy::validate(m)?;
     for id in m.gates.keys() {
         for c in cells(m, id)? {
             let p = m

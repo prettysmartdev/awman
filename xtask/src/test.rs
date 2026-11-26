@@ -12,6 +12,7 @@
 //!   archive --build <id> --out <dir>      nextest archive + expected set + digests
 //!   update-golden [--suite <id>]          rewrite golden files / snapshots
 pub(crate) mod isolation;
+mod kit;
 pub(crate) mod temp_root;
 
 use anyhow::{bail, ensure, Context, Result};
@@ -30,6 +31,8 @@ const PROFILE: &str = "default";
 pub fn run(args: &[String]) -> Result<ExitCode> {
     let root = crate::gates::root();
     match args.first().map(String::as_str) {
+        Some("kit") => kit::build(&root, &args[1..]),
+        Some("kit-run") => kit::run(&args[1..]),
         Some("install-runner") => install_runner(&root),
         Some("run") => run_suites(&root, &Options::parse(&args[1..])?),
         Some("list") => list(&root, &Options::parse(&args[1..])?),
@@ -53,6 +56,8 @@ struct Options {
     tiers: Vec<String>,
     gate: Option<String>,
     build: Option<String>,
+    artifact: Option<PathBuf>,
+    artifact_sha256: Option<String>,
     archive: Option<PathBuf>,
     shard: Option<String>,
     evidence_dir: Option<PathBuf>,
@@ -86,6 +91,8 @@ impl Options {
                 "--tier" => o.tiers.extend(split(&value()?)),
                 "--gate" => o.gate = Some(value()?),
                 "--build" => o.build = Some(value()?),
+                "--artifact" => o.artifact = Some(value()?.into()),
+                "--artifact-sha256" => o.artifact_sha256 = Some(value()?),
                 "--archive" => o.archive = Some(value()?.into()),
                 "--shard" => o.shard = Some(value()?),
                 "--evidence-dir" => o.evidence_dir = Some(value()?.into()),
@@ -512,6 +519,7 @@ fn install_runner(root: &Path) -> Result<ExitCode> {
 
 fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
     let m = crate::manifest::load(root)?;
+    artifact_input(o)?;
     let build_id = requested_build(&m, o)?;
     let build = m
         .builds
@@ -558,6 +566,11 @@ fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
         command.env("PATH", tool_path(root));
         isolation.apply(&mut command);
         command.env(&m.test_env["tier"], &inv.tier);
+        if let (Some(path), Some(digest)) = (&o.artifact, &o.artifact_sha256) {
+            command
+                .env(&m.test_env["artifact"], path)
+                .env(&m.test_env["artifact_sha256"], digest);
+        }
         if let Some(dir) = &o.evidence_dir {
             command.env(&m.test_env["evidence"], dir);
         }
@@ -966,6 +979,58 @@ fn archive(root: &Path, o: &Options) -> Result<ExitCode> {
     );
     let expected = out.join(format!("expected-tests-{build}.json"));
     std::fs::write(&expected, &listing.stdout)?;
+    // Compile/list each suite independently of test-job results. The gate
+    // compares the disjoint union of raw shard inventories to this build set.
+    let mut suite_inventories = std::collections::BTreeMap::new();
+    let suites: std::collections::BTreeSet<_> = m
+        .gates
+        .keys()
+        .map(|g| crate::manifest::validate::cells(&m, g))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .filter(|c| c.build == build)
+        .filter(|c| m.suites.get(&c.suite).is_some_and(|s| s.kind == "nextest"))
+        .map(|c| c.suite)
+        .collect();
+    for id in suites {
+        let suite = &m.suites[&id];
+        let mut list = Command::new("cargo");
+        list.current_dir(root)
+            .env("PATH", tool_path(root))
+            .args([
+                "nextest",
+                "list",
+                "--locked",
+                "-p",
+                suite.package.as_deref().context("suite package")?,
+            ])
+            .args(target_flags(
+                suite.target.as_deref().context("suite target")?,
+            )?)
+            .args(package_features(
+                &features,
+                suite.package.as_deref().unwrap(),
+            ))
+            .args(["-E", &suite_filter(suite)?, "--message-format", "json"]);
+        let listed = list.output()?;
+        ensure!(
+            listed.status.success(),
+            "independent build inventory {id} failed: {}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        suite_inventories.insert(
+            id,
+            crate::evidence::actions::expected(&serde_json::from_slice(&listed.stdout)?)?,
+        );
+    }
+    std::fs::write(
+        out.join("suite-inventories.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema":1,"build":build,"manifest_sha256":m.version(),"source":crate::evidence::actions::source(root)?,"suites":suite_inventories,
+            "producer":{"run_id":std::env::var("GITHUB_RUN_ID").ok(),"attempt":std::env::var("GITHUB_RUN_ATTEMPT").ok(),"job":std::env::var("GITHUB_JOB").ok()}
+        }))?,
+    )?;
     let digests = serde_json::json!({
         "archive": crate::evidence::digest::sha256_file(&file)?,
         "expected_tests": crate::evidence::digest::sha256_file(&expected)?,
@@ -1005,6 +1070,26 @@ fn update_golden(root: &Path, o: &Options) -> Result<ExitCode> {
         code = code.max(execute(&mut c)?);
     }
     Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
+}
+
+/// Exact bytes are selected as a pair; a digest alone never grants a resource.
+fn artifact_input(o: &Options) -> Result<()> {
+    match (&o.artifact, &o.artifact_sha256) {
+        (None, None) => Ok(()),
+        (Some(path), Some(digest)) => {
+            ensure!(
+                path.is_absolute() && path.is_file(),
+                "--artifact requires an absolute executable path"
+            );
+            ensure!(
+                crate::evidence::digest::is_sha256(digest)
+                    && crate::evidence::digest::sha256_file(path)? == *digest,
+                "artifact-digest: executable differs from --artifact-sha256"
+            );
+            Ok(())
+        }
+        _ => bail!("--artifact and --artifact-sha256 are required together"),
+    }
 }
 
 #[cfg(test)]
@@ -1159,9 +1244,8 @@ mod tests {
         let linux = ids(&m, "linux-x64-native-builtin");
         assert!(linux.iter().any(|id| id == "guest-boot"));
         assert!(linux.iter().any(|id| id == "guest-linux-replacement"));
-        assert!(!linux
-            .iter()
-            .any(|id| id == "guest-upgrade" || id == "guest-linux-published-upgrade"));
+        assert!(!linux.iter().any(|id| id == "guest-upgrade"));
+        assert!(linux.iter().any(|id| id == "guest-linux-published-upgrade"));
         let mac = ids(&m, "macos-arm64-ci-guest-builtin");
         assert!(mac.iter().any(|id| id == "guest-upgrade"));
         assert!(!mac.iter().any(|id| id.starts_with("guest-linux-")));
@@ -1205,15 +1289,13 @@ mod tests {
         assert_eq!(ids(&m, linux_target), common);
         let native = crate::native_validation::suites_for_target(&m, linux_target).unwrap();
         assert!(native.iter().any(|id| id == "artifact-linux-boot"));
-        assert!(!native
+        assert!(native
             .iter()
             .any(|id| id == "artifact-linux-published-upgrade"));
         for target in ["aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
             assert_eq!(ids(&m, target), common, "{target}");
         }
-        let mut apple = common.clone();
-        apple.insert("artifact-signed-boot".into());
-        assert_eq!(ids(&m, "aarch64-apple-darwin"), apple);
+        assert_eq!(ids(&m, "aarch64-apple-darwin"), common);
         m.previous_release.insert(
             linux_target.into(),
             m.previous_release["aarch64-apple-darwin"].clone(),

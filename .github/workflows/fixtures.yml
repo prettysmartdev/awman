@@ -1,9 +1,18 @@
+# Guest fixture publication: prepared infrastructure, never a release step.
+#
+# Dispatch from any branch when the reviewed recipe, image contract or base
+# image changes (`gates check` reports the drift on the PR that causes it).
+# Each architecture is built from the reviewed base image, independently
+# reproduced, attested and published once under fixtures-<commit> with
+# distinct filenames. A maintainer then runs `cargo xtask fixtures pin
+# --arch <arch> …` on the downloaded assets and commits the reviewed pins;
+# `make release` only consumes those pins.
 name: Fixtures
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: New immutable fixtures-* release tag
+        description: New immutable fixtures-<commit> release tag
         required: true
         type: string
 permissions:
@@ -13,9 +22,13 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
-    if: ${{ startsWith(github.ref, 'refs/heads/release/v') }}
+    name: Build ${{ matrix.arch }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, amd64]
     permissions:
       contents: read
       id-token: write
@@ -29,37 +42,38 @@ jobs:
           toolchain: '1.94.0'
       - name: Resolve the fixture publication plan
         run: cargo xtask fixtures publish-plan > fixture-plan.json
-      - name: Build the reviewed immutable guest fixture
+      - name: Build and independently reproduce the guest fixture
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           BASE_IMAGE=$(cat ci/fixture-base-image.txt)
           [[ "$BASE_IMAGE" =~ ^alpine@sha256:[0-9a-f]{64}$ ]] || exit 1
-          docker pull --platform linux/arm64 "$BASE_IMAGE"
+          docker pull --platform "linux/$ARCH" "$BASE_IMAGE"
           docker image save --output base.tar "$BASE_IMAGE"
           BASE_SHA256=$(sha256sum base.tar | cut -d ' ' -f 1)
-          mkdir -p out
-          cargo xtask fixtures build guest-oci-base --base base.tar --sha256 "$BASE_SHA256" --out built
+          recipe=guest-oci-base; [ "$ARCH" = amd64 ] && recipe=guest-oci-base-amd64
+          cargo xtask fixtures build "$recipe" --base base.tar --sha256 "$BASE_SHA256" --out built
           cargo xtask fixtures verify-build --base base.tar --sha256 "$BASE_SHA256" --out built
-          printf '%s\n' "$BASE_IMAGE" > out/base-image.txt
-          cp built/fixture-oci.tar built/fixture-docker.tar built/provenance.json out/
-          (cd out && sha256sum fixture-oci.tar fixture-docker.tar provenance.json base-image.txt > SHA256SUMS)
-          cp fixture-plan.json out/
+          mkdir -p out
+          if [ "$ARCH" = arm64 ]; then
+            cp built/fixture-oci.tar built/fixture-docker.tar built/provenance.json out/
+            printf '%s\n' "$BASE_IMAGE" > out/base-image.txt
+          else
+            cp built/fixture-oci.tar out/fixture-oci-amd64.tar
+            cp built/provenance.json out/provenance-amd64.json
+          fi
       - name: Attest the exact fixture archives and reproduction record
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: |
-            out/fixture-oci.tar
-            out/fixture-docker.tar
-            out/provenance.json
-            out/base-image.txt
+          subject-path: out/*
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fixture-${{ github.run_id }}
+          name: fixture-${{ matrix.arch }}-${{ github.run_id }}
           path: out/
           if-no-files-found: error
           retention-days: 90
   publish:
     needs: build
-    if: ${{ startsWith(github.ref, 'refs/heads/release/v') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -67,9 +81,10 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: fixture-${{ github.run_id }}
+          pattern: fixture-*-${{ github.run_id }}
           path: out
-      - name: Publish once and retain the exact digest for the manifest review
+          merge-multiple: true
+      - name: Publish once and retain the exact digests for the pin review
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -77,7 +92,8 @@ jobs:
           COMMIT: ${{ github.sha }}
         run: |
           [ "$TAG" = "fixtures-$COMMIT" ] || { echo 'Fixture tag must bind the source commit' >&2; exit 1; }
-          (cd out && sha256sum -c SHA256SUMS)
+          (cd out && sha256sum fixture-oci.tar fixture-docker.tar provenance.json base-image.txt \
+            fixture-oci-amd64.tar provenance-amd64.json > SHA256SUMS)
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo 'Refusing to replace an existing fixture release' >&2
             exit 1
@@ -88,4 +104,4 @@ jobs:
           fi
           gh release create "$TAG" --target "$COMMIT" --title "$TAG" --prerelease --latest=false --notes-file out/SHA256SUMS out/*
           cat out/SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
-          echo 'P7 remains open until the downloaded public bytes and all previous-release assets are verified and committed in ci/gates.toml.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Next: download the assets and run cargo xtask fixtures pin --arch arm64|amd64 for each, then commit ci/gates.toml.' >> "$GITHUB_STEP_SUMMARY"

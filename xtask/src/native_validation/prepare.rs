@@ -46,7 +46,7 @@ pub(super) fn run(r: &mut Run, m: &Manifest) -> Result<()> {
         );
         r.env.insert(
             "AWMAN_TEST_HOST_RESOURCES".into(),
-            format!("hypervisor,offline,docker={socket}"),
+            format!("hypervisor,offline,git-transports,docker={socket}"),
         );
         r.env.insert("DOCKER_HOST".into(), socket.into());
         let id = r.command(
@@ -224,7 +224,10 @@ pub(super) fn run(r: &mut Run, m: &Manifest) -> Result<()> {
             )?,
         )?;
     }
-    if let Some(previous) = m.previous_release.get(r.platform.target) {
+    // Without a reviewed pin there is nothing to fetch; the dependent suites
+    // are recorded as BLOCKED and the independent ones still run.
+    let pinned = predecessor_pinned(m, r.platform);
+    if let Some(previous) = m.previous_release.get(r.platform.target).filter(|_| pinned) {
         let previous_path = store
             .join("previous-release")
             .join(r.platform.target)

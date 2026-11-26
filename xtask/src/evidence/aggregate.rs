@@ -4,7 +4,7 @@ use crate::{
     manifest::{self, Manifest},
 };
 use anyhow::{ensure, Result};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 /// Reconstruct from independently acquired event/diff metadata. Downloaded plan
 /// is a consistency check, never the coverage authority.
@@ -34,6 +34,11 @@ pub fn aggregate(
         kind: "gate".into(),
         gate: authoritative.gate.clone(),
         commit: ctx.request.head_sha.clone(),
+        tree: records.first().map(|r| r.tree.clone()).unwrap_or_default(),
+        satisfies: vec![],
+        manifest_sha256: m.version().into(),
+        run_id: None,
+        attempt: None,
         manifest_version: m.version().into(),
         plan_sha256: plan_digest.clone(),
         verdict: Outcome::Passed,
@@ -338,6 +343,7 @@ pub fn aggregate(
     } else if !gate.missing.is_empty() {
         gate.verdict = Outcome::Blocked;
     }
+    gate.satisfies = satisfies(m, &gate);
     Ok(gate)
 }
 /// Permit recovery runs to measure an improvement instead of deadlocking planning.
@@ -571,10 +577,33 @@ pub fn compare(expected: &ExpectedSet, results: &[ResultRecord]) -> Result<()> {
     );
     Ok(())
 }
-/// Explicit nulls and a schema version keep cross-target candidate hashes stable.
-pub fn candidate_digest(
-    inputs: &BTreeMap<String, String>,
-    artifacts: &BTreeMap<String, String>,
-) -> Result<String> {
-    digest::input_digest(&serde_json::json!({"schema":1,"inputs":inputs,"artifacts":artifacts}))
+/// Derive cross-gate satisfaction only from complete passing cells. An unselected
+/// path-filtered PR cannot borrow the full release label.
+pub fn satisfies(m: &Manifest, gate: &GateEvidence) -> Vec<String> {
+    if gate.verdict != Outcome::Passed || !gate.errors.is_empty() || !gate.missing.is_empty() {
+        return vec![];
+    }
+    m.gates
+        .iter()
+        .filter(|(_, g)| g.execution.as_deref() != Some("operator"))
+        .filter_map(|(id, _)| {
+            let cells = manifest::validate::cells(m, id).ok()?;
+            (!cells.is_empty()
+                && cells.iter().all(|c| {
+                    gate.cells.iter().any(|r| {
+                        r.cell == c.id
+                            && r.outcome == Outcome::Passed
+                            && (m.suites.get(&c.suite).is_none_or(|s| s.kind != "nextest")
+                                || (r.counts.expected > 0
+                                    && r.counts.ran == r.counts.expected
+                                    && r.counts.passed == r.counts.expected
+                                    && r.counts.failed == 0
+                                    && r.counts.skipped == 0
+                                    && r.counts.blocked == 0
+                                    && !r.evidence_sha256.is_empty()))
+                    })
+                }))
+            .then(|| id.clone())
+        })
+        .collect()
 }

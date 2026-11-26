@@ -133,7 +133,7 @@ fn actionlint_config_declares_every_self_hosted_label_once() {
 }
 
 #[test]
-fn called_full_gate_and_candidate_main_have_disjoint_artifact_names() {
+fn called_nightly_and_release_have_disjoint_artifact_names() {
     use std::collections::BTreeSet;
     let workflow = include_str!("../../../.github/workflows/ci.yml");
     let parsed: serde_yaml::Value = serde_yaml::from_str(workflow).unwrap();
@@ -163,12 +163,12 @@ fn called_full_gate_and_candidate_main_have_disjoint_artifact_names() {
             .collect()
     };
     let full = names("nightly");
-    let candidate = names("main");
+    let release = names("release");
     assert!(!full.is_empty());
     assert!(
-        full.is_disjoint(&candidate),
+        full.is_disjoint(&release),
         "artifact collision: {:?}",
-        full.intersection(&candidate).collect::<Vec<_>>()
+        full.intersection(&release).collect::<Vec<_>>()
     );
 }
 

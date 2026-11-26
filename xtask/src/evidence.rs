@@ -5,6 +5,7 @@ pub mod aggregate;
 pub mod digest;
 pub mod emit;
 pub mod history;
+pub mod inventory;
 pub mod junit;
 pub mod schema;
 pub mod summary;

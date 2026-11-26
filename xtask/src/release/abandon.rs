@@ -1,86 +1,63 @@
-//! `cargo xtask release abandon`: delete an unpromoted candidate's draft
-//! (`make release-abandon VERSION=…`), after its evidence is retained.
-//!
-//! Owner: workflow step `candidate-promote-pipeline` (see the WI 0144
-//! ownership map). The signature of `run` is fixed by `release/mod.rs`.
-//!
-//! A promoted or published version is refused: published releases are never
-//! removed or moved. The evidence stays in the candidate run's retained
-//! `candidate-record-…` artifact, and is also copied to
-//! `target/release-abandoned/<version>-c<N>/` before the draft is deleted.
+//! `make release-abandon VERSION=…`: delete this attempt's own draft, claim
+//! and private state. Refused once the version tag exists; never deletes a
+//! draft, branch or tag it cannot prove it owns.
 
-use super::state::args::{Flags, Stop};
-use super::state::decide::{self, AbandonAction};
-use super::state::{self, hub, ops, record};
-use anyhow::Result;
-use std::path::PathBuf;
-use std::process::ExitCode;
+use super::error::{Step, Stop};
+use super::evidence::draft_marker;
+use super::journal::Store;
+use super::run::claim_key;
+use super::world::World;
+use std::path::Path;
 
-pub fn run(args: &[String]) -> Result<ExitCode> {
-    let Some((version, rest)) = args.split_first() else {
-        eprintln!("usage: cargo xtask release abandon <vX.Y.Z> [--repo owner/name] [--keep DIR]");
-        return Ok(ExitCode::from(2));
+pub fn abandon(w: &World, dir: &Path) -> Step {
+    let store = Store::open(dir)?;
+    let Some(j) = store.load()? else {
+        return Err(Stop::new(
+            "usage",
+            format!("no release attempt in {}", dir.display()),
+        ));
     };
-    if !record::valid_version(version) {
-        eprintln!("version must be vX.Y.Z, got {version}");
-        return Ok(ExitCode::from(2));
+    if j.release.tag
+        || w.forge
+            .tag(&j.version)?
+            .is_some_and(|t| t.commit == j.commit)
+    {
+        return Err(Stop::new(
+            "supersede-refused",
+            format!(
+                "{} is tagged; a tagged release is finished or published, never abandoned",
+                j.version
+            ),
+        ));
     }
-    let f = Flags::parse(rest, &[])?;
-    let repo = super::status::repo(f.get("repo"))?;
-    let hub = hub::open(&repo, f.get("store"))?;
-    let existing = state::existing(hub.as_ref(), version)?;
-    let action = match decide::abandon_action(version, &existing, hub.tag(version)?.as_deref()) {
-        Ok(a) => a,
-        Err(stop) => return Ok(stop.report()),
-    };
-    let AbandonAction::Delete {
-        release_id,
-        candidate,
-    } = action
-    else {
-        println!("{version}: no unpromoted candidate to abandon");
-        return Ok(ExitCode::SUCCESS);
-    };
-    let e = existing
-        .iter()
-        .find(|e| e.release.id == release_id)
-        .expect("chosen above");
-    let keep = f.get("keep").map(PathBuf::from).unwrap_or_else(|| {
-        PathBuf::from(format!("target/release-abandoned/{version}-c{candidate}"))
-    });
-    std::fs::create_dir_all(&keep)?;
-    let mut kept = 0;
-    for a in &e.release.assets {
-        if [
-            record::STATE_ASSET,
-            record::GATE_ASSET,
-            record::MAIN_GATE_ASSET,
-            record::SUMS,
-        ]
-        .contains(&a.name.as_str())
-        {
-            ops::download(hub.as_ref(), &e.release, &a.name, &keep.join(&a.name))?;
-            kept += 1;
+    let marker = draft_marker(&j.operation);
+    for r in w.forge.releases()? {
+        if r.draft && r.body.contains(&marker) {
+            w.forge.delete_release(r.id)?;
         }
     }
-    let retained = state::recorded(hub.as_ref(), version, record::PRODUCTION)?.contains(&candidate);
-    if kept == 0 && !retained {
-        return Ok(Stop::Blocked(format!(
-            "candidate {candidate} has neither a retained record artifact nor a state asset; \
-             refusing to delete evidence. Inspect draft {release_id} by hand"
-        ))
-        .report());
+    let key = claim_key(&j.version, j.mode(), &j.owner);
+    if let Some(c) = w.forge.read_claim(&key)? {
+        let ours = c
+            .files
+            .get("claim.json")
+            .and_then(|b| serde_json::from_slice::<super::evidence::ClaimDoc>(b).ok())
+            .is_some_and(|d| d.owner.id == j.owner && d.commit == j.commit);
+        if ours {
+            w.forge.delete_claim(&key)?;
+        }
     }
-    hub.delete_release(release_id)?;
-    println!("Abandoned candidate {candidate} of {version} (draft {release_id} deleted)");
+    if j.rehearsal && w.forge.get_ref(&j.push_ref)?.as_deref() == Some(j.commit.as_str()) {
+        w.forge.delete_branch(&j.push_ref)?;
+    }
+    w.source.remove_checkout(&store.path("src"));
+    drop(store);
+    std::fs::remove_dir_all(dir)
+        .map_err(|e| Stop::new("state-corrupt", format!("{}: {e}", dir.display())))?;
     println!(
-        "  evidence kept in {}{}",
-        keep.display(),
-        if retained {
-            " and the run's record artifact"
-        } else {
-            ""
-        }
+        "abandoned {} (commit {} kept; release branch untouched)",
+        j.version,
+        &j.commit[..12]
     );
-    Ok(ExitCode::SUCCESS)
+    Ok(())
 }

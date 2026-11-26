@@ -1,21 +1,23 @@
 # Testing
 
-The manifest test system is the only supported path. See [replacement-ledger.md](replacement-ledger.md) for coverage decisions and evidence. Native Apple Silicon acceptance remains open until the maintainer's packet is independently reviewed.
+The manifest test system is the only supported path. See [replacement-ledger.md](replacement-ledger.md) for coverage decisions and evidence. The release path and its residual risks are in [release.md](release.md).
 
 How awman's tests are organised, isolated, selected and run. The contract itself
 (suites, tiers, capabilities, gates, quarantine) lives in `ci/gates.toml`; this
 document explains it and is checked against it by `cargo xtask gates check`.
 
 <!-- gates:begin contract -->
-Generated from `ci/gates.toml` (schema 1).
+Generated from `ci/gates.toml` (schema 2).
 
 | Gate | Budget (minutes) | Required status |
 | --- | --- | --- |
-| candidate | 20 | gate |
 | main | 20 | gate |
+| native-diagnostic | 120 | operator diagnostic |
 | nightly | 60 | gate |
+| nightly-artifacts | 45 | gate |
+| nightly-kit | 10 | gate |
 | pr | 10 | gate |
-| promote | 20 | gate |
+| release | 15 | gate |
 
 | Tier | Per-test deadline (seconds) | Guarantees |
 | --- | --- | --- |
@@ -42,7 +44,7 @@ capability and either gets it or the run is `blocked`.
 | `boundary` | `tests/boundary/` (target `boundary`) | the real Docker Engine, registry, Git transports, Apple Containers and `sbx`, to prove the fakes tell the truth | only those named in `AWMAN_TEST_HOST_RESOURCES` |
 | `guest` | `tests/guest/` (target `guest`, feature `guest-drivers`) | real builtin microVM guests: boot, exec, import, network, upgrade, builder, strategy | hypervisor, verified payload, pinned fixtures |
 | `artifact` | `tests/artifact/` (target `artifact`) | the exact signed release executables, run as a user would, with no access to library code | the executable under test |
-| `soak` | `tests/boundary/soak/`, guest soak | hosted latency, fuzz and registry runs nightly; long guest runs at release candidate validation | as the suite declares |
+| `soak` | `tests/boundary/soak/`, guest soak | hosted latency, fuzz and registry runs nightly; long guest runs only in the operator-run native diagnostic | as the suite declares |
 
 `unit` and `component` are what `make test` runs. `boundary`, `guest` and
 `artifact` need a named host resource or a release executable and run on the
@@ -419,7 +421,7 @@ expires = "2026-12-31"
 
 ## Acceptance matrix
 
-`ci/acceptance-matrix.toml` records important behavior anchors with named tests and gates. Platform, feature, runtime and complete suite selection come from `ci/gates.toml`; do not duplicate that Cartesian product by hand or demand one test per catalogue permutation. `cargo xtask matrix check` rejects missing behavior slices and nonexistent named tests. `covered` means executable coverage exists, not that it passed on a platform. Only actual run evidence establishes execution, and the native item remains open until its packet is reviewed.
+`ci/acceptance-matrix.toml` records important behavior anchors with named tests and gates. Platform, feature, runtime and complete suite selection come from `ci/gates.toml`; do not duplicate that Cartesian product by hand or demand one test per catalogue permutation. `cargo xtask matrix check` rejects missing behavior slices and nonexistent named tests. `covered` means executable coverage exists, not that it passed on a platform. Only actual run evidence establishes execution. Native evidence comes from the release command's native checks or the native diagnostic.
 
 The manifest runner accepts `--test-threads N` (a positive integer) to limit
 nextest parallelism without changing suite deadlines, retries or selection.
@@ -432,88 +434,72 @@ Tests own their private HOME, Git configuration, processes and sockets through T
 
 `--shuffle-seed` changes suite invocation order. It does not randomize tests inside a nextest invocation. Record repeats, time and failures accurately; a single clean run is not p95 or a long-term flake-rate measurement.
 
-The Actions controller authenticates service run, attempt, job roles and artifact digests, downloads evidence independently, and compares selected compiled tests with passing JUnit. Local packets are operator evidence and cannot authorize CI publication. The native handoff below is separate from release environment and runner-group admission.
+The Actions controller authenticates service run, attempt, job roles and artifact digests, downloads evidence independently, and compares selected compiled tests with passing JUnit. Native results and diagnostic evidence directories are operator evidence and cannot authorize CI publication. The native checks below are separate from the hosted gates.
 
-## Apple Silicon acceptance packet
+## Native validation
 
-On a native Apple Silicon Mac, from a clean checkout of the revision being
-reviewed, run:
+Two different native runs exist. They share the guest tier and the same
+isolation rules but have different purposes.
+
+### Required release checks
+
+`make release` runs exactly two native checks on the attested release bytes, on
+operator machines, through a prebuilt, digest-bound kit produced by the hosted
+`release.yml` build (a standalone `xtask`, the pinned nextest, the compiled
+artifact test target and its fake companion, and a compiled inventory):
+
+- macOS arm64 on the release Mac: signed offline boot and persisted-state
+  upgrade of `awman-macos-arm64`.
+- Linux x86_64 over SSH: offline KVM boot of `awman-linux-amd64` with the
+  architecture-matched amd64 fixture.
+
+Nothing is compiled, signed or rebuilt on the native hosts, and the host has no
+Cargo or checkout. The runner verifies the kit's digests, runs with private
+HOME and Git configuration, deadlines and an exact expected inventory, enforces
+offline operation (seccomp on Linux, the macOS sandbox on the Mac), and writes
+`result.json`, JUnit and a runner log. The release command accepts a result only
+when the raw inventory, JUnit, log, command exit, environment contract, fixture
+and predecessor pins, source, tree, asset and kit digests all reconcile with the
+attested kit. A missing, short, skipped, blocked or failed result prevents
+sealing; there is no waiver. A pending fixture pin or missing capability is
+`BLOCKED`, never a pass. Results are operator evidence, not Actions
+attestations. See [release.md](release.md).
+
+On macOS the runner allocates a short private root under `/private/tmp` and
+checks the canonical guest socket path against the 103-byte limit before
+starting guest tests; a long ambient `TMPDIR` does not change this.
+
+### Broad native diagnostic
 
 ```sh
 make validate-native
 ```
 
-Prerequisites: the repository's pinned Rust toolchain, Xcode command-line tools,
-and Apple Containers with its service running. Docker and `sbx` are not needed
-for this Apple prerelease packet. Run as your normal user,
-with no other validation process using this checkout. Preparation needs internet
-access and enough disk for debug/release builds, payloads and guest images. This
-command explicitly grants the test runner access to those named local runtimes
-and the hypervisor. It never runs an agent on the host.
+runs the registered `native-diagnostic` gate on the host being diagnosed (an
+Apple Silicon Mac or a Linux KVM machine). It is not part of a release and has
+no remote mode: run it on the host itself, from a clean checkout. It installs
+the pinned runner, fetches and verifies the builtin payload, previous
+executable and architecture-specific fixtures, compiles the native suites,
+captures their expected tests, signs the guest executables on macOS and runs the
+guest, boundary, soak and artifact breadth (see the `native-diagnostic` gate in
+[cicd.md](cicd.md)). It never runs an agent on the host and does not run the
+`sbx` boundary while that runtime is disabled pending
+[issue #86](https://github.com/prettysmartdev/awman/issues/86).
 
-On macOS, native validation and the Actions runner allocate a short private
-test root under `/tmp` and check the canonical guest socket path against the
-103-byte limit before starting guest tests. The native packet records the
-selected root. A long ambient `TMPDIR` does not change this selection.
+It writes an evidence directory under `target/native-validation/`. Check one
+with `cargo xtask native-validation verify DIR` from a checkout of its exact
+commit: this checks source inputs, every file digest, complete selection,
+successful command records and equality between the independently enumerated
+tests and passing JUnit. Missing, duplicated, skipped, blocked, failed or
+substituted results fail verification, and so does evidence for another
+revision. A missing historical Linux predecessor is reported as blocked, never
+as a passed upgrade: only the suites that need it are blocked, every
+independent registered suite still runs, and the diagnostic as a whole ends
+BLOCKED (exit 2; a failed suite takes precedence with exit 1).
 
-The target installs the pinned test runner, fetches and verifies the builtin
-payload and published previous executable, fetches both published SHA-256-pinned
-OCI and Docker-save guest fixtures, compiles the native suites, captures their expected tests, signs the
-guest executables and release candidate, and runs the guest and artifact tiers
-plus the declared native boundaries. The signed candidate is copied into the
-packet and must retain the same digest throughout execution. The offline artifact
-tests enforce their own network denial. Image preparation is a separate online
-phase; both verified fixture pins are recorded in `run-config.toml` and do
-not change the repository's fixture policy. Apple store tests retag a private
-copy of the pinned OCI fixture for each attempt and remove only their own tag;
-preexisting user and prior-attempt images remain untouched. Linux native acceptance separately
-uses a local Unix-socket Docker Engine to reconstruct the fixtures and run its
-Docker and registry boundaries. The release candidate does not run the `sbx`
-boundary in v0.14 because the runtime is disabled pending
-[issue #86](https://github.com/prettysmartdev/awman/issues/86). The retained
-boundary suite uses a private test home and validates emitted local kits with
-`sbx kit validate --offline` when the runtime is restored; it does not read the
-runner's login state.
-
-Successful and failed runs both print a `target/native-validation/*.tar.gz`
-path and its SHA-256. Send that archive, the printed digest, and confirmation
-that you ran it on your Mac. Logs, exact source/input hashes, independently
-listed tests, JUnit, command exit codes and timings, fixture provenance and bytes, signing
-checks and the tested executable are included. Do not send your environment,
-credentials, Docker configuration or home directory. A failed packet is useful
-for diagnosis but cannot close acceptance. A target that cannot start because
-Cargo or Make is missing cannot produce a packet; send its console error.
-
-### Instructions for the agent receiving the packet
-
-1. Treat the archive as untrusted input: inspect its member names and reject
-   absolute paths, `..`, links, device files or unexpectedly large expansions
-   before extracting it into a fresh directory. Check the archive SHA-256
-   against the separately supplied digest.
-2. Read `evidence/packet.json`, then check out its **exact commit** in a clean
-   worktree. Do not execute binaries or scripts from the received archive.
-   Review the committed native-validation implementation, selected manifest
-   suites, fixture recipe, and actual test assertions independently.
-3. From that checkout run
-   `cargo xtask native-validation verify /absolute/path/to/evidence`.
-   This checks the source inputs, every packet file digest, the candidate
-   digest, complete native suite selection, successful command records, and
-   equality between the independently enumerated tests and passing JUnit.
-   Missing, duplicated, skipped, blocked, failed or substituted results must
-   fail verification. Check the fixture provenance and exact allowed run-local
-   manifest change as well.
-4. Review host/version and hypervisor logs, payload verification, previous
-   release digest, signing/entitlement output, and actual guest/upgrade/offline
-   results. Confirm the operator's provenance statement. If the source has
-   since changed in a way affecting these contracts or inputs, request a new
-   run; do not transfer evidence to a different revision.
-5. Record the packet's digest, commit, native platform, tested binary and
-   fixture digests, suite/test counts, timings, and reviewer conclusion in the
-   work item. Close its final native item only when the important execution,
-   recovery, upgrade and signed-artifact paths passed. Failed or incomplete
-   evidence leaves the item open and receives a concrete diagnosis.
-
-A single run measures execution time; it does **not** establish p95 latency or
-long-term flake rate. This is operator-supplied acceptance evidence, not an
-Actions-authenticated attestation. It cannot authorize release publication or
-satisfy the release controller's separate provenance requirements.
+The diagnostic is the only route to per-agent guest behavior,
+builder and strategy matrices, guest soak, Apple and Linux Docker/registry/Git
+boundaries and Linux replacement coverage. Nothing schedules it. A single run
+measures execution time; it does **not** establish p95 latency or long-term
+flake rate, cannot authorize release publication and does not satisfy the
+release command's separate provenance requirements.

@@ -45,6 +45,8 @@ pub(crate) struct RunConfig {
 /// One pinned external input (`[fixtures.<id>]` or `[previous_release.<triple>]`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct FixtureSpec {
+    /// Concrete OCI architecture for relocatable native fixtures.
+    pub arch: Option<String>,
     pub sha256: Option<String>,
     /// File name in the fixture store (`file`, or `asset` for previous releases).
     pub file: Option<String>,
@@ -111,6 +113,7 @@ impl RunConfig {
                     t.iter()
                         .map(|(id, v)| {
                             let spec = FixtureSpec {
+                                arch: text_of(v, "arch"),
                                 sha256: text_of(v, "sha256"),
                                 file: text_of(v, "file").or_else(|| text_of(v, "asset")),
                                 tiers: strings(v.get("tiers")),
@@ -171,7 +174,7 @@ impl RunConfig {
 /// Cargo and nextest run test binaries from their package directory, so the
 /// nearest ancestor of the working directory holding both `Cargo.toml` and
 /// `ci/gates.toml` wins; the build-time location is the last resort.
-pub(crate) fn workspace_root() -> PathBuf {
+pub fn workspace_root() -> PathBuf {
     resolve_workspace_root(
         std::env::current_dir().ok().as_deref(),
         Path::new(env!("CARGO_MANIFEST_DIR")),

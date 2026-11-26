@@ -1,6 +1,6 @@
 # Local Development
 
-The manifest test system is the only supported path. See [replacement-ledger.md](replacement-ledger.md) for coverage decisions and evidence. Native Apple Silicon acceptance remains open until the maintainer's packet is independently reviewed.
+The manifest test system is the only supported path. See [replacement-ledger.md](replacement-ledger.md) for coverage decisions and evidence. Releasing is one command: see [release.md](release.md).
 
 Development: local
 Build tools: make, cargo, docker
@@ -26,15 +26,17 @@ Developer Loop:
 Local testing:
 
 <!-- gates:begin contract -->
-Generated from `ci/gates.toml` (schema 1).
+Generated from `ci/gates.toml` (schema 2).
 
 | Gate | Budget (minutes) | Required status |
 | --- | --- | --- |
-| candidate | 20 | gate |
 | main | 20 | gate |
+| native-diagnostic | 120 | operator diagnostic |
 | nightly | 60 | gate |
+| nightly-artifacts | 45 | gate |
+| nightly-kit | 10 | gate |
 | pr | 10 | gate |
-| promote | 20 | gate |
+| release | 15 | gate |
 
 | Tier | Per-test deadline (seconds) | Guarantees |
 | --- | --- | --- |
@@ -109,7 +111,7 @@ and reproduce tests. Locally:
 - On macOS, Hypervisor.framework refuses unsigned processes. `make build`
   ad-hoc signs the Apple Silicon release binary with
   `packaging/macos/awman.entitlements` (`tools/macos-sign.sh`); `make sign-macos
-  BIN=<path>` re-signs a copied or modified binary. `make validate-native` signs the native drivers and candidate and records signature verification in its evidence packet.
+  BIN=<path>` re-signs a copied or modified binary. `make validate-native` signs the native drivers and the executable under test and records signature verification in its evidence directory.
 - Guest scenarios (boot, exec, import, network, upgrade, builder, strategy) run
   only in the `guest` tier on a host that can boot a guest. A missing
   `/dev/kvm`, denied KVM access, missing Apple hypervisor entitlement,
@@ -121,7 +123,7 @@ and reproduce tests. Locally:
   runs cached executable-replacement coverage and adds published-predecessor
   upgrade coverage when its target has a reviewed previous-release pin. An
   explicit default-feature build is refused for the guest tier.
-- SQLite and native dependencies are exercised by persisted-state component contracts, the guest tier and `artifact-deps-scan`. Use `make test-artifact ARTIFACT=...` for a prepared candidate. Runtime execution must work offline with a minimal executable search path and cannot depend on build caches or tools scripts.
+- SQLite and native dependencies are exercised by persisted-state component contracts, the guest tier and `artifact-deps-scan`. Use `make test-artifact ARTIFACT=...` for a prepared executable. Runtime execution must work offline with a minimal executable search path and cannot depend on build caches or tools scripts.
 - The builtin driver uses the vendored `build_lazy_isolated()` entry point on
   pinned `microsandbox 0.7.8`. It starts from independent defaults and
   awman-owned paths without merging installed SDK config.
@@ -135,7 +137,7 @@ and reproduce tests. Locally:
   not require the symbol name. `make payloads` fetches and checksum-verifies the
   host's payload (`tools/msb-payloads/fetch.sh`); `make payloads-verify` verifies bytes against the reviewed payload record. A new payload status requires reviewed native evidence; the command does not automatically promote a record.
 
-### Linux builtin development and prerelease acceptance
+### Linux builtin development and native diagnostics
 
 Linux x86_64 GNU builds include the experimental builtin runtime. Install the
 pinned Rust toolchain, a C/C++ compiler, pkg-config, Clang/libclang and CMake.
@@ -146,44 +148,27 @@ invoking user, then atomically installs to `/usr/local/bin`; use
 `INSTALL_PATH=/your/bin` for a user-owned location. Restart long-running awman
 daemons after upgrading the executable.
 
-Run `make linux-prerelease REMOTE_LOGIN=user@host` from a clean checkout
-after the release prep skill has committed the new version and notes. Either
-prerelease target creates or resumes `release/vX.Y.Z` and pins the reviewed
-arm64 guest fixtures and this Mac's OS build on that branch. The Linux target
-then creates or updates its own release-branch checkout under
-`~/.cache/awman-prerelease/release-vX.Y.Z` on the Linux x86_64 host over SSH.
-Build caches are retained for subsequent runs. It passes the Mac's `gh` token through SSH
-stdin for the HTTPS clone; the token is removed before tests start. The Linux
-target needs `gh`, `python3`, SSH and `scp` on the Mac. The Linux
-host needs read/write `/dev/kvm` access and a Docker Engine on a local Unix
-socket. It needs the pinned Rust toolchain, build tools, curl, tar, network
-access during preparation and enough disk for debug/test and release artifacts.
-The SSH command is noninteractive; the remote script resolves Cargo from its
-command `PATH`, then from the user's rustup or mise installation if a login
-profile did not add it to `PATH`.
-Docker supplies image-source and builder evidence; agents execute only inside
-guests. Offline acceptance uses
-kernel seccomp filters to deny IP sockets while preserving Unix IPC and the
-invoking user's identity. A registered prerequisite test proves enforcement
-before the release build; unavailable seccomp support blocks acceptance.
-The remote runner sets `umask 0002` only in its process, and the packet
-records it, so acceptance exercises private state under permissive defaults
-without changing the developer's shell profile.
-On Debian, add the user to `kvm` and `docker` groups and log in again first.
+Docker supplies image-source and builder evidence for the broad diagnostic;
+agents execute only inside guests. Offline acceptance uses kernel seccomp filters
+to deny IP sockets while preserving Unix IPC and the invoking user's identity.
+A registered prerequisite test proves enforcement before native tests run;
+unavailable seccomp support blocks acceptance. On Debian, add the user to the
+`kvm` (and, for the diagnostic, `docker`) group and log in again first.
 
-`make test-artifact ARTIFACT=...` runs the same six Linux artifact contracts as
-hosted release verification. Use `make linux-prerelease` for KVM boot, image
-sources, builders and upgrade acceptance against the native executable.
+`make test-artifact ARTIFACT=...` runs the same artifact contracts as hosted
+release smoke against an executable you built. For KVM boot, image sources,
+builders and upgrade breadth on this host, run `make validate-native` from a
+clean checkout. It runs on the host being diagnosed only; there is no SSH or
+remote mode, and it is not a release step. Its evidence directory is checked with
+`cargo xtask native-validation verify /path/to/evidence`. It prepares private
+fixtures and an owned loopback registry, runs the registered guest, boundary and
+artifact suites, and removes its registry even on failure. Missing prerequisites
+fail the run; they never count as passing skips.
 
-The target uses the manifest native-validation runner, prepares private fixtures
-and an owned loopback registry, runs the registered guest, Docker/registry
-boundary and artifact suites, and removes its registry even on failure. It
-streams the packet back to `target/prerelease/linux-<commit>/`, safely extracts
-it, and verifies it against the exact local commit. The remote credential file
-is removed before native validation; the managed checkout and build cache stay.
-Verify an extracted packet with
-`cargo xtask native-validation verify /path/to/evidence`.
-Missing prerequisites fail the run; they never count as passing skips.
+The release itself does not use this diagnostic. `make release` runs its two
+required native checks from a prebuilt kit, so the Linux KVM host needs only
+SSH, KVM, Git, the offline enforcement primitives and enough disk; no Rust
+toolchain, Docker, checkout or credentials. See [release.md](release.md).
 
 The first Linux release proves atomic executable replacement and cached restart.
 It does not claim migration from a previous Linux builtin release, because none

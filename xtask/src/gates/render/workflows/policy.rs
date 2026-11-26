@@ -17,27 +17,58 @@ fn strings(v: &Value) -> Vec<&str> {
             .collect()
     }
 }
+/// A release may choose its hosted OS with a finite literal mapping. An
+/// arbitrary output/expression is not evidence that a runner is hosted.
+fn hosted_mapping(labels: &str) -> bool {
+    let Some(expr) = labels
+        .trim()
+        .strip_prefix("${{")
+        .and_then(|s| s.strip_suffix("}}"))
+    else {
+        return false;
+    };
+    let hosted = [
+        "ubuntu-22.04",
+        "ubuntu-24.04",
+        "ubuntu-24.04-arm",
+        "macos-15",
+        "windows-2025",
+    ];
+    let literal = |s: &str| {
+        s.trim()
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))
+            .map(str::to_owned)
+    };
+    expr.split("||").all(|arm| {
+        if let Some((cond, runner)) = arm.split_once("&&") {
+            let Some(asset) = cond
+                .trim()
+                .strip_prefix("inputs.asset == ")
+                .and_then(literal)
+            else {
+                return false;
+            };
+            [
+                "awman-linux-amd64",
+                "awman-linux-arm64",
+                "awman-macos-arm64",
+                "awman-windows-amd64.exe",
+            ]
+            .contains(&asset.as_str())
+                && literal(runner).is_some_and(|s| hosted.contains(&s.as_str()))
+        } else {
+            literal(arm).is_some_and(|s| hosted.contains(&s.as_str()))
+        }
+    })
+}
 fn allowed_write(path: &str, job: &str, scope: &str) -> bool {
     matches!(
         (path.rsplit('/').next().unwrap_or(path), job, scope),
-        (
-            "candidate.yml",
-            "preflight" | "assemble" | "gate" | "cleanup",
-            "contents"
-        ) | (
-            "candidate.yml",
-            "controller" | "build" | "gate",
-            "id-token" | "attestations"
-        ) | ("fixtures.yml", "publish", "contents")
-            // Protected-main fixture preparation attests the exact archives and
-            // reproduction record; only publication gets a contents write token.
+        ("release.yml", "produce", "id-token" | "attestations")
+            | ("fixtures.yml", "publish", "contents")
             | ("fixtures.yml", "build", "id-token" | "attestations")
             | ("nightly.yml", "flake-hunt", "issues")
-            | (
-                "nightly.yml",
-                "rehearsal",
-                "contents" | "id-token" | "attestations"
-            )
     )
 }
 fn permissions(path: &str, job: &str, value: &Value, out: &mut Vec<String>) {
@@ -63,9 +94,6 @@ fn ordering_reason(path: &str, job: &str, need: &str) -> Option<&'static str> {
     match (path.rsplit('/').next().unwrap_or(path), job, need) {
         // These are admission edges. Their jobs build from the checked-out commit,
         // not a preceding job's compiler output.
-        ("candidate.yml", "runner-preflight", "preflight") => {
-            Some("candidate trigger/source admission")
-        }
         // Trends intentionally sample only completed runs; full must finish first.
         ("nightly.yml", "ci-trends", "full") => Some("completed-run sampling barrier"),
         _ => None,
@@ -95,27 +123,29 @@ pub fn verify(path: &str, input: &str) -> Vec<String> {
         permissions(path, id, effective, &mut out);
         let body = text(job);
         let labels = text(&job["runs-on"]);
-        let hardware = labels.contains("self-hosted") || labels.contains("${{");
+        let hardware = labels.contains("self-hosted")
+            || (labels.contains("${{")
+                && !(path.ends_with("release.yml")
+                    && hosted_mapping(job["runs-on"].as_str().unwrap_or(""))));
         if hardware {
-            let guard = job["if"].as_str().unwrap_or("");
-            if !guard.contains("github.ref == 'refs/heads/main'") {
-                out.push(format!(
-                    "{path}: self-hosted/dynamic job {id} lacks protected-main guard"
-                ));
+            out.push(format!(
+                "{path}: self-hosted/dynamic job {id} is forbidden; use explicit hosted labels"
+            ));
+        }
+        if job.get("environment").is_some() {
+            out.push(format!("{path}: job {id} must not require an environment"));
+        }
+        if path.ends_with("release.yml") {
+            if body.contains("secrets.")
+                || body.contains("secrets[")
+                || job.get("secrets").is_some()
+            {
+                out.push(format!("{path}: job {id} must not consume secrets"));
             }
-            if path.ends_with("ci.yml") {
-                if !guard.contains("outputs.hardware == 'true'")
-                    || !guard.contains("github.event_name != 'pull_request'")
-                    || !guard.contains("github.event_name != 'merge_group'")
-                {
-                    out.push(format!(
-                        "{path}: self-hosted job {id} lacks event/hardware admission guards"
-                    ));
+            for step in job["steps"].as_sequence().into_iter().flatten() {
+                if step["uses"].as_str().is_some_and(|s| s.starts_with("./")) {
+                    out.push(format!("{path}: job {id} must not execute local actions"));
                 }
-            } else if job["environment"].as_str() != Some("release") {
-                out.push(format!(
-                    "{path}: self-hosted/dynamic job {id} requires release environment"
-                ));
             }
         }
         let download = body.contains("actions/download-artifact@")
@@ -151,13 +181,27 @@ mod tests {
     #[test]
     fn rejects_unprotected_hardware_and_unconsumed_dependencies() {
         let errors = verify("w.yml", "permissions: {contents: read}\njobs:\n  a: {}\n  x:\n    needs: [a, absent]\n    runs-on: [self-hosted, macOS]\n").join("\n");
-        assert!(errors.contains("protected-main guard"));
-        assert!(errors.contains("release environment"));
+        assert!(errors.contains("self-hosted/dynamic"));
         assert!(errors.contains("needs a without"));
         assert!(errors.contains("nonexistent job absent"));
     }
     #[test]
     fn consumed_outputs_and_verdicts_need_no_artifact_transfer() {
         assert!(verify("w.yml", "permissions: {contents: read}\njobs:\n  a: {}\n  x:\n    needs: a\n    if: ${{ needs.a.result == 'success' }}\n").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod hosted_mapping_tests {
+    use super::*;
+    #[test]
+    fn only_literal_hosted_choices_are_admitted() {
+        assert!(hosted_mapping(
+            "${{ inputs.asset == 'awman-macos-arm64' && 'macos-15' || 'ubuntu-22.04' }}"
+        ));
+        assert!(!hosted_mapping("${{ inputs.runner }}"));
+        assert!(!hosted_mapping(
+            "${{ inputs.asset == 'awman-macos-arm64' && 'self-hosted' || 'ubuntu-22.04' }}"
+        ));
     }
 }

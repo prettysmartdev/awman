@@ -82,6 +82,8 @@ pub struct Platform {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Build {
+    #[serde(default = "hosted_builder")]
+    pub builder: String,
     pub platform: String,
     pub features: String,
     pub profile: String,
@@ -135,6 +137,8 @@ pub struct Applicability {
 #[serde(deny_unknown_fields)]
 pub struct Gate {
     #[serde(default)]
+    pub execution: Option<String>,
+    #[serde(default)]
     pub includes: Vec<String>,
     pub requires_gate: Option<String>,
     pub budget_minutes: Option<u64>,
@@ -173,6 +177,9 @@ pub struct Scenario {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Fixture {
+    pub arch: Option<String>,
+    pub recipe_sha256: Option<String>,
+    pub image_contract_sha256: Option<String>,
     pub sha256: Option<String>,
     pub source: Option<String>,
     pub file: Option<String>,
@@ -257,11 +264,12 @@ pub struct Release {
     pub assets: Vec<String>,
     pub checksums: String,
     pub evidence_valid_days: i64,
-    pub candidate_retention_days: u32,
-    pub operator_path: String,
-    pub environment: String,
-    pub ci_guest_labels: Vec<String>,
-    pub release_labels: Vec<String>,
+    pub retention_days: u32,
+    pub evidence: String,
+    pub gate: String,
+    pub workflow: String,
+    pub smoke_suites: Vec<String>,
+    pub native: BTreeMap<String, Native>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -269,4 +277,20 @@ pub struct Workflow {
     pub jobs: Vec<String>,
     pub commands: Vec<String>,
     pub timeout_minutes: u64,
+}
+
+fn hosted_builder() -> String {
+    "hosted".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Native {
+    pub asset: String,
+    pub host: String,
+    pub suites: Vec<String>,
+    pub fixtures: Vec<String>,
+    pub previous_release: Option<String>,
+    pub budget_seconds: u64,
+    pub required: bool,
 }

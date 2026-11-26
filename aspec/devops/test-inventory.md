@@ -14,5 +14,5 @@ its counts as an acceptance threshold. The Git history preserves that history.
 For a new behavior, update its contract test and manifest suite. For a new
 runtime or platform, update the manifest and acceptance matrix, then obtain
 execution evidence on that platform. A source-level coverage row alone is not
-proof of execution. Native Apple Silicon evidence follows
-[testing.md](testing.md#apple-silicon-acceptance-packet).
+proof of execution. Native evidence follows
+[testing.md](testing.md#native-validation).

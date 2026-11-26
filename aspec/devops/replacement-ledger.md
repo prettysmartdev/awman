@@ -18,8 +18,8 @@ removed; Git history is the historical record.
 | Frontends | CLI parsing/output, real API requests and event delivery, TUI key handling, rendering and session switching | `tests/component/frontend`, `src/frontend/tui/contracts.rs` |
 | Squad and worker | Refusal before resource allocation, task leases and epochs, duplicate events, queue ownership, authenticated transport, interrupted/idempotent Git publishing | `tests/component/squad`, `tests/component/worker`, WSP state model |
 | External boundaries | Docker, registry, Git transports, template builds, Apple image-store export/cache and sbx | `tests/boundary` |
-| Native guest and artifact | Boot/exec/import/network, persistent upgrade, builders/strategy, signed offline candidate, dependency and byte-integrity checks | `tests/guest`, `tests/artifact`; final native packet required |
-| CI and release | Conservative selection, exact compiled inventory/results, authenticated Actions artifacts/jobs, immutable candidate evidence, promotion refusal, operator interaction and runner repair | `xtask` unit, CI, pipeline and release contracts |
+| Native guest and artifact | Boot/exec/import/network, persistent upgrade, builders/strategy, signed offline asset boot, dependency and byte-integrity checks | `tests/guest`, `tests/artifact`; the two release-required native checks run in `make release`, the rest in the operator-run native diagnostic |
+| CI and release | Conservative selection, exact compiled inventory/results, authenticated Actions artifacts/jobs, verified release evidence, sealing and publication guards, resume and recovery, operator interaction | `xtask` unit, CI, pipeline and release contracts |
 
 The `nextgen` reconciliation also covers remote reconnects and parallel-slot
 transitions, stale dialog responses, sequential workflow request handover, and
@@ -45,12 +45,30 @@ During implementation, uncommitted source and local passing tests are not a
 completed CI certification. The independent validation report records which
 checks actually ran, their revision, results and limitations.
 
-The maintainer's inaccessible Apple Silicon Mac is the deliberately deferred
-native item. `make validate-native` produces one reviewable packet, including
-failed-run evidence. Follow the receiving-agent procedure in
-[testing.md](testing.md#apple-silicon-acceptance-packet). Do not mark it verified
-from hosted macOS compilation, a Linux run, an earlier agent's report, or the
-packet generator's unit tests.
+## Release coverage placement
+
+WI 0089 narrowed what blocks a release and moved the rest. The decisions are
+recorded row by row in `ci/release-coverage-baseline.json` and
+`ci/release-coverage-migration.json`, and `cargo xtask gates check` rejects a
+missing row or a silently shrunk filter. The summary of what blocks, what moved
+and where it runs is in [cicd.md](cicd.md#gates); the accepted residual risks
+are in [release.md](release.md#residual-risks).
+
+Retained as release blockers: the 39-cell `release` gate, exact-byte smoke of
+all four assets, and the two native checks. Moved to `pr`/`main`/`nightly`:
+macOS and Windows host suites, lint, web, musl, arm64 builtin units. Moved to
+`nightly-artifacts` and `nightly-kit`: artifact dependency, helper and policy
+scans and kit relocation. Moved to the operator-run `native-diagnostic`: guest
+breadth, soak, Apple and Linux boundaries and Linux replacement and upgrade.
+Deleted: the duplicate main, candidate and promotion gates, the
+packet-review transport, and reproduction of the four shipping assets.
+
+The native evidence remains operator evidence. Real macOS HVF boot and upgrade,
+Linux KVM over SSH, the Windows firewall, and complete publication timing are
+verified by rehearsal on real hosts and recorded in
+[release-measurements.md](release-measurements.md); hosted compilation, a Linux
+run or local fake-host tests do not stand in for them. Native breadth has no
+schedule.
 
 ## Continuing policy
 
@@ -63,6 +81,6 @@ packet generator's unit tests.
   ownership is not a security sandbox for hostile host code.
 - Report actual cold/warm timing and repeat counts. p95 and flake-rate claims
   require a series of comparable measurements, not extrapolation from one run.
-- Production release admission, environment approval and fixture publication
-  remain enforced independently of local acceptance. A maintainer packet is
+- Production release admission and fixture publication
+  remain enforced independently of local acceptance. A native diagnostic directory is
   evidence for review, not an attestation or authorization to publish.

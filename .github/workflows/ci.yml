@@ -3,6 +3,8 @@
 # Change the manifest or xtask/src/gates/render/workflows/, then re-render.
 name: CI
 
+run-name: CI ${{ inputs.gate }} ${{ inputs.key }}
+
 on:
   pull_request:
   merge_group:
@@ -13,16 +15,20 @@ on:
       gate:
         description: Hosted gate to run
         type: choice
-        options: [pr, main, nightly]
-        default: pr
+        options: [pr, main, release]
+        default: main
+      key:
+        description: Release operation discovery key
+        type: string
+        default: ""
       ref:
-        description: Exact open release PR head to test through the main workflow
+        description: Commit to check out (empty means the dispatch ref)
         type: string
         default: ""
   workflow_call:
     inputs:
       gate:
-        description: "pr, main or nightly"
+        description: "pr, main, nightly or release"
         type: string
         default: pr
       ref:
@@ -94,7 +100,7 @@ jobs:
             *) gate="${INPUT_GATE:-pr}" ;;
           esac
           case "$gate" in
-            pr|main|nightly) ;;
+            pr|main|nightly|release) ;;
             *) echo "unknown gate: $gate" >&2; exit 1 ;;
           esac
           echo "gate=$gate" >> "$GITHUB_OUTPUT"
@@ -142,6 +148,8 @@ jobs:
     name: Lint
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.gate != 'release' }}
     env:
       GATE_NAME: ${{ github.event_name == 'pull_request' && 'pr' || github.event_name == 'merge_group' && 'pr' || github.event_name == 'push' && 'main' || inputs.gate || 'pr' }}
     steps:
@@ -253,6 +261,13 @@ jobs:
             archive=archive/test-archive-linux-arm64-builtin.tar.zst \
             expected=archive/expected-tests-linux-arm64-builtin.json \
             binary=archive/awman-debug-linux-arm64-builtin >> "$GITHUB_OUTPUT"
+      - name: Upload independently compiled suite inventories
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-inventory-${{ needs.plan.outputs.gate }}-${{ inputs.mode }}-linux-arm64-builtin
+          path: archive/suite-inventories.json
+          if-no-files-found: error
+          retention-days: 90
       - name: Upload the archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -337,6 +352,13 @@ jobs:
             archive=archive/test-archive-linux-x64-builtin.tar.zst \
             expected=archive/expected-tests-linux-x64-builtin.json \
             binary=archive/awman-debug-linux-x64-builtin >> "$GITHUB_OUTPUT"
+      - name: Upload independently compiled suite inventories
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-inventory-${{ needs.plan.outputs.gate }}-${{ inputs.mode }}-linux-x64-builtin
+          path: archive/suite-inventories.json
+          if-no-files-found: error
+          retention-days: 90
       - name: Upload the archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -419,6 +441,13 @@ jobs:
             archive=archive/test-archive-linux-x64-default.tar.zst \
             expected=archive/expected-tests-linux-x64-default.json \
             binary=archive/awman-debug-linux-x64-default >> "$GITHUB_OUTPUT"
+      - name: Upload independently compiled suite inventories
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-inventory-${{ needs.plan.outputs.gate }}-${{ inputs.mode }}-linux-x64-default
+          path: archive/suite-inventories.json
+          if-no-files-found: error
+          retention-days: 90
       - name: Upload the archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -566,6 +595,13 @@ jobs:
             archive=archive/test-archive-macos-arm64-default.tar.zst \
             expected=archive/expected-tests-macos-arm64-default.json \
             binary=archive/awman-debug-macos-arm64-default >> "$GITHUB_OUTPUT"
+      - name: Upload independently compiled suite inventories
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-inventory-${{ needs.plan.outputs.gate }}-${{ inputs.mode }}-macos-arm64-default
+          path: archive/suite-inventories.json
+          if-no-files-found: error
+          retention-days: 90
       - name: Upload the archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -648,6 +684,13 @@ jobs:
             archive=archive/test-archive-windows-x64-default.tar.zst \
             expected=archive/expected-tests-windows-x64-default.json \
             binary=archive/awman-debug-windows-x64-default >> "$GITHUB_OUTPUT"
+      - name: Upload independently compiled suite inventories
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-inventory-${{ needs.plan.outputs.gate }}-${{ inputs.mode }}-windows-x64-default
+          path: archive/suite-inventories.json
+          if-no-files-found: error
+          retention-days: 90
       - name: Upload the archive
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -680,7 +723,7 @@ jobs:
           key: ${{ steps.cache-key.outputs.key }}
 
   boundary-linux-docker:
-    name: Test boundary on linux-x64
+    name: Test boundary on linux-x64 (cell ${{ strategy.job-index }})
     needs: [plan, build-linux-x64-default]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-linux-x64-default.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'boundary-linux-docker') }}
     runs-on: ubuntu-24.04
@@ -761,7 +804,7 @@ jobs:
           retention-days: 30
 
   builtin-hermetic-linux-arm64:
-    name: Test component on linux-arm64
+    name: Test component on linux-arm64 (cell ${{ strategy.job-index }})
     needs: [plan, build-linux-arm64-builtin]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-linux-arm64-builtin.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'builtin-hermetic-linux-arm64') }}
     runs-on: ubuntu-24.04-arm
@@ -835,7 +878,7 @@ jobs:
           retention-days: 30
 
   builtin-hermetic-linux-x64-release:
-    name: Test component on linux-x64-release
+    name: Test component on linux-x64-release (cell ${{ strategy.job-index }})
     needs: [plan, build-linux-x64-builtin]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-linux-x64-builtin.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'builtin-hermetic-linux-x64-release') }}
     runs-on: ubuntu-22.04
@@ -909,7 +952,7 @@ jobs:
           retention-days: 30
 
   test-component-linux-x64:
-    name: Test component on linux-x64
+    name: Test component on linux-x64 (cell ${{ strategy.job-index }})
     needs: [plan, build-linux-x64-default]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-linux-x64-default.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'test-component-linux-x64') }}
     runs-on: ubuntu-24.04
@@ -983,7 +1026,7 @@ jobs:
           retention-days: 30
 
   test-component-macos-arm64:
-    name: Test component on macos-arm64
+    name: Test component on macos-arm64 (cell ${{ strategy.job-index }})
     needs: [plan, build-macos-arm64-default]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-macos-arm64-default.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'test-component-macos-arm64') }}
     runs-on: macos-15
@@ -1057,7 +1100,7 @@ jobs:
           retention-days: 30
 
   test-component-windows-x64:
-    name: Test component on windows-x64
+    name: Test component on windows-x64 (cell ${{ strategy.job-index }})
     needs: [plan, build-windows-x64-default]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-windows-x64-default.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'test-component-windows-x64') }}
     runs-on: windows-2025
@@ -1131,7 +1174,7 @@ jobs:
           retention-days: 30
 
   test-soak-linux-x64:
-    name: Test soak on linux-x64
+    name: Test soak on linux-x64 (cell ${{ strategy.job-index }})
     needs: [plan, build-linux-x64-default]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-linux-x64-default.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'test-soak-linux-x64') }}
     runs-on: ubuntu-24.04
@@ -1205,7 +1248,7 @@ jobs:
           retention-days: 30
 
   test-soak-linux-x64-private-registry:
-    name: Test soak on linux-x64-private-registry
+    name: Test soak on linux-x64-private-registry (cell ${{ strategy.job-index }})
     needs: [plan, build-linux-x64-default]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-linux-x64-default.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'test-soak-linux-x64-private-registry') }}
     runs-on: ubuntu-24.04
@@ -1284,7 +1327,7 @@ jobs:
           retention-days: 30
 
   test-unit-linux-x64:
-    name: Test unit on linux-x64
+    name: Test unit on linux-x64 (cell ${{ strategy.job-index }})
     needs: [plan, build-linux-x64-default]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-linux-x64-default.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'test-unit-linux-x64') }}
     runs-on: ubuntu-24.04
@@ -1358,7 +1401,7 @@ jobs:
           retention-days: 30
 
   test-unit-macos-arm64:
-    name: Test unit on macos-arm64
+    name: Test unit on macos-arm64 (cell ${{ strategy.job-index }})
     needs: [plan, build-macos-arm64-default]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-macos-arm64-default.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'test-unit-macos-arm64') }}
     runs-on: macos-15
@@ -1432,7 +1475,7 @@ jobs:
           retention-days: 30
 
   test-unit-windows-x64:
-    name: Test unit on windows-x64
+    name: Test unit on windows-x64 (cell ${{ strategy.job-index }})
     needs: [plan, build-windows-x64-default]
     if: ${{ !cancelled() && needs.plan.result == 'success' && needs.build-windows-x64-default.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), 'test-unit-windows-x64') }}
     runs-on: windows-2025

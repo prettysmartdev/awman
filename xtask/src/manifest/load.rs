@@ -10,10 +10,10 @@ pub fn load(root: &Path) -> Result<Manifest> {
 }
 pub fn parse(bytes: &[u8]) -> Result<Manifest> {
     let mut manifest: Manifest = toml::from_str(std::str::from_utf8(bytes)?)
-        .context("gate manifest schema 1 (unknown fields are forbidden)")?;
+        .context("gate manifest schema 2 (unknown fields are forbidden)")?;
     manifest.version = crate::evidence::digest::sha256(bytes);
     anyhow::ensure!(
-        manifest.schema == 1,
+        manifest.schema == 2,
         "unsupported gate manifest schema {}",
         manifest.schema
     );

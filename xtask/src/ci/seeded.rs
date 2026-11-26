@@ -18,7 +18,7 @@
 
 use super::{args::Args, verdict};
 use crate::{
-    gates::{plan, render::workflows},
+    gates::render::workflows,
     manifest::{self, Manifest},
 };
 use anyhow::{bail, Context, Result};
@@ -531,33 +531,19 @@ pub fn pipeline_faults(m: &Manifest) -> Result<Vec<Fault>> {
         detail: errors.join("; "),
     });
 
-    // 3. Release hardware cells are silently skipped: the candidate plan must
-    // show them blocked, never absent.
-    let request = plan::Request {
-        repository_id: "1".into(),
-        event: "workflow_dispatch".into(),
-        head_sha: "a".repeat(40),
-        base_sha: None,
-        paths: vec![],
-        diff_complete: true,
-        admitted_platforms: Default::default(),
-        suite_durations_ms: Default::default(),
-        suite_test_counts: Default::default(),
-        main_durations_ms: vec![],
-    };
-    let p = plan::create(m, "candidate", request, today)?;
-    let guest: Vec<_> = p.tests.iter().filter(|t| t.tier == "guest").collect();
+    // 3. A missing native obligation must fail manifest policy before dispatch.
+    // Diagnostics are never substituted for the three exact-asset tests.
+    let mut missing = m.clone();
+    missing.release.native.remove("native.linux-x64");
+    let result = manifest::validate::validate(&missing, today);
     faults.push(Fault {
         name: "skipped hardware",
-        detected: !guest.is_empty()
-            && guest
-                .iter()
-                .all(|t| t.blocked_reason.is_some() && !t.self_hosted),
-        detail: format!(
-            "{} guest test entries, all blocked and hosted: {}",
-            guest.len(),
-            guest.iter().all(|t| t.blocked_reason.is_some())
-        ),
+        detected: result.is_err(),
+        detail: result
+            .err()
+            .map_or("missing native execution was accepted".into(), |e| {
+                format!("{e:#}")
+            }),
     });
     Ok(faults)
 }

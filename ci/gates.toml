@@ -1,5 +1,5 @@
 # WI 0144 target contract. Pending fixture pins are deliberately red, never fake hashes.
-schema = 1
+schema = 2
 quarantine = []
 override = []
 
@@ -142,7 +142,7 @@ trust = "hosted"
 runs_on = ["ubuntu-24.04-arm"]
 triple = "aarch64-unknown-linux-gnu"
 image = "20261101.172"
-provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "builtin-payload", "release-artifact"]
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "builtin-payload", "release-artifact", "offline"]
 
 [platforms.macos-arm64]
 toolchain = "1.94.0"
@@ -150,7 +150,7 @@ trust = "hosted"
 runs_on = ["macos-15"]
 triple = "aarch64-apple-darwin"
 image = "20261104.0514"
-provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "release-artifact"]
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "release-artifact", "offline"]
 
 [platforms.windows-x64]
 toolchain = "1.94.0"
@@ -158,21 +158,12 @@ trust = "hosted"
 runs_on = ["windows-2025"]
 triple = "x86_64-pc-windows-msvc"
 image = "20261101.318"
-provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "release-artifact"]
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "release-artifact", "offline"]
 
 [platforms.macos-arm64-ci-guest]
 toolchain = "1.94.0"
-trust = "ci-guest"
-runs_on = ["self-hosted", "macOS", "ARM64", "awman-ci-guest"]
-triple = "aarch64-apple-darwin"
-image = "macos-25G83"
-provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "hypervisor", "builtin-payload", "guest-fixtures", "previous-release", "apple-containers", "release-artifact", "offline"]
-max_vms = 2
-
-[platforms.macos-arm64-release]
-toolchain = "1.94.0"
-trust = "release"
-runs_on = ["self-hosted", "macOS", "ARM64", "awman-release"]
+trust = "operator"
+runs_on = []
 triple = "aarch64-apple-darwin"
 image = "macos-25G83"
 provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "hypervisor", "builtin-payload", "guest-fixtures", "previous-release", "apple-containers", "release-artifact", "offline"]
@@ -214,12 +205,6 @@ features = "builtin"
 profile = "test"
 packages = ["awman", "awman-cli", "awman-host-shims", "awman-wsp", "awman-test-support", "xtask"]
 
-[builds.macos-arm64-release-builtin]
-platform = "macos-arm64-release"
-features = "builtin"
-profile = "test"
-packages = ["awman", "awman-cli", "awman-host-shims", "awman-wsp", "awman-test-support", "xtask"]
-
 [builds.linux-x64-musl-static]
 platform = "linux-x64"
 features = "default"
@@ -254,8 +239,8 @@ packages = ["awman-cli"]
 kind = "release"
 asset = "awman-linux-arm64"
 
-[builds.macos-arm64-release-release]
-platform = "macos-arm64-release"
+[builds.macos-arm64-release]
+platform = "macos-arm64"
 features = "builtin"
 profile = "release"
 packages = ["awman-cli"]
@@ -295,12 +280,6 @@ requires = []
 paths = []
 always = true
 filter = "not (test(/^command::commands::exec_workflow::contract_tests::/) | test(/^command::commands::exec_workflow::factory::stuck_timeout_tests::/) | test(/^data::mount_authority::tests::/) | test(/^data::work_item_ref::tests::/) | test(/^data::config::work_items::tests::/) | test(/^engine::issue::http::url_tests::/) | test(/^command::work_item::resolver::key_tests::/) | test(/^command::work_item::draft_sync::timing_tests::/) | test(/^data::checkout_paths::tests::/) | test(/^data::workspace::tests::/) | test(/^data::workflow_definition::read_only_workspace_tests::/) | test(/^data::image_inputs::tests::/) | test(/^data::image_tags::lease_tag_tests::/) | test(/^data::worker::lease_images::tests::/) | test(/^data::execution_event::image_stale_tests::/) | test(/^data::config::work_servers::image_budget_tests::/) | test(/^engine::agent::image_freshness::failure_reason_tests::/) | test(/^engine::container::agent_argv::adapter_tests::/) | test(/^engine::container::agent_version::tests::/) | test(/^engine::agent_output::cursor_stream_json::tests::/) | test(/^engine::agent::session_seed::tests::/) | test(/^engine::sandbox::dsbx::backend::adapter_tail_tests::/) | test(/^data::agent_policy::tests::/) | test(/^data::agent_failure::tests::/) | test(/^data::automation::tests::/) | test(/^engine::agent::credential_routes::tests::/) | test(/^data::credential_update::tests::/) | test(/^data::preparation::tests::/) | test(/^data::settings_profile::tests::/) | test(/^data::ids::tests::/) | test(/^data::config::agents::automation_timeout_tests::/) | test(/^command::dispatch::catalogue::pending::tests::/) | test(/^command::dispatch::projections::optional_enum_tests::/) | test(/^command::dispatch::projections::raw_args::misplaced_flag_tests::/) | test(/^command::dispatch::outcomes::wait_failure_tests::/) | test(/^data::ready_summary::preparation_tests::/) | test(/^data::terminal::automation_frame_tests::/) | test(/^data::execution_event::automation_event_tests::/) | test(/^engine::agent::definition::native_plan_tests::/) | test(/^data::config::agent_definition::native_plan_tests::/) | test(/^command::automation::admission::tests::/) | test(/^command::automation::results::tests::/) | test(/^engine::agent::automation::osc7501::tests::/) | test(/^engine::agent::automation::observer::tests::/) | test(/^engine::agent::automation::tests::/) | test(/^command::daemon_api::capabilities::credential_enrollment_tests::/) | test(/^engine::remote::local::credential_wire_tests::/) | test(/^engine::auth::credential::protected_equality_tests::/) | test(/^frontend::render_helpers::tests::/) | test(/^engine::worker::terminal_relay::tests::/) | test(/^command::worker::terminal::tests::/))"
-
-
-
-
-
-
 
 [suites.unit-wsp]
 tier = "unit"
@@ -361,8 +340,6 @@ contracts = ["unit-awman-builtin"]
 requires = []
 paths = []
 always = true
-
-
 
 # Includes data::automation_store: shared SQLite reservation/CAS/dedup, immutable
 # results and bounded lifecycle recovery (WI 0070 Part A).
@@ -1033,61 +1010,10 @@ suites = ["soak-private-registry"]
 builds = ["linux-x64-default"]
 platform = "linux-x64-private-registry"
 
-[gates.candidate]
-includes = ["main"]
-budget_minutes = 20
-
-[[gates.candidate.cells]]
-suites = ["artifact-entrypoints", "artifact-deps-scan", "artifact-upgrade-policy", "artifact-smoke", "artifact-switches", "artifact-measure"]
-builds = ["linux-x64-release", "linux-arm64-release", "macos-arm64-release-release", "windows-x64-release"]
-
-[[gates.candidate.cells]]
-suites = ["artifact-signed-boot"]
-builds = ["macos-arm64-release-release"]
-
-[[gates.candidate.cells]]
-suites = ["guest-boot", "guest-exec", "guest-import", "guest-network", "guest-upgrade", "guest-builder", "guest-strategy"]
-builds = ["macos-arm64-release-builtin"]
-
-[[gates.candidate.cells]]
-suites = ["unit-awman-builtin", "boundary-apple", "soak-guest"]
-builds = ["macos-arm64-release-builtin"]
-
-[gates.promote]
-requires_gate = "candidate"
-budget_minutes = 20
-
-[[release_critical]]
-id = "guest.actual-awman-boot"
-suite = "guest-boot"
-tests = ["awman-cli::guest boot::actual_awman_boots_a_guest"]
-gates = ["candidate"]
-not_overridable = true
-
-[[release_critical]]
-id = "guest.upgrade-from-previous-release"
-suite = "guest-upgrade"
-tests = ["awman-cli::guest upgrade::previous_release_state_upgrades_and_boots"]
-gates = ["candidate"]
-not_overridable = true
-
-[[release_critical]]
-id = "guest.strategy-matrix"
-suite = "guest-strategy"
-# Each case checks the shipped descriptor's settings/prompt/overlay behavior and
-# proves that its synthetic agent ran inside a guest, with no host execution.
-tests = ["awman-cli::guest strategy::claude_named_skills","awman-cli::guest strategy::claude_all_skills","awman-cli::guest strategy::codex_named_skills","awman-cli::guest strategy::codex_all_skills","awman-cli::guest strategy::opencode_named_skills","awman-cli::guest strategy::opencode_all_skills","awman-cli::guest strategy::opencode_v2_named_skills","awman-cli::guest strategy::opencode_v2_all_skills","awman-cli::guest strategy::cursor_named_skills","awman-cli::guest strategy::cursor_all_skills","awman-cli::guest strategy::copilot_named_skills","awman-cli::guest strategy::copilot_all_skills","awman-cli::guest strategy::cline_named_skills","awman-cli::guest strategy::cline_all_skills","awman-cli::guest strategy::antigravity_named_skills","awman-cli::guest strategy::antigravity_all_skills"]
-gates = ["candidate"]
-not_overridable = true
-
-[[release_critical]]
-id = "artifact.signed-offline-session"
-suite = "artifact-signed-boot"
-tests = ["awman-cli::artifact signed_boot::signed_artifact_runs_an_offline_session", "awman-cli::artifact signed_boot::signed_artifact_upgrades_previous_state_offline"]
-gates = ["candidate"]
-not_overridable = true
-
 [fixtures.guest-oci-base]
+arch = "arm64"
+recipe_sha256 = "cc0ead7736a5f16f36f4281bfd3cce6a679cc854036fde99aa93bff1c9306a71"
+image_contract_sha256 = "e7aaaaf242756ad402827bb35be57385f176892f57102f4b03aab2429155ee79"
 file = "guest-oci-base.tar"
 tiers = ["guest", "artifact"]
 build = "guest-oci-base"
@@ -1095,6 +1021,7 @@ sha256 = "a923846938a4fe539e06b89b7bd6beeca20917344d59e4afee8a5882b84e041e"
 source = "https://github.com/prettysmartdev/awman/releases/download/fixtures-a66c55eec205f218235cf7fedf47f280705f1bfe/fixture-oci.tar"
 
 [fixtures.guest-docker-base]
+arch = "arm64"
 file = "guest-docker-base.tar"
 tiers = ["guest", "artifact"]
 build = "guest-docker-base"
@@ -1188,55 +1115,11 @@ max_threads = 1
 assets = ["awman-linux-amd64", "awman-linux-arm64", "awman-macos-arm64", "awman-windows-amd64.exe"]
 checksums = "SHA256SUMS"
 evidence_valid_days = 14
-candidate_retention_days = 90
-operator_path = "pipeline"
-environment = "release"
-ci_guest_labels = ["self-hosted", "macOS", "ARM64", "awman-ci-guest"]
-release_labels = ["self-hosted", "macOS", "ARM64", "awman-release"]
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+retention_days = 90
+evidence = "release-evidence.json"
+gate = "release"
+workflow = ".github/workflows/release.yml"
+smoke_suites = ["artifact-smoke", "artifact-entrypoints", "artifact-switches"]
 
 [workflows.".github/workflows/ci.yml"]
 jobs = ["plan", "lint", "build", "test", "gate"]
@@ -1248,11 +1131,6 @@ jobs = ["nightly"]
 commands = []
 timeout_minutes = 60
 
-[workflows.".github/workflows/candidate.yml"]
-jobs = ["preflight", "runner-preflight", "build", "assemble", "main-gate", "artifact", "guest", "repro", "gate", "promote"]
-commands = ["release candidate"]
-timeout_minutes = 60
-
 [workflows.".github/workflows/fixtures.yml"]
 jobs = ["build", "publish"]
 commands = ["fixtures build", "fixtures verify-build", "fixtures publish-plan"]
@@ -1260,11 +1138,11 @@ timeout_minutes = 60
 
 # Nightly sbx requires a separately provisioned engine; removing it blocks this cell.
 [platforms.macos-arm64-sbx]
-runs_on = ["self-hosted", "macOS", "ARM64", "awman-ci-sbx"]
+runs_on = []
 triple = "aarch64-apple-darwin"
 toolchain = "1.94.0"
 image = "pending-provisioned-image-digest"
-trust = "ci-guest"
+trust = "operator"
 provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "docker-sbx"]
 
 # Nightly private-registry soak needs separately provisioned credentials; without
@@ -1276,13 +1154,6 @@ toolchain = "1.94.0"
 image = "20261101.360"
 trust = "hosted"
 provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "public-network", "registry-credentials"]
-
-[workflows.".github/workflows/promote.yml"]
-jobs = ["verify-inputs", "verify", "receipt"]
-commands = ["release promote", "release verify"]
-timeout_minutes = 60
-
-
 
 [suites.component-command-models]
 tier = "component"
@@ -1320,11 +1191,11 @@ filter = "test(/^command::settings_profiles::/) | test(/^command::native_resume:
 # Local operator evidence only; no hosted runner is advertised as having KVM.
 [platforms.linux-x64-native]
 toolchain = "1.94.0"
-trust = "ci-guest"
-runs_on = ["self-hosted", "Linux", "X64", "awman-native-kvm"]
+trust = "operator"
+runs_on = []
 triple = "x86_64-unknown-linux-gnu"
 image = "operator-recorded-in-native-packet"
-provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "hypervisor", "builtin-payload", "guest-fixtures", "docker", "release-artifact", "offline"]
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "hypervisor", "builtin-payload", "guest-fixtures", "docker", "release-artifact", "offline", "local-registry", "git-transports", "previous-release"]
 max_vms = 2
 
 [builds.linux-x64-native-builtin]
@@ -1336,11 +1207,11 @@ packages = ["awman", "awman-cli", "awman-host-shims", "awman-wsp", "awman-test-s
 # Local operator evidence only; no hosted runner is advertised as having KVM.
 [platforms.linux-arm64-native]
 toolchain = "1.94.0"
-trust = "ci-guest"
-runs_on = ["self-hosted", "Linux", "ARM64", "awman-native-kvm"]
+trust = "operator"
+runs_on = []
 triple = "aarch64-unknown-linux-gnu"
 image = "operator-recorded-in-native-packet"
-provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "hypervisor", "builtin-payload", "guest-fixtures", "docker", "release-artifact", "offline"]
+provides = ["tempdir", "loopback", "subprocess", "awman-binary", "fake-cli", "local-git", "hypervisor", "builtin-payload", "guest-fixtures", "docker", "release-artifact", "offline", "local-registry", "git-transports", "previous-release"]
 max_vms = 2
 
 [builds.linux-arm64-native-builtin]
@@ -1402,3 +1273,121 @@ requires = ["hypervisor", "guest-fixtures", "offline"]
 paths = ["src/**", "tests/artifact/signed_boot/**"]
 filter = "test(=signed_boot::linux_artifact_runs_an_offline_session) | test(=signed_boot::exact_linux_candidate_replacement_preserves_cached_state_offline)"
 group = "vm"
+
+[gates.release]
+budget_minutes = 15
+required_check = "gate"
+
+[[gates.release.cells]]
+suites = ["component-agent-profiles", "component-profile-commands", "component-core-internals", "component-command-models", "unit-awman", "unit-wsp", "component-wsp-terminals", "unit-test-support", "unit-xtask", "unit-host-shims", "component-data", "component-engine", "component-command", "component-command-edit-artifacts", "component-command-builtin", "component-command-daemon", "component-command-differential", "component-frontend", "component-daemon", "component-squad", "component-worker", "component-worker-terminal-exchange", "component-security", "component-tools", "component-parity-builtin", "component-parity-daemon", "component-parity-differential", "boundary-docker", "boundary-registry", "boundary-git", "boundary-conformance", "boundary-templates", "boundary-offline", "xtask-release-contract", "xtask-pipeline", "xtask-ci", "xtask-gates", "component-test-support"]
+builds = ["linux-x64-default"]
+
+[[gates.release.cells]]
+suites = ["unit-awman-builtin"]
+builds = ["linux-x64-builtin"]
+
+[gates.native-diagnostic]
+execution = "operator"
+budget_minutes = 120
+
+[[gates.native-diagnostic.cells]]
+suites = ["unit-awman-builtin", "guest-boot", "guest-exec", "guest-import", "guest-network", "guest-upgrade", "guest-builder", "guest-strategy", "boundary-apple", "soak-guest", "artifact-signed-boot"]
+builds = ["macos-arm64-ci-guest-builtin"]
+
+[[gates.native-diagnostic.cells]]
+suites = ["unit-awman-builtin", "guest-boot", "guest-exec", "guest-import", "guest-network", "guest-builder", "guest-strategy", "guest-linux-replacement", "guest-linux-published-upgrade", "boundary-docker", "boundary-registry", "boundary-git", "boundary-conformance", "boundary-templates", "boundary-offline", "boundary-private-memory", "artifact-linux-boot", "artifact-linux-published-upgrade", "soak-guest"]
+builds = ["linux-x64-native-builtin"]
+
+[[gates.native-diagnostic.cells]]
+suites = ["unit-awman-builtin", "guest-boot", "guest-exec", "guest-import", "guest-network", "guest-builder", "guest-strategy", "guest-linux-replacement", "guest-linux-published-upgrade", "boundary-docker", "boundary-registry", "boundary-git", "boundary-conformance", "boundary-templates", "boundary-offline", "boundary-private-memory", "artifact-linux-boot", "artifact-linux-published-upgrade", "soak-guest"]
+builds = ["linux-arm64-native-builtin"]
+
+[[gates.native-diagnostic.cells]]
+suites = ["boundary-sbx"]
+builds = ["macos-arm64-ci-guest-builtin"]
+platform = "macos-arm64-sbx"
+
+[gates.nightly-artifacts]
+budget_minutes = 45
+
+[[gates.nightly-artifacts.cells]]
+suites = ["artifact-smoke", "artifact-entrypoints", "artifact-switches", "artifact-deps-scan", "artifact-upgrade-policy", "artifact-measure"]
+builds = ["linux-x64-release", "linux-arm64-release", "macos-arm64-release", "windows-x64-release"]
+
+[[release_critical]]
+id = "artifact.signed-offline-session"
+suite = "artifact-signed-boot"
+tests = ["awman-cli::artifact signed_boot::signed_artifact_runs_an_offline_session", "awman-cli::artifact signed_boot::signed_artifact_upgrades_previous_state_offline"]
+gates = []
+not_overridable = true
+
+[[release_critical]]
+id = "artifact.linux-offline-session"
+suite = "artifact-linux-boot"
+tests = ["awman-cli::artifact signed_boot::linux_artifact_runs_an_offline_session"]
+gates = []
+not_overridable = true
+
+[[release_critical]]
+id = "artifact.access-reduction"
+suite = "artifact-switches"
+tests = ["awman-cli::artifact switches::runtime_opt_ins_have_no_effect_without_isolation", "awman-cli::artifact switches::test_isolation_only_reduces_access"]
+gates = []
+not_overridable = true
+
+[release.native."native.macos-arm64"]
+asset = "awman-macos-arm64"
+host = "local"
+suites = ["artifact-signed-boot"]
+fixtures = ["guest-oci-base"]
+budget_seconds = 600
+required = true
+previous_release = "aarch64-apple-darwin"
+
+[release.native."native.linux-x64"]
+asset = "awman-linux-amd64"
+host = "ssh"
+suites = ["artifact-linux-boot"]
+fixtures = ["guest-oci-base-amd64"]
+budget_seconds = 600
+required = true
+
+[workflows.".github/workflows/release.yml"]
+jobs = ["produce", "validate"]
+commands = ["gates release-plan", "release produce-native", "release produce", "test install-runner", "test kit", "release kit-pack", "release smoke", "release build-record"]
+timeout_minutes = 60
+
+[fixtures.guest-oci-base-amd64]
+file = "guest-oci-base-amd64.tar"
+tiers = ["guest", "artifact"]
+build = "guest-oci-base-amd64"
+arch = "amd64"
+recipe_sha256 = "cc0ead7736a5f16f36f4281bfd3cce6a679cc854036fde99aa93bff1c9306a71"
+image_contract_sha256 = "e7aaaaf242756ad402827bb35be57385f176892f57102f4b03aab2429155ee79"
+pending = "publish architecture-specific amd64 fixture before release cutover"
+
+[[gates.native-diagnostic.cells]]
+suites = ["artifact-smoke", "artifact-entrypoints", "artifact-switches", "artifact-deps-scan", "artifact-upgrade-policy", "artifact-measure"]
+builds = ["macos-arm64-ci-guest-builtin"]
+
+[[gates.native-diagnostic.cells]]
+suites = ["artifact-smoke", "artifact-entrypoints", "artifact-switches", "artifact-deps-scan", "artifact-upgrade-policy", "artifact-measure"]
+builds = ["linux-x64-native-builtin"]
+
+[[gates.native-diagnostic.cells]]
+suites = ["artifact-smoke", "artifact-entrypoints", "artifact-switches", "artifact-deps-scan", "artifact-upgrade-policy", "artifact-measure"]
+builds = ["linux-arm64-native-builtin"]
+
+[suites.kit-relocation]
+tier = "component"
+kind = "command"
+contracts = ["standalone-native-kit-relocation"]
+requires = []
+paths = ["xtask/src/test/**", "ci/test-kit-relocation.sh"]
+command = ["bash", "ci/test-kit-relocation.sh"]
+
+[gates.nightly-kit]
+budget_minutes = 10
+[[gates.nightly-kit.cells]]
+suites = ["kit-relocation"]
+builds = ["linux-x64-default"]

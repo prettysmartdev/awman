@@ -3,7 +3,10 @@
 pub mod check;
 pub mod discovery;
 pub mod doc_refs;
+pub mod migration;
 pub mod plan;
+pub mod release_plan;
+pub mod release_verify;
 pub mod render;
 pub mod selection;
 #[cfg(test)]
@@ -21,6 +24,22 @@ struct Arguments {
 }
 #[derive(Subcommand)]
 enum Command {
+    ReleasePlan {
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    VerifyReleaseEvidence {
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        run_id: u64,
+        #[arg(long)]
+        out: PathBuf,
+    },
     Check {
         #[arg(long)]
         report_only: bool,
@@ -103,6 +122,27 @@ pub fn run(args: &[String]) -> anyhow::Result<ExitCode> {
     let args =
         Arguments::try_parse_from(std::iter::once("gates".to_owned()).chain(args.iter().cloned()))?;
     match args.command {
+        Command::ReleasePlan { root: r } => {
+            match crate::manifest::load(&r.unwrap_or_else(root))
+                .and_then(|m| release_plan::create(&m))
+            {
+                Ok(p) => {
+                    println!("{}", serde_json::to_string_pretty(&p)?);
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err(e) => {
+                    eprintln!("release-plan: {e:#}");
+                    Ok(ExitCode::from(2))
+                }
+            }
+        }
+        Command::VerifyReleaseEvidence {
+            root,
+            plan,
+            repo,
+            run_id,
+            out,
+        } => release_verify::run(&root, &plan, &repo, run_id, &out),
         Command::Check {
             report_only,
             allow_placeholders,

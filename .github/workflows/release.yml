@@ -1,0 +1,195 @@
+# Release asset: build once, attest, then validate those exact bytes.
+#
+# Dispatched by `make release` (cargo xtask release run) once per asset, on
+# the pushed release ref whose head is the release commit R, so every
+# attestation names R as its source digest. Two job roles (design 7.7):
+#
+#   produce   build cache-free, sign once (macOS), select the native kit,
+#             attest and upload durable checkpoints: produced-<asset>,
+#             native-kit-<id>. A rerun first reuses checkpoints it finds.
+#   validate  download the checkpoints, verify provenance, run the exact-asset
+#             smoke suites, write build.json, upload release-asset-<asset>.
+#             A failed validate reruns without touching production.
+#
+# Hosted runners only; no environment, no secrets, no local reusable calls.
+# The command polls this run, verifies attestations itself and publishes from
+# the operator's login: nothing here can write a release, tag or branch.
+name: Release asset
+run-name: release ${{ inputs.version }} ${{ inputs.asset }} ${{ inputs.key }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      asset:
+        description: Release asset name from the release plan
+        type: string
+        required: true
+      version:
+        description: Version being released (vX.Y.Z)
+        type: string
+        required: true
+      commit:
+        description: Full release commit SHA; must be the dispatched ref's head
+        type: string
+        required: true
+      key:
+        description: Idempotency key of the release attempt (set by the command)
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  ASSET: ${{ inputs.asset }}
+  COMMIT: ${{ inputs.commit }}
+  RELEASE_VERSION: ${{ inputs.version }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  produce:
+    name: Produce ${{ inputs.asset }}
+    runs-on: ${{ inputs.asset == 'awman-macos-arm64' && 'macos-15' || inputs.asset == 'awman-windows-amd64.exe' && 'windows-2025' || inputs.asset == 'awman-linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-22.04' }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    outputs:
+      native: ${{ steps.checkpoint.outputs.native }}
+    steps:
+      - name: The dispatched ref must be the release commit
+        run: '[ "$GITHUB_SHA" = "$COMMIT" ] || { echo "dispatched at $GITHUB_SHA, not $COMMIT" >&2; exit 1; }'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
+        with:
+          toolchain: "1.94.0"
+      - name: Release plan
+        run: |
+          echo "XTASK_TARGET=$RUNNER_TEMP/xtask-target" >> "$GITHUB_ENV"
+          cargo run --locked --quiet -p xtask --target-dir "$RUNNER_TEMP/xtask-target" -- gates release-plan > "$RUNNER_TEMP/plan.json"
+      - name: Durable checkpoints from an earlier attempt
+        id: checkpoint
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          native=$(cargo run --locked --quiet -p xtask --target-dir "$XTASK_TARGET" -- release produce-native --asset "$ASSET" --plan "$RUNNER_TEMP/plan.json")
+          echo "native=$native" >> "$GITHUB_OUTPUT"
+          artifacts=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts")
+          expired=$(printf '%s' "$artifacts" | jq --arg asset "produced-$ASSET" --arg kit "native-kit-$native" '[.artifacts[] | select((.name == $asset or .name == $kit) and .expired == true)] | length')
+          [ "$expired" -eq 0 ] || { echo 'retained production bytes expired; refusing to rebuild them' >&2; exit 1; }
+          asset_count=$(printf '%s' "$artifacts" | jq --arg name "produced-$ASSET" '[.artifacts[] | select(.name == $name and .expired == false)] | length')
+          kit_count=$(printf '%s' "$artifacts" | jq --arg name "native-kit-$native" '[.artifacts[] | select(.name == $name and .expired == false)] | length')
+          [ "$asset_count" -le 1 ] && [ "$kit_count" -le 1 ] || { echo 'ambiguous production checkpoints' >&2; exit 1; }
+          echo "reuse_asset=$([ "$asset_count" -eq 1 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "reuse_kit=$([ "$kit_count" -eq 1 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - name: Build once (cache-free) and sign once
+        if: ${{ steps.checkpoint.outputs.reuse_asset != 'true' }}
+        run: cargo run --locked --quiet -p xtask --target-dir "$XTASK_TARGET" -- release produce --asset "$ASSET" --plan "$RUNNER_TEMP/plan.json" --out out
+      - name: Native test kit (selected artifact target only)
+        if: ${{ steps.checkpoint.outputs.reuse_kit != 'true' && steps.checkpoint.outputs.native != '' }}
+        env:
+          NATIVE: ${{ steps.checkpoint.outputs.native }}
+        run: |
+          triple=$(jq -r --arg asset "$ASSET" '.assets[] | select(.asset == $asset) | .triple' "$RUNNER_TEMP/plan.json")
+          bash tools/msb-payloads/fetch.sh "$triple"
+          bash tools/msb-payloads/verify.sh "$triple"
+          mkdir -p out
+          cargo run --locked --quiet -p xtask --target-dir "$XTASK_TARGET" -- test install-runner
+          cargo run --locked --quiet -p xtask --target-dir "$XTASK_TARGET" -- test kit --native "$NATIVE" --commit "$COMMIT" --out "$RUNNER_TEMP/kit"
+          cargo run --locked --quiet -p xtask --target-dir "$XTASK_TARGET" -- release kit-pack --dir "$RUNNER_TEMP/kit" --out "out/native-kit-$NATIVE.tar"
+      - name: Attest the shipping bytes
+        if: ${{ steps.checkpoint.outputs.reuse_asset != 'true' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/${{ inputs.asset }}
+      - name: Attest the native kit
+        if: ${{ steps.checkpoint.outputs.reuse_kit != 'true' && steps.checkpoint.outputs.native != '' }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/native-kit-${{ steps.checkpoint.outputs.native }}.tar
+      - name: Checkpoint the shipping bytes
+        if: ${{ steps.checkpoint.outputs.reuse_asset != 'true' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: produced-${{ inputs.asset }}
+          path: |
+            out/${{ inputs.asset }}
+            out/produce.json
+            out/abi.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Checkpoint the native kit
+        if: ${{ steps.checkpoint.outputs.reuse_kit != 'true' && steps.checkpoint.outputs.native != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-kit-${{ steps.checkpoint.outputs.native }}
+          path: out/native-kit-${{ steps.checkpoint.outputs.native }}.tar
+          if-no-files-found: error
+          retention-days: 90
+
+  validate:
+    name: Validate ${{ inputs.asset }}
+    needs: produce
+    runs-on: ${{ inputs.asset == 'awman-macos-arm64' && 'macos-15' || inputs.asset == 'awman-windows-amd64.exe' && 'windows-2025' || inputs.asset == 'awman-linux-arm64' && 'ubuntu-24.04-arm' || 'ubuntu-22.04' }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
+        with:
+          toolchain: "1.94.0"
+      - name: Exact produced bytes (never rebuilt here)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: produced-${{ inputs.asset }}
+          path: in
+      - name: Verify provenance before executing anything
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify "in/$ASSET" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+            --source-digest "$COMMIT" --deny-self-hosted-runners
+          chmod +x "in/$ASSET"
+      - name: Exact-asset smoke, entrypoints and access-reduction suites
+        run: |
+          cargo run --locked --quiet -p xtask --target-dir "$RUNNER_TEMP/xtask-target" -- gates release-plan > "$RUNNER_TEMP/plan.json"
+          cargo run --locked --quiet -p xtask --target-dir "$RUNNER_TEMP/xtask-target" -- test install-runner
+          cargo run --locked --quiet -p xtask --target-dir "$RUNNER_TEMP/xtask-target" -- release smoke --asset "$ASSET" \
+            --plan "$RUNNER_TEMP/plan.json" --artifact "in/$ASSET" --evidence "$RUNNER_TEMP/evidence"
+      - name: Build record (bytes, commit, ABI, version, complete smoke inventory)
+        run: |
+          cargo run --locked --quiet -p xtask --target-dir "$RUNNER_TEMP/xtask-target" -- release build-record --asset "$ASSET" \
+            --plan "$RUNNER_TEMP/plan.json" --artifact "in/$ASSET" --version "$RELEASE_VERSION" \
+            --evidence "$RUNNER_TEMP/evidence" --out out
+      - name: Validated release asset
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-asset-${{ inputs.asset }}
+          path: |
+            out/${{ inputs.asset }}
+            out/build.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Raw smoke evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-evidence-${{ inputs.asset }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: warn
+          retention-days: 90

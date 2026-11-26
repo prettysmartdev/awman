@@ -4,7 +4,7 @@ INSTALL_PATH ?= /usr/local/bin
 # default of `target`.
 TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 
-.PHONY: all build sign-macos install payloads payloads-verify clean release apple-prerelease apple-silicon-prerelease linux-prerelease architecture-lint docs-reference
+.PHONY: all build sign-macos install payloads payloads-verify clean architecture-lint docs-reference
 
 all: build
 
@@ -89,10 +89,12 @@ test-guest:
 
 # A release executable: `make test-artifact ARTIFACT=/abs/path/awman`.
 test-artifact:
-	AWMAN_TEST_ARTIFACT="$(ARTIFACT)" cargo xtask test run --tier artifact
+	@set -eu; digest="$$(shasum -a 256 "$(ARTIFACT)" | cut -d' ' -f1)"; \
+	cargo xtask test run --tier artifact --artifact "$(ARTIFACT)" --artifact-sha256 "$$digest"
 
-# Native Apple Silicon acceptance, including preparation and a portable evidence
-# packet. See aspec/devops/testing.md for prerequisites and packet review.
+# Broad native diagnostic (guest, boundary and soak breadth) on this host: an
+# Apple Silicon Mac or a Linux KVM machine. Not part of a release; its
+# evidence directory is checked with `cargo xtask native-validation verify DIR`.
 .PHONY: validate-native
 validate-native:
 	CARGO_TARGET_DIR=target/native-validation-tools cargo xtask native-validation run
@@ -146,30 +148,33 @@ clean:
 	cargo clean
 
 # ── Release ──────────────────────────────────────────────────────────────────
-# Full prerelease closure from the Apple Silicon Mac after Linux native acceptance.
-apple-prerelease:
-	@bash tools/prerelease/apple.sh
-
-# The narrower authenticated candidate rehearsal for current main.
-apple-silicon-prerelease:
-	@cargo xtask release validate
-
-# Publish and pin inputs, then run Linux KVM acceptance through SSH. The remote
-# checkout is created by the script; REMOTE_LOGIN is a user@host destination.
-linux-prerelease:
-	@bash tools/prerelease/linux.sh
-
-# Wait for the release PR squash merge, validate its commit, then tag and
-# publish the validated candidate using the maintainer's GitHub login.
-# RELEASE_RUNNER=auto|local|none (see aspec/devops/release.md).
-RELEASE_RUNNER ?= auto
-export RELEASE_RUNNER
+# One command starts or resumes a release from the Apple Silicon Mac: it
+# dispatches the hosted release gate and asset builds, runs the two native
+# checks (this Mac and LINUX_HOST over SSH), seals the draft, asks once for
+# confirmation, then lands, tags, publishes and verifies. After any stop,
+# run the same command again: completed work is kept. See
+# aspec/devops/release.md.
+#
+#   make release [VERSION=vX.Y.Z] [LINUX_HOST=user@host] [YES=1]
+#                [SUPERSEDE=1] [TAKEOVER=<owner>] [REHEARSE=1]
+RELEASE_ARGS = $(if $(VERSION),--version $(VERSION)) $(if $(LINUX_HOST),--linux-host $(LINUX_HOST))
+.PHONY: release release-status release-doctor release-abandon release-rehearse
 release:
-	@bash tools/prerelease/release.sh
+	@cargo xtask release run $(RELEASE_ARGS) $(if $(DECIDED_AT),--decided-at $(DECIDED_AT)) $(if $(REHEARSAL_REPO),--rehearsal-repo $(REHEARSAL_REPO)) $(if $(filter 1,$(YES)),--yes) $(if $(filter 1,$(SUPERSEDE)),--supersede) $(if $(TAKEOVER),--takeover $(TAKEOVER)) $(if $(filter 1,$(REHEARSE)),--rehearse)
 
-.PHONY: release-status release-abandon
+# Read-only: phase table, first error and its recovery.
 release-status:
-	@cargo xtask release status "$(VERSION)"
+	@cargo xtask release status --version "$(VERSION)" $(if $(filter 1,$(REHEARSE)),--rehearse) $(if $(REHEARSAL_REPO),--rehearsal-repo $(REHEARSAL_REPO))
 
+# Prerequisites only (tools, GitHub capabilities, workflows, both native
+# hosts, pinned inputs); changes nothing.
+release-doctor:
+	@cargo xtask release doctor $(RELEASE_ARGS)
+
+# Delete this attempt's own draft, claim and private state (refused once tagged).
 release-abandon:
-	@cargo xtask release abandon "$(VERSION)"
+	@cargo xtask release abandon --version "$(VERSION)" $(if $(filter 1,$(REHEARSE)),--rehearse) $(if $(REHEARSAL_REPO),--rehearsal-repo $(REHEARSAL_REPO))
+
+# Fault-injected rehearsal of the production state machine; no network.
+release-rehearse:
+	@cargo xtask release rehearse $(if $(REPEAT),--repeat $(REPEAT))

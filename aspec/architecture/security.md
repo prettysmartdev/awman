@@ -224,21 +224,44 @@ CLI/TUI, so raw terminal or attach output cannot precede redaction.
 
 ### WI 0144 test and release execution boundaries
 
-Temporary release runners register only into an organization group whose
-server-reported workflow allowlist matches the selected `main` release
-workflows. Labels serve scheduling only. Repository allocation, the `release`
-environment, account isolation, and native teardown remain explicit
-administrator/hardware obligations; source checks cannot certify them.
-Branch protection, approval rules, and tag rulesets are optional repository
-settings and are not release admission checks.
+No self-hosted runner executes repository workflows. All workflow jobs,
+including every release asset build and verification, run on GitHub-hosted
+runners, and `release.yml` uses no environment, release secret or local action.
+Only its `produce` job can write attestations and OIDC tokens; its `validate`
+job only reads. Release publication is performed solely by the maintainer's
+authenticated `gh` login from `make release`, which creates the tag at the
+commit every attestation names as its source. Branch protection, approval rules
+and tag rulesets are optional repository settings; preflight reports the ones
+this login cannot satisfy but they are not admission requirements.
 
-The release-branch full main gate is dispatched through `ci.yml` on
-`main` for the exact head of an open, same-repository `release/vX.Y.Z` PR.
-It runs only on hosted runners. Native guest, boundary, and soak checks run
-under the `main` release candidate workflow after the PR squash merge, on the
-release Mac. Fork PRs and ordinary PR events cannot use that runner. The
-operator's `make release` verifies the merge commit and tree, waits for the
-candidate gate, and then tags and publishes with the maintainer's GitHub login.
+Native guest checks run on the operator's Apple Silicon Mac and on a Linux KVM
+host reached over SSH, from a prebuilt kit whose archive is attested and whose
+files are bound by a digest manifest. The kit is extracted only after
+verification, into a fresh owned root, rejecting absolute or traversing paths,
+links, devices, duplicates and oversized expansion; only allowlisted kit files
+keep executable bits. Nothing is compiled, signed or rebuilt on a native host,
+no GitHub token or other credential is sent to it, no Docker or checkout is
+required on it, and any host work is tied to an owner lease so that only
+identified owned descendants are ever terminated. Hosts allocate private
+short roots (mode 0700, no-follow). Synthetic task agents run only inside the
+guest booted by the exact asset with a private test repository as the only
+mount; the controller checkout and parent directories are never mounted. The
+`HostAgentPinger` exception above is unchanged: the release command adds no
+trigger and no second host-agent mechanism. Native results are operator
+evidence, not Actions attestations; the build provenance of every asset is
+an Actions attestation, and publication requires both. Native kill and
+containment behavior on macOS and Windows must be validated on the real
+platforms; a Linux-only fake does not certify it.
+
+The release gate and the build evidence are verified by the operator's tool from
+the authenticated service record, never from an uploader's summary: run,
+attempt, job and artifact identities, the exact compiled test inventory and
+passing JUnit must reconcile, and a skipped, missing, duplicated or short
+result cannot satisfy a required cell. The release plan's publication policy
+digest is re-checked before sealing and again before landing, tagging and
+publishing; a change to publication-critical policy blocks rather than being
+trusted. Evidence expires after at most 14 days. The accepted residual risks of
+the narrower release gate are in `aspec/devops/release.md`.
 
 The test supervisor rejects registered host keychain/clipboard/agent names before
 checking ordinary executable allowlists, and still examines registered

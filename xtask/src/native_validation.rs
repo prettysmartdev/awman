@@ -1,4 +1,6 @@
-//! Local hardware acceptance. These packets are operator evidence, never CI attestations.
+//! Broad local hardware diagnostic (`make validate-native`). Not a release
+//! step: releases run only the narrow exact-asset native checks of the
+//! release plan. Evidence is operator-produced, never a CI attestation.
 mod packet;
 mod prepare;
 
@@ -84,6 +86,10 @@ struct Packet {
     fixture_sha256: String,
     docker_fixture_sha256: String,
     files: BTreeMap<String, String>,
+    /// Registered suites that could not run, with the reason. Any entry makes
+    /// the verdict non-success; a blocked suite is never a pass or a skip.
+    #[serde(default)]
+    blocked: BTreeMap<String, String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -208,40 +214,17 @@ fn git(root: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(out.stdout)?.trim().into())
 }
 fn suites(m: &Manifest, platform: Platform) -> Vec<String> {
-    m.suites
+    // The private-memory command has its own recorded execution below. Disabled
+    // platform overrides (sbx) are reported by the separate nightly diagnostic.
+    m.gates["native-diagnostic"]
+        .cells
         .iter()
-        .filter(|(id, s)| {
-            if ["guest-linux-replacement", "artifact-linux-boot"].contains(&id.as_str()) {
-                return !platform.apple();
-            }
-            if ["guest-upgrade", "artifact-signed-boot"].contains(&id.as_str()) {
-                return platform.apple();
-            }
-            if [
-                "guest-linux-published-upgrade",
-                "artifact-linux-published-upgrade",
-            ]
-            .contains(&id.as_str())
-            {
-                return !platform.apple() && m.previous_release.contains_key(platform.target);
-            }
-            s.kind == "nextest"
-                && (s.tier == "guest"
-                    || s.tier == "artifact"
-                    || if platform.apple() {
-                        id.as_str() == "boundary-apple"
-                    } else {
-                        [
-                            "boundary-docker",
-                            "boundary-registry",
-                            "boundary-conformance",
-                            "boundary-templates",
-                            "boundary-offline",
-                        ]
-                        .contains(&id.as_str())
-                    })
-        })
-        .map(|(id, _)| id.clone())
+        .filter(|c| c.builds.iter().any(|b| b == platform.build) && c.platform.is_none())
+        .flat_map(|c| c.suites.iter())
+        .filter(|id| m.suites[*id].kind == "nextest")
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -265,6 +248,44 @@ fn source_hashes(root: &Path) -> Result<BTreeMap<String, String>> {
     .into_iter()
     .map(|p| Ok((p.into(), sha256_file(&root.join(p))?)))
     .collect()
+}
+/// A reviewed, digest-pinned published predecessor exists for this platform.
+fn predecessor_pinned(m: &Manifest, platform: Platform) -> bool {
+    m.previous_release
+        .get(platform.target)
+        .is_some_and(|p| p.pending.is_none() && p.sha256.is_some())
+}
+/// Registered suites that cannot run on this platform, with the reason. Only
+/// suites needing the published predecessor are affected; every independent
+/// suite still runs, and any entry here keeps the verdict non-success.
+fn blocked_suites(m: &Manifest, platform: Platform) -> BTreeMap<String, String> {
+    if predecessor_pinned(m, platform) {
+        return BTreeMap::new();
+    }
+    suites(m, platform)
+        .into_iter()
+        .filter(|id| {
+            m.suites[id]
+                .requires
+                .iter()
+                .any(|c| c == "previous-release")
+        })
+        .map(|id| {
+            let reason = format!(
+                "BLOCKED[previous-release]: no reviewed predecessor pin for {}",
+                platform.target
+            );
+            (id, reason)
+        })
+        .collect()
+}
+/// The registered suites this run executes: all of them except the blocked ones.
+fn runnable_suites(m: &Manifest, platform: Platform) -> Vec<String> {
+    let blocked = blocked_suites(m, platform);
+    suites(m, platform)
+        .into_iter()
+        .filter(|id| !blocked.contains_key(id))
+        .collect()
 }
 fn execute(r: &mut Run, m: &Manifest) -> Result<()> {
     ensure!(
@@ -301,7 +322,7 @@ fn execute(r: &mut Run, m: &Manifest) -> Result<()> {
         let umask = r.command("host-umask", "sh", &["-c", "umask"])?;
         ensure!(
             u32::from_str_radix(umask.trim(), 8) == Ok(0o002),
-            "Linux native acceptance requires umask 0002; use make linux-prerelease"
+            "the Linux native diagnostic requires umask 0002; run `umask 0002` in this shell first"
         );
     }
     r.command("rust-version", "rustc", &["-vV"])?;
@@ -320,7 +341,7 @@ fn execute(r: &mut Run, m: &Manifest) -> Result<()> {
     let features = &m.features[&m.builds[platform.build].features].cargo_args;
     // Compile and independently enumerate each selected suite before executing any tests.
     // Enumeration is separate from JUnit: a missing/ignored result cannot become a pass.
-    for id in &suites(m, platform) {
+    for id in &runnable_suites(m, platform) {
         let s = &m.suites[id];
         let mut args = vec![
             "nextest",
@@ -383,7 +404,7 @@ fn execute(r: &mut Run, m: &Manifest) -> Result<()> {
     // Resolve native boot/source failures before spending time on the optimized
     // executable. Artifact suites still run against the exact immutable candidate.
     let mut failures = Vec::new();
-    for id in &suites(m, platform) {
+    for id in &runnable_suites(m, platform) {
         if m.suites[id].tier == "artifact" || id == "boundary-offline" {
             continue;
         }
@@ -424,7 +445,7 @@ fn execute(r: &mut Run, m: &Manifest) -> Result<()> {
         "AWMAN_TEST_ARTIFACT_SHA256".into(),
         r.packet.artifact_sha256.clone(),
     );
-    for id in &suites(m, platform) {
+    for id in &runnable_suites(m, platform) {
         if m.suites[id].tier != "artifact" {
             continue;
         }
@@ -458,7 +479,31 @@ fn execute(r: &mut Run, m: &Manifest) -> Result<()> {
     );
     ensure!(failures.is_empty(), "{}", failures.join("\n"));
     packet::check_results(&r.out, &r.packet, m)?;
+    blocked_outcome(&r.packet.blocked)
+}
+/// Everything that could run has passed; coverage that could not run keeps
+/// the diagnostic BLOCKED rather than letting it read as complete.
+fn blocked_outcome(blocked: &BTreeMap<String, String>) -> Result<()> {
+    ensure!(
+        blocked.is_empty(),
+        "{} registered suite(s) did not run; every other suite passed:\n{}",
+        blocked.len(),
+        blocked
+            .iter()
+            .map(|(id, reason)| format!("{id}: {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
     Ok(())
+}
+/// Packet verdict: a `BLOCKED[...]` reason anywhere in the error is missing
+/// infrastructure; any other error is a failure.
+fn verdict(result: &Result<()>) -> &'static str {
+    match result {
+        Ok(()) => "passed",
+        Err(e) if format!("{e:#}").contains("BLOCKED[") => "blocked",
+        Err(_) => "failed",
+    }
 }
 pub fn run(args: &[String]) -> Result<ExitCode> {
     let root = crate::gates::root();
@@ -532,6 +577,7 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
                     started: chrono::Utc::now().to_rfc3339(),
                     source: source_hashes(&root)?,
                     suites: suites(&m, platform),
+                    blocked: blocked_suites(&m, platform),
                     ..Default::default()
                 },
             };
@@ -543,37 +589,32 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
             } else { Ok(()) };
             let result = result.and(cleanup);
             r.packet.finished = chrono::Utc::now().to_rfc3339();
-            r.packet.verdict = if result.is_ok() { "passed" } else { "failed" }.into();
+            r.packet.verdict = verdict(&result).into();
             r.packet.error = result.as_ref().err().map(|e| format!("{e:#}"));
             r.packet.files = packet::files(&out)?;
             fs::write(
                 out.join("packet.json"),
                 serde_json::to_vec_pretty(&r.packet)?,
             )?;
-            let archive = base.with_extension("tar.gz");
-            let status = Command::new("tar")
-                .args(["-czf"])
-                .arg(&archive)
-                .arg("-C")
-                .arg(&base)
-                .arg("evidence")
-                .status()?;
-            ensure!(
-                status.success(),
-                "could not archive evidence; directory preserved at {}",
-                out.display()
-            );
+            // Diagnostic evidence stays a directory: no tar hand-off, but
+            // `native-validation verify DIR` still checks its completeness.
             eprintln!(
-                "Evidence packet: {}\nSHA-256: {}",
-                archive.display(),
-                sha256_file(&archive)?
+                "Diagnostic evidence: {}\npacket.json SHA-256: {}",
+                out.display(),
+                sha256_file(&out.join("packet.json"))?
             );
             if let Err(e) = result {
+                // Blocked (missing infrastructure) is distinct from failed, and neither passes.
+                if r.packet.verdict == "blocked" {
+                    eprintln!("Native validation BLOCKED: {e:#}");
+                    return Ok(ExitCode::from(2));
+                }
                 eprintln!("Native validation FAILED: {e:#}");
                 return Ok(ExitCode::from(1));
             }
             println!(
-                "Native execution passed; send the evidence packet for independent final review."
+                "Native diagnostic passed; check completeness with `cargo xtask native-validation verify {}`.",
+                out.display()
             );
             Ok(ExitCode::SUCCESS)
         }
@@ -640,5 +681,66 @@ mod tests {
                 "{name}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod predecessor_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn missing_predecessor_blocks_only_dependent_suites_and_the_overall_verdict() {
+        let mut m = crate::manifest::load(&crate::gates::root()).unwrap();
+        for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            let linux = Platform::for_target(target).unwrap();
+            m.previous_release.remove(target);
+            let blocked = blocked_suites(&m, linux);
+            assert_eq!(
+                blocked.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                BTreeSet::from([
+                    "artifact-linux-published-upgrade",
+                    "guest-linux-published-upgrade"
+                ]),
+                "{target}"
+            );
+            assert!(blocked
+                .values()
+                .all(|reason| reason.starts_with("BLOCKED[previous-release]")));
+            // Every independent registered suite still runs.
+            let runnable = runnable_suites(&m, linux);
+            for id in [
+                "guest-boot",
+                "guest-exec",
+                "boundary-docker",
+                "artifact-linux-boot",
+            ] {
+                assert!(runnable.iter().any(|r| r == id), "{target}: {id}");
+            }
+            assert!(runnable.iter().all(|id| !blocked.contains_key(id)));
+            assert_eq!(runnable.len() + blocked.len(), suites(&m, linux).len());
+
+            let outcome = blocked_outcome(&blocked);
+            assert_eq!(verdict(&outcome), "blocked", "{target}");
+        }
+
+        // A pending pin is as unavailable as no pin; a reviewed pin unblocks.
+        let linux = Platform::for_target("x86_64-unknown-linux-gnu").unwrap();
+        let mut pin = m.previous_release["aarch64-apple-darwin"].clone();
+        pin.pending = Some("awaiting the first Linux builtin release".into());
+        m.previous_release.insert(linux.target.into(), pin.clone());
+        assert_eq!(blocked_suites(&m, linux).len(), 2);
+        pin.pending = None;
+        m.previous_release.insert(linux.target.into(), pin);
+        assert!(blocked_suites(&m, linux).is_empty());
+        assert_eq!(runnable_suites(&m, linux), suites(&m, linux));
+        let mac = Platform::for_target("aarch64-apple-darwin").unwrap();
+        assert!(blocked_suites(&m, mac).is_empty());
+
+        assert_eq!(verdict(&blocked_outcome(&BTreeMap::new())), "passed");
+        assert_eq!(
+            verdict(&Err(anyhow::anyhow!("guest-boot failed"))),
+            "failed"
+        );
     }
 }

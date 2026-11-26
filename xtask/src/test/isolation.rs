@@ -78,6 +78,16 @@ pub struct Run {
     root: tempfile::TempDir,
     home: PathBuf,
     before: Snapshot,
+    /// `finish` ran its leak sweep; otherwise dropping the run sweeps, so an
+    /// early error or timeout never removes the roots under live processes.
+    swept: bool,
+}
+impl Drop for Run {
+    fn drop(&mut self) {
+        if !self.swept {
+            cleanup_owned_processes(self.root.path());
+        }
+    }
 }
 impl Run {
     pub fn new() -> Result<Self> {
@@ -86,7 +96,7 @@ impl Run {
             .context("HOME is required for the run canary")?;
         Self::for_home(home)
     }
-    fn for_home(home: PathBuf) -> Result<Self> {
+    pub(super) fn for_home(home: PathBuf) -> Result<Self> {
         let before = protected_snapshot(&home)?;
         let mut builder = tempfile::Builder::new();
         builder.prefix("r-").rand_bytes(6);
@@ -106,7 +116,12 @@ impl Run {
             std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
             builder.create(root.path().join(dir))?;
         }
-        Ok(Self { root, home, before })
+        Ok(Self {
+            root,
+            home,
+            before,
+            swept: false,
+        })
     }
     pub fn apply(&self, cmd: &mut Command) {
         let tool_path = cmd
@@ -155,8 +170,11 @@ impl Run {
             self.root.path().join("home/.gitconfig"),
         );
     }
-    pub fn finish(self) -> Result<()> {
-        let leaks = cleanup_owned_processes(self.root.path());
+    pub fn finish(mut self) -> Result<()> {
+        let leaks = sweep_owned_processes(self.root.path());
+        self.swept = true;
+        // An enumeration failure is missing evidence, never a clean run.
+        let leaks = leaks.context("check for run-owned processes")?;
         let after = protected_snapshot(&self.home)?;
         let changed: std::collections::BTreeSet<_> = self
             .before
@@ -172,20 +190,16 @@ impl Run {
             leaks.is_empty(),
             "run-owned processes survived their test deadline and were killed: {leaks:?}"
         );
-        self.root
-            .close()
-            .context("remove run-owned test directories")
+        std::fs::remove_dir_all(self.root.path()).context("remove run-owned test directories")
     }
 }
 
 /// Process identity is the Linux creation time plus an inherited private root.
 /// Native host containment remains a separate runner admission requirement.
 #[cfg(target_os = "linux")]
-pub(crate) fn cleanup_owned_processes(root: &Path) -> Vec<u32> {
+pub(crate) fn sweep_owned_processes(root: &Path) -> Result<Vec<u32>> {
     let mut leaks = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return leaks;
-    };
+    let entries = std::fs::read_dir("/proc").context("enumerate /proc")?;
     for entry in entries.flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
@@ -206,20 +220,9 @@ pub(crate) fn cleanup_owned_processes(root: &Path) -> Vec<u32> {
         let Ok(env) = std::fs::read(path.join("environ")) else {
             continue;
         };
-        let owned = env.split(|b| *b == 0).any(|value| {
-            [
-                b"HOME=".as_slice(),
-                b"TMPDIR=".as_slice(),
-                b"AWMAN_HOME=".as_slice(),
-            ]
-            .iter()
-            .any(|key| {
-                value
-                    .strip_prefix(*key)
-                    .and_then(|p| std::str::from_utf8(p).ok())
-                    .is_some_and(|p| Path::new(p).starts_with(root))
-            })
-        });
+        let owned = env
+            .split(|b| *b == 0)
+            .any(|value| marks_root(&String::from_utf8_lossy(value), root));
         if owned && identity().as_deref() == Some(start.as_str()) {
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid as i32),
@@ -228,11 +231,86 @@ pub(crate) fn cleanup_owned_processes(root: &Path) -> Vec<u32> {
             leaks.push(pid);
         }
     }
-    leaks
+    Ok(leaks)
 }
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn cleanup_owned_processes(_root: &Path) -> Vec<u32> {
-    Vec::new()
+
+/// macOS has no /proc. `ps -E` appends each same-user process's launch
+/// environment, which carries the private HOME/TMPDIR/AWMAN_HOME the runner
+/// assigned; the start time is re-read before the kill so a reused PID is
+/// never signalled. Processes of other users are never candidates.
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn sweep_owned_processes(root: &Path) -> Result<Vec<u32>> {
+    let listing = Command::new("/bin/ps")
+        .args(["-A", "-E", "-ww", "-o", "pid=,uid=,lstart=,command="])
+        .output()
+        .context("run ps to enumerate run-owned processes")?;
+    ensure!(
+        listing.status.success(),
+        "ps could not enumerate run-owned processes"
+    );
+    let mut leaks = Vec::new();
+    for (pid, start) in owned_in_ps_listing(
+        &String::from_utf8_lossy(&listing.stdout),
+        root,
+        nix::unistd::Uid::effective().as_raw(),
+        std::process::id(),
+    ) {
+        let now = Command::new("/bin/ps")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        let same = |s: String| s.split_whitespace().collect::<Vec<_>>().join(" ") == start;
+        if now.is_ok_and(same) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            leaks.push(pid);
+        }
+    }
+    Ok(leaks)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn sweep_owned_processes(_root: &Path) -> Result<Vec<u32>> {
+    Ok(Vec::new())
+}
+
+/// Kill run-owned processes; enumeration failures report no leaks. Callers
+/// that must prove a clean exit use `sweep_owned_processes`.
+pub(crate) fn cleanup_owned_processes(root: &Path) -> Vec<u32> {
+    sweep_owned_processes(root).unwrap_or_default()
+}
+
+/// An environment entry that places a process's private roots under `root`.
+fn marks_root(entry: &str, root: &Path) -> bool {
+    ["HOME=", "TMPDIR=", "AWMAN_HOME="].iter().any(|key| {
+        entry
+            .strip_prefix(*key)
+            .is_some_and(|p| Path::new(p).starts_with(root))
+    })
+}
+
+/// `(pid, lstart)` of same-user processes in a `ps -o pid=,uid=,lstart=,command=`
+/// listing (with `-E` environment) that carry a private root under `root`.
+/// `lstart` is always five words, e.g. `Wed Nov 26 10:00:00 2026`.
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+fn owned_in_ps_listing(listing: &str, root: &Path, uid: u32, me: u32) -> Vec<(u32, String)> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let pid = words.next()?.parse::<u32>().ok()?;
+            let owner = words.next()?.parse::<u32>().ok()?;
+            let start = words.by_ref().take(5).collect::<Vec<_>>();
+            if start.len() != 5 || owner != uid || pid == me {
+                return None;
+            }
+            words
+                .any(|w| marks_root(w, root))
+                .then(|| (pid, start.join(" ")))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -386,5 +464,57 @@ mod tests {
             .to_string()
             .contains("processes survived"));
         assert!(!leaked.wait().unwrap().success());
+    }
+    #[test]
+    fn mac_listing_selects_only_this_users_processes_under_the_run_root() {
+        let root = Path::new("/private/tmp/r-abc123");
+        let listing = "\
+  101   501 Wed Nov 26 10:00:00 2026 /bin/sleep 300 PATH=/usr/bin HOME=/private/tmp/r-abc123/home
+  102   501 Wed Nov  5 09:00:00 2026 vm-helper TMPDIR=/private/tmp/r-abc123/tmp/x
+  103   502 Wed Nov 26 10:00:00 2026 other-user HOME=/private/tmp/r-abc123/home
+  104   501 Wed Nov 26 10:00:00 2026 operator-shell HOME=/Users/op TMPDIR=/private/tmp/r-abc1234/tmp
+  105   501 Wed Nov 26 10:00:00 2026 self HOME=/private/tmp/r-abc123/home
+  106   501 Wed Nov 26 10:00:00 2026 mentions /private/tmp/r-abc123/home in an argument
+garbage line
+";
+        assert_eq!(
+            owned_in_ps_listing(listing, root, 501, 105),
+            vec![
+                (101, "Wed Nov 26 10:00:00 2026".to_string()),
+                (102, "Wed Nov 5 09:00:00 2026".to_string()),
+            ]
+        );
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    /// hygiene-allow(H2): Seeds an owned child and drops the run without finish (an early-error path); explicitly reaps it even on assertion failure.
+    fn dropping_an_unfinished_run_still_stops_its_owned_processes() {
+        let home = tempfile::tempdir().unwrap();
+        let run = Run::for_home(home.path().to_owned()).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "printf 'ready\\n'; IFS= read -r release"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        run.apply(&mut command);
+        let mut leaked = command.spawn().unwrap();
+        let mut ready = [0u8; 6];
+        std::io::Read::read_exact(&mut leaked.stdout.take().unwrap(), &mut ready).unwrap();
+        assert_eq!(&ready, b"ready\n");
+        drop(run);
+        // SIGKILL delivery is asynchronous; reap with a bounded wait, and
+        // never leave the fixture alive if the sweep regressed.
+        let reaped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            awman_test_support::wait::wait_for(
+                "the dropped run's child to stop",
+                std::time::Duration::from_secs(10),
+                || leaked.try_wait().unwrap(),
+            )
+        }));
+        if reaped.is_err() {
+            let _ = leaked.kill();
+            let _ = leaked.wait();
+        }
+        assert!(!reaped.unwrap().success());
     }
 }

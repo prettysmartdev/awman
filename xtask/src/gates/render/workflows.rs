@@ -1,10 +1,11 @@
 //! `ci.yml` and `nightly.yml` are rendered here from the manifest (`outputs`);
-//! `candidate.yml`, `promote.yml`, `fixtures.yml` are declared in
+//! `release.yml` and `fixtures.yml` are declared in
 //! their own producers and are only verified. The verifier is deliberately
 //! conservative and is supplemented by pinned actionlint in the `lint` job.
 use crate::manifest::Manifest;
 
 mod ci;
+mod closure;
 mod graph;
 mod nightly;
 mod pieces;
@@ -109,10 +110,16 @@ pub fn verify(root: &Path, m: &Manifest) -> Vec<String> {
     let mut errors = Vec::new();
     for (path, expected) in &m.workflows {
         match std::fs::read_to_string(root.join(path)) {
-            Ok(t) => errors.extend(verify_text(path, &t, expected)),
+            Ok(t) => {
+                errors.extend(verify_text(path, &t, expected));
+                if path == ".github/workflows/release.yml" {
+                    errors.extend(release_runners(&t, m));
+                }
+            }
             Err(_) => errors.push(format!("missing required workflow {path}")),
         }
     }
+    errors.extend(closure::verify(root));
     if let Ok(entries) = std::fs::read_dir(root.join(".github/workflows")) {
         for entry in entries.flatten() {
             let path = format!(".github/workflows/{}", entry.file_name().to_string_lossy());
@@ -126,4 +133,81 @@ pub fn verify(root: &Path, m: &Manifest) -> Vec<String> {
         }
     }
     errors
+}
+
+/// Evaluate only the finite literal asset-to-hosted-label selection admitted
+/// by workflow policy, then compare every asset with the manifest.
+fn release_runners(text: &str, m: &Manifest) -> Vec<String> {
+    let mut errors = Vec::new();
+    let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+        return errors;
+    };
+    for job in ["produce", "validate"] {
+        let value = &doc["jobs"][job]["runs-on"];
+        for asset in &m.release.assets {
+            let platform = m
+                .builds
+                .values()
+                .find(|b| b.asset.as_ref() == Some(asset))
+                .and_then(|b| m.platforms.get(&b.platform));
+            let Some(platform) = platform else {
+                errors.push(format!(
+                    "release.yml: {asset} has no registered build/platform"
+                ));
+                continue;
+            };
+            let want = &platform.runs_on;
+            let literal = |s: &str| {
+                s.trim()
+                    .strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+                    .map(str::to_owned)
+            };
+            let actual = value
+                .as_str()
+                .and_then(|s| {
+                    if !s.starts_with("${{") {
+                        return Some(vec![s.to_string()]);
+                    }
+                    let expr = s.strip_prefix("${{")?.trim().strip_suffix("}}")?;
+                    for arm in expr.split("||") {
+                        if let Some((cond, label)) = arm.split_once("&&") {
+                            let key = literal(cond.trim().strip_prefix("inputs.asset == ")?)?;
+                            if key == *asset {
+                                return Some(vec![literal(label)?]);
+                            }
+                        } else {
+                            return Some(vec![literal(arm)?]);
+                        }
+                    }
+                    None
+                })
+                .or_else(|| {
+                    value.as_sequence().map(|v| {
+                        v.iter()
+                            .filter_map(|s| s.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                });
+            if actual.as_ref() != Some(want) {
+                errors.push(format!("release.yml: {job} runner mapping for {asset} differs from manifest: {actual:?}, expected {want:?}"));
+            }
+        }
+    }
+    errors
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn release_asset_runner_mapping_must_match_the_shipping_builds() {
+        let root = crate::gates::root();
+        let m = crate::manifest::load(&root).unwrap();
+        let text = std::fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+        assert!(super::release_runners(&text, &m).is_empty());
+        let wrong = text.replace("'macos-15'", "'ubuntu-24.04'");
+        let errors = super::release_runners(&wrong, &m);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors.iter().all(|e| e.contains("awman-macos-arm64")));
+    }
 }
