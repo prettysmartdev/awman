@@ -18,8 +18,13 @@
     "pid": 9589
   },
   "previous_owners": [],
-  "ci_run": null,
-  "build_runs": {},
+  "ci_run": 45825577753,
+  "build_runs": {
+    "awman-linux-amd64": 45825584323,
+    "awman-linux-arm64": 45825591745,
+    "awman-macos-arm64": 45825599467,
+    "awman-windows-amd64.exe": 45825607642
+  },
   "draft_id": null,
   "seal_sha256": null,
   "started": "2026-11-26T13:04:04.224300Z",
