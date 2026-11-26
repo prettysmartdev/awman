@@ -318,7 +318,10 @@ impl StateRoot {
 
 pub struct Store {
     pub dir: PathBuf,
+    #[cfg(unix)]
     _lock: Option<nix::fcntl::Flock<std::fs::File>>,
+    #[cfg(windows)]
+    _lock: Option<std::fs::File>,
 }
 
 impl Store {
@@ -343,6 +346,7 @@ impl Store {
         let file = options
             .open(&path)
             .map_err(|e| Stop::new("state-corrupt", format!("{}: {e}", path.display())))?;
+        #[cfg(unix)]
         let lock = match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
         {
             Ok(lock) => lock,
@@ -358,10 +362,31 @@ impl Store {
                 ));
             }
         };
+        #[cfg(windows)]
+        let lock = {
+            let holder_path = dir.join("lock-holder");
+            if file.try_lock().is_err() {
+                // Windows locks can prevent reading the locked file itself.
+                let holder = std::fs::read_to_string(&holder_path).unwrap_or_default();
+                return Err(Stop::new(
+                    "attempt-locked",
+                    format!(
+                        "another release process holds {} ({})",
+                        path.display(),
+                        holder.trim()
+                    ),
+                ));
+            }
+            file
+        };
         // Holder identity for the message above; the flock itself is the
         // proof and is released by the kernel when the process dies.
+        #[cfg(unix)]
+        let holder_path = &path;
+        #[cfg(windows)]
+        let holder_path = &dir.join("lock-holder");
         std::fs::write(
-            &path,
+            holder_path,
             format!(
                 "pid {} since {}\n",
                 std::process::id(),
