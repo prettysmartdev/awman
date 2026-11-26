@@ -673,7 +673,19 @@ fn release_plan_freezes_assets_smoke_and_native_test_inventory() {
         ])
     );
     assert_eq!(linux["fixtures"][0]["arch"], "amd64");
-    assert!(linux["fixtures"][0]["sha256"].is_null());
+    let fixture = &m.fixtures["guest-oci-base-amd64"];
+    assert_eq!(
+        linux["fixtures"][0]["sha256"],
+        serde_json::to_value(&fixture.sha256).unwrap()
+    );
+    assert_eq!(
+        linux["fixtures"][0]["url"],
+        serde_json::to_value(&fixture.source).unwrap()
+    );
+    assert_eq!(
+        linux["fixtures"][0]["pending"],
+        serde_json::to_value(&fixture.pending).unwrap()
+    );
     assert!(p["native"]
         .as_array()
         .unwrap()
