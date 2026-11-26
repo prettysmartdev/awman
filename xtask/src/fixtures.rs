@@ -5,12 +5,14 @@
 //!   build <recipe> …                      explicit preparation recipes (fixtures/recipes)
 //!   verify-build --base B --sha256 SHA --out DIR  independently reproduce both guest archives
 //!   publish-plan                          JSON list of fixtures to build and publish (Fixtures workflow)
+//!   pin --arch A --repo R --tag T --assets DIR   write reviewed pins for a published fixture set
 //!
 //! The store layout is the one `awman-test-support` reads: `<store>/<file or id>`
 //! and `<store>/previous-release/<triple>/<asset>`, where `<store>` is
 //! `AWMAN_TEST_FIXTURES` or `<workspace>/target/awman-fixtures`. A fixture
 //! without a published SHA-256 is BLOCKED: fetch and verify fail, they never
 //! place unverified bytes (design 16.9, row P7).
+pub mod pin;
 pub mod recipes;
 use anyhow::{bail, Context, Result};
 use std::{
@@ -23,7 +25,7 @@ use crate::manifest::Manifest;
 pub fn run(args: &[String]) -> Result<ExitCode> {
     let Some((cmd, rest)) = args.split_first() else {
         eprintln!(
-            "usage: cargo xtask fixtures fetch [--tier T] | verify | build <recipe> | verify-build --base B --sha256 SHA --out DIR | publish-plan"
+            "usage: cargo xtask fixtures fetch [--tier T] | verify | build <recipe> | verify-build --base B --sha256 SHA --out DIR | publish-plan | pin --arch A --repo R --tag T --assets DIR"
         );
         return Ok(ExitCode::from(2));
     };
@@ -39,6 +41,7 @@ pub fn run(args: &[String]) -> Result<ExitCode> {
         "verify" => verify(&root, &store(&root, rest)),
         "verify-build" => recipes::verify_guest(rest),
         "publish-plan" => publish_plan(&root),
+        "pin" => pin::run(&root, rest),
         other => bail!("unknown fixtures command {other}"),
     }
 }

@@ -1,6 +1,6 @@
 ---
 name: release-prep
-description: Prepare awman for a new release. Updates version numbers, docs, getting-started, release notes, and blog post. Does NOT run the release script.
+description: Prepare awman for a new release. Updates version numbers, docs, getting-started, release notes, and blog post, then hands off to the one release command. Does NOT run it.
 ---
 
 # awman Release Prep Skill
@@ -18,12 +18,18 @@ Use this skill when the user asks to "prepare for release vX.Y.Z", "bump the ver
 7. Write release notes
 8. Write a blog post
 
-Do **not** run `make release` or push any tags. Stop before the release script.
+Do **not** run `make release` or push any tags. Stop with the prep committed; the maintainer runs the one release command.
 
 Before editing, start from a clean, synchronized `main` checkout and create
 `release/vX.Y.Z`, or resume that existing branch. Commit all release prep
-changes on the release branch. The prerelease targets push it, create the PR,
-and pin/validate its inputs; the skill does not merge the PR.
+changes on that branch (or on `main`). Do not push, open a PR or merge: the
+maintainer's single `make release` command pushes the commit, builds and
+validates it, lands it on `main` unchanged and publishes. Release prep is the
+only manual preparation, and it is part of the timed release, so keep it
+routine: the version, `Cargo.lock`, docs and `docs/releases/vX.Y.Z.md` must be
+committed, consistent and free of placeholders, or the command stops in
+preflight (`version-mismatch`, `notes-missing`, `dirty-checkout`). The full
+procedure is in `aspec/devops/release.md`.
 
 ---
 
@@ -233,4 +239,19 @@ Before finishing, verify:
 - [ ] `docs/releases/vX.Y.Z.md` created
 - [ ] If `WORKER_PROTOCOL` changed: previous protocol added to `UPGRADABLE_FROM`, or release notes have a `No in-place builtin state upgrade:` line
 - [ ] `docs/blog/NNNN-slug.md` created
-- [ ] Release script NOT run (user does that separately)
+- [ ] `make release` NOT run and nothing pushed or tagged (the maintainer does that separately)
+
+## Hand-off
+
+When every box above is checked, tell the maintainer to run, from this checkout
+on the Apple Silicon release Mac:
+
+```bash
+make release-doctor   # optional: prerequisites only, changes nothing
+make release          # the one command; add LINUX_HOST=user@host the first time
+```
+
+Do not run either yourself. If the command stops, the recovery is printed on the
+second line of its output, and the fix is almost always to run `make release`
+again; a product failure is fixed in a new commit and resumed with
+`make release SUPERSEDE=1`.

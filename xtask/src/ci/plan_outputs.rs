@@ -22,10 +22,18 @@ use std::{
 };
 
 pub fn outputs(m: &Manifest, plan: &Plan) -> Result<BTreeMap<String, Value>> {
-    let builds: BTreeSet<_> = plan.builds.iter().map(|b| b.id.clone()).collect();
+    let builds: BTreeSet<_> = plan
+        .builds
+        .iter()
+        .filter(|b| m.builds[&b.id].kind != "release")
+        .map(|b| b.id.clone())
+        .collect();
     let mut jobs: BTreeSet<String> = BTreeSet::new();
     let mut shards: BTreeMap<String, Vec<Value>> = BTreeMap::new();
     for t in &plan.tests {
+        if m.builds[&t.build].kind == "release" {
+            continue;
+        }
         let id = test_job_id(m, &t.tier, &t.platform, &t.build);
         jobs.insert(id.clone());
         let entry = json!({"i": t.shard, "n": t.shards, "suites": t.suites, "host_resources": t.host_resources});

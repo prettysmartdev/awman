@@ -36,6 +36,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+      pull-requests: read
 
   flake-hunt:
     name: Flake hunt (shuffled, repeated, under CPU contention)
@@ -332,7 +333,7 @@ jobs:
 
   nightly:
     name: Nightly verdict
-    needs: [full, flake-hunt, seeded-defects, mutation, coverage, repro-build, audit, ci-trends]
+    needs: [sandbox-coverage, kit-relocation, artifact-linux-x64-release, artifact-linux-arm64-release, artifact-macos-arm64-release, artifact-windows-x64-release, full, flake-hunt, seeded-defects, mutation, coverage, repro-build, audit, ci-trends]
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -341,8 +342,8 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
         run: |
-          blocking="full flake-hunt seeded-defects audit"
-          diagnostic="mutation coverage repro-build ci-trends"
+          blocking="kit-relocation artifact-linux-x64-release artifact-linux-arm64-release artifact-macos-arm64-release artifact-windows-x64-release full flake-hunt seeded-defects audit"
+          diagnostic="sandbox-coverage mutation coverage repro-build ci-trends"
           status=0
           for job in $blocking; do
             result="$(printf '%s' "$NEEDS" | jq -r --arg j "$job" '.[$j].result')"
@@ -358,3 +359,167 @@ jobs:
             fi
           done
           exit "$status"
+
+  artifact-linux-x64-release:
+    name: Scheduled artifact linux-x64-release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
+        with:
+          toolchain: "1.94.0"
+      - name: Verified payload
+        run: bash tools/msb-payloads/fetch.sh x86_64-unknown-linux-gnu
+      - name: Build shipping executable
+        run: cargo build --locked --release -p awman-cli --bin awman --features builtin-runtime
+      - name: Exact executable contracts
+        run: |
+          cargo xtask test install-runner
+          digest="$(shasum -a 256 target/release/awman | cut -d' ' -f1)"
+          AWMAN_TEST_HOST_RESOURCES=offline cargo xtask test run --suite artifact-smoke,artifact-entrypoints,artifact-switches,artifact-deps-scan,artifact-upgrade-policy,artifact-measure --build linux-x64-release --artifact "$PWD/target/release/awman" --artifact-sha256 "$digest" --evidence-dir evidence
+      - name: Retain complete inventory, command exits and JUnit
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-artifact-linux-x64-release
+          path: evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  artifact-linux-arm64-release:
+    name: Scheduled artifact linux-arm64-release
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
+        with:
+          toolchain: "1.94.0"
+      - name: Build shipping executable
+        run: cargo build --locked --release -p awman-cli --bin awman
+      - name: Exact executable contracts
+        run: |
+          cargo xtask test install-runner
+          digest="$(shasum -a 256 target/release/awman | cut -d' ' -f1)"
+          AWMAN_TEST_HOST_RESOURCES=offline cargo xtask test run --suite artifact-smoke,artifact-entrypoints,artifact-switches,artifact-deps-scan,artifact-upgrade-policy,artifact-measure --build linux-arm64-release --artifact "$PWD/target/release/awman" --artifact-sha256 "$digest" --evidence-dir evidence
+      - name: Retain complete inventory, command exits and JUnit
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-artifact-linux-arm64-release
+          path: evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  artifact-macos-arm64-release:
+    name: Scheduled artifact macos-arm64-release
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
+        with:
+          toolchain: "1.94.0"
+      - name: Verified payload
+        run: bash tools/msb-payloads/fetch.sh aarch64-apple-darwin
+      - name: Build shipping executable
+        run: cargo build --locked --release -p awman-cli --bin awman --features builtin-runtime
+      - name: Sign once before validation
+        run: bash tools/macos-sign.sh target/release/awman
+      - name: Exact executable contracts
+        run: |
+          cargo xtask test install-runner
+          digest="$(shasum -a 256 target/release/awman | cut -d' ' -f1)"
+          AWMAN_TEST_HOST_RESOURCES=offline cargo xtask test run --suite artifact-smoke,artifact-entrypoints,artifact-switches,artifact-deps-scan,artifact-upgrade-policy,artifact-measure --build macos-arm64-release --artifact "$PWD/target/release/awman" --artifact-sha256 "$digest" --evidence-dir evidence
+      - name: Retain complete inventory, command exits and JUnit
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-artifact-macos-arm64-release
+          path: evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  artifact-windows-x64-release:
+    name: Scheduled artifact windows-x64-release
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
+        with:
+          toolchain: "1.94.0"
+      - name: Build shipping executable
+        run: cargo build --locked --release -p awman-cli --bin awman
+      - name: Exact executable contracts with verified firewall
+        shell: pwsh
+        run: |
+          cargo xtask test install-runner
+          $digest = (Get-FileHash -Algorithm SHA256 target/release/awman.exe).Hash.ToLowerInvariant()
+          ./ci/artifact-offline.ps1 -Artifact target/release/awman.exe -Sha256 $digest -Build windows-x64-release -Suites 'artifact-smoke,artifact-entrypoints,artifact-switches,artifact-deps-scan,artifact-upgrade-policy,artifact-measure' -Evidence evidence
+      - name: Retain complete inventory, command exits and JUnit
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-artifact-windows-x64-release
+          path: evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  kit-relocation:
+    name: Standalone kit relocation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the commit under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (toolchain pinned below)
+        with:
+          toolchain: "1.94.0"
+      - name: Install pinned runner
+        run: cargo xtask test install-runner
+      - name: Run registered relocation contract
+        run: cargo xtask test run --suite kit-relocation --build linux-x64-default --evidence-dir evidence
+      - name: Retain execution evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kit-relocation
+          path: evidence
+          if-no-files-found: error
+          retention-days: 30
+
+  sandbox-coverage:
+    name: Sandbox coverage (blocked until issue 86)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Report unavailable registered diagnostic cell
+        run: |
+          echo 'BLOCKED: native-diagnostic boundary-sbx@macos-arm64-ci-guest-builtin+macos-arm64-sbx (issue 86)' >> "$GITHUB_STEP_SUMMARY"
+          exit 2

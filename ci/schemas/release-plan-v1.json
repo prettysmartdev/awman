@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Release plan, schema 1",
+  "type": "object",
+  "required": [
+    "schema",
+    "manifest_sha256",
+    "policy_sha256",
+    "gate",
+    "ci",
+    "release_workflow",
+    "checksums",
+    "evidence",
+    "assets",
+    "native"
+  ],
+  "properties": {
+    "schema": {
+      "const": 1
+    },
+    "manifest_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "policy_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "gate": {
+      "const": "release"
+    },
+    "ci": {
+      "type": "object",
+      "required": [
+        "workflow",
+        "inputs",
+        "evidence_artifact_prefix",
+        "evidence_file"
+      ],
+      "properties": {
+        "workflow": {
+          "const": "ci.yml"
+        },
+        "inputs": {
+          "type": "object",
+          "required": [
+            "gate"
+          ],
+          "properties": {
+            "gate": {
+              "const": "release"
+            }
+          },
+          "additionalProperties": true
+        },
+        "evidence_artifact_prefix": {
+          "const": "gate-evidence-"
+        },
+        "evidence_file": {
+          "const": "gate-evidence.json"
+        }
+      },
+      "additionalProperties": true
+    },
+    "assets": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "required": [
+          "asset",
+          "build",
+          "triple",
+          "runs_on",
+          "toolchain",
+          "cargo",
+          "binary",
+          "sign",
+          "builder",
+          "smoke_suites"
+        ],
+        "properties": {
+          "builder": {
+            "const": "hosted"
+          },
+          "smoke_suites": {
+            "const": [
+              "artifact-smoke",
+              "artifact-entrypoints",
+              "artifact-switches"
+            ]
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "native": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "asset",
+          "host",
+          "triple",
+          "suites",
+          "tests",
+          "fixtures",
+          "budget_seconds",
+          "required",
+          "kit_artifact"
+        ],
+        "properties": {
+          "required": {
+            "const": true
+          },
+          "tests": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "host": {
+            "enum": [
+              "local",
+              "ssh"
+            ]
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

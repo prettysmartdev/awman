@@ -27,6 +27,28 @@ pub fn run(root: &Path, check: bool) -> Result<ExitCode> {
             }
         }
     }
+    if !check {
+        for name in ["cicd", "testing", "localdev"] {
+            let path = root.join(format!("aspec/devops/{name}.md"));
+            let text = std::fs::read_to_string(&path)?;
+            let start = text
+                .find("<!-- gates:begin contract -->")
+                .ok_or_else(|| anyhow::anyhow!("missing generated block"))?;
+            let end = text
+                .find("<!-- gates:end contract -->")
+                .ok_or_else(|| anyhow::anyhow!("missing generated block end"))?
+                + "<!-- gates:end contract -->".len();
+            std::fs::write(
+                path,
+                format!(
+                    "{}{}{}",
+                    &text[..start],
+                    docs::render(&m).trim_end(),
+                    &text[end..]
+                ),
+            )?;
+        }
+    }
     let fragments = root.join("target/gates-render");
     if !check {
         std::fs::create_dir_all(&fragments)?;

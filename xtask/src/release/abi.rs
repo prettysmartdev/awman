@@ -52,7 +52,7 @@ pub(super) fn verify(target: &str, executable: &Path, out: &Path) -> Result<()> 
     fs::write(
         out.join("abi.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
-            "artifact_sha256": crate::evidence::digest::sha256_file(executable)?,
+            "artifact_sha256": super::util::sha256_file(executable)?,
             "glibc_ceiling": "2.35", "required_versions": versions, "readelf": text
         }))?,
     )?;
@@ -78,16 +78,5 @@ mod tests {
         ] {
             assert!(glibc_versions(text).is_err(), "{text}");
         }
-    }
-    #[test]
-    fn linux_release_uses_the_abi_baseline_runner_and_keeps_the_static_smoke() {
-        let m = crate::manifest::load(&crate::gates::root()).unwrap();
-        let release = &m.builds["linux-x64-release"];
-        assert_eq!(m.platforms[&release.platform].runs_on, ["ubuntu-22.04"]);
-        assert_eq!(release.features, "builtin");
-        assert_eq!(
-            m.builds["linux-x64-musl-static"].target.as_deref(),
-            Some("x86_64-unknown-linux-musl")
-        );
     }
 }

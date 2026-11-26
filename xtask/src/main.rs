@@ -29,12 +29,12 @@ usage: cargo xtask <command> [args]
   gates check|render|plan      validate, render and plan from ci/gates.toml
   evidence emit|aggregate|...  write and aggregate evidence.json
   test run|archive|list|...    run manifest suites with the pinned runner
-  fixtures fetch|verify|build|verify-build  content-addressed test fixtures
+  fixtures fetch|verify|build|verify-build|pin  content-addressed test fixtures
   lint hygiene|shell|pins|...  repository lints that are not clippy
   matrix render|check          acceptance matrix
-  native-validation run|verify local Apple Silicon or Linux KVM evidence packet
+  native-validation run|verify broad native diagnostic on this host (not a release step)
   ci <helper>                  helpers called by the GitHub workflows
-  release <subcommand>         release operator and pipeline commands
+  release run|status|doctor|...  one-command release (make release) and release.yml steps
 ";
 
 fn main() -> ExitCode {

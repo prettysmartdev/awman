@@ -1,0 +1,55 @@
+# Exact-asset tests on hosted Windows require verified outbound denial.
+# Scope both rules to owned paths and remove them on every exit.
+param(
+    [Parameter(Mandatory=$true)][string]$Artifact,
+    [Parameter(Mandatory=$true)][string]$Sha256,
+    [Parameter(Mandatory=$true)][string]$Build,
+    [Parameter(Mandatory=$true)][string]$Suites,
+    [string]$Evidence = "evidence"
+)
+$ErrorActionPreference = "Stop"
+$nonce = [Guid]::NewGuid().ToString("N")
+$probeDir = Join-Path $env:RUNNER_TEMP "awman-firewall-$nonce"
+$artifactRule = "awman-artifact-$nonce"
+$probeRule = "awman-probe-$nonce"
+$oldResources = $env:AWMAN_TEST_HOST_RESOURCES
+$status = 2
+try {
+    $exe = (Resolve-Path $Artifact).Path
+    if ((Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant() -ne $Sha256) {
+        throw "BLOCKED[artifact-digest]: executable digest changed"
+    }
+    if ((Get-Service MpsSvc).Status -ne "Running") {
+        throw "BLOCKED[offline]: Windows firewall service unavailable"
+    }
+    if (@(Get-NetFirewallProfile | Where-Object { -not $_.Enabled }).Count -ne 0) {
+        throw "BLOCKED[offline]: firewall must enforce every profile"
+    }
+    New-Item -ItemType Directory -Path $probeDir | Out-Null
+    $probe = Join-Path $probeDir "firewall-probe.exe"
+    Copy-Item "$env:SystemRoot\System32\curl.exe" $probe
+    # A live baseline distinguishes actual denial from a broken probe/network.
+    & $probe --fail --silent --show-error --max-time 10 --head https://github.com/ | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "BLOCKED[offline]: firewall probe baseline unavailable" }
+    New-NetFirewallRule -Name $probeRule -DisplayName $probeRule -Program $probe -Direction Outbound -Action Block -Profile Any | Out-Null
+    & $probe --fail --silent --show-error --max-time 5 --head https://github.com/ | Out-Null
+    if ($LASTEXITCODE -eq 0) { throw "BLOCKED[offline]: outbound denial probe failed" }
+    New-NetFirewallRule -Name $artifactRule -DisplayName $artifactRule -Program $exe -Direction Outbound -Action Block -Profile Any | Out-Null
+    $rule = Get-NetFirewallRule -Name $artifactRule -PolicyStore ActiveStore
+    $filter = $rule | Get-NetFirewallApplicationFilter
+    if ($rule.Enabled -ne "True" -or $rule.Action -ne "Block" -or $filter.Program -ne $exe) {
+        throw "BLOCKED[offline]: exact executable rule not active"
+    }
+    $env:AWMAN_TEST_HOST_RESOURCES = "offline=windows-firewall"
+    $status = 0
+    foreach ($suite in $Suites.Split(',')) {
+        cargo xtask test run --suite $suite --build $Build --artifact $exe --artifact-sha256 $Sha256 --evidence-dir (Join-Path $Evidence $suite)
+        if ($LASTEXITCODE -ne 0) { $status = $LASTEXITCODE }
+    }
+} finally {
+    Remove-NetFirewallRule -Name $artifactRule -ErrorAction SilentlyContinue
+    Remove-NetFirewallRule -Name $probeRule -ErrorAction SilentlyContinue
+    if (Test-Path $probeDir) { Remove-Item -Recurse -Force $probeDir }
+    $env:AWMAN_TEST_HOST_RESOURCES = $oldResources
+}
+exit $status

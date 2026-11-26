@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Service-authenticated release gate proof, schema 1",
+  "type": "object",
+  "required": [
+    "schema",
+    "outcome",
+    "reason_code",
+    "repository_id",
+    "run_id",
+    "run_attempt",
+    "commit",
+    "tree",
+    "manifest_sha256",
+    "plan_sha256",
+    "policy_sha256",
+    "workflow",
+    "cells",
+    "artifacts"
+  ],
+  "properties": {
+    "schema": {
+      "const": 1
+    },
+    "outcome": {
+      "enum": [
+        "passed",
+        "failed",
+        "blocked"
+      ]
+    },
+    "cells": {
+      "type": "array"
+    },
+    "artifacts": {
+      "type": "array"
+    }
+  },
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "passed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "repository_id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "run_id": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "run_attempt": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "commit": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "tree": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "manifest_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "plan_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "policy_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "cells": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": [
+                "suite",
+                "build",
+                "platform",
+                "shard",
+                "expected_inventory_sha256",
+                "tests",
+                "job_id",
+                "producer_attempt"
+              ],
+              "properties": {
+                "expected_inventory_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "tests": {
+                  "type": "array",
+                  "minItems": 1,
+                  "uniqueItems": true,
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          },
+          "artifacts": {
+            "type": "array",
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ]
+}

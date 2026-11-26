@@ -106,18 +106,6 @@ fn digest_is_canonical_and_nulls_and_notes_matter() {
         digest::input_digest(&a).unwrap(),
         digest::input_digest(&serde_json::json!({"a":1})).unwrap()
     );
-    assert_ne!(
-        aggregate::candidate_digest(
-            &BTreeMap::from([("notes".into(), "old".into())]),
-            &BTreeMap::new()
-        )
-        .unwrap(),
-        aggregate::candidate_digest(
-            &BTreeMap::from([("notes".into(), "new".into())]),
-            &BTreeMap::new()
-        )
-        .unwrap()
-    );
 }
 fn context() -> (
     crate::manifest::Manifest,

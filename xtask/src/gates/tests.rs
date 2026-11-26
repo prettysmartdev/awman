@@ -36,7 +36,7 @@ fn unknown_keys_and_schema_fail() {
     let text = String::from_utf8(include_bytes!("../../../ci/gates.toml").to_vec()).unwrap();
     assert!(manifest::parse(format!("unknown = 1\n{text}").as_bytes()).is_err());
     assert!(
-        manifest::parse(text.replacen("schema = 1", "schema = 2", 1).as_bytes())
+        manifest::parse(text.replacen("schema = 2", "schema = 3", 1).as_bytes())
             .unwrap_err()
             .to_string()
             .contains("unsupported")
@@ -70,7 +70,7 @@ fn removed_gate_membership_is_red() {
 fn dropped_release_critical_id_is_red() {
     let mut m = manifest();
     m.release_critical
-        .retain(|s| s.id != "guest.actual-awman-boot");
+        .retain(|s| s.id != "artifact.linux-offline-session");
     assert!(error(&m).contains("dropped release-critical scenario ID"));
 }
 #[test]
@@ -128,8 +128,8 @@ fn future_quarantine_does_not_deselect_test() {
 fn required_hardware_override_is_red() {
     let mut m = manifest();
     m.overrides.push(manifest::Override {
-        gate: "candidate".into(),
-        cell: "guest-boot@macos-arm64-release-builtin".into(),
+        gate: "native-diagnostic".into(),
+        cell: "guest-boot@macos-arm64-ci-guest-builtin".into(),
         reason: "unavailable".into(),
         expires: "2026-12-01".into(),
         approved_by: "@owner".into(),
@@ -245,7 +245,7 @@ fn inheritance_cycle_and_self_hosted_pr_fail() {
     m.gates.get_mut("pr").unwrap().includes.push("main".into());
     assert!(error(&m).contains("cycle"));
     let mut m = manifest();
-    m.platforms.get_mut("linux-x64").unwrap().trust = "release".into();
+    m.platforms.get_mut("linux-x64").unwrap().trust = "operator".into();
     assert!(error(&m).contains("cannot schedule self-hosted"));
 }
 #[test]
@@ -392,13 +392,12 @@ fn measured_shards_and_recovery_history_are_bound_to_plan() {
     assert!(plan::create(&m, "pr", r, today()).is_ok());
 }
 #[test]
-fn main_does_not_require_hardware_but_candidate_does() {
+fn hosted_gates_do_not_require_hardware_but_diagnostics_do() {
     let m = manifest();
     let main = plan::create(&m, "main", request("push", &[]), today()).unwrap();
     assert!(main.tests.iter().all(|r| !r.self_hosted));
     assert!(main.builds.iter().all(|b| b.blocked_reason.is_none()));
-    let candidate =
-        plan::create(&m, "candidate", request("workflow_dispatch", &[]), today()).unwrap();
+    let candidate = plan::create(&m, "native-diagnostic", request("local", &[]), today()).unwrap();
     let guest: Vec<_> = candidate
         .tests
         .iter()
@@ -458,15 +457,15 @@ fn scenario_test_removal_changes_the_independent_contract() {
 }
 
 #[test]
-fn only_the_operator_can_publish() {
-    assert!(!root().join(".github/workflows/release.yml").exists());
-    assert_eq!(manifest().release.operator_path, "pipeline");
-    let workflow = std::fs::read_to_string(root().join(".github/workflows/promote.yml")).unwrap();
-    assert!(!workflow.contains("release promote tag"));
-    assert!(!workflow.contains("release promote publish"));
-    let operator = std::fs::read_to_string(root().join("tools/prerelease/publish.sh")).unwrap();
-    assert!(operator.contains("release promote tag"));
-    assert!(operator.contains("release promote publish"));
+fn release_manifest_has_no_publisher_or_self_hosted_builder() {
+    let m = manifest();
+    assert!(m
+        .builds
+        .values()
+        .filter(|b| b.kind == "release")
+        .all(|b| b.builder == "hosted" && m.platforms[&b.platform].trust == "hosted"));
+    assert!(!m.gates.contains_key("candidate"));
+    assert!(!m.gates.contains_key("promote"));
 }
 
 #[test]
@@ -506,13 +505,21 @@ fn fixtures_workflow_builds_from_the_reviewed_image_digest() {
     let workflow = std::fs::read_to_string(root().join(".github/workflows/fixtures.yml")).unwrap();
     assert!(workflow.contains("fixtures publish-plan"));
     assert!(workflow.contains("BASE_IMAGE=$(cat ci/fixture-base-image.txt)"));
-    assert!(workflow.contains("docker pull --platform linux/arm64 \"$BASE_IMAGE\""));
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&workflow).unwrap();
+    assert_eq!(
+        yaml["jobs"]["build"]["strategy"]["matrix"]["arch"],
+        serde_yaml::to_value(["arm64", "amd64"]).unwrap()
+    );
+    assert!(workflow.contains("docker pull --platform \"linux/$ARCH\" \"$BASE_IMAGE\""));
     assert!(workflow.contains("docker image save --output base.tar \"$BASE_IMAGE\""));
+    assert!(workflow
+        .contains("recipe=guest-oci-base; [ \"$ARCH\" = amd64 ] && recipe=guest-oci-base-amd64"));
     assert!(workflow.contains(
-        "fixtures build guest-oci-base --base base.tar --sha256 \"$BASE_SHA256\" --out built"
+        "fixtures build \"$recipe\" --base base.tar --sha256 \"$BASE_SHA256\" --out built"
     ));
+    assert!(workflow.contains("fixture-oci-amd64.tar"));
     assert!(!workflow.contains("base_url"));
-    assert!(workflow.contains("startsWith(github.ref, 'refs/heads/release/v')"));
+    assert!(!workflow.contains("startsWith(github.ref, 'refs/heads/release/v')"));
     assert!(workflow.contains("Refusing to replace an existing fixture release"));
 }
 
@@ -555,7 +562,7 @@ fn empty_prefix_suite_is_detected_without_a_compiled_inventory() {
 }
 
 #[test]
-fn nightly_is_hosted_and_sbx_is_excluded_from_candidate() {
+fn nightly_is_hosted_and_sbx_is_blocked_visible_in_diagnostics() {
     let m = manifest();
     let nightly = plan::create(&m, "nightly", request("schedule", &[]), today()).unwrap();
     assert!(nightly.tests.iter().all(|job| !job.self_hosted));
@@ -563,16 +570,15 @@ fn nightly_is_hosted_and_sbx_is_excluded_from_candidate() {
         .builds
         .iter()
         .all(|build| build.blocked_reason.is_none()));
-    let candidate =
-        plan::create(&m, "candidate", request("workflow_dispatch", &[]), today()).unwrap();
+    let candidate = plan::create(&m, "native-diagnostic", request("local", &[]), today()).unwrap();
     assert!(candidate
         .cells
         .iter()
-        .all(|cell| cell.cell.suite != "boundary-sbx"));
+        .any(|cell| cell.cell.suite == "boundary-sbx"));
     assert!(candidate
         .tests
         .iter()
-        .all(|job| !job.suites.contains("boundary-sbx")));
+        .any(|job| job.suites.contains("boundary-sbx") && job.blocked_reason.is_some()));
 }
 
 #[test]
@@ -631,4 +637,155 @@ fn root_uses_the_build_path_only_when_nothing_else_resolves() {
 fn root_resolves_this_checkout() {
     let found = root();
     assert!(found.join("ci/gates.toml").is_file(), "{}", found.display());
+}
+
+#[test]
+fn release_plan_freezes_assets_smoke_and_native_test_inventory() {
+    let m = manifest();
+    let p = super::release_plan::create(&m).unwrap();
+    assert_eq!(p["schema"], 1);
+    assert_eq!(p["gate"], "release");
+    assert_eq!(p["assets"].as_array().unwrap().len(), 4);
+    assert_eq!(p["native"].as_array().unwrap().len(), 2);
+    for asset in p["assets"].as_array().unwrap() {
+        assert_eq!(asset["builder"], "hosted");
+        assert_eq!(
+            asset["smoke_suites"],
+            serde_json::json!([
+                "artifact-smoke",
+                "artifact-entrypoints",
+                "artifact-switches"
+            ])
+        );
+        assert!(!asset["runs_on"].to_string().contains("self-hosted"));
+        assert!(!asset["cargo"].to_string().contains("guest-drivers"));
+    }
+    let linux = p["native"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == "native.linux-x64")
+        .unwrap();
+    assert_eq!(
+        linux["tests"],
+        serde_json::json!([
+            "awman-cli::artifact signed_boot::linux_artifact_runs_an_offline_session"
+        ])
+    );
+    assert_eq!(linux["fixtures"][0]["arch"], "amd64");
+    assert!(linux["fixtures"][0]["sha256"].is_null());
+    assert!(p["native"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|n| n["required"] == true));
+}
+
+#[test]
+fn release_policy_refuses_added_cells_removed_obligations_and_waivers() {
+    let mut m = manifest();
+    m.gates
+        .get_mut("release")
+        .unwrap()
+        .includes
+        .push("pr".into());
+    assert!(manifest::validate::validate(&m, today()).is_err());
+    let mut m = manifest();
+    m.release
+        .native
+        .get_mut("native.linux-x64")
+        .unwrap()
+        .required = false;
+    assert!(error(&m).contains("required native"));
+    let mut m = manifest();
+    m.gates.get_mut("release").unwrap().cells[0]
+        .suites
+        .retain(|s| s != "component-security");
+    assert!(error(&m).contains("release cell set"));
+}
+
+#[test]
+fn coverage_migration_refuses_missing_rows_and_invalid_destinations() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("ci")).unwrap();
+    let baseline = include_bytes!("../../../ci/release-coverage-baseline.json");
+    let mut ledger: serde_json::Value = serde_json::from_slice(include_bytes!(
+        "../../../ci/release-coverage-migration.json"
+    ))
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("ci/release-coverage-baseline.json"),
+        baseline,
+    )
+    .unwrap();
+    let write = |v: &serde_json::Value| {
+        std::fs::write(
+            tmp.path().join("ci/release-coverage-migration.json"),
+            serde_json::to_vec(v).unwrap(),
+        )
+        .unwrap()
+    };
+    write(&ledger);
+    super::migration::verify(tmp.path(), &manifest()).unwrap();
+    let row = ledger["cells"].as_array_mut().unwrap().pop().unwrap();
+    write(&ledger);
+    assert!(super::migration::verify(tmp.path(), &manifest())
+        .unwrap_err()
+        .to_string()
+        .contains("incomplete"));
+    ledger["cells"].as_array_mut().unwrap().push(row);
+    ledger["cells"][0]["new_selector"]["gate"] = serde_json::json!("removed-gate");
+    write(&ledger);
+    assert!(super::migration::verify(tmp.path(), &manifest()).is_err());
+}
+
+#[test]
+fn publication_policy_changes_invalidate_evidence_but_nightly_budget_does_not() {
+    let mut m = manifest();
+    let original = manifest::release_policy::digest(&m).unwrap();
+    m.gates.get_mut("nightly").unwrap().budget_minutes = Some(90);
+    assert_eq!(original, manifest::release_policy::digest(&m).unwrap());
+    m.suites.get_mut("component-security").unwrap().filter = Some("test(=replacement)".into());
+    assert_ne!(original, manifest::release_policy::digest(&m).unwrap());
+}
+
+/// Service records for a partial rerun: attempt 1 lost cell 1's runner while
+/// cell 0 passed; attempt 2 reran only cell 1. Each retained shard is
+/// authenticated against its own producing job, never its siblings.
+#[test]
+fn release_verify_credits_each_shard_to_its_own_producer_across_attempts() {
+    use super::release_verify::producer_job;
+    use serde_json::{json, Value};
+    let title = "Test unit on linux-x64";
+    let job = |id: u64, cell: usize, attempt: u64, conclusion: &str| -> Value {
+        json!({"id":id, "run_id":42, "run_attempt":attempt, "status":"completed",
+            "conclusion":conclusion, "name":format!("CI / {title} (cell {cell})")})
+    };
+    let attempt1 = vec![job(10, 0, 1, "success"), job(11, 1, 1, "failure")];
+    let attempt2 = vec![job(10, 0, 1, "success"), job(21, 1, 2, "success")];
+
+    // Mixed attempts give complete effective coverage with distinct producers.
+    assert_eq!(producer_job(&attempt1, title, 0, 42, 1, 2).unwrap(), 10);
+    assert_eq!(producer_job(&attempt2, title, 1, 42, 2, 2).unwrap(), 21);
+
+    // A retained artifact whose own producing job failed is rejected, even
+    // though the same cell later passed.
+    assert!(producer_job(&attempt1, title, 1, 42, 1, 2).is_err());
+    // Producer attempts must lie within the verified run.
+    assert!(producer_job(&attempt2, title, 1, 42, 3, 2).is_err());
+    assert!(producer_job(&attempt1, title, 0, 42, 0, 2).is_err());
+    // A record from another run or attempt cannot be borrowed.
+    assert!(producer_job(&attempt1, title, 0, 41, 1, 2).is_err());
+    assert!(producer_job(&attempt2, title, 0, 42, 2, 2).is_err());
+    // The exact cell must exist exactly once and have completed.
+    assert!(producer_job(&attempt1, title, 2, 42, 1, 2).is_err());
+    assert!(producer_job(&attempt1, "Test unit on windows-x64", 0, 42, 1, 2).is_err());
+    let duplicated = vec![job(10, 0, 1, "success"), job(12, 0, 1, "success")];
+    assert!(producer_job(&duplicated, title, 0, 42, 1, 2).is_err());
+    let mut running = job(10, 0, 1, "success");
+    running["status"] = json!("in_progress");
+    assert!(producer_job(&[running], title, 0, 42, 1, 2).is_err());
+    for conclusion in ["skipped", "cancelled", "timed_out"] {
+        assert!(producer_job(&[job(10, 0, 1, conclusion)], title, 0, 42, 1, 1).is_err());
+    }
 }

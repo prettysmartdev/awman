@@ -161,10 +161,10 @@ subsystem = "native"
 mode = "contract"
 backend = "both"
 runtime = "hvf"
-platform = "macos-arm64-release"
+platform = "macos-arm64-ci-guest"
 feature = "builtin"
 status = "covered"
-gate = "candidate"
+gate = "native-diagnostic"
 tests = ["awman-cli::guest boot::actual_awman_boots_a_guest"]
 
 [[cell]]
@@ -176,17 +176,17 @@ platform = "all-hosted"
 feature = "default"
 status = "covered"
 gate = "pr"
-tests = ["xtask::pipeline failed_commands_missing_shards_skipped_counts_and_empty_assertions_cannot_validate"]
+tests = ["xtask::pipeline incomplete_or_failed_evidence_never_validates_a_release", "xtask::pipeline a_failed_assertion_is_never_retried_into_green"]
 
 [[cell]]
 subsystem = "release awman-linux-amd64"
 mode = "contract"
 backend = "both"
 runtime = "declared by suite"
-platform = "all-hosted"
-feature = "default"
+platform = "linux-x64-release"
+feature = "builtin"
 status = "covered"
-gate = "candidate"
+gate = "release"
 tests = ["awman-cli::artifact smoke::exact_executable_runs_a_command_in_a_private_repository"]
 
 [[cell]]
@@ -194,10 +194,10 @@ subsystem = "release awman-linux-arm64"
 mode = "contract"
 backend = "both"
 runtime = "declared by suite"
-platform = "all-hosted"
+platform = "linux-arm64"
 feature = "default"
 status = "covered"
-gate = "candidate"
+gate = "release"
 tests = ["awman-cli::artifact smoke::exact_executable_runs_a_command_in_a_private_repository"]
 
 [[cell]]
@@ -205,10 +205,10 @@ subsystem = "release awman-macos-arm64"
 mode = "contract"
 backend = "both"
 runtime = "declared by suite"
-platform = "all-hosted"
-feature = "default"
+platform = "macos-arm64"
+feature = "builtin"
 status = "covered"
-gate = "candidate"
+gate = "release"
 tests = ["awman-cli::artifact smoke::exact_executable_runs_a_command_in_a_private_repository"]
 
 [[cell]]
@@ -216,10 +216,10 @@ subsystem = "release awman-windows-amd64.exe"
 mode = "contract"
 backend = "both"
 runtime = "declared by suite"
-platform = "all-hosted"
+platform = "windows-x64"
 feature = "default"
 status = "covered"
-gate = "candidate"
+gate = "release"
 tests = ["awman-cli::artifact smoke::exact_executable_runs_a_command_in_a_private_repository"]
 
 [[cell]]

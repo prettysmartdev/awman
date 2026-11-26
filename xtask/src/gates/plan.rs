@@ -82,9 +82,9 @@ fn routing(m: &Manifest, platform: &str, request: &Request) -> (Vec<String>, Opt
         && (!request.admitted_platforms.contains(platform) || request.event == "local")
     {
         (
-            m.platforms["linux-x64"].runs_on.clone(),
+            Vec::new(),
             Some(format!(
-                "blocked: {platform} has no server-verified runner admission (P1/P3)"
+                "blocked: {platform} requires an operator diagnostic host; no Actions runner is registered"
             )),
         )
     } else {

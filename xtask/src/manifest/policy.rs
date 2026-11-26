@@ -66,9 +66,8 @@ pub const REQUIRED_SUITES: &[&str] = &[
     "web",
 ];
 pub const REQUIRED_SCENARIOS: &[&str] = &[
-    "guest.actual-awman-boot",
-    "guest.upgrade-from-previous-release",
-    "guest.strategy-matrix",
+    "artifact.linux-offline-session",
+    "artifact.access-reduction",
     "artifact.signed-offline-session",
 ];
 pub const HOSTED_BUILDS: &[&str] = &[

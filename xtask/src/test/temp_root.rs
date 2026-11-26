@@ -19,6 +19,14 @@ fn guest_socket_len_at(canonical: &Path) -> usize {
         .len()
 }
 
+/// Kit-run supplies TMPROOT directly to the tests, so the generic runner's
+/// r-*/tmp nesting is absent. Include the separator in the declared suffix.
+pub(crate) const KIT_SOCKET_SUFFIX_BYTES: usize = 69;
+#[cfg(unix)]
+pub(crate) fn kit_guest_socket_len(root: &Path) -> Result<usize> {
+    Ok(root.canonicalize()?.as_os_str().as_encoded_bytes().len() + KIT_SOCKET_SUFFIX_BYTES)
+}
+
 pub(crate) fn short_apple_root() -> Result<tempfile::TempDir> {
     let mut builder = tempfile::Builder::new();
     builder.prefix("a.").rand_bytes(6);

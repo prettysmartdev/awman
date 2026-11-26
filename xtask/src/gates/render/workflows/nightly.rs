@@ -50,6 +50,7 @@ const HEAD: &str = r####"  full:
     permissions:
       contents: read
       actions: read
+      pull-requests: read
 
   flake-hunt:
     name: Flake hunt (shuffled, repeated, under CPU contention)
@@ -342,5 +343,75 @@ pub fn render(m: &Manifest) -> Result<String> {
             ("UPLOAD", UPLOAD),
         ],
     ));
+    let artifact_jobs = artifacts(m)?;
+    out = out.replace(
+        "needs: [full, flake-hunt",
+        &format!("needs: [{}, full, flake-hunt", artifact_jobs.0.join(", ")),
+    );
+    out = out.replace(
+        "blocking=\"full flake-hunt seeded-defects audit\"",
+        &format!(
+            "blocking=\"{} full flake-hunt seeded-defects audit\"",
+            artifact_jobs.0.join(" ")
+        ),
+    );
+    out.push_str(&artifact_jobs.1);
+    out = out.replace("needs: [artifact-", "needs: [kit-relocation, artifact-");
+    out = out.replace(
+        "blocking=\"artifact-",
+        "blocking=\"kit-relocation artifact-",
+    );
+    out.push_str(&format!("\n  kit-relocation:\n    name: Standalone kit relocation\n    runs-on: {}\n    timeout-minutes: 10\n    steps:\n{}\n{}\n      - name: Install pinned runner\n        run: cargo xtask test install-runner\n      - name: Run registered relocation contract\n        run: cargo xtask test run --suite kit-relocation --build linux-x64-default --evidence-dir evidence\n      - name: Retain execution evidence\n        if: ${{{{ always() }}}}\n        uses: {UPLOAD}\n        with:\n          name: kit-relocation\n          path: evidence\n          if-no-files-found: error\n          retention-days: 30\n", runs_on(&linux.runs_on), indent(&checkout_ref(false, "${{ github.sha }}"),6), indent(&rust(&linux.toolchain,&[]),6)));
+
+    out = out.replace(
+        "needs: [kit-relocation, artifact-",
+        "needs: [sandbox-coverage, kit-relocation, artifact-",
+    );
+    out = out.replace(
+        "diagnostic=\"mutation",
+        "diagnostic=\"sandbox-coverage mutation",
+    );
+    out.push_str(&format!("\n  sandbox-coverage:\n    name: Sandbox coverage (blocked until issue 86)\n    runs-on: {}\n    timeout-minutes: 5\n    steps:\n      - name: Report unavailable registered diagnostic cell\n        run: |\n          echo 'BLOCKED: native-diagnostic boundary-sbx@macos-arm64-ci-guest-builtin+macos-arm64-sbx (issue 86)' >> \"$GITHUB_STEP_SUMMARY\"\n          exit 2\n", runs_on(&linux.runs_on)));
     Ok(out)
+}
+
+/// Scheduled checks use shipping features, exact signed bytes and all declared
+/// artifact suites. Native boot is deliberately a separate operator obligation.
+fn artifacts(m: &Manifest) -> Result<(Vec<String>, String)> {
+    let mut jobs = Vec::new();
+    let mut text = String::new();
+    let plan = crate::gates::release_plan::create(m)?;
+    let suites = &m.gates["nightly-artifacts"].cells[0].suites.join(",");
+    for a in plan["assets"].as_array().expect("asset array") {
+        let build = a["build"].as_str().expect("build");
+        let b = &m.builds[build];
+        let p = &m.platforms[&b.platform];
+        let job = format!("artifact-{build}");
+        jobs.push(job.clone());
+        text.push_str(&format!("\n  {job}:\n    name: Scheduled artifact {build}\n    runs-on: {}\n    timeout-minutes: 45\n    steps:\n{}\n{}\n", runs_on(&p.runs_on), indent(&checkout_ref(false, "${{ github.sha }}"), 6), indent(&rust(&p.toolchain, &[]), 6)));
+        if b.features == "builtin" {
+            text.push_str(&format!("      - name: Verified payload\n        run: bash tools/msb-payloads/fetch.sh {}\n", p.triple));
+        }
+        let cargo = a["cargo"]
+            .as_array()
+            .expect("cargo")
+            .iter()
+            .map(|s| s.as_str().expect("arg"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        text.push_str(&format!(
+            "      - name: Build shipping executable\n        run: cargo {cargo}\n"
+        ));
+        let binary = a["binary"].as_str().expect("binary");
+        if a["sign"] == true {
+            text.push_str(&format!("      - name: Sign once before validation\n        run: bash tools/macos-sign.sh {binary}\n"));
+        }
+        if p.triple.contains("windows") {
+            text.push_str(&format!("      - name: Exact executable contracts with verified firewall\n        shell: pwsh\n        run: |\n          cargo xtask test install-runner\n          $digest = (Get-FileHash -Algorithm SHA256 {binary}).Hash.ToLowerInvariant()\n          ./ci/artifact-offline.ps1 -Artifact {binary} -Sha256 $digest -Build {build} -Suites '{suites}' -Evidence evidence\n"));
+        } else {
+            text.push_str(&format!("      - name: Exact executable contracts\n        run: |\n          cargo xtask test install-runner\n          digest=\"$(shasum -a 256 {binary} | cut -d' ' -f1)\"\n          AWMAN_TEST_HOST_RESOURCES=offline cargo xtask test run --suite {suites} --build {build} --artifact \"$PWD/{binary}\" --artifact-sha256 \"$digest\" --evidence-dir evidence\n"));
+        }
+        text.push_str(&format!("      - name: Retain complete inventory, command exits and JUnit\n        if: ${{{{ always() }}}}\n        uses: {UPLOAD}\n        with:\n          name: nightly-{job}\n          path: evidence\n          if-no-files-found: error\n          retention-days: 30\n"));
+    }
+    Ok((jobs, text))
 }

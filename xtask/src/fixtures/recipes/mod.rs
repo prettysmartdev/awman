@@ -193,7 +193,8 @@ pub fn run(recipe: &str, args: &[String]) -> Result<ExitCode> {
     let opts = options(args)?;
     match recipe {
         "previous-published" => published(&opts)?,
-        "guest-oci-base" | "guest-docker-base" => guest(recipe, &opts)?,
+        // The amd64 fixture uses the same recipe; the base image decides the architecture.
+        "guest-oci-base" | "guest-oci-base-amd64" | "guest-docker-base" => guest(recipe, &opts)?,
         "previous-from-history" => history(&opts)?,
         _ => bail!("unknown fixture recipe {recipe}"),
     }

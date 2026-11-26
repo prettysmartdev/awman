@@ -7691,6 +7691,8 @@ dependencies = [
  "awman-test-support",
  "chrono",
  "clap",
+ "flate2",
+ "getrandom 0.3.4",
  "libc",
  "nix 0.31.3",
  "portable-pty",

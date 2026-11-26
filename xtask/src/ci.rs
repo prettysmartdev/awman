@@ -1,5 +1,5 @@
 //! `cargo xtask ci`: helpers the GitHub workflows call (cache keys, digests,
-//! tool installs, plan outputs, runner health, leak sweep, summaries, the
+//! tool installs, plan outputs, leak sweep, summaries, the
 //! shell/NOTICE lints and the nightly flake and seeded-defect tooling).
 //!
 //! Owner: workflow step `ci-workflows` (see the WI 0144 ownership map). The
@@ -14,7 +14,6 @@ mod flake;
 mod lint_notice;
 mod lint_shell;
 pub(crate) mod plan_outputs;
-mod preflight;
 mod seeded;
 mod summary;
 mod sweep;
@@ -32,8 +31,7 @@ usage: cargo xtask ci <helper> [args]
   digest record --out FILE name=path...      record SHA-256 of build outputs
   digest verify --file FILE [--expect name=sha256]...
   install-tool NAME                          install a pinned tool from its verified source
-  plan-outputs --plan FILE --hardware BOOL   job-graph outputs of plan.json (GITHUB_OUTPUT lines)
-  runner-preflight --platform ID             health of a self-hosted runner (blocked, never queued)
+  plan-outputs --plan FILE   job-graph outputs of plan.json (GITHUB_OUTPUT lines)
   sweep                                      fail if this run leaked processes, containers or temp roots
   summary ...                                gate summary markdown for the step summary
   lint-shell [--allow-missing-shellcheck]    bash -n + shellcheck over every tracked script
@@ -60,7 +58,6 @@ pub fn run(args: &[String]) -> anyhow::Result<ExitCode> {
         "digest" => digest::run(rest),
         "install-tool" => tools::install_command(&root, rest),
         "plan-outputs" => plan_outputs::run(&root, rest),
-        "runner-preflight" => preflight::run(&root, rest),
         "sweep" => sweep::run(rest),
         "summary" => summary::run(&root, rest),
         "lint-shell" => lint_shell::run(&root, rest),

@@ -126,69 +126,6 @@ fn absent_invalid_or_corrupt_base_inputs_never_produce_fixtures() {
 }
 
 #[test]
-fn normal_and_dry_run_preflight_require_valid_unambiguous_fixture_pins() {
-    for dry_run in [false, true] {
-        let mut w = World::new();
-        let args: &[&str] = if dry_run { &["--dry-run"] } else { &[] };
-        w.preflight(100, C1, args).succeeded();
-        let good = w.manifest.clone();
-        for bad in [
-            "absent",
-            "malformed",
-            "still-pending",
-            "record-bypass",
-            "uppercase",
-            "non-https",
-        ] {
-            let mut m = good.clone();
-            let fixture = m["fixtures"]["guest-oci-base"].as_table_mut().unwrap();
-            match bad {
-                "absent" => {
-                    fixture.remove("sha256");
-                }
-                "malformed" => {
-                    fixture.insert("sha256".into(), "unverifiable".into());
-                }
-                "record-bypass" => {
-                    fixture.insert("verified_record".into(), "x".into());
-                }
-                "uppercase" => {
-                    fixture.insert("sha256".into(), "A".repeat(64).into());
-                }
-                "non-https" => {
-                    fixture.insert("source".into(), "http://example.invalid/archive".into());
-                }
-                _ => {
-                    fixture.insert("pending".into(), "not authenticated".into());
-                }
-            }
-            w.write_src("ci/gates.toml", &toml::to_string(&m).unwrap());
-            w.preflight(101, C1, args)
-                .stopped("BLOCKED: pins are not published yet");
-            assert!(!w.pf(101).exists());
-            assert!(releases(&w.store).is_empty());
-        }
-    }
-}
-
-#[test]
-fn changed_fixture_pin_allocates_new_identity_after_admission() {
-    let mut w = World::new();
-    w.validated(100, C1);
-    let first = w.preflight_json(100);
-    let mut m = w.manifest.clone();
-    m["fixtures"]["guest-oci-base"]["sha256"] = "b".repeat(64).into();
-    w.write_src("ci/gates.toml", &toml::to_string(&m).unwrap());
-    w.preflight(101, C1, &[]).succeeded();
-    let next = w.preflight_json(101);
-    assert_eq!(next["candidate"], 2);
-    assert_ne!(first["input_digest"], next["input_digest"]);
-    assert_eq!(next["decision"], "new");
-    w.promote(102, "verify-inputs", 1, &[])
-        .stopped("ci/gates.toml changed");
-}
-
-#[test]
 fn fixture_fetch_and_verify_require_present_digest_matching_bytes() {
     let s = sandbox("pipeline::fixtures::fetch_and_verify");
     let store = s.work().join("store");

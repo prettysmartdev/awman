@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Native exact-asset result, schema 1",
+  "type": "object",
+  "required": [
+    "schema",
+    "native_id",
+    "commit",
+    "tree",
+    "artifact_sha256",
+    "kit_sha256",
+    "outcome",
+    "reason",
+    "reason_code",
+    "tests",
+    "host",
+    "started",
+    "finished"
+  ],
+  "properties": {
+    "schema": {
+      "const": 1
+    },
+    "kit_sha256": {
+      "description": "SHA-256 of the attestation-verified extracted kit.json; the outer tar attestation subject digest is recorded separately.",
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "outcome": {
+      "enum": [
+        "passed",
+        "failed",
+        "blocked"
+      ]
+    },
+    "reason_code": {
+      "enum": [
+        null,
+        "no-hypervisor",
+        "fixture-digest",
+        "socket-budget",
+        "artifact-digest",
+        "kit-corrupt",
+        "timeout"
+      ]
+    },
+    "tests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "outcome",
+          "duration_ms"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "outcome": {
+            "enum": [
+              "passed",
+              "failed",
+              "blocked",
+              "skipped"
+            ]
+          },
+          "duration_ms": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "passed"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "command_exit",
+          "expected_inventory_sha256",
+          "junit_sha256",
+          "runner_log_sha256",
+          "env_contract_sha256",
+          "manifest_sha256",
+          "plan_sha256",
+          "policy_sha256",
+          "fixtures",
+          "previous_release"
+        ],
+        "properties": {
+          "command_exit": {
+            "const": 0
+          },
+          "artifact_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "kit_sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "tests": {
+            "type": "array",
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ]
+}

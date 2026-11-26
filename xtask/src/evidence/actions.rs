@@ -1,6 +1,8 @@
 //! Authenticate Actions artifacts, then validate the complete selected execution.
 //! Local JSON cannot opt into this transport. Release validation still uses its
-//! stricter artifact/signing/critical-scenario policy in release::state.
+//! stricter artifact/signing/native policy in the release controller.
+mod zip;
+
 use super::{digest, junit, schema::*};
 use crate::{
     gates::{
@@ -15,7 +17,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::Path,
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
+    time::{Duration, Instant},
 };
 
 fn output(program: &str, args: &[&str], root: Option<&Path>) -> Result<Vec<u8>> {
@@ -56,30 +59,16 @@ pub fn source(root: &Path) -> Result<Value> {
         .success();
     Ok(json!({"commit":git("HEAD")?, "tree":git("HEAD^{tree}")?, "clean":clean, "inputs":inputs}))
 }
-fn api(path: &str) -> Result<Value> {
-    Ok(serde_json::from_slice(&output(
-        "gh",
-        &["api", path],
-        None,
-    )?)?)
+pub(crate) fn api(path: &str) -> Result<Value> {
+    Ok(serde_json::from_slice(
+        &output("gh", &["api", path], None).context("service unavailable: Actions API")?,
+    )?)
 }
-fn release_pr_head(pr: &Value, sha: &str, repo: &str) -> bool {
-    let branch = pr["head"]["ref"].as_str().unwrap_or("");
-    let version = branch.strip_prefix("release/v").unwrap_or("");
-    version.split('.').count() == 3
-        && version
-            .split('.')
-            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
-        && pr["head"]["sha"] == sha
-        && pr["head"]["repo"]["full_name"] == repo
-        && pr["base"]["ref"] == "main"
-}
-fn pages(path: &str, field: &str) -> Result<Vec<Value>> {
-    let data: Vec<Value> = serde_json::from_slice(&output(
-        "gh",
-        &["api", "--paginate", "--slurp", path],
-        None,
-    )?)?;
+pub(crate) fn pages(path: &str, field: &str) -> Result<Vec<Value>> {
+    let data: Vec<Value> = serde_json::from_slice(
+        &output("gh", &["api", "--paginate", "--slurp", path], None)
+            .context("service unavailable: Actions API pagination")?,
+    )?;
     let mut all = Vec::new();
     for page in data {
         all.extend(
@@ -95,16 +84,16 @@ fn pages(path: &str, field: &str) -> Result<Vec<Value>> {
 fn environment(name: &str) -> Result<String> {
     std::env::var(name).with_context(|| format!("{name} is required; aggregation runs in Actions"))
 }
-fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
+pub(crate) fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     v[key].as_str().with_context(|| format!("missing {key}"))
 }
-fn number(v: &Value, key: &str) -> Result<u64> {
+pub(crate) fn number(v: &Value, key: &str) -> Result<u64> {
     v[key].as_u64().with_context(|| format!("missing {key}"))
 }
 
 /// Service digest authenticates the compressed bytes, then extraction rejects
 /// traversal, links and non-files. Nothing from an evidence archive is executed.
-fn download(repo: &str, artifact: &Value, dir: &Path) -> Result<()> {
+pub(crate) fn download(repo: &str, artifact: &Value, dir: &Path) -> Result<()> {
     ensure!(artifact["expired"] == false, "artifact expired");
     let id = number(artifact, "id")?;
     let expected = text(artifact, "digest")?
@@ -113,38 +102,50 @@ fn download(repo: &str, artifact: &Value, dir: &Path) -> Result<()> {
     ensure!(digest::is_sha256(expected), "invalid service digest");
     fs::create_dir_all(dir)?;
     let zip = dir.with_extension("zip");
-    let status = Command::new("gh")
-        .args(["api", &format!("repos/{repo}/actions/artifacts/{id}/zip")])
-        .stdout(fs::File::create(&zip)?)
-        .status()?;
-    ensure!(status.success(), "download artifact {id} failed");
+    let mut gh = Command::new("gh");
+    gh.args(["api", &format!("repos/{repo}/actions/artifacts/{id}/zip")])
+        .stdin(Stdio::null())
+        .stdout(fs::File::create(&zip)?);
+    let status = wait_bounded(&mut gh, DOWNLOAD_TIMEOUT)
+        .with_context(|| format!("service unavailable: download artifact {id}"))?;
     ensure!(
-        digest::sha256_file(&zip)? == expected,
+        status.success(),
+        "service unavailable: download artifact {id} failed"
+    );
+    ensure!(
+        fs::metadata(&zip)?.len() <= zip::MAX_TOTAL_BYTES,
+        "artifact {id}: archive exceeds the evidence size bound"
+    );
+    let bytes = fs::read(&zip)?;
+    fs::remove_file(&zip)?;
+    ensure!(
+        digest::sha256(&bytes) == expected,
         "artifact {id}: service digest mismatch"
     );
-    let script = r#"import pathlib, stat, sys, zipfile
-with zipfile.ZipFile(sys.argv[1]) as z:
-    seen = set()
-    for i in z.infolist():
-        p = pathlib.PurePosixPath(i.filename)
-        mode = i.external_attr >> 16
-        assert not p.is_absolute() and '..' not in p.parts and '\\' not in i.filename
-        assert i.filename not in seen
-        seen.add(i.filename)
-        assert stat.S_IFMT(mode) in (0, stat.S_IFREG, stat.S_IFDIR)
-    z.extractall(sys.argv[2])
-"#;
-    let status = Command::new("python3")
-        .args(["-c", script])
-        .arg(&zip)
-        .arg(dir)
-        .stdin(Stdio::null())
-        .status()?;
-    ensure!(status.success(), "unsafe or invalid evidence ZIP");
-    fs::remove_file(zip)?;
-    Ok(())
+    zip::extract(&bytes, dir)
+        .with_context(|| format!("artifact {id}: unsafe or invalid evidence ZIP"))
 }
-fn artifact<'a>(all: &'a [Value], name: &str) -> Result<&'a Value> {
+
+/// Evidence archives are small; a stalled transfer is unavailable service, not progress.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Wait for a child with a wall-clock deadline, killing it when the deadline passes.
+fn wait_bounded(command: &mut Command, timeout: Duration) -> Result<ExitStatus> {
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("no result within {} s; stopped", timeout.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+pub(crate) fn artifact<'a>(all: &'a [Value], name: &str) -> Result<&'a Value> {
     let matching = all.iter().filter(|v| v["name"] == name).collect::<Vec<_>>();
     ensure!(!matching.is_empty(), "required artifact {name}: not found");
     if matching.len() == 1 {
@@ -170,7 +171,7 @@ fn artifact<'a>(all: &'a [Value], name: &str) -> Result<&'a Value> {
     );
     Ok(latest.1)
 }
-fn job_passed(jobs: &[Value], name: &str, count: usize) -> Result<()> {
+pub(crate) fn job_passed(jobs: &[Value], name: &str, count: usize) -> Result<()> {
     let matching = jobs
         .iter()
         .filter(|j| {
@@ -189,7 +190,7 @@ fn job_passed(jobs: &[Value], name: &str, count: usize) -> Result<()> {
     );
     Ok(())
 }
-pub(super) fn expected(v: &Value) -> Result<BTreeSet<String>> {
+pub(crate) fn expected(v: &Value) -> Result<BTreeSet<String>> {
     let mut tests = BTreeSet::new();
     for suite in v["rust-suites"]
         .as_object()
@@ -213,7 +214,7 @@ pub(super) fn expected(v: &Value) -> Result<BTreeSet<String>> {
     ensure!(!tests.is_empty(), "required test invocation is empty");
     Ok(tests)
 }
-pub(super) fn file_in(dir: &Path, name: &str) -> Result<std::path::PathBuf> {
+pub(crate) fn file_in(dir: &Path, name: &str) -> Result<std::path::PathBuf> {
     ensure!(
         !name.is_empty()
             && Path::new(name).components().count() == 1
@@ -224,7 +225,7 @@ pub(super) fn file_in(dir: &Path, name: &str) -> Result<std::path::PathBuf> {
     Ok(dir.join(name))
 }
 /// Pure checks used after service authentication. Never supplies its own trust bit.
-fn check_run(
+pub(crate) fn check_run(
     dir: &Path,
     suites: &BTreeSet<String>,
     build: &str,
@@ -349,56 +350,27 @@ pub fn aggregate(root: &Path, m: &Manifest, p: &Plan) -> Result<GateEvidence> {
     let current = source(root)?;
     let trigger_sha = environment("GITHUB_SHA")?;
     let requested = event["inputs"]["ref"].as_str().unwrap_or("");
-    let release_override = event_name == "workflow_dispatch"
-        && event["inputs"]["gate"] == "main"
-        && !requested.is_empty()
-        && requested != trigger_sha;
-    if release_override {
-        ensure!(
-            environment("GITHUB_REF")? == "refs/heads/main" && run["head_sha"] == trigger_sha,
-            "release gate controller must run from protected main"
-        );
-        let pages: Vec<Value> = serde_json::from_slice(&output(
-            "gh",
-            &[
-                "api",
-                "--paginate",
-                "--slurp",
-                &format!("repos/{repo}/pulls?state=open&per_page=100"),
-            ],
-            None,
-        )?)?;
-        let matching = pages
-            .iter()
-            .filter_map(Value::as_array)
-            .flatten()
-            .filter(|pr| release_pr_head(pr, requested, &repo))
-            .count();
-        ensure!(
-            matching == 1,
-            "release gate ref is not an exact open release PR head"
-        );
-    }
+    let tested_sha = if event_name == "workflow_dispatch" && !requested.is_empty() {
+        requested
+    } else {
+        &trigger_sha
+    };
     ensure!(
-        current["clean"] == true
-            && current["commit"]
-                == if release_override {
-                    requested
-                } else {
-                    &trigger_sha
-                },
+        current["clean"] == true && current["commit"] == tested_sha,
         "checkout differs from triggering source"
     );
-    // PR API head_sha describes the contributor head; GITHUB_SHA is the tested
-    // merge commit. Both are checked against the provider event envelope.
     let service_head = if event_name == "pull_request" {
         &event["pull_request"]["head"]["sha"]
-    } else if release_override {
-        &run["head_sha"]
     } else {
-        &current["commit"]
+        &run["head_sha"]
     };
     ensure!(&run["head_sha"] == service_head, "service head mismatch");
+    if event_name != "pull_request" && requested.is_empty() {
+        ensure!(
+            run["head_sha"] == current["commit"],
+            "service head mismatch"
+        );
+    }
     let mut request = p.request.clone();
     request.repository_id = number(&run["repository"], "id")?.to_string();
     request.event = event_name.clone();
@@ -450,6 +422,11 @@ pub fn aggregate(root: &Path, m: &Manifest, p: &Plan) -> Result<GateEvidence> {
         kind: "gate".into(),
         gate: p.gate.clone(),
         commit: p.request.head_sha.clone(),
+        tree: text(&current, "tree")?.into(),
+        satisfies: vec![],
+        manifest_sha256: m.version().into(),
+        run_id: Some(run_id),
+        attempt: Some(attempt),
         manifest_version: m.version().into(),
         plan_sha256: p.digest()?,
         verdict: Outcome::Passed,
@@ -474,6 +451,9 @@ pub fn aggregate(root: &Path, m: &Manifest, p: &Plan) -> Result<GateEvidence> {
     let matrices = outputs["shards"]
         .as_object()
         .context("missing shard matrices")?;
+    let (independent, _) =
+        super::inventory::authenticate(&repo, &artifacts, p, m, &current, &mode, scratch.path())?;
+    let mut actual = super::inventory::Inventories::new();
     let mut checked: BTreeMap<String, (String, Counts)> = BTreeMap::new();
     for (job, matrix) in matrices {
         let entries = matrix.as_array().context("invalid matrix")?;
@@ -504,6 +484,12 @@ pub fn aggregate(root: &Path, m: &Manifest, p: &Plan) -> Result<GateEvidence> {
                     json!({"run_id":run_id.to_string(), "attempt":attempt.to_string(), "job":job});
                 let shard = format!("{}/{}", number(entry, "i")?, number(entry, "n")?);
                 let counts = check_run(&dir, &ids, &t.build, Some(&shard), &current, &producer, m)?;
+                super::inventory::merge(
+                    &mut actual,
+                    &t.build,
+                    super::inventory::raw(&dir)?,
+                    &independent,
+                )?;
                 Ok((text(a, "digest")?.into(), counts))
             })();
             match check {
@@ -576,6 +562,18 @@ pub fn aggregate(root: &Path, m: &Manifest, p: &Plan) -> Result<GateEvidence> {
             });
             continue;
         }
+        if m.suites
+            .get(&c.cell.suite)
+            .is_some_and(|s| s.kind == "nextest")
+        {
+            if let Err(e) = super::inventory::complete(
+                &actual,
+                &independent,
+                &format!("{}@{}", c.cell.suite, c.cell.build),
+            ) {
+                report.errors.push(e.to_string());
+            }
+        }
         // Build-only cells are certified by their authenticated build job above.
         let is_test = m.suites.contains_key(&c.cell.suite);
         let matches = checked
@@ -609,27 +607,13 @@ pub fn aggregate(root: &Path, m: &Manifest, p: &Plan) -> Result<GateEvidence> {
     if !report.errors.is_empty() || !report.missing.is_empty() {
         report.verdict = Outcome::Failed;
     }
+    report.satisfies = super::aggregate::satisfies(m, &report);
     Ok(report)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn release_override_requires_exact_same_repo_pr_head() {
-        let original = json!({"head":{"ref":"release/v0.14.0","sha":"abc","repo":{"full_name":"owner/repo"}},"base":{"ref":"main"}});
-        assert!(release_pr_head(&original, "abc", "owner/repo"));
-        for (pointer, value) in [
-            ("/head/ref", json!("feature/unsafe")),
-            ("/head/sha", json!("other")),
-            ("/head/repo/full_name", json!("attacker/fork")),
-            ("/base/ref", json!("other")),
-        ] {
-            let mut changed = original.clone();
-            *changed.pointer_mut(pointer).unwrap() = value;
-            assert!(!release_pr_head(&changed, "abc", "owner/repo"));
-        }
-    }
     fn setup(dir: &Path) -> (Value, Value, Manifest, BTreeSet<String>) {
         let source = json!({"commit":"source", "clean":true});
         let producer = json!({"run_id":"42", "attempt":"2", "job":"test-unit-linux-x64"});

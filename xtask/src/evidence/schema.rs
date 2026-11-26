@@ -190,6 +190,11 @@ pub struct GateCell {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GateEvidence {
+    pub tree: String,
+    pub satisfies: Vec<String>,
+    pub manifest_sha256: String,
+    pub run_id: Option<u64>,
+    pub attempt: Option<u64>,
     pub schema: u32,
     pub kind: String,
     pub gate: String,

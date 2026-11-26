@@ -21,10 +21,37 @@ pub fn check(root: &Path, allow_placeholders: bool) -> Result<Report> {
         r.errors.push(format!("manifest: {e:#}"));
     }
     // `gates check` is the `pr` lint: it is red on every pin the pr gate depends
-    // on. Native pins needed only by candidate cells (guest fixtures, the
+    // on. Native pins needed only by native obligations (guest fixtures, the
     // previous release, hardware images) are enforced by the release gate.
     if !allow_placeholders {
         r.errors.extend(manifest::validate::pins_for_gate(&m, "pr"));
+    }
+    if let Err(e) = super::migration::verify(root, &m) {
+        r.errors.push(format!("coverage migration: {e:#}"));
+    }
+    for (id, f) in &m.fixtures {
+        for (recorded, file) in [
+            (
+                &f.recipe_sha256,
+                "xtask/src/fixtures/recipes/guest_image.rs",
+            ),
+            (
+                &f.image_contract_sha256,
+                "tests/guest/support/image-contract.sh",
+            ),
+        ] {
+            if let Some(recorded) = recorded {
+                if crate::evidence::digest::sha256_file(&root.join(file))
+                    .ok()
+                    .as_ref()
+                    != Some(recorded)
+                {
+                    r.errors.push(format!(
+                        "fixture {id}: recipe/input drift in {file}; publish and review a new pin"
+                    ));
+                }
+            }
+        }
     }
     r.errors.extend(scenario_findings(root, &m));
     r.errors.extend(super::render::workflows::verify(root, &m));
@@ -134,7 +161,11 @@ pub fn make_contract() -> Vec<(&'static str, Vec<&'static str>)> {
         ),
         (
             "test-artifact",
-            vec!["cargo xtask test run --tier artifact"],
+            vec![
+                "cargo xtask test run --tier artifact",
+                "--artifact",
+                "--artifact-sha256",
+            ],
         ),
         ("gates", vec!["cargo xtask gates check"]),
     ]

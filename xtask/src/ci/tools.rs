@@ -220,15 +220,11 @@ pub fn actionlint_config(repo: &Path, args: &[String]) -> Result<ExitCode> {
     let a = Args::parse(args, &["out"], &[])?;
     let m = manifest::load(repo)?;
     let mut labels: Vec<&str> = m
-        .release
-        .ci_guest_labels
-        .iter()
-        .chain(&m.release.release_labels)
+        .platforms
+        .values()
+        .flat_map(|p| p.runs_on.iter())
         .map(String::as_str)
         .collect();
-    // Legacy release and sandbox workflows use these runner labels until
-    // their cutover. actionlint's bundled hosted-label list also predates 26.04.
-    labels.extend(["awman-ci-sbx", "hypervisor", "ubuntu-26.04"]);
     labels.sort_unstable();
     labels.dedup();
     let mut text = String::from("self-hosted-runner:\n  labels:\n");

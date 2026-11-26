@@ -6,9 +6,8 @@ use crate::manifest::{self, Manifest};
 use anyhow::{bail, ensure, Result};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Gates whose cells `ci.yml` runs (the candidate/promote gates belong to the
-/// release workflows).
-pub const CI_GATES: [&str; 3] = ["pr", "main", "nightly"];
+/// Hosted test gates rendered by ci.yml. Operator diagnostics never enter it.
+pub const CI_GATES: [&str; 4] = ["pr", "main", "nightly", "release"];
 
 /// Identifier of the job that builds (and archives) one build cell.
 pub fn build_job_id(m: &Manifest, build: &str) -> String {
@@ -58,7 +57,7 @@ pub fn ci_builds(m: &Manifest) -> Result<BTreeSet<String>> {
         for cell in manifest::validate::cells(m, gate)? {
             ensure!(
                 m.platforms[&cell.platform].trust == "hosted",
-                "{gate} gate selects self-hosted cell {}; move it to the release candidate gate",
+                "{gate} gate selects self-hosted cell {}; move it to native-diagnostic",
                 cell.id
             );
             if !m.suites.contains_key(&cell.suite) || m.builds[&cell.build].kind == "test" {

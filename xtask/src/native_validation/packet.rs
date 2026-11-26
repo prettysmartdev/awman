@@ -61,7 +61,11 @@ pub(super) fn check_results(out: &Path, p: &Packet, m: &Manifest) -> Result<()> 
         p.suites == suites(m, platform),
         "packet omits or changes required native suites"
     );
-    for id in &p.suites {
+    ensure!(
+        p.blocked == blocked_suites(m, platform),
+        "packet blocks a different set of suites than the manifest allows"
+    );
+    for id in &runnable_suites(m, platform) {
         let want = expected(&fs::read_to_string(out.join(format!("list-{id}.stdout")))?)?;
         let mut actual = BTreeSet::new();
         let evidence = out.join(id);
@@ -104,7 +108,7 @@ pub(super) fn check_results(out: &Path, p: &Packet, m: &Manifest) -> Result<()> 
 pub(super) fn verify(root: &Path, out: &Path, m: &Manifest) -> Result<()> {
     let p: Packet = serde_json::from_slice(&fs::read(out.join("packet.json"))?)?;
     ensure!(
-        p.schema == 1 && p.verdict == "passed" && p.error.is_none(),
+        p.schema == 1 && p.verdict == "passed" && p.error.is_none() && p.blocked.is_empty(),
         "packet is not a successful schema-1 run"
     );
     let platform = Platform::for_target(&p.target)?;
@@ -168,7 +172,7 @@ pub(super) fn verify(root: &Path, out: &Path, m: &Manifest) -> Result<()> {
             "verify-artifact",
         ]);
     }
-    if m.previous_release.contains_key(platform.target) {
+    if predecessor_pinned(m, platform) {
         required.push("fetch-previous");
     }
     if !platform.apple() {
@@ -287,10 +291,11 @@ mod tests {
                 ids.iter().any(|id| id == "boundary-registry"),
                 !platform.apple()
             );
+            assert_eq!(ids.iter().any(|id| id == "boundary-git"), !platform.apple());
         }
         let linux = Platform::for_target("x86_64-unknown-linux-gnu").unwrap();
         m.previous_release.remove(linux.target);
-        assert!(!suites(&m, linux)
+        assert!(suites(&m, linux)
             .iter()
             .any(|id| id == "guest-linux-published-upgrade"));
         m.previous_release.insert(
@@ -331,5 +336,60 @@ mod tests {
         fs::remove_file(dir.path().join("extra")).unwrap();
         fs::remove_file(dir.path().join("log")).unwrap();
         assert_ne!(files(dir.path()).unwrap(), baseline);
+    }
+}
+
+#[cfg(test)]
+mod blocked_tests {
+    use super::*;
+
+    /// Write passing evidence for exactly the suites a run executed.
+    fn passing_evidence(out: &Path, platform: Platform, ids: &[String]) {
+        let listing = serde_json::json!({"rust-suites":{"guest":{"binary-id":"awman-cli::guest","testcases":{"boot::actual_guest":{"ignored":false,"filter-match":{"status":"matches"}}}}}});
+        for id in ids {
+            fs::write(out.join(format!("list-{id}.stdout")), listing.to_string()).unwrap();
+            let dir = out.join(id);
+            fs::create_dir_all(&dir).unwrap();
+            let run = serde_json::json!({"failed_suites":[],"runner":"nextest","build":platform.build,"invocations":[{"exit":0,"suites":[id]}]});
+            fs::write(dir.join("run.json"), run.to_string()).unwrap();
+            fs::write(
+                dir.join("junit.xml"),
+                "<testsuite><testcase classname=\"awman-cli::guest\" name=\"boot::actual_guest\"/></testsuite>",
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn blocked_predecessor_suites_are_recorded_while_independent_results_are_checked() {
+        let mut m = crate::manifest::load(&crate::gates::root()).unwrap();
+        let linux = Platform::for_target("x86_64-unknown-linux-gnu").unwrap();
+        m.previous_release.remove(linux.target);
+        let out = tempfile::tempdir().unwrap();
+        let runnable = runnable_suites(&m, linux);
+        passing_evidence(out.path(), linux, &runnable);
+        let mut p = Packet {
+            target: linux.target.into(),
+            suites: suites(&m, linux),
+            blocked: blocked_suites(&m, linux),
+            ..Default::default()
+        };
+        assert!(!p.blocked.is_empty());
+        check_results(out.path(), &p, &m).unwrap();
+
+        // A packet cannot hide a blocked suite, nor block one that is runnable.
+        let mut hidden = p.blocked.clone();
+        hidden.pop_first();
+        let all_blocked = std::mem::replace(&mut p.blocked, hidden);
+        assert!(check_results(out.path(), &p, &m).is_err());
+        p.blocked = all_blocked.clone();
+        p.blocked
+            .insert("guest-boot".into(), "BLOCKED[previous-release]".into());
+        assert!(check_results(out.path(), &p, &m).is_err());
+        p.blocked = all_blocked;
+
+        // Even with every runnable result present, the verdict stays blocked.
+        let outcome = blocked_outcome(&p.blocked);
+        assert_eq!(verdict(&outcome), "blocked");
     }
 }

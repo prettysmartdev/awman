@@ -491,7 +491,17 @@ impl Capability for GuestFixtures {
         let ids: Vec<&String> = config
             .fixtures
             .iter()
-            .filter(|(_, f)| f.tiers.iter().any(|t| t == "guest") && f.file.is_some())
+            .filter(|(_, f)| {
+                f.tiers.iter().any(|t| t == "guest")
+                    && f.file.is_some()
+                    && f.arch.as_deref().is_none_or(|arch| {
+                        arch == if cfg!(target_arch = "x86_64") {
+                            "amd64"
+                        } else {
+                            "arm64"
+                        }
+                    })
+            })
             .map(|(id, _)| id)
             .collect();
         if ids.is_empty() {

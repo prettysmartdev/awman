@@ -44,16 +44,20 @@ const TRIGGERS: &str = r##"on:
       gate:
         description: Hosted gate to run
         type: choice
-        options: [pr, main, nightly]
-        default: pr
+        options: [pr, main, release]
+        default: main
+      key:
+        description: Release operation discovery key
+        type: string
+        default: ""
       ref:
-        description: Exact open release PR head to test through the main workflow
+        description: Commit to check out (empty means the dispatch ref)
         type: string
         default: ""
   workflow_call:
     inputs:
       gate:
-        description: "pr, main or nightly"
+        description: "pr, main, nightly or release"
         type: string
         default: pr
       ref:
@@ -117,7 +121,7 @@ const PLAN: &str = r##"  plan:
             *) gate="${INPUT_GATE:-pr}" ;;
           esac
           case "$gate" in
-            pr|main|nightly) ;;
+            pr|main|nightly|release) ;;
             *) echo "unknown gate: $gate" >&2; exit 1 ;;
           esac
           echo "gate=$gate" >> "$GITHUB_OUTPUT"
@@ -166,6 +170,8 @@ const LINT: &str = r##"  lint:
     name: Lint
     runs-on: @@RUNS_ON@@
     timeout-minutes: 30
+    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.gate != 'release' }}
     env:
       GATE_NAME: ${{ github.event_name == 'pull_request' && 'pr' || github.event_name == 'merge_group' && 'pr' || github.event_name == 'push' && 'main' || inputs.gate || 'pr' }}
     steps:
@@ -243,14 +249,10 @@ fn build_job(m: &Manifest, id: &str) -> String {
     let b = &m.builds[id];
     let p = &m.platforms[&b.platform];
     let job = graph::build_job_id(m, id);
-    let hosted = p.trust == "hosted";
     let smoke = b.kind == "build-smoke";
-    let mut cond = format!(
+    let cond = format!(
         "!cancelled() && needs.plan.result == 'success' && contains(fromJSON(needs.plan.outputs.builds), '{id}')"
     );
-    if !hosted {
-        cond.push_str(" && needs.plan.outputs.hardware == 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && github.event_name != 'merge_group'");
-    }
     let mut s = format!(
         "  {job}:\n    name: Build {id}\n    needs: plan\n    if: ${{{{ {cond} }}}}\n    runs-on: {}\n    timeout-minutes: 30\n",
         runs_on(&p.runs_on)
@@ -269,11 +271,6 @@ fn build_job(m: &Manifest, id: &str) -> String {
     }
     s.push_str(&indent(&rust(&p.toolchain, &extra), 6));
     s.push('\n');
-    if !hosted {
-        s.push_str("      - name: Runner health (blocked early, never queued forever)\n        run: cargo xtask ci runner-preflight --platform ");
-        s.push_str(&b.platform);
-        s.push('\n');
-    }
     s.push_str(&format!(
         "      - name: Compute the cache key\n        id: cache-key\n        run: echo \"key=$(cargo xtask ci cache-key --build {id})\" >> \"$GITHUB_OUTPUT\"\n      - name: Restore the cargo and build cache (exact key, no fallback)\n        id: cache\n        uses: {CACHE_RESTORE}\n        with:\n          path: |\n            ~/.cargo/registry\n            ~/.cargo/git\n            target\n          key: ${{{{ steps.cache-key.outputs.key }}}}\n"
     ));
@@ -291,31 +288,24 @@ fn build_job(m: &Manifest, id: &str) -> String {
             ));
         }
         s.push_str(&format!(
-            "      - name: Install the pinned test runner\n        run: cargo xtask test install-runner\n      - name: Build the nextest archive and the debug binary\n        run: |\n          if [ \"$RUNNER_OS\" = Windows ]; then\n            # Nextest recompiles xtask; Windows cannot replace a running exe.\n            cp target/debug/xtask.exe target/xtask-archive.exe\n            target/xtask-archive.exe test archive --build {id} --out archive\n          else\n            cargo xtask test archive --build {id} --out archive\n          fi\n      - name: Record digests\n        id: digests\n        run: |\n          cp \"target/debug/awman$(if [ \"$RUNNER_OS\" = Windows ]; then echo .exe; fi)\" archive/awman-debug-{id}\n          cargo xtask ci digest record --out archive/digests.json \\\n            archive=archive/test-archive-{id}.tar.zst \\\n            expected=archive/expected-tests-{id}.json \\\n            binary=archive/awman-debug-{id} >> \"$GITHUB_OUTPUT\"\n      - name: Upload the archive\n        uses: {UPLOAD}\n        with:\n          name: test-archive-${{{{ needs.plan.outputs.gate }}}}-${{{{ inputs.mode }}}}-{id}\n          path: archive\n          if-no-files-found: error\n          retention-days: 7\n"
+            "      - name: Install the pinned test runner\n        run: cargo xtask test install-runner\n      - name: Build the nextest archive and the debug binary\n        run: |\n          if [ \"$RUNNER_OS\" = Windows ]; then\n            # Nextest recompiles xtask; Windows cannot replace a running exe.\n            cp target/debug/xtask.exe target/xtask-archive.exe\n            target/xtask-archive.exe test archive --build {id} --out archive\n          else\n            cargo xtask test archive --build {id} --out archive\n          fi\n      - name: Record digests\n        id: digests\n        run: |\n          cp \"target/debug/awman$(if [ \"$RUNNER_OS\" = Windows ]; then echo .exe; fi)\" archive/awman-debug-{id}\n          cargo xtask ci digest record --out archive/digests.json \\\n            archive=archive/test-archive-{id}.tar.zst \\\n            expected=archive/expected-tests-{id}.json \\\n            binary=archive/awman-debug-{id} >> \"$GITHUB_OUTPUT\"\n      - name: Upload independently compiled suite inventories\n        uses: {UPLOAD}\n        with:\n          name: test-inventory-${{{{ needs.plan.outputs.gate }}}}-${{{{ inputs.mode }}}}-{id}\n          path: archive/suite-inventories.json\n          if-no-files-found: error\n          retention-days: 90\n      - name: Upload the archive\n        uses: {UPLOAD}\n        with:\n          name: test-archive-${{{{ needs.plan.outputs.gate }}}}-${{{{ inputs.mode }}}}-{id}\n          path: archive\n          if-no-files-found: error\n          retention-days: 7\n"
         ));
     }
     s.push_str(&format!(
         "      - name: Record cache statistics\n        if: ${{{{ always() }}}}\n        env:\n          CACHE_HIT: ${{{{ steps.cache.outputs.cache-hit }}}}\n          CACHE_KEY: ${{{{ steps.cache-key.outputs.key }}}}\n        run: cargo xtask ci cache-stats --build {id} --key \"$CACHE_KEY\" --hit \"${{CACHE_HIT:-false}}\" --out cache-stats\n      - name: Upload cache statistics\n        if: ${{{{ always() }}}}\n        uses: {UPLOAD}\n        with:\n          name: evidence-${{{{ needs.plan.outputs.gate }}}}-${{{{ inputs.mode }}}}-cache-{id}\n          path: cache-stats\n          if-no-files-found: warn\n          retention-days: 30\n      - name: Save the cache (main pushes only)\n        if: ${{{{ github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true' }}}}\n        uses: {CACHE_SAVE}\n        with:\n          path: |\n            ~/.cargo/registry\n            ~/.cargo/git\n            target\n          key: ${{{{ steps.cache-key.outputs.key }}}}\n"
     ));
-    if !hosted {
-        s.push_str("      - name: Leak sweep\n        if: ${{ always() }}\n        run: cargo xtask ci sweep\n");
-    }
     s
 }
 
 fn test_job(m: &Manifest, t: &TestJob) -> String {
     let p = &m.platforms[&t.platform];
     let build_job = graph::build_job_id(m, &t.build);
-    let hosted = p.trust == "hosted";
-    let mut cond = format!(
+    let cond = format!(
         "!cancelled() && needs.plan.result == 'success' && needs.{build_job}.result == 'success' && contains(fromJSON(needs.plan.outputs.jobs), '{}')",
         t.id
     );
-    if !hosted {
-        cond.push_str(" && needs.plan.outputs.hardware == 'true' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && github.event_name != 'merge_group'");
-    }
     let mut s = format!(
-        "  {id}:\n    name: Test {tier} on {platform}\n    needs: [plan, {build_job}]\n    if: ${{{{ {cond} }}}}\n    runs-on: {runs_on}\n    timeout-minutes: {timeout}\n    strategy:\n      fail-fast: false\n      matrix:\n        shard: ${{{{ fromJSON(needs.plan.outputs.shards)['{id}'] || fromJSON('[{{\"i\":1,\"n\":1,\"suites\":\"\"}}]') }}}}\n",
+        "  {id}:\n    name: Test {tier} on {platform} (cell ${{{{ strategy.job-index }}}})\n    needs: [plan, {build_job}]\n    if: ${{{{ {cond} }}}}\n    runs-on: {runs_on}\n    timeout-minutes: {timeout}\n    strategy:\n      fail-fast: false\n      matrix:\n        shard: ${{{{ fromJSON(needs.plan.outputs.shards)['{id}'] || fromJSON('[{{\"i\":1,\"n\":1,\"suites\":\"\"}}]') }}}}\n",
         id = t.id,
         tier = t.tier,
         platform = t.platform,
@@ -332,12 +322,6 @@ fn test_job(m: &Manifest, t: &TestJob) -> String {
     s.push('\n');
     if t.id == "boundary-linux-docker" {
         s.push_str("      - name: Install the loopback Git transport\n        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server\n");
-    }
-    if !hosted {
-        s.push_str(&format!(
-            "      - name: Runner health (blocked early, never queued forever)\n        run: cargo xtask ci runner-preflight --platform {}\n",
-            t.platform
-        ));
     }
     let bid = &t.build;
     s.push_str(&format!(
@@ -551,6 +535,7 @@ pub fn render(m: &Manifest) -> Result<String> {
 
     let mut out = header("CI");
     out.push('\n');
+    out.push_str("run-name: CI ${{ inputs.gate }} ${{ inputs.key }}\n\n");
     out.push_str(TRIGGERS);
     out.push_str("\njobs:\n");
     for (i, (_, text)) in jobs.iter().enumerate() {

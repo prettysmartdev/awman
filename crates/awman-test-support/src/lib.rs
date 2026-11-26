@@ -58,6 +58,7 @@ pub mod tier;
 pub mod wait;
 
 pub use capability::{Capability, Granted, ProbeContext};
+pub use config::workspace_root;
 pub use env::EnvMap;
 pub use leak::Leak;
 pub use net::Ports;

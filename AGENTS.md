@@ -36,7 +36,8 @@ All decisions — architecture, behavior, security, UX, and implementation — a
 make all      # build the awman binary
 make install  # build + install to /usr/local/bin/
 make test     # run the manifest local gate
-make validate-native # Apple Silicon acceptance and evidence packet
+make validate-native # broad native diagnostic on this host (not a release step)
+make release  # one-command release; see aspec/devops/release.md
 ```
 
 ## Architecture Constraints

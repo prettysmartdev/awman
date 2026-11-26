@@ -1,13 +1,17 @@
 use crate::manifest::Manifest;
 pub fn render(m: &Manifest) -> String {
-    let mut text=String::from("<!-- gates:begin contract -->\nGenerated from `ci/gates.toml` (schema 1).\n\n| Gate | Budget (minutes) | Required status |\n| --- | --- | --- |\n");
+    let mut text=String::from("<!-- gates:begin contract -->\nGenerated from `ci/gates.toml` (schema 2).\n\n| Gate | Budget (minutes) | Required status |\n| --- | --- | --- |\n");
     for (id, g) in &m.gates {
         text.push_str(&format!(
             "| {id} | {} | {} |\n",
             g.budget_minutes
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "inherited".into()),
-            g.required_check.as_deref().unwrap_or("gate")
+            if g.execution.as_deref() == Some("operator") {
+                "operator diagnostic"
+            } else {
+                g.required_check.as_deref().unwrap_or("gate")
+            }
         ));
     }
     text.push_str("\n| Tier | Per-test deadline (seconds) | Guarantees |\n| --- | --- | --- |\n");

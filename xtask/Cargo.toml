@@ -30,12 +30,15 @@ serde_yaml = { workspace = true }
 toml = { workspace = true }
 sha2 = { workspace = true }
 tar = { workspace = true }
+# Raw deflate and CRC-32 for safe evidence ZIP extraction (no python3).
+flate2 = { workspace = true }
 chrono = { workspace = true }
 # Module-tree walk for test discovery and the test-hygiene lint.
 syn = { workspace = true }
 # JUnit reports written by cargo-nextest.
 roxmltree = { workspace = true }
 tempfile = { workspace = true }
+getrandom = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["signal", "process", "fs", "user"] }
