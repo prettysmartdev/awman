@@ -120,6 +120,7 @@ pub const IMPLEMENTED: &[&str] = &[
     GitTransports::ID,
     AppleContainers::ID,
     DockerSbx::ID,
+    SbxTestIdentity::ID,
     Hypervisor::ID,
     BuiltinPayload::ID,
     GuestFixtures::ID,
@@ -416,6 +417,147 @@ impl Capability for DockerSbx {
     }
     fn tools(&self) -> Vec<PathBuf> {
         vec![self.cli.clone()]
+    }
+}
+
+/// The isolated Docker Sandboxes identity of the SBX boundary and release
+/// smoke suites: a dedicated, signed-in `HOME` for every `sbx` process
+/// (`AWMAN_TEST_SBX_HOME`, an owned 0700 directory), the non-secret account
+/// label recorded in evidence (`AWMAN_TEST_SBX_IDENTITY`) and a scoped test
+/// provider key (`AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE`, an owned 0600 file).
+/// Requires `sbx-test-identity` in `AWMAN_TEST_HOST_RESOURCES`. The key is
+/// never printed; a test passes it only as the environment of the `env()`
+/// credential grant and redacts it first.
+#[derive(Clone)]
+pub struct SbxTestIdentity {
+    /// The dedicated `HOME` for `sbx` (and therefore for awman children,
+    /// whose own state stays in the private `AWMAN_HOME`).
+    pub home: PathBuf,
+    /// Non-secret account label.
+    pub identity: String,
+    key: String,
+    provider_keys: Option<PathBuf>,
+}
+impl SbxTestIdentity {
+    /// The scoped provider test key. Call `sandbox.redact` before use.
+    pub fn anthropic_key(&self) -> &str {
+        &self.key
+    }
+
+    /// The scoped test value of provider variable `var` (`ANTHROPIC_API_KEY`
+    /// from the key file; anything else from an owned 0600 file of that name
+    /// in `AWMAN_TEST_SBX_PROVIDER_KEYS_DIR`, an owned 0700 directory), or
+    /// why it is unavailable. Call `sandbox.redact` before use.
+    pub fn provider_key(&self, var: &str) -> Result<String, String> {
+        if var == "ANTHROPIC_API_KEY" {
+            return Ok(self.key.clone());
+        }
+        let dir = self.provider_keys.as_ref().ok_or_else(|| {
+            format!("no scoped {var} is provisioned (AWMAN_TEST_SBX_PROVIDER_KEYS_DIR is not set)")
+        })?;
+        private_input("AWMAN_TEST_SBX_PROVIDER_KEYS_DIR", dir, true, 0o700)?;
+        let file = dir.join(var);
+        private_input(
+            &format!("AWMAN_TEST_SBX_PROVIDER_KEYS_DIR/{var}"),
+            &file,
+            false,
+            0o600,
+        )?;
+        let value = std::fs::read_to_string(&file)
+            .map_err(|e| format!("{}: {e}", file.display()))?
+            .trim()
+            .to_string();
+        if value.is_empty() {
+            return Err(format!("{} is empty", file.display()));
+        }
+        Ok(value)
+    }
+}
+impl std::fmt::Debug for SbxTestIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SbxTestIdentity {{ home: {:?}, identity: {:?}, key: <redacted> }}",
+            self.home, self.identity
+        )
+    }
+}
+
+/// An absolute, non-symlink path of the expected type, owned by this user
+/// with exactly `mode` (unix).
+fn private_input(name: &str, path: &Path, directory: bool, mode: u32) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!("{name} must be an absolute path"));
+    }
+    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("{name}: {e}"))?;
+    let right_type = if directory {
+        meta.is_dir()
+    } else {
+        meta.is_file()
+    };
+    if meta.file_type().is_symlink() || !right_type {
+        return Err(format!(
+            "{name} must be a {}",
+            if directory {
+                "directory"
+            } else {
+                "regular file"
+            }
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.mode() & 0o777 != mode || meta.uid() != nix::unistd::geteuid().as_raw() {
+            return Err(format!(
+                "{name} must be owned by this user with mode {mode:o} (found {:o})",
+                meta.mode() & 0o777
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    Ok(())
+}
+
+impl Capability for SbxTestIdentity {
+    const ID: &'static str = "sbx-test-identity";
+    fn probe(ctx: &ProbeContext) -> Result<Self, String> {
+        ctx.host_resource("sbx-test-identity")?;
+        let rt = ctx.runtime();
+        let home = rt
+            .sbx_home
+            .clone()
+            .ok_or("AWMAN_TEST_SBX_HOME is not set")?;
+        private_input("AWMAN_TEST_SBX_HOME", &home, true, 0o700)?;
+        let identity = rt
+            .sbx_identity
+            .clone()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or("AWMAN_TEST_SBX_IDENTITY is not set")?;
+        let key_file = rt
+            .sbx_key_file
+            .clone()
+            .ok_or("AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE is not set")?;
+        private_input("AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE", &key_file, false, 0o600)?;
+        let key = std::fs::read_to_string(&key_file)
+            .map_err(|e| format!("AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE: {e}"))?
+            .trim()
+            .to_string();
+        if key.is_empty() {
+            return Err("AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE is empty".into());
+        }
+        Ok(SbxTestIdentity {
+            home,
+            identity,
+            key,
+            provider_keys: rt.sbx_provider_keys_dir.clone(),
+        })
+    }
+    fn grant_env(&self, env: &mut EnvMap) {
+        // Only `HOME` moves: `AWMAN_HOME`, the XDG roots and the Git config
+        // stay in the private sandbox.
+        env.set("HOME", &self.home);
     }
 }
 
@@ -739,6 +881,88 @@ mod tests {
             require::<AwmanBinary>(Tier::Component, &ctx());
         });
         assert!(text.starts_with("BLOCKED[awman-binary]: "), "{text}");
+    }
+
+    #[test]
+    fn sbx_identity_blocks_until_every_private_input_is_present_and_never_prints_the_key() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("sbx-home");
+        let key = root.path().join("key");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(&key, "sk-ant-test-identity-key\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let ctx_with = |pairs: &[(&str, &std::path::Path)], identity: Option<&str>| {
+            let mut vars = BTreeMap::new();
+            vars.insert(
+                "AWMAN_TEST_HOST_RESOURCES".to_string(),
+                std::ffi::OsString::from("sbx-test-identity"),
+            );
+            for (name, value) in pairs {
+                vars.insert(name.to_string(), value.as_os_str().to_owned());
+            }
+            if let Some(identity) = identity {
+                vars.insert(
+                    "AWMAN_TEST_SBX_IDENTITY".to_string(),
+                    std::ffi::OsString::from(identity),
+                );
+            }
+            ProbeContext::with_runtime(
+                RuntimeEnv::from_vars(&vars, PathBuf::from("/tmp")),
+                crate::runtime_env::get().system_temp.clone(),
+            )
+        };
+        let blocked = |ctx: &ProbeContext| {
+            panic_text(|| {
+                require::<SbxTestIdentity>(Tier::Artifact, ctx);
+            })
+        };
+        // Not named as a host resource: blocked before any input is read.
+        let bare = ProbeContext::with_runtime(
+            RuntimeEnv::from_vars(&BTreeMap::new(), PathBuf::from("/tmp")),
+            crate::runtime_env::get().system_temp.clone(),
+        );
+        let text = blocked(&bare);
+        assert!(text.starts_with("BLOCKED[sbx-test-identity]: "), "{text}");
+        // Named, inputs missing.
+        let text = blocked(&ctx_with(&[], None));
+        assert!(text.contains("AWMAN_TEST_SBX_HOME is not set"), "{text}");
+        let full = [
+            ("AWMAN_TEST_SBX_HOME", home.as_path()),
+            ("AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE", key.as_path()),
+        ];
+        let text = blocked(&ctx_with(&full, None));
+        assert!(
+            text.contains("AWMAN_TEST_SBX_IDENTITY is not set"),
+            "{text}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Wider permissions block: the identity must be private.
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let text = blocked(&ctx_with(&full, Some("awman-ci")));
+            assert!(text.contains("mode 700"), "{text}");
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let text = blocked(&ctx_with(&full, Some("awman-ci")));
+            assert!(text.contains("mode 600"), "{text}");
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let granted =
+                require::<SbxTestIdentity>(Tier::Artifact, &ctx_with(&full, Some("awman-ci")));
+            assert_eq!(granted.anthropic_key(), "sk-ant-test-identity-key");
+            assert_eq!(granted.identity, "awman-ci");
+            assert!(!format!("{granted:?}").contains("sk-ant-test-identity-key"));
+            let mut env = EnvMap::new();
+            env.set("AWMAN_HOME", "/private/awman");
+            granted.grant_env(&mut env);
+            assert_eq!(env.get("HOME"), Some(home.as_os_str()));
+            assert_eq!(env.get_str("AWMAN_HOME"), Some("/private/awman"));
+        }
     }
 
     #[test]

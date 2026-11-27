@@ -559,3 +559,26 @@ fn slow_history_cannot_block_the_fixing_pr_or_an_improved_main_run() {
     assert!(aggregate::budget_findings("main", &history, 100, 100).is_empty());
     assert!(!aggregate::budget_findings("main", &history, 101, 100).is_empty());
 }
+#[test]
+fn junit_reads_blocked_from_the_panic_payload_of_real_nextest_failures() {
+    // nextest puts the panic header in `message` and header + payload in the text.
+    let case = |name: &str, payload: &str| {
+        format!(
+            "<testcase classname='p::t' name='{name}'><failure message=\"thread &apos;{name}&apos; (7) panicked at src/lib.rs:1:2\" type=\"test failure with exit code 101\">thread &apos;{name}&apos; (7) panicked at src/lib.rs:1:2:\n{payload}\nnote: run with `RUST_BACKTRACE=1`</failure></testcase>"
+        )
+    };
+    let xml = format!(
+        "<testsuites><testsuite>{}{}{}</testsuite></testsuites>",
+        case("blocked", "BLOCKED[docker-sbx]: `docker-sbx` is not named"),
+        case("failed", "assertion failed: exit.success()"),
+        case(
+            "mentions",
+            "expected BLOCKED[docker-sbx] but the test passed"
+        ),
+    );
+    let rs = junit::parse(&xml).unwrap();
+    assert_eq!(
+        rs.iter().map(|r| r.outcome).collect::<Vec<_>>(),
+        vec![Outcome::Blocked, Outcome::Failed, Outcome::Failed]
+    );
+}

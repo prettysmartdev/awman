@@ -118,7 +118,6 @@ pub fn convert(
             DeliveryKind::None => SystemPromptMode::Unsupported,
         },
         system_prompt_flag: prompt.and_then(|p| p.flag.clone()),
-        sbx_kit_kind: SbxKitKind::Agent,
         settings_mount: file
             .settings
             .as_ref()
@@ -142,8 +141,6 @@ pub fn convert(
             .as_ref()
             .map(|a| a.env.clone())
             .unwrap_or_default(),
-        sandbox_permission_mode_supported: false,
-        sandbox_model_note: None,
         sandbox_auth_env_vars: vec![],
         deprecation_note: None,
         strict_modes: false,
@@ -154,7 +151,6 @@ pub fn convert(
         interactive_model_fallback: None,
         cli_version: None,
         launch_note: None,
-        sandbox_auth_note: None,
     }
 }
 

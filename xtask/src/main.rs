@@ -21,6 +21,7 @@ mod manifest;
 mod matrix;
 mod native_validation;
 mod release;
+mod sbx_validation;
 mod test;
 
 const USAGE: &str = "\
@@ -33,6 +34,7 @@ usage: cargo xtask <command> [args]
   lint hygiene|shell|pins|...  repository lints that are not clippy
   matrix render|check          acceptance matrix
   native-validation run|verify broad native diagnostic on this host (not a release step)
+  sbx-validation run|verify    logged-in SBX smoke test (make validate-sbx)
   ci <helper>                  helpers called by the GitHub workflows
   release run|status|doctor|...  one-command release (make release) and release.yml steps
 ";
@@ -52,6 +54,7 @@ fn main() -> ExitCode {
         "lint" => lint::run(&args),
         "matrix" => matrix::run(&args),
         "native-validation" => native_validation::run(&args),
+        "sbx-validation" => sbx_validation::run(&args),
         "ci" => ci::run(&args),
         "release" => release::run(&args),
         other => {

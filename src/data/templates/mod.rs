@@ -34,44 +34,40 @@ pub fn dockerfile_matches_template(content: &str) -> bool {
     content.trim() == project_dockerfile_dev().trim()
 }
 
-/// Per-agent Docker Sandbox kit YAML template (`spec.yaml` source).
-///
-/// Additive sibling of [`agent_dockerfile_for`] — the sbx kit templates live
-/// alongside the Dockerfile templates in `templates/` and are embedded with
-/// the same `include_str!` mechanism. A caller that wants a Dockerfile calls
-/// `agent_dockerfile_for`; a caller that wants a kit calls this. The two
-/// families never collide because of the `sbx-kit.` filename prefix.
+/// Reviewed v3 descriptor. Refused agents have no kit sources.
 pub fn sbx_kit_template_for(agent: &str) -> Option<&'static str> {
     Some(match agent {
-        "claude" => include_str!("../../../templates/sbx-kit.claude.yaml"),
-        "codex" => include_str!("../../../templates/sbx-kit.codex.yaml"),
-        "opencode" => include_str!("../../../templates/sbx-kit.opencode.yaml"),
-        "opencode-v2" => include_str!("../../../templates/sbx-kit.opencode-v2.yaml"),
-        "cursor" => include_str!("../../../templates/sbx-kit.cursor.yaml"),
-        "copilot" => include_str!("../../../templates/sbx-kit.copilot.yaml"),
-        "cline" => include_str!("../../../templates/sbx-kit.cline.yaml"),
-        "antigravity" => include_str!("../../../templates/sbx-kit.antigravity.yaml"),
+        "claude" => include_str!("../../../templates/sbx-v3/awman-claude-mixin.yaml"),
+        "codex" => include_str!("../../../templates/sbx-v3/awman-codex-mixin.yaml"),
+        "copilot" => include_str!("../../../templates/sbx-v3/awman-copilot-mixin.yaml"),
+        "opencode" => include_str!("../../../templates/sbx-v3/awman-opencode.yaml"),
+        "cline" => include_str!("../../../templates/sbx-v3/awman-cline.yaml"),
+        "antigravity" => include_str!("../../../templates/sbx-v3/awman-antigravity.yaml"),
         _ => return None,
     })
 }
 
-/// Per-agent Docker Sandbox startup script (`apply-session-config.sh` source).
-///
-/// Written into the emitted kit's `files/home/.awman/` directory by the kit
-/// emitter at `awman ready` time and re-run by the kit's `commands.startup`
-/// on every sandbox restart.
-pub fn sbx_apply_script_for(agent: &str) -> Option<&'static str> {
+/// Dockerfile paired with the v3 descriptor, using the same stem.
+pub fn sbx_dockerfile_for(agent: &str) -> Option<&'static str> {
     Some(match agent {
-        "claude" => include_str!("../../../templates/sbx-apply.claude.sh"),
-        "codex" => include_str!("../../../templates/sbx-apply.codex.sh"),
-        "opencode" => include_str!("../../../templates/sbx-apply.opencode.sh"),
-        "opencode-v2" => include_str!("../../../templates/sbx-apply.opencode-v2.sh"),
-        "cursor" => include_str!("../../../templates/sbx-apply.cursor.sh"),
-        "copilot" => include_str!("../../../templates/sbx-apply.copilot.sh"),
-        "cline" => include_str!("../../../templates/sbx-apply.cline.sh"),
-        "antigravity" => include_str!("../../../templates/sbx-apply.antigravity.sh"),
+        "claude" => include_str!("../../../templates/sbx-v3/awman-claude-mixin.dockerfile"),
+        "codex" => include_str!("../../../templates/sbx-v3/awman-codex-mixin.dockerfile"),
+        "copilot" => include_str!("../../../templates/sbx-v3/awman-copilot-mixin.dockerfile"),
+        "opencode" => include_str!("../../../templates/sbx-v3/awman-opencode.dockerfile"),
+        "cline" => include_str!("../../../templates/sbx-v3/awman-cline.dockerfile"),
+        "antigravity" => include_str!("../../../templates/sbx-v3/awman-antigravity.dockerfile"),
         _ => return None,
     })
+}
+
+/// Shared synchronous apply protocol source; rendered with a matrix allowlist.
+pub fn sbx_apply_script() -> &'static str {
+    include_str!("../../../templates/sbx-v3/awman-apply.sh")
+}
+
+/// Owned workloads' receipt-checking entrypoint.
+pub fn sbx_launch_script() -> &'static str {
+    include_str!("../../../templates/sbx-v3/awman-launch.sh")
 }
 
 /// Default OpenCode artifact selected by the bundled Dockerfile. Users may
@@ -91,163 +87,185 @@ mod tests {
     const AGENTS: &[&str] = &[
         "claude",
         "codex",
-        "opencode",
-        "opencode-v2",
-        "cursor",
         "copilot",
+        "opencode",
         "cline",
         "antigravity",
+        "cursor",
+        "opencode-v2",
     ];
-    const PINNED: &[&str] = &["opencode", "opencode-v2"];
 
     fn sha256_pins(text: &str) -> Vec<&str> {
         text.split(|c: char| !c.is_ascii_hexdigit())
-            .filter(|token| token.len() == 64)
+            .filter(|t| t.len() == 64)
             .collect()
     }
 
     #[test]
-    fn lookups_supply_the_eight_builtins_and_refuse_retired_or_unknown_names() {
+    fn v3_sources_cover_six_routes_and_never_advertise_refused_agents() {
         for agent in AGENTS {
-            assert!(agent_dockerfile_for(agent).is_some(), "{agent}");
-            assert!(sbx_kit_template_for(agent).is_some(), "{agent}");
-            assert!(sbx_apply_script_for(agent).is_some(), "{agent}");
+            assert!(agent_dockerfile_for(agent).is_some());
+            let admitted = !matches!(*agent, "cursor" | "opencode-v2");
+            assert_eq!(sbx_kit_template_for(agent).is_some(), admitted, "{agent}");
+            assert_eq!(sbx_dockerfile_for(agent).is_some(), admitted, "{agent}");
         }
         for agent in ["gemini", "custom", "project", "", "unknown", "OpenCode"] {
-            assert!(agent_dockerfile_for(agent).is_none(), "{agent}");
-            assert!(sbx_kit_template_for(agent).is_none(), "{agent}");
-            assert!(sbx_apply_script_for(agent).is_none(), "{agent}");
-            assert!(pinned_cli_version(agent).is_none(), "{agent}");
+            assert!(agent_dockerfile_for(agent).is_none());
+            assert!(sbx_kit_template_for(agent).is_none());
+            assert!(sbx_dockerfile_for(agent).is_none());
+            assert!(pinned_cli_version(agent).is_none());
         }
     }
 
     #[test]
-    fn bundled_downloads_never_select_a_latest_release() {
+    fn descriptors_and_recipes_keep_the_reviewed_authority_ceiling() {
+        // These are source-shape assertions, not evidence of live SBX support.
         for agent in AGENTS {
-            for text in [
-                agent_dockerfile_for(agent).unwrap(),
-                sbx_kit_template_for(agent).unwrap(),
-            ] {
-                assert!(!text.contains("releases/latest"), "{agent}");
-                assert!(!text.contains("/latest/download"), "{agent}");
+            let Some(descriptor) = sbx_kit_template_for(agent) else {
+                continue;
+            };
+            let yaml: serde_yaml::Value = serde_yaml::from_str(descriptor).unwrap();
+            assert_eq!(yaml["schemaVersion"].as_str(), Some("3"));
+            assert!(!descriptor.contains("lifecycle"));
+            assert!(!descriptor.contains("agent-context"));
+            assert!(!descriptor.contains("registry.npmjs.org"));
+            let (display, service, domain, key, header) = match *agent {
+                "opencode" => (
+                    "OpenCode 1",
+                    "anthropic",
+                    "api.anthropic.com",
+                    "ANTHROPIC_API_KEY",
+                    "x-api-key",
+                ),
+                "cline" => (
+                    "Cline",
+                    "anthropic",
+                    "api.anthropic.com",
+                    "ANTHROPIC_API_KEY",
+                    "x-api-key",
+                ),
+                "antigravity" => (
+                    "Antigravity",
+                    "google",
+                    "generativelanguage.googleapis.com",
+                    "GEMINI_API_KEY",
+                    "x-goog-api-key",
+                ),
+                "claude" => ("Claude Code", "", "", "", ""),
+                "codex" => ("Codex", "", "", "", ""),
+                "copilot" => ("GitHub Copilot", "", "", "", ""),
+                _ => unreachable!(),
+            };
+            let expected = if service.is_empty() {
+                serde_json::json!({"schemaVersion":"3","kind":"mixin","displayName":format!("awman policy for {display}"),"description":"Files awman uses to apply and verify per-launch policy"})
+            } else {
+                serde_json::json!({"schemaVersion":"3","kind":"workload","displayName":format!("awman {display}"),"description":format!("{display} launched and policed by awman"),"capabilities":[
+                    {"type":"com.docker.sandbox/sbx@1"},
+                    {"type":"com.docker.sandbox/network-policy@1","config":{"runtime":{"allow":[format!("{domain}:443")]}}},
+                    {"type":"com.docker.sandbox/credential@1","description":format!("{service} API access for {display}"),"config":{"service":service,"phase":"runtime","apiKey":{"name":key,"proxyManaged":true,"inject":[{"domain":domain,"header":header,"format":"%s"}]}}}
+                ]})
+            };
+            assert_eq!(yaml, serde_yaml::to_value(expected).unwrap(), "{agent}");
+            let recipe = sbx_dockerfile_for(agent).unwrap();
+            for source in [descriptor, recipe, sbx_apply_script(), sbx_launch_script()] {
+                assert!(!source.contains("docker/sandbox-templates"));
+                assert!(!source.contains("session.json"));
+                assert!(!source.contains("AWMAN_VERSION"));
+            }
+            if ["claude", "codex", "copilot"].contains(agent) {
+                assert_eq!(yaml["kind"].as_str(), Some("mixin"));
+                assert!(yaml.get("capabilities").is_none());
+                assert_eq!(recipe, "FROM scratch\nCOPY --chmod=0755 rootfs/usr/local/lib/awman/awman-apply /usr/local/lib/awman/awman-apply\nCOPY --chmod=0644 rootfs/usr/local/lib/awman/kit-id /usr/local/lib/awman/kit-id\n");
+                assert!(!recipe.contains("USER "));
+                assert!(!recipe.contains("ENTRYPOINT"));
+            } else {
+                assert_eq!(yaml["kind"].as_str(), Some("workload"));
+                let caps = yaml["capabilities"].as_sequence().unwrap();
+                assert_eq!(caps.len(), 3);
+                assert_eq!(caps[0]["type"].as_str(), Some("com.docker.sandbox/sbx@1"));
+                assert_eq!(
+                    caps[1]["type"].as_str(),
+                    Some("com.docker.sandbox/network-policy@1")
+                );
+                assert_eq!(
+                    caps[2]["type"].as_str(),
+                    Some("com.docker.sandbox/credential@1")
+                );
+                let domain = if *agent == "antigravity" {
+                    "generativelanguage.googleapis.com"
+                } else {
+                    "api.anthropic.com"
+                };
+                assert_eq!(
+                    caps[1]["config"]["runtime"]["allow"]
+                        .as_sequence()
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    caps[1]["config"]["runtime"]["allow"][0].as_str(),
+                    Some(format!("{domain}:443").as_str())
+                );
+                let cred = &caps[2]["config"];
+                assert_eq!(cred["phase"].as_str(), Some("runtime"));
+                assert_eq!(cred["apiKey"]["proxyManaged"].as_bool(), Some(true));
+                assert_eq!(cred["apiKey"]["inject"].as_sequence().unwrap().len(), 1);
+                assert_eq!(cred["apiKey"]["inject"][0]["domain"].as_str(), Some(domain));
+                assert!(recipe.starts_with("FROM docker.io/sbx/shell-image:latest\n"));
+                assert!(recipe.contains("USER agent\n"));
+                assert!(recipe.contains("ENTRYPOINT [\"/usr/local/lib/awman/awman-launch\""));
+                assert!(recipe.contains("--version"));
             }
         }
     }
 
     #[test]
-    fn pinned_images_and_kits_verify_the_same_versioned_artifacts() {
-        for agent in PINNED {
-            let version = pinned_cli_version(agent).unwrap();
-            let dockerfile = agent_dockerfile_for(agent).unwrap();
-            let kit = sbx_kit_template_for(agent).unwrap();
-            if agent.starts_with("opencode") {
-                assert!(dockerfile.contains("*) echo \"awman: unsupported OpenCode artifact ${OC_ARCH}${OC_LIBC}\" >&2; exit 1"));
-            }
-            let hashes = sha256_pins(dockerfile);
-            assert_eq!(hashes.len(), if *agent == "cursor" { 2 } else { 4 });
-            assert_eq!(hashes, sha256_pins(kit), "{agent} image/kit hash drift");
-            assert!(dockerfile.contains(&format!("awman.agent=\"{agent}\"")));
-            assert!(dockerfile.contains(&format!("awman.agent.cli.version=\"{version}\"")));
-            assert!(!dockerfile.lines().any(|l| l.starts_with("ARG ")));
-            for text in [dockerfile, kit] {
-                assert!(
-                    text.contains(&format!(
-                        "[ \"${{v%%.*}}\" = \"{}\" ]",
-                        if *agent == "opencode" { 1 } else { 2 }
-                    )),
-                    "{agent}"
-                );
-                assert!(text.contains("sha256sum -c -"), "{agent}");
-                assert!(
-                    text.contains("has no Linux package for architecture"),
-                    "{agent}"
-                );
-                assert!(text.contains("(supported: x86_64, aarch64)"), "{agent}");
-                let commands = text
-                    .lines()
-                    .filter(|l| !l.trim_start().starts_with('#'))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                // Match the command token: sha256sum is a required pipeline
-                // consumer and must not be mistaken for the shell `sh`.
-                for consumer in commands.split('|').skip(1) {
-                    let command = consumer.split_whitespace().next().unwrap_or("");
-                    assert!(!matches!(command, "bash" | "sh"), "{agent}");
-                }
-                assert!(!text.contains("CURSOR_API_KEY"), "{agent}");
-                assert!(!text.contains("ANTHROPIC_API_KEY="), "{agent}");
-                assert!(!text.contains("auth.json"), "{agent}");
-            }
-            // The build assertion runs after USER awman, just as a launch does.
-            let smoke = dockerfile.split("USER awman").nth(1).unwrap();
-            assert!(smoke.contains("--version"), "{agent}");
-            assert!(kit.contains("runuser -u agent -- env -i"), "{agent}");
-        }
+    fn owned_installers_use_reviewed_sources_and_exact_version_checks() {
+        let cline = sbx_dockerfile_for("cline").unwrap();
+        assert!(agent_dockerfile_for("cline")
+            .unwrap()
+            .contains("RUN npm install -g --prefix=/usr/local cline\n"));
+        assert!(cline.contains("--ignore-scripts cline@3.0.76"));
+        assert!(!cline.contains("@cline/cli"));
+        let agy = sbx_dockerfile_for("antigravity").unwrap();
+        let installer = "https://antigravity.google/cli/install.sh";
+        assert!(agy.contains(installer));
+        assert!(agent_dockerfile_for("antigravity")
+            .unwrap()
+            .contains(installer));
+        assert!(agy.contains("sha256sum -c -"));
+        assert!(agy.contains("1\\.5\\.18"));
+        assert!(!agy.contains("@google/antigravity-cli"));
     }
 
     #[test]
-    fn opencode_templates_keep_the_two_majors_separate() {
-        let v1 = agent_dockerfile_for("opencode").unwrap();
+    fn opencode_workload_keeps_the_reviewed_tarball_and_major_gate() {
+        let image = agent_dockerfile_for("opencode").unwrap();
+        let recipe = sbx_dockerfile_for("opencode").unwrap();
+        assert_eq!(sha256_pins(image), sha256_pins(recipe));
+        assert_eq!(sha256_pins(recipe).len(), 4);
+        assert!(recipe.contains(&format!(
+            "OC_VERSION={}",
+            pinned_cli_version("opencode").unwrap()
+        )));
+        assert!(recipe.contains("sha256sum -c -"));
+        assert!(recipe.contains("runuser -u agent -- env -i"));
+        assert!(recipe.contains("expected opencode 1.x"));
+        for agent in AGENTS {
+            for source in std::iter::once(agent_dockerfile_for(agent).unwrap())
+                .chain(sbx_dockerfile_for(agent))
+            {
+                assert!(!source.contains("releases/latest"));
+                assert!(!source.contains("/latest/download"));
+            }
+        }
         let v2 = agent_dockerfile_for("opencode-v2").unwrap();
-        assert_ne!(v1, v2);
-        for (agent, major) in [("opencode", 1), ("opencode-v2", 2)] {
-            for text in [
-                agent_dockerfile_for(agent).unwrap(),
-                sbx_kit_template_for(agent).unwrap(),
-            ] {
-                assert!(text.contains(&format!("expected opencode {major}.x")));
-                assert!(text.contains("https://github.com/anomalyco/opencode/releases/download/v${OC_VERSION}/${OC_ASSET}"));
-                assert!(text.contains("x64-musl)"));
-                assert!(text.contains("arm64-musl)"));
-            }
-        }
-    }
-
-    #[test]
-    fn cursor_installs_upstream_without_a_version_gate_or_update_suppression() {
+        assert!(v2.contains("expected opencode 2.x"));
+        assert_ne!(image, v2);
+        let cursor = agent_dockerfile_for("cursor").unwrap();
+        assert!(cursor.contains("https://cursor.com/install"));
+        assert!(cursor.contains("cursor-agent --help"));
         assert!(pinned_cli_version("cursor").is_none());
-        for text in [
-            agent_dockerfile_for("cursor").unwrap(),
-            sbx_kit_template_for("cursor").unwrap(),
-        ] {
-            assert!(text.contains("https://cursor.com/install"));
-            assert!(text.contains("cursor-agent --version"));
-            assert!(text.contains("cursor-agent --help"));
-            assert!(!text.contains("disable-auto-update"));
-            assert!(!text.contains("CA_VERSION"));
-            assert!(!text.contains("awman.agent.cli.version"));
-        }
-    }
-
-    #[test]
-    fn controlled_kits_declare_their_entrypoints_and_do_not_rewrite_agent_config() {
-        for (agent, entrypoint) in [
-            ("opencode", vec!["opencode"]),
-            ("opencode-v2", vec!["opencode", "--standalone"]),
-            ("cursor", vec!["/home/agent/.local/bin/cursor-agent"]),
-        ] {
-            let rendered = sbx_kit_template_for(agent)
-                .unwrap()
-                .replace("{{AWMAN_VERSION}}", "test");
-            let kit: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
-            assert_eq!(kit["kind"].as_str(), Some("agent"));
-            assert_eq!(
-                kit["name"].as_str(),
-                Some(format!("awman-{agent}").as_str())
-            );
-            assert!(kit.get("extends").is_none());
-            let actual: Vec<_> = kit["agent"]["entrypoint"]["run"]
-                .as_sequence()
-                .unwrap()
-                .iter()
-                .map(|value| value.as_str().unwrap())
-                .collect();
-            assert_eq!(actual, entrypoint);
-            let script = sbx_apply_script_for(agent).unwrap();
-            assert!(script.contains("ENV_SH=\"$HOME/.awman/env.sh\""));
-            assert!(!script.contains(".config/opencode"));
-            assert!(!script.contains("cli-config.json"));
-            assert!(!script.contains("auth.json"));
-        }
     }
 }

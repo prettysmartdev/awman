@@ -27,6 +27,14 @@ pub const INPUTS: &[&str] = &[
     "AWMAN_TEST_TMPROOT",
     "AWMAN_TEST_EVIDENCE_DIR",
     "AWMAN_TEST_HOST_RESOURCES",
+    // The isolated Docker Sandboxes identity (read only by the
+    // `sbx-test-identity` capability, which also requires the host resource).
+    "AWMAN_TEST_SBX_HOME",
+    "AWMAN_TEST_SBX_IDENTITY",
+    "AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE",
+    // Optional (boundary-sbx only): 0700 directory of 0600 files named after
+    // the provider variable they hold (`OPENAI_API_KEY`, `GH_TOKEN`, ...).
+    "AWMAN_TEST_SBX_PROVIDER_KEYS_DIR",
     // Snapshot update mode; set only by `cargo xtask test update-golden`.
     "INSTA_UPDATE",
     // Refuses snapshot updates on CI.
@@ -60,6 +68,14 @@ pub struct RuntimeEnv {
     pub evidence_dir: Option<PathBuf>,
     /// `AWMAN_TEST_HOST_RESOURCES`, parsed: `name` or `name=value`, comma separated.
     pub host_resources: BTreeMap<String, String>,
+    /// `AWMAN_TEST_SBX_HOME`: the dedicated, signed-in `HOME` of every `sbx` process.
+    pub sbx_home: Option<PathBuf>,
+    /// `AWMAN_TEST_SBX_IDENTITY`: non-secret label of the dedicated Docker account.
+    pub sbx_identity: Option<String>,
+    /// `AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE`: the 0600 file holding the scoped test key.
+    pub sbx_key_file: Option<PathBuf>,
+    /// `AWMAN_TEST_SBX_PROVIDER_KEYS_DIR`: optional further scoped provider keys.
+    pub sbx_provider_keys_dir: Option<PathBuf>,
     /// `INSTA_UPDATE`.
     pub insta_update: Option<String>,
     /// Whether `CI` is set to a non-empty value other than `false`/`0`.
@@ -97,6 +113,10 @@ impl RuntimeEnv {
             host_resources: parse_host_resources(
                 text("AWMAN_TEST_HOST_RESOURCES").as_deref().unwrap_or(""),
             ),
+            sbx_home: path("AWMAN_TEST_SBX_HOME"),
+            sbx_identity: text("AWMAN_TEST_SBX_IDENTITY"),
+            sbx_key_file: path("AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE"),
+            sbx_provider_keys_dir: path("AWMAN_TEST_SBX_PROVIDER_KEYS_DIR"),
             insta_update: text("INSTA_UPDATE"),
             ci: text("CI").is_some_and(|v| v != "false" && v != "0"),
             package: text("CARGO_PKG_NAME"),

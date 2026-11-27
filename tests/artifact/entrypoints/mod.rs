@@ -1,4 +1,44 @@
 use crate::support;
+
+/// Prove shipping bytes reach SBX agent admission without a debug/test switch.
+/// Cursor is refused before CLI access, so no SBX service or provider is needed.
+#[test]
+fn sbx_release_is_enabled_on_qualified_hosts_without_test_isolation() {
+    use awman_test_support::fixtures::{ConfigTree, RepoBuilder};
+    let mut s = support::sandbox(
+        "entrypoints::sbx_release_is_enabled_on_qualified_hosts_without_test_isolation",
+    );
+    let a = support::artifact(&mut s);
+    ConfigTree::new()
+        .global(serde_json::json!({
+            "runtime":{"kind":"sbx"},
+            "agents":{"auth":{"refresh":{"enabled":false}}}
+        }))
+        .write(&s, None);
+    let repo = RepoBuilder::new(&s, "workspace")
+        .file("README.md", "SBX admission\n")
+        .init();
+    let out = support::run_artifact(&s, &a)
+        .current_dir(repo.path())
+        .env("AWMAN_TEST_ISOLATION", "0")
+        .args(["ready", "--agent", "cursor", "--prepare-only"])
+        .run();
+    assert!(!out.exit.success());
+    let text = format!("{}{}", out.stdout_text(), out.stderr_text());
+    assert!(!text.contains("runtime.kind=sbx is disabled"), "{text}");
+    if cfg!(any(
+        all(target_os = "macos", target_arch = "aarch64"),
+        all(target_os = "linux", target_arch = "x86_64")
+    )) {
+        assert!(
+            text.contains("per-execution state and credential isolation"),
+            "shipping runtime did not reach SBX agent admission: {text}"
+        );
+    } else {
+        assert!(text.contains("not supported on platform"), "{text}");
+    }
+    support::no_helpers(&s);
+}
 #[test]
 fn version_and_provider_info_work_without_path_or_network() {
     let mut s =

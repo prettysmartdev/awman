@@ -2,8 +2,9 @@
 //!
 //! The command verifies the attested kit, extracts it safely, and runs
 //! `<kit>/bin/xtask test kit-run` either locally (`LocalHost`, the Apple
-//! Silicon Mac) or over SSH (`SshHost`, the Linux KVM host). No checkout,
-//! Cargo, Docker or credential is used on either host.
+//! Silicon Mac) or over SSH (`SshHost`, the Linux KVM host). Neither a checkout
+//! nor Cargo is used on either host. The SBX check uses only its dedicated sign-in
+//! and test provider credential on the Mac.
 //!
 //! Before any host work an intent (`native/<id>/intent.json`, random
 //! allocation ID and root) is written atomically; after the started process
@@ -310,6 +311,7 @@ pub fn verify_result(job: &NativeJob, path: &Path, exit: i32) -> Step<NativeReco
     }
     let record = |outcome: &str| -> Step<NativeRecord> {
         Ok(NativeRecord {
+            sbx: read_json::<serde_json::Value>(path)?.get("sbx").cloned(),
             outcome: outcome.into(),
             result_sha256: sha256_file(path)?,
             asset_sha256: r.artifact_sha256.clone(),
@@ -772,6 +774,14 @@ impl LocalHost {
                 crate::test::isolation::cleanup_owned_processes(&root);
             }
         }
+        if job.plan.id == crate::manifest::release_policy::SBX_NATIVE {
+            super::sbx::cleanup(&stale.join("out"), &root.join("tmp")).map_err(|e| {
+                Stop::new(
+                    "native-result-invalid",
+                    format!("owned SBX cleanup failed: {e:#}"),
+                )
+            })?;
+        }
         let _ = std::fs::remove_dir_all(&stale);
         Ok(false)
     }
@@ -834,6 +844,9 @@ impl LocalHost {
                     .map_err(|e| Stop::new("state-corrupt", e.to_string()))?,
             )
             .stderr(log);
+        if job.plan.id == crate::manifest::release_policy::SBX_NATIVE {
+            cmd.args(["--native", &job.plan.id]);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -874,10 +887,12 @@ impl LocalHost {
     }
 
     /// Stop, remove and forget the leased allocation.
-    fn discard(&self, job: &NativeJob, lease: &Lease) {
+    fn discard(&self, job: &NativeJob, lease: &Lease) -> Step {
         self.stop_owned(lease);
+        cleanup_sbx_allocation(job, Path::new(&lease.root))?;
         self.remove_root(&lease.root, &lease.allocation);
         forget(job);
+        Ok(())
     }
 }
 
@@ -908,6 +923,10 @@ impl NativeHost for LocalHost {
                     plan.id
                 ),
             ));
+        }
+        if plan.id == crate::manifest::release_policy::SBX_NATIVE {
+            super::sbx::probe().map_err(Stop::from)?;
+            return Ok(());
         }
         let hv = Command::new("sysctl")
             .args(["-n", "kern.hv_support"])
@@ -972,7 +991,7 @@ impl NativeHost for LocalHost {
                 return Ok(());
             }
             // Dead and incomplete: stop and clean only our allocation.
-            self.discard(job, &lease);
+            self.discard(job, &lease)?;
         }
         let intent = load_intent(job, "local", local_boot_id(), |a| {
             self.allocation_root(a).to_string_lossy().into()
@@ -987,7 +1006,7 @@ impl NativeHost for LocalHost {
         self.reap();
         if let Some(leak) = recorded_leak(job) {
             if let Some(lease) = read_lease(job, "local")? {
-                self.discard(job, &lease);
+                self.discard(job, &lease)?;
             }
             return Err(leak);
         }
@@ -1006,7 +1025,7 @@ impl NativeHost for LocalHost {
             self.settle(&lease);
             let leaked = self.stop_owned(&lease);
             if !out.join("result.json").exists() {
-                self.discard(job, &lease);
+                self.discard(job, &lease)?;
                 return Err(Stop::new(
                     "native-result-invalid",
                     format!(
@@ -1018,6 +1037,9 @@ impl NativeHost for LocalHost {
             if !leaked.is_empty() {
                 record_leak(job, &format!("pids {leaked:?}"))?;
             }
+            if cleanup_sbx_allocation(job, &root)? {
+                record_leak(job, "owned SBX sandbox survived the kit runner")?;
+            }
             // Kept for review even when a leak voids it.
             keep_evidence(&out, &job.out_dir)?;
             self.remove_root(&lease.root, &lease.allocation);
@@ -1028,14 +1050,14 @@ impl NativeHost for LocalHost {
             return Ok(durable(job));
         }
         if !self.alive(&lease) {
-            self.discard(job, &lease);
+            self.discard(job, &lease)?;
             return Err(Stop::new(
                 "native-blocked",
                 format!("the {} kit runner stopped without a result; make release reruns only this check", job.plan.id),
             ));
         }
         if world.clock.now() > lease.deadline {
-            self.discard(job, &lease);
+            self.discard(job, &lease)?;
             return Err(Stop::new(
                 "timeout",
                 format!(
@@ -1621,6 +1643,9 @@ impl RealHosts {
 }
 
 impl super::world::Hosts for RealHosts {
+    fn sbx_qualification(&self) -> Step<super::sbx::Qualification> {
+        Ok(super::sbx::probe()?)
+    }
     fn host(&self, plan: &NativePlan, linux_host: Option<&str>) -> Step<Box<dyn NativeHost>> {
         match plan.host.as_str() {
             "local" => Ok(Box::new(LocalHost::new())),
@@ -1642,6 +1667,18 @@ impl super::world::Hosts for RealHosts {
             }
         }
     }
+}
+
+fn cleanup_sbx_allocation(job: &NativeJob, root: &Path) -> Step<bool> {
+    if job.plan.id != crate::manifest::release_policy::SBX_NATIVE {
+        return Ok(false);
+    }
+    super::sbx::cleanup(&root.join("out"), &root.join("tmp")).map_err(|e| {
+        Stop::new(
+            "native-result-invalid",
+            format!("owned SBX cleanup failed: {e:#}"),
+        )
+    })
 }
 
 #[cfg(test)]

@@ -337,7 +337,7 @@ pub const CONFIG_KEYS: &[ConfigKey] = &[
         "\"docker\"",
         Global,
         false,
-        "Agent runtime; `sbx` is disabled in v0.14 and `builtin` is experimental.",
+        "Agent runtime; `sbx` and `builtin` are experimental.",
     ),
     row(
         "runtime.baseImage",

@@ -30,10 +30,7 @@ pub fn parse(text: &str) -> Result<Vec<ResultRecord>> {
         let outcome = if skipped.is_some() {
             Outcome::Skipped
         } else if failure.is_some() {
-            if detail
-                .as_deref()
-                .is_some_and(|s| s.trim_start().starts_with("BLOCKED["))
-            {
+            if detail.as_deref().is_some_and(reports_blocked) {
                 Outcome::Blocked
             } else {
                 Outcome::Failed
@@ -86,4 +83,17 @@ pub fn counts(expected: usize, results: &[ResultRecord]) -> super::schema::Count
         }
     }
     c
+}
+
+/// Whether a failure's message and text report missing infrastructure: its
+/// panic payload (the first line that is not nextest's or the runtime's
+/// `thread '…' panicked at …` header) starts with `BLOCKED[`. A payload that
+/// merely mentions BLOCKED later on is a product failure.
+fn reports_blocked(detail: &str) -> bool {
+    detail
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find(|line| !line.contains("panicked at"))
+        .is_some_and(|payload| payload.starts_with("BLOCKED["))
 }

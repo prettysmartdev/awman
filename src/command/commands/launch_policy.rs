@@ -192,8 +192,7 @@ impl<'a> LaunchPolicy<'a> {
     /// One helper for every launch path (`chat`, `exec prompt`, workflow
     /// steps, API sessions that go through them) so the same agent shows the
     /// same notes regardless of runtime. Sandbox runtimes receive them through
-    /// the same frontend; the Layer 1 sandbox builder adds only the
-    /// sandbox-specific `sandbox_auth_note`, so nothing is shown twice.
+    /// the same frontend, so nothing is shown twice.
     pub fn launch_notices(
         agent: &AgentName,
         run: &crate::engine::agent::AgentRunOptions,

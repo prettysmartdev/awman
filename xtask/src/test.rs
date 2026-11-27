@@ -556,6 +556,7 @@ fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
 
     let isolation = isolation::Run::new()?;
     let mut failed = Vec::new();
+    let mut prerequisite_only = true;
     let mut records = Vec::new();
     for inv in invocations(&chosen)? {
         let features = package_features(&features, &inv.package);
@@ -625,7 +626,7 @@ fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
         };
         // A failed startup must not copy a previous invocation's JUnit as evidence.
         let junit = nextest_junit_path(root)?;
-        if o.evidence_dir.is_some() && junit.exists() {
+        if o.runner == Runner::Nextest && junit.exists() {
             std::fs::remove_file(&junit)?;
         }
         let started = std::time::Instant::now();
@@ -653,6 +654,11 @@ fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
             }
         }
         if code != 0 {
+            let blocked = std::fs::read_to_string(&junit)
+                .ok()
+                .and_then(|xml| crate::evidence::junit::parse(&xml).ok())
+                .is_some_and(|records| only_blocked_failures(&records));
+            prerequisite_only &= blocked;
             failed.extend(inv.suites.clone());
         }
     }
@@ -684,6 +690,7 @@ fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
             "execution_ms": started.elapsed().as_millis() as u64,
         }));
         if code != 0 {
+            prerequisite_only = false;
             failed.push(id.to_string());
         }
     }
@@ -710,8 +717,16 @@ fn run_suites(root: &Path, o: &Options) -> Result<ExitCode> {
         Ok(ExitCode::SUCCESS)
     } else {
         eprintln!("xtask: failed suites: {}", failed.join(", "));
-        Ok(ExitCode::from(1))
+        Ok(ExitCode::from(if prerequisite_only { 2 } else { 1 }))
     }
+}
+
+fn only_blocked_failures(records: &[crate::evidence::schema::ResultRecord]) -> bool {
+    use crate::evidence::schema::Outcome;
+    records.iter().any(|r| r.outcome == Outcome::Blocked)
+        && records
+            .iter()
+            .all(|r| matches!(r.outcome, Outcome::Passed | Outcome::Blocked))
 }
 
 fn nextest_command(
@@ -1095,6 +1110,19 @@ fn artifact_input(o: &Options) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_blocked_suites_exit_as_infrastructure_but_failures_and_skips_do_not() {
+        let xml = r#"<testsuites><testsuite><testcase classname="sbx" name="blocked"><failure message="BLOCKED[docker-sbx]: absent"/></testcase></testsuite></testsuites>"#;
+        let blocked = crate::evidence::junit::parse(xml).unwrap();
+        assert!(only_blocked_failures(&blocked));
+        let mut mixed = blocked;
+        mixed[0].outcome = crate::evidence::schema::Outcome::Failed;
+        assert!(!only_blocked_failures(&mixed));
+        mixed[0].outcome = crate::evidence::schema::Outcome::Skipped;
+        assert!(!only_blocked_failures(&mixed));
+        assert!(!only_blocked_failures(&[]));
+    }
 
     #[test]
     fn junit_evidence_follows_the_nextest_store_not_cargo_build_output() {

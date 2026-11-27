@@ -153,9 +153,53 @@ pub enum EngineError {
     BackendUnsupportedOnPlatform { backend: String, platform: String },
 
     #[error(
-        "runtime.kind=sbx is disabled in awman v0.14.0 because current Docker Sandboxes kits are incompatible; choose docker, apple, or builtin. Track https://github.com/prettysmartdev/awman/issues/86"
+        "runtime.kind=sbx is disabled in this awman release: the Docker Sandboxes runtime has not passed native qualification yet; choose runtime.kind docker, apple or builtin. Track https://github.com/prettysmartdev/awman/issues/86"
     )]
     SbxRuntimeDisabled,
+
+    // ── Docker Sandboxes (`sbx`) runtime failures (WI 0086) ───────────────
+    //
+    // All of these stop a launch or `awman ready` before the agent starts.
+    // None of them falls back to another runtime.
+    /// The installed `sbx` client is older than awman supports or is a
+    /// version known not to work.
+    #[error(
+        "Docker Sandboxes CLI {found} is not supported by awman (needs {minimum} or newer); upgrade sbx, for example 'brew upgrade docker/tap/sbx'"
+    )]
+    SbxCliIncompatible { found: String, minimum: String },
+
+    /// `sbx --version` printed nothing awman could read as a version.
+    #[error("could not read the Docker Sandboxes CLI version from 'sbx --version' ({raw})")]
+    SbxCliVersionUnreadable { raw: String },
+
+    /// An existing sandbox was not created from the kit this launch needs.
+    /// awman never removes it; the text tells the user how to do so safely.
+    #[error(
+        "sandbox '{sandbox}' cannot be reused: {reason}.\n\
+         awman will not remove it for you. To continue:\n  \
+         1. Save anything you need from inside the sandbox. Files in {workspace} are on this machine and are kept;\n     \
+         agent conversations, logins and other files in the sandbox home are deleted with the sandbox.\n  \
+         2. Remove it:  sbx rm {sandbox}\n  \
+         3. Run the command again; awman creates a new sandbox with the current kit."
+    )]
+    SbxSandboxStale {
+        sandbox: String,
+        reason: String,
+        workspace: String,
+    },
+
+    /// Another awman session holds the per-sandbox launch lock.
+    #[error(
+        "sandbox '{sandbox}' is already in use by another awman session; wait for it to finish or stop it"
+    )]
+    SbxSandboxBusy { sandbox: String },
+
+    /// The per-launch policy could not be applied and verified, so the agent
+    /// was never started.
+    #[error(
+        "could not apply the launch policy to sandbox '{sandbox}': {detail}. The agent was not started."
+    )]
+    SbxPolicyApplyFailed { sandbox: String, detail: String },
 
     #[error(
         "invalid runtime '{value}' in global config ($HOME/.awman/config.json); \
@@ -746,6 +790,13 @@ fn render_definition_problems(path: &std::path::Path, problems: &[String]) -> St
         .join("\n")
 }
 
+/// The shared SBX contract's error is a sandbox failure (contract §10.3).
+impl From<crate::engine::agent::sbx_contract::SbxContractError> for EngineError {
+    fn from(error: crate::engine::agent::sbx_contract::SbxContractError) -> Self {
+        EngineError::Sandbox(error.0)
+    }
+}
+
 impl From<crate::data::config::agent_definition::AgentDefinitionInvalid> for EngineError {
     fn from(e: crate::data::config::agent_definition::AgentDefinitionInvalid) -> Self {
         EngineError::AgentDefinitionInvalid {
@@ -799,6 +850,14 @@ impl EngineError {
             EngineError::Container(_) | EngineError::ContainerRuntimeUnavailable { .. } => 3,
             EngineError::UnknownRuntime { .. }
             | EngineError::SbxRuntimeDisabled
+            // An unsupported `sbx` client is a host-setup refusal, like a
+            // disabled runtime: the user changes their install, not awman.
+            | EngineError::SbxCliIncompatible { .. }
+            | EngineError::SbxCliVersionUnreadable { .. }
+            // A stale or busy sandbox refuses the launch before the agent
+            // starts; the user acts (remove, wait) and retries.
+            | EngineError::SbxSandboxStale { .. }
+            | EngineError::SbxSandboxBusy { .. }
             | EngineError::AgentDefinitionUntrusted { .. }
             | EngineError::CustomAgentRuntimeUnsupported { .. }
             // A contradictory mode selector is invalid usage (WI 0070).
@@ -809,6 +868,8 @@ impl EngineError {
             | EngineError::BuiltinCatalogUpgradeBlocked { .. }
             | EngineError::BuiltinCatalogBackupExists { .. }
             | EngineError::MergeRefConflict { .. } => 1,
+            // A failed policy apply is an engine failure of this launch.
+            EngineError::SbxPolicyApplyFailed { .. } => 1,
             _ => 1,
         }
     }
@@ -852,5 +913,52 @@ pub(crate) fn run_checked<T>(
     match (result, stopped) {
         (_, Some(e)) => Err(e),
         (result, None) => result.map_err(EngineError::from),
+    }
+}
+
+#[cfg(test)]
+mod sbx_error_tests {
+    use super::EngineError;
+
+    #[test]
+    fn sbx_refusals_have_their_exit_classes_and_actionable_text() {
+        let incompatible = EngineError::SbxCliIncompatible {
+            found: "0.52.1".into(),
+            minimum: "0.53.0".into(),
+        };
+        assert_eq!(incompatible.exit_code(), 2);
+        assert!(incompatible
+            .to_string()
+            .contains("brew upgrade docker/tap/sbx"));
+        assert_eq!(
+            EngineError::SbxCliVersionUnreadable { raw: "x".into() }.exit_code(),
+            2
+        );
+        let stale = EngineError::SbxSandboxStale {
+            sandbox: "awman-1-claude".into(),
+            reason: "it was not created by this awman".into(),
+            workspace: "/w".into(),
+        };
+        assert_eq!(stale.exit_code(), 2);
+        let text = stale.to_string();
+        assert!(text.contains("sbx rm awman-1-claude"), "{text}");
+        assert!(text.contains("awman will not remove it"), "{text}");
+        assert!(text.contains("Files in /w are on this machine"), "{text}");
+        assert_eq!(
+            EngineError::SbxSandboxBusy {
+                sandbox: "s".into()
+            }
+            .exit_code(),
+            2
+        );
+        let apply = EngineError::SbxPolicyApplyFailed {
+            sandbox: "s".into(),
+            detail: "d".into(),
+        };
+        assert_eq!(apply.exit_code(), 1);
+        assert!(apply.to_string().ends_with("The agent was not started."));
+        let disabled = EngineError::SbxRuntimeDisabled.to_string();
+        assert!(disabled.contains("issues/86"), "{disabled}");
+        assert!(!disabled.contains("v0.14"), "{disabled}");
     }
 }

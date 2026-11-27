@@ -137,18 +137,24 @@ fn legacy_agent_keys_keep_the_wi_0139_moved_key_hints() {
     sandbox.finish();
 }
 
-/// Design 8.3/8.4: every built-in has a definition, a Dockerfile, a sandbox
-/// kit and an apply script; `gemini` has none of the four; and every major-specific
-/// definition's tested version is the version its bundled Dockerfile installs
-/// and asserts, probed through the same binary the launch runs.
+/// Design 8.3/8.4: every built-in has a definition and a Dockerfile; exactly
+/// the agents with a supported Docker Sandboxes route have a v3 descriptor and
+/// recipe (refused routes have none); `gemini` has nothing; and every
+/// major-specific definition's tested version is the version its bundled
+/// Dockerfile and owned SBX recipe install and assert, probed through the same
+/// binary the launch runs.
 #[test]
 fn every_built_in_has_artifacts_and_only_opencode_requires_a_major() {
     use awman::data::templates::{
-        agent_dockerfile_for, pinned_cli_version, sbx_apply_script_for, sbx_kit_template_for,
+        agent_dockerfile_for, pinned_cli_version, sbx_apply_script, sbx_dockerfile_for,
+        sbx_kit_template_for, sbx_launch_script,
     };
+    use awman::engine::agent::sbx_contract::sbx_route;
     let sandbox = crate::support::sandbox(
         "data::agent_catalogue::every_built_in_has_artifacts_and_only_opencode_requires_a_major",
     );
+    assert!(!sbx_apply_script().is_empty());
+    assert!(!sbx_launch_script().is_empty());
     for agent in FIRST_PARTY_AGENT_NAMES {
         let def =
             first_party::first_party(agent).unwrap_or_else(|| panic!("{agent}: no definition"));
@@ -156,10 +162,16 @@ fn every_built_in_has_artifacts_and_only_opencode_requires_a_major() {
             agent_dockerfile_for(agent).is_some(),
             "{agent}: no Dockerfile"
         );
-        let kit = sbx_kit_template_for(agent).unwrap_or_else(|| panic!("{agent}: no kit"));
-        assert!(
-            sbx_apply_script_for(agent).is_some(),
-            "{agent}: no apply script"
+        let supported = sbx_route(agent).is_some_and(|route| route.is_supported());
+        assert_eq!(
+            sbx_kit_template_for(agent).is_some(),
+            supported,
+            "{agent}: v3 descriptor presence disagrees with the SBX matrix"
+        );
+        assert_eq!(
+            sbx_dockerfile_for(agent).is_some(),
+            supported,
+            "{agent}: v3 recipe presence disagrees with the SBX matrix"
         );
         if let Some(requirement) = &def.cli_version {
             assert_eq!(
@@ -167,10 +179,15 @@ fn every_built_in_has_artifacts_and_only_opencode_requires_a_major() {
                 def.interactive_entrypoint.first(),
                 "{agent}: probe binary is not the launched binary"
             );
-            assert!(kit.contains(&format!(
-                "expected opencode {}.x",
-                requirement.required_major
-            )));
+            if let Some(recipe) = sbx_dockerfile_for(agent) {
+                assert!(
+                    recipe.contains(&format!(
+                        "expected opencode {}.x",
+                        requirement.required_major
+                    )),
+                    "{agent}: owned recipe does not assert the required major"
+                );
+            }
             // Major-specific agents are probed inside the image, never on the host.
             assert!(def.ping_argv.is_none(), "{agent}: host ping");
         }
@@ -181,7 +198,7 @@ fn every_built_in_has_artifacts_and_only_opencode_requires_a_major() {
     assert!(first_party::first_party("gemini").is_none());
     assert!(agent_dockerfile_for("gemini").is_none());
     assert!(sbx_kit_template_for("gemini").is_none());
-    assert!(sbx_apply_script_for("gemini").is_none());
+    assert!(sbx_dockerfile_for("gemini").is_none());
     assert!(pinned_cli_version("gemini").is_none());
     assert!(pinned_cli_version("cursor").is_none());
     sandbox.finish();

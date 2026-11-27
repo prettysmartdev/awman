@@ -19,6 +19,9 @@ use std::time::Instant;
 pub const VERSION: &str = "v0.15.0";
 pub const LINUX_HOST: &str = "build@kvm1";
 const PLAN: &str = include_str!("../../tests/release_contract/fixtures/release-plan.json");
+// Explicit optional-SBX scenarios retain all qualification/cleanup refusals.
+const PLAN_WITH_SBX: &str =
+    include_str!("../../tests/release_contract/fixtures/release-plan-with-sbx.json");
 
 /// One invocation of `make release` and what it must end with.
 pub struct Call {
@@ -115,10 +118,15 @@ fn complete(world: &Path, s: &Store, dispatches: usize) -> Vec<String> {
     );
     expect(
         &mut e,
-        ev["native"]
-            .as_object()
-            .is_some_and(|n| n.len() == 2 && n.values().all(|v| v["outcome"] == "passed")),
-        "evidence does not list 2 native passes",
+        ev["native"].as_object().is_some_and(|n| {
+            n.len()
+                == forge_dir::plan_for(s, &"2".repeat(40))["native"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+                && n.values().all(|v| v["outcome"] == "passed")
+        }),
+        "evidence does not list every selected native pass",
     );
     expect(
         &mut e,
@@ -133,6 +141,221 @@ fn complete(world: &Path, s: &Store, dispatches: usize) -> Vec<String> {
 
 pub fn scenarios() -> Vec<Scenario> {
     vec![
+        Scenario {
+            name: "experimental-sbx-does-not-gate-release",
+            setup: |s| s.script.sbx_unavailable = Some("sbx-identity-missing".into()),
+            calls: vec![call(None)],
+            check: |w, s| {
+                let mut errors = complete(w, s, 5);
+                expect(
+                    &mut errors,
+                    count(s, "sbx-qualification") == 0
+                        && count(s, "native-run native.macos-arm64-sbx ") == 0,
+                    "release required SBX identity/provider setup",
+                );
+                errors
+            },
+        },
+        Scenario {
+            name: "sbx-qualification-changed-on-resume",
+            setup: |s| s.faults.push(fault("checkpoint:seal", 1, "crash")),
+            calls: vec![
+                call(Some("killed")),
+                Call {
+                    before: |w| {
+                        Dir {
+                            path: w.to_path_buf(),
+                        }
+                        .with(|s| s.script.sbx_version = Some("0.54.2".into()));
+                    },
+                    opts: plain,
+                    expect: None,
+                },
+            ],
+            check: |w, s| {
+                let mut e = complete(w, s, 5);
+                expect(
+                    &mut e,
+                    count(s, "native-run native.macos-arm64-sbx ") == 2
+                        && count(s, "native-run native.macos-arm64 on") == 1
+                        && count(s, "native-run native.linux-x64 ") == 1,
+                    "requalification did not rerun only SBX",
+                );
+                expect(
+                    &mut e,
+                    std::fs::read_dir(w.join(format!("state/{VERSION}/native")))
+                        .unwrap()
+                        .any(|e| {
+                            e.unwrap()
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with("native.macos-arm64-sbx-previous-")
+                        }),
+                    "old proof not archived",
+                );
+                e
+            },
+        },
+        Scenario {
+            name: "sbx-qualification-changed-before-seal",
+            setup: |s| s.script.sbx_change_before_seal = true,
+            calls: vec![call(Some("native-result-invalid"))],
+            check: |w, s| {
+                let mut e = vec![];
+                expect(
+                    &mut e,
+                    journal(w)["release"]["seal_sha256"].is_null() && s.releases.is_empty(),
+                    "changed qualification sealed",
+                );
+                e
+            },
+        },
+        Scenario {
+            name: "sbx-retained-proof-tampered-on-requalification",
+            setup: |s| s.faults.push(fault("checkpoint:seal", 1, "crash")),
+            calls: vec![
+                call(Some("killed")),
+                Call {
+                    before: |w| {
+                        Dir {
+                            path: w.to_path_buf(),
+                        }
+                        .with(|s| s.script.sbx_label = Some("changed label".into()));
+                        std::fs::write(w.join(format!("state/{VERSION}/native/native.macos-arm64-sbx/sbx-smoke.claude.json")), "{}").unwrap();
+                    },
+                    opts: plain,
+                    expect: Some("native-result-invalid"),
+                },
+            ],
+            check: |_, s| {
+                let mut e = vec![];
+                expect(
+                    &mut e,
+                    count(s, "native-run native.macos-arm64-sbx ") == 1 && s.releases.is_empty(),
+                    "tampered proof reran or sealed",
+                );
+                e
+            },
+        },
+        Scenario {
+            name: "sbx-pass",
+            setup: |_| {},
+            calls: vec![call(None)],
+            check: |w, s| {
+                let mut e = complete(w, s, 5);
+                let n = &journal(w)["native"]["native.macos-arm64-sbx"];
+                expect(
+                    &mut e,
+                    n["outcome"] == "passed"
+                        && n["sbx"]["cli_version"] == "0.54.1"
+                        && n["sbx"]["operator_label"] == "release-test-account"
+                        && n["sbx"]["cases"].as_array().is_some_and(|a| a.len() == 2),
+                    "SBX qualification/cases not sealed",
+                );
+                expect(
+                    &mut e,
+                    std::fs::read_to_string(w.join("last-summary.txt"))
+                        .unwrap()
+                        .contains("native.macos-arm64-sbx"),
+                    "SBX result missing from release summary",
+                );
+                e
+            },
+        },
+        Scenario {
+            name: "sbx-prerequisite-blocked",
+            setup: |s| s.script.sbx_unavailable = Some("sbx-identity-missing".into()),
+            calls: vec![call(Some("sbx-identity-missing"))],
+            check: |_, s| {
+                let mut e = vec![];
+                expect(
+                    &mut e,
+                    count(s, "dispatch ") == 0 && s.releases.is_empty(),
+                    "SBX missing prerequisite dispatched or sealed work",
+                );
+                e
+            },
+        },
+        Scenario {
+            name: "sbx-product-failed",
+            setup: |s| {
+                s.script
+                    .native
+                    .get_mut("native.macos-arm64-sbx")
+                    .unwrap()
+                    .outcome = Some("failed".into());
+            },
+            calls: vec![call(Some("native-failed")), call(Some("native-failed"))],
+            check: |_, s| {
+                let mut e = vec![];
+                expect(
+                    &mut e,
+                    count(s, "native-run native.macos-arm64-sbx ") == 1 && s.releases.is_empty(),
+                    "failed SBX check retried or sealed",
+                );
+                e
+            },
+        },
+        Scenario {
+            name: "sbx-kit-blocked",
+            setup: |s| {
+                let n = s.script.native.get_mut("native.macos-arm64-sbx").unwrap();
+                n.outcome = Some("blocked".into());
+                n.reason_code = Some("sbx-not-signed-in".into());
+            },
+            calls: vec![call(Some("native-blocked"))],
+            check: |_, s| {
+                let mut e = vec![];
+                expect(&mut e, s.releases.is_empty(), "blocked SBX check sealed");
+                e
+            },
+        },
+        Scenario {
+            name: "sbx-interrupted",
+            setup: |s| {
+                s.faults
+                    .push(fault("native_run:native.macos-arm64-sbx", 1, "crash"))
+            },
+            calls: vec![call(Some("killed")), call(None)],
+            check: |w, s| {
+                let mut e = complete(w, s, 5);
+                expect(
+                    &mut e,
+                    count(s, "native-run native.macos-arm64 on") == 1
+                        && count(s, "native-run native.linux-x64 ") == 1,
+                    "interrupted SBX reran a verified boot check",
+                );
+                expect(
+                    &mut e,
+                    count(s, "native-run native.macos-arm64-sbx ") == 2,
+                    "interrupted SBX did not recover exactly once",
+                );
+                e
+            },
+        },
+        Scenario {
+            name: "sbx-evidence-tampered",
+            setup: |s| s.faults.push(fault("checkpoint:seal", 1, "crash")),
+            calls: vec![
+                call(Some("killed")),
+                Call {
+                    before: |w| {
+                        std::fs::write(w.join(format!("state/{VERSION}/native/native.macos-arm64-sbx/sbx-smoke.claude.json")), "{}").unwrap();
+                    },
+                    opts: plain,
+                    expect: Some("native-result-invalid"),
+                },
+            ],
+            check: |_, s| {
+                let mut e = vec![];
+                expect(
+                    &mut e,
+                    count(s, "native-run native.macos-arm64-sbx ") == 1 && s.releases.is_empty(),
+                    "tampered SBX evidence reran or sealed",
+                );
+                e
+            },
+        },
         Scenario {
             name: "clean",
             setup: |_| {},
@@ -292,7 +515,7 @@ pub fn scenarios() -> Vec<Scenario> {
                 let mut e = complete(w, s, 5);
                 expect(
                     &mut e,
-                    count(s, "native-run native.macos-arm64") == 1,
+                    count(s, "native-run native.macos-arm64 on") == 1,
                     "the macOS result was not reused",
                 );
                 expect(
@@ -314,7 +537,11 @@ pub fn scenarios() -> Vec<Scenario> {
                 let mut e = complete(w, s, 5);
                 expect(
                     &mut e,
-                    count(s, "native-orphan-stopped native.macos-arm64") == 1,
+                    s.calls
+                        .iter()
+                        .filter(|c| c.as_str() == "native-orphan-stopped native.macos-arm64")
+                        .count()
+                        == 1,
                     "the orphan was not stopped",
                 );
                 expect(
@@ -324,7 +551,7 @@ pub fn scenarios() -> Vec<Scenario> {
                 );
                 expect(
                     &mut e,
-                    count(s, "native-run native.macos-arm64") == 2,
+                    count(s, "native-run native.macos-arm64 on") == 2,
                     "only the interrupted Mac check should restart",
                 );
                 e
@@ -612,7 +839,7 @@ pub fn scenarios() -> Vec<Scenario> {
                 let mut e = Vec::new();
                 expect(
                     &mut e,
-                    count(s, "native-run native.macos-arm64") == 1,
+                    count(s, "native-run native.macos-arm64 on") == 1,
                     "a failed native check was retried",
                 );
                 expect(
@@ -1029,7 +1256,12 @@ fn tagged_fingerprint(s: &Store) -> Value {
 
 /// Run one scenario once in `world`.
 pub fn run_one(sc: &Scenario, world: &Path, seed: Option<u64>) -> Outcome {
-    let plan: Value = serde_json::from_str(PLAN).expect("fixture plan");
+    let plan: Value = serde_json::from_str(if sc.name.starts_with("sbx-") {
+        PLAN_WITH_SBX
+    } else {
+        PLAN
+    })
+    .expect("fixture plan");
     let _ = std::fs::remove_dir_all(world);
     std::fs::create_dir_all(world).expect("world dir");
     forge_dir::seed(world, VERSION, plan);

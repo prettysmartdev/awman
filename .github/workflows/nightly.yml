@@ -515,11 +515,11 @@ jobs:
           retention-days: 30
 
   sandbox-coverage:
-    name: Sandbox coverage (blocked until issue 86)
+    name: Sandbox coverage
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Report unavailable registered diagnostic cell
+      - name: Report unprovisioned platform
         run: |
-          echo 'BLOCKED: native-diagnostic boundary-sbx@macos-arm64-ci-guest-builtin+macos-arm64-sbx (issue 86)' >> "$GITHUB_STEP_SUMMARY"
+          echo 'BLOCKED [infrastructure]: macos-arm64-sbx has no runs_on labels; registered cell boundary-sbx@macos-arm64-ci-guest-builtin+macos-arm64-sbx cannot execute' | tee -a "$GITHUB_STEP_SUMMARY"
           exit 2

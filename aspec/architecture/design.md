@@ -424,8 +424,8 @@ Everything else is session-scoped and is resolved from each session's
 sources, agent selection and flags, workflow and automation settings).
 
 `runtime.kind` is global-only and accepts `docker` (default), `apple`, `sbx`
-and `builtin`. In v0.14, `sbx` is recognized but refuses execution with an
-explicit disabled-runtime error pending issue #86. `builtin` is experimental. The builtin microVM is an
+and `builtin`. `sbx` is enabled experimentally on macOS arm64 and Linux x86_64
+after the accepted native smoke; untested hosts are refused. `builtin` is experimental. The builtin microVM is an
 experimental preview on macOS Apple Silicon and Linux x86_64 GNU with KVM;
 Linux ARM64 remains gated. Unsupported platforms fail explicitly. Builtin
 session settings use the `runtime.builtin` object; `stateDir` is process-scoped

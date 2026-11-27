@@ -113,7 +113,15 @@ pub fn render(j: &Journal, w: Option<&World>, receipt: Result<(), String>) -> St
         Err(_) => {}
     }
     for (id, n) in &j.native {
-        s.push_str(&format!("  {id:<20} {}\n", n.outcome));
+        s.push_str(&format!("  {id:<20} {}", n.outcome));
+        if let Some(q) = &n.sbx {
+            s.push_str(&format!(
+                " (sbx {}, operator label {})",
+                q["cli_version"].as_str().unwrap_or("?"),
+                q["operator_label"].as_str().unwrap_or("?")
+            ));
+        }
+        s.push('\n');
     }
     let active: f64 = j.invocations.iter().map(|i| i.monotonic_seconds).sum();
     s.push_str(&format!(

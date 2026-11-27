@@ -7,8 +7,7 @@ make release
 ```
 
 It starts the hosted CI gate and the four asset builds together, runs the two
-required native checks on exact attested bytes (this Mac and a Linux KVM
-host), seals one draft release, asks once for confirmation, then lands the
+required native checks on exact attested bytes (this Mac and a Linux KVM host), seals one draft release, asks once for confirmation, then lands the
 release commit on `main`, tags it, publishes the draft and verifies the public
 bytes anonymously. After any stop, the recovery is the same command again:
 completed work is kept and only unfinished work is repeated.
@@ -81,6 +80,20 @@ and stops at the first failure, before anything is pushed or dispatched.
   state, and a short private temp root under `/private/tmp` so guest socket
   paths stay under the 103-byte limit.
 - Docker, Apple Containers and `python3` are not needed.
+
+**Experimental Docker Sandboxes**
+
+SBX is enabled in shipping builds on Apple silicon macOS and Linux x86_64
+after the accepted native developer smoke. `make validate-sbx` is the opt-in
+current-session diagnostic; add `LINUX_HOST=user@host` to include Linux.
+
+The deeper `artifact-sbx-smoke` provider suite and its native kit declaration
+remain registered as opt-in diagnostics, outside the release plan and hosted
+asset build. They retain their dedicated identity, provider-key, strict cleanup
+and evidence requirements when selected. They do not require SBX installation,
+API keys, credential provisioning or another manual gate for `make release`.
+The Mac and Linux builtin boot checks and attested-byte publication checks
+remain mandatory.
 
 **Linux KVM host (x86_64 GNU)**
 
@@ -280,6 +293,10 @@ a release without blocking it:
   boundaries, and Linux replacement and extended persisted-state upgrade
   coverage run only in the operator-run native diagnostic (`make validate-native`
   on the host being diagnosed) and have no schedule.
+- SBX provider, policy and credential coverage is opt-in through `boundary-sbx`
+  or `artifact-sbx-smoke`. Provisioned nightly SBX runs are diagnostic. The
+  lightweight `make validate-sbx` covers lifecycle and workspace sharing and
+  does not claim provider or effective-policy coverage.
 - Reproducibility of the shipped bytes is observed only for Linux x64 default in
   the nightly; the four shipping target/feature combinations are not covered by
   a reproduction check.
@@ -289,6 +306,7 @@ a release without blocking it:
 - Native results are produced on operator machines and are not Actions
   attestations; build provenance of every asset is. This matches the existing
   trust root: the operator's login already tags and publishes.
+- Experimental SBX provider and policy breadth is opt-in and does not block release. The shipping runtime retains its unsupported-agent, option, host and sandbox-reuse refusals.
 - The Linux KVM host is a required dependency. An unavailable host retains valid
   work and publication waits.
 

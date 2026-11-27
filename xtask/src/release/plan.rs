@@ -168,6 +168,18 @@ impl Plan {
             if !matches!(n.host.as_str(), "local" | "ssh") {
                 return bad(format!("native check {} has unknown host {}", n.id, n.host));
             }
+            if n.id == crate::manifest::release_policy::SBX_NATIVE
+                && (n.asset != "awman-macos-arm64"
+                    || n.triple != "aarch64-apple-darwin"
+                    || n.host != "local"
+                    || n.suites != [crate::manifest::release_policy::SBX_SUITE]
+                    || !n.fixtures.is_empty()
+                    || n.previous_release.is_some()
+                    || n.budget_seconds != 1500
+                    || n.tests != crate::manifest::release_policy::native_tests(&n.id)?)
+            {
+                return bad("invalid SBX smoke selection or platform".into());
+            }
             let mut seen = std::collections::BTreeSet::new();
             if !n.tests.iter().all(|t| seen.insert(t)) {
                 return bad(format!("native check {} lists a test twice", n.id));

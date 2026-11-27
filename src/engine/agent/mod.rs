@@ -37,6 +37,7 @@ pub mod image_freshness;
 pub mod opencode_plan_guard;
 pub mod profile_state;
 pub mod registry;
+pub mod sbx_contract;
 mod seeded_prompt;
 pub mod session_seed;
 
@@ -1910,6 +1911,10 @@ impl AgentEngine {
                     Path::new(crate::data::workspace::WORKSPACE_GUEST_PATH),
                 )],
             )?;
+            resolved.mount_guard = Some(crate::data::mount_authority::MountSourceGuard {
+                authority: launch_authority(session)?.clone(),
+                sources: pins.sources,
+            });
             Ok(ResolvedAgentOptions::Sandbox(Box::new(resolved)))
         } else {
             let mut pins = LaunchMountPins::default();
@@ -1951,8 +1956,8 @@ impl AgentEngine {
     /// sandbox-class runtime. Mirrors `build_options` (same agent definition, same
     /// up-front validation) but emits sandbox-paradigm options: a kit selector
     /// instead of an image ref, a workspace dir instead of arbitrary mounts, and
-    /// system prompts delivered inline via `session.json` rather than via
-    /// host-file mounts (sandbox VMs see only the workspace).
+    /// system prompts delivered through managed guest files or an approved
+    /// argv route (sandbox VMs see only the workspace).
     pub fn build_sandbox_options(
         &self,
         session: &Session,
@@ -1988,100 +1993,59 @@ impl AgentEngine {
             ),
         ];
 
-        // An agent whose credential cannot reach a sandbox says so up front
-        // instead of failing mysteriously inside the VM (cursor).
-        if let Some(note) = &def.sandbox_auth_note {
-            options.push(SandboxOption::UnsupportedNote(note.clone()));
-        }
-
-        // Seeded prompt — recorded in session.json exactly once. For `kind: agent`
-        // kits the dsbx launcher appends it positionally; for `kind: mixin` kits
-        // the apply script renders it from session.json. The driver never does
-        // both, so the prompt is delivered exactly once.
-        if let Some(prompt) = run.initial_prompt.as_ref() {
+        use sbx_contract::SbxDelivery;
+        let route = def
+            .sbx_route()
+            .expect("validate_run admitted a first-party route");
+        if let Some(prompt) = &run.initial_prompt {
             options.push(SandboxOption::SeededPrompt(prompt.clone()));
         }
-
-        // Model.
         if let Some(model) = run.model.as_deref() {
-            let flag = def.model_flag_for(model)?;
-            options.push(SandboxOption::Model { flag });
-            // An agent whose built-in template has no mixin-safe model config
-            // (copilot; the in-VM apply script also warns) declares the note
-            // in its definition, so the flag does not vanish into the VM boot log.
-            if let Some(note) = &def.sandbox_model_note {
-                options.push(SandboxOption::UnsupportedNote(note.clone()));
+            if route.model == SbxDelivery::Refused {
+                return Err(def.sbx_option_refusal("--model"));
             }
+            options.push(SandboxOption::Model {
+                flag: def.model_flag_for(model)?,
+            });
         }
-
-        // Mode flags (plan/yolo/auto). `kind: agent` kits accept agent args
-        // after the `--` delimiter, so they get the same literal argv flags
-        // the container path emits. Mixin kits launch through Docker's
-        // built-in template (no argv channel): claude has a native settings
-        // equivalent (`permissions.defaultMode`, rendered by its apply
-        // script from `session.json`); the other mixins have none awman
-        // manages, so the request is warned about rather than dropped.
-        //
-        // A requested --plan never takes the "note and continue" path: the
-        // delivery was proven by `validate_run` above (a mixin without a
-        // managed settings route is refused there, before provisioning).
         let plan_delivery = def.native_plan_delivery(run, RunParadigm::Sandbox)?;
         let mode_flags = def.mode_flags(run, RunParadigm::Sandbox)?;
-        if plan_delivery
-            .as_ref()
-            .is_some_and(|delivery| delivery.sandbox_permission_mode)
-        {
-            options.push(SandboxOption::PermissionMode("plan".to_string()));
-        } else if !mode_flags.is_empty() {
-            match def.sbx_kit_kind {
-                SbxKitKind::Agent => {
-                    options.push(SandboxOption::AgentModeFlags(mode_flags));
-                }
-                SbxKitKind::Mixin => {
-                    let mode = if matches!(run.yolo, Some(YoloMode::Enabled)) {
-                        "yolo"
-                    } else {
-                        "auto"
-                    };
-                    if def.sandbox_permission_mode_supported {
-                        options.push(SandboxOption::PermissionMode(mode.to_string()));
-                    } else {
-                        options.push(SandboxOption::UnsupportedNote(format!(
-                            "--{mode} cannot be delivered to '{agent}' under the sandbox \
-                             runtime (the built-in template's launch command takes no \
-                             flags and the agent has no settings-file equivalent awman \
-                             manages); continuing without it",
-                            agent = agent.as_str(),
-                        )));
-                    }
+        match route.mode {
+            SbxDelivery::ManagedFile => {
+                let mode = if matches!(run.plan, Some(PlanMode::Enabled)) {
+                    Some("plan")
+                } else if matches!(run.yolo, Some(YoloMode::Enabled)) {
+                    Some("yolo")
+                } else if matches!(
+                    run.auto,
+                    Some(crate::engine::container::options::AutoMode::Enabled)
+                ) {
+                    Some("auto")
+                } else {
+                    None
+                };
+                if let Some(mode) = mode {
+                    options.push(SandboxOption::PermissionMode(mode.into()));
                 }
             }
+            SbxDelivery::Argv if !mode_flags.is_empty() => {
+                options.push(SandboxOption::AgentModeFlags(mode_flags))
+            }
+            _ => {}
         }
-
-        // User-configured extra agent args. Only `kind: agent` kits have an
-        // argv channel; a mixin kit's launch command belongs to Docker's
-        // built-in template, so the flags are warned about, not dropped.
         let mut agent_flags = resolve_agent_flags(session, agent, run);
-        if matches!(def.sbx_kit_kind, SbxKitKind::Agent) {
+        // Refuse configured flags before filtering managed tokens: even a
+        // seemingly redundant flag has no reviewed published-workload route.
+        if !agent_flags.is_empty() && route.agent_flags != SbxDelivery::Argv {
+            return Err(def.sbx_option_refusal("agentFlags"));
+        }
+        if route.agent_flags == SbxDelivery::Argv {
             let managed = def.entrypoint_managed_flags(run.non_interactive);
             agent_flags.retain(|flag| !managed.contains(flag));
-        }
-        let agent_flags =
-            def.reconcile_agent_flags_for_plan(run, agent_flags, agent_flags_origin(run))?;
-        if !agent_flags.is_empty() {
-            match def.sbx_kit_kind {
-                SbxKitKind::Agent => {
-                    options.push(SandboxOption::AgentFlags(agent_flags));
-                }
-                SbxKitKind::Mixin => {
-                    options.push(SandboxOption::UnsupportedNote(format!(
-                        "agentFlags ({}) cannot be delivered to '{agent}' under the sandbox \
-                         runtime (the built-in template owns the launch command); continuing \
-                         without them",
-                        agent_flags.join(" "),
-                        agent = agent.as_str(),
-                    )));
-                }
+            let agent_flags =
+                def.reconcile_agent_flags_for_plan(run, agent_flags, agent_flags_origin(run))?;
+            if !agent_flags.is_empty() {
+                options.push(SandboxOption::AgentFlags(agent_flags));
             }
         }
 
@@ -2092,28 +2056,6 @@ impl AgentEngine {
             )));
         }
 
-        // Headless shape (`--print` / `exec` / `run` / `task`): the
-        // dsbx driver appends it as an agent arg for `kind: agent` kits, but
-        // mixin kits launch through the built-in template's interactive
-        // entrypoint — the prompt still arrives via piped stdin, the agent's
-        // own headless mode just cannot be enabled. Warn, don't drop
-        // silently.
-        if run.non_interactive && matches!(def.sbx_kit_kind, SbxKitKind::Mixin) {
-            if let Some(flag) = def
-                .non_interactive_flag
-                .as_ref()
-                .or(def.headless_prompt_flag.as_ref())
-            {
-                options.push(SandboxOption::UnsupportedNote(format!(
-                    "headless mode ('{flag}') cannot be enabled for '{agent}' \
-                     under the sandbox runtime (the built-in template owns the launch \
-                     command); the prompt is piped to the agent's interactive \
-                     entrypoint instead",
-                    agent = agent.as_str(),
-                )));
-            }
-        }
-
         // Tool allow/deny lists.
         if !run.allowed_tools.is_empty() {
             options.push(SandboxOption::AllowedTools(run.allowed_tools.clone()));
@@ -2122,9 +2064,8 @@ impl AgentEngine {
             options.push(SandboxOption::DisallowedTools(run.disallowed_tools.clone()));
         }
 
-        // Env passthrough. Credential-class names are filtered out of the
-        // workspace-readable session.json by `DSbxSessionConfig`; non-sensitive
-        // names reach the apply script.
+        // Only non-credential environment reaches the agent session. The
+        // runtime registers provider credentials through sandbox-scoped secrets.
         let env_pass = plan_env_passthrough(&def, run)?;
         // The Plan-profile guard verifies what the sandbox VM is given: the
         // workspace and the passed environment. No host-global configuration
@@ -2150,27 +2091,19 @@ impl AgentEngine {
                 value: value.clone(),
             }));
         }
-        // The sandbox has no runtime child env or output redaction, so the
-        // non-secret identity goes as a literal here.
+        // Workflow identity values remain non-secret session environment.
         for (key, value) in grant_env_values(run) {
             options.push(SandboxOption::EnvLiteral(EnvLiteral { key, value }));
         }
 
-        // Every sandbox has a private DinD daemon, so the host-socket mount
-        // `--allow-docker` requests is meaningless here (same trace as ready).
         if run.allow_docker {
-            tracing::debug!("--allow-docker is a no-op under sbx (private DinD is always on)");
+            if route.is_owned_workload() {
+                return Err(def.sbx_option_refusal("--allow-docker"));
+            }
+            tracing::debug!("--allow-docker is a no-op for a published SBX workload");
         }
-
-        // Host-directory mounts cannot be honored: the VM sees only the
-        // virtiofs-mounted workspace. Record each requested-but-unmountable
-        // feature as a note; `run_interactive` surfaces them as warnings.
-        for dir in run.directory_overlays.iter().chain(&run.command_mounts) {
-            options.push(SandboxOption::UnsupportedNote(format!(
-                "directory overlay '{}' cannot be mounted into the sandbox VM \
-                 (only the workspace is visible); continuing without it",
-                dir.host
-            )));
+        if !run.directory_overlays.is_empty() || !run.command_mounts.is_empty() {
+            return Err(def.sbx_option_refusal("directory overlays or command mounts"));
         }
         if run.include_all_skills || !run.named_skills.is_empty() {
             options.push(SandboxOption::UnsupportedNote(
@@ -2180,16 +2113,25 @@ impl AgentEngine {
             ));
         }
         if !run.context_overlays.is_empty() {
+            // LaunchPolicy automatically adds repo context for a staged repo.
+            // That default still supplies rendered text; explicit directory
+            // mounts have no supported SBX delivery and must be refused.
+            let default_repo_context = matches!(
+                session.repo_context(),
+                crate::data::session::RepoContextBinding::Staged(_)
+            ) && run
+                .context_overlays
+                .iter()
+                .all(|overlay| overlay.scope == crate::data::config::overlays::ContextScope::Repo);
+            if !default_repo_context {
+                return Err(def.sbx_option_refusal("context directory mounts"));
+            }
             options.push(SandboxOption::UnsupportedNote(
-                "context directories cannot be mounted into the sandbox VM; the \
-                 rendered system prompt text is still delivered, but /awman/context \
-                 paths will not exist inside the sandbox"
-                    .into(),
+                "the default staged repository context directory cannot be mounted on Docker Sandboxes; rendered context text is delivered, but /awman/context/repo is unavailable".into(),
             ));
         }
 
-        // System prompt — delivered inline via session.json so no host-file
-        // mount is required (the sandbox VM can only see the workspace).
+        // The runtime renders managed context files or an approved argv tail.
         if let Some(ref prompt_text) = run.system_prompt {
             emit_sandbox_system_prompt_options(&def, prompt_text, &mut options);
         }
@@ -2332,84 +2274,24 @@ fn write_prompt_temp_dir(
     ))
 }
 
-/// Emit the `SandboxOption` for system-prompt delivery. Unlike the container
-/// path — which can mount a host file or set an env-file path — the sandbox VM
-/// only sees the workspace, so every text-bearing delivery mode is collapsed to
-/// `SystemPromptInline`: the prompt text travels in `session.json` and the
-/// mixin apply script renders it into the agent's native config. `AddDir`
-/// (extra mounted dirs) cannot be expressed and records an `UnsupportedNote`;
-/// `Unsupported` stays a documented no-op (warned upstream).
+/// Deliver context through the matrix's managed file or argv route.
 fn emit_sandbox_system_prompt_options(
     def: &AgentDefinition,
     prompt_text: &str,
     options: &mut Vec<SandboxOption>,
 ) {
-    match &def.system_prompt_delivery {
-        SystemPromptMode::Append => {
-            options.push(SandboxOption::SystemPromptInline {
-                flag: def
-                    .system_prompt_flag
-                    .as_deref()
-                    .unwrap_or("--append-system-prompt")
-                    .to_string(),
-                text: prompt_text.to_string(),
-            });
-        }
-        SystemPromptMode::AppendInline { key } => {
-            options.push(SandboxOption::SystemPromptInline {
-                flag: def
-                    .system_prompt_flag
-                    .as_deref()
-                    .unwrap_or("--config")
-                    .to_string(),
-                text: format!("{key}={prompt_text}"),
-            });
-        }
-        SystemPromptMode::Replace => {
-            let preamble = format!(
-                "You are {}, an AI coding assistant. Use your full capabilities \
-                 and all available tools to complete the task.\n\n",
-                def.name
-            );
-            options.push(SandboxOption::SystemPromptInline {
-                flag: def
-                    .system_prompt_flag
-                    .as_deref()
-                    .unwrap_or("--system")
-                    .to_string(),
-                text: format!("{preamble}{prompt_text}"),
-            });
-        }
-        SystemPromptMode::EnvFile { var } | SystemPromptMode::EnvDir { var } => {
-            // The mixin apply script materializes the text into a VM-local file
-            // and points `var` at it; the flag slot carries the env-var name.
-            options.push(SandboxOption::SystemPromptInline {
-                flag: var.to_string(),
-                text: prompt_text.to_string(),
-            });
-        }
-        SystemPromptMode::AgentsMd => {
-            // No CLI flag exists for this mode; the mixin apply script reads
-            // the inline text from session.json and stages it in the VM.
-            options.push(SandboxOption::SystemPromptInline {
-                flag: String::new(),
-                text: prompt_text.to_string(),
-            });
-        }
-        SystemPromptMode::AddDir { .. } => {
-            // AddDir plants AGENTS.md into extra mounted directories, which
-            // do not exist under the sandbox runtime — warn, don't drop.
-            options.push(SandboxOption::UnsupportedNote(format!(
-                "agent '{}' delivers system prompts via extra directory mounts, \
-                 which are unavailable under the sandbox runtime; the system \
-                 prompt was not applied",
-                def.name
-            )));
-        }
-        SystemPromptMode::Unsupported => {
-            // Documented no-op — the user-facing warning is emitted by
-            // `resolve_context_overlays`, same as the container path.
-        }
+    use sbx_contract::SbxDelivery;
+    match def.sbx_route().map(|r| r.system_prompt) {
+        Some(SbxDelivery::ManagedFile) => options.push(SandboxOption::SystemPromptInline {
+            flag: String::new(), text: prompt_text.into(),
+        }),
+        Some(SbxDelivery::Argv) => options.push(SandboxOption::SystemPromptInline {
+            flag: "--system".into(), text: prompt_text.into(),
+        }),
+        Some(SbxDelivery::NotedOnly) => options.push(SandboxOption::UnsupportedNote(format!(
+            "system prompt cannot be delivered to '{}' on Docker Sandboxes; continuing without this context", def.name
+        ))),
+        _ => {}
     }
 }
 
@@ -3007,16 +2889,80 @@ mod native_plan_option_tests {
         assert!(kit
             .iter()
             .any(|o| matches!(o, SandboxOption::AgentModeFlags(f) if f == &["--agent", "plan"])));
-        // yolo on a mixin keeps its existing note behaviour.
+        // Published Codex has no reviewed mode-delivery route.
+        let yolo = AgentRunOptions {
+            yolo: Some(YoloMode::Enabled),
+            ..Default::default()
+        };
+        assert!(matches!(
+            engine.build_sandbox_options(&session, &agent("codex"), &yolo),
+            Err(EngineError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn sandbox_matrix_options_deliver_or_refuse_without_policy_downgrades() {
+        let sb = sandbox("sandbox_matrix_options_deliver_or_refuse_without_policy_downgrades");
+        let session = session(&sb);
+        let engine = engine(&session);
+        for name in sbx_contract::SBX_AGENTS {
+            let def = first_party::first_party(name).unwrap();
+            let route = def.sbx_route().unwrap();
+            for non_interactive in [true, false] {
+                let run = AgentRunOptions {
+                    non_interactive,
+                    initial_prompt: Some("hello".into()),
+                    system_prompt: Some("context".into()),
+                    ..Default::default()
+                };
+                let result = engine.build_sandbox_options(&session, &agent(name), &run);
+                if !route.is_supported() {
+                    assert!(result.is_err(), "{name}");
+                    continue;
+                }
+                let options = result.unwrap();
+                assert!(!options.iter().any(|o| matches!(o, SandboxOption::UnsupportedNote(n) if n.contains("headless") || n.contains("agentFlags") || n.contains("--model") || n.contains("--plan"))));
+                if name != "antigravity" {
+                    assert!(options.iter().any(|o| matches!(o, SandboxOption::SystemPromptInline { text, .. } if text == "context")), "{name}");
+                }
+            }
+        }
+        for name in ["claude", "codex", "copilot"] {
+            let flags = AgentRunOptions {
+                agent_flags: Some(vec!["--extra".into()]),
+                ..Default::default()
+            };
+            assert!(engine
+                .build_sandbox_options(&session, &agent(name), &flags)
+                .is_err());
+        }
+        let model = AgentRunOptions {
+            model: Some("chosen".into()),
+            ..Default::default()
+        };
+        assert!(engine
+            .build_sandbox_options(&session, &agent("copilot"), &model)
+            .is_err());
+        for name in ["claude", "codex", "opencode", "cline", "antigravity"] {
+            assert!(
+                engine
+                    .build_sandbox_options(&session, &agent(name), &model)
+                    .unwrap()
+                    .iter()
+                    .any(|o| matches!(o, SandboxOption::Model { .. })),
+                "{name}"
+            );
+        }
         let yolo = AgentRunOptions {
             yolo: Some(YoloMode::Enabled),
             ..Default::default()
         };
         assert!(engine
-            .build_sandbox_options(&session, &agent("codex"), &yolo)
+            .build_sandbox_options(&session, &agent("claude"), &yolo)
             .unwrap()
             .iter()
-            .any(|o| matches!(o, SandboxOption::UnsupportedNote(n) if n.contains("--yolo"))));
+            .any(|o| matches!(o, SandboxOption::PermissionMode(mode) if mode == "yolo")));
+        sb.finish();
     }
 
     fn session_with_env(sandbox: &TestSandbox, extra: &[(&str, &str)]) -> Session {

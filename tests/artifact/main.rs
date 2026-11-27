@@ -10,6 +10,7 @@ mod support;
 mod deps_scan;
 mod entrypoints;
 mod measure;
+mod sbx_smoke;
 mod signed_boot;
 mod smoke;
 mod switches;

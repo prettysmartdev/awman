@@ -64,6 +64,13 @@ fn inherited_input(name: &str) -> bool {
         "AWMAN_TEST_EVIDENCE_DIR",
         "AWMAN_TEST_FIXTURES",
         "AWMAN_TEST_RUN_CONFIG",
+        // The isolated SBX identity: paths and a label, never a key value.
+        // Read only by the `sbx-test-identity` capability, which also needs
+        // the host resource to be named.
+        "AWMAN_TEST_SBX_HOME",
+        "AWMAN_TEST_SBX_IDENTITY",
+        "AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE",
+        "AWMAN_TEST_SBX_PROVIDER_KEYS_DIR",
         "CI",
         "PLAYWRIGHT_BROWSERS_PATH",
     ]

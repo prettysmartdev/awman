@@ -70,10 +70,10 @@ Reusable runtime mechanics. Engines do real I/O against Docker, git and the file
 
 | Module | Owns |
 |---|---|
-| `agent_runtime` | The cross-runtime contract: `AgentRuntimeEngine`, `AgentExecution`, `AgentFrontend`, runtime capabilities, and `detect_effective`, which selects the runtime from config (`docker`, `apple`, `builtin`; `sbx` is disabled in v0.14). `conformance` checks every available runtime against the contract. |
+| `agent_runtime` | The cross-runtime contract: `AgentRuntimeEngine`, `AgentExecution`, `AgentFrontend`, runtime capabilities, and `detect_effective`, which selects the runtime from config (`docker`, `apple`, `builtin`, `sbx`). `conformance` checks every available runtime against the contract. |
 | `container` | `ContainerRuntime`, the container tier. Backends (`docker.rs`, `apple.rs`, `builtin/`) are private to the module behind the `ContainerBackend` trait; `host_cli_backend.rs` is shared by the CLI-driven ones. |
 | `container/builtin` | The embedded microVM backend: driver, exec bridge, image catalog, networking, resource limits, state paths. |
-| `sandbox` | `SandboxRuntime`, the Docker Sandboxes implementation (disabled in v0.14). |
+| `sandbox` | `SandboxRuntime`, the experimental Docker Sandboxes implementation for macOS arm64 and Linux x86_64. |
 | `oci`, `image_prep` | Image acquisition and verification (registries, Docker Engine export, Apple store, archives) and source-matched image builds for the builtin runtime. |
 | `agent` | `AgentRegistry`: first-party agents (`first_party.rs`, the only place in the engine that branches on an agent name) and custom TOML definitions (`custom.rs`). |
 | `workflow` | `WorkflowEngine`: step ordering, parallel groups, yolo countdowns, stuck detection, setup/teardown steps (including `poll_ci`), state persistence. Agents arrive through an `AgentExecutionFactory`; worktree lifecycle is left to Layer 2. |

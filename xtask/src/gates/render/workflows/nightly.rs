@@ -371,7 +371,7 @@ pub fn render(m: &Manifest) -> Result<String> {
         "diagnostic=\"mutation",
         "diagnostic=\"sandbox-coverage mutation",
     );
-    out.push_str(&format!("\n  sandbox-coverage:\n    name: Sandbox coverage (blocked until issue 86)\n    runs-on: {}\n    timeout-minutes: 5\n    steps:\n      - name: Report unavailable registered diagnostic cell\n        run: |\n          echo 'BLOCKED: native-diagnostic boundary-sbx@macos-arm64-ci-guest-builtin+macos-arm64-sbx (issue 86)' >> \"$GITHUB_STEP_SUMMARY\"\n          exit 2\n", runs_on(&linux.runs_on)));
+    out.push_str(&sandbox_coverage(m)?);
     Ok(out)
 }
 
@@ -414,4 +414,48 @@ fn artifacts(m: &Manifest) -> Result<(Vec<String>, String)> {
         text.push_str(&format!("      - name: Retain complete inventory, command exits and JUnit\n        if: ${{{{ always() }}}}\n        uses: {UPLOAD}\n        with:\n          name: nightly-{job}\n          path: evidence\n          if-no-files-found: error\n          retention-days: 30\n"));
     }
     Ok((jobs, text))
+}
+
+/// Execute the registered cell when provisioned; absent labels are infrastructure.
+fn sandbox_coverage(m: &Manifest) -> Result<String> {
+    use anyhow::Context;
+    let cells = crate::manifest::validate::cells(m, "native-diagnostic")?;
+    let cell = cells
+        .iter()
+        .find(|c| c.suite == "boundary-sbx")
+        .context("missing registered boundary-sbx cell")?;
+    let platform = &m.platforms[&cell.platform];
+    if platform.runs_on.is_empty() {
+        return Ok(format!("\n  sandbox-coverage:\n    name: Sandbox coverage\n    runs-on: {}\n    timeout-minutes: 5\n    steps:\n      - name: Report unprovisioned platform\n        run: |\n          echo 'BLOCKED [infrastructure]: {} has no runs_on labels; registered cell {} cannot execute' | tee -a \"$GITHUB_STEP_SUMMARY\"\n          exit 2\n", runs_on(&m.platforms["linux-x64"].runs_on), cell.platform, cell.id));
+    }
+    let build = &m.builds[&cell.build];
+    let payload = if build.features == "builtin" {
+        format!("      - name: Verified builtin payload\n        run: |\n          bash tools/msb-payloads/fetch.sh {}\n          bash tools/msb-payloads/verify.sh {}\n", platform.triple, platform.triple)
+    } else {
+        String::new()
+    };
+    let grants = m.suites[&cell.suite].requires.join(",");
+    Ok(format!("\n  sandbox-coverage:\n    name: Sandbox coverage\n    runs-on: {}\n    timeout-minutes: 30\n    env:\n      AWMAN_TEST_HOST_RESOURCES: {grants}\n      AWMAN_TEST_SBX_HOME: ${{{{ secrets.AWMAN_TEST_SBX_HOME }}}}\n      AWMAN_TEST_SBX_IDENTITY: ${{{{ secrets.AWMAN_TEST_SBX_IDENTITY }}}}\n      AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE: ${{{{ secrets.AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE }}}}\n      AWMAN_TEST_SBX_PROVIDER_KEYS_DIR: ${{{{ secrets.AWMAN_TEST_SBX_PROVIDER_KEYS_DIR }}}}\n    steps:\n{}\n{}\n{}      - name: Install pinned runner\n        run: cargo xtask test install-runner\n      - name: Execute registered cell {}\n        run: cargo xtask test run --suite boundary-sbx --build {} --evidence-dir evidence\n      - name: Retain boundary evidence\n        if: ${{{{ always() }}}}\n        uses: {UPLOAD}\n        with:\n          name: sandbox-coverage\n          path: evidence\n          if-no-files-found: error\n          retention-days: 30\n", runs_on(&platform.runs_on), indent(&checkout_ref(false, "${{ github.sha }}"), 6), indent(&rust(&platform.toolchain, &[]), 6), payload, cell.id, cell.build))
+}
+
+#[cfg(test)]
+mod sbx_tests {
+    #[test]
+    fn provisioned_sbx_cell_has_all_grants_private_inputs_and_verified_payload() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let mut m = crate::manifest::load(root).unwrap();
+        m.platforms.get_mut("macos-arm64-sbx").unwrap().runs_on = vec!["macos-15".into()];
+        let workflow = super::sandbox_coverage(&m).unwrap();
+        for value in [
+            "docker-sbx,sbx-test-identity,public-network",
+            "secrets.AWMAN_TEST_SBX_HOME",
+            "secrets.AWMAN_TEST_SBX_IDENTITY",
+            "secrets.AWMAN_TEST_SBX_ANTHROPIC_KEY_FILE",
+            "tools/msb-payloads/verify.sh",
+        ] {
+            assert!(workflow.contains(value), "{value}: {workflow}");
+        }
+    }
 }

@@ -167,6 +167,7 @@ pub fn make_contract() -> Vec<(&'static str, Vec<&'static str>)> {
                 "--artifact-sha256",
             ],
         ),
+        ("validate-sbx", vec!["cargo xtask sbx-validation run"]),
         ("gates", vec!["cargo xtask gates check"]),
     ]
 }

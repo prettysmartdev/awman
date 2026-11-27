@@ -14,6 +14,10 @@ pub fn render(m: &Manifest) -> Result<String> {
         s.push_str(&format!("[test-groups.{id}]\nmax-threads = {max}\n\n"));
     }
     for (id, suite) in &m.suites {
+        if id == crate::manifest::release_policy::SBX_SUITE {
+            // Native-only smoke has an attested standalone nextest profile.
+            continue;
+        }
         if suite.kind != "nextest" {
             continue;
         }

@@ -1,7 +1,5 @@
-//! `ci.yml` and `nightly.yml` are rendered here from the manifest (`outputs`);
-//! `release.yml` and `fixtures.yml` are declared in
-//! their own producers and are only verified. The verifier is deliberately
-//! conservative and is supplemented by pinned actionlint in the `lint` job.
+//! Manifest-generated CI, nightly and release workflows. Release keeps its original
+//! two job roles through a template; fixtures.yml is independently verified.
 use crate::manifest::Manifest;
 
 mod ci;
@@ -10,6 +8,7 @@ mod graph;
 mod nightly;
 mod pieces;
 mod policy;
+mod release;
 
 #[allow(unused_imports)]
 pub use graph::{build_job_id, ci_builds, ci_test_jobs, lint_suites, test_job_id, TestJob};
@@ -19,6 +18,7 @@ pub fn outputs(m: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
     Ok(vec![
         (".github/workflows/ci.yml".into(), ci::render(m)?),
         (".github/workflows/nightly.yml".into(), nightly::render(m)?),
+        (".github/workflows/release.yml".into(), release::render(m)?),
     ])
 }
 use std::{collections::BTreeSet, path::Path};

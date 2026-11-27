@@ -1418,7 +1418,7 @@ The log path follows the pattern:
 
 This gives you the container's final output for debugging even after the TUI has scrolled it away or the container has been removed.
 
-**When a log is *not* written:** awman only writes a failure log when the container failed on its own. Containers that awman itself stops — yolo auto-advance, control-board **Abort**/**Pause**/**Finish**, a stuck-step cancel, `abort_on_failure` killing sibling steps, or a startup-grace kill — exit as *expected*, so no log is written for them. The `sbx` runtime is disabled in v0.14.
+**When a log is *not* written:** awman only writes a failure log when the container failed on its own. Containers that awman itself stops — yolo auto-advance, control-board **Abort**/**Pause**/**Finish**, a stuck-step cancel, `abort_on_failure` killing sibling steps, or a startup-grace kill — exit as *expected*, so no log is written for them.
 
 **Setup and teardown output.** The output of setup and teardown phases is captured in full to a private temporary file on disk (bounded memory) so a failing phase can be diagnosed. Quiet commands are not killed for silence at startup, though Ctrl-C and overall deadlines still apply. If capturing stops (disk error, or a 256 MiB per-step cap), awman keeps the last 100 lines, prefixes the transcript with `[awman: transcript incomplete after <n> bytes: <reason>; the last 100 lines follow]`, shows a warning, and leaves the step's real exit status unchanged. If the private spool directory is not owner-only, the step is refused before it starts. The failure log described above can still hold only the recent output of very large transcripts.
 
