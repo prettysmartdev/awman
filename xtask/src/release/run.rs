@@ -19,6 +19,7 @@ use super::journal::{
 };
 use super::plan::Plan;
 use super::preflight;
+use super::progress::Progress;
 use super::util::{random_id, sha256_file, valid_ssh_destination, valid_version};
 use super::world::World;
 use std::collections::{BTreeMap, BTreeSet};
@@ -63,6 +64,8 @@ pub struct Ctx<'a> {
     pub invoked: std::time::Instant,
     pub(crate) sbx_workers:
         BTreeMap<String, std::thread::JoinHandle<Step<super::runtime_smoke::sbx::SbxSmokeRecord>>>,
+    pub progress: Option<Progress>,
+    pub fresh: bool,
 }
 
 impl Ctx<'_> {
@@ -132,6 +135,18 @@ impl Ctx<'_> {
 
     pub fn timing(&self, phase: &str, event: &str, detail: &str) {
         self.store.timing(self.w.clock.now(), phase, event, detail);
+    }
+
+    pub fn progress(&self, key: &str, detail: String) {
+        if let Some(progress) = &self.progress {
+            progress.update(key, detail);
+        }
+    }
+
+    pub fn event(&self, detail: &str) {
+        if let Some(progress) = &self.progress {
+            progress.event(detail);
+        }
     }
 }
 
@@ -398,6 +413,14 @@ fn restore_sealed_evidence(
 /// a prepared environment.
 pub fn run(w: &World, root: &StateRoot, opts: &Options) -> Step {
     let invoked = std::time::Instant::now();
+    let bootstrap = Progress::start(
+        "admission",
+        opts.version.as_deref().unwrap_or("pending"),
+        "pending",
+        "pending",
+        "pending",
+        false,
+    );
     let repo = w.forge.repo()?;
     if let Some(canonical) = &opts.canonical_repo {
         if &repo.full_name != canonical {
@@ -463,6 +486,7 @@ pub fn run(w: &World, root: &StateRoot, opts: &Options) -> Step {
         }
     }
     if opts.preflight_only {
+        bootstrap.end("finished");
         return doctor(
             w,
             &repo,
@@ -479,6 +503,7 @@ pub fn run(w: &World, root: &StateRoot, opts: &Options) -> Step {
     let mut journal = store.load()?;
     let key = claim_key(&version, opts.mode(), &owner);
     let mut claim = w.forge.read_claim(&key)?;
+    bootstrap.end("finished");
     let mut previous_owners = Vec::new();
     let mut took_over = false;
 
@@ -562,6 +587,7 @@ pub fn run(w: &World, root: &StateRoot, opts: &Options) -> Step {
                 &repo,
                 &owner,
                 &version,
+                &head.commit,
                 linux_host,
                 previous_owners,
                 claim.map(|c| c.oid),
@@ -579,6 +605,7 @@ pub fn run(w: &World, root: &StateRoot, opts: &Options) -> Step {
             &repo,
             &owner,
             &version,
+            &head.commit,
             linux_host,
             previous_owners,
             None,
@@ -622,6 +649,8 @@ pub fn run(w: &World, root: &StateRoot, opts: &Options) -> Step {
                 hosts: BTreeMap::new(),
                 invoked,
                 sbx_workers: BTreeMap::new(),
+                progress: None,
+                fresh: false,
             };
             super::runtime_smoke::selection_check(&ctx, opts.linux_host.as_deref())?;
             check_linux_destination(ctx.j.linux_host.as_deref(), linux_host.as_deref())?;
@@ -654,6 +683,14 @@ fn remaining(j: &Journal, plan: &Plan) -> (BTreeSet<&'static str>, Vec<String>) 
 }
 
 fn resume_checks(ctx: &mut Ctx) -> Step {
+    let progress = Progress::start(
+        "preflight",
+        &ctx.j.version,
+        &ctx.j.commit,
+        &ctx.store.path("logs/preflight.log").display().to_string(),
+        &ctx.store.path("timings.jsonl").display().to_string(),
+        true,
+    );
     ctx.timing("preflight", "start", "resume");
     super::runtime_smoke::resume(ctx)?;
     // Reuse a passed SBX check only for the same currently qualified CLI and identity.
@@ -720,6 +757,7 @@ fn resume_checks(ctx: &mut Ctx) -> Step {
         if r.is_ok() { "finish" } else { "stop" },
         "resume",
     );
+    progress.end(if r.is_ok() { "finished" } else { "blocked" });
     r
 }
 
@@ -731,6 +769,7 @@ fn start_new(
     repo: &RepoInfo,
     owner: &str,
     version: &str,
+    head_commit: &str,
     linux_host: Option<String>,
     previous_owners: Vec<Owner>,
     claim_parent: Option<String>,
@@ -738,6 +777,14 @@ fn start_new(
     invoked: std::time::Instant,
 ) -> Step {
     let now = w.clock.now();
+    let progress = Progress::start(
+        "preflight",
+        version,
+        head_commit,
+        &store.path("logs/preflight.log").display().to_string(),
+        &store.path("timings.jsonl").display().to_string(),
+        false,
+    );
     store.timing(now, "preflight", "start", "new attempt");
     // The nonce exists before admission so a disposable rehearsal's
     // `rehearsal-*` tag name is what admission and rule checks examine.
@@ -780,6 +827,7 @@ fn start_new(
         &BTreeMap::new(),
     )?;
     store.timing(w.clock.now(), "preflight", "finish", "new attempt");
+    progress.end("finished");
     if let Some(h) = &linux_host {
         w.source.config_set("awman.release.linuxHost", h);
     }
@@ -864,6 +912,8 @@ fn start_new(
         hosts: BTreeMap::new(),
         invoked,
         sbx_workers: BTreeMap::new(),
+        progress: None,
+        fresh: true,
     };
     drive(&mut ctx)
 }
@@ -875,6 +925,9 @@ fn finish_phase(ctx: &mut Ctx, phase: &str) -> Step {
     rec.finished = Some(now);
     rec.error = None;
     ctx.timing(phase, "finish", "");
+    if let Some(progress) = ctx.progress.take() {
+        progress.end("finished");
+    }
     ctx.save()
 }
 
@@ -1013,6 +1066,14 @@ fn drive_phases(ctx: &mut Ctx) -> Step {
     // `pin` ends when the remote claim exists; a driver killed between the
     // journal write and the claim creates it on resume.
     if !ctx.j.done("pin") {
+        ctx.progress = Some(Progress::start(
+            "pin",
+            &ctx.j.version,
+            &ctx.j.commit,
+            &ctx.store.path("logs/pin.log").display().to_string(),
+            &ctx.store.path("timings.jsonl").display().to_string(),
+            !ctx.fresh,
+        ));
         ctx.w.forge.checkpoint("pin")?;
         if let Err(e) = ctx.update_claim(None) {
             return Err(if e.code == "state-foreign" {
@@ -1034,15 +1095,48 @@ fn drive_phases(ctx: &mut Ctx) -> Step {
         if ctx.j.rehearsal && rehearsal_skips.contains(&phase) {
             continue;
         }
-        if ctx.j.done(phase) && still_done(ctx, phase)? {
-            continue;
+        if ctx.j.done(phase) {
+            if !matches!(
+                phase,
+                "push" | "collect" | "land" | "tag" | "publish" | "verify"
+            ) {
+                continue;
+            }
+            let probe = Progress::start(
+                phase,
+                &ctx.j.version,
+                &ctx.j.commit,
+                &ctx.store
+                    .path(&format!("logs/{phase}.log"))
+                    .display()
+                    .to_string(),
+                &ctx.store.path("timings.jsonl").display().to_string(),
+                true,
+            );
+            if still_done(ctx, phase)? {
+                probe.end("retained");
+                continue;
+            }
+            probe.end("reopening");
         }
         ctx.w.interrupted()?;
         let now = ctx.w.clock.now();
         let rec = ctx.j.phases.entry(phase.into()).or_default();
+        let resumed = rec.status != Status::Pending;
         rec.status = Status::Running;
         rec.started.get_or_insert(now);
         ctx.timing(phase, "start", "");
+        ctx.progress = Some(Progress::start(
+            phase,
+            &ctx.j.version,
+            &ctx.j.commit,
+            &ctx.store
+                .path(&format!("logs/{phase}.log"))
+                .display()
+                .to_string(),
+            &ctx.store.path("timings.jsonl").display().to_string(),
+            resumed,
+        ));
         ctx.save()?;
         let result = ctx
             .w
@@ -1051,8 +1145,16 @@ fn drive_phases(ctx: &mut Ctx) -> Step {
             .and_then(|_| super::phases::run(ctx, phase));
         match result {
             Ok(()) => finish_phase(ctx, phase)?,
-            Err(stop) if stop.kind == Kind::Killed => return Err(stop),
+            Err(stop) if stop.kind == Kind::Killed => {
+                if let Some(progress) = ctx.progress.take() {
+                    progress.end("interrupted");
+                }
+                return Err(stop);
+            }
             Err(stop) => {
+                if let Some(progress) = ctx.progress.take() {
+                    progress.end("blocked");
+                }
                 let rec = ctx.j.phases.entry(phase.into()).or_default();
                 rec.status = if stop.kind == Kind::Failed {
                     Status::Failed

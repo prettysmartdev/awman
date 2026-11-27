@@ -177,6 +177,25 @@ fn one_command_publishes_and_verifies_exactly_the_validated_bytes() {
     let run = w.release(&[]);
     run.passed();
     assert!(run.stdout.contains("published and verified"));
+    assert!(run.stdout.contains("collect started"), "{}", run.stdout);
+    assert!(run.stdout.contains("collect: ci: run"), "{}", run.stdout);
+    assert!(run.stdout.contains("actions/runs/"), "{}", run.stdout);
+    assert!(run.stdout.contains("evidence verified"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("reconciling") && run.stdout.contains("bytes"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("PUBLICATION CONFIRMATION"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("logs/collect.log") && run.stdout.contains("timings.jsonl"),
+        "{}",
+        run.stdout
+    );
     let s = w.store();
     let tag = &s["tags"][VERSION];
     assert_eq!(tag["commit"], r());
@@ -236,9 +255,44 @@ fn a_killed_driver_resumes_in_a_new_process_without_dispatching_again() {
     w.edit(|s| s["faults"] = json!([{"op": "run", "nth": 4, "effect": "crash"}]));
     w.release(&[]).stopped(137, "KILLED", "killed");
     assert_eq!(w.calls("dispatch "), 5);
-    w.release(&[]).passed();
+    let resumed = w.release(&[]);
+    resumed.passed();
+    assert!(resumed.stdout.contains("resumed"), "{}", resumed.stdout);
     assert_eq!(w.calls("dispatch "), 5, "resume attached to the same runs");
     assert!(w.published().is_some());
+}
+
+#[test]
+fn upload_progress_survives_a_lost_response_and_resume() {
+    let w = W::new("pipeline::release::upload_progress_resume");
+    w.edit(|s| {
+        s["faults"] = json!([{"op": "upload_asset", "nth": 2, "effect": "error-after-commit"}])
+    });
+    let stopped = w.release(&[]);
+    stopped.stopped(2, "BLOCKED", "network");
+    assert!(
+        stopped.stdout.contains("seal blocked"),
+        "{}",
+        stopped.stdout
+    );
+    assert!(
+        stopped.stdout.contains("reconciling") && stopped.stdout.contains("bytes"),
+        "{}",
+        stopped.stdout
+    );
+    let resumed = w.release(&[]);
+    resumed.passed();
+    assert!(
+        resumed.stdout.contains("seal resumed"),
+        "{}",
+        resumed.stdout
+    );
+    assert!(
+        resumed.stdout.contains("upload reconciled"),
+        "{}",
+        resumed.stdout
+    );
+    assert_eq!(w.calls("dispatch "), 5);
 }
 
 #[test]

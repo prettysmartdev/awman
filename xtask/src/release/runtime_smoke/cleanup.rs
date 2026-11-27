@@ -34,6 +34,8 @@ pub(crate) fn cleanup_attempt(w: &World, store: &Store, journal: &Journal) -> St
         hosts: BTreeMap::new(),
         invoked: std::time::Instant::now(),
         sbx_workers: BTreeMap::new(),
+        progress: None,
+        fresh: false,
     };
     for n in &ctx.plan.native {
         let out = store.path(&format!("native/{}", n.id));

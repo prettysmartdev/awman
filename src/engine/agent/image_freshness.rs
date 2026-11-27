@@ -354,6 +354,82 @@ mod failure_reason_tests {
     }
 }
 
+#[cfg(test)]
+mod project_tag_tests {
+    use super::*;
+    use awman_test_support::{TestCase, TestSandbox};
+
+    #[tokio::test]
+    async fn ready_and_stale_agent_builds_pin_the_local_project_image() {
+        let s = TestSandbox::for_test(TestCase::component(
+            "engine::agent::image_freshness::project_tag_tests::ready_and_stale_agent_builds_pin_the_local_project_image",
+        ));
+        let root = s.work();
+        std::fs::create_dir_all(root.join(".awman")).unwrap();
+        std::fs::write(root.join("Dockerfile.dev"), "FROM scratch\n").unwrap();
+        let project_tag = project_image_tag(&root);
+        let agent_file = root.join(".awman/Dockerfile.claude");
+        std::fs::write(&agent_file, format!("FROM {project_tag}\nRUN echo first\n")).unwrap();
+        let env = EnvSnapshot::from_full_env(
+            s.env()
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect(),
+        );
+        let runtime = Arc::new(test_runtime::BuildRuntime::default());
+        let project_inputs = crate::engine::image_prep::project_inputs_from_disk(
+            &root,
+            &root.join("Dockerfile.dev"),
+        )
+        .unwrap()
+        .unwrap();
+        let project_id = runtime.install(&project_tag, Some(project_inputs.as_str()));
+        let tag = agent_image_tag(&root, "claude");
+        let context = ImageBuildContext {
+            git_root: root.clone(),
+            project_dockerfile: root.join("Dockerfile.dev"),
+            default_agent: "claude".into(),
+        };
+        let data_home = s.root().join("data");
+        let prep = AgentImagePreparer::for_runtime(runtime.clone(), data_home.clone(), context);
+        prep.build_runtime_coordinated(
+            BuildRequest::runtime(&tag, &agent_file, &root, false),
+            &mut crate::engine::image_prep::contracts::Sink::default(),
+        )
+        .await
+        .unwrap();
+        assert!(runtime.recipes.lock().unwrap()[0].starts_with(&format!("FROM {project_id}\n")));
+
+        std::fs::write(
+            &agent_file,
+            format!("FROM {project_tag}\nRUN echo second\n"),
+        )
+        .unwrap();
+        refresh_stale_images(
+            runtime.clone(),
+            &SessionImageInputs {
+                git_root: root.clone(),
+                project_dockerfile: root.join("Dockerfile.dev"),
+                env,
+                data_home,
+            },
+            &["claude".into()],
+            &mut crate::engine::image_prep::contracts::Sink::default(),
+        )
+        .await
+        .unwrap();
+        let recipes = runtime.recipes.lock().unwrap();
+        assert_eq!(recipes.len(), 2);
+        assert!(recipes[1].starts_with(&format!("FROM {project_id}\n")));
+        s.finish();
+    }
+}
+
 /// A building runtime (Docker-like) for session-image contracts: records
 /// builds, gives every build a new image id, installs the request's labels,
 /// and can fail or hold a build. No daemon, no host agent.

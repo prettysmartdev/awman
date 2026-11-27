@@ -93,12 +93,16 @@ impl AgentImagePreparer {
                     })?;
                 let mut recipe = None;
                 if reference != parent_ref {
-                    if let Some(base) = runtime.inspect_image(&parent)? {
+                    let parent_image = runtime.inspect_image(&parent)?;
+                    if let Some(parent_image) = parent_image {
                         let bytes = std::fs::read(&request.dockerfile)
                             .map_err(|e| EngineError::io(&request.dockerfile, e))?;
-                        let text =
-                            crate::data::image_inputs::bind_project_base(&bytes, &parent, &base.id)
-                                .map_err(EngineError::Config)?;
+                        let text = crate::data::image_inputs::bind_project_base(
+                            &bytes,
+                            &parent,
+                            &parent_image.id,
+                        )
+                        .map_err(EngineError::Config)?;
                         let pinned = tempfile::NamedTempFile::new()
                             .map_err(|e| EngineError::io(&request.dockerfile, e))?;
                         std::fs::write(pinned.path(), text)

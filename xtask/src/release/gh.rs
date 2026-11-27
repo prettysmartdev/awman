@@ -511,8 +511,21 @@ impl Forge for GhForge {
                             .collect()
                     })
                     .unwrap_or_default(),
+                active_step: v["steps"].as_array().and_then(|steps| {
+                    steps
+                        .iter()
+                        .find(|step| step["status"] == "in_progress")
+                        .and_then(|step| step["name"].as_str())
+                        .map(str::to_string)
+                }),
             })
             .collect())
+    }
+
+    fn progress_snapshot(&self, run_id: u64) -> Option<(RunInfo, Vec<JobInfo>)> {
+        let run = self.run(run_id).ok()?;
+        let jobs = self.jobs(run_id).unwrap_or_default();
+        Some((run, jobs))
     }
 
     fn rerun_failed(&self, run_id: u64) -> Step {

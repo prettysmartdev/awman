@@ -1588,7 +1588,7 @@ Restart, cancel-to-previous and next act on the group as a whole, and the board 
 
 When an action is unavailable, the reason is shown alongside it rather than just being greyed out silently.
 
-In a final group, dismissing the review board leaves every agent running. Use Ctrl-S to switch among their containers, then Ctrl-W to reopen the board and finish. Earlier groups keep their usual per-step controls.
+In a final group, dismissing the review board leaves every agent running. Use Ctrl-S to switch among their containers, then Ctrl-W to reopen the board and finish. If you prompt an agent and it reports `working` again, Finish becomes unavailable and the board does not open automatically until every remaining agent returns to `done` or `idle`. Earlier groups keep their usual per-step controls.
 
 **Retrying a failed step mid-group.** If a step in the group fails while its peers are still running, opening the control board (Ctrl-W) adds a red `(r)etry failed step <name>` line below the arrow options. Press **r** to relaunch that step immediately, alongside the peers that are still running. If more than one step has failed, the board offers the earliest failure first. Any failure you don't retry this way still gets its usual recovery board after the whole group finishes.
 

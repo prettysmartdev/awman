@@ -151,6 +151,58 @@ fn file_url(path: &Path) -> String {
     format!("file://{}", path.display())
 }
 
+#[test]
+fn sparse_skill_library_clone_and_refresh_fetch_needed_blobs() {
+    let sandbox = sandbox("engine::git::sparse_skill_library_clone_and_refresh_fetch_needed_blobs");
+    let source = RepoBuilder::new(&sandbox, "skill-source")
+        .file("skills/demo/SKILL.md", "first version")
+        .file("outside/outside.txt", "outside the sparse checkout")
+        .init();
+    let bare = source.bare_remote("origin");
+    git(
+        &sandbox,
+        &bare,
+        &["config", "uploadpack.allowFilter", "true"],
+    );
+    let clone = sandbox.work().join("skill-clone");
+    let engine = engine(&sandbox);
+
+    assert_eq!(
+        engine
+            .clone_repo_sparse(&file_url(&bare), &clone, "skills")
+            .unwrap(),
+        awman::engine::git::SparseCloneOutcome::Sparse
+    );
+    assert_eq!(
+        std::fs::read_to_string(clone.join("skills/demo/SKILL.md")).unwrap(),
+        "first version"
+    );
+    assert!(!clone.join("outside/outside.txt").exists());
+
+    source.write("skills/demo/SKILL.md", "second version");
+    source.commit("update builtin skill");
+    source.push("origin", "main");
+    engine.pull_latest_shallow(&clone).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(clone.join("skills/demo/SKILL.md")).unwrap(),
+        "second version"
+    );
+
+    let logged_clone = sandbox.work().join("logged-skill-clone");
+    let mut messages = sink();
+    engine
+        .clone_repo_sparse_logged(&file_url(&bare), &logged_clone, "skills", &mut messages)
+        .unwrap();
+    engine
+        .pull_latest_shallow_logged(&logged_clone, &mut messages)
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(logged_clone.join("skills/demo/SKILL.md")).unwrap(),
+        "second version"
+    );
+    sandbox.finish();
+}
+
 // ─── root, branches, HEAD ───────────────────────────────────────────────────
 
 #[test]

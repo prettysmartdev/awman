@@ -347,6 +347,19 @@ mark the performance target **MISSED**.
 | verify | Download every asset anonymously, compare to the seal, `SHA256SUMS` and attestations, write the receipt. |
 | cleanup | Remove kits, the controller checkout and verification copies. |
 
+### Homebrew tap
+
+`prettysmartdev/homebrew-tap` updates its `awman` formula independently of this
+release command. A scheduled workflow in the tap reads the latest published
+stable release, compares the three supported Homebrew asset digests with
+`SHA256SUMS`, verifies each asset's build attestation against the release tag
+commit and `release.yml`, and tests installation on Apple Silicon macOS and
+both Linux architectures before committing the formula to the tap's `main`.
+The workflow uses only the tap repository's own `GITHUB_TOKEN` to write that
+commit. It cannot change a release, tag or asset. Tap update failures are
+reported by that workflow and do not invalidate an already verified awman
+release; the next scheduled run retries the update.
+
 ### The publication confirmation
 
 Before the irreversible steps the command prints one summary: version, R,
@@ -361,7 +374,19 @@ changed seal is asked about again.
 
 ### Output and exit codes
 
-On any stop the command prints exactly two lines:
+The command flushes phase start, finish, resume and block events to the terminal,
+with elapsed time, version, short commit, phase log and timing ledger locations.
+During long phases it prints changed CI, asset, job and native status as it is
+observed, including Actions run links and active steps when available. A
+heartbeat appears at least every 30 seconds while a phase is running, including
+during a blocking service call. Evidence verification and draft reconciliation
+report each item; uploads include file sizes. The only private paths printed are
+the operator's phase log and timing ledger locations. Credentials, tokens, raw
+command output and other private paths remain in the private attempt state.
+The publication prompt has a prominent heading.
+
+On any stop, preceding progress messages are permitted. The final two lines
+are exactly one primary error and its recovery instruction:
 
 ```
 release: BLOCKED [linux-host-unreachable] ssh build@kvm1 timed out after 8 s

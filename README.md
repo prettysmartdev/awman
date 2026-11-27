@@ -48,6 +48,17 @@ You'll need a project in a git repo, an account for your chosen agent(s), and a 
 
 ```sh
 curl -s https://prettysmart.dev/install/awman.sh | sh
+```
+
+Or install with Homebrew on Apple Silicon macOS or Linux:
+
+```sh
+brew install prettysmartdev/tap/awman
+```
+
+Then start in your repository:
+
+```sh
 cd your-repo
 awman init --agent codex
 awman # open the TUI

@@ -1,6 +1,7 @@
 //! Workflow execution contracts: persistence, recovery, dependency barriers and
 //! cancellation through the production scheduler. No agent runs on the host.
 use super::*;
+use crate::data::program_status::{EffectiveStatus, ProgramState};
 use crate::data::{
     config::env::EnvSnapshot,
     message::{UserMessage, UserMessageSink},
@@ -852,6 +853,194 @@ async fn unattended_and_explicit_non_interactive_runs_finish_without_review() {
             }
         }
     }
+    s.finish();
+}
+
+struct ResumingFinalReviewFrontend {
+    boards: tokio::sync::mpsc::UnboundedSender<bool>,
+    statuses: tokio::sync::mpsc::UnboundedSender<(String, ProgramState)>,
+    requests: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>>,
+    board_count: usize,
+}
+
+impl UserMessageSink for ResumingFinalReviewFrontend {
+    fn write_message(&mut self, _: UserMessage) {}
+    fn replay_queued(&mut self) {}
+}
+
+impl WorkflowFrontend for ResumingFinalReviewFrontend {
+    fn supports_interactive_recovery(&self) -> bool {
+        true
+    }
+
+    fn attach_engine(&mut self, handles: EngineHandles) {
+        if let Some(requests) = handles.requests {
+            *self.requests.lock().unwrap() = Some(requests);
+        }
+    }
+
+    fn show_workflow_control_board(
+        &mut self,
+        _: &WorkflowState,
+        actions: &AvailableActions,
+    ) -> Result<NextAction, EngineError> {
+        self.board_count += 1;
+        self.boards.send(actions.can_finish_workflow).unwrap();
+        Ok(if self.board_count == 3 {
+            NextAction::FinishWorkflow
+        } else {
+            NextAction::Dismiss
+        })
+    }
+
+    fn confirm_resume(&mut self, _: &ResumeMismatch) -> Result<bool, EngineError> {
+        Ok(true)
+    }
+
+    fn yolo_countdown_tick(
+        &mut self,
+        _: &str,
+        _: Duration,
+        _: Duration,
+    ) -> Result<YoloTickOutcome, EngineError> {
+        Ok(YoloTickOutcome::Continue)
+    }
+
+    fn report_agent_status(&mut self, step_name: &str, status: Option<&EffectiveStatus>) {
+        if let Some(status) = status {
+            self.statuses
+                .send((step_name.to_string(), status.state))
+                .unwrap();
+        }
+    }
+
+    fn report_step_status(&mut self, _: &WorkflowStep, _: WorkflowStepStatus) {}
+    fn report_workflow_completed(&mut self, _: &WorkflowOutcome) {}
+}
+
+#[tokio::test]
+async fn final_parallel_review_waits_for_resumed_agent_to_finish_again() {
+    fn report(state: ProgramState) -> StuckEvent {
+        StuckEvent::Reported(Some(EffectiveStatus {
+            state,
+            kind: None,
+            progress: None,
+            msg: None,
+            app: None,
+            id: None,
+        }))
+    }
+
+    let s = TestSandbox::for_test(TestCase::component(
+        "engine::workflow::contracts::final_parallel_review_waits_for_resumed_agent_to_finish_again",
+    ));
+    let trace = Arc::new(Mutex::new(Trace::default()));
+    let requests = Arc::new(Mutex::new(None));
+    let (boards_tx, mut boards_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (statuses_tx, mut statuses_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (started, mut launches) = tokio::sync::mpsc::unbounded_channel();
+    let session = Session::open_at_directory_root(
+        s.work(),
+        SessionOpenOptions {
+            env: Some(environment(&s)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut workflow = definition(true);
+    workflow.steps.truncate(2);
+    for step in &mut workflow.steps {
+        step.depends_on.clear();
+    }
+    let mut engine = WorkflowEngine::new(
+        &session,
+        WorkflowSpec::new(workflow).with_work_item_context(None),
+        WorkflowEngineDeps {
+            frontend: Box::new(ResumingFinalReviewFrontend {
+                boards: boards_tx,
+                statuses: statuses_tx,
+                requests: requests.clone(),
+                board_count: 0,
+            }),
+            agent_factory: Box::new(Runtime {
+                trace: trace.clone(),
+                hold: true,
+                started,
+            }),
+        },
+    )
+    .unwrap();
+    let task = tokio::spawn(async move { engine.run_to_completion().await.unwrap() });
+    let first = tokio::time::timeout(Duration::from_secs(5), launches.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(5), launches.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let send = |name: &str, state| {
+        trace.lock().unwrap().reports[name]
+            .send(report(state))
+            .unwrap();
+    };
+
+    send(&first, ProgramState::Done);
+    send(&second, ProgramState::Idle);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), boards_rx.recv())
+            .await
+            .unwrap(),
+        Some(true)
+    );
+
+    // Prompting one agent makes Finish unavailable until it reports done
+    // again. The status callback proves the scheduler consumed the event.
+    send(&first, ProgramState::Working);
+    loop {
+        let (name, state) = tokio::time::timeout(Duration::from_secs(5), statuses_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if name == first && state == ProgramState::Working {
+            break;
+        }
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), boards_rx.recv())
+            .await
+            .is_err(),
+        "the board reopened while a final agent was working"
+    );
+    requests
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .send(EngineRequest::OpenControlBoard {
+            step_name: first.clone(),
+        })
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), boards_rx.recv())
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    send(&first, ProgramState::Done);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), boards_rx.recv())
+            .await
+            .unwrap(),
+        Some(true)
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap(),
+        WorkflowOutcome::Completed
+    );
     s.finish();
 }
 

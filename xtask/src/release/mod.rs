@@ -21,6 +21,7 @@ mod phases;
 pub mod plan;
 mod preflight;
 mod produce;
+mod progress;
 mod rehearse;
 pub mod run;
 pub(crate) mod runtime_smoke;

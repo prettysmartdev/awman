@@ -111,6 +111,17 @@ fn attach(ctx: &mut Ctx, s: &Slot, runs: &[RunInfo]) -> Step {
     d.run_id = Some(canonical);
     d.acked = true;
     d.duplicates = dups;
+    let name = match s {
+        Slot::Ci => "ci",
+        Slot::Build(a) => a.as_str(),
+    };
+    ctx.progress(
+        name,
+        format!(
+            "{name}: run {canonical} https://github.com/{}/actions/runs/{canonical} attached",
+            ctx.j.repo
+        ),
+    );
     ctx.save()
 }
 
@@ -134,6 +145,13 @@ fn reuse_ci(ctx: &mut Ctx) -> Step<bool> {
             };
             ctx.j.ci.reused = true;
             record_ci(ctx, &run, &v.1);
+            ctx.progress(
+                "ci",
+                format!(
+                    "ci: reused verified run {} https://github.com/{}/actions/runs/{}",
+                    run.id, ctx.j.repo, run.id
+                ),
+            );
             ctx.store.log(
                 "dispatch",
                 &format!("reused CI run {} for {}", run.id, &ctx.j.commit[..12]),
@@ -170,6 +188,11 @@ pub fn dispatch(ctx: &mut Ctx) -> Step {
         d.key = k;
         d.pending_since = Some(now);
         d.acked = false;
+        let name = match s {
+            Slot::Ci => "ci",
+            Slot::Build(a) => a.as_str(),
+        };
+        ctx.progress(name, format!("{name}: waiting for Actions run to appear"));
         ctx.save()?;
         let wf = workflow(ctx, s);
         // The revision that will run is the file at the pushed release ref.
@@ -221,6 +244,7 @@ pub fn dispatch(ctx: &mut Ctx) -> Step {
 }
 
 fn verify_ci(ctx: &mut Ctx, run: &RunInfo) -> Step<(VerifiedCi, Vec<u8>)> {
+    ctx.event(&format!("verifying CI evidence for run {}", run.id));
     let src = ctx.source_dir()?;
     let out = ctx
         .store
@@ -273,6 +297,57 @@ fn verify_ci(ctx: &mut Ctx, run: &RunInfo) -> Step<(VerifiedCi, Vec<u8>)> {
         );
     }
     Ok((v, bytes))
+}
+
+fn report_hosted(ctx: &Ctx) {
+    let mut items = vec![(
+        "ci".to_string(),
+        ctx.j.ci.dispatch.run_id,
+        ctx.j.ci.verified_sha256.is_some(),
+    )];
+    items.extend(ctx.plan.assets.iter().map(|a| {
+        (
+            a.asset.clone(),
+            ctx.j.builds.get(&a.asset).and_then(|b| b.dispatch.run_id),
+            ctx.j
+                .builds
+                .get(&a.asset)
+                .is_some_and(|b| b.validated.is_some()),
+        )
+    }));
+    for (item, id, verified) in items {
+        let Some(id) = id else {
+            ctx.progress(&item, format!("{item}: waiting for run ID"));
+            continue;
+        };
+        let link = format!("https://github.com/{}/actions/runs/{id}", ctx.j.repo);
+        if verified {
+            ctx.progress(&item, format!("{item}: run {id} {link} evidence verified"));
+            continue;
+        }
+        // Status reporting must never change the evidence or the release outcome.
+        let Some((run, jobs)) = ctx.w.forge.progress_snapshot(id) else {
+            continue;
+        };
+        let mut detail = format!("{item}: run {id} {link} {}", run.status);
+        if let Some(conclusion) = &run.conclusion {
+            detail.push_str(&format!("/{conclusion}"));
+        }
+        for job in jobs {
+            detail.push_str(&format!(
+                "; {} {}",
+                super::super::progress::service_label(&job.name),
+                job.status
+            ));
+            if let Some(step) = job.active_step {
+                detail.push_str(&format!(
+                    " [{}]",
+                    super::super::progress::service_label(&step)
+                ));
+            }
+        }
+        ctx.progress(&item, detail);
+    }
 }
 
 fn record_ci(ctx: &mut Ctx, run: &RunInfo, bytes: &[u8]) {
@@ -430,6 +505,7 @@ fn ci_evidence_path(ctx: &Ctx) -> std::path::PathBuf {
 /// record; nothing is rerun. The original completion time is kept, so
 /// re-verification never resets the evidence age.
 fn ensure_ci_evidence(ctx: &mut Ctx) -> Step {
+    ctx.event("checking retained CI evidence");
     let Some(recorded) = ctx.j.ci.verified_sha256.clone() else {
         stop!("state-corrupt", "CI evidence was never verified");
     };
@@ -465,6 +541,9 @@ fn ensure_ci_evidence(ctx: &mut Ctx) -> Step {
 /// digests; otherwise they are re-downloaded from the pinned artifact ID
 /// (never rebuilt) and must reproduce exactly the recorded digests.
 fn ensure_build_evidence(ctx: &mut Ctx, asset: &str) -> Step {
+    ctx.event(&format!(
+        "{asset}: checking retained build bytes and record"
+    ));
     let b = ctx.j.builds.get(asset).cloned().unwrap_or_default();
     let (Some(sha), Some(json_sha)) = (b.sha256.clone(), b.build_json_sha256.clone()) else {
         stop!("state-corrupt", "{asset} was never validated");
@@ -656,6 +735,10 @@ fn step_build(ctx: &mut Ctx, asset: &str) -> Step<bool> {
         );
     }
     let dir = ctx.store.path(&format!("assets/{asset}.d"));
+    ctx.event(&format!(
+        "{asset}: downloading and verifying artifact {} from run {id}",
+        a.id
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     ctx.w.forge.download_artifact(id, &a, &dir)?;
     let file = dir.join(asset);
@@ -701,6 +784,7 @@ fn step_build(ctx: &mut Ctx, asset: &str) -> Step<bool> {
         .map(|n| n.id.clone())
         .collect();
     for nid in ids {
+        ctx.event(&format!("{asset}: verifying native kit {nid}"));
         let n = ctx
             .plan
             .native(&nid)
@@ -824,6 +908,7 @@ pub(crate) fn job(ctx: &Ctx, id: &str) -> Step<Option<NativeJob>> {
 /// The journal records completion, but cannot replace raw execution proof.
 pub(super) fn verify_native_records(ctx: &Ctx) -> Step {
     for n in &ctx.plan.native {
+        ctx.event(&format!("{}: checking retained native result", n.id));
         let job = job(ctx, &n.id)?.ok_or_else(|| {
             Stop::new(
                 "native-result-invalid",
@@ -917,6 +1002,7 @@ fn natives_tick(ctx: &mut Ctx) -> Step {
             let host = ctx.w.hosts.host(&job.plan, ctx.linux_host.as_deref())?;
             ctx.store
                 .log("native", &format!("{id} runs on {}", host.describe()));
+            ctx.progress(&id, format!("native {id}: starting"));
             ctx.hosts.insert(id.clone(), host);
         }
         let host = &ctx.hosts[&id];
@@ -925,6 +1011,7 @@ fn natives_tick(ctx: &mut Ctx) -> Step {
             Ok(None) => {}
             Ok(Some((path, exit))) => match native::verify_result(&job, &path, exit) {
                 Ok(rec) => {
+                    ctx.progress(&id, format!("native {id}: passed"));
                     ctx.timing("native", "result", &format!("{id} passed"));
                     ctx.j.native.insert(id.clone(), rec);
                     ctx.save()?;
@@ -1005,6 +1092,7 @@ pub fn collect(ctx: &mut Ctx) -> Step {
         }
         natives_tick(ctx)?;
         crate::release::runtime_smoke::tick(ctx)?;
+        report_hosted(ctx);
         if done {
             return Ok(());
         }
@@ -1023,6 +1111,13 @@ pub fn native_phase(ctx: &mut Ctx) -> Step {
         ctx.w.interrupted()?;
         natives_tick(ctx)?;
         crate::release::runtime_smoke::tick(ctx)?;
+        for n in &ctx.plan.native {
+            if let Some(record) = ctx.j.native.get(&n.id) {
+                ctx.progress(&n.id, format!("native {}: {}", n.id, record.outcome));
+            } else {
+                ctx.progress(&n.id, format!("native {}: running", n.id));
+            }
+        }
         let all = ctx.plan.native.iter().all(|n| {
             ctx.j
                 .native

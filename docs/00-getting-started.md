@@ -12,7 +12,14 @@ You need a Git repository, a running Docker daemon, and an account with a [suppo
 curl -s https://prettysmart.dev/install/awman.sh | sh
 ```
 
-The installer puts `awman` in `/usr/local/bin`. You can also [download a release](https://github.com/prettysmartdev/awman/releases), run `mise use -g github:prettysmartdev/awman`, or build from source with `make install`. Intel Macs are unsupported; the Linux x86_64 release needs glibc 2.35 or newer. See [Runtimes](11-runtimes.md) for platform details.
+The installer puts `awman` in `/usr/local/bin`. On Apple Silicon macOS or Linux, you can instead use Homebrew:
+
+```sh
+brew install prettysmartdev/tap/awman
+brew upgrade awman
+```
+
+You can also [download a release](https://github.com/prettysmartdev/awman/releases), run `mise use -g github:prettysmartdev/awman`, or build from source with `make install`. Intel Macs are unsupported; the Linux x86_64 release needs glibc 2.35 or newer. See [Runtimes](11-runtimes.md) for platform details.
 
 ## Set up the repository
 
