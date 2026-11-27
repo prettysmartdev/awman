@@ -146,6 +146,19 @@ mark the performance target **MISSED**.
 | verify | Download every asset anonymously, compare to the seal, `SHA256SUMS` and attestations, write the receipt. |
 | cleanup | Remove kits, the controller checkout and verification copies. |
 
+### Homebrew tap
+
+`prettysmartdev/homebrew-tap` updates its `awman` formula independently of this
+release command. A scheduled workflow in the tap reads the latest published
+stable release, compares the three supported Homebrew asset digests with
+`SHA256SUMS`, verifies each asset's build attestation against the release tag
+commit and `release.yml`, and tests installation on Apple Silicon macOS and
+both Linux architectures before committing the formula to the tap's `main`.
+The workflow uses only the tap repository's own `GITHUB_TOKEN` to write that
+commit. It cannot change a release, tag or asset. Tap update failures are
+reported by that workflow and do not invalidate an already verified awman
+release; the next scheduled run retries the update.
+
 ### The publication confirmation
 
 Before the irreversible steps the command prints one summary: version, R,

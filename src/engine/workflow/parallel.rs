@@ -75,15 +75,16 @@ impl WorkflowEngine {
             // A final group stays alive after its countdowns. Once every live
             // member has reached review readiness (or exited), ask once; Esc
             // returns to the live containers, and Ctrl-W can reopen the board.
-            if final_review_group
-                && !final_review_shown
+            let final_review_ready = final_review_group
                 && failed.is_empty()
                 && queue.is_empty()
-                && self
-                    .active_steps
-                    .iter()
-                    .all(|slot| review_ready.contains(&slot.step_name))
-            {
+                && self.all_active_final_steps_ready(&review_ready);
+            if !final_review_ready {
+                // A prompted agent can resume after the board was dismissed.
+                // Its next done/idle report starts a new review episode.
+                final_review_shown = false;
+            }
+            if final_review_ready && !final_review_shown {
                 final_review_shown = true;
                 let step_name = self
                     .active_steps
@@ -288,7 +289,8 @@ impl WorkflowEngine {
                             EngineRequest::OpenControlBoard { step_name: name },
                             &group_names,
                             retryable.as_deref(),
-                            final_review_group && final_review_shown && failed.is_empty() && queue.is_empty(),
+                            final_review_group && failed.is_empty() && queue.is_empty()
+                                && self.all_active_final_steps_ready(&review_ready),
                             true,
                         )? {
                             ParallelRequestOutcome::Continue => {}
@@ -313,11 +315,18 @@ impl WorkflowEngine {
                     // The earliest failure still awaiting recovery is offered
                     // as a retry on any board opened while the group runs.
                     let retryable = failed.first().map(|(name, _)| name.clone());
+                    let final_review_ready = final_review_group
+                        && failed.is_empty()
+                        && queue.is_empty()
+                        && self.all_active_final_steps_ready(&review_ready);
+                    if final_review_ready && matches!(req, EngineRequest::OpenControlBoard { .. }) {
+                        final_review_shown = true;
+                    }
                     match self.handle_parallel_engine_request(
                         req,
                         &group_names,
                         retryable.as_deref(),
-                        final_review_group && final_review_shown && failed.is_empty() && queue.is_empty(),
+                        final_review_ready,
                         false,
                     )? {
                         ParallelRequestOutcome::Continue => {}
@@ -806,6 +815,12 @@ impl WorkflowEngine {
             self.frontend.parallel_step_yolo_countdown_finished(name);
             self.msg_info(format!("Final step '{name}' is ready for review"));
         }
+    }
+
+    fn all_active_final_steps_ready(&self, ready: &HashSet<String>) -> bool {
+        self.active_steps
+            .iter()
+            .all(|slot| ready.contains(&slot.step_name))
     }
 
     /// Yolo countdown expired (or user forced advance) for one parallel slot:
